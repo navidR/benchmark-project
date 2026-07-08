@@ -859,6 +859,12 @@ void WriteEvent(const std::filesystem::path& events_path,
   AppendLine(events_path, boost::json::serialize(object));
 }
 
+void WriteNodeState(const std::filesystem::path& events_path,
+                    const std::string& run_id, const std::string& node_id,
+                    std::string_view state) {
+  WriteEvent(events_path, run_id, node_id, "state", state);
+}
+
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root) {
   std::string network_yaml =
@@ -1070,6 +1076,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     NodeRuntime runtime;
     try {
       runtime.config = config;
+      WriteNodeState(events_path, options.run_id, node_id, "Preparing");
       if (options.isolate_network) {
         runtime.network_namespace = NetworkNamespace::Create();
         runtime.network = MakeNodeVethConfig(options, i);
@@ -1083,6 +1090,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                    "node_ip=" + runtime.network->node_address +
                        " host_if=" + runtime.network->host_name +
                        " peer_if=" + runtime.network->peer_name);
+        WriteNodeState(events_path, options.run_id, node_id, "NetnsReady");
       }
 
       runtime.cgroup = Cgroup::Create(options.run_id, node_id);
@@ -1094,11 +1102,13 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
               : std::nullopt,
           options.cpu_period_us);
       runtime.cgroup->SetPidsMax(options.pids_max);
+      WriteNodeState(events_path, options.run_id, node_id, "CgroupReady");
 
       ProcessSpec process = driver.RenderProcess(runtime.config);
       if (runtime.network_namespace) {
         process.network_namespace_fd = runtime.network_namespace->fd();
       }
+      WriteNodeState(events_path, options.run_id, node_id, "Starting");
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
       BSIM_LOG(info) << "started " << node_id
                      << " pid=" << runtime.process.pid();
@@ -1106,6 +1116,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                  "pid=" + std::to_string(runtime.process.pid()));
       nodes.push_back(std::move(runtime));
     } catch (...) {
+      WriteNodeState(events_path, options.run_id, node_id, "Failed");
       runtime.process.Kill();
       if (runtime.cgroup) {
         try {
@@ -1125,12 +1136,14 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     driver.WaitReady(node.config,
                      std::chrono::seconds(options.ready_timeout_sec));
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
+    WriteNodeState(events_path, options.run_id, node.config.id, "Running");
   }
 }
 
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
                const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
   for (auto& node : nodes) {
+    WriteNodeState(events_path, options.run_id, node.config.id, "Stopping");
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_stop");
     driver.Stop(node.config);
   }
@@ -1139,6 +1152,8 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
       WriteEvent(events_path, options.run_id, node.config.id, "sigterm");
       node.process.Terminate(std::chrono::seconds(5));
     }
+    WriteNodeState(events_path, options.run_id, node.config.id, "Stopped");
+    WriteNodeState(events_path, options.run_id, node.config.id, "Cleaning");
     if (node.cgroup && !options.keep_cgroups) {
       node.cgroup->KillAll();
       try {
@@ -1156,6 +1171,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
     if (node.network_namespace) {
       node.network_namespace->Stop();
     }
+    WriteNodeState(events_path, options.run_id, node.config.id, "Cleaned");
   }
   if (!options.keep_cgroups) {
     try {
@@ -1295,6 +1311,9 @@ int Run(int argc, char** argv) {
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
     BSIM_LOG(info) << "finished run " << options.run_id;
   } catch (...) {
+    for (auto& node : nodes) {
+      WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
+    }
     StopNodes(options, events_path, driver, nodes);
     WriteEvent(events_path, options.run_id, "sim", "run_failed");
     throw;
