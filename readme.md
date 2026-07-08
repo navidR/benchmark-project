@@ -6,8 +6,8 @@ The goal is to run real blockchain daemon processes locally, isolate them like
 separate nodes, apply controlled CPU, memory, process, and network conditions,
 drive benchmark workloads, and write reproducible metrics.
 
-Firo is the MVP priority. Bitcoin Core and Monero are future targets after the
-Firo path is working end to end.
+Firo is the current priority. Bitcoin Core and Monero are future targets after
+the Firo path is working end to end.
 
 ## What Works Now
 
@@ -194,13 +194,13 @@ running, before block generation:
   --runtime-node-network-condition-json '{"node":2,"bandwidth_mbps":10}'
 ```
 
-The current MVP applies bandwidth-only conditions with TBF and delay/loss
-conditions with `netem`. The netem fields are `delay_ms`, `jitter_ms`,
+The current implementation applies bandwidth-only conditions with TBF and
+delay/loss conditions with `netem`. The netem fields are `delay_ms`, `jitter_ms`,
 `loss_basis_points`, `duplicate_basis_points`, `corrupt_basis_points`,
 `reorder_basis_points`, and `limit_packets`. Combining bandwidth with netem
 needs a qdisc hierarchy and is not enabled yet.
 
-Resource limits are global for the current MVP and apply to each node cgroup:
+Default resource limits apply to each node cgroup:
 
 ```bash
 ./build/benchmark-sim \
@@ -275,7 +275,7 @@ block generation:
   --metrics-interval-ms 1000
 ```
 
-The same MVP fields can be loaded from a Boost.JSON scenario file:
+The same run settings can be loaded from a JSON scenario file:
 
 ```json
 {
@@ -370,6 +370,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    ./build/benchmark-sim --probe-route &&
    ./build/benchmark-sim --probe-qdisc &&
    ./build/benchmark-sim --probe-qdisc-mutation &&
+   ./build/benchmark-sim --probe-bandwidth-limit &&
    ./build/benchmark-sim --probe-network-condition &&
    ./build/benchmark-sim --probe-network-condition-update'
 ```
@@ -382,6 +383,7 @@ Useful focused probes:
 ./build/benchmark-sim --probe-cgroup-freeze
 ./build/benchmark-sim --probe-route
 ./build/benchmark-sim --probe-qdisc-mutation
+./build/benchmark-sim --probe-bandwidth-limit
 ./build/benchmark-sim --probe-network-condition
 ./build/benchmark-sim --probe-network-condition-update
 ```
