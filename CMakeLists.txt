@@ -79,6 +79,7 @@ add_executable(benchmark-sim
   src/cgroup.cpp
   src/firo_driver.cpp
   src/http_client.cpp
+  src/log_tail.cpp
   src/logging.cpp
   src/main.cpp
   src/network.cpp
@@ -108,11 +109,13 @@ if(BUILD_TESTING)
   add_executable(benchmark-sim-unit-tests
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
+    tests/unit/log_tail_tests.cpp
     tests/unit/network_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/util_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
+    src/log_tail.cpp
     src/network.cpp
     src/process.cpp
     src/util.cpp

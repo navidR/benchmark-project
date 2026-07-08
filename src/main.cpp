@@ -1,6 +1,7 @@
 #include "benchmark_sim/capability.h"
 #include "benchmark_sim/cgroup.h"
 #include "benchmark_sim/firo_driver.h"
+#include "benchmark_sim/log_tail.h"
 #include "benchmark_sim/logging.h"
 #include "benchmark_sim/network.h"
 #include "benchmark_sim/process.h"
@@ -31,6 +32,7 @@ namespace {
 constexpr const char* kDefaultRewardAddress =
     "TTJW6FsYqLbSiF3ZUwMXRghgQuXK7XTodR";
 constexpr const char* kRunMarkerFile = ".benchmark-sim-run";
+constexpr uint64_t kMaxLogTailBytes = 4096;
 
 struct Options {
   std::filesystem::path scenario_json;
@@ -77,6 +79,8 @@ struct NodeRuntime {
   std::optional<NodeVethConfig> network;
   ChildProcess process;
   uint64_t generated_block_count = 0;
+  uint64_t stdout_offset = 0;
+  uint64_t stderr_offset = 0;
 };
 
 uint32_t JsonUint32Field(const boost::json::object& object,
@@ -1022,6 +1026,46 @@ void WriteNodeState(const std::filesystem::path& events_path,
   WriteEvent(events_path, run_id, node_id, "state", state);
 }
 
+std::string LogTailDetail(std::string_view kind, const LogTailChunk& chunk) {
+  boost::json::object detail;
+  detail["kind"] = kind;
+  detail["start_offset"] = chunk.start_offset;
+  detail["next_offset"] = chunk.next_offset;
+  detail["truncated"] = chunk.truncated;
+  detail["offset_reset"] = chunk.offset_reset;
+  detail["text"] = chunk.text;
+  return boost::json::serialize(detail);
+}
+
+void WriteLogTailEvent(const std::filesystem::path& events_path,
+                       const Options& options, const NodeRuntime& node,
+                       std::string_view kind,
+                       const std::filesystem::path& path, uint64_t* offset) {
+  if (!std::filesystem::exists(path)) {
+    return;
+  }
+  const LogTailChunk chunk = TailLogFile(path, *offset, kMaxLogTailBytes);
+  *offset = chunk.next_offset;
+  if (chunk.text.empty() && !chunk.truncated && !chunk.offset_reset) {
+    return;
+  }
+  WriteEvent(events_path, options.run_id, node.config.id,
+             std::string(kind) + "_tail", LogTailDetail(kind, chunk));
+}
+
+void WriteNodeLogTails(const std::filesystem::path& events_path,
+                       const Options& options,
+                       std::vector<NodeRuntime>& nodes) {
+  for (NodeRuntime& node : nodes) {
+    WriteLogTailEvent(events_path, options, node, "stdout",
+                      node.config.log_dir / "stdout.log",
+                      &node.stdout_offset);
+    WriteLogTailEvent(events_path, options, node, "stderr",
+                      node.config.log_dir / "stderr.log",
+                      &node.stderr_offset);
+  }
+}
+
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root) {
   std::string network_yaml =
@@ -1497,6 +1541,7 @@ int Run(int argc, char** argv) {
   std::vector<NodeRuntime> nodes;
   try {
     StartNodes(options, run_root, events_path, driver, nodes);
+    WriteNodeLogTails(events_path, options, nodes);
 
     for (auto& node : nodes) {
       const std::vector<LinkInfo> links = ListNetworkLinks();
@@ -1553,15 +1598,19 @@ int Run(int argc, char** argv) {
                  MetricsJson(options.run_id, node.config.id, chain,
                              node.generated_block_count, &cg, link, qdisc));
     }
+    WriteNodeLogTails(events_path, options, nodes);
 
     StopNodes(options, events_path, driver, nodes);
+    WriteNodeLogTails(events_path, options, nodes);
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
     BSIM_LOG(info) << "finished run " << options.run_id;
   } catch (...) {
     for (auto& node : nodes) {
       WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
     }
+    WriteNodeLogTails(events_path, options, nodes);
     StopNodes(options, events_path, driver, nodes);
+    WriteNodeLogTails(events_path, options, nodes);
     WriteEvent(events_path, options.run_id, "sim", "run_failed");
     throw;
   }
