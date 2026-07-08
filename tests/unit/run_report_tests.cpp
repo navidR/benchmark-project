@@ -59,12 +59,17 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":1,"
       "\"generated_block_count\":0,\"qdisc_kind\":\"netem\","
+      "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":1000,"
       "\"qdisc_netem_reorder\":0}");
   bsim::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":2,"
-      "\"generated_block_count\":1,\"qdisc_kind\":\"netem\","
-      "\"qdisc_netem_reorder\":429496}");
+      "\"generated_block_count\":1,\"qdisc_kind\":\"tbf+netem\","
+      "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":2000,"
+      "\"qdisc_netem_jitter_us\":500,\"qdisc_netem_reorder\":429496,"
+      "\"qdisc_netem_limit_packets\":1000,\"qdisc_has_tbf_options\":true,"
+      "\"qdisc_tbf_rate_bytes_per_sec\":1250000,"
+      "\"qdisc_tbf_limit_bytes\":125000}");
 
   const boost::json::value value =
       boost::json::parse(bsim::BuildRunReportJson(dir));
@@ -85,7 +90,15 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       node.at("last_metrics").as_object();
   BOOST_TEST(JsonInteger(last_metrics, "height") == 2U);
   BOOST_TEST(JsonInteger(last_metrics, "generated_block_count") == 1U);
+  BOOST_TEST(last_metrics.at("qdisc_kind").as_string() == "tbf+netem");
+  BOOST_TEST(last_metrics.at("qdisc_has_netem_options").as_bool());
+  BOOST_TEST(JsonInteger(last_metrics, "qdisc_netem_latency_us") == 2000U);
+  BOOST_TEST(JsonInteger(last_metrics, "qdisc_netem_jitter_us") == 500U);
   BOOST_TEST(JsonInteger(last_metrics, "qdisc_netem_reorder") == 429496U);
+  BOOST_TEST(JsonInteger(last_metrics, "qdisc_netem_limit_packets") == 1000U);
+  BOOST_TEST(last_metrics.at("qdisc_has_tbf_options").as_bool());
+  BOOST_TEST(JsonInteger(last_metrics, "qdisc_tbf_rate_bytes_per_sec") ==
+             1250000U);
 
   std::filesystem::remove_all(dir);
 }
