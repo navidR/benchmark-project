@@ -24,11 +24,15 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_read_io_and_pressure_totals) {
   bsim::WriteText(dir / "memory.current", "2048\n");
   bsim::WriteText(dir / "memory.peak", "4096\n");
   bsim::WriteText(dir / "memory.events",
-                  "low 0\n"
-                  "high 0\n"
-                  "max 0\n"
+                  "low 4\n"
+                  "high 5\n"
+                  "max 6\n"
                   "oom 2\n"
-                  "oom_kill 1\n");
+                  "oom_kill 1\n"
+                  "oom_group_kill 3\n");
+  bsim::WriteText(dir / "cgroup.events",
+                  "populated 1\n"
+                  "frozen 0\n");
   bsim::WriteText(dir / "io.stat",
                   "8:0 rbytes=10 wbytes=20 rios=1 wios=2 dbytes=0 dios=0\n"
                   "8:16 rbytes=30 wbytes=40 rios=3 wios=4 dbytes=0 dios=0\n");
@@ -36,6 +40,7 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_read_io_and_pressure_totals) {
                   "some avg10=0.00 avg60=0.00 avg300=0.00 total=77\n"
                   "full avg10=0.00 avg60=0.00 avg300=0.00 total=8\n");
   bsim::WriteText(dir / "pids.current", "3\n");
+  bsim::WriteText(dir / "pids.events", "max 9\n");
 
   const bsim::CgroupMetrics metrics = bsim::Cgroup(dir).ReadMetrics();
 
@@ -50,8 +55,15 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_read_io_and_pressure_totals) {
   BOOST_TEST(metrics.io_pressure_some_total_usec == 77U);
   BOOST_TEST(metrics.io_pressure_full_total_usec == 8U);
   BOOST_TEST(metrics.pids_current == 3U);
+  BOOST_TEST(metrics.pids_max_events == 9U);
+  BOOST_TEST(metrics.cgroup_populated == 1U);
+  BOOST_TEST(metrics.cgroup_frozen == 0U);
+  BOOST_TEST(metrics.memory_low == 4U);
+  BOOST_TEST(metrics.memory_high == 5U);
+  BOOST_TEST(metrics.memory_max == 6U);
   BOOST_TEST(metrics.oom == 2U);
   BOOST_TEST(metrics.oom_kill == 1U);
+  BOOST_TEST(metrics.oom_group_kill == 3U);
 
   std::filesystem::remove_all(dir);
 }

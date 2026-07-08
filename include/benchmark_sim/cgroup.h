@@ -21,8 +21,15 @@ struct CgroupMetrics {
   uint64_t io_pressure_some_total_usec = 0;
   uint64_t io_pressure_full_total_usec = 0;
   uint64_t pids_current = 0;
+  uint64_t pids_max_events = 0;
+  uint64_t cgroup_populated = 0;
+  uint64_t cgroup_frozen = 0;
+  uint64_t memory_low = 0;
+  uint64_t memory_high = 0;
+  uint64_t memory_max = 0;
   uint64_t oom = 0;
   uint64_t oom_kill = 0;
+  uint64_t oom_group_kill = 0;
 };
 
 struct CgroupFreezeProbe {

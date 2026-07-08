@@ -967,8 +967,15 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["io_pressure_full_total_usec"] =
         cgroup->io_pressure_full_total_usec;
     object["pids_current"] = cgroup->pids_current;
+    object["pids_max_events"] = cgroup->pids_max_events;
+    object["cgroup_populated"] = cgroup->cgroup_populated;
+    object["cgroup_frozen"] = cgroup->cgroup_frozen;
+    object["memory_low"] = cgroup->memory_low;
+    object["memory_high"] = cgroup->memory_high;
+    object["memory_max"] = cgroup->memory_max;
     object["oom"] = cgroup->oom;
     object["oom_kill"] = cgroup->oom_kill;
+    object["oom_group_kill"] = cgroup->oom_group_kill;
   }
   if (link != nullptr) {
     object["network_has_stats"] = link->has_stats;

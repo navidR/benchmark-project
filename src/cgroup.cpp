@@ -378,8 +378,16 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   metrics.io_pressure_full_total_usec =
       ParsePressureTotal(path_ / "io.pressure", "full");
   metrics.pids_current = ParseSingleUint(path_ / "pids.current");
+  metrics.pids_max_events = ParseKeyValue(path_ / "pids.events", "max");
+  metrics.cgroup_populated = ParseKeyValue(path_ / "cgroup.events", "populated");
+  metrics.cgroup_frozen = ParseKeyValue(path_ / "cgroup.events", "frozen");
+  metrics.memory_low = ParseKeyValue(path_ / "memory.events", "low");
+  metrics.memory_high = ParseKeyValue(path_ / "memory.events", "high");
+  metrics.memory_max = ParseKeyValue(path_ / "memory.events", "max");
   metrics.oom = ParseKeyValue(path_ / "memory.events", "oom");
   metrics.oom_kill = ParseKeyValue(path_ / "memory.events", "oom_kill");
+  metrics.oom_group_kill =
+      ParseKeyValue(path_ / "memory.events", "oom_group_kill");
   return metrics;
 }
 
