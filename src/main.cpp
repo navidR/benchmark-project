@@ -59,6 +59,7 @@ struct Options {
   bool replace_run = false;
   bool probe_address = false;
   bool probe_capabilities = false;
+  bool probe_cgroup_freeze = false;
   bool probe_netns = false;
   bool probe_network_condition = false;
   bool probe_network_condition_update = false;
@@ -439,6 +440,9 @@ Options ParseOptions(int argc, char** argv) {
       "probe-capabilities", po::bool_switch(&options.probe_capabilities),
       "report effective Linux capabilities needed by privileged simulator "
       "paths")(
+      "probe-cgroup-freeze", po::bool_switch(&options.probe_cgroup_freeze),
+      "attach a child process to a cgroup and verify cgroup.freeze/thaw "
+      "paths")(
       "probe-netns", po::bool_switch(&options.probe_netns),
       "create a temporary network namespace and inspect it through setns/libmnl")(
       "probe-network-condition",
@@ -516,6 +520,7 @@ Options ParseOptions(int argc, char** argv) {
   RequireSafeRunId(options.run_id);
   const bool needs_firod = !options.probe_network &&
                            !options.probe_capabilities &&
+                           !options.probe_cgroup_freeze &&
                            !options.probe_netns && !options.probe_veth &&
                            !options.probe_address && !options.probe_route &&
                            !options.probe_qdisc &&
@@ -777,6 +782,17 @@ std::string CapabilityProbeJson() {
   result["cap_sys_admin"] = HasCapability(effective, CAP_SYS_ADMIN);
   result["cap_net_admin"] = HasCapability(effective, CAP_NET_ADMIN);
   result["cap_sys_resource"] = HasCapability(effective, CAP_SYS_RESOURCE);
+  return boost::json::serialize(result);
+}
+
+std::string CgroupFreezeProbeJson() {
+  CgroupFreezeProbe probe = Cgroup::ProbeFreezeThaw();
+  boost::json::object result;
+  result["run_id"] = probe.run_id;
+  result["node_id"] = probe.node_id;
+  result["child_pid"] = probe.child_pid;
+  result["frozen_after_freeze"] = probe.frozen_after_freeze;
+  result["frozen_after_thaw"] = probe.frozen_after_thaw;
   return boost::json::serialize(result);
 }
 
@@ -1389,6 +1405,10 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_capabilities) {
     std::cout << CapabilityProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_cgroup_freeze) {
+    std::cout << CgroupFreezeProbeJson() << "\n";
     return 0;
   }
   if (options.probe_netns) {

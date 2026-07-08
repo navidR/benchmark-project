@@ -25,10 +25,19 @@ struct CgroupMetrics {
   uint64_t oom_kill = 0;
 };
 
+struct CgroupFreezeProbe {
+  std::string run_id;
+  std::string node_id;
+  pid_t child_pid = -1;
+  bool frozen_after_freeze = false;
+  bool frozen_after_thaw = false;
+};
+
 class Cgroup {
  public:
   static Cgroup Create(const std::string& run_id, const std::string& node_id);
   static void RemoveRun(const std::string& run_id);
+  static CgroupFreezeProbe ProbeFreezeThaw();
 
   explicit Cgroup(std::filesystem::path path) : path_(std::move(path)) {}
 
@@ -42,6 +51,7 @@ class Cgroup {
   CgroupMetrics ReadMetrics() const;
   void Freeze() const;
   void Thaw() const;
+  bool Frozen() const;
   void KillAll() const;
   void Remove() const;
 

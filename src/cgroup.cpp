@@ -2,6 +2,8 @@
 
 #include "benchmark_sim/util.h"
 
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -177,6 +179,20 @@ void KillCgroupIfSupported(const std::filesystem::path& dir) {
   }
 }
 
+bool ReadFrozenState(const std::filesystem::path& dir) {
+  return ParseKeyValue(dir / "cgroup.events", "frozen") != 0U;
+}
+
+bool WaitForFrozenState(const Cgroup& cgroup, bool expected) {
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (cgroup.Frozen() == expected) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return false;
+}
+
 void MoveRootProcessesIntoContainerController(
     const std::filesystem::path& sim_root) {
   if (!RunningInsideDocker()) {
@@ -266,6 +282,57 @@ void Cgroup::RemoveRun(const std::string& run_id) {
   }
 }
 
+CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {
+  CgroupFreezeProbe probe;
+  probe.run_id = "freeze-" + std::to_string(getpid());
+  probe.node_id = "node-1";
+
+  Cgroup::RemoveRun(probe.run_id);
+  Cgroup cgroup = Cgroup::Create(probe.run_id, probe.node_id);
+  pid_t child = fork();
+  if (child < 0) {
+    cgroup.Remove();
+    Cgroup::RemoveRun(probe.run_id);
+    throw std::runtime_error(std::string("fork failed: ") +
+                             std::strerror(errno));
+  }
+  if (child == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+
+  probe.child_pid = child;
+  try {
+    cgroup.AttachPid(child);
+    cgroup.Freeze();
+    if (!WaitForFrozenState(cgroup, true)) {
+      throw std::runtime_error("cgroup did not report frozen after freeze");
+    }
+    probe.frozen_after_freeze = cgroup.Frozen();
+    cgroup.Thaw();
+    if (!WaitForFrozenState(cgroup, false)) {
+      throw std::runtime_error("cgroup still reported frozen after thaw");
+    }
+    probe.frozen_after_thaw = cgroup.Frozen();
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    cgroup.Remove();
+    Cgroup::RemoveRun(probe.run_id);
+  } catch (...) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    try {
+      cgroup.KillAll();
+      cgroup.Remove();
+      Cgroup::RemoveRun(probe.run_id);
+    } catch (const std::exception&) {
+    }
+    throw;
+  }
+  return probe;
+}
+
 void Cgroup::AttachPid(pid_t pid) const {
   WriteCgroupFile(path_, "cgroup.procs", std::to_string(pid));
 }
@@ -319,6 +386,8 @@ CgroupMetrics Cgroup::ReadMetrics() const {
 void Cgroup::Freeze() const { WriteCgroupFile(path_, "cgroup.freeze", "1"); }
 
 void Cgroup::Thaw() const { WriteCgroupFile(path_, "cgroup.freeze", "0"); }
+
+bool Cgroup::Frozen() const { return ReadFrozenState(path_); }
 
 void Cgroup::KillAll() const {
   if (std::filesystem::exists(path_ / "cgroup.kill")) {

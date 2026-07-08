@@ -246,6 +246,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim --probe-network &&
    ./build/benchmark-sim --probe-capabilities &&
+   ./build/benchmark-sim --probe-cgroup-freeze &&
    ./build/benchmark-sim --probe-netns &&
    ./build/benchmark-sim --probe-veth &&
    ./build/benchmark-sim --probe-address &&
@@ -261,6 +262,7 @@ Useful focused probes:
 ```bash
 ./build/benchmark-sim --probe-veth
 ./build/benchmark-sim --probe-capabilities
+./build/benchmark-sim --probe-cgroup-freeze
 ./build/benchmark-sim --probe-route
 ./build/benchmark-sim --probe-qdisc-mutation
 ./build/benchmark-sim --probe-network-condition
