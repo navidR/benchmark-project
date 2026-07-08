@@ -188,6 +188,30 @@ bool HasLinkNamed(const std::vector<LinkInfo>& links, const std::string& name) {
   return false;
 }
 
+void StoreLinkStats64(const rtnl_link_stats64& stats, LinkInfo* link) {
+  link->has_stats = true;
+  link->rx_bytes = stats.rx_bytes;
+  link->tx_bytes = stats.tx_bytes;
+  link->rx_packets = stats.rx_packets;
+  link->tx_packets = stats.tx_packets;
+  link->rx_dropped = stats.rx_dropped;
+  link->tx_dropped = stats.tx_dropped;
+  link->rx_errors = stats.rx_errors;
+  link->tx_errors = stats.tx_errors;
+}
+
+void StoreLinkStats32(const rtnl_link_stats& stats, LinkInfo* link) {
+  link->has_stats = true;
+  link->rx_bytes = stats.rx_bytes;
+  link->tx_bytes = stats.tx_bytes;
+  link->rx_packets = stats.rx_packets;
+  link->tx_packets = stats.tx_packets;
+  link->rx_dropped = stats.rx_dropped;
+  link->tx_dropped = stats.tx_dropped;
+  link->rx_errors = stats.rx_errors;
+  link->tx_errors = stats.tx_errors;
+}
+
 bool HasIpv4Address(const std::vector<AddressInfo>& addresses,
                     const std::string& if_name, const std::string& address,
                     std::uint8_t prefix_len) {
@@ -444,6 +468,25 @@ int ParseLinkAttr(const nlattr* attr, void* data) {
       return MNL_CB_ERROR;
     }
     link->name = mnl_attr_get_str(attr);
+  }
+  if (type == IFLA_STATS64) {
+    if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+        mnl_attr_get_payload_len(attr) < sizeof(rtnl_link_stats64)) {
+      errno = EINVAL;
+      return MNL_CB_ERROR;
+    }
+    StoreLinkStats64(
+        *static_cast<const rtnl_link_stats64*>(mnl_attr_get_payload(attr)),
+        link);
+  }
+  if (type == IFLA_STATS && !link->has_stats) {
+    if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+        mnl_attr_get_payload_len(attr) < sizeof(rtnl_link_stats)) {
+      errno = EINVAL;
+      return MNL_CB_ERROR;
+    }
+    StoreLinkStats32(
+        *static_cast<const rtnl_link_stats*>(mnl_attr_get_payload(attr)), link);
   }
   return MNL_CB_OK;
 }

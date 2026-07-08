@@ -241,6 +241,15 @@ boost::json::array LinksJson(const std::vector<LinkInfo>& links) {
     link_json["index"] = link.index;
     link_json["name"] = link.name;
     link_json["up"] = link.up;
+    link_json["has_stats"] = link.has_stats;
+    link_json["rx_bytes"] = link.rx_bytes;
+    link_json["tx_bytes"] = link.tx_bytes;
+    link_json["rx_packets"] = link.rx_packets;
+    link_json["tx_packets"] = link.tx_packets;
+    link_json["rx_dropped"] = link.rx_dropped;
+    link_json["tx_dropped"] = link.tx_dropped;
+    link_json["rx_errors"] = link.rx_errors;
+    link_json["tx_errors"] = link.tx_errors;
     links_json.push_back(std::move(link_json));
   }
   return links_json;
@@ -373,6 +382,16 @@ bool HostIpv4ForwardingEnabled() {
   return !value.empty() && value.front() == '1';
 }
 
+const LinkInfo* FindLinkByName(const std::vector<LinkInfo>& links,
+                               std::string_view name) {
+  for (const LinkInfo& link : links) {
+    if (link.name == name) {
+      return &link;
+    }
+  }
+  return nullptr;
+}
+
 std::string NetworkProbeJson() {
   boost::json::object result;
   result["links"] = LinksJson(ListNetworkLinks());
@@ -493,7 +512,7 @@ std::string AddressProbeJson() {
 
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
                         const FiroMetrics& chain,
-                        const CgroupMetrics* cgroup) {
+                        const CgroupMetrics* cgroup, const LinkInfo* link) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
@@ -520,6 +539,17 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["pids_current"] = cgroup->pids_current;
     object["oom"] = cgroup->oom;
     object["oom_kill"] = cgroup->oom_kill;
+  }
+  if (link != nullptr) {
+    object["network_has_stats"] = link->has_stats;
+    object["network_rx_bytes"] = link->rx_bytes;
+    object["network_tx_bytes"] = link->tx_bytes;
+    object["network_rx_packets"] = link->rx_packets;
+    object["network_tx_packets"] = link->tx_packets;
+    object["network_rx_dropped"] = link->rx_dropped;
+    object["network_tx_dropped"] = link->tx_dropped;
+    object["network_rx_errors"] = link->rx_errors;
+    object["network_tx_errors"] = link->tx_errors;
   }
   return boost::json::serialize(object);
 }
@@ -825,10 +855,15 @@ int Run(int argc, char** argv) {
     StartNodes(options, run_root, events_path, driver, nodes);
 
     for (auto& node : nodes) {
+      const std::vector<LinkInfo> links = ListNetworkLinks();
       FiroMetrics chain = driver.ReadMetrics(node.config);
       CgroupMetrics cg = node.cgroup->ReadMetrics();
+      const LinkInfo* link = node.network
+                                 ? FindLinkByName(links,
+                                                  node.network->host_name)
+                                 : nullptr;
       AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain, &cg));
+                 MetricsJson(options.run_id, node.config.id, chain, &cg, link));
     }
 
     if (options.generate_blocks > 0) {
@@ -849,10 +884,15 @@ int Run(int argc, char** argv) {
     }
 
     for (auto& node : nodes) {
+      const std::vector<LinkInfo> links = ListNetworkLinks();
       FiroMetrics chain = driver.ReadMetrics(node.config);
       CgroupMetrics cg = node.cgroup->ReadMetrics();
+      const LinkInfo* link = node.network
+                                 ? FindLinkByName(links,
+                                                  node.network->host_name)
+                                 : nullptr;
       AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain, &cg));
+                 MetricsJson(options.run_id, node.config.id, chain, &cg, link));
     }
 
     StopNodes(options, events_path, driver, nodes);
