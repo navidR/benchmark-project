@@ -16,6 +16,7 @@ Firo path is working end to end.
 - Apply a simple per-node network condition through host-side `netem`.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
+- Wait for generated blocks to propagate before final metrics are recorded.
 - Record event and metric files under a run directory.
 - Exercise Linux network namespace, veth, address, route, and qdisc operations
   through simulator probes.
@@ -100,7 +101,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --replace-run \
      --nodes 2 \
      --generate-blocks 1 \
-     --ready-timeout-sec 45'
+     --ready-timeout-sec 45 \
+     --sync-timeout-sec 45'
 ```
 
 Two isolated Firo nodes:
@@ -117,6 +119,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --nodes 2 \
      --generate-blocks 1 \
      --ready-timeout-sec 45 \
+     --sync-timeout-sec 45 \
      --isolate-network'
 ```
 

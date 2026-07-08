@@ -34,6 +34,7 @@ struct Options {
   uint32_t nodes = 1;
   uint32_t generate_blocks = 1;
   uint32_t ready_timeout_sec = 30;
+  uint32_t sync_timeout_sec = 30;
   bool keep_cgroups = false;
   bool isolate_network = false;
   bool network_condition_requested = false;
@@ -72,8 +73,11 @@ Options ParseOptions(int argc, char** argv) {
       "generate-blocks", po::value<uint32_t>(&options.generate_blocks),
       "blocks generated on node 0")(
       "ready-timeout-sec", po::value<uint32_t>(&options.ready_timeout_sec),
-      "RPC startup timeout")("keep-cgroups", po::bool_switch(&options.keep_cgroups),
-                             "leave cgroups after exit for inspection")(
+      "RPC startup timeout")(
+      "sync-timeout-sec", po::value<uint32_t>(&options.sync_timeout_sec),
+      "block propagation timeout")(
+      "keep-cgroups", po::bool_switch(&options.keep_cgroups),
+      "leave cgroups after exit for inspection")(
       "isolate-network", po::bool_switch(&options.isolate_network),
       "run each Firo node in its own network namespace and veth link")(
       "network-delay-ms",
@@ -455,7 +459,10 @@ void WriteScenarioFiles(const Options& options,
                 "workloads:\n"
                 "  - type: block_generation\n"
                 "    count: " +
-                std::to_string(options.generate_blocks) + "\n");
+                std::to_string(options.generate_blocks) +
+                "\n"
+                "    sync_timeout_sec: " +
+                std::to_string(options.sync_timeout_sec) + "\n");
 
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
@@ -463,6 +470,7 @@ void WriteScenarioFiles(const Options& options,
   resolved["nodes"] = options.nodes;
   resolved["firod"] = options.firod.string();
   resolved["isolated_network"] = options.isolate_network;
+  resolved["sync_timeout_sec"] = options.sync_timeout_sec;
   if (options.network_condition_requested) {
     resolved["default_network_condition"] =
         NetworkConditionJson(options.network_condition);
@@ -665,10 +673,20 @@ int Run(int argc, char** argv) {
     }
 
     if (options.generate_blocks > 0) {
+      const uint64_t start_height =
+          driver.ReadMetrics(nodes.front().config).height;
       std::vector<std::string> hashes = driver.GenerateBlocks(
           nodes.front().config, options.generate_blocks, kDefaultRewardAddress);
       WriteEvent(events_path, options.run_id, nodes.front().config.id,
                  "generated_blocks", std::to_string(hashes.size()));
+      const uint64_t target_height =
+          start_height + static_cast<uint64_t>(hashes.size());
+      for (auto& node : nodes) {
+        driver.WaitForHeight(node.config, target_height,
+                             std::chrono::seconds(options.sync_timeout_sec));
+        WriteEvent(events_path, options.run_id, node.config.id,
+                   "height_reached", std::to_string(target_height));
+      }
     }
 
     for (auto& node : nodes) {

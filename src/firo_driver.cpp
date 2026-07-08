@@ -112,6 +112,29 @@ void FiroDriver::WaitReady(const FiroNodeConfig& config,
                            " did not become RPC-ready: " + last_error);
 }
 
+void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
+                               std::chrono::seconds timeout) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  uint64_t last_height = 0;
+  std::string last_error;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      FiroMetrics metrics = ReadMetrics(config);
+      last_height = metrics.height;
+      if (metrics.height >= height) {
+        return;
+      }
+    } catch (const std::exception& e) {
+      last_error = e.what();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  throw std::runtime_error("Firo node " + config.id + " reached height " +
+                           std::to_string(last_height) + " before timeout; " +
+                           "target height " + std::to_string(height) +
+                           (last_error.empty() ? "" : ": " + last_error));
+}
+
 FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
   const boost::json::value blockchain =
       RpcCall(config, "getblockchaininfo", boost::json::array{});
