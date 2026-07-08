@@ -111,6 +111,7 @@ if(BUILD_TESTING)
     tests/unit/cgroup_tests.cpp
     tests/unit/log_tail_tests.cpp
     tests/unit/network_tests.cpp
+    tests/unit/no_shellout_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/util_tests.cpp
     src/capability.cpp
@@ -121,6 +122,9 @@ if(BUILD_TESTING)
     src/util.cpp
   )
   target_include_directories(benchmark-sim-unit-tests PRIVATE include)
+  target_compile_definitions(benchmark-sim-unit-tests PRIVATE
+    BENCHMARK_SIM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  )
   target_link_libraries(benchmark-sim-unit-tests PRIVATE
     Boost::json
     Boost::unit_test_framework
