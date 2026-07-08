@@ -11,7 +11,7 @@ the Firo path is working end to end.
 
 ## What Works Now
 
-- Start one or two Firo regtest nodes.
+- Start up to 16 Firo regtest nodes.
 - Run Firo nodes inside isolated network namespaces with one veth pair per node.
 - Apply simple per-node network conditions through host-side `netem` or TBF.
 - Apply live per-node cgroup resource updates after startup.
@@ -94,7 +94,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --ready-timeout-sec 45'
 ```
 
-Two Firo nodes:
+Multiple Firo nodes:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
@@ -103,15 +103,15 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
    ./build/benchmark-sim \
      --firod "$FIROD" \
      --output-dir runs \
-     --run-id smoke2 \
+     --run-id smoke3 \
      --replace-run \
-     --nodes 2 \
+     --nodes 3 \
      --generate-blocks 1 \
      --ready-timeout-sec 45 \
      --sync-timeout-sec 45'
 ```
 
-Two isolated Firo nodes:
+Multiple isolated Firo nodes:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
@@ -122,7 +122,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --output-dir runs \
      --run-id isolated-smoke \
      --replace-run \
-     --nodes 2 \
+     --nodes 3 \
      --generate-blocks 1 \
      --ready-timeout-sec 45 \
      --sync-timeout-sec 45 \

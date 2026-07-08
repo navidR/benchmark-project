@@ -35,6 +35,7 @@ constexpr const char* kDefaultRewardAddress =
     "TTJW6FsYqLbSiF3ZUwMXRghgQuXK7XTodR";
 constexpr const char* kRunMarkerFile = ".benchmark-sim-run";
 constexpr uint64_t kMaxLogTailBytes = 4096;
+constexpr uint32_t kMaxFiroNodes = 16;
 
 struct ResourceLimits {
   uint64_t memory_high_bytes = 0;
@@ -676,6 +677,8 @@ Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
   Options options;
 
+  const std::string nodes_help =
+      "Firo regtest nodes, 1.." + std::to_string(kMaxFiroNodes);
   po::options_description desc("Allowed options");
   desc.add_options()("help", "show this help")(
       "scenario-json", po::value<std::filesystem::path>(&options.scenario_json),
@@ -687,7 +690,7 @@ Options ParseOptions(int argc, char** argv) {
                          "safe run id")(
       "report-run", po::value<std::filesystem::path>(&options.report_run),
       "summarize an existing run directory as JSON and exit")(
-      "nodes", po::value<uint32_t>(&options.nodes), "Firo regtest nodes, 1..2")(
+      "nodes", po::value<uint32_t>(&options.nodes), nodes_help.c_str())(
       "generate-blocks", po::value<uint32_t>(&options.generate_blocks),
       "blocks generated on node 0")(
       "ready-timeout-sec", po::value<uint32_t>(&options.ready_timeout_sec),
@@ -870,8 +873,10 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error(
         "network condition options require --isolate-network");
   }
-  if (options.nodes < 1 || options.nodes > 2) {
-    throw std::runtime_error("--nodes currently supports 1..2 for MVP smoke");
+  if (options.nodes < 1 || options.nodes > kMaxFiroNodes) {
+    throw std::runtime_error("--nodes currently supports 1.." +
+                             std::to_string(kMaxFiroNodes) +
+                             " for Firo smoke runs");
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
@@ -1978,9 +1983,10 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
     }
     options->isolate_network = isolated->as_bool();
   }
-  if (options->nodes < 1 || options->nodes > 2) {
+  if (options->nodes < 1 || options->nodes > kMaxFiroNodes) {
     throw std::runtime_error(
-        "cleanup currently supports resolved node counts in 1..2");
+        "cleanup currently supports resolved node counts in 1.." +
+        std::to_string(kMaxFiroNodes));
   }
 }
 
