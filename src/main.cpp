@@ -74,9 +74,11 @@ struct Options {
   std::vector<std::string> node_network_condition_json;
   std::vector<std::string> runtime_node_network_condition_json;
   std::vector<std::string> runtime_node_resource_json;
+  std::vector<std::string> runtime_node_restart_json;
   std::map<uint32_t, NetworkCondition> node_network_conditions;
   std::map<uint32_t, NetworkCondition> runtime_node_network_conditions;
   std::map<uint32_t, ResourceLimitPatch> runtime_node_resource_updates;
+  std::vector<uint32_t> runtime_node_restarts;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_capabilities = false;
@@ -99,6 +101,7 @@ struct NodeRuntime {
   ChildProcess process;
   ResourceLimits resources;
   uint64_t generated_block_count = 0;
+  uint64_t restart_count = 0;
   uint64_t stdout_offset = 0;
   uint64_t stderr_offset = 0;
   uint64_t daemon_log_offset = 0;
@@ -402,6 +405,37 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
   }
 
+  const boost::json::value* process = scenario.if_contains("process");
+  if (process != nullptr) {
+    if (!process->is_object()) {
+      throw std::runtime_error("scenario process must be a JSON object");
+    }
+    const boost::json::object& object = process->as_object();
+    const boost::json::value* runtime_node_restarts =
+        object.if_contains("runtime_node_restarts");
+    if (runtime_node_restarts != nullptr) {
+      if (!runtime_node_restarts->is_array()) {
+        throw std::runtime_error(
+            "scenario process.runtime_node_restarts must be a JSON array");
+      }
+      for (const boost::json::value& value :
+           runtime_node_restarts->as_array()) {
+        if (!value.is_object()) {
+          throw std::runtime_error(
+              "scenario process.runtime_node_restarts entries must be JSON "
+              "objects");
+        }
+        const uint32_t node = JsonUint32Field(value.as_object(), "node");
+        if (node == 0 || node > options.nodes) {
+          throw std::runtime_error(
+              "scenario process.runtime_node_restarts node must be in 1.." +
+              std::to_string(options.nodes));
+        }
+        options.runtime_node_restarts.push_back(node - 1U);
+      }
+    }
+  }
+
   const boost::json::value* network = scenario.if_contains("network");
   if (network != nullptr) {
     if (!network->is_object()) {
@@ -505,6 +539,24 @@ void ParseRuntimeNodeResourceTexts(
   }
 }
 
+void ParseRuntimeNodeRestartTexts(const std::vector<std::string>& texts,
+                                  uint32_t nodes,
+                                  std::vector<uint32_t>& output) {
+  for (const std::string& text : texts) {
+    boost::json::value value = boost::json::parse(text);
+    if (!value.is_object()) {
+      throw std::runtime_error(
+          "--runtime-node-restart-json must be a JSON object");
+    }
+    const uint32_t node = JsonUint32Field(value.as_object(), "node");
+    if (node == 0 || node > nodes) {
+      throw std::runtime_error(
+          "--runtime-node-restart-json node must be in 1..--nodes");
+    }
+    output.push_back(node - 1U);
+  }
+}
+
 void ParseNodeNetworkConditions(Options& options) {
   ParseNodeNetworkConditionTexts(options.node_network_condition_json,
                                  options.nodes,
@@ -517,6 +569,8 @@ void ParseNodeNetworkConditions(Options& options) {
   ParseRuntimeNodeResourceTexts(options.runtime_node_resource_json,
                                 options.nodes,
                                 options.runtime_node_resource_updates);
+  ParseRuntimeNodeRestartTexts(options.runtime_node_restart_json, options.nodes,
+                               options.runtime_node_restarts);
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -589,6 +643,12 @@ Options ParseOptions(int argc, char** argv) {
           ->composing(),
       "repeatable JSON object with node plus live cgroup limit fields to apply "
       "after nodes are running")(
+      "runtime-node-restart-json",
+      po::value<std::vector<std::string>>(
+          &options.runtime_node_restart_json)
+          ->composing(),
+      "repeatable JSON object with node field for one live node restart after "
+      "nodes are running")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
       "probe-address", po::bool_switch(&options.probe_address),
@@ -1189,8 +1249,8 @@ std::string AddressProbeJson() {
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
                         const FiroMetrics& chain,
                         uint64_t generated_block_count,
-                        const CgroupMetrics* cgroup, const LinkInfo* link,
-                        const QdiscInfo* qdisc) {
+                        uint64_t restart_count, const CgroupMetrics* cgroup,
+                        const LinkInfo* link, const QdiscInfo* qdisc) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
@@ -1201,6 +1261,7 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   object["mempool_tx_count"] = chain.mempool_tx_count;
   object["mempool_bytes"] = chain.mempool_bytes;
   object["generated_block_count"] = generated_block_count;
+  object["restart_count"] = restart_count;
   if (chain.initial_block_download) {
     object["initial_block_download"] = *chain.initial_block_download;
   } else {
@@ -1310,18 +1371,24 @@ void WriteLogTailEvent(const std::filesystem::path& events_path,
              std::string(kind) + "_tail", LogTailDetail(kind, chunk));
 }
 
+void WriteNodeLogTail(const std::filesystem::path& events_path,
+                      const Options& options, const FiroDriver& driver,
+                      NodeRuntime& node) {
+  WriteLogTailEvent(events_path, options, node, "stdout",
+                    node.config.log_dir / "stdout.log",
+                    &node.stdout_offset);
+  WriteLogTailEvent(events_path, options, node, "stderr",
+                    node.config.log_dir / "stderr.log",
+                    &node.stderr_offset);
+  WriteLogTailEvent(events_path, options, node, "daemon_log",
+                    driver.LogPath(node.config), &node.daemon_log_offset);
+}
+
 void WriteNodeLogTails(const std::filesystem::path& events_path,
                        const Options& options, const FiroDriver& driver,
                        std::vector<NodeRuntime>& nodes) {
   for (NodeRuntime& node : nodes) {
-    WriteLogTailEvent(events_path, options, node, "stdout",
-                      node.config.log_dir / "stdout.log",
-                      &node.stdout_offset);
-    WriteLogTailEvent(events_path, options, node, "stderr",
-                      node.config.log_dir / "stderr.log",
-                      &node.stderr_offset);
-    WriteLogTailEvent(events_path, options, node, "daemon_log",
-                      driver.LogPath(node.config), &node.daemon_log_offset);
+    WriteNodeLogTail(events_path, options, driver, node);
   }
 }
 
@@ -1432,6 +1499,16 @@ void WriteScenarioFiles(const Options& options,
     }
   }
 
+  std::string process_yaml;
+  if (!options.runtime_node_restarts.empty()) {
+    process_yaml += "process:\n"
+                    "  runtime_node_restarts:\n";
+    for (uint32_t node_index : options.runtime_node_restarts) {
+      process_yaml +=
+          "    - node: " + std::to_string(node_index + 1U) + "\n";
+    }
+  }
+
   WriteText(run_root / "scenario.yaml",
             "simulation:\n"
             "  name: " +
@@ -1469,6 +1546,7 @@ void WriteScenarioFiles(const Options& options,
                 std::to_string(options.pids_max) +
                 "\n" +
                 runtime_resource_yaml + network_yaml +
+                process_yaml +
                 "workloads:\n"
                 "  - type: block_generation\n"
                 "    count: " +
@@ -1535,6 +1613,15 @@ void WriteScenarioFiles(const Options& options,
       runtime_node_limits.push_back(std::move(node_limits));
     }
     resolved["runtime_node_resource_limits"] = std::move(runtime_node_limits);
+  }
+  if (!options.runtime_node_restarts.empty()) {
+    boost::json::array runtime_node_restarts;
+    for (uint32_t node_index : options.runtime_node_restarts) {
+      boost::json::object restart;
+      restart["node"] = node_index + 1U;
+      runtime_node_restarts.push_back(std::move(restart));
+    }
+    resolved["runtime_node_restarts"] = std::move(runtime_node_restarts);
   }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
@@ -1744,6 +1831,56 @@ void ApplyRuntimeNetworkConditionUpdates(
   }
 }
 
+std::string RestartDetail(pid_t pid, uint64_t restart_count) {
+  boost::json::object detail;
+  detail["pid"] = pid;
+  detail["restart_count"] = restart_count;
+  return boost::json::serialize(detail);
+}
+
+void RestartNode(const Options& options, const std::filesystem::path& events_path,
+                 const FiroDriver& driver, NodeRuntime& node) {
+  if (!node.cgroup) {
+    throw std::runtime_error("node restart requires a node cgroup");
+  }
+
+  WriteNodeState(events_path, options.run_id, node.config.id, "Restarting");
+  WriteEvent(events_path, options.run_id, node.config.id, "restart_requested",
+             "restart_count=" + std::to_string(node.restart_count + 1U));
+  driver.Stop(node.config);
+  if (!node.process.WaitForExit(std::chrono::seconds(15))) {
+    WriteEvent(events_path, options.run_id, node.config.id, "sigterm");
+    node.process.Terminate(std::chrono::seconds(5));
+  }
+  WriteNodeLogTail(events_path, options, driver, node);
+
+  ProcessSpec process = driver.RenderProcess(node.config);
+  if (node.network_namespace) {
+    process.network_namespace_fd = node.network_namespace->fd();
+  }
+  WriteNodeState(events_path, options.run_id, node.config.id, "Starting");
+  node.process = ChildProcess::Spawn(process, node.cgroup->path());
+  ++node.restart_count;
+  WriteEvent(events_path, options.run_id, node.config.id, "process_restarted",
+             RestartDetail(node.process.pid(), node.restart_count));
+  driver.WaitReady(node.config, std::chrono::seconds(options.ready_timeout_sec));
+  WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
+  WriteNodeState(events_path, options.run_id, node.config.id, "Running");
+  WriteNodeLogTail(events_path, options, driver, node);
+}
+
+void ApplyRuntimeNodeRestarts(const Options& options,
+                              const std::filesystem::path& events_path,
+                              const FiroDriver& driver,
+                              std::vector<NodeRuntime>& nodes) {
+  for (uint32_t node_index : options.runtime_node_restarts) {
+    if (node_index >= nodes.size()) {
+      throw std::runtime_error("runtime restart node is out of range");
+    }
+    RestartNode(options, events_path, driver, nodes[node_index]);
+  }
+}
+
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
                const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
   for (auto& node : nodes) {
@@ -1895,11 +2032,13 @@ int Run(int argc, char** argv) {
                                    : nullptr;
       AppendLine(metrics_path,
                  MetricsJson(options.run_id, node.config.id, chain,
-                             node.generated_block_count, &cg, link, qdisc));
+                             node.generated_block_count, node.restart_count,
+                             &cg, link, qdisc));
     }
 
     ApplyRuntimeResourceLimitUpdates(options, events_path, nodes);
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
+    ApplyRuntimeNodeRestarts(options, events_path, driver, nodes);
 
     if (options.generate_blocks > 0) {
       const uint64_t start_height =
@@ -1934,7 +2073,8 @@ int Run(int argc, char** argv) {
                                    : nullptr;
       AppendLine(metrics_path,
                  MetricsJson(options.run_id, node.config.id, chain,
-                             node.generated_block_count, &cg, link, qdisc));
+                             node.generated_block_count, node.restart_count,
+                             &cg, link, qdisc));
     }
     WriteNodeLogTails(events_path, options, driver, nodes);
 

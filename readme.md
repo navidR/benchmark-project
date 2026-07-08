@@ -15,6 +15,7 @@ Firo path is working end to end.
 - Run Firo nodes inside isolated network namespaces with one veth pair per node.
 - Apply a simple per-node network condition through host-side `netem`.
 - Apply live per-node cgroup resource updates after startup.
+- Restart a running Firo node before workload generation.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
 - Wait for generated blocks to propagate before final metrics are recorded.
@@ -203,6 +204,20 @@ restores unlimited CPU quota.
   --runtime-node-resource-json '{"node":1,"memory_high_bytes":1073741824,"cpu_quota_us":50000,"cpu_period_us":100000,"pids_max":128}'
 ```
 
+Runtime restarts stop a node through Firo RPC, respawn it in the same
+cgroup/network/data directory, wait for RPC readiness, then continue the run:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id restart-smoke \
+  --replace-run \
+  --nodes 1 \
+  --generate-blocks 1 \
+  --runtime-node-restart-json '{"node":1}'
+```
+
 The same MVP fields can be loaded from a Boost.JSON scenario file:
 
 ```json
@@ -240,6 +255,13 @@ The same MVP fields can be loaded from a Boost.JSON scenario file:
         "node": 1,
         "delay_ms": 3,
         "jitter_ms": 1
+      }
+    ]
+  },
+  "process": {
+    "runtime_node_restarts": [
+      {
+        "node": 1
       }
     ]
   }
