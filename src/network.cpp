@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <linux/if_link.h>
 #include <linux/rtnetlink.h>
+#include <linux/veth.h>
 #include <net/if.h>
 #include <sched.h>
 #include <signal.h>
@@ -11,7 +12,9 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -143,6 +146,63 @@ UniqueFd OpenFileDescriptor(const std::string& path) {
                              std::strerror(errno));
   }
   return fd;
+}
+
+uint32_t NextSequence() {
+  static std::atomic<uint32_t> sequence{1U};
+  return sequence.fetch_add(1U);
+}
+
+void RequireInterfaceName(const std::string& name) {
+  if (name.empty() || name.size() >= IFNAMSIZ) {
+    throw std::runtime_error("interface name must be 1.." +
+                             std::to_string(IFNAMSIZ - 1) + " bytes");
+  }
+  for (const unsigned char c : name) {
+    const bool ok = std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
+    if (!ok) {
+      throw std::runtime_error("interface name contains unsafe character: " +
+                               name);
+    }
+  }
+}
+
+bool HasLinkNamed(const std::vector<LinkInfo>& links, const std::string& name) {
+  for (const LinkInfo& link : links) {
+    if (link.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence) {
+  MnlSocket socket(NETLINK_ROUTE);
+  socket.Bind(0, MNL_SOCKET_AUTOPID);
+  const unsigned int port_id = socket.PortId();
+  socket.Send(nlh, nlh->nlmsg_len);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  const ssize_t received = socket.Receive(buffer.data(), buffer.size());
+  const int status =
+      mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence, port_id,
+                 nullptr, nullptr);
+  if (status == MNL_CB_ERROR) {
+    throw std::runtime_error(std::string("netlink request failed: ") +
+                             std::strerror(errno));
+  }
+}
+
+void TryDeleteLink(const std::string& name) {
+  try {
+    DeleteLink(name);
+  } catch (const std::exception&) {
+  }
+}
+
+std::string ProbeName(char suffix) {
+  return "bs" + std::to_string(static_cast<long long>(getpid() % 100000)) +
+         suffix;
 }
 
 void WriteExact(int fd, const void* data, size_t size) {
@@ -285,7 +345,8 @@ std::vector<LinkInfo> ListNetworkLinks() {
   nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
   nlh->nlmsg_type = RTM_GETLINK;
   nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-  nlh->nlmsg_seq = 1U;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
 
   auto* message = static_cast<ifinfomsg*>(
       mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
@@ -297,7 +358,7 @@ std::vector<LinkInfo> ListNetworkLinks() {
   while (true) {
     const ssize_t received = socket.Receive(buffer.data(), buffer.size());
     const int status =
-        mnl_cb_run(buffer.data(), static_cast<size_t>(received), nlh->nlmsg_seq,
+        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
                    socket.PortId(), ParseLinkMessage, &links);
     if (status == MNL_CB_ERROR) {
       throw std::runtime_error(std::string("mnl_cb_run failed: ") +
@@ -309,6 +370,97 @@ std::vector<LinkInfo> ListNetworkLinks() {
   }
 
   return links;
+}
+
+void CreateVethPair(const std::string& host_name, const std::string& peer_name) {
+  RequireInterfaceName(host_name);
+  RequireInterfaceName(peer_name);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWLINK;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message = static_cast<ifinfomsg*>(
+      mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
+  message->ifi_family = AF_UNSPEC;
+
+  mnl_attr_put_str(nlh, IFLA_IFNAME, host_name.c_str());
+  nlattr* link_info = mnl_attr_nest_start(nlh, IFLA_LINKINFO);
+  mnl_attr_put_strz(nlh, IFLA_INFO_KIND, "veth");
+  nlattr* info_data = mnl_attr_nest_start(nlh, IFLA_INFO_DATA);
+  nlattr* peer = mnl_attr_nest_start(nlh, VETH_INFO_PEER);
+  auto* peer_message = static_cast<ifinfomsg*>(
+      mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
+  peer_message->ifi_family = AF_UNSPEC;
+  mnl_attr_put_str(nlh, IFLA_IFNAME, peer_name.c_str());
+  mnl_attr_nest_end(nlh, peer);
+  mnl_attr_nest_end(nlh, info_data);
+  mnl_attr_nest_end(nlh, link_info);
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
+void DeleteLink(const std::string& name) {
+  RequireInterfaceName(name);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_DELLINK;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message = static_cast<ifinfomsg*>(
+      mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
+  message->ifi_family = AF_UNSPEC;
+  mnl_attr_put_str(nlh, IFLA_IFNAME, name.c_str());
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
+void MoveLinkToNamespace(const std::string& name, int netns_fd) {
+  RequireInterfaceName(name);
+  if (netns_fd < 0) {
+    throw std::runtime_error("invalid network namespace fd");
+  }
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWLINK;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message = static_cast<ifinfomsg*>(
+      mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
+  message->ifi_family = AF_UNSPEC;
+  mnl_attr_put_str(nlh, IFLA_IFNAME, name.c_str());
+  mnl_attr_put_u32(nlh, IFLA_NET_NS_FD, static_cast<uint32_t>(netns_fd));
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
+void SetLinkUp(const std::string& name, bool up) {
+  RequireInterfaceName(name);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWLINK;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message = static_cast<ifinfomsg*>(
+      mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
+  message->ifi_family = AF_UNSPEC;
+  message->ifi_change = IFF_UP;
+  message->ifi_flags = up ? static_cast<unsigned int>(IFF_UP) : 0U;
+  mnl_attr_put_str(nlh, IFLA_IFNAME, name.c_str());
+
+  SendNetlinkRequest(nlh, sequence);
 }
 
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {
@@ -340,6 +492,52 @@ NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   try {
     probe.namespace_links = ListNetworkLinksInNamespace(namespace_fd.get());
   } catch (...) {
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
+VethProbe ProbeVethPair() {
+  VethProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  probe.parent_before = ListNetworkLinks();
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    probe.parent_after_create = ListNetworkLinks();
+    if (!HasLinkNamed(probe.parent_after_create, probe.host_name) ||
+        !HasLinkNamed(probe.parent_after_create, probe.peer_name)) {
+      throw std::runtime_error("created veth pair was not visible in parent netns");
+    }
+
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+    probe.parent_after_move = ListNetworkLinks();
+    probe.namespace_after_move = ListNetworkLinksInNamespace(namespace_fd.get());
+    if (!HasLinkNamed(probe.parent_after_move, probe.host_name) ||
+        HasLinkNamed(probe.parent_after_move, probe.peer_name) ||
+        !HasLinkNamed(probe.namespace_after_move, probe.peer_name)) {
+      throw std::runtime_error("veth peer did not move to child netns");
+    }
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
     kill(probe.helper_pid, SIGKILL);
     WaitForPid(probe.helper_pid);
     throw;

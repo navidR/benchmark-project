@@ -37,6 +37,7 @@ struct Options {
   bool keep_cgroups = false;
   bool replace_run = false;
   bool probe_netns = false;
+  bool probe_veth = false;
   bool probe_network = false;
 };
 
@@ -67,6 +68,8 @@ Options ParseOptions(int argc, char** argv) {
       "remove an existing run directory first")(
       "probe-netns", po::bool_switch(&options.probe_netns),
       "create a temporary network namespace and inspect it through setns/libmnl")(
+      "probe-veth", po::bool_switch(&options.probe_veth),
+      "create, move, inspect, and delete a temporary veth pair through libmnl")(
       "probe-network", po::bool_switch(&options.probe_network),
       "list links through rtnetlink/libmnl and exit");
 
@@ -82,7 +85,7 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error("--nodes currently supports 1..2 for MVP smoke");
   }
   RequireSafeRunId(options.run_id);
-  if (!options.probe_network && !options.probe_netns) {
+  if (!options.probe_network && !options.probe_netns && !options.probe_veth) {
     RequireExecutable(options.firod);
   }
   return options;
@@ -112,6 +115,20 @@ std::string NetworkNamespaceProbeJson() {
   result["helper_pid"] = probe.helper_pid;
   result["parent_links"] = LinksJson(probe.parent_links);
   result["namespace_links"] = LinksJson(probe.namespace_links);
+  return boost::json::serialize(result);
+}
+
+std::string VethProbeJson() {
+  VethProbe probe = ProbeVethPair();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["parent_before"] = LinksJson(probe.parent_before);
+  result["parent_after_create"] = LinksJson(probe.parent_after_create);
+  result["parent_after_move"] = LinksJson(probe.parent_after_move);
+  result["namespace_after_move"] = LinksJson(probe.namespace_after_move);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
 
@@ -266,6 +283,10 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_netns) {
     std::cout << NetworkNamespaceProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_veth) {
+    std::cout << VethProbeJson() << "\n";
     return 0;
   }
 
