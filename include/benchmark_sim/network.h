@@ -97,6 +97,17 @@ struct QdiscProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
+struct QdiscMutationProbe {
+  pid_t helper_pid = -1;
+  std::string host_name;
+  std::string peer_name;
+  std::uint32_t pfifo_limit_packets = 0;
+  std::vector<QdiscInfo> namespace_qdiscs_before;
+  std::vector<QdiscInfo> namespace_qdiscs_after_replace;
+  std::vector<QdiscInfo> namespace_qdiscs_after_delete;
+  std::vector<LinkInfo> parent_after_delete;
+};
+
 std::vector<LinkInfo> ListNetworkLinks();
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
 std::vector<AddressInfo> ListIpv4Addresses();
@@ -119,9 +130,13 @@ void AddIpv4Route(const std::string& if_name, const std::string& destination,
 void DeleteIpv4Route(const std::string& if_name, const std::string& destination,
                      std::uint8_t prefix_len,
                      const std::string& gateway = "");
+void ReplaceRootPfifoQdisc(const std::string& if_name,
+                           std::uint32_t limit_packets);
+void DeleteRootQdisc(const std::string& if_name);
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();
 RouteProbe ProbeIpv4RouteAssignment();
 QdiscProbe ProbeQdiscDump();
+QdiscMutationProbe ProbeQdiscMutation();
 
 }  // namespace bsim

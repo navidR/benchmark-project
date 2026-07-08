@@ -39,6 +39,7 @@ struct Options {
   bool probe_address = false;
   bool probe_netns = false;
   bool probe_qdisc = false;
+  bool probe_qdisc_mutation = false;
   bool probe_route = false;
   bool probe_veth = false;
   bool probe_network = false;
@@ -76,6 +77,10 @@ Options ParseOptions(int argc, char** argv) {
       "create a temporary network namespace and inspect it through setns/libmnl")(
       "probe-qdisc", po::bool_switch(&options.probe_qdisc),
       "dump qdisc state for a temporary veth peer through libmnl")(
+      "probe-qdisc-mutation",
+      po::bool_switch(&options.probe_qdisc_mutation),
+      "replace and delete a root pfifo qdisc on a temporary veth peer through "
+      "libmnl")(
       "probe-route", po::bool_switch(&options.probe_route),
       "assign and inspect an IPv4 route inside a temporary netns through libmnl")(
       "probe-veth", po::bool_switch(&options.probe_veth),
@@ -96,7 +101,8 @@ Options ParseOptions(int argc, char** argv) {
   }
   RequireSafeRunId(options.run_id);
   if (!options.probe_network && !options.probe_netns && !options.probe_veth &&
-      !options.probe_address && !options.probe_route && !options.probe_qdisc) {
+      !options.probe_address && !options.probe_route && !options.probe_qdisc &&
+      !options.probe_qdisc_mutation) {
     RequireExecutable(options.firod);
   }
   return options;
@@ -200,6 +206,23 @@ std::string QdiscProbeJson() {
   result["peer_name"] = probe.peer_name;
   result["namespace_links"] = LinksJson(probe.namespace_links);
   result["namespace_qdiscs"] = QdiscsJson(probe.namespace_qdiscs);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string QdiscMutationProbeJson() {
+  QdiscMutationProbe probe = ProbeQdiscMutation();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["pfifo_limit_packets"] = probe.pfifo_limit_packets;
+  result["namespace_qdiscs_before"] =
+      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_after_replace"] =
+      QdiscsJson(probe.namespace_qdiscs_after_replace);
+  result["namespace_qdiscs_after_delete"] =
+      QdiscsJson(probe.namespace_qdiscs_after_delete);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -411,6 +434,10 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_qdisc) {
     std::cout << QdiscProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_qdisc_mutation) {
+    std::cout << QdiscMutationProbeJson() << "\n";
     return 0;
   }
 

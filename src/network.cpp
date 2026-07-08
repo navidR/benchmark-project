@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <linux/if_link.h>
+#include <linux/pkt_sched.h>
 #include <linux/rtnetlink.h>
 #include <linux/veth.h>
 #include <net/if.h>
@@ -209,6 +210,17 @@ bool HasQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
                           const std::string& if_name) {
   for (const QdiscInfo& qdisc : qdiscs) {
     if (qdisc.if_name == if_name && !qdisc.kind.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HasQdiscKindForInterface(const std::vector<QdiscInfo>& qdiscs,
+                              const std::string& if_name,
+                              const std::string& kind) {
+  for (const QdiscInfo& qdisc : qdiscs) {
+    if (qdisc.if_name == if_name && qdisc.kind == kind) {
       return true;
     }
   }
@@ -610,6 +622,12 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
 struct NamespaceQdiscState {
   std::vector<LinkInfo> links;
   std::vector<QdiscInfo> qdiscs;
+};
+
+struct NamespaceQdiscMutationState {
+  std::vector<QdiscInfo> qdiscs_before;
+  std::vector<QdiscInfo> qdiscs_after_replace;
+  std::vector<QdiscInfo> qdiscs_after_delete;
 };
 
 }  // namespace
@@ -1023,6 +1041,67 @@ void DeleteIpv4Route(const std::string& if_name, const std::string& destination,
   SendNetlinkRequest(nlh, sequence);
 }
 
+void ReplaceRootPfifoQdisc(const std::string& if_name,
+                           std::uint32_t limit_packets) {
+  RequireInterfaceName(if_name);
+  if (limit_packets == 0U) {
+    throw std::runtime_error("pfifo limit must be greater than zero");
+  }
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWQDISC;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+  message->tcm_ifindex = static_cast<int>(if_index);
+  message->tcm_handle = TC_H_MAKE(1U << 16, 0U);
+  message->tcm_parent = TC_H_ROOT;
+  message->tcm_info = 0;
+
+  tc_fifo_qopt options{};
+  options.limit = limit_packets;
+  mnl_attr_put_strz(nlh, TCA_KIND, "pfifo");
+  mnl_attr_put(nlh, TCA_OPTIONS, sizeof(options), &options);
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
+void DeleteRootQdisc(const std::string& if_name) {
+  RequireInterfaceName(if_name);
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_DELQDISC;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+  message->tcm_ifindex = static_cast<int>(if_index);
+  message->tcm_handle = 0;
+  message->tcm_parent = TC_H_ROOT;
+  message->tcm_info = 0;
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {
   return ExecuteInNetworkNamespace(netns_fd, []() {
     return ListNetworkLinks();
@@ -1055,6 +1134,70 @@ NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   try {
     probe.namespace_links = ListNetworkLinksInNamespace(namespace_fd.get());
   } catch (...) {
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
+QdiscMutationProbe ProbeQdiscMutation() {
+  QdiscMutationProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  probe.pfifo_limit_packets = 64;
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+
+    NamespaceQdiscMutationState namespace_state =
+        ExecuteInNetworkNamespace(namespace_fd.get(), [&probe]() {
+          SetLinkUp("lo", true);
+          SetLinkUp(probe.peer_name, true);
+          NamespaceQdiscMutationState state;
+          state.qdiscs_before = ListQdiscs();
+          ReplaceRootPfifoQdisc(probe.peer_name, probe.pfifo_limit_packets);
+          state.qdiscs_after_replace = ListQdiscs();
+          DeleteRootQdisc(probe.peer_name);
+          state.qdiscs_after_delete = ListQdiscs();
+          return state;
+        });
+    probe.namespace_qdiscs_before = std::move(namespace_state.qdiscs_before);
+    probe.namespace_qdiscs_after_replace =
+        std::move(namespace_state.qdiscs_after_replace);
+    probe.namespace_qdiscs_after_delete =
+        std::move(namespace_state.qdiscs_after_delete);
+
+    if (!HasQdiscKindForInterface(probe.namespace_qdiscs_after_replace,
+                                  probe.peer_name, "pfifo")) {
+      throw std::runtime_error("pfifo qdisc was not visible after replace");
+    }
+    if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
+                                 probe.peer_name, "pfifo")) {
+      throw std::runtime_error("pfifo qdisc remained after delete");
+    }
+    if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
+                              probe.peer_name)) {
+      throw std::runtime_error("qdisc dump lost veth peer after delete");
+    }
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
     kill(probe.helper_pid, SIGKILL);
     WaitForPid(probe.helper_pid);
     throw;
