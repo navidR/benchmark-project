@@ -195,8 +195,10 @@ running, before block generation:
 ```
 
 The current MVP applies bandwidth-only conditions with TBF and delay/loss
-conditions with `netem`. Combining bandwidth with delay/loss needs a qdisc
-hierarchy and is not enabled yet.
+conditions with `netem`. The netem fields are `delay_ms`, `jitter_ms`,
+`loss_basis_points`, `duplicate_basis_points`, `corrupt_basis_points`,
+`reorder_basis_points`, and `limit_packets`. Combining bandwidth with netem
+needs a qdisc hierarchy and is not enabled yet.
 
 Resource limits are global for the current MVP and apply to each node cgroup:
 

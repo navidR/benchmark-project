@@ -274,7 +274,9 @@ const QdiscInfo* FindQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
 bool HasNetemCondition(const NetworkCondition& condition) {
   return condition.delay_ms != 0U || condition.jitter_ms != 0U ||
          condition.loss_basis_points != 0U ||
-         condition.duplicate_basis_points != 0U;
+         condition.duplicate_basis_points != 0U ||
+         condition.corrupt_basis_points != 0U ||
+         condition.reorder_basis_points != 0U;
 }
 
 std::uint32_t NetemProbability(std::uint32_t basis_points) {
@@ -341,6 +343,12 @@ void ValidateNetworkCondition(const NetworkCondition& condition) {
   if (condition.duplicate_basis_points > kMaxBasisPoints) {
     throw std::runtime_error("netem duplicate basis points must be 0..10000");
   }
+  if (condition.corrupt_basis_points > kMaxBasisPoints) {
+    throw std::runtime_error("netem corrupt basis points must be 0..10000");
+  }
+  if (condition.reorder_basis_points > kMaxBasisPoints) {
+    throw std::runtime_error("netem reorder basis points must be 0..10000");
+  }
   if (condition.limit_packets == 0U) {
     throw std::runtime_error("netem packet limit must be greater than zero");
   }
@@ -362,6 +370,10 @@ bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
          qdisc.netem_loss == NetemProbability(condition.loss_basis_points) &&
          qdisc.netem_duplicate ==
              NetemProbability(condition.duplicate_basis_points) &&
+         qdisc.netem_corrupt ==
+             NetemProbability(condition.corrupt_basis_points) &&
+         qdisc.netem_reorder ==
+             NetemProbability(condition.reorder_basis_points) &&
          qdisc.netem_limit_packets == condition.limit_packets;
 }
 
@@ -407,6 +419,21 @@ void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence) {
     throw std::runtime_error(std::string("netlink request failed: ") +
                              std::strerror(errno));
   }
+}
+
+void PutRawPayload(nlmsghdr* nlh, const void* data, size_t size) {
+  void* tail = mnl_nlmsg_get_payload_tail(nlh);
+  std::memcpy(tail, data, size);
+  const size_t aligned_size = MNL_ALIGN(size);
+  if (aligned_size >
+      static_cast<size_t>(std::numeric_limits<__u32>::max() -
+                          nlh->nlmsg_len)) {
+    throw std::runtime_error("netlink message payload is too large");
+  }
+  if (aligned_size > size) {
+    std::memset(static_cast<char*>(tail) + size, 0, aligned_size - size);
+  }
+  nlh->nlmsg_len += static_cast<__u32>(aligned_size);
 }
 
 void TryDeleteLink(const std::string& name) {
@@ -771,6 +798,70 @@ int ParseTbfOptionAttr(const nlattr* attr, void* data) {
   }
 }
 
+int ParseNetemNestedOptionAttr(const nlattr* attr, void* data) {
+  auto* qdisc = static_cast<QdiscInfo*>(data);
+  const uint16_t attr_type = mnl_attr_get_type(attr);
+  if (mnl_attr_type_valid(attr, TCA_NETEM_MAX) < 0) {
+    return MNL_CB_OK;
+  }
+
+  switch (attr_type) {
+    case TCA_NETEM_REORDER:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) < sizeof(tc_netem_reorder)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      } else {
+        const auto* options =
+            static_cast<const tc_netem_reorder*>(mnl_attr_get_payload(attr));
+        qdisc->has_netem_options = true;
+        qdisc->netem_reorder = options->probability;
+      }
+      return MNL_CB_OK;
+    case TCA_NETEM_CORRUPT:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) < sizeof(tc_netem_corrupt)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      } else {
+        const auto* options =
+            static_cast<const tc_netem_corrupt*>(mnl_attr_get_payload(attr));
+        qdisc->has_netem_options = true;
+        qdisc->netem_corrupt = options->probability;
+      }
+      return MNL_CB_OK;
+    default:
+      return MNL_CB_OK;
+  }
+}
+
+int ParseNetemOptions(const nlattr* attr, QdiscInfo* qdisc) {
+  const auto payload_len =
+      static_cast<std::size_t>(mnl_attr_get_payload_len(attr));
+  if (payload_len < sizeof(tc_netem_qopt)) {
+    return MNL_CB_OK;
+  }
+
+  const auto* options =
+      static_cast<const tc_netem_qopt*>(mnl_attr_get_payload(attr));
+  qdisc->has_netem_options = true;
+  qdisc->netem_latency_us = options->latency;
+  qdisc->netem_jitter_us = options->jitter;
+  qdisc->netem_loss = options->loss;
+  qdisc->netem_duplicate = options->duplicate;
+  qdisc->netem_limit_packets = options->limit;
+
+  const std::size_t nested_offset = MNL_ALIGN(sizeof(tc_netem_qopt));
+  if (payload_len <= nested_offset) {
+    return MNL_CB_OK;
+  }
+  const auto* nested_payload =
+      static_cast<const char*>(mnl_attr_get_payload(attr)) + nested_offset;
+  const std::size_t nested_len = payload_len - nested_offset;
+  return mnl_attr_parse_payload(nested_payload, nested_len,
+                                ParseNetemNestedOptionAttr, qdisc);
+}
+
 int ParseQdiscAttr(const nlattr* attr, void* data) {
   auto* qdisc = static_cast<QdiscInfo*>(data);
   const uint16_t attr_type = mnl_attr_get_type(attr);
@@ -800,26 +891,19 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
         qdisc->overlimits = stats->overlimits;
         qdisc->qlen = stats->qlen;
         qdisc->backlog = stats->backlog;
-      }
-      return MNL_CB_OK;
+    }
+    return MNL_CB_OK;
     case TCA_OPTIONS: {
-      const auto payload_len =
-          static_cast<std::size_t>(mnl_attr_get_payload_len(attr));
       if (qdisc->kind == "tbf") {
         if (mnl_attr_parse_nested(attr, ParseTbfOptionAttr, qdisc) < 0) {
           return MNL_CB_ERROR;
         }
         return MNL_CB_OK;
       }
-      if (payload_len >= sizeof(tc_netem_qopt)) {
-        const auto* options =
-            static_cast<const tc_netem_qopt*>(mnl_attr_get_payload(attr));
-        qdisc->has_netem_options = true;
-        qdisc->netem_latency_us = options->latency;
-        qdisc->netem_jitter_us = options->jitter;
-        qdisc->netem_loss = options->loss;
-        qdisc->netem_duplicate = options->duplicate;
-        qdisc->netem_limit_packets = options->limit;
+      if (qdisc->kind == "netem") {
+        if (ParseNetemOptions(attr, qdisc) < 0) {
+          return MNL_CB_ERROR;
+        }
       }
       return MNL_CB_OK;
     }
@@ -918,6 +1002,8 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
     qdisc.netem_jitter_us = 0;
     qdisc.netem_loss = 0;
     qdisc.netem_duplicate = 0;
+    qdisc.netem_corrupt = 0;
+    qdisc.netem_reorder = 0;
     qdisc.netem_limit_packets = 0;
   }
   if (qdisc.kind != "tbf") {
@@ -1470,10 +1556,24 @@ void ReplaceRootNetemQdisc(const std::string& if_name,
   options.loss = NetemProbability(condition.loss_basis_points);
   options.duplicate = NetemProbability(condition.duplicate_basis_points);
   options.limit = condition.limit_packets;
-  options.gap = 0;
+  options.gap = condition.reorder_basis_points == 0U ? 0U : 1U;
 
   mnl_attr_put_strz(nlh, TCA_KIND, "netem");
-  mnl_attr_put(nlh, TCA_OPTIONS, sizeof(options), &options);
+  nlattr* netem_options = mnl_attr_nest_start(nlh, TCA_OPTIONS);
+  PutRawPayload(nlh, &options, sizeof(options));
+  if (condition.reorder_basis_points != 0U) {
+    tc_netem_reorder reorder{};
+    reorder.probability = NetemProbability(condition.reorder_basis_points);
+    reorder.correlation = 0;
+    mnl_attr_put(nlh, TCA_NETEM_REORDER, sizeof(reorder), &reorder);
+  }
+  if (condition.corrupt_basis_points != 0U) {
+    tc_netem_corrupt corrupt{};
+    corrupt.probability = NetemProbability(condition.corrupt_basis_points);
+    corrupt.correlation = 0;
+    mnl_attr_put(nlh, TCA_NETEM_CORRUPT, sizeof(corrupt), &corrupt);
+  }
+  mnl_attr_nest_end(nlh, netem_options);
 
   SendNetlinkRequest(nlh, sequence);
 }
@@ -1651,6 +1751,8 @@ NetworkConditionProbe ProbeNetworkCondition() {
   probe.condition.jitter_ms = 10;
   probe.condition.loss_basis_points = 25;
   probe.condition.duplicate_basis_points = 10;
+  probe.condition.corrupt_basis_points = 15;
+  probe.condition.reorder_basis_points = 20;
   probe.condition.limit_packets = 1000;
 
   pid_t helper_pid = -1;

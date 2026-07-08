@@ -235,6 +235,10 @@ NetworkCondition ParseNetworkConditionObject(
       object, "loss_basis_points", condition.loss_basis_points);
   condition.duplicate_basis_points = JsonOptionalUint32Field(
       object, "duplicate_basis_points", condition.duplicate_basis_points);
+  condition.corrupt_basis_points = JsonOptionalUint32Field(
+      object, "corrupt_basis_points", condition.corrupt_basis_points);
+  condition.reorder_basis_points = JsonOptionalUint32Field(
+      object, "reorder_basis_points", condition.reorder_basis_points);
   condition.limit_packets = JsonOptionalUint32Field(
       object, "limit_packets", condition.limit_packets);
   return condition;
@@ -526,6 +530,14 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         options.network_condition.duplicate_basis_points =
             scenario_condition.duplicate_basis_points;
       }
+      if (!OptionProvided(vm, "network-corrupt-bps")) {
+        options.network_condition.corrupt_basis_points =
+            scenario_condition.corrupt_basis_points;
+      }
+      if (!OptionProvided(vm, "network-reorder-bps")) {
+        options.network_condition.reorder_basis_points =
+            scenario_condition.reorder_basis_points;
+      }
       if (!OptionProvided(vm, "network-limit-packets")) {
         options.network_condition.limit_packets =
             scenario_condition.limit_packets;
@@ -717,6 +729,12 @@ Options ParseOptions(int argc, char** argv) {
       "network-duplicate-bps",
       po::value<uint32_t>(&options.network_condition.duplicate_basis_points),
       "netem packet duplication in basis points, 10000 = 100%")(
+      "network-corrupt-bps",
+      po::value<uint32_t>(&options.network_condition.corrupt_basis_points),
+      "netem packet corruption in basis points, 10000 = 100%")(
+      "network-reorder-bps",
+      po::value<uint32_t>(&options.network_condition.reorder_basis_points),
+      "netem packet reordering in basis points, 10000 = 100%")(
       "network-limit-packets",
       po::value<uint32_t>(&options.network_condition.limit_packets),
       "netem queue limit applied to each isolated node host-side veth")(
@@ -812,6 +830,8 @@ Options ParseOptions(int argc, char** argv) {
       vm.count("network-jitter-ms") != 0U ||
       vm.count("network-loss-bps") != 0U ||
       vm.count("network-duplicate-bps") != 0U ||
+      vm.count("network-corrupt-bps") != 0U ||
+      vm.count("network-reorder-bps") != 0U ||
       vm.count("network-limit-packets") != 0U;
   options.cpu_quota_requested =
       options.cpu_quota_requested || vm.count("cpu-quota-us") != 0U;
@@ -942,6 +962,8 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
     qdisc_json["netem_jitter_us"] = qdisc.netem_jitter_us;
     qdisc_json["netem_loss"] = qdisc.netem_loss;
     qdisc_json["netem_duplicate"] = qdisc.netem_duplicate;
+    qdisc_json["netem_corrupt"] = qdisc.netem_corrupt;
+    qdisc_json["netem_reorder"] = qdisc.netem_reorder;
     qdisc_json["netem_limit_packets"] = qdisc.netem_limit_packets;
     qdisc_json["has_tbf_options"] = qdisc.has_tbf_options;
     qdisc_json["tbf_rate_bytes_per_sec"] = qdisc.tbf_rate_bytes_per_sec;
@@ -960,6 +982,8 @@ boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
   object["jitter_ms"] = condition.jitter_ms;
   object["loss_basis_points"] = condition.loss_basis_points;
   object["duplicate_basis_points"] = condition.duplicate_basis_points;
+  object["corrupt_basis_points"] = condition.corrupt_basis_points;
+  object["reorder_basis_points"] = condition.reorder_basis_points;
   object["limit_packets"] = condition.limit_packets;
   return object;
 }
@@ -1486,6 +1510,8 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["qdisc_netem_jitter_us"] = qdisc->netem_jitter_us;
     object["qdisc_netem_loss"] = qdisc->netem_loss;
     object["qdisc_netem_duplicate"] = qdisc->netem_duplicate;
+    object["qdisc_netem_corrupt"] = qdisc->netem_corrupt;
+    object["qdisc_netem_reorder"] = qdisc->netem_reorder;
     object["qdisc_netem_limit_packets"] = qdisc->netem_limit_packets;
     object["qdisc_has_tbf_options"] = qdisc->has_tbf_options;
     object["qdisc_tbf_rate_bytes_per_sec"] = qdisc->tbf_rate_bytes_per_sec;
@@ -1623,6 +1649,12 @@ void WriteScenarioFiles(const Options& options,
         "    duplicate_basis_points: " +
         std::to_string(options.network_condition.duplicate_basis_points) +
         "\n"
+        "    corrupt_basis_points: " +
+        std::to_string(options.network_condition.corrupt_basis_points) +
+        "\n"
+        "    reorder_basis_points: " +
+        std::to_string(options.network_condition.reorder_basis_points) +
+        "\n"
         "    limit_packets: " +
         std::to_string(options.network_condition.limit_packets) + "\n";
   }
@@ -1647,6 +1679,12 @@ void WriteScenarioFiles(const Options& options,
           "\n"
           "      duplicate_basis_points: " +
           std::to_string(condition.duplicate_basis_points) +
+          "\n"
+          "      corrupt_basis_points: " +
+          std::to_string(condition.corrupt_basis_points) +
+          "\n"
+          "      reorder_basis_points: " +
+          std::to_string(condition.reorder_basis_points) +
           "\n"
           "      limit_packets: " +
           std::to_string(condition.limit_packets) + "\n";
@@ -1673,6 +1711,12 @@ void WriteScenarioFiles(const Options& options,
           "\n"
           "      duplicate_basis_points: " +
           std::to_string(condition.duplicate_basis_points) +
+          "\n"
+          "      corrupt_basis_points: " +
+          std::to_string(condition.corrupt_basis_points) +
+          "\n"
+          "      reorder_basis_points: " +
+          std::to_string(condition.reorder_basis_points) +
           "\n"
           "      limit_packets: " +
           std::to_string(condition.limit_packets) + "\n";

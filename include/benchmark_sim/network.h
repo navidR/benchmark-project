@@ -62,6 +62,8 @@ struct QdiscInfo {
   std::uint32_t netem_jitter_us = 0;
   std::uint32_t netem_loss = 0;
   std::uint32_t netem_duplicate = 0;
+  std::uint32_t netem_corrupt = 0;
+  std::uint32_t netem_reorder = 0;
   std::uint32_t netem_limit_packets = 0;
   bool has_tbf_options = false;
   std::uint64_t tbf_rate_bytes_per_sec = 0;
@@ -76,6 +78,8 @@ struct NetworkCondition {
   std::uint32_t jitter_ms = 0;
   std::uint32_t loss_basis_points = 0;
   std::uint32_t duplicate_basis_points = 0;
+  std::uint32_t corrupt_basis_points = 0;
+  std::uint32_t reorder_basis_points = 0;
   std::uint32_t limit_packets = 1000;
 };
 
