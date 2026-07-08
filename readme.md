@@ -212,6 +212,21 @@ before block generation:
   --runtime-node-unblock-json '{"node":1,"dst_address":"10.210.1.2","dst_port":18168}'
 ```
 
+Runtime partition/heal currently supports two singleton node groups:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id live-partition-heal \
+  --replace-run \
+  --nodes 2 \
+  --generate-blocks 1 \
+  --isolate-network \
+  --runtime-partition-json '{"group_a":[1],"group_b":[2]}' \
+  --runtime-heal-partition-json '{"group_a":[1],"group_b":[2]}'
+```
+
 The current implementation applies bandwidth with TBF and delay/loss conditions
 with `netem`. When both are requested, TBF is the root qdisc and netem is
 attached below it. The netem fields are `delay_ms`, `jitter_ms`,
@@ -346,6 +361,18 @@ The same run settings can be loaded from a JSON scenario file:
         "node": 1,
         "dst_address": "10.210.1.2",
         "dst_port": 18168
+      }
+    ],
+    "runtime_partitions": [
+      {
+        "group_a": [1],
+        "group_b": [2]
+      }
+    ],
+    "runtime_partition_heals": [
+      {
+        "group_a": [1],
+        "group_b": [2]
       }
     ]
   },

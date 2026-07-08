@@ -66,6 +66,11 @@ struct NetworkBlockRule {
   uint32_t handle = 0;
 };
 
+struct NetworkPartitionRule {
+  std::vector<uint32_t> group_a;
+  std::vector<uint32_t> group_b;
+};
+
 struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path firod;
@@ -93,6 +98,8 @@ struct Options {
   std::vector<std::string> runtime_node_network_condition_json;
   std::vector<std::string> runtime_node_block_json;
   std::vector<std::string> runtime_node_unblock_json;
+  std::vector<std::string> runtime_partition_json;
+  std::vector<std::string> runtime_heal_partition_json;
   std::vector<std::string> runtime_node_resource_json;
   std::vector<std::string> runtime_node_restart_json;
   std::vector<std::string> runtime_node_freeze_json;
@@ -101,6 +108,8 @@ struct Options {
   std::map<uint32_t, ResourceLimitPatch> runtime_node_resource_updates;
   std::vector<NetworkBlockRule> runtime_node_blocks;
   std::vector<NetworkBlockRule> runtime_node_unblocks;
+  std::vector<NetworkPartitionRule> runtime_partitions;
+  std::vector<NetworkPartitionRule> runtime_partition_heals;
   std::vector<uint32_t> runtime_node_restarts;
   std::vector<FreezeRequest> runtime_node_freezes;
   bool replace_run = false;
@@ -242,6 +251,36 @@ std::string JsonStringField(const boost::json::object& object,
   return std::string(value->as_string());
 }
 
+std::vector<uint32_t> JsonNodeGroupField(const boost::json::object& object,
+                                         const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || !value->is_array()) {
+    throw std::runtime_error("missing or invalid node group JSON field: " +
+                             std::string(field));
+  }
+  std::vector<uint32_t> nodes;
+  for (const boost::json::value& node_value : value->as_array()) {
+    const uint64_t raw_node = JsonUint64Value(node_value, field);
+    if (raw_node > std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error("partition node value exceeds uint32");
+    }
+    const uint32_t node = static_cast<uint32_t>(raw_node);
+    if (node == 0U) {
+      throw std::runtime_error("partition node values must be greater than zero");
+    }
+    for (uint32_t existing : nodes) {
+      if (existing == node - 1U) {
+        throw std::runtime_error("partition node group contains a duplicate");
+      }
+    }
+    nodes.push_back(node - 1U);
+  }
+  if (nodes.empty()) {
+    throw std::runtime_error("partition node groups must not be empty");
+  }
+  return nodes;
+}
+
 bool OptionProvided(const boost::program_options::variables_map& vm,
                     const char* name) {
   const auto iter = vm.find(name);
@@ -308,6 +347,22 @@ NetworkBlockRule ParseNetworkBlockRuleObject(
   rule.handle = JsonOptionalUint32Field(object, "handle", 0U);
   if (rule.handle == 0U) {
     rule.handle = StableRuleHandle(rule);
+  }
+  return rule;
+}
+
+NetworkPartitionRule ParseNetworkPartitionRuleObject(
+    const boost::json::object& object) {
+  NetworkPartitionRule rule;
+  rule.group_a = JsonNodeGroupField(object, "group_a");
+  rule.group_b = JsonNodeGroupField(object, "group_b");
+  for (uint32_t a : rule.group_a) {
+    for (uint32_t b : rule.group_b) {
+      if (a == b) {
+        throw std::runtime_error(
+            "partition groups must not contain the same node");
+      }
+    }
   }
   return rule;
 }
@@ -395,6 +450,34 @@ void ApplyNetworkBlockRules(const boost::json::array& rules, uint32_t nodes,
     if (rule.node_index >= nodes) {
       throw std::runtime_error(std::string(source) + " node must be in 1.." +
                                std::to_string(nodes));
+    }
+    output.push_back(std::move(rule));
+  }
+}
+
+void ApplyNetworkPartitionRules(const boost::json::array& rules,
+                                uint32_t nodes, std::string_view source,
+                                std::vector<NetworkPartitionRule>& output) {
+  for (const boost::json::value& value : rules) {
+    if (!value.is_object()) {
+      throw std::runtime_error(std::string(source) +
+                               " entries must be JSON objects");
+    }
+    NetworkPartitionRule rule =
+        ParseNetworkPartitionRuleObject(value.as_object());
+    for (uint32_t node_index : rule.group_a) {
+      if (node_index >= nodes) {
+        throw std::runtime_error(std::string(source) +
+                                 " group_a node must be in 1.." +
+                                 std::to_string(nodes));
+      }
+    }
+    for (uint32_t node_index : rule.group_b) {
+      if (node_index >= nodes) {
+        throw std::runtime_error(std::string(source) +
+                                 " group_b node must be in 1.." +
+                                 std::to_string(nodes));
+      }
     }
     output.push_back(std::move(rule));
   }
@@ -673,6 +756,29 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                              "scenario network.runtime_node_unblocks",
                              options.runtime_node_unblocks);
     }
+    const boost::json::value* runtime_partitions =
+        object.if_contains("runtime_partitions");
+    if (runtime_partitions != nullptr) {
+      if (!runtime_partitions->is_array()) {
+        throw std::runtime_error(
+            "scenario network.runtime_partitions must be a JSON array");
+      }
+      ApplyNetworkPartitionRules(runtime_partitions->as_array(), options.nodes,
+                                 "scenario network.runtime_partitions",
+                                 options.runtime_partitions);
+    }
+    const boost::json::value* runtime_partition_heals =
+        object.if_contains("runtime_partition_heals");
+    if (runtime_partition_heals != nullptr) {
+      if (!runtime_partition_heals->is_array()) {
+        throw std::runtime_error(
+            "scenario network.runtime_partition_heals must be a JSON array");
+      }
+      ApplyNetworkPartitionRules(runtime_partition_heals->as_array(),
+                                 options.nodes,
+                                 "scenario network.runtime_partition_heals",
+                                 options.runtime_partition_heals);
+    }
   }
 }
 
@@ -728,6 +834,33 @@ void ParseRuntimeNodeBlockTexts(const std::vector<std::string>& texts,
     if (rule.node_index >= nodes) {
       throw std::runtime_error(std::string(option_name) +
                                " node must be in 1..--nodes");
+    }
+    output.push_back(std::move(rule));
+  }
+}
+
+void ParseRuntimePartitionTexts(const std::vector<std::string>& texts,
+                                uint32_t nodes, std::string_view option_name,
+                                std::vector<NetworkPartitionRule>& output) {
+  for (const std::string& text : texts) {
+    boost::json::value value = boost::json::parse(text);
+    if (!value.is_object()) {
+      throw std::runtime_error(std::string(option_name) +
+                               " must be a JSON object");
+    }
+    NetworkPartitionRule rule =
+        ParseNetworkPartitionRuleObject(value.as_object());
+    for (uint32_t node_index : rule.group_a) {
+      if (node_index >= nodes) {
+        throw std::runtime_error(std::string(option_name) +
+                                 " group_a node must be in 1..--nodes");
+      }
+    }
+    for (uint32_t node_index : rule.group_b) {
+      if (node_index >= nodes) {
+        throw std::runtime_error(std::string(option_name) +
+                                 " group_b node must be in 1..--nodes");
+      }
     }
     output.push_back(std::move(rule));
   }
@@ -791,6 +924,13 @@ void ParseNodeNetworkConditions(Options& options) {
   ParseRuntimeNodeBlockTexts(options.runtime_node_unblock_json, options.nodes,
                              "--runtime-node-unblock-json",
                              options.runtime_node_unblocks);
+  ParseRuntimePartitionTexts(options.runtime_partition_json, options.nodes,
+                             "--runtime-partition-json",
+                             options.runtime_partitions);
+  ParseRuntimePartitionTexts(options.runtime_heal_partition_json,
+                             options.nodes,
+                             "--runtime-heal-partition-json",
+                             options.runtime_partition_heals);
   ParseRuntimeNodeResourceTexts(options.runtime_node_resource_json,
                                 options.nodes,
                                 options.runtime_node_resource_updates);
@@ -896,6 +1036,17 @@ Options ParseOptions(int argc, char** argv) {
           ->composing(),
       "repeatable JSON object with node, dst_address, dst_port, and optional "
       "handle for one live host-side TCP drop filter removal")(
+      "runtime-partition-json",
+      po::value<std::vector<std::string>>(&options.runtime_partition_json)
+          ->composing(),
+      "repeatable JSON object with singleton group_a and group_b arrays for "
+      "one live two-node partition")(
+      "runtime-heal-partition-json",
+      po::value<std::vector<std::string>>(
+          &options.runtime_heal_partition_json)
+          ->composing(),
+      "repeatable JSON object with singleton group_a and group_b arrays for "
+      "one live two-node partition heal")(
       "runtime-node-resource-json",
       po::value<std::vector<std::string>>(
           &options.runtime_node_resource_json)
@@ -1012,7 +1163,11 @@ Options ParseOptions(int argc, char** argv) {
        !options.runtime_node_block_json.empty() ||
        !options.runtime_node_blocks.empty() ||
        !options.runtime_node_unblock_json.empty() ||
-       !options.runtime_node_unblocks.empty()) &&
+       !options.runtime_node_unblocks.empty() ||
+       !options.runtime_partition_json.empty() ||
+       !options.runtime_partitions.empty() ||
+       !options.runtime_heal_partition_json.empty() ||
+       !options.runtime_partition_heals.empty()) &&
       !options.isolate_network) {
     throw std::runtime_error(
         "network runtime options require --isolate-network");
@@ -1186,6 +1341,22 @@ boost::json::object NetworkBlockRuleJson(const NetworkBlockRule& rule) {
   object["dst_address"] = rule.dst_address;
   object["dst_port"] = rule.dst_port;
   object["handle"] = rule.handle;
+  return object;
+}
+
+boost::json::array NodeGroupJson(const std::vector<uint32_t>& nodes) {
+  boost::json::array array;
+  for (uint32_t node_index : nodes) {
+    array.push_back(node_index + 1U);
+  }
+  return array;
+}
+
+boost::json::object NetworkPartitionRuleJson(
+    const NetworkPartitionRule& rule) {
+  boost::json::object object;
+  object["group_a"] = NodeGroupJson(rule.group_a);
+  object["group_b"] = NodeGroupJson(rule.group_b);
   return object;
 }
 
@@ -1872,6 +2043,18 @@ void WriteNodeLogTails(const std::filesystem::path& events_path,
   }
 }
 
+std::string NodeGroupYamlInline(const std::vector<uint32_t>& nodes) {
+  std::string text = "[";
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (i != 0U) {
+      text += ", ";
+    }
+    text += std::to_string(nodes[i] + 1U);
+  }
+  text += "]";
+  return text;
+}
+
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root) {
   std::string network_yaml =
@@ -1999,6 +2182,26 @@ void WriteScenarioFiles(const Options& options,
           "\n"
           "      handle: " +
           std::to_string(rule.handle) + "\n";
+    }
+  }
+  if (!options.runtime_partitions.empty()) {
+    network_yaml += "  runtime_partitions:\n";
+    for (const NetworkPartitionRule& rule : options.runtime_partitions) {
+      network_yaml +=
+          "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
+          "\n"
+          "      group_b: " +
+          NodeGroupYamlInline(rule.group_b) + "\n";
+    }
+  }
+  if (!options.runtime_partition_heals.empty()) {
+    network_yaml += "  runtime_partition_heals:\n";
+    for (const NetworkPartitionRule& rule : options.runtime_partition_heals) {
+      network_yaml +=
+          "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
+          "\n"
+          "      group_b: " +
+          NodeGroupYamlInline(rule.group_b) + "\n";
     }
   }
 
@@ -2177,6 +2380,20 @@ void WriteScenarioFiles(const Options& options,
       runtime_node_unblocks.push_back(NetworkBlockRuleJson(rule));
     }
     resolved["runtime_node_unblocks"] = std::move(runtime_node_unblocks);
+  }
+  if (!options.runtime_partitions.empty()) {
+    boost::json::array runtime_partitions;
+    for (const NetworkPartitionRule& rule : options.runtime_partitions) {
+      runtime_partitions.push_back(NetworkPartitionRuleJson(rule));
+    }
+    resolved["runtime_partitions"] = std::move(runtime_partitions);
+  }
+  if (!options.runtime_partition_heals.empty()) {
+    boost::json::array runtime_partition_heals;
+    for (const NetworkPartitionRule& rule : options.runtime_partition_heals) {
+      runtime_partition_heals.push_back(NetworkPartitionRuleJson(rule));
+    }
+    resolved["runtime_partition_heals"] = std::move(runtime_partition_heals);
   }
   if (!options.runtime_node_resource_updates.empty()) {
     boost::json::array runtime_node_limits;
@@ -2504,6 +2721,107 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
   }
 }
 
+NetworkBlockRule MakeP2pBlockRule(uint32_t node_index,
+                                  const std::vector<NodeRuntime>& nodes) {
+  if (node_index >= nodes.size()) {
+    throw std::runtime_error("partition node is out of range");
+  }
+  NetworkBlockRule rule;
+  rule.node_index = node_index;
+  rule.dst_address = NodeAddress(node_index);
+  rule.dst_port = nodes[node_index].config.p2p_port;
+  rule.handle = StableRuleHandle(rule);
+  return rule;
+}
+
+std::vector<NetworkBlockRule> PartitionBlockRules(
+    const NetworkPartitionRule& partition,
+    const std::vector<NodeRuntime>& nodes) {
+  if (partition.group_a.size() != 1U || partition.group_b.size() != 1U) {
+    throw std::runtime_error(
+        "current partition MVP supports exactly one node in group_a and "
+        "exactly one node in group_b");
+  }
+  return {MakeP2pBlockRule(partition.group_a.front(), nodes),
+          MakeP2pBlockRule(partition.group_b.front(), nodes)};
+}
+
+boost::json::object PartitionRuleResultJson(const NodeRuntime& node,
+                                            const NetworkBlockRule& rule,
+                                            bool existed_before,
+                                            bool present_after) {
+  boost::json::object object = NetworkBlockRuleJson(rule);
+  object["node_id"] = node.config.id;
+  if (node.network) {
+    object["host_if"] = node.network->host_name;
+  } else {
+    object["host_if"] = nullptr;
+  }
+  object["existed_before"] = existed_before;
+  object["present_after"] = present_after;
+  return object;
+}
+
+std::string NetworkPartitionDetail(
+    const NetworkPartitionRule& partition,
+    const boost::json::array& rule_results) {
+  boost::json::object detail = NetworkPartitionRuleJson(partition);
+  detail["rules"] = rule_results;
+  detail["scope"] = "two_node_mvp";
+  return boost::json::serialize(detail);
+}
+
+void ApplyRuntimeNetworkPartition(
+    const Options& options, const std::filesystem::path& events_path,
+    std::vector<NodeRuntime>& nodes, const NetworkPartitionRule& partition,
+    bool heal) {
+  boost::json::array rule_results;
+  for (const NetworkBlockRule& rule : PartitionBlockRules(partition, nodes)) {
+    NodeRuntime& node = nodes[rule.node_index];
+    RequireNetworkBlockNode(node);
+    const bool existed_before = NetworkBlockRulePresent(node, rule);
+    if (heal) {
+      if (existed_before) {
+        DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
+      }
+    } else {
+      ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.dst_address,
+                                     rule.dst_port, rule.handle);
+    }
+    const bool present_after = NetworkBlockRulePresent(node, rule);
+    if (!heal && !present_after) {
+      throw std::runtime_error(
+          "runtime network partition rule was not visible after apply");
+    }
+    if (heal && present_after) {
+      throw std::runtime_error(
+          "runtime network partition rule remained after heal");
+    }
+    rule_results.push_back(PartitionRuleResultJson(node, rule, existed_before,
+                                                   present_after));
+  }
+
+  WriteEvent(events_path, options.run_id, "sim",
+             heal ? "network_partition_healed" : "network_partition_applied",
+             NetworkPartitionDetail(partition, rule_results));
+}
+
+void ApplyRuntimeNetworkPartitions(const Options& options,
+                                   const std::filesystem::path& events_path,
+                                   std::vector<NodeRuntime>& nodes) {
+  for (const NetworkPartitionRule& partition : options.runtime_partitions) {
+    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, false);
+  }
+}
+
+void ApplyRuntimeNetworkPartitionHeals(
+    const Options& options, const std::filesystem::path& events_path,
+    std::vector<NodeRuntime>& nodes) {
+  for (const NetworkPartitionRule& partition : options.runtime_partition_heals) {
+    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, true);
+  }
+}
+
 std::string RestartDetail(pid_t pid, uint64_t restart_count) {
   boost::json::object detail;
   detail["pid"] = pid;
@@ -2775,6 +3093,8 @@ int Run(int argc, char** argv) {
     ApplyRuntimeResourceLimitUpdates(options, events_path, nodes);
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
     ApplyRuntimeNetworkBlockRules(options, events_path, nodes);
+    ApplyRuntimeNetworkPartitions(options, events_path, nodes);
+    ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes);
     ApplyRuntimeNetworkUnblockRules(options, events_path, nodes);
     ApplyRuntimeNodeRestarts(options, events_path, driver, nodes);
     ApplyRuntimeNodeFreezes(options, events_path, nodes);
