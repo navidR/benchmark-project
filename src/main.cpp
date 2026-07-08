@@ -52,6 +52,11 @@ struct ResourceLimitPatch {
   std::optional<uint64_t> pids_max;
 };
 
+struct FreezeRequest {
+  uint32_t node_index = 0;
+  uint32_t duration_ms = 0;
+};
+
 struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path firod;
@@ -78,10 +83,12 @@ struct Options {
   std::vector<std::string> runtime_node_network_condition_json;
   std::vector<std::string> runtime_node_resource_json;
   std::vector<std::string> runtime_node_restart_json;
+  std::vector<std::string> runtime_node_freeze_json;
   std::map<uint32_t, NetworkCondition> node_network_conditions;
   std::map<uint32_t, NetworkCondition> runtime_node_network_conditions;
   std::map<uint32_t, ResourceLimitPatch> runtime_node_resource_updates;
   std::vector<uint32_t> runtime_node_restarts;
+  std::vector<FreezeRequest> runtime_node_freezes;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_capabilities = false;
@@ -445,6 +452,38 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         options.runtime_node_restarts.push_back(node - 1U);
       }
     }
+    const boost::json::value* runtime_node_freezes =
+        object.if_contains("runtime_node_freezes");
+    if (runtime_node_freezes != nullptr) {
+      if (!runtime_node_freezes->is_array()) {
+        throw std::runtime_error(
+            "scenario process.runtime_node_freezes must be a JSON array");
+      }
+      for (const boost::json::value& value :
+           runtime_node_freezes->as_array()) {
+        if (!value.is_object()) {
+          throw std::runtime_error(
+              "scenario process.runtime_node_freezes entries must be JSON "
+              "objects");
+        }
+        const boost::json::object& freeze = value.as_object();
+        const uint32_t node = JsonUint32Field(freeze, "node");
+        if (node == 0 || node > options.nodes) {
+          throw std::runtime_error(
+              "scenario process.runtime_node_freezes node must be in 1.." +
+              std::to_string(options.nodes));
+        }
+        const uint32_t duration_ms = JsonUint32Field(freeze, "duration_ms");
+        if (duration_ms == 0U) {
+          throw std::runtime_error(
+              "scenario process.runtime_node_freezes duration_ms must be "
+              "greater than zero");
+        }
+        options.runtime_node_freezes.push_back(
+            FreezeRequest{.node_index = node - 1U,
+                          .duration_ms = duration_ms});
+      }
+    }
   }
 
   const boost::json::value* network = scenario.if_contains("network");
@@ -568,6 +607,31 @@ void ParseRuntimeNodeRestartTexts(const std::vector<std::string>& texts,
   }
 }
 
+void ParseRuntimeNodeFreezeTexts(const std::vector<std::string>& texts,
+                                 uint32_t nodes,
+                                 std::vector<FreezeRequest>& output) {
+  for (const std::string& text : texts) {
+    boost::json::value value = boost::json::parse(text);
+    if (!value.is_object()) {
+      throw std::runtime_error(
+          "--runtime-node-freeze-json must be a JSON object");
+    }
+    const boost::json::object& object = value.as_object();
+    const uint32_t node = JsonUint32Field(object, "node");
+    if (node == 0 || node > nodes) {
+      throw std::runtime_error(
+          "--runtime-node-freeze-json node must be in 1..--nodes");
+    }
+    const uint32_t duration_ms = JsonUint32Field(object, "duration_ms");
+    if (duration_ms == 0U) {
+      throw std::runtime_error(
+          "--runtime-node-freeze-json duration_ms must be greater than zero");
+    }
+    output.push_back(
+        FreezeRequest{.node_index = node - 1U, .duration_ms = duration_ms});
+  }
+}
+
 void ParseNodeNetworkConditions(Options& options) {
   ParseNodeNetworkConditionTexts(options.node_network_condition_json,
                                  options.nodes,
@@ -582,6 +646,8 @@ void ParseNodeNetworkConditions(Options& options) {
                                 options.runtime_node_resource_updates);
   ParseRuntimeNodeRestartTexts(options.runtime_node_restart_json, options.nodes,
                                options.runtime_node_restarts);
+  ParseRuntimeNodeFreezeTexts(options.runtime_node_freeze_json, options.nodes,
+                              options.runtime_node_freezes);
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -667,6 +733,12 @@ Options ParseOptions(int argc, char** argv) {
           ->composing(),
       "repeatable JSON object with node field for one live node restart after "
       "nodes are running")(
+      "runtime-node-freeze-json",
+      po::value<std::vector<std::string>>(
+          &options.runtime_node_freeze_json)
+          ->composing(),
+      "repeatable JSON object with node and duration_ms for one live cgroup "
+      "freeze/thaw after nodes are running")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
       "probe-address", po::bool_switch(&options.probe_address),
@@ -1559,12 +1631,25 @@ void WriteScenarioFiles(const Options& options,
   }
 
   std::string process_yaml;
-  if (!options.runtime_node_restarts.empty()) {
-    process_yaml += "process:\n"
-                    "  runtime_node_restarts:\n";
-    for (uint32_t node_index : options.runtime_node_restarts) {
-      process_yaml +=
-          "    - node: " + std::to_string(node_index + 1U) + "\n";
+  if (!options.runtime_node_restarts.empty() ||
+      !options.runtime_node_freezes.empty()) {
+    process_yaml += "process:\n";
+    if (!options.runtime_node_restarts.empty()) {
+      process_yaml += "  runtime_node_restarts:\n";
+      for (uint32_t node_index : options.runtime_node_restarts) {
+        process_yaml +=
+            "    - node: " + std::to_string(node_index + 1U) + "\n";
+      }
+    }
+    if (!options.runtime_node_freezes.empty()) {
+      process_yaml += "  runtime_node_freezes:\n";
+      for (const FreezeRequest& freeze : options.runtime_node_freezes) {
+        process_yaml +=
+            "    - node: " + std::to_string(freeze.node_index + 1U) +
+            "\n"
+            "      duration_ms: " +
+            std::to_string(freeze.duration_ms) + "\n";
+      }
     }
   }
 
@@ -1690,6 +1775,16 @@ void WriteScenarioFiles(const Options& options,
       runtime_node_restarts.push_back(std::move(restart));
     }
     resolved["runtime_node_restarts"] = std::move(runtime_node_restarts);
+  }
+  if (!options.runtime_node_freezes.empty()) {
+    boost::json::array runtime_node_freezes;
+    for (const FreezeRequest& freeze : options.runtime_node_freezes) {
+      boost::json::object object;
+      object["node"] = freeze.node_index + 1U;
+      object["duration_ms"] = freeze.duration_ms;
+      runtime_node_freezes.push_back(std::move(object));
+    }
+    resolved["runtime_node_freezes"] = std::move(runtime_node_freezes);
   }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
@@ -1949,6 +2044,67 @@ void ApplyRuntimeNodeRestarts(const Options& options,
   }
 }
 
+bool WaitForNodeFrozenState(const Cgroup& cgroup, bool expected) {
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (cgroup.Frozen() == expected) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return false;
+}
+
+std::string FreezeDetail(uint32_t duration_ms, bool frozen) {
+  boost::json::object detail;
+  detail["duration_ms"] = duration_ms;
+  detail["frozen"] = frozen;
+  return boost::json::serialize(detail);
+}
+
+void FreezeNodeForDuration(const Options& options,
+                           const std::filesystem::path& events_path,
+                           NodeRuntime& node, uint32_t duration_ms) {
+  if (!node.cgroup) {
+    throw std::runtime_error("node freeze requires a node cgroup");
+  }
+
+  node.cgroup->Freeze();
+  try {
+    if (!WaitForNodeFrozenState(*node.cgroup, true)) {
+      throw std::runtime_error("node cgroup did not report frozen: " +
+                               node.config.id);
+    }
+    WriteEvent(events_path, options.run_id, node.config.id, "cgroup_frozen",
+               FreezeDetail(duration_ms, true));
+    std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+    node.cgroup->Thaw();
+    if (!WaitForNodeFrozenState(*node.cgroup, false)) {
+      throw std::runtime_error("node cgroup did not report thawed: " +
+                               node.config.id);
+    }
+    WriteEvent(events_path, options.run_id, node.config.id, "cgroup_thawed",
+               FreezeDetail(duration_ms, false));
+  } catch (...) {
+    try {
+      node.cgroup->Thaw();
+    } catch (const std::exception&) {
+    }
+    throw;
+  }
+}
+
+void ApplyRuntimeNodeFreezes(const Options& options,
+                             const std::filesystem::path& events_path,
+                             std::vector<NodeRuntime>& nodes) {
+  for (const FreezeRequest& freeze : options.runtime_node_freezes) {
+    if (freeze.node_index >= nodes.size()) {
+      throw std::runtime_error("runtime freeze node is out of range");
+    }
+    FreezeNodeForDuration(options, events_path, nodes[freeze.node_index],
+                          freeze.duration_ms);
+  }
+}
+
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
                const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
   for (auto& node : nodes) {
@@ -2090,6 +2246,7 @@ int Run(int argc, char** argv) {
     ApplyRuntimeResourceLimitUpdates(options, events_path, nodes);
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
     ApplyRuntimeNodeRestarts(options, events_path, driver, nodes);
+    ApplyRuntimeNodeFreezes(options, events_path, nodes);
     WritePeriodicMetrics(events_path, metrics_path, options, driver, nodes);
 
     if (options.generate_blocks > 0) {

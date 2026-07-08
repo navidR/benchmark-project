@@ -16,6 +16,7 @@ Firo path is working end to end.
 - Apply a simple per-node network condition through host-side `netem`.
 - Apply live per-node cgroup resource updates after startup.
 - Restart a running Firo node before workload generation.
+- Freeze and thaw a running Firo node cgroup for a bounded duration.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
 - Wait for generated blocks to propagate before final metrics are recorded.
@@ -219,6 +220,20 @@ cgroup/network/data directory, wait for RPC readiness, then continue the run:
   --runtime-node-restart-json '{"node":1}'
 ```
 
+Runtime freezes pause a node cgroup for a bounded duration, verify frozen and
+thawed states, then continue the run:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id freeze-smoke \
+  --replace-run \
+  --nodes 1 \
+  --generate-blocks 1 \
+  --runtime-node-freeze-json '{"node":1,"duration_ms":100}'
+```
+
 Extra metric samples can be collected between runtime updates/restarts and
 block generation:
 
@@ -280,6 +295,12 @@ The same MVP fields can be loaded from a Boost.JSON scenario file:
     "runtime_node_restarts": [
       {
         "node": 1
+      }
+    ],
+    "runtime_node_freezes": [
+      {
+        "node": 1,
+        "duration_ms": 100
       }
     ]
   }
