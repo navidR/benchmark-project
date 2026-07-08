@@ -48,6 +48,7 @@ class FiroDriver {
       : http_(rpc_timeout) {}
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const;
+  std::filesystem::path LogPath(const FiroNodeConfig& config) const;
   RpcEndpoint Endpoint(const FiroNodeConfig& config) const;
   void WaitReady(const FiroNodeConfig& config,
                  std::chrono::seconds timeout) const;

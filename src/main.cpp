@@ -81,6 +81,7 @@ struct NodeRuntime {
   uint64_t generated_block_count = 0;
   uint64_t stdout_offset = 0;
   uint64_t stderr_offset = 0;
+  uint64_t daemon_log_offset = 0;
 };
 
 uint32_t JsonUint32Field(const boost::json::object& object,
@@ -1054,7 +1055,7 @@ void WriteLogTailEvent(const std::filesystem::path& events_path,
 }
 
 void WriteNodeLogTails(const std::filesystem::path& events_path,
-                       const Options& options,
+                       const Options& options, const FiroDriver& driver,
                        std::vector<NodeRuntime>& nodes) {
   for (NodeRuntime& node : nodes) {
     WriteLogTailEvent(events_path, options, node, "stdout",
@@ -1063,6 +1064,8 @@ void WriteNodeLogTails(const std::filesystem::path& events_path,
     WriteLogTailEvent(events_path, options, node, "stderr",
                       node.config.log_dir / "stderr.log",
                       &node.stderr_offset);
+    WriteLogTailEvent(events_path, options, node, "daemon_log",
+                      driver.LogPath(node.config), &node.daemon_log_offset);
   }
 }
 
@@ -1541,7 +1544,7 @@ int Run(int argc, char** argv) {
   std::vector<NodeRuntime> nodes;
   try {
     StartNodes(options, run_root, events_path, driver, nodes);
-    WriteNodeLogTails(events_path, options, nodes);
+    WriteNodeLogTails(events_path, options, driver, nodes);
 
     for (auto& node : nodes) {
       const std::vector<LinkInfo> links = ListNetworkLinks();
@@ -1598,19 +1601,19 @@ int Run(int argc, char** argv) {
                  MetricsJson(options.run_id, node.config.id, chain,
                              node.generated_block_count, &cg, link, qdisc));
     }
-    WriteNodeLogTails(events_path, options, nodes);
+    WriteNodeLogTails(events_path, options, driver, nodes);
 
     StopNodes(options, events_path, driver, nodes);
-    WriteNodeLogTails(events_path, options, nodes);
+    WriteNodeLogTails(events_path, options, driver, nodes);
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
     BSIM_LOG(info) << "finished run " << options.run_id;
   } catch (...) {
     for (auto& node : nodes) {
       WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
     }
-    WriteNodeLogTails(events_path, options, nodes);
+    WriteNodeLogTails(events_path, options, driver, nodes);
     StopNodes(options, events_path, driver, nodes);
-    WriteNodeLogTails(events_path, options, nodes);
+    WriteNodeLogTails(events_path, options, driver, nodes);
     WriteEvent(events_path, options.run_id, "sim", "run_failed");
     throw;
   }

@@ -71,7 +71,6 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
       "-listenonion=0",
       "-discover=0",
       "-upnp=0",
-      "-printtoconsole=1",
       "-debug=net",
   };
   for (const auto& allow_ip : config.rpc_allow_ips) {
@@ -84,6 +83,10 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
     spec.argv.push_back(Arg("-connect", peer));
   }
   return spec;
+}
+
+std::filesystem::path FiroDriver::LogPath(const FiroNodeConfig& config) const {
+  return config.data_dir / "regtest" / "debug.log";
 }
 
 RpcEndpoint FiroDriver::Endpoint(const FiroNodeConfig& config) const {
