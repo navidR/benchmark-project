@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(benchmark_project LANGUAGES CXX)
+project(benchmark_project LANGUAGES C CXX)
 
 include(CTest)
 
@@ -23,6 +23,32 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ICU, so keep the vendored Boost build from creating system-ICU targets.
 set(CMAKE_DISABLE_FIND_PACKAGE_ICU ON)
 add_subdirectory(third_party/boost EXCLUDE_FROM_ALL)
+
+set(LIBMNL_GENERATED_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/libmnl")
+file(MAKE_DIRECTORY "${LIBMNL_GENERATED_INCLUDE}")
+file(WRITE "${LIBMNL_GENERATED_INCLUDE}/config.h"
+  "#pragma once\n"
+  "#define HAVE_VISIBILITY_HIDDEN 1\n"
+)
+
+add_library(vendored_libmnl STATIC
+  third_party/libmnl/src/attr.c
+  third_party/libmnl/src/callback.c
+  third_party/libmnl/src/nlmsg.c
+  third_party/libmnl/src/socket.c
+)
+add_library(libmnl::libmnl ALIAS vendored_libmnl)
+target_include_directories(vendored_libmnl
+  SYSTEM PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libmnl/include"
+  PRIVATE
+    "${LIBMNL_GENERATED_INCLUDE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libmnl/src"
+)
+set_target_properties(vendored_libmnl PROPERTIES
+  OUTPUT_NAME mnl
+  C_VISIBILITY_PRESET hidden
+)
 
 function(collect_directory_targets output directory)
   get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
@@ -54,6 +80,7 @@ add_executable(benchmark-sim
   src/http_client.cpp
   src/logging.cpp
   src/main.cpp
+  src/network.cpp
   src/process.cpp
   src/util.cpp
 )
@@ -67,6 +94,7 @@ target_link_libraries(benchmark-sim PRIVATE
   Boost::log_setup
   Boost::program_options
   Boost::system
+  libmnl::libmnl
 )
 target_compile_options(benchmark-sim PRIVATE
   -Wall
@@ -77,13 +105,16 @@ target_compile_options(benchmark-sim PRIVATE
 
 if(BUILD_TESTING)
   add_executable(benchmark-sim-unit-tests
+    tests/unit/network_tests.cpp
     tests/unit/util_tests.cpp
+    src/network.cpp
     src/util.cpp
   )
   target_include_directories(benchmark-sim-unit-tests PRIVATE include)
   target_link_libraries(benchmark-sim-unit-tests PRIVATE
     Boost::json
     Boost::unit_test_framework
+    libmnl::libmnl
   )
   target_compile_options(benchmark-sim-unit-tests PRIVATE
     -Wall

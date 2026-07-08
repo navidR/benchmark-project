@@ -1,6 +1,7 @@
 #include "benchmark_sim/cgroup.h"
 #include "benchmark_sim/firo_driver.h"
 #include "benchmark_sim/logging.h"
+#include "benchmark_sim/network.h"
 #include "benchmark_sim/process.h"
 #include "benchmark_sim/util.h"
 
@@ -15,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/program_options.hpp>
@@ -34,6 +36,7 @@ struct Options {
   uint32_t ready_timeout_sec = 30;
   bool keep_cgroups = false;
   bool replace_run = false;
+  bool probe_network = false;
 };
 
 struct NodeRuntime {
@@ -60,7 +63,9 @@ Options ParseOptions(int argc, char** argv) {
       "RPC startup timeout")("keep-cgroups", po::bool_switch(&options.keep_cgroups),
                              "leave cgroups after exit for inspection")(
       "replace-run", po::bool_switch(&options.replace_run),
-      "remove an existing run directory first");
+      "remove an existing run directory first")(
+      "probe-network", po::bool_switch(&options.probe_network),
+      "list links through rtnetlink/libmnl and exit");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -74,8 +79,25 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error("--nodes currently supports 1..2 for MVP smoke");
   }
   RequireSafeRunId(options.run_id);
-  RequireExecutable(options.firod);
+  if (!options.probe_network) {
+    RequireExecutable(options.firod);
+  }
   return options;
+}
+
+std::string NetworkProbeJson() {
+  boost::json::array links_json;
+  for (const LinkInfo& link : ListNetworkLinks()) {
+    boost::json::object link_json;
+    link_json["index"] = link.index;
+    link_json["name"] = link.name;
+    link_json["up"] = link.up;
+    links_json.push_back(std::move(link_json));
+  }
+
+  boost::json::object result;
+  result["links"] = std::move(links_json);
+  return boost::json::serialize(result);
 }
 
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
@@ -223,6 +245,11 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
 
 int Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);
+  if (options.probe_network) {
+    std::cout << NetworkProbeJson() << "\n";
+    return 0;
+  }
+
   BSIM_LOG(info) << "starting run " << options.run_id;
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
