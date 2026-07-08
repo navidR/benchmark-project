@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -225,6 +226,53 @@ bool HasQdiscKindForInterface(const std::vector<QdiscInfo>& qdiscs,
     }
   }
   return false;
+}
+
+const QdiscInfo* FindQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
+                                       const std::string& if_name,
+                                       const std::string& kind) {
+  for (const QdiscInfo& qdisc : qdiscs) {
+    if (qdisc.if_name == if_name && qdisc.kind == kind) {
+      return &qdisc;
+    }
+  }
+  return nullptr;
+}
+
+std::uint32_t NetemProbability(std::uint32_t basis_points) {
+  constexpr std::uint64_t kScale = 0xFFFFFFFFULL;
+  constexpr std::uint64_t kBasisPointsPerWhole = 10000ULL;
+  return static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(basis_points) * kScale) /
+      kBasisPointsPerWhole);
+}
+
+void ValidateNetworkCondition(const NetworkCondition& condition) {
+  constexpr std::uint32_t kMaxBasisPoints = 10000U;
+  constexpr std::uint32_t kMaxDelayMs = 4294967U;
+  if (condition.delay_ms > kMaxDelayMs || condition.jitter_ms > kMaxDelayMs) {
+    throw std::runtime_error("netem delay and jitter must fit in uint32 usec");
+  }
+  if (condition.loss_basis_points > kMaxBasisPoints) {
+    throw std::runtime_error("netem loss basis points must be 0..10000");
+  }
+  if (condition.duplicate_basis_points > kMaxBasisPoints) {
+    throw std::runtime_error("netem duplicate basis points must be 0..10000");
+  }
+  if (condition.limit_packets == 0U) {
+    throw std::runtime_error("netem packet limit must be greater than zero");
+  }
+}
+
+bool MatchesNetworkCondition(const QdiscInfo& qdisc,
+                             const NetworkCondition& condition) {
+  return qdisc.has_netem_options &&
+         qdisc.netem_latency_us == condition.delay_ms * 1000U &&
+         qdisc.netem_jitter_us == condition.jitter_ms * 1000U &&
+         qdisc.netem_loss == NetemProbability(condition.loss_basis_points) &&
+         qdisc.netem_duplicate ==
+             NetemProbability(condition.duplicate_basis_points) &&
+         qdisc.netem_limit_packets == condition.limit_packets;
 }
 
 template <typename Operation>
@@ -590,6 +638,20 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
     }
     qdisc->kind = mnl_attr_get_str(attr);
   }
+  if (attr_type == TCA_OPTIONS) {
+    const auto payload_len = static_cast<std::size_t>(
+        mnl_attr_get_payload_len(attr));
+    if (payload_len >= sizeof(tc_netem_qopt)) {
+      const auto* options =
+          static_cast<const tc_netem_qopt*>(mnl_attr_get_payload(attr));
+      qdisc->has_netem_options = true;
+      qdisc->netem_latency_us = options->latency;
+      qdisc->netem_jitter_us = options->jitter;
+      qdisc->netem_loss = options->loss;
+      qdisc->netem_duplicate = options->duplicate;
+      qdisc->netem_limit_packets = options->limit;
+    }
+  }
   return MNL_CB_OK;
 }
 
@@ -615,6 +677,14 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
   if (mnl_attr_parse(nlh, sizeof(*message), ParseQdiscAttr, &qdisc) < 0) {
     return MNL_CB_ERROR;
   }
+  if (qdisc.kind != "netem") {
+    qdisc.has_netem_options = false;
+    qdisc.netem_latency_us = 0;
+    qdisc.netem_jitter_us = 0;
+    qdisc.netem_loss = 0;
+    qdisc.netem_duplicate = 0;
+    qdisc.netem_limit_packets = 0;
+  }
   qdiscs->push_back(std::move(qdisc));
   return MNL_CB_OK;
 }
@@ -627,6 +697,12 @@ struct NamespaceQdiscState {
 struct NamespaceQdiscMutationState {
   std::vector<QdiscInfo> qdiscs_before;
   std::vector<QdiscInfo> qdiscs_after_replace;
+  std::vector<QdiscInfo> qdiscs_after_delete;
+};
+
+struct NamespaceNetworkConditionState {
+  std::vector<QdiscInfo> qdiscs_before;
+  std::vector<QdiscInfo> qdiscs_after_apply;
   std::vector<QdiscInfo> qdiscs_after_delete;
 };
 
@@ -1076,6 +1152,45 @@ void ReplaceRootPfifoQdisc(const std::string& if_name,
   SendNetlinkRequest(nlh, sequence);
 }
 
+void ReplaceRootNetemQdisc(const std::string& if_name,
+                           const NetworkCondition& condition) {
+  RequireInterfaceName(if_name);
+  ValidateNetworkCondition(condition);
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWQDISC;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+  message->tcm_ifindex = static_cast<int>(if_index);
+  message->tcm_handle = TC_H_MAKE(1U << 16, 0U);
+  message->tcm_parent = TC_H_ROOT;
+  message->tcm_info = 0;
+
+  tc_netem_qopt options{};
+  options.latency = condition.delay_ms * 1000U;
+  options.jitter = condition.jitter_ms * 1000U;
+  options.loss = NetemProbability(condition.loss_basis_points);
+  options.duplicate = NetemProbability(condition.duplicate_basis_points);
+  options.limit = condition.limit_packets;
+  options.gap = 0;
+
+  mnl_attr_put_strz(nlh, TCA_KIND, "netem");
+  mnl_attr_put(nlh, TCA_OPTIONS, sizeof(options), &options);
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
 void DeleteRootQdisc(const std::string& if_name) {
   RequireInterfaceName(if_name);
   const unsigned int if_index = if_nametoindex(if_name.c_str());
@@ -1134,6 +1249,78 @@ NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   try {
     probe.namespace_links = ListNetworkLinksInNamespace(namespace_fd.get());
   } catch (...) {
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
+NetworkConditionProbe ProbeNetworkCondition() {
+  NetworkConditionProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  probe.condition.delay_ms = 80;
+  probe.condition.jitter_ms = 10;
+  probe.condition.loss_basis_points = 25;
+  probe.condition.duplicate_basis_points = 10;
+  probe.condition.limit_packets = 1000;
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+
+    NamespaceNetworkConditionState namespace_state =
+        ExecuteInNetworkNamespace(namespace_fd.get(), [&probe]() {
+          SetLinkUp("lo", true);
+          SetLinkUp(probe.peer_name, true);
+          NamespaceNetworkConditionState state;
+          state.qdiscs_before = ListQdiscs();
+          ReplaceRootNetemQdisc(probe.peer_name, probe.condition);
+          state.qdiscs_after_apply = ListQdiscs();
+          DeleteRootQdisc(probe.peer_name);
+          state.qdiscs_after_delete = ListQdiscs();
+          return state;
+        });
+    probe.namespace_qdiscs_before = std::move(namespace_state.qdiscs_before);
+    probe.namespace_qdiscs_after_apply =
+        std::move(namespace_state.qdiscs_after_apply);
+    probe.namespace_qdiscs_after_delete =
+        std::move(namespace_state.qdiscs_after_delete);
+
+    const QdiscInfo* netem = FindQdiscForInterface(
+        probe.namespace_qdiscs_after_apply, probe.peer_name, "netem");
+    if (netem == nullptr) {
+      throw std::runtime_error("netem qdisc was not visible after apply");
+    }
+    if (!MatchesNetworkCondition(*netem, probe.condition)) {
+      throw std::runtime_error("netem qdisc options did not match condition");
+    }
+    if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
+                                 probe.peer_name, "netem")) {
+      throw std::runtime_error("netem qdisc remained after delete");
+    }
+    if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
+                              probe.peer_name)) {
+      throw std::runtime_error("qdisc dump lost veth peer after netem delete");
+    }
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
     kill(probe.helper_pid, SIGKILL);
     WaitForPid(probe.helper_pid);
     throw;

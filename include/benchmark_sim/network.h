@@ -40,6 +40,20 @@ struct QdiscInfo {
   std::uint32_t handle = 0;
   std::uint32_t parent = 0;
   std::uint32_t info = 0;
+  bool has_netem_options = false;
+  std::uint32_t netem_latency_us = 0;
+  std::uint32_t netem_jitter_us = 0;
+  std::uint32_t netem_loss = 0;
+  std::uint32_t netem_duplicate = 0;
+  std::uint32_t netem_limit_packets = 0;
+};
+
+struct NetworkCondition {
+  std::uint32_t delay_ms = 0;
+  std::uint32_t jitter_ms = 0;
+  std::uint32_t loss_basis_points = 0;
+  std::uint32_t duplicate_basis_points = 0;
+  std::uint32_t limit_packets = 1000;
 };
 
 struct NetworkNamespaceProbe {
@@ -108,6 +122,17 @@ struct QdiscMutationProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
+struct NetworkConditionProbe {
+  pid_t helper_pid = -1;
+  std::string host_name;
+  std::string peer_name;
+  NetworkCondition condition;
+  std::vector<QdiscInfo> namespace_qdiscs_before;
+  std::vector<QdiscInfo> namespace_qdiscs_after_apply;
+  std::vector<QdiscInfo> namespace_qdiscs_after_delete;
+  std::vector<LinkInfo> parent_after_delete;
+};
+
 std::vector<LinkInfo> ListNetworkLinks();
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
 std::vector<AddressInfo> ListIpv4Addresses();
@@ -132,11 +157,14 @@ void DeleteIpv4Route(const std::string& if_name, const std::string& destination,
                      const std::string& gateway = "");
 void ReplaceRootPfifoQdisc(const std::string& if_name,
                            std::uint32_t limit_packets);
+void ReplaceRootNetemQdisc(const std::string& if_name,
+                           const NetworkCondition& condition);
 void DeleteRootQdisc(const std::string& if_name);
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();
 RouteProbe ProbeIpv4RouteAssignment();
 QdiscProbe ProbeQdiscDump();
 QdiscMutationProbe ProbeQdiscMutation();
+NetworkConditionProbe ProbeNetworkCondition();
 
 }  // namespace bsim

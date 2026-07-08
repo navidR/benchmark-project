@@ -38,6 +38,7 @@ struct Options {
   bool replace_run = false;
   bool probe_address = false;
   bool probe_netns = false;
+  bool probe_network_condition = false;
   bool probe_qdisc = false;
   bool probe_qdisc_mutation = false;
   bool probe_route = false;
@@ -75,6 +76,10 @@ Options ParseOptions(int argc, char** argv) {
       "libmnl")(
       "probe-netns", po::bool_switch(&options.probe_netns),
       "create a temporary network namespace and inspect it through setns/libmnl")(
+      "probe-network-condition",
+      po::bool_switch(&options.probe_network_condition),
+      "apply and remove a netem network condition on a temporary veth peer "
+      "through libmnl")(
       "probe-qdisc", po::bool_switch(&options.probe_qdisc),
       "dump qdisc state for a temporary veth peer through libmnl")(
       "probe-qdisc-mutation",
@@ -102,7 +107,7 @@ Options ParseOptions(int argc, char** argv) {
   RequireSafeRunId(options.run_id);
   if (!options.probe_network && !options.probe_netns && !options.probe_veth &&
       !options.probe_address && !options.probe_route && !options.probe_qdisc &&
-      !options.probe_qdisc_mutation) {
+      !options.probe_qdisc_mutation && !options.probe_network_condition) {
     RequireExecutable(options.firod);
   }
   return options;
@@ -161,9 +166,25 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
     qdisc_json["handle"] = qdisc.handle;
     qdisc_json["parent"] = qdisc.parent;
     qdisc_json["info"] = qdisc.info;
+    qdisc_json["has_netem_options"] = qdisc.has_netem_options;
+    qdisc_json["netem_latency_us"] = qdisc.netem_latency_us;
+    qdisc_json["netem_jitter_us"] = qdisc.netem_jitter_us;
+    qdisc_json["netem_loss"] = qdisc.netem_loss;
+    qdisc_json["netem_duplicate"] = qdisc.netem_duplicate;
+    qdisc_json["netem_limit_packets"] = qdisc.netem_limit_packets;
     qdiscs_json.push_back(std::move(qdisc_json));
   }
   return qdiscs_json;
+}
+
+boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
+  boost::json::object object;
+  object["delay_ms"] = condition.delay_ms;
+  object["jitter_ms"] = condition.jitter_ms;
+  object["loss_basis_points"] = condition.loss_basis_points;
+  object["duplicate_basis_points"] = condition.duplicate_basis_points;
+  object["limit_packets"] = condition.limit_packets;
+  return object;
 }
 
 std::string NetworkProbeJson() {
@@ -194,6 +215,23 @@ std::string VethProbeJson() {
   result["parent_after_create"] = LinksJson(probe.parent_after_create);
   result["parent_after_move"] = LinksJson(probe.parent_after_move);
   result["namespace_after_move"] = LinksJson(probe.namespace_after_move);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string NetworkConditionProbeJson() {
+  NetworkConditionProbe probe = ProbeNetworkCondition();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["condition"] = NetworkConditionJson(probe.condition);
+  result["namespace_qdiscs_before"] =
+      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_after_apply"] =
+      QdiscsJson(probe.namespace_qdiscs_after_apply);
+  result["namespace_qdiscs_after_delete"] =
+      QdiscsJson(probe.namespace_qdiscs_after_delete);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -422,6 +460,10 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_veth) {
     std::cout << VethProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_network_condition) {
+    std::cout << NetworkConditionProbeJson() << "\n";
     return 0;
   }
   if (options.probe_address) {

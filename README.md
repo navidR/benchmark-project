@@ -123,7 +123,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    ./build/benchmark-sim --probe-address &&
    ./build/benchmark-sim --probe-route &&
    ./build/benchmark-sim --probe-qdisc &&
-   ./build/benchmark-sim --probe-qdisc-mutation'
+   ./build/benchmark-sim --probe-qdisc-mutation &&
+   ./build/benchmark-sim --probe-network-condition'
 ```
 
 Useful focused probes:
@@ -132,6 +133,7 @@ Useful focused probes:
 ./build/benchmark-sim --probe-veth
 ./build/benchmark-sim --probe-route
 ./build/benchmark-sim --probe-qdisc-mutation
+./build/benchmark-sim --probe-network-condition
 ```
 
 ## Cleanup Checks
