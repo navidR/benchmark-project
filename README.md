@@ -1,85 +1,46 @@
 # Benchmark Project
 
-Linux-only local blockchain benchmark simulator.
+Benchmark Project is a Linux-local blockchain benchmark simulator.
 
-The simulator runs real blockchain daemon processes, controls the Linux
-environment around them, and records benchmark outputs. Firo is the absolute
-priority for the MVP. Bitcoin Core and Monero are later targets only when they
-are needed after Firo support is solid.
+The goal is to run real blockchain daemon processes locally, isolate them like
+separate nodes, apply controlled CPU, memory, process, and network conditions,
+drive benchmark workloads, and write reproducible metrics.
 
-## Current Scope
+Firo is the MVP priority. Bitcoin Core and Monero are future targets after the
+Firo path is working end to end.
 
-Implemented MVP pieces:
+## What Works Now
 
-- C++20/CMake project with Google clang-format style.
-- Vendored Boost from `third_party/boost`.
-- Vendored libmnl from `third_party/libmnl`.
-- Firo regtest process launch and JSON-RPC smoke flow.
-- cgroup v2 resource setup and metrics reads.
-- Network link discovery through rtnetlink/libmnl.
-- Network namespace creation and inspection.
-- veth create, move-to-netns, link up, and delete.
-- IPv4 address add/list/delete through rtnetlink/libmnl.
-- IPv4 route add/list/delete through rtnetlink/libmnl.
-- qdisc dump plus root `pfifo` replace/delete probe through rtnetlink/libmnl.
-- Boost.Test unit tests for utility and network dump paths.
+- Start one or two Firo regtest nodes.
+- Wait for JSON-RPC readiness.
+- Generate regtest blocks.
+- Record event and metric files under a run directory.
+- Exercise Linux network namespace, veth, address, route, and qdisc operations
+  through simulator probes.
+- Run unit tests with CTest.
 
-Not yet complete:
+## Requirements
 
-- Full per-node isolated runtime wiring for Firo daemons.
-- Scenario parser beyond generated MVP output files.
-- TBF/netem bandwidth, delay, jitter, loss, reorder, duplicate, and corrupt
-  policy translation.
-- tc filters/actions or nftables netlink policy support.
-- ncurses TUI.
-- Bitcoin Core and Monero drivers.
+- Linux with cgroup v2, network namespaces, veth, and traffic-control support.
+- CMake 3.20 or newer.
+- A C++20 compiler.
+- A compiled `firod` binary for Firo smoke runs.
+- Privileges/capabilities for network probes, usually `CAP_SYS_ADMIN` and
+  `CAP_NET_ADMIN`.
 
-## Hard Rule
+The normal development path is a Docker container with the project mounted. The
+examples below use `benchmark-project-codex` as the container name.
 
-Simulator code must not shell out to command-line tools for OS control.
-
-Forbidden inside simulator code:
-
-- `ip`
-- `tc`
-- `nft`
-- `iptables`
-- cgroup command-line tools
-- Docker or Podman
-- shell wrappers such as `system`, `popen`, or `bash -c`
-
-Network control is implemented through the official Linux kernel netlink ABI
-using vendored libmnl. Build and validation scripts may still use normal shell
-commands outside the simulator.
-
-## Dependencies
-
-Project library dependencies must be vendored in `third_party/` and pinned to
-official release tags.
-
-Current vendored dependencies:
-
-- Boost: main C++ library stack, consumed through
-  `add_subdirectory(third_party/boost)`.
-- libmnl: netlink/rtnetlink transport and message helpers.
-
-Approved future dependency:
-
-- ncurses: C++ TUI implementation.
-
-The simulator must not depend on system Boost or system libmnl packages.
-
-## Build
-
-Set these paths for local builds and examples:
+Set paths used by the commands:
 
 ```bash
 export PROJECT_ROOT=/path/to/benchmark-project
 export FIROD=/path/to/firod
 ```
 
-The current development path uses a Docker container with the project mounted.
-The examples below use `benchmark-project-codex` as the container name.
+## Build
+
+Configure and build inside Docker:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
@@ -88,15 +49,17 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    cmake --build build -j16'
 ```
 
-Direct host build has the same CMake shape when the environment has the needed
-compiler and Linux headers:
+Build directly on the host:
 
 ```bash
+cd "$PROJECT_ROOT"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j16
 ```
 
-## Tests
+## Test
+
+Run unit tests:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
@@ -104,39 +67,9 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    ctest --test-dir build --output-on-failure'
 ```
 
-## Network Probes
+## Run Firo Smoke Benchmarks
 
-These probes exercise kernel network operations through libmnl/rtnetlink.
-
-```bash
-./build/benchmark-sim --probe-network
-./build/benchmark-sim --probe-netns
-./build/benchmark-sim --probe-veth
-./build/benchmark-sim --probe-address
-./build/benchmark-sim --probe-route
-./build/benchmark-sim --probe-qdisc
-./build/benchmark-sim --probe-qdisc-mutation
-```
-
-Run them inside the Docker development container:
-
-```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim --probe-veth &&
-   ./build/benchmark-sim --probe-address &&
-   ./build/benchmark-sim --probe-route &&
-   ./build/benchmark-sim --probe-qdisc-mutation'
-```
-
-Expected capabilities for the network probes include `CAP_SYS_ADMIN` and
-`CAP_NET_ADMIN`.
-
-## Firo Regtest Smoke
-
-Set `FIROD` to a compiled Firo daemon binary.
-
-One-node smoke:
+One Firo node:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
@@ -152,7 +85,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --ready-timeout-sec 45'
 ```
 
-Two-node smoke:
+Two Firo nodes:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
@@ -168,23 +101,48 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --ready-timeout-sec 45'
 ```
 
-Outputs are written under `runs/<run-id>/`:
+Each run writes:
 
-- `scenario.yaml`
-- `resolved-scenario.json`
-- `events.jsonl`
-- `metrics.jsonl`
-- per-node data/log directories
+- `runs/<run-id>/scenario.yaml`
+- `runs/<run-id>/resolved-scenario.json`
+- `runs/<run-id>/events.jsonl`
+- `runs/<run-id>/metrics.jsonl`
+- `runs/<run-id>/nodes/<node-id>/`
+
+## Run Network Probes
+
+The probes validate the Linux isolation and network-control pieces used by the
+simulator.
+
+```bash
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
+   ./build/benchmark-sim --probe-network &&
+   ./build/benchmark-sim --probe-netns &&
+   ./build/benchmark-sim --probe-veth &&
+   ./build/benchmark-sim --probe-address &&
+   ./build/benchmark-sim --probe-route &&
+   ./build/benchmark-sim --probe-qdisc &&
+   ./build/benchmark-sim --probe-qdisc-mutation'
+```
+
+Useful focused probes:
+
+```bash
+./build/benchmark-sim --probe-veth
+./build/benchmark-sim --probe-route
+./build/benchmark-sim --probe-qdisc-mutation
+```
 
 ## Cleanup Checks
 
-After probe or smoke runs:
+Check for leftover Firo daemons:
 
 ```bash
 docker exec benchmark-project-codex bash -lc 'pgrep -a firod || true'
 ```
 
-Check for leaked temporary benchmark veth names:
+Check for leaked temporary veth names:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
