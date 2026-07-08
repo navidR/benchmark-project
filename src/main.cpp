@@ -33,6 +33,7 @@ constexpr const char* kDefaultRewardAddress =
 constexpr const char* kRunMarkerFile = ".benchmark-sim-run";
 
 struct Options {
+  std::filesystem::path scenario_json;
   std::filesystem::path firod;
   std::filesystem::path output_dir = "runs";
   std::string run_id = MakeRunId();
@@ -111,6 +112,52 @@ uint32_t JsonOptionalUint32Field(const boost::json::object& object,
   throw std::runtime_error("invalid uint32 JSON field: " + std::string(field));
 }
 
+uint64_t JsonOptionalUint64Field(const boost::json::object& object,
+                                 const char* field, uint64_t default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return default_value;
+  }
+  if (value->is_uint64()) {
+    return value->as_uint64();
+  }
+  if (value->is_int64() && value->as_int64() >= 0) {
+    return static_cast<uint64_t>(value->as_int64());
+  }
+  throw std::runtime_error("invalid uint64 JSON field: " + std::string(field));
+}
+
+bool JsonOptionalBoolField(const boost::json::object& object, const char* field,
+                           bool default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return default_value;
+  }
+  if (!value->is_bool()) {
+    throw std::runtime_error("invalid bool JSON field: " + std::string(field));
+  }
+  return value->as_bool();
+}
+
+std::filesystem::path JsonOptionalPathField(
+    const boost::json::object& object, const char* field,
+    const std::filesystem::path& default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return default_value;
+  }
+  if (!value->is_string()) {
+    throw std::runtime_error("invalid path JSON field: " + std::string(field));
+  }
+  return std::filesystem::path(std::string(value->as_string()));
+}
+
+bool OptionProvided(const boost::program_options::variables_map& vm,
+                    const char* name) {
+  const auto iter = vm.find(name);
+  return iter != vm.end() && !iter->second.defaulted();
+}
+
 NetworkCondition ParseNetworkConditionObject(
     const boost::json::object& object) {
   NetworkCondition condition;
@@ -125,6 +172,152 @@ NetworkCondition ParseNetworkConditionObject(
   condition.limit_packets = JsonOptionalUint32Field(
       object, "limit_packets", condition.limit_packets);
   return condition;
+}
+
+void ApplyScenarioNodeConditions(const boost::json::array& conditions,
+                                 Options& options) {
+  for (const boost::json::value& value : conditions) {
+    if (!value.is_object()) {
+      throw std::runtime_error("scenario network.node_conditions entries must "
+                               "be JSON objects");
+    }
+    const boost::json::object& object = value.as_object();
+    const uint32_t node = JsonUint32Field(object, "node");
+    if (node == 0 || node > options.nodes) {
+      throw std::runtime_error(
+          "scenario network.node_conditions node must be in 1..nodes");
+    }
+    options.node_network_conditions[node - 1U] =
+        ParseNetworkConditionObject(object);
+  }
+}
+
+void ApplyScenarioJson(const boost::json::object& scenario,
+                       const boost::program_options::variables_map& vm,
+                       Options& options) {
+  if (!OptionProvided(vm, "firod")) {
+    options.firod = JsonOptionalPathField(scenario, "firod", options.firod);
+  }
+  if (!OptionProvided(vm, "output-dir")) {
+    options.output_dir =
+        JsonOptionalPathField(scenario, "output_dir", options.output_dir);
+  }
+  if (!OptionProvided(vm, "run-id")) {
+    const boost::json::value* run_id = scenario.if_contains("run_id");
+    if (run_id != nullptr) {
+      if (!run_id->is_string()) {
+        throw std::runtime_error("scenario run_id must be a string");
+      }
+      options.run_id = std::string(run_id->as_string());
+    }
+  }
+  if (!OptionProvided(vm, "nodes")) {
+    options.nodes = JsonOptionalUint32Field(scenario, "nodes", options.nodes);
+  }
+  if (!OptionProvided(vm, "generate-blocks")) {
+    options.generate_blocks = JsonOptionalUint32Field(
+        scenario, "generate_blocks", options.generate_blocks);
+  }
+  if (!OptionProvided(vm, "ready-timeout-sec")) {
+    options.ready_timeout_sec = JsonOptionalUint32Field(
+        scenario, "ready_timeout_sec", options.ready_timeout_sec);
+  }
+  if (!OptionProvided(vm, "sync-timeout-sec")) {
+    options.sync_timeout_sec = JsonOptionalUint32Field(
+        scenario, "sync_timeout_sec", options.sync_timeout_sec);
+  }
+  if (!OptionProvided(vm, "isolate-network")) {
+    options.isolate_network = JsonOptionalBoolField(
+        scenario, "isolated_network", options.isolate_network);
+  }
+
+  const boost::json::value* resources = scenario.if_contains("resources");
+  if (resources != nullptr) {
+    if (!resources->is_object()) {
+      throw std::runtime_error("scenario resources must be a JSON object");
+    }
+    const boost::json::object& object = resources->as_object();
+    if (!OptionProvided(vm, "memory-high-bytes")) {
+      options.memory_high_bytes = JsonOptionalUint64Field(
+          object, "memory_high_bytes", options.memory_high_bytes);
+    }
+    if (!OptionProvided(vm, "memory-max-bytes")) {
+      options.memory_max_bytes = JsonOptionalUint64Field(
+          object, "memory_max_bytes", options.memory_max_bytes);
+    }
+    if (!OptionProvided(vm, "cpu-period-us")) {
+      options.cpu_period_us = JsonOptionalUint64Field(
+          object, "cpu_period_us", options.cpu_period_us);
+    }
+    if (!OptionProvided(vm, "pids-max")) {
+      options.pids_max =
+          JsonOptionalUint64Field(object, "pids_max", options.pids_max);
+    }
+    if (!OptionProvided(vm, "cpu-quota-us")) {
+      const boost::json::value* quota = object.if_contains("cpu_quota_us");
+      if (quota != nullptr && !quota->is_null()) {
+        if (!quota->is_uint64() &&
+            !(quota->is_int64() && quota->as_int64() >= 0)) {
+          throw std::runtime_error(
+              "scenario resources.cpu_quota_us must be uint or null");
+        }
+        options.cpu_quota_us =
+            quota->is_uint64() ? quota->as_uint64()
+                               : static_cast<uint64_t>(quota->as_int64());
+        options.cpu_quota_requested = true;
+      }
+    }
+  }
+
+  const boost::json::value* network = scenario.if_contains("network");
+  if (network != nullptr) {
+    if (!network->is_object()) {
+      throw std::runtime_error("scenario network must be a JSON object");
+    }
+    const boost::json::object& object = network->as_object();
+    if (!OptionProvided(vm, "isolate-network")) {
+      options.isolate_network =
+          JsonOptionalBoolField(object, "isolated", options.isolate_network);
+    }
+    const boost::json::value* default_condition =
+        object.if_contains("default_condition");
+    if (default_condition != nullptr) {
+      if (!default_condition->is_object()) {
+        throw std::runtime_error(
+            "scenario network.default_condition must be a JSON object");
+      }
+      const NetworkCondition scenario_condition =
+          ParseNetworkConditionObject(default_condition->as_object());
+      if (!OptionProvided(vm, "network-delay-ms")) {
+        options.network_condition.delay_ms = scenario_condition.delay_ms;
+      }
+      if (!OptionProvided(vm, "network-jitter-ms")) {
+        options.network_condition.jitter_ms = scenario_condition.jitter_ms;
+      }
+      if (!OptionProvided(vm, "network-loss-bps")) {
+        options.network_condition.loss_basis_points =
+            scenario_condition.loss_basis_points;
+      }
+      if (!OptionProvided(vm, "network-duplicate-bps")) {
+        options.network_condition.duplicate_basis_points =
+            scenario_condition.duplicate_basis_points;
+      }
+      if (!OptionProvided(vm, "network-limit-packets")) {
+        options.network_condition.limit_packets =
+            scenario_condition.limit_packets;
+      }
+      options.network_condition_requested = true;
+    }
+    const boost::json::value* node_conditions =
+        object.if_contains("node_conditions");
+    if (node_conditions != nullptr) {
+      if (!node_conditions->is_array()) {
+        throw std::runtime_error(
+            "scenario network.node_conditions must be a JSON array");
+      }
+      ApplyScenarioNodeConditions(node_conditions->as_array(), options);
+    }
+  }
 }
 
 void ParseNodeNetworkConditions(Options& options) {
@@ -151,6 +344,8 @@ Options ParseOptions(int argc, char** argv) {
 
   po::options_description desc("Allowed options");
   desc.add_options()("help", "show this help")(
+      "scenario-json", po::value<std::filesystem::path>(&options.scenario_json),
+      "Boost.JSON scenario file for the Firo MVP")(
       "firod", po::value<std::filesystem::path>(&options.firod),
       "explicit firod binary")(
       "output-dir", po::value<std::filesystem::path>(&options.output_dir),
@@ -236,13 +431,23 @@ Options ParseOptions(int argc, char** argv) {
     std::cout << "Usage: " << argv[0] << " [options]\n" << desc << "\n";
     std::exit(0);
   }
+  if (vm.count("scenario-json") != 0U) {
+    const boost::json::value scenario =
+        boost::json::parse(ReadText(options.scenario_json));
+    if (!scenario.is_object()) {
+      throw std::runtime_error("--scenario-json root must be a JSON object");
+    }
+    ApplyScenarioJson(scenario.as_object(), vm, options);
+  }
   options.network_condition_requested =
+      options.network_condition_requested ||
       vm.count("network-delay-ms") != 0U ||
       vm.count("network-jitter-ms") != 0U ||
       vm.count("network-loss-bps") != 0U ||
       vm.count("network-duplicate-bps") != 0U ||
       vm.count("network-limit-packets") != 0U;
-  options.cpu_quota_requested = vm.count("cpu-quota-us") != 0U;
+  options.cpu_quota_requested =
+      options.cpu_quota_requested || vm.count("cpu-quota-us") != 0U;
   if (options.memory_high_bytes > options.memory_max_bytes) {
     throw std::runtime_error(
         "--memory-high-bytes must be less than or equal to --memory-max-bytes");
@@ -275,8 +480,9 @@ Options ParseOptions(int argc, char** argv) {
                            !options.probe_qdisc_mutation &&
                            !options.probe_network_condition &&
                            !options.cleanup_run;
-  if (needs_firod && vm.count("firod") == 0U) {
-    throw std::runtime_error("Firo runs require an explicit --firod path");
+  if (needs_firod && options.firod.empty()) {
+    throw std::runtime_error(
+        "Firo runs require an explicit --firod path or scenario firod field");
   }
   if (needs_firod) {
     RequireExecutable(options.firod);
@@ -751,6 +957,9 @@ void WriteScenarioFiles(const Options& options,
   resolved["chain"] = "firo";
   resolved["nodes"] = options.nodes;
   resolved["firod"] = options.firod.string();
+  if (!options.scenario_json.empty()) {
+    resolved["scenario_json"] = options.scenario_json.string();
+  }
   resolved["isolated_network"] = options.isolate_network;
   resolved["sync_timeout_sec"] = options.sync_timeout_sec;
   boost::json::object resources;

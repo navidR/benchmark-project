@@ -172,6 +172,40 @@ Resource limits are global for the current MVP and apply to each node cgroup:
   --pids-max 128
 ```
 
+The same MVP fields can be loaded from a Boost.JSON scenario file:
+
+```json
+{
+  "firod": "/path/to/firod",
+  "output_dir": "runs",
+  "run_id": "scenario-smoke",
+  "nodes": 1,
+  "generate_blocks": 1,
+  "ready_timeout_sec": 45,
+  "sync_timeout_sec": 45,
+  "resources": {
+    "memory_high_bytes": 1073741824,
+    "memory_max_bytes": 1610612736,
+    "cpu_quota_us": 75000,
+    "cpu_period_us": 100000,
+    "pids_max": 128
+  },
+  "network": {
+    "isolated": true,
+    "default_condition": {
+      "delay_ms": 1,
+      "limit_packets": 1000
+    }
+  }
+}
+```
+
+Run it:
+
+```bash
+./build/benchmark-sim --scenario-json /path/to/scenario.json --replace-run
+```
+
 Each run writes:
 
 - `runs/<run-id>/scenario.yaml`
