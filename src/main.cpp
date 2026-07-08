@@ -187,6 +187,10 @@ std::string RouteProbeJson() {
       LinksJson(probe.namespace_links_after_route);
   result["namespace_addresses"] = AddressesJson(probe.namespace_addresses);
   result["namespace_routes"] = RoutesJson(probe.namespace_routes);
+  result["namespace_addresses_after_delete"] =
+      AddressesJson(probe.namespace_addresses_after_delete);
+  result["namespace_routes_after_delete"] =
+      RoutesJson(probe.namespace_routes_after_delete);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -203,6 +207,8 @@ std::string AddressProbeJson() {
   result["namespace_links_after_address"] =
       LinksJson(probe.namespace_links_after_address);
   result["namespace_addresses"] = AddressesJson(probe.namespace_addresses);
+  result["namespace_addresses_after_delete"] =
+      AddressesJson(probe.namespace_addresses_after_delete);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }

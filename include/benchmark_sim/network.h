@@ -59,6 +59,7 @@ struct AddressProbe {
   std::vector<LinkInfo> parent_after_move;
   std::vector<LinkInfo> namespace_links_after_address;
   std::vector<AddressInfo> namespace_addresses;
+  std::vector<AddressInfo> namespace_addresses_after_delete;
   std::vector<LinkInfo> parent_after_delete;
 };
 
@@ -73,6 +74,8 @@ struct RouteProbe {
   std::vector<LinkInfo> namespace_links_after_route;
   std::vector<AddressInfo> namespace_addresses;
   std::vector<RouteInfo> namespace_routes;
+  std::vector<AddressInfo> namespace_addresses_after_delete;
+  std::vector<RouteInfo> namespace_routes_after_delete;
   std::vector<LinkInfo> parent_after_delete;
 };
 
@@ -89,8 +92,13 @@ void MoveLinkToNamespace(const std::string& name, int netns_fd);
 void SetLinkUp(const std::string& name, bool up);
 void AddIpv4Address(const std::string& if_name, const std::string& address,
                     std::uint8_t prefix_len);
+void DeleteIpv4Address(const std::string& if_name, const std::string& address,
+                       std::uint8_t prefix_len);
 void AddIpv4Route(const std::string& if_name, const std::string& destination,
                   std::uint8_t prefix_len, const std::string& gateway = "");
+void DeleteIpv4Route(const std::string& if_name, const std::string& destination,
+                     std::uint8_t prefix_len,
+                     const std::string& gateway = "");
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();
 RouteProbe ProbeIpv4RouteAssignment();
