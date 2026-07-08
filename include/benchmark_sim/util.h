@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,5 +28,7 @@ std::vector<std::string> SplitWhitespace(std::string_view text);
 std::string JsonString(const boost::json::value& value,
                        std::string_view field);
 uint64_t JsonUint(const boost::json::value& value, std::string_view field);
+std::optional<bool> JsonOptionalBool(const boost::json::value& value,
+                                     std::string_view field);
 
 }  // namespace bsim

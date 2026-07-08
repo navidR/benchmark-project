@@ -188,4 +188,18 @@ uint64_t JsonUint(const boost::json::value& value, std::string_view field) {
                            std::string(field));
 }
 
+std::optional<bool> JsonOptionalBool(const boost::json::value& value,
+                                     std::string_view field) {
+  const auto& object = value.as_object();
+  const boost::json::value* found = object.if_contains(field);
+  if (found == nullptr) {
+    return std::nullopt;
+  }
+  if (!found->is_bool()) {
+    throw std::runtime_error("JSON field is not boolean: " +
+                             std::string(field));
+  }
+  return found->as_bool();
+}
+
 }  // namespace bsim
