@@ -34,6 +34,23 @@ constexpr const char* kDefaultRewardAddress =
 constexpr const char* kRunMarkerFile = ".benchmark-sim-run";
 constexpr uint64_t kMaxLogTailBytes = 4096;
 
+struct ResourceLimits {
+  uint64_t memory_high_bytes = 0;
+  uint64_t memory_max_bytes = 0;
+  std::optional<uint64_t> cpu_quota_us;
+  uint64_t cpu_period_us = 0;
+  uint64_t pids_max = 0;
+};
+
+struct ResourceLimitPatch {
+  std::optional<uint64_t> memory_high_bytes;
+  std::optional<uint64_t> memory_max_bytes;
+  bool cpu_quota_present = false;
+  std::optional<uint64_t> cpu_quota_us;
+  std::optional<uint64_t> cpu_period_us;
+  std::optional<uint64_t> pids_max;
+};
+
 struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path firod;
@@ -56,8 +73,10 @@ struct Options {
   NetworkCondition network_condition;
   std::vector<std::string> node_network_condition_json;
   std::vector<std::string> runtime_node_network_condition_json;
+  std::vector<std::string> runtime_node_resource_json;
   std::map<uint32_t, NetworkCondition> node_network_conditions;
   std::map<uint32_t, NetworkCondition> runtime_node_network_conditions;
+  std::map<uint32_t, ResourceLimitPatch> runtime_node_resource_updates;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_capabilities = false;
@@ -78,6 +97,7 @@ struct NodeRuntime {
   std::optional<NetworkNamespace> network_namespace;
   std::optional<NodeVethConfig> network;
   ChildProcess process;
+  ResourceLimits resources;
   uint64_t generated_block_count = 0;
   uint64_t stdout_offset = 0;
   uint64_t stderr_offset = 0;
@@ -137,6 +157,26 @@ uint64_t JsonOptionalUint64Field(const boost::json::object& object,
   throw std::runtime_error("invalid uint64 JSON field: " + std::string(field));
 }
 
+uint64_t JsonUint64Value(const boost::json::value& value,
+                         std::string_view field) {
+  if (value.is_uint64()) {
+    return value.as_uint64();
+  }
+  if (value.is_int64() && value.as_int64() >= 0) {
+    return static_cast<uint64_t>(value.as_int64());
+  }
+  throw std::runtime_error("invalid uint64 JSON field: " + std::string(field));
+}
+
+std::optional<uint64_t> JsonOptionalUint64FieldValue(
+    const boost::json::object& object, const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  return JsonUint64Value(*value, field);
+}
+
 bool JsonOptionalBoolField(const boost::json::object& object, const char* field,
                            bool default_value) {
   const boost::json::value* value = object.if_contains(field);
@@ -184,6 +224,59 @@ NetworkCondition ParseNetworkConditionObject(
   return condition;
 }
 
+bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
+  return !patch.memory_high_bytes && !patch.memory_max_bytes &&
+         !patch.cpu_quota_present && !patch.cpu_period_us && !patch.pids_max;
+}
+
+void RequireNonZero(uint64_t value, std::string_view field) {
+  if (value == 0U) {
+    throw std::runtime_error(std::string(field) +
+                             " must be greater than zero");
+  }
+}
+
+ResourceLimitPatch ParseResourceLimitPatchObject(
+    const boost::json::object& object) {
+  ResourceLimitPatch patch;
+  patch.memory_high_bytes =
+      JsonOptionalUint64FieldValue(object, "memory_high_bytes");
+  patch.memory_max_bytes =
+      JsonOptionalUint64FieldValue(object, "memory_max_bytes");
+  const boost::json::value* quota = object.if_contains("cpu_quota_us");
+  if (quota != nullptr) {
+    patch.cpu_quota_present = true;
+    if (!quota->is_null()) {
+      patch.cpu_quota_us = JsonUint64Value(*quota, "cpu_quota_us");
+    }
+  }
+  patch.cpu_period_us =
+      JsonOptionalUint64FieldValue(object, "cpu_period_us");
+  patch.pids_max = JsonOptionalUint64FieldValue(object, "pids_max");
+
+  if (ResourceLimitPatchEmpty(patch)) {
+    throw std::runtime_error("runtime resource update has no limit fields");
+  }
+  if (patch.memory_max_bytes) {
+    RequireNonZero(*patch.memory_max_bytes, "memory_max_bytes");
+  }
+  if (patch.cpu_quota_us) {
+    RequireNonZero(*patch.cpu_quota_us, "cpu_quota_us");
+  }
+  if (patch.cpu_period_us) {
+    RequireNonZero(*patch.cpu_period_us, "cpu_period_us");
+  }
+  if (patch.pids_max) {
+    RequireNonZero(*patch.pids_max, "pids_max");
+  }
+  if (patch.memory_high_bytes && patch.memory_max_bytes &&
+      *patch.memory_high_bytes > *patch.memory_max_bytes) {
+    throw std::runtime_error(
+        "memory_high_bytes must be less than or equal to memory_max_bytes");
+  }
+  return patch;
+}
+
 void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
                          std::string_view source,
                          std::map<uint32_t, NetworkCondition>& output) {
@@ -199,6 +292,24 @@ void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
                                std::to_string(nodes));
     }
     output[node - 1U] = ParseNetworkConditionObject(object);
+  }
+}
+
+void ApplyResourceLimitPatches(
+    const boost::json::array& updates, uint32_t nodes, std::string_view source,
+    std::map<uint32_t, ResourceLimitPatch>& output) {
+  for (const boost::json::value& value : updates) {
+    if (!value.is_object()) {
+      throw std::runtime_error(std::string(source) +
+                               " entries must be JSON objects");
+    }
+    const boost::json::object& object = value.as_object();
+    const uint32_t node = JsonUint32Field(object, "node");
+    if (node == 0 || node > nodes) {
+      throw std::runtime_error(std::string(source) + " node must be in 1.." +
+                               std::to_string(nodes));
+    }
+    output[node - 1U] = ParseResourceLimitPatchObject(object);
   }
 }
 
@@ -276,6 +387,18 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                                : static_cast<uint64_t>(quota->as_int64());
         options.cpu_quota_requested = true;
       }
+    }
+    const boost::json::value* runtime_node_limits =
+        object.if_contains("runtime_node_limits");
+    if (runtime_node_limits != nullptr) {
+      if (!runtime_node_limits->is_array()) {
+        throw std::runtime_error(
+            "scenario resources.runtime_node_limits must be a JSON array");
+      }
+      ApplyResourceLimitPatches(runtime_node_limits->as_array(),
+                                options.nodes,
+                                "scenario resources.runtime_node_limits",
+                                options.runtime_node_resource_updates);
     }
   }
 
@@ -363,6 +486,25 @@ void ParseNodeNetworkConditionTexts(
   }
 }
 
+void ParseRuntimeNodeResourceTexts(
+    const std::vector<std::string>& texts, uint32_t nodes,
+    std::map<uint32_t, ResourceLimitPatch>& output) {
+  for (const std::string& text : texts) {
+    boost::json::value value = boost::json::parse(text);
+    if (!value.is_object()) {
+      throw std::runtime_error(
+          "--runtime-node-resource-json must be a JSON object");
+    }
+    const boost::json::object& object = value.as_object();
+    const uint32_t node = JsonUint32Field(object, "node");
+    if (node == 0 || node > nodes) {
+      throw std::runtime_error(
+          "--runtime-node-resource-json node must be in 1..--nodes");
+    }
+    output[node - 1U] = ParseResourceLimitPatchObject(object);
+  }
+}
+
 void ParseNodeNetworkConditions(Options& options) {
   ParseNodeNetworkConditionTexts(options.node_network_condition_json,
                                  options.nodes,
@@ -372,6 +514,9 @@ void ParseNodeNetworkConditions(Options& options) {
                                  options.nodes,
                                  "--runtime-node-network-condition-json",
                                  options.runtime_node_network_conditions);
+  ParseRuntimeNodeResourceTexts(options.runtime_node_resource_json,
+                                options.nodes,
+                                options.runtime_node_resource_updates);
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -438,6 +583,12 @@ Options ParseOptions(int argc, char** argv) {
           ->composing(),
       "repeatable JSON object with node plus live netem fields to apply after "
       "isolated nodes are running")(
+      "runtime-node-resource-json",
+      po::value<std::vector<std::string>>(
+          &options.runtime_node_resource_json)
+          ->composing(),
+      "repeatable JSON object with node plus live cgroup limit fields to apply "
+      "after nodes are running")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
       "probe-address", po::bool_switch(&options.probe_address),
@@ -633,6 +784,111 @@ boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
   object["duplicate_basis_points"] = condition.duplicate_basis_points;
   object["limit_packets"] = condition.limit_packets;
   return object;
+}
+
+boost::json::object ResourceLimitsJson(const ResourceLimits& limits) {
+  boost::json::object object;
+  object["memory_high_bytes"] = limits.memory_high_bytes;
+  object["memory_max_bytes"] = limits.memory_max_bytes;
+  if (limits.cpu_quota_us) {
+    object["cpu_quota_us"] = *limits.cpu_quota_us;
+  } else {
+    object["cpu_quota_us"] = nullptr;
+  }
+  object["cpu_period_us"] = limits.cpu_period_us;
+  object["pids_max"] = limits.pids_max;
+  return object;
+}
+
+boost::json::object ResourceLimitPatchJson(const ResourceLimitPatch& patch) {
+  boost::json::object object;
+  if (patch.memory_high_bytes) {
+    object["memory_high_bytes"] = *patch.memory_high_bytes;
+  }
+  if (patch.memory_max_bytes) {
+    object["memory_max_bytes"] = *patch.memory_max_bytes;
+  }
+  if (patch.cpu_quota_present) {
+    if (patch.cpu_quota_us) {
+      object["cpu_quota_us"] = *patch.cpu_quota_us;
+    } else {
+      object["cpu_quota_us"] = nullptr;
+    }
+  }
+  if (patch.cpu_period_us) {
+    object["cpu_period_us"] = *patch.cpu_period_us;
+  }
+  if (patch.pids_max) {
+    object["pids_max"] = *patch.pids_max;
+  }
+  return object;
+}
+
+ResourceLimits InitialResourceLimits(const Options& options) {
+  return ResourceLimits{
+      .memory_high_bytes = options.memory_high_bytes,
+      .memory_max_bytes = options.memory_max_bytes,
+      .cpu_quota_us = options.cpu_quota_requested
+                          ? std::optional<uint64_t>(options.cpu_quota_us)
+                          : std::nullopt,
+      .cpu_period_us = options.cpu_period_us,
+      .pids_max = options.pids_max,
+  };
+}
+
+ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
+                                       const ResourceLimitPatch& patch,
+                                       const std::string& node_id) {
+  ResourceLimits next = current;
+  if (patch.memory_high_bytes) {
+    next.memory_high_bytes = *patch.memory_high_bytes;
+  }
+  if (patch.memory_max_bytes) {
+    next.memory_max_bytes = *patch.memory_max_bytes;
+  }
+  if (patch.cpu_quota_present) {
+    next.cpu_quota_us = patch.cpu_quota_us;
+  }
+  if (patch.cpu_period_us) {
+    next.cpu_period_us = *patch.cpu_period_us;
+  }
+  if (patch.pids_max) {
+    next.pids_max = *patch.pids_max;
+  }
+  if (next.memory_high_bytes > next.memory_max_bytes) {
+    throw std::runtime_error("runtime resource update for " + node_id +
+                             " would make memory_high_bytes exceed "
+                             "memory_max_bytes");
+  }
+  RequireNonZero(next.memory_max_bytes, "memory_max_bytes");
+  RequireNonZero(next.cpu_period_us, "cpu_period_us");
+  if (next.cpu_quota_us) {
+    RequireNonZero(*next.cpu_quota_us, "cpu_quota_us");
+  }
+  RequireNonZero(next.pids_max, "pids_max");
+  return next;
+}
+
+void WriteResourceLimits(const Cgroup& cgroup, const ResourceLimits& previous,
+                         const ResourceLimits& next) {
+  if (next.memory_max_bytes != previous.memory_max_bytes &&
+      next.memory_max_bytes > previous.memory_max_bytes) {
+    cgroup.SetMemoryMax(next.memory_max_bytes);
+  }
+  if (next.memory_high_bytes != previous.memory_high_bytes) {
+    cgroup.SetMemoryHigh(next.memory_high_bytes);
+  }
+  if (next.memory_max_bytes != previous.memory_max_bytes &&
+      next.memory_max_bytes <= previous.memory_max_bytes) {
+    cgroup.SetMemoryMax(next.memory_max_bytes);
+  }
+  if (next.cpu_quota_us != previous.cpu_quota_us ||
+      next.cpu_period_us != previous.cpu_period_us) {
+    cgroup.SetCpuMax(next.cpu_quota_us, next.cpu_period_us);
+  }
+  if (next.pids_max != previous.pids_max) {
+    cgroup.SetPidsMax(next.pids_max);
+  }
 }
 
 std::string NetworkConditionVerificationDetail(const NodeVethConfig& config,
@@ -1140,6 +1396,42 @@ void WriteScenarioFiles(const Options& options,
     }
   }
 
+  std::string runtime_resource_yaml;
+  if (!options.runtime_node_resource_updates.empty()) {
+    runtime_resource_yaml += "  runtime_node_limits:\n";
+    for (const auto& [node_index, patch] :
+         options.runtime_node_resource_updates) {
+      runtime_resource_yaml +=
+          "    firo-" + std::to_string(node_index + 1U) + ":\n";
+      if (patch.memory_high_bytes) {
+        runtime_resource_yaml +=
+            "      memory_high_bytes: " +
+            std::to_string(*patch.memory_high_bytes) + "\n";
+      }
+      if (patch.memory_max_bytes) {
+        runtime_resource_yaml +=
+            "      memory_max_bytes: " +
+            std::to_string(*patch.memory_max_bytes) + "\n";
+      }
+      if (patch.cpu_quota_present) {
+        runtime_resource_yaml +=
+            "      cpu_quota_us: " +
+            (patch.cpu_quota_us ? std::to_string(*patch.cpu_quota_us)
+                                : std::string("max")) +
+            "\n";
+      }
+      if (patch.cpu_period_us) {
+        runtime_resource_yaml +=
+            "      cpu_period_us: " + std::to_string(*patch.cpu_period_us) +
+            "\n";
+      }
+      if (patch.pids_max) {
+        runtime_resource_yaml +=
+            "      pids_max: " + std::to_string(*patch.pids_max) + "\n";
+      }
+    }
+  }
+
   WriteText(run_root / "scenario.yaml",
             "simulation:\n"
             "  name: " +
@@ -1175,8 +1467,8 @@ void WriteScenarioFiles(const Options& options,
                 "\n"
                 "    pids_max: " +
                 std::to_string(options.pids_max) +
-                "\n"
-                + network_yaml +
+                "\n" +
+                runtime_resource_yaml + network_yaml +
                 "workloads:\n"
                 "  - type: block_generation\n"
                 "    count: " +
@@ -1232,6 +1524,17 @@ void WriteScenarioFiles(const Options& options,
     }
     resolved["runtime_node_network_conditions"] =
         std::move(runtime_node_conditions);
+  }
+  if (!options.runtime_node_resource_updates.empty()) {
+    boost::json::array runtime_node_limits;
+    for (const auto& [node_index, patch] :
+         options.runtime_node_resource_updates) {
+      boost::json::object node_limits;
+      node_limits["node"] = node_index + 1U;
+      node_limits["limits"] = ResourceLimitPatchJson(patch);
+      runtime_node_limits.push_back(std::move(node_limits));
+    }
+    resolved["runtime_node_resource_limits"] = std::move(runtime_node_limits);
   }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
@@ -1341,14 +1644,12 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       }
 
       runtime.cgroup = Cgroup::Create(options.run_id, node_id);
-      runtime.cgroup->SetMemoryHigh(options.memory_high_bytes);
-      runtime.cgroup->SetMemoryMax(options.memory_max_bytes);
-      runtime.cgroup->SetCpuMax(
-          options.cpu_quota_requested
-              ? std::optional<uint64_t>(options.cpu_quota_us)
-              : std::nullopt,
-          options.cpu_period_us);
-      runtime.cgroup->SetPidsMax(options.pids_max);
+      runtime.resources = InitialResourceLimits(options);
+      runtime.cgroup->SetMemoryHigh(runtime.resources.memory_high_bytes);
+      runtime.cgroup->SetMemoryMax(runtime.resources.memory_max_bytes);
+      runtime.cgroup->SetCpuMax(runtime.resources.cpu_quota_us,
+                                runtime.resources.cpu_period_us);
+      runtime.cgroup->SetPidsMax(runtime.resources.pids_max);
       WriteNodeState(events_path, options.run_id, node_id, "CgroupReady");
 
       ProcessSpec process = driver.RenderProcess(runtime.config);
@@ -1384,6 +1685,39 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                      std::chrono::seconds(options.ready_timeout_sec));
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
     WriteNodeState(events_path, options.run_id, node.config.id, "Running");
+  }
+}
+
+std::string ResourceLimitUpdateDetail(const ResourceLimitPatch& patch,
+                                      const ResourceLimits& previous,
+                                      const ResourceLimits& current) {
+  boost::json::object detail;
+  detail["requested"] = ResourceLimitPatchJson(patch);
+  detail["previous"] = ResourceLimitsJson(previous);
+  detail["current"] = ResourceLimitsJson(current);
+  return boost::json::serialize(detail);
+}
+
+void ApplyRuntimeResourceLimitUpdates(
+    const Options& options, const std::filesystem::path& events_path,
+    std::vector<NodeRuntime>& nodes) {
+  for (const auto& [node_index, patch] : options.runtime_node_resource_updates) {
+    if (node_index >= nodes.size()) {
+      throw std::runtime_error("runtime resource update node is out of range");
+    }
+    NodeRuntime& node = nodes[node_index];
+    if (!node.cgroup) {
+      throw std::runtime_error(
+          "runtime resource update requires a node cgroup");
+    }
+    const ResourceLimits previous = node.resources;
+    const ResourceLimits next =
+        ApplyResourceLimitPatch(previous, patch, node.config.id);
+    WriteResourceLimits(*node.cgroup, previous, next);
+    node.resources = next;
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "resource_limits_updated",
+               ResourceLimitUpdateDetail(patch, previous, next));
   }
 }
 
@@ -1564,6 +1898,7 @@ int Run(int argc, char** argv) {
                              node.generated_block_count, &cg, link, qdisc));
     }
 
+    ApplyRuntimeResourceLimitUpdates(options, events_path, nodes);
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
 
     if (options.generate_blocks > 0) {

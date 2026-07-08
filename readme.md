@@ -14,6 +14,7 @@ Firo path is working end to end.
 - Start one or two Firo regtest nodes.
 - Run Firo nodes inside isolated network namespaces with one veth pair per node.
 - Apply a simple per-node network condition through host-side `netem`.
+- Apply live per-node cgroup resource updates after startup.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
 - Wait for generated blocks to propagate before final metrics are recorded.
@@ -187,6 +188,21 @@ Resource limits are global for the current MVP and apply to each node cgroup:
   --pids-max 128
 ```
 
+Runtime resource updates are applied after nodes are running, before block
+generation. Omitted fields keep their current values; `cpu_quota_us: null`
+restores unlimited CPU quota.
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id live-resources \
+  --replace-run \
+  --nodes 1 \
+  --generate-blocks 1 \
+  --runtime-node-resource-json '{"node":1,"memory_high_bytes":1073741824,"cpu_quota_us":50000,"cpu_period_us":100000,"pids_max":128}'
+```
+
 The same MVP fields can be loaded from a Boost.JSON scenario file:
 
 ```json
@@ -203,7 +219,15 @@ The same MVP fields can be loaded from a Boost.JSON scenario file:
     "memory_max_bytes": 1610612736,
     "cpu_quota_us": 75000,
     "cpu_period_us": 100000,
-    "pids_max": 128
+    "pids_max": 128,
+    "runtime_node_limits": [
+      {
+        "node": 1,
+        "memory_high_bytes": 805306368,
+        "cpu_quota_us": null,
+        "pids_max": 128
+      }
+    ]
   },
   "network": {
     "isolated": true,
