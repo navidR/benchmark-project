@@ -150,6 +150,7 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
   metrics.best_hash = JsonString(blockchain, "bestblockhash");
   metrics.peer_count = JsonUint(network, "connections");
   metrics.mempool_tx_count = JsonUint(mempool, "size");
+  metrics.mempool_bytes = JsonUint(mempool, "bytes");
   metrics.rpc_latency_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
   return metrics;
