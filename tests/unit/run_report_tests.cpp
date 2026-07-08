@@ -44,7 +44,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const std::filesystem::path dir = MakeTestDir("run-report");
   bsim::WriteText(dir / "resolved-scenario.json",
                   "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
-                  "\"isolated_network\":true}\n");
+                  "\"generate_blocks\":2,\"generate_node\":1,"
+                  "\"isolated_network\":true,\"sync_timeout_sec\":45}\n");
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"sim\",\"event\":\"run_started\"}");
@@ -79,6 +80,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(JsonInteger(report, "event_count") == 3U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
+  BOOST_TEST(JsonInteger(report, "generate_blocks") == 2U);
+  BOOST_TEST(JsonInteger(report, "generate_node") == 1U);
+  BOOST_TEST(JsonInteger(report, "sync_timeout_sec") == 45U);
   const boost::json::array& nodes =
       report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);

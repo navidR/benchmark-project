@@ -2354,6 +2354,7 @@ void WriteScenarioFiles(const Options& options,
   resolved["run_id"] = options.run_id;
   resolved["chain"] = "firo";
   resolved["nodes"] = options.nodes;
+  resolved["generate_blocks"] = options.generate_blocks;
   resolved["generate_node"] = options.generate_node;
   resolved["firod"] = options.firod.string();
   if (!options.scenario_json.empty()) {

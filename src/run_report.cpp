@@ -119,7 +119,10 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "run_id", report);
   CopyField(scenario, "chain", report);
   CopyField(scenario, "nodes", report);
+  CopyField(scenario, "generate_blocks", report);
+  CopyField(scenario, "generate_node", report);
   CopyField(scenario, "isolated_network", report);
+  CopyField(scenario, "sync_timeout_sec", report);
 }
 
 boost::json::object EventCountsJson(

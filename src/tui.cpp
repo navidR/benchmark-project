@@ -214,6 +214,10 @@ void DrawSummary(const std::filesystem::path& run_root,
           "nodes: " + JsonIntegerText(report, "nodes"));
   AddText(6, cols / 2, cols - (cols / 2),
           "isolated: " + JsonBoolText(report, "isolated_network"));
+  AddText(7, 0, cols / 2,
+          "generate node: " + JsonIntegerText(report, "generate_node"));
+  AddText(7, cols / 2, cols - (cols / 2),
+          "generate blocks: " + JsonIntegerText(report, "generate_blocks"));
 
   DrawHorizontalLine(8);
   AddText(9, 0, 12, "Node", A_BOLD);
