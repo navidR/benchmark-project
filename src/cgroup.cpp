@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cctype>
 #include <filesystem>
+#include <initializer_list>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -129,6 +130,33 @@ void EnableControllers(const std::filesystem::path& dir) {
   }
 }
 
+bool ContainsController(const std::vector<std::string>& controllers,
+                        std::string_view required) {
+  for (const std::string& controller : controllers) {
+    if (controller == required) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void RequireControllersAvailable(
+    const std::filesystem::path& dir,
+    std::initializer_list<std::string_view> required_controllers) {
+  const auto controllers_file = dir / "cgroup.controllers";
+  if (!std::filesystem::exists(controllers_file)) {
+    throw std::runtime_error("missing cgroup.controllers at " + dir.string());
+  }
+  const std::vector<std::string> controllers =
+      SplitWhitespace(ReadText(controllers_file));
+  for (std::string_view required : required_controllers) {
+    if (!ContainsController(controllers, required)) {
+      throw std::runtime_error("required cgroup controller unavailable at " +
+                               dir.string() + ": " + std::string(required));
+    }
+  }
+}
+
 bool CgroupProcsEmpty(const std::filesystem::path& dir) {
   return SplitWhitespace(ReadText(dir / "cgroup.procs")).empty();
 }
@@ -197,13 +225,16 @@ Cgroup Cgroup::Create(const std::string& run_id, const std::string& node_id) {
   const std::filesystem::path run_root = sim_root / run_id;
   const std::filesystem::path node_root = run_root / node_id;
 
+  RequireControllersAvailable(root, {"cpu", "io", "memory", "pids"});
   EnsureDirectory(sim_root);
   if (!CgroupProcsEmpty(root)) {
     MoveRootProcessesIntoContainerController(sim_root);
   }
   EnableControllers(root);
+  RequireControllersAvailable(sim_root, {"cpu", "io", "memory", "pids"});
   EnsureDirectory(run_root);
   EnableControllers(sim_root);
+  RequireControllersAvailable(run_root, {"cpu", "io", "memory", "pids"});
   EnsureDirectory(node_root);
   EnableControllers(run_root);
 
