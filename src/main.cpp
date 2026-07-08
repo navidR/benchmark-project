@@ -5,8 +5,6 @@
 #include "benchmark_sim/process.h"
 #include "benchmark_sim/util.h"
 
-#include <unistd.h>
-
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -16,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/json/array.hpp>
@@ -317,16 +316,37 @@ std::string NodeAddress(uint32_t node_index) {
   return "10.210." + std::to_string(node_index + 1U) + ".2";
 }
 
-std::string NodeInterfaceName(uint32_t node_index, char suffix) {
-  return "bs" + std::to_string(static_cast<long long>(getpid() % 100000)) +
-         "n" + std::to_string(node_index + 1U) + suffix;
+uint32_t StableRunHash(std::string_view run_id) {
+  uint32_t hash = 2166136261U;
+  for (const unsigned char c : run_id) {
+    hash ^= c;
+    hash *= 16777619U;
+  }
+  return hash;
+}
+
+std::string RunInterfaceToken(std::string_view run_id) {
+  constexpr char kHex[] = "0123456789abcdef";
+  uint32_t value = StableRunHash(run_id) & 0x00FFFFFFU;
+  std::string token(6, '0');
+  for (int i = 5; i >= 0; --i) {
+    token[static_cast<size_t>(i)] = kHex[value & 0x0FU];
+    value >>= 4U;
+  }
+  return token;
+}
+
+std::string NodeInterfaceName(std::string_view run_id, uint32_t node_index,
+                              char suffix) {
+  return "bs" + RunInterfaceToken(run_id) + "n" +
+         std::to_string(node_index + 1U) + suffix;
 }
 
 NodeVethConfig MakeNodeVethConfig(const Options& options,
                                   uint32_t node_index) {
   NodeVethConfig config;
-  config.host_name = NodeInterfaceName(node_index, 'h');
-  config.peer_name = NodeInterfaceName(node_index, 'p');
+  config.host_name = NodeInterfaceName(options.run_id, node_index, 'h');
+  config.peer_name = NodeInterfaceName(options.run_id, node_index, 'p');
   config.host_address = NodeHostAddress(node_index);
   config.node_address = NodeAddress(node_index);
   config.prefix_len = 30;
@@ -649,7 +669,9 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         runtime.config.rpc_allow_ips = {runtime.network->host_address};
         runtime.config.p2p_bind = runtime.network->node_address;
         WriteEvent(events_path, options.run_id, node_id, "network_ready",
-                   runtime.network->node_address);
+                   "node_ip=" + runtime.network->node_address +
+                       " host_if=" + runtime.network->host_name +
+                       " peer_if=" + runtime.network->peer_name);
       }
 
       runtime.cgroup = Cgroup::Create(options.run_id, node_id);
