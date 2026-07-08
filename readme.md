@@ -25,6 +25,7 @@ the Firo path is working end to end.
 - Record cgroup usage, pressure, event counters, and configured limits.
 - Record Firo daemon version, protocol version, and subversion in metrics.
 - Record event and metric files under a run directory.
+- View a run directory through a read-only ncurses TUI.
 - Exercise Linux network namespace, veth, address, route, and qdisc operations
   through simulator probes.
 - Run unit tests with CTest.
@@ -410,6 +411,18 @@ Summarize an existing run:
 
 ```bash
 ./build/benchmark-sim --report-run runs/<run-id>
+```
+
+View an existing or active run in the read-only TUI:
+
+```bash
+./build/benchmark-tui --run runs/<run-id>
+```
+
+Render one TUI frame and exit, useful for validation:
+
+```bash
+TERM=xterm ./build/benchmark-tui --run runs/<run-id> --once
 ```
 
 ## Run Network Probes

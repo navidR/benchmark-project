@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(benchmark_project LANGUAGES C CXX)
 
 include(CTest)
+include(ExternalProject)
 
 set(BOOST_INCLUDE_LIBRARIES
   asio
@@ -49,6 +50,47 @@ set_target_properties(vendored_libmnl PROPERTIES
   OUTPUT_NAME mnl
   C_VISIBILITY_PRESET hidden
 )
+
+find_program(MAKE_EXECUTABLE make REQUIRED)
+set(NCURSES_INSTALL_DIR
+  "${CMAKE_CURRENT_BINARY_DIR}/third_party/ncurses/install"
+)
+set(NCURSES_INCLUDE_DIR "${NCURSES_INSTALL_DIR}/include")
+set(NCURSES_LIBRARY "${NCURSES_INSTALL_DIR}/lib/libncursesw.a")
+file(MAKE_DIRECTORY "${NCURSES_INCLUDE_DIR}")
+
+ExternalProject_Add(vendored_ncurses_project
+  SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncurses"
+  BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/third_party/ncurses/build"
+  INSTALL_DIR "${NCURSES_INSTALL_DIR}"
+  CONFIGURE_COMMAND
+    <SOURCE_DIR>/configure
+    CC=${CMAKE_C_COMPILER}
+    --prefix=<INSTALL_DIR>
+    --with-normal
+    --without-shared
+    --without-debug
+    --without-ada
+    --without-cxx-binding
+    --without-tests
+    --without-manpages
+    --enable-widec
+    --enable-ext-colors
+    --disable-db-install
+    --with-fallbacks=xterm,xterm-256color,screen,tmux,linux,vt100
+  BUILD_COMMAND "${MAKE_EXECUTABLE}" -j16
+  INSTALL_COMMAND "${MAKE_EXECUTABLE}" install
+  BUILD_BYPRODUCTS "${NCURSES_LIBRARY}"
+)
+
+add_library(vendored_ncursesw STATIC IMPORTED GLOBAL)
+add_library(ncurses::ncursesw ALIAS vendored_ncursesw)
+set_target_properties(vendored_ncursesw PROPERTIES
+  IMPORTED_LOCATION "${NCURSES_LIBRARY}"
+  INTERFACE_INCLUDE_DIRECTORIES "${NCURSES_INCLUDE_DIR}"
+  INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${NCURSES_INCLUDE_DIR}"
+)
+add_dependencies(vendored_ncursesw vendored_ncurses_project)
 
 function(collect_directory_targets output directory)
   get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
@@ -100,6 +142,26 @@ target_link_libraries(benchmark-sim PRIVATE
   libmnl::libmnl
 )
 target_compile_options(benchmark-sim PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Wconversion
+  -Werror
+)
+
+add_executable(benchmark-tui
+  src/run_report.cpp
+  src/tui.cpp
+  src/tui_main.cpp
+  src/util.cpp
+)
+target_include_directories(benchmark-tui PRIVATE include)
+target_link_libraries(benchmark-tui PRIVATE
+  Boost::json
+  Boost::program_options
+  ncurses::ncursesw
+)
+target_compile_options(benchmark-tui PRIVATE
   -Wall
   -Wextra
   -Wpedantic
