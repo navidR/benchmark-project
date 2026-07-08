@@ -29,3 +29,16 @@ BOOST_AUTO_TEST_CASE(rtnetlink_lists_ipv4_loopback_with_libmnl) {
   BOOST_TEST(loopback->if_index > 0);
   BOOST_TEST(loopback->prefix_len == 8U);
 }
+
+BOOST_AUTO_TEST_CASE(rtnetlink_lists_ipv4_routes_with_libmnl) {
+  const std::vector<bsim::RouteInfo> routes = bsim::ListIpv4Routes();
+
+  BOOST_TEST(!routes.empty());
+  const auto valid_route =
+      std::find_if(routes.begin(), routes.end(),
+                   [](const bsim::RouteInfo& route) {
+                     return !route.destination.empty() &&
+                            route.prefix_len <= 32U;
+                   });
+  BOOST_REQUIRE(valid_route != routes.end());
+}

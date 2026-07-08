@@ -192,6 +192,19 @@ bool HasIpv4Address(const std::vector<AddressInfo>& addresses,
   return false;
 }
 
+bool HasIpv4Route(const std::vector<RouteInfo>& routes,
+                  const std::string& oif_name,
+                  const std::string& destination,
+                  std::uint8_t prefix_len) {
+  for (const RouteInfo& route : routes) {
+    if (route.oif_name == oif_name && route.destination == destination &&
+        route.prefix_len == prefix_len) {
+      return true;
+    }
+  }
+  return false;
+}
+
 template <typename Operation>
 auto ExecuteInNetworkNamespace(int netns_fd, Operation operation)
     -> decltype(operation()) {
@@ -458,6 +471,87 @@ struct NamespaceAddressState {
   std::vector<AddressInfo> addresses;
 };
 
+int StoreRouteIpv4Address(const nlattr* attr, std::string* address) {
+  if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0) {
+    return MNL_CB_ERROR;
+  }
+
+  char text[INET_ADDRSTRLEN] = {};
+  if (inet_ntop(AF_INET, mnl_attr_get_payload(attr), text, sizeof(text)) ==
+      nullptr) {
+    return MNL_CB_ERROR;
+  }
+  *address = text;
+  return MNL_CB_OK;
+}
+
+int ParseRouteAttr(const nlattr* attr, void* data) {
+  auto* route = static_cast<RouteInfo*>(data);
+  const uint16_t attr_type = mnl_attr_get_type(attr);
+  if (mnl_attr_type_valid(attr, RTA_MAX) < 0) {
+    return MNL_CB_OK;
+  }
+
+  switch (attr_type) {
+    case RTA_DST:
+      return StoreRouteIpv4Address(attr, &route->destination);
+    case RTA_GATEWAY:
+      return StoreRouteIpv4Address(attr, &route->gateway);
+    case RTA_OIF:
+      if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0) {
+        return MNL_CB_ERROR;
+      }
+      route->oif_index = static_cast<int>(mnl_attr_get_u32(attr));
+      return MNL_CB_OK;
+    case RTA_TABLE:
+      if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0) {
+        return MNL_CB_ERROR;
+      }
+      route->table = mnl_attr_get_u32(attr);
+      return MNL_CB_OK;
+    default:
+      return MNL_CB_OK;
+  }
+}
+
+int ParseRouteMessage(const nlmsghdr* nlh, void* data) {
+  auto* routes = static_cast<std::vector<RouteInfo>*>(data);
+  if (nlh->nlmsg_type != RTM_NEWROUTE) {
+    return MNL_CB_OK;
+  }
+
+  const auto* message = static_cast<const rtmsg*>(mnl_nlmsg_get_payload(nlh));
+  if (message->rtm_family != AF_INET) {
+    return MNL_CB_OK;
+  }
+
+  RouteInfo route;
+  route.destination = "0.0.0.0";
+  route.prefix_len = message->rtm_dst_len;
+  route.table = message->rtm_table;
+  route.protocol = message->rtm_protocol;
+  route.scope = message->rtm_scope;
+  route.type = message->rtm_type;
+  if (mnl_attr_parse(nlh, sizeof(*message), ParseRouteAttr, &route) < 0) {
+    return MNL_CB_ERROR;
+  }
+  if (route.oif_index > 0) {
+    char if_name[IF_NAMESIZE] = {};
+    if (if_indextoname(static_cast<unsigned int>(route.oif_index), if_name) !=
+        nullptr) {
+      route.oif_name = if_name;
+    }
+  }
+  routes->push_back(std::move(route));
+  return MNL_CB_OK;
+}
+
+struct NamespaceRouteState {
+  std::vector<LinkInfo> links;
+  std::vector<AddressInfo> addresses;
+  std::vector<RouteInfo> routes;
+};
+
 }  // namespace
 
 std::vector<LinkInfo> ListNetworkLinks() {
@@ -528,6 +622,41 @@ std::vector<AddressInfo> ListIpv4Addresses() {
   }
 
   return addresses;
+}
+
+std::vector<RouteInfo> ListIpv4Routes() {
+  MnlSocket socket(NETLINK_ROUTE);
+  socket.Bind(0, MNL_SOCKET_AUTOPID);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_GETROUTE;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<rtmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(rtmsg)));
+  message->rtm_family = AF_INET;
+
+  socket.Send(nlh, nlh->nlmsg_len);
+
+  std::vector<RouteInfo> routes;
+  while (true) {
+    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
+    const int status =
+        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
+                   socket.PortId(), ParseRouteMessage, &routes);
+    if (status == MNL_CB_ERROR) {
+      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
+                               std::strerror(errno));
+    }
+    if (status == MNL_CB_STOP) {
+      break;
+    }
+  }
+
+  return routes;
 }
 
 void CreateVethPair(const std::string& host_name, const std::string& peer_name) {
@@ -659,6 +788,57 @@ void AddIpv4Address(const std::string& if_name, const std::string& address,
   SendNetlinkRequest(nlh, sequence);
 }
 
+void AddIpv4Route(const std::string& if_name, const std::string& destination,
+                  std::uint8_t prefix_len, const std::string& gateway) {
+  RequireInterfaceName(if_name);
+  if (prefix_len > 32U) {
+    throw std::runtime_error("IPv4 route prefix length must be 0..32");
+  }
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+
+  in_addr destination_address{};
+  if (inet_pton(AF_INET, destination.c_str(), &destination_address) != 1) {
+    throw std::runtime_error("invalid IPv4 route destination: " + destination);
+  }
+
+  in_addr gateway_address{};
+  if (!gateway.empty() &&
+      inet_pton(AF_INET, gateway.c_str(), &gateway_address) != 1) {
+    throw std::runtime_error("invalid IPv4 route gateway: " + gateway);
+  }
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWROUTE;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<rtmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(rtmsg)));
+  message->rtm_family = AF_INET;
+  message->rtm_dst_len = prefix_len;
+  message->rtm_src_len = 0;
+  message->rtm_tos = 0;
+  message->rtm_protocol = RTPROT_STATIC;
+  message->rtm_table = RT_TABLE_MAIN;
+  message->rtm_type = RTN_UNICAST;
+  message->rtm_scope = gateway.empty() ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
+  message->rtm_flags = 0;
+
+  mnl_attr_put_u32(nlh, RTA_DST, destination_address.s_addr);
+  mnl_attr_put_u32(nlh, RTA_OIF, if_index);
+  if (!gateway.empty()) {
+    mnl_attr_put_u32(nlh, RTA_GATEWAY, gateway_address.s_addr);
+  }
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {
   return ExecuteInNetworkNamespace(netns_fd, []() {
     return ListNetworkLinks();
@@ -671,6 +851,12 @@ std::vector<AddressInfo> ListIpv4AddressesInNamespace(int netns_fd) {
   });
 }
 
+std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd) {
+  return ExecuteInNetworkNamespace(netns_fd, []() {
+    return ListIpv4Routes();
+  });
+}
+
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   NetworkNamespaceProbe probe;
   probe.parent_links = ListNetworkLinks();
@@ -679,6 +865,72 @@ NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   try {
     probe.namespace_links = ListNetworkLinksInNamespace(namespace_fd.get());
   } catch (...) {
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
+RouteProbe ProbeIpv4RouteAssignment() {
+  RouteProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  probe.assigned_address = "10.20.0.2";
+  probe.assigned_prefix_len = 24;
+  probe.route_destination = "10.30.0.0";
+  probe.route_prefix_len = 24;
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+
+    NamespaceRouteState namespace_state =
+        ExecuteInNetworkNamespace(namespace_fd.get(), [&probe]() {
+          SetLinkUp("lo", true);
+          SetLinkUp(probe.peer_name, true);
+          AddIpv4Address(probe.peer_name, probe.assigned_address,
+                         probe.assigned_prefix_len);
+          AddIpv4Route(probe.peer_name, probe.route_destination,
+                       probe.route_prefix_len);
+          NamespaceRouteState state;
+          state.links = ListNetworkLinks();
+          state.addresses = ListIpv4Addresses();
+          state.routes = ListIpv4Routes();
+          return state;
+        });
+    probe.namespace_links_after_route = std::move(namespace_state.links);
+    probe.namespace_addresses = std::move(namespace_state.addresses);
+    probe.namespace_routes = std::move(namespace_state.routes);
+
+    if (!HasLinkNamed(probe.namespace_links_after_route, probe.peer_name)) {
+      throw std::runtime_error("veth peer was not visible before route probe");
+    }
+    if (!HasIpv4Address(probe.namespace_addresses, probe.peer_name,
+                        probe.assigned_address, probe.assigned_prefix_len)) {
+      throw std::runtime_error("IPv4 address was not visible before route probe");
+    }
+    if (!HasIpv4Route(probe.namespace_routes, probe.peer_name,
+                      probe.route_destination, probe.route_prefix_len)) {
+      throw std::runtime_error("IPv4 route was not visible in child netns");
+    }
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
     kill(probe.helper_pid, SIGKILL);
     WaitForPid(probe.helper_pid);
     throw;
