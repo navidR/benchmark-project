@@ -59,6 +59,13 @@ struct FreezeRequest {
   uint32_t duration_ms = 0;
 };
 
+struct NetworkBlockRule {
+  uint32_t node_index = 0;
+  std::string dst_address;
+  uint16_t dst_port = 0;
+  uint32_t handle = 0;
+};
+
 struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path firod;
@@ -84,12 +91,16 @@ struct Options {
   NetworkCondition network_condition;
   std::vector<std::string> node_network_condition_json;
   std::vector<std::string> runtime_node_network_condition_json;
+  std::vector<std::string> runtime_node_block_json;
+  std::vector<std::string> runtime_node_unblock_json;
   std::vector<std::string> runtime_node_resource_json;
   std::vector<std::string> runtime_node_restart_json;
   std::vector<std::string> runtime_node_freeze_json;
   std::map<uint32_t, NetworkCondition> node_network_conditions;
   std::map<uint32_t, NetworkCondition> runtime_node_network_conditions;
   std::map<uint32_t, ResourceLimitPatch> runtime_node_resource_updates;
+  std::vector<NetworkBlockRule> runtime_node_blocks;
+  std::vector<NetworkBlockRule> runtime_node_unblocks;
   std::vector<uint32_t> runtime_node_restarts;
   std::vector<FreezeRequest> runtime_node_freezes;
   bool replace_run = false;
@@ -221,6 +232,16 @@ std::filesystem::path JsonOptionalPathField(
   return std::filesystem::path(std::string(value->as_string()));
 }
 
+std::string JsonStringField(const boost::json::object& object,
+                            const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || !value->is_string()) {
+    throw std::runtime_error("missing or invalid string JSON field: " +
+                             std::string(field));
+  }
+  return std::string(value->as_string());
+}
+
 bool OptionProvided(const boost::program_options::variables_map& vm,
                     const char* name) {
   const auto iter = vm.find(name);
@@ -247,6 +268,48 @@ NetworkCondition ParseNetworkConditionObject(
   condition.limit_packets = JsonOptionalUint32Field(
       object, "limit_packets", condition.limit_packets);
   return condition;
+}
+
+uint32_t StableRuleHandle(const NetworkBlockRule& rule) {
+  uint32_t hash = 2166136261U;
+  const auto mix_byte = [&hash](unsigned char value) {
+    hash ^= value;
+    hash *= 16777619U;
+  };
+  const auto mix_uint32 = [&mix_byte](uint32_t value) {
+    for (uint32_t shift = 0; shift < 32U; shift += 8U) {
+      mix_byte(static_cast<unsigned char>((value >> shift) & 0xFFU));
+    }
+  };
+  mix_uint32(rule.node_index + 1U);
+  for (const unsigned char c : rule.dst_address) {
+    mix_byte(c);
+  }
+  mix_uint32(rule.dst_port);
+  hash &= 0x00FFFFFFU;
+  return hash == 0U ? 1U : hash;
+}
+
+NetworkBlockRule ParseNetworkBlockRuleObject(
+    const boost::json::object& object) {
+  const uint32_t node = JsonUint32Field(object, "node");
+  if (node == 0U) {
+    throw std::runtime_error("network block rule node must be greater than zero");
+  }
+  const uint32_t dst_port = JsonUint32Field(object, "dst_port");
+  if (dst_port == 0U || dst_port > 65535U) {
+    throw std::runtime_error("network block rule dst_port must be 1..65535");
+  }
+
+  NetworkBlockRule rule;
+  rule.node_index = node - 1U;
+  rule.dst_address = JsonStringField(object, "dst_address");
+  rule.dst_port = static_cast<uint16_t>(dst_port);
+  rule.handle = JsonOptionalUint32Field(object, "handle", 0U);
+  if (rule.handle == 0U) {
+    rule.handle = StableRuleHandle(rule);
+  }
+  return rule;
 }
 
 bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
@@ -317,6 +380,23 @@ void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
                                std::to_string(nodes));
     }
     output[node - 1U] = ParseNetworkConditionObject(object);
+  }
+}
+
+void ApplyNetworkBlockRules(const boost::json::array& rules, uint32_t nodes,
+                            std::string_view source,
+                            std::vector<NetworkBlockRule>& output) {
+  for (const boost::json::value& value : rules) {
+    if (!value.is_object()) {
+      throw std::runtime_error(std::string(source) +
+                               " entries must be JSON objects");
+    }
+    NetworkBlockRule rule = ParseNetworkBlockRuleObject(value.as_object());
+    if (rule.node_index >= nodes) {
+      throw std::runtime_error(std::string(source) + " node must be in 1.." +
+                               std::to_string(nodes));
+    }
+    output.push_back(std::move(rule));
   }
 }
 
@@ -571,6 +651,28 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                           "scenario network.runtime_node_conditions",
                           options.runtime_node_network_conditions);
     }
+    const boost::json::value* runtime_node_blocks =
+        object.if_contains("runtime_node_blocks");
+    if (runtime_node_blocks != nullptr) {
+      if (!runtime_node_blocks->is_array()) {
+        throw std::runtime_error(
+            "scenario network.runtime_node_blocks must be a JSON array");
+      }
+      ApplyNetworkBlockRules(runtime_node_blocks->as_array(), options.nodes,
+                             "scenario network.runtime_node_blocks",
+                             options.runtime_node_blocks);
+    }
+    const boost::json::value* runtime_node_unblocks =
+        object.if_contains("runtime_node_unblocks");
+    if (runtime_node_unblocks != nullptr) {
+      if (!runtime_node_unblocks->is_array()) {
+        throw std::runtime_error(
+            "scenario network.runtime_node_unblocks must be a JSON array");
+      }
+      ApplyNetworkBlockRules(runtime_node_unblocks->as_array(), options.nodes,
+                             "scenario network.runtime_node_unblocks",
+                             options.runtime_node_unblocks);
+    }
   }
 }
 
@@ -610,6 +712,24 @@ void ParseRuntimeNodeResourceTexts(
           "--runtime-node-resource-json node must be in 1..--nodes");
     }
     output[node - 1U] = ParseResourceLimitPatchObject(object);
+  }
+}
+
+void ParseRuntimeNodeBlockTexts(const std::vector<std::string>& texts,
+                                uint32_t nodes, std::string_view option_name,
+                                std::vector<NetworkBlockRule>& output) {
+  for (const std::string& text : texts) {
+    boost::json::value value = boost::json::parse(text);
+    if (!value.is_object()) {
+      throw std::runtime_error(std::string(option_name) +
+                               " must be a JSON object");
+    }
+    NetworkBlockRule rule = ParseNetworkBlockRuleObject(value.as_object());
+    if (rule.node_index >= nodes) {
+      throw std::runtime_error(std::string(option_name) +
+                               " node must be in 1..--nodes");
+    }
+    output.push_back(std::move(rule));
   }
 }
 
@@ -665,6 +785,12 @@ void ParseNodeNetworkConditions(Options& options) {
                                  options.nodes,
                                  "--runtime-node-network-condition-json",
                                  options.runtime_node_network_conditions);
+  ParseRuntimeNodeBlockTexts(options.runtime_node_block_json, options.nodes,
+                             "--runtime-node-block-json",
+                             options.runtime_node_blocks);
+  ParseRuntimeNodeBlockTexts(options.runtime_node_unblock_json, options.nodes,
+                             "--runtime-node-unblock-json",
+                             options.runtime_node_unblocks);
   ParseRuntimeNodeResourceTexts(options.runtime_node_resource_json,
                                 options.nodes,
                                 options.runtime_node_resource_updates);
@@ -760,6 +886,16 @@ Options ParseOptions(int argc, char** argv) {
           ->composing(),
       "repeatable JSON object with node plus live network condition fields to "
       "apply after isolated nodes are running")(
+      "runtime-node-block-json",
+      po::value<std::vector<std::string>>(&options.runtime_node_block_json)
+          ->composing(),
+      "repeatable JSON object with node, dst_address, dst_port, and optional "
+      "handle for one live host-side TCP drop filter")(
+      "runtime-node-unblock-json",
+      po::value<std::vector<std::string>>(&options.runtime_node_unblock_json)
+          ->composing(),
+      "repeatable JSON object with node, dst_address, dst_port, and optional "
+      "handle for one live host-side TCP drop filter removal")(
       "runtime-node-resource-json",
       po::value<std::vector<std::string>>(
           &options.runtime_node_resource_json)
@@ -872,10 +1008,14 @@ Options ParseOptions(int argc, char** argv) {
        !options.node_network_condition_json.empty() ||
        !options.node_network_conditions.empty() ||
        !options.runtime_node_network_condition_json.empty() ||
-       !options.runtime_node_network_conditions.empty()) &&
+       !options.runtime_node_network_conditions.empty() ||
+       !options.runtime_node_block_json.empty() ||
+       !options.runtime_node_blocks.empty() ||
+       !options.runtime_node_unblock_json.empty() ||
+       !options.runtime_node_unblocks.empty()) &&
       !options.isolate_network) {
     throw std::runtime_error(
-        "network condition options require --isolate-network");
+        "network runtime options require --isolate-network");
   }
   if (options.nodes < 1 || options.nodes > kMaxFiroNodes) {
     throw std::runtime_error("--nodes currently supports 1.." +
@@ -1037,6 +1177,15 @@ boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
   object["corrupt_basis_points"] = condition.corrupt_basis_points;
   object["reorder_basis_points"] = condition.reorder_basis_points;
   object["limit_packets"] = condition.limit_packets;
+  return object;
+}
+
+boost::json::object NetworkBlockRuleJson(const NetworkBlockRule& rule) {
+  boost::json::object object;
+  object["node"] = rule.node_index + 1U;
+  object["dst_address"] = rule.dst_address;
+  object["dst_port"] = rule.dst_port;
+  object["handle"] = rule.handle;
   return object;
 }
 
@@ -1820,6 +1969,38 @@ void WriteScenarioFiles(const Options& options,
           std::to_string(condition.limit_packets) + "\n";
     }
   }
+  if (!options.runtime_node_blocks.empty()) {
+    network_yaml += "  runtime_node_blocks:\n";
+    for (const NetworkBlockRule& rule : options.runtime_node_blocks) {
+      network_yaml +=
+          "    - node: " + std::to_string(rule.node_index + 1U) +
+          "\n"
+          "      dst_address: " +
+          rule.dst_address +
+          "\n"
+          "      dst_port: " +
+          std::to_string(rule.dst_port) +
+          "\n"
+          "      handle: " +
+          std::to_string(rule.handle) + "\n";
+    }
+  }
+  if (!options.runtime_node_unblocks.empty()) {
+    network_yaml += "  runtime_node_unblocks:\n";
+    for (const NetworkBlockRule& rule : options.runtime_node_unblocks) {
+      network_yaml +=
+          "    - node: " + std::to_string(rule.node_index + 1U) +
+          "\n"
+          "      dst_address: " +
+          rule.dst_address +
+          "\n"
+          "      dst_port: " +
+          std::to_string(rule.dst_port) +
+          "\n"
+          "      handle: " +
+          std::to_string(rule.handle) + "\n";
+    }
+  }
 
   std::string runtime_resource_yaml;
   if (!options.runtime_node_resource_updates.empty()) {
@@ -1982,6 +2163,20 @@ void WriteScenarioFiles(const Options& options,
     }
     resolved["runtime_node_network_conditions"] =
         std::move(runtime_node_conditions);
+  }
+  if (!options.runtime_node_blocks.empty()) {
+    boost::json::array runtime_node_blocks;
+    for (const NetworkBlockRule& rule : options.runtime_node_blocks) {
+      runtime_node_blocks.push_back(NetworkBlockRuleJson(rule));
+    }
+    resolved["runtime_node_blocks"] = std::move(runtime_node_blocks);
+  }
+  if (!options.runtime_node_unblocks.empty()) {
+    boost::json::array runtime_node_unblocks;
+    for (const NetworkBlockRule& rule : options.runtime_node_unblocks) {
+      runtime_node_unblocks.push_back(NetworkBlockRuleJson(rule));
+    }
+    resolved["runtime_node_unblocks"] = std::move(runtime_node_unblocks);
   }
   if (!options.runtime_node_resource_updates.empty()) {
     boost::json::array runtime_node_limits;
@@ -2220,6 +2415,92 @@ void ApplyRuntimeNetworkConditionUpdates(
     WriteEvent(events_path, options.run_id, node.config.id,
                "network_condition_updated",
                NetworkConditionVerificationDetail(*node.network, qdisc));
+  }
+}
+
+bool NetworkBlockRulePresent(const NodeRuntime& node,
+                             const NetworkBlockRule& rule) {
+  if (!node.network) {
+    return false;
+  }
+  const std::vector<TcFilterInfo> filters = ListTcFilters();
+  for (const TcFilterInfo& filter : filters) {
+    if (TcFilterMatchesEgressIpv4TcpDrop(filter, node.network->host_name,
+                                         rule.dst_address, rule.dst_port,
+                                         rule.handle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string NetworkBlockRuleDetail(const NodeRuntime& node,
+                                   const NetworkBlockRule& rule,
+                                   bool existed_before, bool present_after) {
+  boost::json::object detail = NetworkBlockRuleJson(rule);
+  if (node.network) {
+    detail["host_if"] = node.network->host_name;
+  } else {
+    detail["host_if"] = nullptr;
+  }
+  detail["existed_before"] = existed_before;
+  detail["present_after"] = present_after;
+  return boost::json::serialize(detail);
+}
+
+void RequireNetworkBlockNode(const NodeRuntime& node) {
+  if (!node.network) {
+    throw std::runtime_error(
+        "runtime network block rule requires isolated networking");
+  }
+}
+
+void ApplyRuntimeNetworkBlockRules(const Options& options,
+                                   const std::filesystem::path& events_path,
+                                   std::vector<NodeRuntime>& nodes) {
+  for (const NetworkBlockRule& rule : options.runtime_node_blocks) {
+    if (rule.node_index >= nodes.size()) {
+      throw std::runtime_error("runtime network block node is out of range");
+    }
+    NodeRuntime& node = nodes[rule.node_index];
+    RequireNetworkBlockNode(node);
+    const bool existed_before = NetworkBlockRulePresent(node, rule);
+    ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.dst_address,
+                                   rule.dst_port, rule.handle);
+    const bool present_after = NetworkBlockRulePresent(node, rule);
+    if (!present_after) {
+      throw std::runtime_error(
+          "runtime network block rule was not visible after apply");
+    }
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "network_block_applied",
+               NetworkBlockRuleDetail(node, rule, existed_before,
+                                      present_after));
+  }
+}
+
+void ApplyRuntimeNetworkUnblockRules(const Options& options,
+                                     const std::filesystem::path& events_path,
+                                     std::vector<NodeRuntime>& nodes) {
+  for (const NetworkBlockRule& rule : options.runtime_node_unblocks) {
+    if (rule.node_index >= nodes.size()) {
+      throw std::runtime_error("runtime network unblock node is out of range");
+    }
+    NodeRuntime& node = nodes[rule.node_index];
+    RequireNetworkBlockNode(node);
+    const bool existed_before = NetworkBlockRulePresent(node, rule);
+    if (existed_before) {
+      DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
+    }
+    const bool present_after = NetworkBlockRulePresent(node, rule);
+    if (present_after) {
+      throw std::runtime_error(
+          "runtime network block rule remained after unblock");
+    }
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "network_block_removed",
+               NetworkBlockRuleDetail(node, rule, existed_before,
+                                      present_after));
   }
 }
 
@@ -2493,6 +2774,8 @@ int Run(int argc, char** argv) {
 
     ApplyRuntimeResourceLimitUpdates(options, events_path, nodes);
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
+    ApplyRuntimeNetworkBlockRules(options, events_path, nodes);
+    ApplyRuntimeNetworkUnblockRules(options, events_path, nodes);
     ApplyRuntimeNodeRestarts(options, events_path, driver, nodes);
     ApplyRuntimeNodeFreezes(options, events_path, nodes);
     WritePeriodicMetrics(events_path, metrics_path, options, driver, nodes);

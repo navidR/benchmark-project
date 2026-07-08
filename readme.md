@@ -14,6 +14,7 @@ the Firo path is working end to end.
 - Start up to 16 Firo regtest nodes.
 - Run Firo nodes inside isolated network namespaces with one veth pair per node.
 - Apply simple per-node network conditions through host-side `netem` or TBF.
+- Apply and remove live per-node TCP destination block rules.
 - Apply live per-node cgroup resource updates after startup.
 - Restart a running Firo node before workload generation.
 - Freeze and thaw a running Firo node cgroup for a bounded duration.
@@ -194,6 +195,23 @@ running, before block generation:
   --runtime-node-network-condition-json '{"node":2,"bandwidth_mbps":10}'
 ```
 
+Runtime block/unblock rules match a destination IPv4 address and TCP port on a
+node's host-side veth. This example applies and then removes the same rule
+before block generation:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id live-block-unblock \
+  --replace-run \
+  --nodes 2 \
+  --generate-blocks 1 \
+  --isolate-network \
+  --runtime-node-block-json '{"node":1,"dst_address":"10.210.1.2","dst_port":18168}' \
+  --runtime-node-unblock-json '{"node":1,"dst_address":"10.210.1.2","dst_port":18168}'
+```
+
 The current implementation applies bandwidth with TBF and delay/loss conditions
 with `netem`. When both are requested, TBF is the root qdisc and netem is
 attached below it. The netem fields are `delay_ms`, `jitter_ms`,
@@ -314,6 +332,20 @@ The same run settings can be loaded from a JSON scenario file:
         "node": 1,
         "delay_ms": 3,
         "jitter_ms": 1
+      }
+    ],
+    "runtime_node_blocks": [
+      {
+        "node": 1,
+        "dst_address": "10.210.1.2",
+        "dst_port": 18168
+      }
+    ],
+    "runtime_node_unblocks": [
+      {
+        "node": 1,
+        "dst_address": "10.210.1.2",
+        "dst_port": 18168
       }
     ]
   },
