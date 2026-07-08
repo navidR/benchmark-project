@@ -30,7 +30,7 @@ constexpr const char* kDefaultRewardAddress =
     "TTJW6FsYqLbSiF3ZUwMXRghgQuXK7XTodR";
 
 struct Options {
-  std::filesystem::path firod = "/home/navidr/work/firo/build/bin/firod";
+  std::filesystem::path firod;
   std::filesystem::path output_dir = "runs";
   std::string run_id = MakeRunId();
   uint32_t nodes = 1;
@@ -230,10 +230,15 @@ Options ParseOptions(int argc, char** argv) {
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
-  if (!options.probe_network && !options.probe_netns && !options.probe_veth &&
+  const bool needs_firod =
+      !options.probe_network && !options.probe_netns && !options.probe_veth &&
       !options.probe_address && !options.probe_route && !options.probe_qdisc &&
       !options.probe_qdisc_mutation && !options.probe_network_condition &&
-      !options.cleanup_run) {
+      !options.cleanup_run;
+  if (needs_firod && vm.count("firod") == 0U) {
+    throw std::runtime_error("Firo runs require an explicit --firod path");
+  }
+  if (needs_firod) {
     RequireExecutable(options.firod);
   }
   return options;
