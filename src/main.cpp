@@ -53,7 +53,9 @@ struct Options {
   bool network_condition_requested = false;
   NetworkCondition network_condition;
   std::vector<std::string> node_network_condition_json;
+  std::vector<std::string> runtime_node_network_condition_json;
   std::map<uint32_t, NetworkCondition> node_network_conditions;
+  std::map<uint32_t, NetworkCondition> runtime_node_network_conditions;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_capabilities = false;
@@ -175,21 +177,21 @@ NetworkCondition ParseNetworkConditionObject(
   return condition;
 }
 
-void ApplyScenarioNodeConditions(const boost::json::array& conditions,
-                                 Options& options) {
+void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
+                         std::string_view source,
+                         std::map<uint32_t, NetworkCondition>& output) {
   for (const boost::json::value& value : conditions) {
     if (!value.is_object()) {
-      throw std::runtime_error("scenario network.node_conditions entries must "
-                               "be JSON objects");
+      throw std::runtime_error(std::string(source) +
+                               " entries must be JSON objects");
     }
     const boost::json::object& object = value.as_object();
     const uint32_t node = JsonUint32Field(object, "node");
-    if (node == 0 || node > options.nodes) {
-      throw std::runtime_error(
-          "scenario network.node_conditions node must be in 1..nodes");
+    if (node == 0 || node > nodes) {
+      throw std::runtime_error(std::string(source) + " node must be in 1.." +
+                               std::to_string(nodes));
     }
-    options.node_network_conditions[node - 1U] =
-        ParseNetworkConditionObject(object);
+    output[node - 1U] = ParseNetworkConditionObject(object);
   }
 }
 
@@ -316,27 +318,53 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         throw std::runtime_error(
             "scenario network.node_conditions must be a JSON array");
       }
-      ApplyScenarioNodeConditions(node_conditions->as_array(), options);
+      ApplyNodeConditions(node_conditions->as_array(), options.nodes,
+                          "scenario network.node_conditions",
+                          options.node_network_conditions);
+    }
+    const boost::json::value* runtime_node_conditions =
+        object.if_contains("runtime_node_conditions");
+    if (runtime_node_conditions != nullptr) {
+      if (!runtime_node_conditions->is_array()) {
+        throw std::runtime_error(
+            "scenario network.runtime_node_conditions must be a JSON array");
+      }
+      ApplyNodeConditions(runtime_node_conditions->as_array(), options.nodes,
+                          "scenario network.runtime_node_conditions",
+                          options.runtime_node_network_conditions);
     }
   }
 }
 
-void ParseNodeNetworkConditions(Options& options) {
-  for (const std::string& text : options.node_network_condition_json) {
+void ParseNodeNetworkConditionTexts(
+    const std::vector<std::string>& texts, uint32_t nodes,
+    std::string_view option_name,
+    std::map<uint32_t, NetworkCondition>& output) {
+  for (const std::string& text : texts) {
     boost::json::value value = boost::json::parse(text);
     if (!value.is_object()) {
-      throw std::runtime_error(
-          "--node-network-condition-json must be a JSON object");
+      throw std::runtime_error(std::string(option_name) +
+                               " must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
     const uint32_t node = JsonUint32Field(object, "node");
-    if (node == 0 || node > options.nodes) {
-      throw std::runtime_error(
-          "--node-network-condition-json node must be in 1..--nodes");
+    if (node == 0 || node > nodes) {
+      throw std::runtime_error(std::string(option_name) +
+                               " node must be in 1..--nodes");
     }
-    options.node_network_conditions[node - 1U] =
-        ParseNetworkConditionObject(object);
+    output[node - 1U] = ParseNetworkConditionObject(object);
   }
+}
+
+void ParseNodeNetworkConditions(Options& options) {
+  ParseNodeNetworkConditionTexts(options.node_network_condition_json,
+                                 options.nodes,
+                                 "--node-network-condition-json",
+                                 options.node_network_conditions);
+  ParseNodeNetworkConditionTexts(options.runtime_node_network_condition_json,
+                                 options.nodes,
+                                 "--runtime-node-network-condition-json",
+                                 options.runtime_node_network_conditions);
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -397,6 +425,12 @@ Options ParseOptions(int argc, char** argv) {
           ->composing(),
       "repeatable JSON object with node plus netem fields for one isolated "
       "node")(
+      "runtime-node-network-condition-json",
+      po::value<std::vector<std::string>>(
+          &options.runtime_node_network_condition_json)
+          ->composing(),
+      "repeatable JSON object with node plus live netem fields to apply after "
+      "isolated nodes are running")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
       "probe-address", po::bool_switch(&options.probe_address),
@@ -467,7 +501,10 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error("--pids-max must be greater than zero");
   }
   if ((options.network_condition_requested ||
-       !options.node_network_condition_json.empty()) &&
+       !options.node_network_condition_json.empty() ||
+       !options.node_network_conditions.empty() ||
+       !options.runtime_node_network_condition_json.empty() ||
+       !options.runtime_node_network_conditions.empty()) &&
       !options.isolate_network) {
     throw std::runtime_error(
         "network condition options require --isolate-network");
@@ -995,6 +1032,29 @@ void WriteScenarioFiles(const Options& options,
           std::to_string(condition.limit_packets) + "\n";
     }
   }
+  if (!options.runtime_node_network_conditions.empty()) {
+    network_yaml += "  runtime_node_conditions:\n";
+    for (const auto& [node_index, condition] :
+         options.runtime_node_network_conditions) {
+      network_yaml +=
+          "    firo-" + std::to_string(node_index + 1U) +
+          ":\n"
+          "      delay_ms: " +
+          std::to_string(condition.delay_ms) +
+          "\n"
+          "      jitter_ms: " +
+          std::to_string(condition.jitter_ms) +
+          "\n"
+          "      loss_basis_points: " +
+          std::to_string(condition.loss_basis_points) +
+          "\n"
+          "      duplicate_basis_points: " +
+          std::to_string(condition.duplicate_basis_points) +
+          "\n"
+          "      limit_packets: " +
+          std::to_string(condition.limit_packets) + "\n";
+    }
+  }
 
   WriteText(run_root / "scenario.yaml",
             "simulation:\n"
@@ -1076,6 +1136,18 @@ void WriteScenarioFiles(const Options& options,
       node_conditions.push_back(std::move(node_condition));
     }
     resolved["node_network_conditions"] = std::move(node_conditions);
+  }
+  if (!options.runtime_node_network_conditions.empty()) {
+    boost::json::array runtime_node_conditions;
+    for (const auto& [node_index, condition] :
+         options.runtime_node_network_conditions) {
+      boost::json::object node_condition;
+      node_condition["node"] = node_index + 1U;
+      node_condition["condition"] = NetworkConditionJson(condition);
+      runtime_node_conditions.push_back(std::move(node_condition));
+    }
+    resolved["runtime_node_network_conditions"] =
+        std::move(runtime_node_conditions);
   }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
@@ -1231,6 +1303,29 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
   }
 }
 
+void ApplyRuntimeNetworkConditionUpdates(
+    const Options& options, const std::filesystem::path& events_path,
+    std::vector<NodeRuntime>& nodes) {
+  for (const auto& [node_index, condition] :
+       options.runtime_node_network_conditions) {
+    if (node_index >= nodes.size()) {
+      throw std::runtime_error("runtime network condition node is out of range");
+    }
+    NodeRuntime& node = nodes[node_index];
+    if (!node.network) {
+      throw std::runtime_error(
+          "runtime network condition requires isolated networking");
+    }
+    node.network->apply_condition = true;
+    node.network->condition = condition;
+    ReplaceRootNetemQdisc(node.network->host_name, node.network->condition);
+    const QdiscInfo qdisc = VerifyNodeNetworkCondition(*node.network);
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "network_condition_updated",
+               NetworkConditionVerificationDetail(*node.network, qdisc));
+  }
+}
+
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
                const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
   for (auto& node : nodes) {
@@ -1379,6 +1474,8 @@ int Run(int argc, char** argv) {
                  MetricsJson(options.run_id, node.config.id, chain, &cg, link,
                              qdisc));
     }
+
+    ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
 
     if (options.generate_blocks > 0) {
       const uint64_t start_height =

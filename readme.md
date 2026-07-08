@@ -155,6 +155,21 @@ Per-node isolated network conditions use repeatable JSON objects:
   --node-network-condition-json '{"node":2,"delay_ms":5}'
 ```
 
+Runtime network updates use the same JSON shape and are applied after nodes are
+running, before block generation:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id live-netem \
+  --replace-run \
+  --nodes 2 \
+  --generate-blocks 1 \
+  --isolate-network \
+  --runtime-node-network-condition-json '{"node":2,"delay_ms":3,"jitter_ms":1}'
+```
+
 Resource limits are global for the current MVP and apply to each node cgroup:
 
 ```bash
@@ -195,7 +210,14 @@ The same MVP fields can be loaded from a Boost.JSON scenario file:
     "default_condition": {
       "delay_ms": 1,
       "limit_packets": 1000
-    }
+    },
+    "runtime_node_conditions": [
+      {
+        "node": 1,
+        "delay_ms": 3,
+        "jitter_ms": 1
+      }
+    ]
   }
 }
 ```
@@ -230,7 +252,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    ./build/benchmark-sim --probe-route &&
    ./build/benchmark-sim --probe-qdisc &&
    ./build/benchmark-sim --probe-qdisc-mutation &&
-   ./build/benchmark-sim --probe-network-condition'
+   ./build/benchmark-sim --probe-network-condition &&
+   ./build/benchmark-sim --probe-network-condition-update'
 ```
 
 Useful focused probes:
@@ -241,6 +264,7 @@ Useful focused probes:
 ./build/benchmark-sim --probe-route
 ./build/benchmark-sim --probe-qdisc-mutation
 ./build/benchmark-sim --probe-network-condition
+./build/benchmark-sim --probe-network-condition-update
 ```
 
 ## Cleanup Checks
