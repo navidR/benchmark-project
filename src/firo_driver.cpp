@@ -136,18 +136,22 @@ void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
 }
 
 FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
+  const auto start = std::chrono::steady_clock::now();
   const boost::json::value blockchain =
       RpcCall(config, "getblockchaininfo", boost::json::array{});
   const boost::json::value network =
       RpcCall(config, "getnetworkinfo", boost::json::array{});
   const boost::json::value mempool =
       RpcCall(config, "getmempoolinfo", boost::json::array{});
+  const auto elapsed = std::chrono::steady_clock::now() - start;
 
   FiroMetrics metrics;
   metrics.height = JsonUint(blockchain, "blocks");
   metrics.best_hash = JsonString(blockchain, "bestblockhash");
   metrics.peer_count = JsonUint(network, "connections");
   metrics.mempool_tx_count = JsonUint(mempool, "size");
+  metrics.rpc_latency_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
   return metrics;
 }
 

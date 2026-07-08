@@ -526,6 +526,7 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   object["best_hash"] = chain.best_hash;
   object["peer_count"] = chain.peer_count;
   object["mempool_tx_count"] = chain.mempool_tx_count;
+  object["rpc_latency_ms"] = chain.rpc_latency_ms;
   if (cgroup != nullptr) {
     object["cpu_usage_usec"] = cgroup->cpu_usage_usec;
     object["cpu_throttled_usec"] = cgroup->cpu_throttled_usec;
