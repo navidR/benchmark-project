@@ -19,6 +19,7 @@ Firo path is working end to end.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
 - Wait for generated blocks to propagate before final metrics are recorded.
+- Record optional periodic metric samples between runtime events and workloads.
 - Record event and metric files under a run directory.
 - Exercise Linux network namespace, veth, address, route, and qdisc operations
   through simulator probes.
@@ -218,6 +219,21 @@ cgroup/network/data directory, wait for RPC readiness, then continue the run:
   --runtime-node-restart-json '{"node":1}'
 ```
 
+Extra metric samples can be collected between runtime updates/restarts and
+block generation:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id sampled-smoke \
+  --replace-run \
+  --nodes 1 \
+  --generate-blocks 1 \
+  --metrics-sample-count 5 \
+  --metrics-interval-ms 1000
+```
+
 The same MVP fields can be loaded from a Boost.JSON scenario file:
 
 ```json
@@ -229,6 +245,8 @@ The same MVP fields can be loaded from a Boost.JSON scenario file:
   "generate_blocks": 1,
   "ready_timeout_sec": 45,
   "sync_timeout_sec": 45,
+  "metrics_sample_count": 5,
+  "metrics_interval_ms": 1000,
   "resources": {
     "memory_high_bytes": 1073741824,
     "memory_max_bytes": 1610612736,

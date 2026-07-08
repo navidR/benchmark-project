@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <boost/json/array.hpp>
@@ -60,6 +61,8 @@ struct Options {
   uint32_t generate_blocks = 1;
   uint32_t ready_timeout_sec = 30;
   uint32_t sync_timeout_sec = 30;
+  uint32_t metrics_sample_count = 0;
+  uint32_t metrics_interval_ms = 1000;
   uint64_t memory_high_bytes = 1536ULL * 1024ULL * 1024ULL;
   uint64_t memory_max_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
   uint64_t cpu_period_us = 100000;
@@ -350,6 +353,14 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     options.sync_timeout_sec = JsonOptionalUint32Field(
         scenario, "sync_timeout_sec", options.sync_timeout_sec);
   }
+  if (!OptionProvided(vm, "metrics-sample-count")) {
+    options.metrics_sample_count = JsonOptionalUint32Field(
+        scenario, "metrics_sample_count", options.metrics_sample_count);
+  }
+  if (!OptionProvided(vm, "metrics-interval-ms")) {
+    options.metrics_interval_ms = JsonOptionalUint32Field(
+        scenario, "metrics_interval_ms", options.metrics_interval_ms);
+  }
   if (!OptionProvided(vm, "isolate-network")) {
     options.isolate_network = JsonOptionalBoolField(
         scenario, "isolated_network", options.isolate_network);
@@ -593,6 +604,13 @@ Options ParseOptions(int argc, char** argv) {
       "RPC startup timeout")(
       "sync-timeout-sec", po::value<uint32_t>(&options.sync_timeout_sec),
       "block propagation timeout")(
+      "metrics-sample-count",
+      po::value<uint32_t>(&options.metrics_sample_count),
+      "extra metric samples to collect after runtime events and before "
+      "workload generation")(
+      "metrics-interval-ms",
+      po::value<uint32_t>(&options.metrics_interval_ms),
+      "milliseconds between extra metric samples")(
       "memory-high-bytes", po::value<uint64_t>(&options.memory_high_bytes),
       "cgroup memory.high soft pressure threshold in bytes")(
       "memory-max-bytes", po::value<uint64_t>(&options.memory_max_bytes),
@@ -720,6 +738,10 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (options.pids_max == 0U) {
     throw std::runtime_error("--pids-max must be greater than zero");
+  }
+  if (options.metrics_sample_count > 0U && options.metrics_interval_ms == 0U) {
+    throw std::runtime_error(
+        "--metrics-interval-ms must be greater than zero when sampling");
   }
   if ((options.network_condition_requested ||
        !options.node_network_condition_json.empty() ||
@@ -1344,6 +1366,43 @@ void WriteNodeState(const std::filesystem::path& events_path,
   WriteEvent(events_path, run_id, node_id, "state", state);
 }
 
+void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
+                          const Options& options, const FiroDriver& driver,
+                          std::vector<NodeRuntime>& nodes) {
+  const std::vector<LinkInfo> links = ListNetworkLinks();
+  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+  for (auto& node : nodes) {
+    FiroMetrics chain = driver.ReadMetrics(node.config);
+    CgroupMetrics cg = node.cgroup->ReadMetrics();
+    const LinkInfo* link =
+        node.network ? FindLinkByName(links, node.network->host_name) : nullptr;
+    const QdiscInfo* qdisc =
+        node.network ? FindQdiscByInterfaceName(qdiscs, node.network->host_name)
+                     : nullptr;
+    AppendLine(metrics_path,
+               MetricsJson(options.run_id, node.config.id, chain,
+                           node.generated_block_count, node.restart_count, &cg,
+                           link, qdisc));
+  }
+}
+
+void WritePeriodicMetrics(const std::filesystem::path& events_path,
+                          const std::filesystem::path& metrics_path,
+                          const Options& options, const FiroDriver& driver,
+                          std::vector<NodeRuntime>& nodes) {
+  for (uint32_t sample = 0; sample < options.metrics_sample_count; ++sample) {
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(options.metrics_interval_ms));
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
+    boost::json::object detail;
+    detail["sample"] = sample + 1U;
+    detail["sample_count"] = options.metrics_sample_count;
+    detail["interval_ms"] = options.metrics_interval_ms;
+    WriteEvent(events_path, options.run_id, "sim", "metrics_sample",
+               boost::json::serialize(detail));
+  }
+}
+
 std::string LogTailDetail(std::string_view kind, const LogTailChunk& chunk) {
   boost::json::object detail;
   detail["kind"] = kind;
@@ -1526,6 +1585,13 @@ void WriteScenarioFiles(const Options& options,
                 "nodes: " +
                 std::to_string(options.nodes) +
                 "\n"
+                "metrics:\n"
+                "  extra_sample_count: " +
+                std::to_string(options.metrics_sample_count) +
+                "\n"
+                "  interval_ms: " +
+                std::to_string(options.metrics_interval_ms) +
+                "\n"
                 "resources:\n"
                 "  default:\n"
                 "    memory_high_bytes: " +
@@ -1565,6 +1631,8 @@ void WriteScenarioFiles(const Options& options,
   }
   resolved["isolated_network"] = options.isolate_network;
   resolved["sync_timeout_sec"] = options.sync_timeout_sec;
+  resolved["metrics_sample_count"] = options.metrics_sample_count;
+  resolved["metrics_interval_ms"] = options.metrics_interval_ms;
   boost::json::object resources;
   resources["memory_high_bytes"] = options.memory_high_bytes;
   resources["memory_max_bytes"] = options.memory_max_bytes;
@@ -2017,28 +2085,12 @@ int Run(int argc, char** argv) {
     StartNodes(options, run_root, events_path, driver, nodes);
     WriteNodeLogTails(events_path, options, driver, nodes);
 
-    for (auto& node : nodes) {
-      const std::vector<LinkInfo> links = ListNetworkLinks();
-      const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-      FiroMetrics chain = driver.ReadMetrics(node.config);
-      CgroupMetrics cg = node.cgroup->ReadMetrics();
-      const LinkInfo* link = node.network
-                                 ? FindLinkByName(links,
-                                                  node.network->host_name)
-                                 : nullptr;
-      const QdiscInfo* qdisc = node.network
-                                   ? FindQdiscByInterfaceName(
-                                         qdiscs, node.network->host_name)
-                                   : nullptr;
-      AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain,
-                             node.generated_block_count, node.restart_count,
-                             &cg, link, qdisc));
-    }
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
 
     ApplyRuntimeResourceLimitUpdates(options, events_path, nodes);
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
     ApplyRuntimeNodeRestarts(options, events_path, driver, nodes);
+    WritePeriodicMetrics(events_path, metrics_path, options, driver, nodes);
 
     if (options.generate_blocks > 0) {
       const uint64_t start_height =
@@ -2058,24 +2110,7 @@ int Run(int argc, char** argv) {
       }
     }
 
-    for (auto& node : nodes) {
-      const std::vector<LinkInfo> links = ListNetworkLinks();
-      const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-      FiroMetrics chain = driver.ReadMetrics(node.config);
-      CgroupMetrics cg = node.cgroup->ReadMetrics();
-      const LinkInfo* link = node.network
-                                 ? FindLinkByName(links,
-                                                  node.network->host_name)
-                                 : nullptr;
-      const QdiscInfo* qdisc = node.network
-                                   ? FindQdiscByInterfaceName(
-                                         qdiscs, node.network->host_name)
-                                   : nullptr;
-      AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain,
-                             node.generated_block_count, node.restart_count,
-                             &cg, link, qdisc));
-    }
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
     WriteNodeLogTails(events_path, options, driver, nodes);
 
     StopNodes(options, events_path, driver, nodes);
