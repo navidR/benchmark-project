@@ -30,6 +30,7 @@ namespace {
 
 constexpr const char* kDefaultRewardAddress =
     "TTJW6FsYqLbSiF3ZUwMXRghgQuXK7XTodR";
+constexpr const char* kRunMarkerFile = ".benchmark-sim-run";
 
 struct Options {
   std::filesystem::path firod;
@@ -399,6 +400,33 @@ std::string FiroPeerHost(const Options& options, uint32_t node_index) {
 bool HostIpv4ForwardingEnabled() {
   const std::string value = ReadText("/proc/sys/net/ipv4/ip_forward");
   return !value.empty() && value.front() == '1';
+}
+
+void RequireSafeOutputDirectory(const std::filesystem::path& output_dir) {
+  if (output_dir.empty()) {
+    throw std::runtime_error("output directory must not be empty");
+  }
+  const std::filesystem::path absolute = std::filesystem::absolute(output_dir);
+  if (absolute == absolute.root_path()) {
+    throw std::runtime_error("output directory must not be filesystem root");
+  }
+}
+
+bool IsOwnedRunDirectory(const std::filesystem::path& run_root) {
+  return std::filesystem::exists(run_root / kRunMarkerFile) ||
+         std::filesystem::exists(run_root / "resolved-scenario.json");
+}
+
+void RequireOwnedRunDirectory(const std::filesystem::path& run_root) {
+  if (!std::filesystem::is_directory(run_root)) {
+    throw std::runtime_error("run path exists but is not a directory: " +
+                             run_root.string());
+  }
+  if (!IsOwnedRunDirectory(run_root)) {
+    throw std::runtime_error(
+        "refusing to remove directory without simulator marker: " +
+        run_root.string());
+  }
 }
 
 const LinkInfo* FindLinkByName(const std::vector<LinkInfo>& links,
@@ -868,6 +896,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
 
 int Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);
+  RequireSafeOutputDirectory(options.output_dir);
   if (options.probe_network) {
     std::cout << NetworkProbeJson() << "\n";
     return 0;
@@ -925,6 +954,7 @@ int Run(int argc, char** argv) {
                                run_root.string() +
                                " (use --replace-run to remove it)");
     }
+    RequireOwnedRunDirectory(run_root);
     std::error_code ec;
     std::filesystem::remove_all(run_root, ec);
     if (ec) {
@@ -933,6 +963,8 @@ int Run(int argc, char** argv) {
     }
     Cgroup::RemoveRun(options.run_id);
   }
+  EnsureDirectory(run_root);
+  WriteText(run_root / kRunMarkerFile, "benchmark-sim run\n");
   EnsureDirectory(run_root / "nodes");
   WriteScenarioFiles(options, run_root);
 
