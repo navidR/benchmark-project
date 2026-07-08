@@ -57,6 +57,12 @@ class UniqueFd {
 
   int get() const { return fd_; }
 
+  int Release() {
+    const int fd = fd_;
+    fd_ = -1;
+    return fd;
+  }
+
   void Reset() {
     if (fd_ >= 0) {
       close(fd_);
@@ -708,6 +714,45 @@ struct NamespaceNetworkConditionState {
 
 }  // namespace
 
+NetworkNamespace NetworkNamespace::Create() {
+  pid_t helper_pid = -1;
+  UniqueFd netns = StartNetworkNamespaceHelper(&helper_pid);
+  return NetworkNamespace(helper_pid, netns.Release());
+}
+
+NetworkNamespace::NetworkNamespace(NetworkNamespace&& other) noexcept {
+  *this = std::move(other);
+}
+
+NetworkNamespace& NetworkNamespace::operator=(
+    NetworkNamespace&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  Stop();
+  helper_pid_ = other.helper_pid_;
+  fd_ = other.fd_;
+  other.helper_pid_ = -1;
+  other.fd_ = -1;
+  return *this;
+}
+
+NetworkNamespace::~NetworkNamespace() { Stop(); }
+
+void NetworkNamespace::Stop() {
+  if (fd_ >= 0) {
+    close(fd_);
+    fd_ = -1;
+  }
+  if (helper_pid_ > 0) {
+    kill(helper_pid_, SIGKILL);
+    int status = 0;
+    while (waitpid(helper_pid_, &status, 0) < 0 && errno == EINTR) {
+    }
+    helper_pid_ = -1;
+  }
+}
+
 std::vector<LinkInfo> ListNetworkLinks() {
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
@@ -1215,6 +1260,47 @@ void DeleteRootQdisc(const std::string& if_name) {
   message->tcm_info = 0;
 
   SendNetlinkRequest(nlh, sequence);
+}
+
+void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
+  if (netns_fd < 0) {
+    throw std::runtime_error("invalid network namespace fd");
+  }
+  RequireInterfaceName(config.host_name);
+  RequireInterfaceName(config.peer_name);
+  if (config.prefix_len > 32U) {
+    throw std::runtime_error("node network prefix length must be 0..32");
+  }
+
+  TryDeleteLink(config.host_name);
+  TryDeleteLink(config.peer_name);
+
+  try {
+    CreateVethPair(config.host_name, config.peer_name);
+    AddIpv4Address(config.host_name, config.host_address, config.prefix_len);
+    SetLinkUp(config.host_name, true);
+    if (config.apply_condition) {
+      ReplaceRootNetemQdisc(config.host_name, config.condition);
+    }
+    MoveLinkToNamespace(config.peer_name, netns_fd);
+
+    ExecuteInNetworkNamespace(netns_fd, [&config]() {
+      SetLinkUp("lo", true);
+      AddIpv4Address(config.peer_name, config.node_address,
+                     config.prefix_len);
+      SetLinkUp(config.peer_name, true);
+      AddIpv4Route(config.peer_name, "0.0.0.0", 0, config.host_address);
+    });
+  } catch (...) {
+    TryDeleteLink(config.host_name);
+    TryDeleteLink(config.peer_name);
+    throw;
+  }
+}
+
+void DeleteNodeVethNetwork(const NodeVethConfig& config) {
+  TryDeleteLink(config.host_name);
+  TryDeleteLink(config.peer_name);
 }
 
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {

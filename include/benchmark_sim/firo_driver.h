@@ -29,6 +29,10 @@ struct FiroNodeConfig {
   uint16_t rpc_port = 0;
   std::string rpc_user;
   std::string rpc_password;
+  std::string rpc_host = "127.0.0.1";
+  std::string rpc_bind = "127.0.0.1";
+  std::vector<std::string> rpc_allow_ips = {"127.0.0.1"};
+  std::string p2p_bind;
   bool listen = true;
   std::vector<std::string> connect_peers;
 };

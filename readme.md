@@ -12,6 +12,8 @@ Firo path is working end to end.
 ## What Works Now
 
 - Start one or two Firo regtest nodes.
+- Run Firo nodes inside isolated network namespaces with one veth pair per node.
+- Apply a simple per-node network condition through host-side `netem`.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
 - Record event and metric files under a run directory.
@@ -75,13 +77,13 @@ One Firo node:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim
-     --firod "$FIROD"
-     --output-dir runs
-     --run-id smoke1
-     --replace-run
-     --nodes 1
-     --generate-blocks 1
+   ./build/benchmark-sim \
+     --firod "$FIROD" \
+     --output-dir runs \
+     --run-id smoke1 \
+     --replace-run \
+     --nodes 1 \
+     --generate-blocks 1 \
      --ready-timeout-sec 45'
 ```
 
@@ -91,14 +93,49 @@ Two Firo nodes:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim
-     --firod "$FIROD"
-     --output-dir runs
-     --run-id smoke2
-     --replace-run
-     --nodes 2
-     --generate-blocks 1
+   ./build/benchmark-sim \
+     --firod "$FIROD" \
+     --output-dir runs \
+     --run-id smoke2 \
+     --replace-run \
+     --nodes 2 \
+     --generate-blocks 1 \
      --ready-timeout-sec 45'
+```
+
+Two isolated Firo nodes:
+
+```bash
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
+  benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
+   ./build/benchmark-sim \
+     --firod "$FIROD" \
+     --output-dir runs \
+     --run-id isolated-smoke \
+     --replace-run \
+     --nodes 2 \
+     --generate-blocks 1 \
+     --ready-timeout-sec 45 \
+     --isolate-network'
+```
+
+Isolated Firo node with a default network condition:
+
+```bash
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
+  benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
+   ./build/benchmark-sim \
+     --firod "$FIROD" \
+     --output-dir runs \
+     --run-id isolated-delay \
+     --replace-run \
+     --nodes 1 \
+     --generate-blocks 1 \
+     --ready-timeout-sec 45 \
+     --isolate-network \
+     --network-delay-ms 5'
 ```
 
 Each run writes:

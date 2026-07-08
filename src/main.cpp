@@ -35,6 +35,9 @@ struct Options {
   uint32_t generate_blocks = 1;
   uint32_t ready_timeout_sec = 30;
   bool keep_cgroups = false;
+  bool isolate_network = false;
+  bool network_condition_requested = false;
+  NetworkCondition network_condition;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_netns = false;
@@ -49,6 +52,8 @@ struct Options {
 struct NodeRuntime {
   FiroNodeConfig config;
   std::optional<Cgroup> cgroup;
+  std::optional<NetworkNamespace> network_namespace;
+  std::optional<NodeVethConfig> network;
   ChildProcess process;
 };
 
@@ -69,6 +74,23 @@ Options ParseOptions(int argc, char** argv) {
       "ready-timeout-sec", po::value<uint32_t>(&options.ready_timeout_sec),
       "RPC startup timeout")("keep-cgroups", po::bool_switch(&options.keep_cgroups),
                              "leave cgroups after exit for inspection")(
+      "isolate-network", po::bool_switch(&options.isolate_network),
+      "run each Firo node in its own network namespace and veth link")(
+      "network-delay-ms",
+      po::value<uint32_t>(&options.network_condition.delay_ms),
+      "netem delay applied to each isolated node host-side veth")(
+      "network-jitter-ms",
+      po::value<uint32_t>(&options.network_condition.jitter_ms),
+      "netem jitter applied to each isolated node host-side veth")(
+      "network-loss-bps",
+      po::value<uint32_t>(&options.network_condition.loss_basis_points),
+      "netem packet loss in basis points, 10000 = 100%")(
+      "network-duplicate-bps",
+      po::value<uint32_t>(&options.network_condition.duplicate_basis_points),
+      "netem packet duplication in basis points, 10000 = 100%")(
+      "network-limit-packets",
+      po::value<uint32_t>(&options.network_condition.limit_packets),
+      "netem queue limit applied to each isolated node host-side veth")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
       "probe-address", po::bool_switch(&options.probe_address),
@@ -100,6 +122,15 @@ Options ParseOptions(int argc, char** argv) {
   if (vm.count("help") != 0U) {
     std::cout << "Usage: " << argv[0] << " [options]\n" << desc << "\n";
     std::exit(0);
+  }
+  options.network_condition_requested =
+      vm.count("network-delay-ms") != 0U ||
+      vm.count("network-jitter-ms") != 0U ||
+      vm.count("network-loss-bps") != 0U ||
+      vm.count("network-duplicate-bps") != 0U ||
+      vm.count("network-limit-packets") != 0U;
+  if (options.network_condition_requested && !options.isolate_network) {
+    throw std::runtime_error("network condition options require --isolate-network");
   }
   if (options.nodes < 1 || options.nodes > 2) {
     throw std::runtime_error("--nodes currently supports 1..2 for MVP smoke");
@@ -185,6 +216,44 @@ boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
   object["duplicate_basis_points"] = condition.duplicate_basis_points;
   object["limit_packets"] = condition.limit_packets;
   return object;
+}
+
+std::string NodeHostAddress(uint32_t node_index) {
+  return "10.210." + std::to_string(node_index + 1U) + ".1";
+}
+
+std::string NodeAddress(uint32_t node_index) {
+  return "10.210." + std::to_string(node_index + 1U) + ".2";
+}
+
+std::string NodeInterfaceName(uint32_t node_index, char suffix) {
+  return "bs" + std::to_string(static_cast<long long>(getpid() % 100000)) +
+         "n" + std::to_string(node_index + 1U) + suffix;
+}
+
+NodeVethConfig MakeNodeVethConfig(const Options& options,
+                                  uint32_t node_index) {
+  NodeVethConfig config;
+  config.host_name = NodeInterfaceName(node_index, 'h');
+  config.peer_name = NodeInterfaceName(node_index, 'p');
+  config.host_address = NodeHostAddress(node_index);
+  config.node_address = NodeAddress(node_index);
+  config.prefix_len = 30;
+  config.apply_condition = options.network_condition_requested;
+  config.condition = options.network_condition;
+  return config;
+}
+
+std::string FiroPeerHost(const Options& options, uint32_t node_index) {
+  if (options.isolate_network) {
+    return NodeAddress(node_index);
+  }
+  return "127.0.0.1";
+}
+
+bool HostIpv4ForwardingEnabled() {
+  const std::string value = ReadText("/proc/sys/net/ipv4/ip_forward");
+  return !value.empty() && value.front() == '1';
 }
 
 std::string NetworkProbeJson() {
@@ -342,6 +411,29 @@ void WriteEvent(const std::filesystem::path& events_path,
 
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root) {
+  std::string network_yaml =
+      "network:\n"
+      "  isolated: " +
+      std::string(options.isolate_network ? "true" : "false") + "\n";
+  if (options.network_condition_requested) {
+    network_yaml +=
+        "  default_condition:\n"
+        "    delay_ms: " +
+        std::to_string(options.network_condition.delay_ms) +
+        "\n"
+        "    jitter_ms: " +
+        std::to_string(options.network_condition.jitter_ms) +
+        "\n"
+        "    loss_basis_points: " +
+        std::to_string(options.network_condition.loss_basis_points) +
+        "\n"
+        "    duplicate_basis_points: " +
+        std::to_string(options.network_condition.duplicate_basis_points) +
+        "\n"
+        "    limit_packets: " +
+        std::to_string(options.network_condition.limit_packets) + "\n";
+  }
+
   WriteText(run_root / "scenario.yaml",
             "simulation:\n"
             "  name: " +
@@ -359,6 +451,7 @@ void WriteScenarioFiles(const Options& options,
                 "nodes: " +
                 std::to_string(options.nodes) +
                 "\n"
+                + network_yaml +
                 "workloads:\n"
                 "  - type: block_generation\n"
                 "    count: " +
@@ -369,6 +462,11 @@ void WriteScenarioFiles(const Options& options,
   resolved["chain"] = "firo";
   resolved["nodes"] = options.nodes;
   resolved["firod"] = options.firod.string();
+  resolved["isolated_network"] = options.isolate_network;
+  if (options.network_condition_requested) {
+    resolved["default_network_condition"] =
+        NetworkConditionJson(options.network_condition);
+  }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
 }
@@ -376,10 +474,17 @@ void WriteScenarioFiles(const Options& options,
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
                 const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
+  if (options.isolate_network && options.nodes > 1 &&
+      !HostIpv4ForwardingEnabled()) {
+    throw std::runtime_error(
+        "isolated multi-node Firo runs require IPv4 forwarding in the parent "
+        "network namespace");
+  }
   nodes.reserve(options.nodes);
   for (uint32_t i = 0; i < options.nodes; ++i) {
     const std::string node_id = "firo-" + std::to_string(i + 1);
     const auto node_root = run_root / "nodes" / node_id;
+
     FiroNodeConfig config;
     config.id = node_id;
     config.binary = options.firod;
@@ -391,23 +496,55 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     config.rpc_password = "pass-" + options.run_id + "-" + std::to_string(i);
     config.listen = true;
     if (i > 0) {
-      config.connect_peers.push_back("127.0.0.1:18168");
+      config.connect_peers.push_back(FiroPeerHost(options, 0) + ":18168");
     }
 
     NodeRuntime runtime;
-    runtime.config = config;
-    runtime.cgroup = Cgroup::Create(options.run_id, node_id);
-    runtime.cgroup->SetMemoryHigh(1536ULL * 1024ULL * 1024ULL);
-    runtime.cgroup->SetMemoryMax(2ULL * 1024ULL * 1024ULL * 1024ULL);
-    runtime.cgroup->SetCpuMax(std::nullopt, 100000);
-    runtime.cgroup->SetPidsMax(256);
+    try {
+      runtime.config = config;
+      if (options.isolate_network) {
+        runtime.network_namespace = NetworkNamespace::Create();
+        runtime.network = MakeNodeVethConfig(options, i);
+        SetupNodeVethNetwork(runtime.network_namespace->fd(),
+                             *runtime.network);
+        runtime.config.rpc_host = runtime.network->node_address;
+        runtime.config.rpc_bind = runtime.network->node_address;
+        runtime.config.rpc_allow_ips = {runtime.network->host_address};
+        runtime.config.p2p_bind = runtime.network->node_address;
+        WriteEvent(events_path, options.run_id, node_id, "network_ready",
+                   runtime.network->node_address);
+      }
 
-    ProcessSpec process = driver.RenderProcess(runtime.config);
-    runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
-    BSIM_LOG(info) << "started " << node_id << " pid=" << runtime.process.pid();
-    WriteEvent(events_path, options.run_id, node_id, "process_started",
-               "pid=" + std::to_string(runtime.process.pid()));
-    nodes.push_back(std::move(runtime));
+      runtime.cgroup = Cgroup::Create(options.run_id, node_id);
+      runtime.cgroup->SetMemoryHigh(1536ULL * 1024ULL * 1024ULL);
+      runtime.cgroup->SetMemoryMax(2ULL * 1024ULL * 1024ULL * 1024ULL);
+      runtime.cgroup->SetCpuMax(std::nullopt, 100000);
+      runtime.cgroup->SetPidsMax(256);
+
+      ProcessSpec process = driver.RenderProcess(runtime.config);
+      if (runtime.network_namespace) {
+        process.network_namespace_fd = runtime.network_namespace->fd();
+      }
+      runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
+      BSIM_LOG(info) << "started " << node_id
+                     << " pid=" << runtime.process.pid();
+      WriteEvent(events_path, options.run_id, node_id, "process_started",
+                 "pid=" + std::to_string(runtime.process.pid()));
+      nodes.push_back(std::move(runtime));
+    } catch (...) {
+      runtime.process.Kill();
+      if (runtime.cgroup) {
+        try {
+          runtime.cgroup->KillAll();
+          runtime.cgroup->Remove();
+        } catch (const std::exception&) {
+        }
+      }
+      if (runtime.network) {
+        DeleteNodeVethNetwork(*runtime.network);
+      }
+      throw;
+    }
   }
 
   for (auto& node : nodes) {
@@ -436,6 +573,14 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
         WriteEvent(events_path, options.run_id, node.config.id,
                    "cgroup_remove_failed", e.what());
       }
+    }
+    if (node.network) {
+      DeleteNodeVethNetwork(*node.network);
+      WriteEvent(events_path, options.run_id, node.config.id,
+                 "network_removed");
+    }
+    if (node.network_namespace) {
+      node.network_namespace->Stop();
     }
   }
   if (!options.keep_cgroups) {

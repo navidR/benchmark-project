@@ -56,6 +56,39 @@ struct NetworkCondition {
   std::uint32_t limit_packets = 1000;
 };
 
+class NetworkNamespace {
+ public:
+  static NetworkNamespace Create();
+
+  NetworkNamespace() = default;
+  NetworkNamespace(const NetworkNamespace&) = delete;
+  NetworkNamespace& operator=(const NetworkNamespace&) = delete;
+  NetworkNamespace(NetworkNamespace&& other) noexcept;
+  NetworkNamespace& operator=(NetworkNamespace&& other) noexcept;
+  ~NetworkNamespace();
+
+  int fd() const { return fd_; }
+  pid_t helper_pid() const { return helper_pid_; }
+  void Stop();
+
+ private:
+  NetworkNamespace(pid_t helper_pid, int fd)
+      : helper_pid_(helper_pid), fd_(fd) {}
+
+  pid_t helper_pid_ = -1;
+  int fd_ = -1;
+};
+
+struct NodeVethConfig {
+  std::string host_name;
+  std::string peer_name;
+  std::string host_address;
+  std::string node_address;
+  std::uint8_t prefix_len = 30;
+  bool apply_condition = false;
+  NetworkCondition condition;
+};
+
 struct NetworkNamespaceProbe {
   pid_t helper_pid = -1;
   std::vector<LinkInfo> parent_links;
@@ -160,6 +193,8 @@ void ReplaceRootPfifoQdisc(const std::string& if_name,
 void ReplaceRootNetemQdisc(const std::string& if_name,
                            const NetworkCondition& condition);
 void DeleteRootQdisc(const std::string& if_name);
+void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config);
+void DeleteNodeVethNetwork(const NodeVethConfig& config);
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();
 RouteProbe ProbeIpv4RouteAssignment();

@@ -62,8 +62,7 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
       "-server=1",
       Arg("-rpcuser", config.rpc_user),
       Arg("-rpcpassword", config.rpc_password),
-      "-rpcbind=127.0.0.1",
-      "-rpcallowip=127.0.0.1",
+      Arg("-rpcbind", config.rpc_bind),
       Arg("-rpcport", std::to_string(config.rpc_port)),
       Arg("-port", std::to_string(config.p2p_port)),
       Arg("-listen", config.listen ? "1" : "0"),
@@ -75,6 +74,12 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
       "-printtoconsole=1",
       "-debug=net",
   };
+  for (const auto& allow_ip : config.rpc_allow_ips) {
+    spec.argv.push_back(Arg("-rpcallowip", allow_ip));
+  }
+  if (!config.p2p_bind.empty()) {
+    spec.argv.push_back(Arg("-bind", config.p2p_bind));
+  }
   for (const auto& peer : config.connect_peers) {
     spec.argv.push_back(Arg("-connect", peer));
   }
@@ -83,7 +88,7 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
 
 RpcEndpoint FiroDriver::Endpoint(const FiroNodeConfig& config) const {
   return RpcEndpoint{
-      .host = "127.0.0.1",
+      .host = config.rpc_host,
       .port = config.rpc_port,
       .user = config.rpc_user,
       .password = config.rpc_password,
