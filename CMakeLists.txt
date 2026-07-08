@@ -1,92 +1,97 @@
+cmake_minimum_required(VERSION 3.20)
 
-################################################
-cmake_minimum_required(VERSION 3.19)
-project(storage-engine LANGUAGES CXX)
+project(benchmark_project LANGUAGES CXX)
 
-################################################
-# CMake utilities
-include(cmake/utilities.cmake)
+include(CTest)
 
-# Universal settings
+set(BOOST_INCLUDE_LIBRARIES
+  asio
+  beast
+  json
+  log
+  program_options
+  system
+  test
+)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-project(benchmark_project LANGUAGES CXX C)
+# Boost.Regex can discover optional ICU support; the simulator does not vendor
+# ICU, so keep the vendored Boost build from creating system-ICU targets.
+set(CMAKE_DISABLE_FIND_PACKAGE_ICU ON)
+add_subdirectory(third_party/boost EXCLUDE_FROM_ALL)
 
-include(FetchContent)
+function(collect_directory_targets output directory)
+  get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+  get_property(subdirectories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+  foreach(subdirectory IN LISTS subdirectories)
+    collect_directory_targets(child_targets "${subdirectory}")
+    list(APPEND targets ${child_targets})
+  endforeach()
+  set(${output} ${targets} PARENT_SCOPE)
+endfunction()
 
-################################################
-# Define global variables
-set(thirdparty_source ${CMAKE_SOURCE_DIR}/thirdparty CACHE INTERNAL "Thirdparty source location." FORCE)
+function(mark_target_interface_includes_system target)
+  get_target_property(include_dirs "${target}" INTERFACE_INCLUDE_DIRECTORIES)
+  if(include_dirs)
+    set_property(TARGET "${target}" APPEND PROPERTY
+      INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${include_dirs}
+    )
+  endif()
+endfunction()
 
-if(CMAKE_BUILD_TYPE MATCHES Debug)
-  add_definitions(-DDEBUGBUILD)
-  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3 -ggdb")
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3 -ggdb")
+collect_directory_targets(boost_targets "${CMAKE_CURRENT_SOURCE_DIR}/third_party/boost")
+foreach(boost_target IN LISTS boost_targets)
+  mark_target_interface_includes_system("${boost_target}")
+endforeach()
+
+add_executable(benchmark-sim
+  src/cgroup.cpp
+  src/firo_driver.cpp
+  src/http_client.cpp
+  src/logging.cpp
+  src/main.cpp
+  src/process.cpp
+  src/util.cpp
+)
+
+target_include_directories(benchmark-sim PRIVATE include)
+target_link_libraries(benchmark-sim PRIVATE
+  Boost::asio
+  Boost::beast
+  Boost::json
+  Boost::log
+  Boost::log_setup
+  Boost::program_options
+  Boost::system
+)
+target_compile_options(benchmark-sim PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Wconversion
+)
+
+if(BUILD_TESTING)
+  add_executable(benchmark-sim-unit-tests
+    tests/unit/util_tests.cpp
+    src/util.cpp
+  )
+  target_include_directories(benchmark-sim-unit-tests PRIVATE include)
+  target_link_libraries(benchmark-sim-unit-tests PRIVATE
+    Boost::json
+    Boost::unit_test_framework
+  )
+  target_compile_options(benchmark-sim-unit-tests PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion
+  )
+  add_test(NAME benchmark-sim-unit-tests COMMAND benchmark-sim-unit-tests)
 endif()
 
-################################################
-# Add thirdparty libaries
-# Define submodules required commit
-set(googletest_dir "googletest")
-set(benchmark_dir "benchmark")
-set(asio_dir "asio")
-set(rpclib_dir "rpclib")
-set(json_rpc_cxx "json-rpc-cxx")
-
-# v1.14.x
-set(googletest_REQUIRED_COMMIT "f8d7d77c06936315286eb55f8de22cd23c188571")
-# v1.8.3
-set(benchmark_REQUIRED_COMMIT "344117638c8ff7e239044fd0fa7085839fc03021")
-# boost-1.83.0
-set(asio_REQUIRED_COMMIT "f2fbbd824c1fafa67c1b9c7ee6e4d2649b343a46")
-# cpr 1.10.5
-set(cpr_REQUIRED_COMMIT "3b15fa82ea74739b574d705fea44959b58142eb8")
-
-################################################
-# Git submodules setup
-find_package(Git QUIET)
-
-if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-  set_submodule_with_specific_commit(${thirdparty_source}/${googletest_dir}      ${googletest_REQUIRED_COMMIT})
-  set_submodule_with_specific_commit(${thirdparty_source}/${benchmark_dir}       ${benchmark_REQUIRED_COMMIT})
-  set_submodule_with_specific_commit(${thirdparty_source}/${asio_dir}            ${asio_REQUIRED_COMMIT})
-else()
-  message(FATAL_ERROR "Cannot find git executable. Make sure you have installed git.")
-endif()
-
-################################################
-# googltest only if testing is enabled.
-if(BUILD_TESTS)
-  include(cmake/googletest.cmake)
-endif()
-
-################################################
-# googlebenchmark
-include(cmake/benchmark.cmake)
-
-################################################
-# asio
-include(cmake/asio.cmake)
-
-################################################
-# cpr
-include(cmake/cpr.cmake)
-
-
-################################################
-# Boost
-set(Boost_USE_STATIC_LIBS OFF)
-set(Boost_USE_MULTITHREADED ON)
-set(Boost_USE_STATIC_RUNTIME OFF)
-find_package(Boost 1.81.0 COMPONENTS system filesystem thread date_time chrono regex serialization program_options log json)
-
-if(NOT Boost_FOUND)
-  message(FATAL_ERROR "Cannot find boost libraries")
-endif()
-
-add_executable(benchmark_project benchmark_project.cpp)
-target_include_directories(benchmark_project PRIVATE ${Boost_INCLUDE_DIRS})
-target_link_libraries(benchmark_project PRIVATE gtest ${Boost_LIBRARIES} cpr::cpr)
+install(TARGETS benchmark-sim RUNTIME DESTINATION bin)
