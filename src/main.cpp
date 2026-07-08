@@ -552,6 +552,14 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
     qdisc_json["handle"] = qdisc.handle;
     qdisc_json["parent"] = qdisc.parent;
     qdisc_json["info"] = qdisc.info;
+    qdisc_json["has_stats"] = qdisc.has_stats;
+    qdisc_json["bytes"] = qdisc.bytes;
+    qdisc_json["packets"] = qdisc.packets;
+    qdisc_json["drops"] = qdisc.drops;
+    qdisc_json["overlimits"] = qdisc.overlimits;
+    qdisc_json["qlen"] = qdisc.qlen;
+    qdisc_json["backlog"] = qdisc.backlog;
+    qdisc_json["requeues"] = qdisc.requeues;
     qdisc_json["has_netem_options"] = qdisc.has_netem_options;
     qdisc_json["netem_latency_us"] = qdisc.netem_latency_us;
     qdisc_json["netem_jitter_us"] = qdisc.netem_jitter_us;

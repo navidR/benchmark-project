@@ -49,6 +49,14 @@ struct QdiscInfo {
   std::uint32_t handle = 0;
   std::uint32_t parent = 0;
   std::uint32_t info = 0;
+  bool has_stats = false;
+  std::uint64_t bytes = 0;
+  std::uint64_t packets = 0;
+  std::uint32_t drops = 0;
+  std::uint32_t overlimits = 0;
+  std::uint32_t qlen = 0;
+  std::uint32_t backlog = 0;
+  std::uint32_t requeues = 0;
   bool has_netem_options = false;
   std::uint32_t netem_latency_us = 0;
   std::uint32_t netem_jitter_us = 0;

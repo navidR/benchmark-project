@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <linux/gen_stats.h>
 #include <linux/if_link.h>
 #include <linux/pkt_sched.h>
 #include <linux/rtnetlink.h>
@@ -681,27 +682,109 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
     return MNL_CB_OK;
   }
 
-  if (attr_type == TCA_KIND) {
-    if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
+  switch (attr_type) {
+    case TCA_KIND:
+      if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
+        return MNL_CB_ERROR;
+      }
+      qdisc->kind = mnl_attr_get_str(attr);
+      return MNL_CB_OK;
+    case TCA_STATS:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) < sizeof(tc_stats)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      } else {
+        const auto* stats =
+            static_cast<const tc_stats*>(mnl_attr_get_payload(attr));
+        qdisc->has_stats = true;
+        qdisc->bytes = stats->bytes;
+        qdisc->packets = stats->packets;
+        qdisc->drops = stats->drops;
+        qdisc->overlimits = stats->overlimits;
+        qdisc->qlen = stats->qlen;
+        qdisc->backlog = stats->backlog;
+      }
+      return MNL_CB_OK;
+    case TCA_OPTIONS: {
+      const auto payload_len =
+          static_cast<std::size_t>(mnl_attr_get_payload_len(attr));
+      if (payload_len >= sizeof(tc_netem_qopt)) {
+        const auto* options =
+            static_cast<const tc_netem_qopt*>(mnl_attr_get_payload(attr));
+        qdisc->has_netem_options = true;
+        qdisc->netem_latency_us = options->latency;
+        qdisc->netem_jitter_us = options->jitter;
+        qdisc->netem_loss = options->loss;
+        qdisc->netem_duplicate = options->duplicate;
+        qdisc->netem_limit_packets = options->limit;
+      }
+      return MNL_CB_OK;
+    }
+    default:
+      return MNL_CB_OK;
+  }
+}
+
+int ParseQdiscStats2Attr(const nlattr* attr, void* data) {
+  auto* qdisc = static_cast<QdiscInfo*>(data);
+  const uint16_t attr_type = mnl_attr_get_type(attr);
+  if (mnl_attr_type_valid(attr, TCA_STATS_MAX) < 0) {
+    return MNL_CB_OK;
+  }
+
+  switch (attr_type) {
+    case TCA_STATS_BASIC:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) < sizeof(gnet_stats_basic)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      } else {
+        const auto* stats =
+            static_cast<const gnet_stats_basic*>(mnl_attr_get_payload(attr));
+        qdisc->has_stats = true;
+        qdisc->bytes = stats->bytes;
+        qdisc->packets = stats->packets;
+      }
+      return MNL_CB_OK;
+    case TCA_STATS_PKT64:
+      if (mnl_attr_validate(attr, MNL_TYPE_U64) < 0) {
+        return MNL_CB_ERROR;
+      }
+      qdisc->has_stats = true;
+      qdisc->packets = mnl_attr_get_u64(attr);
+      return MNL_CB_OK;
+    case TCA_STATS_QUEUE:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) < sizeof(gnet_stats_queue)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      } else {
+        const auto* stats =
+            static_cast<const gnet_stats_queue*>(mnl_attr_get_payload(attr));
+        qdisc->has_stats = true;
+        qdisc->qlen = stats->qlen;
+        qdisc->backlog = stats->backlog;
+        qdisc->drops = stats->drops;
+        qdisc->requeues = stats->requeues;
+        qdisc->overlimits = stats->overlimits;
+      }
+      return MNL_CB_OK;
+    default:
+      return MNL_CB_OK;
+  }
+}
+
+int ParseQdiscTopLevelAttr(const nlattr* attr, void* data) {
+  auto* qdisc = static_cast<QdiscInfo*>(data);
+  const uint16_t attr_type = mnl_attr_get_type(attr);
+  if (attr_type == TCA_STATS2) {
+    if (mnl_attr_parse_nested(attr, ParseQdiscStats2Attr, qdisc) < 0) {
       return MNL_CB_ERROR;
     }
-    qdisc->kind = mnl_attr_get_str(attr);
+    return MNL_CB_OK;
   }
-  if (attr_type == TCA_OPTIONS) {
-    const auto payload_len = static_cast<std::size_t>(
-        mnl_attr_get_payload_len(attr));
-    if (payload_len >= sizeof(tc_netem_qopt)) {
-      const auto* options =
-          static_cast<const tc_netem_qopt*>(mnl_attr_get_payload(attr));
-      qdisc->has_netem_options = true;
-      qdisc->netem_latency_us = options->latency;
-      qdisc->netem_jitter_us = options->jitter;
-      qdisc->netem_loss = options->loss;
-      qdisc->netem_duplicate = options->duplicate;
-      qdisc->netem_limit_packets = options->limit;
-    }
-  }
-  return MNL_CB_OK;
+  return ParseQdiscAttr(attr, data);
 }
 
 int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
@@ -723,7 +806,8 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
       qdisc.if_name = if_name;
     }
   }
-  if (mnl_attr_parse(nlh, sizeof(*message), ParseQdiscAttr, &qdisc) < 0) {
+  if (mnl_attr_parse(nlh, sizeof(*message), ParseQdiscTopLevelAttr, &qdisc) <
+      0) {
     return MNL_CB_ERROR;
   }
   if (qdisc.kind != "netem") {
