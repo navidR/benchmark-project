@@ -1548,6 +1548,77 @@ NetworkConditionProbe ProbeNetworkCondition() {
   return probe;
 }
 
+NetworkConditionUpdateProbe ProbeNetworkConditionUpdate() {
+  NetworkConditionUpdateProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  probe.initial_condition.delay_ms = 20;
+  probe.initial_condition.jitter_ms = 1;
+  probe.initial_condition.loss_basis_points = 5;
+  probe.initial_condition.duplicate_basis_points = 0;
+  probe.initial_condition.limit_packets = 512;
+  probe.updated_condition.delay_ms = 75;
+  probe.updated_condition.jitter_ms = 10;
+  probe.updated_condition.loss_basis_points = 25;
+  probe.updated_condition.duplicate_basis_points = 10;
+  probe.updated_condition.limit_packets = 2048;
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+    ExecuteInNetworkNamespace(namespace_fd.get(), [&probe]() {
+      SetLinkUp("lo", true);
+      SetLinkUp(probe.peer_name, true);
+    });
+
+    ReplaceRootNetemQdisc(probe.host_name, probe.initial_condition);
+    probe.parent_qdiscs_after_initial = ListQdiscs();
+    const QdiscInfo* initial = FindQdiscForInterface(
+        probe.parent_qdiscs_after_initial, probe.host_name, "netem");
+    if (initial == nullptr ||
+        !QdiscMatchesNetworkCondition(*initial, probe.initial_condition)) {
+      throw std::runtime_error("initial live netem condition was not visible");
+    }
+
+    ReplaceRootNetemQdisc(probe.host_name, probe.updated_condition);
+    probe.parent_qdiscs_after_update = ListQdiscs();
+    const QdiscInfo* updated = FindQdiscForInterface(
+        probe.parent_qdiscs_after_update, probe.host_name, "netem");
+    if (updated == nullptr ||
+        !QdiscMatchesNetworkCondition(*updated, probe.updated_condition)) {
+      throw std::runtime_error("updated live netem condition was not visible");
+    }
+
+    DeleteRootQdisc(probe.host_name);
+    probe.parent_qdiscs_after_delete = ListQdiscs();
+    if (HasQdiscKindForInterface(probe.parent_qdiscs_after_delete,
+                                 probe.host_name, "netem")) {
+      throw std::runtime_error("live netem condition remained after delete");
+    }
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+  probe.parent_after_delete = ListNetworkLinks();
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
 QdiscMutationProbe ProbeQdiscMutation() {
   QdiscMutationProbe probe;
   probe.host_name = ProbeName('h');

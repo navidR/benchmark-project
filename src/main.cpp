@@ -59,6 +59,7 @@ struct Options {
   bool probe_capabilities = false;
   bool probe_netns = false;
   bool probe_network_condition = false;
+  bool probe_network_condition_update = false;
   bool probe_qdisc = false;
   bool probe_qdisc_mutation = false;
   bool probe_route = false;
@@ -410,6 +411,10 @@ Options ParseOptions(int argc, char** argv) {
       po::bool_switch(&options.probe_network_condition),
       "apply and remove a netem network condition on a temporary veth peer "
       "through libmnl")(
+      "probe-network-condition-update",
+      po::bool_switch(&options.probe_network_condition_update),
+      "replace a live host-side netem network condition on a temporary veth "
+      "through libmnl")(
       "probe-qdisc", po::bool_switch(&options.probe_qdisc),
       "dump qdisc state for a temporary veth peer through libmnl")(
       "probe-qdisc-mutation",
@@ -479,6 +484,7 @@ Options ParseOptions(int argc, char** argv) {
                            !options.probe_qdisc &&
                            !options.probe_qdisc_mutation &&
                            !options.probe_network_condition &&
+                           !options.probe_network_condition_update &&
                            !options.cleanup_run;
   if (needs_firod && options.firod.empty()) {
     throw std::runtime_error(
@@ -773,6 +779,25 @@ std::string NetworkConditionProbeJson() {
       QdiscsJson(probe.namespace_qdiscs_after_apply);
   result["namespace_qdiscs_after_delete"] =
       QdiscsJson(probe.namespace_qdiscs_after_delete);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string NetworkConditionUpdateProbeJson() {
+  NetworkConditionUpdateProbe probe = ProbeNetworkConditionUpdate();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["initial_condition"] =
+      NetworkConditionJson(probe.initial_condition);
+  result["updated_condition"] = NetworkConditionJson(probe.updated_condition);
+  result["parent_qdiscs_after_initial"] =
+      QdiscsJson(probe.parent_qdiscs_after_initial);
+  result["parent_qdiscs_after_update"] =
+      QdiscsJson(probe.parent_qdiscs_after_update);
+  result["parent_qdiscs_after_delete"] =
+      QdiscsJson(probe.parent_qdiscs_after_delete);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -1273,6 +1298,11 @@ int Run(int argc, char** argv) {
   if (options.probe_network_condition) {
     RequireNetworkSetupCapabilities();
     std::cout << NetworkConditionProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_network_condition_update) {
+    RequireNetworkSetupCapabilities();
+    std::cout << NetworkConditionUpdateProbeJson() << "\n";
     return 0;
   }
   if (options.probe_address) {

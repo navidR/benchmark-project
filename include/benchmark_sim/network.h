@@ -183,6 +183,18 @@ struct NetworkConditionProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
+struct NetworkConditionUpdateProbe {
+  pid_t helper_pid = -1;
+  std::string host_name;
+  std::string peer_name;
+  NetworkCondition initial_condition;
+  NetworkCondition updated_condition;
+  std::vector<QdiscInfo> parent_qdiscs_after_initial;
+  std::vector<QdiscInfo> parent_qdiscs_after_update;
+  std::vector<QdiscInfo> parent_qdiscs_after_delete;
+  std::vector<LinkInfo> parent_after_delete;
+};
+
 std::vector<LinkInfo> ListNetworkLinks();
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
 std::vector<AddressInfo> ListIpv4Addresses();
@@ -220,5 +232,6 @@ RouteProbe ProbeIpv4RouteAssignment();
 QdiscProbe ProbeQdiscDump();
 QdiscMutationProbe ProbeQdiscMutation();
 NetworkConditionProbe ProbeNetworkCondition();
+NetworkConditionUpdateProbe ProbeNetworkConditionUpdate();
 
 }  // namespace bsim
