@@ -103,6 +103,7 @@ target_compile_options(benchmark-sim PRIVATE
   -Wextra
   -Wpedantic
   -Wconversion
+  -Werror
 )
 
 if(BUILD_TESTING)
@@ -135,6 +136,7 @@ if(BUILD_TESTING)
     -Wextra
     -Wpedantic
     -Wconversion
+    -Werror
   )
   add_test(NAME benchmark-sim-unit-tests COMMAND benchmark-sim-unit-tests)
 endif()
