@@ -106,8 +106,10 @@ target_compile_options(benchmark-sim PRIVATE
 if(BUILD_TESTING)
   add_executable(benchmark-sim-unit-tests
     tests/unit/network_tests.cpp
+    tests/unit/process_tests.cpp
     tests/unit/util_tests.cpp
     src/network.cpp
+    src/process.cpp
     src/util.cpp
   )
   target_include_directories(benchmark-sim-unit-tests PRIVATE include)

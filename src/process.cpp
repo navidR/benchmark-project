@@ -3,6 +3,7 @@
 #include "benchmark_sim/util.h"
 
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -22,6 +23,55 @@ namespace {
   write(STDERR_FILENO, message, std::strlen(message));
   write(STDERR_FILENO, "\n", 1);
   _exit(127);
+}
+
+void WriteExactOrExit(int fd, const void* data, size_t size) {
+  const char* cursor = static_cast<const char*>(data);
+  size_t remaining = size;
+  while (remaining != 0U) {
+    const ssize_t written = write(fd, cursor, remaining);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      _exit(127);
+    }
+    cursor += written;
+    remaining -= static_cast<size_t>(written);
+  }
+}
+
+[[noreturn]] void ChildSetupFail(const char* message, int status_fd) {
+  const int status = errno == 0 ? ECHILD : errno;
+  WriteExactOrExit(status_fd, &status, sizeof(status));
+  ChildFail(message);
+}
+
+void WriteSetupOkOrExit(int status_fd) {
+  const int status = 0;
+  WriteExactOrExit(status_fd, &status, sizeof(status));
+}
+
+int ReadSetupStatus(int fd) {
+  int status = 0;
+  char* cursor = reinterpret_cast<char*>(&status);
+  size_t remaining = sizeof(status);
+  while (remaining != 0U) {
+    const ssize_t received = read(fd, cursor, remaining);
+    if (received < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::runtime_error(std::string("read child setup status failed: ") +
+                               std::strerror(errno));
+    }
+    if (received == 0) {
+      throw std::runtime_error("child exited before reporting setup status");
+    }
+    cursor += received;
+    remaining -= static_cast<size_t>(received);
+  }
+  return status;
 }
 
 int OpenLog(const std::filesystem::path& path) {
@@ -76,30 +126,46 @@ ChildProcess ChildProcess::Spawn(
   if (pipe2(gate, O_CLOEXEC) != 0) {
     throw std::runtime_error(std::string("pipe2 failed: ") + std::strerror(errno));
   }
+  int setup_status[2];
+  if (pipe2(setup_status, O_CLOEXEC) != 0) {
+    close(gate[0]);
+    close(gate[1]);
+    throw std::runtime_error(std::string("pipe2 failed: ") + std::strerror(errno));
+  }
 
   pid_t pid = fork();
   if (pid < 0) {
     close(gate[0]);
     close(gate[1]);
+    close(setup_status[0]);
+    close(setup_status[1]);
     throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
   }
 
   if (pid == 0) {
     close(gate[1]);
+    close(setup_status[0]);
+    if (spec.network_namespace_fd &&
+        setns(*spec.network_namespace_fd, CLONE_NEWNET) != 0) {
+      ChildSetupFail("setns network namespace", setup_status[1]);
+    }
     if (setpgid(0, 0) != 0) {
-      ChildFail("setpgid");
+      ChildSetupFail("setpgid", setup_status[1]);
     }
     if (!spec.cwd.empty() && chdir(spec.cwd.c_str()) != 0) {
-      ChildFail("chdir");
+      ChildSetupFail("chdir", setup_status[1]);
     }
 
     int out_fd = OpenLog(spec.stdout_path);
     int err_fd = OpenLog(spec.stderr_path);
     if (dup2(out_fd, STDOUT_FILENO) < 0 || dup2(err_fd, STDERR_FILENO) < 0) {
-      ChildFail("dup2");
+      ChildSetupFail("dup2", setup_status[1]);
     }
     close(out_fd);
     close(err_fd);
+
+    WriteSetupOkOrExit(setup_status[1]);
+    close(setup_status[1]);
 
     char token = 0;
     ssize_t n = read(gate[0], &token, 1);
@@ -127,7 +193,15 @@ ChildProcess ChildProcess::Spawn(
   }
 
   close(gate[0]);
+  close(setup_status[1]);
   try {
+    const int setup = ReadSetupStatus(setup_status[0]);
+    close(setup_status[0]);
+    setup_status[0] = -1;
+    if (setup != 0) {
+      throw std::runtime_error(std::string("child setup failed: ") +
+                               std::strerror(setup));
+    }
     if (cgroup) {
       AttachPidToCgroup(*cgroup, pid);
     }
@@ -137,6 +211,9 @@ ChildProcess ChildProcess::Spawn(
     }
   } catch (...) {
     close(gate[1]);
+    if (setup_status[0] >= 0) {
+      close(setup_status[0]);
+    }
     kill(pid, SIGKILL);
     waitpid(pid, nullptr, 0);
     throw;

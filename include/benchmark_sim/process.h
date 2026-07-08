@@ -16,6 +16,7 @@ struct ProcessSpec {
   std::filesystem::path cwd;
   std::filesystem::path stdout_path;
   std::filesystem::path stderr_path;
+  std::optional<int> network_namespace_fd;
 };
 
 class ChildProcess {
