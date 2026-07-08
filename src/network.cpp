@@ -27,6 +27,7 @@
 #include <exception>
 #include <future>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -322,6 +323,8 @@ std::string DescribeTcFilters(const std::vector<TcFilterInfo>& filters) {
            << " ip_proto="
            << (filter.has_ip_proto ? static_cast<unsigned int>(filter.ip_proto)
                                    : 0U)
+           << " ipv4_src="
+           << (filter.has_ipv4_src ? filter.ipv4_src : std::string(""))
            << " ipv4_dst="
            << (filter.has_ipv4_dst ? filter.ipv4_dst : std::string(""))
            << " tcp_dst=" << (filter.has_tcp_dst ? filter.tcp_dst : 0U)
@@ -518,11 +521,26 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& dst_address,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle) {
+  return TcFilterMatchesEgressIpv4TcpDrop(filter, if_name, "", dst_address,
+                                          dst_port, handle);
+}
+
+bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
+                                      const std::string& if_name,
+                                      const std::string& src_address,
+                                      const std::string& dst_address,
+                                      std::uint16_t dst_port,
+                                      std::uint32_t handle) {
+  const bool source_matches =
+      src_address.empty()
+          ? !filter.has_ipv4_src
+          : (filter.has_ipv4_src && filter.ipv4_src == src_address);
   return filter.if_name == if_name && filter.kind == "flower" &&
          filter.handle == handle && filter.parent == kClsactEgressParent &&
          filter.egress && filter.protocol == ETH_P_IP &&
          filter.has_eth_type && filter.eth_type == ETH_P_IP &&
          filter.has_ip_proto && filter.ip_proto == IPPROTO_TCP &&
+         source_matches &&
          filter.has_ipv4_dst && filter.ipv4_dst == dst_address &&
          filter.has_tcp_dst && filter.tcp_dst == dst_port &&
          filter.has_drop_action;
@@ -1252,6 +1270,32 @@ int ParseFlowerAttr(const nlattr* attr, void* data) {
       }
       filter->has_ip_proto = true;
       filter->ip_proto = mnl_attr_get_u8(attr);
+      return MNL_CB_OK;
+    case TCA_FLOWER_KEY_IPV4_SRC:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) != sizeof(in_addr)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      }
+      filter->has_ipv4_src = true;
+      try {
+        filter->ipv4_src = Ipv4ToString(mnl_attr_get_payload(attr));
+      } catch (...) {
+        return MNL_CB_ERROR;
+      }
+      return MNL_CB_OK;
+    case TCA_FLOWER_KEY_IPV4_SRC_MASK:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) != sizeof(in_addr)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      }
+      filter->has_ipv4_src_mask = true;
+      try {
+        filter->ipv4_src_mask = Ipv4ToString(mnl_attr_get_payload(attr));
+      } catch (...) {
+        return MNL_CB_ERROR;
+      }
       return MNL_CB_OK;
     case TCA_FLOWER_KEY_IPV4_DST:
       if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
@@ -2093,6 +2137,14 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
                                     const std::string& dst_address,
                                     std::uint16_t dst_port,
                                     std::uint32_t handle) {
+  ReplaceEgressIpv4TcpDropFilter(if_name, "", dst_address, dst_port, handle);
+}
+
+void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
+                                    const std::string& src_address,
+                                    const std::string& dst_address,
+                                    std::uint16_t dst_port,
+                                    std::uint32_t handle) {
   RequireInterfaceName(if_name);
   RequireDropFilterHandle(handle);
   if (dst_port == 0U) {
@@ -2102,6 +2154,10 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
   if (if_index == 0U) {
     throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
                              std::strerror(errno));
+  }
+  std::optional<in_addr> ipv4_source;
+  if (!src_address.empty()) {
+    ipv4_source = ParseIpv4Address(src_address, "source");
   }
   const in_addr ipv4_address = ParseIpv4Address(dst_address, "destination");
   const std::uint32_t ipv4_mask = 0xFFFFFFFFU;
@@ -2131,6 +2187,11 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
                    htons(static_cast<std::uint16_t>(ETH_P_IP)));
   mnl_attr_put_u8(nlh, TCA_FLOWER_KEY_IP_PROTO,
                   static_cast<std::uint8_t>(IPPROTO_TCP));
+  if (ipv4_source) {
+    mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_SRC,
+                     ipv4_source->s_addr);
+    mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_SRC_MASK, ipv4_mask);
+  }
   mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST, ipv4_address.s_addr);
   mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST_MASK, ipv4_mask);
   mnl_attr_put_u16(nlh, TCA_FLOWER_KEY_TCP_DST, htons(dst_port));

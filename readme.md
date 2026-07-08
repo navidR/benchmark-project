@@ -14,7 +14,8 @@ the Firo path is working end to end.
 - Start up to 16 Firo regtest nodes.
 - Run Firo nodes inside isolated network namespaces with one veth pair per node.
 - Apply simple per-node network conditions through host-side `netem` or TBF.
-- Apply and remove live per-node TCP destination block rules.
+- Apply and remove live per-node TCP block rules, optionally scoped by source.
+- Apply and heal source-aware group network partitions.
 - Apply live per-node cgroup resource updates after startup.
 - Restart a running Firo node before workload generation.
 - Freeze and thaw a running Firo node cgroup for a bounded duration.
@@ -197,7 +198,8 @@ running, before block generation:
 ```
 
 Runtime block/unblock rules match a destination IPv4 address and TCP port on a
-node's host-side veth. This example applies and then removes the same rule
+node's host-side veth. Add `src_address` when the rule should only match one
+source node. This example applies and then removes the same source-scoped rule
 before block generation:
 
 ```bash
@@ -209,11 +211,12 @@ before block generation:
   --nodes 2 \
   --generate-blocks 1 \
   --isolate-network \
-  --runtime-node-block-json '{"node":1,"dst_address":"10.210.1.2","dst_port":18168}' \
-  --runtime-node-unblock-json '{"node":1,"dst_address":"10.210.1.2","dst_port":18168}'
+  --runtime-node-block-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}' \
+  --runtime-node-unblock-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}'
 ```
 
-Runtime partition/heal currently supports two singleton node groups:
+Runtime partition/heal accepts two node groups and installs source-aware
+cross-group P2P block rules in both directions:
 
 ```bash
 ./build/benchmark-sim \
@@ -221,11 +224,11 @@ Runtime partition/heal currently supports two singleton node groups:
   --output-dir runs \
   --run-id live-partition-heal \
   --replace-run \
-  --nodes 2 \
+  --nodes 3 \
   --generate-blocks 1 \
   --isolate-network \
-  --runtime-partition-json '{"group_a":[1],"group_b":[2]}' \
-  --runtime-heal-partition-json '{"group_a":[1],"group_b":[2]}'
+  --runtime-partition-json '{"group_a":[1,2],"group_b":[3]}' \
+  --runtime-heal-partition-json '{"group_a":[1,2],"group_b":[3]}'
 ```
 
 The current implementation applies bandwidth with TBF and delay/loss conditions
@@ -316,7 +319,7 @@ The same run settings can be loaded from a JSON scenario file:
   "firod": "/path/to/firod",
   "output_dir": "runs",
   "run_id": "scenario-smoke",
-  "nodes": 1,
+  "nodes": 3,
   "generate_blocks": 1,
   "ready_timeout_sec": 45,
   "sync_timeout_sec": 45,
@@ -353,6 +356,7 @@ The same run settings can be loaded from a JSON scenario file:
     "runtime_node_blocks": [
       {
         "node": 1,
+        "src_address": "10.210.2.2",
         "dst_address": "10.210.1.2",
         "dst_port": 18168
       }
@@ -360,20 +364,21 @@ The same run settings can be loaded from a JSON scenario file:
     "runtime_node_unblocks": [
       {
         "node": 1,
+        "src_address": "10.210.2.2",
         "dst_address": "10.210.1.2",
         "dst_port": 18168
       }
     ],
     "runtime_partitions": [
       {
-        "group_a": [1],
-        "group_b": [2]
+        "group_a": [1, 2],
+        "group_b": [3]
       }
     ],
     "runtime_partition_heals": [
       {
-        "group_a": [1],
-        "group_b": [2]
+        "group_a": [1, 2],
+        "group_b": [3]
       }
     ]
   },

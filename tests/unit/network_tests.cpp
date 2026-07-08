@@ -147,6 +147,56 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_egress_ipv4_tcp_drop) {
       filter, "veth0", "198.51.100.7", 18168, 1001));
 }
 
+BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_source_aware_tcp_drop) {
+  bsim::TcFilterInfo filter;
+  filter.if_name = "veth0";
+  filter.kind = "flower";
+  filter.handle = 1001;
+  filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
+  filter.protocol = ETH_P_IP;
+  filter.egress = true;
+  filter.has_eth_type = true;
+  filter.eth_type = ETH_P_IP;
+  filter.has_ip_proto = true;
+  filter.ip_proto = IPPROTO_TCP;
+  filter.has_ipv4_src = true;
+  filter.ipv4_src = "198.51.100.11";
+  filter.has_ipv4_dst = true;
+  filter.ipv4_dst = "198.51.100.7";
+  filter.has_tcp_dst = true;
+  filter.tcp_dst = 18168;
+  filter.has_drop_action = true;
+
+  BOOST_TEST(bsim::TcFilterMatchesEgressIpv4TcpDrop(
+      filter, "veth0", "198.51.100.11", "198.51.100.7", 18168, 1001));
+  BOOST_TEST(!bsim::TcFilterMatchesEgressIpv4TcpDrop(
+      filter, "veth0", "198.51.100.12", "198.51.100.7", 18168, 1001));
+}
+
+BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_source_filter_for_dst_only) {
+  bsim::TcFilterInfo filter;
+  filter.if_name = "veth0";
+  filter.kind = "flower";
+  filter.handle = 1001;
+  filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
+  filter.protocol = ETH_P_IP;
+  filter.egress = true;
+  filter.has_eth_type = true;
+  filter.eth_type = ETH_P_IP;
+  filter.has_ip_proto = true;
+  filter.ip_proto = IPPROTO_TCP;
+  filter.has_ipv4_src = true;
+  filter.ipv4_src = "198.51.100.11";
+  filter.has_ipv4_dst = true;
+  filter.ipv4_dst = "198.51.100.7";
+  filter.has_tcp_dst = true;
+  filter.tcp_dst = 18168;
+  filter.has_drop_action = true;
+
+  BOOST_TEST(!bsim::TcFilterMatchesEgressIpv4TcpDrop(
+      filter, "veth0", "198.51.100.7", 18168, 1001));
+}
+
 BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_wrong_port) {
   bsim::TcFilterInfo filter;
   filter.if_name = "veth0";

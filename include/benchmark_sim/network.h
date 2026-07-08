@@ -86,6 +86,10 @@ struct TcFilterInfo {
   std::uint16_t eth_type = 0;
   bool has_ip_proto = false;
   std::uint8_t ip_proto = 0;
+  bool has_ipv4_src = false;
+  std::string ipv4_src;
+  bool has_ipv4_src_mask = false;
+  std::string ipv4_src_mask;
   bool has_ipv4_dst = false;
   std::string ipv4_dst;
   bool has_ipv4_dst_mask = false;
@@ -274,6 +278,12 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& dst_address,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle);
+bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
+                                      const std::string& if_name,
+                                      const std::string& src_address,
+                                      const std::string& dst_address,
+                                      std::uint16_t dst_port,
+                                      std::uint32_t handle);
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace();
 void CreateVethPair(const std::string& host_name, const std::string& peer_name);
 void DeleteLink(const std::string& name);
@@ -298,6 +308,11 @@ void ReplaceNetworkConditionQdisc(const std::string& if_name,
                                   const NetworkCondition& condition);
 void DeleteRootQdisc(const std::string& if_name);
 void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
+                                    const std::string& dst_address,
+                                    std::uint16_t dst_port,
+                                    std::uint32_t handle);
+void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
+                                    const std::string& src_address,
                                     const std::string& dst_address,
                                     std::uint16_t dst_port,
                                     std::uint32_t handle);

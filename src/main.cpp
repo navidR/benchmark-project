@@ -61,6 +61,7 @@ struct FreezeRequest {
 
 struct NetworkBlockRule {
   uint32_t node_index = 0;
+  std::string src_address;
   std::string dst_address;
   uint16_t dst_port = 0;
   uint32_t handle = 0;
@@ -321,6 +322,9 @@ uint32_t StableRuleHandle(const NetworkBlockRule& rule) {
     }
   };
   mix_uint32(rule.node_index + 1U);
+  for (const unsigned char c : rule.src_address) {
+    mix_byte(c);
+  }
   for (const unsigned char c : rule.dst_address) {
     mix_byte(c);
   }
@@ -342,6 +346,14 @@ NetworkBlockRule ParseNetworkBlockRuleObject(
 
   NetworkBlockRule rule;
   rule.node_index = node - 1U;
+  const boost::json::value* src_address = object.if_contains("src_address");
+  if (src_address != nullptr) {
+    if (!src_address->is_string()) {
+      throw std::runtime_error(
+          "network block rule src_address must be a string");
+    }
+    rule.src_address = std::string(src_address->as_string());
+  }
   rule.dst_address = JsonStringField(object, "dst_address");
   rule.dst_port = static_cast<uint16_t>(dst_port);
   rule.handle = JsonOptionalUint32Field(object, "handle", 0U);
@@ -1029,24 +1041,25 @@ Options ParseOptions(int argc, char** argv) {
       "runtime-node-block-json",
       po::value<std::vector<std::string>>(&options.runtime_node_block_json)
           ->composing(),
-      "repeatable JSON object with node, dst_address, dst_port, and optional "
-      "handle for one live host-side TCP drop filter")(
+      "repeatable JSON object with node, optional src_address, dst_address, "
+      "dst_port, and optional handle for one live host-side TCP drop filter")(
       "runtime-node-unblock-json",
       po::value<std::vector<std::string>>(&options.runtime_node_unblock_json)
           ->composing(),
-      "repeatable JSON object with node, dst_address, dst_port, and optional "
-      "handle for one live host-side TCP drop filter removal")(
+      "repeatable JSON object with node, optional src_address, dst_address, "
+      "dst_port, and optional handle for one live host-side TCP drop filter "
+      "removal")(
       "runtime-partition-json",
       po::value<std::vector<std::string>>(&options.runtime_partition_json)
           ->composing(),
-      "repeatable JSON object with singleton group_a and group_b arrays for "
-      "one live two-node partition")(
+      "repeatable JSON object with group_a and group_b arrays for one live "
+      "source-aware group partition")(
       "runtime-heal-partition-json",
       po::value<std::vector<std::string>>(
           &options.runtime_heal_partition_json)
           ->composing(),
-      "repeatable JSON object with singleton group_a and group_b arrays for "
-      "one live two-node partition heal")(
+      "repeatable JSON object with group_a and group_b arrays for one live "
+      "source-aware group partition heal")(
       "runtime-node-resource-json",
       po::value<std::vector<std::string>>(
           &options.runtime_node_resource_json)
@@ -1308,6 +1321,10 @@ boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
     filter_json["eth_type"] = filter.eth_type;
     filter_json["has_ip_proto"] = filter.has_ip_proto;
     filter_json["ip_proto"] = filter.ip_proto;
+    filter_json["has_ipv4_src"] = filter.has_ipv4_src;
+    filter_json["ipv4_src"] = filter.ipv4_src;
+    filter_json["has_ipv4_src_mask"] = filter.has_ipv4_src_mask;
+    filter_json["ipv4_src_mask"] = filter.ipv4_src_mask;
     filter_json["has_ipv4_dst"] = filter.has_ipv4_dst;
     filter_json["ipv4_dst"] = filter.ipv4_dst;
     filter_json["has_ipv4_dst_mask"] = filter.has_ipv4_dst_mask;
@@ -1338,6 +1355,9 @@ boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
 boost::json::object NetworkBlockRuleJson(const NetworkBlockRule& rule) {
   boost::json::object object;
   object["node"] = rule.node_index + 1U;
+  if (!rule.src_address.empty()) {
+    object["src_address"] = rule.src_address;
+  }
   object["dst_address"] = rule.dst_address;
   object["dst_port"] = rule.dst_port;
   object["handle"] = rule.handle;
@@ -2643,8 +2663,8 @@ bool NetworkBlockRulePresent(const NodeRuntime& node,
   const std::vector<TcFilterInfo> filters = ListTcFilters();
   for (const TcFilterInfo& filter : filters) {
     if (TcFilterMatchesEgressIpv4TcpDrop(filter, node.network->host_name,
-                                         rule.dst_address, rule.dst_port,
-                                         rule.handle)) {
+                                         rule.src_address, rule.dst_address,
+                                         rule.dst_port, rule.handle)) {
       return true;
     }
   }
@@ -2682,8 +2702,9 @@ void ApplyRuntimeNetworkBlockRules(const Options& options,
     NodeRuntime& node = nodes[rule.node_index];
     RequireNetworkBlockNode(node);
     const bool existed_before = NetworkBlockRulePresent(node, rule);
-    ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.dst_address,
-                                   rule.dst_port, rule.handle);
+    ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
+                                   rule.dst_address, rule.dst_port,
+                                   rule.handle);
     const bool present_after = NetworkBlockRulePresent(node, rule);
     if (!present_after) {
       throw std::runtime_error(
@@ -2721,15 +2742,17 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
   }
 }
 
-NetworkBlockRule MakeP2pBlockRule(uint32_t node_index,
+NetworkBlockRule MakeP2pBlockRule(uint32_t src_node_index,
+                                  uint32_t dst_node_index,
                                   const std::vector<NodeRuntime>& nodes) {
-  if (node_index >= nodes.size()) {
+  if (src_node_index >= nodes.size() || dst_node_index >= nodes.size()) {
     throw std::runtime_error("partition node is out of range");
   }
   NetworkBlockRule rule;
-  rule.node_index = node_index;
-  rule.dst_address = NodeAddress(node_index);
-  rule.dst_port = nodes[node_index].config.p2p_port;
+  rule.node_index = dst_node_index;
+  rule.src_address = NodeAddress(src_node_index);
+  rule.dst_address = NodeAddress(dst_node_index);
+  rule.dst_port = nodes[dst_node_index].config.p2p_port;
   rule.handle = StableRuleHandle(rule);
   return rule;
 }
@@ -2737,13 +2760,15 @@ NetworkBlockRule MakeP2pBlockRule(uint32_t node_index,
 std::vector<NetworkBlockRule> PartitionBlockRules(
     const NetworkPartitionRule& partition,
     const std::vector<NodeRuntime>& nodes) {
-  if (partition.group_a.size() != 1U || partition.group_b.size() != 1U) {
-    throw std::runtime_error(
-        "current partition MVP supports exactly one node in group_a and "
-        "exactly one node in group_b");
+  std::vector<NetworkBlockRule> rules;
+  rules.reserve((partition.group_a.size() * partition.group_b.size()) * 2U);
+  for (uint32_t node_a : partition.group_a) {
+    for (uint32_t node_b : partition.group_b) {
+      rules.push_back(MakeP2pBlockRule(node_a, node_b, nodes));
+      rules.push_back(MakeP2pBlockRule(node_b, node_a, nodes));
+    }
   }
-  return {MakeP2pBlockRule(partition.group_a.front(), nodes),
-          MakeP2pBlockRule(partition.group_b.front(), nodes)};
+  return rules;
 }
 
 boost::json::object PartitionRuleResultJson(const NodeRuntime& node,
@@ -2767,7 +2792,7 @@ std::string NetworkPartitionDetail(
     const boost::json::array& rule_results) {
   boost::json::object detail = NetworkPartitionRuleJson(partition);
   detail["rules"] = rule_results;
-  detail["scope"] = "two_node_mvp";
+  detail["scope"] = "source_aware_group";
   return boost::json::serialize(detail);
 }
 
@@ -2785,8 +2810,9 @@ void ApplyRuntimeNetworkPartition(
         DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
       }
     } else {
-      ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.dst_address,
-                                     rule.dst_port, rule.handle);
+      ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
+                                     rule.dst_address, rule.dst_port,
+                                     rule.handle);
     }
     const bool present_after = NetworkBlockRulePresent(node, rule);
     if (!heal && !present_after) {
