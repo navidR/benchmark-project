@@ -202,4 +202,23 @@ std::optional<bool> JsonOptionalBool(const boost::json::value& value,
   return found->as_bool();
 }
 
+std::optional<double> JsonOptionalDouble(const boost::json::value& value,
+                                         std::string_view field) {
+  const auto& object = value.as_object();
+  const boost::json::value* found = object.if_contains(field);
+  if (found == nullptr) {
+    return std::nullopt;
+  }
+  if (found->is_double()) {
+    return found->as_double();
+  }
+  if (found->is_int64()) {
+    return static_cast<double>(found->as_int64());
+  }
+  if (found->is_uint64()) {
+    return static_cast<double>(found->as_uint64());
+  }
+  throw std::runtime_error("JSON field is not numeric: " + std::string(field));
+}
+
 }  // namespace bsim

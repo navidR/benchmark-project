@@ -926,6 +926,11 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   } else {
     object["initial_block_download"] = nullptr;
   }
+  if (chain.difficulty) {
+    object["difficulty"] = *chain.difficulty;
+  } else {
+    object["difficulty"] = nullptr;
+  }
   object["rpc_latency_ms"] = chain.rpc_latency_ms;
   if (cgroup != nullptr) {
     object["cpu_usage_usec"] = cgroup->cpu_usage_usec;

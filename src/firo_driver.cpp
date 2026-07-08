@@ -153,6 +153,7 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
   metrics.mempool_bytes = JsonUint(mempool, "bytes");
   metrics.initial_block_download =
       JsonOptionalBool(blockchain, "initialblockdownload");
+  metrics.difficulty = JsonOptionalDouble(blockchain, "difficulty");
   metrics.rpc_latency_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
   return metrics;

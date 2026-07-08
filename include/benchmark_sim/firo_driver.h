@@ -21,6 +21,7 @@ struct FiroMetrics {
   uint64_t mempool_tx_count = 0;
   uint64_t mempool_bytes = 0;
   std::optional<bool> initial_block_download;
+  std::optional<double> difficulty;
   uint64_t rpc_latency_ms = 0;
 };
 

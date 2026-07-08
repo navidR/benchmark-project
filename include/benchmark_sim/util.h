@@ -30,5 +30,7 @@ std::string JsonString(const boost::json::value& value,
 uint64_t JsonUint(const boost::json::value& value, std::string_view field);
 std::optional<bool> JsonOptionalBool(const boost::json::value& value,
                                      std::string_view field);
+std::optional<double> JsonOptionalDouble(const boost::json::value& value,
+                                         std::string_view field);
 
 }  // namespace bsim
