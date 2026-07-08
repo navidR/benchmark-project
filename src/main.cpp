@@ -36,6 +36,7 @@ struct Options {
   uint32_t ready_timeout_sec = 30;
   bool keep_cgroups = false;
   bool replace_run = false;
+  bool probe_netns = false;
   bool probe_network = false;
 };
 
@@ -64,6 +65,8 @@ Options ParseOptions(int argc, char** argv) {
                              "leave cgroups after exit for inspection")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
+      "probe-netns", po::bool_switch(&options.probe_netns),
+      "create a temporary network namespace and inspect it through setns/libmnl")(
       "probe-network", po::bool_switch(&options.probe_network),
       "list links through rtnetlink/libmnl and exit");
 
@@ -79,24 +82,36 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error("--nodes currently supports 1..2 for MVP smoke");
   }
   RequireSafeRunId(options.run_id);
-  if (!options.probe_network) {
+  if (!options.probe_network && !options.probe_netns) {
     RequireExecutable(options.firod);
   }
   return options;
 }
 
-std::string NetworkProbeJson() {
+boost::json::array LinksJson(const std::vector<LinkInfo>& links) {
   boost::json::array links_json;
-  for (const LinkInfo& link : ListNetworkLinks()) {
+  for (const LinkInfo& link : links) {
     boost::json::object link_json;
     link_json["index"] = link.index;
     link_json["name"] = link.name;
     link_json["up"] = link.up;
     links_json.push_back(std::move(link_json));
   }
+  return links_json;
+}
 
+std::string NetworkProbeJson() {
   boost::json::object result;
-  result["links"] = std::move(links_json);
+  result["links"] = LinksJson(ListNetworkLinks());
+  return boost::json::serialize(result);
+}
+
+std::string NetworkNamespaceProbeJson() {
+  NetworkNamespaceProbe probe = ProbeIsolatedNetworkNamespace();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["parent_links"] = LinksJson(probe.parent_links);
+  result["namespace_links"] = LinksJson(probe.namespace_links);
   return boost::json::serialize(result);
 }
 
@@ -247,6 +262,10 @@ int Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);
   if (options.probe_network) {
     std::cout << NetworkProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_netns) {
+    std::cout << NetworkNamespaceProbeJson() << "\n";
     return 0;
   }
 
