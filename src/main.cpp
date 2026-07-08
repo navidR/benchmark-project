@@ -683,6 +683,16 @@ const LinkInfo* FindLinkByName(const std::vector<LinkInfo>& links,
   return nullptr;
 }
 
+const QdiscInfo* FindQdiscByInterfaceName(const std::vector<QdiscInfo>& qdiscs,
+                                          std::string_view name) {
+  for (const QdiscInfo& qdisc : qdiscs) {
+    if (qdisc.if_name == name) {
+      return &qdisc;
+    }
+  }
+  return nullptr;
+}
+
 std::string NetworkProbeJson() {
   boost::json::object result;
   result["links"] = LinksJson(ListNetworkLinks());
@@ -812,7 +822,8 @@ std::string AddressProbeJson() {
 
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
                         const FiroMetrics& chain,
-                        const CgroupMetrics* cgroup, const LinkInfo* link) {
+                        const CgroupMetrics* cgroup, const LinkInfo* link,
+                        const QdiscInfo* qdisc) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
@@ -851,6 +862,19 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["network_tx_dropped"] = link->tx_dropped;
     object["network_rx_errors"] = link->rx_errors;
     object["network_tx_errors"] = link->tx_errors;
+  }
+  if (qdisc != nullptr) {
+    object["qdisc_kind"] = qdisc->kind;
+    object["qdisc_handle"] = qdisc->handle;
+    object["qdisc_parent"] = qdisc->parent;
+    object["qdisc_has_stats"] = qdisc->has_stats;
+    object["qdisc_bytes"] = qdisc->bytes;
+    object["qdisc_packets"] = qdisc->packets;
+    object["qdisc_drops"] = qdisc->drops;
+    object["qdisc_overlimits"] = qdisc->overlimits;
+    object["qdisc_qlen"] = qdisc->qlen;
+    object["qdisc_backlog"] = qdisc->backlog;
+    object["qdisc_requeues"] = qdisc->requeues;
   }
   return boost::json::serialize(object);
 }
@@ -1276,14 +1300,20 @@ int Run(int argc, char** argv) {
 
     for (auto& node : nodes) {
       const std::vector<LinkInfo> links = ListNetworkLinks();
+      const std::vector<QdiscInfo> qdiscs = ListQdiscs();
       FiroMetrics chain = driver.ReadMetrics(node.config);
       CgroupMetrics cg = node.cgroup->ReadMetrics();
       const LinkInfo* link = node.network
                                  ? FindLinkByName(links,
                                                   node.network->host_name)
                                  : nullptr;
+      const QdiscInfo* qdisc = node.network
+                                   ? FindQdiscByInterfaceName(
+                                         qdiscs, node.network->host_name)
+                                   : nullptr;
       AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain, &cg, link));
+                 MetricsJson(options.run_id, node.config.id, chain, &cg, link,
+                             qdisc));
     }
 
     if (options.generate_blocks > 0) {
@@ -1305,14 +1335,20 @@ int Run(int argc, char** argv) {
 
     for (auto& node : nodes) {
       const std::vector<LinkInfo> links = ListNetworkLinks();
+      const std::vector<QdiscInfo> qdiscs = ListQdiscs();
       FiroMetrics chain = driver.ReadMetrics(node.config);
       CgroupMetrics cg = node.cgroup->ReadMetrics();
       const LinkInfo* link = node.network
                                  ? FindLinkByName(links,
                                                   node.network->host_name)
                                  : nullptr;
+      const QdiscInfo* qdisc = node.network
+                                   ? FindQdiscByInterfaceName(
+                                         qdiscs, node.network->host_name)
+                                   : nullptr;
       AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain, &cg, link));
+                 MetricsJson(options.run_id, node.config.id, chain, &cg, link,
+                             qdisc));
     }
 
     StopNodes(options, events_path, driver, nodes);
