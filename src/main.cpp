@@ -76,6 +76,7 @@ struct NodeRuntime {
   std::optional<NetworkNamespace> network_namespace;
   std::optional<NodeVethConfig> network;
   ChildProcess process;
+  uint64_t generated_block_count = 0;
 };
 
 uint32_t JsonUint32Field(const boost::json::object& object,
@@ -926,6 +927,7 @@ std::string AddressProbeJson() {
 
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
                         const FiroMetrics& chain,
+                        uint64_t generated_block_count,
                         const CgroupMetrics* cgroup, const LinkInfo* link,
                         const QdiscInfo* qdisc) {
   boost::json::object object;
@@ -937,6 +939,7 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   object["peer_count"] = chain.peer_count;
   object["mempool_tx_count"] = chain.mempool_tx_count;
   object["mempool_bytes"] = chain.mempool_bytes;
+  object["generated_block_count"] = generated_block_count;
   if (chain.initial_block_download) {
     object["initial_block_download"] = *chain.initial_block_download;
   } else {
@@ -1502,8 +1505,8 @@ int Run(int argc, char** argv) {
                                          qdiscs, node.network->host_name)
                                    : nullptr;
       AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain, &cg, link,
-                             qdisc));
+                 MetricsJson(options.run_id, node.config.id, chain,
+                             node.generated_block_count, &cg, link, qdisc));
     }
 
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
@@ -1513,6 +1516,7 @@ int Run(int argc, char** argv) {
           driver.ReadMetrics(nodes.front().config).height;
       std::vector<std::string> hashes = driver.GenerateBlocks(
           nodes.front().config, options.generate_blocks, kDefaultRewardAddress);
+      nodes.front().generated_block_count += hashes.size();
       WriteEvent(events_path, options.run_id, nodes.front().config.id,
                  "generated_blocks", std::to_string(hashes.size()));
       const uint64_t target_height =
@@ -1539,8 +1543,8 @@ int Run(int argc, char** argv) {
                                          qdiscs, node.network->host_name)
                                    : nullptr;
       AppendLine(metrics_path,
-                 MetricsJson(options.run_id, node.config.id, chain, &cg, link,
-                             qdisc));
+                 MetricsJson(options.run_id, node.config.id, chain,
+                             node.generated_block_count, &cg, link, qdisc));
     }
 
     StopNodes(options, events_path, driver, nodes);
