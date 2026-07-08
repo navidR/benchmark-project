@@ -194,11 +194,11 @@ running, before block generation:
   --runtime-node-network-condition-json '{"node":2,"bandwidth_mbps":10}'
 ```
 
-The current implementation applies bandwidth-only conditions with TBF and
-delay/loss conditions with `netem`. The netem fields are `delay_ms`, `jitter_ms`,
+The current implementation applies bandwidth with TBF and delay/loss conditions
+with `netem`. When both are requested, TBF is the root qdisc and netem is
+attached below it. The netem fields are `delay_ms`, `jitter_ms`,
 `loss_basis_points`, `duplicate_basis_points`, `corrupt_basis_points`,
-`reorder_basis_points`, and `limit_packets`. Combining bandwidth with netem
-needs a qdisc hierarchy and is not enabled yet.
+`reorder_basis_points`, and `limit_packets`.
 
 Default resource limits apply to each node cgroup:
 
@@ -372,6 +372,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    ./build/benchmark-sim --probe-qdisc-mutation &&
    ./build/benchmark-sim --probe-bandwidth-limit &&
    ./build/benchmark-sim --probe-network-condition &&
+   ./build/benchmark-sim --probe-combined-network-condition &&
    ./build/benchmark-sim --probe-network-condition-update'
 ```
 
@@ -385,6 +386,7 @@ Useful focused probes:
 ./build/benchmark-sim --probe-qdisc-mutation
 ./build/benchmark-sim --probe-bandwidth-limit
 ./build/benchmark-sim --probe-network-condition
+./build/benchmark-sim --probe-combined-network-condition
 ./build/benchmark-sim --probe-network-condition-update
 ```
 

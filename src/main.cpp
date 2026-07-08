@@ -97,6 +97,7 @@ struct Options {
   bool probe_capabilities = false;
   bool probe_cgroup_freeze = false;
   bool probe_netns = false;
+  bool probe_combined_network_condition = false;
   bool probe_network_condition = false;
   bool probe_network_condition_update = false;
   bool probe_qdisc = false;
@@ -794,6 +795,10 @@ Options ParseOptions(int argc, char** argv) {
       po::bool_switch(&options.probe_network_condition),
       "apply and remove a netem network condition on a temporary veth peer "
       "through libmnl")(
+      "probe-combined-network-condition",
+      po::bool_switch(&options.probe_combined_network_condition),
+      "apply and remove a combined TBF/netem condition on a temporary veth "
+      "peer through libmnl")(
       "probe-network-condition-update",
       po::bool_switch(&options.probe_network_condition_update),
       "replace a live host-side netem network condition on a temporary veth "
@@ -880,6 +885,7 @@ Options ParseOptions(int argc, char** argv) {
                            !options.probe_qdisc &&
                            !options.probe_qdisc_mutation &&
                            !options.probe_network_condition &&
+                           !options.probe_combined_network_condition &&
                            !options.probe_network_condition_update &&
                            !options.cleanup_run;
   if (needs_firod && options.firod.empty()) {
@@ -1223,17 +1229,14 @@ const QdiscInfo* FindQdiscByInterfaceName(const std::vector<QdiscInfo>& qdiscs,
 
 QdiscInfo VerifyNodeNetworkCondition(const NodeVethConfig& config) {
   const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-  const QdiscInfo* qdisc = FindQdiscByInterfaceName(qdiscs, config.host_name);
-  if (qdisc == nullptr) {
-    throw std::runtime_error("missing host-side qdisc after network setup: " +
-                             config.host_name);
-  }
-  if (!QdiscMatchesNetworkCondition(*qdisc, config.condition)) {
+  QdiscInfo summary;
+  if (!QdiscsMatchNetworkCondition(qdiscs, config.host_name, config.condition,
+                                   &summary)) {
     throw std::runtime_error(
         "host-side qdisc does not match requested network condition: " +
         config.host_name);
   }
-  return *qdisc;
+  return summary;
 }
 
 std::string NetworkProbeJson() {
@@ -1290,6 +1293,23 @@ std::string VethProbeJson() {
 
 std::string NetworkConditionProbeJson() {
   NetworkConditionProbe probe = ProbeNetworkCondition();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["condition"] = NetworkConditionJson(probe.condition);
+  result["namespace_qdiscs_before"] =
+      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_after_apply"] =
+      QdiscsJson(probe.namespace_qdiscs_after_apply);
+  result["namespace_qdiscs_after_delete"] =
+      QdiscsJson(probe.namespace_qdiscs_after_delete);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string CombinedNetworkConditionProbeJson() {
+  NetworkConditionProbe probe = ProbeCombinedNetworkCondition();
   boost::json::object result;
   result["helper_pid"] = probe.helper_pid;
   result["host_name"] = probe.host_name;
@@ -1555,9 +1575,21 @@ void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
     CgroupMetrics cg = node.cgroup->ReadMetrics();
     const LinkInfo* link =
         node.network ? FindLinkByName(links, node.network->host_name) : nullptr;
-    const QdiscInfo* qdisc =
-        node.network ? FindQdiscByInterfaceName(qdiscs, node.network->host_name)
-                     : nullptr;
+    std::optional<QdiscInfo> qdisc_summary;
+    const QdiscInfo* qdisc = nullptr;
+    if (node.network) {
+      if (node.network->apply_condition) {
+        QdiscInfo candidate;
+        if (QdiscsMatchNetworkCondition(qdiscs, node.network->host_name,
+                                        node.network->condition, &candidate)) {
+          qdisc_summary = candidate;
+          qdisc = &*qdisc_summary;
+        }
+      }
+      if (qdisc == nullptr) {
+        qdisc = FindQdiscByInterfaceName(qdiscs, node.network->host_name);
+      }
+    }
     AppendLine(metrics_path,
                MetricsJson(options.run_id, node.config.id, chain,
                            node.generated_block_count, node.restart_count, &cg,
@@ -2120,11 +2152,8 @@ void ApplyRuntimeNetworkConditionUpdates(
     }
     node.network->apply_condition = true;
     node.network->condition = condition;
-    if (node.network->condition.bandwidth_mbps != 0U) {
-      ReplaceRootTbfQdisc(node.network->host_name, node.network->condition);
-    } else {
-      ReplaceRootNetemQdisc(node.network->host_name, node.network->condition);
-    }
+    ReplaceNetworkConditionQdisc(node.network->host_name,
+                                 node.network->condition);
     const QdiscInfo qdisc = VerifyNodeNetworkCondition(*node.network);
     WriteEvent(events_path, options.run_id, node.config.id,
                "network_condition_updated",
@@ -2323,6 +2352,11 @@ int Run(int argc, char** argv) {
   if (options.probe_network_condition) {
     RequireNetworkSetupCapabilities();
     std::cout << NetworkConditionProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_combined_network_condition) {
+    RequireNetworkSetupCapabilities();
+    std::cout << CombinedNetworkConditionProbeJson() << "\n";
     return 0;
   }
   if (options.probe_network_condition_update) {

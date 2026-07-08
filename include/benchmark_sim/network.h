@@ -226,6 +226,10 @@ std::vector<QdiscInfo> ListQdiscs();
 std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd);
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition);
+bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
+                                 const std::string& if_name,
+                                 const NetworkCondition& condition,
+                                 QdiscInfo* summary);
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace();
 void CreateVethPair(const std::string& host_name, const std::string& peer_name);
 void DeleteLink(const std::string& name);
@@ -246,6 +250,8 @@ void ReplaceRootNetemQdisc(const std::string& if_name,
                            const NetworkCondition& condition);
 void ReplaceRootTbfQdisc(const std::string& if_name,
                          const NetworkCondition& condition);
+void ReplaceNetworkConditionQdisc(const std::string& if_name,
+                                  const NetworkCondition& condition);
 void DeleteRootQdisc(const std::string& if_name);
 void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config);
 void DeleteNodeVethNetwork(const NodeVethConfig& config);
@@ -255,6 +261,7 @@ RouteProbe ProbeIpv4RouteAssignment();
 QdiscProbe ProbeQdiscDump();
 QdiscMutationProbe ProbeQdiscMutation();
 NetworkConditionProbe ProbeNetworkCondition();
+NetworkConditionProbe ProbeCombinedNetworkCondition();
 NetworkConditionUpdateProbe ProbeNetworkConditionUpdate();
 BandwidthLimitProbe ProbeBandwidthLimit();
 

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
+#include <linux/pkt_sched.h>
 
 BOOST_AUTO_TEST_CASE(rtnetlink_lists_loopback_with_libmnl) {
   const std::vector<bsim::LinkInfo> links = bsim::ListNetworkLinks();
@@ -54,4 +55,70 @@ BOOST_AUTO_TEST_CASE(rtnetlink_lists_qdiscs_with_libmnl) {
                      return qdisc.if_index > 0 && !qdisc.kind.empty();
                    });
   BOOST_REQUIRE(parsed_qdisc != qdiscs.end());
+}
+
+BOOST_AUTO_TEST_CASE(qdisc_summary_matches_combined_tbf_netem_condition) {
+  bsim::NetworkCondition condition;
+  condition.bandwidth_mbps = 20;
+  condition.delay_ms = 40;
+  condition.jitter_ms = 5;
+  condition.loss_basis_points = 10;
+  condition.duplicate_basis_points = 5;
+  condition.corrupt_basis_points = 5;
+  condition.reorder_basis_points = 10;
+  condition.limit_packets = 1000;
+
+  bsim::QdiscInfo tbf;
+  tbf.if_name = "veth0";
+  tbf.kind = "tbf";
+  tbf.handle = TC_H_MAKE(1U << 16, 0U);
+  tbf.parent = TC_H_ROOT;
+  tbf.has_tbf_options = true;
+  tbf.tbf_rate_bytes_per_sec = 2500000;
+  tbf.tbf_limit_bytes = 250000;
+
+  bsim::QdiscInfo netem;
+  netem.if_name = "veth0";
+  netem.kind = "netem";
+  netem.handle = TC_H_MAKE(2U << 16, 0U);
+  netem.parent = TC_H_MAKE(1U << 16, 1U);
+  netem.has_netem_options = true;
+  netem.netem_latency_us = 40000;
+  netem.netem_jitter_us = 5000;
+  netem.netem_loss = 4294967;
+  netem.netem_duplicate = 2147483;
+  netem.netem_corrupt = 2147483;
+  netem.netem_reorder = 4294967;
+  netem.netem_limit_packets = 1000;
+
+  const std::vector<bsim::QdiscInfo> qdiscs = {tbf, netem};
+  bsim::QdiscInfo summary;
+
+  BOOST_TEST(bsim::QdiscsMatchNetworkCondition(qdiscs, "veth0", condition,
+                                               &summary));
+  BOOST_TEST(summary.kind == "tbf+netem");
+  BOOST_TEST(summary.has_tbf_options);
+  BOOST_TEST(summary.has_netem_options);
+  BOOST_TEST(summary.tbf_rate_bytes_per_sec == 2500000U);
+  BOOST_TEST(summary.netem_latency_us == 40000U);
+  BOOST_TEST(bsim::QdiscMatchesNetworkCondition(summary, condition));
+}
+
+BOOST_AUTO_TEST_CASE(qdisc_summary_rejects_missing_child_netem) {
+  bsim::NetworkCondition condition;
+  condition.bandwidth_mbps = 20;
+  condition.delay_ms = 40;
+
+  bsim::QdiscInfo tbf;
+  tbf.if_name = "veth0";
+  tbf.kind = "tbf";
+  tbf.handle = TC_H_MAKE(1U << 16, 0U);
+  tbf.parent = TC_H_ROOT;
+  tbf.has_tbf_options = true;
+  tbf.tbf_rate_bytes_per_sec = 2500000;
+  tbf.tbf_limit_bytes = 250000;
+
+  bsim::QdiscInfo summary;
+  BOOST_TEST(!bsim::QdiscsMatchNetworkCondition({tbf}, "veth0", condition,
+                                                &summary));
 }
