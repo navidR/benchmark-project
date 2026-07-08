@@ -84,6 +84,7 @@ add_executable(benchmark-sim
   src/main.cpp
   src/network.cpp
   src/process.cpp
+  src/run_report.cpp
   src/util.cpp
 )
 
@@ -114,12 +115,14 @@ if(BUILD_TESTING)
     tests/unit/network_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/process_tests.cpp
+    tests/unit/run_report_tests.cpp
     tests/unit/util_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
     src/log_tail.cpp
     src/network.cpp
     src/process.cpp
+    src/run_report.cpp
     src/util.cpp
   )
   target_include_directories(benchmark-sim-unit-tests PRIVATE include)

@@ -5,6 +5,7 @@
 #include "benchmark_sim/logging.h"
 #include "benchmark_sim/network.h"
 #include "benchmark_sim/process.h"
+#include "benchmark_sim/run_report.h"
 #include "benchmark_sim/util.h"
 
 #include <chrono>
@@ -61,6 +62,7 @@ struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path firod;
   std::filesystem::path output_dir = "runs";
+  std::filesystem::path report_run;
   std::string run_id = MakeRunId();
   uint32_t nodes = 1;
   uint32_t generate_blocks = 1;
@@ -682,6 +684,8 @@ Options ParseOptions(int argc, char** argv) {
       "output-dir", po::value<std::filesystem::path>(&options.output_dir),
       "run output root")("run-id", po::value<std::string>(&options.run_id),
                          "safe run id")(
+      "report-run", po::value<std::filesystem::path>(&options.report_run),
+      "summarize an existing run directory as JSON and exit")(
       "nodes", po::value<uint32_t>(&options.nodes), "Firo regtest nodes, 1..2")(
       "generate-blocks", po::value<uint32_t>(&options.generate_blocks),
       "blocks generated on node 0")(
@@ -867,6 +871,7 @@ Options ParseOptions(int argc, char** argv) {
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
   const bool needs_firod = !options.probe_network &&
+                           options.report_run.empty() &&
                            !options.probe_bandwidth_limit &&
                            !options.probe_capabilities &&
                            !options.probe_cgroup_freeze &&
@@ -2286,6 +2291,10 @@ int Run(int argc, char** argv) {
   RequireSafeOutputDirectory(options.output_dir);
   if (options.probe_network) {
     std::cout << NetworkProbeJson() << "\n";
+    return 0;
+  }
+  if (!options.report_run.empty()) {
+    std::cout << BuildRunReportJson(options.report_run) << "\n";
     return 0;
   }
   if (options.probe_capabilities) {

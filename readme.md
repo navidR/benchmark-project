@@ -347,6 +347,12 @@ Each run writes:
 - `runs/<run-id>/metrics.jsonl`
 - `runs/<run-id>/nodes/<node-id>/`
 
+Summarize an existing run:
+
+```bash
+./build/benchmark-sim --report-run runs/<run-id>
+```
+
 ## Run Network Probes
 
 The probes validate the Linux isolation and network-control pieces used by the
