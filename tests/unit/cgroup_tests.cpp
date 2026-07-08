@@ -23,6 +23,9 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_read_io_and_pressure_totals) {
                   "full avg10=0.00 avg60=0.00 avg300=0.00 total=56\n");
   bsim::WriteText(dir / "memory.current", "2048\n");
   bsim::WriteText(dir / "memory.peak", "4096\n");
+  bsim::WriteText(dir / "memory.high", "8192\n");
+  bsim::WriteText(dir / "memory.max", "max\n");
+  bsim::WriteText(dir / "cpu.max", "50000 100000\n");
   bsim::WriteText(dir / "memory.events",
                   "low 4\n"
                   "high 5\n"
@@ -40,6 +43,7 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_read_io_and_pressure_totals) {
                   "some avg10=0.00 avg60=0.00 avg300=0.00 total=77\n"
                   "full avg10=0.00 avg60=0.00 avg300=0.00 total=8\n");
   bsim::WriteText(dir / "pids.current", "3\n");
+  bsim::WriteText(dir / "pids.max", "max\n");
   bsim::WriteText(dir / "pids.events", "max 9\n");
 
   const bsim::CgroupMetrics metrics = bsim::Cgroup(dir).ReadMetrics();
@@ -50,11 +54,18 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_read_io_and_pressure_totals) {
   BOOST_TEST(metrics.cpu_pressure_full_total_usec == 56U);
   BOOST_TEST(metrics.memory_current == 2048U);
   BOOST_TEST(metrics.memory_peak == 4096U);
+  BOOST_TEST(metrics.memory_high_limit_bytes.has_value());
+  BOOST_TEST(*metrics.memory_high_limit_bytes == 8192U);
+  BOOST_TEST(!metrics.memory_max_limit_bytes.has_value());
+  BOOST_TEST(metrics.cpu_quota_us.has_value());
+  BOOST_TEST(*metrics.cpu_quota_us == 50000U);
+  BOOST_TEST(metrics.cpu_period_us == 100000U);
   BOOST_TEST(metrics.io_read_bytes == 40U);
   BOOST_TEST(metrics.io_write_bytes == 60U);
   BOOST_TEST(metrics.io_pressure_some_total_usec == 77U);
   BOOST_TEST(metrics.io_pressure_full_total_usec == 8U);
   BOOST_TEST(metrics.pids_current == 3U);
+  BOOST_TEST(!metrics.pids_max_limit.has_value());
   BOOST_TEST(metrics.pids_max_events == 9U);
   BOOST_TEST(metrics.cgroup_populated == 1U);
   BOOST_TEST(metrics.cgroup_frozen == 0U);

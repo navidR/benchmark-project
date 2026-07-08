@@ -16,11 +16,16 @@ struct CgroupMetrics {
   uint64_t cpu_pressure_full_total_usec = 0;
   uint64_t memory_current = 0;
   uint64_t memory_peak = 0;
+  std::optional<uint64_t> memory_high_limit_bytes;
+  std::optional<uint64_t> memory_max_limit_bytes;
+  std::optional<uint64_t> cpu_quota_us;
+  uint64_t cpu_period_us = 0;
   uint64_t io_read_bytes = 0;
   uint64_t io_write_bytes = 0;
   uint64_t io_pressure_some_total_usec = 0;
   uint64_t io_pressure_full_total_usec = 0;
   uint64_t pids_current = 0;
+  std::optional<uint64_t> pids_max_limit;
   uint64_t pids_max_events = 0;
   uint64_t cgroup_populated = 0;
   uint64_t cgroup_frozen = 0;

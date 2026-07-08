@@ -31,6 +31,11 @@ struct IoStatTotals {
   uint64_t write_bytes = 0;
 };
 
+struct CpuMaxValue {
+  std::optional<uint64_t> quota_us;
+  uint64_t period_us = 0;
+};
+
 void WriteCgroupFile(const std::filesystem::path& dir, std::string_view file,
                      std::string_view value) {
   WriteText(dir / std::string(file), value);
@@ -43,6 +48,32 @@ uint64_t ParseSingleUint(const std::filesystem::path& path) {
     ++pos;
   }
   return std::stoull(text.substr(pos));
+}
+
+std::optional<uint64_t> ParseMaxOrUint(const std::filesystem::path& path) {
+  const std::string text = ReadText(path);
+  const std::vector<std::string> fields = SplitWhitespace(text);
+  if (fields.empty()) {
+    throw std::runtime_error("empty cgroup max-or-uint file: " +
+                             path.string());
+  }
+  if (fields.front() == "max") {
+    return std::nullopt;
+  }
+  return std::stoull(fields.front());
+}
+
+CpuMaxValue ParseCpuMax(const std::filesystem::path& path) {
+  const std::vector<std::string> fields = SplitWhitespace(ReadText(path));
+  if (fields.size() != 2U) {
+    throw std::runtime_error("invalid cpu.max format: " + path.string());
+  }
+  CpuMaxValue value;
+  if (fields[0] != "max") {
+    value.quota_us = std::stoull(fields[0]);
+  }
+  value.period_us = std::stoull(fields[1]);
+  return value;
 }
 
 uint64_t ParseKeyValue(const std::filesystem::path& path, std::string_view key) {
@@ -370,6 +401,11 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   if (std::filesystem::exists(path_ / "memory.peak")) {
     metrics.memory_peak = ParseSingleUint(path_ / "memory.peak");
   }
+  metrics.memory_high_limit_bytes = ParseMaxOrUint(path_ / "memory.high");
+  metrics.memory_max_limit_bytes = ParseMaxOrUint(path_ / "memory.max");
+  const CpuMaxValue cpu_max = ParseCpuMax(path_ / "cpu.max");
+  metrics.cpu_quota_us = cpu_max.quota_us;
+  metrics.cpu_period_us = cpu_max.period_us;
   const IoStatTotals io = ParseIoStat(path_ / "io.stat");
   metrics.io_read_bytes = io.read_bytes;
   metrics.io_write_bytes = io.write_bytes;
@@ -378,6 +414,7 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   metrics.io_pressure_full_total_usec =
       ParsePressureTotal(path_ / "io.pressure", "full");
   metrics.pids_current = ParseSingleUint(path_ / "pids.current");
+  metrics.pids_max_limit = ParseMaxOrUint(path_ / "pids.max");
   metrics.pids_max_events = ParseKeyValue(path_ / "pids.events", "max");
   metrics.cgroup_populated = ParseKeyValue(path_ / "cgroup.events", "populated");
   metrics.cgroup_frozen = ParseKeyValue(path_ / "cgroup.events", "frozen");

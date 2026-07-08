@@ -1376,6 +1376,22 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
         cgroup->cpu_pressure_full_total_usec;
     object["memory_current"] = cgroup->memory_current;
     object["memory_peak"] = cgroup->memory_peak;
+    if (cgroup->memory_high_limit_bytes) {
+      object["memory_high_limit_bytes"] = *cgroup->memory_high_limit_bytes;
+    } else {
+      object["memory_high_limit_bytes"] = nullptr;
+    }
+    if (cgroup->memory_max_limit_bytes) {
+      object["memory_max_limit_bytes"] = *cgroup->memory_max_limit_bytes;
+    } else {
+      object["memory_max_limit_bytes"] = nullptr;
+    }
+    if (cgroup->cpu_quota_us) {
+      object["cpu_quota_us"] = *cgroup->cpu_quota_us;
+    } else {
+      object["cpu_quota_us"] = nullptr;
+    }
+    object["cpu_period_us"] = cgroup->cpu_period_us;
     object["io_read_bytes"] = cgroup->io_read_bytes;
     object["io_write_bytes"] = cgroup->io_write_bytes;
     object["io_pressure_some_total_usec"] =
@@ -1383,6 +1399,11 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["io_pressure_full_total_usec"] =
         cgroup->io_pressure_full_total_usec;
     object["pids_current"] = cgroup->pids_current;
+    if (cgroup->pids_max_limit) {
+      object["pids_max_limit"] = *cgroup->pids_max_limit;
+    } else {
+      object["pids_max_limit"] = nullptr;
+    }
     object["pids_max_events"] = cgroup->pids_max_events;
     object["cgroup_populated"] = cgroup->cgroup_populated;
     object["cgroup_frozen"] = cgroup->cgroup_frozen;
