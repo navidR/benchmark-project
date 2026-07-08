@@ -205,6 +205,16 @@ bool HasIpv4Route(const std::vector<RouteInfo>& routes,
   return false;
 }
 
+bool HasQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
+                          const std::string& if_name) {
+  for (const QdiscInfo& qdisc : qdiscs) {
+    if (qdisc.if_name == if_name && !qdisc.kind.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 template <typename Operation>
 auto ExecuteInNetworkNamespace(int netns_fd, Operation operation)
     -> decltype(operation()) {
@@ -555,6 +565,53 @@ struct NamespaceRouteState {
   std::vector<RouteInfo> routes_after_delete;
 };
 
+int ParseQdiscAttr(const nlattr* attr, void* data) {
+  auto* qdisc = static_cast<QdiscInfo*>(data);
+  const uint16_t attr_type = mnl_attr_get_type(attr);
+  if (mnl_attr_type_valid(attr, TCA_MAX) < 0) {
+    return MNL_CB_OK;
+  }
+
+  if (attr_type == TCA_KIND) {
+    if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
+      return MNL_CB_ERROR;
+    }
+    qdisc->kind = mnl_attr_get_str(attr);
+  }
+  return MNL_CB_OK;
+}
+
+int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
+  auto* qdiscs = static_cast<std::vector<QdiscInfo>*>(data);
+  if (nlh->nlmsg_type != RTM_NEWQDISC) {
+    return MNL_CB_OK;
+  }
+
+  const auto* message = static_cast<const tcmsg*>(mnl_nlmsg_get_payload(nlh));
+  QdiscInfo qdisc;
+  qdisc.if_index = message->tcm_ifindex;
+  qdisc.handle = message->tcm_handle;
+  qdisc.parent = message->tcm_parent;
+  qdisc.info = message->tcm_info;
+  if (qdisc.if_index > 0) {
+    char if_name[IF_NAMESIZE] = {};
+    if (if_indextoname(static_cast<unsigned int>(qdisc.if_index), if_name) !=
+        nullptr) {
+      qdisc.if_name = if_name;
+    }
+  }
+  if (mnl_attr_parse(nlh, sizeof(*message), ParseQdiscAttr, &qdisc) < 0) {
+    return MNL_CB_ERROR;
+  }
+  qdiscs->push_back(std::move(qdisc));
+  return MNL_CB_OK;
+}
+
+struct NamespaceQdiscState {
+  std::vector<LinkInfo> links;
+  std::vector<QdiscInfo> qdiscs;
+};
+
 }  // namespace
 
 std::vector<LinkInfo> ListNetworkLinks() {
@@ -660,6 +717,41 @@ std::vector<RouteInfo> ListIpv4Routes() {
   }
 
   return routes;
+}
+
+std::vector<QdiscInfo> ListQdiscs() {
+  MnlSocket socket(NETLINK_ROUTE);
+  socket.Bind(0, MNL_SOCKET_AUTOPID);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_GETQDISC;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+
+  socket.Send(nlh, nlh->nlmsg_len);
+
+  std::vector<QdiscInfo> qdiscs;
+  while (true) {
+    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
+    const int status =
+        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
+                   socket.PortId(), ParseQdiscMessage, &qdiscs);
+    if (status == MNL_CB_ERROR) {
+      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
+                               std::strerror(errno));
+    }
+    if (status == MNL_CB_STOP) {
+      break;
+    }
+  }
+
+  return qdiscs;
 }
 
 void CreateVethPair(const std::string& host_name, const std::string& peer_name) {
@@ -949,6 +1041,12 @@ std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd) {
   });
 }
 
+std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd) {
+  return ExecuteInNetworkNamespace(netns_fd, []() {
+    return ListQdiscs();
+  });
+}
+
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   NetworkNamespaceProbe probe;
   probe.parent_links = ListNetworkLinks();
@@ -957,6 +1055,57 @@ NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   try {
     probe.namespace_links = ListNetworkLinksInNamespace(namespace_fd.get());
   } catch (...) {
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
+QdiscProbe ProbeQdiscDump() {
+  QdiscProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+
+    NamespaceQdiscState namespace_state =
+        ExecuteInNetworkNamespace(namespace_fd.get(), [&probe]() {
+          SetLinkUp("lo", true);
+          SetLinkUp(probe.peer_name, true);
+          NamespaceQdiscState state;
+          state.links = ListNetworkLinks();
+          state.qdiscs = ListQdiscs();
+          return state;
+        });
+    probe.namespace_links = std::move(namespace_state.links);
+    probe.namespace_qdiscs = std::move(namespace_state.qdiscs);
+
+    if (!HasLinkNamed(probe.namespace_links, probe.peer_name)) {
+      throw std::runtime_error("veth peer was not visible before qdisc probe");
+    }
+    if (!HasQdiscForInterface(probe.namespace_qdiscs, probe.peer_name)) {
+      throw std::runtime_error("qdisc dump did not include veth peer");
+    }
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
     kill(probe.helper_pid, SIGKILL);
     WaitForPid(probe.helper_pid);
     throw;

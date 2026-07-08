@@ -38,6 +38,7 @@ struct Options {
   bool replace_run = false;
   bool probe_address = false;
   bool probe_netns = false;
+  bool probe_qdisc = false;
   bool probe_route = false;
   bool probe_veth = false;
   bool probe_network = false;
@@ -73,6 +74,8 @@ Options ParseOptions(int argc, char** argv) {
       "libmnl")(
       "probe-netns", po::bool_switch(&options.probe_netns),
       "create a temporary network namespace and inspect it through setns/libmnl")(
+      "probe-qdisc", po::bool_switch(&options.probe_qdisc),
+      "dump qdisc state for a temporary veth peer through libmnl")(
       "probe-route", po::bool_switch(&options.probe_route),
       "assign and inspect an IPv4 route inside a temporary netns through libmnl")(
       "probe-veth", po::bool_switch(&options.probe_veth),
@@ -93,7 +96,7 @@ Options ParseOptions(int argc, char** argv) {
   }
   RequireSafeRunId(options.run_id);
   if (!options.probe_network && !options.probe_netns && !options.probe_veth &&
-      !options.probe_address && !options.probe_route) {
+      !options.probe_address && !options.probe_route && !options.probe_qdisc) {
     RequireExecutable(options.firod);
   }
   return options;
@@ -142,11 +145,27 @@ boost::json::array RoutesJson(const std::vector<RouteInfo>& routes) {
   return routes_json;
 }
 
+boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
+  boost::json::array qdiscs_json;
+  for (const QdiscInfo& qdisc : qdiscs) {
+    boost::json::object qdisc_json;
+    qdisc_json["if_index"] = qdisc.if_index;
+    qdisc_json["if_name"] = qdisc.if_name;
+    qdisc_json["kind"] = qdisc.kind;
+    qdisc_json["handle"] = qdisc.handle;
+    qdisc_json["parent"] = qdisc.parent;
+    qdisc_json["info"] = qdisc.info;
+    qdiscs_json.push_back(std::move(qdisc_json));
+  }
+  return qdiscs_json;
+}
+
 std::string NetworkProbeJson() {
   boost::json::object result;
   result["links"] = LinksJson(ListNetworkLinks());
   result["ipv4_addresses"] = AddressesJson(ListIpv4Addresses());
   result["ipv4_routes"] = RoutesJson(ListIpv4Routes());
+  result["qdiscs"] = QdiscsJson(ListQdiscs());
   return boost::json::serialize(result);
 }
 
@@ -169,6 +188,18 @@ std::string VethProbeJson() {
   result["parent_after_create"] = LinksJson(probe.parent_after_create);
   result["parent_after_move"] = LinksJson(probe.parent_after_move);
   result["namespace_after_move"] = LinksJson(probe.namespace_after_move);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string QdiscProbeJson() {
+  QdiscProbe probe = ProbeQdiscDump();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["namespace_links"] = LinksJson(probe.namespace_links);
+  result["namespace_qdiscs"] = QdiscsJson(probe.namespace_qdiscs);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -376,6 +407,10 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_route) {
     std::cout << RouteProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_qdisc) {
+    std::cout << QdiscProbeJson() << "\n";
     return 0;
   }
 

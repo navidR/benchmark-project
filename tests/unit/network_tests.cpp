@@ -42,3 +42,15 @@ BOOST_AUTO_TEST_CASE(rtnetlink_lists_ipv4_routes_with_libmnl) {
                    });
   BOOST_REQUIRE(valid_route != routes.end());
 }
+
+BOOST_AUTO_TEST_CASE(rtnetlink_lists_qdiscs_with_libmnl) {
+  const std::vector<bsim::QdiscInfo> qdiscs = bsim::ListQdiscs();
+
+  BOOST_TEST(!qdiscs.empty());
+  const auto parsed_qdisc =
+      std::find_if(qdiscs.begin(), qdiscs.end(),
+                   [](const bsim::QdiscInfo& qdisc) {
+                     return qdisc.if_index > 0 && !qdisc.kind.empty();
+                   });
+  BOOST_REQUIRE(parsed_qdisc != qdiscs.end());
+}

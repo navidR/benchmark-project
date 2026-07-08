@@ -33,6 +33,15 @@ struct RouteInfo {
   std::uint8_t type = 0;
 };
 
+struct QdiscInfo {
+  int if_index = 0;
+  std::string if_name;
+  std::string kind;
+  std::uint32_t handle = 0;
+  std::uint32_t parent = 0;
+  std::uint32_t info = 0;
+};
+
 struct NetworkNamespaceProbe {
   pid_t helper_pid = -1;
   std::vector<LinkInfo> parent_links;
@@ -79,12 +88,23 @@ struct RouteProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
+struct QdiscProbe {
+  pid_t helper_pid = -1;
+  std::string host_name;
+  std::string peer_name;
+  std::vector<LinkInfo> namespace_links;
+  std::vector<QdiscInfo> namespace_qdiscs;
+  std::vector<LinkInfo> parent_after_delete;
+};
+
 std::vector<LinkInfo> ListNetworkLinks();
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
 std::vector<AddressInfo> ListIpv4Addresses();
 std::vector<AddressInfo> ListIpv4AddressesInNamespace(int netns_fd);
 std::vector<RouteInfo> ListIpv4Routes();
 std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd);
+std::vector<QdiscInfo> ListQdiscs();
+std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd);
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace();
 void CreateVethPair(const std::string& host_name, const std::string& peer_name);
 void DeleteLink(const std::string& name);
@@ -102,5 +122,6 @@ void DeleteIpv4Route(const std::string& if_name, const std::string& destination,
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();
 RouteProbe ProbeIpv4RouteAssignment();
+QdiscProbe ProbeQdiscDump();
 
 }  // namespace bsim
