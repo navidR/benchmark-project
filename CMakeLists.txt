@@ -105,9 +105,11 @@ target_compile_options(benchmark-sim PRIVATE
 
 if(BUILD_TESTING)
   add_executable(benchmark-sim-unit-tests
+    tests/unit/cgroup_tests.cpp
     tests/unit/network_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/util_tests.cpp
+    src/cgroup.cpp
     src/network.cpp
     src/process.cpp
     src/util.cpp

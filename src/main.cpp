@@ -505,10 +505,18 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   if (cgroup != nullptr) {
     object["cpu_usage_usec"] = cgroup->cpu_usage_usec;
     object["cpu_throttled_usec"] = cgroup->cpu_throttled_usec;
+    object["cpu_pressure_some_total_usec"] =
+        cgroup->cpu_pressure_some_total_usec;
+    object["cpu_pressure_full_total_usec"] =
+        cgroup->cpu_pressure_full_total_usec;
     object["memory_current"] = cgroup->memory_current;
     object["memory_peak"] = cgroup->memory_peak;
     object["io_read_bytes"] = cgroup->io_read_bytes;
     object["io_write_bytes"] = cgroup->io_write_bytes;
+    object["io_pressure_some_total_usec"] =
+        cgroup->io_pressure_some_total_usec;
+    object["io_pressure_full_total_usec"] =
+        cgroup->io_pressure_full_total_usec;
     object["pids_current"] = cgroup->pids_current;
     object["oom"] = cgroup->oom;
     object["oom_kill"] = cgroup->oom_kill;

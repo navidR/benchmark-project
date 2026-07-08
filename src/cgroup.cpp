@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cctype>
 #include <filesystem>
 #include <sstream>
 #include <stdexcept>
@@ -78,6 +79,31 @@ IoStatTotals ParseIoStat(const std::filesystem::path& path) {
     }
   }
   return totals;
+}
+
+uint64_t ParsePressureTotal(const std::filesystem::path& path,
+                            std::string_view category) {
+  if (!std::filesystem::exists(path)) {
+    return 0;
+  }
+
+  std::istringstream lines(ReadText(path));
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream fields(line);
+    std::string token;
+    fields >> token;
+    if (token != category) {
+      continue;
+    }
+    while (fields >> token) {
+      constexpr std::string_view kTotalPrefix = "total=";
+      if (token.starts_with(kTotalPrefix)) {
+        return std::stoull(std::string(token.substr(kTotalPrefix.size())));
+      }
+    }
+  }
+  return 0;
 }
 
 void EnableControllers(const std::filesystem::path& dir) {
@@ -221,6 +247,10 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   metrics.cpu_usage_usec = ParseKeyValue(path_ / "cpu.stat", "usage_usec");
   metrics.cpu_throttled_usec =
       ParseKeyValue(path_ / "cpu.stat", "throttled_usec");
+  metrics.cpu_pressure_some_total_usec =
+      ParsePressureTotal(path_ / "cpu.pressure", "some");
+  metrics.cpu_pressure_full_total_usec =
+      ParsePressureTotal(path_ / "cpu.pressure", "full");
   metrics.memory_current = ParseSingleUint(path_ / "memory.current");
   if (std::filesystem::exists(path_ / "memory.peak")) {
     metrics.memory_peak = ParseSingleUint(path_ / "memory.peak");
@@ -228,6 +258,10 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   const IoStatTotals io = ParseIoStat(path_ / "io.stat");
   metrics.io_read_bytes = io.read_bytes;
   metrics.io_write_bytes = io.write_bytes;
+  metrics.io_pressure_some_total_usec =
+      ParsePressureTotal(path_ / "io.pressure", "some");
+  metrics.io_pressure_full_total_usec =
+      ParsePressureTotal(path_ / "io.pressure", "full");
   metrics.pids_current = ParseSingleUint(path_ / "pids.current");
   metrics.oom = ParseKeyValue(path_ / "memory.events", "oom");
   metrics.oom_kill = ParseKeyValue(path_ / "memory.events", "oom_kill");
