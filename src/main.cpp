@@ -40,6 +40,12 @@ struct Options {
   uint32_t generate_blocks = 1;
   uint32_t ready_timeout_sec = 30;
   uint32_t sync_timeout_sec = 30;
+  uint64_t memory_high_bytes = 1536ULL * 1024ULL * 1024ULL;
+  uint64_t memory_max_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+  uint64_t cpu_period_us = 100000;
+  uint64_t cpu_quota_us = 0;
+  bool cpu_quota_requested = false;
+  uint64_t pids_max = 256;
   bool keep_cgroups = false;
   bool cleanup_run = false;
   bool isolate_network = false;
@@ -157,6 +163,16 @@ Options ParseOptions(int argc, char** argv) {
       "RPC startup timeout")(
       "sync-timeout-sec", po::value<uint32_t>(&options.sync_timeout_sec),
       "block propagation timeout")(
+      "memory-high-bytes", po::value<uint64_t>(&options.memory_high_bytes),
+      "cgroup memory.high soft pressure threshold in bytes")(
+      "memory-max-bytes", po::value<uint64_t>(&options.memory_max_bytes),
+      "cgroup memory.max hard limit in bytes")(
+      "cpu-quota-us", po::value<uint64_t>(&options.cpu_quota_us),
+      "optional cgroup cpu.max quota in microseconds per period")(
+      "cpu-period-us", po::value<uint64_t>(&options.cpu_period_us),
+      "cgroup cpu.max period in microseconds")(
+      "pids-max", po::value<uint64_t>(&options.pids_max),
+      "cgroup pids.max process limit")(
       "keep-cgroups", po::bool_switch(&options.keep_cgroups),
       "leave cgroups after exit for inspection")(
       "cleanup-run", po::bool_switch(&options.cleanup_run),
@@ -226,6 +242,20 @@ Options ParseOptions(int argc, char** argv) {
       vm.count("network-loss-bps") != 0U ||
       vm.count("network-duplicate-bps") != 0U ||
       vm.count("network-limit-packets") != 0U;
+  options.cpu_quota_requested = vm.count("cpu-quota-us") != 0U;
+  if (options.memory_high_bytes > options.memory_max_bytes) {
+    throw std::runtime_error(
+        "--memory-high-bytes must be less than or equal to --memory-max-bytes");
+  }
+  if (options.cpu_period_us == 0U) {
+    throw std::runtime_error("--cpu-period-us must be greater than zero");
+  }
+  if (options.cpu_quota_requested && options.cpu_quota_us == 0U) {
+    throw std::runtime_error("--cpu-quota-us must be greater than zero");
+  }
+  if (options.pids_max == 0U) {
+    throw std::runtime_error("--pids-max must be greater than zero");
+  }
   if ((options.network_condition_requested ||
        !options.node_network_condition_json.empty()) &&
       !options.isolate_network) {
@@ -688,6 +718,25 @@ void WriteScenarioFiles(const Options& options,
                 "nodes: " +
                 std::to_string(options.nodes) +
                 "\n"
+                "resources:\n"
+                "  default:\n"
+                "    memory_high_bytes: " +
+                std::to_string(options.memory_high_bytes) +
+                "\n"
+                "    memory_max_bytes: " +
+                std::to_string(options.memory_max_bytes) +
+                "\n"
+                "    cpu_quota_us: " +
+                (options.cpu_quota_requested
+                     ? std::to_string(options.cpu_quota_us)
+                     : std::string("max")) +
+                "\n"
+                "    cpu_period_us: " +
+                std::to_string(options.cpu_period_us) +
+                "\n"
+                "    pids_max: " +
+                std::to_string(options.pids_max) +
+                "\n"
                 + network_yaml +
                 "workloads:\n"
                 "  - type: block_generation\n"
@@ -704,6 +753,17 @@ void WriteScenarioFiles(const Options& options,
   resolved["firod"] = options.firod.string();
   resolved["isolated_network"] = options.isolate_network;
   resolved["sync_timeout_sec"] = options.sync_timeout_sec;
+  boost::json::object resources;
+  resources["memory_high_bytes"] = options.memory_high_bytes;
+  resources["memory_max_bytes"] = options.memory_max_bytes;
+  if (options.cpu_quota_requested) {
+    resources["cpu_quota_us"] = options.cpu_quota_us;
+  } else {
+    resources["cpu_quota_us"] = nullptr;
+  }
+  resources["cpu_period_us"] = options.cpu_period_us;
+  resources["pids_max"] = options.pids_max;
+  resolved["resources"] = std::move(resources);
   if (options.network_condition_requested) {
     resolved["default_network_condition"] =
         NetworkConditionJson(options.network_condition);
@@ -817,10 +877,14 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       }
 
       runtime.cgroup = Cgroup::Create(options.run_id, node_id);
-      runtime.cgroup->SetMemoryHigh(1536ULL * 1024ULL * 1024ULL);
-      runtime.cgroup->SetMemoryMax(2ULL * 1024ULL * 1024ULL * 1024ULL);
-      runtime.cgroup->SetCpuMax(std::nullopt, 100000);
-      runtime.cgroup->SetPidsMax(256);
+      runtime.cgroup->SetMemoryHigh(options.memory_high_bytes);
+      runtime.cgroup->SetMemoryMax(options.memory_max_bytes);
+      runtime.cgroup->SetCpuMax(
+          options.cpu_quota_requested
+              ? std::optional<uint64_t>(options.cpu_quota_us)
+              : std::nullopt,
+          options.cpu_period_us);
+      runtime.cgroup->SetPidsMax(options.pids_max);
 
       ProcessSpec process = driver.RenderProcess(runtime.config);
       if (runtime.network_namespace) {

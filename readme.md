@@ -155,6 +155,23 @@ Per-node isolated network conditions use repeatable JSON objects:
   --node-network-condition-json '{"node":2,"delay_ms":5}'
 ```
 
+Resource limits are global for the current MVP and apply to each node cgroup:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id resource-smoke \
+  --replace-run \
+  --nodes 1 \
+  --generate-blocks 1 \
+  --memory-high-bytes 1073741824 \
+  --memory-max-bytes 1610612736 \
+  --cpu-quota-us 75000 \
+  --cpu-period-us 100000 \
+  --pids-max 128
+```
+
 Each run writes:
 
 - `runs/<run-id>/scenario.yaml`
