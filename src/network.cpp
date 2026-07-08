@@ -1,10 +1,12 @@
 #include "benchmark_sim/network.h"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <linux/if_link.h>
 #include <linux/rtnetlink.h>
 #include <linux/veth.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -20,7 +22,9 @@
 #include <future>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <libmnl/libmnl.h>
@@ -174,6 +178,43 @@ bool HasLinkNamed(const std::vector<LinkInfo>& links, const std::string& name) {
     }
   }
   return false;
+}
+
+bool HasIpv4Address(const std::vector<AddressInfo>& addresses,
+                    const std::string& if_name, const std::string& address,
+                    std::uint8_t prefix_len) {
+  for (const AddressInfo& entry : addresses) {
+    if (entry.if_name == if_name && entry.address == address &&
+        entry.prefix_len == prefix_len) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename Operation>
+auto ExecuteInNetworkNamespace(int netns_fd, Operation operation)
+    -> decltype(operation()) {
+  using Result = decltype(operation());
+  std::promise<Result> promise;
+  std::future<Result> result = promise.get_future();
+
+  std::thread worker([netns_fd, &operation, &promise]() {
+    try {
+      ScopedNetworkNamespace ns(netns_fd);
+      if constexpr (std::is_void_v<Result>) {
+        operation();
+        promise.set_value();
+      } else {
+        promise.set_value(operation());
+      }
+    } catch (...) {
+      promise.set_exception(std::current_exception());
+    }
+  });
+
+  worker.join();
+  return result.get();
 }
 
 void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence) {
@@ -335,6 +376,88 @@ int ParseLinkMessage(const nlmsghdr* nlh, void* data) {
   return MNL_CB_OK;
 }
 
+struct AddressParseState {
+  AddressInfo address;
+  bool has_address = false;
+};
+
+int StoreIpv4Address(const nlattr* attr, AddressParseState* state, bool prefer) {
+  if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0) {
+    return MNL_CB_ERROR;
+  }
+  if (mnl_attr_get_payload_len(attr) != sizeof(in_addr)) {
+    errno = EINVAL;
+    return MNL_CB_ERROR;
+  }
+
+  char text[INET_ADDRSTRLEN] = {};
+  if (inet_ntop(AF_INET, mnl_attr_get_payload(attr), text, sizeof(text)) ==
+      nullptr) {
+    return MNL_CB_ERROR;
+  }
+  if (prefer || !state->has_address) {
+    state->address.address = text;
+    state->has_address = true;
+  }
+  return MNL_CB_OK;
+}
+
+int ParseAddressAttr(const nlattr* attr, void* data) {
+  auto* state = static_cast<AddressParseState*>(data);
+  const uint16_t type = mnl_attr_get_type(attr);
+  if (mnl_attr_type_valid(attr, IFA_MAX) < 0) {
+    return MNL_CB_OK;
+  }
+  if (type == IFA_LOCAL) {
+    return StoreIpv4Address(attr, state, true);
+  }
+  if (type == IFA_ADDRESS) {
+    return StoreIpv4Address(attr, state, false);
+  }
+  if (type == IFA_LABEL) {
+    if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
+      return MNL_CB_ERROR;
+    }
+    state->address.if_name = mnl_attr_get_str(attr);
+  }
+  return MNL_CB_OK;
+}
+
+int ParseAddressMessage(const nlmsghdr* nlh, void* data) {
+  auto* addresses = static_cast<std::vector<AddressInfo>*>(data);
+  if (nlh->nlmsg_type != RTM_NEWADDR) {
+    return MNL_CB_OK;
+  }
+
+  const auto* message =
+      static_cast<const ifaddrmsg*>(mnl_nlmsg_get_payload(nlh));
+  if (message->ifa_family != AF_INET) {
+    return MNL_CB_OK;
+  }
+
+  AddressParseState state;
+  state.address.if_index = static_cast<int>(message->ifa_index);
+  state.address.prefix_len = message->ifa_prefixlen;
+  if (mnl_attr_parse(nlh, sizeof(*message), ParseAddressAttr, &state) < 0) {
+    return MNL_CB_ERROR;
+  }
+  if (state.address.if_name.empty()) {
+    char if_name[IF_NAMESIZE] = {};
+    if (if_indextoname(message->ifa_index, if_name) != nullptr) {
+      state.address.if_name = if_name;
+    }
+  }
+  if (state.has_address) {
+    addresses->push_back(std::move(state.address));
+  }
+  return MNL_CB_OK;
+}
+
+struct NamespaceAddressState {
+  std::vector<LinkInfo> links;
+  std::vector<AddressInfo> addresses;
+};
+
 }  // namespace
 
 std::vector<LinkInfo> ListNetworkLinks() {
@@ -370,6 +493,41 @@ std::vector<LinkInfo> ListNetworkLinks() {
   }
 
   return links;
+}
+
+std::vector<AddressInfo> ListIpv4Addresses() {
+  MnlSocket socket(NETLINK_ROUTE);
+  socket.Bind(0, MNL_SOCKET_AUTOPID);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_GETADDR;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<rtgenmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(rtgenmsg)));
+  message->rtgen_family = AF_INET;
+
+  socket.Send(nlh, nlh->nlmsg_len);
+
+  std::vector<AddressInfo> addresses;
+  while (true) {
+    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
+    const int status =
+        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
+                   socket.PortId(), ParseAddressMessage, &addresses);
+    if (status == MNL_CB_ERROR) {
+      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
+                               std::strerror(errno));
+    }
+    if (status == MNL_CB_STOP) {
+      break;
+    }
+  }
+
+  return addresses;
 }
 
 void CreateVethPair(const std::string& host_name, const std::string& peer_name) {
@@ -463,25 +621,54 @@ void SetLinkUp(const std::string& name, bool up) {
   SendNetlinkRequest(nlh, sequence);
 }
 
+void AddIpv4Address(const std::string& if_name, const std::string& address,
+                    std::uint8_t prefix_len) {
+  RequireInterfaceName(if_name);
+  if (prefix_len > 32U) {
+    throw std::runtime_error("IPv4 prefix length must be 0..32");
+  }
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+
+  in_addr ipv4_address{};
+  if (inet_pton(AF_INET, address.c_str(), &ipv4_address) != 1) {
+    throw std::runtime_error("invalid IPv4 address: " + address);
+  }
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWADDR;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message = static_cast<ifaddrmsg*>(
+      mnl_nlmsg_put_extra_header(nlh, sizeof(ifaddrmsg)));
+  message->ifa_family = AF_INET;
+  message->ifa_prefixlen = prefix_len;
+  message->ifa_flags = IFA_F_PERMANENT;
+  message->ifa_scope = RT_SCOPE_UNIVERSE;
+  message->ifa_index = if_index;
+
+  mnl_attr_put_u32(nlh, IFA_LOCAL, ipv4_address.s_addr);
+  mnl_attr_put_u32(nlh, IFA_ADDRESS, ipv4_address.s_addr);
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {
-  std::promise<std::vector<LinkInfo>> promise;
-  std::future<std::vector<LinkInfo>> result = promise.get_future();
-
-  std::thread worker([netns_fd, &promise]() {
-    try {
-      std::vector<LinkInfo> links;
-      {
-        ScopedNetworkNamespace ns(netns_fd);
-        links = ListNetworkLinks();
-      }
-      promise.set_value(std::move(links));
-    } catch (...) {
-      promise.set_exception(std::current_exception());
-    }
+  return ExecuteInNetworkNamespace(netns_fd, []() {
+    return ListNetworkLinks();
   });
+}
 
-  worker.join();
-  return result.get();
+std::vector<AddressInfo> ListIpv4AddressesInNamespace(int netns_fd) {
+  return ExecuteInNetworkNamespace(netns_fd, []() {
+    return ListIpv4Addresses();
+  });
 }
 
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
@@ -492,6 +679,65 @@ NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
   try {
     probe.namespace_links = ListNetworkLinksInNamespace(namespace_fd.get());
   } catch (...) {
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
+AddressProbe ProbeIpv4AddressAssignment() {
+  AddressProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  probe.assigned_address = "10.20.0.2";
+  probe.assigned_prefix_len = 24;
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+    probe.parent_after_move = ListNetworkLinks();
+
+    NamespaceAddressState namespace_state =
+        ExecuteInNetworkNamespace(namespace_fd.get(), [&probe]() {
+          SetLinkUp("lo", true);
+          SetLinkUp(probe.peer_name, true);
+          AddIpv4Address(probe.peer_name, probe.assigned_address,
+                         probe.assigned_prefix_len);
+          NamespaceAddressState state;
+          state.links = ListNetworkLinks();
+          state.addresses = ListIpv4Addresses();
+          return state;
+        });
+    probe.namespace_links_after_address = std::move(namespace_state.links);
+    probe.namespace_addresses = std::move(namespace_state.addresses);
+
+    if (!HasLinkNamed(probe.parent_after_move, probe.host_name) ||
+        HasLinkNamed(probe.parent_after_move, probe.peer_name) ||
+        !HasLinkNamed(probe.namespace_links_after_address, probe.peer_name)) {
+      throw std::runtime_error("veth peer was not isolated before address probe");
+    }
+    if (!HasIpv4Address(probe.namespace_addresses, probe.peer_name,
+                        probe.assigned_address, probe.assigned_prefix_len)) {
+      throw std::runtime_error("IPv4 address was not visible in child netns");
+    }
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
     kill(probe.helper_pid, SIGKILL);
     WaitForPid(probe.helper_pid);
     throw;

@@ -36,6 +36,7 @@ struct Options {
   uint32_t ready_timeout_sec = 30;
   bool keep_cgroups = false;
   bool replace_run = false;
+  bool probe_address = false;
   bool probe_netns = false;
   bool probe_veth = false;
   bool probe_network = false;
@@ -66,6 +67,9 @@ Options ParseOptions(int argc, char** argv) {
                              "leave cgroups after exit for inspection")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
+      "probe-address", po::bool_switch(&options.probe_address),
+      "assign and inspect an IPv4 address inside a temporary netns through "
+      "libmnl")(
       "probe-netns", po::bool_switch(&options.probe_netns),
       "create a temporary network namespace and inspect it through setns/libmnl")(
       "probe-veth", po::bool_switch(&options.probe_veth),
@@ -85,7 +89,8 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error("--nodes currently supports 1..2 for MVP smoke");
   }
   RequireSafeRunId(options.run_id);
-  if (!options.probe_network && !options.probe_netns && !options.probe_veth) {
+  if (!options.probe_network && !options.probe_netns && !options.probe_veth &&
+      !options.probe_address) {
     RequireExecutable(options.firod);
   }
   return options;
@@ -103,9 +108,23 @@ boost::json::array LinksJson(const std::vector<LinkInfo>& links) {
   return links_json;
 }
 
+boost::json::array AddressesJson(const std::vector<AddressInfo>& addresses) {
+  boost::json::array addresses_json;
+  for (const AddressInfo& address : addresses) {
+    boost::json::object address_json;
+    address_json["if_index"] = address.if_index;
+    address_json["if_name"] = address.if_name;
+    address_json["address"] = address.address;
+    address_json["prefix_len"] = address.prefix_len;
+    addresses_json.push_back(std::move(address_json));
+  }
+  return addresses_json;
+}
+
 std::string NetworkProbeJson() {
   boost::json::object result;
   result["links"] = LinksJson(ListNetworkLinks());
+  result["ipv4_addresses"] = AddressesJson(ListIpv4Addresses());
   return boost::json::serialize(result);
 }
 
@@ -128,6 +147,22 @@ std::string VethProbeJson() {
   result["parent_after_create"] = LinksJson(probe.parent_after_create);
   result["parent_after_move"] = LinksJson(probe.parent_after_move);
   result["namespace_after_move"] = LinksJson(probe.namespace_after_move);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string AddressProbeJson() {
+  AddressProbe probe = ProbeIpv4AddressAssignment();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["assigned_address"] = probe.assigned_address;
+  result["assigned_prefix_len"] = probe.assigned_prefix_len;
+  result["parent_after_move"] = LinksJson(probe.parent_after_move);
+  result["namespace_links_after_address"] =
+      LinksJson(probe.namespace_links_after_address);
+  result["namespace_addresses"] = AddressesJson(probe.namespace_addresses);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -287,6 +322,10 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_veth) {
     std::cout << VethProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_address) {
+    std::cout << AddressProbeJson() << "\n";
     return 0;
   }
 
