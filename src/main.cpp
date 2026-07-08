@@ -581,6 +581,17 @@ boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
   return object;
 }
 
+std::string NetworkConditionVerificationDetail(const NodeVethConfig& config,
+                                               const QdiscInfo& qdisc) {
+  boost::json::object detail;
+  detail["host_if"] = config.host_name;
+  detail["condition"] = NetworkConditionJson(config.condition);
+  detail["qdisc_kind"] = qdisc.kind;
+  detail["qdisc_handle"] = qdisc.handle;
+  detail["qdisc_parent"] = qdisc.parent;
+  return boost::json::serialize(detail);
+}
+
 std::string NodeHostAddress(uint32_t node_index) {
   return "10.210." + std::to_string(node_index + 1U) + ".1";
 }
@@ -691,6 +702,21 @@ const QdiscInfo* FindQdiscByInterfaceName(const std::vector<QdiscInfo>& qdiscs,
     }
   }
   return nullptr;
+}
+
+QdiscInfo VerifyNodeNetworkCondition(const NodeVethConfig& config) {
+  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+  const QdiscInfo* qdisc = FindQdiscByInterfaceName(qdiscs, config.host_name);
+  if (qdisc == nullptr) {
+    throw std::runtime_error("missing host-side qdisc after network setup: " +
+                             config.host_name);
+  }
+  if (!QdiscMatchesNetworkCondition(*qdisc, config.condition)) {
+    throw std::runtime_error(
+        "host-side qdisc does not match requested network condition: " +
+        config.host_name);
+  }
+  return *qdisc;
 }
 
 std::string NetworkProbeJson() {
@@ -1114,6 +1140,14 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         runtime.network = MakeNodeVethConfig(options, i);
         SetupNodeVethNetwork(runtime.network_namespace->fd(),
                              *runtime.network);
+        if (runtime.network->apply_condition) {
+          const QdiscInfo qdisc =
+              VerifyNodeNetworkCondition(*runtime.network);
+          WriteEvent(events_path, options.run_id, node_id,
+                     "network_condition_verified",
+                     NetworkConditionVerificationDetail(*runtime.network,
+                                                        qdisc));
+        }
         runtime.config.rpc_host = runtime.network->node_address;
         runtime.config.rpc_bind = runtime.network->node_address;
         runtime.config.rpc_allow_ips = {runtime.network->host_address};

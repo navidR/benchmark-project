@@ -191,6 +191,8 @@ std::vector<RouteInfo> ListIpv4Routes();
 std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd);
 std::vector<QdiscInfo> ListQdiscs();
 std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd);
+bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
+                                  const NetworkCondition& condition);
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace();
 void CreateVethPair(const std::string& host_name, const std::string& peer_name);
 void DeleteLink(const std::string& name);

@@ -295,9 +295,11 @@ void ValidateNetworkCondition(const NetworkCondition& condition) {
   }
 }
 
-bool MatchesNetworkCondition(const QdiscInfo& qdisc,
-                             const NetworkCondition& condition) {
-  return qdisc.has_netem_options &&
+}  // namespace
+
+bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
+                                  const NetworkCondition& condition) {
+  return qdisc.kind == "netem" && qdisc.has_netem_options &&
          qdisc.netem_latency_us == condition.delay_ms * 1000U &&
          qdisc.netem_jitter_us == condition.jitter_ms * 1000U &&
          qdisc.netem_loss == NetemProbability(condition.loss_basis_points) &&
@@ -305,6 +307,8 @@ bool MatchesNetworkCondition(const QdiscInfo& qdisc,
              NetemProbability(condition.duplicate_basis_points) &&
          qdisc.netem_limit_packets == condition.limit_packets;
 }
+
+namespace {
 
 template <typename Operation>
 auto ExecuteInNetworkNamespace(int netns_fd, Operation operation)
@@ -1517,7 +1521,7 @@ NetworkConditionProbe ProbeNetworkCondition() {
     if (netem == nullptr) {
       throw std::runtime_error("netem qdisc was not visible after apply");
     }
-    if (!MatchesNetworkCondition(*netem, probe.condition)) {
+    if (!QdiscMatchesNetworkCondition(*netem, probe.condition)) {
       throw std::runtime_error("netem qdisc options did not match condition");
     }
     if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
