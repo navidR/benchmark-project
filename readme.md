@@ -110,6 +110,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --replace-run \
      --nodes 3 \
      --generate-blocks 1 \
+     --generate-node 2 \
      --ready-timeout-sec 45 \
      --sync-timeout-sec 45'
 ```
@@ -321,6 +322,7 @@ The same run settings can be loaded from a JSON scenario file:
   "run_id": "scenario-smoke",
   "nodes": 3,
   "generate_blocks": 1,
+  "generate_node": 2,
   "ready_timeout_sec": 45,
   "sync_timeout_sec": 45,
   "metrics_sample_count": 5,

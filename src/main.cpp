@@ -80,6 +80,7 @@ struct Options {
   std::string run_id = MakeRunId();
   uint32_t nodes = 1;
   uint32_t generate_blocks = 1;
+  uint32_t generate_node = 1;
   uint32_t ready_timeout_sec = 30;
   uint32_t sync_timeout_sec = 30;
   uint32_t metrics_sample_count = 0;
@@ -539,6 +540,10 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     options.generate_blocks = JsonOptionalUint32Field(
         scenario, "generate_blocks", options.generate_blocks);
   }
+  if (!OptionProvided(vm, "generate-node")) {
+    options.generate_node = JsonOptionalUint32Field(
+        scenario, "generate_node", options.generate_node);
+  }
   if (!OptionProvided(vm, "ready-timeout-sec")) {
     options.ready_timeout_sec = JsonOptionalUint32Field(
         scenario, "ready_timeout_sec", options.ready_timeout_sec);
@@ -971,7 +976,9 @@ Options ParseOptions(int argc, char** argv) {
       "summarize an existing run directory as JSON and exit")(
       "nodes", po::value<uint32_t>(&options.nodes), nodes_help.c_str())(
       "generate-blocks", po::value<uint32_t>(&options.generate_blocks),
-      "blocks generated on node 0")(
+      "blocks generated on --generate-node")(
+      "generate-node", po::value<uint32_t>(&options.generate_node),
+      "1-based node number that generates blocks")(
       "ready-timeout-sec", po::value<uint32_t>(&options.ready_timeout_sec),
       "RPC startup timeout")(
       "sync-timeout-sec", po::value<uint32_t>(&options.sync_timeout_sec),
@@ -1189,6 +1196,9 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error("--nodes currently supports 1.." +
                              std::to_string(kMaxFiroNodes) +
                              " for Firo smoke runs");
+  }
+  if (options.generate_node == 0U || options.generate_node > options.nodes) {
+    throw std::runtime_error("--generate-node must be in 1..--nodes");
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
@@ -2331,6 +2341,9 @@ void WriteScenarioFiles(const Options& options,
                 process_yaml +
                 "workloads:\n"
                 "  - type: block_generation\n"
+                "    node: " +
+                std::to_string(options.generate_node) +
+                "\n"
                 "    count: " +
                 std::to_string(options.generate_blocks) +
                 "\n"
@@ -2341,6 +2354,7 @@ void WriteScenarioFiles(const Options& options,
   resolved["run_id"] = options.run_id;
   resolved["chain"] = "firo";
   resolved["nodes"] = options.nodes;
+  resolved["generate_node"] = options.generate_node;
   resolved["firod"] = options.firod.string();
   if (!options.scenario_json.empty()) {
     resolved["scenario_json"] = options.scenario_json.string();
@@ -3127,12 +3141,13 @@ int Run(int argc, char** argv) {
     WritePeriodicMetrics(events_path, metrics_path, options, driver, nodes);
 
     if (options.generate_blocks > 0) {
+      NodeRuntime& generator = nodes[options.generate_node - 1U];
       const uint64_t start_height =
-          driver.ReadMetrics(nodes.front().config).height;
+          driver.ReadMetrics(generator.config).height;
       std::vector<std::string> hashes = driver.GenerateBlocks(
-          nodes.front().config, options.generate_blocks, kDefaultRewardAddress);
-      nodes.front().generated_block_count += hashes.size();
-      WriteEvent(events_path, options.run_id, nodes.front().config.id,
+          generator.config, options.generate_blocks, kDefaultRewardAddress);
+      generator.generated_block_count += hashes.size();
+      WriteEvent(events_path, options.run_id, generator.config.id,
                  "generated_blocks", std::to_string(hashes.size()));
       const uint64_t target_height =
           start_height + static_cast<uint64_t>(hashes.size());
