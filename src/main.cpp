@@ -1,3 +1,4 @@
+#include "benchmark_sim/capability.h"
 #include "benchmark_sim/cgroup.h"
 #include "benchmark_sim/firo_driver.h"
 #include "benchmark_sim/logging.h"
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <linux/capability.h>
 #include <limits>
 #include <map>
 #include <memory>
@@ -46,6 +48,7 @@ struct Options {
   std::map<uint32_t, NetworkCondition> node_network_conditions;
   bool replace_run = false;
   bool probe_address = false;
+  bool probe_capabilities = false;
   bool probe_netns = false;
   bool probe_network_condition = false;
   bool probe_qdisc = false;
@@ -186,6 +189,9 @@ Options ParseOptions(int argc, char** argv) {
       "probe-address", po::bool_switch(&options.probe_address),
       "assign and inspect an IPv4 address inside a temporary netns through "
       "libmnl")(
+      "probe-capabilities", po::bool_switch(&options.probe_capabilities),
+      "report effective Linux capabilities needed by privileged simulator "
+      "paths")(
       "probe-netns", po::bool_switch(&options.probe_netns),
       "create a temporary network namespace and inspect it through setns/libmnl")(
       "probe-network-condition",
@@ -230,11 +236,14 @@ Options ParseOptions(int argc, char** argv) {
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
-  const bool needs_firod =
-      !options.probe_network && !options.probe_netns && !options.probe_veth &&
-      !options.probe_address && !options.probe_route && !options.probe_qdisc &&
-      !options.probe_qdisc_mutation && !options.probe_network_condition &&
-      !options.cleanup_run;
+  const bool needs_firod = !options.probe_network &&
+                           !options.probe_capabilities &&
+                           !options.probe_netns && !options.probe_veth &&
+                           !options.probe_address && !options.probe_route &&
+                           !options.probe_qdisc &&
+                           !options.probe_qdisc_mutation &&
+                           !options.probe_network_condition &&
+                           !options.cleanup_run;
   if (needs_firod && vm.count("firod") == 0U) {
     throw std::runtime_error("Firo runs require an explicit --firod path");
   }
@@ -408,6 +417,15 @@ std::string NetworkProbeJson() {
   result["ipv4_addresses"] = AddressesJson(ListIpv4Addresses());
   result["ipv4_routes"] = RoutesJson(ListIpv4Routes());
   result["qdiscs"] = QdiscsJson(ListQdiscs());
+  return boost::json::serialize(result);
+}
+
+std::string CapabilityProbeJson() {
+  const uint64_t effective = ReadEffectiveCapabilities();
+  boost::json::object result;
+  result["cap_sys_admin"] = HasCapability(effective, CAP_SYS_ADMIN);
+  result["cap_net_admin"] = HasCapability(effective, CAP_NET_ADMIN);
+  result["cap_sys_resource"] = HasCapability(effective, CAP_SYS_RESOURCE);
   return boost::json::serialize(result);
 }
 
@@ -709,6 +727,7 @@ void CleanupRun(Options options) {
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
   LoadCleanupMetadata(run_root, &options);
+  RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
 
   for (uint32_t i = 0; i < options.nodes; ++i) {
     DeleteNodeVethNetwork(MakeNodeVethConfig(options, i));
@@ -723,6 +742,9 @@ void CleanupRun(Options options) {
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
                 const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
+  if (options.isolate_network) {
+    RequireNetworkSetupCapabilities();
+  }
   if (options.isolate_network && options.nodes > 1 &&
       !HostIpv4ForwardingEnabled()) {
     throw std::runtime_error(
@@ -850,31 +872,42 @@ int Run(int argc, char** argv) {
     std::cout << NetworkProbeJson() << "\n";
     return 0;
   }
+  if (options.probe_capabilities) {
+    std::cout << CapabilityProbeJson() << "\n";
+    return 0;
+  }
   if (options.probe_netns) {
+    RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
     std::cout << NetworkNamespaceProbeJson() << "\n";
     return 0;
   }
   if (options.probe_veth) {
+    RequireNetworkSetupCapabilities();
     std::cout << VethProbeJson() << "\n";
     return 0;
   }
   if (options.probe_network_condition) {
+    RequireNetworkSetupCapabilities();
     std::cout << NetworkConditionProbeJson() << "\n";
     return 0;
   }
   if (options.probe_address) {
+    RequireNetworkSetupCapabilities();
     std::cout << AddressProbeJson() << "\n";
     return 0;
   }
   if (options.probe_route) {
+    RequireNetworkSetupCapabilities();
     std::cout << RouteProbeJson() << "\n";
     return 0;
   }
   if (options.probe_qdisc) {
+    RequireNetworkSetupCapabilities();
     std::cout << QdiscProbeJson() << "\n";
     return 0;
   }
   if (options.probe_qdisc_mutation) {
+    RequireNetworkSetupCapabilities();
     std::cout << QdiscMutationProbeJson() << "\n";
     return 0;
   }

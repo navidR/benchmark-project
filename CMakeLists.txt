@@ -75,6 +75,7 @@ foreach(boost_target IN LISTS boost_targets)
 endforeach()
 
 add_executable(benchmark-sim
+  src/capability.cpp
   src/cgroup.cpp
   src/firo_driver.cpp
   src/http_client.cpp
@@ -105,10 +106,12 @@ target_compile_options(benchmark-sim PRIVATE
 
 if(BUILD_TESTING)
   add_executable(benchmark-sim-unit-tests
+    tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
     tests/unit/network_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/util_tests.cpp
+    src/capability.cpp
     src/cgroup.cpp
     src/network.cpp
     src/process.cpp
