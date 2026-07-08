@@ -149,6 +149,9 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
   FiroMetrics metrics;
+  metrics.version = JsonUint(network, "version");
+  metrics.protocol_version = JsonUint(network, "protocolversion");
+  metrics.subversion = JsonString(network, "subversion");
   metrics.height = JsonUint(blockchain, "blocks");
   metrics.best_hash = JsonString(blockchain, "bestblockhash");
   metrics.peer_count = JsonUint(network, "connections");

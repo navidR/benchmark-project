@@ -15,6 +15,9 @@
 namespace bsim {
 
 struct FiroMetrics {
+  uint64_t version = 0;
+  uint64_t protocol_version = 0;
+  std::string subversion;
   uint64_t height = 0;
   std::string best_hash;
   uint64_t peer_count = 0;

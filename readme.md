@@ -22,6 +22,7 @@ Firo path is working end to end.
 - Wait for generated blocks to propagate before final metrics are recorded.
 - Record optional periodic metric samples between runtime events and workloads.
 - Record cgroup usage, pressure, event counters, and configured limits.
+- Record Firo daemon version, protocol version, and subversion in metrics.
 - Record event and metric files under a run directory.
 - Exercise Linux network namespace, veth, address, route, and qdisc operations
   through simulator probes.

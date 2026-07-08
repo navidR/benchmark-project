@@ -1349,6 +1349,9 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
   object["node_id"] = node_id;
+  object["chain_version"] = chain.version;
+  object["chain_protocol_version"] = chain.protocol_version;
+  object["chain_subversion"] = chain.subversion;
   object["height"] = chain.height;
   object["best_hash"] = chain.best_hash;
   object["peer_count"] = chain.peer_count;
