@@ -38,6 +38,7 @@ struct Options {
   uint32_t ready_timeout_sec = 30;
   uint32_t sync_timeout_sec = 30;
   bool keep_cgroups = false;
+  bool cleanup_run = false;
   bool isolate_network = false;
   bool network_condition_requested = false;
   NetworkCondition network_condition;
@@ -154,6 +155,9 @@ Options ParseOptions(int argc, char** argv) {
       "block propagation timeout")(
       "keep-cgroups", po::bool_switch(&options.keep_cgroups),
       "leave cgroups after exit for inspection")(
+      "cleanup-run", po::bool_switch(&options.cleanup_run),
+      "remove stale simulator-owned veth and cgroup objects for --run-id and "
+      "exit")(
       "isolate-network", po::bool_switch(&options.isolate_network),
       "run each Firo node in its own network namespace and veth link")(
       "network-delay-ms",
@@ -228,7 +232,8 @@ Options ParseOptions(int argc, char** argv) {
   RequireSafeRunId(options.run_id);
   if (!options.probe_network && !options.probe_netns && !options.probe_veth &&
       !options.probe_address && !options.probe_route && !options.probe_qdisc &&
-      !options.probe_qdisc_mutation && !options.probe_network_condition) {
+      !options.probe_qdisc_mutation && !options.probe_network_condition &&
+      !options.cleanup_run) {
     RequireExecutable(options.firod);
   }
   return options;
@@ -666,6 +671,49 @@ void WriteScenarioFiles(const Options& options,
             boost::json::serialize(resolved) + "\n");
 }
 
+void LoadCleanupMetadata(const std::filesystem::path& run_root,
+                         Options* options) {
+  const std::filesystem::path resolved_path = run_root / "resolved-scenario.json";
+  if (!std::filesystem::exists(resolved_path)) {
+    return;
+  }
+
+  const boost::json::value value = boost::json::parse(ReadText(resolved_path));
+  if (!value.is_object()) {
+    throw std::runtime_error("resolved scenario is not a JSON object: " +
+                             resolved_path.string());
+  }
+  const boost::json::object& object = value.as_object();
+  options->nodes = JsonOptionalUint32Field(object, "nodes", options->nodes);
+  const boost::json::value* isolated = object.if_contains("isolated_network");
+  if (isolated != nullptr) {
+    if (!isolated->is_bool()) {
+      throw std::runtime_error(
+          "resolved scenario isolated_network is not a boolean");
+    }
+    options->isolate_network = isolated->as_bool();
+  }
+  if (options->nodes < 1 || options->nodes > 2) {
+    throw std::runtime_error(
+        "cleanup currently supports resolved node counts in 1..2");
+  }
+}
+
+void CleanupRun(Options options) {
+  const auto run_root =
+      std::filesystem::absolute(options.output_dir) / options.run_id;
+  LoadCleanupMetadata(run_root, &options);
+
+  for (uint32_t i = 0; i < options.nodes; ++i) {
+    DeleteNodeVethNetwork(MakeNodeVethConfig(options, i));
+  }
+  Cgroup::RemoveRun(options.run_id);
+
+  std::cout << "cleanup_run=" << options.run_id << "\n"
+            << "nodes=" << options.nodes << "\n"
+            << "run_dir=" << run_root << "\n";
+}
+
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
                 const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
@@ -822,6 +870,10 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_qdisc_mutation) {
     std::cout << QdiscMutationProbeJson() << "\n";
+    return 0;
+  }
+  if (options.cleanup_run) {
+    CleanupRun(options);
     return 0;
   }
 

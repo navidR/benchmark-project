@@ -133,6 +133,22 @@ bool CgroupProcsEmpty(const std::filesystem::path& dir) {
   return SplitWhitespace(ReadText(dir / "cgroup.procs")).empty();
 }
 
+void WaitForCgroupProcsEmpty(const std::filesystem::path& dir) {
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (CgroupProcsEmpty(dir)) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+}
+
+void KillCgroupIfSupported(const std::filesystem::path& dir) {
+  if (std::filesystem::exists(dir / "cgroup.kill")) {
+    WriteCgroupFile(dir, "cgroup.kill", "1");
+    WaitForCgroupProcsEmpty(dir);
+  }
+}
+
 void MoveRootProcessesIntoContainerController(
     const std::filesystem::path& sim_root) {
   if (!RunningInsideDocker()) {
@@ -207,6 +223,7 @@ void Cgroup::RemoveRun(const std::string& run_id) {
       break;
     }
     if (entry.is_directory()) {
+      KillCgroupIfSupported(entry.path());
       std::filesystem::remove(entry.path(), ec);
     }
   }
@@ -275,6 +292,7 @@ void Cgroup::Thaw() const { WriteCgroupFile(path_, "cgroup.freeze", "0"); }
 void Cgroup::KillAll() const {
   if (std::filesystem::exists(path_ / "cgroup.kill")) {
     WriteCgroupFile(path_, "cgroup.kill", "1");
+    WaitForCgroupProcsEmpty(path_);
   }
 }
 

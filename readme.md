@@ -206,6 +206,17 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    ./build/benchmark-sim --probe-network | rg "bs[0-9]+[hp]" || true'
 ```
 
+Remove stale simulator-owned kernel objects for a run ID:
+
+```bash
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
+   ./build/benchmark-sim \
+     --output-dir runs \
+     --run-id isolated-smoke \
+     --cleanup-run'
+```
+
 ## License
 
 GPLv3. See `LICENSE`.
