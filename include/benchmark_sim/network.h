@@ -72,6 +72,31 @@ struct QdiscInfo {
   std::uint32_t tbf_mtu_ticks = 0;
 };
 
+struct TcFilterInfo {
+  int if_index = 0;
+  std::string if_name;
+  std::string kind;
+  std::uint32_t handle = 0;
+  std::uint32_t parent = 0;
+  std::uint32_t priority = 0;
+  std::uint16_t protocol = 0;
+  bool egress = false;
+  bool ingress = false;
+  bool has_eth_type = false;
+  std::uint16_t eth_type = 0;
+  bool has_ip_proto = false;
+  std::uint8_t ip_proto = 0;
+  bool has_ipv4_dst = false;
+  std::string ipv4_dst;
+  bool has_ipv4_dst_mask = false;
+  std::string ipv4_dst_mask;
+  bool has_tcp_dst = false;
+  std::uint16_t tcp_dst = 0;
+  bool has_tcp_dst_mask = false;
+  std::uint16_t tcp_dst_mask = 0;
+  bool has_drop_action = false;
+};
+
 struct NetworkCondition {
   std::uint32_t bandwidth_mbps = 0;
   std::uint32_t delay_ms = 0;
@@ -216,6 +241,19 @@ struct BandwidthLimitProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
+struct DropFilterProbe {
+  pid_t helper_pid = -1;
+  std::string host_name;
+  std::string peer_name;
+  std::string dst_address;
+  std::uint16_t dst_port = 0;
+  std::uint32_t handle = 0;
+  std::vector<TcFilterInfo> parent_filters_before;
+  std::vector<TcFilterInfo> parent_filters_after_apply;
+  std::vector<TcFilterInfo> parent_filters_after_delete;
+  std::vector<LinkInfo> parent_after_delete;
+};
+
 std::vector<LinkInfo> ListNetworkLinks();
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
 std::vector<AddressInfo> ListIpv4Addresses();
@@ -224,12 +262,18 @@ std::vector<RouteInfo> ListIpv4Routes();
 std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd);
 std::vector<QdiscInfo> ListQdiscs();
 std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd);
+std::vector<TcFilterInfo> ListTcFilters();
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition);
 bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
                                  const std::string& if_name,
                                  const NetworkCondition& condition,
                                  QdiscInfo* summary);
+bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
+                                      const std::string& if_name,
+                                      const std::string& dst_address,
+                                      std::uint16_t dst_port,
+                                      std::uint32_t handle);
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace();
 void CreateVethPair(const std::string& host_name, const std::string& peer_name);
 void DeleteLink(const std::string& name);
@@ -253,6 +297,12 @@ void ReplaceRootTbfQdisc(const std::string& if_name,
 void ReplaceNetworkConditionQdisc(const std::string& if_name,
                                   const NetworkCondition& condition);
 void DeleteRootQdisc(const std::string& if_name);
+void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
+                                    const std::string& dst_address,
+                                    std::uint16_t dst_port,
+                                    std::uint32_t handle);
+void DeleteEgressIpv4TcpDropFilter(const std::string& if_name,
+                                   std::uint32_t handle);
 void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config);
 void DeleteNodeVethNetwork(const NodeVethConfig& config);
 VethProbe ProbeVethPair();
@@ -264,5 +314,6 @@ NetworkConditionProbe ProbeNetworkCondition();
 NetworkConditionProbe ProbeCombinedNetworkCondition();
 NetworkConditionUpdateProbe ProbeNetworkConditionUpdate();
 BandwidthLimitProbe ProbeBandwidthLimit();
+DropFilterProbe ProbeDropFilter();
 
 }  // namespace bsim

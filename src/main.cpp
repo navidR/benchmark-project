@@ -97,6 +97,7 @@ struct Options {
   bool probe_bandwidth_limit = false;
   bool probe_capabilities = false;
   bool probe_cgroup_freeze = false;
+  bool probe_drop_filter = false;
   bool probe_netns = false;
   bool probe_combined_network_condition = false;
   bool probe_network_condition = false;
@@ -792,6 +793,9 @@ Options ParseOptions(int argc, char** argv) {
       "probe-cgroup-freeze", po::bool_switch(&options.probe_cgroup_freeze),
       "attach a child process to a cgroup and verify cgroup.freeze/thaw "
       "paths")(
+      "probe-drop-filter", po::bool_switch(&options.probe_drop_filter),
+      "apply and remove a flower/gact TCP drop filter on a temporary veth "
+      "through libmnl")(
       "probe-netns", po::bool_switch(&options.probe_netns),
       "create a temporary network namespace and inspect it through setns/libmnl")(
       "probe-network-condition",
@@ -885,6 +889,7 @@ Options ParseOptions(int argc, char** argv) {
                            !options.probe_bandwidth_limit &&
                            !options.probe_capabilities &&
                            !options.probe_cgroup_freeze &&
+                           !options.probe_drop_filter &&
                            !options.probe_netns && !options.probe_veth &&
                            !options.probe_address && !options.probe_route &&
                            !options.probe_qdisc &&
@@ -989,6 +994,37 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
     qdiscs_json.push_back(std::move(qdisc_json));
   }
   return qdiscs_json;
+}
+
+boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
+  boost::json::array filters_json;
+  for (const TcFilterInfo& filter : filters) {
+    boost::json::object filter_json;
+    filter_json["if_index"] = filter.if_index;
+    filter_json["if_name"] = filter.if_name;
+    filter_json["kind"] = filter.kind;
+    filter_json["handle"] = filter.handle;
+    filter_json["parent"] = filter.parent;
+    filter_json["priority"] = filter.priority;
+    filter_json["protocol"] = filter.protocol;
+    filter_json["egress"] = filter.egress;
+    filter_json["ingress"] = filter.ingress;
+    filter_json["has_eth_type"] = filter.has_eth_type;
+    filter_json["eth_type"] = filter.eth_type;
+    filter_json["has_ip_proto"] = filter.has_ip_proto;
+    filter_json["ip_proto"] = filter.ip_proto;
+    filter_json["has_ipv4_dst"] = filter.has_ipv4_dst;
+    filter_json["ipv4_dst"] = filter.ipv4_dst;
+    filter_json["has_ipv4_dst_mask"] = filter.has_ipv4_dst_mask;
+    filter_json["ipv4_dst_mask"] = filter.ipv4_dst_mask;
+    filter_json["has_tcp_dst"] = filter.has_tcp_dst;
+    filter_json["tcp_dst"] = filter.tcp_dst;
+    filter_json["has_tcp_dst_mask"] = filter.has_tcp_dst_mask;
+    filter_json["tcp_dst_mask"] = filter.tcp_dst_mask;
+    filter_json["has_drop_action"] = filter.has_drop_action;
+    filters_json.push_back(std::move(filter_json));
+  }
+  return filters_json;
 }
 
 boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
@@ -1250,6 +1286,7 @@ std::string NetworkProbeJson() {
   result["ipv4_addresses"] = AddressesJson(ListIpv4Addresses());
   result["ipv4_routes"] = RoutesJson(ListIpv4Routes());
   result["qdiscs"] = QdiscsJson(ListQdiscs());
+  result["tc_filters"] = TcFiltersJson(ListTcFilters());
   return boost::json::serialize(result);
 }
 
@@ -1362,6 +1399,25 @@ std::string NetworkConditionUpdateProbeJson() {
       QdiscsJson(probe.parent_qdiscs_after_update);
   result["parent_qdiscs_after_delete"] =
       QdiscsJson(probe.parent_qdiscs_after_delete);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string DropFilterProbeJson() {
+  DropFilterProbe probe = ProbeDropFilter();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["dst_address"] = probe.dst_address;
+  result["dst_port"] = probe.dst_port;
+  result["handle"] = probe.handle;
+  result["parent_filters_before"] =
+      TcFiltersJson(probe.parent_filters_before);
+  result["parent_filters_after_apply"] =
+      TcFiltersJson(probe.parent_filters_after_apply);
+  result["parent_filters_after_delete"] =
+      TcFiltersJson(probe.parent_filters_after_delete);
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -2338,6 +2394,11 @@ int Run(int argc, char** argv) {
   }
   if (options.probe_cgroup_freeze) {
     std::cout << CgroupFreezeProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_drop_filter) {
+    RequireNetworkSetupCapabilities();
+    std::cout << DropFilterProbeJson() << "\n";
     return 0;
   }
   if (options.probe_netns) {
