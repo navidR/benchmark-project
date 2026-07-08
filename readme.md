@@ -141,6 +141,20 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --network-delay-ms 5'
 ```
 
+Per-node isolated network conditions use repeatable JSON objects:
+
+```bash
+./build/benchmark-sim \
+  --firod "$FIROD" \
+  --output-dir runs \
+  --run-id isolated-per-node \
+  --replace-run \
+  --nodes 2 \
+  --generate-blocks 1 \
+  --isolate-network \
+  --node-network-condition-json '{"node":2,"delay_ms":5}'
+```
+
 Each run writes:
 
 - `runs/<run-id>/scenario.yaml`

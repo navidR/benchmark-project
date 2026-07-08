@@ -10,6 +10,8 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -18,6 +20,7 @@
 
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
+#include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/program_options.hpp>
 
@@ -39,6 +42,8 @@ struct Options {
   bool isolate_network = false;
   bool network_condition_requested = false;
   NetworkCondition network_condition;
+  std::vector<std::string> node_network_condition_json;
+  std::map<uint32_t, NetworkCondition> node_network_conditions;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_netns = false;
@@ -57,6 +62,78 @@ struct NodeRuntime {
   std::optional<NodeVethConfig> network;
   ChildProcess process;
 };
+
+uint32_t JsonUint32Field(const boost::json::object& object,
+                         const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("missing or invalid uint32 JSON field: " +
+                             std::string(field));
+  }
+  if (value->is_uint64() &&
+      value->as_uint64() <= std::numeric_limits<uint32_t>::max()) {
+    return static_cast<uint32_t>(value->as_uint64());
+  }
+  if (value->is_int64() && value->as_int64() >= 0 &&
+      static_cast<uint64_t>(value->as_int64()) <=
+          std::numeric_limits<uint32_t>::max()) {
+    return static_cast<uint32_t>(value->as_int64());
+  }
+  throw std::runtime_error("missing or invalid uint32 JSON field: " +
+                           std::string(field));
+}
+
+uint32_t JsonOptionalUint32Field(const boost::json::object& object,
+                                 const char* field, uint32_t default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return default_value;
+  }
+  if (value->is_uint64() &&
+      value->as_uint64() <= std::numeric_limits<uint32_t>::max()) {
+    return static_cast<uint32_t>(value->as_uint64());
+  }
+  if (value->is_int64() && value->as_int64() >= 0 &&
+      static_cast<uint64_t>(value->as_int64()) <=
+          std::numeric_limits<uint32_t>::max()) {
+    return static_cast<uint32_t>(value->as_int64());
+  }
+  throw std::runtime_error("invalid uint32 JSON field: " + std::string(field));
+}
+
+NetworkCondition ParseNetworkConditionObject(
+    const boost::json::object& object) {
+  NetworkCondition condition;
+  condition.delay_ms =
+      JsonOptionalUint32Field(object, "delay_ms", condition.delay_ms);
+  condition.jitter_ms =
+      JsonOptionalUint32Field(object, "jitter_ms", condition.jitter_ms);
+  condition.loss_basis_points = JsonOptionalUint32Field(
+      object, "loss_basis_points", condition.loss_basis_points);
+  condition.duplicate_basis_points = JsonOptionalUint32Field(
+      object, "duplicate_basis_points", condition.duplicate_basis_points);
+  condition.limit_packets = JsonOptionalUint32Field(
+      object, "limit_packets", condition.limit_packets);
+  return condition;
+}
+
+void ParseNodeNetworkConditions(Options& options) {
+  for (const std::string& text : options.node_network_condition_json) {
+    boost::json::value value = boost::json::parse(text);
+    if (!value.is_object()) {
+      throw std::runtime_error(
+          "--node-network-condition-json must be a JSON object");
+    }
+    const boost::json::object& object = value.as_object();
+    const uint32_t node = JsonUint32Field(object, "node");
+    if (node == 0 || node > options.nodes) {
+      throw std::runtime_error(
+          "--node-network-condition-json node must be in 1..--nodes");
+    }
+    options.node_network_conditions[node - 1U] =
+        ParseNetworkConditionObject(object);
+  }
+}
 
 Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
@@ -95,6 +172,12 @@ Options ParseOptions(int argc, char** argv) {
       "network-limit-packets",
       po::value<uint32_t>(&options.network_condition.limit_packets),
       "netem queue limit applied to each isolated node host-side veth")(
+      "node-network-condition-json",
+      po::value<std::vector<std::string>>(
+          &options.node_network_condition_json)
+          ->composing(),
+      "repeatable JSON object with node plus netem fields for one isolated "
+      "node")(
       "replace-run", po::bool_switch(&options.replace_run),
       "remove an existing run directory first")(
       "probe-address", po::bool_switch(&options.probe_address),
@@ -133,12 +216,16 @@ Options ParseOptions(int argc, char** argv) {
       vm.count("network-loss-bps") != 0U ||
       vm.count("network-duplicate-bps") != 0U ||
       vm.count("network-limit-packets") != 0U;
-  if (options.network_condition_requested && !options.isolate_network) {
-    throw std::runtime_error("network condition options require --isolate-network");
+  if ((options.network_condition_requested ||
+       !options.node_network_condition_json.empty()) &&
+      !options.isolate_network) {
+    throw std::runtime_error(
+        "network condition options require --isolate-network");
   }
   if (options.nodes < 1 || options.nodes > 2) {
     throw std::runtime_error("--nodes currently supports 1..2 for MVP smoke");
   }
+  ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
   if (!options.probe_network && !options.probe_netns && !options.probe_veth &&
       !options.probe_address && !options.probe_route && !options.probe_qdisc &&
@@ -243,8 +330,14 @@ NodeVethConfig MakeNodeVethConfig(const Options& options,
   config.host_address = NodeHostAddress(node_index);
   config.node_address = NodeAddress(node_index);
   config.prefix_len = 30;
-  config.apply_condition = options.network_condition_requested;
-  config.condition = options.network_condition;
+  const auto node_condition = options.node_network_conditions.find(node_index);
+  if (node_condition != options.node_network_conditions.end()) {
+    config.apply_condition = true;
+    config.condition = node_condition->second;
+  } else {
+    config.apply_condition = options.network_condition_requested;
+    config.condition = options.network_condition;
+  }
   return config;
 }
 
@@ -437,6 +530,29 @@ void WriteScenarioFiles(const Options& options,
         "    limit_packets: " +
         std::to_string(options.network_condition.limit_packets) + "\n";
   }
+  if (!options.node_network_conditions.empty()) {
+    network_yaml += "  node_conditions:\n";
+    for (const auto& [node_index, condition] :
+         options.node_network_conditions) {
+      network_yaml +=
+          "    firo-" + std::to_string(node_index + 1U) +
+          ":\n"
+          "      delay_ms: " +
+          std::to_string(condition.delay_ms) +
+          "\n"
+          "      jitter_ms: " +
+          std::to_string(condition.jitter_ms) +
+          "\n"
+          "      loss_basis_points: " +
+          std::to_string(condition.loss_basis_points) +
+          "\n"
+          "      duplicate_basis_points: " +
+          std::to_string(condition.duplicate_basis_points) +
+          "\n"
+          "      limit_packets: " +
+          std::to_string(condition.limit_packets) + "\n";
+    }
+  }
 
   WriteText(run_root / "scenario.yaml",
             "simulation:\n"
@@ -474,6 +590,17 @@ void WriteScenarioFiles(const Options& options,
   if (options.network_condition_requested) {
     resolved["default_network_condition"] =
         NetworkConditionJson(options.network_condition);
+  }
+  if (!options.node_network_conditions.empty()) {
+    boost::json::array node_conditions;
+    for (const auto& [node_index, condition] :
+         options.node_network_conditions) {
+      boost::json::object node_condition;
+      node_condition["node"] = node_index + 1U;
+      node_condition["condition"] = NetworkConditionJson(condition);
+      node_conditions.push_back(std::move(node_condition));
+    }
+    resolved["node_network_conditions"] = std::move(node_conditions);
   }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
