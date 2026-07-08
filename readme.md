@@ -13,7 +13,7 @@ Firo path is working end to end.
 
 - Start one or two Firo regtest nodes.
 - Run Firo nodes inside isolated network namespaces with one veth pair per node.
-- Apply a simple per-node network condition through host-side `netem`.
+- Apply simple per-node network conditions through host-side `netem` or TBF.
 - Apply live per-node cgroup resource updates after startup.
 - Restart a running Firo node before workload generation.
 - Freeze and thaw a running Firo node cgroup for a bounded duration.
@@ -147,6 +147,24 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --network-delay-ms 5'
 ```
 
+Isolated Firo node with a bandwidth limit:
+
+```bash
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
+  benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
+   ./build/benchmark-sim \
+     --firod "$FIROD" \
+     --output-dir runs \
+     --run-id isolated-bandwidth \
+     --replace-run \
+     --nodes 1 \
+     --generate-blocks 1 \
+     --ready-timeout-sec 45 \
+     --isolate-network \
+     --network-bandwidth-mbps 20'
+```
+
 Per-node isolated network conditions use repeatable JSON objects:
 
 ```bash
@@ -158,7 +176,7 @@ Per-node isolated network conditions use repeatable JSON objects:
   --nodes 2 \
   --generate-blocks 1 \
   --isolate-network \
-  --node-network-condition-json '{"node":2,"delay_ms":5}'
+  --node-network-condition-json '{"node":2,"bandwidth_mbps":20}'
 ```
 
 Runtime network updates use the same JSON shape and are applied after nodes are
@@ -173,8 +191,12 @@ running, before block generation:
   --nodes 2 \
   --generate-blocks 1 \
   --isolate-network \
-  --runtime-node-network-condition-json '{"node":2,"delay_ms":3,"jitter_ms":1}'
+  --runtime-node-network-condition-json '{"node":2,"bandwidth_mbps":10}'
 ```
+
+The current MVP applies bandwidth-only conditions with TBF and delay/loss
+conditions with `netem`. Combining bandwidth with delay/loss needs a qdisc
+hierarchy and is not enabled yet.
 
 Resource limits are global for the current MVP and apply to each node cgroup:
 

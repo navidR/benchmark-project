@@ -23,6 +23,7 @@
 #include <cstring>
 #include <exception>
 #include <future>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -270,6 +271,12 @@ const QdiscInfo* FindQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
   return nullptr;
 }
 
+bool HasNetemCondition(const NetworkCondition& condition) {
+  return condition.delay_ms != 0U || condition.jitter_ms != 0U ||
+         condition.loss_basis_points != 0U ||
+         condition.duplicate_basis_points != 0U;
+}
+
 std::uint32_t NetemProbability(std::uint32_t basis_points) {
   constexpr std::uint64_t kScale = 0xFFFFFFFFULL;
   constexpr std::uint64_t kBasisPointsPerWhole = 10000ULL;
@@ -278,9 +285,53 @@ std::uint32_t NetemProbability(std::uint32_t basis_points) {
       kBasisPointsPerWhole);
 }
 
+std::uint64_t TbfRateBytesPerSecond(const NetworkCondition& condition) {
+  constexpr std::uint64_t kBytesPerMegabit = 1000000ULL / 8ULL;
+  return static_cast<std::uint64_t>(condition.bandwidth_mbps) *
+         kBytesPerMegabit;
+}
+
+std::uint32_t SaturatingUint32(std::uint64_t value) {
+  constexpr std::uint64_t kMaxUint32 =
+      std::numeric_limits<std::uint32_t>::max();
+  if (value > kMaxUint32) {
+    return std::numeric_limits<std::uint32_t>::max();
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
+std::uint32_t TbfBurstBytes(const NetworkCondition& condition) {
+  constexpr std::uint64_t kMinimumBurstBytes = 1500ULL;
+  const std::uint64_t ten_ms_burst = TbfRateBytesPerSecond(condition) / 100ULL;
+  const std::uint64_t burst =
+      ten_ms_burst > kMinimumBurstBytes ? ten_ms_burst : kMinimumBurstBytes;
+  return SaturatingUint32(burst);
+}
+
+std::uint32_t TbfLimitBytes(const NetworkCondition& condition) {
+  constexpr std::uint64_t kMinimumLimitBytes = 64ULL * 1024ULL;
+  const std::uint64_t rate_limit =
+      TbfRateBytesPerSecond(condition) / 10ULL;
+  const std::uint64_t burst_limit =
+      static_cast<std::uint64_t>(TbfBurstBytes(condition)) * 4ULL;
+  std::uint64_t limit = kMinimumLimitBytes;
+  if (rate_limit > limit) {
+    limit = rate_limit;
+  }
+  if (burst_limit > limit) {
+    limit = burst_limit;
+  }
+  return SaturatingUint32(limit);
+}
+
 void ValidateNetworkCondition(const NetworkCondition& condition) {
   constexpr std::uint32_t kMaxBasisPoints = 10000U;
   constexpr std::uint32_t kMaxDelayMs = 4294967U;
+  if (condition.bandwidth_mbps != 0U && HasNetemCondition(condition)) {
+    throw std::runtime_error(
+        "combined bandwidth and netem delay/loss conditions are not supported "
+        "yet");
+  }
   if (condition.delay_ms > kMaxDelayMs || condition.jitter_ms > kMaxDelayMs) {
     throw std::runtime_error("netem delay and jitter must fit in uint32 usec");
   }
@@ -299,6 +350,12 @@ void ValidateNetworkCondition(const NetworkCondition& condition) {
 
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition) {
+  if (condition.bandwidth_mbps != 0U) {
+    return qdisc.kind == "tbf" && qdisc.has_tbf_options &&
+           qdisc.tbf_rate_bytes_per_sec ==
+               TbfRateBytesPerSecond(condition) &&
+           qdisc.tbf_limit_bytes == TbfLimitBytes(condition);
+  }
   return qdisc.kind == "netem" && qdisc.has_netem_options &&
          qdisc.netem_latency_us == condition.delay_ms * 1000U &&
          qdisc.netem_jitter_us == condition.jitter_ms * 1000U &&
@@ -679,6 +736,41 @@ struct NamespaceRouteState {
   std::vector<RouteInfo> routes_after_delete;
 };
 
+int ParseTbfOptionAttr(const nlattr* attr, void* data) {
+  auto* qdisc = static_cast<QdiscInfo*>(data);
+  const uint16_t attr_type = mnl_attr_get_type(attr);
+  if (mnl_attr_type_valid(attr, TCA_TBF_MAX) < 0) {
+    return MNL_CB_OK;
+  }
+
+  switch (attr_type) {
+    case TCA_TBF_PARMS:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) < sizeof(tc_tbf_qopt)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      } else {
+        const auto* options =
+            static_cast<const tc_tbf_qopt*>(mnl_attr_get_payload(attr));
+        qdisc->has_tbf_options = true;
+        qdisc->tbf_rate_bytes_per_sec = options->rate.rate;
+        qdisc->tbf_limit_bytes = options->limit;
+        qdisc->tbf_buffer_ticks = options->buffer;
+        qdisc->tbf_mtu_ticks = options->mtu;
+      }
+      return MNL_CB_OK;
+    case TCA_TBF_RATE64:
+      if (mnl_attr_validate(attr, MNL_TYPE_U64) < 0) {
+        return MNL_CB_ERROR;
+      }
+      qdisc->has_tbf_options = true;
+      qdisc->tbf_rate_bytes_per_sec = mnl_attr_get_u64(attr);
+      return MNL_CB_OK;
+    default:
+      return MNL_CB_OK;
+  }
+}
+
 int ParseQdiscAttr(const nlattr* attr, void* data) {
   auto* qdisc = static_cast<QdiscInfo*>(data);
   const uint16_t attr_type = mnl_attr_get_type(attr);
@@ -713,6 +805,12 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
     case TCA_OPTIONS: {
       const auto payload_len =
           static_cast<std::size_t>(mnl_attr_get_payload_len(attr));
+      if (qdisc->kind == "tbf") {
+        if (mnl_attr_parse_nested(attr, ParseTbfOptionAttr, qdisc) < 0) {
+          return MNL_CB_ERROR;
+        }
+        return MNL_CB_OK;
+      }
       if (payload_len >= sizeof(tc_netem_qopt)) {
         const auto* options =
             static_cast<const tc_netem_qopt*>(mnl_attr_get_payload(attr));
@@ -822,6 +920,13 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
     qdisc.netem_duplicate = 0;
     qdisc.netem_limit_packets = 0;
   }
+  if (qdisc.kind != "tbf") {
+    qdisc.has_tbf_options = false;
+    qdisc.tbf_rate_bytes_per_sec = 0;
+    qdisc.tbf_limit_bytes = 0;
+    qdisc.tbf_buffer_ticks = 0;
+    qdisc.tbf_mtu_ticks = 0;
+  }
   qdiscs->push_back(std::move(qdisc));
   return MNL_CB_OK;
 }
@@ -838,6 +943,12 @@ struct NamespaceQdiscMutationState {
 };
 
 struct NamespaceNetworkConditionState {
+  std::vector<QdiscInfo> qdiscs_before;
+  std::vector<QdiscInfo> qdiscs_after_apply;
+  std::vector<QdiscInfo> qdiscs_after_delete;
+};
+
+struct NamespaceBandwidthLimitState {
   std::vector<QdiscInfo> qdiscs_before;
   std::vector<QdiscInfo> qdiscs_after_apply;
   std::vector<QdiscInfo> qdiscs_after_delete;
@@ -1367,6 +1478,58 @@ void ReplaceRootNetemQdisc(const std::string& if_name,
   SendNetlinkRequest(nlh, sequence);
 }
 
+void ReplaceRootTbfQdisc(const std::string& if_name,
+                         const NetworkCondition& condition) {
+  RequireInterfaceName(if_name);
+  ValidateNetworkCondition(condition);
+  if (condition.bandwidth_mbps == 0U) {
+    throw std::runtime_error("TBF bandwidth must be greater than zero");
+  }
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+
+  const std::uint64_t rate_bytes_per_second =
+      TbfRateBytesPerSecond(condition);
+  const std::uint32_t burst_bytes = TbfBurstBytes(condition);
+  const std::uint32_t limit_bytes = TbfLimitBytes(condition);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWQDISC;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+  message->tcm_ifindex = static_cast<int>(if_index);
+  message->tcm_handle = TC_H_MAKE(1U << 16, 0U);
+  message->tcm_parent = TC_H_ROOT;
+  message->tcm_info = 0;
+
+  tc_tbf_qopt options{};
+  options.rate.linklayer = TC_LINKLAYER_ETHERNET;
+  options.rate.rate = SaturatingUint32(rate_bytes_per_second);
+  options.limit = limit_bytes;
+
+  mnl_attr_put_strz(nlh, TCA_KIND, "tbf");
+  nlattr* tbf_options = mnl_attr_nest_start(nlh, TCA_OPTIONS);
+  mnl_attr_put(nlh, TCA_TBF_PARMS, sizeof(options), &options);
+  if (rate_bytes_per_second >
+      static_cast<std::uint64_t>(
+          std::numeric_limits<std::uint32_t>::max())) {
+    mnl_attr_put_u64(nlh, TCA_TBF_RATE64, rate_bytes_per_second);
+  }
+  mnl_attr_put_u32(nlh, TCA_TBF_BURST, burst_bytes);
+  mnl_attr_nest_end(nlh, tbf_options);
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
 void DeleteRootQdisc(const std::string& if_name) {
   RequireInterfaceName(if_name);
   const unsigned int if_index = if_nametoindex(if_name.c_str());
@@ -1411,7 +1574,11 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
     AddIpv4Address(config.host_name, config.host_address, config.prefix_len);
     SetLinkUp(config.host_name, true);
     if (config.apply_condition) {
-      ReplaceRootNetemQdisc(config.host_name, config.condition);
+      if (config.condition.bandwidth_mbps != 0U) {
+        ReplaceRootTbfQdisc(config.host_name, config.condition);
+      } else {
+        ReplaceRootNetemQdisc(config.host_name, config.condition);
+      }
     }
     MoveLinkToNamespace(config.peer_name, netns_fd);
 
@@ -1531,6 +1698,74 @@ NetworkConditionProbe ProbeNetworkCondition() {
     if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
                               probe.peer_name)) {
       throw std::runtime_error("qdisc dump lost veth peer after netem delete");
+    }
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
+  return probe;
+}
+
+BandwidthLimitProbe ProbeBandwidthLimit() {
+  BandwidthLimitProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  probe.condition.bandwidth_mbps = 20;
+
+  pid_t helper_pid = -1;
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
+  probe.helper_pid = helper_pid;
+
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+
+    NamespaceBandwidthLimitState namespace_state =
+        ExecuteInNetworkNamespace(namespace_fd.get(), [&probe]() {
+          SetLinkUp("lo", true);
+          SetLinkUp(probe.peer_name, true);
+          NamespaceBandwidthLimitState state;
+          state.qdiscs_before = ListQdiscs();
+          ReplaceRootTbfQdisc(probe.peer_name, probe.condition);
+          state.qdiscs_after_apply = ListQdiscs();
+          DeleteRootQdisc(probe.peer_name);
+          state.qdiscs_after_delete = ListQdiscs();
+          return state;
+        });
+    probe.namespace_qdiscs_before = std::move(namespace_state.qdiscs_before);
+    probe.namespace_qdiscs_after_apply =
+        std::move(namespace_state.qdiscs_after_apply);
+    probe.namespace_qdiscs_after_delete =
+        std::move(namespace_state.qdiscs_after_delete);
+
+    const QdiscInfo* tbf = FindQdiscForInterface(
+        probe.namespace_qdiscs_after_apply, probe.peer_name, "tbf");
+    if (tbf == nullptr) {
+      throw std::runtime_error("TBF qdisc was not visible after apply");
+    }
+    if (!QdiscMatchesNetworkCondition(*tbf, probe.condition)) {
+      throw std::runtime_error("TBF qdisc options did not match condition");
+    }
+    if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
+                                 probe.peer_name, "tbf")) {
+      throw std::runtime_error("TBF qdisc remained after delete");
+    }
+    if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
+                              probe.peer_name)) {
+      throw std::runtime_error("qdisc dump lost veth peer after TBF delete");
     }
 
     DeleteLink(probe.host_name);

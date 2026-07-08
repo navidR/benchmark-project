@@ -91,6 +91,7 @@ struct Options {
   std::vector<FreezeRequest> runtime_node_freezes;
   bool replace_run = false;
   bool probe_address = false;
+  bool probe_bandwidth_limit = false;
   bool probe_capabilities = false;
   bool probe_cgroup_freeze = false;
   bool probe_netns = false;
@@ -224,6 +225,8 @@ bool OptionProvided(const boost::program_options::variables_map& vm,
 NetworkCondition ParseNetworkConditionObject(
     const boost::json::object& object) {
   NetworkCondition condition;
+  condition.bandwidth_mbps = JsonOptionalUint32Field(
+      object, "bandwidth_mbps", condition.bandwidth_mbps);
   condition.delay_ms =
       JsonOptionalUint32Field(object, "delay_ms", condition.delay_ms);
   condition.jitter_ms =
@@ -505,6 +508,10 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       }
       const NetworkCondition scenario_condition =
           ParseNetworkConditionObject(default_condition->as_object());
+      if (!OptionProvided(vm, "network-bandwidth-mbps")) {
+        options.network_condition.bandwidth_mbps =
+            scenario_condition.bandwidth_mbps;
+      }
       if (!OptionProvided(vm, "network-delay-ms")) {
         options.network_condition.delay_ms = scenario_condition.delay_ms;
       }
@@ -694,6 +701,10 @@ Options ParseOptions(int argc, char** argv) {
       "exit")(
       "isolate-network", po::bool_switch(&options.isolate_network),
       "run each Firo node in its own network namespace and veth link")(
+      "network-bandwidth-mbps",
+      po::value<uint32_t>(&options.network_condition.bandwidth_mbps),
+      "TBF bandwidth limit in megabits per second for each isolated node "
+      "host-side veth")(
       "network-delay-ms",
       po::value<uint32_t>(&options.network_condition.delay_ms),
       "netem delay applied to each isolated node host-side veth")(
@@ -713,14 +724,15 @@ Options ParseOptions(int argc, char** argv) {
       po::value<std::vector<std::string>>(
           &options.node_network_condition_json)
           ->composing(),
-      "repeatable JSON object with node plus netem fields for one isolated "
+      "repeatable JSON object with node plus network condition fields for one "
+      "isolated "
       "node")(
       "runtime-node-network-condition-json",
       po::value<std::vector<std::string>>(
           &options.runtime_node_network_condition_json)
           ->composing(),
-      "repeatable JSON object with node plus live netem fields to apply after "
-      "isolated nodes are running")(
+      "repeatable JSON object with node plus live network condition fields to "
+      "apply after isolated nodes are running")(
       "runtime-node-resource-json",
       po::value<std::vector<std::string>>(
           &options.runtime_node_resource_json)
@@ -743,6 +755,10 @@ Options ParseOptions(int argc, char** argv) {
       "remove an existing run directory first")(
       "probe-address", po::bool_switch(&options.probe_address),
       "assign and inspect an IPv4 address inside a temporary netns through "
+      "libmnl")(
+      "probe-bandwidth-limit",
+      po::bool_switch(&options.probe_bandwidth_limit),
+      "apply and remove a TBF bandwidth limit on a temporary veth peer through "
       "libmnl")(
       "probe-capabilities", po::bool_switch(&options.probe_capabilities),
       "report effective Linux capabilities needed by privileged simulator "
@@ -791,6 +807,7 @@ Options ParseOptions(int argc, char** argv) {
   }
   options.network_condition_requested =
       options.network_condition_requested ||
+      vm.count("network-bandwidth-mbps") != 0U ||
       vm.count("network-delay-ms") != 0U ||
       vm.count("network-jitter-ms") != 0U ||
       vm.count("network-loss-bps") != 0U ||
@@ -830,6 +847,7 @@ Options ParseOptions(int argc, char** argv) {
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
   const bool needs_firod = !options.probe_network &&
+                           !options.probe_bandwidth_limit &&
                            !options.probe_capabilities &&
                            !options.probe_cgroup_freeze &&
                            !options.probe_netns && !options.probe_veth &&
@@ -925,6 +943,11 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
     qdisc_json["netem_loss"] = qdisc.netem_loss;
     qdisc_json["netem_duplicate"] = qdisc.netem_duplicate;
     qdisc_json["netem_limit_packets"] = qdisc.netem_limit_packets;
+    qdisc_json["has_tbf_options"] = qdisc.has_tbf_options;
+    qdisc_json["tbf_rate_bytes_per_sec"] = qdisc.tbf_rate_bytes_per_sec;
+    qdisc_json["tbf_limit_bytes"] = qdisc.tbf_limit_bytes;
+    qdisc_json["tbf_buffer_ticks"] = qdisc.tbf_buffer_ticks;
+    qdisc_json["tbf_mtu_ticks"] = qdisc.tbf_mtu_ticks;
     qdiscs_json.push_back(std::move(qdisc_json));
   }
   return qdiscs_json;
@@ -932,6 +955,7 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
 
 boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
   boost::json::object object;
+  object["bandwidth_mbps"] = condition.bandwidth_mbps;
   object["delay_ms"] = condition.delay_ms;
   object["jitter_ms"] = condition.jitter_ms;
   object["loss_basis_points"] = condition.loss_basis_points;
@@ -1252,6 +1276,23 @@ std::string NetworkConditionProbeJson() {
   return boost::json::serialize(result);
 }
 
+std::string BandwidthLimitProbeJson() {
+  BandwidthLimitProbe probe = ProbeBandwidthLimit();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  result["condition"] = NetworkConditionJson(probe.condition);
+  result["namespace_qdiscs_before"] =
+      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_after_apply"] =
+      QdiscsJson(probe.namespace_qdiscs_after_apply);
+  result["namespace_qdiscs_after_delete"] =
+      QdiscsJson(probe.namespace_qdiscs_after_delete);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
 std::string NetworkConditionUpdateProbeJson() {
   NetworkConditionUpdateProbe probe = ProbeNetworkConditionUpdate();
   boost::json::object result;
@@ -1440,6 +1481,17 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["qdisc_qlen"] = qdisc->qlen;
     object["qdisc_backlog"] = qdisc->backlog;
     object["qdisc_requeues"] = qdisc->requeues;
+    object["qdisc_has_netem_options"] = qdisc->has_netem_options;
+    object["qdisc_netem_latency_us"] = qdisc->netem_latency_us;
+    object["qdisc_netem_jitter_us"] = qdisc->netem_jitter_us;
+    object["qdisc_netem_loss"] = qdisc->netem_loss;
+    object["qdisc_netem_duplicate"] = qdisc->netem_duplicate;
+    object["qdisc_netem_limit_packets"] = qdisc->netem_limit_packets;
+    object["qdisc_has_tbf_options"] = qdisc->has_tbf_options;
+    object["qdisc_tbf_rate_bytes_per_sec"] = qdisc->tbf_rate_bytes_per_sec;
+    object["qdisc_tbf_limit_bytes"] = qdisc->tbf_limit_bytes;
+    object["qdisc_tbf_buffer_ticks"] = qdisc->tbf_buffer_ticks;
+    object["qdisc_tbf_mtu_ticks"] = qdisc->tbf_mtu_ticks;
   }
   return boost::json::serialize(object);
 }
@@ -1556,6 +1608,9 @@ void WriteScenarioFiles(const Options& options,
   if (options.network_condition_requested) {
     network_yaml +=
         "  default_condition:\n"
+        "    bandwidth_mbps: " +
+        std::to_string(options.network_condition.bandwidth_mbps) +
+        "\n"
         "    delay_ms: " +
         std::to_string(options.network_condition.delay_ms) +
         "\n"
@@ -1578,6 +1633,9 @@ void WriteScenarioFiles(const Options& options,
       network_yaml +=
           "    firo-" + std::to_string(node_index + 1U) +
           ":\n"
+          "      bandwidth_mbps: " +
+          std::to_string(condition.bandwidth_mbps) +
+          "\n"
           "      delay_ms: " +
           std::to_string(condition.delay_ms) +
           "\n"
@@ -1601,6 +1659,9 @@ void WriteScenarioFiles(const Options& options,
       network_yaml +=
           "    firo-" + std::to_string(node_index + 1U) +
           ":\n"
+          "      bandwidth_mbps: " +
+          std::to_string(condition.bandwidth_mbps) +
+          "\n"
           "      delay_ms: " +
           std::to_string(condition.delay_ms) +
           "\n"
@@ -2010,7 +2071,11 @@ void ApplyRuntimeNetworkConditionUpdates(
     }
     node.network->apply_condition = true;
     node.network->condition = condition;
-    ReplaceRootNetemQdisc(node.network->host_name, node.network->condition);
+    if (node.network->condition.bandwidth_mbps != 0U) {
+      ReplaceRootTbfQdisc(node.network->host_name, node.network->condition);
+    } else {
+      ReplaceRootNetemQdisc(node.network->host_name, node.network->condition);
+    }
     const QdiscInfo qdisc = VerifyNodeNetworkCondition(*node.network);
     WriteEvent(events_path, options.run_id, node.config.id,
                "network_condition_updated",
@@ -2195,6 +2260,11 @@ int Run(int argc, char** argv) {
   if (options.probe_veth) {
     RequireNetworkSetupCapabilities();
     std::cout << VethProbeJson() << "\n";
+    return 0;
+  }
+  if (options.probe_bandwidth_limit) {
+    RequireNetworkSetupCapabilities();
+    std::cout << BandwidthLimitProbeJson() << "\n";
     return 0;
   }
   if (options.probe_network_condition) {

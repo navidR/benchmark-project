@@ -63,9 +63,15 @@ struct QdiscInfo {
   std::uint32_t netem_loss = 0;
   std::uint32_t netem_duplicate = 0;
   std::uint32_t netem_limit_packets = 0;
+  bool has_tbf_options = false;
+  std::uint64_t tbf_rate_bytes_per_sec = 0;
+  std::uint32_t tbf_limit_bytes = 0;
+  std::uint32_t tbf_buffer_ticks = 0;
+  std::uint32_t tbf_mtu_ticks = 0;
 };
 
 struct NetworkCondition {
+  std::uint32_t bandwidth_mbps = 0;
   std::uint32_t delay_ms = 0;
   std::uint32_t jitter_ms = 0;
   std::uint32_t loss_basis_points = 0;
@@ -195,6 +201,17 @@ struct NetworkConditionUpdateProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
+struct BandwidthLimitProbe {
+  pid_t helper_pid = -1;
+  std::string host_name;
+  std::string peer_name;
+  NetworkCondition condition;
+  std::vector<QdiscInfo> namespace_qdiscs_before;
+  std::vector<QdiscInfo> namespace_qdiscs_after_apply;
+  std::vector<QdiscInfo> namespace_qdiscs_after_delete;
+  std::vector<LinkInfo> parent_after_delete;
+};
+
 std::vector<LinkInfo> ListNetworkLinks();
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
 std::vector<AddressInfo> ListIpv4Addresses();
@@ -223,6 +240,8 @@ void ReplaceRootPfifoQdisc(const std::string& if_name,
                            std::uint32_t limit_packets);
 void ReplaceRootNetemQdisc(const std::string& if_name,
                            const NetworkCondition& condition);
+void ReplaceRootTbfQdisc(const std::string& if_name,
+                         const NetworkCondition& condition);
 void DeleteRootQdisc(const std::string& if_name);
 void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config);
 void DeleteNodeVethNetwork(const NodeVethConfig& config);
@@ -233,5 +252,6 @@ QdiscProbe ProbeQdiscDump();
 QdiscMutationProbe ProbeQdiscMutation();
 NetworkConditionProbe ProbeNetworkCondition();
 NetworkConditionUpdateProbe ProbeNetworkConditionUpdate();
+BandwidthLimitProbe ProbeBandwidthLimit();
 
 }  // namespace bsim
