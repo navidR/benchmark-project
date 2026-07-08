@@ -71,11 +71,19 @@ The simulator must not depend on system Boost or system libmnl packages.
 
 ## Build
 
-The current development path uses Docker container `benchmark-project-codex`.
+Set these paths for local builds and examples:
 
 ```bash
-docker exec benchmark-project-codex bash -lc \
-  'cd /home/navidr/work/benchmark-project &&
+export PROJECT_ROOT=/path/to/benchmark-project
+export FIROD=/path/to/firod
+```
+
+The current development path uses a Docker container with the project mounted.
+The examples below use `benchmark-project-codex` as the container name.
+
+```bash
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
    cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug &&
    cmake --build build -j16'
 ```
@@ -91,8 +99,8 @@ cmake --build build -j16
 ## Tests
 
 ```bash
-docker exec benchmark-project-codex bash -lc \
-  'cd /home/navidr/work/benchmark-project &&
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
    ctest --test-dir build --output-on-failure'
 ```
 
@@ -113,8 +121,8 @@ These probes exercise kernel network operations through libmnl/rtnetlink.
 Run them inside the Docker development container:
 
 ```bash
-docker exec benchmark-project-codex bash -lc \
-  'cd /home/navidr/work/benchmark-project &&
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim --probe-veth &&
    ./build/benchmark-sim --probe-address &&
    ./build/benchmark-sim --probe-route &&
@@ -126,19 +134,16 @@ Expected capabilities for the network probes include `CAP_SYS_ADMIN` and
 
 ## Firo Regtest Smoke
 
-The default Firo binary path is:
-
-```text
-/home/navidr/work/firo/build/bin/firod
-```
+Set `FIROD` to a compiled Firo daemon binary.
 
 One-node smoke:
 
 ```bash
-docker exec benchmark-project-codex bash -lc \
-  'cd /home/navidr/work/benchmark-project &&
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
+  benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim
-     --firod /home/navidr/work/firo/build/bin/firod
+     --firod "$FIROD"
      --output-dir runs
      --run-id smoke1
      --replace-run
@@ -150,10 +155,11 @@ docker exec benchmark-project-codex bash -lc \
 Two-node smoke:
 
 ```bash
-docker exec benchmark-project-codex bash -lc \
-  'cd /home/navidr/work/benchmark-project &&
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
+  benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim
-     --firod /home/navidr/work/firo/build/bin/firod
+     --firod "$FIROD"
      --output-dir runs
      --run-id smoke2
      --replace-run
@@ -181,8 +187,8 @@ docker exec benchmark-project-codex bash -lc 'pgrep -a firod || true'
 Check for leaked temporary benchmark veth names:
 
 ```bash
-docker exec benchmark-project-codex bash -lc \
-  'cd /home/navidr/work/benchmark-project &&
+docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
+  'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim --probe-network | rg "bs[0-9]+[hp]" || true'
 ```
 
