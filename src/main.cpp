@@ -487,6 +487,8 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["cpu_throttled_usec"] = cgroup->cpu_throttled_usec;
     object["memory_current"] = cgroup->memory_current;
     object["memory_peak"] = cgroup->memory_peak;
+    object["io_read_bytes"] = cgroup->io_read_bytes;
+    object["io_write_bytes"] = cgroup->io_write_bytes;
     object["pids_current"] = cgroup->pids_current;
     object["oom"] = cgroup->oom;
     object["oom_kill"] = cgroup->oom_kill;

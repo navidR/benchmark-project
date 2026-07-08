@@ -14,6 +14,8 @@ struct CgroupMetrics {
   uint64_t cpu_throttled_usec = 0;
   uint64_t memory_current = 0;
   uint64_t memory_peak = 0;
+  uint64_t io_read_bytes = 0;
+  uint64_t io_write_bytes = 0;
   uint64_t pids_current = 0;
   uint64_t oom = 0;
   uint64_t oom_kill = 0;

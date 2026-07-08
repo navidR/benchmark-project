@@ -22,6 +22,11 @@ std::filesystem::path CgroupRoot() { return std::filesystem::path(kCgroupRoot); 
 
 bool RunningInsideDocker() { return std::filesystem::exists("/.dockerenv"); }
 
+struct IoStatTotals {
+  uint64_t read_bytes = 0;
+  uint64_t write_bytes = 0;
+};
+
 void WriteCgroupFile(const std::filesystem::path& dir, std::string_view file,
                      std::string_view value) {
   WriteText(dir / std::string(file), value);
@@ -46,6 +51,33 @@ uint64_t ParseKeyValue(const std::filesystem::path& path, std::string_view key) 
     }
   }
   return 0;
+}
+
+uint64_t ParseAssignmentUint(std::string_view token, std::string_view key) {
+  if (!token.starts_with(key) || token.size() == key.size()) {
+    return 0;
+  }
+  return std::stoull(std::string(token.substr(key.size())));
+}
+
+IoStatTotals ParseIoStat(const std::filesystem::path& path) {
+  IoStatTotals totals;
+  if (!std::filesystem::exists(path)) {
+    return totals;
+  }
+
+  std::istringstream lines(ReadText(path));
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream fields(line);
+    std::string token;
+    fields >> token;
+    while (fields >> token) {
+      totals.read_bytes += ParseAssignmentUint(token, "rbytes=");
+      totals.write_bytes += ParseAssignmentUint(token, "wbytes=");
+    }
+  }
+  return totals;
 }
 
 void EnableControllers(const std::filesystem::path& dir) {
@@ -193,6 +225,9 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   if (std::filesystem::exists(path_ / "memory.peak")) {
     metrics.memory_peak = ParseSingleUint(path_ / "memory.peak");
   }
+  const IoStatTotals io = ParseIoStat(path_ / "io.stat");
+  metrics.io_read_bytes = io.read_bytes;
+  metrics.io_write_bytes = io.write_bytes;
   metrics.pids_current = ParseSingleUint(path_ / "pids.current");
   metrics.oom = ParseKeyValue(path_ / "memory.events", "oom");
   metrics.oom_kill = ParseKeyValue(path_ / "memory.events", "oom_kill");
