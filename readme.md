@@ -462,6 +462,25 @@ The equivalent YAML entry point is:
 ./build/benchmark-sim --scenario-yaml /path/to/scenario.yaml --replace-run
 ```
 
+Raw Firo transactions can be driven without enabling the wallet. The workload
+mines mature funding to the source address, signs with the supplied regtest WIF,
+submits the transaction, and waits for it in the mempool:
+
+```json
+{
+  "type": "send_raw_transaction",
+  "funding_node": 1,
+  "submit_node": 1,
+  "source_address": "TEDbE9M6woLAtvxKoFitLpFgeDHFicgTA2",
+  "source_private_key": "cTpB4YiyKiBcPxnefsDpbnDxFDffjqJob8wGCEDXxgQ7zQoMXJdH",
+  "destination_address": "TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh",
+  "funding_blocks": 101,
+  "amount": "39.99000000",
+  "fee": "0.01000000",
+  "timeout_sec": 30
+}
+```
+
 Each run writes:
 
 - `runs/<run-id>/scenario.yaml`
@@ -485,6 +504,8 @@ for that peer address to disappear from `getpeerinfo`, and emit a structured
 `peer_disconnected` event.
 `connect_peer` workloads call Firo `addnode <address> onetry`, wait for the
 target address in `getpeerinfo`, and emit a structured `peer_connected` event.
+`send_raw_transaction` workloads use Firo raw transaction RPCs with wallet
+disabled and emit a structured `raw_transaction_submitted` event.
 `restart_node` workloads restart one Firo node and emit a structured
 `node_restarted` event.
 `freeze_node` workloads freeze one Firo node cgroup for `duration_ms`, thaw it,

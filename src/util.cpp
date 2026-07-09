@@ -5,19 +5,20 @@
 #include <unistd.h>
 
 #include <array>
-#include <cerrno>
+#include <boost/json/object.hpp>
+#include <boost/json/serialize.hpp>
+#include <boost/json/string.hpp>
+#include <boost/json/value.hpp>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <stdexcept>
-
-#include <boost/json/object.hpp>
-#include <boost/json/serialize.hpp>
-#include <boost/json/string.hpp>
 
 namespace bsim {
 namespace {
@@ -152,6 +153,95 @@ std::string MakeRunId() {
   return out.str();
 }
 
+uint64_t ParseFixed8Amount(std::string_view text, std::string_view field) {
+  constexpr uint64_t kScale = 100000000ULL;
+  if (text.empty()) {
+    throw std::runtime_error("invalid fixed-8 amount JSON field: " +
+                             std::string(field));
+  }
+
+  uint64_t whole = 0;
+  uint64_t fraction = 0;
+  uint32_t fraction_digits = 0;
+  bool seen_dot = false;
+  bool seen_digit = false;
+  for (char c : text) {
+    if (c == '.') {
+      if (seen_dot) {
+        throw std::runtime_error("invalid fixed-8 amount JSON field: " +
+                                 std::string(field));
+      }
+      seen_dot = true;
+      continue;
+    }
+    if (c < '0' || c > '9') {
+      throw std::runtime_error("invalid fixed-8 amount JSON field: " +
+                               std::string(field));
+    }
+    seen_digit = true;
+    const uint64_t digit = static_cast<uint64_t>(c - '0');
+    if (!seen_dot) {
+      if (whole > (std::numeric_limits<uint64_t>::max() - digit) / 10ULL) {
+        throw std::runtime_error("fixed-8 amount overflows uint64: " +
+                                 std::string(field));
+      }
+      whole = whole * 10ULL + digit;
+    } else if (fraction_digits < 8U) {
+      fraction = fraction * 10ULL + digit;
+      ++fraction_digits;
+    } else if (digit != 0ULL) {
+      throw std::runtime_error("fixed-8 amount has more than 8 decimals: " +
+                               std::string(field));
+    }
+  }
+  if (!seen_digit) {
+    throw std::runtime_error("invalid fixed-8 amount JSON field: " +
+                             std::string(field));
+  }
+  while (fraction_digits < 8U) {
+    fraction *= 10ULL;
+    ++fraction_digits;
+  }
+  if (whole > (std::numeric_limits<uint64_t>::max() - fraction) / kScale) {
+    throw std::runtime_error("fixed-8 amount overflows uint64: " +
+                             std::string(field));
+  }
+  return whole * kScale + fraction;
+}
+
+std::string FormatFixed8Amount(uint64_t amount) {
+  constexpr uint64_t kScale = 100000000ULL;
+  std::ostringstream out;
+  out << (amount / kScale) << "." << std::setw(8) << std::setfill('0')
+      << (amount % kScale);
+  return out.str();
+}
+
+std::string JsonFixed8AmountText(const boost::json::value& value,
+                                 std::string_view field) {
+  std::string text;
+  if (value.is_string()) {
+    text = std::string(value.as_string());
+  } else if (value.is_uint64()) {
+    text = std::to_string(value.as_uint64());
+  } else if (value.is_int64() && value.as_int64() >= 0) {
+    text = std::to_string(value.as_int64());
+  } else if (value.is_double()) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(8) << value.as_double();
+    text = out.str();
+  } else {
+    throw std::runtime_error("invalid fixed-8 amount JSON field: " +
+                             std::string(field));
+  }
+  return FormatFixed8Amount(ParseFixed8Amount(text, field));
+}
+
+uint64_t JsonFixed8Amount(const boost::json::value& value,
+                          std::string_view field) {
+  return ParseFixed8Amount(JsonFixed8AmountText(value, field), field);
+}
+
 std::vector<std::string> SplitWhitespace(std::string_view text) {
   std::istringstream in{std::string(text)};
   std::vector<std::string> words;
@@ -167,7 +257,8 @@ std::string JsonString(const boost::json::value& value,
   const auto& object = value.as_object();
   const boost::json::value* found = object.if_contains(field);
   if (found == nullptr || !found->is_string()) {
-    throw std::runtime_error("missing JSON string field: " + std::string(field));
+    throw std::runtime_error("missing JSON string field: " +
+                             std::string(field));
   }
   return std::string(found->as_string());
 }

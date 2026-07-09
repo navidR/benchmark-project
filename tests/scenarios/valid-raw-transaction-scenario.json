@@ -1,0 +1,23 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "raw-transaction-smoke",
+  "nodes": 1,
+  "generate_blocks": 0,
+  "ready_timeout_sec": 10,
+  "sync_timeout_sec": 30,
+  "workloads": [
+    {
+      "type": "send_raw_transaction",
+      "funding_node": 1,
+      "submit_node": 1,
+      "source_address": "TEDbE9M6woLAtvxKoFitLpFgeDHFicgTA2",
+      "source_private_key": "cTpB4YiyKiBcPxnefsDpbnDxFDffjqJob8wGCEDXxgQ7zQoMXJdH",
+      "destination_address": "TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh",
+      "funding_blocks": 101,
+      "amount": "39.99000000",
+      "fee": "0.01000000",
+      "timeout_sec": 30
+    }
+  ]
+}

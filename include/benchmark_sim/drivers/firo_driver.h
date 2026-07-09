@@ -44,6 +44,27 @@ struct FiroNodeConfig {
   std::vector<std::string> connect_peers;
 };
 
+struct FiroUtxo {
+  std::string txid;
+  uint32_t vout = 0;
+  uint64_t amount_satoshis = 0;
+  std::string amount;
+  std::string script_pub_key;
+  std::string block_hash;
+  uint64_t confirmations = 0;
+};
+
+struct FiroRawTransactionResult {
+  FiroUtxo utxo;
+  std::string raw_hex;
+  std::string signed_hex;
+  std::string txid;
+  std::string destination_amount;
+  std::string change_amount;
+  std::string fee;
+  uint64_t mempool_size = 0;
+};
+
 class FiroDriver {
  public:
   explicit FiroDriver(std::chrono::milliseconds rpc_timeout)
@@ -69,6 +90,19 @@ class FiroDriver {
   std::vector<std::string> GenerateBlocks(const FiroNodeConfig& config,
                                           uint32_t count,
                                           const std::string& address) const;
+  FiroUtxo FindSpendableOutput(const FiroNodeConfig& config,
+                               const std::vector<std::string>& block_hashes,
+                               const std::string& source_address,
+                               uint64_t minimum_amount_satoshis,
+                               uint64_t minimum_confirmations) const;
+  FiroRawTransactionResult SendRawTransaction(
+      const FiroNodeConfig& config, const FiroUtxo& utxo,
+      const std::string& source_address, const std::string& source_private_key,
+      const std::string& destination_address, uint64_t amount_satoshis,
+      uint64_t fee_satoshis, std::chrono::seconds timeout) const;
+  uint64_t WaitForMempoolTransaction(const FiroNodeConfig& config,
+                                     const std::string& txid,
+                                     std::chrono::seconds timeout) const;
   void ConnectPeer(const FiroNodeConfig& config,
                    const std::string& address) const;
   void DisconnectPeer(const FiroNodeConfig& config,

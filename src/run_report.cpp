@@ -287,6 +287,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array peer_waits;
   boost::json::array peer_connects;
   boost::json::array peer_disconnects;
+  boost::json::array raw_transactions;
   boost::json::array node_restarts;
   boost::json::array node_freezes;
   boost::json::array resource_updates;
@@ -328,6 +329,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           AppendEventSummary(event, &peer_connects);
         } else if (event_name == "peer_disconnected") {
           AppendEventSummary(event, &peer_disconnects);
+        } else if (event_name == "raw_transaction_submitted") {
+          AppendEventSummary(event, &raw_transactions);
         } else if (event_name == "node_restarted") {
           AppendEventSummary(event, &node_restarts);
         } else if (event_name == "node_freeze_completed") {
@@ -378,6 +381,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["peer_waits"] = std::move(peer_waits);
   report["peer_connects"] = std::move(peer_connects);
   report["peer_disconnects"] = std::move(peer_disconnects);
+  report["raw_transactions"] = std::move(raw_transactions);
   report["node_restarts"] = std::move(node_restarts);
   report["node_freezes"] = std::move(node_freezes);
   report["resource_updates"] = std::move(resource_updates);

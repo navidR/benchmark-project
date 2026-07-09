@@ -1,0 +1,14 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "send_raw_transaction",
+      "source_address": "TEDbE9M6woLAtvxKoFitLpFgeDHFicgTA2",
+      "source_private_key": "cTpB4YiyKiBcPxnefsDpbnDxFDffjqJob8wGCEDXxgQ7zQoMXJdH",
+      "destination_address": "TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh",
+      "funding_blocks": 101,
+      "amount": "0.00000000",
+      "fee": "0.01000000"
+    }
+  ]
+}

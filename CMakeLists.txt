@@ -246,6 +246,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-peer-churn-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME benchmark-sim-valid-raw-transaction-scenario
+    COMMAND benchmark-sim
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-raw-transaction-scenario.json"
+      --probe-capabilities
+  )
   add_cli_failure_test(
     benchmark-sim-invalid-wait-height-missing-height
     tests/scenarios/invalid-wait-height-missing-height.json
@@ -310,6 +316,26 @@ if(BUILD_TESTING)
     benchmark-sim-invalid-disconnect-peer-zero-timeout
     tests/scenarios/invalid-disconnect-peer-zero-timeout.json
     "scenario disconnect_peer timeout_sec must be greater than zero"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-raw-transaction-missing-private-key
+    tests/scenarios/invalid-raw-transaction-missing-private-key.json
+    "missing or invalid string JSON field: source_private_key"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-raw-transaction-funding-blocks
+    tests/scenarios/invalid-raw-transaction-funding-blocks.json
+    "scenario send_raw_transaction funding_blocks must be at least 101"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-raw-transaction-same-address
+    tests/scenarios/invalid-raw-transaction-same-address.json
+    "scenario send_raw_transaction source_address and destination_address must differ"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-raw-transaction-zero-amount
+    tests/scenarios/invalid-raw-transaction-zero-amount.json
+    "scenario send_raw_transaction amount must be greater than zero"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-restart-node-node

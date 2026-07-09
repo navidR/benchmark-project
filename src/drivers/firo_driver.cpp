@@ -5,6 +5,7 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
+#include <cstdint>
 #include <thread>
 
 #include "benchmark_sim/util.h"
@@ -48,6 +49,75 @@ bool ContainsPeerAddress(const std::vector<std::string>& addresses,
                          const std::string& address) {
   for (const std::string& candidate : addresses) {
     if (candidate == address) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool JsonStringArrayContains(const boost::json::value& value,
+                             const std::string& needle) {
+  if (!value.is_array()) {
+    return false;
+  }
+  for (const boost::json::value& item : value.as_array()) {
+    if (item.is_string() && std::string(item.as_string()) == needle) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string JsonStringMember(const boost::json::object& object,
+                             std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || !value->is_string()) {
+    throw std::runtime_error("missing Firo RPC string field: " +
+                             std::string(field));
+  }
+  return std::string(value->as_string());
+}
+
+uint64_t JsonUint64Member(const boost::json::object& object,
+                          std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value != nullptr && value->is_uint64()) {
+    return value->as_uint64();
+  }
+  if (value != nullptr && value->is_int64() && value->as_int64() >= 0) {
+    return static_cast<uint64_t>(value->as_int64());
+  }
+  throw std::runtime_error("missing Firo RPC uint64 field: " +
+                           std::string(field));
+}
+
+bool TxOutPaysAddress(const boost::json::object& txout,
+                      const std::string& source_address) {
+  const boost::json::value* script = txout.if_contains("scriptPubKey");
+  if (script == nullptr || !script->is_object()) {
+    return false;
+  }
+  const boost::json::value* addresses =
+      script->as_object().if_contains("addresses");
+  return addresses != nullptr &&
+         JsonStringArrayContains(*addresses, source_address);
+}
+
+std::string TxOutScriptPubKeyHex(const boost::json::object& txout) {
+  const boost::json::value* script = txout.if_contains("scriptPubKey");
+  if (script == nullptr || !script->is_object()) {
+    throw std::runtime_error("Firo gettxout result has no scriptPubKey object");
+  }
+  return JsonStringMember(script->as_object(), "hex");
+}
+
+bool MempoolContains(const boost::json::value& mempool,
+                     const std::string& txid) {
+  if (!mempool.is_array()) {
+    return false;
+  }
+  for (const boost::json::value& item : mempool.as_array()) {
+    if (item.is_string() && std::string(item.as_string()) == txid) {
       return true;
     }
   }
@@ -268,6 +338,176 @@ std::vector<std::string> FiroDriver::GenerateBlocks(
   params.push_back(count);
   params.emplace_back(address);
   return ParseStringArrayResult(RpcCall(config, "generatetoaddress", params));
+}
+
+FiroUtxo FiroDriver::FindSpendableOutput(
+    const FiroNodeConfig& config, const std::vector<std::string>& block_hashes,
+    const std::string& source_address, uint64_t minimum_amount_satoshis,
+    uint64_t minimum_confirmations) const {
+  constexpr uint32_t kMaxOutputsToProbe = 64;
+  for (const std::string& block_hash : block_hashes) {
+    boost::json::array block_params;
+    block_params.emplace_back(block_hash);
+    block_params.push_back(1);
+    const boost::json::value block = RpcCall(config, "getblock", block_params);
+    const boost::json::value* transactions =
+        block.as_object().if_contains("tx");
+    if (transactions == nullptr || !transactions->is_array()) {
+      continue;
+    }
+    for (const boost::json::value& tx : transactions->as_array()) {
+      if (!tx.is_string()) {
+        continue;
+      }
+      const std::string txid(tx.as_string());
+      for (uint32_t vout = 0; vout < kMaxOutputsToProbe; ++vout) {
+        boost::json::array txout_params;
+        txout_params.emplace_back(txid);
+        txout_params.push_back(vout);
+        txout_params.push_back(false);
+        const boost::json::value txout =
+            RpcCall(config, "gettxout", txout_params);
+        if (txout.is_null() || !txout.is_object()) {
+          continue;
+        }
+        const boost::json::object& txout_object = txout.as_object();
+        if (!TxOutPaysAddress(txout_object, source_address)) {
+          continue;
+        }
+        const boost::json::value* value = txout_object.if_contains("value");
+        if (value == nullptr) {
+          throw std::runtime_error("Firo gettxout result has no value field");
+        }
+        const uint64_t confirmations =
+            JsonUint64Member(txout_object, "confirmations");
+        const uint64_t amount_satoshis = JsonFixed8Amount(*value, "value");
+        if (confirmations < minimum_confirmations ||
+            amount_satoshis < minimum_amount_satoshis) {
+          continue;
+        }
+
+        FiroUtxo utxo;
+        utxo.txid = txid;
+        utxo.vout = vout;
+        utxo.amount_satoshis = amount_satoshis;
+        utxo.amount = FormatFixed8Amount(amount_satoshis);
+        utxo.script_pub_key = TxOutScriptPubKeyHex(txout_object);
+        utxo.block_hash = block_hash;
+        utxo.confirmations = confirmations;
+        return utxo;
+      }
+    }
+  }
+  throw std::runtime_error("no spendable Firo UTXO found for " +
+                           source_address);
+}
+
+FiroRawTransactionResult FiroDriver::SendRawTransaction(
+    const FiroNodeConfig& config, const FiroUtxo& utxo,
+    const std::string& source_address, const std::string& source_private_key,
+    const std::string& destination_address, uint64_t amount_satoshis,
+    uint64_t fee_satoshis, std::chrono::seconds timeout) const {
+  if (utxo.amount_satoshis < amount_satoshis ||
+      utxo.amount_satoshis - amount_satoshis < fee_satoshis) {
+    throw std::runtime_error(
+        "selected Firo UTXO does not cover amount and fee");
+  }
+  const uint64_t change_satoshis =
+      utxo.amount_satoshis - amount_satoshis - fee_satoshis;
+
+  boost::json::array inputs;
+  boost::json::object input;
+  input["txid"] = utxo.txid;
+  input["vout"] = utxo.vout;
+  inputs.push_back(std::move(input));
+
+  boost::json::object outputs;
+  outputs[destination_address] = FormatFixed8Amount(amount_satoshis);
+  if (change_satoshis != 0U) {
+    outputs[source_address] = FormatFixed8Amount(change_satoshis);
+  }
+
+  boost::json::array create_params;
+  create_params.push_back(std::move(inputs));
+  create_params.push_back(std::move(outputs));
+  const boost::json::value raw =
+      RpcCall(config, "createrawtransaction", create_params);
+  if (!raw.is_string()) {
+    throw std::runtime_error("Firo createrawtransaction returned non-string");
+  }
+
+  boost::json::array prevtxs;
+  boost::json::object prevtx;
+  prevtx["txid"] = utxo.txid;
+  prevtx["vout"] = utxo.vout;
+  prevtx["scriptPubKey"] = utxo.script_pub_key;
+  prevtx["amount"] = utxo.amount;
+  prevtxs.push_back(std::move(prevtx));
+  boost::json::array privkeys;
+  privkeys.emplace_back(source_private_key);
+  boost::json::array sign_params;
+  sign_params.push_back(raw);
+  sign_params.push_back(std::move(prevtxs));
+  sign_params.push_back(std::move(privkeys));
+  const boost::json::value signed_tx =
+      RpcCall(config, "signrawtransaction", sign_params);
+  const boost::json::object& signed_object = signed_tx.as_object();
+  const boost::json::value* complete = signed_object.if_contains("complete");
+  if (complete == nullptr || !complete->is_bool() || !complete->as_bool()) {
+    const boost::json::value* errors = signed_object.if_contains("errors");
+    throw std::runtime_error("Firo signrawtransaction did not complete" +
+                             (errors == nullptr
+                                  ? std::string()
+                                  : ": " + boost::json::serialize(*errors)));
+  }
+  const std::string signed_hex = JsonStringMember(signed_object, "hex");
+
+  boost::json::array send_params;
+  send_params.emplace_back(signed_hex);
+  send_params.push_back(false);
+  const boost::json::value txid_value =
+      RpcCall(config, "sendrawtransaction", send_params);
+  if (!txid_value.is_string()) {
+    throw std::runtime_error("Firo sendrawtransaction returned non-string");
+  }
+  const std::string txid(txid_value.as_string());
+
+  FiroRawTransactionResult result;
+  result.utxo = utxo;
+  result.raw_hex = std::string(raw.as_string());
+  result.signed_hex = signed_hex;
+  result.txid = txid;
+  result.destination_amount = FormatFixed8Amount(amount_satoshis);
+  result.change_amount = FormatFixed8Amount(change_satoshis);
+  result.fee = FormatFixed8Amount(fee_satoshis);
+  result.mempool_size = WaitForMempoolTransaction(config, txid, timeout);
+  return result;
+}
+
+uint64_t FiroDriver::WaitForMempoolTransaction(
+    const FiroNodeConfig& config, const std::string& txid,
+    std::chrono::seconds timeout) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  uint64_t last_size = 0;
+  std::string last_error;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      const boost::json::value mempool =
+          RpcCall(config, "getrawmempool", boost::json::array{});
+      if (mempool.is_array()) {
+        last_size = mempool.as_array().size();
+      }
+      if (MempoolContains(mempool, txid)) {
+        return last_size;
+      }
+    } catch (const std::exception& e) {
+      last_error = e.what();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  throw std::runtime_error(
+      "Firo node " + config.id + " did not report mempool transaction " + txid +
+      " before timeout" + (last_error.empty() ? "" : ": " + last_error));
 }
 
 void FiroDriver::ConnectPeer(const FiroNodeConfig& config,

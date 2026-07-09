@@ -413,6 +413,72 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
+  const std::filesystem::path dir = MakeTestDir("run-report-raw-tx");
+  bsim::WriteText(
+      dir / "resolved-scenario.json",
+      "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
+      "\"workloads\":["
+      "{\"type\":\"send_raw_transaction\",\"funding_node\":1,"
+      "\"submit_node\":1,"
+      "\"source_address\":\"TEDbE9M6woLAtvxKoFitLpFgeDHFicgTA2\","
+      "\"source_private_key\":"
+      "\"cTpB4YiyKiBcPxnefsDpbnDxFDffjqJob8wGCEDXxgQ7zQoMXJdH\","
+      "\"destination_address\":\"TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh\","
+      "\"funding_blocks\":101,\"amount\":\"39.99000000\","
+      "\"fee\":\"0.01000000\",\"timeout_sec\":30}]}\n");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"run_started\"}");
+  bsim::AppendLine(
+      dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+      "\"event\":\"raw_transaction_submitted\","
+      "\"detail\":\"{\\\"workload_index\\\":1,"
+      "\\\"workload_count\\\":1,\\\"funding_node\\\":1,"
+      "\\\"submit_node\\\":1,"
+      "\\\"source_address\\\":\\\"TEDbE9M6woLAtvxKoFitLpFgeDHFicgTA2\\\","
+      "\\\"destination_address\\\":\\\"TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh\\\","
+      "\\\"funding_blocks\\\":101,\\\"funding_hash_count\\\":101,"
+      "\\\"funding_start_height\\\":0,"
+      "\\\"funding_target_height\\\":101,"
+      "\\\"selected_utxo\\\":{\\\"txid\\\":\\\"abc\\\","
+      "\\\"vout\\\":0,\\\"amount\\\":\\\"40.00000000\\\","
+      "\\\"block_hash\\\":\\\"def\\\",\\\"confirmations\\\":101},"
+      "\\\"amount\\\":\\\"39.99000000\\\","
+      "\\\"fee\\\":\\\"0.01000000\\\","
+      "\\\"change_amount\\\":\\\"0.00000000\\\","
+      "\\\"txid\\\":\\\"tx123\\\",\\\"mempool_size\\\":1,"
+      "\\\"timeout_sec\\\":30}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"run_finished\"}");
+
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
+
+  BOOST_TEST(report.at("ok").as_bool());
+  const boost::json::array& workloads = report.at("workloads").as_array();
+  BOOST_REQUIRE_EQUAL(workloads.size(), 1U);
+  BOOST_TEST(workloads.front().as_object().at("type").as_string() ==
+             "send_raw_transaction");
+  const boost::json::array& transactions =
+      report.at("raw_transactions").as_array();
+  BOOST_REQUIRE_EQUAL(transactions.size(), 1U);
+  const boost::json::object& transaction =
+      transactions.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(transaction, "workload_index") == 1U);
+  BOOST_TEST(transaction.at("txid").as_string() == "tx123");
+  BOOST_TEST(transaction.at("amount").as_string() == "39.99000000");
+  BOOST_TEST(JsonInteger(transaction, "mempool_size") == 1U);
+  const boost::json::object& utxo = transaction.at("selected_utxo").as_object();
+  BOOST_TEST(utxo.at("amount").as_string() == "40.00000000");
+  BOOST_TEST(JsonInteger(utxo, "confirmations") == 101U);
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   const std::filesystem::path dir = MakeTestDir("run-report-failed");
   bsim::AppendLine(dir / "events.jsonl",

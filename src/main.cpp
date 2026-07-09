@@ -38,6 +38,7 @@ constexpr const char* kDefaultRewardAddress =
 constexpr const char* kRunMarkerFile = ".benchmark-sim-run";
 constexpr uint64_t kMaxLogTailBytes = 4096;
 constexpr uint32_t kMaxFiroNodes = 16;
+constexpr uint32_t kFiroCoinbaseSpendableConfirmations = 101;
 
 struct ResourceLimits {
   uint64_t memory_high_bytes = 0;
@@ -114,6 +115,18 @@ struct NetworkPartitionWorkload {
   NetworkPartitionRule partition;
 };
 
+struct SendRawTransactionWorkload {
+  uint32_t funding_node = 1;
+  uint32_t submit_node = 1;
+  std::string source_address;
+  std::string source_private_key;
+  std::string destination_address;
+  uint32_t funding_blocks = kFiroCoinbaseSpendableConfirmations;
+  uint64_t amount_satoshis = 0;
+  uint64_t fee_satoshis = 0;
+  uint32_t timeout_sec = 30;
+};
+
 enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
@@ -125,6 +138,7 @@ enum class WorkloadKind {
   kUpdateResourceLimits,
   kPartitionNodes,
   kHealPartition,
+  kSendRawTransaction,
 };
 
 struct ScenarioWorkload {
@@ -138,6 +152,7 @@ struct ScenarioWorkload {
   FreezeNodeWorkload freeze_node;
   ResourceLimitUpdateWorkload update_resource_limits;
   NetworkPartitionWorkload network_partition;
+  SendRawTransactionWorkload send_raw_transaction;
 };
 
 struct NetworkBlockRule {
@@ -355,6 +370,15 @@ std::string JsonStringField(const boost::json::object& object,
                              std::string(field));
   }
   return std::string(value->as_string());
+}
+
+uint64_t JsonAmountField(const boost::json::object& object, const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("missing or invalid fixed-8 amount JSON field: " +
+                             std::string(field));
+  }
+  return JsonFixed8Amount(*value, field);
 }
 
 std::vector<uint32_t> JsonNodeGroupField(const boost::json::object& object,
@@ -1017,6 +1041,35 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kHealPartition;
       scenario_workload.network_partition = partition;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "send_raw_transaction") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP send_raw_transaction workload uses "
+            "funding_node and submit_node, not nodes");
+      }
+      SendRawTransactionWorkload transaction;
+      transaction.funding_node = JsonOptionalUint32Field(
+          workload, "funding_node", transaction.funding_node);
+      transaction.submit_node = JsonOptionalUint32Field(
+          workload, "submit_node", transaction.submit_node);
+      transaction.source_address = JsonStringField(workload, "source_address");
+      transaction.source_private_key =
+          JsonStringField(workload, "source_private_key");
+      transaction.destination_address =
+          JsonStringField(workload, "destination_address");
+      transaction.funding_blocks = JsonOptionalUint32Field(
+          workload, "funding_blocks", transaction.funding_blocks);
+      transaction.amount_satoshis = JsonAmountField(workload, "amount");
+      transaction.fee_satoshis = JsonAmountField(workload, "fee");
+      transaction.timeout_sec =
+          OptionProvided(vm, "sync-timeout-sec")
+              ? options.sync_timeout_sec
+              : JsonOptionalUint32Field(workload, "timeout_sec",
+                                        options.sync_timeout_sec);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kSendRawTransaction;
+      scenario_workload.send_raw_transaction = transaction;
       options.workloads.push_back(scenario_workload);
     } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
@@ -1829,6 +1882,48 @@ Options ParseOptions(int argc, char** argv) {
       ValidateNetworkPartitionRule(workload.network_partition.partition,
                                    options.nodes,
                                    "scenario heal_partition workload");
+    } else if (workload.kind == WorkloadKind::kSendRawTransaction) {
+      const SendRawTransactionWorkload& transaction =
+          workload.send_raw_transaction;
+      if (transaction.funding_node == 0U ||
+          transaction.funding_node > options.nodes) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction funding_node must be in "
+            "1..--nodes");
+      }
+      if (transaction.submit_node == 0U ||
+          transaction.submit_node > options.nodes) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction submit_node must be in 1..--nodes");
+      }
+      if (transaction.source_address == transaction.destination_address) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction source_address and "
+            "destination_address must differ");
+      }
+      if (transaction.funding_blocks < kFiroCoinbaseSpendableConfirmations) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction funding_blocks must be at least " +
+            std::to_string(kFiroCoinbaseSpendableConfirmations));
+      }
+      if (transaction.amount_satoshis == 0U) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction amount must be greater than zero");
+      }
+      if (transaction.fee_satoshis == 0U) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction fee must be greater than zero");
+      }
+      if (transaction.amount_satoshis >
+          std::numeric_limits<uint64_t>::max() - transaction.fee_satoshis) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction amount plus fee overflows uint64");
+      }
+      if (transaction.timeout_sec == 0U) {
+        throw std::runtime_error(
+            "scenario send_raw_transaction timeout_sec must be greater than "
+            "zero");
+      }
     }
   }
   ParseNodeNetworkConditions(options);
@@ -2678,6 +2773,40 @@ std::string PeerChurnDetail(uint32_t workload_index, uint32_t workload_count,
   return boost::json::serialize(detail);
 }
 
+std::string RawTransactionDetail(uint32_t workload_index,
+                                 uint32_t workload_count,
+                                 const SendRawTransactionWorkload& workload,
+                                 uint64_t start_height, uint64_t target_height,
+                                 const std::vector<std::string>& funding_hashes,
+                                 const FiroRawTransactionResult& transaction) {
+  boost::json::object utxo;
+  utxo["txid"] = transaction.utxo.txid;
+  utxo["vout"] = transaction.utxo.vout;
+  utxo["amount"] = transaction.utxo.amount;
+  utxo["block_hash"] = transaction.utxo.block_hash;
+  utxo["confirmations"] = transaction.utxo.confirmations;
+
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["funding_node"] = workload.funding_node;
+  detail["submit_node"] = workload.submit_node;
+  detail["source_address"] = workload.source_address;
+  detail["destination_address"] = workload.destination_address;
+  detail["funding_blocks"] = workload.funding_blocks;
+  detail["funding_hash_count"] = static_cast<uint64_t>(funding_hashes.size());
+  detail["funding_start_height"] = start_height;
+  detail["funding_target_height"] = target_height;
+  detail["selected_utxo"] = std::move(utxo);
+  detail["amount"] = transaction.destination_amount;
+  detail["fee"] = transaction.fee;
+  detail["change_amount"] = transaction.change_amount;
+  detail["txid"] = transaction.txid;
+  detail["mempool_size"] = transaction.mempool_size;
+  detail["timeout_sec"] = workload.timeout_sec;
+  return boost::json::serialize(detail);
+}
+
 std::string RestartNodeWorkloadDetail(uint32_t workload_index,
                                       uint32_t workload_count, uint32_t node,
                                       uint64_t restart_count) {
@@ -3053,6 +3182,22 @@ boost::json::object NetworkPartitionWorkloadJson(
   return object;
 }
 
+boost::json::object SendRawTransactionWorkloadJson(
+    const SendRawTransactionWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "send_raw_transaction";
+  object["funding_node"] = workload.funding_node;
+  object["submit_node"] = workload.submit_node;
+  object["source_address"] = workload.source_address;
+  object["source_private_key"] = workload.source_private_key;
+  object["destination_address"] = workload.destination_address;
+  object["funding_blocks"] = workload.funding_blocks;
+  object["amount"] = FormatFixed8Amount(workload.amount_satoshis);
+  object["fee"] = FormatFixed8Amount(workload.fee_satoshis);
+  object["timeout_sec"] = workload.timeout_sec;
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
@@ -3085,6 +3230,9 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kHealPartition) {
     return NetworkPartitionWorkloadJson(workload.network_partition,
                                         "heal_partition");
+  }
+  if (workload.kind == WorkloadKind::kSendRawTransaction) {
+    return SendRawTransactionWorkloadJson(workload.send_raw_transaction);
   }
   throw std::runtime_error("unknown scenario workload kind");
 }
@@ -3478,6 +3626,43 @@ void ApplyDisconnectPeerWorkload(const Options& options,
                  address, static_cast<uint64_t>(before_addresses.size()),
                  static_cast<uint64_t>(after_addresses.size()),
                  connected_before, connected_after, workload.timeout_sec));
+}
+
+void ApplySendRawTransactionWorkload(const Options& options,
+                                     const std::filesystem::path& events_path,
+                                     const FiroDriver& driver,
+                                     std::vector<NodeRuntime>& nodes,
+                                     const SendRawTransactionWorkload& workload,
+                                     uint32_t workload_index,
+                                     uint32_t workload_count) {
+  NodeRuntime& funder = nodes[workload.funding_node - 1U];
+  NodeRuntime& submitter = nodes[workload.submit_node - 1U];
+  const uint64_t start_height = driver.ReadMetrics(funder.config).height;
+  std::vector<std::string> funding_hashes = driver.GenerateBlocks(
+      funder.config, workload.funding_blocks, workload.source_address);
+  funder.generated_block_count += funding_hashes.size();
+  const uint64_t target_height =
+      start_height + static_cast<uint64_t>(funding_hashes.size());
+  for (auto& node : nodes) {
+    driver.WaitForHeight(node.config, target_height,
+                         std::chrono::seconds(workload.timeout_sec));
+  }
+
+  const uint64_t minimum_amount =
+      workload.amount_satoshis + workload.fee_satoshis;
+  const FiroUtxo utxo = driver.FindSpendableOutput(
+      funder.config, funding_hashes, workload.source_address, minimum_amount,
+      kFiroCoinbaseSpendableConfirmations);
+  const FiroRawTransactionResult transaction = driver.SendRawTransaction(
+      submitter.config, utxo, workload.source_address,
+      workload.source_private_key, workload.destination_address,
+      workload.amount_satoshis, workload.fee_satoshis,
+      std::chrono::seconds(workload.timeout_sec));
+  WriteEvent(events_path, options.run_id, submitter.config.id,
+             "raw_transaction_submitted",
+             RawTransactionDetail(workload_index, workload_count, workload,
+                                  start_height, target_height, funding_hashes,
+                                  transaction));
 }
 
 void ApplyRuntimeNetworkConditionUpdates(
@@ -4061,6 +4246,12 @@ int Run(int argc, char** argv) {
                                     scenario_workload.disconnect_peer,
                                     static_cast<uint32_t>(workload_index + 1U),
                                     static_cast<uint32_t>(workloads.size()));
+      } else if (scenario_workload.kind == WorkloadKind::kSendRawTransaction) {
+        ApplySendRawTransactionWorkload(
+            options, events_path, driver, nodes,
+            scenario_workload.send_raw_transaction,
+            static_cast<uint32_t>(workload_index + 1U),
+            static_cast<uint32_t>(workloads.size()));
       } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
         const RestartNodeWorkload& workload = scenario_workload.restart_node;
         NodeRuntime& node = nodes[workload.node - 1U];

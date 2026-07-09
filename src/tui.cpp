@@ -245,6 +245,13 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
       text += "partition";
     } else if (type == "heal_partition") {
       text += "heal";
+    } else if (type == "send_raw_transaction") {
+      text += "tx n";
+      text += JsonMetricText(workload, "funding_node");
+      text += "->n";
+      text += JsonMetricText(workload, "submit_node");
+      text += " ";
+      text += JsonString(workload, "amount", "-");
     } else {
       text += type;
     }
