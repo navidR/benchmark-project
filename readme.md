@@ -464,7 +464,9 @@ The equivalent YAML entry point is:
 
 Wallet and miner roles can be declared in the scenario topology. Counts resolve
 deterministically to concrete node lists; explicit `wallet_nodes` and
-`miner_nodes` may be used when a scenario needs fixed assignments.
+`miner_nodes` may be used when a scenario needs fixed assignments. If a
+scenario has miners and does not set `generate_node`, block generation defaults
+to the first resolved miner node.
 
 ```json
 {

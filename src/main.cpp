@@ -1268,6 +1268,18 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     options.nodes = node_count_present ? scenario_node_count : scenario_nodes;
   }
+  const boost::json::value* topology = scenario.if_contains("topology");
+  if (topology != nullptr) {
+    if (!topology->is_object()) {
+      throw std::runtime_error("scenario topology must be a JSON object");
+    }
+    options.topology =
+        ParseNodeRoleTopologyObject(topology->as_object(), options.nodes);
+    if (!OptionProvided(vm, "generate-node") &&
+        !options.topology.miner_nodes.empty()) {
+      options.generate_node = options.topology.miner_nodes.front() + 1U;
+    }
+  }
   if (!OptionProvided(vm, "generate-blocks")) {
     options.generate_blocks = JsonOptionalUint32Field(
         scenario, "generate_blocks", options.generate_blocks);
@@ -1303,15 +1315,6 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     options.workloads_configured = true;
     ApplyScenarioWorkloads(workloads->as_array(), vm, options);
-  }
-
-  const boost::json::value* topology = scenario.if_contains("topology");
-  if (topology != nullptr) {
-    if (!topology->is_object()) {
-      throw std::runtime_error("scenario topology must be a JSON object");
-    }
-    options.topology =
-        ParseNodeRoleTopologyObject(topology->as_object(), options.nodes);
   }
 
   const boost::json::value* resources = scenario.if_contains("resources");

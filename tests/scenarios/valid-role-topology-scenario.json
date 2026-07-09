@@ -9,6 +9,5 @@
     "wallet_node_count": 2,
     "miner_node_count": 1,
     "allow_miner_wallet_overlap": false
-  },
-  "workloads": []
+  }
 }
