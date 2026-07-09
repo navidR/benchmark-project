@@ -134,6 +134,7 @@ add_executable(benchmark-sim
   src/network.cpp
   src/process.cpp
   src/run_report.cpp
+  src/simulation_registry.cpp
   src/util.cpp
 )
 
@@ -186,6 +187,7 @@ if(BUILD_TESTING)
     tests/unit/no_shellout_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/run_report_tests.cpp
+    tests/unit/simulation_registry_tests.cpp
     tests/unit/util_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
@@ -193,6 +195,7 @@ if(BUILD_TESTING)
     src/network.cpp
     src/process.cpp
     src/run_report.cpp
+    src/simulation_registry.cpp
     src/util.cpp
   )
   target_include_directories(benchmark-sim-unit-tests PRIVATE include)
@@ -256,6 +259,12 @@ if(BUILD_TESTING)
     COMMAND benchmark-sim
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-role-topology-scenario.json"
+      --probe-capabilities
+  )
+  add_test(NAME benchmark-sim-valid-wallet-transactions-scenario
+    COMMAND benchmark-sim
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transactions-scenario.json"
       --probe-capabilities
   )
   add_cli_failure_test(
@@ -352,6 +361,11 @@ if(BUILD_TESTING)
     benchmark-sim-invalid-raw-transaction-zero-amount
     tests/scenarios/invalid-raw-transaction-zero-amount.json
     "scenario send_raw_transaction amount must be greater than zero"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wallet-transactions-wallet-material
+    tests/scenarios/invalid-wallet-transactions-wallet-material.json
+    "scenario wallet_transactions workload must use topology.wallet_initialization instead of wallet keys or addresses"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-restart-node-node

@@ -41,6 +41,7 @@ struct FiroNodeConfig {
   std::vector<std::string> rpc_allow_ips = {"127.0.0.1"};
   std::string p2p_bind;
   bool listen = true;
+  bool wallet_enabled = false;
   std::vector<std::string> connect_peers;
 };
 
@@ -62,6 +63,18 @@ struct FiroRawTransactionResult {
   std::string destination_amount;
   std::string change_amount;
   std::string fee;
+  uint64_t mempool_size = 0;
+};
+
+enum class WalletMode {
+  kPublic,
+  kPrivate,
+};
+
+struct FiroWalletTransactionResult {
+  std::vector<std::string> txids;
+  std::string destination_amount;
+  std::string requested_fee_rate;
   uint64_t mempool_size = 0;
 };
 
@@ -90,6 +103,8 @@ class FiroDriver {
   std::vector<std::string> GenerateBlocks(const FiroNodeConfig& config,
                                           uint32_t count,
                                           const std::string& address) const;
+  std::string CreateWalletAddress(const FiroNodeConfig& config,
+                                  WalletMode wallet_mode) const;
   FiroUtxo FindSpendableOutput(const FiroNodeConfig& config,
                                const std::vector<std::string>& block_hashes,
                                const std::string& source_address,
@@ -98,6 +113,10 @@ class FiroDriver {
   FiroRawTransactionResult SendRawTransaction(
       const FiroNodeConfig& config, const FiroUtxo& utxo,
       const std::string& source_address, const std::string& source_private_key,
+      const std::string& destination_address, uint64_t amount_satoshis,
+      uint64_t fee_satoshis, std::chrono::seconds timeout) const;
+  FiroWalletTransactionResult SendWalletTransaction(
+      const FiroNodeConfig& config, WalletMode wallet_mode,
       const std::string& destination_address, uint64_t amount_satoshis,
       uint64_t fee_satoshis, std::chrono::seconds timeout) const;
   uint64_t WaitForMempoolTransaction(const FiroNodeConfig& config,

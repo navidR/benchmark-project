@@ -28,6 +28,7 @@
 #include "benchmark_sim/network.h"
 #include "benchmark_sim/process.h"
 #include "benchmark_sim/run_report.h"
+#include "benchmark_sim/simulation_registry.h"
 #include "benchmark_sim/util.h"
 
 namespace bsim {
@@ -127,14 +128,18 @@ struct SendRawTransactionWorkload {
   uint32_t timeout_sec = 30;
 };
 
-struct NodeRoleTopology {
-  bool configured = false;
-  uint32_t node_count = 0;
-  uint32_t wallet_node_count = 0;
-  uint32_t miner_node_count = 0;
-  bool allow_miner_wallet_overlap = false;
-  std::vector<uint32_t> wallet_nodes;
-  std::vector<uint32_t> miner_nodes;
+enum class WalletTransferStrategy {
+  kRoundRobin,
+};
+
+struct WalletTransactionsWorkload {
+  WalletTransferStrategy strategy = WalletTransferStrategy::kRoundRobin;
+  uint32_t funding_blocks_per_wallet = kFiroCoinbaseSpendableConfirmations;
+  uint64_t readiness_confirmations = kFiroCoinbaseSpendableConfirmations;
+  uint32_t transaction_count = 0;
+  uint64_t amount_satoshis = 0;
+  uint64_t fee_satoshis = 0;
+  uint32_t timeout_sec = 30;
 };
 
 enum class WorkloadKind {
@@ -149,6 +154,7 @@ enum class WorkloadKind {
   kPartitionNodes,
   kHealPartition,
   kSendRawTransaction,
+  kWalletTransactions,
 };
 
 struct ScenarioWorkload {
@@ -163,6 +169,7 @@ struct ScenarioWorkload {
   ResourceLimitUpdateWorkload update_resource_limits;
   NetworkPartitionWorkload network_partition;
   SendRawTransactionWorkload send_raw_transaction;
+  WalletTransactionsWorkload wallet_transactions;
 };
 
 struct NetworkBlockRule {
@@ -218,6 +225,7 @@ struct Options {
   std::vector<FreezeRequest> runtime_node_freezes;
   std::vector<ScenarioWorkload> workloads;
   bool workloads_configured = false;
+  bool wallet_backed_workload_requested = false;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_bandwidth_limit = false;
@@ -234,6 +242,7 @@ struct Options {
   bool probe_veth = false;
   bool probe_network = false;
   NodeRoleTopology topology;
+  WalletInitialization wallet_initialization;
 };
 
 struct NodeRuntime {
@@ -378,6 +387,20 @@ std::string JsonStringField(const boost::json::object& object,
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr || !value->is_string()) {
     throw std::runtime_error("missing or invalid string JSON field: " +
+                             std::string(field));
+  }
+  return std::string(value->as_string());
+}
+
+std::string JsonOptionalStringField(const boost::json::object& object,
+                                    const char* field,
+                                    std::string_view default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return std::string(default_value);
+  }
+  if (!value->is_string()) {
+    throw std::runtime_error("invalid string JSON field: " +
                              std::string(field));
   }
   return std::string(value->as_string());
@@ -845,6 +868,80 @@ bool NodeListsOverlap(const std::vector<uint32_t>& left,
   return false;
 }
 
+bool NodeListContains(const std::vector<uint32_t>& nodes, uint32_t node_index) {
+  for (uint32_t candidate : nodes) {
+    if (candidate == node_index) {
+      return true;
+    }
+  }
+  return false;
+}
+
+WalletInitializationStrategy ParseWalletInitializationStrategy(
+    std::string_view value) {
+  if (value == "driver_rpc") {
+    return WalletInitializationStrategy::kDriverRpc;
+  }
+  throw std::runtime_error(
+      "scenario topology.wallet_initialization strategy must be driver_rpc");
+}
+
+WalletPrivacyMode ParseWalletPrivacyMode(std::string_view value) {
+  if (value == "public") {
+    return WalletPrivacyMode::kPublic;
+  }
+  if (value == "private") {
+    return WalletPrivacyMode::kPrivate;
+  }
+  throw std::runtime_error(
+      "scenario topology.wallet_initialization mode must be public or private");
+}
+
+WalletTransferStrategy ParseWalletTransferStrategy(std::string_view value) {
+  if (value == "round_robin") {
+    return WalletTransferStrategy::kRoundRobin;
+  }
+  throw std::runtime_error(
+      "scenario wallet_transactions strategy must be round_robin");
+}
+
+std::string_view WalletInitializationStrategyName(
+    WalletInitializationStrategy strategy) {
+  switch (strategy) {
+    case WalletInitializationStrategy::kDriverRpc:
+      return "driver_rpc";
+  }
+  throw std::runtime_error("unknown wallet initialization strategy");
+}
+
+std::string_view WalletPrivacyModeName(WalletPrivacyMode mode) {
+  switch (mode) {
+    case WalletPrivacyMode::kPublic:
+      return "public";
+    case WalletPrivacyMode::kPrivate:
+      return "private";
+  }
+  throw std::runtime_error("unknown wallet privacy mode");
+}
+
+std::string_view WalletTransferStrategyName(WalletTransferStrategy strategy) {
+  switch (strategy) {
+    case WalletTransferStrategy::kRoundRobin:
+      return "round_robin";
+  }
+  throw std::runtime_error("unknown wallet transfer strategy");
+}
+
+WalletMode ToFiroWalletMode(const WalletInitialization& initialization) {
+  switch (initialization.mode) {
+    case WalletPrivacyMode::kPublic:
+      return WalletMode::kPublic;
+    case WalletPrivacyMode::kPrivate:
+      return WalletMode::kPrivate;
+  }
+  throw std::runtime_error("unknown wallet privacy mode");
+}
+
 NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
                                              uint32_t nodes) {
   NodeRoleTopology topology;
@@ -925,6 +1022,97 @@ NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
         "allow_miner_wallet_overlap is false");
   }
   return topology;
+}
+
+WalletInitialization ParseWalletInitializationObject(
+    const boost::json::object& topology) {
+  WalletInitialization initialization;
+  const boost::json::value* value =
+      topology.if_contains("wallet_initialization");
+  if (value == nullptr) {
+    return initialization;
+  }
+  if (!value->is_object()) {
+    throw std::runtime_error(
+        "scenario topology.wallet_initialization must be a JSON object");
+  }
+  const boost::json::object& object = value->as_object();
+  initialization.strategy =
+      ParseWalletInitializationStrategy(JsonOptionalStringField(
+          object, "strategy",
+          WalletInitializationStrategyName(initialization.strategy)));
+  initialization.mode = ParseWalletPrivacyMode(JsonOptionalStringField(
+      object, "mode", WalletPrivacyModeName(initialization.mode)));
+  initialization.seed =
+      JsonOptionalStringField(object, "seed", initialization.seed);
+  return initialization;
+}
+
+void ValidateWalletTransactionsWorkload(
+    const WalletTransactionsWorkload& workload, const Options& options) {
+  if (!options.topology.configured) {
+    throw std::runtime_error(
+        "scenario wallet_transactions workload requires topology");
+  }
+  if (options.topology.miner_nodes.empty()) {
+    throw std::runtime_error(
+        "scenario wallet_transactions workload requires at least one "
+        "MinerNode");
+  }
+  const size_t wallet_count = options.topology.wallet_nodes.size();
+  if (wallet_count < 2U) {
+    throw std::runtime_error(
+        "scenario wallet_transactions workload requires at least two "
+        "WalletNode roles");
+  }
+  if (workload.transaction_count == 0U) {
+    throw std::runtime_error(
+        "scenario wallet_transactions transaction_count must be greater than "
+        "zero");
+  }
+  if (workload.transaction_count > static_cast<uint32_t>(wallet_count)) {
+    throw std::runtime_error(
+        "scenario wallet_transactions transaction_count currently must be <= "
+        "wallet node count");
+  }
+  if (workload.funding_blocks_per_wallet <
+      kFiroCoinbaseSpendableConfirmations) {
+    throw std::runtime_error(
+        "scenario wallet_transactions funding_blocks_per_wallet must be at "
+        "least " +
+        std::to_string(kFiroCoinbaseSpendableConfirmations));
+  }
+  if (workload.readiness_confirmations < kFiroCoinbaseSpendableConfirmations) {
+    throw std::runtime_error(
+        "scenario wallet_transactions readiness_confirmations must be at "
+        "least " +
+        std::to_string(kFiroCoinbaseSpendableConfirmations));
+  }
+  if (workload.funding_blocks_per_wallet < workload.readiness_confirmations) {
+    throw std::runtime_error(
+        "scenario wallet_transactions funding_blocks_per_wallet must be >= "
+        "readiness_confirmations");
+  }
+  if (workload.amount_satoshis == 0U) {
+    throw std::runtime_error(
+        "scenario wallet_transactions amount must be greater than zero");
+  }
+  if (workload.fee_satoshis == 0U) {
+    throw std::runtime_error(
+        "scenario wallet_transactions fee must be greater than zero");
+  }
+  if (workload.amount_satoshis >
+      std::numeric_limits<uint64_t>::max() - workload.fee_satoshis) {
+    throw std::runtime_error(
+        "scenario wallet_transactions amount plus fee overflows uint64");
+  }
+  if (workload.timeout_sec == 0U) {
+    throw std::runtime_error(
+        "scenario wallet_transactions timeout_sec must be greater than zero");
+  }
+
+  SimulationRegistry::FromTopology(options.topology,
+                                   options.wallet_initialization);
 }
 
 bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
@@ -1229,6 +1417,46 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kSendRawTransaction;
       scenario_workload.send_raw_transaction = transaction;
       options.workloads.push_back(scenario_workload);
+    } else if (type == "wallet_transactions") {
+      if (workload.if_contains("wallets") != nullptr ||
+          workload.if_contains("private_key") != nullptr ||
+          workload.if_contains("source_private_key") != nullptr ||
+          workload.if_contains("address") != nullptr ||
+          workload.if_contains("source_address") != nullptr ||
+          workload.if_contains("destination_address") != nullptr) {
+        throw std::runtime_error(
+            "scenario wallet_transactions workload must use "
+            "topology.wallet_initialization instead of wallet keys or "
+            "addresses");
+      }
+      WalletTransactionsWorkload transactions;
+      transactions.strategy =
+          ParseWalletTransferStrategy(JsonOptionalStringField(
+              workload, "strategy",
+              WalletTransferStrategyName(transactions.strategy)));
+      transactions.funding_blocks_per_wallet =
+          JsonOptionalUint32Field(workload, "funding_blocks_per_wallet",
+                                  transactions.funding_blocks_per_wallet);
+      transactions.readiness_confirmations =
+          JsonOptionalUint64Field(workload, "readiness_confirmations",
+                                  transactions.readiness_confirmations);
+      transactions.transaction_count = JsonOptionalUint32Field(
+          workload, "transaction_count",
+          options.topology.configured
+              ? static_cast<uint32_t>(options.topology.wallet_nodes.size())
+              : 0U);
+      transactions.amount_satoshis = JsonAmountField(workload, "amount");
+      transactions.fee_satoshis = JsonAmountField(workload, "fee");
+      transactions.timeout_sec =
+          OptionProvided(vm, "sync-timeout-sec")
+              ? options.sync_timeout_sec
+              : JsonOptionalUint32Field(workload, "timeout_sec",
+                                        options.sync_timeout_sec);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kWalletTransactions;
+      scenario_workload.wallet_transactions = std::move(transactions);
+      options.workloads.push_back(std::move(scenario_workload));
+      options.wallet_backed_workload_requested = true;
     } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
     }
@@ -1275,6 +1503,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     options.topology =
         ParseNodeRoleTopologyObject(topology->as_object(), options.nodes);
+    options.wallet_initialization =
+        ParseWalletInitializationObject(topology->as_object());
     if (!OptionProvided(vm, "generate-node") &&
         !options.topology.miner_nodes.empty()) {
       options.generate_node = options.topology.miner_nodes.front() + 1U;
@@ -2105,7 +2335,13 @@ Options ParseOptions(int argc, char** argv) {
             "scenario send_raw_transaction timeout_sec must be greater than "
             "zero");
       }
+    } else if (workload.kind == WorkloadKind::kWalletTransactions) {
+      ValidateWalletTransactionsWorkload(workload.wallet_transactions, options);
     }
+  }
+  if (options.topology.configured) {
+    SimulationRegistry::FromTopology(options.topology,
+                                     options.wallet_initialization);
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
@@ -2291,7 +2527,21 @@ boost::json::object NetworkPartitionRuleJson(const NetworkPartitionRule& rule) {
   return object;
 }
 
-boost::json::object NodeRoleTopologyJson(const NodeRoleTopology& topology) {
+boost::json::object WalletInitializationJson(
+    const WalletInitialization& initialization) {
+  boost::json::object object;
+  object["strategy"] =
+      std::string(WalletInitializationStrategyName(initialization.strategy));
+  object["mode"] = std::string(WalletPrivacyModeName(initialization.mode));
+  if (!initialization.seed.empty()) {
+    object["seed"] = initialization.seed;
+  }
+  return object;
+}
+
+boost::json::object NodeRoleTopologyJson(
+    const NodeRoleTopology& topology,
+    const WalletInitialization& wallet_initialization) {
   boost::json::object object;
   object["node_count"] = topology.node_count;
   object["wallet_node_count"] = topology.wallet_node_count;
@@ -2299,6 +2549,8 @@ boost::json::object NodeRoleTopologyJson(const NodeRoleTopology& topology) {
   object["allow_miner_wallet_overlap"] = topology.allow_miner_wallet_overlap;
   object["wallet_nodes"] = NodeGroupJson(topology.wallet_nodes);
   object["miner_nodes"] = NodeGroupJson(topology.miner_nodes);
+  object["wallet_initialization"] =
+      WalletInitializationJson(wallet_initialization);
   return object;
 }
 
@@ -2999,6 +3251,62 @@ std::string RawTransactionDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
+boost::json::array TxIdsJson(const std::vector<std::string>& txids) {
+  boost::json::array array;
+  for (const std::string& txid : txids) {
+    array.emplace_back(txid);
+  }
+  return array;
+}
+
+std::string WalletTransactionDetail(
+    uint32_t workload_index, uint32_t workload_count,
+    const WalletTransactionsWorkload& workload, uint32_t transaction_index,
+    const WalletIdentity& sender, const WalletIdentity& receiver,
+    uint32_t funding_miner_node, uint64_t funding_start_height,
+    uint64_t funding_target_height, uint64_t funding_hash_count,
+    const FiroWalletTransactionResult& transaction) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["transaction_index"] = transaction_index;
+  detail["transaction_count"] = workload.transaction_count;
+  detail["strategy"] =
+      std::string(WalletTransferStrategyName(workload.strategy));
+  detail["sender_wallet_index"] = sender.wallet_index;
+  detail["receiver_wallet_index"] = receiver.wallet_index;
+  detail["sender_node"] = sender.node;
+  detail["receiver_node"] = receiver.node;
+  detail["sender_address"] = sender.address;
+  detail["receiver_address"] = receiver.address;
+  detail["funding_miner_node"] = funding_miner_node;
+  detail["funding_blocks_per_wallet"] = workload.funding_blocks_per_wallet;
+  detail["funding_hash_count"] = funding_hash_count;
+  detail["funding_start_height"] = funding_start_height;
+  detail["funding_target_height"] = funding_target_height;
+  detail["readiness_confirmations"] = workload.readiness_confirmations;
+  detail["amount"] = transaction.destination_amount;
+  detail["requested_fee_rate"] = transaction.requested_fee_rate;
+  detail["txids"] = TxIdsJson(transaction.txids);
+  detail["mempool_size"] = transaction.mempool_size;
+  detail["timeout_sec"] = workload.timeout_sec;
+  return boost::json::serialize(detail);
+}
+
+std::string WalletAddressDetail(const WalletIdentity& wallet,
+                                const WalletInitialization& initialization) {
+  boost::json::object detail;
+  detail["wallet_index"] = wallet.wallet_index;
+  detail["node"] = wallet.node;
+  detail["strategy"] =
+      std::string(WalletInitializationStrategyName(initialization.strategy));
+  detail["mode"] = std::string(WalletPrivacyModeName(initialization.mode));
+  if (!wallet.address.empty()) {
+    detail["address"] = wallet.address;
+  }
+  return boost::json::serialize(detail);
+}
+
 std::string RestartNodeWorkloadDetail(uint32_t workload_index,
                                       uint32_t workload_count, uint32_t node,
                                       uint64_t restart_count) {
@@ -3390,6 +3698,21 @@ boost::json::object SendRawTransactionWorkloadJson(
   return object;
 }
 
+boost::json::object WalletTransactionsWorkloadJson(
+    const WalletTransactionsWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "wallet_transactions";
+  object["strategy"] =
+      std::string(WalletTransferStrategyName(workload.strategy));
+  object["funding_blocks_per_wallet"] = workload.funding_blocks_per_wallet;
+  object["readiness_confirmations"] = workload.readiness_confirmations;
+  object["transaction_count"] = workload.transaction_count;
+  object["amount"] = FormatFixed8Amount(workload.amount_satoshis);
+  object["fee"] = FormatFixed8Amount(workload.fee_satoshis);
+  object["timeout_sec"] = workload.timeout_sec;
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
@@ -3426,6 +3749,9 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kSendRawTransaction) {
     return SendRawTransactionWorkloadJson(workload.send_raw_transaction);
   }
+  if (workload.kind == WorkloadKind::kWalletTransactions) {
+    return WalletTransactionsWorkloadJson(workload.wallet_transactions);
+  }
   throw std::runtime_error("unknown scenario workload kind");
 }
 
@@ -3460,7 +3786,8 @@ void WriteScenarioFiles(const Options& options,
   resolved["metrics_sample_count"] = options.metrics_sample_count;
   resolved["metrics_interval_ms"] = options.metrics_interval_ms;
   if (options.topology.configured) {
-    resolved["topology"] = NodeRoleTopologyJson(options.topology);
+    resolved["topology"] =
+        NodeRoleTopologyJson(options.topology, options.wallet_initialization);
   }
   boost::json::array workload_array;
   for (const ScenarioWorkload& workload : workloads) {
@@ -3641,6 +3968,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     config.rpc_user = "sim-" + options.run_id;
     config.rpc_password = "pass-" + options.run_id + "-" + std::to_string(i);
     config.listen = true;
+    config.wallet_enabled = options.wallet_backed_workload_requested &&
+                            NodeListContains(options.topology.wallet_nodes, i);
     if (i > 0) {
       config.connect_peers.push_back(FiroPeerHost(options, 0) + ":18168");
     }
@@ -3713,6 +4042,45 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                      std::chrono::seconds(options.ready_timeout_sec));
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
     WriteNodeState(events_path, options.run_id, node.config.id, "Running");
+  }
+}
+
+void InitializeWalletNodes(const Options& options,
+                           const std::filesystem::path& events_path,
+                           const FiroDriver& driver,
+                           std::vector<NodeRuntime>& nodes,
+                           SimulationRegistry& registry) {
+  if (!options.wallet_backed_workload_requested) {
+    return;
+  }
+  if (registry.wallet_initialization().strategy !=
+      WalletInitializationStrategy::kDriverRpc) {
+    throw std::runtime_error(
+        "wallet-backed workload requires driver_rpc wallet initialization");
+  }
+
+  for (size_t wallet_index = 0; wallet_index < registry.wallets().size();
+       ++wallet_index) {
+    WalletIdentity& wallet = registry.MutableWalletByIndex(wallet_index);
+    if (wallet.node == 0U || wallet.node > nodes.size()) {
+      throw std::runtime_error("wallet node is out of range");
+    }
+    NodeRuntime& node = nodes[wallet.node - 1U];
+    if (!node.config.wallet_enabled) {
+      throw std::runtime_error(
+          "wallet node was not started with wallet support enabled");
+    }
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "wallet_address_requested",
+               WalletAddressDetail(wallet, registry.wallet_initialization()));
+    wallet.address = driver.CreateWalletAddress(
+        node.config, ToFiroWalletMode(registry.wallet_initialization()));
+    if (wallet.address.empty()) {
+      throw std::runtime_error("Firo wallet RPC returned an empty address");
+    }
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "wallet_address_created",
+               WalletAddressDetail(wallet, registry.wallet_initialization()));
   }
 }
 
@@ -3858,6 +4226,79 @@ void ApplySendRawTransactionWorkload(const Options& options,
              RawTransactionDetail(workload_index, workload_count, workload,
                                   start_height, target_height, funding_hashes,
                                   transaction));
+}
+
+void ApplyWalletTransactionsWorkload(const Options& options,
+                                     const std::filesystem::path& events_path,
+                                     const FiroDriver& driver,
+                                     std::vector<NodeRuntime>& nodes,
+                                     const SimulationRegistry& registry,
+                                     const WalletTransactionsWorkload& workload,
+                                     uint32_t workload_index,
+                                     uint32_t workload_count) {
+  struct FundingState {
+    uint32_t miner_node = 1;
+    uint64_t start_height = 0;
+    uint64_t target_height = 0;
+    std::vector<std::string> hashes;
+  };
+
+  const std::vector<WalletIdentity>& wallets = registry.wallets();
+  std::vector<FundingState> funding;
+  funding.reserve(wallets.size());
+  for (size_t wallet_index = 0; wallet_index < wallets.size(); ++wallet_index) {
+    const WalletIdentity& wallet = wallets[wallet_index];
+    if (wallet.address.empty()) {
+      throw std::runtime_error(
+          "wallet-backed workload requires initialized WalletNode addresses");
+    }
+    const uint32_t miner_node = registry.MinerNodeForWalletIndex(wallet_index);
+    NodeRuntime& miner = nodes[miner_node - 1U];
+    FundingState state;
+    state.miner_node = miner_node;
+    state.start_height = driver.ReadMetrics(miner.config).height;
+    state.hashes = driver.GenerateBlocks(
+        miner.config, workload.funding_blocks_per_wallet, wallet.address);
+    miner.generated_block_count += state.hashes.size();
+    state.target_height =
+        state.start_height + static_cast<uint64_t>(state.hashes.size());
+    for (NodeRuntime& node : nodes) {
+      driver.WaitForHeight(node.config, state.target_height,
+                           std::chrono::seconds(workload.timeout_sec));
+    }
+    funding.push_back(std::move(state));
+  }
+
+  for (uint32_t transaction_index = 0;
+       transaction_index < workload.transaction_count; ++transaction_index) {
+    const size_t sender_index = transaction_index % wallets.size();
+    const size_t receiver_index = (sender_index + 1U) % wallets.size();
+    const WalletIdentity& sender = wallets[sender_index];
+    const WalletIdentity& receiver = wallets[receiver_index];
+    const FundingState& sender_funding = funding[sender_index];
+    NodeRuntime& sender_node = nodes[sender.node - 1U];
+
+    const FiroWalletTransactionResult transaction =
+        driver.SendWalletTransaction(
+            sender_node.config,
+            ToFiroWalletMode(registry.wallet_initialization()),
+            receiver.address, workload.amount_satoshis, workload.fee_satoshis,
+            std::chrono::seconds(workload.timeout_sec));
+    for (NodeRuntime& node : nodes) {
+      for (const std::string& txid : transaction.txids) {
+        driver.WaitForMempoolTransaction(
+            node.config, txid, std::chrono::seconds(workload.timeout_sec));
+      }
+    }
+    WriteEvent(
+        events_path, options.run_id, sender_node.config.id,
+        "wallet_transaction_submitted",
+        WalletTransactionDetail(
+            workload_index, workload_count, workload, transaction_index + 1U,
+            sender, receiver, sender_funding.miner_node,
+            sender_funding.start_height, sender_funding.target_height,
+            static_cast<uint64_t>(sender_funding.hashes.size()), transaction));
+  }
 }
 
 void ApplyRuntimeNetworkConditionUpdates(
@@ -4343,6 +4784,8 @@ int Run(int argc, char** argv) {
   EnsureDirectory(run_root);
   WriteText(run_root / kRunMarkerFile, "benchmark-sim run\n");
   EnsureDirectory(run_root / "nodes");
+  SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
+      options.topology, options.wallet_initialization);
   WriteScenarioFiles(options, run_root);
 
   const auto events_path = run_root / "events.jsonl";
@@ -4362,6 +4805,8 @@ int Run(int argc, char** argv) {
   };
   try {
     StartNodes(options, run_root, events_path, driver, nodes);
+    InitializeWalletNodes(options, events_path, driver, nodes,
+                          simulation_registry);
     WriteNodeLogTails(events_path, options, driver, nodes);
 
     WriteMetricsSnapshot(metrics_path, options, driver, nodes);
@@ -4445,6 +4890,12 @@ int Run(int argc, char** argv) {
         ApplySendRawTransactionWorkload(
             options, events_path, driver, nodes,
             scenario_workload.send_raw_transaction,
+            static_cast<uint32_t>(workload_index + 1U),
+            static_cast<uint32_t>(workloads.size()));
+      } else if (scenario_workload.kind == WorkloadKind::kWalletTransactions) {
+        ApplyWalletTransactionsWorkload(
+            options, events_path, driver, nodes, simulation_registry,
+            scenario_workload.wallet_transactions,
             static_cast<uint32_t>(workload_index + 1U),
             static_cast<uint32_t>(workloads.size()));
       } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {

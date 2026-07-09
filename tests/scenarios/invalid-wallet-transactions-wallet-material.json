@@ -1,0 +1,26 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "invalid-wallet-material",
+  "nodes": 3,
+  "topology": {
+    "node_count": 3,
+    "wallet_node_count": 2,
+    "miner_node_count": 1,
+    "wallet_nodes": [1, 2],
+    "miner_nodes": [3]
+  },
+  "workloads": [
+    {
+      "type": "wallet_transactions",
+      "wallets": [
+        {
+          "address": "not-allowed",
+          "private_key": "not-allowed"
+        }
+      ],
+      "amount": "1.00000000",
+      "fee": "0.00001000"
+    }
+  ]
+}
