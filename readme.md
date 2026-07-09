@@ -321,12 +321,17 @@ The same run settings can be loaded from a JSON scenario file:
   "output_dir": "runs",
   "run_id": "scenario-smoke",
   "nodes": 3,
-  "generate_blocks": 1,
-  "generate_node": 2,
   "ready_timeout_sec": 45,
-  "sync_timeout_sec": 45,
   "metrics_sample_count": 5,
   "metrics_interval_ms": 1000,
+  "workloads": [
+    {
+      "type": "block_generation",
+      "node": 2,
+      "count": 1,
+      "sync_timeout_sec": 45
+    }
+  ],
   "resources": {
     "memory_high_bytes": 1073741824,
     "memory_max_bytes": 1610612736,

@@ -514,6 +514,43 @@ void ApplyResourceLimitPatches(
   }
 }
 
+void ApplyScenarioWorkloads(
+    const boost::json::array& workloads,
+    const boost::program_options::variables_map& vm, Options& options) {
+  bool block_generation_seen = false;
+  for (const boost::json::value& value : workloads) {
+    if (!value.is_object()) {
+      throw std::runtime_error("scenario workloads entries must be JSON objects");
+    }
+    const boost::json::object& workload = value.as_object();
+    const std::string type = JsonStringField(workload, "type");
+    if (type != "block_generation") {
+      throw std::runtime_error("unsupported scenario workload type: " + type);
+    }
+    if (block_generation_seen) {
+      throw std::runtime_error(
+          "current Firo MVP supports one block_generation workload");
+    }
+    if (workload.if_contains("nodes") != nullptr) {
+      throw std::runtime_error(
+          "current Firo MVP block_generation workload uses node, not nodes");
+    }
+    block_generation_seen = true;
+    if (!OptionProvided(vm, "generate-blocks")) {
+      options.generate_blocks =
+          JsonOptionalUint32Field(workload, "count", options.generate_blocks);
+    }
+    if (!OptionProvided(vm, "generate-node")) {
+      options.generate_node =
+          JsonOptionalUint32Field(workload, "node", options.generate_node);
+    }
+    if (!OptionProvided(vm, "sync-timeout-sec")) {
+      options.sync_timeout_sec = JsonOptionalUint32Field(
+          workload, "sync_timeout_sec", options.sync_timeout_sec);
+    }
+  }
+}
+
 void ApplyScenarioJson(const boost::json::object& scenario,
                        const boost::program_options::variables_map& vm,
                        Options& options) {
@@ -563,6 +600,13 @@ void ApplyScenarioJson(const boost::json::object& scenario,
   if (!OptionProvided(vm, "isolate-network")) {
     options.isolate_network = JsonOptionalBoolField(
         scenario, "isolated_network", options.isolate_network);
+  }
+  const boost::json::value* workloads = scenario.if_contains("workloads");
+  if (workloads != nullptr) {
+    if (!workloads->is_array()) {
+      throw std::runtime_error("scenario workloads must be a JSON array");
+    }
+    ApplyScenarioWorkloads(workloads->as_array(), vm, options);
   }
 
   const boost::json::value* resources = scenario.if_contains("resources");
