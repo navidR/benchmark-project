@@ -1,0 +1,10 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "update_resource_limits",
+      "nodes": [1],
+      "pids_max": 128
+    }
+  ]
+}

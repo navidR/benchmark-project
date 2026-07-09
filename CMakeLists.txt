@@ -290,6 +290,21 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-freeze-node-zero-duration.json
     "scenario freeze_node duration_ms must be greater than zero"
   )
+  add_cli_failure_test(
+    benchmark-sim-invalid-update-resource-limits-empty
+    tests/scenarios/invalid-update-resource-limits-empty.json
+    "runtime resource update has no limit fields"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-update-resource-limits-node
+    tests/scenarios/invalid-update-resource-limits-node.json
+    "scenario update_resource_limits workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-update-resource-limits-plural-nodes
+    tests/scenarios/invalid-update-resource-limits-plural-nodes.json
+    "current Firo MVP update_resource_limits workload uses node, not nodes"
+  )
 endif()
 
 install(TARGETS benchmark-sim RUNTIME DESTINATION bin)

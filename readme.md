@@ -16,7 +16,8 @@ the Firo path is working end to end.
 - Apply simple per-node network conditions through host-side `netem` or TBF.
 - Apply and remove live per-node TCP block rules, optionally scoped by source.
 - Apply and heal source-aware group network partitions.
-- Apply live per-node cgroup resource updates after startup.
+- Apply live per-node cgroup resource updates after startup or as an ordered
+  workload.
 - Restart a running Firo node before workload generation or as an ordered
   workload.
 - Freeze and thaw a running Firo node cgroup before workload generation or as
@@ -453,6 +454,8 @@ peer count and emit a structured `peer_count_reached` event.
 `node_restarted` event.
 `freeze_node` workloads freeze one Firo node cgroup for `duration_ms`, thaw it,
 and emit a structured `node_freeze_completed` event.
+`update_resource_limits` workloads apply live cgroup limit changes to one node
+and emit a structured `resource_limits_updated` event.
 An explicit empty scenario workload list, `"workloads": []`, disables block
 generation for that run.
 

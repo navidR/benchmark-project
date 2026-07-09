@@ -1,0 +1,9 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "update_resource_limits",
+      "node": 1
+    }
+  ]
+}

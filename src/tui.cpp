@@ -222,6 +222,9 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
       text += " ";
       text += JsonMetricText(workload, "duration_ms");
       text += "ms";
+    } else if (type == "update_resource_limits") {
+      text += "limits n";
+      text += JsonMetricText(workload, "node");
     } else {
       text += type;
     }

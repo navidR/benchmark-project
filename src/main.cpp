@@ -86,12 +86,18 @@ struct FreezeNodeWorkload {
   uint32_t duration_ms = 0;
 };
 
+struct ResourceLimitUpdateWorkload {
+  uint32_t node = 1;
+  ResourceLimitPatch patch;
+};
+
 enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
   kWaitForPeers,
   kRestartNode,
   kFreezeNode,
+  kUpdateResourceLimits,
 };
 
 struct ScenarioWorkload {
@@ -101,6 +107,7 @@ struct ScenarioWorkload {
   WaitForPeersWorkload wait_for_peers;
   RestartNodeWorkload restart_node;
   FreezeNodeWorkload freeze_node;
+  ResourceLimitUpdateWorkload update_resource_limits;
 };
 
 struct NetworkBlockRule {
@@ -666,6 +673,19 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kFreezeNode;
       scenario_workload.freeze_node = freeze;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "update_resource_limits") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP update_resource_limits workload uses node, not "
+            "nodes");
+      }
+      ResourceLimitUpdateWorkload update;
+      update.node = JsonOptionalUint32Field(workload, "node", update.node);
+      update.patch = ParseResourceLimitPatchObject(workload);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kUpdateResourceLimits;
+      scenario_workload.update_resource_limits = update;
       options.workloads.push_back(scenario_workload);
     } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
@@ -1400,6 +1420,13 @@ Options ParseOptions(int argc, char** argv) {
         throw std::runtime_error(
             "scenario freeze_node duration_ms must be greater than zero");
       }
+    } else if (workload.kind == WorkloadKind::kUpdateResourceLimits) {
+      if (workload.update_resource_limits.node == 0U ||
+          workload.update_resource_limits.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario update_resource_limits workload node must be in "
+            "1..--nodes");
+      }
     }
   }
   ParseNodeNetworkConditions(options);
@@ -1622,6 +1649,38 @@ boost::json::object ResourceLimitPatchJson(const ResourceLimitPatch& patch) {
     object["pids_max"] = *patch.pids_max;
   }
   return object;
+}
+
+void AppendResourceLimitPatchYaml(std::string* yaml,
+                                  const ResourceLimitPatch& patch,
+                                  std::string_view indent) {
+  if (patch.memory_high_bytes) {
+    *yaml += std::string(indent) +
+             "memory_high_bytes: " + std::to_string(*patch.memory_high_bytes) +
+             "\n";
+  }
+  if (patch.memory_max_bytes) {
+    *yaml += std::string(indent) +
+             "memory_max_bytes: " + std::to_string(*patch.memory_max_bytes) +
+             "\n";
+  }
+  if (patch.cpu_quota_present) {
+    *yaml += std::string(indent) + "cpu_quota_us: ";
+    if (patch.cpu_quota_us) {
+      *yaml += std::to_string(*patch.cpu_quota_us);
+    } else {
+      *yaml += "max";
+    }
+    *yaml += "\n";
+  }
+  if (patch.cpu_period_us) {
+    *yaml += std::string(indent) +
+             "cpu_period_us: " + std::to_string(*patch.cpu_period_us) + "\n";
+  }
+  if (patch.pids_max) {
+    *yaml += std::string(indent) +
+             "pids_max: " + std::to_string(*patch.pids_max) + "\n";
+  }
 }
 
 ResourceLimits InitialResourceLimits(const Options& options) {
@@ -2447,6 +2506,13 @@ std::string WorkloadsYaml(const std::vector<ScenarioWorkload>& workloads) {
           "\n"
           "    duration_ms: " +
           std::to_string(workload.freeze_node.duration_ms) + "\n";
+    } else if (workload.kind == WorkloadKind::kUpdateResourceLimits) {
+      yaml +=
+          "  - type: update_resource_limits\n"
+          "    node: " +
+          std::to_string(workload.update_resource_limits.node) + "\n";
+      AppendResourceLimitPatchYaml(&yaml, workload.update_resource_limits.patch,
+                                   "    ");
     }
   }
   return yaml;
@@ -2498,6 +2564,14 @@ boost::json::object FreezeNodeWorkloadJson(const FreezeNodeWorkload& workload) {
   return object;
 }
 
+boost::json::object ResourceLimitUpdateWorkloadJson(
+    const ResourceLimitUpdateWorkload& workload) {
+  boost::json::object object = ResourceLimitPatchJson(workload.patch);
+  object["type"] = "update_resource_limits";
+  object["node"] = workload.node;
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
@@ -2511,7 +2585,10 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kRestartNode) {
     return RestartNodeWorkloadJson(workload.restart_node);
   }
-  return FreezeNodeWorkloadJson(workload.freeze_node);
+  if (workload.kind == WorkloadKind::kFreezeNode) {
+    return FreezeNodeWorkloadJson(workload.freeze_node);
+  }
+  return ResourceLimitUpdateWorkloadJson(workload.update_resource_limits);
 }
 
 void WriteScenarioFiles(const Options& options,
@@ -2666,31 +2743,7 @@ void WriteScenarioFiles(const Options& options,
          options.runtime_node_resource_updates) {
       runtime_resource_yaml +=
           "    firo-" + std::to_string(node_index + 1U) + ":\n";
-      if (patch.memory_high_bytes) {
-        runtime_resource_yaml += "      memory_high_bytes: " +
-                                 std::to_string(*patch.memory_high_bytes) +
-                                 "\n";
-      }
-      if (patch.memory_max_bytes) {
-        runtime_resource_yaml += "      memory_max_bytes: " +
-                                 std::to_string(*patch.memory_max_bytes) + "\n";
-      }
-      if (patch.cpu_quota_present) {
-        runtime_resource_yaml +=
-            "      cpu_quota_us: " +
-            (patch.cpu_quota_us ? std::to_string(*patch.cpu_quota_us)
-                                : std::string("max")) +
-            "\n";
-      }
-      if (patch.cpu_period_us) {
-        runtime_resource_yaml +=
-            "      cpu_period_us: " + std::to_string(*patch.cpu_period_us) +
-            "\n";
-      }
-      if (patch.pids_max) {
-        runtime_resource_yaml +=
-            "      pids_max: " + std::to_string(*patch.pids_max) + "\n";
-      }
+      AppendResourceLimitPatchYaml(&runtime_resource_yaml, patch, "      ");
     }
   }
 
@@ -3037,14 +3090,46 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
   }
 }
 
-std::string ResourceLimitUpdateDetail(const ResourceLimitPatch& patch,
-                                      const ResourceLimits& previous,
-                                      const ResourceLimits& current) {
+std::string ResourceLimitUpdateDetail(
+    const ResourceLimitPatch& patch, const ResourceLimits& previous,
+    const ResourceLimits& current,
+    std::optional<uint32_t> workload_index = std::nullopt,
+    std::optional<uint32_t> workload_count = std::nullopt,
+    std::optional<uint32_t> node = std::nullopt) {
   boost::json::object detail;
+  if (workload_index) {
+    detail["workload_index"] = *workload_index;
+  }
+  if (workload_count) {
+    detail["workload_count"] = *workload_count;
+  }
+  if (node) {
+    detail["node"] = *node;
+  }
   detail["requested"] = ResourceLimitPatchJson(patch);
   detail["previous"] = ResourceLimitsJson(previous);
   detail["current"] = ResourceLimitsJson(current);
   return boost::json::serialize(detail);
+}
+
+void ApplyResourceLimitUpdate(
+    const Options& options, const std::filesystem::path& events_path,
+    NodeRuntime& node, const ResourceLimitPatch& patch,
+    std::optional<uint32_t> workload_index = std::nullopt,
+    std::optional<uint32_t> workload_count = std::nullopt,
+    std::optional<uint32_t> workload_node = std::nullopt) {
+  if (!node.cgroup) {
+    throw std::runtime_error("resource update requires a node cgroup");
+  }
+  const ResourceLimits previous = node.resources;
+  const ResourceLimits next =
+      ApplyResourceLimitPatch(previous, patch, node.config.id);
+  WriteResourceLimits(*node.cgroup, previous, next);
+  node.resources = next;
+  WriteEvent(events_path, options.run_id, node.config.id,
+             "resource_limits_updated",
+             ResourceLimitUpdateDetail(patch, previous, next, workload_index,
+                                       workload_count, workload_node));
 }
 
 void ApplyRuntimeResourceLimitUpdates(const Options& options,
@@ -3056,18 +3141,7 @@ void ApplyRuntimeResourceLimitUpdates(const Options& options,
       throw std::runtime_error("runtime resource update node is out of range");
     }
     NodeRuntime& node = nodes[node_index];
-    if (!node.cgroup) {
-      throw std::runtime_error(
-          "runtime resource update requires a node cgroup");
-    }
-    const ResourceLimits previous = node.resources;
-    const ResourceLimits next =
-        ApplyResourceLimitPatch(previous, patch, node.config.id);
-    WriteResourceLimits(*node.cgroup, previous, next);
-    node.resources = next;
-    WriteEvent(events_path, options.run_id, node.config.id,
-               "resource_limits_updated",
-               ResourceLimitUpdateDetail(patch, previous, next));
+    ApplyResourceLimitUpdate(options, events_path, node, patch);
   }
 }
 
@@ -3652,6 +3726,15 @@ int Run(int argc, char** argv) {
             FreezeNodeWorkloadDetail(static_cast<uint32_t>(workload_index + 1U),
                                      static_cast<uint32_t>(workloads.size()),
                                      workload.node, workload.duration_ms));
+      } else if (scenario_workload.kind ==
+                 WorkloadKind::kUpdateResourceLimits) {
+        const ResourceLimitUpdateWorkload& workload =
+            scenario_workload.update_resource_limits;
+        NodeRuntime& node = nodes[workload.node - 1U];
+        ApplyResourceLimitUpdate(options, events_path, node, workload.patch,
+                                 static_cast<uint32_t>(workload_index + 1U),
+                                 static_cast<uint32_t>(workloads.size()),
+                                 workload.node);
       }
     }
 
