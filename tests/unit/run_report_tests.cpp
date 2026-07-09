@@ -46,6 +46,12 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
                   "\"generate_blocks\":3,\"generate_node\":null,"
                   "\"isolated_network\":true,\"sync_timeout_sec\":null,"
+                  "\"resources\":{\"memory_max_bytes\":1024},"
+                  "\"default_network_condition\":{\"delay_ms\":2},"
+                  "\"node_network_conditions\":[{\"node\":1,\"delay_ms\":3}],"
+                  "\"runtime_node_resource_limits\":["
+                  "{\"node\":1,\"pids_max\":128}],"
+                  "\"runtime_node_restarts\":[{\"node\":1}],"
                   "\"workloads\":["
                   "{\"type\":\"block_generation\",\"node\":1,\"count\":1,"
                   "\"sync_timeout_sec\":45},"
@@ -106,6 +112,16 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(first_workload, "node") == 1U);
   BOOST_TEST(JsonInteger(first_workload, "count") == 1U);
   BOOST_TEST(JsonInteger(first_workload, "sync_timeout_sec") == 45U);
+  BOOST_TEST(JsonInteger(report.at("resources").as_object(),
+                         "memory_max_bytes") == 1024U);
+  BOOST_TEST(JsonInteger(report.at("default_network_condition").as_object(),
+                         "delay_ms") == 2U);
+  BOOST_REQUIRE_EQUAL(report.at("node_network_conditions").as_array().size(),
+                      1U);
+  BOOST_REQUIRE_EQUAL(
+      report.at("runtime_node_resource_limits").as_array().size(), 1U);
+  BOOST_REQUIRE_EQUAL(report.at("runtime_node_restarts").as_array().size(),
+                      1U);
   const boost::json::array& generated_blocks =
       report.at("generated_blocks").as_array();
   BOOST_REQUIRE_EQUAL(generated_blocks.size(), 1U);

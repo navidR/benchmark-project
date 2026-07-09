@@ -126,6 +126,17 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "isolated_network", report);
   CopyField(scenario, "sync_timeout_sec", report);
   CopyField(scenario, "workloads", report);
+  CopyField(scenario, "resources", report);
+  CopyField(scenario, "default_network_condition", report);
+  CopyField(scenario, "node_network_conditions", report);
+  CopyField(scenario, "runtime_node_network_conditions", report);
+  CopyField(scenario, "runtime_node_blocks", report);
+  CopyField(scenario, "runtime_node_unblocks", report);
+  CopyField(scenario, "runtime_partitions", report);
+  CopyField(scenario, "runtime_partition_heals", report);
+  CopyField(scenario, "runtime_node_resource_limits", report);
+  CopyField(scenario, "runtime_node_restarts", report);
+  CopyField(scenario, "runtime_node_freezes", report);
 }
 
 boost::json::object EventCountsJson(
