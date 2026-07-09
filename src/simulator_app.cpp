@@ -647,12 +647,12 @@ std::string_view PeerConnectivityModeName(PeerConnectivityMode mode) {
   throw std::runtime_error("unknown peer connectivity mode");
 }
 
-WalletMode ToFiroWalletMode(const WalletInitialization& initialization) {
+ChainWalletMode ToChainWalletMode(const WalletInitialization& initialization) {
   switch (initialization.mode) {
     case WalletPrivacyMode::kPublic:
-      return WalletMode::kPublic;
+      return ChainWalletMode::kPublic;
     case WalletPrivacyMode::kPrivate:
-      return WalletMode::kPrivate;
+      return ChainWalletMode::kPrivate;
   }
   throw std::runtime_error("unknown wallet privacy mode");
 }
@@ -2884,7 +2884,7 @@ std::string AddressProbeJson() {
 }
 
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
-                        const FiroMetrics& chain,
+                        const ChainMetrics& chain,
                         uint64_t generated_block_count, uint64_t restart_count,
                         const CgroupMetrics* cgroup, const LinkInfo* link,
                         const QdiscInfo* qdisc) {
@@ -3107,7 +3107,7 @@ std::string RawTransactionDetail(uint32_t workload_index,
                                  const SendRawTransactionWorkload& workload,
                                  uint64_t start_height, uint64_t target_height,
                                  const std::vector<std::string>& funding_hashes,
-                                 const FiroRawTransactionResult& transaction) {
+                                 const ChainRawTransactionResult& transaction) {
   boost::json::object utxo;
   utxo["txid"] = transaction.utxo.txid;
   utxo["vout"] = transaction.utxo.vout;
@@ -3150,7 +3150,7 @@ std::string WalletTransactionDetail(
     const WalletIdentity& sender, const WalletIdentity& receiver,
     uint32_t funding_miner_node, uint64_t funding_start_height,
     uint64_t funding_target_height, uint64_t funding_hash_count,
-    const FiroWalletTransactionResult& transaction) {
+    const ChainWalletTransactionResult& transaction) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
@@ -3215,12 +3215,12 @@ std::string FreezeNodeWorkloadDetail(uint32_t workload_index,
 }
 
 void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
-                          const Options& options, const FiroDriver& driver,
+                          const Options& options, const ChainDriver& driver,
                           std::vector<NodeRuntime>& nodes) {
   const std::vector<LinkInfo> links = ListNetworkLinks();
   const std::vector<QdiscInfo> qdiscs = ListQdiscs();
   for (auto& node : nodes) {
-    FiroMetrics chain = driver.ReadMetrics(node.config);
+    ChainMetrics chain = driver.ReadMetrics(node.config);
     CgroupMetrics cg = node.cgroup->ReadMetrics();
     const LinkInfo* link =
         node.network ? FindLinkByName(links, node.network->host_name) : nullptr;
@@ -3247,7 +3247,7 @@ void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
 
 void WritePeriodicMetrics(const std::filesystem::path& events_path,
                           const std::filesystem::path& metrics_path,
-                          const Options& options, const FiroDriver& driver,
+                          const Options& options, const ChainDriver& driver,
                           std::vector<NodeRuntime>& nodes) {
   for (uint32_t sample = 0; sample < options.metrics_sample_count; ++sample) {
     std::this_thread::sleep_for(
@@ -3290,7 +3290,7 @@ void WriteLogTailEvent(const std::filesystem::path& events_path,
 }
 
 void WriteNodeLogTail(const std::filesystem::path& events_path,
-                      const Options& options, const FiroDriver& driver,
+                      const Options& options, const ChainDriver& driver,
                       NodeRuntime& node) {
   WriteLogTailEvent(events_path, options, node, "stdout",
                     node.config.log_dir / "stdout.log", &node.stdout_offset);
@@ -3301,7 +3301,7 @@ void WriteNodeLogTail(const std::filesystem::path& events_path,
 }
 
 void WriteNodeLogTails(const std::filesystem::path& events_path,
-                       const Options& options, const FiroDriver& driver,
+                       const Options& options, const ChainDriver& driver,
                        std::vector<NodeRuntime>& nodes) {
   for (NodeRuntime& node : nodes) {
     WriteNodeLogTail(events_path, options, driver, node);
@@ -3790,7 +3790,7 @@ void CleanupRun(Options options) {
 
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
-                const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
+                const ChainDriver& driver, std::vector<NodeRuntime>& nodes) {
   if (options.isolate_network) {
     RequireNetworkSetupCapabilities();
   }
@@ -3805,7 +3805,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     const std::string node_id = "firo-" + std::to_string(i + 1);
     const auto node_root = run_root / "nodes" / node_id;
 
-    FiroNodeConfig config;
+    ChainNodeConfig config;
     config.id = node_id;
     config.binary = options.firod;
     config.data_dir = node_root / "data";
@@ -3892,7 +3892,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
 
 void InitializeWalletNodes(const Options& options,
                            const std::filesystem::path& events_path,
-                           const FiroDriver& driver,
+                           const ChainDriver& driver,
                            std::vector<NodeRuntime>& nodes,
                            SimulationRegistry& registry) {
   if (!options.wallet_backed_workload_requested) {
@@ -3919,7 +3919,7 @@ void InitializeWalletNodes(const Options& options,
                "wallet_address_requested",
                WalletAddressDetail(wallet, registry.wallet_initialization()));
     wallet.address = driver.CreateWalletAddress(
-        node.config, ToFiroWalletMode(registry.wallet_initialization()));
+        node.config, ToChainWalletMode(registry.wallet_initialization()));
     if (wallet.address.empty()) {
       throw std::runtime_error("Firo wallet RPC returned an empty address");
     }
@@ -3986,7 +3986,7 @@ void ApplyRuntimeResourceLimitUpdates(const Options& options,
 
 void ApplyConnectPeerWorkload(const Options& options,
                               const std::filesystem::path& events_path,
-                              const FiroDriver& driver,
+                              const ChainDriver& driver,
                               std::vector<NodeRuntime>& nodes,
                               const ConnectPeerWorkload& workload,
                               uint32_t workload_index,
@@ -4012,7 +4012,7 @@ void ApplyConnectPeerWorkload(const Options& options,
 
 void ApplyDisconnectPeerWorkload(const Options& options,
                                  const std::filesystem::path& events_path,
-                                 const FiroDriver& driver,
+                                 const ChainDriver& driver,
                                  std::vector<NodeRuntime>& nodes,
                                  const DisconnectPeerWorkload& workload,
                                  uint32_t workload_index,
@@ -4038,7 +4038,7 @@ void ApplyDisconnectPeerWorkload(const Options& options,
 
 void ApplySendRawTransactionWorkload(const Options& options,
                                      const std::filesystem::path& events_path,
-                                     const FiroDriver& driver,
+                                     const ChainDriver& driver,
                                      std::vector<NodeRuntime>& nodes,
                                      const SendRawTransactionWorkload& workload,
                                      uint32_t workload_index,
@@ -4058,10 +4058,10 @@ void ApplySendRawTransactionWorkload(const Options& options,
 
   const uint64_t minimum_amount =
       workload.amount_satoshis + workload.fee_satoshis;
-  const FiroUtxo utxo = driver.FindSpendableOutput(
+  const ChainUtxo utxo = driver.FindSpendableOutput(
       funder.config, funding_hashes, workload.source_address, minimum_amount,
       kFiroCoinbaseSpendableConfirmations);
-  const FiroRawTransactionResult transaction = driver.SendRawTransaction(
+  const ChainRawTransactionResult transaction = driver.SendRawTransaction(
       submitter.config, utxo, workload.source_address,
       workload.source_private_key, workload.destination_address,
       workload.amount_satoshis, workload.fee_satoshis,
@@ -4075,7 +4075,7 @@ void ApplySendRawTransactionWorkload(const Options& options,
 
 void ApplyWalletTransactionsWorkload(const Options& options,
                                      const std::filesystem::path& events_path,
-                                     const FiroDriver& driver,
+                                     const ChainDriver& driver,
                                      std::vector<NodeRuntime>& nodes,
                                      const SimulationRegistry& registry,
                                      const WalletTransactionsWorkload& workload,
@@ -4123,10 +4123,10 @@ void ApplyWalletTransactionsWorkload(const Options& options,
     const FundingState& sender_funding = funding[sender_index];
     NodeRuntime& sender_node = nodes[sender.node - 1U];
 
-    const FiroWalletTransactionResult transaction =
+    const ChainWalletTransactionResult transaction =
         driver.SendWalletTransaction(
             sender_node.config,
-            ToFiroWalletMode(registry.wallet_initialization()),
+            ToChainWalletMode(registry.wallet_initialization()),
             receiver.address, workload.amount_satoshis, workload.fee_satoshis,
             std::chrono::seconds(workload.timeout_sec));
     for (NodeRuntime& node : nodes) {
@@ -4382,7 +4382,7 @@ std::string RestartDetail(pid_t pid, uint64_t restart_count) {
 
 void RestartNode(const Options& options,
                  const std::filesystem::path& events_path,
-                 const FiroDriver& driver, NodeRuntime& node) {
+                 const ChainDriver& driver, NodeRuntime& node) {
   if (!node.cgroup) {
     throw std::runtime_error("node restart requires a node cgroup");
   }
@@ -4415,7 +4415,7 @@ void RestartNode(const Options& options,
 
 void ApplyRuntimeNodeRestarts(const Options& options,
                               const std::filesystem::path& events_path,
-                              const FiroDriver& driver,
+                              const ChainDriver& driver,
                               std::vector<NodeRuntime>& nodes) {
   for (uint32_t node_index : options.runtime_node_restarts) {
     if (node_index >= nodes.size()) {
@@ -4487,7 +4487,7 @@ void ApplyRuntimeNodeFreezes(const Options& options,
 }
 
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
-               const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
+               const ChainDriver& driver, std::vector<NodeRuntime>& nodes) {
   for (auto& node : nodes) {
     WriteNodeState(events_path, options.run_id, node.config.id, "Stopping");
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_stop");
