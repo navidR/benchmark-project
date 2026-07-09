@@ -161,6 +161,7 @@ target_compile_options(benchmark-sim PRIVATE
 )
 
 add_executable(benchmark-tui
+  src/logging.cpp
   src/run_report.cpp
   src/tui.cpp
   src/tui_main.cpp
@@ -169,7 +170,10 @@ add_executable(benchmark-tui
 target_include_directories(benchmark-tui PRIVATE include)
 target_link_libraries(benchmark-tui PRIVATE
   Boost::json
+  Boost::log
+  Boost::log_setup
   Boost::program_options
+  Boost::system
   ncurses::ncursesw
 )
 target_compile_options(benchmark-tui PRIVATE

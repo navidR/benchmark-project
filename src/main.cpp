@@ -1,4 +1,3 @@
-#include <iostream>
 #include <stdexcept>
 
 #include "benchmark_sim/logging.h"
@@ -10,7 +9,7 @@ int main(int argc, char** argv) {
     bsim::SimulatorApp app;
     return app.Run(argc, argv);
   } catch (const std::exception& e) {
-    std::cerr << "benchmark-sim: " << e.what() << "\n";
+    BSIM_LOG(error) << "benchmark-sim: " << e.what();
     return 1;
   }
 }

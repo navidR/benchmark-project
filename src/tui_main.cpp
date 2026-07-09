@@ -1,11 +1,11 @@
-#include "benchmark_sim/tui.h"
-
+#include <boost/program_options.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 
-#include <boost/program_options.hpp>
+#include "benchmark_sim/logging.h"
+#include "benchmark_sim/tui.h"
 
 namespace {
 
@@ -22,8 +22,7 @@ Options ParseOptions(int argc, char** argv) {
   desc.add_options()("help", "show this help")(
       "run", po::value<std::filesystem::path>(&options.run_root),
       "run directory containing events.jsonl and metrics.jsonl")(
-      "once", po::bool_switch(&options.once),
-      "render one frame and exit")(
+      "once", po::bool_switch(&options.once), "render one frame and exit")(
       "refresh-ms", po::value<std::uint32_t>(&options.refresh_ms),
       "milliseconds between report refreshes");
 
@@ -49,11 +48,12 @@ Options ParseOptions(int argc, char** argv) {
 
 int main(int argc, char** argv) {
   try {
+    bsim::InitLogging();
     const Options options = ParseOptions(argc, argv);
     return bsim::RunTuiReport(options.run_root, options.once,
                               options.refresh_ms);
   } catch (const std::exception& e) {
-    std::cerr << "benchmark-tui: " << e.what() << "\n";
+    BSIM_LOG(error) << "benchmark-tui: " << e.what();
     return 1;
   }
 }
