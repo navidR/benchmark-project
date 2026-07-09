@@ -93,7 +93,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
      --firod "$FIROD" \
-     --output-dir runs \
+     --benchmark-root runs \
      --run-id smoke1 \
      --replace-run \
      --nodes 1 \
@@ -109,7 +109,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
      --firod "$FIROD" \
-     --output-dir runs \
+     --benchmark-root runs \
      --run-id smoke3 \
      --replace-run \
      --nodes 3 \
@@ -127,7 +127,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
      --firod "$FIROD" \
-     --output-dir runs \
+     --benchmark-root runs \
      --run-id isolated-smoke \
      --replace-run \
      --nodes 3 \
@@ -145,7 +145,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
      --firod "$FIROD" \
-     --output-dir runs \
+     --benchmark-root runs \
      --run-id isolated-delay \
      --replace-run \
      --nodes 1 \
@@ -163,7 +163,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
      --firod "$FIROD" \
-     --output-dir runs \
+     --benchmark-root runs \
      --run-id isolated-bandwidth \
      --replace-run \
      --nodes 1 \
@@ -178,7 +178,7 @@ Per-node isolated network conditions use repeatable JSON objects:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id isolated-per-node \
   --replace-run \
   --nodes 2 \
@@ -193,7 +193,7 @@ running, before block generation:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id live-netem \
   --replace-run \
   --nodes 2 \
@@ -210,7 +210,7 @@ before block generation:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id live-block-unblock \
   --replace-run \
   --nodes 2 \
@@ -226,7 +226,7 @@ cross-group P2P block rules in both directions:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id live-partition-heal \
   --replace-run \
   --nodes 3 \
@@ -247,7 +247,7 @@ Default resource limits apply to each node cgroup:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id resource-smoke \
   --replace-run \
   --nodes 1 \
@@ -266,7 +266,7 @@ restores unlimited CPU quota.
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id live-resources \
   --replace-run \
   --nodes 1 \
@@ -280,7 +280,7 @@ cgroup/network/data directory, wait for RPC readiness, then continue the run:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id restart-smoke \
   --replace-run \
   --nodes 1 \
@@ -294,7 +294,7 @@ thawed states, then continue the run:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id freeze-smoke \
   --replace-run \
   --nodes 1 \
@@ -308,7 +308,7 @@ block generation:
 ```bash
 ./build/benchmark-sim \
   --firod "$FIROD" \
-  --output-dir runs \
+  --benchmark-root runs \
   --run-id sampled-smoke \
   --replace-run \
   --nodes 1 \
@@ -621,7 +621,7 @@ Remove stale simulator-owned kernel objects for a run ID:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
-     --output-dir runs \
+     --benchmark-root runs \
      --run-id isolated-smoke \
      --cleanup-run'
 ```

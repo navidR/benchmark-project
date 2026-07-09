@@ -252,6 +252,21 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transactions-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME benchmark-sim-benchmark-root-option
+    COMMAND benchmark-sim
+      --benchmark-root "${CMAKE_CURRENT_BINARY_DIR}/benchmark-root-option"
+      --probe-capabilities
+  )
+  add_test(NAME benchmark-sim-benchmark-root-output-dir-conflict
+    COMMAND benchmark-sim
+      --benchmark-root "${CMAKE_CURRENT_BINARY_DIR}/benchmark-root-option"
+      --output-dir "${CMAKE_CURRENT_BINARY_DIR}/legacy-output-dir"
+      --probe-capabilities
+  )
+  set_tests_properties(benchmark-sim-benchmark-root-output-dir-conflict
+    PROPERTIES
+      WILL_FAIL TRUE
+  )
   add_test(NAME benchmark-sim-integrated-tui-once
     COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm
       $<TARGET_FILE:benchmark-sim>

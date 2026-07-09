@@ -1164,7 +1164,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
   if (!OptionProvided(vm, "firod")) {
     options.firod = JsonOptionalPathField(scenario, "firod", options.firod);
   }
-  if (!OptionProvided(vm, "output-dir")) {
+  if (!OptionProvided(vm, "benchmark-root") &&
+      !OptionProvided(vm, "output-dir")) {
     options.output_dir =
         JsonOptionalPathField(scenario, "output_dir", options.output_dir);
   }
@@ -1653,9 +1654,12 @@ Options ParseOptions(int argc, char** argv) {
       "libyaml scenario file for the Firo MVP")(
       "firod", po::value<std::filesystem::path>(&options.firod),
       "explicit firod binary")(
-      "output-dir", po::value<std::filesystem::path>(&options.output_dir),
-      "run output root")("run-id", po::value<std::string>(&options.run_id),
-                         "safe run id")(
+      "benchmark-root", po::value<std::filesystem::path>(&options.output_dir),
+      "root directory for run data, node directories, metrics, events, and "
+      "logs")("output-dir",
+              po::value<std::filesystem::path>(&options.output_dir),
+              "legacy alias for --benchmark-root")(
+      "run-id", po::value<std::string>(&options.run_id), "safe run id")(
       "report-run", po::value<std::filesystem::path>(&options.report_run),
       "summarize an existing run directory as JSON and exit")(
       "run", po::value<std::filesystem::path>(&options.tui_run),
@@ -1822,6 +1826,12 @@ Options ParseOptions(int argc, char** argv) {
   if (vm.count("scenario-json") != 0U && vm.count("scenario-yaml") != 0U) {
     throw std::runtime_error(
         "--scenario-json and --scenario-yaml are mutually exclusive");
+  }
+  if (OptionProvided(vm, "benchmark-root") &&
+      OptionProvided(vm, "output-dir")) {
+    throw std::runtime_error(
+        "--benchmark-root and --output-dir are aliases and must not both be "
+        "provided");
   }
   if (vm.count("run") != 0U && vm.count("report-run") != 0U) {
     throw std::runtime_error("--run and --report-run are mutually exclusive");
@@ -2058,12 +2068,12 @@ Options ParseOptions(int argc, char** argv) {
   RequireSafeRunId(options.run_id);
   const bool needs_firod =
       !options.probe_network && options.report_run.empty() &&
-      options.tui_run.empty() &&
-      !options.probe_bandwidth_limit && !options.probe_capabilities &&
-      !options.probe_cgroup_freeze && !options.probe_drop_filter &&
-      !options.probe_netns && !options.probe_veth && !options.probe_address &&
-      !options.probe_route && !options.probe_qdisc &&
-      !options.probe_qdisc_mutation && !options.probe_network_condition &&
+      options.tui_run.empty() && !options.probe_bandwidth_limit &&
+      !options.probe_capabilities && !options.probe_cgroup_freeze &&
+      !options.probe_drop_filter && !options.probe_netns &&
+      !options.probe_veth && !options.probe_address && !options.probe_route &&
+      !options.probe_qdisc && !options.probe_qdisc_mutation &&
+      !options.probe_network_condition &&
       !options.probe_combined_network_condition &&
       !options.probe_network_condition_update && !options.cleanup_run;
   if (needs_firod && options.firod.empty()) {
