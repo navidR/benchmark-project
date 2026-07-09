@@ -550,7 +550,7 @@ and latest log tails.
 View an existing or active run in the read-only TUI:
 
 ```bash
-./build/benchmark-tui --run runs/<run-id>
+./build/benchmark-sim --run runs/<run-id>
 ```
 
 The TUI shows run status, lifecycle timestamps, workload summary, node chain
@@ -559,7 +559,7 @@ state, resource metrics, network counters, and qdisc state.
 Render one TUI frame and exit, useful for validation:
 
 ```bash
-TERM=xterm ./build/benchmark-tui --run runs/<run-id> --once
+TERM=xterm ./build/benchmark-sim --run runs/<run-id> --once
 ```
 
 ## Run Network Probes

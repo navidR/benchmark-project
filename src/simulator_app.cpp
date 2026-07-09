@@ -34,6 +34,7 @@
 #include "benchmark_sim/simulator/node_runtime.h"
 #include "benchmark_sim/simulator/options.h"
 #include "benchmark_sim/simulator/yaml_helpers.h"
+#include "benchmark_sim/tui.h"
 #include "benchmark_sim/util.h"
 
 namespace bsim {
@@ -1657,6 +1658,12 @@ Options ParseOptions(int argc, char** argv) {
                          "safe run id")(
       "report-run", po::value<std::filesystem::path>(&options.report_run),
       "summarize an existing run directory as JSON and exit")(
+      "run", po::value<std::filesystem::path>(&options.tui_run),
+      "view an existing run directory in the integrated ncurses TUI")(
+      "once", po::bool_switch(&options.tui_once),
+      "render one integrated TUI frame and exit; requires --run")(
+      "refresh-ms", po::value<std::uint32_t>(&options.tui_refresh_ms),
+      "milliseconds between integrated TUI report refreshes")(
       "nodes", po::value<uint32_t>(&options.nodes), nodes_help.c_str())(
       "generate-blocks", po::value<uint32_t>(&options.generate_blocks),
       "blocks generated on --generate-node")(
@@ -1815,6 +1822,16 @@ Options ParseOptions(int argc, char** argv) {
   if (vm.count("scenario-json") != 0U && vm.count("scenario-yaml") != 0U) {
     throw std::runtime_error(
         "--scenario-json and --scenario-yaml are mutually exclusive");
+  }
+  if (vm.count("run") != 0U && vm.count("report-run") != 0U) {
+    throw std::runtime_error("--run and --report-run are mutually exclusive");
+  }
+  if (vm.count("run") == 0U &&
+      (OptionProvided(vm, "once") || OptionProvided(vm, "refresh-ms"))) {
+    throw std::runtime_error("--once and --refresh-ms require --run");
+  }
+  if (vm.count("run") != 0U && options.tui_refresh_ms == 0U) {
+    throw std::runtime_error("--refresh-ms must be greater than zero");
   }
   if (vm.count("scenario-json") != 0U) {
     const boost::json::value scenario =
@@ -2041,6 +2058,7 @@ Options ParseOptions(int argc, char** argv) {
   RequireSafeRunId(options.run_id);
   const bool needs_firod =
       !options.probe_network && options.report_run.empty() &&
+      options.tui_run.empty() &&
       !options.probe_bandwidth_limit && !options.probe_capabilities &&
       !options.probe_cgroup_freeze && !options.probe_drop_filter &&
       !options.probe_netns && !options.probe_veth && !options.probe_address &&
@@ -4352,6 +4370,10 @@ int SimulatorApp::Run(int argc, char** argv) {
   if (!options.report_run.empty()) {
     BSIM_LOG(info) << BuildRunReportJson(options.report_run);
     return 0;
+  }
+  if (!options.tui_run.empty()) {
+    return RunTuiReport(options.tui_run, options.tui_once,
+                        options.tui_refresh_ms);
   }
   if (options.probe_capabilities) {
     BSIM_LOG(info) << CapabilityProbeJson();

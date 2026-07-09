@@ -23,12 +23,14 @@ struct Options {
   std::filesystem::path firod;
   std::filesystem::path output_dir = "runs";
   std::filesystem::path report_run;
+  std::filesystem::path tui_run;
   std::string run_id = MakeRunId();
   std::uint32_t nodes = 1;
   std::uint32_t generate_blocks = 1;
   std::uint32_t generate_node = 1;
   std::uint32_t ready_timeout_sec = 30;
   std::uint32_t sync_timeout_sec = 30;
+  std::uint32_t tui_refresh_ms = 1000;
   std::uint32_t metrics_sample_count = 0;
   std::uint32_t metrics_interval_ms = 1000;
   std::uint64_t memory_high_bytes = 1536ULL * 1024ULL * 1024ULL;
@@ -39,6 +41,7 @@ struct Options {
   std::uint64_t pids_max = 256;
   bool keep_cgroups = false;
   bool cleanup_run = false;
+  bool tui_once = false;
   bool isolate_network = false;
   bool network_condition_requested = false;
   NetworkCondition network_condition;

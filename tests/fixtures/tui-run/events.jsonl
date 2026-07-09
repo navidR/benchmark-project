@@ -1,0 +1,3 @@
+{"timestamp":"2026-07-09T00:00:00Z","run_id":"tui-fixture","node_id":"sim","event":"run_started"}
+{"timestamp":"2026-07-09T00:00:01Z","run_id":"tui-fixture","node_id":"firo-1","event":"state","detail":"Running"}
+{"timestamp":"2026-07-09T00:00:02Z","run_id":"tui-fixture","node_id":"sim","event":"run_finished"}

@@ -137,6 +137,7 @@ add_executable(benchmark-sim
   src/run_report.cpp
   src/simulation_registry.cpp
   src/simulator_app.cpp
+  src/tui.cpp
   src/util.cpp
   src/yaml_helpers.cpp
 )
@@ -151,34 +152,10 @@ target_link_libraries(benchmark-sim PRIVATE
   Boost::program_options
   Boost::system
   libmnl::libmnl
+  ncurses::ncursesw
   yaml::yaml
 )
 target_compile_options(benchmark-sim PRIVATE
-  -Wall
-  -Wextra
-  -Wpedantic
-  -Wconversion
-  -Werror
-)
-
-add_executable(benchmark-tui
-  src/log_view.cpp
-  src/logging.cpp
-  src/run_report.cpp
-  src/tui.cpp
-  src/tui_main.cpp
-  src/util.cpp
-)
-target_include_directories(benchmark-tui PRIVATE include)
-target_link_libraries(benchmark-tui PRIVATE
-  Boost::json
-  Boost::log
-  Boost::log_setup
-  Boost::program_options
-  Boost::system
-  ncurses::ncursesw
-)
-target_compile_options(benchmark-tui PRIVATE
   -Wall
   -Wextra
   -Wpedantic
@@ -274,6 +251,12 @@ if(BUILD_TESTING)
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transactions-scenario.json"
       --probe-capabilities
+  )
+  add_test(NAME benchmark-sim-integrated-tui-once
+    COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm
+      $<TARGET_FILE:benchmark-sim>
+      --run "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+      --once
   )
   add_cli_failure_test(
     benchmark-sim-invalid-role-topology-miners
