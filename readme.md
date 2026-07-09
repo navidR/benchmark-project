@@ -17,7 +17,8 @@ the Firo path is working end to end.
 - Apply and remove live per-node TCP block rules, optionally scoped by source.
 - Apply and heal source-aware group network partitions.
 - Apply live per-node cgroup resource updates after startup.
-- Restart a running Firo node before workload generation.
+- Restart a running Firo node before workload generation or as an ordered
+  workload.
 - Freeze and thaw a running Firo node cgroup for a bounded duration.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
@@ -447,6 +448,8 @@ are present in `events.jsonl`.
 and emit a structured `height_wait_reached` event.
 `wait_for_peers` workloads wait for one Firo node to report at least the target
 peer count and emit a structured `peer_count_reached` event.
+`restart_node` workloads restart one Firo node and emit a structured
+`node_restarted` event.
 An explicit empty scenario workload list, `"workloads": []`, disables block
 generation for that run.
 

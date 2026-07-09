@@ -77,10 +77,15 @@ struct WaitForPeersWorkload {
   uint32_t timeout_sec = 30;
 };
 
+struct RestartNodeWorkload {
+  uint32_t node = 1;
+};
+
 enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
   kWaitForPeers,
+  kRestartNode,
 };
 
 struct ScenarioWorkload {
@@ -88,6 +93,7 @@ struct ScenarioWorkload {
   BlockGenerationWorkload block_generation;
   WaitUntilHeightWorkload wait_until_height;
   WaitForPeersWorkload wait_for_peers;
+  RestartNodeWorkload restart_node;
 };
 
 struct NetworkBlockRule {
@@ -630,6 +636,17 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kWaitForPeers;
       scenario_workload.wait_for_peers = wait;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "restart_node") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP restart_node workload uses node, not nodes");
+      }
+      RestartNodeWorkload restart;
+      restart.node = JsonOptionalUint32Field(workload, "node", restart.node);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kRestartNode;
+      scenario_workload.restart_node = restart;
       options.workloads.push_back(scenario_workload);
     } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
@@ -1347,6 +1364,12 @@ Options ParseOptions(int argc, char** argv) {
       if (workload.wait_for_peers.timeout_sec == 0U) {
         throw std::runtime_error(
             "scenario wait_for_peers timeout_sec must be greater than zero");
+      }
+    } else if (workload.kind == WorkloadKind::kRestartNode) {
+      if (workload.restart_node.node == 0U ||
+          workload.restart_node.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario restart_node workload node must be in 1..--nodes");
       }
     }
   }
@@ -2157,6 +2180,17 @@ std::string PeerCountWaitDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
+std::string RestartNodeWorkloadDetail(uint32_t workload_index,
+                                      uint32_t workload_count, uint32_t node,
+                                      uint64_t restart_count) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = node;
+  detail["restart_count"] = restart_count;
+  return boost::json::serialize(detail);
+}
+
 void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
                           const Options& options, const FiroDriver& driver,
                           std::vector<NodeRuntime>& nodes) {
@@ -2360,6 +2394,11 @@ std::string WorkloadsYaml(const std::vector<ScenarioWorkload>& workloads) {
           "\n"
           "    timeout_sec: " +
           std::to_string(workload.wait_for_peers.timeout_sec) + "\n";
+    } else if (workload.kind == WorkloadKind::kRestartNode) {
+      yaml +=
+          "  - type: restart_node\n"
+          "    node: " +
+          std::to_string(workload.restart_node.node) + "\n";
     }
   }
   return yaml;
@@ -2395,6 +2434,14 @@ boost::json::object WaitForPeersWorkloadJson(
   return object;
 }
 
+boost::json::object RestartNodeWorkloadJson(
+    const RestartNodeWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "restart_node";
+  object["node"] = workload.node;
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
@@ -2402,7 +2449,10 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kWaitUntilHeight) {
     return WaitUntilHeightWorkloadJson(workload.wait_until_height);
   }
-  return WaitForPeersWorkloadJson(workload.wait_for_peers);
+  if (workload.kind == WorkloadKind::kWaitForPeers) {
+    return WaitForPeersWorkloadJson(workload.wait_for_peers);
+  }
+  return RestartNodeWorkloadJson(workload.restart_node);
 }
 
 void WriteScenarioFiles(const Options& options,
@@ -3523,6 +3573,16 @@ int Run(int argc, char** argv) {
                                 static_cast<uint32_t>(workloads.size()),
                                 workload.node, workload.peer_count,
                                 observed_peer_count));
+      } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
+        const RestartNodeWorkload& workload = scenario_workload.restart_node;
+        NodeRuntime& node = nodes[workload.node - 1U];
+        RestartNode(options, events_path, driver, node);
+        WriteEvent(events_path, options.run_id, node.config.id,
+                   "node_restarted",
+                   RestartNodeWorkloadDetail(
+                       static_cast<uint32_t>(workload_index + 1U),
+                       static_cast<uint32_t>(workloads.size()), workload.node,
+                       node.restart_count));
       }
     }
 

@@ -213,6 +213,9 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
       text += " ";
       text += JsonMetricText(workload, "timeout_sec");
       text += "s";
+    } else if (type == "restart_node") {
+      text += "restart n";
+      text += JsonMetricText(workload, "node");
     } else {
       text += type;
     }

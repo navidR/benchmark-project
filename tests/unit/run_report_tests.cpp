@@ -56,7 +56,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "{\"type\":\"block_generation\",\"node\":2,\"count\":2,"
                   "\"sync_timeout_sec\":60},"
                   "{\"type\":\"wait_for_peers\",\"node\":1,"
-                  "\"peer_count\":1,\"timeout_sec\":30}]}\n");
+                  "\"peer_count\":1,\"timeout_sec\":30},"
+                  "{\"type\":\"restart_node\",\"node\":1}]}\n");
   bsim::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:00Z\","
@@ -77,7 +78,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "\"timestamp\":\"2026-07-09T00:00:01Z\","
                    "\"event\":\"generated_blocks\","
                    "\"detail\":\"{\\\"workload_index\\\":1,"
-                   "\\\"workload_count\\\":3,\\\"generator_node\\\":1,"
+                   "\\\"workload_count\\\":4,\\\"generator_node\\\":1,"
                    "\\\"count\\\":1,\\\"start_height\\\":0,"
                    "\\\"target_height\\\":1,\\\"reward_address\\\":\\\"a\\\","
                    "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
@@ -88,15 +89,21 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"height_wait_reached\","
                    "\"detail\":\"{\\\"workload_index\\\":2,"
-                   "\\\"workload_count\\\":3,\\\"node\\\":1,"
+                   "\\\"workload_count\\\":4,\\\"node\\\":1,"
                    "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
       "\"event\":\"peer_count_reached\","
       "\"detail\":\"{\\\"workload_index\\\":3,"
-      "\\\"workload_count\\\":3,\\\"node\\\":1,"
+      "\\\"workload_count\\\":4,\\\"node\\\":1,"
       "\\\"target_peer_count\\\":1,\\\"observed_peer_count\\\":1}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"event\":\"node_restarted\","
+                   "\"detail\":\"{\\\"workload_index\\\":4,"
+                   "\\\"workload_count\\\":4,\\\"node\\\":1,"
+                   "\\\"restart_count\\\":1}\"}");
   bsim::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:02Z\","
@@ -132,13 +139,13 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
-  BOOST_TEST(JsonInteger(report, "event_count") == 8U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 9U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
   BOOST_TEST(report.at("sync_timeout_sec").is_null());
   const boost::json::array& workloads = report.at("workloads").as_array();
-  BOOST_REQUIRE_EQUAL(workloads.size(), 3U);
+  BOOST_REQUIRE_EQUAL(workloads.size(), 4U);
   const boost::json::object& first_workload = workloads.front().as_object();
   BOOST_TEST(first_workload.at("type").as_string() == "block_generation");
   BOOST_TEST(JsonInteger(first_workload, "node") == 1U);
@@ -164,7 +171,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const boost::json::object& generated_block_detail =
       generated_block_event.at("detail").as_object();
   BOOST_TEST(JsonInteger(generated_block_detail, "workload_index") == 1U);
-  BOOST_TEST(JsonInteger(generated_block_detail, "workload_count") == 3U);
+  BOOST_TEST(JsonInteger(generated_block_detail, "workload_count") == 4U);
   BOOST_TEST(JsonInteger(generated_block_detail, "generator_node") == 1U);
   BOOST_TEST(JsonInteger(generated_block_detail, "target_height") == 1U);
   BOOST_REQUIRE_EQUAL(generated_block_detail.at("hashes").as_array().size(),
@@ -189,6 +196,14 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(peer_wait, "workload_index") == 3U);
   BOOST_TEST(JsonInteger(peer_wait, "target_peer_count") == 1U);
   BOOST_TEST(JsonInteger(peer_wait, "observed_peer_count") == 1U);
+  const boost::json::array& node_restarts =
+      report.at("node_restarts").as_array();
+  BOOST_REQUIRE_EQUAL(node_restarts.size(), 1U);
+  const boost::json::object& node_restart =
+      node_restarts.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(node_restart, "workload_index") == 4U);
+  BOOST_TEST(JsonInteger(node_restart, "node") == 1U);
+  BOOST_TEST(JsonInteger(node_restart, "restart_count") == 1U);
   const boost::json::array& nodes = report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);
   const boost::json::object& node = nodes.front().as_object();

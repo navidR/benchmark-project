@@ -260,6 +260,16 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-wait-peers-plural-nodes.json
     "current Firo MVP wait_for_peers workload uses node, not nodes"
   )
+  add_cli_failure_test(
+    benchmark-sim-invalid-restart-node-node
+    tests/scenarios/invalid-restart-node-node.json
+    "scenario restart_node workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-restart-node-plural-nodes
+    tests/scenarios/invalid-restart-node-plural-nodes.json
+    "current Firo MVP restart_node workload uses node, not nodes"
+  )
 endif()
 
 install(TARGETS benchmark-sim RUNTIME DESTINATION bin)

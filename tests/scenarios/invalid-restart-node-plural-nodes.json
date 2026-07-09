@@ -1,0 +1,9 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "restart_node",
+      "nodes": [1]
+    }
+  ]
+}
