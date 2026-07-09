@@ -1,0 +1,10 @@
+{
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "connect_peer",
+      "node": 1,
+      "peer": 3
+    }
+  ]
+}

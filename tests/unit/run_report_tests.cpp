@@ -346,6 +346,73 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
+  const std::filesystem::path dir = MakeTestDir("run-report-peer-churn");
+  bsim::WriteText(dir / "resolved-scenario.json",
+                  "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
+                  "\"isolated_network\":true,"
+                  "\"workloads\":["
+                  "{\"type\":\"disconnect_peer\",\"node\":2,\"peer\":1,"
+                  "\"timeout_sec\":5},"
+                  "{\"type\":\"connect_peer\",\"node\":2,\"peer\":1,"
+                  "\"timeout_sec\":5}]}\n");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"run_started\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+                   "\"event\":\"peer_disconnected\","
+                   "\"detail\":\"{\\\"workload_index\\\":1,"
+                   "\\\"workload_count\\\":2,\\\"node\\\":2,"
+                   "\\\"peer\\\":1,\\\"address\\\":\\\"10.210.1.2:18168\\\","
+                   "\\\"before_peer_count\\\":1,"
+                   "\\\"after_peer_count\\\":0,"
+                   "\\\"connected_before\\\":true,"
+                   "\\\"connected_after\\\":false}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+                   "\"event\":\"peer_connected\","
+                   "\"detail\":\"{\\\"workload_index\\\":2,"
+                   "\\\"workload_count\\\":2,\\\"node\\\":2,"
+                   "\\\"peer\\\":1,\\\"address\\\":\\\"10.210.1.2:18168\\\","
+                   "\\\"before_peer_count\\\":0,"
+                   "\\\"after_peer_count\\\":1,"
+                   "\\\"connected_before\\\":false,"
+                   "\\\"connected_after\\\":true,"
+                   "\\\"timeout_sec\\\":5}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"run_finished\"}");
+
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
+
+  BOOST_TEST(report.at("ok").as_bool());
+  const boost::json::array& workloads = report.at("workloads").as_array();
+  BOOST_REQUIRE_EQUAL(workloads.size(), 2U);
+  BOOST_TEST(workloads.front().as_object().at("type").as_string() ==
+             "disconnect_peer");
+  const boost::json::array& disconnects =
+      report.at("peer_disconnects").as_array();
+  BOOST_REQUIRE_EQUAL(disconnects.size(), 1U);
+  const boost::json::object& disconnect_detail =
+      disconnects.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(disconnect_detail, "workload_index") == 1U);
+  BOOST_TEST(JsonInteger(disconnect_detail, "node") == 2U);
+  BOOST_TEST(JsonInteger(disconnect_detail, "peer") == 1U);
+  BOOST_TEST(!disconnect_detail.at("connected_after").as_bool());
+  const boost::json::array& connects = report.at("peer_connects").as_array();
+  BOOST_REQUIRE_EQUAL(connects.size(), 1U);
+  const boost::json::object& connect_detail =
+      connects.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(connect_detail, "workload_index") == 2U);
+  BOOST_TEST(connect_detail.at("connected_after").as_bool());
+  BOOST_TEST(JsonInteger(connect_detail, "timeout_sec") == 5U);
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   const std::filesystem::path dir = MakeTestDir("run-report-failed");
   bsim::AppendLine(dir / "events.jsonl",

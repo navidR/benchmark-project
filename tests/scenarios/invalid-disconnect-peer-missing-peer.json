@@ -1,0 +1,9 @@
+{
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "disconnect_peer",
+      "node": 1
+    }
+  ]
+}

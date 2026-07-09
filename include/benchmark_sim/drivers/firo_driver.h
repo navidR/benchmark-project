@@ -58,10 +58,21 @@ class FiroDriver {
                      std::chrono::seconds timeout) const;
   void WaitForPeerCount(const FiroNodeConfig& config, uint64_t peer_count,
                         std::chrono::seconds timeout) const;
+  void WaitForPeerAddress(const FiroNodeConfig& config,
+                          const std::string& address,
+                          std::chrono::seconds timeout) const;
+  void WaitForPeerAddressAbsent(const FiroNodeConfig& config,
+                                const std::string& address,
+                                std::chrono::seconds timeout) const;
   FiroMetrics ReadMetrics(const FiroNodeConfig& config) const;
+  std::vector<std::string> PeerAddresses(const FiroNodeConfig& config) const;
   std::vector<std::string> GenerateBlocks(const FiroNodeConfig& config,
                                           uint32_t count,
                                           const std::string& address) const;
+  void ConnectPeer(const FiroNodeConfig& config,
+                   const std::string& address) const;
+  void DisconnectPeer(const FiroNodeConfig& config,
+                      const std::string& address) const;
   void Stop(const FiroNodeConfig& config) const;
 
  private:

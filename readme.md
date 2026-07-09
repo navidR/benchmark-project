@@ -337,6 +337,18 @@ formats use the same field names and validation rules.
       "timeout_sec": 45
     },
     {
+      "type": "disconnect_peer",
+      "node": 2,
+      "peer": 1,
+      "timeout_sec": 45
+    },
+    {
+      "type": "connect_peer",
+      "node": 2,
+      "peer": 1,
+      "timeout_sec": 45
+    },
+    {
       "type": "partition_nodes",
       "group_a": [1],
       "group_b": [2, 3]
@@ -468,6 +480,11 @@ are present in `events.jsonl`.
 and emit a structured `height_wait_reached` event.
 `wait_for_peers` workloads wait for one Firo node to report at least the target
 peer count and emit a structured `peer_count_reached` event.
+`disconnect_peer` workloads call Firo `disconnectnode` for one target peer, wait
+for that peer address to disappear from `getpeerinfo`, and emit a structured
+`peer_disconnected` event.
+`connect_peer` workloads call Firo `addnode <address> onetry`, wait for the
+target address in `getpeerinfo`, and emit a structured `peer_connected` event.
 `restart_node` workloads restart one Firo node and emit a structured
 `node_restarted` event.
 `freeze_node` workloads freeze one Firo node cgroup for `duration_ms`, thaw it,

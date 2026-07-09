@@ -213,6 +213,22 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
       text += " ";
       text += JsonMetricText(workload, "timeout_sec");
       text += "s";
+    } else if (type == "connect_peer") {
+      text += "connect n";
+      text += JsonMetricText(workload, "node");
+      text += "->n";
+      text += JsonMetricText(workload, "peer");
+      text += " ";
+      text += JsonMetricText(workload, "timeout_sec");
+      text += "s";
+    } else if (type == "disconnect_peer") {
+      text += "disconnect n";
+      text += JsonMetricText(workload, "node");
+      text += "->n";
+      text += JsonMetricText(workload, "peer");
+      text += " ";
+      text += JsonMetricText(workload, "timeout_sec");
+      text += "s";
     } else if (type == "restart_node") {
       text += "restart n";
       text += JsonMetricText(workload, "node");

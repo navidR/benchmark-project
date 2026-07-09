@@ -240,6 +240,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-yaml-scenario.yaml"
       --probe-capabilities
   )
+  add_test(NAME benchmark-sim-valid-peer-churn-scenario
+    COMMAND benchmark-sim
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-peer-churn-scenario.json"
+      --probe-capabilities
+  )
   add_cli_failure_test(
     benchmark-sim-invalid-wait-height-missing-height
     tests/scenarios/invalid-wait-height-missing-height.json
@@ -284,6 +290,26 @@ if(BUILD_TESTING)
     benchmark-sim-invalid-wait-peers-plural-nodes
     tests/scenarios/invalid-wait-peers-plural-nodes.json
     "current Firo MVP wait_for_peers workload uses node, not nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-connect-peer-peer
+    tests/scenarios/invalid-connect-peer-peer.json
+    "scenario connect_peer workload peer must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-connect-peer-self
+    tests/scenarios/invalid-connect-peer-self.json
+    "scenario connect_peer workload node and peer must differ"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-disconnect-peer-missing-peer
+    tests/scenarios/invalid-disconnect-peer-missing-peer.json
+    "missing or invalid uint32 JSON field: peer"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-disconnect-peer-zero-timeout
+    tests/scenarios/invalid-disconnect-peer-zero-timeout.json
+    "scenario disconnect_peer timeout_sec must be greater than zero"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-restart-node-node

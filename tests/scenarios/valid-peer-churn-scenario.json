@@ -1,0 +1,36 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "peer-churn-smoke",
+  "nodes": 3,
+  "isolated_network": true,
+  "generate_blocks": 0,
+  "ready_timeout_sec": 10,
+  "sync_timeout_sec": 10,
+  "workloads": [
+    {
+      "type": "wait_for_peers",
+      "node": 2,
+      "peer_count": 1,
+      "timeout_sec": 10
+    },
+    {
+      "type": "connect_peer",
+      "node": 2,
+      "peer": 3,
+      "timeout_sec": 10
+    },
+    {
+      "type": "wait_for_peers",
+      "node": 2,
+      "peer_count": 2,
+      "timeout_sec": 10
+    },
+    {
+      "type": "disconnect_peer",
+      "node": 2,
+      "peer": 3,
+      "timeout_sec": 10
+    }
+  ]
+}

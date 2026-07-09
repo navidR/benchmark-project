@@ -44,6 +44,16 @@ std::vector<std::string> ParseStringArrayResult(
   return values;
 }
 
+bool ContainsPeerAddress(const std::vector<std::string>& addresses,
+                         const std::string& address) {
+  for (const std::string& candidate : addresses) {
+    if (candidate == address) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
@@ -163,6 +173,50 @@ void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
                            (last_error.empty() ? "" : ": " + last_error));
 }
 
+void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
+                                    const std::string& address,
+                                    std::chrono::seconds timeout) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::string last_error;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      const std::vector<std::string> addresses = PeerAddresses(config);
+      for (const std::string& candidate : addresses) {
+        if (candidate == address) {
+          return;
+        }
+      }
+    } catch (const std::exception& e) {
+      last_error = e.what();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  throw std::runtime_error(
+      "Firo node " + config.id + " did not connect to peer " + address +
+      " before timeout" + (last_error.empty() ? "" : ": " + last_error));
+}
+
+void FiroDriver::WaitForPeerAddressAbsent(const FiroNodeConfig& config,
+                                          const std::string& address,
+                                          std::chrono::seconds timeout) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::string last_error;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      const std::vector<std::string> addresses = PeerAddresses(config);
+      if (!ContainsPeerAddress(addresses, address)) {
+        return;
+      }
+    } catch (const std::exception& e) {
+      last_error = e.what();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  throw std::runtime_error(
+      "Firo node " + config.id + " remained connected to peer " + address +
+      " before timeout" + (last_error.empty() ? "" : ": " + last_error));
+}
+
 FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
   const auto start = std::chrono::steady_clock::now();
   const boost::json::value blockchain =
@@ -190,6 +244,23 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
   return metrics;
 }
 
+std::vector<std::string> FiroDriver::PeerAddresses(
+    const FiroNodeConfig& config) const {
+  const boost::json::value peers =
+      RpcCall(config, "getpeerinfo", boost::json::array{});
+  std::vector<std::string> addresses;
+  for (const boost::json::value& peer : peers.as_array()) {
+    if (!peer.is_object()) {
+      continue;
+    }
+    const boost::json::value* address = peer.as_object().if_contains("addr");
+    if (address != nullptr && address->is_string()) {
+      addresses.emplace_back(address->as_string());
+    }
+  }
+  return addresses;
+}
+
 std::vector<std::string> FiroDriver::GenerateBlocks(
     const FiroNodeConfig& config, uint32_t count,
     const std::string& address) const {
@@ -197,6 +268,21 @@ std::vector<std::string> FiroDriver::GenerateBlocks(
   params.push_back(count);
   params.emplace_back(address);
   return ParseStringArrayResult(RpcCall(config, "generatetoaddress", params));
+}
+
+void FiroDriver::ConnectPeer(const FiroNodeConfig& config,
+                             const std::string& address) const {
+  boost::json::array params;
+  params.emplace_back(address);
+  params.emplace_back("onetry");
+  RpcCall(config, "addnode", params);
+}
+
+void FiroDriver::DisconnectPeer(const FiroNodeConfig& config,
+                                const std::string& address) const {
+  boost::json::array params;
+  params.emplace_back(address);
+  RpcCall(config, "disconnectnode", params);
 }
 
 void FiroDriver::Stop(const FiroNodeConfig& config) const {

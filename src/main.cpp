@@ -79,6 +79,18 @@ struct WaitForPeersWorkload {
   uint32_t timeout_sec = 30;
 };
 
+struct ConnectPeerWorkload {
+  uint32_t node = 1;
+  uint32_t peer = 0;
+  uint32_t timeout_sec = 30;
+};
+
+struct DisconnectPeerWorkload {
+  uint32_t node = 1;
+  uint32_t peer = 0;
+  uint32_t timeout_sec = 30;
+};
+
 struct RestartNodeWorkload {
   uint32_t node = 1;
 };
@@ -106,6 +118,8 @@ enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
   kWaitForPeers,
+  kConnectPeer,
+  kDisconnectPeer,
   kRestartNode,
   kFreezeNode,
   kUpdateResourceLimits,
@@ -118,6 +132,8 @@ struct ScenarioWorkload {
   BlockGenerationWorkload block_generation;
   WaitUntilHeightWorkload wait_until_height;
   WaitForPeersWorkload wait_for_peers;
+  ConnectPeerWorkload connect_peer;
+  DisconnectPeerWorkload disconnect_peer;
   RestartNodeWorkload restart_node;
   FreezeNodeWorkload freeze_node;
   ResourceLimitUpdateWorkload update_resource_limits;
@@ -917,6 +933,41 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kWaitForPeers;
       scenario_workload.wait_for_peers = wait;
       options.workloads.push_back(scenario_workload);
+    } else if (type == "connect_peer") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP connect_peer workload uses node, not nodes");
+      }
+      ConnectPeerWorkload connect;
+      connect.node = JsonOptionalUint32Field(workload, "node", connect.node);
+      connect.peer = JsonUint32Field(workload, "peer");
+      connect.timeout_sec =
+          OptionProvided(vm, "sync-timeout-sec")
+              ? options.sync_timeout_sec
+              : JsonOptionalUint32Field(workload, "timeout_sec",
+                                        options.sync_timeout_sec);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kConnectPeer;
+      scenario_workload.connect_peer = connect;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "disconnect_peer") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP disconnect_peer workload uses node, not nodes");
+      }
+      DisconnectPeerWorkload disconnect;
+      disconnect.node =
+          JsonOptionalUint32Field(workload, "node", disconnect.node);
+      disconnect.peer = JsonUint32Field(workload, "peer");
+      disconnect.timeout_sec =
+          OptionProvided(vm, "sync-timeout-sec")
+              ? options.sync_timeout_sec
+              : JsonOptionalUint32Field(workload, "timeout_sec",
+                                        options.sync_timeout_sec);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kDisconnectPeer;
+      scenario_workload.disconnect_peer = disconnect;
+      options.workloads.push_back(scenario_workload);
     } else if (type == "restart_node") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
@@ -1708,6 +1759,44 @@ Options ParseOptions(int argc, char** argv) {
       if (workload.wait_for_peers.timeout_sec == 0U) {
         throw std::runtime_error(
             "scenario wait_for_peers timeout_sec must be greater than zero");
+      }
+    } else if (workload.kind == WorkloadKind::kConnectPeer) {
+      if (workload.connect_peer.node == 0U ||
+          workload.connect_peer.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario connect_peer workload node must be in 1..--nodes");
+      }
+      if (workload.connect_peer.peer == 0U ||
+          workload.connect_peer.peer > options.nodes) {
+        throw std::runtime_error(
+            "scenario connect_peer workload peer must be in 1..--nodes");
+      }
+      if (workload.connect_peer.node == workload.connect_peer.peer) {
+        throw std::runtime_error(
+            "scenario connect_peer workload node and peer must differ");
+      }
+      if (workload.connect_peer.timeout_sec == 0U) {
+        throw std::runtime_error(
+            "scenario connect_peer timeout_sec must be greater than zero");
+      }
+    } else if (workload.kind == WorkloadKind::kDisconnectPeer) {
+      if (workload.disconnect_peer.node == 0U ||
+          workload.disconnect_peer.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario disconnect_peer workload node must be in 1..--nodes");
+      }
+      if (workload.disconnect_peer.peer == 0U ||
+          workload.disconnect_peer.peer > options.nodes) {
+        throw std::runtime_error(
+            "scenario disconnect_peer workload peer must be in 1..--nodes");
+      }
+      if (workload.disconnect_peer.node == workload.disconnect_peer.peer) {
+        throw std::runtime_error(
+            "scenario disconnect_peer workload node and peer must differ");
+      }
+      if (workload.disconnect_peer.timeout_sec == 0U) {
+        throw std::runtime_error(
+            "scenario disconnect_peer timeout_sec must be greater than zero");
       }
     } else if (workload.kind == WorkloadKind::kRestartNode) {
       if (workload.restart_node.node == 0U ||
@@ -2549,6 +2638,46 @@ std::string PeerCountWaitDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
+bool ContainsPeerAddress(const std::vector<std::string>& addresses,
+                         const std::string& address) {
+  for (const std::string& candidate : addresses) {
+    if (candidate == address) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string PeerAddress(const Options& options,
+                        const std::vector<NodeRuntime>& nodes, uint32_t node) {
+  const uint32_t node_index = node - 1U;
+  return FiroPeerHost(options, node_index) + ":" +
+         std::to_string(nodes[node_index].config.p2p_port);
+}
+
+std::string PeerChurnDetail(uint32_t workload_index, uint32_t workload_count,
+                            uint32_t node, uint32_t peer,
+                            const std::string& address,
+                            uint64_t before_peer_count,
+                            uint64_t after_peer_count, bool connected_before,
+                            bool connected_after,
+                            std::optional<uint32_t> timeout_sec) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = node;
+  detail["peer"] = peer;
+  detail["address"] = address;
+  detail["before_peer_count"] = before_peer_count;
+  detail["after_peer_count"] = after_peer_count;
+  detail["connected_before"] = connected_before;
+  detail["connected_after"] = connected_after;
+  if (timeout_sec) {
+    detail["timeout_sec"] = *timeout_sec;
+  }
+  return boost::json::serialize(detail);
+}
+
 std::string RestartNodeWorkloadDetail(uint32_t workload_index,
                                       uint32_t workload_count, uint32_t node,
                                       uint64_t restart_count) {
@@ -2873,6 +3002,26 @@ boost::json::object WaitForPeersWorkloadJson(
   return object;
 }
 
+boost::json::object ConnectPeerWorkloadJson(
+    const ConnectPeerWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "connect_peer";
+  object["node"] = workload.node;
+  object["peer"] = workload.peer;
+  object["timeout_sec"] = workload.timeout_sec;
+  return object;
+}
+
+boost::json::object DisconnectPeerWorkloadJson(
+    const DisconnectPeerWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "disconnect_peer";
+  object["node"] = workload.node;
+  object["peer"] = workload.peer;
+  object["timeout_sec"] = workload.timeout_sec;
+  return object;
+}
+
 boost::json::object RestartNodeWorkloadJson(
     const RestartNodeWorkload& workload) {
   boost::json::object object;
@@ -2913,6 +3062,12 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   }
   if (workload.kind == WorkloadKind::kWaitForPeers) {
     return WaitForPeersWorkloadJson(workload.wait_for_peers);
+  }
+  if (workload.kind == WorkloadKind::kConnectPeer) {
+    return ConnectPeerWorkloadJson(workload.connect_peer);
+  }
+  if (workload.kind == WorkloadKind::kDisconnectPeer) {
+    return DisconnectPeerWorkloadJson(workload.disconnect_peer);
   }
   if (workload.kind == WorkloadKind::kRestartNode) {
     return RestartNodeWorkloadJson(workload.restart_node);
@@ -3271,6 +3426,58 @@ void ApplyRuntimeResourceLimitUpdates(const Options& options,
     NodeRuntime& node = nodes[node_index];
     ApplyResourceLimitUpdate(options, events_path, node, patch);
   }
+}
+
+void ApplyConnectPeerWorkload(const Options& options,
+                              const std::filesystem::path& events_path,
+                              const FiroDriver& driver,
+                              std::vector<NodeRuntime>& nodes,
+                              const ConnectPeerWorkload& workload,
+                              uint32_t workload_index,
+                              uint32_t workload_count) {
+  NodeRuntime& node = nodes[workload.node - 1U];
+  const std::string address = PeerAddress(options, nodes, workload.peer);
+  const std::vector<std::string> before_addresses =
+      driver.PeerAddresses(node.config);
+  const bool connected_before = ContainsPeerAddress(before_addresses, address);
+  driver.ConnectPeer(node.config, address);
+  driver.WaitForPeerAddress(node.config, address,
+                            std::chrono::seconds(workload.timeout_sec));
+  const std::vector<std::string> after_addresses =
+      driver.PeerAddresses(node.config);
+  const bool connected_after = ContainsPeerAddress(after_addresses, address);
+  WriteEvent(events_path, options.run_id, node.config.id, "peer_connected",
+             PeerChurnDetail(
+                 workload_index, workload_count, workload.node, workload.peer,
+                 address, static_cast<uint64_t>(before_addresses.size()),
+                 static_cast<uint64_t>(after_addresses.size()),
+                 connected_before, connected_after, workload.timeout_sec));
+}
+
+void ApplyDisconnectPeerWorkload(const Options& options,
+                                 const std::filesystem::path& events_path,
+                                 const FiroDriver& driver,
+                                 std::vector<NodeRuntime>& nodes,
+                                 const DisconnectPeerWorkload& workload,
+                                 uint32_t workload_index,
+                                 uint32_t workload_count) {
+  NodeRuntime& node = nodes[workload.node - 1U];
+  const std::string address = PeerAddress(options, nodes, workload.peer);
+  const std::vector<std::string> before_addresses =
+      driver.PeerAddresses(node.config);
+  const bool connected_before = ContainsPeerAddress(before_addresses, address);
+  driver.DisconnectPeer(node.config, address);
+  driver.WaitForPeerAddressAbsent(node.config, address,
+                                  std::chrono::seconds(workload.timeout_sec));
+  const std::vector<std::string> after_addresses =
+      driver.PeerAddresses(node.config);
+  const bool connected_after = ContainsPeerAddress(after_addresses, address);
+  WriteEvent(events_path, options.run_id, node.config.id, "peer_disconnected",
+             PeerChurnDetail(
+                 workload_index, workload_count, workload.node, workload.peer,
+                 address, static_cast<uint64_t>(before_addresses.size()),
+                 static_cast<uint64_t>(after_addresses.size()),
+                 connected_before, connected_after, workload.timeout_sec));
 }
 
 void ApplyRuntimeNetworkConditionUpdates(
@@ -3844,6 +4051,16 @@ int Run(int argc, char** argv) {
                                 static_cast<uint32_t>(workloads.size()),
                                 workload.node, workload.peer_count,
                                 observed_peer_count));
+      } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
+        ApplyConnectPeerWorkload(options, events_path, driver, nodes,
+                                 scenario_workload.connect_peer,
+                                 static_cast<uint32_t>(workload_index + 1U),
+                                 static_cast<uint32_t>(workloads.size()));
+      } else if (scenario_workload.kind == WorkloadKind::kDisconnectPeer) {
+        ApplyDisconnectPeerWorkload(options, events_path, driver, nodes,
+                                    scenario_workload.disconnect_peer,
+                                    static_cast<uint32_t>(workload_index + 1U),
+                                    static_cast<uint32_t>(workloads.size()));
       } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
         const RestartNodeWorkload& workload = scenario_workload.restart_node;
         NodeRuntime& node = nodes[workload.node - 1U];
