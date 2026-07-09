@@ -9,8 +9,10 @@ namespace bsim {
 
 struct WalletTransactionsWorkload {
   WalletTransferStrategy strategy = WalletTransferStrategy::kRoundRobin;
-  std::uint32_t funding_blocks_per_wallet = kFiroCoinbaseSpendableConfirmations;
-  std::uint64_t readiness_confirmations = kFiroCoinbaseSpendableConfirmations;
+  std::uint32_t funding_blocks_per_wallet =
+      kDefaultCoinbaseSpendableConfirmations;
+  std::uint64_t readiness_confirmations =
+      kDefaultCoinbaseSpendableConfirmations;
   std::uint32_t transaction_count = 0;
   std::uint64_t amount_satoshis = 0;
   std::uint64_t fee_satoshis = 0;

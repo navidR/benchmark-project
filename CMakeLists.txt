@@ -211,6 +211,7 @@ mark_target_interface_includes_system(yaml)
 add_executable(benchmark-sim
   src/capability.cpp
   src/cgroup.cpp
+  src/drivers/chain_driver_registry.cpp
   src/drivers/firo_driver.cpp
   src/http_client.cpp
   src/log_tail.cpp
@@ -404,7 +405,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     benchmark-sim-invalid-wait-height-plural-nodes
     tests/scenarios/invalid-wait-height-plural-nodes.json
-    "current Firo MVP wait_until_height workload uses node, not nodes"
+    "current MVP wait_until_height workload uses node, not nodes"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-wait-peers-missing-peer-count
@@ -429,7 +430,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     benchmark-sim-invalid-wait-peers-plural-nodes
     tests/scenarios/invalid-wait-peers-plural-nodes.json
-    "current Firo MVP wait_for_peers workload uses node, not nodes"
+    "current MVP wait_for_peers workload uses node, not nodes"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-connect-peer-peer
@@ -484,7 +485,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     benchmark-sim-invalid-restart-node-plural-nodes
     tests/scenarios/invalid-restart-node-plural-nodes.json
-    "current Firo MVP restart_node workload uses node, not nodes"
+    "current MVP restart_node workload uses node, not nodes"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-freeze-node-missing-duration
@@ -499,7 +500,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     benchmark-sim-invalid-freeze-node-plural-nodes
     tests/scenarios/invalid-freeze-node-plural-nodes.json
-    "current Firo MVP freeze_node workload uses node, not nodes"
+    "current MVP freeze_node workload uses node, not nodes"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-freeze-node-zero-duration
@@ -519,7 +520,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     benchmark-sim-invalid-update-resource-limits-plural-nodes
     tests/scenarios/invalid-update-resource-limits-plural-nodes.json
-    "current Firo MVP update_resource_limits workload uses node, not nodes"
+    "current MVP update_resource_limits workload uses node, not nodes"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-partition-workload-requires-isolate

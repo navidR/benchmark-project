@@ -13,7 +13,7 @@ struct SendRawTransactionWorkload {
   std::string source_address;
   std::string source_private_key;
   std::string destination_address;
-  std::uint32_t funding_blocks = kFiroCoinbaseSpendableConfirmations;
+  std::uint32_t funding_blocks = kDefaultCoinbaseSpendableConfirmations;
   std::uint64_t amount_satoshis = 0;
   std::uint64_t fee_satoshis = 0;
   std::uint32_t timeout_sec = 30;

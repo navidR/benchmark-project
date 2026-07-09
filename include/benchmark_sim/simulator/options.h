@@ -20,7 +20,7 @@ namespace bsim {
 struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path scenario_yaml;
-  std::filesystem::path firod;
+  std::filesystem::path chain_daemon;
   std::filesystem::path output_dir = "runs";
   std::filesystem::path report_run;
   std::filesystem::path tui_run;

@@ -23,7 +23,7 @@
 
 #include "benchmark_sim/capability.h"
 #include "benchmark_sim/cgroup.h"
-#include "benchmark_sim/drivers/firo_driver.h"
+#include "benchmark_sim/drivers/chain_driver_registry.h"
 #include "benchmark_sim/log_tail.h"
 #include "benchmark_sim/logging.h"
 #include "benchmark_sim/network.h"
@@ -859,17 +859,18 @@ void ValidateWalletTransactionsWorkload(
         "wallet node count");
   }
   if (workload.funding_blocks_per_wallet <
-      kFiroCoinbaseSpendableConfirmations) {
+      kDefaultCoinbaseSpendableConfirmations) {
     throw std::runtime_error(
         "scenario wallet_transactions funding_blocks_per_wallet must be at "
         "least " +
-        std::to_string(kFiroCoinbaseSpendableConfirmations));
+        std::to_string(kDefaultCoinbaseSpendableConfirmations));
   }
-  if (workload.readiness_confirmations < kFiroCoinbaseSpendableConfirmations) {
+  if (workload.readiness_confirmations <
+      kDefaultCoinbaseSpendableConfirmations) {
     throw std::runtime_error(
         "scenario wallet_transactions readiness_confirmations must be at "
         "least " +
-        std::to_string(kFiroCoinbaseSpendableConfirmations));
+        std::to_string(kDefaultCoinbaseSpendableConfirmations));
   }
   if (workload.funding_blocks_per_wallet < workload.readiness_confirmations) {
     throw std::runtime_error(
@@ -1030,7 +1031,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     if (type == "block_generation") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP block_generation workload uses node, not nodes");
+            "current MVP block_generation workload uses node, not nodes");
       }
       BlockGenerationWorkload block_generation;
       block_generation.count =
@@ -1055,7 +1056,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "wait_until_height") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP wait_until_height workload uses node, not nodes");
+            "current MVP wait_until_height workload uses node, not nodes");
       }
       WaitUntilHeightWorkload wait;
       wait.node = JsonOptionalUint32Field(workload, "node", wait.node);
@@ -1072,7 +1073,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "wait_for_peers") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP wait_for_peers workload uses node, not nodes");
+            "current MVP wait_for_peers workload uses node, not nodes");
       }
       WaitForPeersWorkload wait;
       wait.node = JsonOptionalUint32Field(workload, "node", wait.node);
@@ -1089,7 +1090,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "connect_peer") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP connect_peer workload uses node, not nodes");
+            "current MVP connect_peer workload uses node, not nodes");
       }
       ConnectPeerWorkload connect;
       connect.node = JsonOptionalUint32Field(workload, "node", connect.node);
@@ -1106,7 +1107,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "disconnect_peer") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP disconnect_peer workload uses node, not nodes");
+            "current MVP disconnect_peer workload uses node, not nodes");
       }
       DisconnectPeerWorkload disconnect;
       disconnect.node =
@@ -1124,7 +1125,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "restart_node") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP restart_node workload uses node, not nodes");
+            "current MVP restart_node workload uses node, not nodes");
       }
       RestartNodeWorkload restart;
       restart.node = JsonOptionalUint32Field(workload, "node", restart.node);
@@ -1135,7 +1136,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "freeze_node") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP freeze_node workload uses node, not nodes");
+            "current MVP freeze_node workload uses node, not nodes");
       }
       FreezeNodeWorkload freeze;
       freeze.node = JsonOptionalUint32Field(workload, "node", freeze.node);
@@ -1147,7 +1148,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "update_resource_limits") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP update_resource_limits workload uses node, not "
+            "current MVP update_resource_limits workload uses node, not "
             "nodes");
       }
       ResourceLimitUpdateWorkload update;
@@ -1174,7 +1175,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
     } else if (type == "send_raw_transaction") {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
-            "current Firo MVP send_raw_transaction workload uses "
+            "current MVP send_raw_transaction workload uses "
             "funding_node and submit_node, not nodes");
       }
       SendRawTransactionWorkload transaction;
@@ -1249,8 +1250,16 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
 void ApplyScenarioJson(const boost::json::object& scenario,
                        const boost::program_options::variables_map& vm,
                        Options& options) {
-  if (!OptionProvided(vm, "firod")) {
-    options.firod = JsonOptionalPathField(scenario, "firod", options.firod);
+  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
+  const bool chain_daemon_provided =
+      OptionProvided(vm, "chain-daemon") ||
+      OptionProvided(vm, chain_spec.daemon_option_name.c_str());
+  if (!chain_daemon_provided) {
+    options.chain_daemon =
+        JsonOptionalPathField(scenario, "chain_daemon", options.chain_daemon);
+    options.chain_daemon = JsonOptionalPathField(
+        scenario, chain_spec.daemon_scenario_field.c_str(),
+        options.chain_daemon);
   }
   if (!OptionProvided(vm, "benchmark-root") &&
       !OptionProvided(vm, "output-dir")) {
@@ -1731,17 +1740,21 @@ void ParseNodeNetworkConditions(Options& options) {
 Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
   Options options;
+  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
 
   const std::string nodes_help =
-      "Firo regtest nodes, 1.." + std::to_string(kMaxFiroNodes);
+      "chain regtest nodes, 1.." + std::to_string(chain_spec.max_nodes);
   po::options_description desc("Allowed options");
   desc.add_options()("help", "show this help")(
       "scenario-json", po::value<std::filesystem::path>(&options.scenario_json),
-      "Boost.JSON scenario file for the Firo MVP")(
+      "Boost.JSON scenario file for the chain MVP")(
       "scenario-yaml", po::value<std::filesystem::path>(&options.scenario_yaml),
-      "libyaml scenario file for the Firo MVP")(
-      "firod", po::value<std::filesystem::path>(&options.firod),
-      "explicit firod binary")(
+      "libyaml scenario file for the chain MVP")(
+      "chain-daemon", po::value<std::filesystem::path>(&options.chain_daemon),
+      "explicit chain daemon binary")(
+      chain_spec.daemon_option_name.c_str(),
+      po::value<std::filesystem::path>(&options.chain_daemon),
+      "legacy chain daemon binary alias")(
       "benchmark-root", po::value<std::filesystem::path>(&options.output_dir),
       "root directory for run data, node directories, metrics, events, and "
       "logs")("output-dir",
@@ -1786,7 +1799,7 @@ Options ParseOptions(int argc, char** argv) {
       "cleanup-run", po::bool_switch(&options.cleanup_run),
       "remove stale simulator-owned veth and cgroup objects for --run-id and "
       "exit")("isolate-network", po::bool_switch(&options.isolate_network),
-              "run each Firo node in its own network namespace and veth link")(
+              "run each chain node in its own network namespace and veth link")(
       "network-bandwidth-mbps",
       po::value<uint32_t>(&options.network_condition.bandwidth_mbps),
       "TBF bandwidth limit in megabits per second for each isolated node "
@@ -1921,6 +1934,11 @@ Options ParseOptions(int argc, char** argv) {
         "--benchmark-root and --output-dir are aliases and must not both be "
         "provided");
   }
+  if (OptionProvided(vm, "chain-daemon") &&
+      OptionProvided(vm, chain_spec.daemon_option_name.c_str())) {
+    throw std::runtime_error(
+        "--chain-daemon and its legacy alias must not both be provided");
+  }
   if (vm.count("run") != 0U && vm.count("report-run") != 0U) {
     throw std::runtime_error("--run and --report-run are mutually exclusive");
   }
@@ -1994,10 +2012,10 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error(
         "network runtime options require --isolate-network");
   }
-  if (options.nodes < 1 || options.nodes > kMaxFiroNodes) {
+  if (options.nodes < 1 || options.nodes > chain_spec.max_nodes) {
     throw std::runtime_error("--nodes currently supports 1.." +
-                             std::to_string(kMaxFiroNodes) +
-                             " for Firo smoke runs");
+                             std::to_string(chain_spec.max_nodes) +
+                             " for chain smoke runs");
   }
   if (options.generate_node == 0U || options.generate_node > options.nodes) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
@@ -2121,10 +2139,10 @@ Options ParseOptions(int argc, char** argv) {
             "scenario send_raw_transaction source_address and "
             "destination_address must differ");
       }
-      if (transaction.funding_blocks < kFiroCoinbaseSpendableConfirmations) {
+      if (transaction.funding_blocks < kDefaultCoinbaseSpendableConfirmations) {
         throw std::runtime_error(
             "scenario send_raw_transaction funding_blocks must be at least " +
-            std::to_string(kFiroCoinbaseSpendableConfirmations));
+            std::to_string(kDefaultCoinbaseSpendableConfirmations));
       }
       if (transaction.amount_satoshis == 0U) {
         throw std::runtime_error(
@@ -2154,7 +2172,7 @@ Options ParseOptions(int argc, char** argv) {
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
-  const bool needs_firod =
+  const bool needs_chain_daemon =
       !options.probe_network && options.report_run.empty() &&
       options.tui_run.empty() && !options.probe_bandwidth_limit &&
       !options.probe_capabilities && !options.probe_cgroup_freeze &&
@@ -2164,12 +2182,12 @@ Options ParseOptions(int argc, char** argv) {
       !options.probe_network_condition &&
       !options.probe_combined_network_condition &&
       !options.probe_network_condition_update && !options.cleanup_run;
-  if (needs_firod && options.firod.empty()) {
-    throw std::runtime_error(
-        "Firo runs require an explicit --firod path or scenario firod field");
+  if (needs_chain_daemon && options.chain_daemon.empty()) {
+    throw std::runtime_error("chain runs require --chain-daemon or --" +
+                             chain_spec.daemon_option_name);
   }
-  if (needs_firod) {
-    RequireExecutable(options.firod);
+  if (needs_chain_daemon) {
+    RequireExecutable(options.chain_daemon);
   }
   return options;
 }
@@ -2558,16 +2576,19 @@ NodeVethConfig MakeNodeVethConfig(const Options& options, uint32_t node_index) {
   return config;
 }
 
-std::string FiroPeerHost(const Options& options, uint32_t node_index) {
+std::string PeerHost(const Options& options, uint32_t node_index) {
   if (options.isolate_network) {
     return NodeAddress(node_index);
   }
   return "127.0.0.1";
 }
 
-std::string FiroPeerAddress(const Options& options, uint32_t node_index) {
-  return FiroPeerHost(options, node_index) + ":" +
-         std::to_string(18168 + node_index);
+std::string StartupPeerAddress(const Options& options,
+                               const ChainDriverSpec& chain_spec,
+                               uint32_t node_index) {
+  return PeerHost(options, node_index) + ":" +
+         std::to_string(static_cast<uint32_t>(chain_spec.p2p_port_base) +
+                        node_index);
 }
 
 std::vector<uint32_t> LegacyStartupPeerIndexes(uint32_t node_index) {
@@ -2602,6 +2623,7 @@ std::vector<uint32_t> ConfiguredStartupPeerIndexes(const Options& options,
 }
 
 std::vector<std::string> StartupPeerAddresses(const Options& options,
+                                              const ChainDriverSpec& chain_spec,
                                               uint32_t node_index) {
   const std::vector<uint32_t> peer_indexes =
       options.topology.configured
@@ -2610,7 +2632,7 @@ std::vector<std::string> StartupPeerAddresses(const Options& options,
   std::vector<std::string> peers;
   peers.reserve(peer_indexes.size());
   for (uint32_t peer_index : peer_indexes) {
-    peers.push_back(FiroPeerAddress(options, peer_index));
+    peers.push_back(StartupPeerAddress(options, chain_spec, peer_index));
   }
   return peers;
 }
@@ -3020,7 +3042,8 @@ std::string GeneratedBlocksDetail(uint32_t workload_index,
                                   uint32_t workload_count,
                                   uint32_t generator_node,
                                   uint64_t start_height, uint64_t target_height,
-                                  const std::vector<std::string>& hashes) {
+                                  const std::vector<std::string>& hashes,
+                                  const std::string& reward_address) {
   boost::json::array hash_array;
   for (const std::string& hash : hashes) {
     hash_array.emplace_back(hash);
@@ -3032,7 +3055,7 @@ std::string GeneratedBlocksDetail(uint32_t workload_index,
   detail["count"] = static_cast<uint64_t>(hashes.size());
   detail["start_height"] = start_height;
   detail["target_height"] = target_height;
-  detail["reward_address"] = kDefaultRewardAddress;
+  detail["reward_address"] = reward_address;
   detail["hashes"] = std::move(hash_array);
   return boost::json::serialize(detail);
 }
@@ -3075,7 +3098,7 @@ bool ContainsPeerAddress(const std::vector<std::string>& addresses,
 std::string PeerAddress(const Options& options,
                         const std::vector<NodeRuntime>& nodes, uint32_t node) {
   const uint32_t node_index = node - 1U;
-  return FiroPeerHost(options, node_index) + ":" +
+  return PeerHost(options, node_index) + ":" +
          std::to_string(nodes[node_index].config.p2p_port);
 }
 
@@ -3603,11 +3626,12 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
 }
 
 void WriteScenarioFiles(const Options& options,
-                        const std::filesystem::path& run_root) {
+                        const std::filesystem::path& run_root,
+                        const ChainDriverSpec& chain_spec) {
   const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
-  resolved["chain"] = "firo";
+  resolved["chain"] = chain_spec.name;
   resolved["nodes"] = options.nodes;
   resolved["generate_blocks"] = TotalBlockGenerationCount(workloads);
   if (const std::optional<uint32_t> generate_node =
@@ -3616,7 +3640,8 @@ void WriteScenarioFiles(const Options& options,
   } else {
     resolved["generate_node"] = nullptr;
   }
-  resolved["firod"] = options.firod.string();
+  resolved["chain_daemon"] = options.chain_daemon.string();
+  resolved[chain_spec.daemon_scenario_field] = options.chain_daemon.string();
   if (!options.scenario_json.empty()) {
     resolved["scenario_json"] = options.scenario_json.string();
   }
@@ -3765,10 +3790,11 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
     }
     options->isolate_network = isolated->as_bool();
   }
-  if (options->nodes < 1 || options->nodes > kMaxFiroNodes) {
+  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
+  if (options->nodes < 1 || options->nodes > chain_spec.max_nodes) {
     throw std::runtime_error(
         "cleanup currently supports resolved node counts in 1.." +
-        std::to_string(kMaxFiroNodes));
+        std::to_string(chain_spec.max_nodes));
   }
 }
 
@@ -3790,34 +3816,31 @@ void CleanupRun(Options options) {
 
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
-                const ChainDriver& driver, std::vector<NodeRuntime>& nodes) {
+                const ChainDriverSpec& chain_spec, const ChainDriver& driver,
+                std::vector<NodeRuntime>& nodes) {
   if (options.isolate_network) {
     RequireNetworkSetupCapabilities();
   }
   if (options.isolate_network && options.nodes > 1 &&
       !HostIpv4ForwardingEnabled()) {
     throw std::runtime_error(
-        "isolated multi-node Firo runs require IPv4 forwarding in the parent "
+        "isolated multi-node chain runs require IPv4 forwarding in the parent "
         "network namespace");
   }
   nodes.reserve(options.nodes);
   for (uint32_t i = 0; i < options.nodes; ++i) {
-    const std::string node_id = "firo-" + std::to_string(i + 1);
-    const auto node_root = run_root / "nodes" / node_id;
+    ChainNodeConfigRequest config_request;
+    config_request.run_id = options.run_id;
+    config_request.run_root = run_root;
+    config_request.daemon_binary = options.chain_daemon;
+    config_request.node_index = i;
+    config_request.wallet_enabled =
+        options.wallet_backed_workload_requested &&
+        NodeListContains(options.topology.wallet_nodes, i);
+    config_request.connect_peers = StartupPeerAddresses(options, chain_spec, i);
 
-    ChainNodeConfig config;
-    config.id = node_id;
-    config.binary = options.firod;
-    config.data_dir = node_root / "data";
-    config.log_dir = node_root;
-    config.p2p_port = static_cast<uint16_t>(18168 + i);
-    config.rpc_port = static_cast<uint16_t>(18888 + i);
-    config.rpc_user = "sim-" + options.run_id;
-    config.rpc_password = "pass-" + options.run_id + "-" + std::to_string(i);
-    config.listen = true;
-    config.wallet_enabled = options.wallet_backed_workload_requested &&
-                            NodeListContains(options.topology.wallet_nodes, i);
-    config.connect_peers = StartupPeerAddresses(options, i);
+    ChainNodeConfig config = MakeChainNodeConfig(chain_spec, config_request);
+    const std::string node_id = config.id;
 
     NodeRuntime runtime;
     try {
@@ -3921,7 +3944,7 @@ void InitializeWalletNodes(const Options& options,
     wallet.address = driver.CreateWalletAddress(
         node.config, ToChainWalletMode(registry.wallet_initialization()));
     if (wallet.address.empty()) {
-      throw std::runtime_error("Firo wallet RPC returned an empty address");
+      throw std::runtime_error("chain wallet RPC returned an empty address");
     }
     WriteEvent(events_path, options.run_id, node.config.id,
                "wallet_address_created",
@@ -4060,7 +4083,7 @@ void ApplySendRawTransactionWorkload(const Options& options,
       workload.amount_satoshis + workload.fee_satoshis;
   const ChainUtxo utxo = driver.FindSpendableOutput(
       funder.config, funding_hashes, workload.source_address, minimum_amount,
-      kFiroCoinbaseSpendableConfirmations);
+      DefaultChainDriverSpec().coinbase_spendable_confirmations);
   const ChainRawTransactionResult transaction = driver.SendRawTransaction(
       submitter.config, utxo, workload.source_address,
       workload.source_private_key, workload.destination_address,
@@ -4636,15 +4659,17 @@ int SimulatorApp::Run(int argc, char** argv) {
   BSIM_LOG(info) << "starting run " << options.run_id;
   WriteText(run_root / kRunMarkerFile, "benchmark-sim run\n");
   EnsureDirectory(run_root / "nodes");
+  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
   SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
       options.topology, options.wallet_initialization);
-  WriteScenarioFiles(options, run_root);
+  WriteScenarioFiles(options, run_root, chain_spec);
 
   const auto events_path = run_root / "events.jsonl";
   const auto metrics_path = run_root / "metrics.jsonl";
   WriteEvent(events_path, options.run_id, "sim", "run_started");
 
-  FiroDriver driver(std::chrono::seconds(5));
+  std::unique_ptr<ChainDriver> driver_owner = CreateDefaultChainDriver();
+  ChainDriver& driver = *driver_owner;
   std::vector<NodeRuntime> nodes;
   const auto handle_run_failure = [&](std::string_view detail) {
     for (auto& node : nodes) {
@@ -4656,7 +4681,7 @@ int SimulatorApp::Run(int argc, char** argv) {
     WriteNodeLogTails(events_path, options, driver, nodes);
   };
   try {
-    StartNodes(options, run_root, events_path, driver, nodes);
+    StartNodes(options, run_root, events_path, chain_spec, driver, nodes);
     InitializeWalletNodes(options, events_path, driver, nodes,
                           simulation_registry);
     WriteNodeLogTails(events_path, options, driver, nodes);
@@ -4686,17 +4711,19 @@ int SimulatorApp::Run(int argc, char** argv) {
         NodeRuntime& generator = nodes[workload.node - 1U];
         const uint64_t start_height =
             driver.ReadMetrics(generator.config).height;
-        std::vector<std::string> hashes = driver.GenerateBlocks(
-            generator.config, workload.count, kDefaultRewardAddress);
+        std::vector<std::string> hashes =
+            driver.GenerateBlocks(generator.config, workload.count,
+                                  chain_spec.default_reward_address);
         generator.generated_block_count += hashes.size();
         const uint64_t target_height =
             start_height + static_cast<uint64_t>(hashes.size());
-        WriteEvent(events_path, options.run_id, generator.config.id,
-                   "generated_blocks",
-                   GeneratedBlocksDetail(
-                       static_cast<uint32_t>(workload_index + 1U),
-                       static_cast<uint32_t>(workloads.size()), workload.node,
-                       start_height, target_height, hashes));
+        WriteEvent(
+            events_path, options.run_id, generator.config.id,
+            "generated_blocks",
+            GeneratedBlocksDetail(static_cast<uint32_t>(workload_index + 1U),
+                                  static_cast<uint32_t>(workloads.size()),
+                                  workload.node, start_height, target_height,
+                                  hashes, chain_spec.default_reward_address));
         for (auto& node : nodes) {
           driver.WaitForHeight(node.config, target_height,
                                std::chrono::seconds(workload.sync_timeout_sec));
