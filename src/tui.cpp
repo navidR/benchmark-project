@@ -365,6 +365,16 @@ boost::json::object LoadReport(const std::filesystem::path& run_root,
   }
 }
 
+std::vector<std::string> LoadRecentLogLines(
+    const std::filesystem::path& run_root) {
+  Result<std::vector<std::string>> log_lines =
+      ReadRecentLogLines(RunLogPath(run_root), 256U);
+  if (!log_lines) {
+    return {};
+  }
+  return std::move(log_lines).unsafe_value();
+}
+
 void DrawSummary(const std::filesystem::path& run_root,
                  const boost::json::object& report, std::string_view error,
                  const std::vector<std::string>& log_lines) {
@@ -495,8 +505,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
   while (true) {
     std::string error;
     const boost::json::object report = LoadReport(run_root, &error);
-    const std::vector<std::string> log_lines =
-        ReadRecentLogLines(RunLogPath(run_root), 256U);
+    const std::vector<std::string> log_lines = LoadRecentLogLines(run_root);
     DrawSummary(run_root, report, error, log_lines);
     if (once) {
       return error.empty() ? 0 : 1;
