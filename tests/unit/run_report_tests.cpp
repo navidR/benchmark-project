@@ -85,8 +85,14 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   bsim::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":2,"
+      "\"initial_block_download\":false,\"difficulty\":1.25,"
       "\"mempool_tx_count\":3,\"mempool_bytes\":450,"
       "\"generated_block_count\":1,\"qdisc_kind\":\"tbf+netem\","
+      "\"cpu_usage_usec\":10,\"memory_current\":20,"
+      "\"memory_high_limit_bytes\":null,\"io_read_bytes\":30,"
+      "\"pids_current\":2,\"oom_kill\":0,"
+      "\"network_rx_bytes\":100,\"network_tx_bytes\":200,"
+      "\"qdisc_bytes\":300,\"qdisc_drops\":1,"
       "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":2000,"
       "\"qdisc_netem_jitter_us\":500,\"qdisc_netem_reorder\":429496,"
       "\"qdisc_netem_limit_packets\":1000,\"qdisc_has_tbf_options\":true,"
@@ -149,7 +155,18 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "mempool_tx_count") == 3U);
   BOOST_TEST(JsonInteger(last_metrics, "mempool_bytes") == 450U);
   BOOST_TEST(JsonInteger(last_metrics, "generated_block_count") == 1U);
+  BOOST_TEST(!last_metrics.at("initial_block_download").as_bool());
+  BOOST_TEST(JsonInteger(last_metrics, "cpu_usage_usec") == 10U);
+  BOOST_TEST(JsonInteger(last_metrics, "memory_current") == 20U);
+  BOOST_TEST(last_metrics.at("memory_high_limit_bytes").is_null());
+  BOOST_TEST(JsonInteger(last_metrics, "io_read_bytes") == 30U);
+  BOOST_TEST(JsonInteger(last_metrics, "pids_current") == 2U);
+  BOOST_TEST(JsonInteger(last_metrics, "oom_kill") == 0U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_rx_bytes") == 100U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_tx_bytes") == 200U);
   BOOST_TEST(last_metrics.at("qdisc_kind").as_string() == "tbf+netem");
+  BOOST_TEST(JsonInteger(last_metrics, "qdisc_bytes") == 300U);
+  BOOST_TEST(JsonInteger(last_metrics, "qdisc_drops") == 1U);
   BOOST_TEST(last_metrics.at("qdisc_has_netem_options").as_bool());
   BOOST_TEST(JsonInteger(last_metrics, "qdisc_netem_latency_us") == 2000U);
   BOOST_TEST(JsonInteger(last_metrics, "qdisc_netem_jitter_us") == 500U);
