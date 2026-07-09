@@ -352,7 +352,13 @@ void DrawLogPane(int top, int rows, int cols,
 boost::json::object LoadReport(const std::filesystem::path& run_root,
                                std::string* error) {
   try {
-    boost::json::value value = boost::json::parse(BuildRunReportJson(run_root));
+    Result<std::string> report_json = BuildRunReportJson(run_root);
+    if (!report_json) {
+      *error = report_json.error();
+      return {};
+    }
+    boost::json::value value =
+        boost::json::parse(std::move(report_json).unsafe_value());
     if (!value.is_object()) {
       *error = "run report root is not a JSON object";
       return {};
