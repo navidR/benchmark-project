@@ -31,6 +31,7 @@ constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
+constexpr int kDetailPaneRows = 9;
 
 struct TuiState {
   std::size_t selected_node = 0;
@@ -165,6 +166,19 @@ std::string JsonBytesKiBText(const boost::json::object& object,
   }
   constexpr std::uint64_t kKiB = 1024ULL;
   return std::to_string((*bytes + kKiB - 1U) / kKiB) + "K";
+}
+
+std::string JsonBytesPerSecondText(const boost::json::object& object,
+                                   std::string_view field) {
+  const std::optional<std::uint64_t> bytes = JsonUnsignedMetric(object, field);
+  if (!bytes) {
+    return "-";
+  }
+  constexpr std::uint64_t kKiB = 1024ULL;
+  if (*bytes < kKiB) {
+    return std::to_string(*bytes) + "B/s";
+  }
+  return std::to_string((*bytes + kKiB - 1U) / kKiB) + "K/s";
 }
 
 std::string JsonUsecMillisText(const boost::json::object& object,
@@ -446,10 +460,21 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "network",
-                JsonBytesKiBText(metric_object, "network_rx_bytes") + " rx / " +
-                    JsonBytesKiBText(metric_object, "network_tx_bytes") +
-                    " tx");
+  AddDetailPair(
+      y, 0, left_width, "net total",
+      "down " + JsonBytesKiBText(metric_object, "network_downlink_bytes") +
+          " / up " + JsonBytesKiBText(metric_object, "network_uplink_bytes"));
+  AddDetailPair(y, left_width, right_width, "net rate",
+                "down " +
+                    JsonBytesPerSecondText(metric_object,
+                                           "network_downlink_bytes_per_sec") +
+                    " / up " +
+                    JsonBytesPerSecondText(metric_object,
+                                           "network_uplink_bytes_per_sec"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
   AddDetailPair(y, left_width, right_width, "qdisc",
                 JsonMetricText(metric_object, "qdisc_kind") + " drops " +
                     JsonMetricText(metric_object, "qdisc_drops"));
@@ -551,8 +576,9 @@ void DrawSummary(const std::filesystem::path& run_root,
 
   const int data_top = 13;
   const int available_data_rows = content_bottom - data_top;
-  const bool has_detail_pane = available_data_rows >= 9;
-  const int detail_top = has_detail_pane ? content_bottom - 6 : content_bottom;
+  const bool has_detail_pane = available_data_rows >= kDetailPaneRows + 3;
+  const int detail_top =
+      has_detail_pane ? content_bottom - kDetailPaneRows : content_bottom;
   const int table_bottom = has_detail_pane ? detail_top - 1 : content_bottom;
   const int table_capacity = std::max(0, table_bottom - data_top);
   std::size_t first_node = 0;

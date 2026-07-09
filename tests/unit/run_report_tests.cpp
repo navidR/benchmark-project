@@ -151,12 +151,15 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   bsim::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":1,"
+      "\"timestamp_ms\":1000,"
       "\"generated_block_count\":0,\"qdisc_kind\":\"netem\","
+      "\"network_rx_bytes\":25,\"network_tx_bytes\":50,"
       "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":1000,"
       "\"qdisc_netem_reorder\":0}");
   bsim::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":2,"
+      "\"timestamp_ms\":3000,"
       "\"initial_block_download\":false,\"difficulty\":1.25,"
       "\"mempool_tx_count\":3,\"mempool_bytes\":450,"
       "\"generated_block_count\":1,\"qdisc_kind\":\"tbf+netem\","
@@ -291,6 +294,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "oom_kill") == 0U);
   BOOST_TEST(JsonInteger(last_metrics, "network_rx_bytes") == 100U);
   BOOST_TEST(JsonInteger(last_metrics, "network_tx_bytes") == 200U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_uplink_bytes") == 100U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_downlink_bytes") == 200U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_uplink_bytes_per_sec") == 37U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_downlink_bytes_per_sec") ==
+             75U);
   BOOST_TEST(last_metrics.at("qdisc_kind").as_string() == "tbf+netem");
   BOOST_TEST(JsonInteger(last_metrics, "qdisc_bytes") == 300U);
   BOOST_TEST(JsonInteger(last_metrics, "qdisc_drops") == 1U);

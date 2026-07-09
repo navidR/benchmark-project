@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -24,6 +25,9 @@ struct NodeReport {
   std::string final_state;
   boost::json::object last_metrics;
   boost::json::object log_tails;
+  std::optional<std::uint64_t> previous_timestamp_ms;
+  std::optional<std::uint64_t> previous_network_rx_bytes;
+  std::optional<std::uint64_t> previous_network_tx_bytes;
 };
 
 std::string OptionalStringField(const boost::json::object& object,
@@ -33,6 +37,21 @@ std::string OptionalStringField(const boost::json::object& object,
     return "";
   }
   return std::string(value->as_string());
+}
+
+std::optional<std::uint64_t> OptionalUint64Field(
+    const boost::json::object& object, std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (value->is_uint64()) {
+    return value->as_uint64();
+  }
+  if (value->is_int64() && value->as_int64() >= 0) {
+    return static_cast<std::uint64_t>(value->as_int64());
+  }
+  return std::nullopt;
 }
 
 void CopyField(const boost::json::object& source, std::string_view field,
@@ -58,6 +77,7 @@ boost::json::value ParseEventDetail(const boost::json::object& event) {
 void CopySelectedMetricFields(const boost::json::object& source,
                               boost::json::object* target) {
   constexpr std::string_view kFields[] = {
+      "timestamp_ms",
       "height",
       "best_hash",
       "peer_count",
@@ -133,6 +153,66 @@ void CopySelectedMetricFields(const boost::json::object& source,
   for (std::string_view field : kFields) {
     CopyField(source, field, target);
   }
+}
+
+std::optional<std::uint64_t> BytesPerSecond(std::uint64_t current_bytes,
+                                            std::uint64_t previous_bytes,
+                                            std::uint64_t elapsed_ms) {
+  if (elapsed_ms == 0U || current_bytes < previous_bytes) {
+    return std::nullopt;
+  }
+  const std::uint64_t delta_bytes = current_bytes - previous_bytes;
+  if (delta_bytes > std::numeric_limits<std::uint64_t>::max() / 1000ULL) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return (delta_bytes * 1000ULL) / elapsed_ms;
+}
+
+void AddNodeBandwidthMetrics(const boost::json::object& metric,
+                             const NodeReport& node,
+                             boost::json::object* target) {
+  const std::optional<std::uint64_t> timestamp_ms =
+      OptionalUint64Field(metric, "timestamp_ms");
+  const std::optional<std::uint64_t> network_rx_bytes =
+      OptionalUint64Field(metric, "network_rx_bytes");
+  const std::optional<std::uint64_t> network_tx_bytes =
+      OptionalUint64Field(metric, "network_tx_bytes");
+
+  if (network_tx_bytes) {
+    (*target)["network_downlink_bytes"] = *network_tx_bytes;
+  }
+  if (network_rx_bytes) {
+    (*target)["network_uplink_bytes"] = *network_rx_bytes;
+  }
+  if (!timestamp_ms || !node.previous_timestamp_ms ||
+      *timestamp_ms <= *node.previous_timestamp_ms) {
+    return;
+  }
+
+  const std::uint64_t elapsed_ms = *timestamp_ms - *node.previous_timestamp_ms;
+  if (network_tx_bytes && node.previous_network_tx_bytes) {
+    const std::optional<std::uint64_t> rate = BytesPerSecond(
+        *network_tx_bytes, *node.previous_network_tx_bytes, elapsed_ms);
+    if (rate) {
+      (*target)["network_downlink_bytes_per_sec"] = *rate;
+    }
+  }
+  if (network_rx_bytes && node.previous_network_rx_bytes) {
+    const std::optional<std::uint64_t> rate = BytesPerSecond(
+        *network_rx_bytes, *node.previous_network_rx_bytes, elapsed_ms);
+    if (rate) {
+      (*target)["network_uplink_bytes_per_sec"] = *rate;
+    }
+  }
+}
+
+void RememberNodeBandwidthSample(const boost::json::object& metric,
+                                 NodeReport* node) {
+  node->previous_timestamp_ms = OptionalUint64Field(metric, "timestamp_ms");
+  node->previous_network_rx_bytes =
+      OptionalUint64Field(metric, "network_rx_bytes");
+  node->previous_network_tx_bytes =
+      OptionalUint64Field(metric, "network_tx_bytes");
 }
 
 boost::json::object ParseJsonObjectLine(const std::filesystem::path& path,
@@ -356,6 +436,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
         ++node.metric_samples;
         node.last_metrics = {};
         CopySelectedMetricFields(metric, &node.last_metrics);
+        AddNodeBandwidthMetrics(metric, node, &node.last_metrics);
+        RememberNodeBandwidthSample(metric, &node);
       });
 
   const bool ok = run_started && run_finished && !run_failed;
