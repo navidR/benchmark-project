@@ -429,6 +429,8 @@ Block-generation workloads run sequentially. For each one, the
 `generated_blocks` event detail is JSON with the workload index, generator node,
 generated count, start and target height, reward address, and returned block
 hashes.
+An explicit empty scenario workload list, `"workloads": []`, disables block
+generation for that run.
 
 Summarize an existing run:
 

@@ -121,6 +121,7 @@ struct Options {
   std::vector<uint32_t> runtime_node_restarts;
   std::vector<FreezeRequest> runtime_node_freezes;
   std::vector<BlockGenerationWorkload> block_generation_workloads;
+  bool workloads_configured = false;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_bandwidth_limit = false;
@@ -612,6 +613,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     if (!workloads->is_array()) {
       throw std::runtime_error("scenario workloads must be a JSON array");
     }
+    options.workloads_configured = true;
     ApplyScenarioWorkloads(workloads->as_array(), vm, options);
   }
 
@@ -2166,7 +2168,7 @@ std::string NodeGroupYamlInline(const std::vector<uint32_t>& nodes) {
 
 std::vector<BlockGenerationWorkload> EffectiveBlockGenerationWorkloads(
     const Options& options) {
-  if (!options.block_generation_workloads.empty()) {
+  if (options.workloads_configured) {
     return options.block_generation_workloads;
   }
   BlockGenerationWorkload workload;
@@ -2215,6 +2217,9 @@ std::optional<uint32_t> CommonBlockGenerationSyncTimeout(
 
 std::string BlockGenerationWorkloadsYaml(
     const std::vector<BlockGenerationWorkload>& workloads) {
+  if (workloads.empty()) {
+    return "workloads: []\n";
+  }
   std::string yaml = "workloads:\n";
   for (const BlockGenerationWorkload& workload : workloads) {
     yaml +=
