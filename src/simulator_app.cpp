@@ -806,8 +806,12 @@ void ValidateWalletTransactionsWorkload(
         "scenario wallet_transactions timeout_sec must be greater than zero");
   }
 
-  SimulationRegistry::FromTopology(options.topology,
-                                   options.wallet_initialization);
+  const Result<SimulationRegistry> registry_result =
+      SimulationRegistry::FromTopology(options.topology,
+                                       options.wallet_initialization);
+  if (!registry_result) {
+    throw std::runtime_error(registry_result.error());
+  }
 }
 
 bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
@@ -2035,8 +2039,12 @@ Options ParseOptions(int argc, char** argv) {
     }
   }
   if (options.topology.configured) {
-    SimulationRegistry::FromTopology(options.topology,
-                                     options.wallet_initialization);
+    const Result<SimulationRegistry> registry_result =
+        SimulationRegistry::FromTopology(options.topology,
+                                         options.wallet_initialization);
+    if (!registry_result) {
+      throw std::runtime_error(registry_result.error());
+    }
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
@@ -3718,7 +3726,12 @@ void InitializeWalletNodes(const Options& options,
 
   for (size_t wallet_index = 0; wallet_index < registry.wallets().size();
        ++wallet_index) {
-    WalletIdentity& wallet = registry.MutableWalletByIndex(wallet_index);
+    Result<WalletIdentity*> wallet_result =
+        registry.MutableWalletByIndex(wallet_index);
+    if (!wallet_result) {
+      throw std::runtime_error(wallet_result.error());
+    }
+    WalletIdentity& wallet = *wallet_result.unsafe_value();
     if (wallet.node == 0U || wallet.node > nodes.size()) {
       throw std::runtime_error("wallet node is out of range");
     }
@@ -3909,7 +3922,12 @@ void ApplyWalletTransactionsWorkload(const Options& options,
       throw std::runtime_error(
           "wallet-backed workload requires initialized WalletNode addresses");
     }
-    const uint32_t miner_node = registry.MinerNodeForWalletIndex(wallet_index);
+    const Result<uint32_t> miner_node_result =
+        registry.MinerNodeForWalletIndex(wallet_index);
+    if (!miner_node_result) {
+      throw std::runtime_error(miner_node_result.error());
+    }
+    const uint32_t miner_node = miner_node_result.unsafe_value();
     NodeRuntime& miner = nodes[miner_node - 1U];
     FundingState state;
     state.miner_node = miner_node;
@@ -4443,8 +4461,14 @@ int SimulatorApp::Run(int argc, char** argv) {
   EnsureDirectory(run_root);
   WriteText(run_root / kRunMarkerFile, "benchmark-sim run\n");
   EnsureDirectory(run_root / "nodes");
-  SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
-      options.topology, options.wallet_initialization);
+  Result<SimulationRegistry> simulation_registry_result =
+      SimulationRegistry::FromTopology(options.topology,
+                                       options.wallet_initialization);
+  if (!simulation_registry_result) {
+    throw std::runtime_error(simulation_registry_result.error());
+  }
+  SimulationRegistry simulation_registry =
+      std::move(simulation_registry_result).unsafe_value();
   WriteScenarioFiles(options, run_root);
 
   const auto events_path = run_root / "events.jsonl";

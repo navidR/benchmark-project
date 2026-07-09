@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "benchmark_sim/result.h"
+
 namespace bsim {
 
 struct NodeRoleTopology {
@@ -41,7 +43,7 @@ struct WalletIdentity {
 
 class SimulationRegistry {
  public:
-  static SimulationRegistry FromTopology(
+  static Result<SimulationRegistry> FromTopology(
       const NodeRoleTopology& topology,
       const WalletInitialization& wallet_initialization);
 
@@ -54,11 +56,11 @@ class SimulationRegistry {
     return topology_.miner_nodes;
   }
 
-  uint32_t MinerNodeForWalletIndex(size_t wallet_index) const;
+  Result<uint32_t> MinerNodeForWalletIndex(size_t wallet_index) const;
 
   void AddWallet(WalletIdentity wallet);
-  WalletIdentity& MutableWalletByIndex(size_t wallet_index);
-  const WalletIdentity& WalletByIndex(size_t wallet_index) const;
+  Result<WalletIdentity*> MutableWalletByIndex(size_t wallet_index);
+  Result<const WalletIdentity*> WalletByIndex(size_t wallet_index) const;
 
  private:
   NodeRoleTopology topology_;
