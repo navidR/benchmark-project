@@ -1,16 +1,15 @@
 #include "benchmark_sim/capability.h"
 
-#include "benchmark_sim/util.h"
-
 #include <linux/capability.h>
 
 #include <sstream>
-#include <stdexcept>
 #include <string>
+
+#include "benchmark_sim/util.h"
 
 namespace bsim {
 
-uint64_t ParseEffectiveCapabilities(std::string_view proc_status) {
+Result<uint64_t> ParseEffectiveCapabilities(std::string_view proc_status) {
   std::istringstream lines{std::string(proc_status)};
   std::string line;
   while (std::getline(lines, line)) {
@@ -19,13 +18,13 @@ uint64_t ParseEffectiveCapabilities(std::string_view proc_status) {
     std::string value;
     fields >> name >> value;
     if (name == "CapEff:" && !value.empty()) {
-      return std::stoull(value, nullptr, 16);
+      return Ok(std::stoull(value, nullptr, 16));
     }
   }
-  throw std::runtime_error("missing CapEff in /proc/self/status");
+  return Error<uint64_t>("missing CapEff in /proc/self/status");
 }
 
-uint64_t ReadEffectiveCapabilities() {
+Result<uint64_t> ReadEffectiveCapabilities() {
   return ParseEffectiveCapabilities(ReadText("/proc/self/status"));
 }
 
@@ -36,16 +35,27 @@ bool HasCapability(uint64_t effective_capabilities, int capability) {
   return (effective_capabilities & (uint64_t{1} << capability)) != 0U;
 }
 
-void RequireEffectiveCapability(int capability, std::string_view name) {
-  if (!HasCapability(ReadEffectiveCapabilities(), capability)) {
-    throw std::runtime_error("missing required capability: " +
-                             std::string(name));
+Status RequireEffectiveCapability(int capability, std::string_view name) {
+  const Result<uint64_t> capabilities = ReadEffectiveCapabilities();
+  if (!capabilities) {
+    return ErrorStatus(capabilities.error());
   }
+  if (!HasCapability(capabilities.unsafe_value(), capability)) {
+    return ErrorStatus("missing required capability: " + std::string(name));
+  }
+  return OkStatus();
 }
 
-void RequireNetworkSetupCapabilities() {
-  RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
-  RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
+Status RequireNetworkSetupCapabilities() {
+  Status status = RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
+  if (!status) {
+    return status;
+  }
+  status = RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
+  if (!status) {
+    return status;
+  }
+  return OkStatus();
 }
 
 }  // namespace bsim

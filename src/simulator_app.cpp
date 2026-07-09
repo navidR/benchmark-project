@@ -40,6 +40,20 @@
 namespace bsim {
 namespace {
 
+void RequireStatus(const Status& status) {
+  if (!status) {
+    throw std::runtime_error(status.error());
+  }
+}
+
+template <typename T>
+T RequireResult(Result<T> result) {
+  if (!result) {
+    throw std::runtime_error(result.error());
+  }
+  return std::move(result).unsafe_value();
+}
+
 uint32_t JsonUint32Field(const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr) {
@@ -2507,7 +2521,7 @@ std::string NetworkProbeJson() {
 }
 
 std::string CapabilityProbeJson() {
-  const uint64_t effective = ReadEffectiveCapabilities();
+  const uint64_t effective = RequireResult(ReadEffectiveCapabilities());
   boost::json::object result;
   result["cap_sys_admin"] = HasCapability(effective, CAP_SYS_ADMIN);
   result["cap_net_admin"] = HasCapability(effective, CAP_NET_ADMIN);
@@ -3594,7 +3608,7 @@ void CleanupRun(Options options) {
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
   LoadCleanupMetadata(run_root, &options);
-  RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
+  RequireStatus(RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN"));
 
   for (uint32_t i = 0; i < options.nodes; ++i) {
     DeleteNodeVethNetwork(MakeNodeVethConfig(options, i));
@@ -3610,7 +3624,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
                 const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
   if (options.isolate_network) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
   }
   if (options.isolate_network && options.nodes > 1 &&
       !HostIpv4ForwardingEnabled()) {
@@ -4381,57 +4395,57 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
   if (options.probe_drop_filter) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << DropFilterProbeJson() << "\n";
     return 0;
   }
   if (options.probe_netns) {
-    RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
+    RequireStatus(RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN"));
     std::cout << NetworkNamespaceProbeJson() << "\n";
     return 0;
   }
   if (options.probe_veth) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << VethProbeJson() << "\n";
     return 0;
   }
   if (options.probe_bandwidth_limit) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << BandwidthLimitProbeJson() << "\n";
     return 0;
   }
   if (options.probe_network_condition) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << NetworkConditionProbeJson() << "\n";
     return 0;
   }
   if (options.probe_combined_network_condition) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << CombinedNetworkConditionProbeJson() << "\n";
     return 0;
   }
   if (options.probe_network_condition_update) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << NetworkConditionUpdateProbeJson() << "\n";
     return 0;
   }
   if (options.probe_address) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << AddressProbeJson() << "\n";
     return 0;
   }
   if (options.probe_route) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << RouteProbeJson() << "\n";
     return 0;
   }
   if (options.probe_qdisc) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << QdiscProbeJson() << "\n";
     return 0;
   }
   if (options.probe_qdisc_mutation) {
-    RequireNetworkSetupCapabilities();
+    RequireStatus(RequireNetworkSetupCapabilities());
     std::cout << QdiscMutationProbeJson() << "\n";
     return 0;
   }
