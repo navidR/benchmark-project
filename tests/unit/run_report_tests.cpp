@@ -65,6 +65,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   bsim::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":2,"
+      "\"mempool_tx_count\":3,\"mempool_bytes\":450,"
       "\"generated_block_count\":1,\"qdisc_kind\":\"tbf+netem\","
       "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":2000,"
       "\"qdisc_netem_jitter_us\":500,\"qdisc_netem_reorder\":429496,"
@@ -93,6 +94,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const boost::json::object& last_metrics =
       node.at("last_metrics").as_object();
   BOOST_TEST(JsonInteger(last_metrics, "height") == 2U);
+  BOOST_TEST(JsonInteger(last_metrics, "mempool_tx_count") == 3U);
+  BOOST_TEST(JsonInteger(last_metrics, "mempool_bytes") == 450U);
   BOOST_TEST(JsonInteger(last_metrics, "generated_block_count") == 1U);
   BOOST_TEST(last_metrics.at("qdisc_kind").as_string() == "tbf+netem");
   BOOST_TEST(last_metrics.at("qdisc_has_netem_options").as_bool());
