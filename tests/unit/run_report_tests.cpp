@@ -227,3 +227,29 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 
   std::filesystem::remove_all(dir);
 }
+
+BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
+  const std::filesystem::path dir = MakeTestDir("run-report-failed");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"timestamp\":\"2026-07-09T00:00:00Z\","
+                   "\"event\":\"run_started\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"timestamp\":\"2026-07-09T00:00:01Z\","
+                   "\"event\":\"run_failed\","
+                   "\"detail\":\"peer wait timed out\"}");
+
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
+
+  BOOST_TEST(!report.at("ok").as_bool());
+  BOOST_TEST(report.at("status").as_string() == "failed");
+  BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
+  BOOST_TEST(report.at("failed_at").as_string() == "2026-07-09T00:00:01Z");
+  BOOST_TEST(report.at("failure").as_string() == "peer wait timed out");
+  BOOST_TEST(JsonInteger(report, "event_count") == 2U);
+
+  std::filesystem::remove_all(dir);
+}

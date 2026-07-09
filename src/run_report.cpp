@@ -278,6 +278,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   std::string started_at;
   std::string finished_at;
   std::string failed_at;
+  boost::json::value failure_detail;
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;
   boost::json::array generated_blocks;
@@ -300,6 +301,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
         } else if (event_name == "run_failed") {
           run_failed = true;
           failed_at = OptionalStringField(event, "timestamp");
+          failure_detail = ParseEventDetail(event);
         } else if (event_name == "state" && !node_id.empty()) {
           nodes[node_id].final_state = OptionalStringField(event, "detail");
         } else if (const std::optional<std::string_view> kind =
@@ -342,6 +344,9 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   }
   if (!failed_at.empty()) {
     report["failed_at"] = failed_at;
+  }
+  if (!failure_detail.is_null()) {
+    report["failure"] = std::move(failure_detail);
   }
   report["event_count"] = event_count;
   report["metric_count"] = metric_count;

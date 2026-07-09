@@ -3443,6 +3443,15 @@ int Run(int argc, char** argv) {
 
   FiroDriver driver(std::chrono::seconds(5));
   std::vector<NodeRuntime> nodes;
+  const auto handle_run_failure = [&](std::string_view detail) {
+    for (auto& node : nodes) {
+      WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
+    }
+    WriteEvent(events_path, options.run_id, "sim", "run_failed", detail);
+    WriteNodeLogTails(events_path, options, driver, nodes);
+    StopNodes(options, events_path, driver, nodes);
+    WriteNodeLogTails(events_path, options, driver, nodes);
+  };
   try {
     StartNodes(options, run_root, events_path, driver, nodes);
     WriteNodeLogTails(events_path, options, driver, nodes);
@@ -3524,14 +3533,11 @@ int Run(int argc, char** argv) {
     WriteNodeLogTails(events_path, options, driver, nodes);
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
     BSIM_LOG(info) << "finished run " << options.run_id;
+  } catch (const std::exception& e) {
+    handle_run_failure(e.what());
+    throw;
   } catch (...) {
-    for (auto& node : nodes) {
-      WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
-    }
-    WriteNodeLogTails(events_path, options, driver, nodes);
-    StopNodes(options, events_path, driver, nodes);
-    WriteNodeLogTails(events_path, options, driver, nodes);
-    WriteEvent(events_path, options.run_id, "sim", "run_failed");
+    handle_run_failure("unknown exception");
     throw;
   }
 

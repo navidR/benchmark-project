@@ -456,8 +456,9 @@ Summarize an existing run:
 ./build/benchmark-sim --report-run runs/<run-id>
 ```
 
-The compact report includes the run status, lifecycle timestamps, event counts,
-workload summaries, final per-node metrics, and latest log tails.
+The compact report includes the run status, lifecycle timestamps, failure
+detail when present, event counts, workload summaries, final per-node metrics,
+and latest log tails.
 
 View an existing or active run in the read-only TUI:
 
