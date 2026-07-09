@@ -270,6 +270,26 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-restart-node-plural-nodes.json
     "current Firo MVP restart_node workload uses node, not nodes"
   )
+  add_cli_failure_test(
+    benchmark-sim-invalid-freeze-node-missing-duration
+    tests/scenarios/invalid-freeze-node-missing-duration.json
+    "missing or invalid uint32 JSON field: duration_ms"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-freeze-node-node
+    tests/scenarios/invalid-freeze-node-node.json
+    "scenario freeze_node workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-freeze-node-plural-nodes
+    tests/scenarios/invalid-freeze-node-plural-nodes.json
+    "current Firo MVP freeze_node workload uses node, not nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-freeze-node-zero-duration
+    tests/scenarios/invalid-freeze-node-zero-duration.json
+    "scenario freeze_node duration_ms must be greater than zero"
+  )
 endif()
 
 install(TARGETS benchmark-sim RUNTIME DESTINATION bin)

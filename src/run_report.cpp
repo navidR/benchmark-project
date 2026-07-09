@@ -286,6 +286,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array height_waits;
   boost::json::array peer_waits;
   boost::json::array node_restarts;
+  boost::json::array node_freezes;
 
   ForEachJsonLine(
       run_root / "events.jsonl", [&](const boost::json::object& event) {
@@ -320,6 +321,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           AppendEventSummary(event, &peer_waits);
         } else if (event_name == "node_restarted") {
           AppendEventSummary(event, &node_restarts);
+        } else if (event_name == "node_freeze_completed") {
+          AppendEventSummary(event, &node_freezes);
         }
       });
 
@@ -359,6 +362,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["height_waits"] = std::move(height_waits);
   report["peer_waits"] = std::move(peer_waits);
   report["node_restarts"] = std::move(node_restarts);
+  report["node_freezes"] = std::move(node_freezes);
   report["nodes_summary"] = NodesJson(nodes);
   return boost::json::serialize(report);
 }

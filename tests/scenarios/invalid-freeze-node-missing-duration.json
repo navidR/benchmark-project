@@ -1,0 +1,9 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "freeze_node",
+      "node": 1
+    }
+  ]
+}

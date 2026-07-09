@@ -81,11 +81,17 @@ struct RestartNodeWorkload {
   uint32_t node = 1;
 };
 
+struct FreezeNodeWorkload {
+  uint32_t node = 1;
+  uint32_t duration_ms = 0;
+};
+
 enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
   kWaitForPeers,
   kRestartNode,
+  kFreezeNode,
 };
 
 struct ScenarioWorkload {
@@ -94,6 +100,7 @@ struct ScenarioWorkload {
   WaitUntilHeightWorkload wait_until_height;
   WaitForPeersWorkload wait_for_peers;
   RestartNodeWorkload restart_node;
+  FreezeNodeWorkload freeze_node;
 };
 
 struct NetworkBlockRule {
@@ -647,6 +654,18 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kRestartNode;
       scenario_workload.restart_node = restart;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "freeze_node") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP freeze_node workload uses node, not nodes");
+      }
+      FreezeNodeWorkload freeze;
+      freeze.node = JsonOptionalUint32Field(workload, "node", freeze.node);
+      freeze.duration_ms = JsonUint32Field(workload, "duration_ms");
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kFreezeNode;
+      scenario_workload.freeze_node = freeze;
       options.workloads.push_back(scenario_workload);
     } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
@@ -1370,6 +1389,16 @@ Options ParseOptions(int argc, char** argv) {
           workload.restart_node.node > options.nodes) {
         throw std::runtime_error(
             "scenario restart_node workload node must be in 1..--nodes");
+      }
+    } else if (workload.kind == WorkloadKind::kFreezeNode) {
+      if (workload.freeze_node.node == 0U ||
+          workload.freeze_node.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario freeze_node workload node must be in 1..--nodes");
+      }
+      if (workload.freeze_node.duration_ms == 0U) {
+        throw std::runtime_error(
+            "scenario freeze_node duration_ms must be greater than zero");
       }
     }
   }
@@ -2191,6 +2220,17 @@ std::string RestartNodeWorkloadDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
+std::string FreezeNodeWorkloadDetail(uint32_t workload_index,
+                                     uint32_t workload_count, uint32_t node,
+                                     uint32_t duration_ms) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = node;
+  detail["duration_ms"] = duration_ms;
+  return boost::json::serialize(detail);
+}
+
 void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
                           const Options& options, const FiroDriver& driver,
                           std::vector<NodeRuntime>& nodes) {
@@ -2399,6 +2439,14 @@ std::string WorkloadsYaml(const std::vector<ScenarioWorkload>& workloads) {
           "  - type: restart_node\n"
           "    node: " +
           std::to_string(workload.restart_node.node) + "\n";
+    } else if (workload.kind == WorkloadKind::kFreezeNode) {
+      yaml +=
+          "  - type: freeze_node\n"
+          "    node: " +
+          std::to_string(workload.freeze_node.node) +
+          "\n"
+          "    duration_ms: " +
+          std::to_string(workload.freeze_node.duration_ms) + "\n";
     }
   }
   return yaml;
@@ -2442,6 +2490,14 @@ boost::json::object RestartNodeWorkloadJson(
   return object;
 }
 
+boost::json::object FreezeNodeWorkloadJson(const FreezeNodeWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "freeze_node";
+  object["node"] = workload.node;
+  object["duration_ms"] = workload.duration_ms;
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
@@ -2452,7 +2508,10 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kWaitForPeers) {
     return WaitForPeersWorkloadJson(workload.wait_for_peers);
   }
-  return RestartNodeWorkloadJson(workload.restart_node);
+  if (workload.kind == WorkloadKind::kRestartNode) {
+    return RestartNodeWorkloadJson(workload.restart_node);
+  }
+  return FreezeNodeWorkloadJson(workload.freeze_node);
 }
 
 void WriteScenarioFiles(const Options& options,
@@ -3583,6 +3642,16 @@ int Run(int argc, char** argv) {
                        static_cast<uint32_t>(workload_index + 1U),
                        static_cast<uint32_t>(workloads.size()), workload.node,
                        node.restart_count));
+      } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
+        const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
+        NodeRuntime& node = nodes[workload.node - 1U];
+        FreezeNodeForDuration(options, events_path, node, workload.duration_ms);
+        WriteEvent(
+            events_path, options.run_id, node.config.id,
+            "node_freeze_completed",
+            FreezeNodeWorkloadDetail(static_cast<uint32_t>(workload_index + 1U),
+                                     static_cast<uint32_t>(workloads.size()),
+                                     workload.node, workload.duration_ms));
       }
     }
 

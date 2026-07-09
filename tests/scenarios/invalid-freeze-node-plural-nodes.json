@@ -1,0 +1,10 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "freeze_node",
+      "nodes": [1],
+      "duration_ms": 1
+    }
+  ]
+}

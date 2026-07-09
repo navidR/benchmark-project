@@ -216,6 +216,12 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
     } else if (type == "restart_node") {
       text += "restart n";
       text += JsonMetricText(workload, "node");
+    } else if (type == "freeze_node") {
+      text += "freeze n";
+      text += JsonMetricText(workload, "node");
+      text += " ";
+      text += JsonMetricText(workload, "duration_ms");
+      text += "ms";
     } else {
       text += type;
     }

@@ -19,7 +19,8 @@ the Firo path is working end to end.
 - Apply live per-node cgroup resource updates after startup.
 - Restart a running Firo node before workload generation or as an ordered
   workload.
-- Freeze and thaw a running Firo node cgroup for a bounded duration.
+- Freeze and thaw a running Firo node cgroup before workload generation or as
+  an ordered workload.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
 - Wait for generated blocks to propagate before final metrics are recorded.
@@ -450,6 +451,8 @@ and emit a structured `height_wait_reached` event.
 peer count and emit a structured `peer_count_reached` event.
 `restart_node` workloads restart one Firo node and emit a structured
 `node_restarted` event.
+`freeze_node` workloads freeze one Firo node cgroup for `duration_ms`, thaw it,
+and emit a structured `node_freeze_completed` event.
 An explicit empty scenario workload list, `"workloads": []`, disables block
 generation for that run.
 
