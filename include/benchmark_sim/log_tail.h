@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <string>
 
+#include "benchmark_sim/result.h"
+
 namespace bsim {
 
 struct LogTailChunk {
@@ -14,7 +16,7 @@ struct LogTailChunk {
   std::string text;
 };
 
-LogTailChunk TailLogFile(const std::filesystem::path& path,
-                         std::uint64_t offset, std::uint64_t max_bytes);
+Result<LogTailChunk> TailLogFile(const std::filesystem::path& path,
+                                 std::uint64_t offset, std::uint64_t max_bytes);
 
 }  // namespace bsim
