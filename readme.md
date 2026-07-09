@@ -462,6 +462,22 @@ The equivalent YAML entry point is:
 ./build/benchmark-sim --scenario-yaml /path/to/scenario.yaml --replace-run
 ```
 
+Wallet and miner roles can be declared in the scenario topology. Counts resolve
+deterministically to concrete node lists; explicit `wallet_nodes` and
+`miner_nodes` may be used when a scenario needs fixed assignments.
+
+```json
+{
+  "node_count": 3,
+  "topology": {
+    "node_count": 3,
+    "wallet_node_count": 2,
+    "miner_node_count": 1,
+    "allow_miner_wallet_overlap": false
+  }
+}
+```
+
 Raw Firo transactions can be driven without enabling the wallet. The workload
 mines mature funding to the source address, signs with the supplied regtest WIF,
 submits the transaction, and waits for it in the mempool:

@@ -36,6 +36,16 @@ std::uint64_t JsonInteger(const boost::json::object& object,
   throw std::runtime_error("expected non-negative JSON integer");
 }
 
+std::uint64_t JsonIntegerValue(const boost::json::value& value) {
+  if (value.is_uint64()) {
+    return value.as_uint64();
+  }
+  if (value.is_int64() && value.as_int64() >= 0) {
+    return static_cast<std::uint64_t>(value.as_int64());
+  }
+  throw std::runtime_error("expected non-negative JSON integer");
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
@@ -44,6 +54,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
                   "\"generate_blocks\":3,\"generate_node\":null,"
                   "\"isolated_network\":true,\"sync_timeout_sec\":null,"
+                  "\"topology\":{\"node_count\":1,"
+                  "\"wallet_node_count\":1,\"miner_node_count\":1,"
+                  "\"allow_miner_wallet_overlap\":true,"
+                  "\"wallet_nodes\":[1],\"miner_nodes\":[1]},"
                   "\"resources\":{\"memory_max_bytes\":1024},"
                   "\"default_network_condition\":{\"delay_ms\":2},"
                   "\"node_network_conditions\":[{\"node\":1,\"delay_ms\":3}],"
@@ -170,6 +184,17 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
   BOOST_TEST(report.at("sync_timeout_sec").is_null());
+  const boost::json::object& topology = report.at("topology").as_object();
+  BOOST_TEST(JsonInteger(topology, "node_count") == 1U);
+  BOOST_TEST(JsonInteger(topology, "wallet_node_count") == 1U);
+  BOOST_TEST(JsonInteger(topology, "miner_node_count") == 1U);
+  BOOST_TEST(topology.at("allow_miner_wallet_overlap").as_bool());
+  BOOST_REQUIRE_EQUAL(topology.at("wallet_nodes").as_array().size(), 1U);
+  BOOST_TEST(JsonIntegerValue(topology.at("wallet_nodes").as_array().front()) ==
+             1U);
+  BOOST_REQUIRE_EQUAL(topology.at("miner_nodes").as_array().size(), 1U);
+  BOOST_TEST(JsonIntegerValue(topology.at("miner_nodes").as_array().front()) ==
+             1U);
   const boost::json::array& workloads = report.at("workloads").as_array();
   BOOST_REQUIRE_EQUAL(workloads.size(), 6U);
   const boost::json::object& first_workload = workloads.front().as_object();

@@ -127,6 +127,16 @@ struct SendRawTransactionWorkload {
   uint32_t timeout_sec = 30;
 };
 
+struct NodeRoleTopology {
+  bool configured = false;
+  uint32_t node_count = 0;
+  uint32_t wallet_node_count = 0;
+  uint32_t miner_node_count = 0;
+  bool allow_miner_wallet_overlap = false;
+  std::vector<uint32_t> wallet_nodes;
+  std::vector<uint32_t> miner_nodes;
+};
+
 enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
@@ -223,6 +233,7 @@ struct Options {
   bool probe_route = false;
   bool probe_veth = false;
   bool probe_network = false;
+  NodeRoleTopology topology;
 };
 
 struct NodeRuntime {
@@ -408,6 +419,39 @@ std::vector<uint32_t> JsonNodeGroupField(const boost::json::object& object,
   }
   if (nodes.empty()) {
     throw std::runtime_error("partition node groups must not be empty");
+  }
+  return nodes;
+}
+
+std::optional<std::vector<uint32_t>> JsonOptionalNodeIndexListField(
+    const boost::json::object& object, const char* field,
+    std::string_view source) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (!value->is_array()) {
+    throw std::runtime_error(std::string(source) + " must be a JSON array");
+  }
+
+  std::vector<uint32_t> nodes;
+  for (const boost::json::value& node_value : value->as_array()) {
+    const uint64_t raw_node = JsonUint64Value(node_value, field);
+    if (raw_node > std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error(std::string(source) +
+                               " node value exceeds uint32");
+    }
+    const uint32_t node = static_cast<uint32_t>(raw_node);
+    if (node == 0U) {
+      throw std::runtime_error(std::string(source) +
+                               " node values must be greater than zero");
+    }
+    for (uint32_t existing : nodes) {
+      if (existing == node - 1U) {
+        throw std::runtime_error(std::string(source) + " contains a duplicate");
+      }
+    }
+    nodes.push_back(node - 1U);
   }
   return nodes;
 }
@@ -769,6 +813,120 @@ void ValidateNetworkPartitionRule(const NetworkPartitionRule& rule,
   }
 }
 
+std::vector<uint32_t> ConsecutiveNodeIndexes(uint32_t first_index,
+                                             uint32_t count) {
+  std::vector<uint32_t> nodes;
+  nodes.reserve(count);
+  for (uint32_t offset = 0; offset < count; ++offset) {
+    nodes.push_back(first_index + offset);
+  }
+  return nodes;
+}
+
+void ValidateRoleNodeList(const std::vector<uint32_t>& role_nodes,
+                          uint32_t node_count, std::string_view source) {
+  for (uint32_t node_index : role_nodes) {
+    if (node_index >= node_count) {
+      throw std::runtime_error(std::string(source) + " must be in 1.." +
+                               std::to_string(node_count));
+    }
+  }
+}
+
+bool NodeListsOverlap(const std::vector<uint32_t>& left,
+                      const std::vector<uint32_t>& right) {
+  for (uint32_t left_node : left) {
+    for (uint32_t right_node : right) {
+      if (left_node == right_node) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
+                                             uint32_t nodes) {
+  NodeRoleTopology topology;
+  topology.configured = true;
+  topology.node_count = JsonOptionalUint32Field(object, "node_count", nodes);
+  if (topology.node_count != nodes) {
+    throw std::runtime_error(
+        "scenario topology.node_count must match node count");
+  }
+
+  std::optional<std::vector<uint32_t>> wallet_nodes =
+      JsonOptionalNodeIndexListField(object, "wallet_nodes",
+                                     "scenario topology.wallet_nodes");
+  std::optional<std::vector<uint32_t>> miner_nodes =
+      JsonOptionalNodeIndexListField(object, "miner_nodes",
+                                     "scenario topology.miner_nodes");
+  const bool wallet_count_present =
+      object.if_contains("wallet_node_count") != nullptr;
+  const bool miner_count_present =
+      object.if_contains("miner_node_count") != nullptr;
+  const uint32_t wallet_nodes_size =
+      wallet_nodes ? static_cast<uint32_t>(wallet_nodes->size()) : 0U;
+  const uint32_t miner_nodes_size =
+      miner_nodes ? static_cast<uint32_t>(miner_nodes->size()) : 0U;
+
+  topology.wallet_node_count = JsonOptionalUint32Field(
+      object, "wallet_node_count", wallet_nodes ? wallet_nodes_size : 0U);
+  topology.miner_node_count = JsonOptionalUint32Field(
+      object, "miner_node_count", miner_nodes ? miner_nodes_size : 0U);
+  topology.allow_miner_wallet_overlap =
+      JsonOptionalBoolField(object, "allow_miner_wallet_overlap",
+                            topology.allow_miner_wallet_overlap);
+
+  if (wallet_nodes && wallet_count_present &&
+      topology.wallet_node_count != wallet_nodes_size) {
+    throw std::runtime_error(
+        "scenario topology wallet_node_count must match wallet_nodes size");
+  }
+  if (miner_nodes && miner_count_present &&
+      topology.miner_node_count != miner_nodes_size) {
+    throw std::runtime_error(
+        "scenario topology miner_node_count must match miner_nodes size");
+  }
+  if (topology.wallet_node_count > topology.node_count) {
+    throw std::runtime_error(
+        "scenario topology wallet_node_count must be <= node_count");
+  }
+  if (topology.miner_node_count > topology.node_count) {
+    throw std::runtime_error(
+        "scenario topology miner_node_count must be <= node_count");
+  }
+  if (!topology.allow_miner_wallet_overlap &&
+      topology.wallet_node_count >
+          topology.node_count - topology.miner_node_count) {
+    throw std::runtime_error(
+        "scenario topology wallet_node_count plus miner_node_count must be <= "
+        "node_count when overlap is disabled");
+  }
+
+  topology.wallet_nodes =
+      wallet_nodes ? *wallet_nodes
+                   : ConsecutiveNodeIndexes(0U, topology.wallet_node_count);
+  const uint32_t first_miner_index =
+      topology.allow_miner_wallet_overlap ? 0U : topology.wallet_node_count;
+  topology.miner_nodes =
+      miner_nodes ? *miner_nodes
+                  : ConsecutiveNodeIndexes(first_miner_index,
+                                           topology.miner_node_count);
+
+  ValidateRoleNodeList(topology.wallet_nodes, topology.node_count,
+                       "scenario topology.wallet_nodes");
+  ValidateRoleNodeList(topology.miner_nodes, topology.node_count,
+                       "scenario topology.miner_nodes");
+  if (!topology.allow_miner_wallet_overlap &&
+      NodeListsOverlap(topology.wallet_nodes, topology.miner_nodes)) {
+    throw std::runtime_error(
+        "scenario topology wallet_nodes and miner_nodes overlap but "
+        "allow_miner_wallet_overlap is false");
+  }
+  return topology;
+}
+
 bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
   return !patch.memory_high_bytes && !patch.memory_max_bytes &&
          !patch.cpu_quota_present && !patch.cpu_period_us && !patch.pids_max;
@@ -1097,7 +1255,18 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
   }
   if (!OptionProvided(vm, "nodes")) {
-    options.nodes = JsonOptionalUint32Field(scenario, "nodes", options.nodes);
+    const bool nodes_present = scenario.if_contains("nodes") != nullptr;
+    const bool node_count_present =
+        scenario.if_contains("node_count") != nullptr;
+    const uint32_t scenario_nodes =
+        JsonOptionalUint32Field(scenario, "nodes", options.nodes);
+    const uint32_t scenario_node_count =
+        JsonOptionalUint32Field(scenario, "node_count", scenario_nodes);
+    if (nodes_present && node_count_present &&
+        scenario_nodes != scenario_node_count) {
+      throw std::runtime_error("scenario nodes and node_count must match");
+    }
+    options.nodes = node_count_present ? scenario_node_count : scenario_nodes;
   }
   if (!OptionProvided(vm, "generate-blocks")) {
     options.generate_blocks = JsonOptionalUint32Field(
@@ -1134,6 +1303,15 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     options.workloads_configured = true;
     ApplyScenarioWorkloads(workloads->as_array(), vm, options);
+  }
+
+  const boost::json::value* topology = scenario.if_contains("topology");
+  if (topology != nullptr) {
+    if (!topology->is_object()) {
+      throw std::runtime_error("scenario topology must be a JSON object");
+    }
+    options.topology =
+        ParseNodeRoleTopologyObject(topology->as_object(), options.nodes);
   }
 
   const boost::json::value* resources = scenario.if_contains("resources");
@@ -2107,6 +2285,17 @@ boost::json::object NetworkPartitionRuleJson(const NetworkPartitionRule& rule) {
   boost::json::object object;
   object["group_a"] = NodeGroupJson(rule.group_a);
   object["group_b"] = NodeGroupJson(rule.group_b);
+  return object;
+}
+
+boost::json::object NodeRoleTopologyJson(const NodeRoleTopology& topology) {
+  boost::json::object object;
+  object["node_count"] = topology.node_count;
+  object["wallet_node_count"] = topology.wallet_node_count;
+  object["miner_node_count"] = topology.miner_node_count;
+  object["allow_miner_wallet_overlap"] = topology.allow_miner_wallet_overlap;
+  object["wallet_nodes"] = NodeGroupJson(topology.wallet_nodes);
+  object["miner_nodes"] = NodeGroupJson(topology.miner_nodes);
   return object;
 }
 
@@ -3267,6 +3456,9 @@ void WriteScenarioFiles(const Options& options,
   }
   resolved["metrics_sample_count"] = options.metrics_sample_count;
   resolved["metrics_interval_ms"] = options.metrics_interval_ms;
+  if (options.topology.configured) {
+    resolved["topology"] = NodeRoleTopologyJson(options.topology);
+  }
   boost::json::array workload_array;
   for (const ScenarioWorkload& workload : workloads) {
     workload_array.push_back(WorkloadJson(workload));

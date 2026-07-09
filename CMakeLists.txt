@@ -252,6 +252,22 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-raw-transaction-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME benchmark-sim-valid-role-topology-scenario
+    COMMAND benchmark-sim
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-role-topology-scenario.json"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-role-topology-miners
+    tests/scenarios/invalid-role-topology-miners.json
+    "scenario topology miner_node_count must be <= node_count"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-role-topology-capacity
+    tests/scenarios/invalid-role-topology-capacity.json
+    "scenario topology wallet_node_count plus miner_node_count must be <= node_count when overlap is disabled"
+  )
   add_cli_failure_test(
     benchmark-sim-invalid-wait-height-missing-height
     tests/scenarios/invalid-wait-height-missing-height.json
