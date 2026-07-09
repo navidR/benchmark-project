@@ -332,12 +332,41 @@ const boost::json::array* NodeSummaries(const boost::json::object& report) {
   return &nodes_value->as_array();
 }
 
+const boost::json::array* WalletSummaries(const boost::json::object& report) {
+  const boost::json::value* wallets_value =
+      report.if_contains("wallets_summary");
+  if (wallets_value == nullptr || !wallets_value->is_array()) {
+    return nullptr;
+  }
+  return &wallets_value->as_array();
+}
+
 const boost::json::object* NodeAt(const boost::json::array& nodes,
                                   std::size_t index) {
   if (index >= nodes.size() || !nodes[index].is_object()) {
     return nullptr;
   }
   return &nodes[index].as_object();
+}
+
+const boost::json::object* WalletForNode(const boost::json::object& report,
+                                         std::size_t one_based_node) {
+  const boost::json::array* wallets = WalletSummaries(report);
+  if (wallets == nullptr) {
+    return nullptr;
+  }
+  for (const boost::json::value& wallet_value : *wallets) {
+    if (!wallet_value.is_object()) {
+      continue;
+    }
+    const boost::json::object& wallet = wallet_value.as_object();
+    const std::optional<std::uint64_t> node =
+        JsonUnsignedMetric(wallet, "node");
+    if (node && *node == one_based_node) {
+      return &wallet;
+    }
+  }
+  return nullptr;
 }
 
 std::size_t ClampNodeSelection(const boost::json::object& report,
@@ -404,6 +433,8 @@ void AddDetailPair(int y, int x, int width, std::string_view label,
 }
 
 void DrawSelectedNodeDetail(int top, int bottom, int cols,
+                            const boost::json::object& report,
+                            std::size_t selected_node,
                             const boost::json::object* node) {
   if (top < 0 || bottom - top < 4 || cols <= 0) {
     return;
@@ -478,6 +509,21 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   AddDetailPair(y, left_width, right_width, "qdisc",
                 JsonMetricText(metric_object, "qdisc_kind") + " drops " +
                     JsonMetricText(metric_object, "qdisc_drops"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  const boost::json::object* wallet = WalletForNode(report, selected_node + 1U);
+  if (wallet == nullptr) {
+    AddDetailPair(y, 0, left_width, "wallet", "-");
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "wallet",
+                "#" + JsonMetricText(*wallet, "wallet_index") + " sent " +
+                    JsonMetricText(*wallet, "transactions_sent") + " recv " +
+                    JsonMetricText(*wallet, "transactions_received"));
+  AddDetailPair(y, left_width, right_width, "addr",
+                JsonString(*wallet, "address", "-"));
 }
 
 boost::json::object LoadReport(const std::filesystem::path& run_root,
@@ -528,6 +574,7 @@ void DrawSummary(const std::filesystem::path& run_root,
 
   const std::string status = JsonString(report, "status", "unknown");
   const bool ok = JsonBoolText(report, "ok", "false") == "true";
+  const boost::json::array* wallets = WalletSummaries(report);
   AddText(3, 0, cols, "run: " + run_root.string(), A_BOLD);
   AddText(
       4, 0, cols / 2, "status: " + status,
@@ -538,8 +585,9 @@ void DrawSummary(const std::filesystem::path& run_root,
   AddText(5, cols / 2, cols - (cols / 2),
           "metrics: " + JsonIntegerText(report, "metric_count"));
   AddText(6, 0, cols / 2, "nodes: " + JsonIntegerText(report, "nodes"));
-  AddText(6, cols / 2, cols - (cols / 2),
-          "isolated: " + JsonBoolText(report, "isolated_network"));
+  AddText(
+      6, cols / 2, cols - (cols / 2),
+      "wallets: " + std::to_string(wallets == nullptr ? 0U : wallets->size()));
   AddText(7, 0, cols / 2,
           "generate node: " + JsonIntegerText(report, "generate_node"));
   AddText(7, cols / 2, cols - (cols / 2),
@@ -626,8 +674,8 @@ void DrawSummary(const std::filesystem::path& run_root,
   }
 
   if (has_detail_pane) {
-    DrawSelectedNodeDetail(detail_top, content_bottom, cols,
-                           NodeAt(*nodes, selected_node));
+    DrawSelectedNodeDetail(detail_top, content_bottom, cols, report,
+                           selected_node, NodeAt(*nodes, selected_node));
   }
 
   if (log_rows != 0) {
