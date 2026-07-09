@@ -10,6 +10,7 @@
 #include <boost/program_options.hpp>
 #include <charconv>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -1765,6 +1766,9 @@ Options ParseOptions(int argc, char** argv) {
       "summarize an existing run directory as JSON and exit")(
       "run", po::value<std::filesystem::path>(&options.tui_run),
       "view an existing run directory in the integrated ncurses TUI")(
+      "no-tui", po::bool_switch(&options.no_tui),
+      "run a new benchmark headlessly with Boost.Log output instead of the "
+      "integrated ncurses TUI")(
       "once", po::bool_switch(&options.tui_once),
       "render one integrated TUI frame and exit; requires --run")(
       "refresh-ms", po::value<std::uint32_t>(&options.tui_refresh_ms),
@@ -1942,11 +1946,10 @@ Options ParseOptions(int argc, char** argv) {
   if (vm.count("run") != 0U && vm.count("report-run") != 0U) {
     throw std::runtime_error("--run and --report-run are mutually exclusive");
   }
-  if (vm.count("run") == 0U &&
-      (OptionProvided(vm, "once") || OptionProvided(vm, "refresh-ms"))) {
-    throw std::runtime_error("--once and --refresh-ms require --run");
+  if (vm.count("run") == 0U && OptionProvided(vm, "once")) {
+    throw std::runtime_error("--once requires --run");
   }
-  if (vm.count("run") != 0U && options.tui_refresh_ms == 0U) {
+  if (options.tui_refresh_ms == 0U) {
     throw std::runtime_error("--refresh-ms must be greater than zero");
   }
   if (vm.count("scenario-json") != 0U) {
@@ -4563,93 +4566,12 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
   }
 }
 
-}  // namespace
+std::filesystem::path BenchmarkRunRoot(const Options& options) {
+  return std::filesystem::absolute(options.output_dir) / options.run_id;
+}
 
-int SimulatorApp::Run(int argc, char** argv) {
-  Options options = ParseOptions(argc, argv);
-  RequireSafeOutputDirectory(options.output_dir);
-  if (options.probe_network) {
-    BSIM_LOG(info) << NetworkProbeJson();
-    return 0;
-  }
-  if (!options.report_run.empty()) {
-    BSIM_LOG(info) << BuildRunReportJson(options.report_run);
-    return 0;
-  }
-  if (!options.tui_run.empty()) {
-    return RunTuiReport(options.tui_run, options.tui_once,
-                        options.tui_refresh_ms);
-  }
-  if (options.probe_capabilities) {
-    BSIM_LOG(info) << CapabilityProbeJson();
-    return 0;
-  }
-  if (options.probe_cgroup_freeze) {
-    BSIM_LOG(info) << CgroupFreezeProbeJson();
-    return 0;
-  }
-  if (options.probe_drop_filter) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << DropFilterProbeJson();
-    return 0;
-  }
-  if (options.probe_netns) {
-    RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
-    BSIM_LOG(info) << NetworkNamespaceProbeJson();
-    return 0;
-  }
-  if (options.probe_veth) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << VethProbeJson();
-    return 0;
-  }
-  if (options.probe_bandwidth_limit) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << BandwidthLimitProbeJson();
-    return 0;
-  }
-  if (options.probe_network_condition) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << NetworkConditionProbeJson();
-    return 0;
-  }
-  if (options.probe_combined_network_condition) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << CombinedNetworkConditionProbeJson();
-    return 0;
-  }
-  if (options.probe_network_condition_update) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << NetworkConditionUpdateProbeJson();
-    return 0;
-  }
-  if (options.probe_address) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << AddressProbeJson();
-    return 0;
-  }
-  if (options.probe_route) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << RouteProbeJson();
-    return 0;
-  }
-  if (options.probe_qdisc) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << QdiscProbeJson();
-    return 0;
-  }
-  if (options.probe_qdisc_mutation) {
-    RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << QdiscMutationProbeJson();
-    return 0;
-  }
-  if (options.cleanup_run) {
-    CleanupRun(options);
-    return 0;
-  }
-
-  const auto run_root =
-      std::filesystem::absolute(options.output_dir) / options.run_id;
+int RunBenchmarkHeadless(Options options) {
+  const auto run_root = BenchmarkRunRoot(options);
   if (std::filesystem::exists(run_root)) {
     if (!options.replace_run) {
       throw std::runtime_error(
@@ -4852,6 +4774,128 @@ int SimulatorApp::Run(int argc, char** argv) {
                  << "metrics=" << metrics_path << "\n"
                  << "events=" << events_path;
   return 0;
+}
+
+int RunBenchmarkWithTui(Options options) {
+  const auto run_root = BenchmarkRunRoot(options);
+  std::exception_ptr simulation_failure;
+  std::exception_ptr tui_failure;
+  int simulation_result = 1;
+
+  std::thread simulation_thread([&options, &simulation_failure,
+                                 &simulation_result]() {
+    try {
+      simulation_result = RunBenchmarkHeadless(options);
+    } catch (...) {
+      simulation_failure = std::current_exception();
+    }
+  });
+
+  int tui_result = 1;
+  try {
+    tui_result = RunTuiReport(run_root, false, options.tui_refresh_ms);
+  } catch (...) {
+    tui_failure = std::current_exception();
+  }
+  simulation_thread.join();
+
+  if (simulation_failure) {
+    std::rethrow_exception(simulation_failure);
+  }
+  if (tui_failure) {
+    std::rethrow_exception(tui_failure);
+  }
+  return simulation_result == 0 ? tui_result : simulation_result;
+}
+
+}  // namespace
+
+int SimulatorApp::Run(int argc, char** argv) {
+  Options options = ParseOptions(argc, argv);
+  RequireSafeOutputDirectory(options.output_dir);
+  if (options.probe_network) {
+    BSIM_LOG(info) << NetworkProbeJson();
+    return 0;
+  }
+  if (!options.report_run.empty()) {
+    BSIM_LOG(info) << BuildRunReportJson(options.report_run);
+    return 0;
+  }
+  if (!options.tui_run.empty()) {
+    return RunTuiReport(options.tui_run, options.tui_once,
+                        options.tui_refresh_ms);
+  }
+  if (options.probe_capabilities) {
+    BSIM_LOG(info) << CapabilityProbeJson();
+    return 0;
+  }
+  if (options.probe_cgroup_freeze) {
+    BSIM_LOG(info) << CgroupFreezeProbeJson();
+    return 0;
+  }
+  if (options.probe_drop_filter) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << DropFilterProbeJson();
+    return 0;
+  }
+  if (options.probe_netns) {
+    RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
+    BSIM_LOG(info) << NetworkNamespaceProbeJson();
+    return 0;
+  }
+  if (options.probe_veth) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << VethProbeJson();
+    return 0;
+  }
+  if (options.probe_bandwidth_limit) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << BandwidthLimitProbeJson();
+    return 0;
+  }
+  if (options.probe_network_condition) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << NetworkConditionProbeJson();
+    return 0;
+  }
+  if (options.probe_combined_network_condition) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << CombinedNetworkConditionProbeJson();
+    return 0;
+  }
+  if (options.probe_network_condition_update) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << NetworkConditionUpdateProbeJson();
+    return 0;
+  }
+  if (options.probe_address) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << AddressProbeJson();
+    return 0;
+  }
+  if (options.probe_route) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << RouteProbeJson();
+    return 0;
+  }
+  if (options.probe_qdisc) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << QdiscProbeJson();
+    return 0;
+  }
+  if (options.probe_qdisc_mutation) {
+    RequireNetworkSetupCapabilities();
+    BSIM_LOG(info) << QdiscMutationProbeJson();
+    return 0;
+  }
+  if (options.cleanup_run) {
+    CleanupRun(options);
+    return 0;
+  }
+  if (options.no_tui) {
+    return RunBenchmarkHeadless(options);
+  }
+  return RunBenchmarkWithTui(options);
 }
 
 }  // namespace bsim

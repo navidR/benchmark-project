@@ -41,6 +41,7 @@ struct Options {
   std::uint64_t pids_max = 256;
   bool keep_cgroups = false;
   bool cleanup_run = false;
+  bool no_tui = false;
   bool tui_once = false;
   bool isolate_network = false;
   bool network_condition_requested = false;
