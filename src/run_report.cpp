@@ -125,6 +125,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "generate_node", report);
   CopyField(scenario, "isolated_network", report);
   CopyField(scenario, "sync_timeout_sec", report);
+  CopyField(scenario, "workloads", report);
 }
 
 boost::json::object EventCountsJson(

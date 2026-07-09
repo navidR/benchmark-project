@@ -44,8 +44,13 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const std::filesystem::path dir = MakeTestDir("run-report");
   bsim::WriteText(dir / "resolved-scenario.json",
                   "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
-                  "\"generate_blocks\":2,\"generate_node\":1,"
-                  "\"isolated_network\":true,\"sync_timeout_sec\":45}\n");
+                  "\"generate_blocks\":3,\"generate_node\":null,"
+                  "\"isolated_network\":true,\"sync_timeout_sec\":null,"
+                  "\"workloads\":["
+                  "{\"type\":\"block_generation\",\"node\":1,\"count\":1,"
+                  "\"sync_timeout_sec\":45},"
+                  "{\"type\":\"block_generation\",\"node\":2,\"count\":2,"
+                  "\"sync_timeout_sec\":60}]}\n");
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"sim\",\"event\":\"run_started\"}");
@@ -81,9 +86,17 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(JsonInteger(report, "event_count") == 3U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
-  BOOST_TEST(JsonInteger(report, "generate_blocks") == 2U);
-  BOOST_TEST(JsonInteger(report, "generate_node") == 1U);
-  BOOST_TEST(JsonInteger(report, "sync_timeout_sec") == 45U);
+  BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
+  BOOST_TEST(report.at("generate_node").is_null());
+  BOOST_TEST(report.at("sync_timeout_sec").is_null());
+  const boost::json::array& workloads = report.at("workloads").as_array();
+  BOOST_REQUIRE_EQUAL(workloads.size(), 2U);
+  const boost::json::object& first_workload =
+      workloads.front().as_object();
+  BOOST_TEST(first_workload.at("type").as_string() == "block_generation");
+  BOOST_TEST(JsonInteger(first_workload, "node") == 1U);
+  BOOST_TEST(JsonInteger(first_workload, "count") == 1U);
+  BOOST_TEST(JsonInteger(first_workload, "sync_timeout_sec") == 45U);
   const boost::json::array& nodes =
       report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);

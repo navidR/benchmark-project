@@ -125,6 +125,34 @@ std::string JsonMetricText(const boost::json::object& object,
   return boost::json::serialize(*value);
 }
 
+std::string WorkloadsSummaryText(const boost::json::object& report) {
+  const boost::json::value* workloads_value = report.if_contains("workloads");
+  if (workloads_value == nullptr || !workloads_value->is_array() ||
+      workloads_value->as_array().empty()) {
+    return "workloads: -";
+  }
+
+  const boost::json::array& workloads = workloads_value->as_array();
+  std::string text = "workloads: " + std::to_string(workloads.size());
+  std::size_t index = 0;
+  for (const boost::json::value& workload_value : workloads) {
+    ++index;
+    if (!workload_value.is_object()) {
+      continue;
+    }
+    const boost::json::object& workload = workload_value.as_object();
+    text += index == 1 ? " " : ", ";
+    text += "#" + std::to_string(index) + " node ";
+    text += JsonMetricText(workload, "node");
+    text += " x";
+    text += JsonMetricText(workload, "count");
+    text += " sync ";
+    text += JsonMetricText(workload, "sync_timeout_sec");
+    text += "s";
+  }
+  return text;
+}
+
 void AddText(int y, int x, int width, std::string_view text, int attributes) {
   if (width <= 0 || y < 0 || x < 0) {
     return;
@@ -218,17 +246,18 @@ void DrawSummary(const std::filesystem::path& run_root,
           "generate node: " + JsonIntegerText(report, "generate_node"));
   AddText(7, cols / 2, cols - (cols / 2),
           "generate blocks: " + JsonIntegerText(report, "generate_blocks"));
+  AddText(8, 0, cols, WorkloadsSummaryText(report));
 
-  DrawHorizontalLine(8);
-  AddText(9, 0, 12, "Node", A_BOLD);
-  AddText(9, 12, 12, "State", A_BOLD);
-  AddText(9, 24, 10, "Height", A_BOLD);
-  AddText(9, 34, 8, "Peers", A_BOLD);
-  AddText(9, 42, 10, "Blocks", A_BOLD);
-  AddText(9, 52, 10, "Mempool", A_BOLD);
-  AddText(9, 62, 10, "RPC ms", A_BOLD);
-  AddText(9, 72, std::max(0, cols - 72), "Qdisc", A_BOLD);
-  DrawHorizontalLine(10);
+  DrawHorizontalLine(9);
+  AddText(10, 0, 12, "Node", A_BOLD);
+  AddText(10, 12, 12, "State", A_BOLD);
+  AddText(10, 24, 10, "Height", A_BOLD);
+  AddText(10, 34, 8, "Peers", A_BOLD);
+  AddText(10, 42, 10, "Blocks", A_BOLD);
+  AddText(10, 52, 10, "Mempool", A_BOLD);
+  AddText(10, 62, 10, "RPC ms", A_BOLD);
+  AddText(10, 72, std::max(0, cols - 72), "Qdisc", A_BOLD);
+  DrawHorizontalLine(11);
 
   const boost::json::value* nodes_value = report.if_contains("nodes_summary");
   if (nodes_value == nullptr || !nodes_value->is_array()) {
@@ -238,7 +267,7 @@ void DrawSummary(const std::filesystem::path& run_root,
     return;
   }
 
-  int y = 11;
+  int y = 12;
   for (const boost::json::value& node_value : nodes_value->as_array()) {
     if (y >= rows - 2) {
       break;
