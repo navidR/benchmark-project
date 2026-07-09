@@ -1,0 +1,12 @@
+{
+  "run_id": "invalid-wait-height-node",
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "wait_until_height",
+      "node": 3,
+      "height": 1,
+      "timeout_sec": 30
+    }
+  ]
+}

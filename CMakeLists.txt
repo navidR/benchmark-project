@@ -204,6 +204,37 @@ if(BUILD_TESTING)
     -Werror
   )
   add_test(NAME benchmark-sim-unit-tests COMMAND benchmark-sim-unit-tests)
+
+  function(add_cli_failure_test name scenario regex)
+    add_test(NAME "${name}"
+      COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_COMMAND=$<TARGET_FILE:benchmark-sim>"
+        "-DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/${scenario}"
+        "-DREGEX=${regex}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_failure.cmake"
+    )
+  endfunction()
+
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-height-missing-height
+    tests/scenarios/invalid-wait-height-missing-height.json
+    "missing or invalid uint64 JSON field: height"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-height-node
+    tests/scenarios/invalid-wait-height-node.json
+    "scenario wait_until_height workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-height-timeout
+    tests/scenarios/invalid-wait-height-timeout.json
+    "scenario wait_until_height timeout_sec must be greater than zero"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-height-plural-nodes
+    tests/scenarios/invalid-wait-height-plural-nodes.json
+    "current Firo MVP wait_until_height workload uses node, not nodes"
+  )
 endif()
 
 install(TARGETS benchmark-sim RUNTIME DESTINATION bin)
