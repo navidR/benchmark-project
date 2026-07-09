@@ -59,7 +59,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "\"sync_timeout_sec\":60}]}\n");
   bsim::AppendLine(
       dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"sim\",\"event\":\"run_started\"}");
+      "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+      "\"timestamp\":\"2026-07-09T00:00:00Z\","
+      "\"event\":\"run_started\"}");
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"event\":\"state\","
@@ -95,7 +97,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
   bsim::AppendLine(
       dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"sim\",\"event\":\"run_finished\"}");
+      "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+      "\"timestamp\":\"2026-07-09T00:00:02Z\","
+      "\"event\":\"run_finished\"}");
   bsim::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":1,"
@@ -125,6 +129,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 
   BOOST_TEST(report.at("ok").as_bool());
   BOOST_TEST(report.at("status").as_string() == "finished");
+  BOOST_TEST(report.at("started_at").as_string() ==
+             "2026-07-09T00:00:00Z");
+  BOOST_TEST(report.at("finished_at").as_string() ==
+             "2026-07-09T00:00:02Z");
   BOOST_TEST(JsonInteger(report, "event_count") == 7U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
