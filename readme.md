@@ -15,7 +15,8 @@ the Firo path is working end to end.
 - Run Firo nodes inside isolated network namespaces with one veth pair per node.
 - Apply simple per-node network conditions through host-side `netem` or TBF.
 - Apply and remove live per-node TCP block rules, optionally scoped by source.
-- Apply and heal source-aware group network partitions.
+- Apply and heal source-aware group network partitions after startup or as an
+  ordered workload.
 - Apply live per-node cgroup resource updates after startup or as an ordered
   workload.
 - Restart a running Firo node before workload generation or as an ordered
@@ -335,6 +336,16 @@ The same run settings can be loaded from a JSON scenario file:
       "timeout_sec": 45
     },
     {
+      "type": "partition_nodes",
+      "group_a": [1],
+      "group_b": [2, 3]
+    },
+    {
+      "type": "heal_partition",
+      "group_a": [1],
+      "group_b": [2, 3]
+    },
+    {
       "type": "block_generation",
       "node": 2,
       "count": 1,
@@ -456,6 +467,10 @@ peer count and emit a structured `peer_count_reached` event.
 and emit a structured `node_freeze_completed` event.
 `update_resource_limits` workloads apply live cgroup limit changes to one node
 and emit a structured `resource_limits_updated` event.
+`partition_nodes` workloads install source-aware group P2P drop filters and
+emit a structured `network_partition_applied` event.
+`heal_partition` workloads remove matching group P2P drop filters and emit a
+structured `network_partition_healed` event.
 An explicit empty scenario workload list, `"workloads": []`, disables block
 generation for that run.
 
