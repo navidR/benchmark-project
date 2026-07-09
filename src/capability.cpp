@@ -1,43 +1,59 @@
 #include "benchmark_sim/capability.h"
 
-#include "benchmark_sim/util.h"
+#include <sys/capability.h>
 
-#include <linux/capability.h>
-
-#include <sstream>
+#include <cerrno>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
 namespace bsim {
+namespace {
 
-uint64_t ParseEffectiveCapabilities(std::string_view proc_status) {
-  std::istringstream lines{std::string(proc_status)};
-  std::string line;
-  while (std::getline(lines, line)) {
-    std::istringstream fields(line);
-    std::string name;
-    std::string value;
-    fields >> name >> value;
-    if (name == "CapEff:" && !value.empty()) {
-      return std::stoull(value, nullptr, 16);
+class ScopedCapabilities {
+ public:
+  explicit ScopedCapabilities(cap_t capabilities)
+      : capabilities_(capabilities) {}
+
+  ScopedCapabilities(const ScopedCapabilities&) = delete;
+  ScopedCapabilities& operator=(const ScopedCapabilities&) = delete;
+
+  ~ScopedCapabilities() {
+    if (capabilities_ != nullptr) {
+      cap_free(capabilities_);
     }
   }
-  throw std::runtime_error("missing CapEff in /proc/self/status");
+
+  cap_t get() const { return capabilities_; }
+
+ private:
+  cap_t capabilities_;
+};
+
+std::string ErrnoMessage(std::string_view prefix, int error_number) {
+  return std::string(prefix) + ": " + std::strerror(error_number);
 }
 
-uint64_t ReadEffectiveCapabilities() {
-  return ParseEffectiveCapabilities(ReadText("/proc/self/status"));
-}
+}  // namespace
 
-bool HasCapability(uint64_t effective_capabilities, int capability) {
-  if (capability < 0 || capability >= 64) {
+bool HasEffectiveCapability(int capability) {
+  if (capability < 0 || capability >= cap_max_bits()) {
     return false;
   }
-  return (effective_capabilities & (uint64_t{1} << capability)) != 0U;
+  ScopedCapabilities capabilities(cap_get_proc());
+  if (capabilities.get() == nullptr) {
+    throw std::runtime_error(ErrnoMessage("cap_get_proc failed", errno));
+  }
+  cap_flag_value_t value = CAP_CLEAR;
+  if (cap_get_flag(capabilities.get(), capability, CAP_EFFECTIVE, &value) !=
+      0) {
+    throw std::runtime_error(ErrnoMessage("cap_get_flag failed", errno));
+  }
+  return value == CAP_SET;
 }
 
 void RequireEffectiveCapability(int capability, std::string_view name) {
-  if (!HasCapability(ReadEffectiveCapabilities(), capability)) {
+  if (!HasEffectiveCapability(capability)) {
     throw std::runtime_error("missing required capability: " +
                              std::string(name));
   }

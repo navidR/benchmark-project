@@ -57,6 +57,91 @@ set_target_properties(vendored_libmnl PROPERTIES
   C_VISIBILITY_PRESET hidden
 )
 
+set(LIBCAP_GENERATED_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/libcap")
+file(MAKE_DIRECTORY "${LIBCAP_GENERATED_INCLUDE}")
+file(STRINGS
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libcap/libcap/include/uapi/linux/capability.h"
+  LIBCAP_CAPABILITY_LINES
+  REGEX "^#define[ \t]+CAP_[^ \t]+[ \t]+[0-9]+[ \t]*$"
+)
+set(LIBCAP_NAMES_BY_INDEX)
+set(LIBCAP_CAP_NAME_SIZE 0)
+foreach(capability_line IN LISTS LIBCAP_CAPABILITY_LINES)
+  string(REGEX MATCH
+    "^#define[ \t]+CAP_([^ \t]+)[ \t]+([0-9]+)[ \t]*$"
+    capability_match
+    "${capability_line}"
+  )
+  if(NOT capability_match)
+    message(FATAL_ERROR
+      "could not parse libcap capability line: ${capability_line}"
+    )
+  endif()
+  string(TOLOWER "${CMAKE_MATCH_1}" capability_name)
+  set(capability_index "${CMAKE_MATCH_2}")
+  list(LENGTH LIBCAP_NAMES_BY_INDEX libcap_name_count)
+  if(NOT capability_index EQUAL libcap_name_count)
+    message(FATAL_ERROR
+      "libcap capability indices must be contiguous: ${capability_line}"
+    )
+  endif()
+  list(APPEND LIBCAP_NAMES_BY_INDEX "${capability_name}")
+  string(LENGTH "${capability_name}" capability_name_size)
+  if(capability_name_size GREATER LIBCAP_CAP_NAME_SIZE)
+    set(LIBCAP_CAP_NAME_SIZE "${capability_name_size}")
+  endif()
+endforeach()
+list(LENGTH LIBCAP_NAMES_BY_INDEX LIBCAP_CAP_BITS)
+math(EXPR LIBCAP_CAP_NAME_SIZE "${LIBCAP_CAP_NAME_SIZE} + 1")
+set(LIBCAP_CAP_NAMES)
+set(libcap_cap_index 0)
+foreach(capability_name IN LISTS LIBCAP_NAMES_BY_INDEX)
+  string(APPEND LIBCAP_CAP_NAMES
+    "      /* ${libcap_cap_index} */ \"${capability_name}\", \\\n"
+  )
+  math(EXPR libcap_cap_index "${libcap_cap_index} + 1")
+endforeach()
+file(WRITE "${LIBCAP_GENERATED_INCLUDE}/cap_names.h"
+  "/* Generated from libcap's vendored UAPI capability header. */\n\n"
+  "#define __CAP_BITS       ${LIBCAP_CAP_BITS}\n"
+  "#define __CAP_NAME_SIZE  ${LIBCAP_CAP_NAME_SIZE}\n"
+  "\n"
+  "#ifdef LIBCAP_PLEASE_INCLUDE_ARRAY\n"
+  "#define LIBCAP_CAP_NAMES { \\\n"
+  "${LIBCAP_CAP_NAMES}"
+  "  }\n"
+  "#endif /* LIBCAP_PLEASE_INCLUDE_ARRAY */\n"
+)
+
+add_library(vendored_libcap STATIC
+  third_party/libcap/libcap/cap_alloc.c
+  third_party/libcap/libcap/cap_extint.c
+  third_party/libcap/libcap/cap_file.c
+  third_party/libcap/libcap/cap_flag.c
+  third_party/libcap/libcap/cap_proc.c
+  third_party/libcap/libcap/cap_syscalls.c
+  third_party/libcap/libcap/cap_text.c
+)
+add_library(libcap::cap ALIAS vendored_libcap)
+target_compile_definitions(vendored_libcap PRIVATE
+  linux
+  _LARGEFILE64_SOURCE
+  _FILE_OFFSET_BITS=64
+  _LIBPSX_PTHREAD_LINKAGE
+)
+target_include_directories(vendored_libcap
+  SYSTEM PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libcap/libcap/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libcap/libcap/include/uapi"
+  PRIVATE
+    "${LIBCAP_GENERATED_INCLUDE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libcap/libcap"
+)
+set_target_properties(vendored_libcap PROPERTIES
+  OUTPUT_NAME cap
+  C_VISIBILITY_PRESET hidden
+)
+
 find_program(MAKE_EXECUTABLE make REQUIRED)
 set(NCURSES_INSTALL_DIR
   "${CMAKE_CURRENT_BINARY_DIR}/third_party/ncurses/install"
@@ -151,6 +236,7 @@ target_link_libraries(benchmark-sim PRIVATE
   Boost::log_setup
   Boost::program_options
   Boost::system
+  libcap::cap
   libmnl::libmnl
   ncurses::ncursesw
   yaml::yaml
@@ -190,6 +276,7 @@ if(BUILD_TESTING)
   target_link_libraries(benchmark-sim-unit-tests PRIVATE
     Boost::json
     Boost::unit_test_framework
+    libcap::cap
     libmnl::libmnl
   )
   target_compile_options(benchmark-sim-unit-tests PRIVATE

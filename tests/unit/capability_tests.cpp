@@ -1,24 +1,22 @@
-#include "benchmark_sim/capability.h"
-
-#include <linux/capability.h>
-
-#include <stdexcept>
+#include <sys/capability.h>
 
 #include <boost/test/unit_test.hpp>
+#include <stdexcept>
 
-BOOST_AUTO_TEST_CASE(capability_parser_reads_effective_mask) {
-  const uint64_t mask = bsim::ParseEffectiveCapabilities(
-      "Name:\tbenchmark-sim\n"
-      "State:\tR (running)\n"
-      "Uid:\t0\t0\t0\t0\n"
-      "CapEff:\t0000000000201000\n");
+#include "benchmark_sim/capability.h"
 
-  BOOST_TEST(bsim::HasCapability(mask, CAP_NET_ADMIN));
-  BOOST_TEST(bsim::HasCapability(mask, CAP_SYS_ADMIN));
-  BOOST_TEST(!bsim::HasCapability(mask, CAP_SYS_RESOURCE));
+BOOST_AUTO_TEST_CASE(capability_check_rejects_invalid_capability_numbers) {
+  BOOST_TEST(!bsim::HasEffectiveCapability(-1));
+  BOOST_TEST(!bsim::HasEffectiveCapability(cap_max_bits()));
 }
 
-BOOST_AUTO_TEST_CASE(capability_parser_rejects_missing_effective_mask) {
-  BOOST_CHECK_THROW(bsim::ParseEffectiveCapabilities("Name:\ttest\n"),
-                    std::runtime_error);
+BOOST_AUTO_TEST_CASE(capability_check_reads_current_process_capabilities) {
+  BOOST_CHECK_NO_THROW(
+      static_cast<void>(bsim::HasEffectiveCapability(CAP_NET_ADMIN)));
+}
+
+BOOST_AUTO_TEST_CASE(capability_requirement_rejects_invalid_capability) {
+  BOOST_CHECK_THROW(
+      bsim::RequireEffectiveCapability(cap_max_bits(), "invalid capability"),
+      std::runtime_error);
 }

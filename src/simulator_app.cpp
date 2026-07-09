@@ -2526,11 +2526,10 @@ std::string NetworkProbeJson() {
 }
 
 std::string CapabilityProbeJson() {
-  const uint64_t effective = ReadEffectiveCapabilities();
   boost::json::object result;
-  result["cap_sys_admin"] = HasCapability(effective, CAP_SYS_ADMIN);
-  result["cap_net_admin"] = HasCapability(effective, CAP_NET_ADMIN);
-  result["cap_sys_resource"] = HasCapability(effective, CAP_SYS_RESOURCE);
+  result["cap_sys_admin"] = HasEffectiveCapability(CAP_SYS_ADMIN);
+  result["cap_net_admin"] = HasEffectiveCapability(CAP_NET_ADMIN);
+  result["cap_sys_resource"] = HasEffectiveCapability(CAP_SYS_RESOURCE);
   return boost::json::serialize(result);
 }
 

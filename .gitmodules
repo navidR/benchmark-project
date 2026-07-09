@@ -10,3 +10,6 @@
 [submodule "third_party/libyaml"]
 	path = third_party/libyaml
 	url = https://github.com/yaml/libyaml.git
+[submodule "third_party/libcap"]
+	path = third_party/libcap
+	url = https://git.kernel.org/pub/scm/libs/libcap/libcap.git
