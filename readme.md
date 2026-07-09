@@ -330,6 +330,12 @@ The same run settings can be loaded from a JSON scenario file:
       "node": 2,
       "count": 1,
       "sync_timeout_sec": 45
+    },
+    {
+      "type": "block_generation",
+      "node": 1,
+      "count": 1,
+      "sync_timeout_sec": 45
     }
   ],
   "resources": {
@@ -419,9 +425,10 @@ Each run writes:
 - `runs/<run-id>/metrics.jsonl`
 - `runs/<run-id>/nodes/<node-id>/`
 
-For block-generation workloads, the `generated_blocks` event detail is JSON
-with the generator node, generated count, start and target height, reward
-address, and returned block hashes.
+Block-generation workloads run sequentially. For each one, the
+`generated_blocks` event detail is JSON with the workload index, generator node,
+generated count, start and target height, reward address, and returned block
+hashes.
 
 Summarize an existing run:
 

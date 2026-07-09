@@ -59,6 +59,12 @@ struct FreezeRequest {
   uint32_t duration_ms = 0;
 };
 
+struct BlockGenerationWorkload {
+  uint32_t node = 1;
+  uint32_t count = 0;
+  uint32_t sync_timeout_sec = 30;
+};
+
 struct NetworkBlockRule {
   uint32_t node_index = 0;
   std::string src_address;
@@ -114,6 +120,7 @@ struct Options {
   std::vector<NetworkPartitionRule> runtime_partition_heals;
   std::vector<uint32_t> runtime_node_restarts;
   std::vector<FreezeRequest> runtime_node_freezes;
+  std::vector<BlockGenerationWorkload> block_generation_workloads;
   bool replace_run = false;
   bool probe_address = false;
   bool probe_bandwidth_limit = false;
@@ -517,7 +524,6 @@ void ApplyResourceLimitPatches(
 void ApplyScenarioWorkloads(
     const boost::json::array& workloads,
     const boost::program_options::variables_map& vm, Options& options) {
-  bool block_generation_seen = false;
   for (const boost::json::value& value : workloads) {
     if (!value.is_object()) {
       throw std::runtime_error("scenario workloads entries must be JSON objects");
@@ -527,27 +533,27 @@ void ApplyScenarioWorkloads(
     if (type != "block_generation") {
       throw std::runtime_error("unsupported scenario workload type: " + type);
     }
-    if (block_generation_seen) {
-      throw std::runtime_error(
-          "current Firo MVP supports one block_generation workload");
-    }
     if (workload.if_contains("nodes") != nullptr) {
       throw std::runtime_error(
           "current Firo MVP block_generation workload uses node, not nodes");
     }
-    block_generation_seen = true;
-    if (!OptionProvided(vm, "generate-blocks")) {
-      options.generate_blocks =
-          JsonOptionalUint32Field(workload, "count", options.generate_blocks);
-    }
-    if (!OptionProvided(vm, "generate-node")) {
-      options.generate_node =
-          JsonOptionalUint32Field(workload, "node", options.generate_node);
-    }
-    if (!OptionProvided(vm, "sync-timeout-sec")) {
-      options.sync_timeout_sec = JsonOptionalUint32Field(
-          workload, "sync_timeout_sec", options.sync_timeout_sec);
-    }
+    BlockGenerationWorkload block_generation;
+    block_generation.count =
+        OptionProvided(vm, "generate-blocks")
+            ? options.generate_blocks
+            : JsonOptionalUint32Field(workload, "count",
+                                      options.generate_blocks);
+    block_generation.node =
+        OptionProvided(vm, "generate-node")
+            ? options.generate_node
+            : JsonOptionalUint32Field(workload, "node",
+                                      options.generate_node);
+    block_generation.sync_timeout_sec =
+        OptionProvided(vm, "sync-timeout-sec")
+            ? options.sync_timeout_sec
+            : JsonOptionalUint32Field(workload, "sync_timeout_sec",
+                                      options.sync_timeout_sec);
+    options.block_generation_workloads.push_back(block_generation);
   }
 }
 
@@ -1243,6 +1249,13 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (options.generate_node == 0U || options.generate_node > options.nodes) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
+  }
+  for (const BlockGenerationWorkload& workload :
+       options.block_generation_workloads) {
+    if (workload.node == 0U || workload.node > options.nodes) {
+      throw std::runtime_error(
+          "scenario block_generation workload node must be in 1..--nodes");
+    }
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
@@ -2020,7 +2033,9 @@ void WriteNodeState(const std::filesystem::path& events_path,
   WriteEvent(events_path, run_id, node_id, "state", state);
 }
 
-std::string GeneratedBlocksDetail(uint32_t generator_node,
+std::string GeneratedBlocksDetail(uint32_t workload_index,
+                                  uint32_t workload_count,
+                                  uint32_t generator_node,
                                   uint64_t start_height,
                                   uint64_t target_height,
                                   const std::vector<std::string>& hashes) {
@@ -2029,6 +2044,8 @@ std::string GeneratedBlocksDetail(uint32_t generator_node,
     hash_array.emplace_back(hash);
   }
   boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
   detail["generator_node"] = generator_node;
   detail["count"] = static_cast<uint64_t>(hashes.size());
   detail["start_height"] = start_height;
@@ -2147,8 +2164,87 @@ std::string NodeGroupYamlInline(const std::vector<uint32_t>& nodes) {
   return text;
 }
 
+std::vector<BlockGenerationWorkload> EffectiveBlockGenerationWorkloads(
+    const Options& options) {
+  if (!options.block_generation_workloads.empty()) {
+    return options.block_generation_workloads;
+  }
+  BlockGenerationWorkload workload;
+  workload.node = options.generate_node;
+  workload.count = options.generate_blocks;
+  workload.sync_timeout_sec = options.sync_timeout_sec;
+  return {workload};
+}
+
+uint64_t TotalBlockGenerationCount(
+    const std::vector<BlockGenerationWorkload>& workloads) {
+  uint64_t total = 0;
+  for (const BlockGenerationWorkload& workload : workloads) {
+    total += workload.count;
+  }
+  return total;
+}
+
+std::optional<uint32_t> CommonBlockGenerationNode(
+    const std::vector<BlockGenerationWorkload>& workloads) {
+  if (workloads.empty()) {
+    return std::nullopt;
+  }
+  const uint32_t node = workloads.front().node;
+  for (const BlockGenerationWorkload& workload : workloads) {
+    if (workload.node != node) {
+      return std::nullopt;
+    }
+  }
+  return node;
+}
+
+std::optional<uint32_t> CommonBlockGenerationSyncTimeout(
+    const std::vector<BlockGenerationWorkload>& workloads) {
+  if (workloads.empty()) {
+    return std::nullopt;
+  }
+  const uint32_t sync_timeout_sec = workloads.front().sync_timeout_sec;
+  for (const BlockGenerationWorkload& workload : workloads) {
+    if (workload.sync_timeout_sec != sync_timeout_sec) {
+      return std::nullopt;
+    }
+  }
+  return sync_timeout_sec;
+}
+
+std::string BlockGenerationWorkloadsYaml(
+    const std::vector<BlockGenerationWorkload>& workloads) {
+  std::string yaml = "workloads:\n";
+  for (const BlockGenerationWorkload& workload : workloads) {
+    yaml +=
+        "  - type: block_generation\n"
+        "    node: " +
+        std::to_string(workload.node) +
+        "\n"
+        "    count: " +
+        std::to_string(workload.count) +
+        "\n"
+        "    sync_timeout_sec: " +
+        std::to_string(workload.sync_timeout_sec) + "\n";
+  }
+  return yaml;
+}
+
+boost::json::object BlockGenerationWorkloadJson(
+    const BlockGenerationWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "block_generation";
+  object["node"] = workload.node;
+  object["count"] = workload.count;
+  object["sync_timeout_sec"] = workload.sync_timeout_sec;
+  return object;
+}
+
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root) {
+  const std::vector<BlockGenerationWorkload> workloads =
+      EffectiveBlockGenerationWorkloads(options);
   std::string network_yaml =
       "network:\n"
       "  isolated: " +
@@ -2401,31 +2497,37 @@ void WriteScenarioFiles(const Options& options,
                 "\n" +
                 runtime_resource_yaml + network_yaml +
                 process_yaml +
-                "workloads:\n"
-                "  - type: block_generation\n"
-                "    node: " +
-                std::to_string(options.generate_node) +
-                "\n"
-                "    count: " +
-                std::to_string(options.generate_blocks) +
-                "\n"
-                "    sync_timeout_sec: " +
-                std::to_string(options.sync_timeout_sec) + "\n");
+                BlockGenerationWorkloadsYaml(workloads));
 
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
   resolved["chain"] = "firo";
   resolved["nodes"] = options.nodes;
-  resolved["generate_blocks"] = options.generate_blocks;
-  resolved["generate_node"] = options.generate_node;
+  resolved["generate_blocks"] = TotalBlockGenerationCount(workloads);
+  if (const std::optional<uint32_t> generate_node =
+          CommonBlockGenerationNode(workloads)) {
+    resolved["generate_node"] = *generate_node;
+  } else {
+    resolved["generate_node"] = nullptr;
+  }
   resolved["firod"] = options.firod.string();
   if (!options.scenario_json.empty()) {
     resolved["scenario_json"] = options.scenario_json.string();
   }
   resolved["isolated_network"] = options.isolate_network;
-  resolved["sync_timeout_sec"] = options.sync_timeout_sec;
+  if (const std::optional<uint32_t> sync_timeout_sec =
+          CommonBlockGenerationSyncTimeout(workloads)) {
+    resolved["sync_timeout_sec"] = *sync_timeout_sec;
+  } else {
+    resolved["sync_timeout_sec"] = nullptr;
+  }
   resolved["metrics_sample_count"] = options.metrics_sample_count;
   resolved["metrics_interval_ms"] = options.metrics_interval_ms;
+  boost::json::array workload_array;
+  for (const BlockGenerationWorkload& workload : workloads) {
+    workload_array.push_back(BlockGenerationWorkloadJson(workload));
+  }
+  resolved["workloads"] = std::move(workload_array);
   boost::json::object resources;
   resources["memory_high_bytes"] = options.memory_high_bytes;
   resources["memory_max_bytes"] = options.memory_max_bytes;
@@ -3203,22 +3305,33 @@ int Run(int argc, char** argv) {
     ApplyRuntimeNodeFreezes(options, events_path, nodes);
     WritePeriodicMetrics(events_path, metrics_path, options, driver, nodes);
 
-    if (options.generate_blocks > 0) {
-      NodeRuntime& generator = nodes[options.generate_node - 1U];
+    const std::vector<BlockGenerationWorkload> block_generation_workloads =
+        EffectiveBlockGenerationWorkloads(options);
+    for (size_t workload_index = 0;
+         workload_index < block_generation_workloads.size();
+         ++workload_index) {
+      const BlockGenerationWorkload& workload =
+          block_generation_workloads[workload_index];
+      if (workload.count == 0U) {
+        continue;
+      }
+      NodeRuntime& generator = nodes[workload.node - 1U];
       const uint64_t start_height =
           driver.ReadMetrics(generator.config).height;
       std::vector<std::string> hashes = driver.GenerateBlocks(
-          generator.config, options.generate_blocks, kDefaultRewardAddress);
+          generator.config, workload.count, kDefaultRewardAddress);
       generator.generated_block_count += hashes.size();
       const uint64_t target_height =
           start_height + static_cast<uint64_t>(hashes.size());
       WriteEvent(events_path, options.run_id, generator.config.id,
                  "generated_blocks",
-                 GeneratedBlocksDetail(options.generate_node, start_height,
-                                       target_height, hashes));
+                 GeneratedBlocksDetail(
+                     static_cast<uint32_t>(workload_index + 1U),
+                     static_cast<uint32_t>(block_generation_workloads.size()),
+                     workload.node, start_height, target_height, hashes));
       for (auto& node : nodes) {
         driver.WaitForHeight(node.config, target_height,
-                             std::chrono::seconds(options.sync_timeout_sec));
+                             std::chrono::seconds(workload.sync_timeout_sec));
         WriteEvent(events_path, options.run_id, node.config.id,
                    "height_reached", std::to_string(target_height));
       }
