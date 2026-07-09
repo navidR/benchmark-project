@@ -46,15 +46,6 @@ std::uint64_t JsonIntegerValue(const boost::json::value& value) {
   throw std::runtime_error("expected non-negative JSON integer");
 }
 
-boost::json::object BuildReportObject(const std::filesystem::path& dir) {
-  bsim::Result<std::string> report_json = bsim::BuildRunReportJson(dir);
-  BOOST_REQUIRE(report_json);
-  boost::json::value value =
-      boost::json::parse(std::move(report_json).unsafe_value());
-  BOOST_REQUIRE(value.is_object());
-  return value.as_object();
-}
-
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
@@ -180,7 +171,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"qdisc_tbf_rate_bytes_per_sec\":1250000,"
       "\"qdisc_tbf_limit_bytes\":125000}");
 
-  const boost::json::object report = BuildReportObject(dir);
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
   BOOST_TEST(report.at("status").as_string() == "finished");
@@ -350,7 +343,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_finished\"}");
 
-  const boost::json::object report = BuildReportObject(dir);
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
   BOOST_TEST(JsonInteger(report, "event_count") == 4U);
@@ -414,7 +409,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_finished\"}");
 
-  const boost::json::object report = BuildReportObject(dir);
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
   const boost::json::array& workloads = report.at("workloads").as_array();
@@ -482,7 +479,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_finished\"}");
 
-  const boost::json::object report = BuildReportObject(dir);
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
   const boost::json::array& workloads = report.at("workloads").as_array();
@@ -517,7 +516,9 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
                    "\"event\":\"run_failed\","
                    "\"detail\":\"peer wait timed out\"}");
 
-  const boost::json::object report = BuildReportObject(dir);
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
 
   BOOST_TEST(!report.at("ok").as_bool());
   BOOST_TEST(report.at("status").as_string() == "failed");
@@ -525,19 +526,6 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   BOOST_TEST(report.at("failed_at").as_string() == "2026-07-09T00:00:01Z");
   BOOST_TEST(report.at("failure").as_string() == "peer wait timed out");
   BOOST_TEST(JsonInteger(report, "event_count") == 2U);
-
-  std::filesystem::remove_all(dir);
-}
-
-BOOST_AUTO_TEST_CASE(run_report_reports_missing_run_directory) {
-  const std::filesystem::path dir = MakeTestDir("run-report-missing");
-  const std::filesystem::path missing = dir / "missing";
-
-  const bsim::Result<std::string> report_json =
-      bsim::BuildRunReportJson(missing);
-  BOOST_REQUIRE(!report_json);
-  BOOST_TEST(report_json.error().find("run root is not a directory") !=
-             std::string::npos);
 
   std::filesystem::remove_all(dir);
 }

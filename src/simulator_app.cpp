@@ -4383,7 +4383,7 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
   if (!options.report_run.empty()) {
-    BSIM_LOG(info) << RequireResult(BuildRunReportJson(options.report_run));
+    BSIM_LOG(info) << BuildRunReportJson(options.report_run);
     return 0;
   }
   if (options.probe_capabilities) {

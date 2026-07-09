@@ -261,141 +261,135 @@ void AppendEventSummary(const boost::json::object& event,
 
 }  // namespace
 
-Result<std::string> BuildRunReportJson(const std::filesystem::path& run_root) {
-  try {
-    if (!std::filesystem::is_directory(run_root)) {
-      return Error<std::string>("run root is not a directory: " +
-                                run_root.string());
-    }
-
-    boost::json::object report;
-    report["run_root"] = std::filesystem::absolute(run_root).string();
-    LoadResolvedScenario(run_root / "resolved-scenario.json", &report);
-
-    std::uint64_t event_count = 0;
-    std::uint64_t metric_count = 0;
-    bool run_started = false;
-    bool run_finished = false;
-    bool run_failed = false;
-    std::string started_at;
-    std::string finished_at;
-    std::string failed_at;
-    boost::json::value failure_detail;
-    std::map<std::string, std::uint64_t> event_counts;
-    std::map<std::string, NodeReport> nodes;
-    boost::json::array generated_blocks;
-    boost::json::array height_reached;
-    boost::json::array height_waits;
-    boost::json::array peer_waits;
-    boost::json::array peer_connects;
-    boost::json::array peer_disconnects;
-    boost::json::array raw_transactions;
-    boost::json::array node_restarts;
-    boost::json::array node_freezes;
-    boost::json::array resource_updates;
-    boost::json::array network_partitions;
-    boost::json::array network_partition_heals;
-
-    ForEachJsonLine(
-        run_root / "events.jsonl", [&](const boost::json::object& event) {
-          ++event_count;
-          const std::string event_name = OptionalStringField(event, "event");
-          const std::string node_id = OptionalStringField(event, "node_id");
-          ++event_counts[event_name];
-          if (event_name == "run_started") {
-            run_started = true;
-            started_at = OptionalStringField(event, "timestamp");
-          } else if (event_name == "run_finished") {
-            run_finished = true;
-            finished_at = OptionalStringField(event, "timestamp");
-          } else if (event_name == "run_failed") {
-            run_failed = true;
-            failed_at = OptionalStringField(event, "timestamp");
-            failure_detail = ParseEventDetail(event);
-          } else if (event_name == "state" && !node_id.empty()) {
-            nodes[node_id].final_state = OptionalStringField(event, "detail");
-          } else if (const std::optional<std::string_view> kind =
-                         LogTailKind(event_name);
-                     kind && !node_id.empty()) {
-            nodes[node_id].log_tails[std::string(*kind)] =
-                ParseEventDetail(event);
-          } else if (event_name == "generated_blocks") {
-            AppendEventSummary(event, &generated_blocks);
-          } else if (event_name == "height_reached") {
-            AppendEventSummary(event, &height_reached);
-          } else if (event_name == "height_wait_reached") {
-            AppendEventSummary(event, &height_waits);
-          } else if (event_name == "peer_count_reached") {
-            AppendEventSummary(event, &peer_waits);
-          } else if (event_name == "peer_connected") {
-            AppendEventSummary(event, &peer_connects);
-          } else if (event_name == "peer_disconnected") {
-            AppendEventSummary(event, &peer_disconnects);
-          } else if (event_name == "raw_transaction_submitted") {
-            AppendEventSummary(event, &raw_transactions);
-          } else if (event_name == "node_restarted") {
-            AppendEventSummary(event, &node_restarts);
-          } else if (event_name == "node_freeze_completed") {
-            AppendEventSummary(event, &node_freezes);
-          } else if (event_name == "resource_limits_updated") {
-            AppendEventSummary(event, &resource_updates);
-          } else if (event_name == "network_partition_applied") {
-            AppendEventSummary(event, &network_partitions);
-          } else if (event_name == "network_partition_healed") {
-            AppendEventSummary(event, &network_partition_heals);
-          }
-        });
-
-    ForEachJsonLine(
-        run_root / "metrics.jsonl", [&](const boost::json::object& metric) {
-          ++metric_count;
-          const std::string node_id = OptionalStringField(metric, "node_id");
-          if (node_id.empty()) {
-            return;
-          }
-          NodeReport& node = nodes[node_id];
-          ++node.metric_samples;
-          node.last_metrics = {};
-          CopySelectedMetricFields(metric, &node.last_metrics);
-        });
-
-    const bool ok = run_started && run_finished && !run_failed;
-    report["ok"] = ok;
-    report["status"] = ok ? "finished" : (run_failed ? "failed" : "incomplete");
-    if (!started_at.empty()) {
-      report["started_at"] = started_at;
-    }
-    if (!finished_at.empty()) {
-      report["finished_at"] = finished_at;
-    }
-    if (!failed_at.empty()) {
-      report["failed_at"] = failed_at;
-    }
-    if (!failure_detail.is_null()) {
-      report["failure"] = std::move(failure_detail);
-    }
-    report["event_count"] = event_count;
-    report["metric_count"] = metric_count;
-    report["event_counts"] = EventCountsJson(event_counts);
-    report["generated_blocks"] = std::move(generated_blocks);
-    report["height_reached"] = std::move(height_reached);
-    report["height_waits"] = std::move(height_waits);
-    report["peer_waits"] = std::move(peer_waits);
-    report["peer_connects"] = std::move(peer_connects);
-    report["peer_disconnects"] = std::move(peer_disconnects);
-    report["raw_transactions"] = std::move(raw_transactions);
-    report["node_restarts"] = std::move(node_restarts);
-    report["node_freezes"] = std::move(node_freezes);
-    report["resource_updates"] = std::move(resource_updates);
-    report["network_partitions"] = std::move(network_partitions);
-    report["network_partition_heals"] = std::move(network_partition_heals);
-    report["nodes_summary"] = NodesJson(nodes);
-    return Ok(boost::json::serialize(report));
-  } catch (const std::exception& e) {
-    return Error<std::string>(e.what());
-  } catch (...) {
-    return Error<std::string>("unknown run report error");
+std::string BuildRunReportJson(const std::filesystem::path& run_root) {
+  if (!std::filesystem::is_directory(run_root)) {
+    throw std::runtime_error("run root is not a directory: " +
+                             run_root.string());
   }
+
+  boost::json::object report;
+  report["run_root"] = std::filesystem::absolute(run_root).string();
+  LoadResolvedScenario(run_root / "resolved-scenario.json", &report);
+
+  std::uint64_t event_count = 0;
+  std::uint64_t metric_count = 0;
+  bool run_started = false;
+  bool run_finished = false;
+  bool run_failed = false;
+  std::string started_at;
+  std::string finished_at;
+  std::string failed_at;
+  boost::json::value failure_detail;
+  std::map<std::string, std::uint64_t> event_counts;
+  std::map<std::string, NodeReport> nodes;
+  boost::json::array generated_blocks;
+  boost::json::array height_reached;
+  boost::json::array height_waits;
+  boost::json::array peer_waits;
+  boost::json::array peer_connects;
+  boost::json::array peer_disconnects;
+  boost::json::array raw_transactions;
+  boost::json::array node_restarts;
+  boost::json::array node_freezes;
+  boost::json::array resource_updates;
+  boost::json::array network_partitions;
+  boost::json::array network_partition_heals;
+
+  ForEachJsonLine(
+      run_root / "events.jsonl", [&](const boost::json::object& event) {
+        ++event_count;
+        const std::string event_name = OptionalStringField(event, "event");
+        const std::string node_id = OptionalStringField(event, "node_id");
+        ++event_counts[event_name];
+        if (event_name == "run_started") {
+          run_started = true;
+          started_at = OptionalStringField(event, "timestamp");
+        } else if (event_name == "run_finished") {
+          run_finished = true;
+          finished_at = OptionalStringField(event, "timestamp");
+        } else if (event_name == "run_failed") {
+          run_failed = true;
+          failed_at = OptionalStringField(event, "timestamp");
+          failure_detail = ParseEventDetail(event);
+        } else if (event_name == "state" && !node_id.empty()) {
+          nodes[node_id].final_state = OptionalStringField(event, "detail");
+        } else if (const std::optional<std::string_view> kind =
+                       LogTailKind(event_name);
+                   kind && !node_id.empty()) {
+          nodes[node_id].log_tails[std::string(*kind)] =
+              ParseEventDetail(event);
+        } else if (event_name == "generated_blocks") {
+          AppendEventSummary(event, &generated_blocks);
+        } else if (event_name == "height_reached") {
+          AppendEventSummary(event, &height_reached);
+        } else if (event_name == "height_wait_reached") {
+          AppendEventSummary(event, &height_waits);
+        } else if (event_name == "peer_count_reached") {
+          AppendEventSummary(event, &peer_waits);
+        } else if (event_name == "peer_connected") {
+          AppendEventSummary(event, &peer_connects);
+        } else if (event_name == "peer_disconnected") {
+          AppendEventSummary(event, &peer_disconnects);
+        } else if (event_name == "raw_transaction_submitted") {
+          AppendEventSummary(event, &raw_transactions);
+        } else if (event_name == "node_restarted") {
+          AppendEventSummary(event, &node_restarts);
+        } else if (event_name == "node_freeze_completed") {
+          AppendEventSummary(event, &node_freezes);
+        } else if (event_name == "resource_limits_updated") {
+          AppendEventSummary(event, &resource_updates);
+        } else if (event_name == "network_partition_applied") {
+          AppendEventSummary(event, &network_partitions);
+        } else if (event_name == "network_partition_healed") {
+          AppendEventSummary(event, &network_partition_heals);
+        }
+      });
+
+  ForEachJsonLine(
+      run_root / "metrics.jsonl", [&](const boost::json::object& metric) {
+        ++metric_count;
+        const std::string node_id = OptionalStringField(metric, "node_id");
+        if (node_id.empty()) {
+          return;
+        }
+        NodeReport& node = nodes[node_id];
+        ++node.metric_samples;
+        node.last_metrics = {};
+        CopySelectedMetricFields(metric, &node.last_metrics);
+      });
+
+  const bool ok = run_started && run_finished && !run_failed;
+  report["ok"] = ok;
+  report["status"] = ok ? "finished" : (run_failed ? "failed" : "incomplete");
+  if (!started_at.empty()) {
+    report["started_at"] = started_at;
+  }
+  if (!finished_at.empty()) {
+    report["finished_at"] = finished_at;
+  }
+  if (!failed_at.empty()) {
+    report["failed_at"] = failed_at;
+  }
+  if (!failure_detail.is_null()) {
+    report["failure"] = std::move(failure_detail);
+  }
+  report["event_count"] = event_count;
+  report["metric_count"] = metric_count;
+  report["event_counts"] = EventCountsJson(event_counts);
+  report["generated_blocks"] = std::move(generated_blocks);
+  report["height_reached"] = std::move(height_reached);
+  report["height_waits"] = std::move(height_waits);
+  report["peer_waits"] = std::move(peer_waits);
+  report["peer_connects"] = std::move(peer_connects);
+  report["peer_disconnects"] = std::move(peer_disconnects);
+  report["raw_transactions"] = std::move(raw_transactions);
+  report["node_restarts"] = std::move(node_restarts);
+  report["node_freezes"] = std::move(node_freezes);
+  report["resource_updates"] = std::move(resource_updates);
+  report["network_partitions"] = std::move(network_partitions);
+  report["network_partition_heals"] = std::move(network_partition_heals);
+  report["nodes_summary"] = NodesJson(nodes);
+  return boost::json::serialize(report);
 }
 
 }  // namespace bsim
