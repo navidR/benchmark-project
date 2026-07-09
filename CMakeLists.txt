@@ -135,7 +135,9 @@ add_executable(benchmark-sim
   src/process.cpp
   src/run_report.cpp
   src/simulation_registry.cpp
+  src/simulator_app.cpp
   src/util.cpp
+  src/yaml_helpers.cpp
 )
 
 target_include_directories(benchmark-sim PRIVATE include)
