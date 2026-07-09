@@ -419,6 +419,10 @@ Each run writes:
 - `runs/<run-id>/metrics.jsonl`
 - `runs/<run-id>/nodes/<node-id>/`
 
+For block-generation workloads, the `generated_blocks` event detail is JSON
+with the generator node, generated count, start and target height, reward
+address, and returned block hashes.
+
 Summarize an existing run:
 
 ```bash

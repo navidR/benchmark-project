@@ -2020,6 +2020,24 @@ void WriteNodeState(const std::filesystem::path& events_path,
   WriteEvent(events_path, run_id, node_id, "state", state);
 }
 
+std::string GeneratedBlocksDetail(uint32_t generator_node,
+                                  uint64_t start_height,
+                                  uint64_t target_height,
+                                  const std::vector<std::string>& hashes) {
+  boost::json::array hash_array;
+  for (const std::string& hash : hashes) {
+    hash_array.emplace_back(hash);
+  }
+  boost::json::object detail;
+  detail["generator_node"] = generator_node;
+  detail["count"] = static_cast<uint64_t>(hashes.size());
+  detail["start_height"] = start_height;
+  detail["target_height"] = target_height;
+  detail["reward_address"] = kDefaultRewardAddress;
+  detail["hashes"] = std::move(hash_array);
+  return boost::json::serialize(detail);
+}
+
 void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
                           const Options& options, const FiroDriver& driver,
                           std::vector<NodeRuntime>& nodes) {
@@ -3192,10 +3210,12 @@ int Run(int argc, char** argv) {
       std::vector<std::string> hashes = driver.GenerateBlocks(
           generator.config, options.generate_blocks, kDefaultRewardAddress);
       generator.generated_block_count += hashes.size();
-      WriteEvent(events_path, options.run_id, generator.config.id,
-                 "generated_blocks", std::to_string(hashes.size()));
       const uint64_t target_height =
           start_height + static_cast<uint64_t>(hashes.size());
+      WriteEvent(events_path, options.run_id, generator.config.id,
+                 "generated_blocks",
+                 GeneratedBlocksDetail(options.generate_node, start_height,
+                                       target_height, hashes));
       for (auto& node : nodes) {
         driver.WaitForHeight(node.config, target_height,
                              std::chrono::seconds(options.sync_timeout_sec));
