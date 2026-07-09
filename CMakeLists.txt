@@ -223,6 +223,23 @@ if(BUILD_TESTING)
     )
   endfunction()
 
+  function(add_cli_failure_test_with_option name option scenario regex)
+    add_test(NAME "${name}"
+      COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_COMMAND=$<TARGET_FILE:benchmark-sim>"
+        "-DSCENARIO_OPTION=${option}"
+        "-DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/${scenario}"
+        "-DREGEX=${regex}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_failure.cmake"
+    )
+  endfunction()
+
+  add_test(NAME benchmark-sim-valid-yaml-scenario
+    COMMAND benchmark-sim
+      --scenario-yaml
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-yaml-scenario.yaml"
+      --probe-capabilities
+  )
   add_cli_failure_test(
     benchmark-sim-invalid-wait-height-missing-height
     tests/scenarios/invalid-wait-height-missing-height.json
@@ -327,6 +344,18 @@ if(BUILD_TESTING)
     benchmark-sim-invalid-heal-partition-workload-overlap
     tests/scenarios/invalid-heal-partition-workload-overlap.json
     "partition groups must not contain the same node"
+  )
+  add_cli_failure_test_with_option(
+    benchmark-sim-invalid-yaml-root-sequence
+    "--scenario-yaml"
+    tests/scenarios/invalid-yaml-root-sequence.yaml
+    "--scenario-yaml root must be a YAML mapping"
+  )
+  add_cli_failure_test_with_option(
+    benchmark-sim-invalid-yaml-quoted-nodes
+    "--scenario-yaml"
+    tests/scenarios/invalid-yaml-quoted-nodes.yaml
+    "invalid uint32 JSON field: nodes"
   )
 endif()
 

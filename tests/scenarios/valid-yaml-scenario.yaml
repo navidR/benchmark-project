@@ -1,0 +1,33 @@
+firod: "/tmp/not-used-by-probe"
+output_dir: "runs"
+run_id: "yaml-scenario-smoke"
+nodes: 2
+isolated_network: true
+generate_blocks: 0
+generate_node: null
+ready_timeout_sec: 5
+sync_timeout_sec: null
+metrics_sample_count: 0
+metrics_interval_ms: 1000
+workloads:
+  - type: "wait_for_peers"
+    node: 1
+    peer_count: 1
+    timeout_sec: 5
+  - type: "partition_nodes"
+    group_a: [1]
+    group_b: [2]
+  - type: "heal_partition"
+    group_a: [1]
+    group_b: [2]
+resources:
+  memory_high_bytes: 1073741824
+  memory_max_bytes: 1610612736
+  cpu_quota_us: null
+  cpu_period_us: 100000
+  pids_max: 128
+network:
+  isolated: true
+  default_condition:
+    delay_ms: 1
+    limit_packets: 1000

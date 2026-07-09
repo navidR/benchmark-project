@@ -317,7 +317,8 @@ block generation:
   --metrics-interval-ms 1000
 ```
 
-The same run settings can be loaded from a JSON scenario file:
+The same run settings can be loaded from a JSON or YAML scenario file. Both
+formats use the same field names and validation rules.
 
 ```json
 {
@@ -441,6 +442,12 @@ Run it:
 
 ```bash
 ./build/benchmark-sim --scenario-json /path/to/scenario.json --replace-run
+```
+
+The equivalent YAML entry point is:
+
+```bash
+./build/benchmark-sim --scenario-yaml /path/to/scenario.yaml --replace-run
 ```
 
 Each run writes:

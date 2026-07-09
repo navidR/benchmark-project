@@ -6,6 +6,7 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/program_options.hpp>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -133,6 +134,7 @@ struct NetworkBlockRule {
 
 struct Options {
   std::filesystem::path scenario_json;
+  std::filesystem::path scenario_yaml;
   std::filesystem::path firod;
   std::filesystem::path output_dir = "runs";
   std::filesystem::path report_run;
@@ -241,6 +243,16 @@ uint32_t JsonOptionalUint32Field(const boost::json::object& object,
     return static_cast<uint32_t>(value->as_int64());
   }
   throw std::runtime_error("invalid uint32 JSON field: " + std::string(field));
+}
+
+uint32_t JsonOptionalNullableUint32Field(const boost::json::object& object,
+                                         const char* field,
+                                         uint32_t default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value != nullptr && value->is_null()) {
+    return default_value;
+  }
+  return JsonOptionalUint32Field(object, field, default_value);
 }
 
 uint64_t JsonOptionalUint64Field(const boost::json::object& object,
@@ -364,6 +376,247 @@ bool OptionProvided(const boost::program_options::variables_map& vm,
                     const char* name) {
   const auto iter = vm.find(name);
   return iter != vm.end() && !iter->second.defaulted();
+}
+
+class YamlEvent {
+ public:
+  YamlEvent() = default;
+  ~YamlEvent() {
+    if (active_) {
+      yaml_event_delete(&event_);
+    }
+  }
+
+  YamlEvent(const YamlEvent&) = delete;
+  YamlEvent& operator=(const YamlEvent&) = delete;
+
+  YamlEvent(YamlEvent&& other) noexcept
+      : event_(other.event_), active_(other.active_) {
+    other.active_ = false;
+  }
+
+  YamlEvent& operator=(YamlEvent&& other) noexcept {
+    if (this != &other) {
+      if (active_) {
+        yaml_event_delete(&event_);
+      }
+      event_ = other.event_;
+      active_ = other.active_;
+      other.active_ = false;
+    }
+    return *this;
+  }
+
+  yaml_event_t* Mutable() { return &event_; }
+  void Activate() { active_ = true; }
+  yaml_event_type_t Type() const { return event_.type; }
+  const yaml_event_t& Raw() const { return event_; }
+
+ private:
+  yaml_event_t event_{};
+  bool active_ = false;
+};
+
+class YamlParser {
+ public:
+  YamlParser(std::string input, std::string source)
+      : input_(std::move(input)), source_(std::move(source)) {
+    if (yaml_parser_initialize(&parser_) == 0) {
+      throw std::runtime_error("yaml parser initialization failed");
+    }
+    yaml_parser_set_input_string(
+        &parser_, reinterpret_cast<const unsigned char*>(input_.data()),
+        input_.size());
+  }
+
+  ~YamlParser() { yaml_parser_delete(&parser_); }
+
+  YamlParser(const YamlParser&) = delete;
+  YamlParser& operator=(const YamlParser&) = delete;
+
+  YamlEvent Next() {
+    YamlEvent event;
+    if (yaml_parser_parse(&parser_, event.Mutable()) == 0) {
+      throw std::runtime_error(ErrorMessage());
+    }
+    event.Activate();
+    return event;
+  }
+
+ private:
+  std::string ErrorMessage() const {
+    const char* problem = parser_.problem;
+    std::string message = "yaml parse failed";
+    if (!source_.empty()) {
+      message += " in " + source_;
+    }
+    if (problem != nullptr) {
+      message += ": ";
+      message += problem;
+    }
+    message += " at line " + std::to_string(parser_.problem_mark.line + 1U);
+    message += ", column " + std::to_string(parser_.problem_mark.column + 1U);
+    return message;
+  }
+
+  yaml_parser_t parser_{};
+  std::string input_;
+  std::string source_;
+};
+
+std::string YamlScalarText(const yaml_event_t& event) {
+  return std::string(reinterpret_cast<const char*>(event.data.scalar.value),
+                     event.data.scalar.length);
+}
+
+std::string LowerAscii(std::string_view text) {
+  std::string lower;
+  lower.reserve(text.size());
+  for (const char c : text) {
+    if (c >= 'A' && c <= 'Z') {
+      lower.push_back(static_cast<char>(c - 'A' + 'a'));
+    } else {
+      lower.push_back(c);
+    }
+  }
+  return lower;
+}
+
+bool IsDecimalInteger(std::string_view text) {
+  if (text.empty()) {
+    return false;
+  }
+  size_t offset = 0;
+  if (text.front() == '-') {
+    if (text.size() == 1U) {
+      return false;
+    }
+    offset = 1U;
+  }
+  for (size_t i = offset; i < text.size(); ++i) {
+    if (text[i] < '0' || text[i] > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+boost::json::value ParseYamlPlainScalar(std::string_view text) {
+  const std::string lower = LowerAscii(text);
+  if (text.empty() || text == "~" || lower == "null") {
+    return nullptr;
+  }
+  if (lower == "true") {
+    return true;
+  }
+  if (lower == "false") {
+    return false;
+  }
+  if (!IsDecimalInteger(text)) {
+    return boost::json::string(text);
+  }
+  if (text.front() == '-') {
+    int64_t value = 0;
+    const auto result =
+        std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec == std::errc() && result.ptr == text.data() + text.size()) {
+      return value;
+    }
+  } else {
+    uint64_t value = 0;
+    const auto result =
+        std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec == std::errc() && result.ptr == text.data() + text.size()) {
+      return value;
+    }
+  }
+  return boost::json::string(text);
+}
+
+boost::json::value ParseYamlValue(YamlParser* parser, YamlEvent event);
+
+boost::json::array ParseYamlSequence(YamlParser* parser) {
+  boost::json::array array;
+  while (true) {
+    YamlEvent event = parser->Next();
+    if (event.Type() == YAML_SEQUENCE_END_EVENT) {
+      break;
+    }
+    array.push_back(ParseYamlValue(parser, std::move(event)));
+  }
+  return array;
+}
+
+boost::json::object ParseYamlMapping(YamlParser* parser) {
+  boost::json::object object;
+  while (true) {
+    YamlEvent key_event = parser->Next();
+    if (key_event.Type() == YAML_MAPPING_END_EVENT) {
+      break;
+    }
+    if (key_event.Type() != YAML_SCALAR_EVENT) {
+      throw std::runtime_error("YAML mapping keys must be scalars");
+    }
+    const std::string key = YamlScalarText(key_event.Raw());
+    if (object.if_contains(key) != nullptr) {
+      throw std::runtime_error("duplicate YAML mapping key: " + key);
+    }
+    object[key] = ParseYamlValue(parser, parser->Next());
+  }
+  return object;
+}
+
+boost::json::value ParseYamlValue(YamlParser* parser, YamlEvent event) {
+  if (event.Type() == YAML_SCALAR_EVENT) {
+    const std::string text = YamlScalarText(event.Raw());
+    if (event.Raw().data.scalar.style != YAML_PLAIN_SCALAR_STYLE) {
+      return boost::json::string(text);
+    }
+    return ParseYamlPlainScalar(text);
+  }
+  if (event.Type() == YAML_SEQUENCE_START_EVENT) {
+    return ParseYamlSequence(parser);
+  }
+  if (event.Type() == YAML_MAPPING_START_EVENT) {
+    return ParseYamlMapping(parser);
+  }
+  if (event.Type() == YAML_ALIAS_EVENT) {
+    throw std::runtime_error("YAML aliases are not supported");
+  }
+  throw std::runtime_error("unexpected YAML event while parsing scenario");
+}
+
+void RequireYamlEvent(const YamlEvent& event, yaml_event_type_t expected,
+                      std::string_view message) {
+  if (event.Type() != expected) {
+    throw std::runtime_error(std::string(message));
+  }
+}
+
+boost::json::value ParseYamlDocument(std::string input,
+                                     const std::filesystem::path& source) {
+  YamlParser parser(std::move(input), source.string());
+  RequireYamlEvent(parser.Next(), YAML_STREAM_START_EVENT,
+                   "YAML stream did not start");
+  YamlEvent document_start = parser.Next();
+  if (document_start.Type() == YAML_STREAM_END_EVENT) {
+    return nullptr;
+  }
+  RequireYamlEvent(document_start, YAML_DOCUMENT_START_EVENT,
+                   "YAML document did not start");
+
+  boost::json::value root;
+  YamlEvent root_event = parser.Next();
+  if (root_event.Type() == YAML_DOCUMENT_END_EVENT) {
+    root = nullptr;
+  } else {
+    root = ParseYamlValue(&parser, std::move(root_event));
+    RequireYamlEvent(parser.Next(), YAML_DOCUMENT_END_EVENT,
+                     "YAML document did not end");
+  }
+  RequireYamlEvent(parser.Next(), YAML_STREAM_END_EVENT,
+                   "YAML scenario must contain exactly one document");
+  return root;
 }
 
 NetworkCondition ParseNetworkConditionObject(
@@ -747,15 +1000,15 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         scenario, "generate_blocks", options.generate_blocks);
   }
   if (!OptionProvided(vm, "generate-node")) {
-    options.generate_node = JsonOptionalUint32Field(scenario, "generate_node",
-                                                    options.generate_node);
+    options.generate_node = JsonOptionalNullableUint32Field(
+        scenario, "generate_node", options.generate_node);
   }
   if (!OptionProvided(vm, "ready-timeout-sec")) {
     options.ready_timeout_sec = JsonOptionalUint32Field(
         scenario, "ready_timeout_sec", options.ready_timeout_sec);
   }
   if (!OptionProvided(vm, "sync-timeout-sec")) {
-    options.sync_timeout_sec = JsonOptionalUint32Field(
+    options.sync_timeout_sec = JsonOptionalNullableUint32Field(
         scenario, "sync_timeout_sec", options.sync_timeout_sec);
   }
   if (!OptionProvided(vm, "metrics-sample-count")) {
@@ -1186,6 +1439,8 @@ Options ParseOptions(int argc, char** argv) {
   desc.add_options()("help", "show this help")(
       "scenario-json", po::value<std::filesystem::path>(&options.scenario_json),
       "Boost.JSON scenario file for the Firo MVP")(
+      "scenario-yaml", po::value<std::filesystem::path>(&options.scenario_yaml),
+      "libyaml scenario file for the Firo MVP")(
       "firod", po::value<std::filesystem::path>(&options.firod),
       "explicit firod binary")(
       "output-dir", po::value<std::filesystem::path>(&options.output_dir),
@@ -1348,11 +1603,23 @@ Options ParseOptions(int argc, char** argv) {
     std::cout << "Usage: " << argv[0] << " [options]\n" << desc << "\n";
     std::exit(0);
   }
+  if (vm.count("scenario-json") != 0U && vm.count("scenario-yaml") != 0U) {
+    throw std::runtime_error(
+        "--scenario-json and --scenario-yaml are mutually exclusive");
+  }
   if (vm.count("scenario-json") != 0U) {
     const boost::json::value scenario =
         boost::json::parse(ReadText(options.scenario_json));
     if (!scenario.is_object()) {
       throw std::runtime_error("--scenario-json root must be a JSON object");
+    }
+    ApplyScenarioJson(scenario.as_object(), vm, options);
+  }
+  if (vm.count("scenario-yaml") != 0U) {
+    const boost::json::value scenario = ParseYamlDocument(
+        ReadText(options.scenario_yaml), options.scenario_yaml);
+    if (!scenario.is_object()) {
+      throw std::runtime_error("--scenario-yaml root must be a YAML mapping");
     }
     ApplyScenarioJson(scenario.as_object(), vm, options);
   }
@@ -2684,6 +2951,9 @@ void WriteScenarioFiles(const Options& options,
   resolved["firod"] = options.firod.string();
   if (!options.scenario_json.empty()) {
     resolved["scenario_json"] = options.scenario_json.string();
+  }
+  if (!options.scenario_yaml.empty()) {
+    resolved["scenario_yaml"] = options.scenario_yaml.string();
   }
   resolved["isolated_network"] = options.isolate_network;
   if (const std::optional<uint32_t> sync_timeout_sec =

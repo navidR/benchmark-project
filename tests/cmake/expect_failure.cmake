@@ -7,9 +7,12 @@ endif()
 if(NOT DEFINED REGEX)
   message(FATAL_ERROR "REGEX is required")
 endif()
+if(NOT DEFINED SCENARIO_OPTION)
+  set(SCENARIO_OPTION "--scenario-json")
+endif()
 
 execute_process(
-  COMMAND "${TEST_COMMAND}" --scenario-json "${SCENARIO}"
+  COMMAND "${TEST_COMMAND}" "${SCENARIO_OPTION}" "${SCENARIO}"
   RESULT_VARIABLE result
   OUTPUT_VARIABLE output
   ERROR_VARIABLE error
