@@ -1,0 +1,12 @@
+{
+  "run_id": "invalid-wait-peers-timeout",
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "wait_for_peers",
+      "node": 1,
+      "peer_count": 1,
+      "timeout_sec": 0
+    }
+  ]
+}

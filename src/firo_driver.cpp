@@ -138,6 +138,31 @@ void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
                            (last_error.empty() ? "" : ": " + last_error));
 }
 
+void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
+                                  uint64_t peer_count,
+                                  std::chrono::seconds timeout) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  uint64_t last_peer_count = 0;
+  std::string last_error;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      FiroMetrics metrics = ReadMetrics(config);
+      last_peer_count = metrics.peer_count;
+      if (metrics.peer_count >= peer_count) {
+        return;
+      }
+    } catch (const std::exception& e) {
+      last_error = e.what();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  throw std::runtime_error("Firo node " + config.id + " reached peer count " +
+                           std::to_string(last_peer_count) +
+                           " before timeout; target peer count " +
+                           std::to_string(peer_count) +
+                           (last_error.empty() ? "" : ": " + last_error));
+}
+
 FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
   const auto start = std::chrono::steady_clock::now();
   const boost::json::value blockchain =

@@ -1,0 +1,15 @@
+{
+  "run_id": "invalid-wait-peers-plural-nodes",
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "wait_for_peers",
+      "nodes": [
+        1,
+        2
+      ],
+      "peer_count": 1,
+      "timeout_sec": 30
+    }
+  ]
+}

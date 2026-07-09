@@ -235,6 +235,31 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-wait-height-plural-nodes.json
     "current Firo MVP wait_until_height workload uses node, not nodes"
   )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-peers-missing-peer-count
+    tests/scenarios/invalid-wait-peers-missing-peer-count.json
+    "missing or invalid uint64 JSON field: peer_count"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-peers-node
+    tests/scenarios/invalid-wait-peers-node.json
+    "scenario wait_for_peers workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-peers-timeout
+    tests/scenarios/invalid-wait-peers-timeout.json
+    "scenario wait_for_peers timeout_sec must be greater than zero"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-peers-zero-count
+    tests/scenarios/invalid-wait-peers-zero-count.json
+    "scenario wait_for_peers peer_count must be greater than zero"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-wait-peers-plural-nodes
+    tests/scenarios/invalid-wait-peers-plural-nodes.json
+    "current Firo MVP wait_for_peers workload uses node, not nodes"
+  )
 endif()
 
 install(TARGETS benchmark-sim RUNTIME DESTINATION bin)

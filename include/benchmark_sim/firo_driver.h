@@ -57,6 +57,8 @@ class FiroDriver {
                  std::chrono::seconds timeout) const;
   void WaitForHeight(const FiroNodeConfig& config, uint64_t height,
                      std::chrono::seconds timeout) const;
+  void WaitForPeerCount(const FiroNodeConfig& config, uint64_t peer_count,
+                        std::chrono::seconds timeout) const;
   FiroMetrics ReadMetrics(const FiroNodeConfig& config) const;
   std::vector<std::string> GenerateBlocks(const FiroNodeConfig& config,
                                           uint32_t count,

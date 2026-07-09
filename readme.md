@@ -326,6 +326,12 @@ The same run settings can be loaded from a JSON scenario file:
   "metrics_interval_ms": 1000,
   "workloads": [
     {
+      "type": "wait_for_peers",
+      "node": 2,
+      "peer_count": 1,
+      "timeout_sec": 45
+    },
+    {
       "type": "block_generation",
       "node": 2,
       "count": 1,
@@ -439,6 +445,8 @@ hashes. Per-node block sync confirmations are exposed in reports as
 are present in `events.jsonl`.
 `wait_until_height` workloads wait for one Firo node to reach a target height
 and emit a structured `height_wait_reached` event.
+`wait_for_peers` workloads wait for one Firo node to report at least the target
+peer count and emit a structured `peer_count_reached` event.
 An explicit empty scenario workload list, `"workloads": []`, disables block
 generation for that run.
 

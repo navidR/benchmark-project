@@ -192,19 +192,27 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
     text += "#" + std::to_string(index) + " ";
     const std::string type = JsonString(workload, "type", "-");
     if (type == "block_generation") {
-      text += "gen node ";
+      text += "gen n";
       text += JsonMetricText(workload, "node");
       text += " x";
       text += JsonMetricText(workload, "count");
-      text += " sync ";
+      text += " ";
       text += JsonMetricText(workload, "sync_timeout_sec");
       text += "s";
     } else if (type == "wait_until_height") {
-      text += "wait node ";
+      text += "height n";
       text += JsonMetricText(workload, "node");
-      text += " height ";
+      text += ">=";
       text += JsonMetricText(workload, "height");
-      text += " timeout ";
+      text += " ";
+      text += JsonMetricText(workload, "timeout_sec");
+      text += "s";
+    } else if (type == "wait_for_peers") {
+      text += "peers n";
+      text += JsonMetricText(workload, "node");
+      text += ">=";
+      text += JsonMetricText(workload, "peer_count");
+      text += " ";
       text += JsonMetricText(workload, "timeout_sec");
       text += "s";
     } else {

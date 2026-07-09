@@ -71,15 +71,23 @@ struct WaitUntilHeightWorkload {
   uint32_t timeout_sec = 30;
 };
 
+struct WaitForPeersWorkload {
+  uint32_t node = 1;
+  uint64_t peer_count = 0;
+  uint32_t timeout_sec = 30;
+};
+
 enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
+  kWaitForPeers,
 };
 
 struct ScenarioWorkload {
   WorkloadKind kind = WorkloadKind::kBlockGeneration;
   BlockGenerationWorkload block_generation;
   WaitUntilHeightWorkload wait_until_height;
+  WaitForPeersWorkload wait_for_peers;
 };
 
 struct NetworkBlockRule {
@@ -606,6 +614,23 @@ void ApplyScenarioWorkloads(
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kWaitUntilHeight;
       scenario_workload.wait_until_height = wait;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "wait_for_peers") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP wait_for_peers workload uses node, not nodes");
+      }
+      WaitForPeersWorkload wait;
+      wait.node = JsonOptionalUint32Field(workload, "node", wait.node);
+      wait.peer_count = JsonUint64Field(workload, "peer_count");
+      wait.timeout_sec =
+          OptionProvided(vm, "sync-timeout-sec")
+              ? options.sync_timeout_sec
+              : JsonOptionalUint32Field(workload, "timeout_sec",
+                                        options.sync_timeout_sec);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kWaitForPeers;
+      scenario_workload.wait_for_peers = wait;
       options.workloads.push_back(scenario_workload);
     } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
@@ -1323,6 +1348,20 @@ Options ParseOptions(int argc, char** argv) {
       if (workload.wait_until_height.timeout_sec == 0U) {
         throw std::runtime_error(
             "scenario wait_until_height timeout_sec must be greater than zero");
+      }
+    } else if (workload.kind == WorkloadKind::kWaitForPeers) {
+      if (workload.wait_for_peers.node == 0U ||
+          workload.wait_for_peers.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario wait_for_peers workload node must be in 1..--nodes");
+      }
+      if (workload.wait_for_peers.peer_count == 0U) {
+        throw std::runtime_error(
+            "scenario wait_for_peers peer_count must be greater than zero");
+      }
+      if (workload.wait_for_peers.timeout_sec == 0U) {
+        throw std::runtime_error(
+            "scenario wait_for_peers timeout_sec must be greater than zero");
       }
     }
   }
@@ -2136,6 +2175,19 @@ std::string HeightWaitDetail(uint32_t workload_index, uint32_t workload_count,
   return boost::json::serialize(detail);
 }
 
+std::string PeerCountWaitDetail(uint32_t workload_index,
+                                uint32_t workload_count, uint32_t node,
+                                uint64_t target_peer_count,
+                                uint64_t observed_peer_count) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = node;
+  detail["target_peer_count"] = target_peer_count;
+  detail["observed_peer_count"] = observed_peer_count;
+  return boost::json::serialize(detail);
+}
+
 void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
                           const Options& options, const FiroDriver& driver,
                           std::vector<NodeRuntime>& nodes) {
@@ -2331,6 +2383,17 @@ std::string WorkloadsYaml(const std::vector<ScenarioWorkload>& workloads) {
           "\n"
           "    timeout_sec: " +
           std::to_string(workload.wait_until_height.timeout_sec) + "\n";
+    } else if (workload.kind == WorkloadKind::kWaitForPeers) {
+      yaml +=
+          "  - type: wait_for_peers\n"
+          "    node: " +
+          std::to_string(workload.wait_for_peers.node) +
+          "\n"
+          "    peer_count: " +
+          std::to_string(workload.wait_for_peers.peer_count) +
+          "\n"
+          "    timeout_sec: " +
+          std::to_string(workload.wait_for_peers.timeout_sec) + "\n";
     }
   }
   return yaml;
@@ -2356,11 +2419,24 @@ boost::json::object WaitUntilHeightWorkloadJson(
   return object;
 }
 
+boost::json::object WaitForPeersWorkloadJson(
+    const WaitForPeersWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "wait_for_peers";
+  object["node"] = workload.node;
+  object["peer_count"] = workload.peer_count;
+  object["timeout_sec"] = workload.timeout_sec;
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
   }
-  return WaitUntilHeightWorkloadJson(workload.wait_until_height);
+  if (workload.kind == WorkloadKind::kWaitUntilHeight) {
+    return WaitUntilHeightWorkloadJson(workload.wait_until_height);
+  }
+  return WaitForPeersWorkloadJson(workload.wait_for_peers);
 }
 
 void WriteScenarioFiles(const Options& options,
@@ -3470,6 +3546,20 @@ int Run(int argc, char** argv) {
                                     static_cast<uint32_t>(workloads.size()),
                                     workload.node, workload.height,
                                     observed_height));
+      } else if (scenario_workload.kind == WorkloadKind::kWaitForPeers) {
+        const WaitForPeersWorkload& workload =
+            scenario_workload.wait_for_peers;
+        NodeRuntime& node = nodes[workload.node - 1U];
+        driver.WaitForPeerCount(node.config, workload.peer_count,
+                                std::chrono::seconds(workload.timeout_sec));
+        const uint64_t observed_peer_count =
+            driver.ReadMetrics(node.config).peer_count;
+        WriteEvent(events_path, options.run_id, node.config.id,
+                   "peer_count_reached",
+                   PeerCountWaitDetail(
+                       static_cast<uint32_t>(workload_index + 1U),
+                       static_cast<uint32_t>(workloads.size()), workload.node,
+                       workload.peer_count, observed_peer_count));
       }
     }
 
