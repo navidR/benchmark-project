@@ -1,7 +1,6 @@
 #include <boost/program_options.hpp>
 #include <cstdint>
 #include <filesystem>
-#include <iostream>
 #include <stdexcept>
 
 #include "benchmark_sim/logging.h"
@@ -31,8 +30,8 @@ Options ParseOptions(int argc, char** argv) {
   po::notify(vm);
 
   if (vm.count("help") != 0U) {
-    std::cout << "Usage: " << argv[0] << " --run <run-dir> [options]\n"
-              << desc << "\n";
+    BSIM_LOG(info) << "Usage: " << argv[0] << " --run <run-dir> [options]\n"
+                   << desc;
     std::exit(0);
   }
   if (options.run_root.empty()) {

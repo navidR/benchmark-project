@@ -11,7 +11,6 @@
 #include <charconv>
 #include <chrono>
 #include <filesystem>
-#include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1828,7 +1827,7 @@ Options ParseOptions(int argc, char** argv) {
   po::notify(vm);
 
   if (vm.count("help") != 0U) {
-    std::cout << "Usage: " << argv[0] << " [options]\n" << desc << "\n";
+    BSIM_LOG(info) << "Usage: " << argv[0] << " [options]\n" << desc;
     std::exit(0);
   }
   if (vm.count("scenario-json") != 0U && vm.count("scenario-yaml") != 0U) {
@@ -3615,9 +3614,9 @@ void CleanupRun(Options options) {
   }
   Cgroup::RemoveRun(options.run_id);
 
-  std::cout << "cleanup_run=" << options.run_id << "\n"
-            << "nodes=" << options.nodes << "\n"
-            << "run_dir=" << run_root << "\n";
+  BSIM_LOG(info) << "cleanup_run=" << options.run_id << "\n"
+                 << "nodes=" << options.nodes << "\n"
+                 << "run_dir=" << run_root;
 }
 
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
@@ -4379,74 +4378,74 @@ int SimulatorApp::Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);
   RequireSafeOutputDirectory(options.output_dir);
   if (options.probe_network) {
-    std::cout << NetworkProbeJson() << "\n";
+    BSIM_LOG(info) << NetworkProbeJson();
     return 0;
   }
   if (!options.report_run.empty()) {
-    std::cout << BuildRunReportJson(options.report_run) << "\n";
+    BSIM_LOG(info) << BuildRunReportJson(options.report_run);
     return 0;
   }
   if (options.probe_capabilities) {
-    std::cout << CapabilityProbeJson() << "\n";
+    BSIM_LOG(info) << CapabilityProbeJson();
     return 0;
   }
   if (options.probe_cgroup_freeze) {
-    std::cout << CgroupFreezeProbeJson() << "\n";
+    BSIM_LOG(info) << CgroupFreezeProbeJson();
     return 0;
   }
   if (options.probe_drop_filter) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << DropFilterProbeJson() << "\n";
+    BSIM_LOG(info) << DropFilterProbeJson();
     return 0;
   }
   if (options.probe_netns) {
     RequireStatus(RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN"));
-    std::cout << NetworkNamespaceProbeJson() << "\n";
+    BSIM_LOG(info) << NetworkNamespaceProbeJson();
     return 0;
   }
   if (options.probe_veth) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << VethProbeJson() << "\n";
+    BSIM_LOG(info) << VethProbeJson();
     return 0;
   }
   if (options.probe_bandwidth_limit) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << BandwidthLimitProbeJson() << "\n";
+    BSIM_LOG(info) << BandwidthLimitProbeJson();
     return 0;
   }
   if (options.probe_network_condition) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << NetworkConditionProbeJson() << "\n";
+    BSIM_LOG(info) << NetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_combined_network_condition) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << CombinedNetworkConditionProbeJson() << "\n";
+    BSIM_LOG(info) << CombinedNetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_network_condition_update) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << NetworkConditionUpdateProbeJson() << "\n";
+    BSIM_LOG(info) << NetworkConditionUpdateProbeJson();
     return 0;
   }
   if (options.probe_address) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << AddressProbeJson() << "\n";
+    BSIM_LOG(info) << AddressProbeJson();
     return 0;
   }
   if (options.probe_route) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << RouteProbeJson() << "\n";
+    BSIM_LOG(info) << RouteProbeJson();
     return 0;
   }
   if (options.probe_qdisc) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << QdiscProbeJson() << "\n";
+    BSIM_LOG(info) << QdiscProbeJson();
     return 0;
   }
   if (options.probe_qdisc_mutation) {
     RequireStatus(RequireNetworkSetupCapabilities());
-    std::cout << QdiscMutationProbeJson() << "\n";
+    BSIM_LOG(info) << QdiscMutationProbeJson();
     return 0;
   }
   if (options.cleanup_run) {
@@ -4454,7 +4453,6 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
 
-  BSIM_LOG(info) << "starting run " << options.run_id;
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
   if (std::filesystem::exists(run_root)) {
@@ -4473,6 +4471,8 @@ int SimulatorApp::Run(int argc, char** argv) {
     Cgroup::RemoveRun(options.run_id);
   }
   EnsureDirectory(run_root);
+  AttachRunLogFile(run_root);
+  BSIM_LOG(info) << "starting run " << options.run_id;
   WriteText(run_root / kRunMarkerFile, "benchmark-sim run\n");
   EnsureDirectory(run_root / "nodes");
   Result<SimulationRegistry> simulation_registry_result =
@@ -4654,10 +4654,10 @@ int SimulatorApp::Run(int argc, char** argv) {
     throw;
   }
 
-  std::cout << "run_id=" << options.run_id << "\n"
-            << "output_dir=" << run_root << "\n"
-            << "metrics=" << metrics_path << "\n"
-            << "events=" << events_path << "\n";
+  BSIM_LOG(info) << "run_id=" << options.run_id << "\n"
+                 << "output_dir=" << run_root << "\n"
+                 << "metrics=" << metrics_path << "\n"
+                 << "events=" << events_path;
   return 0;
 }
 

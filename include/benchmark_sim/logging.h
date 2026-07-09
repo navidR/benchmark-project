@@ -1,10 +1,12 @@
 #pragma once
 
 #include <boost/log/trivial.hpp>
+#include <filesystem>
 
 namespace bsim {
 
 void InitLogging();
+void AttachRunLogFile(const std::filesystem::path& run_root);
 
 }  // namespace bsim
 

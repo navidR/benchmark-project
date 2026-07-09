@@ -17,7 +17,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
+#include "benchmark_sim/log_view.h"
 #include "benchmark_sim/run_report.h"
 
 namespace bsim {
@@ -27,6 +29,8 @@ constexpr int kColorTitle = 1;
 constexpr int kColorOk = 2;
 constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
+constexpr int kMinLogPaneRows = 5;
+constexpr int kMaxLogPaneRows = 10;
 
 class CursesSession {
  public:
@@ -311,6 +315,40 @@ void DrawHorizontalLine(int y) {
   }
 }
 
+int LogPaneRows(int rows) {
+  if (rows < 20) {
+    return 0;
+  }
+  return std::clamp(rows / 4, kMinLogPaneRows, kMaxLogPaneRows);
+}
+
+void DrawLogPane(int top, int rows, int cols,
+                 const std::vector<std::string>& log_lines) {
+  if (top <= 0 || cols <= 0 || rows - top < 4) {
+    return;
+  }
+  DrawHorizontalLine(top);
+  AddText(top + 1, 0, cols, "Logs", A_BOLD);
+  const int first_line = top + 2;
+  const int last_line = rows - 3;
+  const int capacity = last_line - first_line + 1;
+  if (capacity <= 0) {
+    return;
+  }
+  if (log_lines.empty()) {
+    AddText(first_line, 0, cols, "No log output.", COLOR_PAIR(kColorMuted));
+    return;
+  }
+  const std::size_t line_count = static_cast<std::size_t>(capacity);
+  const std::size_t first_log =
+      log_lines.size() > line_count ? log_lines.size() - line_count : 0U;
+  int y = first_line;
+  for (std::size_t i = first_log; i < log_lines.size() && y <= last_line; ++i) {
+    AddText(y, 0, cols, log_lines[i]);
+    ++y;
+  }
+}
+
 boost::json::object LoadReport(const std::filesystem::path& run_root,
                                std::string* error) {
   try {
@@ -328,11 +366,15 @@ boost::json::object LoadReport(const std::filesystem::path& run_root,
 }
 
 void DrawSummary(const std::filesystem::path& run_root,
-                 const boost::json::object& report, std::string_view error) {
+                 const boost::json::object& report, std::string_view error,
+                 const std::vector<std::string>& log_lines) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
   erase();
+  const int log_rows = LogPaneRows(rows);
+  const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
+  const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
 
   AddText(0, 0, cols, "Benchmark Project TUI",
           COLOR_PAIR(kColorTitle) | A_BOLD);
@@ -342,6 +384,12 @@ void DrawSummary(const std::filesystem::path& run_root,
     AddText(3, 0, cols, "run: " + run_root.string(), A_BOLD);
     AddText(5, 0, cols, "error: " + std::string(error),
             COLOR_PAIR(kColorWarning) | A_BOLD);
+    if (log_rows != 0) {
+      DrawLogPane(log_top, rows, cols, log_lines);
+    }
+    DrawHorizontalLine(rows - 2);
+    AddText(rows - 1, 0, cols, "Read-only run report. q or Esc exits.",
+            COLOR_PAIR(kColorMuted));
     refresh();
     return;
   }
@@ -384,13 +432,19 @@ void DrawSummary(const std::filesystem::path& run_root,
   if (nodes_value == nullptr || !nodes_value->is_array()) {
     AddText(13, 0, cols, "No node summaries in report.",
             COLOR_PAIR(kColorMuted));
+    if (log_rows != 0) {
+      DrawLogPane(log_top, rows, cols, log_lines);
+    }
+    DrawHorizontalLine(rows - 2);
+    AddText(rows - 1, 0, cols, "Read-only run report. q or Esc exits.",
+            COLOR_PAIR(kColorMuted));
     refresh();
     return;
   }
 
   int y = 13;
   for (const boost::json::value& node_value : nodes_value->as_array()) {
-    if (y >= rows - 2) {
+    if (y >= content_bottom) {
       break;
     }
     if (!node_value.is_object()) {
@@ -420,6 +474,9 @@ void DrawSummary(const std::filesystem::path& run_root,
     ++y;
   }
 
+  if (log_rows != 0) {
+    DrawLogPane(log_top, rows, cols, log_lines);
+  }
   DrawHorizontalLine(rows - 2);
   AddText(rows - 1, 0, cols, "Read-only run report. q or Esc exits.",
           COLOR_PAIR(kColorMuted));
@@ -438,7 +495,9 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
   while (true) {
     std::string error;
     const boost::json::object report = LoadReport(run_root, &error);
-    DrawSummary(run_root, report, error);
+    const std::vector<std::string> log_lines =
+        ReadRecentLogLines(RunLogPath(run_root), 256U);
+    DrawSummary(run_root, report, error, log_lines);
     if (once) {
       return error.empty() ? 0 : 1;
     }

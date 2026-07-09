@@ -129,6 +129,7 @@ add_executable(benchmark-sim
   src/drivers/firo_driver.cpp
   src/http_client.cpp
   src/log_tail.cpp
+  src/log_view.cpp
   src/logging.cpp
   src/main.cpp
   src/network.cpp
@@ -161,6 +162,7 @@ target_compile_options(benchmark-sim PRIVATE
 )
 
 add_executable(benchmark-tui
+  src/log_view.cpp
   src/logging.cpp
   src/run_report.cpp
   src/tui.cpp
