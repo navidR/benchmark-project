@@ -457,6 +457,9 @@ View an existing or active run in the read-only TUI:
 ./build/benchmark-tui --run runs/<run-id>
 ```
 
+The TUI shows run status, lifecycle timestamps, workload summary, node chain
+state, resource metrics, network counters, and qdisc state.
+
 Render one TUI frame and exit, useful for validation:
 
 ```bash

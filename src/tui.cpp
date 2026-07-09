@@ -214,6 +214,19 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
   return text;
 }
 
+std::string LifecycleSummaryText(const boost::json::object& report) {
+  std::string text = "started: ";
+  text += JsonString(report, "started_at", "-");
+  text += " finished: ";
+  const std::string finished_at = JsonString(report, "finished_at", "");
+  if (!finished_at.empty()) {
+    text += finished_at;
+  } else {
+    text += JsonString(report, "failed_at", "-");
+  }
+  return text;
+}
+
 void AddText(int y, int x, int width, std::string_view text, int attributes) {
   if (width <= 0 || y < 0 || x < 0) {
     return;
@@ -307,30 +320,31 @@ void DrawSummary(const std::filesystem::path& run_root,
           "generate node: " + JsonIntegerText(report, "generate_node"));
   AddText(7, cols / 2, cols - (cols / 2),
           "generate blocks: " + JsonIntegerText(report, "generate_blocks"));
-  AddText(8, 0, cols, WorkloadsSummaryText(report));
+  AddText(8, 0, cols, LifecycleSummaryText(report));
+  AddText(9, 0, cols, WorkloadsSummaryText(report));
 
-  DrawHorizontalLine(9);
-  AddText(10, 0, 10, "Node", A_BOLD);
-  AddText(10, 10, 10, "State", A_BOLD);
-  AddText(10, 20, 7, "Height", A_BOLD);
-  AddText(10, 27, 6, "Peers", A_BOLD);
-  AddText(10, 33, 7, "Blocks", A_BOLD);
-  AddText(10, 40, 7, "Pool", A_BOLD);
-  AddText(10, 47, 9, "Mem", A_BOLD);
-  AddText(10, 56, 9, "CPUms", A_BOLD);
-  AddText(10, 65, 8, "RX", A_BOLD);
-  AddText(10, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
-  DrawHorizontalLine(11);
+  DrawHorizontalLine(10);
+  AddText(11, 0, 10, "Node", A_BOLD);
+  AddText(11, 10, 10, "State", A_BOLD);
+  AddText(11, 20, 7, "Height", A_BOLD);
+  AddText(11, 27, 6, "Peers", A_BOLD);
+  AddText(11, 33, 7, "Blocks", A_BOLD);
+  AddText(11, 40, 7, "Pool", A_BOLD);
+  AddText(11, 47, 9, "Mem", A_BOLD);
+  AddText(11, 56, 9, "CPUms", A_BOLD);
+  AddText(11, 65, 8, "RX", A_BOLD);
+  AddText(11, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
+  DrawHorizontalLine(12);
 
   const boost::json::value* nodes_value = report.if_contains("nodes_summary");
   if (nodes_value == nullptr || !nodes_value->is_array()) {
-    AddText(12, 0, cols, "No node summaries in report.",
+    AddText(13, 0, cols, "No node summaries in report.",
             COLOR_PAIR(kColorMuted));
     refresh();
     return;
   }
 
-  int y = 12;
+  int y = 13;
   for (const boost::json::value& node_value : nodes_value->as_array()) {
     if (y >= rows - 2) {
       break;
