@@ -32,6 +32,10 @@ constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
 
+struct TuiState {
+  std::size_t selected_node = 0;
+};
+
 class CursesSession {
  public:
   CursesSession() {
@@ -306,6 +310,31 @@ void AddText(int y, int x, int width, std::string_view text) {
   AddText(y, x, width, text, 0);
 }
 
+const boost::json::array* NodeSummaries(const boost::json::object& report) {
+  const boost::json::value* nodes_value = report.if_contains("nodes_summary");
+  if (nodes_value == nullptr || !nodes_value->is_array()) {
+    return nullptr;
+  }
+  return &nodes_value->as_array();
+}
+
+const boost::json::object* NodeAt(const boost::json::array& nodes,
+                                  std::size_t index) {
+  if (index >= nodes.size() || !nodes[index].is_object()) {
+    return nullptr;
+  }
+  return &nodes[index].as_object();
+}
+
+std::size_t ClampNodeSelection(const boost::json::object& report,
+                               std::size_t selected_node) {
+  const boost::json::array* nodes = NodeSummaries(report);
+  if (nodes == nullptr || nodes->empty()) {
+    return 0;
+  }
+  return std::min(selected_node, nodes->size() - 1U);
+}
+
 void DrawHorizontalLine(int y) {
   int rows = 0;
   int cols = 0;
@@ -349,6 +378,83 @@ void DrawLogPane(int top, int rows, int cols,
   }
 }
 
+void AddDetailPair(int y, int x, int width, std::string_view label,
+                   std::string_view value) {
+  if (width <= 0) {
+    return;
+  }
+  std::string text(label);
+  text += ": ";
+  text += value;
+  AddText(y, x, width, text);
+}
+
+void DrawSelectedNodeDetail(int top, int bottom, int cols,
+                            const boost::json::object* node) {
+  if (top < 0 || bottom - top < 4 || cols <= 0) {
+    return;
+  }
+  DrawHorizontalLine(top);
+  AddText(top + 1, 0, cols, "Selected Node", A_BOLD);
+  if (node == nullptr) {
+    AddText(top + 2, 0, cols, "No selectable node.", COLOR_PAIR(kColorMuted));
+    return;
+  }
+
+  const boost::json::value* metrics_value = node->if_contains("last_metrics");
+  const boost::json::object* metrics = nullptr;
+  if (metrics_value != nullptr && metrics_value->is_object()) {
+    metrics = &metrics_value->as_object();
+  }
+  const boost::json::object empty_metrics;
+  const boost::json::object& metric_object =
+      metrics == nullptr ? empty_metrics : *metrics;
+
+  const int left_width = std::max(0, cols / 2);
+  const int right_width = std::max(0, cols - left_width);
+  int y = top + 2;
+  AddDetailPair(y, 0, left_width, "id", JsonString(*node, "node_id", "-"));
+  AddDetailPair(y, left_width, right_width, "state",
+                JsonString(*node, "final_state", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "height",
+                JsonMetricText(metric_object, "height"));
+  AddDetailPair(y, left_width, right_width, "best",
+                JsonMetricText(metric_object, "best_hash"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "peers",
+                JsonMetricText(metric_object, "peer_count"));
+  AddDetailPair(y, left_width, right_width, "mempool",
+                JsonMetricText(metric_object, "mempool_tx_count") + " tx / " +
+                    JsonBytesKiBText(metric_object, "mempool_bytes"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "memory",
+                JsonBytesMiBText(metric_object, "memory_current") + " cur / " +
+                    JsonBytesMiBText(metric_object, "memory_peak") + " peak");
+  AddDetailPair(y, left_width, right_width, "cpu",
+                JsonUsecMillisText(metric_object, "cpu_usage_usec") + " ms");
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "network",
+                JsonBytesKiBText(metric_object, "network_rx_bytes") + " rx / " +
+                    JsonBytesKiBText(metric_object, "network_tx_bytes") +
+                    " tx");
+  AddDetailPair(y, left_width, right_width, "qdisc",
+                JsonMetricText(metric_object, "qdisc_kind") + " drops " +
+                    JsonMetricText(metric_object, "qdisc_drops"));
+}
+
 boost::json::object LoadReport(const std::filesystem::path& run_root,
                                std::string* error) {
   try {
@@ -367,7 +473,8 @@ boost::json::object LoadReport(const std::filesystem::path& run_root,
 
 void DrawSummary(const std::filesystem::path& run_root,
                  const boost::json::object& report, std::string_view error,
-                 const std::vector<std::string>& log_lines) {
+                 const std::vector<std::string>& log_lines,
+                 std::size_t selected_node) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -428,8 +535,8 @@ void DrawSummary(const std::filesystem::path& run_root,
   AddText(11, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
   DrawHorizontalLine(12);
 
-  const boost::json::value* nodes_value = report.if_contains("nodes_summary");
-  if (nodes_value == nullptr || !nodes_value->is_array()) {
+  const boost::json::array* nodes = NodeSummaries(report);
+  if (nodes == nullptr) {
     AddText(13, 0, cols, "No node summaries in report.",
             COLOR_PAIR(kColorMuted));
     if (log_rows != 0) {
@@ -442,16 +549,28 @@ void DrawSummary(const std::filesystem::path& run_root,
     return;
   }
 
-  int y = 13;
-  for (const boost::json::value& node_value : nodes_value->as_array()) {
-    if (y >= content_bottom) {
+  const int data_top = 13;
+  const int available_data_rows = content_bottom - data_top;
+  const bool has_detail_pane = available_data_rows >= 9;
+  const int detail_top = has_detail_pane ? content_bottom - 6 : content_bottom;
+  const int table_bottom = has_detail_pane ? detail_top - 1 : content_bottom;
+  const int table_capacity = std::max(0, table_bottom - data_top);
+  std::size_t first_node = 0;
+  if (table_capacity > 0 &&
+      selected_node >= static_cast<std::size_t>(table_capacity)) {
+    first_node = selected_node - static_cast<std::size_t>(table_capacity) + 1U;
+  }
+
+  int y = data_top;
+  for (std::size_t index = first_node; index < nodes->size(); ++index) {
+    if (y >= table_bottom) {
       break;
     }
-    if (!node_value.is_object()) {
+    const boost::json::object* node = NodeAt(*nodes, index);
+    if (node == nullptr) {
       continue;
     }
-    const boost::json::object& node = node_value.as_object();
-    const boost::json::value* metrics_value = node.if_contains("last_metrics");
+    const boost::json::value* metrics_value = node->if_contains("last_metrics");
     const boost::json::object* metrics = nullptr;
     if (metrics_value != nullptr && metrics_value->is_object()) {
       metrics = &metrics_value->as_object();
@@ -459,19 +578,30 @@ void DrawSummary(const std::filesystem::path& run_root,
     const boost::json::object empty_metrics;
     const boost::json::object& metric_object =
         metrics == nullptr ? empty_metrics : *metrics;
+    const int attributes = index == selected_node ? A_REVERSE : 0;
 
-    AddText(y, 0, 10, JsonString(node, "node_id", "-"));
-    AddText(y, 10, 10, JsonString(node, "final_state", "-"));
-    AddText(y, 20, 7, JsonMetricText(metric_object, "height"));
-    AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"));
-    AddText(y, 33, 7, JsonMetricText(metric_object, "generated_block_count"));
-    AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"));
-    AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"));
-    AddText(y, 56, 9, JsonUsecMillisText(metric_object, "cpu_usage_usec"));
-    AddText(y, 65, 8, JsonBytesKiBText(metric_object, "network_rx_bytes"));
+    AddText(y, 0, 10, JsonString(*node, "node_id", "-"), attributes);
+    AddText(y, 10, 10, JsonString(*node, "final_state", "-"), attributes);
+    AddText(y, 20, 7, JsonMetricText(metric_object, "height"), attributes);
+    AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"), attributes);
+    AddText(y, 33, 7, JsonMetricText(metric_object, "generated_block_count"),
+            attributes);
+    AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"),
+            attributes);
+    AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"),
+            attributes);
+    AddText(y, 56, 9, JsonUsecMillisText(metric_object, "cpu_usage_usec"),
+            attributes);
+    AddText(y, 65, 8, JsonBytesKiBText(metric_object, "network_rx_bytes"),
+            attributes);
     AddText(y, 73, std::max(0, cols - 73),
-            JsonMetricText(metric_object, "qdisc_kind"));
+            JsonMetricText(metric_object, "qdisc_kind"), attributes);
     ++y;
+  }
+
+  if (has_detail_pane) {
+    DrawSelectedNodeDetail(detail_top, content_bottom, cols,
+                           NodeAt(*nodes, selected_node));
   }
 
   if (log_rows != 0) {
@@ -485,19 +615,35 @@ void DrawSummary(const std::filesystem::path& run_root,
 
 bool ShouldExit(int ch) { return ch == 'q' || ch == 'Q' || ch == 27; }
 
+void HandleInput(int ch, const boost::json::object& report, TuiState* state) {
+  const boost::json::array* nodes = NodeSummaries(report);
+  if (nodes == nullptr || nodes->empty()) {
+    state->selected_node = 0;
+    return;
+  }
+  if ((ch == KEY_UP || ch == 'k') && state->selected_node > 0) {
+    --state->selected_node;
+  } else if ((ch == KEY_DOWN || ch == 'j') &&
+             state->selected_node + 1U < nodes->size()) {
+    ++state->selected_node;
+  }
+}
+
 }  // namespace
 
 int RunTuiReport(const std::filesystem::path& run_root, bool once,
                  std::uint32_t refresh_ms) {
   CursesSession curses;
   const std::uint32_t sleep_step_ms = 50;
+  TuiState state;
 
   while (true) {
     std::string error;
     const boost::json::object report = LoadReport(run_root, &error);
+    state.selected_node = ClampNodeSelection(report, state.selected_node);
     const std::vector<std::string> log_lines =
         ReadRecentLogLines(RunLogPath(run_root), 256U);
-    DrawSummary(run_root, report, error, log_lines);
+    DrawSummary(run_root, report, error, log_lines, state.selected_node);
     if (once) {
       return error.empty() ? 0 : 1;
     }
@@ -507,6 +653,10 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       const int ch = getch();
       if (ShouldExit(ch)) {
         return 0;
+      }
+      HandleInput(ch, report, &state);
+      if (ch == KEY_UP || ch == KEY_DOWN || ch == 'j' || ch == 'k') {
+        break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(sleep_step_ms));
       slept_ms += sleep_step_ms;
