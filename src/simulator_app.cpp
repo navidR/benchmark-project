@@ -4,6 +4,7 @@
 #include <sys/wait.h>
 #include <yaml.h>
 
+#include <algorithm>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
@@ -16,11 +17,14 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "benchmark_sim/capability.h"
@@ -608,8 +612,11 @@ WalletTransferStrategy ParseWalletTransferStrategy(std::string_view value) {
   if (value == "round_robin") {
     return WalletTransferStrategy::kRoundRobin;
   }
+  if (value == "random") {
+    return WalletTransferStrategy::kRandom;
+  }
   throw std::runtime_error(
-      "scenario wallet_transactions strategy must be round_robin");
+      "scenario wallet_transactions strategy must be round_robin or random");
 }
 
 std::string_view WalletInitializationStrategyName(
@@ -635,6 +642,8 @@ std::string_view WalletTransferStrategyName(WalletTransferStrategy strategy) {
   switch (strategy) {
     case WalletTransferStrategy::kRoundRobin:
       return "round_robin";
+    case WalletTransferStrategy::kRandom:
+      return "random";
   }
   throw std::runtime_error("unknown wallet transfer strategy");
 }
@@ -1233,6 +1242,8 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
               : 0U);
       transactions.amount_satoshis = JsonAmountField(workload, "amount");
       transactions.fee_satoshis = JsonAmountField(workload, "fee");
+      transactions.random_seed =
+          JsonOptionalUint64Field(workload, "seed", transactions.random_seed);
       transactions.timeout_sec =
           OptionProvided(vm, "sync-timeout-sec")
               ? options.sync_timeout_sec
@@ -3186,6 +3197,7 @@ std::string WalletTransactionDetail(
   detail["transaction_count"] = workload.transaction_count;
   detail["strategy"] =
       std::string(WalletTransferStrategyName(workload.strategy));
+  detail["seed"] = workload.random_seed;
   detail["sender_wallet_index"] = sender.wallet_index;
   detail["receiver_wallet_index"] = receiver.wallet_index;
   detail["sender_node"] = sender.node;
@@ -3608,6 +3620,7 @@ boost::json::object WalletTransactionsWorkloadJson(
   object["transaction_count"] = workload.transaction_count;
   object["amount"] = FormatFixed8Amount(workload.amount_satoshis);
   object["fee"] = FormatFixed8Amount(workload.fee_satoshis);
+  object["seed"] = workload.random_seed;
   object["timeout_sec"] = workload.timeout_sec;
   return object;
 }
@@ -4134,6 +4147,38 @@ void ApplySendRawTransactionWorkload(const Options& options,
                                   transaction));
 }
 
+std::vector<std::pair<size_t, size_t>> WalletTransferPlan(
+    const std::vector<WalletIdentity>& wallets,
+    const WalletTransactionsWorkload& workload) {
+  if (wallets.size() < 2U) {
+    throw std::runtime_error(
+        "wallet transfer plan requires at least two wallets");
+  }
+  std::vector<size_t> sender_order(wallets.size());
+  std::iota(sender_order.begin(), sender_order.end(), 0U);
+  switch (workload.strategy) {
+    case WalletTransferStrategy::kRoundRobin:
+      break;
+    case WalletTransferStrategy::kRandom: {
+      std::mt19937_64 rng(workload.random_seed);
+      std::shuffle(sender_order.begin(), sender_order.end(), rng);
+      break;
+    }
+  }
+
+  std::vector<std::pair<size_t, size_t>> plan;
+  plan.reserve(workload.transaction_count);
+  for (uint32_t transaction_index = 0;
+       transaction_index < workload.transaction_count; ++transaction_index) {
+    const size_t sender_position = transaction_index % sender_order.size();
+    const size_t receiver_position =
+        (sender_position + 1U) % sender_order.size();
+    plan.emplace_back(sender_order[sender_position],
+                      sender_order[receiver_position]);
+  }
+  return plan;
+}
+
 void ApplyWalletTransactionsWorkload(const Options& options,
                                      const std::filesystem::path& events_path,
                                      const ChainDriver& driver,
@@ -4182,10 +4227,12 @@ void ApplyWalletTransactionsWorkload(const Options& options,
     funding.push_back(std::move(state));
   }
 
-  for (uint32_t transaction_index = 0;
-       transaction_index < workload.transaction_count; ++transaction_index) {
-    const size_t sender_index = transaction_index % wallets.size();
-    const size_t receiver_index = (sender_index + 1U) % wallets.size();
+  const std::vector<std::pair<size_t, size_t>> transfer_plan =
+      WalletTransferPlan(wallets, workload);
+  for (size_t transaction_index = 0; transaction_index < transfer_plan.size();
+       ++transaction_index) {
+    const size_t sender_index = transfer_plan[transaction_index].first;
+    const size_t receiver_index = transfer_plan[transaction_index].second;
     const WalletIdentity& sender = wallets[sender_index];
     const WalletIdentity& receiver = wallets[receiver_index];
     const FundingState& sender_funding = funding[sender_index];
@@ -4203,15 +4250,15 @@ void ApplyWalletTransactionsWorkload(const Options& options,
             node.config, txid, std::chrono::seconds(workload.timeout_sec));
       }
     }
-    WriteEvent(
-        events_path, options.run_id, sender_node.config.id,
-        "wallet_transaction_submitted",
-        WalletTransactionDetail(
-            workload_index, workload_count, workload, transaction_index + 1U,
-            sender, receiver, sender_funding.miner_node,
-            sender_funding.start_height, sender_funding.target_height,
-            static_cast<uint64_t>(sender_funding.hashes.size()),
-            sender_funding.ready_balance_satoshis, transaction));
+    WriteEvent(events_path, options.run_id, sender_node.config.id,
+               "wallet_transaction_submitted",
+               WalletTransactionDetail(
+                   workload_index, workload_count, workload,
+                   static_cast<uint32_t>(transaction_index + 1U), sender,
+                   receiver, sender_funding.miner_node,
+                   sender_funding.start_height, sender_funding.target_height,
+                   static_cast<uint64_t>(sender_funding.hashes.size()),
+                   sender_funding.ready_balance_satoshis, transaction));
   }
 }
 
@@ -4814,14 +4861,14 @@ int RunBenchmarkWithTui(Options options) {
   std::exception_ptr tui_failure;
   int simulation_result = 1;
 
-  std::thread simulation_thread([&options, &simulation_failure,
-                                 &simulation_result]() {
-    try {
-      simulation_result = RunBenchmarkHeadless(options);
-    } catch (...) {
-      simulation_failure = std::current_exception();
-    }
-  });
+  std::thread simulation_thread(
+      [&options, &simulation_failure, &simulation_result]() {
+        try {
+          simulation_result = RunBenchmarkHeadless(options);
+        } catch (...) {
+          simulation_failure = std::current_exception();
+        }
+      });
 
   int tui_result = 1;
   try {

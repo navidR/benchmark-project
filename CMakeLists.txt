@@ -346,6 +346,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transactions-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME benchmark-sim-valid-wallet-random-transactions-scenario
+    COMMAND benchmark-sim
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-random-transactions-scenario.json"
+      --probe-capabilities
+  )
   add_test(NAME benchmark-sim-benchmark-root-option
     COMMAND benchmark-sim
       --benchmark-root "${CMAKE_CURRENT_BINARY_DIR}/benchmark-root-option"

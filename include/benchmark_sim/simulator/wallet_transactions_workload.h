@@ -16,6 +16,7 @@ struct WalletTransactionsWorkload {
   std::uint32_t transaction_count = 0;
   std::uint64_t amount_satoshis = 0;
   std::uint64_t fee_satoshis = 0;
+  std::uint64_t random_seed = 0;
   std::uint32_t timeout_sec = 30;
 };
 
