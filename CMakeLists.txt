@@ -212,7 +212,6 @@ if(BUILD_TESTING)
   )
   target_link_libraries(benchmark-sim-unit-tests PRIVATE
     Boost::json
-    Boost::system
     Boost::unit_test_framework
     libmnl::libmnl
   )
