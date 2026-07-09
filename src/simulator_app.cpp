@@ -3111,8 +3111,7 @@ void WriteLogTailEvent(const std::filesystem::path& events_path,
   if (!std::filesystem::exists(path)) {
     return;
   }
-  const LogTailChunk chunk =
-      RequireResult(TailLogFile(path, *offset, kMaxLogTailBytes));
+  const LogTailChunk chunk = TailLogFile(path, *offset, kMaxLogTailBytes);
   *offset = chunk.next_offset;
   if (chunk.text.empty() && !chunk.truncated && !chunk.offset_reset) {
     return;

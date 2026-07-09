@@ -2,24 +2,18 @@
 
 #include <algorithm>
 #include <fstream>
-#include <limits>
+#include <stdexcept>
 
 namespace bsim {
 
-Result<LogTailChunk> TailLogFile(const std::filesystem::path& path,
-                                 std::uint64_t offset,
-                                 std::uint64_t max_bytes) {
+LogTailChunk TailLogFile(const std::filesystem::path& path,
+                         std::uint64_t offset, std::uint64_t max_bytes) {
   if (max_bytes == 0U) {
-    return Error<LogTailChunk>("max log tail bytes must be greater than zero");
+    throw std::runtime_error("max log tail bytes must be greater than zero");
   }
 
-  std::error_code ec;
   const std::uint64_t file_size =
-      static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
-  if (ec) {
-    return Error<LogTailChunk>("stat log file failed: " + path.string() + ": " +
-                               ec.message());
-  }
+      static_cast<std::uint64_t>(std::filesystem::file_size(path));
   LogTailChunk chunk;
   chunk.start_offset = offset;
   if (chunk.start_offset > file_size) {
@@ -34,26 +28,21 @@ Result<LogTailChunk> TailLogFile(const std::filesystem::path& path,
 
   std::ifstream input(path, std::ios::binary);
   if (!input) {
-    return Error<LogTailChunk>("open log file failed: " + path.string());
-  }
-  if (chunk.start_offset >
-      static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
-    return Error<LogTailChunk>("log file offset is too large: " +
-                               path.string());
+    throw std::runtime_error("open log file failed: " + path.string());
   }
   input.seekg(static_cast<std::streamoff>(chunk.start_offset));
   if (!input) {
-    return Error<LogTailChunk>("seek log file failed: " + path.string());
+    throw std::runtime_error("seek log file failed: " + path.string());
   }
 
   chunk.text.resize(static_cast<std::size_t>(bytes_to_read));
   if (bytes_to_read != 0U) {
     input.read(chunk.text.data(), static_cast<std::streamsize>(bytes_to_read));
     if (input.gcount() != static_cast<std::streamsize>(bytes_to_read)) {
-      return Error<LogTailChunk>("read log file failed: " + path.string());
+      throw std::runtime_error("read log file failed: " + path.string());
     }
   }
-  return Ok(std::move(chunk));
+  return chunk;
 }
 
 }  // namespace bsim
