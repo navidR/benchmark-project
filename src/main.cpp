@@ -20,7 +20,7 @@
 
 #include "benchmark_sim/capability.h"
 #include "benchmark_sim/cgroup.h"
-#include "benchmark_sim/firo_driver.h"
+#include "benchmark_sim/drivers/firo_driver.h"
 #include "benchmark_sim/log_tail.h"
 #include "benchmark_sim/logging.h"
 #include "benchmark_sim/network.h"

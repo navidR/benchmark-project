@@ -1,4 +1,4 @@
-#include "benchmark_sim/firo_driver.h"
+#include "benchmark_sim/drivers/firo_driver.h"
 
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>

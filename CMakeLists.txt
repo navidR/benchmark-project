@@ -119,7 +119,7 @@ endforeach()
 add_executable(benchmark-sim
   src/capability.cpp
   src/cgroup.cpp
-  src/firo_driver.cpp
+  src/drivers/firo_driver.cpp
   src/http_client.cpp
   src/log_tail.cpp
   src/logging.cpp
