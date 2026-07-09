@@ -9,6 +9,7 @@
 #include <clocale>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -125,14 +126,60 @@ std::string JsonMetricText(const boost::json::object& object,
   return boost::json::serialize(*value);
 }
 
+std::optional<std::uint64_t> JsonUnsignedMetric(
+    const boost::json::object& object, std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || value->is_null()) {
+    return std::nullopt;
+  }
+  if (value->is_uint64()) {
+    return value->as_uint64();
+  }
+  if (value->is_int64() && value->as_int64() >= 0) {
+    return static_cast<std::uint64_t>(value->as_int64());
+  }
+  return std::nullopt;
+}
+
+std::string JsonBytesMiBText(const boost::json::object& object,
+                             std::string_view field) {
+  const std::optional<std::uint64_t> bytes = JsonUnsignedMetric(object, field);
+  if (!bytes) {
+    return "-";
+  }
+  constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+  return std::to_string((*bytes + kMiB - 1U) / kMiB) + "M";
+}
+
+std::string JsonBytesKiBText(const boost::json::object& object,
+                             std::string_view field) {
+  const std::optional<std::uint64_t> bytes = JsonUnsignedMetric(object, field);
+  if (!bytes) {
+    return "-";
+  }
+  constexpr std::uint64_t kKiB = 1024ULL;
+  return std::to_string((*bytes + kKiB - 1U) / kKiB) + "K";
+}
+
+std::string JsonUsecMillisText(const boost::json::object& object,
+                               std::string_view field) {
+  const std::optional<std::uint64_t> usec = JsonUnsignedMetric(object, field);
+  if (!usec) {
+    return "-";
+  }
+  return std::to_string(*usec / 1000ULL);
+}
+
 std::string WorkloadsSummaryText(const boost::json::object& report) {
   const boost::json::value* workloads_value = report.if_contains("workloads");
-  if (workloads_value == nullptr || !workloads_value->is_array() ||
-      workloads_value->as_array().empty()) {
+  if (workloads_value == nullptr || !workloads_value->is_array()) {
     return "workloads: -";
   }
 
   const boost::json::array& workloads = workloads_value->as_array();
+  if (workloads.empty()) {
+    return "workloads: 0";
+  }
   std::string text = "workloads: " + std::to_string(workloads.size());
   std::size_t index = 0;
   for (const boost::json::value& workload_value : workloads) {
@@ -249,14 +296,16 @@ void DrawSummary(const std::filesystem::path& run_root,
   AddText(8, 0, cols, WorkloadsSummaryText(report));
 
   DrawHorizontalLine(9);
-  AddText(10, 0, 12, "Node", A_BOLD);
-  AddText(10, 12, 12, "State", A_BOLD);
-  AddText(10, 24, 10, "Height", A_BOLD);
-  AddText(10, 34, 8, "Peers", A_BOLD);
-  AddText(10, 42, 10, "Blocks", A_BOLD);
-  AddText(10, 52, 10, "Mempool", A_BOLD);
-  AddText(10, 62, 10, "RPC ms", A_BOLD);
-  AddText(10, 72, std::max(0, cols - 72), "Qdisc", A_BOLD);
+  AddText(10, 0, 10, "Node", A_BOLD);
+  AddText(10, 10, 10, "State", A_BOLD);
+  AddText(10, 20, 7, "Height", A_BOLD);
+  AddText(10, 27, 6, "Peers", A_BOLD);
+  AddText(10, 33, 7, "Blocks", A_BOLD);
+  AddText(10, 40, 7, "Pool", A_BOLD);
+  AddText(10, 47, 9, "Mem", A_BOLD);
+  AddText(10, 56, 9, "CPUms", A_BOLD);
+  AddText(10, 65, 8, "RX", A_BOLD);
+  AddText(10, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
   DrawHorizontalLine(11);
 
   const boost::json::value* nodes_value = report.if_contains("nodes_summary");
@@ -285,15 +334,17 @@ void DrawSummary(const std::filesystem::path& run_root,
     const boost::json::object& metric_object =
         metrics == nullptr ? empty_metrics : *metrics;
 
-    AddText(y, 0, 12, JsonString(node, "node_id", "-"));
-    AddText(y, 12, 12, JsonString(node, "final_state", "-"));
-    AddText(y, 24, 10, JsonMetricText(metric_object, "height"));
-    AddText(y, 34, 8, JsonMetricText(metric_object, "peer_count"));
-    AddText(y, 42, 10,
+    AddText(y, 0, 10, JsonString(node, "node_id", "-"));
+    AddText(y, 10, 10, JsonString(node, "final_state", "-"));
+    AddText(y, 20, 7, JsonMetricText(metric_object, "height"));
+    AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"));
+    AddText(y, 33, 7,
             JsonMetricText(metric_object, "generated_block_count"));
-    AddText(y, 52, 10, JsonMetricText(metric_object, "mempool_tx_count"));
-    AddText(y, 62, 10, JsonMetricText(metric_object, "rpc_latency_ms"));
-    AddText(y, 72, std::max(0, cols - 72),
+    AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"));
+    AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"));
+    AddText(y, 56, 9, JsonUsecMillisText(metric_object, "cpu_usage_usec"));
+    AddText(y, 65, 8, JsonBytesKiBText(metric_object, "network_rx_bytes"));
+    AddText(y, 73, std::max(0, cols - 73),
             JsonMetricText(metric_object, "qdisc_kind"));
     ++y;
   }
