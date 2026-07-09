@@ -83,6 +83,13 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
   bsim::AppendLine(
       dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+      "\"event\":\"height_wait_reached\","
+      "\"detail\":\"{\\\"workload_index\\\":2,"
+      "\\\"workload_count\\\":2,\\\"node\\\":1,"
+      "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
+  bsim::AppendLine(
+      dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"sim\",\"event\":\"run_finished\"}");
   bsim::AppendLine(
       dir / "metrics.jsonl",
@@ -113,7 +120,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 
   BOOST_TEST(report.at("ok").as_bool());
   BOOST_TEST(report.at("status").as_string() == "finished");
-  BOOST_TEST(JsonInteger(report, "event_count") == 5U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 6U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -150,6 +157,14 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(generated_block_detail, "target_height") == 1U);
   BOOST_REQUIRE_EQUAL(generated_block_detail.at("hashes").as_array().size(),
                       1U);
+  const boost::json::array& height_waits =
+      report.at("height_waits").as_array();
+  BOOST_REQUIRE_EQUAL(height_waits.size(), 1U);
+  const boost::json::object& height_wait =
+      height_waits.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(height_wait, "workload_index") == 2U);
+  BOOST_TEST(JsonInteger(height_wait, "target_height") == 2U);
+  BOOST_TEST(JsonInteger(height_wait, "observed_height") == 2U);
   const boost::json::array& nodes =
       report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);

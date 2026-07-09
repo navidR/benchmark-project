@@ -241,8 +241,8 @@ std::optional<std::string_view> LogTailKind(std::string_view event_name) {
   return std::nullopt;
 }
 
-void AppendGeneratedBlocksEvent(const boost::json::object& event,
-                                boost::json::array* generated_blocks) {
+void AppendEventSummary(const boost::json::object& event,
+                        boost::json::array* summaries) {
   boost::json::object summary;
   const std::string node_id = OptionalStringField(event, "node_id");
   if (!node_id.empty()) {
@@ -253,7 +253,7 @@ void AppendGeneratedBlocksEvent(const boost::json::object& event,
   if (!detail.is_null()) {
     summary["detail"] = std::move(detail);
   }
-  generated_blocks->push_back(std::move(summary));
+  summaries->push_back(std::move(summary));
 }
 
 }  // namespace
@@ -276,6 +276,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;
   boost::json::array generated_blocks;
+  boost::json::array height_waits;
 
   ForEachJsonLine(run_root / "events.jsonl",
                   [&](const boost::json::object& event) {
@@ -300,7 +301,9 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
                       nodes[node_id].log_tails[std::string(*kind)] =
                           ParseEventDetail(event);
                     } else if (event_name == "generated_blocks") {
-                      AppendGeneratedBlocksEvent(event, &generated_blocks);
+                      AppendEventSummary(event, &generated_blocks);
+                    } else if (event_name == "height_wait_reached") {
+                      AppendEventSummary(event, &height_waits);
                     }
                   });
 
@@ -326,6 +329,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["metric_count"] = metric_count;
   report["event_counts"] = EventCountsJson(event_counts);
   report["generated_blocks"] = std::move(generated_blocks);
+  report["height_waits"] = std::move(height_waits);
   report["nodes_summary"] = NodesJson(nodes);
   return boost::json::serialize(report);
 }

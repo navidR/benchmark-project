@@ -336,6 +336,12 @@ The same run settings can be loaded from a JSON scenario file:
       "node": 1,
       "count": 1,
       "sync_timeout_sec": 45
+    },
+    {
+      "type": "wait_until_height",
+      "node": 2,
+      "height": 1,
+      "timeout_sec": 45
     }
   ],
   "resources": {
@@ -429,6 +435,8 @@ Block-generation workloads run sequentially. For each one, the
 `generated_blocks` event detail is JSON with the workload index, generator node,
 generated count, start and target height, reward address, and returned block
 hashes.
+`wait_until_height` workloads wait for one Firo node to reach a target height
+and emit a structured `height_wait_reached` event.
 An explicit empty scenario workload list, `"workloads": []`, disables block
 generation for that run.
 

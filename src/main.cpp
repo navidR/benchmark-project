@@ -65,6 +65,23 @@ struct BlockGenerationWorkload {
   uint32_t sync_timeout_sec = 30;
 };
 
+struct WaitUntilHeightWorkload {
+  uint32_t node = 1;
+  uint64_t height = 0;
+  uint32_t timeout_sec = 30;
+};
+
+enum class WorkloadKind {
+  kBlockGeneration,
+  kWaitUntilHeight,
+};
+
+struct ScenarioWorkload {
+  WorkloadKind kind = WorkloadKind::kBlockGeneration;
+  BlockGenerationWorkload block_generation;
+  WaitUntilHeightWorkload wait_until_height;
+};
+
 struct NetworkBlockRule {
   uint32_t node_index = 0;
   std::string src_address;
@@ -120,7 +137,7 @@ struct Options {
   std::vector<NetworkPartitionRule> runtime_partition_heals;
   std::vector<uint32_t> runtime_node_restarts;
   std::vector<FreezeRequest> runtime_node_freezes;
-  std::vector<BlockGenerationWorkload> block_generation_workloads;
+  std::vector<ScenarioWorkload> workloads;
   bool workloads_configured = false;
   bool replace_run = false;
   bool probe_address = false;
@@ -204,6 +221,23 @@ uint64_t JsonOptionalUint64Field(const boost::json::object& object,
     return static_cast<uint64_t>(value->as_int64());
   }
   throw std::runtime_error("invalid uint64 JSON field: " + std::string(field));
+}
+
+uint64_t JsonUint64Field(const boost::json::object& object,
+                         const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("missing or invalid uint64 JSON field: " +
+                             std::string(field));
+  }
+  if (value->is_uint64()) {
+    return value->as_uint64();
+  }
+  if (value->is_int64() && value->as_int64() >= 0) {
+    return static_cast<uint64_t>(value->as_int64());
+  }
+  throw std::runtime_error("missing or invalid uint64 JSON field: " +
+                           std::string(field));
 }
 
 uint64_t JsonUint64Value(const boost::json::value& value,
@@ -531,30 +565,51 @@ void ApplyScenarioWorkloads(
     }
     const boost::json::object& workload = value.as_object();
     const std::string type = JsonStringField(workload, "type");
-    if (type != "block_generation") {
+    if (type == "block_generation") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP block_generation workload uses node, not nodes");
+      }
+      BlockGenerationWorkload block_generation;
+      block_generation.count =
+          OptionProvided(vm, "generate-blocks")
+              ? options.generate_blocks
+              : JsonOptionalUint32Field(workload, "count",
+                                        options.generate_blocks);
+      block_generation.node =
+          OptionProvided(vm, "generate-node")
+              ? options.generate_node
+              : JsonOptionalUint32Field(workload, "node",
+                                        options.generate_node);
+      block_generation.sync_timeout_sec =
+          OptionProvided(vm, "sync-timeout-sec")
+              ? options.sync_timeout_sec
+              : JsonOptionalUint32Field(workload, "sync_timeout_sec",
+                                        options.sync_timeout_sec);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kBlockGeneration;
+      scenario_workload.block_generation = block_generation;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "wait_until_height") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current Firo MVP wait_until_height workload uses node, not nodes");
+      }
+      WaitUntilHeightWorkload wait;
+      wait.node = JsonOptionalUint32Field(workload, "node", wait.node);
+      wait.height = JsonUint64Field(workload, "height");
+      wait.timeout_sec =
+          OptionProvided(vm, "sync-timeout-sec")
+              ? options.sync_timeout_sec
+              : JsonOptionalUint32Field(workload, "timeout_sec",
+                                        options.sync_timeout_sec);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kWaitUntilHeight;
+      scenario_workload.wait_until_height = wait;
+      options.workloads.push_back(scenario_workload);
+    } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
     }
-    if (workload.if_contains("nodes") != nullptr) {
-      throw std::runtime_error(
-          "current Firo MVP block_generation workload uses node, not nodes");
-    }
-    BlockGenerationWorkload block_generation;
-    block_generation.count =
-        OptionProvided(vm, "generate-blocks")
-            ? options.generate_blocks
-            : JsonOptionalUint32Field(workload, "count",
-                                      options.generate_blocks);
-    block_generation.node =
-        OptionProvided(vm, "generate-node")
-            ? options.generate_node
-            : JsonOptionalUint32Field(workload, "node",
-                                      options.generate_node);
-    block_generation.sync_timeout_sec =
-        OptionProvided(vm, "sync-timeout-sec")
-            ? options.sync_timeout_sec
-            : JsonOptionalUint32Field(workload, "sync_timeout_sec",
-                                      options.sync_timeout_sec);
-    options.block_generation_workloads.push_back(block_generation);
   }
 }
 
@@ -1252,11 +1307,23 @@ Options ParseOptions(int argc, char** argv) {
   if (options.generate_node == 0U || options.generate_node > options.nodes) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
   }
-  for (const BlockGenerationWorkload& workload :
-       options.block_generation_workloads) {
-    if (workload.node == 0U || workload.node > options.nodes) {
-      throw std::runtime_error(
-          "scenario block_generation workload node must be in 1..--nodes");
+  for (const ScenarioWorkload& workload : options.workloads) {
+    if (workload.kind == WorkloadKind::kBlockGeneration) {
+      if (workload.block_generation.node == 0U ||
+          workload.block_generation.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario block_generation workload node must be in 1..--nodes");
+      }
+    } else if (workload.kind == WorkloadKind::kWaitUntilHeight) {
+      if (workload.wait_until_height.node == 0U ||
+          workload.wait_until_height.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario wait_until_height workload node must be in 1..--nodes");
+      }
+      if (workload.wait_until_height.timeout_sec == 0U) {
+        throw std::runtime_error(
+            "scenario wait_until_height timeout_sec must be greater than zero");
+      }
     }
   }
   ParseNodeNetworkConditions(options);
@@ -2057,6 +2124,18 @@ std::string GeneratedBlocksDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
+std::string HeightWaitDetail(uint32_t workload_index, uint32_t workload_count,
+                             uint32_t node, uint64_t target_height,
+                             uint64_t observed_height) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = node;
+  detail["target_height"] = target_height;
+  detail["observed_height"] = observed_height;
+  return boost::json::serialize(detail);
+}
+
 void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
                           const Options& options, const FiroDriver& driver,
                           std::vector<NodeRuntime>& nodes) {
@@ -2166,35 +2245,41 @@ std::string NodeGroupYamlInline(const std::vector<uint32_t>& nodes) {
   return text;
 }
 
-std::vector<BlockGenerationWorkload> EffectiveBlockGenerationWorkloads(
-    const Options& options) {
+std::vector<ScenarioWorkload> EffectiveWorkloads(const Options& options) {
   if (options.workloads_configured) {
-    return options.block_generation_workloads;
+    return options.workloads;
   }
   BlockGenerationWorkload workload;
   workload.node = options.generate_node;
   workload.count = options.generate_blocks;
   workload.sync_timeout_sec = options.sync_timeout_sec;
-  return {workload};
+  ScenarioWorkload scenario_workload;
+  scenario_workload.kind = WorkloadKind::kBlockGeneration;
+  scenario_workload.block_generation = workload;
+  return {scenario_workload};
 }
 
 uint64_t TotalBlockGenerationCount(
-    const std::vector<BlockGenerationWorkload>& workloads) {
+    const std::vector<ScenarioWorkload>& workloads) {
   uint64_t total = 0;
-  for (const BlockGenerationWorkload& workload : workloads) {
-    total += workload.count;
+  for (const ScenarioWorkload& workload : workloads) {
+    if (workload.kind == WorkloadKind::kBlockGeneration) {
+      total += workload.block_generation.count;
+    }
   }
   return total;
 }
 
 std::optional<uint32_t> CommonBlockGenerationNode(
-    const std::vector<BlockGenerationWorkload>& workloads) {
-  if (workloads.empty()) {
-    return std::nullopt;
-  }
-  const uint32_t node = workloads.front().node;
-  for (const BlockGenerationWorkload& workload : workloads) {
-    if (workload.node != node) {
+    const std::vector<ScenarioWorkload>& workloads) {
+  std::optional<uint32_t> node;
+  for (const ScenarioWorkload& workload : workloads) {
+    if (workload.kind != WorkloadKind::kBlockGeneration) {
+      continue;
+    }
+    if (!node) {
+      node = workload.block_generation.node;
+    } else if (*node != workload.block_generation.node) {
       return std::nullopt;
     }
   }
@@ -2202,36 +2287,51 @@ std::optional<uint32_t> CommonBlockGenerationNode(
 }
 
 std::optional<uint32_t> CommonBlockGenerationSyncTimeout(
-    const std::vector<BlockGenerationWorkload>& workloads) {
-  if (workloads.empty()) {
-    return std::nullopt;
-  }
-  const uint32_t sync_timeout_sec = workloads.front().sync_timeout_sec;
-  for (const BlockGenerationWorkload& workload : workloads) {
-    if (workload.sync_timeout_sec != sync_timeout_sec) {
+    const std::vector<ScenarioWorkload>& workloads) {
+  std::optional<uint32_t> sync_timeout_sec;
+  for (const ScenarioWorkload& workload : workloads) {
+    if (workload.kind != WorkloadKind::kBlockGeneration) {
+      continue;
+    }
+    if (!sync_timeout_sec) {
+      sync_timeout_sec = workload.block_generation.sync_timeout_sec;
+    } else if (*sync_timeout_sec !=
+               workload.block_generation.sync_timeout_sec) {
       return std::nullopt;
     }
   }
   return sync_timeout_sec;
 }
 
-std::string BlockGenerationWorkloadsYaml(
-    const std::vector<BlockGenerationWorkload>& workloads) {
+std::string WorkloadsYaml(const std::vector<ScenarioWorkload>& workloads) {
   if (workloads.empty()) {
     return "workloads: []\n";
   }
   std::string yaml = "workloads:\n";
-  for (const BlockGenerationWorkload& workload : workloads) {
-    yaml +=
-        "  - type: block_generation\n"
-        "    node: " +
-        std::to_string(workload.node) +
-        "\n"
-        "    count: " +
-        std::to_string(workload.count) +
-        "\n"
-        "    sync_timeout_sec: " +
-        std::to_string(workload.sync_timeout_sec) + "\n";
+  for (const ScenarioWorkload& workload : workloads) {
+    if (workload.kind == WorkloadKind::kBlockGeneration) {
+      yaml +=
+          "  - type: block_generation\n"
+          "    node: " +
+          std::to_string(workload.block_generation.node) +
+          "\n"
+          "    count: " +
+          std::to_string(workload.block_generation.count) +
+          "\n"
+          "    sync_timeout_sec: " +
+          std::to_string(workload.block_generation.sync_timeout_sec) + "\n";
+    } else if (workload.kind == WorkloadKind::kWaitUntilHeight) {
+      yaml +=
+          "  - type: wait_until_height\n"
+          "    node: " +
+          std::to_string(workload.wait_until_height.node) +
+          "\n"
+          "    height: " +
+          std::to_string(workload.wait_until_height.height) +
+          "\n"
+          "    timeout_sec: " +
+          std::to_string(workload.wait_until_height.timeout_sec) + "\n";
+    }
   }
   return yaml;
 }
@@ -2246,10 +2346,26 @@ boost::json::object BlockGenerationWorkloadJson(
   return object;
 }
 
+boost::json::object WaitUntilHeightWorkloadJson(
+    const WaitUntilHeightWorkload& workload) {
+  boost::json::object object;
+  object["type"] = "wait_until_height";
+  object["node"] = workload.node;
+  object["height"] = workload.height;
+  object["timeout_sec"] = workload.timeout_sec;
+  return object;
+}
+
+boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
+  if (workload.kind == WorkloadKind::kBlockGeneration) {
+    return BlockGenerationWorkloadJson(workload.block_generation);
+  }
+  return WaitUntilHeightWorkloadJson(workload.wait_until_height);
+}
+
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root) {
-  const std::vector<BlockGenerationWorkload> workloads =
-      EffectiveBlockGenerationWorkloads(options);
+  const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
   std::string network_yaml =
       "network:\n"
       "  isolated: " +
@@ -2502,7 +2618,7 @@ void WriteScenarioFiles(const Options& options,
                 "\n" +
                 runtime_resource_yaml + network_yaml +
                 process_yaml +
-                BlockGenerationWorkloadsYaml(workloads));
+                WorkloadsYaml(workloads));
 
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
@@ -2529,8 +2645,8 @@ void WriteScenarioFiles(const Options& options,
   resolved["metrics_sample_count"] = options.metrics_sample_count;
   resolved["metrics_interval_ms"] = options.metrics_interval_ms;
   boost::json::array workload_array;
-  for (const BlockGenerationWorkload& workload : workloads) {
-    workload_array.push_back(BlockGenerationWorkloadJson(workload));
+  for (const ScenarioWorkload& workload : workloads) {
+    workload_array.push_back(WorkloadJson(workload));
   }
   resolved["workloads"] = std::move(workload_array);
   boost::json::object resources;
@@ -3310,35 +3426,50 @@ int Run(int argc, char** argv) {
     ApplyRuntimeNodeFreezes(options, events_path, nodes);
     WritePeriodicMetrics(events_path, metrics_path, options, driver, nodes);
 
-    const std::vector<BlockGenerationWorkload> block_generation_workloads =
-        EffectiveBlockGenerationWorkloads(options);
-    for (size_t workload_index = 0;
-         workload_index < block_generation_workloads.size();
+    const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
+    for (size_t workload_index = 0; workload_index < workloads.size();
          ++workload_index) {
-      const BlockGenerationWorkload& workload =
-          block_generation_workloads[workload_index];
-      if (workload.count == 0U) {
-        continue;
-      }
-      NodeRuntime& generator = nodes[workload.node - 1U];
-      const uint64_t start_height =
-          driver.ReadMetrics(generator.config).height;
-      std::vector<std::string> hashes = driver.GenerateBlocks(
-          generator.config, workload.count, kDefaultRewardAddress);
-      generator.generated_block_count += hashes.size();
-      const uint64_t target_height =
-          start_height + static_cast<uint64_t>(hashes.size());
-      WriteEvent(events_path, options.run_id, generator.config.id,
-                 "generated_blocks",
-                 GeneratedBlocksDetail(
-                     static_cast<uint32_t>(workload_index + 1U),
-                     static_cast<uint32_t>(block_generation_workloads.size()),
-                     workload.node, start_height, target_height, hashes));
-      for (auto& node : nodes) {
-        driver.WaitForHeight(node.config, target_height,
-                             std::chrono::seconds(workload.sync_timeout_sec));
+      const ScenarioWorkload& scenario_workload = workloads[workload_index];
+      if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
+        const BlockGenerationWorkload& workload =
+            scenario_workload.block_generation;
+        if (workload.count == 0U) {
+          continue;
+        }
+        NodeRuntime& generator = nodes[workload.node - 1U];
+        const uint64_t start_height =
+            driver.ReadMetrics(generator.config).height;
+        std::vector<std::string> hashes = driver.GenerateBlocks(
+            generator.config, workload.count, kDefaultRewardAddress);
+        generator.generated_block_count += hashes.size();
+        const uint64_t target_height =
+            start_height + static_cast<uint64_t>(hashes.size());
+        WriteEvent(events_path, options.run_id, generator.config.id,
+                   "generated_blocks",
+                   GeneratedBlocksDetail(
+                       static_cast<uint32_t>(workload_index + 1U),
+                       static_cast<uint32_t>(workloads.size()), workload.node,
+                       start_height, target_height, hashes));
+        for (auto& node : nodes) {
+          driver.WaitForHeight(node.config, target_height,
+                               std::chrono::seconds(workload.sync_timeout_sec));
+          WriteEvent(events_path, options.run_id, node.config.id,
+                     "height_reached", std::to_string(target_height));
+        }
+      } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
+        const WaitUntilHeightWorkload& workload =
+            scenario_workload.wait_until_height;
+        NodeRuntime& node = nodes[workload.node - 1U];
+        driver.WaitForHeight(node.config, workload.height,
+                             std::chrono::seconds(workload.timeout_sec));
+        const uint64_t observed_height =
+            driver.ReadMetrics(node.config).height;
         WriteEvent(events_path, options.run_id, node.config.id,
-                   "height_reached", std::to_string(target_height));
+                   "height_wait_reached",
+                   HeightWaitDetail(static_cast<uint32_t>(workload_index + 1U),
+                                    static_cast<uint32_t>(workloads.size()),
+                                    workload.node, workload.height,
+                                    observed_height));
       }
     }
 
