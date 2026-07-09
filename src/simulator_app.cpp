@@ -3173,6 +3173,7 @@ std::string WalletTransactionDetail(
     const WalletIdentity& sender, const WalletIdentity& receiver,
     uint32_t funding_miner_node, uint64_t funding_start_height,
     uint64_t funding_target_height, uint64_t funding_hash_count,
+    uint64_t funding_ready_balance_satoshis,
     const ChainWalletTransactionResult& transaction) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
@@ -3193,6 +3194,8 @@ std::string WalletTransactionDetail(
   detail["funding_start_height"] = funding_start_height;
   detail["funding_target_height"] = funding_target_height;
   detail["readiness_confirmations"] = workload.readiness_confirmations;
+  detail["funding_ready_balance"] =
+      FormatFixed8Amount(funding_ready_balance_satoshis);
   detail["amount"] = transaction.destination_amount;
   detail["requested_fee_rate"] = transaction.requested_fee_rate;
   detail["txids"] = TxIdsJson(transaction.txids);
@@ -4108,6 +4111,7 @@ void ApplyWalletTransactionsWorkload(const Options& options,
     uint32_t miner_node = 1;
     uint64_t start_height = 0;
     uint64_t target_height = 0;
+    uint64_t ready_balance_satoshis = 0;
     std::vector<std::string> hashes;
   };
 
@@ -4134,6 +4138,12 @@ void ApplyWalletTransactionsWorkload(const Options& options,
       driver.WaitForHeight(node.config, state.target_height,
                            std::chrono::seconds(workload.timeout_sec));
     }
+    NodeRuntime& wallet_node = nodes[wallet.node - 1U];
+    state.ready_balance_satoshis = driver.WaitForWalletBalance(
+        wallet_node.config, ToChainWalletMode(registry.wallet_initialization()),
+        workload.amount_satoshis + workload.fee_satoshis,
+        workload.readiness_confirmations,
+        std::chrono::seconds(workload.timeout_sec));
     funding.push_back(std::move(state));
   }
 
@@ -4165,7 +4175,8 @@ void ApplyWalletTransactionsWorkload(const Options& options,
             workload_index, workload_count, workload, transaction_index + 1U,
             sender, receiver, sender_funding.miner_node,
             sender_funding.start_height, sender_funding.target_height,
-            static_cast<uint64_t>(sender_funding.hashes.size()), transaction));
+            static_cast<uint64_t>(sender_funding.hashes.size()),
+            sender_funding.ready_balance_satoshis, transaction));
   }
 }
 

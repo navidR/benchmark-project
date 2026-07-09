@@ -106,6 +106,11 @@ class ChainDriver {
       const std::string& address) const = 0;
   virtual std::string CreateWalletAddress(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode) const = 0;
+  virtual uint64_t WaitForWalletBalance(const ChainNodeConfig& config,
+                                        ChainWalletMode wallet_mode,
+                                        uint64_t minimum_balance_satoshis,
+                                        uint64_t minimum_confirmations,
+                                        std::chrono::seconds timeout) const = 0;
   virtual ChainUtxo FindSpendableOutput(
       const ChainNodeConfig& config,
       const std::vector<std::string>& block_hashes,

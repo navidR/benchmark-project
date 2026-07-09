@@ -390,6 +390,38 @@ std::string FiroDriver::CreateWalletAddress(const FiroNodeConfig& config,
   return std::string(address.as_string());
 }
 
+uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
+                                          WalletMode wallet_mode,
+                                          uint64_t minimum_balance_satoshis,
+                                          uint64_t minimum_confirmations,
+                                          std::chrono::seconds timeout) const {
+  RequireSupportedWalletMode(wallet_mode, "balance readiness");
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  uint64_t last_balance = 0;
+  std::string last_error;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      boost::json::array params;
+      params.emplace_back("*");
+      params.push_back(minimum_confirmations);
+      const boost::json::value balance = RpcCall(config, "getbalance", params);
+      last_balance = JsonFixed8Amount(balance, "getbalance");
+      if (last_balance >= minimum_balance_satoshis) {
+        return last_balance;
+      }
+    } catch (const std::exception& e) {
+      last_error = e.what();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  throw std::runtime_error(
+      "Firo node " + config.id + " wallet balance " +
+      FormatFixed8Amount(last_balance) + " remained below " +
+      FormatFixed8Amount(minimum_balance_satoshis) + " with " +
+      std::to_string(minimum_confirmations) + " confirmations before timeout" +
+      (last_error.empty() ? "" : ": " + last_error));
+}
+
 FiroUtxo FiroDriver::FindSpendableOutput(
     const FiroNodeConfig& config, const std::vector<std::string>& block_hashes,
     const std::string& source_address, uint64_t minimum_amount_satoshis,
