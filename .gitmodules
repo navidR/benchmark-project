@@ -7,3 +7,6 @@
 [submodule "third_party/ncurses"]
 	path = third_party/ncurses
 	url = https://github.com/ThomasDickey/ncurses-snapshots.git
+[submodule "third_party/libyaml"]
+	path = third_party/libyaml
+	url = https://github.com/yaml/libyaml.git

@@ -1,4 +1,5 @@
 #include <linux/capability.h>
+#include <yaml.h>
 
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
@@ -1651,38 +1652,6 @@ boost::json::object ResourceLimitPatchJson(const ResourceLimitPatch& patch) {
   return object;
 }
 
-void AppendResourceLimitPatchYaml(std::string* yaml,
-                                  const ResourceLimitPatch& patch,
-                                  std::string_view indent) {
-  if (patch.memory_high_bytes) {
-    *yaml += std::string(indent) +
-             "memory_high_bytes: " + std::to_string(*patch.memory_high_bytes) +
-             "\n";
-  }
-  if (patch.memory_max_bytes) {
-    *yaml += std::string(indent) +
-             "memory_max_bytes: " + std::to_string(*patch.memory_max_bytes) +
-             "\n";
-  }
-  if (patch.cpu_quota_present) {
-    *yaml += std::string(indent) + "cpu_quota_us: ";
-    if (patch.cpu_quota_us) {
-      *yaml += std::to_string(*patch.cpu_quota_us);
-    } else {
-      *yaml += "max";
-    }
-    *yaml += "\n";
-  }
-  if (patch.cpu_period_us) {
-    *yaml += std::string(indent) +
-             "cpu_period_us: " + std::to_string(*patch.cpu_period_us) + "\n";
-  }
-  if (patch.pids_max) {
-    *yaml += std::string(indent) +
-             "pids_max: " + std::to_string(*patch.pids_max) + "\n";
-  }
-}
-
 ResourceLimits InitialResourceLimits(const Options& options) {
   return ResourceLimits{
       .memory_high_bytes = options.memory_high_bytes,
@@ -2384,16 +2353,124 @@ void WriteNodeLogTails(const std::filesystem::path& events_path,
   }
 }
 
-std::string NodeGroupYamlInline(const std::vector<uint32_t>& nodes) {
-  std::string text = "[";
-  for (size_t i = 0; i < nodes.size(); ++i) {
-    if (i != 0U) {
-      text += ", ";
+int YamlWriteHandler(void* data, unsigned char* buffer, size_t size) {
+  auto* output = static_cast<std::string*>(data);
+  output->append(reinterpret_cast<const char*>(buffer), size);
+  return 1;
+}
+
+class YamlEmitter {
+ public:
+  YamlEmitter() {
+    if (yaml_emitter_initialize(&emitter_) == 0) {
+      throw std::runtime_error("yaml emitter initialization failed");
     }
-    text += std::to_string(nodes[i] + 1U);
+    yaml_emitter_set_output(&emitter_, YamlWriteHandler, &output_);
+    yaml_emitter_set_unicode(&emitter_, 1);
+    yaml_emitter_set_indent(&emitter_, 2);
   }
-  text += "]";
-  return text;
+
+  ~YamlEmitter() { yaml_emitter_delete(&emitter_); }
+
+  YamlEmitter(const YamlEmitter&) = delete;
+  YamlEmitter& operator=(const YamlEmitter&) = delete;
+
+  void Emit(yaml_event_t* event) {
+    if (yaml_emitter_emit(&emitter_, event) == 0) {
+      const char* problem = emitter_.problem;
+      throw std::runtime_error(
+          std::string("yaml emit failed: ") +
+          (problem == nullptr ? "unknown error" : problem));
+    }
+  }
+
+  std::string Output() const { return output_; }
+
+ private:
+  yaml_emitter_t emitter_{};
+  std::string output_;
+};
+
+void EmitYamlScalar(YamlEmitter* emitter, std::string_view value,
+                    yaml_scalar_style_t style) {
+  if (value.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("YAML scalar is too large");
+  }
+  yaml_event_t event;
+  yaml_scalar_event_initialize(
+      &event, nullptr, nullptr,
+      const_cast<yaml_char_t*>(
+          reinterpret_cast<const yaml_char_t*>(value.data())),
+      static_cast<int>(value.size()), 1, 1, style);
+  emitter->Emit(&event);
+}
+
+void EmitYamlJsonValue(YamlEmitter* emitter, const boost::json::value& value);
+
+void EmitYamlJsonObject(YamlEmitter* emitter,
+                        const boost::json::object& object) {
+  yaml_event_t event;
+  yaml_mapping_start_event_initialize(&event, nullptr, nullptr, 1,
+                                      YAML_BLOCK_MAPPING_STYLE);
+  emitter->Emit(&event);
+  for (const auto& item : object) {
+    EmitYamlScalar(emitter, item.key(), YAML_PLAIN_SCALAR_STYLE);
+    EmitYamlJsonValue(emitter, item.value());
+  }
+  yaml_mapping_end_event_initialize(&event);
+  emitter->Emit(&event);
+}
+
+void EmitYamlJsonArray(YamlEmitter* emitter, const boost::json::array& array) {
+  yaml_event_t event;
+  yaml_sequence_start_event_initialize(&event, nullptr, nullptr, 1,
+                                       YAML_BLOCK_SEQUENCE_STYLE);
+  emitter->Emit(&event);
+  for (const boost::json::value& value : array) {
+    EmitYamlJsonValue(emitter, value);
+  }
+  yaml_sequence_end_event_initialize(&event);
+  emitter->Emit(&event);
+}
+
+void EmitYamlJsonValue(YamlEmitter* emitter, const boost::json::value& value) {
+  if (value.is_object()) {
+    EmitYamlJsonObject(emitter, value.as_object());
+  } else if (value.is_array()) {
+    EmitYamlJsonArray(emitter, value.as_array());
+  } else if (value.is_string()) {
+    EmitYamlScalar(emitter, std::string_view(value.as_string()),
+                   YAML_DOUBLE_QUOTED_SCALAR_STYLE);
+  } else if (value.is_bool()) {
+    EmitYamlScalar(emitter, value.as_bool() ? "true" : "false",
+                   YAML_PLAIN_SCALAR_STYLE);
+  } else if (value.is_int64()) {
+    EmitYamlScalar(emitter, std::to_string(value.as_int64()),
+                   YAML_PLAIN_SCALAR_STYLE);
+  } else if (value.is_uint64()) {
+    EmitYamlScalar(emitter, std::to_string(value.as_uint64()),
+                   YAML_PLAIN_SCALAR_STYLE);
+  } else if (value.is_double()) {
+    EmitYamlScalar(emitter, boost::json::serialize(value),
+                   YAML_PLAIN_SCALAR_STYLE);
+  } else if (value.is_null()) {
+    EmitYamlScalar(emitter, "null", YAML_PLAIN_SCALAR_STYLE);
+  }
+}
+
+std::string YamlFromJson(const boost::json::value& value) {
+  YamlEmitter emitter;
+  yaml_event_t event;
+  yaml_stream_start_event_initialize(&event, YAML_UTF8_ENCODING);
+  emitter.Emit(&event);
+  yaml_document_start_event_initialize(&event, nullptr, nullptr, nullptr, 0);
+  emitter.Emit(&event);
+  EmitYamlJsonValue(&emitter, value);
+  yaml_document_end_event_initialize(&event, 0);
+  emitter.Emit(&event);
+  yaml_stream_end_event_initialize(&event);
+  emitter.Emit(&event);
+  return emitter.Output();
 }
 
 std::vector<ScenarioWorkload> EffectiveWorkloads(const Options& options) {
@@ -2452,70 +2529,6 @@ std::optional<uint32_t> CommonBlockGenerationSyncTimeout(
     }
   }
   return sync_timeout_sec;
-}
-
-std::string WorkloadsYaml(const std::vector<ScenarioWorkload>& workloads) {
-  if (workloads.empty()) {
-    return "workloads: []\n";
-  }
-  std::string yaml = "workloads:\n";
-  for (const ScenarioWorkload& workload : workloads) {
-    if (workload.kind == WorkloadKind::kBlockGeneration) {
-      yaml +=
-          "  - type: block_generation\n"
-          "    node: " +
-          std::to_string(workload.block_generation.node) +
-          "\n"
-          "    count: " +
-          std::to_string(workload.block_generation.count) +
-          "\n"
-          "    sync_timeout_sec: " +
-          std::to_string(workload.block_generation.sync_timeout_sec) + "\n";
-    } else if (workload.kind == WorkloadKind::kWaitUntilHeight) {
-      yaml +=
-          "  - type: wait_until_height\n"
-          "    node: " +
-          std::to_string(workload.wait_until_height.node) +
-          "\n"
-          "    height: " +
-          std::to_string(workload.wait_until_height.height) +
-          "\n"
-          "    timeout_sec: " +
-          std::to_string(workload.wait_until_height.timeout_sec) + "\n";
-    } else if (workload.kind == WorkloadKind::kWaitForPeers) {
-      yaml +=
-          "  - type: wait_for_peers\n"
-          "    node: " +
-          std::to_string(workload.wait_for_peers.node) +
-          "\n"
-          "    peer_count: " +
-          std::to_string(workload.wait_for_peers.peer_count) +
-          "\n"
-          "    timeout_sec: " +
-          std::to_string(workload.wait_for_peers.timeout_sec) + "\n";
-    } else if (workload.kind == WorkloadKind::kRestartNode) {
-      yaml +=
-          "  - type: restart_node\n"
-          "    node: " +
-          std::to_string(workload.restart_node.node) + "\n";
-    } else if (workload.kind == WorkloadKind::kFreezeNode) {
-      yaml +=
-          "  - type: freeze_node\n"
-          "    node: " +
-          std::to_string(workload.freeze_node.node) +
-          "\n"
-          "    duration_ms: " +
-          std::to_string(workload.freeze_node.duration_ms) + "\n";
-    } else if (workload.kind == WorkloadKind::kUpdateResourceLimits) {
-      yaml +=
-          "  - type: update_resource_limits\n"
-          "    node: " +
-          std::to_string(workload.update_resource_limits.node) + "\n";
-      AppendResourceLimitPatchYaml(&yaml, workload.update_resource_limits.patch,
-                                   "    ");
-    }
-  }
-  return yaml;
 }
 
 boost::json::object BlockGenerationWorkloadJson(
@@ -2594,225 +2607,6 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root) {
   const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
-  std::string network_yaml =
-      "network:\n"
-      "  isolated: " +
-      std::string(options.isolate_network ? "true" : "false") + "\n";
-  if (options.network_condition_requested) {
-    network_yaml +=
-        "  default_condition:\n"
-        "    bandwidth_mbps: " +
-        std::to_string(options.network_condition.bandwidth_mbps) +
-        "\n"
-        "    delay_ms: " +
-        std::to_string(options.network_condition.delay_ms) +
-        "\n"
-        "    jitter_ms: " +
-        std::to_string(options.network_condition.jitter_ms) +
-        "\n"
-        "    loss_basis_points: " +
-        std::to_string(options.network_condition.loss_basis_points) +
-        "\n"
-        "    duplicate_basis_points: " +
-        std::to_string(options.network_condition.duplicate_basis_points) +
-        "\n"
-        "    corrupt_basis_points: " +
-        std::to_string(options.network_condition.corrupt_basis_points) +
-        "\n"
-        "    reorder_basis_points: " +
-        std::to_string(options.network_condition.reorder_basis_points) +
-        "\n"
-        "    limit_packets: " +
-        std::to_string(options.network_condition.limit_packets) + "\n";
-  }
-  if (!options.node_network_conditions.empty()) {
-    network_yaml += "  node_conditions:\n";
-    for (const auto& [node_index, condition] :
-         options.node_network_conditions) {
-      network_yaml += "    firo-" + std::to_string(node_index + 1U) +
-                      ":\n"
-                      "      bandwidth_mbps: " +
-                      std::to_string(condition.bandwidth_mbps) +
-                      "\n"
-                      "      delay_ms: " +
-                      std::to_string(condition.delay_ms) +
-                      "\n"
-                      "      jitter_ms: " +
-                      std::to_string(condition.jitter_ms) +
-                      "\n"
-                      "      loss_basis_points: " +
-                      std::to_string(condition.loss_basis_points) +
-                      "\n"
-                      "      duplicate_basis_points: " +
-                      std::to_string(condition.duplicate_basis_points) +
-                      "\n"
-                      "      corrupt_basis_points: " +
-                      std::to_string(condition.corrupt_basis_points) +
-                      "\n"
-                      "      reorder_basis_points: " +
-                      std::to_string(condition.reorder_basis_points) +
-                      "\n"
-                      "      limit_packets: " +
-                      std::to_string(condition.limit_packets) + "\n";
-    }
-  }
-  if (!options.runtime_node_network_conditions.empty()) {
-    network_yaml += "  runtime_node_conditions:\n";
-    for (const auto& [node_index, condition] :
-         options.runtime_node_network_conditions) {
-      network_yaml += "    firo-" + std::to_string(node_index + 1U) +
-                      ":\n"
-                      "      bandwidth_mbps: " +
-                      std::to_string(condition.bandwidth_mbps) +
-                      "\n"
-                      "      delay_ms: " +
-                      std::to_string(condition.delay_ms) +
-                      "\n"
-                      "      jitter_ms: " +
-                      std::to_string(condition.jitter_ms) +
-                      "\n"
-                      "      loss_basis_points: " +
-                      std::to_string(condition.loss_basis_points) +
-                      "\n"
-                      "      duplicate_basis_points: " +
-                      std::to_string(condition.duplicate_basis_points) +
-                      "\n"
-                      "      corrupt_basis_points: " +
-                      std::to_string(condition.corrupt_basis_points) +
-                      "\n"
-                      "      reorder_basis_points: " +
-                      std::to_string(condition.reorder_basis_points) +
-                      "\n"
-                      "      limit_packets: " +
-                      std::to_string(condition.limit_packets) + "\n";
-    }
-  }
-  if (!options.runtime_node_blocks.empty()) {
-    network_yaml += "  runtime_node_blocks:\n";
-    for (const NetworkBlockRule& rule : options.runtime_node_blocks) {
-      network_yaml += "    - node: " + std::to_string(rule.node_index + 1U) +
-                      "\n"
-                      "      dst_address: " +
-                      rule.dst_address +
-                      "\n"
-                      "      dst_port: " +
-                      std::to_string(rule.dst_port) +
-                      "\n"
-                      "      handle: " +
-                      std::to_string(rule.handle) + "\n";
-    }
-  }
-  if (!options.runtime_node_unblocks.empty()) {
-    network_yaml += "  runtime_node_unblocks:\n";
-    for (const NetworkBlockRule& rule : options.runtime_node_unblocks) {
-      network_yaml += "    - node: " + std::to_string(rule.node_index + 1U) +
-                      "\n"
-                      "      dst_address: " +
-                      rule.dst_address +
-                      "\n"
-                      "      dst_port: " +
-                      std::to_string(rule.dst_port) +
-                      "\n"
-                      "      handle: " +
-                      std::to_string(rule.handle) + "\n";
-    }
-  }
-  if (!options.runtime_partitions.empty()) {
-    network_yaml += "  runtime_partitions:\n";
-    for (const NetworkPartitionRule& rule : options.runtime_partitions) {
-      network_yaml += "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
-                      "\n"
-                      "      group_b: " +
-                      NodeGroupYamlInline(rule.group_b) + "\n";
-    }
-  }
-  if (!options.runtime_partition_heals.empty()) {
-    network_yaml += "  runtime_partition_heals:\n";
-    for (const NetworkPartitionRule& rule : options.runtime_partition_heals) {
-      network_yaml += "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
-                      "\n"
-                      "      group_b: " +
-                      NodeGroupYamlInline(rule.group_b) + "\n";
-    }
-  }
-
-  std::string runtime_resource_yaml;
-  if (!options.runtime_node_resource_updates.empty()) {
-    runtime_resource_yaml += "  runtime_node_limits:\n";
-    for (const auto& [node_index, patch] :
-         options.runtime_node_resource_updates) {
-      runtime_resource_yaml +=
-          "    firo-" + std::to_string(node_index + 1U) + ":\n";
-      AppendResourceLimitPatchYaml(&runtime_resource_yaml, patch, "      ");
-    }
-  }
-
-  std::string process_yaml;
-  if (!options.runtime_node_restarts.empty() ||
-      !options.runtime_node_freezes.empty()) {
-    process_yaml += "process:\n";
-    if (!options.runtime_node_restarts.empty()) {
-      process_yaml += "  runtime_node_restarts:\n";
-      for (uint32_t node_index : options.runtime_node_restarts) {
-        process_yaml += "    - node: " + std::to_string(node_index + 1U) + "\n";
-      }
-    }
-    if (!options.runtime_node_freezes.empty()) {
-      process_yaml += "  runtime_node_freezes:\n";
-      for (const FreezeRequest& freeze : options.runtime_node_freezes) {
-        process_yaml +=
-            "    - node: " + std::to_string(freeze.node_index + 1U) +
-            "\n"
-            "      duration_ms: " +
-            std::to_string(freeze.duration_ms) + "\n";
-      }
-    }
-  }
-
-  WriteText(
-      run_root / "scenario.yaml",
-      "simulation:\n"
-      "  name: " +
-          options.run_id +
-          "\n"
-          "  output_dir: " +
-          run_root.string() +
-          "\n"
-          "chains:\n"
-          "  firo:\n"
-          "    driver: firo\n"
-          "    default_binary: " +
-          options.firod.string() +
-          "\n"
-          "nodes: " +
-          std::to_string(options.nodes) +
-          "\n"
-          "metrics:\n"
-          "  extra_sample_count: " +
-          std::to_string(options.metrics_sample_count) +
-          "\n"
-          "  interval_ms: " +
-          std::to_string(options.metrics_interval_ms) +
-          "\n"
-          "resources:\n"
-          "  default:\n"
-          "    memory_high_bytes: " +
-          std::to_string(options.memory_high_bytes) +
-          "\n"
-          "    memory_max_bytes: " +
-          std::to_string(options.memory_max_bytes) +
-          "\n"
-          "    cpu_quota_us: " +
-          (options.cpu_quota_requested ? std::to_string(options.cpu_quota_us)
-                                       : std::string("max")) +
-          "\n"
-          "    cpu_period_us: " +
-          std::to_string(options.cpu_period_us) +
-          "\n"
-          "    pids_max: " +
-          std::to_string(options.pids_max) + "\n" + runtime_resource_yaml +
-          network_yaml + process_yaml + WorkloadsYaml(workloads));
-
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
   resolved["chain"] = "firo";
@@ -2940,6 +2734,7 @@ void WriteScenarioFiles(const Options& options,
   }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
+  WriteText(run_root / "scenario.yaml", YamlFromJson(resolved));
 }
 
 void LoadCleanupMetadata(const std::filesystem::path& run_root,

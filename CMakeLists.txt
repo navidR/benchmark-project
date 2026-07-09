@@ -25,6 +25,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_DISABLE_FIND_PACKAGE_ICU ON)
 add_subdirectory(third_party/boost EXCLUDE_FROM_ALL)
 
+set(BENCHMARK_PROJECT_BUILD_TESTING "${BUILD_TESTING}")
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/libyaml EXCLUDE_FROM_ALL)
+set(BUILD_TESTING "${BENCHMARK_PROJECT_BUILD_TESTING}" CACHE BOOL "" FORCE)
+add_library(yaml::yaml ALIAS yaml)
+
 set(LIBMNL_GENERATED_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/libmnl")
 file(MAKE_DIRECTORY "${LIBMNL_GENERATED_INCLUDE}")
 file(WRITE "${LIBMNL_GENERATED_INCLUDE}/config.h"
@@ -115,6 +121,7 @@ collect_directory_targets(boost_targets "${CMAKE_CURRENT_SOURCE_DIR}/third_party
 foreach(boost_target IN LISTS boost_targets)
   mark_target_interface_includes_system("${boost_target}")
 endforeach()
+mark_target_interface_includes_system(yaml)
 
 add_executable(benchmark-sim
   src/capability.cpp
@@ -140,6 +147,7 @@ target_link_libraries(benchmark-sim PRIVATE
   Boost::program_options
   Boost::system
   libmnl::libmnl
+  yaml::yaml
 )
 target_compile_options(benchmark-sim PRIVATE
   -Wall
