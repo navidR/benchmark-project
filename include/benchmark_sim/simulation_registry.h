@@ -7,6 +7,17 @@
 
 namespace bsim {
 
+enum class PeerConnectivityMode {
+  kFixedCount,
+  kAllPeers,
+};
+
+struct PeerConnectivityPolicy {
+  uint32_t node = 0;
+  PeerConnectivityMode mode = PeerConnectivityMode::kFixedCount;
+  uint32_t max_peer_count = 1;
+};
+
 struct NodeRoleTopology {
   bool configured = false;
   uint32_t node_count = 0;
@@ -15,6 +26,7 @@ struct NodeRoleTopology {
   bool allow_miner_wallet_overlap = false;
   std::vector<uint32_t> wallet_nodes;
   std::vector<uint32_t> miner_nodes;
+  std::vector<PeerConnectivityPolicy> peer_connectivity;
 };
 
 enum class WalletInitializationStrategy {

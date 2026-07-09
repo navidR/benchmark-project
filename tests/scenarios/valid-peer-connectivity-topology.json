@@ -1,0 +1,27 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "peer-connectivity-topology-smoke",
+  "node_count": 4,
+  "generate_blocks": 0,
+  "topology": {
+    "node_count": 4,
+    "wallet_node_count": 1,
+    "miner_node_count": 1,
+    "allow_miner_wallet_overlap": false,
+    "peer_connectivity": [
+      {
+        "node": 1,
+        "max_peer_count": 2
+      },
+      {
+        "node": 2,
+        "all_peers": true
+      },
+      {
+        "node": 3,
+        "max_peer_count": 0
+      }
+    ]
+  }
+}

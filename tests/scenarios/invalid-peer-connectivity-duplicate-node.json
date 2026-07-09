@@ -1,0 +1,18 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 3,
+  "topology": {
+    "node_count": 3,
+    "peer_connectivity": [
+      {
+        "node": 1,
+        "max_peer_count": 1
+      },
+      {
+        "node": 1,
+        "all_peers": true
+      }
+    ]
+  },
+  "workloads": []
+}

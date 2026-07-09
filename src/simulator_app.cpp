@@ -572,6 +572,16 @@ bool NodeListContains(const std::vector<uint32_t>& nodes, uint32_t node_index) {
   return false;
 }
 
+const PeerConnectivityPolicy* FindPeerConnectivityPolicy(
+    const NodeRoleTopology& topology, uint32_t node_index) {
+  for (const PeerConnectivityPolicy& policy : topology.peer_connectivity) {
+    if (policy.node == node_index) {
+      return &policy;
+    }
+  }
+  return nullptr;
+}
+
 WalletInitializationStrategy ParseWalletInitializationStrategy(
     std::string_view value) {
   if (value == "driver_rpc") {
@@ -627,6 +637,16 @@ std::string_view WalletTransferStrategyName(WalletTransferStrategy strategy) {
   throw std::runtime_error("unknown wallet transfer strategy");
 }
 
+std::string_view PeerConnectivityModeName(PeerConnectivityMode mode) {
+  switch (mode) {
+    case PeerConnectivityMode::kFixedCount:
+      return "fixed_count";
+    case PeerConnectivityMode::kAllPeers:
+      return "all_peers";
+  }
+  throw std::runtime_error("unknown peer connectivity mode");
+}
+
 WalletMode ToFiroWalletMode(const WalletInitialization& initialization) {
   switch (initialization.mode) {
     case WalletPrivacyMode::kPublic:
@@ -635,6 +655,72 @@ WalletMode ToFiroWalletMode(const WalletInitialization& initialization) {
       return WalletMode::kPrivate;
   }
   throw std::runtime_error("unknown wallet privacy mode");
+}
+
+PeerConnectivityPolicy ParsePeerConnectivityPolicyObject(
+    const boost::json::object& object, uint32_t node_count) {
+  const uint32_t node = JsonUint32Field(object, "node");
+  if (node == 0U || node > node_count) {
+    throw std::runtime_error(
+        "scenario topology.peer_connectivity node must be in 1..node_count");
+  }
+  PeerConnectivityPolicy policy;
+  policy.node = node - 1U;
+  const bool all_peers = JsonOptionalBoolField(object, "all_peers", false);
+  const bool max_peer_count_present =
+      object.if_contains("max_peer_count") != nullptr;
+  if (all_peers && max_peer_count_present) {
+    throw std::runtime_error(
+        "scenario topology.peer_connectivity cannot set both all_peers and "
+        "max_peer_count");
+  }
+  if (all_peers) {
+    policy.mode = PeerConnectivityMode::kAllPeers;
+    policy.max_peer_count = 0;
+    return policy;
+  }
+  if (!max_peer_count_present) {
+    throw std::runtime_error(
+        "scenario topology.peer_connectivity requires all_peers or "
+        "max_peer_count");
+  }
+  policy.mode = PeerConnectivityMode::kFixedCount;
+  policy.max_peer_count = JsonUint32Field(object, "max_peer_count");
+  if (policy.max_peer_count >= node_count) {
+    throw std::runtime_error(
+        "scenario topology.peer_connectivity max_peer_count must be less than "
+        "node_count");
+  }
+  return policy;
+}
+
+std::vector<PeerConnectivityPolicy> ParsePeerConnectivityPolicies(
+    const boost::json::object& object, uint32_t node_count) {
+  const boost::json::value* value = object.if_contains("peer_connectivity");
+  if (value == nullptr) {
+    return {};
+  }
+  if (!value->is_array()) {
+    throw std::runtime_error(
+        "scenario topology.peer_connectivity must be a JSON array");
+  }
+  std::vector<PeerConnectivityPolicy> policies;
+  for (const boost::json::value& item : value->as_array()) {
+    if (!item.is_object()) {
+      throw std::runtime_error(
+          "scenario topology.peer_connectivity entries must be objects");
+    }
+    PeerConnectivityPolicy policy =
+        ParsePeerConnectivityPolicyObject(item.as_object(), node_count);
+    for (const PeerConnectivityPolicy& existing : policies) {
+      if (existing.node == policy.node) {
+        throw std::runtime_error(
+            "scenario topology.peer_connectivity contains duplicate node");
+      }
+    }
+    policies.push_back(policy);
+  }
+  return policies;
 }
 
 NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
@@ -716,6 +802,8 @@ NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
         "scenario topology wallet_nodes and miner_nodes overlap but "
         "allow_miner_wallet_overlap is false");
   }
+  topology.peer_connectivity =
+      ParsePeerConnectivityPolicies(object, topology.node_count);
   return topology;
 }
 
@@ -2261,6 +2349,28 @@ boost::json::object WalletInitializationJson(
   return object;
 }
 
+boost::json::object PeerConnectivityPolicyJson(
+    const PeerConnectivityPolicy& policy) {
+  boost::json::object object;
+  object["node"] = policy.node + 1U;
+  object["mode"] = std::string(PeerConnectivityModeName(policy.mode));
+  if (policy.mode == PeerConnectivityMode::kAllPeers) {
+    object["all_peers"] = true;
+  } else {
+    object["max_peer_count"] = policy.max_peer_count;
+  }
+  return object;
+}
+
+boost::json::array PeerConnectivityPoliciesJson(
+    const std::vector<PeerConnectivityPolicy>& policies) {
+  boost::json::array array;
+  for (const PeerConnectivityPolicy& policy : policies) {
+    array.push_back(PeerConnectivityPolicyJson(policy));
+  }
+  return array;
+}
+
 boost::json::object NodeRoleTopologyJson(
     const NodeRoleTopology& topology,
     const WalletInitialization& wallet_initialization) {
@@ -2273,6 +2383,10 @@ boost::json::object NodeRoleTopologyJson(
   object["miner_nodes"] = NodeGroupJson(topology.miner_nodes);
   object["wallet_initialization"] =
       WalletInitializationJson(wallet_initialization);
+  if (!topology.peer_connectivity.empty()) {
+    object["peer_connectivity"] =
+        PeerConnectivityPoliciesJson(topology.peer_connectivity);
+  }
   return object;
 }
 
@@ -2449,6 +2563,56 @@ std::string FiroPeerHost(const Options& options, uint32_t node_index) {
     return NodeAddress(node_index);
   }
   return "127.0.0.1";
+}
+
+std::string FiroPeerAddress(const Options& options, uint32_t node_index) {
+  return FiroPeerHost(options, node_index) + ":" +
+         std::to_string(18168 + node_index);
+}
+
+std::vector<uint32_t> LegacyStartupPeerIndexes(uint32_t node_index) {
+  if (node_index == 0U) {
+    return {};
+  }
+  return {0U};
+}
+
+std::vector<uint32_t> ConfiguredStartupPeerIndexes(const Options& options,
+                                                   uint32_t node_index) {
+  const PeerConnectivityPolicy* policy =
+      FindPeerConnectivityPolicy(options.topology, node_index);
+  if (policy == nullptr) {
+    return LegacyStartupPeerIndexes(node_index);
+  }
+  const uint32_t max_peer_count =
+      policy->mode == PeerConnectivityMode::kAllPeers ? options.nodes - 1U
+                                                      : policy->max_peer_count;
+  std::vector<uint32_t> peers;
+  peers.reserve(max_peer_count);
+  for (uint32_t peer_index = 0; peer_index < options.nodes; ++peer_index) {
+    if (peers.size() >= max_peer_count) {
+      break;
+    }
+    if (peer_index == node_index) {
+      continue;
+    }
+    peers.push_back(peer_index);
+  }
+  return peers;
+}
+
+std::vector<std::string> StartupPeerAddresses(const Options& options,
+                                              uint32_t node_index) {
+  const std::vector<uint32_t> peer_indexes =
+      options.topology.configured
+          ? ConfiguredStartupPeerIndexes(options, node_index)
+          : LegacyStartupPeerIndexes(node_index);
+  std::vector<std::string> peers;
+  peers.reserve(peer_indexes.size());
+  for (uint32_t peer_index : peer_indexes) {
+    peers.push_back(FiroPeerAddress(options, peer_index));
+  }
+  return peers;
 }
 
 bool HostIpv4ForwardingEnabled() {
@@ -3653,9 +3817,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     config.listen = true;
     config.wallet_enabled = options.wallet_backed_workload_requested &&
                             NodeListContains(options.topology.wallet_nodes, i);
-    if (i > 0) {
-      config.connect_peers.push_back(FiroPeerHost(options, 0) + ":18168");
-    }
+    config.connect_peers = StartupPeerAddresses(options, i);
 
     NodeRuntime runtime;
     try {
