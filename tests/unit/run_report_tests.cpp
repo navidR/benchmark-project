@@ -145,6 +145,39 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "\\\"cpu_period_us\\\":100000,"
                    "\\\"pids_max\\\":128}}\"}");
   bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"event\":\"wallet_address_created\","
+                   "\"detail\":\"{\\\"wallet_index\\\":1,"
+                   "\\\"node\\\":1,\\\"strategy\\\":\\\"driver_rpc\\\","
+                   "\\\"mode\\\":\\\"public\\\","
+                   "\\\"address\\\":\\\"addr1\\\"}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+                   "\"event\":\"wallet_address_created\","
+                   "\"detail\":\"{\\\"wallet_index\\\":2,"
+                   "\\\"node\\\":2,\\\"strategy\\\":\\\"driver_rpc\\\","
+                   "\\\"mode\\\":\\\"public\\\","
+                   "\\\"address\\\":\\\"addr2\\\"}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"event\":\"wallet_transaction_submitted\","
+                   "\"detail\":\"{\\\"workload_index\\\":7,"
+                   "\\\"workload_count\\\":7,"
+                   "\\\"transaction_index\\\":1,"
+                   "\\\"transaction_count\\\":1,"
+                   "\\\"strategy\\\":\\\"random\\\","
+                   "\\\"seed\\\":42,"
+                   "\\\"sender_wallet_index\\\":1,"
+                   "\\\"receiver_wallet_index\\\":2,"
+                   "\\\"sender_node\\\":1,"
+                   "\\\"receiver_node\\\":2,"
+                   "\\\"sender_address\\\":\\\"addr1\\\","
+                   "\\\"receiver_address\\\":\\\"addr2\\\","
+                   "\\\"funding_miner_node\\\":1,"
+                   "\\\"amount\\\":\\\"1.00000000\\\","
+                   "\\\"txids\\\":[\\\"tx1\\\"],"
+                   "\\\"mempool_size\\\":1}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:02Z\","
                    "\"event\":\"run_finished\"}");
@@ -182,7 +215,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
-  BOOST_TEST(JsonInteger(report, "event_count") == 11U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 14U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -274,6 +307,33 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(resource_update, "node") == 1U);
   BOOST_TEST(JsonInteger(resource_update.at("requested").as_object(),
                          "pids_max") == 128U);
+  const boost::json::array& wallet_transactions =
+      report.at("wallet_transactions").as_array();
+  BOOST_REQUIRE_EQUAL(wallet_transactions.size(), 1U);
+  const boost::json::object& wallet_transaction =
+      wallet_transactions.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(wallet_transaction, "sender_wallet_index") == 1U);
+  BOOST_TEST(JsonInteger(wallet_transaction, "receiver_wallet_index") == 2U);
+  BOOST_TEST(wallet_transaction.at("strategy").as_string() == "random");
+  BOOST_TEST(JsonInteger(wallet_transaction, "seed") == 42U);
+  const boost::json::array& wallets = report.at("wallets_summary").as_array();
+  BOOST_REQUIRE_EQUAL(wallets.size(), 2U);
+  const boost::json::object& sender_wallet = wallets.front().as_object();
+  BOOST_TEST(JsonInteger(sender_wallet, "wallet_index") == 1U);
+  BOOST_TEST(JsonInteger(sender_wallet, "node") == 1U);
+  BOOST_TEST(sender_wallet.at("address").as_string() == "addr1");
+  BOOST_TEST(sender_wallet.at("strategy").as_string() == "driver_rpc");
+  BOOST_TEST(sender_wallet.at("mode").as_string() == "public");
+  BOOST_TEST(JsonInteger(sender_wallet, "transactions_sent") == 1U);
+  BOOST_TEST(JsonInteger(sender_wallet, "transactions_received") == 0U);
+  BOOST_TEST(JsonInteger(sender_wallet.at("last_sent_transaction").as_object(),
+                         "receiver_wallet_index") == 2U);
+  const boost::json::object& receiver_wallet = wallets[1].as_object();
+  BOOST_TEST(JsonInteger(receiver_wallet, "wallet_index") == 2U);
+  BOOST_TEST(JsonInteger(receiver_wallet, "node") == 2U);
+  BOOST_TEST(receiver_wallet.at("address").as_string() == "addr2");
+  BOOST_TEST(JsonInteger(receiver_wallet, "transactions_sent") == 0U);
+  BOOST_TEST(JsonInteger(receiver_wallet, "transactions_received") == 1U);
   const boost::json::array& nodes = report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);
   const boost::json::object& node = nodes.front().as_object();

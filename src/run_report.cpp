@@ -30,6 +30,18 @@ struct NodeReport {
   std::optional<std::uint64_t> previous_network_tx_bytes;
 };
 
+struct WalletReport {
+  std::uint64_t wallet_index = 0;
+  std::uint64_t node = 0;
+  std::string address;
+  std::string strategy;
+  std::string mode;
+  std::uint64_t transactions_sent = 0;
+  std::uint64_t transactions_received = 0;
+  boost::json::object last_sent_transaction;
+  boost::json::object last_received_transaction;
+};
+
 std::string OptionalStringField(const boost::json::object& object,
                                 std::string_view field) {
   const boost::json::value* value = object.if_contains(field);
@@ -307,6 +319,102 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
   return array;
 }
 
+void CopyOptionalStringField(const boost::json::object& source,
+                             std::string_view field, std::string* target) {
+  const std::string value = OptionalStringField(source, field);
+  if (!value.empty()) {
+    *target = value;
+  }
+}
+
+void CopyOptionalUint64Field(const boost::json::object& source,
+                             std::string_view field, std::uint64_t* target) {
+  const std::optional<std::uint64_t> value = OptionalUint64Field(source, field);
+  if (value) {
+    *target = *value;
+  }
+}
+
+void RememberWalletAddressEvent(
+    const boost::json::value& detail,
+    std::map<std::uint64_t, WalletReport>* wallets) {
+  if (!detail.is_object()) {
+    return;
+  }
+  const boost::json::object& object = detail.as_object();
+  const std::optional<std::uint64_t> wallet_index =
+      OptionalUint64Field(object, "wallet_index");
+  if (!wallet_index) {
+    return;
+  }
+  WalletReport& wallet = (*wallets)[*wallet_index];
+  wallet.wallet_index = *wallet_index;
+  CopyOptionalUint64Field(object, "node", &wallet.node);
+  CopyOptionalStringField(object, "address", &wallet.address);
+  CopyOptionalStringField(object, "strategy", &wallet.strategy);
+  CopyOptionalStringField(object, "mode", &wallet.mode);
+}
+
+void RememberWalletTransactionEvent(
+    const boost::json::value& detail,
+    std::map<std::uint64_t, WalletReport>* wallets) {
+  if (!detail.is_object()) {
+    return;
+  }
+  const boost::json::object& object = detail.as_object();
+  const std::optional<std::uint64_t> sender_index =
+      OptionalUint64Field(object, "sender_wallet_index");
+  const std::optional<std::uint64_t> receiver_index =
+      OptionalUint64Field(object, "receiver_wallet_index");
+  if (sender_index) {
+    WalletReport& sender = (*wallets)[*sender_index];
+    sender.wallet_index = *sender_index;
+    ++sender.transactions_sent;
+    CopyOptionalUint64Field(object, "sender_node", &sender.node);
+    CopyOptionalStringField(object, "sender_address", &sender.address);
+    sender.last_sent_transaction = object;
+  }
+  if (receiver_index) {
+    WalletReport& receiver = (*wallets)[*receiver_index];
+    receiver.wallet_index = *receiver_index;
+    ++receiver.transactions_received;
+    CopyOptionalUint64Field(object, "receiver_node", &receiver.node);
+    CopyOptionalStringField(object, "receiver_address", &receiver.address);
+    receiver.last_received_transaction = object;
+  }
+}
+
+boost::json::array WalletsJson(
+    const std::map<std::uint64_t, WalletReport>& wallets) {
+  boost::json::array array;
+  for (const auto& [wallet_index, wallet] : wallets) {
+    boost::json::object object;
+    object["wallet_index"] = wallet_index;
+    if (wallet.node != 0U) {
+      object["node"] = wallet.node;
+    }
+    if (!wallet.address.empty()) {
+      object["address"] = wallet.address;
+    }
+    if (!wallet.strategy.empty()) {
+      object["strategy"] = wallet.strategy;
+    }
+    if (!wallet.mode.empty()) {
+      object["mode"] = wallet.mode;
+    }
+    object["transactions_sent"] = wallet.transactions_sent;
+    object["transactions_received"] = wallet.transactions_received;
+    if (!wallet.last_sent_transaction.empty()) {
+      object["last_sent_transaction"] = wallet.last_sent_transaction;
+    }
+    if (!wallet.last_received_transaction.empty()) {
+      object["last_received_transaction"] = wallet.last_received_transaction;
+    }
+    array.push_back(std::move(object));
+  }
+  return array;
+}
+
 std::optional<std::string_view> LogTailKind(std::string_view event_name) {
   if (event_name == "stdout_tail") {
     return "stdout";
@@ -374,6 +482,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array resource_updates;
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
+  boost::json::array wallet_transactions;
+  std::map<std::uint64_t, WalletReport> wallets;
 
   ForEachJsonLine(
       run_root / "events.jsonl", [&](const boost::json::object& event) {
@@ -422,6 +532,13 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           AppendEventSummary(event, &network_partitions);
         } else if (event_name == "network_partition_healed") {
           AppendEventSummary(event, &network_partition_heals);
+        } else if (event_name == "wallet_address_requested" ||
+                   event_name == "wallet_address_created") {
+          RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
+        } else if (event_name == "wallet_transaction_submitted") {
+          boost::json::value detail = ParseEventDetail(event);
+          RememberWalletTransactionEvent(detail, &wallets);
+          AppendEventSummary(event, &wallet_transactions);
         }
       });
 
@@ -470,6 +587,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["resource_updates"] = std::move(resource_updates);
   report["network_partitions"] = std::move(network_partitions);
   report["network_partition_heals"] = std::move(network_partition_heals);
+  report["wallet_transactions"] = std::move(wallet_transactions);
+  report["wallets_summary"] = WalletsJson(wallets);
   report["nodes_summary"] = NodesJson(nodes);
   return boost::json::serialize(report);
 }
