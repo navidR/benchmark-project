@@ -67,6 +67,14 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+      "\"event\":\"daemon_log_tail\","
+      "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
+      "\\\"start_offset\\\":0,\\\"next_offset\\\":4,"
+      "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
+      "\\\"text\\\":\\\"tail\\\"}\"}");
+  bsim::AppendLine(
+      dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
       "\"event\":\"generated_blocks\","
       "\"detail\":\"{\\\"workload_index\\\":1,"
       "\\\"workload_count\\\":2,\\\"generator_node\\\":1,"
@@ -105,7 +113,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 
   BOOST_TEST(report.at("ok").as_bool());
   BOOST_TEST(report.at("status").as_string() == "finished");
-  BOOST_TEST(JsonInteger(report, "event_count") == 4U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 5U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -175,6 +183,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(last_metrics.at("qdisc_has_tbf_options").as_bool());
   BOOST_TEST(JsonInteger(last_metrics, "qdisc_tbf_rate_bytes_per_sec") ==
              1250000U);
+  const boost::json::object& log_tails = node.at("log_tails").as_object();
+  const boost::json::object& daemon_log_tail =
+      log_tails.at("daemon_log").as_object();
+  BOOST_TEST(daemon_log_tail.at("text").as_string() == "tail");
 
   std::filesystem::remove_all(dir);
 }

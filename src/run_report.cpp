@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -23,6 +24,7 @@ struct NodeReport {
   std::uint64_t metric_samples = 0;
   std::string final_state;
   boost::json::object last_metrics;
+  boost::json::object log_tails;
 };
 
 std::string OptionalStringField(const boost::json::object& object,
@@ -39,6 +41,18 @@ void CopyField(const boost::json::object& source, std::string_view field,
   const boost::json::value* value = source.if_contains(field);
   if (value != nullptr) {
     (*target)[field] = *value;
+  }
+}
+
+boost::json::value ParseEventDetail(const boost::json::object& event) {
+  const std::string detail = OptionalStringField(event, "detail");
+  if (detail.empty()) {
+    return nullptr;
+  }
+  try {
+    return boost::json::parse(detail);
+  } catch (...) {
+    return boost::json::value(boost::json::string(detail));
   }
 }
 
@@ -206,9 +220,25 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
       object["final_state"] = node.final_state;
     }
     object["last_metrics"] = node.last_metrics;
+    if (!node.log_tails.empty()) {
+      object["log_tails"] = node.log_tails;
+    }
     array.push_back(std::move(object));
   }
   return array;
+}
+
+std::optional<std::string_view> LogTailKind(std::string_view event_name) {
+  if (event_name == "stdout_tail") {
+    return "stdout";
+  }
+  if (event_name == "stderr_tail") {
+    return "stderr";
+  }
+  if (event_name == "daemon_log_tail") {
+    return "daemon_log";
+  }
+  return std::nullopt;
 }
 
 void AppendGeneratedBlocksEvent(const boost::json::object& event,
@@ -219,18 +249,9 @@ void AppendGeneratedBlocksEvent(const boost::json::object& event,
     summary["node_id"] = node_id;
   }
 
-  const std::string detail = OptionalStringField(event, "detail");
-  if (!detail.empty()) {
-    try {
-      boost::json::value detail_value = boost::json::parse(detail);
-      if (detail_value.is_object()) {
-        summary["detail"] = detail_value.as_object();
-      } else {
-        summary["detail"] = detail;
-      }
-    } catch (...) {
-      summary["detail"] = detail;
-    }
+  boost::json::value detail = ParseEventDetail(event);
+  if (!detail.is_null()) {
+    summary["detail"] = std::move(detail);
   }
   generated_blocks->push_back(std::move(summary));
 }
@@ -273,6 +294,11 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
                     } else if (event_name == "state" && !node_id.empty()) {
                       nodes[node_id].final_state =
                           OptionalStringField(event, "detail");
+                    } else if (const std::optional<std::string_view> kind =
+                                   LogTailKind(event_name);
+                               kind && !node_id.empty()) {
+                      nodes[node_id].log_tails[std::string(*kind)] =
+                          ParseEventDetail(event);
                     } else if (event_name == "generated_blocks") {
                       AppendGeneratedBlocksEvent(event, &generated_blocks);
                     }
