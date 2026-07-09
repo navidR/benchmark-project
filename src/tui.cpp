@@ -1,10 +1,13 @@
 #include "benchmark_sim/tui.h"
 
-#include "benchmark_sim/run_report.h"
-
 #include <ncursesw/curses.h>
 
 #include <algorithm>
+#include <boost/json/array.hpp>
+#include <boost/json/object.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
+#include <boost/json/value.hpp>
 #include <chrono>
 #include <clocale>
 #include <cstdint>
@@ -15,11 +18,7 @@
 #include <string_view>
 #include <thread>
 
-#include <boost/json/array.hpp>
-#include <boost/json/object.hpp>
-#include <boost/json/parse.hpp>
-#include <boost/json/serialize.hpp>
-#include <boost/json/value.hpp>
+#include "benchmark_sim/run_report.h"
 
 namespace bsim {
 namespace {
@@ -66,8 +65,7 @@ class CursesSession {
 };
 
 std::string JsonString(const boost::json::object& object,
-                       std::string_view field,
-                       std::string_view fallback = "") {
+                       std::string_view field, std::string_view fallback = "") {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr || !value->is_string()) {
     return std::string(fallback);
@@ -297,7 +295,8 @@ void DrawSummary(const std::filesystem::path& run_root,
   getmaxyx(stdscr, rows, cols);
   erase();
 
-  AddText(0, 0, cols, "Benchmark Project TUI", COLOR_PAIR(kColorTitle) | A_BOLD);
+  AddText(0, 0, cols, "Benchmark Project TUI",
+          COLOR_PAIR(kColorTitle) | A_BOLD);
   DrawHorizontalLine(1);
 
   if (!error.empty()) {
@@ -311,17 +310,15 @@ void DrawSummary(const std::filesystem::path& run_root,
   const std::string status = JsonString(report, "status", "unknown");
   const bool ok = JsonBoolText(report, "ok", "false") == "true";
   AddText(3, 0, cols, "run: " + run_root.string(), A_BOLD);
-  AddText(4, 0, cols / 2, "status: " + status,
-          ok ? COLOR_PAIR(kColorOk) | A_BOLD
-             : COLOR_PAIR(kColorWarning) | A_BOLD);
+  AddText(
+      4, 0, cols / 2, "status: " + status,
+      ok ? COLOR_PAIR(kColorOk) | A_BOLD : COLOR_PAIR(kColorWarning) | A_BOLD);
   AddText(4, cols / 2, cols - (cols / 2),
           "chain: " + JsonString(report, "chain", "-"));
-  AddText(5, 0, cols / 2,
-          "events: " + JsonIntegerText(report, "event_count"));
+  AddText(5, 0, cols / 2, "events: " + JsonIntegerText(report, "event_count"));
   AddText(5, cols / 2, cols - (cols / 2),
           "metrics: " + JsonIntegerText(report, "metric_count"));
-  AddText(6, 0, cols / 2,
-          "nodes: " + JsonIntegerText(report, "nodes"));
+  AddText(6, 0, cols / 2, "nodes: " + JsonIntegerText(report, "nodes"));
   AddText(6, cols / 2, cols - (cols / 2),
           "isolated: " + JsonBoolText(report, "isolated_network"));
   AddText(7, 0, cols / 2,
@@ -374,8 +371,7 @@ void DrawSummary(const std::filesystem::path& run_root,
     AddText(y, 10, 10, JsonString(node, "final_state", "-"));
     AddText(y, 20, 7, JsonMetricText(metric_object, "height"));
     AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"));
-    AddText(y, 33, 7,
-            JsonMetricText(metric_object, "generated_block_count"));
+    AddText(y, 33, 7, JsonMetricText(metric_object, "generated_block_count"));
     AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"));
     AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"));
     AddText(y, 56, 9, JsonUsecMillisText(metric_object, "cpu_usage_usec"));
@@ -391,9 +387,7 @@ void DrawSummary(const std::filesystem::path& run_root,
   refresh();
 }
 
-bool ShouldExit(int ch) {
-  return ch == 'q' || ch == 'Q' || ch == 27;
-}
+bool ShouldExit(int ch) { return ch == 'q' || ch == 'Q' || ch == 27; }
 
 }  // namespace
 

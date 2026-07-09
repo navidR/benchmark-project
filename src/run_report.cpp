@@ -1,7 +1,10 @@
 #include "benchmark_sim/run_report.h"
 
-#include "benchmark_sim/util.h"
-
+#include <boost/json/array.hpp>
+#include <boost/json/object.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
+#include <boost/json/value.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -11,11 +14,7 @@
 #include <string>
 #include <string_view>
 
-#include <boost/json/array.hpp>
-#include <boost/json/object.hpp>
-#include <boost/json/parse.hpp>
-#include <boost/json/serialize.hpp>
-#include <boost/json/value.hpp>
+#include "benchmark_sim/util.h"
 
 namespace bsim {
 namespace {
@@ -141,8 +140,7 @@ boost::json::object ParseJsonObjectLine(const std::filesystem::path& path,
                                         std::uint64_t line_number) {
   boost::json::value value = boost::json::parse(line);
   if (!value.is_object()) {
-    throw std::runtime_error(path.string() + ":" +
-                             std::to_string(line_number) +
+    throw std::runtime_error(path.string() + ":" + std::to_string(line_number) +
                              " JSONL entry is not an object");
   }
   return value.as_object();
@@ -287,60 +285,55 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array height_waits;
   boost::json::array peer_waits;
 
-  ForEachJsonLine(run_root / "events.jsonl",
-                  [&](const boost::json::object& event) {
-                    ++event_count;
-                    const std::string event_name =
-                        OptionalStringField(event, "event");
-                    const std::string node_id =
-                        OptionalStringField(event, "node_id");
-                    ++event_counts[event_name];
-                    if (event_name == "run_started") {
-                      run_started = true;
-                      started_at = OptionalStringField(event, "timestamp");
-                    } else if (event_name == "run_finished") {
-                      run_finished = true;
-                      finished_at = OptionalStringField(event, "timestamp");
-                    } else if (event_name == "run_failed") {
-                      run_failed = true;
-                      failed_at = OptionalStringField(event, "timestamp");
-                    } else if (event_name == "state" && !node_id.empty()) {
-                      nodes[node_id].final_state =
-                          OptionalStringField(event, "detail");
-                    } else if (const std::optional<std::string_view> kind =
-                                   LogTailKind(event_name);
-                               kind && !node_id.empty()) {
-                      nodes[node_id].log_tails[std::string(*kind)] =
-                          ParseEventDetail(event);
-                    } else if (event_name == "generated_blocks") {
-                      AppendEventSummary(event, &generated_blocks);
-                    } else if (event_name == "height_reached") {
-                      AppendEventSummary(event, &height_reached);
-                    } else if (event_name == "height_wait_reached") {
-                      AppendEventSummary(event, &height_waits);
-                    } else if (event_name == "peer_count_reached") {
-                      AppendEventSummary(event, &peer_waits);
-                    }
-                  });
+  ForEachJsonLine(
+      run_root / "events.jsonl", [&](const boost::json::object& event) {
+        ++event_count;
+        const std::string event_name = OptionalStringField(event, "event");
+        const std::string node_id = OptionalStringField(event, "node_id");
+        ++event_counts[event_name];
+        if (event_name == "run_started") {
+          run_started = true;
+          started_at = OptionalStringField(event, "timestamp");
+        } else if (event_name == "run_finished") {
+          run_finished = true;
+          finished_at = OptionalStringField(event, "timestamp");
+        } else if (event_name == "run_failed") {
+          run_failed = true;
+          failed_at = OptionalStringField(event, "timestamp");
+        } else if (event_name == "state" && !node_id.empty()) {
+          nodes[node_id].final_state = OptionalStringField(event, "detail");
+        } else if (const std::optional<std::string_view> kind =
+                       LogTailKind(event_name);
+                   kind && !node_id.empty()) {
+          nodes[node_id].log_tails[std::string(*kind)] =
+              ParseEventDetail(event);
+        } else if (event_name == "generated_blocks") {
+          AppendEventSummary(event, &generated_blocks);
+        } else if (event_name == "height_reached") {
+          AppendEventSummary(event, &height_reached);
+        } else if (event_name == "height_wait_reached") {
+          AppendEventSummary(event, &height_waits);
+        } else if (event_name == "peer_count_reached") {
+          AppendEventSummary(event, &peer_waits);
+        }
+      });
 
-  ForEachJsonLine(run_root / "metrics.jsonl",
-                  [&](const boost::json::object& metric) {
-                    ++metric_count;
-                    const std::string node_id =
-                        OptionalStringField(metric, "node_id");
-                    if (node_id.empty()) {
-                      return;
-                    }
-                    NodeReport& node = nodes[node_id];
-                    ++node.metric_samples;
-                    node.last_metrics = {};
-                    CopySelectedMetricFields(metric, &node.last_metrics);
-                  });
+  ForEachJsonLine(
+      run_root / "metrics.jsonl", [&](const boost::json::object& metric) {
+        ++metric_count;
+        const std::string node_id = OptionalStringField(metric, "node_id");
+        if (node_id.empty()) {
+          return;
+        }
+        NodeReport& node = nodes[node_id];
+        ++node.metric_samples;
+        node.last_metrics = {};
+        CopySelectedMetricFields(metric, &node.last_metrics);
+      });
 
   const bool ok = run_started && run_finished && !run_failed;
   report["ok"] = ok;
-  report["status"] =
-      ok ? "finished" : (run_failed ? "failed" : "incomplete");
+  report["status"] = ok ? "finished" : (run_failed ? "failed" : "incomplete");
   if (!started_at.empty()) {
     report["started_at"] = started_at;
   }

@@ -1,17 +1,13 @@
-#include "benchmark_sim/capability.h"
-#include "benchmark_sim/cgroup.h"
-#include "benchmark_sim/firo_driver.h"
-#include "benchmark_sim/log_tail.h"
-#include "benchmark_sim/logging.h"
-#include "benchmark_sim/network.h"
-#include "benchmark_sim/process.h"
-#include "benchmark_sim/run_report.h"
-#include "benchmark_sim/util.h"
+#include <linux/capability.h>
 
+#include <boost/json/array.hpp>
+#include <boost/json/object.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
+#include <boost/program_options.hpp>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
-#include <linux/capability.h>
 #include <limits>
 #include <map>
 #include <memory>
@@ -22,11 +18,15 @@
 #include <thread>
 #include <vector>
 
-#include <boost/json/array.hpp>
-#include <boost/json/object.hpp>
-#include <boost/json/parse.hpp>
-#include <boost/json/serialize.hpp>
-#include <boost/program_options.hpp>
+#include "benchmark_sim/capability.h"
+#include "benchmark_sim/cgroup.h"
+#include "benchmark_sim/firo_driver.h"
+#include "benchmark_sim/log_tail.h"
+#include "benchmark_sim/logging.h"
+#include "benchmark_sim/network.h"
+#include "benchmark_sim/process.h"
+#include "benchmark_sim/run_report.h"
+#include "benchmark_sim/util.h"
 
 namespace bsim {
 namespace {
@@ -178,8 +178,7 @@ struct NodeRuntime {
   uint64_t daemon_log_offset = 0;
 };
 
-uint32_t JsonUint32Field(const boost::json::object& object,
-                         const char* field) {
+uint32_t JsonUint32Field(const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr) {
     throw std::runtime_error("missing or invalid uint32 JSON field: " +
@@ -231,8 +230,7 @@ uint64_t JsonOptionalUint64Field(const boost::json::object& object,
   throw std::runtime_error("invalid uint64 JSON field: " + std::string(field));
 }
 
-uint64_t JsonUint64Field(const boost::json::object& object,
-                         const char* field) {
+uint64_t JsonUint64Field(const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr) {
     throw std::runtime_error("missing or invalid uint64 JSON field: " +
@@ -318,7 +316,8 @@ std::vector<uint32_t> JsonNodeGroupField(const boost::json::object& object,
     }
     const uint32_t node = static_cast<uint32_t>(raw_node);
     if (node == 0U) {
-      throw std::runtime_error("partition node values must be greater than zero");
+      throw std::runtime_error(
+          "partition node values must be greater than zero");
     }
     for (uint32_t existing : nodes) {
       if (existing == node - 1U) {
@@ -342,8 +341,8 @@ bool OptionProvided(const boost::program_options::variables_map& vm,
 NetworkCondition ParseNetworkConditionObject(
     const boost::json::object& object) {
   NetworkCondition condition;
-  condition.bandwidth_mbps = JsonOptionalUint32Field(
-      object, "bandwidth_mbps", condition.bandwidth_mbps);
+  condition.bandwidth_mbps = JsonOptionalUint32Field(object, "bandwidth_mbps",
+                                                     condition.bandwidth_mbps);
   condition.delay_ms =
       JsonOptionalUint32Field(object, "delay_ms", condition.delay_ms);
   condition.jitter_ms =
@@ -356,8 +355,8 @@ NetworkCondition ParseNetworkConditionObject(
       object, "corrupt_basis_points", condition.corrupt_basis_points);
   condition.reorder_basis_points = JsonOptionalUint32Field(
       object, "reorder_basis_points", condition.reorder_basis_points);
-  condition.limit_packets = JsonOptionalUint32Field(
-      object, "limit_packets", condition.limit_packets);
+  condition.limit_packets =
+      JsonOptionalUint32Field(object, "limit_packets", condition.limit_packets);
   return condition;
 }
 
@@ -388,7 +387,8 @@ NetworkBlockRule ParseNetworkBlockRuleObject(
     const boost::json::object& object) {
   const uint32_t node = JsonUint32Field(object, "node");
   if (node == 0U) {
-    throw std::runtime_error("network block rule node must be greater than zero");
+    throw std::runtime_error(
+        "network block rule node must be greater than zero");
   }
   const uint32_t dst_port = JsonUint32Field(object, "dst_port");
   if (dst_port == 0U || dst_port > 65535U) {
@@ -437,8 +437,7 @@ bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
 
 void RequireNonZero(uint64_t value, std::string_view field) {
   if (value == 0U) {
-    throw std::runtime_error(std::string(field) +
-                             " must be greater than zero");
+    throw std::runtime_error(std::string(field) + " must be greater than zero");
   }
 }
 
@@ -456,8 +455,7 @@ ResourceLimitPatch ParseResourceLimitPatchObject(
       patch.cpu_quota_us = JsonUint64Value(*quota, "cpu_quota_us");
     }
   }
-  patch.cpu_period_us =
-      JsonOptionalUint64FieldValue(object, "cpu_period_us");
+  patch.cpu_period_us = JsonOptionalUint64FieldValue(object, "cpu_period_us");
   patch.pids_max = JsonOptionalUint64FieldValue(object, "pids_max");
 
   if (ResourceLimitPatchEmpty(patch)) {
@@ -518,8 +516,8 @@ void ApplyNetworkBlockRules(const boost::json::array& rules, uint32_t nodes,
   }
 }
 
-void ApplyNetworkPartitionRules(const boost::json::array& rules,
-                                uint32_t nodes, std::string_view source,
+void ApplyNetworkPartitionRules(const boost::json::array& rules, uint32_t nodes,
+                                std::string_view source,
                                 std::vector<NetworkPartitionRule>& output) {
   for (const boost::json::value& value : rules) {
     if (!value.is_object()) {
@@ -546,9 +544,9 @@ void ApplyNetworkPartitionRules(const boost::json::array& rules,
   }
 }
 
-void ApplyResourceLimitPatches(
-    const boost::json::array& updates, uint32_t nodes, std::string_view source,
-    std::map<uint32_t, ResourceLimitPatch>& output) {
+void ApplyResourceLimitPatches(const boost::json::array& updates,
+                               uint32_t nodes, std::string_view source,
+                               std::map<uint32_t, ResourceLimitPatch>& output) {
   for (const boost::json::value& value : updates) {
     if (!value.is_object()) {
       throw std::runtime_error(std::string(source) +
@@ -564,12 +562,13 @@ void ApplyResourceLimitPatches(
   }
 }
 
-void ApplyScenarioWorkloads(
-    const boost::json::array& workloads,
-    const boost::program_options::variables_map& vm, Options& options) {
+void ApplyScenarioWorkloads(const boost::json::array& workloads,
+                            const boost::program_options::variables_map& vm,
+                            Options& options) {
   for (const boost::json::value& value : workloads) {
     if (!value.is_object()) {
-      throw std::runtime_error("scenario workloads entries must be JSON objects");
+      throw std::runtime_error(
+          "scenario workloads entries must be JSON objects");
     }
     const boost::json::object& workload = value.as_object();
     const std::string type = JsonStringField(workload, "type");
@@ -665,8 +664,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         scenario, "generate_blocks", options.generate_blocks);
   }
   if (!OptionProvided(vm, "generate-node")) {
-    options.generate_node = JsonOptionalUint32Field(
-        scenario, "generate_node", options.generate_node);
+    options.generate_node = JsonOptionalUint32Field(scenario, "generate_node",
+                                                    options.generate_node);
   }
   if (!OptionProvided(vm, "ready-timeout-sec")) {
     options.ready_timeout_sec = JsonOptionalUint32Field(
@@ -712,8 +711,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
           object, "memory_max_bytes", options.memory_max_bytes);
     }
     if (!OptionProvided(vm, "cpu-period-us")) {
-      options.cpu_period_us = JsonOptionalUint64Field(
-          object, "cpu_period_us", options.cpu_period_us);
+      options.cpu_period_us = JsonOptionalUint64Field(object, "cpu_period_us",
+                                                      options.cpu_period_us);
     }
     if (!OptionProvided(vm, "pids-max")) {
       options.pids_max =
@@ -727,9 +726,9 @@ void ApplyScenarioJson(const boost::json::object& scenario,
           throw std::runtime_error(
               "scenario resources.cpu_quota_us must be uint or null");
         }
-        options.cpu_quota_us =
-            quota->is_uint64() ? quota->as_uint64()
-                               : static_cast<uint64_t>(quota->as_int64());
+        options.cpu_quota_us = quota->is_uint64()
+                                   ? quota->as_uint64()
+                                   : static_cast<uint64_t>(quota->as_int64());
         options.cpu_quota_requested = true;
       }
     }
@@ -740,8 +739,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         throw std::runtime_error(
             "scenario resources.runtime_node_limits must be a JSON array");
       }
-      ApplyResourceLimitPatches(runtime_node_limits->as_array(),
-                                options.nodes,
+      ApplyResourceLimitPatches(runtime_node_limits->as_array(), options.nodes,
                                 "scenario resources.runtime_node_limits",
                                 options.runtime_node_resource_updates);
     }
@@ -783,8 +781,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         throw std::runtime_error(
             "scenario process.runtime_node_freezes must be a JSON array");
       }
-      for (const boost::json::value& value :
-           runtime_node_freezes->as_array()) {
+      for (const boost::json::value& value : runtime_node_freezes->as_array()) {
         if (!value.is_object()) {
           throw std::runtime_error(
               "scenario process.runtime_node_freezes entries must be JSON "
@@ -804,8 +801,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
               "greater than zero");
         }
         options.runtime_node_freezes.push_back(
-            FreezeRequest{.node_index = node - 1U,
-                          .duration_ms = duration_ms});
+            FreezeRequest{.node_index = node - 1U, .duration_ms = duration_ms});
       }
     }
   }
@@ -1060,8 +1056,7 @@ void ParseRuntimeNodeFreezeTexts(const std::vector<std::string>& texts,
 
 void ParseNodeNetworkConditions(Options& options) {
   ParseNodeNetworkConditionTexts(options.node_network_condition_json,
-                                 options.nodes,
-                                 "--node-network-condition-json",
+                                 options.nodes, "--node-network-condition-json",
                                  options.node_network_conditions);
   ParseNodeNetworkConditionTexts(options.runtime_node_network_condition_json,
                                  options.nodes,
@@ -1076,8 +1071,7 @@ void ParseNodeNetworkConditions(Options& options) {
   ParseRuntimePartitionTexts(options.runtime_partition_json, options.nodes,
                              "--runtime-partition-json",
                              options.runtime_partitions);
-  ParseRuntimePartitionTexts(options.runtime_heal_partition_json,
-                             options.nodes,
+  ParseRuntimePartitionTexts(options.runtime_heal_partition_json, options.nodes,
                              "--runtime-heal-partition-json",
                              options.runtime_partition_heals);
   ParseRuntimeNodeResourceTexts(options.runtime_node_resource_json,
@@ -1112,16 +1106,15 @@ Options ParseOptions(int argc, char** argv) {
       "generate-node", po::value<uint32_t>(&options.generate_node),
       "1-based node number that generates blocks")(
       "ready-timeout-sec", po::value<uint32_t>(&options.ready_timeout_sec),
-      "RPC startup timeout")(
-      "sync-timeout-sec", po::value<uint32_t>(&options.sync_timeout_sec),
-      "block propagation timeout")(
+      "RPC startup timeout")("sync-timeout-sec",
+                             po::value<uint32_t>(&options.sync_timeout_sec),
+                             "block propagation timeout")(
       "metrics-sample-count",
       po::value<uint32_t>(&options.metrics_sample_count),
       "extra metric samples to collect after runtime events and before "
-      "workload generation")(
-      "metrics-interval-ms",
-      po::value<uint32_t>(&options.metrics_interval_ms),
-      "milliseconds between extra metric samples")(
+      "workload generation")("metrics-interval-ms",
+                             po::value<uint32_t>(&options.metrics_interval_ms),
+                             "milliseconds between extra metric samples")(
       "memory-high-bytes", po::value<uint64_t>(&options.memory_high_bytes),
       "cgroup memory.high soft pressure threshold in bytes")(
       "memory-max-bytes", po::value<uint64_t>(&options.memory_max_bytes),
@@ -1136,9 +1129,8 @@ Options ParseOptions(int argc, char** argv) {
       "leave cgroups after exit for inspection")(
       "cleanup-run", po::bool_switch(&options.cleanup_run),
       "remove stale simulator-owned veth and cgroup objects for --run-id and "
-      "exit")(
-      "isolate-network", po::bool_switch(&options.isolate_network),
-      "run each Firo node in its own network namespace and veth link")(
+      "exit")("isolate-network", po::bool_switch(&options.isolate_network),
+              "run each Firo node in its own network namespace and veth link")(
       "network-bandwidth-mbps",
       po::value<uint32_t>(&options.network_condition.bandwidth_mbps),
       "TBF bandwidth limit in megabits per second for each isolated node "
@@ -1165,8 +1157,7 @@ Options ParseOptions(int argc, char** argv) {
       po::value<uint32_t>(&options.network_condition.limit_packets),
       "netem queue limit applied to each isolated node host-side veth")(
       "node-network-condition-json",
-      po::value<std::vector<std::string>>(
-          &options.node_network_condition_json)
+      po::value<std::vector<std::string>>(&options.node_network_condition_json)
           ->composing(),
       "repeatable JSON object with node plus network condition fields for one "
       "isolated "
@@ -1194,26 +1185,22 @@ Options ParseOptions(int argc, char** argv) {
       "repeatable JSON object with group_a and group_b arrays for one live "
       "source-aware group partition")(
       "runtime-heal-partition-json",
-      po::value<std::vector<std::string>>(
-          &options.runtime_heal_partition_json)
+      po::value<std::vector<std::string>>(&options.runtime_heal_partition_json)
           ->composing(),
       "repeatable JSON object with group_a and group_b arrays for one live "
       "source-aware group partition heal")(
       "runtime-node-resource-json",
-      po::value<std::vector<std::string>>(
-          &options.runtime_node_resource_json)
+      po::value<std::vector<std::string>>(&options.runtime_node_resource_json)
           ->composing(),
       "repeatable JSON object with node plus live cgroup limit fields to apply "
       "after nodes are running")(
       "runtime-node-restart-json",
-      po::value<std::vector<std::string>>(
-          &options.runtime_node_restart_json)
+      po::value<std::vector<std::string>>(&options.runtime_node_restart_json)
           ->composing(),
       "repeatable JSON object with node field for one live node restart after "
       "nodes are running")(
       "runtime-node-freeze-json",
-      po::value<std::vector<std::string>>(
-          &options.runtime_node_freeze_json)
+      po::value<std::vector<std::string>>(&options.runtime_node_freeze_json)
           ->composing(),
       "repeatable JSON object with node and duration_ms for one live cgroup "
       "freeze/thaw after nodes are running")(
@@ -1222,8 +1209,7 @@ Options ParseOptions(int argc, char** argv) {
       "probe-address", po::bool_switch(&options.probe_address),
       "assign and inspect an IPv4 address inside a temporary netns through "
       "libmnl")(
-      "probe-bandwidth-limit",
-      po::bool_switch(&options.probe_bandwidth_limit),
+      "probe-bandwidth-limit", po::bool_switch(&options.probe_bandwidth_limit),
       "apply and remove a TBF bandwidth limit on a temporary veth peer through "
       "libmnl")(
       "probe-capabilities", po::bool_switch(&options.probe_capabilities),
@@ -1234,9 +1220,9 @@ Options ParseOptions(int argc, char** argv) {
       "paths")(
       "probe-drop-filter", po::bool_switch(&options.probe_drop_filter),
       "apply and remove a flower/gact TCP drop filter on a temporary veth "
-      "through libmnl")(
-      "probe-netns", po::bool_switch(&options.probe_netns),
-      "create a temporary network namespace and inspect it through setns/libmnl")(
+      "through libmnl")("probe-netns", po::bool_switch(&options.probe_netns),
+                        "create a temporary network namespace and inspect it "
+                        "through setns/libmnl")(
       "probe-network-condition",
       po::bool_switch(&options.probe_network_condition),
       "apply and remove a netem network condition on a temporary veth peer "
@@ -1251,12 +1237,11 @@ Options ParseOptions(int argc, char** argv) {
       "through libmnl")(
       "probe-qdisc", po::bool_switch(&options.probe_qdisc),
       "dump qdisc state for a temporary veth peer through libmnl")(
-      "probe-qdisc-mutation",
-      po::bool_switch(&options.probe_qdisc_mutation),
+      "probe-qdisc-mutation", po::bool_switch(&options.probe_qdisc_mutation),
       "replace and delete a root pfifo qdisc on a temporary veth peer through "
-      "libmnl")(
-      "probe-route", po::bool_switch(&options.probe_route),
-      "assign and inspect an IPv4 route inside a temporary netns through libmnl")(
+      "libmnl")("probe-route", po::bool_switch(&options.probe_route),
+                "assign and inspect an IPv4 route inside a temporary netns "
+                "through libmnl")(
       "probe-veth", po::bool_switch(&options.probe_veth),
       "create, move, inspect, and delete a temporary veth pair through libmnl")(
       "probe-network", po::bool_switch(&options.probe_network),
@@ -1367,20 +1352,15 @@ Options ParseOptions(int argc, char** argv) {
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
-  const bool needs_firod = !options.probe_network &&
-                           options.report_run.empty() &&
-                           !options.probe_bandwidth_limit &&
-                           !options.probe_capabilities &&
-                           !options.probe_cgroup_freeze &&
-                           !options.probe_drop_filter &&
-                           !options.probe_netns && !options.probe_veth &&
-                           !options.probe_address && !options.probe_route &&
-                           !options.probe_qdisc &&
-                           !options.probe_qdisc_mutation &&
-                           !options.probe_network_condition &&
-                           !options.probe_combined_network_condition &&
-                           !options.probe_network_condition_update &&
-                           !options.cleanup_run;
+  const bool needs_firod =
+      !options.probe_network && options.report_run.empty() &&
+      !options.probe_bandwidth_limit && !options.probe_capabilities &&
+      !options.probe_cgroup_freeze && !options.probe_drop_filter &&
+      !options.probe_netns && !options.probe_veth && !options.probe_address &&
+      !options.probe_route && !options.probe_qdisc &&
+      !options.probe_qdisc_mutation && !options.probe_network_condition &&
+      !options.probe_combined_network_condition &&
+      !options.probe_network_condition_update && !options.cleanup_run;
   if (needs_firod && options.firod.empty()) {
     throw std::runtime_error(
         "Firo runs require an explicit --firod path or scenario firod field");
@@ -1547,8 +1527,7 @@ boost::json::array NodeGroupJson(const std::vector<uint32_t>& nodes) {
   return array;
 }
 
-boost::json::object NetworkPartitionRuleJson(
-    const NetworkPartitionRule& rule) {
+boost::json::object NetworkPartitionRuleJson(const NetworkPartitionRule& rule) {
   boost::json::object object;
   object["group_a"] = NodeGroupJson(rule.group_a);
   object["group_b"] = NodeGroupJson(rule.group_b);
@@ -1705,8 +1684,7 @@ std::string NodeInterfaceName(std::string_view run_id, uint32_t node_index,
          std::to_string(node_index + 1U) + suffix;
 }
 
-NodeVethConfig MakeNodeVethConfig(const Options& options,
-                                  uint32_t node_index) {
+NodeVethConfig MakeNodeVethConfig(const Options& options, uint32_t node_index) {
   NodeVethConfig config;
   config.host_name = NodeInterfaceName(options.run_id, node_index, 'h');
   config.peer_name = NodeInterfaceName(options.run_id, node_index, 'p');
@@ -1855,8 +1833,7 @@ std::string NetworkConditionProbeJson() {
   result["host_name"] = probe.host_name;
   result["peer_name"] = probe.peer_name;
   result["condition"] = NetworkConditionJson(probe.condition);
-  result["namespace_qdiscs_before"] =
-      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
   result["namespace_qdiscs_after_apply"] =
       QdiscsJson(probe.namespace_qdiscs_after_apply);
   result["namespace_qdiscs_after_delete"] =
@@ -1872,8 +1849,7 @@ std::string CombinedNetworkConditionProbeJson() {
   result["host_name"] = probe.host_name;
   result["peer_name"] = probe.peer_name;
   result["condition"] = NetworkConditionJson(probe.condition);
-  result["namespace_qdiscs_before"] =
-      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
   result["namespace_qdiscs_after_apply"] =
       QdiscsJson(probe.namespace_qdiscs_after_apply);
   result["namespace_qdiscs_after_delete"] =
@@ -1889,8 +1865,7 @@ std::string BandwidthLimitProbeJson() {
   result["host_name"] = probe.host_name;
   result["peer_name"] = probe.peer_name;
   result["condition"] = NetworkConditionJson(probe.condition);
-  result["namespace_qdiscs_before"] =
-      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
   result["namespace_qdiscs_after_apply"] =
       QdiscsJson(probe.namespace_qdiscs_after_apply);
   result["namespace_qdiscs_after_delete"] =
@@ -1905,8 +1880,7 @@ std::string NetworkConditionUpdateProbeJson() {
   result["helper_pid"] = probe.helper_pid;
   result["host_name"] = probe.host_name;
   result["peer_name"] = probe.peer_name;
-  result["initial_condition"] =
-      NetworkConditionJson(probe.initial_condition);
+  result["initial_condition"] = NetworkConditionJson(probe.initial_condition);
   result["updated_condition"] = NetworkConditionJson(probe.updated_condition);
   result["parent_qdiscs_after_initial"] =
       QdiscsJson(probe.parent_qdiscs_after_initial);
@@ -1927,8 +1901,7 @@ std::string DropFilterProbeJson() {
   result["dst_address"] = probe.dst_address;
   result["dst_port"] = probe.dst_port;
   result["handle"] = probe.handle;
-  result["parent_filters_before"] =
-      TcFiltersJson(probe.parent_filters_before);
+  result["parent_filters_before"] = TcFiltersJson(probe.parent_filters_before);
   result["parent_filters_after_apply"] =
       TcFiltersJson(probe.parent_filters_after_apply);
   result["parent_filters_after_delete"] =
@@ -1956,8 +1929,7 @@ std::string QdiscMutationProbeJson() {
   result["host_name"] = probe.host_name;
   result["peer_name"] = probe.peer_name;
   result["pfifo_limit_packets"] = probe.pfifo_limit_packets;
-  result["namespace_qdiscs_before"] =
-      QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
   result["namespace_qdiscs_after_replace"] =
       QdiscsJson(probe.namespace_qdiscs_after_replace);
   result["namespace_qdiscs_after_delete"] =
@@ -2008,9 +1980,9 @@ std::string AddressProbeJson() {
 
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
                         const FiroMetrics& chain,
-                        uint64_t generated_block_count,
-                        uint64_t restart_count, const CgroupMetrics* cgroup,
-                        const LinkInfo* link, const QdiscInfo* qdisc) {
+                        uint64_t generated_block_count, uint64_t restart_count,
+                        const CgroupMetrics* cgroup, const LinkInfo* link,
+                        const QdiscInfo* qdisc) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
@@ -2063,10 +2035,8 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["cpu_period_us"] = cgroup->cpu_period_us;
     object["io_read_bytes"] = cgroup->io_read_bytes;
     object["io_write_bytes"] = cgroup->io_write_bytes;
-    object["io_pressure_some_total_usec"] =
-        cgroup->io_pressure_some_total_usec;
-    object["io_pressure_full_total_usec"] =
-        cgroup->io_pressure_full_total_usec;
+    object["io_pressure_some_total_usec"] = cgroup->io_pressure_some_total_usec;
+    object["io_pressure_full_total_usec"] = cgroup->io_pressure_full_total_usec;
     object["pids_current"] = cgroup->pids_current;
     if (cgroup->pids_max_limit) {
       object["pids_max_limit"] = *cgroup->pids_max_limit;
@@ -2144,8 +2114,7 @@ void WriteNodeState(const std::filesystem::path& events_path,
 std::string GeneratedBlocksDetail(uint32_t workload_index,
                                   uint32_t workload_count,
                                   uint32_t generator_node,
-                                  uint64_t start_height,
-                                  uint64_t target_height,
+                                  uint64_t start_height, uint64_t target_height,
                                   const std::vector<std::string>& hashes) {
   boost::json::array hash_array;
   for (const std::string& hash : hashes) {
@@ -2213,10 +2182,9 @@ void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
         qdisc = FindQdiscByInterfaceName(qdiscs, node.network->host_name);
       }
     }
-    AppendLine(metrics_path,
-               MetricsJson(options.run_id, node.config.id, chain,
-                           node.generated_block_count, node.restart_count, &cg,
-                           link, qdisc));
+    AppendLine(metrics_path, MetricsJson(options.run_id, node.config.id, chain,
+                                         node.generated_block_count,
+                                         node.restart_count, &cg, link, qdisc));
   }
 }
 
@@ -2250,8 +2218,8 @@ std::string LogTailDetail(std::string_view kind, const LogTailChunk& chunk) {
 
 void WriteLogTailEvent(const std::filesystem::path& events_path,
                        const Options& options, const NodeRuntime& node,
-                       std::string_view kind,
-                       const std::filesystem::path& path, uint64_t* offset) {
+                       std::string_view kind, const std::filesystem::path& path,
+                       uint64_t* offset) {
   if (!std::filesystem::exists(path)) {
     return;
   }
@@ -2268,11 +2236,9 @@ void WriteNodeLogTail(const std::filesystem::path& events_path,
                       const Options& options, const FiroDriver& driver,
                       NodeRuntime& node) {
   WriteLogTailEvent(events_path, options, node, "stdout",
-                    node.config.log_dir / "stdout.log",
-                    &node.stdout_offset);
+                    node.config.log_dir / "stdout.log", &node.stdout_offset);
   WriteLogTailEvent(events_path, options, node, "stderr",
-                    node.config.log_dir / "stderr.log",
-                    &node.stderr_offset);
+                    node.config.log_dir / "stderr.log", &node.stderr_offset);
   WriteLogTailEvent(events_path, options, node, "daemon_log",
                     driver.LogPath(node.config), &node.daemon_log_offset);
 }
@@ -2477,116 +2443,110 @@ void WriteScenarioFiles(const Options& options,
     network_yaml += "  node_conditions:\n";
     for (const auto& [node_index, condition] :
          options.node_network_conditions) {
-      network_yaml +=
-          "    firo-" + std::to_string(node_index + 1U) +
-          ":\n"
-          "      bandwidth_mbps: " +
-          std::to_string(condition.bandwidth_mbps) +
-          "\n"
-          "      delay_ms: " +
-          std::to_string(condition.delay_ms) +
-          "\n"
-          "      jitter_ms: " +
-          std::to_string(condition.jitter_ms) +
-          "\n"
-          "      loss_basis_points: " +
-          std::to_string(condition.loss_basis_points) +
-          "\n"
-          "      duplicate_basis_points: " +
-          std::to_string(condition.duplicate_basis_points) +
-          "\n"
-          "      corrupt_basis_points: " +
-          std::to_string(condition.corrupt_basis_points) +
-          "\n"
-          "      reorder_basis_points: " +
-          std::to_string(condition.reorder_basis_points) +
-          "\n"
-          "      limit_packets: " +
-          std::to_string(condition.limit_packets) + "\n";
+      network_yaml += "    firo-" + std::to_string(node_index + 1U) +
+                      ":\n"
+                      "      bandwidth_mbps: " +
+                      std::to_string(condition.bandwidth_mbps) +
+                      "\n"
+                      "      delay_ms: " +
+                      std::to_string(condition.delay_ms) +
+                      "\n"
+                      "      jitter_ms: " +
+                      std::to_string(condition.jitter_ms) +
+                      "\n"
+                      "      loss_basis_points: " +
+                      std::to_string(condition.loss_basis_points) +
+                      "\n"
+                      "      duplicate_basis_points: " +
+                      std::to_string(condition.duplicate_basis_points) +
+                      "\n"
+                      "      corrupt_basis_points: " +
+                      std::to_string(condition.corrupt_basis_points) +
+                      "\n"
+                      "      reorder_basis_points: " +
+                      std::to_string(condition.reorder_basis_points) +
+                      "\n"
+                      "      limit_packets: " +
+                      std::to_string(condition.limit_packets) + "\n";
     }
   }
   if (!options.runtime_node_network_conditions.empty()) {
     network_yaml += "  runtime_node_conditions:\n";
     for (const auto& [node_index, condition] :
          options.runtime_node_network_conditions) {
-      network_yaml +=
-          "    firo-" + std::to_string(node_index + 1U) +
-          ":\n"
-          "      bandwidth_mbps: " +
-          std::to_string(condition.bandwidth_mbps) +
-          "\n"
-          "      delay_ms: " +
-          std::to_string(condition.delay_ms) +
-          "\n"
-          "      jitter_ms: " +
-          std::to_string(condition.jitter_ms) +
-          "\n"
-          "      loss_basis_points: " +
-          std::to_string(condition.loss_basis_points) +
-          "\n"
-          "      duplicate_basis_points: " +
-          std::to_string(condition.duplicate_basis_points) +
-          "\n"
-          "      corrupt_basis_points: " +
-          std::to_string(condition.corrupt_basis_points) +
-          "\n"
-          "      reorder_basis_points: " +
-          std::to_string(condition.reorder_basis_points) +
-          "\n"
-          "      limit_packets: " +
-          std::to_string(condition.limit_packets) + "\n";
+      network_yaml += "    firo-" + std::to_string(node_index + 1U) +
+                      ":\n"
+                      "      bandwidth_mbps: " +
+                      std::to_string(condition.bandwidth_mbps) +
+                      "\n"
+                      "      delay_ms: " +
+                      std::to_string(condition.delay_ms) +
+                      "\n"
+                      "      jitter_ms: " +
+                      std::to_string(condition.jitter_ms) +
+                      "\n"
+                      "      loss_basis_points: " +
+                      std::to_string(condition.loss_basis_points) +
+                      "\n"
+                      "      duplicate_basis_points: " +
+                      std::to_string(condition.duplicate_basis_points) +
+                      "\n"
+                      "      corrupt_basis_points: " +
+                      std::to_string(condition.corrupt_basis_points) +
+                      "\n"
+                      "      reorder_basis_points: " +
+                      std::to_string(condition.reorder_basis_points) +
+                      "\n"
+                      "      limit_packets: " +
+                      std::to_string(condition.limit_packets) + "\n";
     }
   }
   if (!options.runtime_node_blocks.empty()) {
     network_yaml += "  runtime_node_blocks:\n";
     for (const NetworkBlockRule& rule : options.runtime_node_blocks) {
-      network_yaml +=
-          "    - node: " + std::to_string(rule.node_index + 1U) +
-          "\n"
-          "      dst_address: " +
-          rule.dst_address +
-          "\n"
-          "      dst_port: " +
-          std::to_string(rule.dst_port) +
-          "\n"
-          "      handle: " +
-          std::to_string(rule.handle) + "\n";
+      network_yaml += "    - node: " + std::to_string(rule.node_index + 1U) +
+                      "\n"
+                      "      dst_address: " +
+                      rule.dst_address +
+                      "\n"
+                      "      dst_port: " +
+                      std::to_string(rule.dst_port) +
+                      "\n"
+                      "      handle: " +
+                      std::to_string(rule.handle) + "\n";
     }
   }
   if (!options.runtime_node_unblocks.empty()) {
     network_yaml += "  runtime_node_unblocks:\n";
     for (const NetworkBlockRule& rule : options.runtime_node_unblocks) {
-      network_yaml +=
-          "    - node: " + std::to_string(rule.node_index + 1U) +
-          "\n"
-          "      dst_address: " +
-          rule.dst_address +
-          "\n"
-          "      dst_port: " +
-          std::to_string(rule.dst_port) +
-          "\n"
-          "      handle: " +
-          std::to_string(rule.handle) + "\n";
+      network_yaml += "    - node: " + std::to_string(rule.node_index + 1U) +
+                      "\n"
+                      "      dst_address: " +
+                      rule.dst_address +
+                      "\n"
+                      "      dst_port: " +
+                      std::to_string(rule.dst_port) +
+                      "\n"
+                      "      handle: " +
+                      std::to_string(rule.handle) + "\n";
     }
   }
   if (!options.runtime_partitions.empty()) {
     network_yaml += "  runtime_partitions:\n";
     for (const NetworkPartitionRule& rule : options.runtime_partitions) {
-      network_yaml +=
-          "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
-          "\n"
-          "      group_b: " +
-          NodeGroupYamlInline(rule.group_b) + "\n";
+      network_yaml += "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
+                      "\n"
+                      "      group_b: " +
+                      NodeGroupYamlInline(rule.group_b) + "\n";
     }
   }
   if (!options.runtime_partition_heals.empty()) {
     network_yaml += "  runtime_partition_heals:\n";
     for (const NetworkPartitionRule& rule : options.runtime_partition_heals) {
-      network_yaml +=
-          "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
-          "\n"
-          "      group_b: " +
-          NodeGroupYamlInline(rule.group_b) + "\n";
+      network_yaml += "    - group_a: " + NodeGroupYamlInline(rule.group_a) +
+                      "\n"
+                      "      group_b: " +
+                      NodeGroupYamlInline(rule.group_b) + "\n";
     }
   }
 
@@ -2598,14 +2558,13 @@ void WriteScenarioFiles(const Options& options,
       runtime_resource_yaml +=
           "    firo-" + std::to_string(node_index + 1U) + ":\n";
       if (patch.memory_high_bytes) {
-        runtime_resource_yaml +=
-            "      memory_high_bytes: " +
-            std::to_string(*patch.memory_high_bytes) + "\n";
+        runtime_resource_yaml += "      memory_high_bytes: " +
+                                 std::to_string(*patch.memory_high_bytes) +
+                                 "\n";
       }
       if (patch.memory_max_bytes) {
-        runtime_resource_yaml +=
-            "      memory_max_bytes: " +
-            std::to_string(*patch.memory_max_bytes) + "\n";
+        runtime_resource_yaml += "      memory_max_bytes: " +
+                                 std::to_string(*patch.memory_max_bytes) + "\n";
       }
       if (patch.cpu_quota_present) {
         runtime_resource_yaml +=
@@ -2633,8 +2592,7 @@ void WriteScenarioFiles(const Options& options,
     if (!options.runtime_node_restarts.empty()) {
       process_yaml += "  runtime_node_restarts:\n";
       for (uint32_t node_index : options.runtime_node_restarts) {
-        process_yaml +=
-            "    - node: " + std::to_string(node_index + 1U) + "\n";
+        process_yaml += "    - node: " + std::to_string(node_index + 1U) + "\n";
       }
     }
     if (!options.runtime_node_freezes.empty()) {
@@ -2649,52 +2607,49 @@ void WriteScenarioFiles(const Options& options,
     }
   }
 
-  WriteText(run_root / "scenario.yaml",
-            "simulation:\n"
-            "  name: " +
-                options.run_id +
-                "\n"
-                "  output_dir: " +
-                run_root.string() +
-                "\n"
-                "chains:\n"
-                "  firo:\n"
-                "    driver: firo\n"
-                "    default_binary: " +
-                options.firod.string() +
-                "\n"
-                "nodes: " +
-                std::to_string(options.nodes) +
-                "\n"
-                "metrics:\n"
-                "  extra_sample_count: " +
-                std::to_string(options.metrics_sample_count) +
-                "\n"
-                "  interval_ms: " +
-                std::to_string(options.metrics_interval_ms) +
-                "\n"
-                "resources:\n"
-                "  default:\n"
-                "    memory_high_bytes: " +
-                std::to_string(options.memory_high_bytes) +
-                "\n"
-                "    memory_max_bytes: " +
-                std::to_string(options.memory_max_bytes) +
-                "\n"
-                "    cpu_quota_us: " +
-                (options.cpu_quota_requested
-                     ? std::to_string(options.cpu_quota_us)
-                     : std::string("max")) +
-                "\n"
-                "    cpu_period_us: " +
-                std::to_string(options.cpu_period_us) +
-                "\n"
-                "    pids_max: " +
-                std::to_string(options.pids_max) +
-                "\n" +
-                runtime_resource_yaml + network_yaml +
-                process_yaml +
-                WorkloadsYaml(workloads));
+  WriteText(
+      run_root / "scenario.yaml",
+      "simulation:\n"
+      "  name: " +
+          options.run_id +
+          "\n"
+          "  output_dir: " +
+          run_root.string() +
+          "\n"
+          "chains:\n"
+          "  firo:\n"
+          "    driver: firo\n"
+          "    default_binary: " +
+          options.firod.string() +
+          "\n"
+          "nodes: " +
+          std::to_string(options.nodes) +
+          "\n"
+          "metrics:\n"
+          "  extra_sample_count: " +
+          std::to_string(options.metrics_sample_count) +
+          "\n"
+          "  interval_ms: " +
+          std::to_string(options.metrics_interval_ms) +
+          "\n"
+          "resources:\n"
+          "  default:\n"
+          "    memory_high_bytes: " +
+          std::to_string(options.memory_high_bytes) +
+          "\n"
+          "    memory_max_bytes: " +
+          std::to_string(options.memory_max_bytes) +
+          "\n"
+          "    cpu_quota_us: " +
+          (options.cpu_quota_requested ? std::to_string(options.cpu_quota_us)
+                                       : std::string("max")) +
+          "\n"
+          "    cpu_period_us: " +
+          std::to_string(options.cpu_period_us) +
+          "\n"
+          "    pids_max: " +
+          std::to_string(options.pids_max) + "\n" + runtime_resource_yaml +
+          network_yaml + process_yaml + WorkloadsYaml(workloads));
 
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
@@ -2827,7 +2782,8 @@ void WriteScenarioFiles(const Options& options,
 
 void LoadCleanupMetadata(const std::filesystem::path& run_root,
                          Options* options) {
-  const std::filesystem::path resolved_path = run_root / "resolved-scenario.json";
+  const std::filesystem::path resolved_path =
+      run_root / "resolved-scenario.json";
   if (!std::filesystem::exists(resolved_path)) {
     return;
   }
@@ -2908,15 +2864,13 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       if (options.isolate_network) {
         runtime.network_namespace = NetworkNamespace::Create();
         runtime.network = MakeNodeVethConfig(options, i);
-        SetupNodeVethNetwork(runtime.network_namespace->fd(),
-                             *runtime.network);
+        SetupNodeVethNetwork(runtime.network_namespace->fd(), *runtime.network);
         if (runtime.network->apply_condition) {
-          const QdiscInfo qdisc =
-              VerifyNodeNetworkCondition(*runtime.network);
-          WriteEvent(events_path, options.run_id, node_id,
-                     "network_condition_verified",
-                     NetworkConditionVerificationDetail(*runtime.network,
-                                                        qdisc));
+          const QdiscInfo qdisc = VerifyNodeNetworkCondition(*runtime.network);
+          WriteEvent(
+              events_path, options.run_id, node_id,
+              "network_condition_verified",
+              NetworkConditionVerificationDetail(*runtime.network, qdisc));
         }
         runtime.config.rpc_host = runtime.network->node_address;
         runtime.config.rpc_bind = runtime.network->node_address;
@@ -2984,10 +2938,11 @@ std::string ResourceLimitUpdateDetail(const ResourceLimitPatch& patch,
   return boost::json::serialize(detail);
 }
 
-void ApplyRuntimeResourceLimitUpdates(
-    const Options& options, const std::filesystem::path& events_path,
-    std::vector<NodeRuntime>& nodes) {
-  for (const auto& [node_index, patch] : options.runtime_node_resource_updates) {
+void ApplyRuntimeResourceLimitUpdates(const Options& options,
+                                      const std::filesystem::path& events_path,
+                                      std::vector<NodeRuntime>& nodes) {
+  for (const auto& [node_index, patch] :
+       options.runtime_node_resource_updates) {
     if (node_index >= nodes.size()) {
       throw std::runtime_error("runtime resource update node is out of range");
     }
@@ -3013,7 +2968,8 @@ void ApplyRuntimeNetworkConditionUpdates(
   for (const auto& [node_index, condition] :
        options.runtime_node_network_conditions) {
     if (node_index >= nodes.size()) {
-      throw std::runtime_error("runtime network condition node is out of range");
+      throw std::runtime_error(
+          "runtime network condition node is out of range");
     }
     NodeRuntime& node = nodes[node_index];
     if (!node.network) {
@@ -3086,10 +3042,9 @@ void ApplyRuntimeNetworkBlockRules(const Options& options,
       throw std::runtime_error(
           "runtime network block rule was not visible after apply");
     }
-    WriteEvent(events_path, options.run_id, node.config.id,
-               "network_block_applied",
-               NetworkBlockRuleDetail(node, rule, existed_before,
-                                      present_after));
+    WriteEvent(
+        events_path, options.run_id, node.config.id, "network_block_applied",
+        NetworkBlockRuleDetail(node, rule, existed_before, present_after));
   }
 }
 
@@ -3111,10 +3066,9 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
       throw std::runtime_error(
           "runtime network block rule remained after unblock");
     }
-    WriteEvent(events_path, options.run_id, node.config.id,
-               "network_block_removed",
-               NetworkBlockRuleDetail(node, rule, existed_before,
-                                      present_after));
+    WriteEvent(
+        events_path, options.run_id, node.config.id, "network_block_removed",
+        NetworkBlockRuleDetail(node, rule, existed_before, present_after));
   }
 }
 
@@ -3163,19 +3117,19 @@ boost::json::object PartitionRuleResultJson(const NodeRuntime& node,
   return object;
 }
 
-std::string NetworkPartitionDetail(
-    const NetworkPartitionRule& partition,
-    const boost::json::array& rule_results) {
+std::string NetworkPartitionDetail(const NetworkPartitionRule& partition,
+                                   const boost::json::array& rule_results) {
   boost::json::object detail = NetworkPartitionRuleJson(partition);
   detail["rules"] = rule_results;
   detail["scope"] = "source_aware_group";
   return boost::json::serialize(detail);
 }
 
-void ApplyRuntimeNetworkPartition(
-    const Options& options, const std::filesystem::path& events_path,
-    std::vector<NodeRuntime>& nodes, const NetworkPartitionRule& partition,
-    bool heal) {
+void ApplyRuntimeNetworkPartition(const Options& options,
+                                  const std::filesystem::path& events_path,
+                                  std::vector<NodeRuntime>& nodes,
+                                  const NetworkPartitionRule& partition,
+                                  bool heal) {
   boost::json::array rule_results;
   for (const NetworkBlockRule& rule : PartitionBlockRules(partition, nodes)) {
     NodeRuntime& node = nodes[rule.node_index];
@@ -3199,8 +3153,8 @@ void ApplyRuntimeNetworkPartition(
       throw std::runtime_error(
           "runtime network partition rule remained after heal");
     }
-    rule_results.push_back(PartitionRuleResultJson(node, rule, existed_before,
-                                                   present_after));
+    rule_results.push_back(
+        PartitionRuleResultJson(node, rule, existed_before, present_after));
   }
 
   WriteEvent(events_path, options.run_id, "sim",
@@ -3216,10 +3170,11 @@ void ApplyRuntimeNetworkPartitions(const Options& options,
   }
 }
 
-void ApplyRuntimeNetworkPartitionHeals(
-    const Options& options, const std::filesystem::path& events_path,
-    std::vector<NodeRuntime>& nodes) {
-  for (const NetworkPartitionRule& partition : options.runtime_partition_heals) {
+void ApplyRuntimeNetworkPartitionHeals(const Options& options,
+                                       const std::filesystem::path& events_path,
+                                       std::vector<NodeRuntime>& nodes) {
+  for (const NetworkPartitionRule& partition :
+       options.runtime_partition_heals) {
     ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, true);
   }
 }
@@ -3231,7 +3186,8 @@ std::string RestartDetail(pid_t pid, uint64_t restart_count) {
   return boost::json::serialize(detail);
 }
 
-void RestartNode(const Options& options, const std::filesystem::path& events_path,
+void RestartNode(const Options& options,
+                 const std::filesystem::path& events_path,
                  const FiroDriver& driver, NodeRuntime& node) {
   if (!node.cgroup) {
     throw std::runtime_error("node restart requires a node cgroup");
@@ -3256,7 +3212,8 @@ void RestartNode(const Options& options, const std::filesystem::path& events_pat
   ++node.restart_count;
   WriteEvent(events_path, options.run_id, node.config.id, "process_restarted",
              RestartDetail(node.process.pid(), node.restart_count));
-  driver.WaitReady(node.config, std::chrono::seconds(options.ready_timeout_sec));
+  driver.WaitReady(node.config,
+                   std::chrono::seconds(options.ready_timeout_sec));
   WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
   WriteNodeState(events_path, options.run_id, node.config.id, "Running");
   WriteNodeLogTail(events_path, options, driver, node);
@@ -3462,9 +3419,9 @@ int Run(int argc, char** argv) {
       std::filesystem::absolute(options.output_dir) / options.run_id;
   if (std::filesystem::exists(run_root)) {
     if (!options.replace_run) {
-      throw std::runtime_error("run directory already exists: " +
-                               run_root.string() +
-                               " (use --replace-run to remove it)");
+      throw std::runtime_error(
+          "run directory already exists: " + run_root.string() +
+          " (use --replace-run to remove it)");
     }
     RequireOwnedRunDirectory(run_root);
     std::error_code ec;
@@ -3538,28 +3495,25 @@ int Run(int argc, char** argv) {
         NodeRuntime& node = nodes[workload.node - 1U];
         driver.WaitForHeight(node.config, workload.height,
                              std::chrono::seconds(workload.timeout_sec));
-        const uint64_t observed_height =
-            driver.ReadMetrics(node.config).height;
-        WriteEvent(events_path, options.run_id, node.config.id,
-                   "height_wait_reached",
-                   HeightWaitDetail(static_cast<uint32_t>(workload_index + 1U),
-                                    static_cast<uint32_t>(workloads.size()),
-                                    workload.node, workload.height,
-                                    observed_height));
+        const uint64_t observed_height = driver.ReadMetrics(node.config).height;
+        WriteEvent(
+            events_path, options.run_id, node.config.id, "height_wait_reached",
+            HeightWaitDetail(static_cast<uint32_t>(workload_index + 1U),
+                             static_cast<uint32_t>(workloads.size()),
+                             workload.node, workload.height, observed_height));
       } else if (scenario_workload.kind == WorkloadKind::kWaitForPeers) {
-        const WaitForPeersWorkload& workload =
-            scenario_workload.wait_for_peers;
+        const WaitForPeersWorkload& workload = scenario_workload.wait_for_peers;
         NodeRuntime& node = nodes[workload.node - 1U];
         driver.WaitForPeerCount(node.config, workload.peer_count,
                                 std::chrono::seconds(workload.timeout_sec));
         const uint64_t observed_peer_count =
             driver.ReadMetrics(node.config).peer_count;
-        WriteEvent(events_path, options.run_id, node.config.id,
-                   "peer_count_reached",
-                   PeerCountWaitDetail(
-                       static_cast<uint32_t>(workload_index + 1U),
-                       static_cast<uint32_t>(workloads.size()), workload.node,
-                       workload.peer_count, observed_peer_count));
+        WriteEvent(
+            events_path, options.run_id, node.config.id, "peer_count_reached",
+            PeerCountWaitDetail(static_cast<uint32_t>(workload_index + 1U),
+                                static_cast<uint32_t>(workloads.size()),
+                                workload.node, workload.peer_count,
+                                observed_peer_count));
       }
     }
 

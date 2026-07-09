@@ -1,16 +1,15 @@
 #pragma once
 
-#include "benchmark_sim/http_client.h"
-#include "benchmark_sim/process.h"
-
+#include <boost/json/array.hpp>
+#include <boost/json/value.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <boost/json/array.hpp>
-#include <boost/json/value.hpp>
+#include "benchmark_sim/http_client.h"
+#include "benchmark_sim/process.h"
 
 namespace bsim {
 

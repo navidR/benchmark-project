@@ -1,19 +1,17 @@
-#include "benchmark_sim/run_report.h"
-
-#include "benchmark_sim/util.h"
-
 #include <unistd.h>
 
+#include <boost/json/array.hpp>
+#include <boost/json/object.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/test/unit_test.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
-#include <boost/json/array.hpp>
-#include <boost/json/object.hpp>
-#include <boost/json/parse.hpp>
-#include <boost/test/unit_test.hpp>
+#include "benchmark_sim/run_report.h"
+#include "benchmark_sim/util.h"
 
 namespace {
 
@@ -59,44 +57,39 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "\"sync_timeout_sec\":60},"
                   "{\"type\":\"wait_for_peers\",\"node\":1,"
                   "\"peer_count\":1,\"timeout_sec\":30}]}\n");
-  bsim::AppendLine(
-      dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-      "\"timestamp\":\"2026-07-09T00:00:00Z\","
-      "\"event\":\"run_started\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"timestamp\":\"2026-07-09T00:00:00Z\","
+                   "\"event\":\"run_started\"}");
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"event\":\"state\","
       "\"detail\":\"Running\"}");
-  bsim::AppendLine(
-      dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-      "\"event\":\"daemon_log_tail\","
-      "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
-      "\\\"start_offset\\\":0,\\\"next_offset\\\":4,"
-      "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
-      "\\\"text\\\":\\\"tail\\\"}\"}");
-  bsim::AppendLine(
-      dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-      "\"timestamp\":\"2026-07-09T00:00:01Z\","
-      "\"event\":\"generated_blocks\","
-      "\"detail\":\"{\\\"workload_index\\\":1,"
-      "\\\"workload_count\\\":3,\\\"generator_node\\\":1,"
-      "\\\"count\\\":1,\\\"start_height\\\":0,"
-      "\\\"target_height\\\":1,\\\"reward_address\\\":\\\"a\\\","
-      "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
-  bsim::AppendLine(
-      dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-      "\"event\":\"height_reached\",\"detail\":\"1\"}");
-  bsim::AppendLine(
-      dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-      "\"event\":\"height_wait_reached\","
-      "\"detail\":\"{\\\"workload_index\\\":2,"
-      "\\\"workload_count\\\":3,\\\"node\\\":1,"
-      "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"event\":\"daemon_log_tail\","
+                   "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
+                   "\\\"start_offset\\\":0,\\\"next_offset\\\":4,"
+                   "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
+                   "\\\"text\\\":\\\"tail\\\"}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"timestamp\":\"2026-07-09T00:00:01Z\","
+                   "\"event\":\"generated_blocks\","
+                   "\"detail\":\"{\\\"workload_index\\\":1,"
+                   "\\\"workload_count\\\":3,\\\"generator_node\\\":1,"
+                   "\\\"count\\\":1,\\\"start_height\\\":0,"
+                   "\\\"target_height\\\":1,\\\"reward_address\\\":\\\"a\\\","
+                   "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"event\":\"height_reached\",\"detail\":\"1\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"event\":\"height_wait_reached\","
+                   "\"detail\":\"{\\\"workload_index\\\":2,"
+                   "\\\"workload_count\\\":3,\\\"node\\\":1,"
+                   "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
@@ -104,11 +97,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"detail\":\"{\\\"workload_index\\\":3,"
       "\\\"workload_count\\\":3,\\\"node\\\":1,"
       "\\\"target_peer_count\\\":1,\\\"observed_peer_count\\\":1}\"}");
-  bsim::AppendLine(
-      dir / "events.jsonl",
-      "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-      "\"timestamp\":\"2026-07-09T00:00:02Z\","
-      "\"event\":\"run_finished\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"timestamp\":\"2026-07-09T00:00:02Z\","
+                   "\"event\":\"run_finished\"}");
   bsim::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":1,"
@@ -138,10 +130,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 
   BOOST_TEST(report.at("ok").as_bool());
   BOOST_TEST(report.at("status").as_string() == "finished");
-  BOOST_TEST(report.at("started_at").as_string() ==
-             "2026-07-09T00:00:00Z");
-  BOOST_TEST(report.at("finished_at").as_string() ==
-             "2026-07-09T00:00:02Z");
+  BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
+  BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
   BOOST_TEST(JsonInteger(report, "event_count") == 8U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
@@ -149,8 +139,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("sync_timeout_sec").is_null());
   const boost::json::array& workloads = report.at("workloads").as_array();
   BOOST_REQUIRE_EQUAL(workloads.size(), 3U);
-  const boost::json::object& first_workload =
-      workloads.front().as_object();
+  const boost::json::object& first_workload = workloads.front().as_object();
   BOOST_TEST(first_workload.at("type").as_string() == "block_generation");
   BOOST_TEST(JsonInteger(first_workload, "node") == 1U);
   BOOST_TEST(JsonInteger(first_workload, "count") == 1U);
@@ -163,8 +152,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                       1U);
   BOOST_REQUIRE_EQUAL(
       report.at("runtime_node_resource_limits").as_array().size(), 1U);
-  BOOST_REQUIRE_EQUAL(report.at("runtime_node_restarts").as_array().size(),
-                      1U);
+  BOOST_REQUIRE_EQUAL(report.at("runtime_node_restarts").as_array().size(), 1U);
   const boost::json::array& generated_blocks =
       report.at("generated_blocks").as_array();
   BOOST_REQUIRE_EQUAL(generated_blocks.size(), 1U);
@@ -184,12 +172,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const boost::json::array& height_reached =
       report.at("height_reached").as_array();
   BOOST_REQUIRE_EQUAL(height_reached.size(), 1U);
-  const boost::json::object& reached_event =
-      height_reached.front().as_object();
+  const boost::json::object& reached_event = height_reached.front().as_object();
   BOOST_TEST(reached_event.at("node_id").as_string() == "firo-1");
   BOOST_TEST(reached_event.at("detail").as_int64() == 1);
-  const boost::json::array& height_waits =
-      report.at("height_waits").as_array();
+  const boost::json::array& height_waits = report.at("height_waits").as_array();
   BOOST_REQUIRE_EQUAL(height_waits.size(), 1U);
   const boost::json::object& height_wait =
       height_waits.front().as_object().at("detail").as_object();
@@ -203,15 +189,13 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(peer_wait, "workload_index") == 3U);
   BOOST_TEST(JsonInteger(peer_wait, "target_peer_count") == 1U);
   BOOST_TEST(JsonInteger(peer_wait, "observed_peer_count") == 1U);
-  const boost::json::array& nodes =
-      report.at("nodes_summary").as_array();
+  const boost::json::array& nodes = report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);
   const boost::json::object& node = nodes.front().as_object();
   BOOST_TEST(node.at("node_id").as_string() == "firo-1");
   BOOST_TEST(JsonInteger(node, "metric_samples") == 2U);
   BOOST_TEST(node.at("final_state").as_string() == "Running");
-  const boost::json::object& last_metrics =
-      node.at("last_metrics").as_object();
+  const boost::json::object& last_metrics = node.at("last_metrics").as_object();
   BOOST_TEST(JsonInteger(last_metrics, "height") == 2U);
   BOOST_TEST(JsonInteger(last_metrics, "mempool_tx_count") == 3U);
   BOOST_TEST(JsonInteger(last_metrics, "mempool_bytes") == 450U);

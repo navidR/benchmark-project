@@ -1,14 +1,13 @@
 #include "benchmark_sim/firo_driver.h"
 
-#include "benchmark_sim/util.h"
-
-#include <thread>
-
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
+#include <thread>
+
+#include "benchmark_sim/util.h"
 
 namespace bsim {
 namespace {
@@ -36,7 +35,8 @@ boost::json::value ParseRpcResponse(std::string_view body,
   return *result;
 }
 
-std::vector<std::string> ParseStringArrayResult(const boost::json::value& value) {
+std::vector<std::string> ParseStringArrayResult(
+    const boost::json::value& value) {
   std::vector<std::string> values;
   for (const boost::json::value& item : value.as_array()) {
     values.emplace_back(item.as_string());
