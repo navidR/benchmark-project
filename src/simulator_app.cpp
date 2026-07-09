@@ -39,20 +39,6 @@
 namespace bsim {
 namespace {
 
-void RequireStatus(const Status& status) {
-  if (!status) {
-    throw std::runtime_error(status.error());
-  }
-}
-
-template <typename T>
-T RequireResult(Result<T> result) {
-  if (!result) {
-    throw std::runtime_error(result.error());
-  }
-  return std::move(result).unsafe_value();
-}
-
 uint32_t JsonUint32Field(const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr) {
@@ -2520,7 +2506,7 @@ std::string NetworkProbeJson() {
 }
 
 std::string CapabilityProbeJson() {
-  const uint64_t effective = RequireResult(ReadEffectiveCapabilities());
+  const uint64_t effective = ReadEffectiveCapabilities();
   boost::json::object result;
   result["cap_sys_admin"] = HasCapability(effective, CAP_SYS_ADMIN);
   result["cap_net_admin"] = HasCapability(effective, CAP_NET_ADMIN);
@@ -3607,7 +3593,7 @@ void CleanupRun(Options options) {
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
   LoadCleanupMetadata(run_root, &options);
-  RequireStatus(RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN"));
+  RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
 
   for (uint32_t i = 0; i < options.nodes; ++i) {
     DeleteNodeVethNetwork(MakeNodeVethConfig(options, i));
@@ -3623,7 +3609,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
                 const FiroDriver& driver, std::vector<NodeRuntime>& nodes) {
   if (options.isolate_network) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
   }
   if (options.isolate_network && options.nodes > 1 &&
       !HostIpv4ForwardingEnabled()) {
@@ -4394,57 +4380,57 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
   if (options.probe_drop_filter) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << DropFilterProbeJson();
     return 0;
   }
   if (options.probe_netns) {
-    RequireStatus(RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN"));
+    RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
     BSIM_LOG(info) << NetworkNamespaceProbeJson();
     return 0;
   }
   if (options.probe_veth) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << VethProbeJson();
     return 0;
   }
   if (options.probe_bandwidth_limit) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << BandwidthLimitProbeJson();
     return 0;
   }
   if (options.probe_network_condition) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << NetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_combined_network_condition) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << CombinedNetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_network_condition_update) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << NetworkConditionUpdateProbeJson();
     return 0;
   }
   if (options.probe_address) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << AddressProbeJson();
     return 0;
   }
   if (options.probe_route) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << RouteProbeJson();
     return 0;
   }
   if (options.probe_qdisc) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << QdiscProbeJson();
     return 0;
   }
   if (options.probe_qdisc_mutation) {
-    RequireStatus(RequireNetworkSetupCapabilities());
+    RequireNetworkSetupCapabilities();
     BSIM_LOG(info) << QdiscMutationProbeJson();
     return 0;
   }
