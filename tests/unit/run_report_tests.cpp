@@ -75,6 +75,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   bsim::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+      "\"timestamp\":\"2026-07-09T00:00:01Z\","
       "\"event\":\"generated_blocks\","
       "\"detail\":\"{\\\"workload_index\\\":1,"
       "\\\"workload_count\\\":2,\\\"generator_node\\\":1,"
@@ -153,6 +154,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const boost::json::object& generated_block_event =
       generated_blocks.front().as_object();
   BOOST_TEST(generated_block_event.at("node_id").as_string() == "firo-1");
+  BOOST_TEST(generated_block_event.at("timestamp").as_string() ==
+             "2026-07-09T00:00:01Z");
   const boost::json::object& generated_block_detail =
       generated_block_event.at("detail").as_object();
   BOOST_TEST(JsonInteger(generated_block_detail, "workload_index") == 1U);

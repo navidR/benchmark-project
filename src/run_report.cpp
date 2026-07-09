@@ -248,6 +248,10 @@ void AppendEventSummary(const boost::json::object& event,
   if (!node_id.empty()) {
     summary["node_id"] = node_id;
   }
+  const std::string timestamp = OptionalStringField(event, "timestamp");
+  if (!timestamp.empty()) {
+    summary["timestamp"] = timestamp;
+  }
 
   boost::json::value detail = ParseEventDetail(event);
   if (!detail.is_null()) {

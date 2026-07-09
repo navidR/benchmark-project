@@ -435,7 +435,8 @@ Block-generation workloads run sequentially. For each one, the
 `generated_blocks` event detail is JSON with the workload index, generator node,
 generated count, start and target height, reward address, and returned block
 hashes. Per-node block sync confirmations are exposed in reports as
-`height_reached`.
+`height_reached`. Compact event summaries preserve event timestamps when they
+are present in `events.jsonl`.
 `wait_until_height` workloads wait for one Firo node to reach a target height
 and emit a structured `height_wait_reached` event.
 An explicit empty scenario workload list, `"workloads": []`, disables block
