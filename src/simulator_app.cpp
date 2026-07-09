@@ -1,6 +1,7 @@
 #include "benchmark_sim/simulator_app.h"
 
 #include <linux/capability.h>
+#include <sys/wait.h>
 #include <yaml.h>
 
 #include <boost/json/array.hpp>
@@ -3221,6 +3222,28 @@ std::string WalletAddressDetail(const WalletIdentity& wallet,
   return boost::json::serialize(detail);
 }
 
+std::string ProcessExitDetail(const ChildProcess& process) {
+  const bool running = process.running();
+  boost::json::object detail;
+  detail["running"] = running;
+  detail["pid"] = process.pid();
+  const std::optional<int> status = process.exit_status();
+  if (!status) {
+    return boost::json::serialize(detail);
+  }
+  detail["raw_status"] = *status;
+  if (WIFEXITED(*status)) {
+    detail["kind"] = "exit";
+    detail["exit_code"] = WEXITSTATUS(*status);
+  } else if (WIFSIGNALED(*status)) {
+    detail["kind"] = "signal";
+    detail["signal"] = WTERMSIG(*status);
+  } else {
+    detail["kind"] = "other";
+  }
+  return boost::json::serialize(detail);
+}
+
 std::string RestartNodeWorkloadDetail(uint32_t workload_index,
                                       uint32_t workload_count, uint32_t node,
                                       uint64_t restart_count) {
@@ -3912,8 +3935,17 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
   }
 
   for (auto& node : nodes) {
-    driver.WaitReady(node.config,
-                     std::chrono::seconds(options.ready_timeout_sec));
+    try {
+      driver.WaitReady(node.config,
+                       std::chrono::seconds(options.ready_timeout_sec));
+    } catch (...) {
+      if (!node.process.running()) {
+        WriteEvent(events_path, options.run_id, node.config.id,
+                   "process_exited_before_rpc_ready",
+                   ProcessExitDetail(node.process));
+      }
+      throw;
+    }
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
     WriteNodeState(events_path, options.run_id, node.config.id, "Running");
   }
