@@ -285,6 +285,67 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
+  const std::filesystem::path dir = MakeTestDir("run-report-partition");
+  bsim::WriteText(dir / "resolved-scenario.json",
+                  "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
+                  "\"isolated_network\":true,"
+                  "\"workloads\":["
+                  "{\"type\":\"partition_nodes\","
+                  "\"group_a\":[1],\"group_b\":[2]},"
+                  "{\"type\":\"heal_partition\","
+                  "\"group_a\":[1],\"group_b\":[2]}]}\n");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"run_started\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"network_partition_applied\","
+                   "\"detail\":\"{\\\"workload_index\\\":1,"
+                   "\\\"workload_count\\\":2,"
+                   "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
+                   "\\\"scope\\\":\\\"source_aware_group\\\","
+                   "\\\"rules\\\":[]}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"network_partition_healed\","
+                   "\"detail\":\"{\\\"workload_index\\\":2,"
+                   "\\\"workload_count\\\":2,"
+                   "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
+                   "\\\"scope\\\":\\\"source_aware_group\\\","
+                   "\\\"rules\\\":[]}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                   "\"event\":\"run_finished\"}");
+
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
+
+  BOOST_TEST(report.at("ok").as_bool());
+  BOOST_TEST(JsonInteger(report, "event_count") == 4U);
+  const boost::json::array& workloads = report.at("workloads").as_array();
+  BOOST_REQUIRE_EQUAL(workloads.size(), 2U);
+  BOOST_TEST(workloads.front().as_object().at("type").as_string() ==
+             "partition_nodes");
+  const boost::json::array& partitions =
+      report.at("network_partitions").as_array();
+  BOOST_REQUIRE_EQUAL(partitions.size(), 1U);
+  const boost::json::object& partition_detail =
+      partitions.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(partition_detail, "workload_index") == 1U);
+  BOOST_TEST(JsonInteger(partition_detail, "workload_count") == 2U);
+  BOOST_REQUIRE_EQUAL(partition_detail.at("group_a").as_array().size(), 1U);
+  const boost::json::array& heals =
+      report.at("network_partition_heals").as_array();
+  BOOST_REQUIRE_EQUAL(heals.size(), 1U);
+  const boost::json::object& heal_detail =
+      heals.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(heal_detail, "workload_index") == 2U);
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   const std::filesystem::path dir = MakeTestDir("run-report-failed");
   bsim::AppendLine(dir / "events.jsonl",

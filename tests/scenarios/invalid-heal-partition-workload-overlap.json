@@ -1,0 +1,11 @@
+{
+  "nodes": 2,
+  "isolated_network": true,
+  "workloads": [
+    {
+      "type": "heal_partition",
+      "group_a": [1],
+      "group_b": [1]
+    }
+  ]
+}

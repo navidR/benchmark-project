@@ -313,6 +313,21 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-update-resource-limits-plural-nodes.json
     "current Firo MVP update_resource_limits workload uses node, not nodes"
   )
+  add_cli_failure_test(
+    benchmark-sim-invalid-partition-workload-requires-isolate
+    tests/scenarios/invalid-partition-workload-requires-isolate.json
+    "network runtime options require --isolate-network"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-partition-workload-node
+    tests/scenarios/invalid-partition-workload-node.json
+    "scenario partition_nodes workload group_b node must be in 1..2"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-heal-partition-workload-overlap
+    tests/scenarios/invalid-heal-partition-workload-overlap.json
+    "partition groups must not contain the same node"
+  )
 endif()
 
 install(TARGETS benchmark-sim RUNTIME DESTINATION bin)

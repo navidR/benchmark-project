@@ -288,6 +288,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array node_restarts;
   boost::json::array node_freezes;
   boost::json::array resource_updates;
+  boost::json::array network_partitions;
+  boost::json::array network_partition_heals;
 
   ForEachJsonLine(
       run_root / "events.jsonl", [&](const boost::json::object& event) {
@@ -326,6 +328,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           AppendEventSummary(event, &node_freezes);
         } else if (event_name == "resource_limits_updated") {
           AppendEventSummary(event, &resource_updates);
+        } else if (event_name == "network_partition_applied") {
+          AppendEventSummary(event, &network_partitions);
+        } else if (event_name == "network_partition_healed") {
+          AppendEventSummary(event, &network_partition_heals);
         }
       });
 
@@ -367,6 +373,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["node_restarts"] = std::move(node_restarts);
   report["node_freezes"] = std::move(node_freezes);
   report["resource_updates"] = std::move(resource_updates);
+  report["network_partitions"] = std::move(network_partitions);
+  report["network_partition_heals"] = std::move(network_partition_heals);
   report["nodes_summary"] = NodesJson(nodes);
   return boost::json::serialize(report);
 }

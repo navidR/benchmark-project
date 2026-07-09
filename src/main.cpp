@@ -92,6 +92,15 @@ struct ResourceLimitUpdateWorkload {
   ResourceLimitPatch patch;
 };
 
+struct NetworkPartitionRule {
+  std::vector<uint32_t> group_a;
+  std::vector<uint32_t> group_b;
+};
+
+struct NetworkPartitionWorkload {
+  NetworkPartitionRule partition;
+};
+
 enum class WorkloadKind {
   kBlockGeneration,
   kWaitUntilHeight,
@@ -99,6 +108,8 @@ enum class WorkloadKind {
   kRestartNode,
   kFreezeNode,
   kUpdateResourceLimits,
+  kPartitionNodes,
+  kHealPartition,
 };
 
 struct ScenarioWorkload {
@@ -109,6 +120,7 @@ struct ScenarioWorkload {
   RestartNodeWorkload restart_node;
   FreezeNodeWorkload freeze_node;
   ResourceLimitUpdateWorkload update_resource_limits;
+  NetworkPartitionWorkload network_partition;
 };
 
 struct NetworkBlockRule {
@@ -117,11 +129,6 @@ struct NetworkBlockRule {
   std::string dst_address;
   uint16_t dst_port = 0;
   uint32_t handle = 0;
-};
-
-struct NetworkPartitionRule {
-  std::vector<uint32_t> group_a;
-  std::vector<uint32_t> group_b;
 };
 
 struct Options {
@@ -451,6 +458,24 @@ NetworkPartitionRule ParseNetworkPartitionRuleObject(
   return rule;
 }
 
+void ValidateNetworkPartitionRule(const NetworkPartitionRule& rule,
+                                  uint32_t nodes, std::string_view source) {
+  for (uint32_t node_index : rule.group_a) {
+    if (node_index >= nodes) {
+      throw std::runtime_error(std::string(source) +
+                               " group_a node must be in 1.." +
+                               std::to_string(nodes));
+    }
+  }
+  for (uint32_t node_index : rule.group_b) {
+    if (node_index >= nodes) {
+      throw std::runtime_error(std::string(source) +
+                               " group_b node must be in 1.." +
+                               std::to_string(nodes));
+    }
+  }
+}
+
 bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
   return !patch.memory_high_bytes && !patch.memory_max_bytes &&
          !patch.cpu_quota_present && !patch.cpu_period_us && !patch.pids_max;
@@ -547,20 +572,7 @@ void ApplyNetworkPartitionRules(const boost::json::array& rules, uint32_t nodes,
     }
     NetworkPartitionRule rule =
         ParseNetworkPartitionRuleObject(value.as_object());
-    for (uint32_t node_index : rule.group_a) {
-      if (node_index >= nodes) {
-        throw std::runtime_error(std::string(source) +
-                                 " group_a node must be in 1.." +
-                                 std::to_string(nodes));
-      }
-    }
-    for (uint32_t node_index : rule.group_b) {
-      if (node_index >= nodes) {
-        throw std::runtime_error(std::string(source) +
-                                 " group_b node must be in 1.." +
-                                 std::to_string(nodes));
-      }
-    }
+    ValidateNetworkPartitionRule(rule, nodes, source);
     output.push_back(std::move(rule));
   }
 }
@@ -687,6 +699,20 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kUpdateResourceLimits;
       scenario_workload.update_resource_limits = update;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "partition_nodes") {
+      NetworkPartitionWorkload partition;
+      partition.partition = ParseNetworkPartitionRuleObject(workload);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kPartitionNodes;
+      scenario_workload.network_partition = partition;
+      options.workloads.push_back(scenario_workload);
+    } else if (type == "heal_partition") {
+      NetworkPartitionWorkload partition;
+      partition.partition = ParseNetworkPartitionRuleObject(workload);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kHealPartition;
+      scenario_workload.network_partition = partition;
       options.workloads.push_back(scenario_workload);
     } else {
       throw std::runtime_error("unsupported scenario workload type: " + type);
@@ -982,6 +1008,16 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                                  options.runtime_partition_heals);
     }
   }
+}
+
+bool WorkloadsRequireIsolatedNetwork(const Options& options) {
+  for (const ScenarioWorkload& workload : options.workloads) {
+    if (workload.kind == WorkloadKind::kPartitionNodes ||
+        workload.kind == WorkloadKind::kHealPartition) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void ParseNodeNetworkConditionTexts(
@@ -1361,7 +1397,8 @@ Options ParseOptions(int argc, char** argv) {
        !options.runtime_partition_json.empty() ||
        !options.runtime_partitions.empty() ||
        !options.runtime_heal_partition_json.empty() ||
-       !options.runtime_partition_heals.empty()) &&
+       !options.runtime_partition_heals.empty() ||
+       WorkloadsRequireIsolatedNetwork(options)) &&
       !options.isolate_network) {
     throw std::runtime_error(
         "network runtime options require --isolate-network");
@@ -1428,6 +1465,14 @@ Options ParseOptions(int argc, char** argv) {
             "scenario update_resource_limits workload node must be in "
             "1..--nodes");
       }
+    } else if (workload.kind == WorkloadKind::kPartitionNodes) {
+      ValidateNetworkPartitionRule(workload.network_partition.partition,
+                                   options.nodes,
+                                   "scenario partition_nodes workload");
+    } else if (workload.kind == WorkloadKind::kHealPartition) {
+      ValidateNetworkPartitionRule(workload.network_partition.partition,
+                                   options.nodes,
+                                   "scenario heal_partition workload");
     }
   }
   ParseNodeNetworkConditions(options);
@@ -2585,6 +2630,13 @@ boost::json::object ResourceLimitUpdateWorkloadJson(
   return object;
 }
 
+boost::json::object NetworkPartitionWorkloadJson(
+    const NetworkPartitionWorkload& workload, std::string_view type) {
+  boost::json::object object = NetworkPartitionRuleJson(workload.partition);
+  object["type"] = std::string(type);
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
@@ -2601,7 +2653,18 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kFreezeNode) {
     return FreezeNodeWorkloadJson(workload.freeze_node);
   }
-  return ResourceLimitUpdateWorkloadJson(workload.update_resource_limits);
+  if (workload.kind == WorkloadKind::kUpdateResourceLimits) {
+    return ResourceLimitUpdateWorkloadJson(workload.update_resource_limits);
+  }
+  if (workload.kind == WorkloadKind::kPartitionNodes) {
+    return NetworkPartitionWorkloadJson(workload.network_partition,
+                                        "partition_nodes");
+  }
+  if (workload.kind == WorkloadKind::kHealPartition) {
+    return NetworkPartitionWorkloadJson(workload.network_partition,
+                                        "heal_partition");
+  }
+  throw std::runtime_error("unknown scenario workload kind");
 }
 
 void WriteScenarioFiles(const Options& options,
@@ -3096,8 +3159,16 @@ boost::json::object PartitionRuleResultJson(const NodeRuntime& node,
 }
 
 std::string NetworkPartitionDetail(const NetworkPartitionRule& partition,
-                                   const boost::json::array& rule_results) {
+                                   const boost::json::array& rule_results,
+                                   uint32_t workload_index = 0,
+                                   uint32_t workload_count = 0) {
   boost::json::object detail = NetworkPartitionRuleJson(partition);
+  if (workload_index != 0U) {
+    detail["workload_index"] = workload_index;
+  }
+  if (workload_count != 0U) {
+    detail["workload_count"] = workload_count;
+  }
   detail["rules"] = rule_results;
   detail["scope"] = "source_aware_group";
   return boost::json::serialize(detail);
@@ -3107,7 +3178,8 @@ void ApplyRuntimeNetworkPartition(const Options& options,
                                   const std::filesystem::path& events_path,
                                   std::vector<NodeRuntime>& nodes,
                                   const NetworkPartitionRule& partition,
-                                  bool heal) {
+                                  bool heal, uint32_t workload_index = 0,
+                                  uint32_t workload_count = 0) {
   boost::json::array rule_results;
   for (const NetworkBlockRule& rule : PartitionBlockRules(partition, nodes)) {
     NodeRuntime& node = nodes[rule.node_index];
@@ -3137,7 +3209,8 @@ void ApplyRuntimeNetworkPartition(const Options& options,
 
   WriteEvent(events_path, options.run_id, "sim",
              heal ? "network_partition_healed" : "network_partition_applied",
-             NetworkPartitionDetail(partition, rule_results));
+             NetworkPartitionDetail(partition, rule_results, workload_index,
+                                    workload_count));
 }
 
 void ApplyRuntimeNetworkPartitions(const Options& options,
@@ -3530,6 +3603,18 @@ int Run(int argc, char** argv) {
                                  static_cast<uint32_t>(workload_index + 1U),
                                  static_cast<uint32_t>(workloads.size()),
                                  workload.node);
+      } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
+        ApplyRuntimeNetworkPartition(
+            options, events_path, nodes,
+            scenario_workload.network_partition.partition, false,
+            static_cast<uint32_t>(workload_index + 1U),
+            static_cast<uint32_t>(workloads.size()));
+      } else if (scenario_workload.kind == WorkloadKind::kHealPartition) {
+        ApplyRuntimeNetworkPartition(
+            options, events_path, nodes,
+            scenario_workload.network_partition.partition, true,
+            static_cast<uint32_t>(workload_index + 1U),
+            static_cast<uint32_t>(workloads.size()));
       }
     }
 

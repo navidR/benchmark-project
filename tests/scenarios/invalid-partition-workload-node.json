@@ -1,0 +1,11 @@
+{
+  "nodes": 2,
+  "isolated_network": true,
+  "workloads": [
+    {
+      "type": "partition_nodes",
+      "group_a": [1],
+      "group_b": [3]
+    }
+  ]
+}

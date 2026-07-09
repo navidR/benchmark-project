@@ -1,0 +1,10 @@
+{
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "partition_nodes",
+      "group_a": [1],
+      "group_b": [2]
+    }
+  ]
+}

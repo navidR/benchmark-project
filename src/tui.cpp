@@ -225,6 +225,10 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
     } else if (type == "update_resource_limits") {
       text += "limits n";
       text += JsonMetricText(workload, "node");
+    } else if (type == "partition_nodes") {
+      text += "partition";
+    } else if (type == "heal_partition") {
+      text += "heal";
     } else {
       text += type;
     }
