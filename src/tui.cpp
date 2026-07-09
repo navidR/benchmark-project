@@ -225,8 +225,9 @@ void DrawSummary(const std::filesystem::path& run_root,
   AddText(9, 24, 10, "Height", A_BOLD);
   AddText(9, 34, 8, "Peers", A_BOLD);
   AddText(9, 42, 10, "Blocks", A_BOLD);
-  AddText(9, 52, 10, "RPC ms", A_BOLD);
-  AddText(9, 62, std::max(0, cols - 62), "Qdisc", A_BOLD);
+  AddText(9, 52, 10, "Mempool", A_BOLD);
+  AddText(9, 62, 10, "RPC ms", A_BOLD);
+  AddText(9, 72, std::max(0, cols - 72), "Qdisc", A_BOLD);
   DrawHorizontalLine(10);
 
   const boost::json::value* nodes_value = report.if_contains("nodes_summary");
@@ -261,8 +262,9 @@ void DrawSummary(const std::filesystem::path& run_root,
     AddText(y, 34, 8, JsonMetricText(metric_object, "peer_count"));
     AddText(y, 42, 10,
             JsonMetricText(metric_object, "generated_block_count"));
-    AddText(y, 52, 10, JsonMetricText(metric_object, "rpc_latency_ms"));
-    AddText(y, 62, std::max(0, cols - 62),
+    AddText(y, 52, 10, JsonMetricText(metric_object, "mempool_tx_count"));
+    AddText(y, 62, 10, JsonMetricText(metric_object, "rpc_latency_ms"));
+    AddText(y, 72, std::max(0, cols - 72),
             JsonMetricText(metric_object, "qdisc_kind"));
     ++y;
   }
