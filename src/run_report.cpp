@@ -152,6 +152,30 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
   return array;
 }
 
+void AppendGeneratedBlocksEvent(const boost::json::object& event,
+                                boost::json::array* generated_blocks) {
+  boost::json::object summary;
+  const std::string node_id = OptionalStringField(event, "node_id");
+  if (!node_id.empty()) {
+    summary["node_id"] = node_id;
+  }
+
+  const std::string detail = OptionalStringField(event, "detail");
+  if (!detail.empty()) {
+    try {
+      boost::json::value detail_value = boost::json::parse(detail);
+      if (detail_value.is_object()) {
+        summary["detail"] = detail_value.as_object();
+      } else {
+        summary["detail"] = detail;
+      }
+    } catch (...) {
+      summary["detail"] = detail;
+    }
+  }
+  generated_blocks->push_back(std::move(summary));
+}
+
 }  // namespace
 
 std::string BuildRunReportJson(const std::filesystem::path& run_root) {
@@ -171,6 +195,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   bool run_failed = false;
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;
+  boost::json::array generated_blocks;
 
   ForEachJsonLine(run_root / "events.jsonl",
                   [&](const boost::json::object& event) {
@@ -189,6 +214,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
                     } else if (event_name == "state" && !node_id.empty()) {
                       nodes[node_id].final_state =
                           OptionalStringField(event, "detail");
+                    } else if (event_name == "generated_blocks") {
+                      AppendGeneratedBlocksEvent(event, &generated_blocks);
                     }
                   });
 
@@ -213,6 +240,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["event_count"] = event_count;
   report["metric_count"] = metric_count;
   report["event_counts"] = EventCountsJson(event_counts);
+  report["generated_blocks"] = std::move(generated_blocks);
   report["nodes_summary"] = NodesJson(nodes);
   return boost::json::serialize(report);
 }

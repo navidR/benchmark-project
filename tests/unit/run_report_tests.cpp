@@ -60,6 +60,15 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"detail\":\"Running\"}");
   bsim::AppendLine(
       dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+      "\"event\":\"generated_blocks\","
+      "\"detail\":\"{\\\"workload_index\\\":1,"
+      "\\\"workload_count\\\":2,\\\"generator_node\\\":1,"
+      "\\\"count\\\":1,\\\"start_height\\\":0,"
+      "\\\"target_height\\\":1,\\\"reward_address\\\":\\\"a\\\","
+      "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
+  bsim::AppendLine(
+      dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"sim\",\"event\":\"run_finished\"}");
   bsim::AppendLine(
       dir / "metrics.jsonl",
@@ -84,7 +93,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 
   BOOST_TEST(report.at("ok").as_bool());
   BOOST_TEST(report.at("status").as_string() == "finished");
-  BOOST_TEST(JsonInteger(report, "event_count") == 3U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 4U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -97,6 +106,20 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(first_workload, "node") == 1U);
   BOOST_TEST(JsonInteger(first_workload, "count") == 1U);
   BOOST_TEST(JsonInteger(first_workload, "sync_timeout_sec") == 45U);
+  const boost::json::array& generated_blocks =
+      report.at("generated_blocks").as_array();
+  BOOST_REQUIRE_EQUAL(generated_blocks.size(), 1U);
+  const boost::json::object& generated_block_event =
+      generated_blocks.front().as_object();
+  BOOST_TEST(generated_block_event.at("node_id").as_string() == "firo-1");
+  const boost::json::object& generated_block_detail =
+      generated_block_event.at("detail").as_object();
+  BOOST_TEST(JsonInteger(generated_block_detail, "workload_index") == 1U);
+  BOOST_TEST(JsonInteger(generated_block_detail, "workload_count") == 2U);
+  BOOST_TEST(JsonInteger(generated_block_detail, "generator_node") == 1U);
+  BOOST_TEST(JsonInteger(generated_block_detail, "target_height") == 1U);
+  BOOST_REQUIRE_EQUAL(generated_block_detail.at("hashes").as_array().size(),
+                      1U);
   const boost::json::array& nodes =
       report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);
