@@ -223,6 +223,7 @@ add_executable(benchmark-sim
   src/network.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
+  src/periodic_metrics_collector.cpp
   src/process.cpp
   src/run_report.cpp
   src/simulation_command.cpp
@@ -266,6 +267,7 @@ if(BUILD_TESTING)
     tests/unit/network_tests.cpp
     tests/unit/node_log_pane_tests.cpp
     tests/unit/no_shellout_tests.cpp
+    tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/run_report_tests.cpp
     tests/unit/simulation_command_processor_tests.cpp
@@ -281,6 +283,7 @@ if(BUILD_TESTING)
     src/logging.cpp
     src/network.cpp
     src/node_log_pane.cpp
+    src/periodic_metrics_collector.cpp
     src/process.cpp
     src/run_report.cpp
     src/simulation_command_processor.cpp

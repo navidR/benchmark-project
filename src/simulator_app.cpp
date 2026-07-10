@@ -14,9 +14,11 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -35,6 +37,7 @@
 #include "benchmark_sim/logging.h"
 #include "benchmark_sim/network.h"
 #include "benchmark_sim/node_log_collector.h"
+#include "benchmark_sim/periodic_metrics_collector.h"
 #include "benchmark_sim/process.h"
 #include "benchmark_sim/run_report.h"
 #include "benchmark_sim/simulation_command_processor.h"
@@ -49,6 +52,8 @@
 
 namespace bsim {
 namespace {
+
+std::mutex node_network_state_mutex;
 
 uint32_t JsonUint32Field(const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
@@ -3307,51 +3312,58 @@ std::string FreezeNodeWorkloadDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
-void WriteMetricsSnapshot(const std::filesystem::path& metrics_path,
-                          const Options& options, const ChainDriver& driver,
-                          std::vector<NodeRuntime>& nodes) {
+using NodeMetricsFailureHandler =
+    std::function<void(const NodeRuntime&, std::string_view)>;
+using MetricsStopRequested = std::function<bool()>;
+
+void WriteMetricsSnapshot(
+    const std::filesystem::path& metrics_path, const Options& options,
+    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    const NodeMetricsFailureHandler& node_failure_handler = {},
+    const MetricsStopRequested& stop_requested = {}) {
   const std::vector<LinkInfo> links = ListNetworkLinks();
   const std::vector<QdiscInfo> qdiscs = ListQdiscs();
   for (auto& node : nodes) {
-    ChainMetrics chain = driver.ReadMetrics(node.config);
+    if (stop_requested && stop_requested()) {
+      return;
+    }
+    ChainMetrics chain;
+    try {
+      chain = driver.ReadMetrics(node.config);
+    } catch (const std::exception& error) {
+      if (!node_failure_handler) {
+        throw;
+      }
+      node_failure_handler(node, error.what());
+      continue;
+    }
     CgroupMetrics cg = node.cgroup->ReadMetrics();
+    std::optional<NodeVethConfig> network;
+    {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      network = node.network;
+    }
     const LinkInfo* link =
-        node.network ? FindLinkByName(links, node.network->host_name) : nullptr;
+        network ? FindLinkByName(links, network->host_name) : nullptr;
     std::optional<QdiscInfo> qdisc_summary;
     const QdiscInfo* qdisc = nullptr;
-    if (node.network) {
-      if (node.network->apply_condition) {
+    if (network) {
+      if (network->apply_condition) {
         QdiscInfo candidate;
-        if (QdiscsMatchNetworkCondition(qdiscs, node.network->host_name,
-                                        node.network->condition, &candidate)) {
+        if (QdiscsMatchNetworkCondition(qdiscs, network->host_name,
+                                        network->condition, &candidate)) {
           qdisc_summary = candidate;
           qdisc = &*qdisc_summary;
         }
       }
       if (qdisc == nullptr) {
-        qdisc = FindQdiscByInterfaceName(qdiscs, node.network->host_name);
+        qdisc = FindQdiscByInterfaceName(qdiscs, network->host_name);
       }
     }
-    AppendLine(metrics_path, MetricsJson(options.run_id, node.config.id, chain,
-                                         node.generated_block_count,
-                                         node.restart_count, &cg, link, qdisc));
-  }
-}
-
-void WritePeriodicMetrics(const std::filesystem::path& events_path,
-                          const std::filesystem::path& metrics_path,
-                          const Options& options, const ChainDriver& driver,
-                          std::vector<NodeRuntime>& nodes) {
-  for (uint32_t sample = 0; sample < options.metrics_sample_count; ++sample) {
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(options.metrics_interval_ms));
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
-    boost::json::object detail;
-    detail["sample"] = sample + 1U;
-    detail["sample_count"] = options.metrics_sample_count;
-    detail["interval_ms"] = options.metrics_interval_ms;
-    WriteEvent(events_path, options.run_id, "sim", "metrics_sample",
-               boost::json::serialize(detail));
+    AppendLine(metrics_path,
+               MetricsJson(options.run_id, node.config.id, chain,
+                           node.GeneratedBlockCount(), node.RestartCount(), &cg,
+                           link, qdisc));
   }
 }
 
@@ -4256,7 +4268,7 @@ void ApplySendRawTransactionWorkload(const Options& options,
   const uint64_t start_height = driver.ReadMetrics(funder.config).height;
   std::vector<std::string> funding_hashes = driver.GenerateBlocks(
       funder.config, workload.funding_blocks, workload.source_address);
-  funder.generated_block_count += funding_hashes.size();
+  funder.AddGeneratedBlocks(static_cast<std::uint64_t>(funding_hashes.size()));
   const uint64_t target_height =
       start_height + static_cast<uint64_t>(funding_hashes.size());
   for (auto& node : nodes) {
@@ -4345,7 +4357,7 @@ void ApplyWalletTransactionsWorkload(const Options& options,
     state.start_height = driver.ReadMetrics(miner.config).height;
     state.hashes = driver.GenerateBlocks(
         miner.config, workload.funding_blocks_per_wallet, wallet.address);
-    miner.generated_block_count += state.hashes.size();
+    miner.AddGeneratedBlocks(static_cast<std::uint64_t>(state.hashes.size()));
     state.target_height =
         state.start_height + static_cast<uint64_t>(state.hashes.size());
     for (NodeRuntime& node : nodes) {
@@ -4406,18 +4418,27 @@ void ApplyRuntimeNetworkConditionUpdates(
           "runtime network condition node is out of range");
     }
     NodeRuntime& node = nodes[node_index];
-    if (!node.network) {
-      throw std::runtime_error(
-          "runtime network condition requires isolated networking");
+    NodeVethConfig updated_network;
+    {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      if (!node.network) {
+        throw std::runtime_error(
+            "runtime network condition requires isolated networking");
+      }
+      updated_network = *node.network;
     }
-    node.network->apply_condition = true;
-    node.network->condition = condition;
-    ReplaceNetworkConditionQdisc(node.network->host_name,
-                                 node.network->condition);
-    const QdiscInfo qdisc = VerifyNodeNetworkCondition(*node.network);
+    updated_network.apply_condition = true;
+    updated_network.condition = condition;
+    ReplaceNetworkConditionQdisc(updated_network.host_name,
+                                 updated_network.condition);
+    const QdiscInfo qdisc = VerifyNodeNetworkCondition(updated_network);
+    {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      node.network = updated_network;
+    }
     WriteEvent(events_path, options.run_id, node.config.id,
                "network_condition_updated",
-               NetworkConditionVerificationDetail(*node.network, qdisc));
+               NetworkConditionVerificationDetail(updated_network, qdisc));
   }
 }
 
@@ -4639,7 +4660,7 @@ void RestartNode(const Options& options,
 
   WriteNodeState(events_path, options.run_id, node.config.id, "Restarting");
   WriteEvent(events_path, options.run_id, node.config.id, "restart_requested",
-             "restart_count=" + std::to_string(node.restart_count + 1U));
+             "restart_count=" + std::to_string(node.RestartCount() + 1U));
   driver.Stop(node.config);
   if (!node.process.WaitForExit(std::chrono::seconds(15))) {
     WriteEvent(events_path, options.run_id, node.config.id, "sigterm");
@@ -4651,9 +4672,9 @@ void RestartNode(const Options& options,
   }
   WriteNodeState(events_path, options.run_id, node.config.id, "Starting");
   node.process = ChildProcess::Spawn(process, node.cgroup->path());
-  ++node.restart_count;
+  const std::uint64_t restart_count = node.IncrementRestartCount();
   WriteEvent(events_path, options.run_id, node.config.id, "process_restarted",
-             RestartDetail(node.process.pid(), node.restart_count));
+             RestartDetail(node.process.pid(), restart_count));
   driver.WaitReady(node.config,
                    std::chrono::seconds(options.ready_timeout_sec));
   WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
@@ -4827,6 +4848,7 @@ int RunBenchmarkHeadless(Options options,
   ChainDriver& driver = *driver_owner;
   std::vector<NodeRuntime> nodes;
   std::unique_ptr<NodeLogCollector> log_collector;
+  std::unique_ptr<PeriodicMetricsCollector> metrics_collector;
   std::unique_ptr<ChainCommandExecutor> chain_command_executor;
   std::unique_ptr<SimulationCommandProcessor> command_processor;
   const auto stop_command_processor = [&]() {
@@ -4838,6 +4860,9 @@ int RunBenchmarkHeadless(Options options,
   };
   const auto handle_run_failure = [&](std::string_view detail) {
     stop_command_processor();
+    if (metrics_collector) {
+      metrics_collector->Stop();
+    }
     for (auto& node : nodes) {
       WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
     }
@@ -4901,6 +4926,34 @@ int RunBenchmarkHeadless(Options options,
           WriteLogTailChunkEvent(events_path, options, config, source, chunk);
         });
     log_collector->Start();
+    metrics_collector = std::make_unique<PeriodicMetricsCollector>(
+        options.metrics_sample_count,
+        std::chrono::milliseconds(options.metrics_interval_ms),
+        [&](std::uint32_t sample) {
+          WriteMetricsSnapshot(
+              metrics_path, options, driver, nodes,
+              [&](const NodeRuntime& node, std::string_view error) {
+                boost::json::object detail;
+                detail["sample"] = sample;
+                detail["error"] = error;
+                WriteEvent(events_path, options.run_id, node.config.id,
+                           "metrics_node_unavailable",
+                           boost::json::serialize(detail));
+                BSIM_LOG(warning) << "metrics sample " << sample << " skipped "
+                                  << node.config.id << ": " << error;
+              },
+              [&] { return metrics_collector->StopRequested(); });
+          if (metrics_collector->StopRequested()) {
+            return;
+          }
+          boost::json::object detail;
+          detail["sample"] = sample;
+          detail["sample_count"] = options.metrics_sample_count;
+          detail["interval_ms"] = options.metrics_interval_ms;
+          WriteEvent(events_path, options.run_id, "sim", "metrics_sample",
+                     boost::json::serialize(detail));
+        });
+    metrics_collector->Start();
     InitializeWalletNodes(options, events_path, driver, nodes,
                           simulation_registry);
 
@@ -4914,8 +4967,6 @@ int RunBenchmarkHeadless(Options options,
     ApplyRuntimeNetworkUnblockRules(options, events_path, nodes);
     ApplyRuntimeNodeRestarts(options, events_path, driver, nodes);
     ApplyRuntimeNodeFreezes(options, events_path, nodes);
-    WritePeriodicMetrics(events_path, metrics_path, options, driver, nodes);
-
     const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
     for (size_t workload_index = 0; workload_index < workloads.size();
          ++workload_index) {
@@ -4932,7 +4983,7 @@ int RunBenchmarkHeadless(Options options,
         std::vector<std::string> hashes =
             driver.GenerateBlocks(generator.config, workload.count,
                                   chain_spec.default_reward_address);
-        generator.generated_block_count += hashes.size();
+        generator.AddGeneratedBlocks(static_cast<std::uint64_t>(hashes.size()));
         const uint64_t target_height =
             start_height + static_cast<uint64_t>(hashes.size());
         WriteEvent(
@@ -5004,7 +5055,7 @@ int RunBenchmarkHeadless(Options options,
                    RestartNodeWorkloadDetail(
                        static_cast<uint32_t>(workload_index + 1U),
                        static_cast<uint32_t>(workloads.size()), workload.node,
-                       node.restart_count));
+                       node.RestartCount()));
       } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
         const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
         NodeRuntime& node = nodes[workload.node - 1U];
@@ -5045,6 +5096,7 @@ int RunBenchmarkHeadless(Options options,
       }
     }
 
+    metrics_collector->Wait();
     WriteMetricsSnapshot(metrics_path, options, driver, nodes);
 
     stop_command_processor();

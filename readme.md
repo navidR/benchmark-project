@@ -26,7 +26,8 @@ the Firo path is working end to end.
 - Wait for JSON-RPC readiness.
 - Generate regtest blocks.
 - Wait for generated blocks to propagate before final metrics are recorded.
-- Record optional periodic metric samples between runtime events and workloads.
+- Record optional periodic metric samples concurrently with wallet setup,
+  runtime events, and workloads.
 - Record cgroup usage, pressure, event counters, and configured limits.
 - Record Firo daemon version, protocol version, and subversion in metrics.
 - Record event and metric files under a run directory.
@@ -303,8 +304,9 @@ thawed states, then continue the run:
   --runtime-node-freeze-json '{"node":1,"duration_ms":100}'
 ```
 
-Extra metric samples can be collected between runtime updates/restarts and
-block generation:
+Extra metric samples can be collected while runtime updates, restarts, and
+block generation execute. The nodes remain active until the requested sample
+count is complete:
 
 ```bash
 ./build/benchmark-sim \
@@ -317,6 +319,10 @@ block generation:
   --metrics-sample-count 5 \
   --metrics-interval-ms 1000
 ```
+
+Temporary chain RPC unavailability during restart or freeze is recorded as a
+`metrics_node_unavailable` event for that node. Remaining nodes and later
+samples continue; storage and internal collection failures still fail the run.
 
 The same run settings can be loaded from a JSON or YAML scenario file. Both
 formats use the same field names and validation rules.
