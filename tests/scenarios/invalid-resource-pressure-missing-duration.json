@@ -1,0 +1,10 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "resource_pressure",
+      "node": 1,
+      "pids_max": 128
+    }
+  ]
+}

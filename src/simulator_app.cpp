@@ -1169,6 +1169,19 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kUpdateResourceLimits;
       scenario_workload.update_resource_limits = update;
       options.workloads.push_back(scenario_workload);
+    } else if (type == "resource_pressure") {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current MVP resource_pressure workload uses node, not nodes");
+      }
+      ResourcePressureWorkload pressure;
+      pressure.node = JsonOptionalUint32Field(workload, "node", pressure.node);
+      pressure.patch = ParseResourceLimitPatchObject(workload);
+      pressure.duration_ms = JsonUint32Field(workload, "duration_ms");
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kResourcePressure;
+      scenario_workload.resource_pressure = pressure;
+      options.workloads.push_back(scenario_workload);
     } else if (type == "partition_nodes") {
       NetworkPartitionWorkload partition;
       partition.partition = ParseNetworkPartitionRuleObject(workload);
@@ -2126,6 +2139,18 @@ Options ParseOptions(int argc, char** argv) {
         throw std::runtime_error(
             "scenario update_resource_limits workload node must be in "
             "1..--nodes");
+      }
+    } else if (workload.kind == WorkloadKind::kResourcePressure) {
+      if (workload.resource_pressure.node == 0U ||
+          workload.resource_pressure.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario resource_pressure workload node must be in "
+            "1..--nodes");
+      }
+      if (workload.resource_pressure.duration_ms == 0U) {
+        throw std::runtime_error(
+            "scenario resource_pressure duration_ms must be greater than "
+            "zero");
       }
     } else if (workload.kind == WorkloadKind::kPartitionNodes) {
       ValidateNetworkPartitionRule(workload.network_partition.partition,
@@ -3586,6 +3611,15 @@ boost::json::object ResourceLimitUpdateWorkloadJson(
   return object;
 }
 
+boost::json::object ResourcePressureWorkloadJson(
+    const ResourcePressureWorkload& workload) {
+  boost::json::object object = ResourceLimitPatchJson(workload.patch);
+  object["type"] = "resource_pressure";
+  object["node"] = workload.node;
+  object["duration_ms"] = workload.duration_ms;
+  return object;
+}
+
 boost::json::object NetworkPartitionWorkloadJson(
     const NetworkPartitionWorkload& workload, std::string_view type) {
   boost::json::object object = NetworkPartitionRuleJson(workload.partition);
@@ -3649,6 +3683,9 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   }
   if (workload.kind == WorkloadKind::kUpdateResourceLimits) {
     return ResourceLimitUpdateWorkloadJson(workload.update_resource_limits);
+  }
+  if (workload.kind == WorkloadKind::kResourcePressure) {
+    return ResourcePressureWorkloadJson(workload.resource_pressure);
   }
   if (workload.kind == WorkloadKind::kPartitionNodes) {
     return NetworkPartitionWorkloadJson(workload.network_partition,
@@ -4056,6 +4093,84 @@ void ApplyRuntimeResourceLimitUpdates(const Options& options,
     NodeRuntime& node = nodes[node_index];
     ApplyResourceLimitUpdate(options, events_path, node, patch);
   }
+}
+
+std::string ResourcePressureDetail(const ResourcePressureWorkload& workload,
+                                   const ResourceLimits& previous_limits,
+                                   const ResourceLimits& pressure_limits,
+                                   const ResourceLimits& current_limits,
+                                   uint32_t workload_index,
+                                   uint32_t workload_count) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = workload.node;
+  detail["duration_ms"] = workload.duration_ms;
+  detail["requested"] = ResourceLimitPatchJson(workload.patch);
+  detail["previous"] = ResourceLimitsJson(previous_limits);
+  detail["pressure"] = ResourceLimitsJson(pressure_limits);
+  detail["current"] = ResourceLimitsJson(current_limits);
+  return boost::json::serialize(detail);
+}
+
+void ApplyResourcePressureWorkload(
+    const Options& options, const std::filesystem::path& events_path,
+    const std::filesystem::path& metrics_path, const ChainDriver& driver,
+    std::vector<NodeRuntime>& nodes, const ResourcePressureWorkload& workload,
+    uint32_t workload_index, uint32_t workload_count) {
+  NodeRuntime& node = nodes[workload.node - 1U];
+  if (!node.cgroup) {
+    throw std::runtime_error("resource pressure requires a node cgroup");
+  }
+
+  const ResourceLimits previous_limits = node.resources;
+  const ResourceLimits pressure_limits =
+      ApplyResourceLimitPatch(previous_limits, workload.patch, node.config.id);
+  try {
+    WriteResourceLimits(*node.cgroup, previous_limits, pressure_limits);
+  } catch (...) {
+    const std::exception_ptr apply_error = std::current_exception();
+    try {
+      WriteResourceLimits(*node.cgroup, pressure_limits, previous_limits);
+    } catch (const std::exception& restore_error) {
+      BSIM_LOG(error) << "failed to restore partially applied resource "
+                         "pressure limits for "
+                      << node.config.id << ": " << restore_error.what();
+    } catch (...) {
+      BSIM_LOG(error) << "failed to restore partially applied resource "
+                         "pressure limits for "
+                      << node.config.id << ": unknown exception";
+    }
+    std::rethrow_exception(apply_error);
+  }
+  node.resources = pressure_limits;
+
+  try {
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "resource_pressure_started",
+               ResourcePressureDetail(workload, previous_limits,
+                                      pressure_limits, pressure_limits,
+                                      workload_index, workload_count));
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(workload.duration_ms));
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
+  } catch (...) {
+    WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
+    node.resources = previous_limits;
+    WriteEvent(events_path, options.run_id, node.config.id,
+               "resource_pressure_restored_after_error",
+               ResourcePressureDetail(workload, previous_limits,
+                                      pressure_limits, previous_limits,
+                                      workload_index, workload_count));
+    throw;
+  }
+
+  WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
+  node.resources = previous_limits;
+  WriteEvent(
+      events_path, options.run_id, node.config.id, "resource_pressure_finished",
+      ResourcePressureDetail(workload, previous_limits, pressure_limits,
+                             previous_limits, workload_index, workload_count));
 }
 
 void ApplyConnectPeerWorkload(const Options& options,
@@ -4818,6 +4933,12 @@ int RunBenchmarkHeadless(Options options) {
                                  static_cast<uint32_t>(workload_index + 1U),
                                  static_cast<uint32_t>(workloads.size()),
                                  workload.node);
+      } else if (scenario_workload.kind == WorkloadKind::kResourcePressure) {
+        ApplyResourcePressureWorkload(
+            options, events_path, metrics_path, driver, nodes,
+            scenario_workload.resource_pressure,
+            static_cast<uint32_t>(workload_index + 1U),
+            static_cast<uint32_t>(workloads.size()));
       } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
         ApplyRuntimeNetworkPartition(
             options, events_path, nodes,

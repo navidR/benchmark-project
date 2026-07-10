@@ -352,6 +352,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-random-transactions-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME benchmark-sim-valid-resource-pressure-scenario
+    COMMAND benchmark-sim
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-resource-pressure-scenario.json"
+      --probe-capabilities
+  )
   add_test(NAME benchmark-sim-benchmark-root-option
     COMMAND benchmark-sim
       --benchmark-root "${CMAKE_CURRENT_BINARY_DIR}/benchmark-root-option"
@@ -527,6 +533,26 @@ if(BUILD_TESTING)
     benchmark-sim-invalid-update-resource-limits-plural-nodes
     tests/scenarios/invalid-update-resource-limits-plural-nodes.json
     "current MVP update_resource_limits workload uses node, not nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-resource-pressure-missing-duration
+    tests/scenarios/invalid-resource-pressure-missing-duration.json
+    "missing or invalid uint32 JSON field: duration_ms"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-resource-pressure-zero-duration
+    tests/scenarios/invalid-resource-pressure-zero-duration.json
+    "scenario resource_pressure duration_ms must be greater than zero"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-resource-pressure-node
+    tests/scenarios/invalid-resource-pressure-node.json
+    "scenario resource_pressure workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-resource-pressure-plural-nodes
+    tests/scenarios/invalid-resource-pressure-plural-nodes.json
+    "current MVP resource_pressure workload uses node, not nodes"
   )
   add_cli_failure_test(
     benchmark-sim-invalid-partition-workload-requires-isolate

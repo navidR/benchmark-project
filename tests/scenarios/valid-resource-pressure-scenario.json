@@ -1,0 +1,14 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "resource_pressure",
+      "node": 2,
+      "memory_high_bytes": 536870912,
+      "cpu_quota_us": 25000,
+      "cpu_period_us": 100000,
+      "duration_ms": 25
+    }
+  ]
+}

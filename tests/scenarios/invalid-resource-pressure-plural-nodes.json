@@ -1,0 +1,11 @@
+{
+  "nodes": 2,
+  "workloads": [
+    {
+      "type": "resource_pressure",
+      "nodes": [1, 2],
+      "pids_max": 128,
+      "duration_ms": 25
+    }
+  ]
+}
