@@ -1,8 +1,8 @@
-#include "benchmark_sim/simulation_command.h"
+#include "bbp/simulation_command.h"
 
 #include <stdexcept>
 
-namespace bsim {
+namespace bbp {
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
   switch (kind) {
@@ -26,4 +26,4 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
   throw std::runtime_error("unknown simulation command kind");
 }
 
-}  // namespace bsim
+}  // namespace bbp

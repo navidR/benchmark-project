@@ -1,9 +1,9 @@
-#include "benchmark_sim/simulation_registry.h"
+#include "bbp/simulation_registry.h"
 
 #include <cstdint>
 #include <stdexcept>
 
-namespace bsim {
+namespace bbp {
 
 SimulationRegistry SimulationRegistry::FromTopology(
     const NodeRoleTopology& topology,
@@ -57,4 +57,4 @@ uint32_t SimulationRegistry::MinerNodeForWalletIndex(
          1U;
 }
 
-}  // namespace bsim
+}  // namespace bbp

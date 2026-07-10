@@ -1,9 +1,9 @@
-#include "benchmark_sim/simulator/yaml_helpers.h"
+#include "bbp/simulator/yaml_helpers.h"
 
 #include <stdexcept>
 #include <utility>
 
-namespace bsim {
+namespace bbp {
 
 YamlEvent::~YamlEvent() {
   if (active_) {
@@ -100,4 +100,4 @@ int YamlEmitter::WriteHandler(void* data, unsigned char* buffer,
   return 1;
 }
 
-}  // namespace bsim
+}  // namespace bbp

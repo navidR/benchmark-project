@@ -1,6 +1,6 @@
-#include "benchmark_sim/cgroup.h"
+#include "bbp/cgroup.h"
 
-#include "benchmark_sim/util.h"
+#include "bbp/util.h"
 
 #include <signal.h>
 #include <sys/wait.h>
@@ -16,11 +16,11 @@
 #include <string_view>
 #include <thread>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr std::string_view kCgroupRoot = "/sys/fs/cgroup";
-constexpr std::string_view kSimulatorRootName = "benchmark-sim";
+constexpr std::string_view kSimulatorRootName = "bbp";
 
 std::filesystem::path CgroupRoot() { return std::filesystem::path(kCgroupRoot); }
 
@@ -450,4 +450,4 @@ void Cgroup::Remove() const {
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

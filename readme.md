@@ -1,6 +1,6 @@
-# Benchmark Project
+# Blockchain Benchmark Project
 
-Benchmark Project is a Linux-local blockchain benchmark simulator.
+Blockchain Benchmark Project is a Linux-local blockchain benchmark simulator.
 
 The goal is to run real blockchain daemon processes locally, isolate them like
 separate nodes, apply controlled CPU, memory, process, and network conditions,
@@ -95,7 +95,7 @@ One Firo node:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim \
+   ./build/bbp \
      --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id smoke1 \
@@ -114,7 +114,7 @@ Multiple Firo nodes:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim \
+   ./build/bbp \
      --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id smoke3 \
@@ -135,7 +135,7 @@ Multiple isolated Firo nodes:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim \
+   ./build/bbp \
      --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-smoke \
@@ -156,7 +156,7 @@ Isolated Firo node with a default network condition:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim \
+   ./build/bbp \
      --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-delay \
@@ -177,7 +177,7 @@ Isolated Firo node with a bandwidth limit:
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim \
+   ./build/bbp \
      --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-bandwidth \
@@ -195,7 +195,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
 Per-node isolated network conditions use repeatable JSON objects:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id isolated-per-node \
@@ -213,7 +213,7 @@ Runtime network updates use the same JSON shape and are applied after nodes are
 running, while scheduled block production and metrics collection continue:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-netem \
@@ -233,7 +233,7 @@ source node. This example applies and then removes the same source-scoped rule
 while scheduled block production and metrics collection continue:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-block-unblock \
@@ -252,7 +252,7 @@ Runtime partition/heal accepts two node groups and installs source-aware
 cross-group P2P block rules in both directions:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-partition-heal \
@@ -276,7 +276,7 @@ attached below it. The netem fields are `delay_ms`, `jitter_ms`,
 Default resource limits apply to each node cgroup:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id resource-smoke \
@@ -298,7 +298,7 @@ generation. Omitted fields keep their current values; `cpu_quota_us: null`
 restores unlimited CPU quota.
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-resources \
@@ -315,7 +315,7 @@ Runtime restarts stop a node through Firo RPC, respawn it in the same
 cgroup/network/data directory, wait for RPC readiness, then continue the run:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id restart-smoke \
@@ -332,7 +332,7 @@ Runtime freezes pause a node cgroup for a bounded duration, verify frozen and
 thawed states, then continue the run:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id freeze-smoke \
@@ -350,7 +350,7 @@ scheduled block production execute. The nodes remain active until the requested
 sample count is complete:
 
 ```bash
-./build/benchmark-sim \
+./build/bbp \
   --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id sampled-smoke \
@@ -517,13 +517,13 @@ formats use the same field names and validation rules.
 Run it:
 
 ```bash
-./build/benchmark-sim --scenario-json /path/to/scenario.json --replace-run
+./build/bbp --scenario-json /path/to/scenario.json --replace-run
 ```
 
 The equivalent YAML entry point is:
 
 ```bash
-./build/benchmark-sim --scenario-yaml /path/to/scenario.yaml --replace-run
+./build/bbp --scenario-yaml /path/to/scenario.yaml --replace-run
 ```
 
 Wallet and miner roles can be declared in the scenario topology. Counts resolve
@@ -605,7 +605,7 @@ generation for that run.
 Summarize an existing run:
 
 ```bash
-./build/benchmark-sim --report-run runs/<run-id>
+./build/bbp --report-run runs/<run-id>
 ```
 
 The compact report includes the run status, lifecycle timestamps, failure
@@ -615,7 +615,7 @@ and latest log tails.
 View an existing run in the read-only TUI:
 
 ```bash
-./build/benchmark-sim --run runs/<run-id>
+./build/bbp --run runs/<run-id>
 ```
 
 The TUI shows run status, lifecycle timestamps, workload summary, node chain
@@ -634,7 +634,7 @@ selected chain does not support an operation, the TUI shows a dismissible
 Render one TUI frame and exit, useful for validation:
 
 ```bash
-TERM=xterm ./build/benchmark-sim --run runs/<run-id> --once
+TERM=xterm ./build/bbp --run runs/<run-id> --once
 ```
 
 ## Run Network Probes
@@ -645,33 +645,33 @@ simulator.
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim --probe-network &&
-   ./build/benchmark-sim --probe-capabilities &&
-   ./build/benchmark-sim --probe-cgroup-freeze &&
-   ./build/benchmark-sim --probe-netns &&
-   ./build/benchmark-sim --probe-veth &&
-   ./build/benchmark-sim --probe-address &&
-   ./build/benchmark-sim --probe-route &&
-   ./build/benchmark-sim --probe-qdisc &&
-   ./build/benchmark-sim --probe-qdisc-mutation &&
-   ./build/benchmark-sim --probe-bandwidth-limit &&
-   ./build/benchmark-sim --probe-network-condition &&
-   ./build/benchmark-sim --probe-combined-network-condition &&
-   ./build/benchmark-sim --probe-network-condition-update'
+   ./build/bbp --probe-network &&
+   ./build/bbp --probe-capabilities &&
+   ./build/bbp --probe-cgroup-freeze &&
+   ./build/bbp --probe-netns &&
+   ./build/bbp --probe-veth &&
+   ./build/bbp --probe-address &&
+   ./build/bbp --probe-route &&
+   ./build/bbp --probe-qdisc &&
+   ./build/bbp --probe-qdisc-mutation &&
+   ./build/bbp --probe-bandwidth-limit &&
+   ./build/bbp --probe-network-condition &&
+   ./build/bbp --probe-combined-network-condition &&
+   ./build/bbp --probe-network-condition-update'
 ```
 
 Useful focused probes:
 
 ```bash
-./build/benchmark-sim --probe-veth
-./build/benchmark-sim --probe-capabilities
-./build/benchmark-sim --probe-cgroup-freeze
-./build/benchmark-sim --probe-route
-./build/benchmark-sim --probe-qdisc-mutation
-./build/benchmark-sim --probe-bandwidth-limit
-./build/benchmark-sim --probe-network-condition
-./build/benchmark-sim --probe-combined-network-condition
-./build/benchmark-sim --probe-network-condition-update
+./build/bbp --probe-veth
+./build/bbp --probe-capabilities
+./build/bbp --probe-cgroup-freeze
+./build/bbp --probe-route
+./build/bbp --probe-qdisc-mutation
+./build/bbp --probe-bandwidth-limit
+./build/bbp --probe-network-condition
+./build/bbp --probe-combined-network-condition
+./build/bbp --probe-network-condition-update
 ```
 
 ## Cleanup Checks
@@ -687,7 +687,7 @@ Check for leaked temporary veth names:
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim --probe-network | rg "bs[0-9]+[hp]" || true'
+   ./build/bbp --probe-network | rg "bbp[0-9]+[hp]" || true'
 ```
 
 Remove stale simulator-owned kernel objects for a run ID:
@@ -695,7 +695,7 @@ Remove stale simulator-owned kernel objects for a run ID:
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
-   ./build/benchmark-sim \
+   ./build/bbp \
      --benchmark-root runs \
      --run-id isolated-smoke \
      --cleanup-run'

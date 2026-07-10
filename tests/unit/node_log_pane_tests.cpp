@@ -4,7 +4,7 @@
 #include <string_view>
 #include <utility>
 
-#include "benchmark_sim/node_log_pane.h"
+#include "bbp/node_log_pane.h"
 
 namespace {
 
@@ -28,7 +28,7 @@ boost::json::object MakeReport(std::string_view source, std::string_view text) {
 BOOST_AUTO_TEST_CASE(node_log_pane_is_closed_by_default_and_toggles) {
   const boost::json::object report =
       MakeReport("daemon_log", "first\nsecond\nthird\n");
-  bsim::NodeLogPane pane;
+  bbp::NodeLogPane pane;
 
   BOOST_TEST(!pane.IsOpen());
   pane.Toggle(report, 0U);
@@ -45,7 +45,7 @@ BOOST_AUTO_TEST_CASE(node_log_pane_is_closed_by_default_and_toggles) {
 BOOST_AUTO_TEST_CASE(node_log_pane_scrolls_and_returns_to_live_tail) {
   const boost::json::object report =
       MakeReport("daemon_log", "one\ntwo\nthree\nfour\n");
-  bsim::NodeLogPane pane;
+  bbp::NodeLogPane pane;
   pane.Toggle(report, 0U);
 
   BOOST_TEST(pane.FirstVisibleLine(2U) == 2U);
@@ -61,7 +61,7 @@ BOOST_AUTO_TEST_CASE(node_log_pane_scrolls_and_returns_to_live_tail) {
 
 BOOST_AUTO_TEST_CASE(node_log_pane_falls_back_to_stderr) {
   const boost::json::object report = MakeReport("stderr", "fatal error\n");
-  bsim::NodeLogPane pane;
+  bbp::NodeLogPane pane;
   pane.Toggle(report, 0U);
 
   BOOST_TEST(pane.SourceName() == "stderr");
@@ -70,7 +70,7 @@ BOOST_AUTO_TEST_CASE(node_log_pane_falls_back_to_stderr) {
 }
 
 BOOST_AUTO_TEST_CASE(node_log_pane_does_not_follow_when_scrolled_up) {
-  bsim::NodeLogPane pane;
+  bbp::NodeLogPane pane;
   pane.Toggle(MakeReport("daemon_log", "one\ntwo\nthree\nfour\n"), 0U);
   pane.ScrollUp(2U, 1U);
   BOOST_TEST(pane.FirstVisibleLine(2U) == 1U);

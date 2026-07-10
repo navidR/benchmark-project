@@ -1,4 +1,4 @@
-#include "benchmark_sim/simulator_app.h"
+#include "bbp/simulator_app.h"
 
 #include <linux/capability.h>
 #include <sys/wait.h>
@@ -32,30 +32,30 @@
 #include <utility>
 #include <vector>
 
-#include "benchmark_sim/capability.h"
-#include "benchmark_sim/cgroup.h"
-#include "benchmark_sim/drivers/chain_command_executor.h"
-#include "benchmark_sim/drivers/chain_driver_registry.h"
-#include "benchmark_sim/log_tail.h"
-#include "benchmark_sim/logging.h"
-#include "benchmark_sim/network.h"
-#include "benchmark_sim/node_log_collector.h"
-#include "benchmark_sim/periodic_metrics_collector.h"
-#include "benchmark_sim/probabilistic_block_scheduler.h"
-#include "benchmark_sim/process.h"
-#include "benchmark_sim/run_report.h"
-#include "benchmark_sim/simulation_cancelled.h"
-#include "benchmark_sim/simulation_command_processor.h"
-#include "benchmark_sim/simulation_command_queue.h"
-#include "benchmark_sim/simulation_registry.h"
-#include "benchmark_sim/simulator/constants.h"
-#include "benchmark_sim/simulator/node_runtime.h"
-#include "benchmark_sim/simulator/options.h"
-#include "benchmark_sim/simulator/yaml_helpers.h"
-#include "benchmark_sim/tui.h"
-#include "benchmark_sim/util.h"
+#include "bbp/capability.h"
+#include "bbp/cgroup.h"
+#include "bbp/drivers/chain_command_executor.h"
+#include "bbp/drivers/chain_driver_registry.h"
+#include "bbp/log_tail.h"
+#include "bbp/logging.h"
+#include "bbp/network.h"
+#include "bbp/node_log_collector.h"
+#include "bbp/periodic_metrics_collector.h"
+#include "bbp/probabilistic_block_scheduler.h"
+#include "bbp/process.h"
+#include "bbp/run_report.h"
+#include "bbp/simulation_cancelled.h"
+#include "bbp/simulation_command_processor.h"
+#include "bbp/simulation_command_queue.h"
+#include "bbp/simulation_registry.h"
+#include "bbp/simulator/constants.h"
+#include "bbp/simulator/node_runtime.h"
+#include "bbp/simulator/options.h"
+#include "bbp/simulator/yaml_helpers.h"
+#include "bbp/tui.h"
+#include "bbp/util.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 std::mutex node_network_state_mutex;
@@ -2084,7 +2084,7 @@ Options ParseOptions(int argc, char** argv) {
   }
 
   if (vm.count("help") != 0U) {
-    BSIM_LOG(info) << "Usage: " << argv[0] << " [options]\n" << desc;
+    BBP_LOG(info) << "Usage: " << argv[0] << " [options]\n" << desc;
     std::exit(0);
   }
   if (vm.count("scenario-json") != 0U && vm.count("scenario-yaml") != 0U) {
@@ -2736,7 +2736,7 @@ std::string RunInterfaceToken(std::string_view run_id) {
 
 std::string NodeInterfaceName(std::string_view run_id, uint32_t node_index,
                               char suffix) {
-  return "bs" + RunInterfaceToken(run_id) + "n" +
+  return "bbp" + RunInterfaceToken(run_id) + "n" +
          std::to_string(node_index + 1U) + suffix;
 }
 
@@ -3529,7 +3529,7 @@ void WriteLogTailEvent(const std::filesystem::path& events_path,
   try {
     chunk = driver.ReadLogTail(node.config, source, *cursor, kMaxLogTailBytes);
   } catch (const std::exception& error) {
-    BSIM_LOG(warning) << "cannot read " << ChainLogSourceName(source) << " for "
+    BBP_LOG(warning) << "cannot read " << ChainLogSourceName(source) << " for "
                       << node.config.id << ": " << error.what();
     return;
   }
@@ -4047,7 +4047,7 @@ void CleanupRun(Options options) {
   }
   Cgroup::RemoveRun(options.run_id);
 
-  BSIM_LOG(info) << "cleanup_run=" << options.run_id << "\n"
+  BBP_LOG(info) << "cleanup_run=" << options.run_id << "\n"
                  << "nodes=" << options.nodes << "\n"
                  << "run_dir=" << run_root;
 }
@@ -4122,7 +4122,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       }
       WriteNodeState(events_path, options.run_id, node_id, "Starting");
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
-      BSIM_LOG(info) << "started " << node_id
+      BBP_LOG(info) << "started " << node_id
                      << " pid=" << runtime.process.pid();
       WriteEvent(events_path, options.run_id, node_id, "process_started",
                  "pid=" + std::to_string(runtime.process.pid()));
@@ -4300,11 +4300,11 @@ void ApplyResourcePressureWorkload(
     try {
       WriteResourceLimits(*node.cgroup, pressure_limits, previous_limits);
     } catch (const std::exception& restore_error) {
-      BSIM_LOG(error) << "failed to restore partially applied resource "
+      BBP_LOG(error) << "failed to restore partially applied resource "
                          "pressure limits for "
                       << node.config.id << ": " << restore_error.what();
     } catch (...) {
-      BSIM_LOG(error) << "failed to restore partially applied resource "
+      BBP_LOG(error) << "failed to restore partially applied resource "
                          "pressure limits for "
                       << node.config.id << ": unknown exception";
     }
@@ -4333,10 +4333,10 @@ void ApplyResourcePressureWorkload(
                                         pressure_limits, previous_limits,
                                         workload_index, workload_count));
     } catch (const std::exception& restore_error) {
-      BSIM_LOG(error) << "failed to restore resource pressure limits for "
+      BBP_LOG(error) << "failed to restore resource pressure limits for "
                       << node.config.id << ": " << restore_error.what();
     } catch (...) {
-      BSIM_LOG(error) << "failed to restore resource pressure limits for "
+      BBP_LOG(error) << "failed to restore resource pressure limits for "
                       << node.config.id << ": unknown exception";
     }
     std::rethrow_exception(original_error);
@@ -4955,13 +4955,13 @@ void RunNodeCleanupStep(bool best_effort, std::string_view description,
     if (!best_effort) {
       throw;
     }
-    BSIM_LOG(error) << description
+    BBP_LOG(error) << description
                     << " failed during node cleanup: " << error.what();
   } catch (...) {
     if (!best_effort) {
       throw;
     }
-    BSIM_LOG(error) << description << " failed during node cleanup";
+    BBP_LOG(error) << description << " failed during node cleanup";
   }
 }
 
@@ -5190,8 +5190,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   }
   EnsureDirectory(run_root);
   AttachRunLogFile(run_root);
-  BSIM_LOG(info) << "starting run " << options.run_id;
-  WriteText(run_root / kRunMarkerFile, "benchmark-sim run\n");
+  BBP_LOG(info) << "starting run " << options.run_id;
+  WriteText(run_root / kRunMarkerFile, "bbp run\n");
   EnsureDirectory(run_root / "nodes");
   const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
   SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
@@ -5256,10 +5256,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     try {
       action();
     } catch (const std::exception& error) {
-      BSIM_LOG(error) << component
+      BBP_LOG(error) << component
                       << " failed during run cleanup: " << error.what();
     } catch (...) {
-      BSIM_LOG(error) << component << " failed during run cleanup";
+      BBP_LOG(error) << component << " failed during run cleanup";
     }
   };
   const auto handle_run_failure = [&](std::string_view detail) {
@@ -5326,7 +5326,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     cleanup_step("run finished event", [&] {
       WriteEvent(events_path, options.run_id, "sim", "run_finished");
     });
-    BSIM_LOG(info) << "cancelled run " << options.run_id;
+    BBP_LOG(info) << "cancelled run " << options.run_id;
   };
   try {
     StartNodes(options, run_root, events_path, chain_spec, driver, nodes,
@@ -5374,7 +5374,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             }
             WriteEvent(events_path, options.run_id, node_id,
                        "scheduled_block_failed", error);
-            BSIM_LOG(warning) << "scheduled block production failed for "
+            BBP_LOG(warning) << "scheduled block production failed for "
                               << node_id << ": " << error;
           });
     }
@@ -5436,7 +5436,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             WriteEvent(events_path, options.run_id, command.node_id,
                        "operator_command_completed",
                        SimulationCommandDetail(command));
-            BSIM_LOG(info) << "command #" << command.sequence << " "
+            BBP_LOG(info) << "command #" << command.sequence << " "
                            << SimulationCommandKindName(command.kind) << " for "
                            << command.node_id << " completed";
           },
@@ -5447,7 +5447,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             WriteEvent(events_path, options.run_id, command.node_id,
                        "operator_command_failed",
                        SimulationCommandDetail(command, error));
-            BSIM_LOG(warning)
+            BBP_LOG(warning)
                 << "command #" << command.sequence << " "
                 << SimulationCommandKindName(command.kind) << " for "
                 << command.node_id << " failed: " << error;
@@ -5475,7 +5475,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 WriteEvent(events_path, options.run_id, node.config.id,
                            "metrics_node_unavailable",
                            boost::json::serialize(detail));
-                BSIM_LOG(warning) << "metrics sample " << sample << " skipped "
+                BBP_LOG(warning) << "metrics sample " << sample << " skipped "
                                   << node.config.id << ": " << error;
               },
               [&] { return metrics_collector->StopRequested(); },
@@ -5670,7 +5670,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     StopNodes(options, events_path, driver, nodes);
     log_collector->Stop();
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
-    BSIM_LOG(info) << "finished run " << options.run_id;
+    BBP_LOG(info) << "finished run " << options.run_id;
   } catch (const SimulationCancelled&) {
     handle_run_cancellation();
   } catch (const std::exception& e) {
@@ -5681,7 +5681,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     throw;
   }
 
-  BSIM_LOG(info) << "run_id=" << options.run_id << "\n"
+  BBP_LOG(info) << "run_id=" << options.run_id << "\n"
                  << "output_dir=" << run_root << "\n"
                  << "metrics=" << metrics_path << "\n"
                  << "events=" << events_path;
@@ -5740,11 +5740,11 @@ int SimulatorApp::Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);
   RequireSafeOutputDirectory(options.output_dir);
   if (options.probe_network) {
-    BSIM_LOG(info) << NetworkProbeJson();
+    BBP_LOG(info) << NetworkProbeJson();
     return 0;
   }
   if (!options.report_run.empty()) {
-    BSIM_LOG(info) << BuildRunReportJson(options.report_run);
+    BBP_LOG(info) << BuildRunReportJson(options.report_run);
     return 0;
   }
   if (!options.tui_run.empty()) {
@@ -5752,66 +5752,66 @@ int SimulatorApp::Run(int argc, char** argv) {
                         options.tui_refresh_ms);
   }
   if (options.probe_capabilities) {
-    BSIM_LOG(info) << CapabilityProbeJson();
+    BBP_LOG(info) << CapabilityProbeJson();
     return 0;
   }
   if (options.probe_cgroup_freeze) {
-    BSIM_LOG(info) << CgroupFreezeProbeJson();
+    BBP_LOG(info) << CgroupFreezeProbeJson();
     return 0;
   }
   if (options.probe_drop_filter) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << DropFilterProbeJson();
+    BBP_LOG(info) << DropFilterProbeJson();
     return 0;
   }
   if (options.probe_netns) {
     RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
-    BSIM_LOG(info) << NetworkNamespaceProbeJson();
+    BBP_LOG(info) << NetworkNamespaceProbeJson();
     return 0;
   }
   if (options.probe_veth) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << VethProbeJson();
+    BBP_LOG(info) << VethProbeJson();
     return 0;
   }
   if (options.probe_bandwidth_limit) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << BandwidthLimitProbeJson();
+    BBP_LOG(info) << BandwidthLimitProbeJson();
     return 0;
   }
   if (options.probe_network_condition) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << NetworkConditionProbeJson();
+    BBP_LOG(info) << NetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_combined_network_condition) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << CombinedNetworkConditionProbeJson();
+    BBP_LOG(info) << CombinedNetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_network_condition_update) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << NetworkConditionUpdateProbeJson();
+    BBP_LOG(info) << NetworkConditionUpdateProbeJson();
     return 0;
   }
   if (options.probe_address) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << AddressProbeJson();
+    BBP_LOG(info) << AddressProbeJson();
     return 0;
   }
   if (options.probe_route) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << RouteProbeJson();
+    BBP_LOG(info) << RouteProbeJson();
     return 0;
   }
   if (options.probe_qdisc) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << QdiscProbeJson();
+    BBP_LOG(info) << QdiscProbeJson();
     return 0;
   }
   if (options.probe_qdisc_mutation) {
     RequireNetworkSetupCapabilities();
-    BSIM_LOG(info) << QdiscMutationProbeJson();
+    BBP_LOG(info) << QdiscMutationProbeJson();
     return 0;
   }
   if (options.cleanup_run) {
@@ -5824,4 +5824,4 @@ int SimulatorApp::Run(int argc, char** argv) {
   return RunBenchmarkWithTui(options);
 }
 
-}  // namespace bsim
+}  // namespace bbp

@@ -1,10 +1,10 @@
-#include "benchmark_sim/periodic_metrics_collector.h"
+#include "bbp/periodic_metrics_collector.h"
 
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
 
-namespace bsim {
+namespace bbp {
 
 PeriodicMetricsCollector::PeriodicMetricsCollector(
     std::uint32_t sample_count, std::chrono::milliseconds interval,
@@ -107,4 +107,4 @@ void PeriodicMetricsCollector::Run() {
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

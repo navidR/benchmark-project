@@ -1,4 +1,4 @@
-#include "benchmark_sim/tui_command_parser.h"
+#include "bbp/tui_command_parser.h"
 
 #include <array>
 #include <boost/algorithm/string.hpp>
@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr std::array<std::string_view, 7> kCommandNames = {
@@ -113,4 +113,4 @@ std::span<const std::string_view> TuiCommandParser::CommandNames() {
   return kCommandNames;
 }
 
-}  // namespace bsim
+}  // namespace bbp

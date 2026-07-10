@@ -9,25 +9,25 @@
 #include <stop_token>
 #include <thread>
 
-#include "benchmark_sim/drivers/firo_driver.h"
-#include "benchmark_sim/simulation_cancelled.h"
+#include "bbp/drivers/firo_driver.h"
+#include "bbp/simulation_cancelled.h"
 
 BOOST_AUTO_TEST_CASE(firo_readiness_wait_honors_stop_token_promptly) {
-  bsim::FiroNodeConfig config;
+  bbp::FiroNodeConfig config;
   config.id = "cancel-test";
   config.rpc_host = "127.0.0.1";
   config.rpc_port = 1U;
   config.rpc_user = "user";
   config.rpc_password = "password";
 
-  bsim::FiroDriver driver(std::chrono::milliseconds(100));
+  bbp::FiroDriver driver(std::chrono::milliseconds(100));
   std::stop_source stop_source;
   std::atomic<bool> cancelled = false;
   std::exception_ptr failure;
   std::thread waiter([&] {
     try {
       driver.WaitReady(config, std::chrono::hours(24), stop_source.get_token());
-    } catch (const bsim::SimulationCancelled&) {
+    } catch (const bbp::SimulationCancelled&) {
       cancelled = true;
     } catch (...) {
       failure = std::current_exception();
@@ -71,21 +71,21 @@ BOOST_AUTO_TEST_CASE(firo_rpc_wait_honors_stop_while_server_is_silent) {
     server_wakeup.wait(lock, stop_token, [] { return false; });
   });
 
-  bsim::FiroNodeConfig config;
+  bbp::FiroNodeConfig config;
   config.id = "silent-server-test";
   config.rpc_host = "127.0.0.1";
   config.rpc_port = acceptor.local_endpoint().port();
   config.rpc_user = "user";
   config.rpc_password = "password";
 
-  bsim::FiroDriver driver(std::chrono::seconds(30));
+  bbp::FiroDriver driver(std::chrono::seconds(30));
   std::stop_source stop_source;
   std::atomic<bool> cancelled = false;
   std::exception_ptr failure;
   std::thread waiter([&] {
     try {
       driver.WaitReady(config, std::chrono::hours(24), stop_source.get_token());
-    } catch (const bsim::SimulationCancelled&) {
+    } catch (const bbp::SimulationCancelled&) {
       cancelled = true;
     } catch (...) {
       failure = std::current_exception();

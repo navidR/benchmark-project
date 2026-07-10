@@ -1,4 +1,4 @@
-#include "benchmark_sim/log_tail.h"
+#include "bbp/log_tail.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr std::uint64_t kBoundaryBytes = 64;
@@ -136,4 +136,4 @@ std::optional<LogTailChunk> TailLogFile(const std::filesystem::path& path,
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

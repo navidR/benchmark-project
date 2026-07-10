@@ -1,11 +1,11 @@
-#include "benchmark_sim/simulation_command_processor.h"
+#include "bbp/simulation_command_processor.h"
 
 #include <stdexcept>
 #include <utility>
 
-#include "benchmark_sim/logging.h"
+#include "bbp/logging.h"
 
-namespace bsim {
+namespace bbp {
 
 SimulationCommandProcessor::SimulationCommandProcessor(
     SimulationCommandQueue& queue, CommandHandler command_handler,
@@ -60,12 +60,12 @@ void SimulationCommandProcessor::ReportFailure(const SimulationCommand& command,
   try {
     failure_handler_(command, detail);
   } catch (const std::exception& error) {
-    BSIM_LOG(error) << "simulation command failure handler failed for command "
+    BBP_LOG(error) << "simulation command failure handler failed for command "
                     << command.sequence << ": " << error.what();
   } catch (...) {
-    BSIM_LOG(error) << "simulation command failure handler failed for command "
+    BBP_LOG(error) << "simulation command failure handler failed for command "
                     << command.sequence;
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

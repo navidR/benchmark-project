@@ -5,11 +5,11 @@
 #include <thread>
 #include <vector>
 
-#include "benchmark_sim/periodic_metrics_collector.h"
+#include "bbp/periodic_metrics_collector.h"
 
 BOOST_AUTO_TEST_CASE(periodic_metrics_collector_collects_requested_samples) {
   std::vector<std::uint32_t> samples;
-  bsim::PeriodicMetricsCollector collector(
+  bbp::PeriodicMetricsCollector collector(
       3U, std::chrono::milliseconds(1),
       [&samples](std::uint32_t sample) { samples.push_back(sample); });
 
@@ -24,7 +24,7 @@ BOOST_AUTO_TEST_CASE(periodic_metrics_collector_collects_requested_samples) {
 
 BOOST_AUTO_TEST_CASE(periodic_metrics_collector_stops_before_next_sample) {
   std::atomic<std::uint32_t> sample_count = 0U;
-  bsim::PeriodicMetricsCollector collector(
+  bbp::PeriodicMetricsCollector collector(
       1U, std::chrono::seconds(10),
       [&sample_count](std::uint32_t) { ++sample_count; });
 
@@ -35,7 +35,7 @@ BOOST_AUTO_TEST_CASE(periodic_metrics_collector_stops_before_next_sample) {
 }
 
 BOOST_AUTO_TEST_CASE(periodic_metrics_collector_propagates_sample_failure) {
-  bsim::PeriodicMetricsCollector collector(
+  bbp::PeriodicMetricsCollector collector(
       1U, std::chrono::milliseconds(1),
       [](std::uint32_t) { throw std::runtime_error("sample failed"); });
 
@@ -49,7 +49,7 @@ BOOST_AUTO_TEST_CASE(periodic_metrics_collector_propagates_sample_failure) {
 BOOST_AUTO_TEST_CASE(periodic_metrics_collector_runs_until_external_stop) {
   std::atomic<std::uint32_t> sample_count = 0U;
   std::atomic<bool> stop_requested = false;
-  bsim::PeriodicMetricsCollector collector(
+  bbp::PeriodicMetricsCollector collector(
       0U, std::chrono::milliseconds(1),
       [&sample_count, &stop_requested](std::uint32_t) {
         if (++sample_count == 3U) {
@@ -67,7 +67,7 @@ BOOST_AUTO_TEST_CASE(periodic_metrics_collector_runs_until_external_stop) {
 BOOST_AUTO_TEST_CASE(periodic_metrics_collector_external_stop_is_prompt) {
   std::atomic<std::uint32_t> sample_count = 0U;
   std::atomic<bool> stop_requested = false;
-  bsim::PeriodicMetricsCollector collector(
+  bbp::PeriodicMetricsCollector collector(
       0U, std::chrono::hours(24),
       [&sample_count](std::uint32_t) { ++sample_count; },
       [&stop_requested] { return stop_requested.load(); });

@@ -1,12 +1,12 @@
-#include "benchmark_sim/node_log_collector.h"
+#include "bbp/node_log_collector.h"
 
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
 
-#include "benchmark_sim/logging.h"
+#include "bbp/logging.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr std::array<ChainLogSource, 3> kLogSources = {
@@ -56,9 +56,9 @@ NodeLogCollector::~NodeLogCollector() {
   try {
     Stop();
   } catch (const std::exception& error) {
-    BSIM_LOG(error) << "node log collector shutdown failed: " << error.what();
+    BBP_LOG(error) << "node log collector shutdown failed: " << error.what();
   } catch (...) {
-    BSIM_LOG(error) << "node log collector shutdown failed";
+    BBP_LOG(error) << "node log collector shutdown failed";
   }
 }
 
@@ -114,7 +114,7 @@ void NodeLogCollector::PollOnce() {
       } catch (const std::exception& error) {
         const std::string message = error.what();
         if (message != last_errors_[node_index][source_index]) {
-          BSIM_LOG(warning)
+          BBP_LOG(warning)
               << "cannot read " << ChainLogSourceName(source) << " for "
               << nodes_[node_index].id << ": " << message;
           last_errors_[node_index][source_index] = message;
@@ -141,4 +141,4 @@ void NodeLogCollector::PollOnce() {
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

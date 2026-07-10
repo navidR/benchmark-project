@@ -1,4 +1,4 @@
-#include "benchmark_sim/capability.h"
+#include "bbp/capability.h"
 
 #include <sys/capability.h>
 
@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 class ScopedCapabilities {
@@ -64,4 +64,4 @@ void RequireNetworkSetupCapabilities() {
   RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
 }
 
-}  // namespace bsim
+}  // namespace bbp

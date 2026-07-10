@@ -1,9 +1,9 @@
-#include "benchmark_sim/simulation_command_queue.h"
+#include "bbp/simulation_command_queue.h"
 
 #include <stdexcept>
 #include <utility>
 
-namespace bsim {
+namespace bbp {
 
 std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
                                            std::string node_id) {
@@ -99,4 +99,4 @@ bool SimulationCommandQueue::IsClosed() const {
   return closed_;
 }
 
-}  // namespace bsim
+}  // namespace bbp

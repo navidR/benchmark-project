@@ -1,4 +1,4 @@
-#include "benchmark_sim/tui.h"
+#include "bbp/tui.h"
 
 #include <ncursesw/curses.h>
 
@@ -20,13 +20,13 @@
 #include <thread>
 #include <vector>
 
-#include "benchmark_sim/log_view.h"
-#include "benchmark_sim/node_log_pane.h"
-#include "benchmark_sim/run_report.h"
-#include "benchmark_sim/simulation_command_queue.h"
-#include "benchmark_sim/tui_command_parser.h"
+#include "bbp/log_view.h"
+#include "bbp/node_log_pane.h"
+#include "bbp/run_report.h"
+#include "bbp/simulation_command_queue.h"
+#include "bbp/tui_command_parser.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr int kColorTitle = 1;
@@ -714,7 +714,7 @@ void DrawSummary(const std::filesystem::path& run_root,
   const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
   const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
 
-  AddText(0, 0, cols, "Benchmark Project TUI",
+  AddText(0, 0, cols, "Blockchain Benchmark Project TUI",
           COLOR_PAIR(kColorTitle) | A_BOLD);
   DrawHorizontalLine(1);
 
@@ -1151,4 +1151,4 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

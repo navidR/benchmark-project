@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(benchmark_project LANGUAGES C CXX)
+project(blockchain_benchmark_project LANGUAGES C CXX)
 
 # CMake 4 requires an explicit compatibility floor for libyaml's release
 # CMakeLists, which still declares compatibility with CMake 2.8.
@@ -30,10 +30,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_DISABLE_FIND_PACKAGE_ICU ON)
 add_subdirectory(third_party/boost EXCLUDE_FROM_ALL)
 
-set(BENCHMARK_PROJECT_BUILD_TESTING "${BUILD_TESTING}")
+set(BLOCKCHAIN_BENCHMARK_PROJECT_BUILD_TESTING "${BUILD_TESTING}")
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/libyaml EXCLUDE_FROM_ALL)
-set(BUILD_TESTING "${BENCHMARK_PROJECT_BUILD_TESTING}" CACHE BOOL "" FORCE)
+set(BUILD_TESTING "${BLOCKCHAIN_BENCHMARK_PROJECT_BUILD_TESTING}" CACHE BOOL "" FORCE)
 add_library(yaml::yaml ALIAS yaml)
 
 set(LIBMNL_GENERATED_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/libmnl")
@@ -213,7 +213,7 @@ foreach(boost_target IN LISTS boost_targets)
 endforeach()
 mark_target_interface_includes_system(yaml)
 
-add_executable(benchmark-sim
+add_executable(bbp
   src/block_production_policy.cpp
   src/capability.cpp
   src/cgroup.cpp
@@ -245,8 +245,8 @@ add_executable(benchmark-sim
   src/yaml_helpers.cpp
 )
 
-target_include_directories(benchmark-sim PRIVATE include)
-target_link_libraries(benchmark-sim PRIVATE
+target_include_directories(bbp PRIVATE include)
+target_link_libraries(bbp PRIVATE
   Boost::asio
   Boost::beast
   Boost::json
@@ -260,7 +260,7 @@ target_link_libraries(benchmark-sim PRIVATE
   ncurses::ncursesw
   yaml::yaml
 )
-target_compile_options(benchmark-sim PRIVATE
+target_compile_options(bbp PRIVATE
   -Wall
   -Wextra
   -Wpedantic
@@ -269,7 +269,7 @@ target_compile_options(benchmark-sim PRIVATE
 )
 
 if(BUILD_TESTING)
-  add_executable(benchmark-sim-unit-tests
+  add_executable(bbp-unit-tests
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
@@ -311,11 +311,11 @@ if(BUILD_TESTING)
     src/tui_command_parser.cpp
     src/util.cpp
   )
-  target_include_directories(benchmark-sim-unit-tests PRIVATE include)
-  target_compile_definitions(benchmark-sim-unit-tests PRIVATE
-    BENCHMARK_SIM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  target_include_directories(bbp-unit-tests PRIVATE include)
+  target_compile_definitions(bbp-unit-tests PRIVATE
+    BBP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   )
-  target_link_libraries(benchmark-sim-unit-tests PRIVATE
+  target_link_libraries(bbp-unit-tests PRIVATE
     Boost::asio
     Boost::beast
     Boost::json
@@ -327,19 +327,19 @@ if(BUILD_TESTING)
     libcap::cap
     libmnl::libmnl
   )
-  target_compile_options(benchmark-sim-unit-tests PRIVATE
+  target_compile_options(bbp-unit-tests PRIVATE
     -Wall
     -Wextra
     -Wpedantic
     -Wconversion
     -Werror
   )
-  add_test(NAME benchmark-sim-unit-tests COMMAND benchmark-sim-unit-tests)
+  add_test(NAME bbp-unit-tests COMMAND bbp-unit-tests)
 
   function(add_cli_failure_test name scenario regex)
     add_test(NAME "${name}"
       COMMAND "${CMAKE_COMMAND}"
-        "-DTEST_COMMAND=$<TARGET_FILE:benchmark-sim>"
+        "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
         "-DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/${scenario}"
         "-DREGEX=${regex}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_failure.cmake"
@@ -349,7 +349,7 @@ if(BUILD_TESTING)
   function(add_cli_failure_test_with_option name option scenario regex)
     add_test(NAME "${name}"
       COMMAND "${CMAKE_COMMAND}"
-        "-DTEST_COMMAND=$<TARGET_FILE:benchmark-sim>"
+        "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
         "-DSCENARIO_OPTION=${option}"
         "-DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/${scenario}"
         "-DREGEX=${regex}"
@@ -357,287 +357,287 @@ if(BUILD_TESTING)
     )
   endfunction()
 
-  add_test(NAME benchmark-sim-valid-yaml-scenario
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-yaml-scenario
+    COMMAND bbp
       --scenario-yaml
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-yaml-scenario.yaml"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-valid-peer-churn-scenario
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-peer-churn-scenario
+    COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-peer-churn-scenario.json"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-valid-raw-transaction-scenario
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-raw-transaction-scenario
+    COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-raw-transaction-scenario.json"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-valid-role-topology-scenario
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-role-topology-scenario
+    COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-role-topology-scenario.json"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-valid-peer-connectivity-topology
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-peer-connectivity-topology
+    COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-peer-connectivity-topology.json"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-valid-wallet-transactions-scenario
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-wallet-transactions-scenario
+    COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transactions-scenario.json"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-valid-wallet-random-transactions-scenario
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-wallet-random-transactions-scenario
+    COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-random-transactions-scenario.json"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-valid-resource-pressure-scenario
-    COMMAND benchmark-sim
+  add_test(NAME bbp-valid-resource-pressure-scenario
+    COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-resource-pressure-scenario.json"
       --probe-capabilities
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-legacy-generate-blocks
+    bbp-invalid-legacy-generate-blocks
     tests/scenarios/invalid-legacy-generate-blocks.json
     "scenario generate_blocks was removed"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-block-production-without-miner
+    bbp-invalid-block-production-without-miner
     tests/scenarios/invalid-block-production-without-miner.json
     "enabled block production requires at least one configured miner"
   )
-  add_test(NAME benchmark-sim-benchmark-root-option
-    COMMAND benchmark-sim
+  add_test(NAME bbp-benchmark-root-option
+    COMMAND bbp
       --benchmark-root "${CMAKE_CURRENT_BINARY_DIR}/benchmark-root-option"
       --probe-capabilities
   )
-  add_test(NAME benchmark-sim-benchmark-root-output-dir-conflict
-    COMMAND benchmark-sim
+  add_test(NAME bbp-benchmark-root-output-dir-conflict
+    COMMAND bbp
       --benchmark-root "${CMAKE_CURRENT_BINARY_DIR}/benchmark-root-option"
       --output-dir "${CMAKE_CURRENT_BINARY_DIR}/legacy-output-dir"
       --probe-capabilities
   )
-  set_tests_properties(benchmark-sim-benchmark-root-output-dir-conflict
+  set_tests_properties(bbp-benchmark-root-output-dir-conflict
     PROPERTIES
       WILL_FAIL TRUE
   )
-  add_test(NAME benchmark-sim-integrated-tui-once
+  add_test(NAME bbp-integrated-tui-once
     COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm
-      $<TARGET_FILE:benchmark-sim>
+      $<TARGET_FILE:bbp>
       --run "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
       --once
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-role-topology-miners
+    bbp-invalid-role-topology-miners
     tests/scenarios/invalid-role-topology-miners.json
     "scenario topology miner_node_count must be <= node_count"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-role-topology-capacity
+    bbp-invalid-role-topology-capacity
     tests/scenarios/invalid-role-topology-capacity.json
     "scenario topology wallet_node_count plus miner_node_count must be <= node_count when overlap is disabled"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-peer-connectivity-duplicate-node
+    bbp-invalid-peer-connectivity-duplicate-node
     tests/scenarios/invalid-peer-connectivity-duplicate-node.json
     "scenario topology.peer_connectivity contains duplicate node"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-peer-connectivity-max-count
+    bbp-invalid-peer-connectivity-max-count
     tests/scenarios/invalid-peer-connectivity-max-count.json
     "scenario topology.peer_connectivity max_peer_count must be less than node_count"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-height-missing-height
+    bbp-invalid-wait-height-missing-height
     tests/scenarios/invalid-wait-height-missing-height.json
     "missing or invalid uint64 JSON field: height"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-height-node
+    bbp-invalid-wait-height-node
     tests/scenarios/invalid-wait-height-node.json
     "scenario wait_until_height workload node must be in 1..--nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-height-timeout
+    bbp-invalid-wait-height-timeout
     tests/scenarios/invalid-wait-height-timeout.json
     "scenario wait_until_height timeout_sec must be greater than zero"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-height-plural-nodes
+    bbp-invalid-wait-height-plural-nodes
     tests/scenarios/invalid-wait-height-plural-nodes.json
     "current MVP wait_until_height workload uses node, not nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-peers-missing-peer-count
+    bbp-invalid-wait-peers-missing-peer-count
     tests/scenarios/invalid-wait-peers-missing-peer-count.json
     "missing or invalid uint64 JSON field: peer_count"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-peers-node
+    bbp-invalid-wait-peers-node
     tests/scenarios/invalid-wait-peers-node.json
     "scenario wait_for_peers workload node must be in 1..--nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-peers-timeout
+    bbp-invalid-wait-peers-timeout
     tests/scenarios/invalid-wait-peers-timeout.json
     "scenario wait_for_peers timeout_sec must be greater than zero"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-peers-zero-count
+    bbp-invalid-wait-peers-zero-count
     tests/scenarios/invalid-wait-peers-zero-count.json
     "scenario wait_for_peers peer_count must be greater than zero"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wait-peers-plural-nodes
+    bbp-invalid-wait-peers-plural-nodes
     tests/scenarios/invalid-wait-peers-plural-nodes.json
     "current MVP wait_for_peers workload uses node, not nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-connect-peer-peer
+    bbp-invalid-connect-peer-peer
     tests/scenarios/invalid-connect-peer-peer.json
     "scenario connect_peer workload peer must be in 1..--nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-connect-peer-self
+    bbp-invalid-connect-peer-self
     tests/scenarios/invalid-connect-peer-self.json
     "scenario connect_peer workload node and peer must differ"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-disconnect-peer-missing-peer
+    bbp-invalid-disconnect-peer-missing-peer
     tests/scenarios/invalid-disconnect-peer-missing-peer.json
     "missing or invalid uint32 JSON field: peer"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-disconnect-peer-zero-timeout
+    bbp-invalid-disconnect-peer-zero-timeout
     tests/scenarios/invalid-disconnect-peer-zero-timeout.json
     "scenario disconnect_peer timeout_sec must be greater than zero"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-raw-transaction-missing-private-key
+    bbp-invalid-raw-transaction-missing-private-key
     tests/scenarios/invalid-raw-transaction-missing-private-key.json
     "missing or invalid string JSON field: source_private_key"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-raw-transaction-funding-blocks
+    bbp-invalid-raw-transaction-funding-blocks
     tests/scenarios/invalid-raw-transaction-funding-blocks.json
     "scenario send_raw_transaction funding_blocks must be at least 101"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-raw-transaction-same-address
+    bbp-invalid-raw-transaction-same-address
     tests/scenarios/invalid-raw-transaction-same-address.json
     "scenario send_raw_transaction source_address and destination_address must differ"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-raw-transaction-zero-amount
+    bbp-invalid-raw-transaction-zero-amount
     tests/scenarios/invalid-raw-transaction-zero-amount.json
     "scenario send_raw_transaction amount must be greater than zero"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-wallet-transactions-wallet-material
+    bbp-invalid-wallet-transactions-wallet-material
     tests/scenarios/invalid-wallet-transactions-wallet-material.json
     "scenario wallet_transactions workload must use topology.wallet_initialization instead of wallet keys or addresses"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-restart-node-node
+    bbp-invalid-restart-node-node
     tests/scenarios/invalid-restart-node-node.json
     "scenario restart_node workload node must be in 1..--nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-restart-node-plural-nodes
+    bbp-invalid-restart-node-plural-nodes
     tests/scenarios/invalid-restart-node-plural-nodes.json
     "current MVP restart_node workload uses node, not nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-freeze-node-missing-duration
+    bbp-invalid-freeze-node-missing-duration
     tests/scenarios/invalid-freeze-node-missing-duration.json
     "missing or invalid uint32 JSON field: duration_ms"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-freeze-node-node
+    bbp-invalid-freeze-node-node
     tests/scenarios/invalid-freeze-node-node.json
     "scenario freeze_node workload node must be in 1..--nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-freeze-node-plural-nodes
+    bbp-invalid-freeze-node-plural-nodes
     tests/scenarios/invalid-freeze-node-plural-nodes.json
     "current MVP freeze_node workload uses node, not nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-freeze-node-zero-duration
+    bbp-invalid-freeze-node-zero-duration
     tests/scenarios/invalid-freeze-node-zero-duration.json
     "scenario freeze_node duration_ms must be greater than zero"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-update-resource-limits-empty
+    bbp-invalid-update-resource-limits-empty
     tests/scenarios/invalid-update-resource-limits-empty.json
     "runtime resource update has no limit fields"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-update-resource-limits-node
+    bbp-invalid-update-resource-limits-node
     tests/scenarios/invalid-update-resource-limits-node.json
     "scenario update_resource_limits workload node must be in 1..--nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-update-resource-limits-plural-nodes
+    bbp-invalid-update-resource-limits-plural-nodes
     tests/scenarios/invalid-update-resource-limits-plural-nodes.json
     "current MVP update_resource_limits workload uses node, not nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-resource-pressure-missing-duration
+    bbp-invalid-resource-pressure-missing-duration
     tests/scenarios/invalid-resource-pressure-missing-duration.json
     "missing or invalid uint32 JSON field: duration_ms"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-resource-pressure-zero-duration
+    bbp-invalid-resource-pressure-zero-duration
     tests/scenarios/invalid-resource-pressure-zero-duration.json
     "scenario resource_pressure duration_ms must be greater than zero"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-resource-pressure-node
+    bbp-invalid-resource-pressure-node
     tests/scenarios/invalid-resource-pressure-node.json
     "scenario resource_pressure workload node must be in 1..--nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-resource-pressure-plural-nodes
+    bbp-invalid-resource-pressure-plural-nodes
     tests/scenarios/invalid-resource-pressure-plural-nodes.json
     "current MVP resource_pressure workload uses node, not nodes"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-partition-workload-requires-isolate
+    bbp-invalid-partition-workload-requires-isolate
     tests/scenarios/invalid-partition-workload-requires-isolate.json
     "network runtime options require --isolate-network"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-partition-workload-node
+    bbp-invalid-partition-workload-node
     tests/scenarios/invalid-partition-workload-node.json
     "scenario partition_nodes workload group_b node must be in 1..2"
   )
   add_cli_failure_test(
-    benchmark-sim-invalid-heal-partition-workload-overlap
+    bbp-invalid-heal-partition-workload-overlap
     tests/scenarios/invalid-heal-partition-workload-overlap.json
     "partition groups must not contain the same node"
   )
   add_cli_failure_test_with_option(
-    benchmark-sim-invalid-yaml-root-sequence
+    bbp-invalid-yaml-root-sequence
     "--scenario-yaml"
     tests/scenarios/invalid-yaml-root-sequence.yaml
     "--scenario-yaml root must be a YAML mapping"
   )
   add_cli_failure_test_with_option(
-    benchmark-sim-invalid-yaml-quoted-nodes
+    bbp-invalid-yaml-quoted-nodes
     "--scenario-yaml"
     tests/scenarios/invalid-yaml-quoted-nodes.yaml
     "invalid uint32 JSON field: nodes"
   )
 endif()
 
-install(TARGETS benchmark-sim RUNTIME DESTINATION bin)
+install(TARGETS bbp RUNTIME DESTINATION bin)

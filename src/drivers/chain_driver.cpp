@@ -1,8 +1,8 @@
-#include "benchmark_sim/drivers/chain_driver.h"
+#include "bbp/drivers/chain_driver.h"
 
 #include <stdexcept>
 
-namespace bsim {
+namespace bbp {
 
 UnsupportedChainOperation::UnsupportedChainOperation(std::string_view chain,
                                                      std::string_view operation)
@@ -21,4 +21,4 @@ std::string_view ChainLogSourceName(ChainLogSource source) {
   throw std::runtime_error("unknown chain log source");
 }
 
-}  // namespace bsim
+}  // namespace bbp

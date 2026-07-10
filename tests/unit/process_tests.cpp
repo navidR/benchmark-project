@@ -1,4 +1,4 @@
-#include "benchmark_sim/process.h"
+#include "bbp/process.h"
 
 #include <fcntl.h>
 #include <sched.h>
@@ -213,10 +213,10 @@ BOOST_AUTO_TEST_CASE(child_process_enters_configured_network_namespace) {
 
   const std::filesystem::path run_dir =
       std::filesystem::temp_directory_path() /
-      ("benchmark-sim-process-netns-" + std::to_string(getpid()));
+      ("bbp-process-netns-" + std::to_string(getpid()));
   std::filesystem::create_directories(run_dir);
 
-  bsim::ProcessSpec spec;
+  bbp::ProcessSpec spec;
   spec.binary = "/bin/sleep";
   spec.argv = {"2"};
   spec.cwd = run_dir;
@@ -224,7 +224,7 @@ BOOST_AUTO_TEST_CASE(child_process_enters_configured_network_namespace) {
   spec.stderr_path = run_dir / "stderr.log";
   spec.network_namespace_fd = helper->netns_fd();
 
-  bsim::ChildProcess child = bsim::ChildProcess::Spawn(spec, std::nullopt);
+  bbp::ChildProcess child = bbp::ChildProcess::Spawn(spec, std::nullopt);
   const std::string helper_netns =
       ReadLink("/proc/" + std::to_string(helper->pid()) + "/ns/net");
   const std::string child_netns =

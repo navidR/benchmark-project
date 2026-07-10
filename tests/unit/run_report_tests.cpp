@@ -11,15 +11,15 @@
 #include <string>
 #include <string_view>
 
-#include "benchmark_sim/run_report.h"
-#include "benchmark_sim/util.h"
+#include "bbp/run_report.h"
+#include "bbp/util.h"
 
 namespace {
 
 std::filesystem::path MakeTestDir(const std::string& name) {
   const std::filesystem::path dir =
       std::filesystem::temp_directory_path() /
-      ("benchmark-sim-" + name + "-" + std::to_string(getpid()));
+      ("bbp-" + name + "-" + std::to_string(getpid()));
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);
   return dir;
@@ -51,7 +51,7 @@ std::uint64_t JsonIntegerValue(const boost::json::value& value) {
 
 BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const std::filesystem::path dir = MakeTestDir("run-report");
-  bsim::WriteText(dir / "resolved-scenario.json",
+  bbp::WriteText(dir / "resolved-scenario.json",
                   "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
                   "\"generate_blocks\":3,\"generate_node\":null,"
                   "\"isolated_network\":true,\"sync_timeout_sec\":null,"
@@ -77,29 +77,29 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "\"duration_ms\":25},"
                   "{\"type\":\"update_resource_limits\",\"node\":1,"
                   "\"pids_max\":128}]}\n");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:00Z\","
                    "\"event\":\"run_started\"}");
-  bsim::AppendLine(
+  bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"event\":\"state\","
       "\"detail\":\"Running\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"daemon_log_tail\","
                    "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
                    "\\\"start_offset\\\":0,\\\"next_offset\\\":4,"
                    "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
                    "\\\"text\\\":\\\"tail\\\"}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"daemon_log_tail\","
                    "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
                    "\\\"start_offset\\\":4,\\\"next_offset\\\":9,"
                    "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
                    "\\\"text\\\":\\\" next\\\"}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"timestamp\":\"2026-07-09T00:00:01Z\","
                    "\"event\":\"generated_blocks\","
@@ -108,40 +108,40 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "\\\"count\\\":1,\\\"start_height\\\":0,"
                    "\\\"target_height\\\":1,\\\"reward_address\\\":\\\"a\\\","
                    "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"height_reached\",\"detail\":\"1\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"timestamp\":\"2026-07-09T00:00:02Z\","
                    "\"event\":\"scheduled_block_produced\","
                    "\"detail\":\"{\\\"hashes\\\":[\\\"def\\\"]}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"height_wait_reached\","
                    "\"detail\":\"{\\\"workload_index\\\":2,"
                    "\\\"workload_count\\\":6,\\\"node\\\":1,"
                    "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
-  bsim::AppendLine(
+  bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
       "\"event\":\"peer_count_reached\","
       "\"detail\":\"{\\\"workload_index\\\":3,"
       "\\\"workload_count\\\":6,\\\"node\\\":1,"
       "\\\"target_peer_count\\\":1,\\\"observed_peer_count\\\":1}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"node_restarted\","
                    "\"detail\":\"{\\\"workload_index\\\":4,"
                    "\\\"workload_count\\\":6,\\\"node\\\":1,"
                    "\\\"restart_count\\\":1}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"node_freeze_completed\","
                    "\"detail\":\"{\\\"workload_index\\\":5,"
                    "\\\"workload_count\\\":6,\\\"node\\\":1,"
                    "\\\"duration_ms\\\":25}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"resource_limits_updated\","
                    "\"detail\":\"{\\\"workload_index\\\":6,"
@@ -157,21 +157,21 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "\\\"cpu_quota_us\\\":null,"
                    "\\\"cpu_period_us\\\":100000,"
                    "\\\"pids_max\\\":128}}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"wallet_address_created\","
                    "\"detail\":\"{\\\"wallet_index\\\":1,"
                    "\\\"node\\\":1,\\\"strategy\\\":\\\"driver_rpc\\\","
                    "\\\"mode\\\":\\\"public\\\","
                    "\\\"address\\\":\\\"addr1\\\"}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
                    "\"event\":\"wallet_address_created\","
                    "\"detail\":\"{\\\"wallet_index\\\":2,"
                    "\\\"node\\\":2,\\\"strategy\\\":\\\"driver_rpc\\\","
                    "\\\"mode\\\":\\\"public\\\","
                    "\\\"address\\\":\\\"addr2\\\"}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"wallet_transaction_submitted\","
                    "\"detail\":\"{\\\"workload_index\\\":7,"
@@ -190,7 +190,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "\\\"amount\\\":\\\"1.00000000\\\","
                    "\\\"txids\\\":[\\\"tx1\\\"],"
                    "\\\"mempool_size\\\":1}\"}");
-  bsim::AppendLine(
+  bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
       "\"timestamp\":\"2026-07-09T00:00:01Z\","
@@ -199,11 +199,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\\\"kind\\\":\\\"increase_log_verbosity\\\","
       "\\\"error\\\":\\\"Firo does not support runtime log verbosity "
       "adjustment functionality.\\\"}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:02Z\","
                    "\"event\":\"run_finished\"}");
-  bsim::AppendLine(
+  bbp::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":1,"
       "\"timestamp_ms\":1000,"
@@ -211,7 +211,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"network_rx_bytes\":25,\"network_tx_bytes\":50,"
       "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":1000,"
       "\"qdisc_netem_reorder\":0}");
-  bsim::AppendLine(
+  bbp::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":2,"
       "\"timestamp_ms\":3000,"
@@ -230,7 +230,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"qdisc_tbf_limit_bytes\":125000}");
 
   const boost::json::value value =
-      boost::json::parse(bsim::BuildRunReportJson(dir));
+      boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
@@ -428,7 +428,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 
 BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-partition");
-  bsim::WriteText(dir / "resolved-scenario.json",
+  bbp::WriteText(dir / "resolved-scenario.json",
                   "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
                   "\"isolated_network\":true,"
                   "\"workloads\":["
@@ -436,10 +436,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
                   "\"group_a\":[1],\"group_b\":[2]},"
                   "{\"type\":\"heal_partition\","
                   "\"group_a\":[1],\"group_b\":[2]}]}\n");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_started\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"network_partition_applied\","
                    "\"detail\":\"{\\\"workload_index\\\":1,"
@@ -447,7 +447,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
                    "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
                    "\\\"scope\\\":\\\"source_aware_group\\\","
                    "\\\"rules\\\":[]}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"network_partition_healed\","
                    "\"detail\":\"{\\\"workload_index\\\":2,"
@@ -455,12 +455,12 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
                    "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
                    "\\\"scope\\\":\\\"source_aware_group\\\","
                    "\\\"rules\\\":[]}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_finished\"}");
 
   const boost::json::value value =
-      boost::json::parse(bsim::BuildRunReportJson(dir));
+      boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
@@ -489,7 +489,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
 
 BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-peer-churn");
-  bsim::WriteText(dir / "resolved-scenario.json",
+  bbp::WriteText(dir / "resolved-scenario.json",
                   "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
                   "\"isolated_network\":true,"
                   "\"workloads\":["
@@ -497,10 +497,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
                   "\"timeout_sec\":5},"
                   "{\"type\":\"connect_peer\",\"node\":2,\"peer\":1,"
                   "\"timeout_sec\":5}]}\n");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_started\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
                    "\"event\":\"peer_disconnected\","
                    "\"detail\":\"{\\\"workload_index\\\":1,"
@@ -510,7 +510,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
                    "\\\"after_peer_count\\\":0,"
                    "\\\"connected_before\\\":true,"
                    "\\\"connected_after\\\":false}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
                    "\"event\":\"peer_connected\","
                    "\"detail\":\"{\\\"workload_index\\\":2,"
@@ -521,12 +521,12 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
                    "\\\"connected_before\\\":false,"
                    "\\\"connected_after\\\":true,"
                    "\\\"timeout_sec\\\":5}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_finished\"}");
 
   const boost::json::value value =
-      boost::json::parse(bsim::BuildRunReportJson(dir));
+      boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
@@ -556,7 +556,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
 
 BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-raw-tx");
-  bsim::WriteText(
+  bbp::WriteText(
       dir / "resolved-scenario.json",
       "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
       "\"workloads\":["
@@ -568,10 +568,10 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
       "\"destination_address\":\"TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh\","
       "\"funding_blocks\":101,\"amount\":\"39.99000000\","
       "\"fee\":\"0.01000000\",\"timeout_sec\":30}]}\n");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_started\"}");
-  bsim::AppendLine(
+  bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
       "\"event\":\"raw_transaction_submitted\","
@@ -591,12 +591,12 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
       "\\\"change_amount\\\":\\\"0.00000000\\\","
       "\\\"txid\\\":\\\"tx123\\\",\\\"mempool_size\\\":1,"
       "\\\"timeout_sec\\\":30}\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"event\":\"run_finished\"}");
 
   const boost::json::value value =
-      boost::json::parse(bsim::BuildRunReportJson(dir));
+      boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
@@ -622,18 +622,18 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
 
 BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   const std::filesystem::path dir = MakeTestDir("run-report-failed");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:00Z\","
                    "\"event\":\"run_started\"}");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:01Z\","
                    "\"event\":\"run_failed\","
                    "\"detail\":\"peer wait timed out\"}");
 
   const boost::json::value value =
-      boost::json::parse(bsim::BuildRunReportJson(dir));
+      boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
 
   BOOST_TEST(!report.at("ok").as_bool());
@@ -659,9 +659,9 @@ BOOST_AUTO_TEST_CASE(
   scenario["run_id"] = "r1";
   scenario["nodes"] = 1U;
   scenario["block_production"] = std::move(initial_policy);
-  bsim::WriteText(dir / "resolved-scenario.json",
+  bbp::WriteText(dir / "resolved-scenario.json",
                   boost::json::serialize(scenario) + "\n");
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl",
                    R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
   for (std::uint64_t index = 0U; index < 260U; ++index) {
     boost::json::array hashes;
@@ -673,7 +673,7 @@ BOOST_AUTO_TEST_CASE(
     event["node_id"] = "firo-1";
     event["event"] = "scheduled_block_produced";
     event["detail"] = boost::json::serialize(detail);
-    bsim::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+    bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
   }
   boost::json::object command_detail;
   command_detail["kind"] = "set_block_production_policy";
@@ -685,12 +685,12 @@ BOOST_AUTO_TEST_CASE(
   command_event["node_id"] = "sim";
   command_event["event"] = "operator_command_completed";
   command_event["detail"] = boost::json::serialize(command_detail);
-  bsim::AppendLine(dir / "events.jsonl", boost::json::serialize(command_event));
-  bsim::AppendLine(dir / "events.jsonl",
+  bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(command_event));
+  bbp::AppendLine(dir / "events.jsonl",
                    R"({"run_id":"r1","node_id":"sim","event":"run_finished"})");
 
   const boost::json::value value =
-      boost::json::parse(bsim::BuildRunReportJson(dir));
+      boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
   BOOST_TEST(JsonInteger(report, "scheduled_block_count") == 260U);
   const boost::json::array& blocks = report.at("scheduled_blocks").as_array();

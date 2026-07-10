@@ -1,4 +1,4 @@
-#include "benchmark_sim/http_client.h"
+#include "bbp/http_client.h"
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core.hpp>
@@ -8,9 +8,9 @@
 #include <boost/system/system_error.hpp>
 #include <string>
 
-#include "benchmark_sim/simulation_cancelled.h"
+#include "bbp/simulation_cancelled.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 namespace asio = boost::asio;
@@ -112,4 +112,4 @@ HttpResponse HttpClient::PostJson(const RpcEndpoint& endpoint,
                       .body = response.body()};
 }
 
-}  // namespace bsim
+}  // namespace bbp

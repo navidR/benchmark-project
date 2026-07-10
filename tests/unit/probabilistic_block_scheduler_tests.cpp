@@ -9,8 +9,8 @@
 #include <thread>
 #include <vector>
 
-#include "benchmark_sim/block_production_policy.h"
-#include "benchmark_sim/probabilistic_block_scheduler.h"
+#include "bbp/block_production_policy.h"
+#include "bbp/probabilistic_block_scheduler.h"
 
 namespace {
 
@@ -22,8 +22,8 @@ BOOST_AUTO_TEST_CASE(probabilistic_block_scheduler_produces_and_stops) {
   std::mutex mutex;
   std::condition_variable produced;
   std::vector<std::string> miners;
-  bsim::ProbabilisticBlockScheduler scheduler(
-      {"node-1", "node-2"}, bsim::BlockProductionPolicy(2ms, 1.0, 9U),
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1", "node-2"}, bbp::BlockProductionPolicy(2ms, 1.0, 9U),
       [&](const std::string& node_id) {
         {
           std::lock_guard<std::mutex> lock(mutex);
@@ -54,8 +54,8 @@ BOOST_AUTO_TEST_CASE(probabilistic_block_scheduler_updates_policy) {
   std::mutex mutex;
   std::condition_variable produced;
   std::size_t count = 0;
-  bsim::ProbabilisticBlockScheduler scheduler(
-      {"node-1"}, bsim::BlockProductionPolicy(2ms, 0.0, 1U),
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1"}, bbp::BlockProductionPolicy(2ms, 0.0, 1U),
       [&](const std::string&) {
         {
           std::lock_guard<std::mutex> lock(mutex);
@@ -68,7 +68,7 @@ BOOST_AUTO_TEST_CASE(probabilistic_block_scheduler_updates_policy) {
       });
 
   scheduler.Start();
-  scheduler.UpdatePolicy(bsim::BlockProductionPolicy(2ms, 1.0, 2U));
+  scheduler.UpdatePolicy(bbp::BlockProductionPolicy(2ms, 1.0, 2U));
   {
     std::unique_lock<std::mutex> lock(mutex);
     BOOST_REQUIRE(
@@ -85,8 +85,8 @@ BOOST_AUTO_TEST_CASE(
   std::mutex mutex;
   std::condition_variable failure_reported;
   bool failed = false;
-  bsim::ProbabilisticBlockScheduler scheduler(
-      {"node-1"}, bsim::BlockProductionPolicy(1ms, 1.0, 1U),
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1"}, bbp::BlockProductionPolicy(1ms, 1.0, 1U),
       [](const std::string&) { throw std::runtime_error("production failed"); },
       [&](const std::string&, std::string_view) {
         {
@@ -118,8 +118,8 @@ BOOST_AUTO_TEST_CASE(
   bool release_handler = false;
   std::atomic<std::uint32_t> production_count = 0U;
   std::atomic<bool> stop_returned = false;
-  bsim::ProbabilisticBlockScheduler scheduler(
-      {"node-1"}, bsim::BlockProductionPolicy(1ms, 1.0, 1U),
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1"}, bbp::BlockProductionPolicy(1ms, 1.0, 1U),
       [&](const std::string&) {
         std::unique_lock<std::mutex> lock(mutex);
         ++production_count;

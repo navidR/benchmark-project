@@ -5,27 +5,27 @@
 #include <utility>
 #include <vector>
 
-#include "benchmark_sim/simulation_command_processor.h"
+#include "bbp/simulation_command_processor.h"
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
-  bsim::SimulationCommandQueue queue;
-  std::vector<bsim::SimulationCommand> handled;
+  bbp::SimulationCommandQueue queue;
+  std::vector<bbp::SimulationCommand> handled;
   std::vector<std::string> failures;
   std::promise<void> handled_all;
-  bsim::SimulationCommandProcessor processor(
+  bbp::SimulationCommandProcessor processor(
       queue,
-      [&handled, &handled_all](const bsim::SimulationCommand& command) {
+      [&handled, &handled_all](const bbp::SimulationCommand& command) {
         handled.push_back(command);
         if (handled.size() == 2U) {
           handled_all.set_value();
         }
       },
-      [&failures](const bsim::SimulationCommand&, std::string_view detail) {
+      [&failures](const bbp::SimulationCommand&, std::string_view detail) {
         failures.emplace_back(detail);
       });
 
-  queue.Push(bsim::SimulationCommandKind::kDisconnectNode, "firo-1");
-  queue.Push(bsim::SimulationCommandKind::kKillNode, "firo-2");
+  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1");
+  queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2");
   processor.Start();
   handled_all.get_future().wait();
   processor.Stop();
@@ -37,26 +37,26 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_reports_and_continues) {
-  bsim::SimulationCommandQueue queue;
+  bbp::SimulationCommandQueue queue;
   std::vector<std::uint64_t> handled;
   std::vector<std::pair<std::uint64_t, std::string>> failures;
   std::promise<void> handled_all;
-  bsim::SimulationCommandProcessor processor(
+  bbp::SimulationCommandProcessor processor(
       queue,
-      [&handled, &handled_all](const bsim::SimulationCommand& command) {
+      [&handled, &handled_all](const bbp::SimulationCommand& command) {
         if (command.sequence == 1U) {
           throw std::runtime_error("expected failure");
         }
         handled.push_back(command.sequence);
         handled_all.set_value();
       },
-      [&failures](const bsim::SimulationCommand& command,
+      [&failures](const bbp::SimulationCommand& command,
                   std::string_view detail) {
         failures.emplace_back(command.sequence, detail);
       });
 
-  queue.Push(bsim::SimulationCommandKind::kDisconnectNode, "firo-1");
-  queue.Push(bsim::SimulationCommandKind::kDisconnectNode, "firo-2");
+  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1");
+  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-2");
   processor.Start();
   handled_all.get_future().wait();
   processor.Stop();
@@ -69,14 +69,14 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_reports_and_continues) {
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_requires_handlers) {
-  bsim::SimulationCommandQueue queue;
+  bbp::SimulationCommandQueue queue;
   BOOST_CHECK_THROW(
-      bsim::SimulationCommandProcessor(
-          queue, bsim::SimulationCommandProcessor::CommandHandler{},
-          [](const bsim::SimulationCommand&, std::string_view) {}),
+      bbp::SimulationCommandProcessor(
+          queue, bbp::SimulationCommandProcessor::CommandHandler{},
+          [](const bbp::SimulationCommand&, std::string_view) {}),
       std::runtime_error);
-  BOOST_CHECK_THROW(bsim::SimulationCommandProcessor(
-                        queue, [](const bsim::SimulationCommand&) {},
-                        bsim::SimulationCommandProcessor::FailureHandler{}),
+  BOOST_CHECK_THROW(bbp::SimulationCommandProcessor(
+                        queue, [](const bbp::SimulationCommand&) {},
+                        bbp::SimulationCommandProcessor::FailureHandler{}),
                     std::runtime_error);
 }

@@ -1,4 +1,4 @@
-#include "benchmark_sim/run_report.h"
+#include "bbp/run_report.h"
 
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
@@ -15,9 +15,9 @@
 #include <string>
 #include <string_view>
 
-#include "benchmark_sim/util.h"
+#include "bbp/util.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
@@ -723,4 +723,4 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   return boost::json::serialize(report);
 }
 
-}  // namespace bsim
+}  // namespace bbp

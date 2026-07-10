@@ -1,4 +1,4 @@
-#include "benchmark_sim/probabilistic_block_scheduler.h"
+#include "bbp/probabilistic_block_scheduler.h"
 
 #include <algorithm>
 #include <boost/random/bernoulli_distribution.hpp>
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace bsim {
+namespace bbp {
 
 ProbabilisticBlockScheduler::ProbabilisticBlockScheduler(
     std::vector<std::string> miner_node_ids, BlockProductionPolicy policy,
@@ -199,4 +199,4 @@ void ProbabilisticBlockScheduler::Run() {
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

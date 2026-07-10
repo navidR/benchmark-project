@@ -1,12 +1,12 @@
-#include "benchmark_sim/drivers/chain_driver_registry.h"
+#include "bbp/drivers/chain_driver_registry.h"
 
 #include <chrono>
 #include <limits>
 #include <stdexcept>
 
-#include "benchmark_sim/drivers/firo_driver.h"
+#include "bbp/drivers/firo_driver.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr const char* kFiroChainName = "firo";
@@ -70,4 +70,4 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
   return config;
 }
 
-}  // namespace bsim
+}  // namespace bbp

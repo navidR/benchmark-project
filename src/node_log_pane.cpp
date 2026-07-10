@@ -1,4 +1,4 @@
-#include "benchmark_sim/node_log_pane.h"
+#include "bbp/node_log_pane.h"
 
 #include <algorithm>
 #include <array>
@@ -7,7 +7,7 @@
 #include <sstream>
 #include <utility>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 const boost::json::object* NodeAt(const boost::json::object& report,
@@ -182,4 +182,4 @@ std::size_t NodeLogPane::MaximumScroll(std::size_t visible_rows) const {
   return lines_.size() > visible_rows ? lines_.size() - visible_rows : 0U;
 }
 
-}  // namespace bsim
+}  // namespace bbp

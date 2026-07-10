@@ -1,4 +1,4 @@
-#include "benchmark_sim/logging.h"
+#include "bbp/logging.h"
 
 #include <boost/log/core.hpp>
 #include <boost/log/expressions.hpp>
@@ -12,9 +12,9 @@
 #include <ios>
 #include <mutex>
 
-#include "benchmark_sim/log_view.h"
+#include "bbp/log_view.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 using TextFileSink =
@@ -79,4 +79,4 @@ void AttachRunLogFile(const std::filesystem::path& run_root) {
       boost::log::keywords::format = LogFormatter());
 }
 
-}  // namespace bsim
+}  // namespace bbp

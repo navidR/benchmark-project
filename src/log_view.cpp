@@ -1,9 +1,9 @@
-#include "benchmark_sim/log_view.h"
+#include "bbp/log_view.h"
 
 #include <deque>
 #include <fstream>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr const char* kRunLogFile = "simulator.log";
@@ -34,4 +34,4 @@ std::vector<std::string> ReadRecentLogLines(
   return {lines.begin(), lines.end()};
 }
 
-}  // namespace bsim
+}  // namespace bbp

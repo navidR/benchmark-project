@@ -1,9 +1,9 @@
-#include "benchmark_sim/mining_difficulty.h"
+#include "bbp/mining_difficulty.h"
 
 #include <cmath>
 #include <stdexcept>
 
-namespace bsim {
+namespace bbp {
 
 MiningDifficulty::MiningDifficulty(double value) : value_(value) {
   if (!std::isfinite(value_) || value_ <= 0.0) {
@@ -11,4 +11,4 @@ MiningDifficulty::MiningDifficulty(double value) : value_(value) {
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

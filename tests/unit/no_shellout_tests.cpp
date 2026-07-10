@@ -1,4 +1,4 @@
-#include "benchmark_sim/util.h"
+#include "bbp/util.h"
 
 #include <filesystem>
 #include <string>
@@ -28,7 +28,7 @@ void CheckDirectoryForForbiddenTokens(const std::filesystem::path& directory) {
     if (!entry.is_regular_file() || !IsSourceFile(entry.path())) {
       continue;
     }
-    const std::string text = bsim::ReadText(entry.path());
+    const std::string text = bbp::ReadText(entry.path());
     for (std::string_view token : forbidden) {
       if (text.find(token) != std::string::npos) {
         BOOST_FAIL("forbidden shell-out token '" << token << "' in "
@@ -41,7 +41,7 @@ void CheckDirectoryForForbiddenTokens(const std::filesystem::path& directory) {
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(simulator_source_does_not_shell_out) {
-  const std::filesystem::path source_root = BENCHMARK_SIM_SOURCE_DIR;
+  const std::filesystem::path source_root = BBP_SOURCE_DIR;
   CheckDirectoryForForbiddenTokens(source_root / "include");
   CheckDirectoryForForbiddenTokens(source_root / "src");
 }

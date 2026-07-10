@@ -1,9 +1,9 @@
-#include "benchmark_sim/block_production_policy.h"
+#include "bbp/block_production_policy.h"
 
 #include <cmath>
 #include <stdexcept>
 
-namespace bsim {
+namespace bbp {
 
 BlockProductionPolicy::BlockProductionPolicy(std::chrono::milliseconds period,
                                              double probability,
@@ -19,4 +19,4 @@ BlockProductionPolicy::BlockProductionPolicy(std::chrono::milliseconds period,
   }
 }
 
-}  // namespace bsim
+}  // namespace bbp

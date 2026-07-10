@@ -1,10 +1,10 @@
-#include "benchmark_sim/drivers/chain_command_executor.h"
+#include "bbp/drivers/chain_command_executor.h"
 
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
 
-namespace bsim {
+namespace bbp {
 
 ChainCommandExecutor::ChainCommandExecutor(
     const ChainDriver& driver, std::vector<ChainNodeConfig> nodes,
@@ -79,4 +79,4 @@ const ChainNodeConfig& ChainCommandExecutor::FindNode(
   return *node;
 }
 
-}  // namespace bsim
+}  // namespace bbp

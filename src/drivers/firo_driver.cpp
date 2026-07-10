@@ -1,4 +1,4 @@
-#include "benchmark_sim/drivers/firo_driver.h"
+#include "bbp/drivers/firo_driver.h"
 
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
@@ -9,10 +9,10 @@
 #include <cstdint>
 #include <mutex>
 
-#include "benchmark_sim/simulation_cancelled.h"
-#include "benchmark_sim/util.h"
+#include "bbp/simulation_cancelled.h"
+#include "bbp/util.h"
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 void ThrowIfStopRequested(std::stop_token stop_token) {
@@ -767,7 +767,7 @@ boost::json::value FiroDriver::RpcCall(const FiroNodeConfig& config,
                                        std::stop_token stop_token) const {
   boost::json::object request;
   request["jsonrpc"] = "1.0";
-  request["id"] = "benchmark-sim";
+  request["id"] = "bbp";
   request["method"] = method;
   request["params"] = params;
   const std::string body = boost::json::serialize(request);
@@ -781,4 +781,4 @@ boost::json::value FiroDriver::RpcCall(const FiroNodeConfig& config,
   return ParseRpcResponse(response.body, method);
 }
 
-}  // namespace bsim
+}  // namespace bbp

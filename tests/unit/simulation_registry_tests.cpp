@@ -1,11 +1,11 @@
 #include <boost/test/unit_test.hpp>
 
-#include "benchmark_sim/simulation_registry.h"
+#include "bbp/simulation_registry.h"
 
 namespace {
 
-bsim::NodeRoleTopology TestTopology() {
-  bsim::NodeRoleTopology topology;
+bbp::NodeRoleTopology TestTopology() {
+  bbp::NodeRoleTopology topology;
   topology.configured = true;
   topology.node_count = 3;
   topology.wallet_node_count = 2;
@@ -18,8 +18,8 @@ bsim::NodeRoleTopology TestTopology() {
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(simulation_registry_initializes_wallet_nodes) {
-  const bsim::SimulationRegistry registry =
-      bsim::SimulationRegistry::FromTopology(TestTopology(), {});
+  const bbp::SimulationRegistry registry =
+      bbp::SimulationRegistry::FromTopology(TestTopology(), {});
 
   BOOST_REQUIRE_EQUAL(registry.wallets().size(), 2U);
   BOOST_TEST(registry.wallets()[0].wallet_index == 1U);
@@ -31,12 +31,12 @@ BOOST_AUTO_TEST_CASE(simulation_registry_initializes_wallet_nodes) {
 }
 
 BOOST_AUTO_TEST_CASE(simulation_registry_accepts_private_wallet_mode) {
-  bsim::WalletInitialization initialization;
-  initialization.mode = bsim::WalletPrivacyMode::kPrivate;
+  bbp::WalletInitialization initialization;
+  initialization.mode = bbp::WalletPrivacyMode::kPrivate;
 
-  const bsim::SimulationRegistry registry =
-      bsim::SimulationRegistry::FromTopology(TestTopology(), initialization);
+  const bbp::SimulationRegistry registry =
+      bbp::SimulationRegistry::FromTopology(TestTopology(), initialization);
 
   BOOST_TEST(static_cast<int>(registry.wallet_initialization().mode) ==
-             static_cast<int>(bsim::WalletPrivacyMode::kPrivate));
+             static_cast<int>(bbp::WalletPrivacyMode::kPrivate));
 }

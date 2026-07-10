@@ -1,4 +1,4 @@
-#include "benchmark_sim/util.h"
+#include "bbp/util.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -21,7 +21,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 std::mutex append_line_mutex;
@@ -153,7 +153,7 @@ std::string MakeRunId() {
   std::random_device rd;
   uint32_t suffix = rd();
   std::ostringstream out;
-  out << "bs" << millis << "-" << std::hex << (suffix & 0xffff);
+  out << "bbp" << millis << "-" << std::hex << (suffix & 0xffff);
   return out.str();
 }
 
@@ -316,4 +316,4 @@ std::optional<double> JsonOptionalDouble(const boost::json::value& value,
   throw std::runtime_error("JSON field is not numeric: " + std::string(field));
 }
 
-}  // namespace bsim
+}  // namespace bbp

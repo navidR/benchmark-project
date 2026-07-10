@@ -1,6 +1,6 @@
-#include "benchmark_sim/process.h"
+#include "bbp/process.h"
 
-#include "benchmark_sim/util.h"
+#include "bbp/util.h"
 
 #include <fcntl.h>
 #include <sched.h>
@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 [[noreturn]] void ChildFail(const char* message) {
@@ -309,4 +309,4 @@ void ChildProcess::Kill() {
   WaitForExit(std::chrono::seconds(5));
 }
 
-}  // namespace bsim
+}  // namespace bbp

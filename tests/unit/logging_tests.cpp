@@ -4,20 +4,20 @@
 #include <sstream>
 #include <string>
 
-#include "benchmark_sim/logging.h"
+#include "bbp/logging.h"
 
 BOOST_AUTO_TEST_CASE(console_logging_can_be_suspended_for_ncurses) {
-  bsim::InitLogging();
+  bbp::InitLogging();
   std::ostringstream output;
   std::streambuf* previous_buffer = std::clog.rdbuf(output.rdbuf());
 
-  bsim::SetConsoleLoggingEnabled(false);
-  BSIM_LOG(info) << "hidden-while-ncurses-owns-terminal";
+  bbp::SetConsoleLoggingEnabled(false);
+  BBP_LOG(info) << "hidden-while-ncurses-owns-terminal";
   boost::log::core::get()->flush();
   const std::string suspended_output = output.str();
 
-  bsim::SetConsoleLoggingEnabled(true);
-  BSIM_LOG(info) << "visible-after-ncurses-releases-terminal";
+  bbp::SetConsoleLoggingEnabled(true);
+  BBP_LOG(info) << "visible-after-ncurses-releases-terminal";
   boost::log::core::get()->flush();
   const std::string restored_output = output.str();
   std::clog.rdbuf(previous_buffer);

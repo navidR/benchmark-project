@@ -5,15 +5,15 @@
 #include <optional>
 #include <string>
 
-#include "benchmark_sim/log_tail.h"
-#include "benchmark_sim/util.h"
+#include "bbp/log_tail.h"
+#include "bbp/util.h"
 
 namespace {
 
 std::filesystem::path MakeTestDir(const std::string& name) {
   const std::filesystem::path dir =
       std::filesystem::temp_directory_path() /
-      ("benchmark-sim-" + name + "-" + std::to_string(getpid()));
+      ("bbp-" + name + "-" + std::to_string(getpid()));
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);
   return dir;
@@ -24,23 +24,23 @@ std::filesystem::path MakeTestDir(const std::string& name) {
 BOOST_AUTO_TEST_CASE(log_tail_reads_incrementally_by_offset) {
   const std::filesystem::path dir = MakeTestDir("log-tail-incremental");
   const std::filesystem::path log = dir / "daemon.log";
-  bsim::WriteText(log, "alpha\nbeta\n");
+  bbp::WriteText(log, "alpha\nbeta\n");
 
-  const std::optional<bsim::LogTailChunk> first_result =
-      bsim::TailLogFile(log, {}, 1024);
+  const std::optional<bbp::LogTailChunk> first_result =
+      bbp::TailLogFile(log, {}, 1024);
   BOOST_REQUIRE(first_result.has_value());
-  const bsim::LogTailChunk& first = *first_result;
+  const bbp::LogTailChunk& first = *first_result;
   BOOST_TEST(first.start_offset == 0U);
   BOOST_TEST(first.next_offset == 11U);
   BOOST_TEST(!first.truncated);
   BOOST_TEST(!first.offset_reset);
   BOOST_TEST(first.text == "alpha\nbeta\n");
 
-  bsim::AppendLine(log, "gamma");
-  const std::optional<bsim::LogTailChunk> second_result =
-      bsim::TailLogFile(log, first.next_cursor, 1024);
+  bbp::AppendLine(log, "gamma");
+  const std::optional<bbp::LogTailChunk> second_result =
+      bbp::TailLogFile(log, first.next_cursor, 1024);
   BOOST_REQUIRE(second_result.has_value());
-  const bsim::LogTailChunk& second = *second_result;
+  const bbp::LogTailChunk& second = *second_result;
   BOOST_TEST(second.start_offset == 11U);
   BOOST_TEST(second.next_offset == 17U);
   BOOST_TEST(second.text == "gamma\n");
@@ -51,12 +51,12 @@ BOOST_AUTO_TEST_CASE(log_tail_reads_incrementally_by_offset) {
 BOOST_AUTO_TEST_CASE(log_tail_reports_truncated_bounded_reads) {
   const std::filesystem::path dir = MakeTestDir("log-tail-bounded");
   const std::filesystem::path log = dir / "daemon.log";
-  bsim::WriteText(log, "0123456789");
+  bbp::WriteText(log, "0123456789");
 
-  const std::optional<bsim::LogTailChunk> result =
-      bsim::TailLogFile(log, {}, 4);
+  const std::optional<bbp::LogTailChunk> result =
+      bbp::TailLogFile(log, {}, 4);
   BOOST_REQUIRE(result.has_value());
-  const bsim::LogTailChunk& chunk = *result;
+  const bbp::LogTailChunk& chunk = *result;
   BOOST_TEST(chunk.start_offset == 0U);
   BOOST_TEST(chunk.next_offset == 4U);
   BOOST_TEST(chunk.truncated);
@@ -68,17 +68,17 @@ BOOST_AUTO_TEST_CASE(log_tail_reports_truncated_bounded_reads) {
 BOOST_AUTO_TEST_CASE(log_tail_resets_offset_after_file_truncation) {
   const std::filesystem::path dir = MakeTestDir("log-tail-reset");
   const std::filesystem::path log = dir / "daemon.log";
-  bsim::WriteText(log, "first long contents\n");
-  const std::optional<bsim::LogTailChunk> before_truncate_result =
-      bsim::TailLogFile(log, {}, 1024);
+  bbp::WriteText(log, "first long contents\n");
+  const std::optional<bbp::LogTailChunk> before_truncate_result =
+      bbp::TailLogFile(log, {}, 1024);
   BOOST_REQUIRE(before_truncate_result.has_value());
-  const bsim::LogTailChunk& before_truncate = *before_truncate_result;
-  bsim::WriteText(log, "new\n");
+  const bbp::LogTailChunk& before_truncate = *before_truncate_result;
+  bbp::WriteText(log, "new\n");
 
-  const std::optional<bsim::LogTailChunk> after_truncate_result =
-      bsim::TailLogFile(log, before_truncate.next_cursor, 1024);
+  const std::optional<bbp::LogTailChunk> after_truncate_result =
+      bbp::TailLogFile(log, before_truncate.next_cursor, 1024);
   BOOST_REQUIRE(after_truncate_result.has_value());
-  const bsim::LogTailChunk& after_truncate = *after_truncate_result;
+  const bbp::LogTailChunk& after_truncate = *after_truncate_result;
   BOOST_TEST(after_truncate.offset_reset);
   BOOST_TEST(after_truncate.start_offset == 0U);
   BOOST_TEST(after_truncate.next_offset == 4U);
@@ -90,15 +90,15 @@ BOOST_AUTO_TEST_CASE(log_tail_resets_offset_after_file_truncation) {
 BOOST_AUTO_TEST_CASE(log_tail_detects_truncate_and_regrow_on_same_inode) {
   const std::filesystem::path dir = MakeTestDir("log-tail-regrow");
   const std::filesystem::path log = dir / "daemon.log";
-  bsim::WriteText(log, "old contents before restart\n");
-  const std::optional<bsim::LogTailChunk> before =
-      bsim::TailLogFile(log, {}, 1024);
+  bbp::WriteText(log, "old contents before restart\n");
+  const std::optional<bbp::LogTailChunk> before =
+      bbp::TailLogFile(log, {}, 1024);
   BOOST_REQUIRE(before.has_value());
 
-  bsim::WriteText(log,
+  bbp::WriteText(log,
                   "new process contents are longer than the previous log\n");
-  const std::optional<bsim::LogTailChunk> after =
-      bsim::TailLogFile(log, before->next_cursor, 1024);
+  const std::optional<bbp::LogTailChunk> after =
+      bbp::TailLogFile(log, before->next_cursor, 1024);
   BOOST_REQUIRE(after.has_value());
   BOOST_TEST(after->offset_reset);
   BOOST_TEST(after->start_offset == 0U);
@@ -111,6 +111,6 @@ BOOST_AUTO_TEST_CASE(log_tail_detects_truncate_and_regrow_on_same_inode) {
 BOOST_AUTO_TEST_CASE(log_tail_returns_empty_for_missing_file) {
   const std::filesystem::path missing =
       MakeTestDir("log-tail-missing") / "missing.log";
-  BOOST_TEST(!bsim::TailLogFile(missing, {}, 1024).has_value());
+  BOOST_TEST(!bbp::TailLogFile(missing, {}, 1024).has_value());
   std::filesystem::remove_all(missing.parent_path());
 }

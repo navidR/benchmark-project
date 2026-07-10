@@ -1,4 +1,4 @@
-#include "benchmark_sim/network.h"
+#include "bbp/network.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -38,7 +38,7 @@
 
 #include <libmnl/libmnl.h>
 
-namespace bsim {
+namespace bbp {
 namespace {
 
 constexpr std::uint32_t kRootQdiscHandle = TC_H_MAKE(1U << 16, 0U);
@@ -613,7 +613,7 @@ void TryDeleteLink(const std::string& name) {
 }
 
 std::string ProbeName(char suffix) {
-  return "bs" + std::to_string(static_cast<long long>(getpid() % 100000)) +
+  return "bbp" + std::to_string(static_cast<long long>(getpid() % 100000)) +
          suffix;
 }
 
@@ -3008,4 +3008,4 @@ VethProbe ProbeVethPair() {
   return probe;
 }
 
-}  // namespace bsim
+}  // namespace bbp
