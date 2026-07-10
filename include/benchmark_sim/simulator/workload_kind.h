@@ -11,6 +11,7 @@ enum class WorkloadKind {
   kRestartNode,
   kFreezeNode,
   kUpdateResourceLimits,
+  kResourcePressure,
   kPartitionNodes,
   kHealPartition,
   kSendRawTransaction,

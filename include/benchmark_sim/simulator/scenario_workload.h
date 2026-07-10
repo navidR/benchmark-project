@@ -6,6 +6,7 @@
 #include "benchmark_sim/simulator/freeze_node_workload.h"
 #include "benchmark_sim/simulator/network_partition_workload.h"
 #include "benchmark_sim/simulator/resource_limit_update_workload.h"
+#include "benchmark_sim/simulator/resource_pressure_workload.h"
 #include "benchmark_sim/simulator/restart_node_workload.h"
 #include "benchmark_sim/simulator/send_raw_transaction_workload.h"
 #include "benchmark_sim/simulator/wait_for_peers_workload.h"
@@ -25,6 +26,7 @@ struct ScenarioWorkload {
   RestartNodeWorkload restart_node;
   FreezeNodeWorkload freeze_node;
   ResourceLimitUpdateWorkload update_resource_limits;
+  ResourcePressureWorkload resource_pressure;
   NetworkPartitionWorkload network_partition;
   SendRawTransactionWorkload send_raw_transaction;
   WalletTransactionsWorkload wallet_transactions;
