@@ -22,6 +22,7 @@
 #include "benchmark_sim/log_view.h"
 #include "benchmark_sim/node_log_pane.h"
 #include "benchmark_sim/run_report.h"
+#include "benchmark_sim/simulation_command_queue.h"
 
 namespace bsim {
 namespace {
@@ -37,6 +38,10 @@ constexpr int kDetailPaneRows = 9;
 struct TuiState {
   std::size_t selected_node = 0;
   NodeLogPane node_log_pane;
+  std::string command_status;
+  std::uint64_t last_command_result_sequence = 0;
+  bool command_error_open = false;
+  std::string command_error;
 };
 
 class CursesSession {
@@ -351,6 +356,41 @@ const boost::json::object* NodeAt(const boost::json::array& nodes,
   return &nodes[index].as_object();
 }
 
+void RefreshCommandResults(const boost::json::object& report, TuiState* state) {
+  const boost::json::value* commands_value =
+      report.if_contains("operator_commands");
+  if (commands_value == nullptr || !commands_value->is_array()) {
+    return;
+  }
+  for (const boost::json::value& command_value : commands_value->as_array()) {
+    if (!command_value.is_object()) {
+      continue;
+    }
+    const boost::json::object& command = command_value.as_object();
+    const boost::json::value* detail_value = command.if_contains("detail");
+    if (detail_value == nullptr || !detail_value->is_object()) {
+      continue;
+    }
+    const boost::json::object& detail = detail_value->as_object();
+    const std::optional<std::uint64_t> sequence =
+        JsonUnsignedMetric(detail, "sequence");
+    if (!sequence || *sequence <= state->last_command_result_sequence) {
+      continue;
+    }
+    state->last_command_result_sequence = *sequence;
+    const std::string status = JsonString(command, "status");
+    if (status == "failed") {
+      state->command_error =
+          JsonString(detail, "error", "The chain rejected this command.");
+      state->command_error_open = true;
+    } else if (status == "completed") {
+      state->command_status =
+          "Command #" + std::to_string(*sequence) + " completed for " +
+          JsonString(command, "node_id", "selected node") + ".";
+    }
+  }
+}
+
 const boost::json::object* WalletForNode(const boost::json::object& report,
                                          std::size_t one_based_node) {
   const boost::json::array* wallets = WalletSummaries(report);
@@ -467,6 +507,32 @@ void DrawNodeLogPane(int content_bottom, int cols,
     }
   }
   DrawHorizontalLine(content_bottom - 1);
+}
+
+void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
+  constexpr int kPopupRows = 7;
+  if (rows < kPopupRows + 2 || cols < 32) {
+    return;
+  }
+  const int popup_cols = std::min(cols - 4, 72);
+  const int top = (rows - kPopupRows) / 2;
+  const int left = (cols - popup_cols) / 2;
+  for (int row = 0; row < kPopupRows; ++row) {
+    mvhline(top + row, left, ' ', popup_cols);
+  }
+  mvhline(top, left + 1, ACS_HLINE, popup_cols - 2);
+  mvhline(top + kPopupRows - 1, left + 1, ACS_HLINE, popup_cols - 2);
+  mvvline(top + 1, left, ACS_VLINE, kPopupRows - 2);
+  mvvline(top + 1, left + popup_cols - 1, ACS_VLINE, kPopupRows - 2);
+  mvaddch(top, left, ACS_ULCORNER);
+  mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
+  mvaddch(top + kPopupRows - 1, left, ACS_LLCORNER);
+  mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
+  AddText(top + 1, left + 2, popup_cols - 4, "Command error",
+          A_BOLD | COLOR_PAIR(kColorWarning));
+  AddText(top + 3, left + 2, popup_cols - 4, message);
+  AddText(top + 5, left + 2, popup_cols - 4, "Press Enter or Esc to dismiss.",
+          COLOR_PAIR(kColorMuted));
 }
 
 void AddDetailPair(int y, int x, int width, std::string_view label,
@@ -593,7 +659,9 @@ boost::json::object LoadReport(const std::filesystem::path& run_root,
 void DrawSummary(const std::filesystem::path& run_root,
                  const boost::json::object& report, std::string_view error,
                  const std::vector<std::string>& log_lines,
-                 std::size_t selected_node, const NodeLogPane& node_log_pane) {
+                 std::size_t selected_node, const NodeLogPane& node_log_pane,
+                 std::string_view command_status, bool command_error_open,
+                 std::string_view command_error) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -731,11 +799,19 @@ void DrawSummary(const std::filesystem::path& run_root,
   }
   DrawNodeLogPane(content_bottom, cols, node_log_pane);
   DrawHorizontalLine(rows - 2);
-  AddText(rows - 1, 0, cols,
-          node_log_pane.IsOpen()
-              ? "Node log: arrows/PgUp/PgDn/Home/End scroll. l closes. q exits."
-              : "Arrows select. l node log. q or Esc exits.",
-          COLOR_PAIR(kColorMuted));
+  std::string footer;
+  if (!command_status.empty()) {
+    footer = std::string(command_status) + " | ";
+  }
+  footer += node_log_pane.IsOpen()
+                ? "Node log: arrows/PgUp/PgDn/Home/End scroll. +/- verbosity. "
+                  "l closes. q exits."
+                : "Arrows select. l node log. s stop mining. d disconnect. q "
+                  "or Esc exits.";
+  AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
+  if (command_error_open) {
+    DrawCommandErrorPopup(rows, cols, command_error);
+  }
   refresh();
 }
 
@@ -752,7 +828,45 @@ std::size_t CurrentNodeLogVisibleRows() {
   return static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
 }
 
-bool HandleInput(int ch, const boost::json::object& report, TuiState* state) {
+bool QueueSelectedNodeCommand(SimulationCommandKind kind,
+                              const boost::json::object& report,
+                              SimulationCommandQueue* command_queue,
+                              TuiState* state) {
+  const boost::json::array* nodes = NodeSummaries(report);
+  const boost::json::object* node =
+      nodes == nullptr ? nullptr : NodeAt(*nodes, state->selected_node);
+  if (node == nullptr) {
+    state->command_status = "No node is selected.";
+    return true;
+  }
+  if (command_queue == nullptr) {
+    state->command_status = "Live commands are unavailable in report mode.";
+    return true;
+  }
+
+  const std::string node_id = JsonString(*node, "node_id");
+  try {
+    const std::uint64_t sequence = command_queue->Push(kind, node_id);
+    state->command_status = "Queued #" + std::to_string(sequence) + " " +
+                            std::string(SimulationCommandKindName(kind)) +
+                            " for " + node_id + ".";
+  } catch (const std::exception& error) {
+    state->command_status = "Command rejected: " + std::string(error.what());
+  }
+  return true;
+}
+
+bool HandleInput(int ch, const boost::json::object& report,
+                 SimulationCommandQueue* command_queue, TuiState* state) {
+  if (state->command_error_open) {
+    if (ch == '\n' || ch == KEY_ENTER || ch == 27) {
+      state->command_error_open = false;
+      state->command_error.clear();
+      return true;
+    }
+    return ch != ERR && ch != 'q' && ch != 'Q';
+  }
+
   const boost::json::array* nodes = NodeSummaries(report);
   if (nodes == nullptr || nodes->empty()) {
     state->selected_node = 0;
@@ -764,7 +878,26 @@ bool HandleInput(int ch, const boost::json::object& report, TuiState* state) {
     return true;
   }
 
+  if (ch == 's' || ch == 'S') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kStopMining, report,
+                                    command_queue, state);
+  }
+  if (ch == 'd' || ch == 'D') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kDisconnectNode,
+                                    report, command_queue, state);
+  }
+
   if (state->node_log_pane.IsOpen()) {
+    if (ch == '+') {
+      return QueueSelectedNodeCommand(
+          SimulationCommandKind::kIncreaseLogVerbosity, report, command_queue,
+          state);
+    }
+    if (ch == '-') {
+      return QueueSelectedNodeCommand(
+          SimulationCommandKind::kDecreaseLogVerbosity, report, command_queue,
+          state);
+    }
     const std::size_t visible_rows = CurrentNodeLogVisibleRows();
     const std::size_t page_rows = std::max<std::size_t>(visible_rows, 1U);
     if (ch == KEY_UP) {
@@ -799,7 +932,8 @@ bool HandleInput(int ch, const boost::json::object& report, TuiState* state) {
 }  // namespace
 
 int RunTuiReport(const std::filesystem::path& run_root, bool once,
-                 std::uint32_t refresh_ms) {
+                 std::uint32_t refresh_ms,
+                 SimulationCommandQueue* command_queue) {
   CursesSession curses;
   const std::uint32_t sleep_step_ms = 50;
   TuiState state;
@@ -810,11 +944,13 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
     state.selected_node = ClampNodeSelection(report, state.selected_node);
     if (error.empty()) {
       state.node_log_pane.Refresh(report, state.selected_node);
+      RefreshCommandResults(report, &state);
     }
     const std::vector<std::string> log_lines =
         ReadRecentLogLines(RunLogPath(run_root), 256U);
     DrawSummary(run_root, report, error, log_lines, state.selected_node,
-                state.node_log_pane);
+                state.node_log_pane, state.command_status,
+                state.command_error_open, state.command_error);
     if (once) {
       return error.empty() ? 0 : 1;
     }
@@ -822,11 +958,11 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
     std::uint32_t slept_ms = 0;
     while (slept_ms < refresh_ms) {
       const int ch = getch();
+      if (HandleInput(ch, report, command_queue, &state)) {
+        break;
+      }
       if (ShouldExit(ch)) {
         return 0;
-      }
-      if (HandleInput(ch, report, &state)) {
-        break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(sleep_step_ms));
       slept_ms += sleep_step_ms;

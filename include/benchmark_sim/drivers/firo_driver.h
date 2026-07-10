@@ -72,6 +72,11 @@ class FiroDriver final : public ChainDriver {
                    const std::string& address) const override;
   void DisconnectPeer(const FiroNodeConfig& config,
                       const std::string& address) const override;
+  void ChangeLogVerbosity(const FiroNodeConfig& config,
+                          ChainLogVerbosityChange change) const override;
+  void StopMining(const FiroNodeConfig& config) const override;
+  void SetNetworkActive(const FiroNodeConfig& config,
+                        bool active) const override;
   void Stop(const FiroNodeConfig& config) const override;
 
  private:

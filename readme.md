@@ -30,7 +30,8 @@ the Firo path is working end to end.
 - Record cgroup usage, pressure, event counters, and configured limits.
 - Record Firo daemon version, protocol version, and subversion in metrics.
 - Record event and metric files under a run directory.
-- View a run directory through a read-only ncurses TUI.
+- Operate a live run through ncurses and view a completed run in read-only
+  mode.
 - Exercise Linux network namespace, veth, address, route, and qdisc operations
   through simulator probes.
 - Run unit tests with CTest.
@@ -547,7 +548,7 @@ The compact report includes the run status, lifecycle timestamps, failure
 detail when present, event counts, workload summaries, final per-node metrics,
 and latest log tails.
 
-View an existing or active run in the read-only TUI:
+View an existing run in the read-only TUI:
 
 ```bash
 ./build/benchmark-sim --run runs/<run-id>
@@ -558,6 +559,13 @@ state, resource metrics, network counters, qdisc state, and simulator logs. Use
 the arrow keys to select a node and press `l` to toggle its separate log pane.
 The node pane supports arrow keys, Page Up, Page Down, Home, and End for
 scrolling; press `l` again to close it.
+
+During a live benchmark launched without `--no-tui`, press `d` to disconnect
+the selected node from the simulated network or `s` to request that its mining
+operation stop. While the node log pane is open, `+` and `-` request higher or
+lower daemon log verbosity. Commands pass through the chain driver; when the
+selected chain does not support an operation, the TUI shows a dismissible
+`Command error` popup instead of attempting a chain-specific fallback.
 
 Render one TUI frame and exit, useful for validation:
 

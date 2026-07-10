@@ -4,6 +4,11 @@
 
 namespace bsim {
 
+UnsupportedChainOperation::UnsupportedChainOperation(std::string_view chain,
+                                                     std::string_view operation)
+    : std::runtime_error(std::string(chain) + " does not support " +
+                         std::string(operation) + " functionality.") {}
+
 std::string_view ChainLogSourceName(ChainLogSource source) {
   switch (source) {
     case ChainLogSource::kDaemon:

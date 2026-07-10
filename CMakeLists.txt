@@ -212,6 +212,7 @@ add_executable(benchmark-sim
   src/capability.cpp
   src/cgroup.cpp
   src/drivers/chain_driver.cpp
+  src/drivers/chain_command_executor.cpp
   src/drivers/chain_driver_registry.cpp
   src/drivers/firo_driver.cpp
   src/http_client.cpp
@@ -224,6 +225,7 @@ add_executable(benchmark-sim
   src/node_log_pane.cpp
   src/process.cpp
   src/run_report.cpp
+  src/simulation_command.cpp
   src/simulation_command_processor.cpp
   src/simulation_command_queue.cpp
   src/simulation_registry.cpp
@@ -272,6 +274,7 @@ if(BUILD_TESTING)
     tests/unit/util_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
+    src/simulation_command.cpp
     src/drivers/chain_driver.cpp
     src/log_tail.cpp
     src/log_view.cpp

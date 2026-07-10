@@ -29,6 +29,7 @@
 
 #include "benchmark_sim/capability.h"
 #include "benchmark_sim/cgroup.h"
+#include "benchmark_sim/drivers/chain_command_executor.h"
 #include "benchmark_sim/drivers/chain_driver_registry.h"
 #include "benchmark_sim/log_tail.h"
 #include "benchmark_sim/logging.h"
@@ -36,6 +37,8 @@
 #include "benchmark_sim/node_log_collector.h"
 #include "benchmark_sim/process.h"
 #include "benchmark_sim/run_report.h"
+#include "benchmark_sim/simulation_command_processor.h"
+#include "benchmark_sim/simulation_command_queue.h"
 #include "benchmark_sim/simulation_registry.h"
 #include "benchmark_sim/simulator/constants.h"
 #include "benchmark_sim/simulator/node_runtime.h"
@@ -4777,7 +4780,19 @@ std::filesystem::path BenchmarkRunRoot(const Options& options) {
   return std::filesystem::absolute(options.output_dir) / options.run_id;
 }
 
-int RunBenchmarkHeadless(Options options) {
+std::string SimulationCommandDetail(const SimulationCommand& command,
+                                    std::string_view error = {}) {
+  boost::json::object detail;
+  detail["sequence"] = command.sequence;
+  detail["kind"] = SimulationCommandKindName(command.kind);
+  if (!error.empty()) {
+    detail["error"] = error;
+  }
+  return boost::json::serialize(detail);
+}
+
+int RunBenchmarkHeadless(Options options,
+                         SimulationCommandQueue* command_queue) {
   const auto run_root = BenchmarkRunRoot(options);
   if (std::filesystem::exists(run_root)) {
     if (!options.replace_run) {
@@ -4812,7 +4827,17 @@ int RunBenchmarkHeadless(Options options) {
   ChainDriver& driver = *driver_owner;
   std::vector<NodeRuntime> nodes;
   std::unique_ptr<NodeLogCollector> log_collector;
+  std::unique_ptr<ChainCommandExecutor> chain_command_executor;
+  std::unique_ptr<SimulationCommandProcessor> command_processor;
+  const auto stop_command_processor = [&]() {
+    if (command_processor) {
+      command_processor->Stop();
+    } else if (command_queue != nullptr) {
+      command_queue->Close();
+    }
+  };
   const auto handle_run_failure = [&](std::string_view detail) {
+    stop_command_processor();
     for (auto& node : nodes) {
       WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
     }
@@ -4838,6 +4863,34 @@ int RunBenchmarkHeadless(Options options) {
     log_nodes.reserve(nodes.size());
     for (const NodeRuntime& node : nodes) {
       log_nodes.push_back(node.config);
+    }
+    if (command_queue != nullptr) {
+      chain_command_executor =
+          std::make_unique<ChainCommandExecutor>(driver, log_nodes);
+      command_processor = std::make_unique<SimulationCommandProcessor>(
+          *command_queue,
+          [&](const SimulationCommand& command) {
+            WriteEvent(events_path, options.run_id, command.node_id,
+                       "operator_command_started",
+                       SimulationCommandDetail(command));
+            chain_command_executor->Execute(command);
+            WriteEvent(events_path, options.run_id, command.node_id,
+                       "operator_command_completed",
+                       SimulationCommandDetail(command));
+            BSIM_LOG(info) << "command #" << command.sequence << " "
+                           << SimulationCommandKindName(command.kind) << " for "
+                           << command.node_id << " completed";
+          },
+          [&](const SimulationCommand& command, std::string_view error) {
+            WriteEvent(events_path, options.run_id, command.node_id,
+                       "operator_command_failed",
+                       SimulationCommandDetail(command, error));
+            BSIM_LOG(warning)
+                << "command #" << command.sequence << " "
+                << SimulationCommandKindName(command.kind) << " for "
+                << command.node_id << " failed: " << error;
+          });
+      command_processor->Start();
     }
     log_collector = std::make_unique<NodeLogCollector>(
         driver, std::move(log_nodes),
@@ -4994,6 +5047,7 @@ int RunBenchmarkHeadless(Options options) {
 
     WriteMetricsSnapshot(metrics_path, options, driver, nodes);
 
+    stop_command_processor();
     StopNodes(options, events_path, driver, nodes);
     log_collector->Stop();
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
@@ -5020,11 +5074,12 @@ int RunBenchmarkWithTui(Options options) {
     std::exception_ptr simulation_failure;
     std::exception_ptr tui_failure;
     int simulation_result = 1;
+    SimulationCommandQueue command_queue;
 
     std::thread simulation_thread(
-        [&options, &simulation_failure, &simulation_result]() {
+        [&options, &simulation_failure, &simulation_result, &command_queue]() {
           try {
-            simulation_result = RunBenchmarkHeadless(options);
+            simulation_result = RunBenchmarkHeadless(options, &command_queue);
           } catch (...) {
             simulation_failure = std::current_exception();
           }
@@ -5032,10 +5087,12 @@ int RunBenchmarkWithTui(Options options) {
 
     int tui_result = 1;
     try {
-      tui_result = RunTuiReport(run_root, false, options.tui_refresh_ms);
+      tui_result =
+          RunTuiReport(run_root, false, options.tui_refresh_ms, &command_queue);
     } catch (...) {
       tui_failure = std::current_exception();
     }
+    command_queue.Close();
     simulation_thread.join();
 
     if (simulation_failure) {
@@ -5137,7 +5194,7 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
   if (options.no_tui) {
-    return RunBenchmarkHeadless(options);
+    return RunBenchmarkHeadless(options, nullptr);
   }
   return RunBenchmarkWithTui(options);
 }

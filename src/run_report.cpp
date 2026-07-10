@@ -21,6 +21,7 @@ namespace bsim {
 namespace {
 
 constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
+constexpr std::size_t kMaximumOperatorCommandSummaries = 256U;
 
 struct NodeReport {
   std::uint64_t metric_samples = 0;
@@ -507,6 +508,29 @@ void AppendEventSummary(const boost::json::object& event,
   summaries->push_back(std::move(summary));
 }
 
+void AppendOperatorCommandSummary(const boost::json::object& event,
+                                  std::string_view status,
+                                  boost::json::array* summaries) {
+  boost::json::object summary;
+  summary["status"] = status;
+  const std::string node_id = OptionalStringField(event, "node_id");
+  if (!node_id.empty()) {
+    summary["node_id"] = node_id;
+  }
+  const std::string timestamp = OptionalStringField(event, "timestamp");
+  if (!timestamp.empty()) {
+    summary["timestamp"] = timestamp;
+  }
+  boost::json::value detail = ParseEventDetail(event);
+  if (!detail.is_null()) {
+    summary["detail"] = std::move(detail);
+  }
+  summaries->push_back(std::move(summary));
+  if (summaries->size() > kMaximumOperatorCommandSummaries) {
+    summaries->erase(summaries->begin());
+  }
+}
+
 }  // namespace
 
 std::string BuildRunReportJson(const std::filesystem::path& run_root) {
@@ -543,6 +567,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
   boost::json::array wallet_transactions;
+  boost::json::array operator_commands;
   std::map<std::uint64_t, WalletReport> wallets;
 
   ForEachJsonLine(
@@ -599,6 +624,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           boost::json::value detail = ParseEventDetail(event);
           RememberWalletTransactionEvent(detail, &wallets);
           AppendEventSummary(event, &wallet_transactions);
+        } else if (event_name == "operator_command_completed") {
+          AppendOperatorCommandSummary(event, "completed", &operator_commands);
+        } else if (event_name == "operator_command_failed") {
+          AppendOperatorCommandSummary(event, "failed", &operator_commands);
         }
       });
 
@@ -648,6 +677,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["network_partitions"] = std::move(network_partitions);
   report["network_partition_heals"] = std::move(network_partition_heals);
   report["wallet_transactions"] = std::move(wallet_transactions);
+  report["operator_commands"] = std::move(operator_commands);
   report["wallets_summary"] = WalletsJson(wallets);
   report["nodes_summary"] = NodesJson(nodes);
   return boost::json::serialize(report);

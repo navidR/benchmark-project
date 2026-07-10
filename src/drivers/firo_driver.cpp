@@ -652,6 +652,25 @@ void FiroDriver::DisconnectPeer(const FiroNodeConfig& config,
   RpcCall(config, "disconnectnode", params);
 }
 
+void FiroDriver::ChangeLogVerbosity(const FiroNodeConfig& config,
+                                    ChainLogVerbosityChange change) const {
+  static_cast<void>(config);
+  static_cast<void>(change);
+  throw UnsupportedChainOperation("Firo", "runtime log verbosity adjustment");
+}
+
+void FiroDriver::StopMining(const FiroNodeConfig& config) const {
+  static_cast<void>(config);
+  throw UnsupportedChainOperation("Firo regtest", "persistent mining stop");
+}
+
+void FiroDriver::SetNetworkActive(const FiroNodeConfig& config,
+                                  bool active) const {
+  boost::json::array params;
+  params.emplace_back(active);
+  RpcCall(config, "setnetworkactive", params);
+}
+
 void FiroDriver::Stop(const FiroNodeConfig& config) const {
   try {
     RpcCall(config, "stop", boost::json::array{});

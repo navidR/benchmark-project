@@ -184,6 +184,15 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "\\\"amount\\\":\\\"1.00000000\\\","
                    "\\\"txids\\\":[\\\"tx1\\\"],"
                    "\\\"mempool_size\\\":1}\"}");
+  bsim::AppendLine(
+      dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+      "\"timestamp\":\"2026-07-09T00:00:01Z\","
+      "\"event\":\"operator_command_failed\","
+      "\"detail\":\"{\\\"sequence\\\":7,"
+      "\\\"kind\\\":\\\"increase_log_verbosity\\\","
+      "\\\"error\\\":\\\"Firo does not support runtime log verbosity "
+      "adjustment functionality.\\\"}\"}");
   bsim::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                    "\"timestamp\":\"2026-07-09T00:00:02Z\","
@@ -222,7 +231,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
-  BOOST_TEST(JsonInteger(report, "event_count") == 15U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 16U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -254,6 +263,19 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_REQUIRE_EQUAL(
       report.at("runtime_node_resource_limits").as_array().size(), 1U);
   BOOST_REQUIRE_EQUAL(report.at("runtime_node_restarts").as_array().size(), 1U);
+  const boost::json::array& operator_commands =
+      report.at("operator_commands").as_array();
+  BOOST_REQUIRE_EQUAL(operator_commands.size(), 1U);
+  const boost::json::object& operator_command =
+      operator_commands.front().as_object();
+  BOOST_TEST(operator_command.at("status").as_string() == "failed");
+  BOOST_TEST(operator_command.at("node_id").as_string() == "firo-1");
+  const boost::json::object& operator_detail =
+      operator_command.at("detail").as_object();
+  BOOST_TEST(JsonInteger(operator_detail, "sequence") == 7U);
+  BOOST_TEST(operator_detail.at("error").as_string() ==
+             "Firo does not support runtime log verbosity adjustment "
+             "functionality.");
   const boost::json::array& generated_blocks =
       report.at("generated_blocks").as_array();
   BOOST_REQUIRE_EQUAL(generated_blocks.size(), 1U);

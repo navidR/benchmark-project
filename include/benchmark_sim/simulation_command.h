@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace bsim {
 
@@ -18,5 +19,7 @@ struct SimulationCommand {
   SimulationCommandKind kind = SimulationCommandKind::kIncreaseLogVerbosity;
   std::string node_id;
 };
+
+std::string_view SimulationCommandKindName(SimulationCommandKind kind);
 
 }  // namespace bsim

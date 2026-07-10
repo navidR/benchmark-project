@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -78,7 +79,17 @@ enum class ChainLogSource {
   kStderr,
 };
 
+enum class ChainLogVerbosityChange {
+  kIncrease,
+  kDecrease,
+};
+
 std::string_view ChainLogSourceName(ChainLogSource source);
+
+class UnsupportedChainOperation : public std::runtime_error {
+ public:
+  UnsupportedChainOperation(std::string_view chain, std::string_view operation);
+};
 
 struct ChainWalletTransactionResult {
   std::vector<std::string> txids;
@@ -143,6 +154,11 @@ class ChainDriver {
                            const std::string& address) const = 0;
   virtual void DisconnectPeer(const ChainNodeConfig& config,
                               const std::string& address) const = 0;
+  virtual void ChangeLogVerbosity(const ChainNodeConfig& config,
+                                  ChainLogVerbosityChange change) const = 0;
+  virtual void StopMining(const ChainNodeConfig& config) const = 0;
+  virtual void SetNetworkActive(const ChainNodeConfig& config,
+                                bool active) const = 0;
   virtual void Stop(const ChainNodeConfig& config) const = 0;
 };
 
