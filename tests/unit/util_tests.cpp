@@ -1,4 +1,4 @@
-#define BOOST_TEST_MODULE BenchmarkSimUtilTests
+#define BOOST_TEST_MODULE BlockchainBenchmarkProjectUtilTests
 
 #include "bbp/util.h"
 
