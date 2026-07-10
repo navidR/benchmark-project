@@ -5,13 +5,31 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
+#include <condition_variable>
 #include <cstdint>
-#include <thread>
+#include <mutex>
 
+#include "benchmark_sim/simulation_cancelled.h"
 #include "benchmark_sim/util.h"
 
 namespace bsim {
 namespace {
+
+void ThrowIfStopRequested(std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw SimulationCancelled();
+  }
+}
+
+void WaitForNextPoll(std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
+  std::condition_variable_any condition;
+  std::mutex mutex;
+  std::unique_lock<std::mutex> lock(mutex);
+  condition.wait_for(lock, stop_token, std::chrono::milliseconds(250),
+                     [] { return false; });
+  ThrowIfStopRequested(stop_token);
+}
 
 std::string Arg(std::string key, const std::string& value) {
   key += "=";
@@ -232,30 +250,35 @@ RpcEndpoint FiroDriver::Endpoint(const FiroNodeConfig& config) const {
 }
 
 void FiroDriver::WaitReady(const FiroNodeConfig& config,
-                           std::chrono::seconds timeout) const {
+                           std::chrono::seconds timeout,
+                           std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
     try {
-      ReadMetrics(config);
+      ReadMetrics(config, stop_token);
       return;
     } catch (const std::exception& e) {
       last_error = e.what();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    WaitForNextPoll(stop_token);
   }
+  ThrowIfStopRequested(stop_token);
   throw std::runtime_error("Firo node " + config.id +
                            " did not become RPC-ready: " + last_error);
 }
 
 void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
-                               std::chrono::seconds timeout) const {
+                               std::chrono::seconds timeout,
+                               std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   uint64_t last_height = 0;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
     try {
-      FiroMetrics metrics = ReadMetrics(config);
+      FiroMetrics metrics = ReadMetrics(config, stop_token);
       last_height = metrics.height;
       if (metrics.height >= height) {
         return;
@@ -263,8 +286,9 @@ void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
     } catch (const std::exception& e) {
       last_error = e.what();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    WaitForNextPoll(stop_token);
   }
+  ThrowIfStopRequested(stop_token);
   throw std::runtime_error("Firo node " + config.id + " reached height " +
                            std::to_string(last_height) + " before timeout; " +
                            "target height " + std::to_string(height) +
@@ -273,13 +297,15 @@ void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
 
 void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
                                   uint64_t peer_count,
-                                  std::chrono::seconds timeout) const {
+                                  std::chrono::seconds timeout,
+                                  std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   uint64_t last_peer_count = 0;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
     try {
-      FiroMetrics metrics = ReadMetrics(config);
+      FiroMetrics metrics = ReadMetrics(config, stop_token);
       last_peer_count = metrics.peer_count;
       if (metrics.peer_count >= peer_count) {
         return;
@@ -287,8 +313,9 @@ void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
     } catch (const std::exception& e) {
       last_error = e.what();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    WaitForNextPoll(stop_token);
   }
+  ThrowIfStopRequested(stop_token);
   throw std::runtime_error("Firo node " + config.id + " reached peer count " +
                            std::to_string(last_peer_count) +
                            " before timeout; target peer count " +
@@ -298,12 +325,15 @@ void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
 
 void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
                                     const std::string& address,
-                                    std::chrono::seconds timeout) const {
+                                    std::chrono::seconds timeout,
+                                    std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
     try {
-      const std::vector<std::string> addresses = PeerAddresses(config);
+      const std::vector<std::string> addresses =
+          PeerAddresses(config, stop_token);
       for (const std::string& candidate : addresses) {
         if (candidate == address) {
           return;
@@ -312,8 +342,9 @@ void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
     } catch (const std::exception& e) {
       last_error = e.what();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    WaitForNextPoll(stop_token);
   }
+  ThrowIfStopRequested(stop_token);
   throw std::runtime_error(
       "Firo node " + config.id + " did not connect to peer " + address +
       " before timeout" + (last_error.empty() ? "" : ": " + last_error));
@@ -321,33 +352,38 @@ void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
 
 void FiroDriver::WaitForPeerAddressAbsent(const FiroNodeConfig& config,
                                           const std::string& address,
-                                          std::chrono::seconds timeout) const {
+                                          std::chrono::seconds timeout,
+                                          std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
     try {
-      const std::vector<std::string> addresses = PeerAddresses(config);
+      const std::vector<std::string> addresses =
+          PeerAddresses(config, stop_token);
       if (!ContainsPeerAddress(addresses, address)) {
         return;
       }
     } catch (const std::exception& e) {
       last_error = e.what();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    WaitForNextPoll(stop_token);
   }
+  ThrowIfStopRequested(stop_token);
   throw std::runtime_error(
       "Firo node " + config.id + " remained connected to peer " + address +
       " before timeout" + (last_error.empty() ? "" : ": " + last_error));
 }
 
-FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
+FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config,
+                                    std::stop_token stop_token) const {
   const auto start = std::chrono::steady_clock::now();
   const boost::json::value blockchain =
-      RpcCall(config, "getblockchaininfo", boost::json::array{});
+      RpcCall(config, "getblockchaininfo", boost::json::array{}, stop_token);
   const boost::json::value network =
-      RpcCall(config, "getnetworkinfo", boost::json::array{});
+      RpcCall(config, "getnetworkinfo", boost::json::array{}, stop_token);
   const boost::json::value mempool =
-      RpcCall(config, "getmempoolinfo", boost::json::array{});
+      RpcCall(config, "getmempoolinfo", boost::json::array{}, stop_token);
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
   FiroMetrics metrics;
@@ -368,9 +404,9 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config) const {
 }
 
 std::vector<std::string> FiroDriver::PeerAddresses(
-    const FiroNodeConfig& config) const {
+    const FiroNodeConfig& config, std::stop_token stop_token) const {
   const boost::json::value peers =
-      RpcCall(config, "getpeerinfo", boost::json::array{});
+      RpcCall(config, "getpeerinfo", boost::json::array{}, stop_token);
   std::vector<std::string> addresses;
   for (const boost::json::value& peer : peers.as_array()) {
     if (!peer.is_object()) {
@@ -385,19 +421,21 @@ std::vector<std::string> FiroDriver::PeerAddresses(
 }
 
 std::vector<std::string> FiroDriver::GenerateBlocks(
-    const FiroNodeConfig& config, uint32_t count,
-    const std::string& address) const {
+    const FiroNodeConfig& config, uint32_t count, const std::string& address,
+    std::stop_token stop_token) const {
   boost::json::array params;
   params.push_back(count);
   params.emplace_back(address);
-  return ParseStringArrayResult(RpcCall(config, "generatetoaddress", params));
+  return ParseStringArrayResult(
+      RpcCall(config, "generatetoaddress", params, stop_token));
 }
 
 std::string FiroDriver::CreateWalletAddress(const FiroNodeConfig& config,
-                                            WalletMode wallet_mode) const {
+                                            WalletMode wallet_mode,
+                                            std::stop_token stop_token) const {
   RequireSupportedWalletMode(wallet_mode, "address creation");
   const boost::json::value address =
-      RpcCall(config, "getnewaddress", boost::json::array{});
+      RpcCall(config, "getnewaddress", boost::json::array{}, stop_token);
   if (!address.is_string()) {
     throw std::runtime_error("Firo getnewaddress returned non-string");
   }
@@ -408,17 +446,20 @@ uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
                                           WalletMode wallet_mode,
                                           uint64_t minimum_balance_satoshis,
                                           uint64_t minimum_confirmations,
-                                          std::chrono::seconds timeout) const {
+                                          std::chrono::seconds timeout,
+                                          std::stop_token stop_token) const {
   RequireSupportedWalletMode(wallet_mode, "balance readiness");
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   uint64_t last_balance = 0;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
     try {
       boost::json::array params;
       params.emplace_back("*");
       params.push_back(minimum_confirmations);
-      const boost::json::value balance = RpcCall(config, "getbalance", params);
+      const boost::json::value balance =
+          RpcCall(config, "getbalance", params, stop_token);
       last_balance = JsonFixed8Amount(balance, "getbalance");
       if (last_balance >= minimum_balance_satoshis) {
         return last_balance;
@@ -426,8 +467,9 @@ uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
     } catch (const std::exception& e) {
       last_error = e.what();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    WaitForNextPoll(stop_token);
   }
+  ThrowIfStopRequested(stop_token);
   throw std::runtime_error(
       "Firo node " + config.id + " wallet balance " +
       FormatFixed8Amount(last_balance) + " remained below " +
@@ -439,13 +481,15 @@ uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
 FiroUtxo FiroDriver::FindSpendableOutput(
     const FiroNodeConfig& config, const std::vector<std::string>& block_hashes,
     const std::string& source_address, uint64_t minimum_amount_satoshis,
-    uint64_t minimum_confirmations) const {
+    uint64_t minimum_confirmations, std::stop_token stop_token) const {
   constexpr uint32_t kMaxOutputsToProbe = 64;
   for (const std::string& block_hash : block_hashes) {
+    ThrowIfStopRequested(stop_token);
     boost::json::array block_params;
     block_params.emplace_back(block_hash);
     block_params.push_back(1);
-    const boost::json::value block = RpcCall(config, "getblock", block_params);
+    const boost::json::value block =
+        RpcCall(config, "getblock", block_params, stop_token);
     const boost::json::value* transactions =
         block.as_object().if_contains("tx");
     if (transactions == nullptr || !transactions->is_array()) {
@@ -457,12 +501,13 @@ FiroUtxo FiroDriver::FindSpendableOutput(
       }
       const std::string txid(tx.as_string());
       for (uint32_t vout = 0; vout < kMaxOutputsToProbe; ++vout) {
+        ThrowIfStopRequested(stop_token);
         boost::json::array txout_params;
         txout_params.emplace_back(txid);
         txout_params.push_back(vout);
         txout_params.push_back(false);
         const boost::json::value txout =
-            RpcCall(config, "gettxout", txout_params);
+            RpcCall(config, "gettxout", txout_params, stop_token);
         if (txout.is_null() || !txout.is_object()) {
           continue;
         }
@@ -502,7 +547,9 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
     const FiroNodeConfig& config, const FiroUtxo& utxo,
     const std::string& source_address, const std::string& source_private_key,
     const std::string& destination_address, uint64_t amount_satoshis,
-    uint64_t fee_satoshis, std::chrono::seconds timeout) const {
+    uint64_t fee_satoshis, std::chrono::seconds timeout,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
   if (utxo.amount_satoshis < amount_satoshis ||
       utxo.amount_satoshis - amount_satoshis < fee_satoshis) {
     throw std::runtime_error(
@@ -527,7 +574,7 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
   create_params.push_back(std::move(inputs));
   create_params.push_back(std::move(outputs));
   const boost::json::value raw =
-      RpcCall(config, "createrawtransaction", create_params);
+      RpcCall(config, "createrawtransaction", create_params, stop_token);
   if (!raw.is_string()) {
     throw std::runtime_error("Firo createrawtransaction returned non-string");
   }
@@ -546,7 +593,7 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
   sign_params.push_back(std::move(prevtxs));
   sign_params.push_back(std::move(privkeys));
   const boost::json::value signed_tx =
-      RpcCall(config, "signrawtransaction", sign_params);
+      RpcCall(config, "signrawtransaction", sign_params, stop_token);
   const boost::json::object& signed_object = signed_tx.as_object();
   const boost::json::value* complete = signed_object.if_contains("complete");
   if (complete == nullptr || !complete->is_bool() || !complete->as_bool()) {
@@ -562,7 +609,7 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
   send_params.emplace_back(signed_hex);
   send_params.push_back(false);
   const boost::json::value txid_value =
-      RpcCall(config, "sendrawtransaction", send_params);
+      RpcCall(config, "sendrawtransaction", send_params, stop_token);
   if (!txid_value.is_string()) {
     throw std::runtime_error("Firo sendrawtransaction returned non-string");
   }
@@ -576,18 +623,22 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
   result.destination_amount = FormatFixed8Amount(amount_satoshis);
   result.change_amount = FormatFixed8Amount(change_satoshis);
   result.fee = FormatFixed8Amount(fee_satoshis);
-  result.mempool_size = WaitForMempoolTransaction(config, txid, timeout);
+  result.mempool_size =
+      WaitForMempoolTransaction(config, txid, timeout, stop_token);
   return result;
 }
 
 FiroWalletTransactionResult FiroDriver::SendWalletTransaction(
     const FiroNodeConfig& config, WalletMode wallet_mode,
     const std::string& destination_address, uint64_t amount_satoshis,
-    uint64_t fee_satoshis, std::chrono::seconds timeout) const {
+    uint64_t fee_satoshis, std::chrono::seconds timeout,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
   RequireSupportedWalletMode(wallet_mode, "transaction submission");
   boost::json::array fee_params;
   fee_params.emplace_back(FormatFixed8Amount(fee_satoshis));
-  const boost::json::value fee_result = RpcCall(config, "settxfee", fee_params);
+  const boost::json::value fee_result =
+      RpcCall(config, "settxfee", fee_params, stop_token);
   if (fee_result.is_bool() && !fee_result.as_bool()) {
     throw std::runtime_error("Firo settxfee returned false");
   }
@@ -598,29 +649,32 @@ FiroWalletTransactionResult FiroDriver::SendWalletTransaction(
   send_params.emplace_back("");
   send_params.emplace_back("");
   send_params.emplace_back(false);
-  const std::vector<std::string> txids = ParseTxIdResult(
-      RpcCall(config, "sendtoaddress", send_params), "sendtoaddress");
+  const std::vector<std::string> txids =
+      ParseTxIdResult(RpcCall(config, "sendtoaddress", send_params, stop_token),
+                      "sendtoaddress");
 
   FiroWalletTransactionResult result;
   result.txids = txids;
   result.destination_amount = FormatFixed8Amount(amount_satoshis);
   result.requested_fee_rate = FormatFixed8Amount(fee_satoshis);
   for (const std::string& txid : result.txids) {
-    result.mempool_size = WaitForMempoolTransaction(config, txid, timeout);
+    result.mempool_size =
+        WaitForMempoolTransaction(config, txid, timeout, stop_token);
   }
   return result;
 }
 
 uint64_t FiroDriver::WaitForMempoolTransaction(
     const FiroNodeConfig& config, const std::string& txid,
-    std::chrono::seconds timeout) const {
+    std::chrono::seconds timeout, std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   uint64_t last_size = 0;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
     try {
       const boost::json::value mempool =
-          RpcCall(config, "getrawmempool", boost::json::array{});
+          RpcCall(config, "getrawmempool", boost::json::array{}, stop_token);
       if (mempool.is_array()) {
         last_size = mempool.as_array().size();
       }
@@ -630,64 +684,95 @@ uint64_t FiroDriver::WaitForMempoolTransaction(
     } catch (const std::exception& e) {
       last_error = e.what();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    WaitForNextPoll(stop_token);
   }
+  ThrowIfStopRequested(stop_token);
   throw std::runtime_error(
       "Firo node " + config.id + " did not report mempool transaction " + txid +
       " before timeout" + (last_error.empty() ? "" : ": " + last_error));
 }
 
 void FiroDriver::ConnectPeer(const FiroNodeConfig& config,
-                             const std::string& address) const {
+                             const std::string& address,
+                             std::stop_token stop_token) const {
   boost::json::array params;
   params.emplace_back(address);
   params.emplace_back("onetry");
-  RpcCall(config, "addnode", params);
+  RpcCall(config, "addnode", params, stop_token);
 }
 
 void FiroDriver::DisconnectPeer(const FiroNodeConfig& config,
-                                const std::string& address) const {
+                                const std::string& address,
+                                std::stop_token stop_token) const {
   boost::json::array params;
   params.emplace_back(address);
-  RpcCall(config, "disconnectnode", params);
+  RpcCall(config, "disconnectnode", params, stop_token);
 }
 
 void FiroDriver::ChangeLogVerbosity(const FiroNodeConfig& config,
-                                    ChainLogVerbosityChange change) const {
+                                    ChainLogVerbosityChange change,
+                                    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
   static_cast<void>(config);
   static_cast<void>(change);
   throw UnsupportedChainOperation("Firo", "runtime log verbosity adjustment");
 }
 
-void FiroDriver::StopMining(const FiroNodeConfig& config) const {
+void FiroDriver::SetMiningDifficulty(const FiroNodeConfig& config,
+                                     MiningDifficulty difficulty,
+                                     std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  static_cast<void>(config);
+  static_cast<void>(difficulty);
+  throw UnsupportedChainOperation("Firo regtest",
+                                  "mining difficulty adjustment");
+}
+
+void FiroDriver::StartMining(const FiroNodeConfig& config,
+                             const std::string& reward_address,
+                             std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  static_cast<void>(config);
+  static_cast<void>(reward_address);
+  throw UnsupportedChainOperation("Firo regtest", "native continuous mining");
+}
+
+void FiroDriver::StopMining(const FiroNodeConfig& config,
+                            std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
   static_cast<void>(config);
   throw UnsupportedChainOperation("Firo regtest", "persistent mining stop");
 }
 
-void FiroDriver::SetNetworkActive(const FiroNodeConfig& config,
-                                  bool active) const {
+void FiroDriver::SetNetworkActive(const FiroNodeConfig& config, bool active,
+                                  std::stop_token stop_token) const {
   boost::json::array params;
   params.emplace_back(active);
-  RpcCall(config, "setnetworkactive", params);
+  RpcCall(config, "setnetworkactive", params, stop_token);
 }
 
-void FiroDriver::Stop(const FiroNodeConfig& config) const {
+void FiroDriver::Stop(const FiroNodeConfig& config,
+                      std::stop_token stop_token) const {
   try {
-    RpcCall(config, "stop", boost::json::array{});
+    RpcCall(config, "stop", boost::json::array{}, stop_token);
+  } catch (const SimulationCancelled&) {
+    throw;
   } catch (const std::exception&) {
   }
 }
 
 boost::json::value FiroDriver::RpcCall(const FiroNodeConfig& config,
                                        std::string_view method,
-                                       const boost::json::array& params) const {
+                                       const boost::json::array& params,
+                                       std::stop_token stop_token) const {
   boost::json::object request;
   request["jsonrpc"] = "1.0";
   request["id"] = "benchmark-sim";
   request["method"] = method;
   request["params"] = params;
   const std::string body = boost::json::serialize(request);
-  HttpResponse response = http_.PostJson(Endpoint(config), "/", body);
+  HttpResponse response =
+      http_.PostJson(Endpoint(config), "/", body, stop_token);
   if (response.status != 200) {
     throw std::runtime_error("Firo RPC HTTP status " +
                              std::to_string(response.status) + " for " +

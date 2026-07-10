@@ -2,6 +2,7 @@
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "benchmark_sim/periodic_metrics_collector.h"
@@ -43,4 +44,43 @@ BOOST_AUTO_TEST_CASE(periodic_metrics_collector_propagates_sample_failure) {
                         [](const std::runtime_error& error) {
                           return std::string(error.what()) == "sample failed";
                         });
+}
+
+BOOST_AUTO_TEST_CASE(periodic_metrics_collector_runs_until_external_stop) {
+  std::atomic<std::uint32_t> sample_count = 0U;
+  std::atomic<bool> stop_requested = false;
+  bsim::PeriodicMetricsCollector collector(
+      0U, std::chrono::milliseconds(1),
+      [&sample_count, &stop_requested](std::uint32_t) {
+        if (++sample_count == 3U) {
+          stop_requested = true;
+        }
+      },
+      [&stop_requested] { return stop_requested.load(); });
+
+  collector.Start();
+  collector.Wait();
+
+  BOOST_TEST(sample_count.load() == 3U);
+}
+
+BOOST_AUTO_TEST_CASE(periodic_metrics_collector_external_stop_is_prompt) {
+  std::atomic<std::uint32_t> sample_count = 0U;
+  std::atomic<bool> stop_requested = false;
+  bsim::PeriodicMetricsCollector collector(
+      0U, std::chrono::hours(24),
+      [&sample_count](std::uint32_t) { ++sample_count; },
+      [&stop_requested] { return stop_requested.load(); });
+
+  collector.Start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const auto stop_started = std::chrono::steady_clock::now();
+  stop_requested = true;
+  collector.Wait();
+  const auto stop_duration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - stop_started);
+
+  BOOST_TEST(sample_count.load() == 0U);
+  BOOST_TEST(stop_duration.count() < 500);
 }

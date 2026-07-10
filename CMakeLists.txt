@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 
 project(benchmark_project LANGUAGES C CXX)
 
+# CMake 4 requires an explicit compatibility floor for libyaml's release
+# CMakeLists, which still declares compatibility with CMake 2.8.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
 include(CTest)
 include(ExternalProject)
 
@@ -11,6 +15,7 @@ set(BOOST_INCLUDE_LIBRARIES
   json
   log
   program_options
+  random
   system
   test
 )
@@ -209,6 +214,7 @@ endforeach()
 mark_target_interface_includes_system(yaml)
 
 add_executable(benchmark-sim
+  src/block_production_policy.cpp
   src/capability.cpp
   src/cgroup.cpp
   src/drivers/chain_driver.cpp
@@ -220,11 +226,13 @@ add_executable(benchmark-sim
   src/log_view.cpp
   src/logging.cpp
   src/main.cpp
+  src/mining_difficulty.cpp
   src/network.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
   src/periodic_metrics_collector.cpp
   src/process.cpp
+  src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
   src/simulation_command.cpp
   src/simulation_command_processor.cpp
@@ -232,6 +240,7 @@ add_executable(benchmark-sim
   src/simulation_registry.cpp
   src/simulator_app.cpp
   src/tui.cpp
+  src/tui_command_parser.cpp
   src/util.cpp
   src/yaml_helpers.cpp
 )
@@ -244,6 +253,7 @@ target_link_libraries(benchmark-sim PRIVATE
   Boost::log
   Boost::log_setup
   Boost::program_options
+  Boost::random
   Boost::system
   libcap::cap
   libmnl::libmnl
@@ -260,8 +270,10 @@ target_compile_options(benchmark-sim PRIVATE
 
 if(BUILD_TESTING)
   add_executable(benchmark-sim-unit-tests
+    tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
+    tests/unit/firo_driver_tests.cpp
     tests/unit/log_tail_tests.cpp
     tests/unit/logging_tests.cpp
     tests/unit/network_tests.cpp
@@ -269,26 +281,34 @@ if(BUILD_TESTING)
     tests/unit/no_shellout_tests.cpp
     tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/process_tests.cpp
+    tests/unit/probabilistic_block_scheduler_tests.cpp
     tests/unit/run_report_tests.cpp
     tests/unit/simulation_command_processor_tests.cpp
     tests/unit/simulation_command_queue_tests.cpp
     tests/unit/simulation_registry_tests.cpp
+    tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
+    src/block_production_policy.cpp
     src/simulation_command.cpp
     src/drivers/chain_driver.cpp
+    src/drivers/firo_driver.cpp
+    src/http_client.cpp
     src/log_tail.cpp
     src/log_view.cpp
     src/logging.cpp
+    src/mining_difficulty.cpp
     src/network.cpp
     src/node_log_pane.cpp
     src/periodic_metrics_collector.cpp
     src/process.cpp
+    src/probabilistic_block_scheduler.cpp
     src/run_report.cpp
     src/simulation_command_processor.cpp
     src/simulation_command_queue.cpp
     src/simulation_registry.cpp
+    src/tui_command_parser.cpp
     src/util.cpp
   )
   target_include_directories(benchmark-sim-unit-tests PRIVATE include)
@@ -296,10 +316,14 @@ if(BUILD_TESTING)
     BENCHMARK_SIM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   )
   target_link_libraries(benchmark-sim-unit-tests PRIVATE
+    Boost::asio
+    Boost::beast
     Boost::json
     Boost::log
     Boost::log_setup
+    Boost::random
     Boost::unit_test_framework
+    Boost::system
     libcap::cap
     libmnl::libmnl
   )
@@ -380,6 +404,16 @@ if(BUILD_TESTING)
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-resource-pressure-scenario.json"
       --probe-capabilities
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-legacy-generate-blocks
+    tests/scenarios/invalid-legacy-generate-blocks.json
+    "scenario generate_blocks was removed"
+  )
+  add_cli_failure_test(
+    benchmark-sim-invalid-block-production-without-miner
+    tests/scenarios/invalid-block-production-without-miner.json
+    "enabled block production requires at least one configured miner"
   )
   add_test(NAME benchmark-sim-benchmark-root-option
     COMMAND benchmark-sim

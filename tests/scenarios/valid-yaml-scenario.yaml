@@ -3,7 +3,8 @@ output_dir: "runs"
 run_id: "yaml-scenario-smoke"
 nodes: 2
 isolated_network: true
-generate_blocks: 0
+block_production:
+  enabled: false
 generate_node: null
 ready_timeout_sec: 5
 sync_timeout_sec: null

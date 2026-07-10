@@ -24,8 +24,10 @@ the Firo path is working end to end.
 - Freeze and thaw a running Firo node cgroup before workload generation or as
   an ordered workload.
 - Wait for JSON-RPC readiness.
-- Generate regtest blocks.
-- Wait for generated blocks to propagate before final metrics are recorded.
+- Produce regtest blocks through a reproducible global Bernoulli scheduler,
+  selecting one configured miner uniformly after each successful draw.
+- Wait for blocks from explicit generation workloads to propagate before those
+  workloads complete.
 - Record optional periodic metric samples concurrently with wallet setup,
   runtime events, and workloads.
 - Record cgroup usage, pressure, event counters, and configured limits.
@@ -94,12 +96,15 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
-     --firod "$FIROD" \
+     --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id smoke1 \
      --replace-run \
      --nodes 1 \
-     --generate-blocks 1 \
+     --block-production-probability 1 \
+     --block-production-period-ms 250 \
+     --metrics-sample-count 4 \
+     --metrics-interval-ms 250 \
      --ready-timeout-sec 45'
 ```
 
@@ -110,12 +115,15 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
-     --firod "$FIROD" \
+     --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id smoke3 \
      --replace-run \
      --nodes 3 \
-     --generate-blocks 1 \
+     --block-production-probability 1 \
+     --block-production-period-ms 250 \
+     --metrics-sample-count 4 \
+     --metrics-interval-ms 250 \
      --generate-node 2 \
      --ready-timeout-sec 45 \
      --sync-timeout-sec 45'
@@ -128,12 +136,15 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
-     --firod "$FIROD" \
+     --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-smoke \
      --replace-run \
      --nodes 3 \
-     --generate-blocks 1 \
+     --block-production-probability 1 \
+     --block-production-period-ms 250 \
+     --metrics-sample-count 4 \
+     --metrics-interval-ms 250 \
      --ready-timeout-sec 45 \
      --sync-timeout-sec 45 \
      --isolate-network'
@@ -146,12 +157,15 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
-     --firod "$FIROD" \
+     --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-delay \
      --replace-run \
      --nodes 1 \
-     --generate-blocks 1 \
+     --block-production-probability 1 \
+     --block-production-period-ms 250 \
+     --metrics-sample-count 4 \
+     --metrics-interval-ms 250 \
      --ready-timeout-sec 45 \
      --isolate-network \
      --network-delay-ms 5'
@@ -164,12 +178,15 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/benchmark-sim \
-     --firod "$FIROD" \
+     --chain-daemon "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-bandwidth \
      --replace-run \
      --nodes 1 \
-     --generate-blocks 1 \
+     --block-production-probability 1 \
+     --block-production-period-ms 250 \
+     --metrics-sample-count 4 \
+     --metrics-interval-ms 250 \
      --ready-timeout-sec 45 \
      --isolate-network \
      --network-bandwidth-mbps 20'
@@ -179,27 +196,33 @@ Per-node isolated network conditions use repeatable JSON objects:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id isolated-per-node \
   --replace-run \
   --nodes 2 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --isolate-network \
   --node-network-condition-json '{"node":2,"bandwidth_mbps":20}'
 ```
 
 Runtime network updates use the same JSON shape and are applied after nodes are
-running, before block generation:
+running, while scheduled block production and metrics collection continue:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-netem \
   --replace-run \
   --nodes 2 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --isolate-network \
   --runtime-node-network-condition-json '{"node":2,"bandwidth_mbps":10}'
 ```
@@ -207,16 +230,19 @@ running, before block generation:
 Runtime block/unblock rules match a destination IPv4 address and TCP port on a
 node's host-side veth. Add `src_address` when the rule should only match one
 source node. This example applies and then removes the same source-scoped rule
-before block generation:
+while scheduled block production and metrics collection continue:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-block-unblock \
   --replace-run \
   --nodes 2 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --isolate-network \
   --runtime-node-block-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}' \
   --runtime-node-unblock-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}'
@@ -227,12 +253,15 @@ cross-group P2P block rules in both directions:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-partition-heal \
   --replace-run \
   --nodes 3 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --isolate-network \
   --runtime-partition-json '{"group_a":[1,2],"group_b":[3]}' \
   --runtime-heal-partition-json '{"group_a":[1,2],"group_b":[3]}'
@@ -248,12 +277,15 @@ Default resource limits apply to each node cgroup:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id resource-smoke \
   --replace-run \
   --nodes 1 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --memory-high-bytes 1073741824 \
   --memory-max-bytes 1610612736 \
   --cpu-quota-us 75000 \
@@ -267,12 +299,15 @@ restores unlimited CPU quota.
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id live-resources \
   --replace-run \
   --nodes 1 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --runtime-node-resource-json '{"node":1,"memory_high_bytes":1073741824,"cpu_quota_us":50000,"cpu_period_us":100000,"pids_max":128}'
 ```
 
@@ -281,12 +316,15 @@ cgroup/network/data directory, wait for RPC readiness, then continue the run:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id restart-smoke \
   --replace-run \
   --nodes 1 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --runtime-node-restart-json '{"node":1}'
 ```
 
@@ -295,27 +333,31 @@ thawed states, then continue the run:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id freeze-smoke \
   --replace-run \
   --nodes 1 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
+  --metrics-sample-count 4 \
+  --metrics-interval-ms 250 \
   --runtime-node-freeze-json '{"node":1,"duration_ms":100}'
 ```
 
 Extra metric samples can be collected while runtime updates, restarts, and
-block generation execute. The nodes remain active until the requested sample
-count is complete:
+scheduled block production execute. The nodes remain active until the requested
+sample count is complete:
 
 ```bash
 ./build/benchmark-sim \
-  --firod "$FIROD" \
+  --chain-daemon "$FIROD" \
   --benchmark-root runs \
   --run-id sampled-smoke \
   --replace-run \
   --nodes 1 \
-  --generate-blocks 1 \
+  --block-production-probability 1 \
+  --block-production-period-ms 250 \
   --metrics-sample-count 5 \
   --metrics-interval-ms 1000
 ```
@@ -323,19 +365,34 @@ count is complete:
 Temporary chain RPC unavailability during restart or freeze is recorded as a
 `metrics_node_unavailable` event for that node. Remaining nodes and later
 samples continue; storage and internal collection failures still fail the run.
+The default `--metrics-sample-count 0` keeps metrics and scheduled block
+production running until the integrated TUI exits. Headless runs that must
+finish automatically should pass a positive sample count. `--no-mining`
+disables scheduled production without disabling metrics.
+`generated_block_count` counts blocks explicitly requested by the simulator;
+native-mining output is reflected in chain height and is not attributed to a
+specific miner unless that chain driver can report the attribution.
 
 The same run settings can be loaded from a JSON or YAML scenario file. Both
 formats use the same field names and validation rules.
 
 ```json
 {
-  "firod": "/path/to/firod",
+  "chain_daemon": "/path/to/firod",
   "output_dir": "runs",
   "run_id": "scenario-smoke",
   "nodes": 3,
   "ready_timeout_sec": 45,
   "metrics_sample_count": 5,
   "metrics_interval_ms": 1000,
+  "block_production": {
+    "enabled": true,
+    "native_mining": false,
+    "period_ms": 1000,
+    "probability": 0.5,
+    "seed": 7,
+    "difficulty": null
+  },
   "workloads": [
     {
       "type": "wait_for_peers",
@@ -472,8 +529,9 @@ The equivalent YAML entry point is:
 Wallet and miner roles can be declared in the scenario topology. Counts resolve
 deterministically to concrete node lists; explicit `wallet_nodes` and
 `miner_nodes` may be used when a scenario needs fixed assignments. If a
-scenario has miners and does not set `generate_node`, block generation defaults
-to the first resolved miner node.
+scenario has miners, each successful global block-production draw selects one
+active miner uniformly. Without a topology, `generate_node` identifies the
+single default miner.
 
 ```json
 {

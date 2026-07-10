@@ -3,7 +3,14 @@
   "output_dir": "runs",
   "run_id": "role-topology-smoke",
   "node_count": 3,
-  "generate_blocks": 0,
+  "block_production": {
+    "enabled": true,
+    "native_mining": false,
+    "period_ms": 1000,
+    "probability": 0.5,
+    "seed": 7,
+    "difficulty": null
+  },
   "topology": {
     "node_count": 3,
     "wallet_node_count": 2,

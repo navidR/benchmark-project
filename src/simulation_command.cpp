@@ -14,6 +14,12 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "stop_mining";
     case SimulationCommandKind::kDisconnectNode:
       return "disconnect_node";
+    case SimulationCommandKind::kReconnectNode:
+      return "reconnect_node";
+    case SimulationCommandKind::kSetBlockProductionPolicy:
+      return "set_block_production_policy";
+    case SimulationCommandKind::kSetMiningDifficulty:
+      return "set_mining_difficulty";
     case SimulationCommandKind::kKillNode:
       return "kill_node";
   }

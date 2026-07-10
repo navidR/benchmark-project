@@ -8,6 +8,7 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
+#include <cctype>
 #include <chrono>
 #include <clocale>
 #include <cstdint>
@@ -23,6 +24,7 @@
 #include "benchmark_sim/node_log_pane.h"
 #include "benchmark_sim/run_report.h"
 #include "benchmark_sim/simulation_command_queue.h"
+#include "benchmark_sim/tui_command_parser.h"
 
 namespace bsim {
 namespace {
@@ -42,6 +44,9 @@ struct TuiState {
   std::uint64_t last_command_result_sequence = 0;
   bool command_error_open = false;
   std::string command_error;
+  bool command_palette_open = false;
+  std::string command_input;
+  std::string command_input_error;
 };
 
 class CursesSession {
@@ -536,6 +541,42 @@ void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
           COLOR_PAIR(kColorMuted));
 }
 
+void DrawCommandPalette(int rows, int cols, std::string_view input,
+                        std::string_view error) {
+  constexpr int kPopupRows = 10;
+  if (rows < kPopupRows + 2 || cols < 48) {
+    return;
+  }
+  const int popup_cols = std::min(cols - 4, 78);
+  const int top = (rows - kPopupRows) / 2;
+  const int left = (cols - popup_cols) / 2;
+  for (int row = 0; row < kPopupRows; ++row) {
+    mvhline(top + row, left, ' ', popup_cols);
+  }
+  mvhline(top, left + 1, ACS_HLINE, popup_cols - 2);
+  mvhline(top + kPopupRows - 1, left + 1, ACS_HLINE, popup_cols - 2);
+  mvvline(top + 1, left, ACS_VLINE, kPopupRows - 2);
+  mvvline(top + 1, left + popup_cols - 1, ACS_VLINE, kPopupRows - 2);
+  mvaddch(top, left, ACS_ULCORNER);
+  mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
+  mvaddch(top + kPopupRows - 1, left, ACS_LLCORNER);
+  mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
+  AddText(top + 1, left + 2, popup_cols - 4, "Node command", A_BOLD);
+  AddText(top + 2, left + 2, popup_cols - 4,
+          "block-production <probability> <period-ms>");
+  AddText(top + 3, left + 2, popup_cols - 4, "mining-difficulty <value>");
+  AddText(top + 4, left + 2, popup_cols - 4,
+          "stop-mining  disconnect  reconnect  log-more  log-less");
+  AddText(top + 6, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+          A_BOLD);
+  if (!error.empty()) {
+    AddText(top + 7, left + 2, popup_cols - 4, error,
+            COLOR_PAIR(kColorWarning));
+  }
+  AddText(top + 8, left + 2, popup_cols - 4,
+          "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
+}
+
 void AddDetailPair(int y, int x, int width, std::string_view label,
                    std::string_view value) {
   if (width <= 0) {
@@ -662,7 +703,9 @@ void DrawSummary(const std::filesystem::path& run_root,
                  const std::vector<std::string>& log_lines,
                  std::size_t selected_node, const NodeLogPane& node_log_pane,
                  std::string_view command_status, bool command_error_open,
-                 std::string_view command_error) {
+                 std::string_view command_error, bool command_palette_open,
+                 std::string_view command_input,
+                 std::string_view command_input_error) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -705,10 +748,24 @@ void DrawSummary(const std::filesystem::path& run_root,
   AddText(
       6, cols / 2, cols - (cols / 2),
       "wallets: " + std::to_string(wallets == nullptr ? 0U : wallets->size()));
+  const boost::json::value* block_production_value =
+      report.if_contains("block_production");
+  const boost::json::object empty_block_production;
+  const boost::json::object& block_production =
+      block_production_value != nullptr && block_production_value->is_object()
+          ? block_production_value->as_object()
+          : empty_block_production;
+  const bool block_production_enabled =
+      JsonBoolText(block_production, "enabled", "false") == "true";
+  const bool native_mining =
+      JsonBoolText(block_production, "native_mining", "false") == "true";
   AddText(7, 0, cols / 2,
-          "generate node: " + JsonIntegerText(report, "generate_node"));
+          "mining: " + std::string(!block_production_enabled ? "disabled"
+                                   : native_mining           ? "native"
+                                                             : "scheduled"));
   AddText(7, cols / 2, cols - (cols / 2),
-          "generate blocks: " + JsonIntegerText(report, "generate_blocks"));
+          "block draw: p=" + JsonMetricText(block_production, "probability") +
+              " / " + JsonIntegerText(block_production, "period_ms") + "ms");
   AddText(8, 0, cols, LifecycleSummaryText(report));
   AddText(9, 0, cols, WorkloadsSummaryText(report));
 
@@ -807,11 +864,14 @@ void DrawSummary(const std::filesystem::path& run_root,
   footer += node_log_pane.IsOpen()
                 ? "Node log: arrows/PgUp/PgDn/Home/End scroll. +/- verbosity. "
                   "l closes. q exits."
-                : "Arrows select. l node log. s stop mining. d disconnect. q "
-                  "or Esc exits.";
+                : "Arrows select. l log. c command. s stop mining. d/r "
+                  "disconnect/reconnect. q or Esc exits.";
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
     DrawCommandErrorPopup(rows, cols, command_error);
+  }
+  if (command_palette_open) {
+    DrawCommandPalette(rows, cols, command_input, command_input_error);
   }
   refresh();
 }
@@ -827,6 +887,110 @@ std::size_t CurrentNodeLogVisibleRows() {
   const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
   const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
   return static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
+}
+
+std::uint64_t BlockProductionSeed(const boost::json::object& report) {
+  const boost::json::value* value = report.if_contains("block_production");
+  if (value == nullptr || !value->is_object()) {
+    return 0U;
+  }
+  return JsonUnsignedMetric(value->as_object(), "seed").value_or(0U);
+}
+
+bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
+                            const boost::json::object& report,
+                            SimulationCommandQueue* command_queue,
+                            TuiState* state) {
+  if (command_queue == nullptr) {
+    state->command_input_error =
+        "Live commands are unavailable in report mode.";
+    return false;
+  }
+
+  try {
+    std::uint64_t sequence = 0U;
+    std::string target = "the simulation";
+    if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
+      if (!parsed.block_production_policy) {
+        throw std::runtime_error("block production policy is missing");
+      }
+      sequence = command_queue->PushBlockProductionPolicy(
+          *parsed.block_production_policy);
+    } else {
+      const boost::json::array* nodes = NodeSummaries(report);
+      const boost::json::object* node =
+          nodes == nullptr ? nullptr : NodeAt(*nodes, state->selected_node);
+      if (node == nullptr) {
+        state->command_input_error = "No node is selected.";
+        return false;
+      }
+      const std::string node_id = JsonString(*node, "node_id");
+      target = node_id;
+      if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
+        if (!parsed.mining_difficulty) {
+          throw std::runtime_error("mining difficulty is missing");
+        }
+        sequence = command_queue->PushMiningDifficulty(
+            node_id, *parsed.mining_difficulty);
+      } else {
+        sequence = command_queue->Push(parsed.kind, node_id);
+      }
+    }
+    state->command_status =
+        "Queued #" + std::to_string(sequence) + " " +
+        std::string(SimulationCommandKindName(parsed.kind)) + " for " + target +
+        ".";
+    state->command_input_error.clear();
+    return true;
+  } catch (const std::exception& error) {
+    state->command_input_error =
+        "Command rejected: " + std::string(error.what());
+    return false;
+  }
+}
+
+bool HandleCommandPaletteInput(int ch, const boost::json::object& report,
+                               SimulationCommandQueue* command_queue,
+                               TuiState* state) {
+  if (ch == 27) {
+    state->command_palette_open = false;
+    state->command_input.clear();
+    state->command_input_error.clear();
+    return true;
+  }
+  if (ch == '\n' || ch == KEY_ENTER) {
+    try {
+      const ParsedTuiCommand parsed = TuiCommandParser::Parse(
+          state->command_input, BlockProductionSeed(report));
+      if (QueueParsedNodeCommand(parsed, report, command_queue, state)) {
+        state->command_palette_open = false;
+        state->command_input.clear();
+      }
+    } catch (const std::exception& error) {
+      state->command_input_error = error.what();
+    }
+    return true;
+  }
+  if (ch == '\t') {
+    state->command_input = TuiCommandParser::Complete(state->command_input);
+    state->command_input_error.clear();
+    return true;
+  }
+  if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+    if (!state->command_input.empty()) {
+      state->command_input.pop_back();
+    }
+    state->command_input_error.clear();
+    return true;
+  }
+  if (ch >= 0 && ch <= 255 &&
+      std::isprint(static_cast<unsigned char>(ch)) != 0 &&
+      state->command_input.size() < 128U) {
+    state->command_input.push_back(static_cast<char>(ch));
+    state->command_input_error.clear();
+    return true;
+  }
+  return ch != ERR;
 }
 
 bool QueueSelectedNodeCommand(SimulationCommandKind kind,
@@ -859,6 +1023,9 @@ bool QueueSelectedNodeCommand(SimulationCommandKind kind,
 
 bool HandleInput(int ch, const boost::json::object& report,
                  SimulationCommandQueue* command_queue, TuiState* state) {
+  if (state->command_palette_open) {
+    return HandleCommandPaletteInput(ch, report, command_queue, state);
+  }
   if (state->command_error_open) {
     if (ch == '\n' || ch == KEY_ENTER || ch == 27) {
       state->command_error_open = false;
@@ -879,12 +1046,23 @@ bool HandleInput(int ch, const boost::json::object& report,
     return true;
   }
 
+  if (ch == 'c' || ch == 'C') {
+    state->command_palette_open = true;
+    state->command_input.clear();
+    state->command_input_error.clear();
+    return true;
+  }
+
   if (ch == 's' || ch == 'S') {
     return QueueSelectedNodeCommand(SimulationCommandKind::kStopMining, report,
                                     command_queue, state);
   }
   if (ch == 'd' || ch == 'D') {
     return QueueSelectedNodeCommand(SimulationCommandKind::kDisconnectNode,
+                                    report, command_queue, state);
+  }
+  if (ch == 'r' || ch == 'R') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kReconnectNode,
                                     report, command_queue, state);
   }
 
@@ -951,7 +1129,9 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         ReadRecentLogLines(RunLogPath(run_root), 256U);
     DrawSummary(run_root, report, error, log_lines, state.selected_node,
                 state.node_log_pane, state.command_status,
-                state.command_error_open, state.command_error);
+                state.command_error_open, state.command_error,
+                state.command_palette_open, state.command_input,
+                state.command_input_error);
     if (once) {
       return error.empty() ? 0 : 1;
     }

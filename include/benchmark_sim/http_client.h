@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <stop_token>
 #include <string>
 #include <string_view>
 
@@ -24,7 +25,8 @@ class HttpClient {
   explicit HttpClient(std::chrono::milliseconds timeout) : timeout_(timeout) {}
 
   HttpResponse PostJson(const RpcEndpoint& endpoint, std::string_view path,
-                        std::string_view body) const;
+                        std::string_view body,
+                        std::stop_token stop_token = {}) const;
 
  private:
   std::chrono::milliseconds timeout_;

@@ -36,7 +36,7 @@ void SimulationCommandProcessor::Stop() {
   if (!started_) {
     return;
   }
-  queue_.Close();
+  queue_.Cancel();
   if (thread_.joinable()) {
     thread_.join();
   }

@@ -61,9 +61,43 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_closes_waiting_consumer) {
       std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_cancel_discards_pending_commands) {
+  bsim::SimulationCommandQueue queue;
+  queue.Push(bsim::SimulationCommandKind::kDisconnectNode, "firo-1");
+  queue.Push(bsim::SimulationCommandKind::kKillNode, "firo-2");
+
+  queue.Cancel();
+
+  BOOST_TEST(queue.IsClosed());
+  BOOST_TEST(!queue.TryPop());
+  BOOST_TEST(!queue.WaitPop());
+  BOOST_CHECK_THROW(
+      queue.Push(bsim::SimulationCommandKind::kKillNode, "firo-3"),
+      std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_rejects_empty_node_id) {
   bsim::SimulationCommandQueue queue;
   BOOST_CHECK_THROW(
       queue.Push(bsim::SimulationCommandKind::kKillNode, std::string{}),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
+  bsim::SimulationCommandQueue queue;
+  queue.PushBlockProductionPolicy(
+      bsim::BlockProductionPolicy(std::chrono::seconds(2), 0.25, 8U));
+  queue.PushMiningDifficulty("firo-2", bsim::MiningDifficulty(3.0));
+
+  const std::optional<bsim::SimulationCommand> policy = queue.TryPop();
+  const std::optional<bsim::SimulationCommand> difficulty = queue.TryPop();
+  BOOST_REQUIRE(policy);
+  BOOST_TEST(policy->node_id == "sim");
+  BOOST_REQUIRE(policy->block_production_policy);
+  BOOST_TEST(policy->block_production_policy->period().count() == 2000);
+  BOOST_TEST(policy->block_production_policy->probability() == 0.25);
+  BOOST_REQUIRE(difficulty);
+  BOOST_REQUIRE(difficulty->mining_difficulty);
+  BOOST_TEST(difficulty->mining_difficulty->value() == 3.0);
 }

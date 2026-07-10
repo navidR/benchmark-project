@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "benchmark_sim/block_production_config.h"
 #include "benchmark_sim/network.h"
 #include "benchmark_sim/simulation_registry.h"
 #include "benchmark_sim/simulator/freeze_request.h"
@@ -26,7 +27,6 @@ struct Options {
   std::filesystem::path tui_run;
   std::string run_id = MakeRunId();
   std::uint32_t nodes = 1;
-  std::uint32_t generate_blocks = 1;
   std::uint32_t generate_node = 1;
   std::uint32_t ready_timeout_sec = 30;
   std::uint32_t sync_timeout_sec = 30;
@@ -84,6 +84,7 @@ struct Options {
   bool probe_network = false;
   NodeRoleTopology topology;
   WalletInitialization wallet_initialization;
+  BlockProductionConfig block_production;
 };
 
 }  // namespace bsim

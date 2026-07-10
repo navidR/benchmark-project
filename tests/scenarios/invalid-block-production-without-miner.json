@@ -1,0 +1,12 @@
+{
+  "nodes": 2,
+  "block_production": {
+    "enabled": true
+  },
+  "topology": {
+    "node_count": 2,
+    "wallet_node_count": 1,
+    "miner_node_count": 0,
+    "allow_miner_wallet_overlap": false
+  }
+}

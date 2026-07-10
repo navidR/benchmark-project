@@ -5,6 +5,7 @@
 #include <yaml.h>
 
 #include <algorithm>
+#include <atomic>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
@@ -12,6 +13,7 @@
 #include <boost/program_options.hpp>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -23,6 +25,7 @@
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -38,8 +41,10 @@
 #include "benchmark_sim/network.h"
 #include "benchmark_sim/node_log_collector.h"
 #include "benchmark_sim/periodic_metrics_collector.h"
+#include "benchmark_sim/probabilistic_block_scheduler.h"
 #include "benchmark_sim/process.h"
 #include "benchmark_sim/run_report.h"
+#include "benchmark_sim/simulation_cancelled.h"
 #include "benchmark_sim/simulation_command_processor.h"
 #include "benchmark_sim/simulation_command_queue.h"
 #include "benchmark_sim/simulation_registry.h"
@@ -54,6 +59,22 @@ namespace bsim {
 namespace {
 
 std::mutex node_network_state_mutex;
+
+void ThrowIfStopRequested(std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw SimulationCancelled();
+  }
+}
+
+void WaitForDuration(std::chrono::milliseconds duration,
+                     std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
+  std::condition_variable_any condition;
+  std::mutex mutex;
+  std::unique_lock<std::mutex> lock(mutex);
+  condition.wait_for(lock, stop_token, duration, [] { return false; });
+  ThrowIfStopRequested(stop_token);
+}
 
 uint32_t JsonUint32Field(const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
@@ -115,6 +136,33 @@ uint64_t JsonOptionalUint64Field(const boost::json::object& object,
     return static_cast<uint64_t>(value->as_int64());
   }
   throw std::runtime_error("invalid uint64 JSON field: " + std::string(field));
+}
+
+double JsonOptionalDoubleField(const boost::json::object& object,
+                               const char* field, double default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return default_value;
+  }
+  if (value->is_double()) {
+    return value->as_double();
+  }
+  if (value->is_uint64()) {
+    return static_cast<double>(value->as_uint64());
+  }
+  if (value->is_int64()) {
+    return static_cast<double>(value->as_int64());
+  }
+  throw std::runtime_error("invalid numeric JSON field: " + std::string(field));
+}
+
+std::optional<double> JsonOptionalNullableDoubleField(
+    const boost::json::object& object, const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || value->is_null()) {
+    return std::nullopt;
+  }
+  return JsonOptionalDoubleField(object, field, 0.0);
 }
 
 uint64_t JsonUint64Field(const boost::json::object& object, const char* field) {
@@ -1054,11 +1102,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
             "current MVP block_generation workload uses node, not nodes");
       }
       BlockGenerationWorkload block_generation;
-      block_generation.count =
-          OptionProvided(vm, "generate-blocks")
-              ? options.generate_blocks
-              : JsonOptionalUint32Field(workload, "count",
-                                        options.generate_blocks);
+      block_generation.count = JsonUint32Field(workload, "count");
       block_generation.node =
           OptionProvided(vm, "generate-node")
               ? options.generate_node
@@ -1285,6 +1329,11 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
 void ApplyScenarioJson(const boost::json::object& scenario,
                        const boost::program_options::variables_map& vm,
                        Options& options) {
+  if (scenario.if_contains("generate_blocks") != nullptr) {
+    throw std::runtime_error(
+        "scenario generate_blocks was removed; use block_production.enabled "
+        "or an explicit block_generation workload");
+  }
   const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
   const bool chain_daemon_provided =
       OptionProvided(vm, "chain-daemon") ||
@@ -1338,13 +1387,58 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       options.generate_node = options.topology.miner_nodes.front() + 1U;
     }
   }
-  if (!OptionProvided(vm, "generate-blocks")) {
-    options.generate_blocks = JsonOptionalUint32Field(
-        scenario, "generate_blocks", options.generate_blocks);
-  }
   if (!OptionProvided(vm, "generate-node")) {
     options.generate_node = JsonOptionalNullableUint32Field(
         scenario, "generate_node", options.generate_node);
+  }
+  const boost::json::value* block_production =
+      scenario.if_contains("block_production");
+  if (block_production != nullptr) {
+    if (!block_production->is_object()) {
+      throw std::runtime_error(
+          "scenario block_production must be a JSON object");
+    }
+    const boost::json::object& object = block_production->as_object();
+    if (!OptionProvided(vm, "no-mining")) {
+      options.block_production.enabled = JsonOptionalBoolField(
+          object, "enabled", options.block_production.enabled);
+    }
+    if (!OptionProvided(vm, "native-mining")) {
+      options.block_production.mode =
+          JsonOptionalBoolField(object, "native_mining", false)
+              ? MiningMode::kNativeMining
+              : MiningMode::kScheduledBlockProduction;
+    }
+    const std::uint32_t period_ms =
+        OptionProvided(vm, "block-production-period-ms")
+            ? static_cast<std::uint32_t>(
+                  options.block_production.policy.period().count())
+            : JsonOptionalUint32Field(
+                  object, "period_ms",
+                  static_cast<std::uint32_t>(
+                      options.block_production.policy.period().count()));
+    const double probability =
+        OptionProvided(vm, "block-production-probability")
+            ? options.block_production.policy.probability()
+            : JsonOptionalDoubleField(
+                  object, "probability",
+                  options.block_production.policy.probability());
+    const std::uint64_t seed =
+        OptionProvided(vm, "block-production-seed")
+            ? options.block_production.policy.seed()
+            : JsonOptionalUint64Field(object, "seed",
+                                      options.block_production.policy.seed());
+    options.block_production.policy = BlockProductionPolicy(
+        std::chrono::milliseconds(period_ms), probability, seed);
+    if (!OptionProvided(vm, "mining-difficulty") &&
+        object.if_contains("difficulty") != nullptr) {
+      const std::optional<double> difficulty =
+          JsonOptionalNullableDoubleField(object, "difficulty");
+      options.block_production.difficulty =
+          difficulty
+              ? std::optional<MiningDifficulty>(MiningDifficulty(*difficulty))
+              : std::nullopt;
+    }
   }
   if (!OptionProvided(vm, "ready-timeout-sec")) {
     options.ready_timeout_sec = JsonOptionalUint32Field(
@@ -1776,6 +1870,12 @@ Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
   Options options;
   const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
+  std::uint32_t block_production_period_ms = 1000U;
+  double block_production_probability = 0.5;
+  std::uint64_t block_production_seed = 0U;
+  double mining_difficulty = 1.0;
+  bool no_mining = false;
+  bool native_mining = false;
 
   const std::string nodes_help =
       "chain regtest nodes, 1.." + std::to_string(chain_spec.max_nodes);
@@ -1808,21 +1908,34 @@ Options ParseOptions(int argc, char** argv) {
       "refresh-ms", po::value<std::uint32_t>(&options.tui_refresh_ms),
       "milliseconds between integrated TUI report refreshes")(
       "nodes", po::value<uint32_t>(&options.nodes), nodes_help.c_str())(
-      "generate-blocks", po::value<uint32_t>(&options.generate_blocks),
-      "blocks generated on --generate-node")(
       "generate-node", po::value<uint32_t>(&options.generate_node),
-      "1-based node number that generates blocks")(
+      "default 1-based miner node when no topology is configured")(
+      "no-mining", po::bool_switch(&no_mining),
+      "disable scheduled block production")(
+      "native-mining", po::bool_switch(&native_mining),
+      "use the chain's native continuous miner instead of scheduled block "
+      "production")(
+      "block-production-period-ms",
+      po::value<std::uint32_t>(&block_production_period_ms),
+      "milliseconds between global Bernoulli block-production draws")(
+      "block-production-probability",
+      po::value<double>(&block_production_probability),
+      "probability in [0,1] of producing one block at each draw")(
+      "block-production-seed", po::value<std::uint64_t>(&block_production_seed),
+      "reproducible global Bernoulli scheduler seed")(
+      "mining-difficulty", po::value<double>(&mining_difficulty),
+      "chain-specific mining difficulty requested for configured miners")(
       "ready-timeout-sec", po::value<uint32_t>(&options.ready_timeout_sec),
       "RPC startup timeout")("sync-timeout-sec",
                              po::value<uint32_t>(&options.sync_timeout_sec),
                              "block propagation timeout")(
       "metrics-sample-count",
       po::value<uint32_t>(&options.metrics_sample_count),
-      "extra metric samples to collect after runtime events and before "
-      "workload generation")("metrics-interval-ms",
-                             po::value<uint32_t>(&options.metrics_interval_ms),
-                             "milliseconds between metric and node-log "
-                             "samples")(
+      "periodic metric samples collected concurrently with workloads and "
+      "block production")("metrics-interval-ms",
+                          po::value<uint32_t>(&options.metrics_interval_ms),
+                          "milliseconds between metric and node-log "
+                          "samples")(
       "memory-high-bytes", po::value<uint64_t>(&options.memory_high_bytes),
       "cgroup memory.high soft pressure threshold in bytes")(
       "memory-max-bytes", po::value<uint64_t>(&options.memory_max_bytes),
@@ -1959,6 +2072,17 @@ Options ParseOptions(int argc, char** argv) {
   po::store(po::parse_command_line(argc, argv, desc), vm);
   po::notify(vm);
 
+  options.block_production.enabled = !no_mining;
+  options.block_production.mode = native_mining
+                                      ? MiningMode::kNativeMining
+                                      : MiningMode::kScheduledBlockProduction;
+  options.block_production.policy = BlockProductionPolicy(
+      std::chrono::milliseconds(block_production_period_ms),
+      block_production_probability, block_production_seed);
+  if (OptionProvided(vm, "mining-difficulty")) {
+    options.block_production.difficulty = MiningDifficulty(mining_difficulty);
+  }
+
   if (vm.count("help") != 0U) {
     BSIM_LOG(info) << "Usage: " << argv[0] << " [options]\n" << desc;
     std::exit(0);
@@ -1983,6 +2107,10 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (vm.count("run") == 0U && OptionProvided(vm, "once")) {
     throw std::runtime_error("--once requires --run");
+  }
+  if (no_mining && native_mining) {
+    throw std::runtime_error(
+        "--no-mining and --native-mining are mutually exclusive");
   }
   if (options.tui_refresh_ms == 0U) {
     throw std::runtime_error("--refresh-ms must be greater than zero");
@@ -2218,6 +2346,11 @@ Options ParseOptions(int argc, char** argv) {
   if (options.topology.configured) {
     SimulationRegistry::FromTopology(options.topology,
                                      options.wallet_initialization);
+    if (options.block_production.enabled &&
+        options.topology.miner_nodes.empty()) {
+      throw std::runtime_error(
+          "enabled block production requires at least one configured miner");
+    }
   }
   ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
@@ -3320,7 +3453,8 @@ void WriteMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
     const NodeMetricsFailureHandler& node_failure_handler = {},
-    const MetricsStopRequested& stop_requested = {}) {
+    const MetricsStopRequested& stop_requested = {},
+    std::stop_token stop_token = {}) {
   const std::vector<LinkInfo> links = ListNetworkLinks();
   const std::vector<QdiscInfo> qdiscs = ListQdiscs();
   for (auto& node : nodes) {
@@ -3329,7 +3463,7 @@ void WriteMetricsSnapshot(
     }
     ChainMetrics chain;
     try {
-      chain = driver.ReadMetrics(node.config);
+      chain = driver.ReadMetrics(node.config, stop_token);
     } catch (const std::exception& error) {
       if (!node_failure_handler) {
         throw;
@@ -3511,28 +3645,7 @@ std::string YamlFromJson(const boost::json::value& value) {
 }
 
 std::vector<ScenarioWorkload> EffectiveWorkloads(const Options& options) {
-  if (options.workloads_configured) {
-    return options.workloads;
-  }
-  BlockGenerationWorkload workload;
-  workload.node = options.generate_node;
-  workload.count = options.generate_blocks;
-  workload.sync_timeout_sec = options.sync_timeout_sec;
-  ScenarioWorkload scenario_workload;
-  scenario_workload.kind = WorkloadKind::kBlockGeneration;
-  scenario_workload.block_generation = workload;
-  return {scenario_workload};
-}
-
-uint64_t TotalBlockGenerationCount(
-    const std::vector<ScenarioWorkload>& workloads) {
-  uint64_t total = 0;
-  for (const ScenarioWorkload& workload : workloads) {
-    if (workload.kind == WorkloadKind::kBlockGeneration) {
-      total += workload.block_generation.count;
-    }
-  }
-  return total;
+  return options.workloads;
 }
 
 std::optional<uint32_t> CommonBlockGenerationNode(
@@ -3743,7 +3856,6 @@ void WriteScenarioFiles(const Options& options,
   resolved["run_id"] = options.run_id;
   resolved["chain"] = chain_spec.name;
   resolved["nodes"] = options.nodes;
-  resolved["generate_blocks"] = TotalBlockGenerationCount(workloads);
   if (const std::optional<uint32_t> generate_node =
           CommonBlockGenerationNode(workloads)) {
     resolved["generate_node"] = *generate_node;
@@ -3767,6 +3879,22 @@ void WriteScenarioFiles(const Options& options,
   }
   resolved["metrics_sample_count"] = options.metrics_sample_count;
   resolved["metrics_interval_ms"] = options.metrics_interval_ms;
+  boost::json::object block_production;
+  block_production["enabled"] = options.block_production.enabled;
+  block_production["native_mining"] =
+      options.block_production.mode == MiningMode::kNativeMining;
+  block_production["period_ms"] =
+      options.block_production.policy.period().count();
+  block_production["probability"] =
+      options.block_production.policy.probability();
+  block_production["seed"] = options.block_production.policy.seed();
+  if (options.block_production.difficulty) {
+    block_production["difficulty"] =
+        options.block_production.difficulty->value();
+  } else {
+    block_production["difficulty"] = nullptr;
+  }
+  resolved["block_production"] = std::move(block_production);
   if (options.topology.configured) {
     resolved["topology"] =
         NodeRoleTopologyJson(options.topology, options.wallet_initialization);
@@ -3927,7 +4055,7 @@ void CleanupRun(Options options) {
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
                 const ChainDriverSpec& chain_spec, const ChainDriver& driver,
-                std::vector<NodeRuntime>& nodes) {
+                std::vector<NodeRuntime>& nodes, std::stop_token stop_token) {
   if (options.isolate_network) {
     RequireNetworkSetupCapabilities();
   }
@@ -3939,6 +4067,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
   }
   nodes.reserve(options.nodes);
   for (uint32_t i = 0; i < options.nodes; ++i) {
+    ThrowIfStopRequested(stop_token);
     ChainNodeConfigRequest config_request;
     config_request.run_id = options.run_id;
     config_request.run_root = run_root;
@@ -4018,7 +4147,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
   for (auto& node : nodes) {
     try {
       driver.WaitReady(node.config,
-                       std::chrono::seconds(options.ready_timeout_sec));
+                       std::chrono::seconds(options.ready_timeout_sec),
+                       stop_token);
     } catch (...) {
       if (!node.process.running()) {
         WriteEvent(events_path, options.run_id, node.config.id,
@@ -4036,7 +4166,8 @@ void InitializeWalletNodes(const Options& options,
                            const std::filesystem::path& events_path,
                            const ChainDriver& driver,
                            std::vector<NodeRuntime>& nodes,
-                           SimulationRegistry& registry) {
+                           SimulationRegistry& registry,
+                           std::stop_token stop_token) {
   if (!options.wallet_backed_workload_requested) {
     return;
   }
@@ -4048,6 +4179,7 @@ void InitializeWalletNodes(const Options& options,
 
   for (size_t wallet_index = 0; wallet_index < registry.wallets().size();
        ++wallet_index) {
+    ThrowIfStopRequested(stop_token);
     WalletIdentity& wallet = registry.MutableWalletByIndex(wallet_index);
     if (wallet.node == 0U || wallet.node > nodes.size()) {
       throw std::runtime_error("wallet node is out of range");
@@ -4061,7 +4193,8 @@ void InitializeWalletNodes(const Options& options,
                "wallet_address_requested",
                WalletAddressDetail(wallet, registry.wallet_initialization()));
     wallet.address = driver.CreateWalletAddress(
-        node.config, ToChainWalletMode(registry.wallet_initialization()));
+        node.config, ToChainWalletMode(registry.wallet_initialization()),
+        stop_token);
     if (wallet.address.empty()) {
       throw std::runtime_error("chain wallet RPC returned an empty address");
     }
@@ -4115,9 +4248,11 @@ void ApplyResourceLimitUpdate(
 
 void ApplyRuntimeResourceLimitUpdates(const Options& options,
                                       const std::filesystem::path& events_path,
-                                      std::vector<NodeRuntime>& nodes) {
+                                      std::vector<NodeRuntime>& nodes,
+                                      std::stop_token stop_token) {
   for (const auto& [node_index, patch] :
        options.runtime_node_resource_updates) {
+    ThrowIfStopRequested(stop_token);
     if (node_index >= nodes.size()) {
       throw std::runtime_error("runtime resource update node is out of range");
     }
@@ -4148,7 +4283,8 @@ void ApplyResourcePressureWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const std::filesystem::path& metrics_path, const ChainDriver& driver,
     std::vector<NodeRuntime>& nodes, const ResourcePressureWorkload& workload,
-    uint32_t workload_index, uint32_t workload_count) {
+    uint32_t workload_index, uint32_t workload_count,
+    std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
   if (!node.cgroup) {
     throw std::runtime_error("resource pressure requires a node cgroup");
@@ -4182,18 +4318,28 @@ void ApplyResourcePressureWorkload(
                ResourcePressureDetail(workload, previous_limits,
                                       pressure_limits, pressure_limits,
                                       workload_index, workload_count));
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(workload.duration_ms));
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
+    WaitForDuration(std::chrono::milliseconds(workload.duration_ms),
+                    stop_token);
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
+                         stop_token);
   } catch (...) {
-    WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
-    node.resources = previous_limits;
-    WriteEvent(events_path, options.run_id, node.config.id,
-               "resource_pressure_restored_after_error",
-               ResourcePressureDetail(workload, previous_limits,
-                                      pressure_limits, previous_limits,
-                                      workload_index, workload_count));
-    throw;
+    const std::exception_ptr original_error = std::current_exception();
+    try {
+      WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
+      node.resources = previous_limits;
+      WriteEvent(events_path, options.run_id, node.config.id,
+                 "resource_pressure_restored_after_error",
+                 ResourcePressureDetail(workload, previous_limits,
+                                        pressure_limits, previous_limits,
+                                        workload_index, workload_count));
+    } catch (const std::exception& restore_error) {
+      BSIM_LOG(error) << "failed to restore resource pressure limits for "
+                      << node.config.id << ": " << restore_error.what();
+    } catch (...) {
+      BSIM_LOG(error) << "failed to restore resource pressure limits for "
+                      << node.config.id << ": unknown exception";
+    }
+    std::rethrow_exception(original_error);
   }
 
   WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
@@ -4209,18 +4355,19 @@ void ApplyConnectPeerWorkload(const Options& options,
                               const ChainDriver& driver,
                               std::vector<NodeRuntime>& nodes,
                               const ConnectPeerWorkload& workload,
-                              uint32_t workload_index,
-                              uint32_t workload_count) {
+                              uint32_t workload_index, uint32_t workload_count,
+                              std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
   const std::string address = PeerAddress(options, nodes, workload.peer);
   const std::vector<std::string> before_addresses =
-      driver.PeerAddresses(node.config);
+      driver.PeerAddresses(node.config, stop_token);
   const bool connected_before = ContainsPeerAddress(before_addresses, address);
-  driver.ConnectPeer(node.config, address);
+  driver.ConnectPeer(node.config, address, stop_token);
   driver.WaitForPeerAddress(node.config, address,
-                            std::chrono::seconds(workload.timeout_sec));
+                            std::chrono::seconds(workload.timeout_sec),
+                            stop_token);
   const std::vector<std::string> after_addresses =
-      driver.PeerAddresses(node.config);
+      driver.PeerAddresses(node.config, stop_token);
   const bool connected_after = ContainsPeerAddress(after_addresses, address);
   WriteEvent(events_path, options.run_id, node.config.id, "peer_connected",
              PeerChurnDetail(
@@ -4230,23 +4377,22 @@ void ApplyConnectPeerWorkload(const Options& options,
                  connected_before, connected_after, workload.timeout_sec));
 }
 
-void ApplyDisconnectPeerWorkload(const Options& options,
-                                 const std::filesystem::path& events_path,
-                                 const ChainDriver& driver,
-                                 std::vector<NodeRuntime>& nodes,
-                                 const DisconnectPeerWorkload& workload,
-                                 uint32_t workload_index,
-                                 uint32_t workload_count) {
+void ApplyDisconnectPeerWorkload(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    const DisconnectPeerWorkload& workload, uint32_t workload_index,
+    uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
   const std::string address = PeerAddress(options, nodes, workload.peer);
   const std::vector<std::string> before_addresses =
-      driver.PeerAddresses(node.config);
+      driver.PeerAddresses(node.config, stop_token);
   const bool connected_before = ContainsPeerAddress(before_addresses, address);
-  driver.DisconnectPeer(node.config, address);
+  driver.DisconnectPeer(node.config, address, stop_token);
   driver.WaitForPeerAddressAbsent(node.config, address,
-                                  std::chrono::seconds(workload.timeout_sec));
+                                  std::chrono::seconds(workload.timeout_sec),
+                                  stop_token);
   const std::vector<std::string> after_addresses =
-      driver.PeerAddresses(node.config);
+      driver.PeerAddresses(node.config, stop_token);
   const bool connected_after = ContainsPeerAddress(after_addresses, address);
   WriteEvent(events_path, options.run_id, node.config.id, "peer_disconnected",
              PeerChurnDetail(
@@ -4256,36 +4402,37 @@ void ApplyDisconnectPeerWorkload(const Options& options,
                  connected_before, connected_after, workload.timeout_sec));
 }
 
-void ApplySendRawTransactionWorkload(const Options& options,
-                                     const std::filesystem::path& events_path,
-                                     const ChainDriver& driver,
-                                     std::vector<NodeRuntime>& nodes,
-                                     const SendRawTransactionWorkload& workload,
-                                     uint32_t workload_index,
-                                     uint32_t workload_count) {
+void ApplySendRawTransactionWorkload(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    const SendRawTransactionWorkload& workload, uint32_t workload_index,
+    uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& funder = nodes[workload.funding_node - 1U];
   NodeRuntime& submitter = nodes[workload.submit_node - 1U];
-  const uint64_t start_height = driver.ReadMetrics(funder.config).height;
-  std::vector<std::string> funding_hashes = driver.GenerateBlocks(
-      funder.config, workload.funding_blocks, workload.source_address);
+  const uint64_t start_height =
+      driver.ReadMetrics(funder.config, stop_token).height;
+  std::vector<std::string> funding_hashes =
+      driver.GenerateBlocks(funder.config, workload.funding_blocks,
+                            workload.source_address, stop_token);
   funder.AddGeneratedBlocks(static_cast<std::uint64_t>(funding_hashes.size()));
   const uint64_t target_height =
       start_height + static_cast<uint64_t>(funding_hashes.size());
   for (auto& node : nodes) {
     driver.WaitForHeight(node.config, target_height,
-                         std::chrono::seconds(workload.timeout_sec));
+                         std::chrono::seconds(workload.timeout_sec),
+                         stop_token);
   }
 
   const uint64_t minimum_amount =
       workload.amount_satoshis + workload.fee_satoshis;
   const ChainUtxo utxo = driver.FindSpendableOutput(
       funder.config, funding_hashes, workload.source_address, minimum_amount,
-      DefaultChainDriverSpec().coinbase_spendable_confirmations);
+      DefaultChainDriverSpec().coinbase_spendable_confirmations, stop_token);
   const ChainRawTransactionResult transaction = driver.SendRawTransaction(
       submitter.config, utxo, workload.source_address,
       workload.source_private_key, workload.destination_address,
       workload.amount_satoshis, workload.fee_satoshis,
-      std::chrono::seconds(workload.timeout_sec));
+      std::chrono::seconds(workload.timeout_sec), stop_token);
   WriteEvent(events_path, options.run_id, submitter.config.id,
              "raw_transaction_submitted",
              RawTransactionDetail(workload_index, workload_count, workload,
@@ -4325,14 +4472,12 @@ std::vector<std::pair<size_t, size_t>> WalletTransferPlan(
   return plan;
 }
 
-void ApplyWalletTransactionsWorkload(const Options& options,
-                                     const std::filesystem::path& events_path,
-                                     const ChainDriver& driver,
-                                     std::vector<NodeRuntime>& nodes,
-                                     const SimulationRegistry& registry,
-                                     const WalletTransactionsWorkload& workload,
-                                     uint32_t workload_index,
-                                     uint32_t workload_count) {
+void ApplyWalletTransactionsWorkload(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    const SimulationRegistry& registry,
+    const WalletTransactionsWorkload& workload, uint32_t workload_index,
+    uint32_t workload_count, std::stop_token stop_token) {
   struct FundingState {
     uint32_t miner_node = 1;
     uint64_t start_height = 0;
@@ -4345,6 +4490,7 @@ void ApplyWalletTransactionsWorkload(const Options& options,
   std::vector<FundingState> funding;
   funding.reserve(wallets.size());
   for (size_t wallet_index = 0; wallet_index < wallets.size(); ++wallet_index) {
+    ThrowIfStopRequested(stop_token);
     const WalletIdentity& wallet = wallets[wallet_index];
     if (wallet.address.empty()) {
       throw std::runtime_error(
@@ -4354,22 +4500,24 @@ void ApplyWalletTransactionsWorkload(const Options& options,
     NodeRuntime& miner = nodes[miner_node - 1U];
     FundingState state;
     state.miner_node = miner_node;
-    state.start_height = driver.ReadMetrics(miner.config).height;
-    state.hashes = driver.GenerateBlocks(
-        miner.config, workload.funding_blocks_per_wallet, wallet.address);
+    state.start_height = driver.ReadMetrics(miner.config, stop_token).height;
+    state.hashes =
+        driver.GenerateBlocks(miner.config, workload.funding_blocks_per_wallet,
+                              wallet.address, stop_token);
     miner.AddGeneratedBlocks(static_cast<std::uint64_t>(state.hashes.size()));
     state.target_height =
         state.start_height + static_cast<uint64_t>(state.hashes.size());
     for (NodeRuntime& node : nodes) {
       driver.WaitForHeight(node.config, state.target_height,
-                           std::chrono::seconds(workload.timeout_sec));
+                           std::chrono::seconds(workload.timeout_sec),
+                           stop_token);
     }
     NodeRuntime& wallet_node = nodes[wallet.node - 1U];
     state.ready_balance_satoshis = driver.WaitForWalletBalance(
         wallet_node.config, ToChainWalletMode(registry.wallet_initialization()),
         workload.amount_satoshis + workload.fee_satoshis,
         workload.readiness_confirmations,
-        std::chrono::seconds(workload.timeout_sec));
+        std::chrono::seconds(workload.timeout_sec), stop_token);
     funding.push_back(std::move(state));
   }
 
@@ -4377,6 +4525,7 @@ void ApplyWalletTransactionsWorkload(const Options& options,
       WalletTransferPlan(wallets, workload);
   for (size_t transaction_index = 0; transaction_index < transfer_plan.size();
        ++transaction_index) {
+    ThrowIfStopRequested(stop_token);
     const size_t sender_index = transfer_plan[transaction_index].first;
     const size_t receiver_index = transfer_plan[transaction_index].second;
     const WalletIdentity& sender = wallets[sender_index];
@@ -4389,11 +4538,12 @@ void ApplyWalletTransactionsWorkload(const Options& options,
             sender_node.config,
             ToChainWalletMode(registry.wallet_initialization()),
             receiver.address, workload.amount_satoshis, workload.fee_satoshis,
-            std::chrono::seconds(workload.timeout_sec));
+            std::chrono::seconds(workload.timeout_sec), stop_token);
     for (NodeRuntime& node : nodes) {
       for (const std::string& txid : transaction.txids) {
         driver.WaitForMempoolTransaction(
-            node.config, txid, std::chrono::seconds(workload.timeout_sec));
+            node.config, txid, std::chrono::seconds(workload.timeout_sec),
+            stop_token);
       }
     }
     WriteEvent(events_path, options.run_id, sender_node.config.id,
@@ -4410,9 +4560,10 @@ void ApplyWalletTransactionsWorkload(const Options& options,
 
 void ApplyRuntimeNetworkConditionUpdates(
     const Options& options, const std::filesystem::path& events_path,
-    std::vector<NodeRuntime>& nodes) {
+    std::vector<NodeRuntime>& nodes, std::stop_token stop_token) {
   for (const auto& [node_index, condition] :
        options.runtime_node_network_conditions) {
+    ThrowIfStopRequested(stop_token);
     if (node_index >= nodes.size()) {
       throw std::runtime_error(
           "runtime network condition node is out of range");
@@ -4429,8 +4580,10 @@ void ApplyRuntimeNetworkConditionUpdates(
     }
     updated_network.apply_condition = true;
     updated_network.condition = condition;
+    ThrowIfStopRequested(stop_token);
     ReplaceNetworkConditionQdisc(updated_network.host_name,
                                  updated_network.condition);
+    ThrowIfStopRequested(stop_token);
     const QdiscInfo qdisc = VerifyNodeNetworkCondition(updated_network);
     {
       std::lock_guard<std::mutex> lock(node_network_state_mutex);
@@ -4481,17 +4634,22 @@ void RequireNetworkBlockNode(const NodeRuntime& node) {
 
 void ApplyRuntimeNetworkBlockRules(const Options& options,
                                    const std::filesystem::path& events_path,
-                                   std::vector<NodeRuntime>& nodes) {
+                                   std::vector<NodeRuntime>& nodes,
+                                   std::stop_token stop_token) {
   for (const NetworkBlockRule& rule : options.runtime_node_blocks) {
+    ThrowIfStopRequested(stop_token);
     if (rule.node_index >= nodes.size()) {
       throw std::runtime_error("runtime network block node is out of range");
     }
     NodeRuntime& node = nodes[rule.node_index];
     RequireNetworkBlockNode(node);
+    ThrowIfStopRequested(stop_token);
     const bool existed_before = NetworkBlockRulePresent(node, rule);
+    ThrowIfStopRequested(stop_token);
     ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
                                    rule.dst_address, rule.dst_port,
                                    rule.handle);
+    ThrowIfStopRequested(stop_token);
     const bool present_after = NetworkBlockRulePresent(node, rule);
     if (!present_after) {
       throw std::runtime_error(
@@ -4505,17 +4663,22 @@ void ApplyRuntimeNetworkBlockRules(const Options& options,
 
 void ApplyRuntimeNetworkUnblockRules(const Options& options,
                                      const std::filesystem::path& events_path,
-                                     std::vector<NodeRuntime>& nodes) {
+                                     std::vector<NodeRuntime>& nodes,
+                                     std::stop_token stop_token) {
   for (const NetworkBlockRule& rule : options.runtime_node_unblocks) {
+    ThrowIfStopRequested(stop_token);
     if (rule.node_index >= nodes.size()) {
       throw std::runtime_error("runtime network unblock node is out of range");
     }
     NodeRuntime& node = nodes[rule.node_index];
     RequireNetworkBlockNode(node);
+    ThrowIfStopRequested(stop_token);
     const bool existed_before = NetworkBlockRulePresent(node, rule);
     if (existed_before) {
+      ThrowIfStopRequested(stop_token);
       DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
     }
+    ThrowIfStopRequested(stop_token);
     const bool present_after = NetworkBlockRulePresent(node, rule);
     if (present_after) {
       throw std::runtime_error(
@@ -4593,21 +4756,27 @@ void ApplyRuntimeNetworkPartition(const Options& options,
                                   std::vector<NodeRuntime>& nodes,
                                   const NetworkPartitionRule& partition,
                                   bool heal, uint32_t workload_index = 0,
-                                  uint32_t workload_count = 0) {
+                                  uint32_t workload_count = 0,
+                                  std::stop_token stop_token = {}) {
   boost::json::array rule_results;
   for (const NetworkBlockRule& rule : PartitionBlockRules(partition, nodes)) {
+    ThrowIfStopRequested(stop_token);
     NodeRuntime& node = nodes[rule.node_index];
     RequireNetworkBlockNode(node);
+    ThrowIfStopRequested(stop_token);
     const bool existed_before = NetworkBlockRulePresent(node, rule);
     if (heal) {
       if (existed_before) {
+        ThrowIfStopRequested(stop_token);
         DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
       }
     } else {
+      ThrowIfStopRequested(stop_token);
       ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
                                      rule.dst_address, rule.dst_port,
                                      rule.handle);
     }
+    ThrowIfStopRequested(stop_token);
     const bool present_after = NetworkBlockRulePresent(node, rule);
     if (!heal && !present_after) {
       throw std::runtime_error(
@@ -4629,18 +4798,24 @@ void ApplyRuntimeNetworkPartition(const Options& options,
 
 void ApplyRuntimeNetworkPartitions(const Options& options,
                                    const std::filesystem::path& events_path,
-                                   std::vector<NodeRuntime>& nodes) {
+                                   std::vector<NodeRuntime>& nodes,
+                                   std::stop_token stop_token) {
   for (const NetworkPartitionRule& partition : options.runtime_partitions) {
-    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, false);
+    ThrowIfStopRequested(stop_token);
+    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, false,
+                                 0U, 0U, stop_token);
   }
 }
 
 void ApplyRuntimeNetworkPartitionHeals(const Options& options,
                                        const std::filesystem::path& events_path,
-                                       std::vector<NodeRuntime>& nodes) {
+                                       std::vector<NodeRuntime>& nodes,
+                                       std::stop_token stop_token) {
   for (const NetworkPartitionRule& partition :
        options.runtime_partition_heals) {
-    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, true);
+    ThrowIfStopRequested(stop_token);
+    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, true,
+                                 0U, 0U, stop_token);
   }
 }
 
@@ -4653,7 +4828,9 @@ std::string RestartDetail(pid_t pid, uint64_t restart_count) {
 
 void RestartNode(const Options& options,
                  const std::filesystem::path& events_path,
-                 const ChainDriver& driver, NodeRuntime& node) {
+                 const ChainDriver& driver, NodeRuntime& node,
+                 std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
   if (!node.cgroup) {
     throw std::runtime_error("node restart requires a node cgroup");
   }
@@ -4661,11 +4838,18 @@ void RestartNode(const Options& options,
   WriteNodeState(events_path, options.run_id, node.config.id, "Restarting");
   WriteEvent(events_path, options.run_id, node.config.id, "restart_requested",
              "restart_count=" + std::to_string(node.RestartCount() + 1U));
-  driver.Stop(node.config);
-  if (!node.process.WaitForExit(std::chrono::seconds(15))) {
+  driver.Stop(node.config, stop_token);
+  const auto exit_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (node.process.running() &&
+         std::chrono::steady_clock::now() < exit_deadline) {
+    WaitForDuration(std::chrono::milliseconds(50), stop_token);
+  }
+  if (node.process.running()) {
     WriteEvent(events_path, options.run_id, node.config.id, "sigterm");
     node.process.Terminate(std::chrono::seconds(5));
   }
+  ThrowIfStopRequested(stop_token);
   ProcessSpec process = driver.RenderProcess(node.config);
   if (node.network_namespace) {
     process.network_namespace_fd = node.network_namespace->fd();
@@ -4675,8 +4859,8 @@ void RestartNode(const Options& options,
   const std::uint64_t restart_count = node.IncrementRestartCount();
   WriteEvent(events_path, options.run_id, node.config.id, "process_restarted",
              RestartDetail(node.process.pid(), restart_count));
-  driver.WaitReady(node.config,
-                   std::chrono::seconds(options.ready_timeout_sec));
+  driver.WaitReady(node.config, std::chrono::seconds(options.ready_timeout_sec),
+                   stop_token);
   WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
   WriteNodeState(events_path, options.run_id, node.config.id, "Running");
 }
@@ -4684,21 +4868,25 @@ void RestartNode(const Options& options,
 void ApplyRuntimeNodeRestarts(const Options& options,
                               const std::filesystem::path& events_path,
                               const ChainDriver& driver,
-                              std::vector<NodeRuntime>& nodes) {
+                              std::vector<NodeRuntime>& nodes,
+                              std::stop_token stop_token) {
   for (uint32_t node_index : options.runtime_node_restarts) {
+    ThrowIfStopRequested(stop_token);
     if (node_index >= nodes.size()) {
       throw std::runtime_error("runtime restart node is out of range");
     }
-    RestartNode(options, events_path, driver, nodes[node_index]);
+    RestartNode(options, events_path, driver, nodes[node_index], stop_token);
   }
 }
 
-bool WaitForNodeFrozenState(const Cgroup& cgroup, bool expected) {
+bool WaitForNodeFrozenState(const Cgroup& cgroup, bool expected,
+                            std::stop_token stop_token) {
   for (int attempt = 0; attempt < 50; ++attempt) {
+    ThrowIfStopRequested(stop_token);
     if (cgroup.Frozen() == expected) {
       return true;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    WaitForDuration(std::chrono::milliseconds(20), stop_token);
   }
   return false;
 }
@@ -4712,22 +4900,24 @@ std::string FreezeDetail(uint32_t duration_ms, bool frozen) {
 
 void FreezeNodeForDuration(const Options& options,
                            const std::filesystem::path& events_path,
-                           NodeRuntime& node, uint32_t duration_ms) {
+                           NodeRuntime& node, uint32_t duration_ms,
+                           std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
   if (!node.cgroup) {
     throw std::runtime_error("node freeze requires a node cgroup");
   }
 
   node.cgroup->Freeze();
   try {
-    if (!WaitForNodeFrozenState(*node.cgroup, true)) {
+    if (!WaitForNodeFrozenState(*node.cgroup, true, stop_token)) {
       throw std::runtime_error("node cgroup did not report frozen: " +
                                node.config.id);
     }
     WriteEvent(events_path, options.run_id, node.config.id, "cgroup_frozen",
                FreezeDetail(duration_ms, true));
-    std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+    WaitForDuration(std::chrono::milliseconds(duration_ms), stop_token);
     node.cgroup->Thaw();
-    if (!WaitForNodeFrozenState(*node.cgroup, false)) {
+    if (!WaitForNodeFrozenState(*node.cgroup, false, stop_token)) {
       throw std::runtime_error("node cgroup did not report thawed: " +
                                node.config.id);
     }
@@ -4744,56 +4934,186 @@ void FreezeNodeForDuration(const Options& options,
 
 void ApplyRuntimeNodeFreezes(const Options& options,
                              const std::filesystem::path& events_path,
-                             std::vector<NodeRuntime>& nodes) {
+                             std::vector<NodeRuntime>& nodes,
+                             std::stop_token stop_token) {
   for (const FreezeRequest& freeze : options.runtime_node_freezes) {
+    ThrowIfStopRequested(stop_token);
     if (freeze.node_index >= nodes.size()) {
       throw std::runtime_error("runtime freeze node is out of range");
     }
     FreezeNodeForDuration(options, events_path, nodes[freeze.node_index],
-                          freeze.duration_ms);
+                          freeze.duration_ms, stop_token);
+  }
+}
+
+template <typename Action>
+void RunNodeCleanupStep(bool best_effort, std::string_view description,
+                        Action&& action) {
+  try {
+    action();
+  } catch (const std::exception& error) {
+    if (!best_effort) {
+      throw;
+    }
+    BSIM_LOG(error) << description
+                    << " failed during node cleanup: " << error.what();
+  } catch (...) {
+    if (!best_effort) {
+      throw;
+    }
+    BSIM_LOG(error) << description << " failed during node cleanup";
   }
 }
 
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
-               const ChainDriver& driver, std::vector<NodeRuntime>& nodes) {
-  for (auto& node : nodes) {
-    WriteNodeState(events_path, options.run_id, node.config.id, "Stopping");
-    WriteEvent(events_path, options.run_id, node.config.id, "rpc_stop");
-    driver.Stop(node.config);
-  }
-  for (auto& node : nodes) {
-    if (!node.process.WaitForExit(std::chrono::seconds(15))) {
-      WriteEvent(events_path, options.run_id, node.config.id, "sigterm");
-      node.process.Terminate(std::chrono::seconds(5));
+               const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+               bool best_effort = false) {
+  const auto shutdown_timeout =
+      best_effort ? std::chrono::seconds(2) : std::chrono::seconds(15);
+  const auto shutdown_deadline =
+      std::chrono::steady_clock::now() + shutdown_timeout;
+  std::exception_ptr first_failure;
+  const auto record_failure = [&](std::string_view description,
+                                  const std::exception_ptr& failure) {
+    if (!failure) {
+      return;
     }
-    WriteNodeState(events_path, options.run_id, node.config.id, "Stopped");
-    WriteNodeState(events_path, options.run_id, node.config.id, "Cleaning");
-    if (node.cgroup && !options.keep_cgroups) {
-      node.cgroup->KillAll();
+    if (!first_failure) {
+      first_failure = failure;
+    }
+    if (best_effort) {
+      RunNodeCleanupStep(true, description,
+                         [&] { std::rethrow_exception(failure); });
+    }
+  };
+
+  for (auto& node : nodes) {
+    RunNodeCleanupStep(best_effort, "stopping state event", [&] {
+      WriteNodeState(events_path, options.run_id, node.config.id, "Stopping");
+    });
+    RunNodeCleanupStep(best_effort, "RPC stop event", [&] {
+      WriteEvent(events_path, options.run_id, node.config.id, "rpc_stop");
+    });
+  }
+
+  std::stop_source rpc_stop_source;
+  std::vector<std::exception_ptr> rpc_failures(nodes.size());
+  std::atomic<std::size_t> completed_rpc_stops = 0U;
+  std::vector<std::jthread> rpc_workers;
+  rpc_workers.reserve(nodes.size());
+  for (std::size_t index = 0; index < nodes.size(); ++index) {
+    rpc_workers.emplace_back([&, index] {
       try {
-        node.cgroup->Remove();
-      } catch (const std::exception& e) {
-        WriteEvent(events_path, options.run_id, node.config.id,
-                   "cgroup_remove_failed", e.what());
+        driver.Stop(nodes[index].config, rpc_stop_source.get_token());
+      } catch (...) {
+        rpc_failures[index] = std::current_exception();
+      }
+      completed_rpc_stops.fetch_add(1U, std::memory_order_release);
+    });
+  }
+  while (completed_rpc_stops.load(std::memory_order_acquire) < nodes.size() &&
+         std::chrono::steady_clock::now() < shutdown_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  rpc_stop_source.request_stop();
+  rpc_workers.clear();
+  for (const std::exception_ptr& failure : rpc_failures) {
+    record_failure("node RPC stop", failure);
+  }
+
+  bool process_running = true;
+  while (process_running &&
+         std::chrono::steady_clock::now() < shutdown_deadline) {
+    process_running = false;
+    for (auto& node : nodes) {
+      process_running = node.process.running() || process_running;
+    }
+    if (process_running) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+
+  std::vector<std::size_t> running_processes;
+  for (std::size_t index = 0; index < nodes.size(); ++index) {
+    if (!nodes[index].process.running()) {
+      continue;
+    }
+    running_processes.push_back(index);
+    RunNodeCleanupStep(best_effort, "SIGTERM event", [&] {
+      WriteEvent(events_path, options.run_id, nodes[index].config.id,
+                 "sigterm");
+    });
+  }
+  std::vector<std::exception_ptr> termination_failures(nodes.size());
+  std::vector<std::jthread> termination_workers;
+  termination_workers.reserve(running_processes.size());
+  for (const std::size_t index : running_processes) {
+    termination_workers.emplace_back([&, index] {
+      try {
+        nodes[index].process.Terminate(std::chrono::seconds(1));
+      } catch (...) {
+        termination_failures[index] = std::current_exception();
+      }
+    });
+  }
+  termination_workers.clear();
+  for (const std::exception_ptr& failure : termination_failures) {
+    record_failure("node process termination", failure);
+  }
+
+  for (auto& node : nodes) {
+    RunNodeCleanupStep(best_effort, "stopped state event", [&] {
+      WriteNodeState(events_path, options.run_id, node.config.id, "Stopped");
+    });
+    RunNodeCleanupStep(best_effort, "cleaning state event", [&] {
+      WriteNodeState(events_path, options.run_id, node.config.id, "Cleaning");
+    });
+    if (node.cgroup && !options.keep_cgroups) {
+      RunNodeCleanupStep(best_effort, "cgroup process kill",
+                         [&] { node.cgroup->KillAll(); });
+      if (best_effort) {
+        RunNodeCleanupStep(true, "cgroup removal",
+                           [&] { node.cgroup->Remove(); });
+      } else {
+        try {
+          node.cgroup->Remove();
+        } catch (const std::exception& error) {
+          WriteEvent(events_path, options.run_id, node.config.id,
+                     "cgroup_remove_failed", error.what());
+        }
       }
     }
     if (node.network) {
-      DeleteNodeVethNetwork(*node.network);
-      WriteEvent(events_path, options.run_id, node.config.id,
-                 "network_removed");
+      RunNodeCleanupStep(best_effort, "node network removal",
+                         [&] { DeleteNodeVethNetwork(*node.network); });
+      RunNodeCleanupStep(best_effort, "network removal event", [&] {
+        WriteEvent(events_path, options.run_id, node.config.id,
+                   "network_removed");
+      });
     }
     if (node.network_namespace) {
-      node.network_namespace->Stop();
+      RunNodeCleanupStep(best_effort, "network namespace stop",
+                         [&] { node.network_namespace->Stop(); });
     }
-    WriteNodeState(events_path, options.run_id, node.config.id, "Cleaned");
+    RunNodeCleanupStep(best_effort, "cleaned state event", [&] {
+      WriteNodeState(events_path, options.run_id, node.config.id, "Cleaned");
+    });
   }
   if (!options.keep_cgroups) {
-    try {
-      Cgroup::RemoveRun(options.run_id);
-    } catch (const std::exception& e) {
-      WriteEvent(events_path, options.run_id, "sim", "run_cgroup_remove_failed",
-                 e.what());
+    if (best_effort) {
+      RunNodeCleanupStep(true, "run cgroup removal",
+                         [&] { Cgroup::RemoveRun(options.run_id); });
+    } else {
+      try {
+        Cgroup::RemoveRun(options.run_id);
+      } catch (const std::exception& error) {
+        WriteEvent(events_path, options.run_id, "sim",
+                   "run_cgroup_remove_failed", error.what());
+      }
     }
+  }
+  if (!best_effort && first_failure) {
+    std::rethrow_exception(first_failure);
   }
 }
 
@@ -4801,19 +5121,57 @@ std::filesystem::path BenchmarkRunRoot(const Options& options) {
   return std::filesystem::absolute(options.output_dir) / options.run_id;
 }
 
+std::vector<std::uint32_t> ConfiguredMinerIndexes(const Options& options) {
+  if (options.topology.configured) {
+    return options.topology.miner_nodes;
+  }
+  return {options.generate_node - 1U};
+}
+
+NodeRuntime& FindNodeRuntimeById(std::vector<NodeRuntime>& nodes,
+                                 const std::string& node_id) {
+  const auto node = std::find_if(nodes.begin(), nodes.end(),
+                                 [&node_id](const NodeRuntime& candidate) {
+                                   return candidate.config.id == node_id;
+                                 });
+  if (node == nodes.end()) {
+    throw std::runtime_error("unknown block producer node: " + node_id);
+  }
+  return *node;
+}
+
+std::string ScheduledBlockDetail(const std::vector<std::string>& hashes) {
+  boost::json::object detail;
+  boost::json::array block_hashes;
+  block_hashes.reserve(hashes.size());
+  for (const std::string& hash : hashes) {
+    block_hashes.emplace_back(hash);
+  }
+  detail["hashes"] = std::move(block_hashes);
+  return boost::json::serialize(detail);
+}
+
 std::string SimulationCommandDetail(const SimulationCommand& command,
                                     std::string_view error = {}) {
   boost::json::object detail;
   detail["sequence"] = command.sequence;
   detail["kind"] = SimulationCommandKindName(command.kind);
+  if (command.block_production_policy) {
+    detail["period_ms"] = command.block_production_policy->period().count();
+    detail["probability"] = command.block_production_policy->probability();
+    detail["seed"] = command.block_production_policy->seed();
+  }
+  if (command.mining_difficulty) {
+    detail["difficulty"] = command.mining_difficulty->value();
+  }
   if (!error.empty()) {
     detail["error"] = error;
   }
   return boost::json::serialize(detail);
 }
 
-int RunBenchmarkHeadless(Options options,
-                         SimulationCommandQueue* command_queue) {
+int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
+                         std::stop_token stop_token = {}) {
   const auto run_root = BenchmarkRunRoot(options);
   if (std::filesystem::exists(run_root)) {
     if (!options.replace_run) {
@@ -4849,56 +5207,232 @@ int RunBenchmarkHeadless(Options options,
   std::vector<NodeRuntime> nodes;
   std::unique_ptr<NodeLogCollector> log_collector;
   std::unique_ptr<PeriodicMetricsCollector> metrics_collector;
+  std::unique_ptr<ProbabilisticBlockScheduler> block_scheduler;
   std::unique_ptr<ChainCommandExecutor> chain_command_executor;
   std::unique_ptr<SimulationCommandProcessor> command_processor;
+  std::vector<std::string> active_native_miner_ids;
+  std::stop_source command_rpc_stop_source;
+  std::stop_source block_production_rpc_stop_source;
+  std::stop_source metrics_rpc_stop_source;
+  std::stop_callback cancel_command_rpc(stop_token, [&command_rpc_stop_source] {
+    command_rpc_stop_source.request_stop();
+  });
+  std::stop_callback cancel_block_production_rpc(
+      stop_token, [&block_production_rpc_stop_source] {
+        block_production_rpc_stop_source.request_stop();
+      });
+  std::stop_callback cancel_metrics_rpc(stop_token, [&metrics_rpc_stop_source] {
+    metrics_rpc_stop_source.request_stop();
+  });
   const auto stop_command_processor = [&]() {
+    command_rpc_stop_source.request_stop();
     if (command_processor) {
       command_processor->Stop();
     } else if (command_queue != nullptr) {
-      command_queue->Close();
+      command_queue->Cancel();
+    }
+  };
+  const auto stop_block_production = [&]() {
+    block_production_rpc_stop_source.request_stop();
+    if (block_scheduler) {
+      block_scheduler->Stop();
+    }
+    std::exception_ptr first_failure;
+    for (const std::string& node_id : active_native_miner_ids) {
+      try {
+        driver.StopMining(FindNodeRuntimeById(nodes, node_id).config);
+      } catch (...) {
+        if (!first_failure) {
+          first_failure = std::current_exception();
+        }
+      }
+    }
+    active_native_miner_ids.clear();
+    if (first_failure) {
+      std::rethrow_exception(first_failure);
+    }
+  };
+  const auto cleanup_step = [](std::string_view component, auto&& action) {
+    try {
+      action();
+    } catch (const std::exception& error) {
+      BSIM_LOG(error) << component
+                      << " failed during run cleanup: " << error.what();
+    } catch (...) {
+      BSIM_LOG(error) << component << " failed during run cleanup";
     }
   };
   const auto handle_run_failure = [&](std::string_view detail) {
-    stop_command_processor();
-    if (metrics_collector) {
-      metrics_collector->Stop();
-    }
-    for (auto& node : nodes) {
-      WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
-    }
-    WriteEvent(events_path, options.run_id, "sim", "run_failed", detail);
-    if (!log_collector) {
-      WriteNodeLogTails(events_path, options, driver, nodes);
-    }
-    StopNodes(options, events_path, driver, nodes);
-    if (log_collector) {
-      try {
-        log_collector->Stop();
-      } catch (const std::exception& error) {
-        BSIM_LOG(error) << "node log collector failed while handling run "
-                        << "failure: " << error.what();
+    cleanup_step("command processor shutdown", stop_command_processor);
+    cleanup_step("block production shutdown", stop_block_production);
+    cleanup_step("metrics collector shutdown", [&] {
+      if (metrics_collector) {
+        metrics_rpc_stop_source.request_stop();
+        metrics_collector->Stop();
       }
+    });
+    for (auto& node : nodes) {
+      cleanup_step("failed node state event", [&] {
+        WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
+      });
+    }
+    cleanup_step("run failure event", [&] {
+      WriteEvent(events_path, options.run_id, "sim", "run_failed", detail);
+    });
+    if (!log_collector) {
+      cleanup_step("node log tail collection", [&] {
+        WriteNodeLogTails(events_path, options, driver, nodes);
+      });
+    }
+    cleanup_step("node shutdown",
+                 [&] { StopNodes(options, events_path, driver, nodes, true); });
+    for (auto& node : nodes) {
+      cleanup_step("node process fallback shutdown", [&] {
+        if (node.process.running()) {
+          node.process.Terminate(std::chrono::seconds(1));
+        }
+      });
+    }
+    if (log_collector) {
+      cleanup_step("node log collector shutdown",
+                   [&] { log_collector->Stop(); });
     } else {
-      WriteNodeLogTails(events_path, options, driver, nodes);
+      cleanup_step("final node log tail collection", [&] {
+        WriteNodeLogTails(events_path, options, driver, nodes);
+      });
     }
   };
+  const auto handle_run_cancellation = [&]() {
+    cleanup_step("command processor shutdown", stop_command_processor);
+    cleanup_step("block production shutdown", stop_block_production);
+    cleanup_step("metrics collector shutdown", [&] {
+      if (metrics_collector) {
+        metrics_rpc_stop_source.request_stop();
+        metrics_collector->Stop();
+      }
+    });
+    cleanup_step("run cancellation event", [&] {
+      WriteEvent(events_path, options.run_id, "sim", "run_cancelled");
+    });
+    cleanup_step("node shutdown",
+                 [&] { StopNodes(options, events_path, driver, nodes, true); });
+    cleanup_step("node log collector shutdown", [&] {
+      if (log_collector) {
+        log_collector->Stop();
+      } else {
+        WriteNodeLogTails(events_path, options, driver, nodes);
+      }
+    });
+    cleanup_step("run finished event", [&] {
+      WriteEvent(events_path, options.run_id, "sim", "run_finished");
+    });
+    BSIM_LOG(info) << "cancelled run " << options.run_id;
+  };
   try {
-    StartNodes(options, run_root, events_path, chain_spec, driver, nodes);
+    StartNodes(options, run_root, events_path, chain_spec, driver, nodes,
+               stop_token);
+    const std::vector<std::uint32_t> miner_indexes =
+        ConfiguredMinerIndexes(options);
+    if (options.block_production.enabled && miner_indexes.empty()) {
+      throw std::runtime_error(
+          "enabled block production requires at least one configured miner");
+    }
+    std::vector<std::string> miner_node_ids;
+    miner_node_ids.reserve(miner_indexes.size());
+    for (const std::uint32_t miner_index : miner_indexes) {
+      if (miner_index >= nodes.size()) {
+        throw std::runtime_error(
+            "configured miner index exceeds the running node count");
+      }
+      miner_node_ids.push_back(nodes[miner_index].config.id);
+      if (options.block_production.enabled &&
+          options.block_production.difficulty) {
+        driver.SetMiningDifficulty(nodes[miner_index].config,
+                                   *options.block_production.difficulty,
+                                   stop_token);
+      }
+    }
+    if (options.block_production.enabled &&
+        options.block_production.mode ==
+            MiningMode::kScheduledBlockProduction &&
+        !miner_node_ids.empty()) {
+      block_scheduler = std::make_unique<ProbabilisticBlockScheduler>(
+          miner_node_ids, options.block_production.policy,
+          [&](const std::string& node_id) {
+            NodeRuntime& miner = FindNodeRuntimeById(nodes, node_id);
+            const std::vector<std::string> hashes = driver.GenerateBlocks(
+                miner.config, 1U, chain_spec.default_reward_address,
+                block_production_rpc_stop_source.get_token());
+            miner.AddGeneratedBlocks(static_cast<std::uint64_t>(hashes.size()));
+            WriteEvent(events_path, options.run_id, node_id,
+                       "scheduled_block_produced",
+                       ScheduledBlockDetail(hashes));
+          },
+          [&](const std::string& node_id, std::string_view error) {
+            if (block_production_rpc_stop_source.stop_requested()) {
+              return;
+            }
+            WriteEvent(events_path, options.run_id, node_id,
+                       "scheduled_block_failed", error);
+            BSIM_LOG(warning) << "scheduled block production failed for "
+                              << node_id << ": " << error;
+          });
+    }
     std::vector<ChainNodeConfig> log_nodes;
     log_nodes.reserve(nodes.size());
     for (const NodeRuntime& node : nodes) {
       log_nodes.push_back(node.config);
     }
     if (command_queue != nullptr) {
-      chain_command_executor =
-          std::make_unique<ChainCommandExecutor>(driver, log_nodes);
+      chain_command_executor = std::make_unique<ChainCommandExecutor>(
+          driver, log_nodes,
+          [&](const ChainNodeConfig& config,
+              std::stop_token command_stop_token) {
+            if (std::find(miner_node_ids.begin(), miner_node_ids.end(),
+                          config.id) == miner_node_ids.end()) {
+              throw std::runtime_error("node is not a configured miner: " +
+                                       config.id);
+            }
+            if (options.block_production.mode ==
+                MiningMode::kScheduledBlockProduction) {
+              if (!block_scheduler) {
+                throw std::runtime_error(
+                    "scheduled block production is not active");
+              }
+              block_scheduler->StopMiner(config.id);
+            } else {
+              driver.StopMining(config, command_stop_token);
+              active_native_miner_ids.erase(
+                  std::remove(active_native_miner_ids.begin(),
+                              active_native_miner_ids.end(), config.id),
+                  active_native_miner_ids.end());
+            }
+          },
+          [&](BlockProductionPolicy policy) {
+            if (!block_scheduler) {
+              throw UnsupportedChainOperation(
+                  "active mining mode",
+                  "probabilistic block production policy adjustment");
+            }
+            block_scheduler->UpdatePolicy(policy);
+          },
+          [&](const ChainNodeConfig& config, MiningDifficulty difficulty,
+              std::stop_token command_stop_token) {
+            if (std::find(miner_node_ids.begin(), miner_node_ids.end(),
+                          config.id) == miner_node_ids.end()) {
+              throw std::runtime_error("node is not a configured miner: " +
+                                       config.id);
+            }
+            driver.SetMiningDifficulty(config, difficulty, command_stop_token);
+          });
       command_processor = std::make_unique<SimulationCommandProcessor>(
           *command_queue,
           [&](const SimulationCommand& command) {
             WriteEvent(events_path, options.run_id, command.node_id,
                        "operator_command_started",
                        SimulationCommandDetail(command));
-            chain_command_executor->Execute(command);
+            chain_command_executor->Execute(
+                command, command_rpc_stop_source.get_token());
             WriteEvent(events_path, options.run_id, command.node_id,
                        "operator_command_completed",
                        SimulationCommandDetail(command));
@@ -4907,6 +5441,9 @@ int RunBenchmarkHeadless(Options options,
                            << command.node_id << " completed";
           },
           [&](const SimulationCommand& command, std::string_view error) {
+            if (command_rpc_stop_source.stop_requested()) {
+              return;
+            }
             WriteEvent(events_path, options.run_id, command.node_id,
                        "operator_command_failed",
                        SimulationCommandDetail(command, error));
@@ -4915,7 +5452,6 @@ int RunBenchmarkHeadless(Options options,
                 << SimulationCommandKindName(command.kind) << " for "
                 << command.node_id << " failed: " << error;
           });
-      command_processor->Start();
     }
     log_collector = std::make_unique<NodeLogCollector>(
         driver, std::move(log_nodes),
@@ -4942,7 +5478,8 @@ int RunBenchmarkHeadless(Options options,
                 BSIM_LOG(warning) << "metrics sample " << sample << " skipped "
                                   << node.config.id << ": " << error;
               },
-              [&] { return metrics_collector->StopRequested(); });
+              [&] { return metrics_collector->StopRequested(); },
+              metrics_rpc_stop_source.get_token());
           if (metrics_collector->StopRequested()) {
             return;
           }
@@ -4952,24 +5489,45 @@ int RunBenchmarkHeadless(Options options,
           detail["interval_ms"] = options.metrics_interval_ms;
           WriteEvent(events_path, options.run_id, "sim", "metrics_sample",
                      boost::json::serialize(detail));
-        });
+        },
+        [stop_token] { return stop_token.stop_requested(); });
     metrics_collector->Start();
     InitializeWalletNodes(options, events_path, driver, nodes,
-                          simulation_registry);
+                          simulation_registry, stop_token);
 
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
+    ThrowIfStopRequested(stop_token);
+    if (options.block_production.enabled) {
+      if (options.block_production.mode == MiningMode::kNativeMining) {
+        for (const std::uint32_t miner_index : miner_indexes) {
+          driver.StartMining(nodes[miner_index].config,
+                             chain_spec.default_reward_address, stop_token);
+          active_native_miner_ids.push_back(nodes[miner_index].config.id);
+        }
+      } else if (block_scheduler) {
+        block_scheduler->Start();
+      }
+    }
+    if (command_processor) {
+      command_processor->Start();
+    }
 
-    ApplyRuntimeResourceLimitUpdates(options, events_path, nodes);
-    ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes);
-    ApplyRuntimeNetworkBlockRules(options, events_path, nodes);
-    ApplyRuntimeNetworkPartitions(options, events_path, nodes);
-    ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes);
-    ApplyRuntimeNetworkUnblockRules(options, events_path, nodes);
-    ApplyRuntimeNodeRestarts(options, events_path, driver, nodes);
-    ApplyRuntimeNodeFreezes(options, events_path, nodes);
+    ThrowIfStopRequested(stop_token);
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
+                         stop_token);
+
+    ApplyRuntimeResourceLimitUpdates(options, events_path, nodes, stop_token);
+    ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes,
+                                        stop_token);
+    ApplyRuntimeNetworkBlockRules(options, events_path, nodes, stop_token);
+    ApplyRuntimeNetworkPartitions(options, events_path, nodes, stop_token);
+    ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes, stop_token);
+    ApplyRuntimeNetworkUnblockRules(options, events_path, nodes, stop_token);
+    ApplyRuntimeNodeRestarts(options, events_path, driver, nodes, stop_token);
+    ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
     const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
     for (size_t workload_index = 0; workload_index < workloads.size();
          ++workload_index) {
+      ThrowIfStopRequested(stop_token);
       const ScenarioWorkload& scenario_workload = workloads[workload_index];
       if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
         const BlockGenerationWorkload& workload =
@@ -4979,10 +5537,10 @@ int RunBenchmarkHeadless(Options options,
         }
         NodeRuntime& generator = nodes[workload.node - 1U];
         const uint64_t start_height =
-            driver.ReadMetrics(generator.config).height;
-        std::vector<std::string> hashes =
-            driver.GenerateBlocks(generator.config, workload.count,
-                                  chain_spec.default_reward_address);
+            driver.ReadMetrics(generator.config, stop_token).height;
+        std::vector<std::string> hashes = driver.GenerateBlocks(
+            generator.config, workload.count, chain_spec.default_reward_address,
+            stop_token);
         generator.AddGeneratedBlocks(static_cast<std::uint64_t>(hashes.size()));
         const uint64_t target_height =
             start_height + static_cast<uint64_t>(hashes.size());
@@ -4995,7 +5553,8 @@ int RunBenchmarkHeadless(Options options,
                                   hashes, chain_spec.default_reward_address));
         for (auto& node : nodes) {
           driver.WaitForHeight(node.config, target_height,
-                               std::chrono::seconds(workload.sync_timeout_sec));
+                               std::chrono::seconds(workload.sync_timeout_sec),
+                               stop_token);
           WriteEvent(events_path, options.run_id, node.config.id,
                      "height_reached", std::to_string(target_height));
         }
@@ -5004,8 +5563,10 @@ int RunBenchmarkHeadless(Options options,
             scenario_workload.wait_until_height;
         NodeRuntime& node = nodes[workload.node - 1U];
         driver.WaitForHeight(node.config, workload.height,
-                             std::chrono::seconds(workload.timeout_sec));
-        const uint64_t observed_height = driver.ReadMetrics(node.config).height;
+                             std::chrono::seconds(workload.timeout_sec),
+                             stop_token);
+        const uint64_t observed_height =
+            driver.ReadMetrics(node.config, stop_token).height;
         WriteEvent(
             events_path, options.run_id, node.config.id, "height_wait_reached",
             HeightWaitDetail(static_cast<uint32_t>(workload_index + 1U),
@@ -5015,9 +5576,10 @@ int RunBenchmarkHeadless(Options options,
         const WaitForPeersWorkload& workload = scenario_workload.wait_for_peers;
         NodeRuntime& node = nodes[workload.node - 1U];
         driver.WaitForPeerCount(node.config, workload.peer_count,
-                                std::chrono::seconds(workload.timeout_sec));
+                                std::chrono::seconds(workload.timeout_sec),
+                                stop_token);
         const uint64_t observed_peer_count =
-            driver.ReadMetrics(node.config).peer_count;
+            driver.ReadMetrics(node.config, stop_token).peer_count;
         WriteEvent(
             events_path, options.run_id, node.config.id, "peer_count_reached",
             PeerCountWaitDetail(static_cast<uint32_t>(workload_index + 1U),
@@ -5025,31 +5587,32 @@ int RunBenchmarkHeadless(Options options,
                                 workload.node, workload.peer_count,
                                 observed_peer_count));
       } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
-        ApplyConnectPeerWorkload(options, events_path, driver, nodes,
-                                 scenario_workload.connect_peer,
-                                 static_cast<uint32_t>(workload_index + 1U),
-                                 static_cast<uint32_t>(workloads.size()));
+        ApplyConnectPeerWorkload(
+            options, events_path, driver, nodes, scenario_workload.connect_peer,
+            static_cast<uint32_t>(workload_index + 1U),
+            static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kDisconnectPeer) {
         ApplyDisconnectPeerWorkload(options, events_path, driver, nodes,
                                     scenario_workload.disconnect_peer,
                                     static_cast<uint32_t>(workload_index + 1U),
-                                    static_cast<uint32_t>(workloads.size()));
+                                    static_cast<uint32_t>(workloads.size()),
+                                    stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kSendRawTransaction) {
         ApplySendRawTransactionWorkload(
             options, events_path, driver, nodes,
             scenario_workload.send_raw_transaction,
             static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()));
+            static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kWalletTransactions) {
         ApplyWalletTransactionsWorkload(
             options, events_path, driver, nodes, simulation_registry,
             scenario_workload.wallet_transactions,
             static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()));
+            static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
         const RestartNodeWorkload& workload = scenario_workload.restart_node;
         NodeRuntime& node = nodes[workload.node - 1U];
-        RestartNode(options, events_path, driver, node);
+        RestartNode(options, events_path, driver, node, stop_token);
         WriteEvent(events_path, options.run_id, node.config.id,
                    "node_restarted",
                    RestartNodeWorkloadDetail(
@@ -5059,7 +5622,8 @@ int RunBenchmarkHeadless(Options options,
       } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
         const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
         NodeRuntime& node = nodes[workload.node - 1U];
-        FreezeNodeForDuration(options, events_path, node, workload.duration_ms);
+        FreezeNodeForDuration(options, events_path, node, workload.duration_ms,
+                              stop_token);
         WriteEvent(
             events_path, options.run_id, node.config.id,
             "node_freeze_completed",
@@ -5080,30 +5644,35 @@ int RunBenchmarkHeadless(Options options,
             options, events_path, metrics_path, driver, nodes,
             scenario_workload.resource_pressure,
             static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()));
+            static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
         ApplyRuntimeNetworkPartition(
             options, events_path, nodes,
             scenario_workload.network_partition.partition, false,
             static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()));
+            static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kHealPartition) {
         ApplyRuntimeNetworkPartition(
             options, events_path, nodes,
             scenario_workload.network_partition.partition, true,
             static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()));
+            static_cast<uint32_t>(workloads.size()), stop_token);
       }
     }
 
     metrics_collector->Wait();
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes);
-
+    ThrowIfStopRequested(stop_token);
     stop_command_processor();
+    stop_block_production();
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
+                         stop_token);
+
     StopNodes(options, events_path, driver, nodes);
     log_collector->Stop();
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
     BSIM_LOG(info) << "finished run " << options.run_id;
+  } catch (const SimulationCancelled&) {
+    handle_run_cancellation();
   } catch (const std::exception& e) {
     handle_run_failure(e.what());
     throw;
@@ -5127,15 +5696,18 @@ int RunBenchmarkWithTui(Options options) {
     std::exception_ptr tui_failure;
     int simulation_result = 1;
     SimulationCommandQueue command_queue;
+    std::stop_source stop_source;
 
-    std::thread simulation_thread(
-        [&options, &simulation_failure, &simulation_result, &command_queue]() {
-          try {
-            simulation_result = RunBenchmarkHeadless(options, &command_queue);
-          } catch (...) {
-            simulation_failure = std::current_exception();
-          }
-        });
+    std::thread simulation_thread([&options, &simulation_failure,
+                                   &simulation_result, &command_queue,
+                                   &stop_source]() {
+      try {
+        simulation_result = RunBenchmarkHeadless(options, &command_queue,
+                                                 stop_source.get_token());
+      } catch (...) {
+        simulation_failure = std::current_exception();
+      }
+    });
 
     int tui_result = 1;
     try {
@@ -5144,6 +5716,7 @@ int RunBenchmarkWithTui(Options options) {
     } catch (...) {
       tui_failure = std::current_exception();
     }
+    stop_source.request_stop();
     command_queue.Close();
     simulation_thread.join();
 

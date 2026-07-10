@@ -22,6 +22,7 @@ namespace {
 
 constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
 constexpr std::size_t kMaximumOperatorCommandSummaries = 256U;
+constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
 
 struct NodeReport {
   std::uint64_t metric_samples = 0;
@@ -281,6 +282,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "nodes", report);
   CopyField(scenario, "generate_blocks", report);
   CopyField(scenario, "generate_node", report);
+  CopyField(scenario, "block_production", report);
   CopyField(scenario, "isolated_network", report);
   CopyField(scenario, "sync_timeout_sec", report);
   CopyField(scenario, "topology", report);
@@ -508,6 +510,36 @@ void AppendEventSummary(const boost::json::object& event,
   summaries->push_back(std::move(summary));
 }
 
+void AppendScheduledBlockSummary(const boost::json::object& event,
+                                 boost::json::array* summaries) {
+  AppendEventSummary(event, summaries);
+  if (summaries->size() > kMaximumScheduledBlockSummaries) {
+    summaries->erase(summaries->begin());
+  }
+}
+
+void ApplyBlockProductionPolicyEvent(const boost::json::object& event,
+                                     boost::json::object* report) {
+  const boost::json::value detail = ParseEventDetail(event);
+  if (!detail.is_object()) {
+    return;
+  }
+  const boost::json::object& command = detail.as_object();
+  if (OptionalStringField(command, "kind") != "set_block_production_policy") {
+    return;
+  }
+  boost::json::value* block_production =
+      report->if_contains("block_production");
+  if (block_production == nullptr || !block_production->is_object()) {
+    (*report)["block_production"] = boost::json::object{};
+    block_production = report->if_contains("block_production");
+  }
+  boost::json::object& policy = block_production->as_object();
+  CopyField(command, "period_ms", &policy);
+  CopyField(command, "probability", &policy);
+  CopyField(command, "seed", &policy);
+}
+
 void AppendOperatorCommandSummary(const boost::json::object& event,
                                   std::string_view status,
                                   boost::json::array* summaries) {
@@ -545,6 +577,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
 
   std::uint64_t event_count = 0;
   std::uint64_t metric_count = 0;
+  std::uint64_t scheduled_block_count = 0;
   bool run_started = false;
   bool run_finished = false;
   bool run_failed = false;
@@ -555,6 +588,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;
   boost::json::array generated_blocks;
+  boost::json::array scheduled_blocks;
   boost::json::array height_reached;
   boost::json::array height_waits;
   boost::json::array peer_waits;
@@ -595,6 +629,9 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
                           &nodes[node_id].log_tails);
         } else if (event_name == "generated_blocks") {
           AppendEventSummary(event, &generated_blocks);
+        } else if (event_name == "scheduled_block_produced") {
+          ++scheduled_block_count;
+          AppendScheduledBlockSummary(event, &scheduled_blocks);
         } else if (event_name == "height_reached") {
           AppendEventSummary(event, &height_reached);
         } else if (event_name == "height_wait_reached") {
@@ -626,6 +663,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           AppendEventSummary(event, &wallet_transactions);
         } else if (event_name == "operator_command_completed") {
           AppendOperatorCommandSummary(event, "completed", &operator_commands);
+          ApplyBlockProductionPolicyEvent(event, &report);
         } else if (event_name == "operator_command_failed") {
           AppendOperatorCommandSummary(event, "failed", &operator_commands);
         }
@@ -665,6 +703,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["metric_count"] = metric_count;
   report["event_counts"] = EventCountsJson(event_counts);
   report["generated_blocks"] = std::move(generated_blocks);
+  report["scheduled_block_count"] = scheduled_block_count;
+  report["scheduled_blocks"] = std::move(scheduled_blocks);
   report["height_reached"] = std::move(height_reached);
   report["height_waits"] = std::move(height_waits);
   report["peer_waits"] = std::move(peer_waits);

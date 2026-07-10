@@ -4,7 +4,7 @@
   "run_id": "peer-churn-smoke",
   "nodes": 3,
   "isolated_network": true,
-  "generate_blocks": 0,
+  "block_production": {"enabled": false},
   "ready_timeout_sec": 10,
   "sync_timeout_sec": 10,
   "workloads": [

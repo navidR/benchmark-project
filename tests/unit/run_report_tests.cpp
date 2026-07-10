@@ -3,6 +3,7 @@
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
 #include <boost/test/unit_test.hpp>
 #include <cstdint>
 #include <filesystem>
@@ -110,6 +111,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   bsim::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"height_reached\",\"detail\":\"1\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"timestamp\":\"2026-07-09T00:00:02Z\","
+                   "\"event\":\"scheduled_block_produced\","
+                   "\"detail\":\"{\\\"hashes\\\":[\\\"def\\\"]}\"}");
   bsim::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"event\":\"height_wait_reached\","
@@ -231,7 +237,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
-  BOOST_TEST(JsonInteger(report, "event_count") == 16U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 17U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -292,6 +298,17 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(generated_block_detail, "target_height") == 1U);
   BOOST_REQUIRE_EQUAL(generated_block_detail.at("hashes").as_array().size(),
                       1U);
+  const boost::json::array& scheduled_blocks =
+      report.at("scheduled_blocks").as_array();
+  BOOST_REQUIRE_EQUAL(scheduled_blocks.size(), 1U);
+  BOOST_TEST(scheduled_blocks.front()
+                 .as_object()
+                 .at("detail")
+                 .as_object()
+                 .at("hashes")
+                 .as_array()
+                 .front()
+                 .as_string() == "def");
   const boost::json::array& height_reached =
       report.at("height_reached").as_array();
   BOOST_REQUIRE_EQUAL(height_reached.size(), 1U);
@@ -625,6 +642,71 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   BOOST_TEST(report.at("failed_at").as_string() == "2026-07-09T00:00:01Z");
   BOOST_TEST(report.at("failure").as_string() == "peer wait timed out");
   BOOST_TEST(JsonInteger(report, "event_count") == 2U);
+
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_report_bounds_scheduled_blocks_and_applies_runtime_policy) {
+  const std::filesystem::path dir = MakeTestDir("run-report-scheduled-blocks");
+  boost::json::object initial_policy;
+  initial_policy["enabled"] = true;
+  initial_policy["native_mining"] = false;
+  initial_policy["period_ms"] = 1000U;
+  initial_policy["probability"] = 0.5;
+  initial_policy["seed"] = 1U;
+  boost::json::object scenario;
+  scenario["run_id"] = "r1";
+  scenario["nodes"] = 1U;
+  scenario["block_production"] = std::move(initial_policy);
+  bsim::WriteText(dir / "resolved-scenario.json",
+                  boost::json::serialize(scenario) + "\n");
+  bsim::AppendLine(dir / "events.jsonl",
+                   R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
+  for (std::uint64_t index = 0U; index < 260U; ++index) {
+    boost::json::array hashes;
+    hashes.emplace_back("hash-" + std::to_string(index));
+    boost::json::object detail;
+    detail["hashes"] = std::move(hashes);
+    boost::json::object event;
+    event["run_id"] = "r1";
+    event["node_id"] = "firo-1";
+    event["event"] = "scheduled_block_produced";
+    event["detail"] = boost::json::serialize(detail);
+    bsim::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+  }
+  boost::json::object command_detail;
+  command_detail["kind"] = "set_block_production_policy";
+  command_detail["period_ms"] = 250U;
+  command_detail["probability"] = 0.75;
+  command_detail["seed"] = 9U;
+  boost::json::object command_event;
+  command_event["run_id"] = "r1";
+  command_event["node_id"] = "sim";
+  command_event["event"] = "operator_command_completed";
+  command_event["detail"] = boost::json::serialize(command_detail);
+  bsim::AppendLine(dir / "events.jsonl", boost::json::serialize(command_event));
+  bsim::AppendLine(dir / "events.jsonl",
+                   R"({"run_id":"r1","node_id":"sim","event":"run_finished"})");
+
+  const boost::json::value value =
+      boost::json::parse(bsim::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
+  BOOST_TEST(JsonInteger(report, "scheduled_block_count") == 260U);
+  const boost::json::array& blocks = report.at("scheduled_blocks").as_array();
+  BOOST_REQUIRE_EQUAL(blocks.size(), 256U);
+  BOOST_TEST(blocks.front()
+                 .as_object()
+                 .at("detail")
+                 .as_object()
+                 .at("hashes")
+                 .as_array()
+                 .front()
+                 .as_string() == "hash-4");
+  const boost::json::object& policy = report.at("block_production").as_object();
+  BOOST_TEST(JsonInteger(policy, "period_ms") == 250U);
+  BOOST_TEST(policy.at("probability").as_double() == 0.75);
+  BOOST_TEST(JsonInteger(policy, "seed") == 9U);
 
   std::filesystem::remove_all(dir);
 }
