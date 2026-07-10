@@ -6,6 +6,7 @@
 namespace bsim {
 
 void InitLogging();
+void SetConsoleLoggingEnabled(bool enabled);
 void AttachRunLogFile(const std::filesystem::path& run_root);
 
 }  // namespace bsim

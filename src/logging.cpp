@@ -4,6 +4,7 @@
 #include <boost/log/expressions.hpp>
 #include <boost/log/sinks/sync_frontend.hpp>
 #include <boost/log/sinks/text_file_backend.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
 #include <boost/log/support/date_time.hpp>
 #include <boost/log/utility/setup/common_attributes.hpp>
 #include <boost/log/utility/setup/console.hpp>
@@ -18,10 +19,15 @@ namespace {
 
 using TextFileSink =
     boost::log::sinks::synchronous_sink<boost::log::sinks::text_file_backend>;
+using ConsoleSink = boost::log::sinks::synchronous_sink<
+    boost::log::sinks::text_ostream_backend>;
 
 std::once_flag init_logging_once;
+std::mutex console_log_mutex;
 std::mutex run_log_mutex;
+boost::shared_ptr<ConsoleSink> console_log_sink;
 boost::shared_ptr<TextFileSink> run_log_sink;
+bool console_logging_enabled = false;
 
 auto LogFormatter() {
   namespace expr = boost::log::expressions;
@@ -38,7 +44,23 @@ void InitLogging() {
     boost::log::add_common_attributes();
     auto sink = boost::log::add_console_log();
     sink->set_formatter(LogFormatter());
+    console_log_sink = std::move(sink);
+    console_logging_enabled = true;
   });
+}
+
+void SetConsoleLoggingEnabled(bool enabled) {
+  InitLogging();
+  std::lock_guard<std::mutex> lock(console_log_mutex);
+  if (enabled == console_logging_enabled) {
+    return;
+  }
+  if (enabled) {
+    boost::log::core::get()->add_sink(console_log_sink);
+  } else {
+    boost::log::core::get()->remove_sink(console_log_sink);
+  }
+  console_logging_enabled = enabled;
 }
 
 void AttachRunLogFile(const std::filesystem::path& run_root) {

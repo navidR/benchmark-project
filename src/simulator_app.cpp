@@ -4977,35 +4977,42 @@ int RunBenchmarkHeadless(Options options) {
 }
 
 int RunBenchmarkWithTui(Options options) {
-  const auto run_root = BenchmarkRunRoot(options);
-  std::exception_ptr simulation_failure;
-  std::exception_ptr tui_failure;
-  int simulation_result = 1;
-
-  std::thread simulation_thread(
-      [&options, &simulation_failure, &simulation_result]() {
-        try {
-          simulation_result = RunBenchmarkHeadless(options);
-        } catch (...) {
-          simulation_failure = std::current_exception();
-        }
-      });
-
-  int tui_result = 1;
+  SetConsoleLoggingEnabled(false);
   try {
-    tui_result = RunTuiReport(run_root, false, options.tui_refresh_ms);
-  } catch (...) {
-    tui_failure = std::current_exception();
-  }
-  simulation_thread.join();
+    const auto run_root = BenchmarkRunRoot(options);
+    std::exception_ptr simulation_failure;
+    std::exception_ptr tui_failure;
+    int simulation_result = 1;
 
-  if (simulation_failure) {
-    std::rethrow_exception(simulation_failure);
+    std::thread simulation_thread(
+        [&options, &simulation_failure, &simulation_result]() {
+          try {
+            simulation_result = RunBenchmarkHeadless(options);
+          } catch (...) {
+            simulation_failure = std::current_exception();
+          }
+        });
+
+    int tui_result = 1;
+    try {
+      tui_result = RunTuiReport(run_root, false, options.tui_refresh_ms);
+    } catch (...) {
+      tui_failure = std::current_exception();
+    }
+    simulation_thread.join();
+
+    if (simulation_failure) {
+      std::rethrow_exception(simulation_failure);
+    }
+    if (tui_failure) {
+      std::rethrow_exception(tui_failure);
+    }
+    SetConsoleLoggingEnabled(true);
+    return simulation_result == 0 ? tui_result : simulation_result;
+  } catch (...) {
+    SetConsoleLoggingEnabled(true);
+    throw;
   }
-  if (tui_failure) {
-    std::rethrow_exception(tui_failure);
-  }
-  return simulation_result == 0 ? tui_result : simulation_result;
 }
 
 }  // namespace
