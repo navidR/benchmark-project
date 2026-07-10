@@ -224,6 +224,7 @@ add_executable(benchmark-sim
   src/node_log_pane.cpp
   src/process.cpp
   src/run_report.cpp
+  src/simulation_command_queue.cpp
   src/simulation_registry.cpp
   src/simulator_app.cpp
   src/tui.cpp
@@ -264,6 +265,7 @@ if(BUILD_TESTING)
     tests/unit/no_shellout_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/run_report_tests.cpp
+    tests/unit/simulation_command_queue_tests.cpp
     tests/unit/simulation_registry_tests.cpp
     tests/unit/util_tests.cpp
     src/capability.cpp
@@ -276,6 +278,7 @@ if(BUILD_TESTING)
     src/node_log_pane.cpp
     src/process.cpp
     src/run_report.cpp
+    src/simulation_command_queue.cpp
     src/simulation_registry.cpp
     src/util.cpp
   )
