@@ -204,8 +204,22 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
   return spec;
 }
 
-std::filesystem::path FiroDriver::LogPath(const FiroNodeConfig& config) const {
-  return config.data_dir / "regtest" / "debug.log";
+std::optional<LogTailChunk> FiroDriver::ReadLogTail(
+    const FiroNodeConfig& config, ChainLogSource source,
+    const LogTailCursor& cursor, std::uint64_t max_bytes) const {
+  std::filesystem::path path;
+  switch (source) {
+    case ChainLogSource::kDaemon:
+      path = config.data_dir / "regtest" / "debug.log";
+      break;
+    case ChainLogSource::kStdout:
+      path = config.log_dir / "stdout.log";
+      break;
+    case ChainLogSource::kStderr:
+      path = config.log_dir / "stderr.log";
+      break;
+  }
+  return TailLogFile(path, cursor, max_bytes);
 }
 
 RpcEndpoint FiroDriver::Endpoint(const FiroNodeConfig& config) const {

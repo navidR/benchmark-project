@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "benchmark_sim/log_view.h"
+#include "benchmark_sim/node_log_pane.h"
 #include "benchmark_sim/run_report.h"
 
 namespace bsim {
@@ -35,6 +36,7 @@ constexpr int kDetailPaneRows = 9;
 
 struct TuiState {
   std::size_t selected_node = 0;
+  NodeLogPane node_log_pane;
 };
 
 class CursesSession {
@@ -400,7 +402,7 @@ void DrawLogPane(int top, int rows, int cols,
     return;
   }
   DrawHorizontalLine(top);
-  AddText(top + 1, 0, cols, "Logs", A_BOLD);
+  AddText(top + 1, 0, cols, "Simulator Logs", A_BOLD);
   const int first_line = top + 2;
   const int last_line = rows - 3;
   const int capacity = last_line - first_line + 1;
@@ -419,6 +421,52 @@ void DrawLogPane(int top, int rows, int cols,
     AddText(y, 0, cols, log_lines[i]);
     ++y;
   }
+}
+
+int NodeLogVisibleRows(int content_bottom) {
+  constexpr int kPaneTop = 2;
+  constexpr int kBorderAndTitleRows = 3;
+  return std::max(0, content_bottom - kPaneTop - kBorderAndTitleRows);
+}
+
+void DrawNodeLogPane(int content_bottom, int cols,
+                     const NodeLogPane& node_log_pane) {
+  constexpr int kPaneTop = 2;
+  if (!node_log_pane.IsOpen() || cols <= 0 ||
+      NodeLogVisibleRows(content_bottom) <= 0) {
+    return;
+  }
+
+  for (int y = kPaneTop; y < content_bottom; ++y) {
+    mvhline(y, 0, ' ', cols);
+  }
+  DrawHorizontalLine(kPaneTop);
+
+  const std::size_t visible_rows =
+      static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
+  const std::size_t first = node_log_pane.FirstVisibleLine(visible_rows);
+  const std::size_t last = node_log_pane.LastVisibleLine(visible_rows);
+  std::string title = "Node Log: ";
+  title += node_log_pane.NodeId().empty() ? "-" : node_log_pane.NodeId();
+  title += " / ";
+  title += node_log_pane.SourceName();
+  if (!node_log_pane.Lines().empty()) {
+    title += " [" + std::to_string(first + 1U) + "-" + std::to_string(last) +
+             "/" + std::to_string(node_log_pane.Lines().size()) + "]";
+  }
+  AddText(kPaneTop + 1, 0, cols, title, A_BOLD);
+
+  if (node_log_pane.Lines().empty()) {
+    AddText(kPaneTop + 2, 0, cols, "No node log output.",
+            COLOR_PAIR(kColorMuted));
+  } else {
+    int y = kPaneTop + 2;
+    for (std::size_t index = first; index < last; ++index) {
+      AddText(y, 0, cols, node_log_pane.Lines()[index]);
+      ++y;
+    }
+  }
+  DrawHorizontalLine(content_bottom - 1);
 }
 
 void AddDetailPair(int y, int x, int width, std::string_view label,
@@ -545,7 +593,7 @@ boost::json::object LoadReport(const std::filesystem::path& run_root,
 void DrawSummary(const std::filesystem::path& run_root,
                  const boost::json::object& report, std::string_view error,
                  const std::vector<std::string>& log_lines,
-                 std::size_t selected_node) {
+                 std::size_t selected_node, const NodeLogPane& node_log_pane) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -566,7 +614,7 @@ void DrawSummary(const std::filesystem::path& run_root,
       DrawLogPane(log_top, rows, cols, log_lines);
     }
     DrawHorizontalLine(rows - 2);
-    AddText(rows - 1, 0, cols, "Read-only run report. q or Esc exits.",
+    AddText(rows - 1, 0, cols, "Arrows select. l node log. q or Esc exits.",
             COLOR_PAIR(kColorMuted));
     refresh();
     return;
@@ -616,7 +664,7 @@ void DrawSummary(const std::filesystem::path& run_root,
       DrawLogPane(log_top, rows, cols, log_lines);
     }
     DrawHorizontalLine(rows - 2);
-    AddText(rows - 1, 0, cols, "Read-only run report. q or Esc exits.",
+    AddText(rows - 1, 0, cols, "Arrows select. l node log. q or Esc exits.",
             COLOR_PAIR(kColorMuted));
     refresh();
     return;
@@ -681,26 +729,71 @@ void DrawSummary(const std::filesystem::path& run_root,
   if (log_rows != 0) {
     DrawLogPane(log_top, rows, cols, log_lines);
   }
+  DrawNodeLogPane(content_bottom, cols, node_log_pane);
   DrawHorizontalLine(rows - 2);
-  AddText(rows - 1, 0, cols, "Read-only run report. q or Esc exits.",
+  AddText(rows - 1, 0, cols,
+          node_log_pane.IsOpen()
+              ? "Node log: arrows/PgUp/PgDn/Home/End scroll. l closes. q exits."
+              : "Arrows select. l node log. q or Esc exits.",
           COLOR_PAIR(kColorMuted));
   refresh();
 }
 
 bool ShouldExit(int ch) { return ch == 'q' || ch == 'Q' || ch == 27; }
 
-void HandleInput(int ch, const boost::json::object& report, TuiState* state) {
+std::size_t CurrentNodeLogVisibleRows() {
+  int rows = 0;
+  int cols = 0;
+  getmaxyx(stdscr, rows, cols);
+  static_cast<void>(cols);
+  const int log_rows = LogPaneRows(rows);
+  const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
+  const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
+  return static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
+}
+
+bool HandleInput(int ch, const boost::json::object& report, TuiState* state) {
   const boost::json::array* nodes = NodeSummaries(report);
   if (nodes == nullptr || nodes->empty()) {
     state->selected_node = 0;
-    return;
+    return false;
   }
-  if ((ch == KEY_UP || ch == 'k') && state->selected_node > 0) {
+
+  if (ch == 'l' || ch == 'L') {
+    state->node_log_pane.Toggle(report, state->selected_node);
+    return true;
+  }
+
+  if (state->node_log_pane.IsOpen()) {
+    const std::size_t visible_rows = CurrentNodeLogVisibleRows();
+    const std::size_t page_rows = std::max<std::size_t>(visible_rows, 1U);
+    if (ch == KEY_UP) {
+      state->node_log_pane.ScrollUp(visible_rows, 1U);
+    } else if (ch == KEY_DOWN) {
+      state->node_log_pane.ScrollDown(visible_rows, 1U);
+    } else if (ch == KEY_PPAGE) {
+      state->node_log_pane.ScrollUp(visible_rows, page_rows);
+    } else if (ch == KEY_NPAGE) {
+      state->node_log_pane.ScrollDown(visible_rows, page_rows);
+    } else if (ch == KEY_HOME) {
+      state->node_log_pane.ScrollHome(visible_rows);
+    } else if (ch == KEY_END) {
+      state->node_log_pane.ScrollEnd();
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  if (ch == KEY_UP && state->selected_node > 0) {
     --state->selected_node;
-  } else if ((ch == KEY_DOWN || ch == 'j') &&
-             state->selected_node + 1U < nodes->size()) {
-    ++state->selected_node;
+    return true;
   }
+  if (ch == KEY_DOWN && state->selected_node + 1U < nodes->size()) {
+    ++state->selected_node;
+    return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -715,9 +808,13 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
     std::string error;
     const boost::json::object report = LoadReport(run_root, &error);
     state.selected_node = ClampNodeSelection(report, state.selected_node);
+    if (error.empty()) {
+      state.node_log_pane.Refresh(report, state.selected_node);
+    }
     const std::vector<std::string> log_lines =
         ReadRecentLogLines(RunLogPath(run_root), 256U);
-    DrawSummary(run_root, report, error, log_lines, state.selected_node);
+    DrawSummary(run_root, report, error, log_lines, state.selected_node,
+                state.node_log_pane);
     if (once) {
       return error.empty() ? 0 : 1;
     }
@@ -728,8 +825,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       if (ShouldExit(ch)) {
         return 0;
       }
-      HandleInput(ch, report, &state);
-      if (ch == KEY_UP || ch == KEY_DOWN || ch == 'j' || ch == 'k') {
+      if (HandleInput(ch, report, &state)) {
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(sleep_step_ms));

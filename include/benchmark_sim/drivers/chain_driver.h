@@ -5,9 +5,11 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "benchmark_sim/http_client.h"
+#include "benchmark_sim/log_tail.h"
 #include "benchmark_sim/process.h"
 
 namespace bsim {
@@ -70,6 +72,14 @@ enum class ChainWalletMode {
   kPrivate,
 };
 
+enum class ChainLogSource {
+  kDaemon,
+  kStdout,
+  kStderr,
+};
+
+std::string_view ChainLogSourceName(ChainLogSource source);
+
 struct ChainWalletTransactionResult {
   std::vector<std::string> txids;
   std::string destination_amount;
@@ -82,8 +92,9 @@ class ChainDriver {
   virtual ~ChainDriver() = default;
 
   virtual ProcessSpec RenderProcess(const ChainNodeConfig& config) const = 0;
-  virtual std::filesystem::path LogPath(
-      const ChainNodeConfig& config) const = 0;
+  virtual std::optional<LogTailChunk> ReadLogTail(
+      const ChainNodeConfig& config, ChainLogSource source,
+      const LogTailCursor& cursor, std::uint64_t max_bytes) const = 0;
   virtual RpcEndpoint Endpoint(const ChainNodeConfig& config) const = 0;
   virtual void WaitReady(const ChainNodeConfig& config,
                          std::chrono::seconds timeout) const = 0;

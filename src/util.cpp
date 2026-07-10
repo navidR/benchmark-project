@@ -16,12 +16,15 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 
 namespace bsim {
 namespace {
+
+std::mutex append_line_mutex;
 
 std::runtime_error IoError(const std::filesystem::path& path,
                            std::string_view action) {
@@ -75,6 +78,7 @@ void WriteText(const std::filesystem::path& path, std::string_view text) {
 }
 
 void AppendLine(const std::filesystem::path& path, std::string_view text) {
+  std::lock_guard<std::mutex> lock(append_line_mutex);
   int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
   if (fd < 0) {
     throw IoError(path, "open");

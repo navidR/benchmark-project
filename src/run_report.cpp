@@ -20,6 +20,8 @@
 namespace bsim {
 namespace {
 
+constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
+
 struct NodeReport {
   std::uint64_t metric_samples = 0;
   std::string final_state;
@@ -252,6 +254,9 @@ void ForEachJsonLine(const std::filesystem::path& path, Callback callback) {
   std::uint64_t line_number = 0;
   while (std::getline(input, line)) {
     ++line_number;
+    if (input.eof()) {
+      break;
+    }
     if (line.empty()) {
       continue;
     }
@@ -428,6 +433,61 @@ std::optional<std::string_view> LogTailKind(std::string_view event_name) {
   return std::nullopt;
 }
 
+void RememberLogTail(boost::json::value detail, std::string_view kind,
+                     boost::json::object* log_tails) {
+  if (!detail.is_object()) {
+    (*log_tails)[kind] = std::move(detail);
+    return;
+  }
+
+  boost::json::object next = std::move(detail).as_object();
+  const boost::json::value* next_text_value = next.if_contains("text");
+  if (next_text_value == nullptr || !next_text_value->is_string()) {
+    (*log_tails)[kind] = std::move(next);
+    return;
+  }
+
+  std::string text;
+  std::optional<std::uint64_t> start_offset =
+      OptionalUint64Field(next, "start_offset");
+  const boost::json::value* previous_value = log_tails->if_contains(kind);
+  const boost::json::value* reset_value = next.if_contains("offset_reset");
+  const bool offset_reset = reset_value != nullptr && reset_value->is_bool() &&
+                            reset_value->as_bool();
+  if (!offset_reset && previous_value != nullptr &&
+      previous_value->is_object()) {
+    const boost::json::object& previous = previous_value->as_object();
+    const std::optional<std::uint64_t> previous_next_offset =
+        OptionalUint64Field(previous, "next_offset");
+    if (start_offset && previous_next_offset &&
+        *start_offset == *previous_next_offset) {
+      const boost::json::value* previous_text = previous.if_contains("text");
+      if (previous_text != nullptr && previous_text->is_string()) {
+        text = std::string(previous_text->as_string());
+        start_offset = OptionalUint64Field(previous, "start_offset");
+      }
+    }
+  }
+  text += std::string(next_text_value->as_string());
+  std::size_t removed_bytes = 0;
+  if (text.size() > kMaximumNodeLogTailBytes) {
+    const std::size_t first_newline =
+        text.find('\n', text.size() - kMaximumNodeLogTailBytes);
+    removed_bytes = first_newline == std::string::npos
+                        ? text.size() - kMaximumNodeLogTailBytes
+                        : first_newline + 1U;
+    text.erase(0, removed_bytes);
+  }
+  if (start_offset &&
+      *start_offset <= std::numeric_limits<std::uint64_t>::max() -
+                           static_cast<std::uint64_t>(removed_bytes)) {
+    next["start_offset"] =
+        *start_offset + static_cast<std::uint64_t>(removed_bytes);
+  }
+  next["text"] = std::move(text);
+  (*log_tails)[kind] = std::move(next);
+}
+
 void AppendEventSummary(const boost::json::object& event,
                         boost::json::array* summaries) {
   boost::json::object summary;
@@ -506,8 +566,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
         } else if (const std::optional<std::string_view> kind =
                        LogTailKind(event_name);
                    kind && !node_id.empty()) {
-          nodes[node_id].log_tails[std::string(*kind)] =
-              ParseEventDetail(event);
+          RememberLogTail(ParseEventDetail(event), *kind,
+                          &nodes[node_id].log_tails);
         } else if (event_name == "generated_blocks") {
           AppendEventSummary(event, &generated_blocks);
         } else if (event_name == "height_reached") {

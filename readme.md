@@ -554,7 +554,10 @@ View an existing or active run in the read-only TUI:
 ```
 
 The TUI shows run status, lifecycle timestamps, workload summary, node chain
-state, resource metrics, network counters, and qdisc state.
+state, resource metrics, network counters, qdisc state, and simulator logs. Use
+the arrow keys to select a node and press `l` to toggle its separate log pane.
+The node pane supports arrow keys, Page Up, Page Down, Home, and End for
+scrolling; press `l` again to close it.
 
 Render one TUI frame and exit, useful for validation:
 

@@ -93,6 +93,13 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                    "\\\"text\\\":\\\"tail\\\"}\"}");
   bsim::AppendLine(dir / "events.jsonl",
                    "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                   "\"event\":\"daemon_log_tail\","
+                   "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
+                   "\\\"start_offset\\\":4,\\\"next_offset\\\":9,"
+                   "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
+                   "\\\"text\\\":\\\" next\\\"}\"}");
+  bsim::AppendLine(dir / "events.jsonl",
+                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                    "\"timestamp\":\"2026-07-09T00:00:01Z\","
                    "\"event\":\"generated_blocks\","
                    "\"detail\":\"{\\\"workload_index\\\":1,"
@@ -215,7 +222,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
-  BOOST_TEST(JsonInteger(report, "event_count") == 14U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 15U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -373,7 +380,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const boost::json::object& log_tails = node.at("log_tails").as_object();
   const boost::json::object& daemon_log_tail =
       log_tails.at("daemon_log").as_object();
-  BOOST_TEST(daemon_log_tail.at("text").as_string() == "tail");
+  BOOST_TEST(daemon_log_tail.at("text").as_string() == "tail next");
+  BOOST_TEST(JsonInteger(daemon_log_tail, "start_offset") == 0U);
+  BOOST_TEST(JsonInteger(daemon_log_tail, "next_offset") == 9U);
 
   std::filesystem::remove_all(dir);
 }

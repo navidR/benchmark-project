@@ -33,6 +33,7 @@
 #include "benchmark_sim/log_tail.h"
 #include "benchmark_sim/logging.h"
 #include "benchmark_sim/network.h"
+#include "benchmark_sim/node_log_collector.h"
 #include "benchmark_sim/process.h"
 #include "benchmark_sim/run_report.h"
 #include "benchmark_sim/simulation_registry.h"
@@ -1812,7 +1813,8 @@ Options ParseOptions(int argc, char** argv) {
       "extra metric samples to collect after runtime events and before "
       "workload generation")("metrics-interval-ms",
                              po::value<uint32_t>(&options.metrics_interval_ms),
-                             "milliseconds between extra metric samples")(
+                             "milliseconds between metric and node-log "
+                             "samples")(
       "memory-high-bytes", po::value<uint64_t>(&options.memory_high_bytes),
       "cgroup memory.high soft pressure threshold in bytes")(
       "memory-max-bytes", po::value<uint64_t>(&options.memory_max_bytes),
@@ -2018,9 +2020,8 @@ Options ParseOptions(int argc, char** argv) {
   if (options.pids_max == 0U) {
     throw std::runtime_error("--pids-max must be greater than zero");
   }
-  if (options.metrics_sample_count > 0U && options.metrics_interval_ms == 0U) {
-    throw std::runtime_error(
-        "--metrics-interval-ms must be greater than zero when sampling");
+  if (options.metrics_interval_ms == 0U) {
+    throw std::runtime_error("--metrics-interval-ms must be greater than zero");
   }
   if ((options.network_condition_requested ||
        !options.node_network_condition_json.empty() ||
@@ -3362,31 +3363,46 @@ std::string LogTailDetail(std::string_view kind, const LogTailChunk& chunk) {
   return boost::json::serialize(detail);
 }
 
-void WriteLogTailEvent(const std::filesystem::path& events_path,
-                       const Options& options, const NodeRuntime& node,
-                       std::string_view kind, const std::filesystem::path& path,
-                       uint64_t* offset) {
-  if (!std::filesystem::exists(path)) {
-    return;
-  }
-  const LogTailChunk chunk = TailLogFile(path, *offset, kMaxLogTailBytes);
-  *offset = chunk.next_offset;
-  if (chunk.text.empty() && !chunk.truncated && !chunk.offset_reset) {
-    return;
-  }
-  WriteEvent(events_path, options.run_id, node.config.id,
+void WriteLogTailChunkEvent(const std::filesystem::path& events_path,
+                            const Options& options,
+                            const ChainNodeConfig& config,
+                            ChainLogSource source, const LogTailChunk& chunk) {
+  const std::string_view kind = ChainLogSourceName(source);
+  WriteEvent(events_path, options.run_id, config.id,
              std::string(kind) + "_tail", LogTailDetail(kind, chunk));
+}
+
+void WriteLogTailEvent(const std::filesystem::path& events_path,
+                       const Options& options, const ChainDriver& driver,
+                       const NodeRuntime& node, ChainLogSource source,
+                       LogTailCursor* cursor) {
+  std::optional<LogTailChunk> chunk;
+  try {
+    chunk = driver.ReadLogTail(node.config, source, *cursor, kMaxLogTailBytes);
+  } catch (const std::exception& error) {
+    BSIM_LOG(warning) << "cannot read " << ChainLogSourceName(source) << " for "
+                      << node.config.id << ": " << error.what();
+    return;
+  }
+  if (!chunk) {
+    return;
+  }
+  *cursor = chunk->next_cursor;
+  if (chunk->text.empty() && !chunk->truncated && !chunk->offset_reset) {
+    return;
+  }
+  WriteLogTailChunkEvent(events_path, options, node.config, source, *chunk);
 }
 
 void WriteNodeLogTail(const std::filesystem::path& events_path,
                       const Options& options, const ChainDriver& driver,
                       NodeRuntime& node) {
-  WriteLogTailEvent(events_path, options, node, "stdout",
-                    node.config.log_dir / "stdout.log", &node.stdout_offset);
-  WriteLogTailEvent(events_path, options, node, "stderr",
-                    node.config.log_dir / "stderr.log", &node.stderr_offset);
-  WriteLogTailEvent(events_path, options, node, "daemon_log",
-                    driver.LogPath(node.config), &node.daemon_log_offset);
+  WriteLogTailEvent(events_path, options, driver, node, ChainLogSource::kStdout,
+                    &node.stdout_log_cursor);
+  WriteLogTailEvent(events_path, options, driver, node, ChainLogSource::kStderr,
+                    &node.stderr_log_cursor);
+  WriteLogTailEvent(events_path, options, driver, node, ChainLogSource::kDaemon,
+                    &node.daemon_log_cursor);
 }
 
 void WriteNodeLogTails(const std::filesystem::path& events_path,
@@ -4626,8 +4642,6 @@ void RestartNode(const Options& options,
     WriteEvent(events_path, options.run_id, node.config.id, "sigterm");
     node.process.Terminate(std::chrono::seconds(5));
   }
-  WriteNodeLogTail(events_path, options, driver, node);
-
   ProcessSpec process = driver.RenderProcess(node.config);
   if (node.network_namespace) {
     process.network_namespace_fd = node.network_namespace->fd();
@@ -4641,7 +4655,6 @@ void RestartNode(const Options& options,
                    std::chrono::seconds(options.ready_timeout_sec));
   WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
   WriteNodeState(events_path, options.run_id, node.config.id, "Running");
-  WriteNodeLogTail(events_path, options, driver, node);
 }
 
 void ApplyRuntimeNodeRestarts(const Options& options,
@@ -4798,20 +4811,45 @@ int RunBenchmarkHeadless(Options options) {
   std::unique_ptr<ChainDriver> driver_owner = CreateDefaultChainDriver();
   ChainDriver& driver = *driver_owner;
   std::vector<NodeRuntime> nodes;
+  std::unique_ptr<NodeLogCollector> log_collector;
   const auto handle_run_failure = [&](std::string_view detail) {
     for (auto& node : nodes) {
       WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
     }
     WriteEvent(events_path, options.run_id, "sim", "run_failed", detail);
-    WriteNodeLogTails(events_path, options, driver, nodes);
+    if (!log_collector) {
+      WriteNodeLogTails(events_path, options, driver, nodes);
+    }
     StopNodes(options, events_path, driver, nodes);
-    WriteNodeLogTails(events_path, options, driver, nodes);
+    if (log_collector) {
+      try {
+        log_collector->Stop();
+      } catch (const std::exception& error) {
+        BSIM_LOG(error) << "node log collector failed while handling run "
+                        << "failure: " << error.what();
+      }
+    } else {
+      WriteNodeLogTails(events_path, options, driver, nodes);
+    }
   };
   try {
     StartNodes(options, run_root, events_path, chain_spec, driver, nodes);
+    std::vector<ChainNodeConfig> log_nodes;
+    log_nodes.reserve(nodes.size());
+    for (const NodeRuntime& node : nodes) {
+      log_nodes.push_back(node.config);
+    }
+    log_collector = std::make_unique<NodeLogCollector>(
+        driver, std::move(log_nodes),
+        std::chrono::milliseconds(options.metrics_interval_ms),
+        kMaxLogTailBytes,
+        [&](const ChainNodeConfig& config, ChainLogSource source,
+            const LogTailChunk& chunk) {
+          WriteLogTailChunkEvent(events_path, options, config, source, chunk);
+        });
+    log_collector->Start();
     InitializeWalletNodes(options, events_path, driver, nodes,
                           simulation_registry);
-    WriteNodeLogTails(events_path, options, driver, nodes);
 
     WriteMetricsSnapshot(metrics_path, options, driver, nodes);
 
@@ -4955,10 +4993,9 @@ int RunBenchmarkHeadless(Options options) {
     }
 
     WriteMetricsSnapshot(metrics_path, options, driver, nodes);
-    WriteNodeLogTails(events_path, options, driver, nodes);
 
     StopNodes(options, events_path, driver, nodes);
-    WriteNodeLogTails(events_path, options, driver, nodes);
+    log_collector->Stop();
     WriteEvent(events_path, options.run_id, "sim", "run_finished");
     BSIM_LOG(info) << "finished run " << options.run_id;
   } catch (const std::exception& e) {

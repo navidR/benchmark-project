@@ -211,6 +211,7 @@ mark_target_interface_includes_system(yaml)
 add_executable(benchmark-sim
   src/capability.cpp
   src/cgroup.cpp
+  src/drivers/chain_driver.cpp
   src/drivers/chain_driver_registry.cpp
   src/drivers/firo_driver.cpp
   src/http_client.cpp
@@ -219,6 +220,8 @@ add_executable(benchmark-sim
   src/logging.cpp
   src/main.cpp
   src/network.cpp
+  src/node_log_collector.cpp
+  src/node_log_pane.cpp
   src/process.cpp
   src/run_report.cpp
   src/simulation_registry.cpp
@@ -257,6 +260,7 @@ if(BUILD_TESTING)
     tests/unit/log_tail_tests.cpp
     tests/unit/logging_tests.cpp
     tests/unit/network_tests.cpp
+    tests/unit/node_log_pane_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/run_report_tests.cpp
@@ -264,10 +268,12 @@ if(BUILD_TESTING)
     tests/unit/util_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
+    src/drivers/chain_driver.cpp
     src/log_tail.cpp
     src/log_view.cpp
     src/logging.cpp
     src/network.cpp
+    src/node_log_pane.cpp
     src/process.cpp
     src/run_report.cpp
     src/simulation_registry.cpp

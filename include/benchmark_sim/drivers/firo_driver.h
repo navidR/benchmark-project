@@ -22,7 +22,9 @@ class FiroDriver final : public ChainDriver {
       : http_(rpc_timeout) {}
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const override;
-  std::filesystem::path LogPath(const FiroNodeConfig& config) const override;
+  std::optional<LogTailChunk> ReadLogTail(
+      const FiroNodeConfig& config, ChainLogSource source,
+      const LogTailCursor& cursor, std::uint64_t max_bytes) const override;
   RpcEndpoint Endpoint(const FiroNodeConfig& config) const override;
   void WaitReady(const FiroNodeConfig& config,
                  std::chrono::seconds timeout) const override;
