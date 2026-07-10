@@ -456,7 +456,8 @@ void DrawLogPane(int top, int rows, int cols,
   const std::size_t line_count = static_cast<std::size_t>(capacity);
   const std::size_t first_log =
       log_lines.size() > line_count ? log_lines.size() - line_count : 0U;
-  int y = first_line;
+  const std::size_t visible_lines = log_lines.size() - first_log;
+  int y = last_line - static_cast<int>(visible_lines) + 1;
   for (std::size_t i = first_log; i < log_lines.size() && y <= last_line; ++i) {
     AddText(y, 0, cols, log_lines[i]);
     ++y;
