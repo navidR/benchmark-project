@@ -865,7 +865,7 @@ void DrawSummary(const std::filesystem::path& run_root,
                 ? "Node log: arrows/PgUp/PgDn/Home/End scroll. +/- verbosity. "
                   "l closes. q exits."
                 : "Arrows select. l log. c command. s stop mining. d/r "
-                  "disconnect/reconnect. q or Esc exits.";
+                  "disconnect/reconnect. k kill. q or Esc exits.";
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
     DrawCommandErrorPopup(rows, cols, command_error);
@@ -1064,6 +1064,10 @@ bool HandleInput(int ch, const boost::json::object& report,
   if (ch == 'r' || ch == 'R') {
     return QueueSelectedNodeCommand(SimulationCommandKind::kReconnectNode,
                                     report, command_queue, state);
+  }
+  if (ch == 'k' || ch == 'K') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kKillNode, report,
+                                    command_queue, state);
   }
 
   if (state->node_log_pane.IsOpen()) {

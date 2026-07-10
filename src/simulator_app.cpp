@@ -3530,7 +3530,7 @@ void WriteLogTailEvent(const std::filesystem::path& events_path,
     chunk = driver.ReadLogTail(node.config, source, *cursor, kMaxLogTailBytes);
   } catch (const std::exception& error) {
     BBP_LOG(warning) << "cannot read " << ChainLogSourceName(source) << " for "
-                      << node.config.id << ": " << error.what();
+                     << node.config.id << ": " << error.what();
     return;
   }
   if (!chunk) {
@@ -4048,8 +4048,8 @@ void CleanupRun(Options options) {
   Cgroup::RemoveRun(options.run_id);
 
   BBP_LOG(info) << "cleanup_run=" << options.run_id << "\n"
-                 << "nodes=" << options.nodes << "\n"
-                 << "run_dir=" << run_root;
+                << "nodes=" << options.nodes << "\n"
+                << "run_dir=" << run_root;
 }
 
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
@@ -4123,7 +4123,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       WriteNodeState(events_path, options.run_id, node_id, "Starting");
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
       BBP_LOG(info) << "started " << node_id
-                     << " pid=" << runtime.process.pid();
+                    << " pid=" << runtime.process.pid();
       WriteEvent(events_path, options.run_id, node_id, "process_started",
                  "pid=" + std::to_string(runtime.process.pid()));
       nodes.push_back(std::move(runtime));
@@ -4301,12 +4301,12 @@ void ApplyResourcePressureWorkload(
       WriteResourceLimits(*node.cgroup, pressure_limits, previous_limits);
     } catch (const std::exception& restore_error) {
       BBP_LOG(error) << "failed to restore partially applied resource "
-                         "pressure limits for "
-                      << node.config.id << ": " << restore_error.what();
+                        "pressure limits for "
+                     << node.config.id << ": " << restore_error.what();
     } catch (...) {
       BBP_LOG(error) << "failed to restore partially applied resource "
-                         "pressure limits for "
-                      << node.config.id << ": unknown exception";
+                        "pressure limits for "
+                     << node.config.id << ": unknown exception";
     }
     std::rethrow_exception(apply_error);
   }
@@ -4334,10 +4334,10 @@ void ApplyResourcePressureWorkload(
                                         workload_index, workload_count));
     } catch (const std::exception& restore_error) {
       BBP_LOG(error) << "failed to restore resource pressure limits for "
-                      << node.config.id << ": " << restore_error.what();
+                     << node.config.id << ": " << restore_error.what();
     } catch (...) {
       BBP_LOG(error) << "failed to restore resource pressure limits for "
-                      << node.config.id << ": unknown exception";
+                     << node.config.id << ": unknown exception";
     }
     std::rethrow_exception(original_error);
   }
@@ -4956,7 +4956,7 @@ void RunNodeCleanupStep(bool best_effort, std::string_view description,
       throw;
     }
     BBP_LOG(error) << description
-                    << " failed during node cleanup: " << error.what();
+                   << " failed during node cleanup: " << error.what();
   } catch (...) {
     if (!best_effort) {
       throw;
@@ -4991,17 +4991,30 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
     RunNodeCleanupStep(best_effort, "stopping state event", [&] {
       WriteNodeState(events_path, options.run_id, node.config.id, "Stopping");
     });
-    RunNodeCleanupStep(best_effort, "RPC stop event", [&] {
-      WriteEvent(events_path, options.run_id, node.config.id, "rpc_stop");
-    });
   }
 
   std::stop_source rpc_stop_source;
   std::vector<std::exception_ptr> rpc_failures(nodes.size());
+  std::vector<std::size_t> running_processes;
+  running_processes.reserve(nodes.size());
+  for (std::size_t index = 0; index < nodes.size(); ++index) {
+    if (nodes[index].process.running()) {
+      running_processes.push_back(index);
+      RunNodeCleanupStep(best_effort, "RPC stop event", [&] {
+        WriteEvent(events_path, options.run_id, nodes[index].config.id,
+                   "rpc_stop");
+      });
+    } else {
+      RunNodeCleanupStep(best_effort, "RPC stop skipped event", [&] {
+        WriteEvent(events_path, options.run_id, nodes[index].config.id,
+                   "rpc_stop_skipped", "process is not running");
+      });
+    }
+  }
   std::atomic<std::size_t> completed_rpc_stops = 0U;
   std::vector<std::jthread> rpc_workers;
-  rpc_workers.reserve(nodes.size());
-  for (std::size_t index = 0; index < nodes.size(); ++index) {
+  rpc_workers.reserve(running_processes.size());
+  for (const std::size_t index : running_processes) {
     rpc_workers.emplace_back([&, index] {
       try {
         driver.Stop(nodes[index].config, rpc_stop_source.get_token());
@@ -5011,7 +5024,8 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
       completed_rpc_stops.fetch_add(1U, std::memory_order_release);
     });
   }
-  while (completed_rpc_stops.load(std::memory_order_acquire) < nodes.size() &&
+  while (completed_rpc_stops.load(std::memory_order_acquire) <
+             running_processes.size() &&
          std::chrono::steady_clock::now() < shutdown_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
@@ -5033,7 +5047,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
     }
   }
 
-  std::vector<std::size_t> running_processes;
+  running_processes.clear();
   for (std::size_t index = 0; index < nodes.size(); ++index) {
     if (!nodes[index].process.running()) {
       continue;
@@ -5211,6 +5225,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::unique_ptr<ChainCommandExecutor> chain_command_executor;
   std::unique_ptr<SimulationCommandProcessor> command_processor;
   std::vector<std::string> active_native_miner_ids;
+  std::mutex node_process_mutex;
   std::stop_source command_rpc_stop_source;
   std::stop_source block_production_rpc_stop_source;
   std::stop_source metrics_rpc_stop_source;
@@ -5257,7 +5272,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       action();
     } catch (const std::exception& error) {
       BBP_LOG(error) << component
-                      << " failed during run cleanup: " << error.what();
+                     << " failed during run cleanup: " << error.what();
     } catch (...) {
       BBP_LOG(error) << component << " failed during run cleanup";
     }
@@ -5375,7 +5390,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             WriteEvent(events_path, options.run_id, node_id,
                        "scheduled_block_failed", error);
             BBP_LOG(warning) << "scheduled block production failed for "
-                              << node_id << ": " << error;
+                             << node_id << ": " << error;
           });
     }
     std::vector<ChainNodeConfig> log_nodes;
@@ -5431,14 +5446,47 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             WriteEvent(events_path, options.run_id, command.node_id,
                        "operator_command_started",
                        SimulationCommandDetail(command));
-            chain_command_executor->Execute(
-                command, command_rpc_stop_source.get_token());
+            if (command.kind == SimulationCommandKind::kKillNode) {
+              NodeRuntime& node = FindNodeRuntimeById(nodes, command.node_id);
+              std::lock_guard<std::mutex> lock(node_process_mutex);
+              if (!node.process.running()) {
+                throw std::runtime_error("node process is not running: " +
+                                         command.node_id);
+              }
+              if (block_scheduler &&
+                  std::find(miner_node_ids.begin(), miner_node_ids.end(),
+                            command.node_id) != miner_node_ids.end()) {
+                block_scheduler->StopMiner(command.node_id);
+              }
+              active_native_miner_ids.erase(
+                  std::remove(active_native_miner_ids.begin(),
+                              active_native_miner_ids.end(), command.node_id),
+                  active_native_miner_ids.end());
+              const pid_t pid = node.process.pid();
+              WriteNodeState(events_path, options.run_id, command.node_id,
+                             "Killing");
+              WriteEvent(events_path, options.run_id, command.node_id,
+                         "process_kill_requested",
+                         "pid=" + std::to_string(pid));
+              node.process.Kill();
+              if (node.process.running()) {
+                throw std::runtime_error("node process survived SIGKILL: " +
+                                         command.node_id);
+              }
+              WriteEvent(events_path, options.run_id, command.node_id,
+                         "process_killed", "pid=" + std::to_string(pid));
+              WriteNodeState(events_path, options.run_id, command.node_id,
+                             "Killed");
+            } else {
+              chain_command_executor->Execute(
+                  command, command_rpc_stop_source.get_token());
+            }
             WriteEvent(events_path, options.run_id, command.node_id,
                        "operator_command_completed",
                        SimulationCommandDetail(command));
             BBP_LOG(info) << "command #" << command.sequence << " "
-                           << SimulationCommandKindName(command.kind) << " for "
-                           << command.node_id << " completed";
+                          << SimulationCommandKindName(command.kind) << " for "
+                          << command.node_id << " completed";
           },
           [&](const SimulationCommand& command, std::string_view error) {
             if (command_rpc_stop_source.stop_requested()) {
@@ -5476,7 +5524,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                            "metrics_node_unavailable",
                            boost::json::serialize(detail));
                 BBP_LOG(warning) << "metrics sample " << sample << " skipped "
-                                  << node.config.id << ": " << error;
+                                 << node.config.id << ": " << error;
               },
               [&] { return metrics_collector->StopRequested(); },
               metrics_rpc_stop_source.get_token());
@@ -5522,7 +5570,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     ApplyRuntimeNetworkPartitions(options, events_path, nodes, stop_token);
     ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes, stop_token);
     ApplyRuntimeNetworkUnblockRules(options, events_path, nodes, stop_token);
-    ApplyRuntimeNodeRestarts(options, events_path, driver, nodes, stop_token);
+    {
+      std::lock_guard<std::mutex> lock(node_process_mutex);
+      ApplyRuntimeNodeRestarts(options, events_path, driver, nodes, stop_token);
+    }
     ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
     const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
     for (size_t workload_index = 0; workload_index < workloads.size();
@@ -5612,7 +5663,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
         const RestartNodeWorkload& workload = scenario_workload.restart_node;
         NodeRuntime& node = nodes[workload.node - 1U];
-        RestartNode(options, events_path, driver, node, stop_token);
+        {
+          std::lock_guard<std::mutex> lock(node_process_mutex);
+          RestartNode(options, events_path, driver, node, stop_token);
+        }
         WriteEvent(events_path, options.run_id, node.config.id,
                    "node_restarted",
                    RestartNodeWorkloadDetail(
@@ -5682,9 +5736,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   }
 
   BBP_LOG(info) << "run_id=" << options.run_id << "\n"
-                 << "output_dir=" << run_root << "\n"
-                 << "metrics=" << metrics_path << "\n"
-                 << "events=" << events_path;
+                << "output_dir=" << run_root << "\n"
+                << "metrics=" << metrics_path << "\n"
+                << "events=" << events_path;
   return 0;
 }
 
