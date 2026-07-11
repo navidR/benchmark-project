@@ -1,10 +1,28 @@
 #include "bbp/drivers/chain_command_executor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace bbp {
+namespace {
+
+constexpr std::chrono::seconds kPeerCommandTimeout(10);
+
+std::string PeerEndpoint(const ChainNodeConfig& config) {
+  return config.p2p_host + ":" + std::to_string(config.p2p_port);
+}
+
+const std::string& RequirePeerNodeId(const SimulationCommand& command) {
+  if (!command.peer_node_id || command.peer_node_id->empty()) {
+    throw std::runtime_error("peer command requires a target peer node id");
+  }
+  return *command.peer_node_id;
+}
+
+}  // namespace
 
 ChainCommandExecutor::ChainCommandExecutor(
     const ChainDriver& driver, std::vector<ChainNodeConfig> nodes,
@@ -62,6 +80,30 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
     case SimulationCommandKind::kKillNode:
       throw std::runtime_error(
           "kill-node commands must be handled by the simulator process owner");
+    case SimulationCommandKind::kConnectPeer: {
+      const ChainNodeConfig& node = FindNode(command.node_id);
+      const ChainNodeConfig& peer = FindNode(RequirePeerNodeId(command));
+      if (node.id == peer.id) {
+        throw std::runtime_error("peer command source and target must differ");
+      }
+      const std::string endpoint = PeerEndpoint(peer);
+      driver_.ConnectPeer(node, endpoint, stop_token);
+      driver_.WaitForPeerAddress(node, endpoint, kPeerCommandTimeout,
+                                 stop_token);
+      return;
+    }
+    case SimulationCommandKind::kDisconnectPeer: {
+      const ChainNodeConfig& node = FindNode(command.node_id);
+      const ChainNodeConfig& peer = FindNode(RequirePeerNodeId(command));
+      if (node.id == peer.id) {
+        throw std::runtime_error("peer command source and target must differ");
+      }
+      const std::string endpoint = PeerEndpoint(peer);
+      driver_.DisconnectPeer(node, endpoint, stop_token);
+      driver_.WaitForPeerAddressAbsent(node, endpoint, kPeerCommandTimeout,
+                                       stop_token);
+      return;
+    }
   }
   throw std::runtime_error("unknown simulation command kind");
 }

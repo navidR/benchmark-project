@@ -56,9 +56,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_closes_waiting_consumer) {
   BOOST_CHECK(pending.wait_for(1s) == std::future_status::ready);
   BOOST_TEST(!pending.get());
   BOOST_TEST(queue.IsClosed());
-  BOOST_CHECK_THROW(
-      queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-1"),
-      std::runtime_error);
+  BOOST_CHECK_THROW(queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-1"),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -72,9 +71,8 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(queue.IsClosed());
   BOOST_TEST(!queue.TryPop());
   BOOST_TEST(!queue.WaitPop());
-  BOOST_CHECK_THROW(
-      queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-3"),
-      std::runtime_error);
+  BOOST_CHECK_THROW(queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-3"),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_queue_rejects_empty_node_id) {
@@ -100,4 +98,25 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
   BOOST_REQUIRE(difficulty);
   BOOST_REQUIRE(difficulty->mining_difficulty);
   BOOST_TEST(difficulty->mining_difficulty->value() == 3.0);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_peer_target) {
+  bbp::SimulationCommandQueue queue;
+  queue.PushPeerCommand(bbp::SimulationCommandKind::kDisconnectPeer, "firo-1",
+                        "firo-2");
+
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kDisconnectPeer);
+  BOOST_TEST(command->node_id == "firo-1");
+  BOOST_REQUIRE(command->peer_node_id);
+  BOOST_TEST(*command->peer_node_id == "firo-2");
+
+  BOOST_CHECK_THROW(
+      queue.PushPeerCommand(bbp::SimulationCommandKind::kConnectPeer, "firo-1",
+                            "firo-1"),
+      std::runtime_error);
+  BOOST_CHECK_THROW(queue.PushPeerCommand(bbp::SimulationCommandKind::kKillNode,
+                                          "firo-1", "firo-2"),
+                    std::runtime_error);
 }

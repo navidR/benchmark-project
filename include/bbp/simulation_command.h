@@ -19,6 +19,8 @@ enum class SimulationCommandKind {
   kSetBlockProductionPolicy,
   kSetMiningDifficulty,
   kKillNode,
+  kConnectPeer,
+  kDisconnectPeer,
 };
 
 struct SimulationCommand {
@@ -27,6 +29,7 @@ struct SimulationCommand {
   std::string node_id;
   std::optional<BlockProductionPolicy> block_production_policy;
   std::optional<MiningDifficulty> mining_difficulty;
+  std::optional<std::string> peer_node_id;
 };
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind);

@@ -24,6 +24,7 @@ struct ChainMetrics {
   uint64_t height = 0;
   std::string best_hash;
   uint64_t peer_count = 0;
+  std::vector<std::string> peer_addresses;
   uint64_t mempool_tx_count = 0;
   uint64_t mempool_bytes = 0;
   std::optional<bool> initial_block_download;
@@ -43,6 +44,7 @@ struct ChainNodeConfig {
   std::string rpc_host = "127.0.0.1";
   std::string rpc_bind = "127.0.0.1";
   std::vector<std::string> rpc_allow_ips = {"127.0.0.1"};
+  std::string p2p_host = "127.0.0.1";
   std::string p2p_bind;
   bool listen = true;
   bool wallet_enabled = false;

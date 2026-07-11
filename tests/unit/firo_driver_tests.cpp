@@ -1,9 +1,12 @@
+#include <unistd.h>
+
 #include <atomic>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
+#include <filesystem>
 #include <future>
 #include <mutex>
 #include <stop_token>
@@ -11,6 +14,32 @@
 
 #include "bbp/drivers/firo_driver.h"
 #include "bbp/simulation_cancelled.h"
+
+BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
+  const std::filesystem::path test_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-firo-process-peers-" + std::to_string(getpid()));
+  std::filesystem::remove_all(test_dir);
+
+  bbp::FiroNodeConfig config;
+  config.id = "peer-argument-test";
+  config.binary = "/usr/bin/firod";
+  config.data_dir = test_dir / "data";
+  config.log_dir = test_dir / "logs";
+  config.rpc_port = 18888U;
+  config.p2p_port = 18168U;
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  config.connect_peers = {"127.0.0.1:18169"};
+
+  const bbp::FiroDriver driver(std::chrono::milliseconds(100));
+  const bbp::ProcessSpec process = driver.RenderProcess(config);
+  for (const std::string& argument : process.argv) {
+    BOOST_TEST(!argument.starts_with("-connect="));
+  }
+
+  std::filesystem::remove_all(test_dir);
+}
 
 BOOST_AUTO_TEST_CASE(firo_readiness_wait_honors_stop_token_promptly) {
   bbp::FiroNodeConfig config;

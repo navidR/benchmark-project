@@ -12,9 +12,10 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 7> kCommandNames = {
-    "block-production", "mining-difficulty", "stop-mining", "disconnect",
-    "reconnect",        "log-more",          "log-less",
+constexpr std::array<std::string_view, 9> kCommandNames = {
+    "block-production", "mining-difficulty", "stop-mining",
+    "disconnect",       "reconnect",         "connect-peer",
+    "disconnect-peer",  "log-more",          "log-less",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -53,6 +54,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
               BlockProductionPolicy(std::chrono::milliseconds(period_ms),
                                     probability, block_production_seed),
           .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
       };
     }
     if (tokens[0] == "mining-difficulty") {
@@ -62,6 +64,18 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .block_production_policy = std::nullopt,
           .mining_difficulty =
               MiningDifficulty(boost::lexical_cast<double>(tokens[1])),
+          .peer_node_id = std::nullopt,
+      };
+    }
+    if (tokens[0] == "connect-peer" || tokens[0] == "disconnect-peer") {
+      RequireArgumentCount(tokens, 2U, tokens[0] + " <simulation-node-id>");
+      return ParsedTuiCommand{
+          .kind = tokens[0] == "connect-peer"
+                      ? SimulationCommandKind::kConnectPeer
+                      : SimulationCommandKind::kDisconnectPeer,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = tokens[1],
       };
     }
 
@@ -84,6 +98,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         .kind = kind,
         .block_production_policy = std::nullopt,
         .mining_difficulty = std::nullopt,
+        .peer_node_id = std::nullopt,
     };
   } catch (const boost::bad_lexical_cast&) {
     throw std::runtime_error("command contains an invalid numeric argument");

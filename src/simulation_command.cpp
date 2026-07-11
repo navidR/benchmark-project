@@ -22,6 +22,10 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "set_mining_difficulty";
     case SimulationCommandKind::kKillNode:
       return "kill_node";
+    case SimulationCommandKind::kConnectPeer:
+      return "connect_peer";
+    case SimulationCommandKind::kDisconnectPeer:
+      return "disconnect_peer";
   }
   throw std::runtime_error("unknown simulation command kind");
 }

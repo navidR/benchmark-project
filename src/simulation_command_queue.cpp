@@ -13,6 +13,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .node_id = std::move(node_id),
       .block_production_policy = std::nullopt,
       .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
   });
 }
 
@@ -24,6 +25,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .node_id = "sim",
       .block_production_policy = policy,
       .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
   });
 }
 
@@ -35,6 +37,29 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .node_id = std::move(node_id),
       .block_production_policy = std::nullopt,
       .mining_difficulty = difficulty,
+      .peer_node_id = std::nullopt,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushPeerCommand(
+    SimulationCommandKind kind, std::string node_id, std::string peer_node_id) {
+  if (kind != SimulationCommandKind::kConnectPeer &&
+      kind != SimulationCommandKind::kDisconnectPeer) {
+    throw std::runtime_error("peer command requires a peer command kind");
+  }
+  if (peer_node_id.empty()) {
+    throw std::runtime_error("peer command requires a target peer node id");
+  }
+  if (node_id == peer_node_id) {
+    throw std::runtime_error("peer command source and target must differ");
+  }
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = kind,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::move(peer_node_id),
   });
 }
 

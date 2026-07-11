@@ -20,6 +20,18 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
       bbp::TuiCommandParser::Parse("mining-difficulty 3.5", 0U);
   BOOST_REQUIRE(difficulty.mining_difficulty);
   BOOST_TEST(difficulty.mining_difficulty->value() == 3.5);
+
+  const bbp::ParsedTuiCommand connect =
+      bbp::TuiCommandParser::Parse("connect-peer firo-2", 0U);
+  BOOST_CHECK(connect.kind == bbp::SimulationCommandKind::kConnectPeer);
+  BOOST_REQUIRE(connect.peer_node_id);
+  BOOST_TEST(*connect.peer_node_id == "firo-2");
+
+  const bbp::ParsedTuiCommand disconnect =
+      bbp::TuiCommandParser::Parse("disconnect-peer firo-3", 0U);
+  BOOST_CHECK(disconnect.kind == bbp::SimulationCommandKind::kDisconnectPeer);
+  BOOST_REQUIRE(disconnect.peer_node_id);
+  BOOST_TEST(*disconnect.peer_node_id == "firo-3");
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
@@ -30,4 +42,6 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
   BOOST_CHECK_THROW(
       bbp::TuiCommandParser::Parse("block-production nope 1000", 0U),
       std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("connect-peer", 0U),
+                    std::runtime_error);
 }

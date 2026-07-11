@@ -3102,6 +3102,12 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   object["height"] = chain.height;
   object["best_hash"] = chain.best_hash;
   object["peer_count"] = chain.peer_count;
+  boost::json::array peer_addresses;
+  peer_addresses.reserve(chain.peer_addresses.size());
+  for (const std::string& address : chain.peer_addresses) {
+    peer_addresses.emplace_back(address);
+  }
+  object["peer_addresses"] = std::move(peer_addresses);
   object["mempool_tx_count"] = chain.mempool_tx_count;
   object["mempool_bytes"] = chain.mempool_bytes;
   object["generated_block_count"] = generated_block_count;
@@ -4099,6 +4105,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         runtime.config.rpc_host = runtime.network->node_address;
         runtime.config.rpc_bind = runtime.network->node_address;
         runtime.config.rpc_allow_ips = {runtime.network->host_address};
+        runtime.config.p2p_host = runtime.network->node_address;
         runtime.config.p2p_bind = runtime.network->node_address;
         WriteEvent(events_path, options.run_id, node_id, "network_ready",
                    "node_ip=" + runtime.network->node_address +
@@ -4159,6 +4166,18 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     }
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
     WriteNodeState(events_path, options.run_id, node.config.id, "Running");
+  }
+
+  for (auto& node : nodes) {
+    for (const std::string& peer : node.config.connect_peers) {
+      ThrowIfStopRequested(stop_token);
+      driver.ConnectPeer(node.config, peer, stop_token);
+      driver.WaitForPeerAddress(node.config, peer,
+                                std::chrono::seconds(options.ready_timeout_sec),
+                                stop_token);
+      WriteEvent(events_path, options.run_id, node.config.id,
+                 "startup_peer_connected", "address=" + peer);
+    }
   }
 }
 
@@ -5177,6 +5196,9 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
   }
   if (command.mining_difficulty) {
     detail["difficulty"] = command.mining_difficulty->value();
+  }
+  if (command.peer_node_id) {
+    detail["peer_node_id"] = *command.peer_node_id;
   }
   if (!error.empty()) {
     detail["error"] = error;

@@ -18,6 +18,7 @@ set(BOOST_INCLUDE_LIBRARIES
   random
   system
   test
+  url
 )
 
 set(CMAKE_CXX_STANDARD 20)
@@ -255,6 +256,7 @@ target_link_libraries(bbp PRIVATE
   Boost::program_options
   Boost::random
   Boost::system
+  Boost::url
   libcap::cap
   libmnl::libmnl
   ncurses::ncursesw
@@ -324,6 +326,7 @@ if(BUILD_TESTING)
     Boost::random
     Boost::unit_test_framework
     Boost::system
+    Boost::url
     libcap::cap
     libmnl::libmnl
   )

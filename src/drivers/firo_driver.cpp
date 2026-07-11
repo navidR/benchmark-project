@@ -1,10 +1,14 @@
 #include "bbp/drivers/firo_driver.h"
 
+#include <boost/asio/ip/address.hpp>
+#include <boost/asio/ip/network_v4.hpp>
+#include <boost/asio/ip/network_v6.hpp>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
+#include <boost/url/parse.hpp>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -14,6 +18,56 @@
 
 namespace bbp {
 namespace {
+
+std::string PeerHost(const std::string& endpoint) {
+  const std::string uri = "tcp://" + endpoint;
+  const boost::system::result<boost::urls::url_view> parsed =
+      boost::urls::parse_uri(uri);
+  if (!parsed) {
+    throw std::runtime_error("invalid Firo peer endpoint: " + endpoint);
+  }
+  const std::string host(parsed->host());
+  if (host.empty()) {
+    throw std::runtime_error("Firo peer endpoint has no host: " + endpoint);
+  }
+  boost::system::error_code error;
+  boost::asio::ip::make_address(host, error);
+  if (error) {
+    throw std::runtime_error("Firo peer endpoint host is not an IP address: " +
+                             endpoint);
+  }
+  return host;
+}
+
+bool IsExactBanForAddress(std::string_view subnet,
+                          const boost::asio::ip::address& address) {
+  boost::system::error_code error;
+  if (address.is_v4()) {
+    const boost::asio::ip::network_v4 network =
+        boost::asio::ip::make_network_v4(subnet, error);
+    return !error && network.prefix_length() == 32U &&
+           network.network() == address.to_v4();
+  }
+  const boost::asio::ip::network_v6 network =
+      boost::asio::ip::make_network_v6(subnet, error);
+  return !error && network.prefix_length() == 128U &&
+         network.network() == address.to_v6();
+}
+
+bool IsPeerHostBanned(const boost::json::value& bans, const std::string& host) {
+  const boost::asio::ip::address address = boost::asio::ip::make_address(host);
+  for (const boost::json::value& ban : bans.as_array()) {
+    if (!ban.is_object()) {
+      continue;
+    }
+    const boost::json::value* subnet = ban.as_object().if_contains("address");
+    if (subnet != nullptr && subnet->is_string() &&
+        IsExactBanForAddress(subnet->as_string(), address)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 void ThrowIfStopRequested(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
@@ -90,8 +144,9 @@ std::vector<std::string> ParseTxIdResult(const boost::json::value& value,
 
 bool ContainsPeerAddress(const std::vector<std::string>& addresses,
                          const std::string& address) {
+  const std::string expected_host = PeerHost(address);
   for (const std::string& candidate : addresses) {
-    if (candidate == address) {
+    if (PeerHost(candidate) == expected_host) {
       return true;
     }
   }
@@ -216,9 +271,6 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
   if (!config.p2p_bind.empty()) {
     spec.argv.push_back(Arg("-bind", config.p2p_bind));
   }
-  for (const auto& peer : config.connect_peers) {
-    spec.argv.push_back(Arg("-connect", peer));
-  }
   return spec;
 }
 
@@ -334,10 +386,8 @@ void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
     try {
       const std::vector<std::string> addresses =
           PeerAddresses(config, stop_token);
-      for (const std::string& candidate : addresses) {
-        if (candidate == address) {
-          return;
-        }
+      if (ContainsPeerAddress(addresses, address)) {
+        return;
       }
     } catch (const std::exception& e) {
       last_error = e.what();
@@ -393,6 +443,7 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config,
   metrics.height = JsonUint(blockchain, "blocks");
   metrics.best_hash = JsonString(blockchain, "bestblockhash");
   metrics.peer_count = JsonUint(network, "connections");
+  metrics.peer_addresses = PeerAddresses(config, stop_token);
   metrics.mempool_tx_count = JsonUint(mempool, "size");
   metrics.mempool_bytes = JsonUint(mempool, "bytes");
   metrics.initial_block_download =
@@ -695,6 +746,18 @@ uint64_t FiroDriver::WaitForMempoolTransaction(
 void FiroDriver::ConnectPeer(const FiroNodeConfig& config,
                              const std::string& address,
                              std::stop_token stop_token) const {
+  if (ContainsPeerAddress(PeerAddresses(config, stop_token), address)) {
+    return;
+  }
+  const std::string host = PeerHost(address);
+  const boost::json::value bans =
+      RpcCall(config, "listbanned", boost::json::array{}, stop_token);
+  if (IsPeerHostBanned(bans, host)) {
+    boost::json::array unban_params;
+    unban_params.emplace_back(host);
+    unban_params.emplace_back("remove");
+    RpcCall(config, "setban", unban_params, stop_token);
+  }
   boost::json::array params;
   params.emplace_back(address);
   params.emplace_back("onetry");
@@ -704,9 +767,16 @@ void FiroDriver::ConnectPeer(const FiroNodeConfig& config,
 void FiroDriver::DisconnectPeer(const FiroNodeConfig& config,
                                 const std::string& address,
                                 std::stop_token stop_token) const {
+  const std::string host = PeerHost(address);
+  const boost::json::value bans =
+      RpcCall(config, "listbanned", boost::json::array{}, stop_token);
+  if (IsPeerHostBanned(bans, host)) {
+    return;
+  }
   boost::json::array params;
-  params.emplace_back(address);
-  RpcCall(config, "disconnectnode", params, stop_token);
+  params.emplace_back(host);
+  params.emplace_back("add");
+  RpcCall(config, "setban", params, stop_token);
 }
 
 void FiroDriver::ChangeLogVerbosity(const FiroNodeConfig& config,

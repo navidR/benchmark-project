@@ -3,6 +3,7 @@
 #include <ncursesw/curses.h>
 
 #include <algorithm>
+#include <boost/algorithm/string/join.hpp>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
@@ -35,7 +36,7 @@ constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
-constexpr int kDetailPaneRows = 9;
+constexpr int kDetailPaneRows = 10;
 
 struct TuiState {
   std::size_t selected_node = 0;
@@ -143,6 +144,24 @@ std::string JsonMetricText(const boost::json::object& object,
     return std::to_string(value->as_double());
   }
   return boost::json::serialize(*value);
+}
+
+std::string JsonStringArrayText(const boost::json::object& object,
+                                std::string_view field,
+                                std::string_view fallback = "-") {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || !value->is_array()) {
+    return std::string(fallback);
+  }
+  std::vector<std::string> values;
+  values.reserve(value->as_array().size());
+  for (const boost::json::value& item : value->as_array()) {
+    if (item.is_string()) {
+      values.emplace_back(item.as_string());
+    }
+  }
+  return values.empty() ? std::string(fallback)
+                        : boost::algorithm::join(values, ", ");
 }
 
 std::optional<std::uint64_t> JsonUnsignedMetric(
@@ -543,7 +562,7 @@ void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
 
 void DrawCommandPalette(int rows, int cols, std::string_view input,
                         std::string_view error) {
-  constexpr int kPopupRows = 10;
+  constexpr int kPopupRows = 11;
   if (rows < kPopupRows + 2 || cols < 48) {
     return;
   }
@@ -567,13 +586,15 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   AddText(top + 3, left + 2, popup_cols - 4, "mining-difficulty <value>");
   AddText(top + 4, left + 2, popup_cols - 4,
           "stop-mining  disconnect  reconnect  log-more  log-less");
-  AddText(top + 6, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+  AddText(top + 5, left + 2, popup_cols - 4,
+          "connect-peer <node-id>  disconnect-peer <node-id>");
+  AddText(top + 7, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
           A_BOLD);
   if (!error.empty()) {
-    AddText(top + 7, left + 2, popup_cols - 4, error,
+    AddText(top + 8, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   }
-  AddText(top + 8, left + 2, popup_cols - 4,
+  AddText(top + 9, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
 }
 
@@ -634,6 +655,12 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   AddDetailPair(y, left_width, right_width, "mempool",
                 JsonMetricText(metric_object, "mempool_tx_count") + " tx / " +
                     JsonBytesKiBText(metric_object, "mempool_bytes"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "peer set",
+                JsonStringArrayText(metric_object, "peer_addresses"));
   ++y;
   if (y >= bottom) {
     return;
@@ -932,6 +959,13 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
         }
         sequence = command_queue->PushMiningDifficulty(
             node_id, *parsed.mining_difficulty);
+      } else if (parsed.kind == SimulationCommandKind::kConnectPeer ||
+                 parsed.kind == SimulationCommandKind::kDisconnectPeer) {
+        if (!parsed.peer_node_id) {
+          throw std::runtime_error("peer target node is missing");
+        }
+        sequence = command_queue->PushPeerCommand(parsed.kind, node_id,
+                                                  *parsed.peer_node_id);
       } else {
         sequence = command_queue->Push(parsed.kind, node_id);
       }
