@@ -280,6 +280,7 @@ if(BUILD_TESTING)
     tests/unit/logging_tests.cpp
     tests/unit/network_tests.cpp
     tests/unit/node_log_pane_tests.cpp
+    tests/unit/node_runtime_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/process_tests.cpp

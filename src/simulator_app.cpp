@@ -3467,10 +3467,16 @@ void WriteMetricsSnapshot(
     if (stop_requested && stop_requested()) {
       return;
     }
+    if (!node.AllowsChainMetrics()) {
+      continue;
+    }
     ChainMetrics chain;
     try {
       chain = driver.ReadMetrics(node.config, stop_token);
     } catch (const std::exception& error) {
+      if (!node.AllowsChainMetrics()) {
+        continue;
+      }
       if (!node_failure_handler) {
         throw;
       }
@@ -4165,6 +4171,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       throw;
     }
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
+    node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
     WriteNodeState(events_path, options.run_id, node.config.id, "Running");
   }
 
@@ -4855,6 +4862,7 @@ void RestartNode(const Options& options,
   }
 
   WriteNodeState(events_path, options.run_id, node.config.id, "Restarting");
+  node.SetLifecycle(NodeRuntimeLifecycle::kRestarting);
   WriteEvent(events_path, options.run_id, node.config.id, "restart_requested",
              "restart_count=" + std::to_string(node.RestartCount() + 1U));
   driver.Stop(node.config, stop_token);
@@ -4881,6 +4889,7 @@ void RestartNode(const Options& options,
   driver.WaitReady(node.config, std::chrono::seconds(options.ready_timeout_sec),
                    stop_token);
   WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
+  node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
   WriteNodeState(events_path, options.run_id, node.config.id, "Running");
 }
 
@@ -5485,16 +5494,25 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                               active_native_miner_ids.end(), command.node_id),
                   active_native_miner_ids.end());
               const pid_t pid = node.process.pid();
+              node.SetLifecycle(NodeRuntimeLifecycle::kKilling);
               WriteNodeState(events_path, options.run_id, command.node_id,
                              "Killing");
               WriteEvent(events_path, options.run_id, command.node_id,
                          "process_kill_requested",
                          "pid=" + std::to_string(pid));
-              node.process.Kill();
-              if (node.process.running()) {
-                throw std::runtime_error("node process survived SIGKILL: " +
-                                         command.node_id);
+              try {
+                node.process.Kill();
+                if (node.process.running()) {
+                  throw std::runtime_error("node process survived SIGKILL: " +
+                                           command.node_id);
+                }
+              } catch (...) {
+                if (node.process.running()) {
+                  node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+                }
+                throw;
               }
+              node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
               WriteEvent(events_path, options.run_id, command.node_id,
                          "process_killed", "pid=" + std::to_string(pid));
               WriteNodeState(events_path, options.run_id, command.node_id,
