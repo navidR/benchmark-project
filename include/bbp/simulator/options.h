@@ -56,15 +56,6 @@ struct Options {
   std::optional<SimulationNetworkAddressPlan> network_address_plan;
   bool network_condition_requested = false;
   NetworkCondition network_condition;
-  std::vector<std::string> node_network_condition_json;
-  std::vector<std::string> runtime_node_network_condition_json;
-  std::vector<std::string> runtime_node_block_json;
-  std::vector<std::string> runtime_node_unblock_json;
-  std::vector<std::string> runtime_partition_json;
-  std::vector<std::string> runtime_heal_partition_json;
-  std::vector<std::string> runtime_node_resource_json;
-  std::vector<std::string> runtime_node_restart_json;
-  std::vector<std::string> runtime_node_freeze_json;
   std::map<std::uint32_t, NetworkCondition> node_network_conditions;
   std::map<std::uint32_t, NetworkCondition> runtime_node_network_conditions;
   std::map<std::uint32_t, ResourceLimitPatch> runtime_node_resource_updates;

@@ -52,6 +52,7 @@
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulation_registry.h"
 #include "bbp/simulator/constants.h"
+#include "bbp/simulator/legacy_cli_inputs.h"
 #include "bbp/simulator/node_runtime.h"
 #include "bbp/simulator/options.h"
 #include "bbp/simulator/yaml_helpers.h"
@@ -1859,38 +1860,38 @@ void ParseRuntimeNodeFreezeTexts(const std::vector<std::string>& texts,
   }
 }
 
-void ParseNodeNetworkConditions(Options& options) {
-  ParseNodeNetworkConditionTexts(options.node_network_condition_json,
-                                 options.nodes, "--node-network-condition-json",
+void ParseLegacyCliInputs(const LegacyCliInputs& inputs, Options& options) {
+  ParseNodeNetworkConditionTexts(inputs.node_network_conditions, options.nodes,
+                                 "--node-network-condition-json",
                                  options.node_network_conditions);
-  ParseNodeNetworkConditionTexts(options.runtime_node_network_condition_json,
+  ParseNodeNetworkConditionTexts(inputs.runtime_node_network_conditions,
                                  options.nodes,
                                  "--runtime-node-network-condition-json",
                                  options.runtime_node_network_conditions);
-  ParseRuntimeNodeBlockTexts(options.runtime_node_block_json, options.nodes,
+  ParseRuntimeNodeBlockTexts(inputs.runtime_node_blocks, options.nodes,
                              "--runtime-node-block-json",
                              options.runtime_node_blocks);
-  ParseRuntimeNodeBlockTexts(options.runtime_node_unblock_json, options.nodes,
+  ParseRuntimeNodeBlockTexts(inputs.runtime_node_unblocks, options.nodes,
                              "--runtime-node-unblock-json",
                              options.runtime_node_unblocks);
-  ParseRuntimePartitionTexts(options.runtime_partition_json, options.nodes,
+  ParseRuntimePartitionTexts(inputs.runtime_partitions, options.nodes,
                              "--runtime-partition-json",
                              options.runtime_partitions);
-  ParseRuntimePartitionTexts(options.runtime_heal_partition_json, options.nodes,
+  ParseRuntimePartitionTexts(inputs.runtime_partition_heals, options.nodes,
                              "--runtime-heal-partition-json",
                              options.runtime_partition_heals);
-  ParseRuntimeNodeResourceTexts(options.runtime_node_resource_json,
-                                options.nodes,
+  ParseRuntimeNodeResourceTexts(inputs.runtime_node_resources, options.nodes,
                                 options.runtime_node_resource_updates);
-  ParseRuntimeNodeRestartTexts(options.runtime_node_restart_json, options.nodes,
+  ParseRuntimeNodeRestartTexts(inputs.runtime_node_restarts, options.nodes,
                                options.runtime_node_restarts);
-  ParseRuntimeNodeFreezeTexts(options.runtime_node_freeze_json, options.nodes,
+  ParseRuntimeNodeFreezeTexts(inputs.runtime_node_freezes, options.nodes,
                               options.runtime_node_freezes);
 }
 
 Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
   Options options;
+  LegacyCliInputs legacy_inputs;
   const ChainDriverSpec& default_chain_spec = DefaultChainDriverSpec();
   std::string chain_name = std::string(ChainKindName(options.chain));
   std::string log_level_name = std::string(LogLevelName(options.log_level));
@@ -2048,50 +2049,52 @@ Options ParseOptions(int argc, char** argv) {
       po::value<uint32_t>(&options.network_condition.limit_packets),
       "netem queue limit applied to each isolated node host-side veth")(
       "node-network-condition-json",
-      po::value<std::vector<std::string>>(&options.node_network_condition_json)
+      po::value<std::vector<std::string>>(
+          &legacy_inputs.node_network_conditions)
           ->composing(),
       "repeatable JSON object with node plus network condition fields for one "
       "isolated "
       "node")(
       "runtime-node-network-condition-json",
       po::value<std::vector<std::string>>(
-          &options.runtime_node_network_condition_json)
+          &legacy_inputs.runtime_node_network_conditions)
           ->composing(),
       "repeatable JSON object with node plus live network condition fields to "
       "apply after isolated nodes are running")(
       "runtime-node-block-json",
-      po::value<std::vector<std::string>>(&options.runtime_node_block_json)
+      po::value<std::vector<std::string>>(&legacy_inputs.runtime_node_blocks)
           ->composing(),
       "repeatable JSON object with node, optional src_address, dst_address, "
       "dst_port, and optional handle for one live host-side TCP drop filter")(
       "runtime-node-unblock-json",
-      po::value<std::vector<std::string>>(&options.runtime_node_unblock_json)
+      po::value<std::vector<std::string>>(&legacy_inputs.runtime_node_unblocks)
           ->composing(),
       "repeatable JSON object with node, optional src_address, dst_address, "
       "dst_port, and optional handle for one live host-side TCP drop filter "
       "removal")(
       "runtime-partition-json",
-      po::value<std::vector<std::string>>(&options.runtime_partition_json)
+      po::value<std::vector<std::string>>(&legacy_inputs.runtime_partitions)
           ->composing(),
       "repeatable JSON object with group_a and group_b arrays for one live "
       "source-aware group partition")(
       "runtime-heal-partition-json",
-      po::value<std::vector<std::string>>(&options.runtime_heal_partition_json)
+      po::value<std::vector<std::string>>(
+          &legacy_inputs.runtime_partition_heals)
           ->composing(),
       "repeatable JSON object with group_a and group_b arrays for one live "
       "source-aware group partition heal")(
       "runtime-node-resource-json",
-      po::value<std::vector<std::string>>(&options.runtime_node_resource_json)
+      po::value<std::vector<std::string>>(&legacy_inputs.runtime_node_resources)
           ->composing(),
       "repeatable JSON object with node plus live cgroup limit fields to apply "
       "after nodes are running")(
       "runtime-node-restart-json",
-      po::value<std::vector<std::string>>(&options.runtime_node_restart_json)
+      po::value<std::vector<std::string>>(&legacy_inputs.runtime_node_restarts)
           ->composing(),
       "repeatable JSON object with node field for one live node restart after "
       "nodes are running")(
       "runtime-node-freeze-json",
-      po::value<std::vector<std::string>>(&options.runtime_node_freeze_json)
+      po::value<std::vector<std::string>>(&legacy_inputs.runtime_node_freezes)
           ->composing(),
       "repeatable JSON object with node and duration_ms for one live cgroup "
       "freeze/thaw after nodes are running")(
@@ -2266,6 +2269,7 @@ Options ParseOptions(int argc, char** argv) {
       vm.count("network-limit-packets") != 0U;
   options.cpu_quota_requested =
       options.cpu_quota_requested || vm.count("cpu-quota-us") != 0U;
+  ParseLegacyCliInputs(legacy_inputs, options);
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   if (options.memory_high_bytes > options.memory_max_bytes) {
     throw std::runtime_error(
@@ -2281,17 +2285,11 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error("--pids-max must be greater than zero");
   }
   if ((options.network_condition_requested ||
-       !options.node_network_condition_json.empty() ||
        !options.node_network_conditions.empty() ||
-       !options.runtime_node_network_condition_json.empty() ||
        !options.runtime_node_network_conditions.empty() ||
-       !options.runtime_node_block_json.empty() ||
        !options.runtime_node_blocks.empty() ||
-       !options.runtime_node_unblock_json.empty() ||
        !options.runtime_node_unblocks.empty() ||
-       !options.runtime_partition_json.empty() ||
        !options.runtime_partitions.empty() ||
-       !options.runtime_heal_partition_json.empty() ||
        !options.runtime_partition_heals.empty() ||
        WorkloadsRequireIsolatedNetwork(options)) &&
       !options.isolate_network) {
@@ -2473,7 +2471,6 @@ Options ParseOptions(int argc, char** argv) {
           "enabled block production requires at least one configured miner");
     }
   }
-  ParseNodeNetworkConditions(options);
   RequireSafeRunId(options.run_id);
   const bool needs_chain_daemon =
       !options.probe_network && options.report_run.empty() &&
