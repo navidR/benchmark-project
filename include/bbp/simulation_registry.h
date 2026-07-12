@@ -5,18 +5,9 @@
 #include <string>
 #include <vector>
 
+#include "bbp/peer_connectivity_policy.h"
+
 namespace bbp {
-
-enum class PeerConnectivityMode {
-  kFixedCount,
-  kAllPeers,
-};
-
-struct PeerConnectivityPolicy {
-  uint32_t node = 0;
-  PeerConnectivityMode mode = PeerConnectivityMode::kFixedCount;
-  uint32_t max_peer_count = 1;
-};
 
 struct NodeRoleTopology {
   bool configured = false;

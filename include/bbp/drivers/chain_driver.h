@@ -132,6 +132,10 @@ class ChainDriver {
                                    std::stop_token stop_token = {}) const = 0;
   virtual std::vector<std::string> PeerAddresses(
       const ChainNodeConfig& config, std::stop_token stop_token = {}) const = 0;
+  virtual std::vector<std::string> ConnectedPeerAddresses(
+      const ChainNodeConfig& config,
+      const std::vector<std::string>& candidate_addresses,
+      std::stop_token stop_token = {}) const = 0;
   virtual std::vector<std::string> GenerateBlocks(
       const ChainNodeConfig& config, uint32_t count, const std::string& address,
       std::stop_token stop_token = {}) const = 0;

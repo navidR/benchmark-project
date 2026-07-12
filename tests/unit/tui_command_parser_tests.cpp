@@ -32,6 +32,13 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
   BOOST_CHECK(disconnect.kind == bbp::SimulationCommandKind::kDisconnectPeer);
   BOOST_REQUIRE(disconnect.peer_node_id);
   BOOST_TEST(*disconnect.peer_node_id == "firo-3");
+
+  const bbp::ParsedTuiCommand policy =
+      bbp::TuiCommandParser::Parse("peer-policy 1 3", 0U);
+  BOOST_CHECK(policy.kind == bbp::SimulationCommandKind::kSetPeerCountPolicy);
+  BOOST_REQUIRE(policy.peer_count_policy);
+  BOOST_TEST(policy.peer_count_policy->minimum() == 1U);
+  BOOST_TEST(policy.peer_count_policy->maximum() == 3U);
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
@@ -43,5 +50,7 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
       bbp::TuiCommandParser::Parse("block-production nope 1000", 0U),
       std::runtime_error);
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("connect-peer", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("peer-policy 2 1", 0U),
                     std::runtime_error);
 }

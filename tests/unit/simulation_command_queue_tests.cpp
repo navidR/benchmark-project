@@ -120,3 +120,16 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_peer_target) {
                                           "firo-1", "firo-2"),
                     std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_peer_count_policy) {
+  bbp::SimulationCommandQueue queue;
+  queue.PushPeerCountPolicy("firo-2", bbp::PeerCountPolicy(1U, 3U));
+
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kSetPeerCountPolicy);
+  BOOST_TEST(command->node_id == "firo-2");
+  BOOST_REQUIRE(command->peer_count_policy);
+  BOOST_TEST(command->peer_count_policy->minimum() == 1U);
+  BOOST_TEST(command->peer_count_policy->maximum() == 3U);
+}

@@ -19,6 +19,8 @@ class SimulationCommandQueue {
                                      MiningDifficulty difficulty);
   std::uint64_t PushPeerCommand(SimulationCommandKind kind, std::string node_id,
                                 std::string peer_node_id);
+  std::uint64_t PushPeerCountPolicy(std::string node_id,
+                                    PeerCountPolicy policy);
   std::optional<SimulationCommand> TryPop();
   std::optional<SimulationCommand> WaitPop();
   void Close();

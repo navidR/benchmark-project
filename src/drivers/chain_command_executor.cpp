@@ -1,19 +1,12 @@
 #include "bbp/drivers/chain_command_executor.h"
 
 #include <algorithm>
-#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace bbp {
 namespace {
-
-constexpr std::chrono::seconds kPeerCommandTimeout(10);
-
-std::string PeerEndpoint(const ChainNodeConfig& config) {
-  return config.p2p_host + ":" + std::to_string(config.p2p_port);
-}
 
 const std::string& RequirePeerNodeId(const SimulationCommand& command) {
   if (!command.peer_node_id || command.peer_node_id->empty()) {
@@ -28,15 +21,21 @@ ChainCommandExecutor::ChainCommandExecutor(
     const ChainDriver& driver, std::vector<ChainNodeConfig> nodes,
     StopMiningHandler stop_mining_handler,
     BlockProductionPolicyHandler policy_handler,
-    MiningDifficultyHandler difficulty_handler)
+    MiningDifficultyHandler difficulty_handler,
+    PeerHandler connect_peer_handler, PeerHandler disconnect_peer_handler,
+    PeerCountPolicyHandler peer_count_policy_handler)
     : driver_(driver),
       nodes_(std::move(nodes)),
       stop_mining_handler_(std::move(stop_mining_handler)),
       policy_handler_(std::move(policy_handler)),
-      difficulty_handler_(std::move(difficulty_handler)) {
-  if (!stop_mining_handler_ || !policy_handler_ || !difficulty_handler_) {
-    throw std::runtime_error(
-        "chain command executor requires mining control handlers");
+      difficulty_handler_(std::move(difficulty_handler)),
+      connect_peer_handler_(std::move(connect_peer_handler)),
+      disconnect_peer_handler_(std::move(disconnect_peer_handler)),
+      peer_count_policy_handler_(std::move(peer_count_policy_handler)) {
+  if (!stop_mining_handler_ || !policy_handler_ || !difficulty_handler_ ||
+      !connect_peer_handler_ || !disconnect_peer_handler_ ||
+      !peer_count_policy_handler_) {
+    throw std::runtime_error("chain command executor requires all handlers");
   }
 }
 
@@ -86,10 +85,7 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
       if (node.id == peer.id) {
         throw std::runtime_error("peer command source and target must differ");
       }
-      const std::string endpoint = PeerEndpoint(peer);
-      driver_.ConnectPeer(node, endpoint, stop_token);
-      driver_.WaitForPeerAddress(node, endpoint, kPeerCommandTimeout,
-                                 stop_token);
+      connect_peer_handler_(node, peer, stop_token);
       return;
     }
     case SimulationCommandKind::kDisconnectPeer: {
@@ -98,10 +94,16 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
       if (node.id == peer.id) {
         throw std::runtime_error("peer command source and target must differ");
       }
-      const std::string endpoint = PeerEndpoint(peer);
-      driver_.DisconnectPeer(node, endpoint, stop_token);
-      driver_.WaitForPeerAddressAbsent(node, endpoint, kPeerCommandTimeout,
-                                       stop_token);
+      disconnect_peer_handler_(node, peer, stop_token);
+      return;
+    }
+    case SimulationCommandKind::kSetPeerCountPolicy: {
+      if (!command.peer_count_policy) {
+        throw std::runtime_error(
+            "set-peer-count-policy command requires a policy");
+      }
+      peer_count_policy_handler_(FindNode(command.node_id),
+                                 *command.peer_count_policy);
       return;
     }
   }

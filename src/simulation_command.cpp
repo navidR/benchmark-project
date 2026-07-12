@@ -26,6 +26,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "connect_peer";
     case SimulationCommandKind::kDisconnectPeer:
       return "disconnect_peer";
+    case SimulationCommandKind::kSetPeerCountPolicy:
+      return "set_peer_count_policy";
   }
   throw std::runtime_error("unknown simulation command kind");
 }

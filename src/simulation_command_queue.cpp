@@ -14,6 +14,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .block_production_policy = std::nullopt,
       .mining_difficulty = std::nullopt,
       .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
   });
 }
 
@@ -26,6 +27,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .block_production_policy = policy,
       .mining_difficulty = std::nullopt,
       .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
   });
 }
 
@@ -38,6 +40,7 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .block_production_policy = std::nullopt,
       .mining_difficulty = difficulty,
       .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
   });
 }
 
@@ -60,6 +63,20 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .block_production_policy = std::nullopt,
       .mining_difficulty = std::nullopt,
       .peer_node_id = std::move(peer_node_id),
+      .peer_count_policy = std::nullopt,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
+    std::string node_id, PeerCountPolicy policy) {
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kSetPeerCountPolicy,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = policy,
   });
 }
 

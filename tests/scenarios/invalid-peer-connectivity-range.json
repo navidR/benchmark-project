@@ -1,0 +1,17 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "node_count": 3,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 3,
+    "wallet_node_count": 0,
+    "miner_node_count": 0,
+    "peer_connectivity": [
+      {
+        "node": 1,
+        "min_peer_count": 2,
+        "max_peer_count": 1
+      }
+    ]
+  }
+}

@@ -231,6 +231,8 @@ add_executable(bbp
   src/network.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
+  src/peer_count_policy.cpp
+  src/peer_connectivity_controller.cpp
   src/periodic_metrics_collector.cpp
   src/process.cpp
   src/probabilistic_block_scheduler.cpp
@@ -281,6 +283,7 @@ if(BUILD_TESTING)
     tests/unit/network_tests.cpp
     tests/unit/node_log_pane_tests.cpp
     tests/unit/node_runtime_tests.cpp
+    tests/unit/peer_connectivity_controller_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/process_tests.cpp
@@ -304,6 +307,8 @@ if(BUILD_TESTING)
     src/mining_difficulty.cpp
     src/network.cpp
     src/node_log_pane.cpp
+    src/peer_count_policy.cpp
+    src/peer_connectivity_controller.cpp
     src/periodic_metrics_collector.cpp
     src/process.cpp
     src/probabilistic_block_scheduler.cpp
@@ -459,6 +464,11 @@ if(BUILD_TESTING)
     bbp-invalid-peer-connectivity-max-count
     tests/scenarios/invalid-peer-connectivity-max-count.json
     "scenario topology.peer_connectivity max_peer_count must be less than node_count"
+  )
+  add_cli_failure_test(
+    bbp-invalid-peer-connectivity-range
+    tests/scenarios/invalid-peer-connectivity-range.json
+    "scenario topology.peer_connectivity min_peer_count must not exceed max_peer_count"
   )
   add_cli_failure_test(
     bbp-invalid-wait-height-missing-height

@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <set>
 
 #include "bbp/simulation_cancelled.h"
 #include "bbp/util.h"
@@ -469,6 +470,31 @@ std::vector<std::string> FiroDriver::PeerAddresses(
     }
   }
   return addresses;
+}
+
+std::vector<std::string> FiroDriver::ConnectedPeerAddresses(
+    const FiroNodeConfig& config,
+    const std::vector<std::string>& candidate_addresses,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  std::set<std::string> candidate_hosts;
+  for (const std::string& candidate : candidate_addresses) {
+    if (!candidate_hosts.insert(PeerHost(candidate)).second) {
+      throw UnsupportedChainOperation(
+          "Firo",
+          "per-node peer identity without isolated networking; rerun with "
+          "--isolate-network");
+    }
+  }
+  const std::vector<std::string> reported = PeerAddresses(config, stop_token);
+  std::vector<std::string> connected;
+  connected.reserve(candidate_addresses.size());
+  for (const std::string& candidate : candidate_addresses) {
+    if (ContainsPeerAddress(reported, candidate)) {
+      connected.push_back(candidate);
+    }
+  }
+  return connected;
 }
 
 std::vector<std::string> FiroDriver::GenerateBlocks(

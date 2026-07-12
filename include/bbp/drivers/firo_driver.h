@@ -48,6 +48,10 @@ class FiroDriver final : public ChainDriver {
   std::vector<std::string> PeerAddresses(
       const FiroNodeConfig& config,
       std::stop_token stop_token = {}) const override;
+  std::vector<std::string> ConnectedPeerAddresses(
+      const FiroNodeConfig& config,
+      const std::vector<std::string>& candidate_addresses,
+      std::stop_token stop_token = {}) const override;
   std::vector<std::string> GenerateBlocks(
       const FiroNodeConfig& config, uint32_t count, const std::string& address,
       std::stop_token stop_token = {}) const override;

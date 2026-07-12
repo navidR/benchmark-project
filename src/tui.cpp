@@ -415,6 +415,68 @@ void RefreshCommandResults(const boost::json::object& report, TuiState* state) {
   }
 }
 
+std::string SelectedPeerPolicyText(const boost::json::object& report,
+                                   std::size_t selected_node,
+                                   std::string_view node_id) {
+  const boost::json::value* commands_value =
+      report.if_contains("operator_commands");
+  if (commands_value != nullptr && commands_value->is_array()) {
+    const boost::json::array& commands = commands_value->as_array();
+    for (auto command = commands.rbegin(); command != commands.rend();
+         ++command) {
+      if (!command->is_object()) {
+        continue;
+      }
+      const boost::json::object& command_object = command->as_object();
+      if (JsonString(command_object, "status") != "completed" ||
+          JsonString(command_object, "node_id") != node_id) {
+        continue;
+      }
+      const boost::json::value* detail_value =
+          command_object.if_contains("detail");
+      if (detail_value == nullptr || !detail_value->is_object()) {
+        continue;
+      }
+      const boost::json::object& detail = detail_value->as_object();
+      if (JsonString(detail, "kind") != "set_peer_count_policy") {
+        continue;
+      }
+      return "min " + JsonIntegerText(detail, "minimum_peer_count") +
+             " / max " + JsonIntegerText(detail, "maximum_peer_count");
+    }
+  }
+
+  const boost::json::value* topology_value = report.if_contains("topology");
+  if (topology_value == nullptr || !topology_value->is_object()) {
+    return "unmanaged";
+  }
+  const boost::json::value* policies_value =
+      topology_value->as_object().if_contains("peer_connectivity");
+  if (policies_value == nullptr || !policies_value->is_array()) {
+    return "unmanaged";
+  }
+  for (const boost::json::value& policy_value : policies_value->as_array()) {
+    if (!policy_value.is_object()) {
+      continue;
+    }
+    const boost::json::object& policy = policy_value.as_object();
+    const std::optional<std::uint64_t> policy_node =
+        JsonUnsignedMetric(policy, "node");
+    if (!policy_node || *policy_node != selected_node + 1U) {
+      continue;
+    }
+    if (JsonBoolText(policy, "all_peers", "false") == "true") {
+      const boost::json::array* nodes = NodeSummaries(report);
+      const std::size_t count =
+          nodes == nullptr || nodes->empty() ? 0U : nodes->size() - 1U;
+      return "all (" + std::to_string(count) + ")";
+    }
+    return "min " + JsonIntegerText(policy, "min_peer_count") + " / max " +
+           JsonIntegerText(policy, "max_peer_count");
+  }
+  return "unmanaged";
+}
+
 const boost::json::object* WalletForNode(const boost::json::object& report,
                                          std::size_t one_based_node) {
   const boost::json::array* wallets = WalletSummaries(report);
@@ -562,7 +624,7 @@ void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
 
 void DrawCommandPalette(int rows, int cols, std::string_view input,
                         std::string_view error) {
-  constexpr int kPopupRows = 11;
+  constexpr int kPopupRows = 12;
   if (rows < kPopupRows + 2 || cols < 48) {
     return;
   }
@@ -588,13 +650,14 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
           "stop-mining  disconnect  reconnect  log-more  log-less");
   AddText(top + 5, left + 2, popup_cols - 4,
           "connect-peer <node-id>  disconnect-peer <node-id>");
-  AddText(top + 7, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+  AddText(top + 6, left + 2, popup_cols - 4, "peer-policy <minimum> <maximum>");
+  AddText(top + 8, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
           A_BOLD);
   if (!error.empty()) {
-    AddText(top + 8, left + 2, popup_cols - 4, error,
+    AddText(top + 9, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   }
-  AddText(top + 9, left + 2, popup_cols - 4,
+  AddText(top + 10, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
 }
 
@@ -689,6 +752,9 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
+  AddDetailPair(y, 0, left_width, "peer policy",
+                SelectedPeerPolicyText(report, selected_node,
+                                       JsonString(*node, "node_id")));
   AddDetailPair(y, left_width, right_width, "qdisc",
                 JsonMetricText(metric_object, "qdisc_kind") + " drops " +
                     JsonMetricText(metric_object, "qdisc_drops"));
@@ -959,6 +1025,12 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
         }
         sequence = command_queue->PushMiningDifficulty(
             node_id, *parsed.mining_difficulty);
+      } else if (parsed.kind == SimulationCommandKind::kSetPeerCountPolicy) {
+        if (!parsed.peer_count_policy) {
+          throw std::runtime_error("peer count policy is missing");
+        }
+        sequence = command_queue->PushPeerCountPolicy(
+            node_id, *parsed.peer_count_policy);
       } else if (parsed.kind == SimulationCommandKind::kConnectPeer ||
                  parsed.kind == SimulationCommandKind::kDisconnectPeer) {
         if (!parsed.peer_node_id) {

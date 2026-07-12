@@ -12,6 +12,7 @@
     "peer_connectivity": [
       {
         "node": 1,
+        "min_peer_count": 1,
         "max_peer_count": 2
       },
       {

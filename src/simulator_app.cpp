@@ -40,6 +40,7 @@
 #include "bbp/logging.h"
 #include "bbp/network.h"
 #include "bbp/node_log_collector.h"
+#include "bbp/peer_connectivity_controller.h"
 #include "bbp/periodic_metrics_collector.h"
 #include "bbp/probabilistic_block_scheduler.h"
 #include "bbp/process.h"
@@ -735,16 +736,18 @@ PeerConnectivityPolicy ParsePeerConnectivityPolicyObject(
   PeerConnectivityPolicy policy;
   policy.node = node - 1U;
   const bool all_peers = JsonOptionalBoolField(object, "all_peers", false);
+  const bool min_peer_count_present =
+      object.if_contains("min_peer_count") != nullptr;
   const bool max_peer_count_present =
       object.if_contains("max_peer_count") != nullptr;
-  if (all_peers && max_peer_count_present) {
+  if (all_peers && (min_peer_count_present || max_peer_count_present)) {
     throw std::runtime_error(
-        "scenario topology.peer_connectivity cannot set both all_peers and "
-        "max_peer_count");
+        "scenario topology.peer_connectivity cannot combine all_peers with "
+        "minimum or maximum peer counts");
   }
   if (all_peers) {
     policy.mode = PeerConnectivityMode::kAllPeers;
-    policy.max_peer_count = 0;
+    policy.peer_count = PeerCountPolicy(node_count - 1U, node_count - 1U);
     return policy;
   }
   if (!max_peer_count_present) {
@@ -753,12 +756,20 @@ PeerConnectivityPolicy ParsePeerConnectivityPolicyObject(
         "max_peer_count");
   }
   policy.mode = PeerConnectivityMode::kFixedCount;
-  policy.max_peer_count = JsonUint32Field(object, "max_peer_count");
-  if (policy.max_peer_count >= node_count) {
+  const uint32_t maximum = JsonUint32Field(object, "max_peer_count");
+  const uint32_t minimum =
+      JsonOptionalUint32Field(object, "min_peer_count", maximum);
+  if (maximum >= node_count) {
     throw std::runtime_error(
         "scenario topology.peer_connectivity max_peer_count must be less than "
         "node_count");
   }
+  if (minimum > maximum) {
+    throw std::runtime_error(
+        "scenario topology.peer_connectivity min_peer_count must not exceed "
+        "max_peer_count");
+  }
+  policy.peer_count = PeerCountPolicy(minimum, maximum);
   return policy;
 }
 
@@ -2557,7 +2568,8 @@ boost::json::object PeerConnectivityPolicyJson(
   if (policy.mode == PeerConnectivityMode::kAllPeers) {
     object["all_peers"] = true;
   } else {
-    object["max_peer_count"] = policy.max_peer_count;
+    object["min_peer_count"] = policy.peer_count.minimum();
+    object["max_peer_count"] = policy.peer_count.maximum();
   }
   return object;
 }
@@ -2787,13 +2799,11 @@ std::vector<uint32_t> ConfiguredStartupPeerIndexes(const Options& options,
   if (policy == nullptr) {
     return LegacyStartupPeerIndexes(node_index);
   }
-  const uint32_t max_peer_count =
-      policy->mode == PeerConnectivityMode::kAllPeers ? options.nodes - 1U
-                                                      : policy->max_peer_count;
+  const uint32_t initial_peer_count = policy->peer_count.minimum();
   std::vector<uint32_t> peers;
-  peers.reserve(max_peer_count);
+  peers.reserve(initial_peer_count);
   for (uint32_t peer_index = 0; peer_index < options.nodes; ++peer_index) {
-    if (peers.size() >= max_peer_count) {
+    if (peers.size() >= initial_peer_count) {
       break;
     }
     if (peer_index == node_index) {
@@ -3271,16 +3281,6 @@ std::string PeerCountWaitDetail(uint32_t workload_index,
   detail["target_peer_count"] = target_peer_count;
   detail["observed_peer_count"] = observed_peer_count;
   return boost::json::serialize(detail);
-}
-
-bool ContainsPeerAddress(const std::vector<std::string>& addresses,
-                         const std::string& address) {
-  for (const std::string& candidate : addresses) {
-    if (candidate == address) {
-      return true;
-    }
-  }
-  return false;
 }
 
 std::string PeerAddress(const Options& options,
@@ -4379,6 +4379,7 @@ void ApplyResourcePressureWorkload(
 void ApplyConnectPeerWorkload(const Options& options,
                               const std::filesystem::path& events_path,
                               const ChainDriver& driver,
+                              PeerConnectivityController& controller,
                               std::vector<NodeRuntime>& nodes,
                               const ConnectPeerWorkload& workload,
                               uint32_t workload_index, uint32_t workload_count,
@@ -4387,14 +4388,17 @@ void ApplyConnectPeerWorkload(const Options& options,
   const std::string address = PeerAddress(options, nodes, workload.peer);
   const std::vector<std::string> before_addresses =
       driver.PeerAddresses(node.config, stop_token);
-  const bool connected_before = ContainsPeerAddress(before_addresses, address);
-  driver.ConnectPeer(node.config, address, stop_token);
-  driver.WaitForPeerAddress(node.config, address,
-                            std::chrono::seconds(workload.timeout_sec),
-                            stop_token);
+  const bool connected_before =
+      !driver.ConnectedPeerAddresses(node.config, {address}, stop_token)
+           .empty();
+  controller.ConnectPeer(node.config.id, nodes[workload.peer - 1U].config.id,
+                         std::chrono::seconds(workload.timeout_sec),
+                         stop_token);
   const std::vector<std::string> after_addresses =
       driver.PeerAddresses(node.config, stop_token);
-  const bool connected_after = ContainsPeerAddress(after_addresses, address);
+  const bool connected_after =
+      !driver.ConnectedPeerAddresses(node.config, {address}, stop_token)
+           .empty();
   WriteEvent(events_path, options.run_id, node.config.id, "peer_connected",
              PeerChurnDetail(
                  workload_index, workload_count, workload.node, workload.peer,
@@ -4405,21 +4409,25 @@ void ApplyConnectPeerWorkload(const Options& options,
 
 void ApplyDisconnectPeerWorkload(
     const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
-    const DisconnectPeerWorkload& workload, uint32_t workload_index,
-    uint32_t workload_count, std::stop_token stop_token) {
+    const ChainDriver& driver, PeerConnectivityController& controller,
+    std::vector<NodeRuntime>& nodes, const DisconnectPeerWorkload& workload,
+    uint32_t workload_index, uint32_t workload_count,
+    std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
   const std::string address = PeerAddress(options, nodes, workload.peer);
   const std::vector<std::string> before_addresses =
       driver.PeerAddresses(node.config, stop_token);
-  const bool connected_before = ContainsPeerAddress(before_addresses, address);
-  driver.DisconnectPeer(node.config, address, stop_token);
-  driver.WaitForPeerAddressAbsent(node.config, address,
-                                  std::chrono::seconds(workload.timeout_sec),
-                                  stop_token);
+  const bool connected_before =
+      !driver.ConnectedPeerAddresses(node.config, {address}, stop_token)
+           .empty();
+  controller.DisconnectPeer(node.config.id, nodes[workload.peer - 1U].config.id,
+                            std::chrono::seconds(workload.timeout_sec),
+                            stop_token);
   const std::vector<std::string> after_addresses =
       driver.PeerAddresses(node.config, stop_token);
-  const bool connected_after = ContainsPeerAddress(after_addresses, address);
+  const bool connected_after =
+      !driver.ConnectedPeerAddresses(node.config, {address}, stop_token)
+           .empty();
   WriteEvent(events_path, options.run_id, node.config.id, "peer_disconnected",
              PeerChurnDetail(
                  workload_index, workload_count, workload.node, workload.peer,
@@ -5182,6 +5190,20 @@ NodeRuntime& FindNodeRuntimeById(std::vector<NodeRuntime>& nodes,
   return *node;
 }
 
+std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
+    const Options& options, const std::vector<NodeRuntime>& nodes) {
+  std::map<std::string, PeerCountPolicy> policies;
+  for (const PeerConnectivityPolicy& policy :
+       options.topology.peer_connectivity) {
+    if (policy.node >= nodes.size()) {
+      throw std::runtime_error(
+          "peer connectivity policy references an unknown node");
+    }
+    policies.emplace(nodes[policy.node].config.id, policy.peer_count);
+  }
+  return policies;
+}
+
 std::string ScheduledBlockDetail(const std::vector<std::string>& hashes) {
   boost::json::object detail;
   boost::json::array block_hashes;
@@ -5208,6 +5230,10 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
   }
   if (command.peer_node_id) {
     detail["peer_node_id"] = *command.peer_node_id;
+  }
+  if (command.peer_count_policy) {
+    detail["minimum_peer_count"] = command.peer_count_policy->minimum();
+    detail["maximum_peer_count"] = command.peer_count_policy->maximum();
   }
   if (!error.empty()) {
     detail["error"] = error;
@@ -5253,6 +5279,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::unique_ptr<NodeLogCollector> log_collector;
   std::unique_ptr<PeriodicMetricsCollector> metrics_collector;
   std::unique_ptr<ProbabilisticBlockScheduler> block_scheduler;
+  std::unique_ptr<PeerConnectivityController> peer_connectivity_controller;
   std::unique_ptr<ChainCommandExecutor> chain_command_executor;
   std::unique_ptr<SimulationCommandProcessor> command_processor;
   std::vector<std::string> active_native_miner_ids;
@@ -5276,6 +5303,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       command_processor->Stop();
     } else if (command_queue != nullptr) {
       command_queue->Cancel();
+    }
+  };
+  const auto stop_peer_connectivity = [&]() {
+    if (peer_connectivity_controller) {
+      peer_connectivity_controller->Stop();
     }
   };
   const auto stop_block_production = [&]() {
@@ -5310,6 +5342,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   };
   const auto handle_run_failure = [&](std::string_view detail) {
     cleanup_step("command processor shutdown", stop_command_processor);
+    cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
     cleanup_step("block production shutdown", stop_block_production);
     cleanup_step("metrics collector shutdown", [&] {
       if (metrics_collector) {
@@ -5350,6 +5383,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   };
   const auto handle_run_cancellation = [&]() {
     cleanup_step("command processor shutdown", stop_command_processor);
+    cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
     cleanup_step("block production shutdown", stop_block_production);
     cleanup_step("metrics collector shutdown", [&] {
       if (metrics_collector) {
@@ -5429,6 +5463,33 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     for (const NodeRuntime& node : nodes) {
       log_nodes.push_back(node.config);
     }
+    peer_connectivity_controller = std::make_unique<PeerConnectivityController>(
+        driver, log_nodes, InitialPeerCountPolicies(options, nodes),
+        std::chrono::milliseconds(options.metrics_interval_ms),
+        [&](std::string_view node_id) {
+          return FindNodeRuntimeById(nodes, std::string(node_id))
+              .AllowsChainMetrics();
+        },
+        [&](std::string_view node_id, std::string_view peer_node_id,
+            PeerConnectivityAction action, const PeerCountPolicy& policy) {
+          boost::json::object detail;
+          detail["peer_node_id"] = peer_node_id;
+          detail["minimum_peer_count"] = policy.minimum();
+          detail["maximum_peer_count"] = policy.maximum();
+          const std::string_view event =
+              action == PeerConnectivityAction::kConnected
+                  ? "peer_policy_connected"
+                  : "peer_policy_disconnected";
+          WriteEvent(events_path, options.run_id, std::string(node_id), event,
+                     boost::json::serialize(detail));
+          BBP_LOG(info) << event << " " << node_id << " -> " << peer_node_id;
+        },
+        [&](std::string_view node_id, std::string_view error) {
+          WriteEvent(events_path, options.run_id, std::string(node_id),
+                     "peer_policy_enforcement_failed", error);
+          BBP_LOG(warning) << "peer policy enforcement failed for " << node_id
+                           << ": " << error;
+        });
     if (command_queue != nullptr) {
       chain_command_executor = std::make_unique<ChainCommandExecutor>(
           driver, log_nodes,
@@ -5470,6 +5531,21 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                        config.id);
             }
             driver.SetMiningDifficulty(config, difficulty, command_stop_token);
+          },
+          [&](const ChainNodeConfig& config, const ChainNodeConfig& peer,
+              std::stop_token command_stop_token) {
+            peer_connectivity_controller->ConnectPeer(config.id, peer.id,
+                                                      std::chrono::seconds(10),
+                                                      command_stop_token);
+          },
+          [&](const ChainNodeConfig& config, const ChainNodeConfig& peer,
+              std::stop_token command_stop_token) {
+            peer_connectivity_controller->DisconnectPeer(
+                config.id, peer.id, std::chrono::seconds(10),
+                command_stop_token);
+          },
+          [&](const ChainNodeConfig& config, PeerCountPolicy policy) {
+            peer_connectivity_controller->SetPolicy(config.id, policy);
           });
       command_processor = std::make_unique<SimulationCommandProcessor>(
           *command_queue,
@@ -5584,6 +5660,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                           simulation_registry, stop_token);
 
     ThrowIfStopRequested(stop_token);
+    peer_connectivity_controller->Start();
     if (options.block_production.enabled) {
       if (options.block_production.mode == MiningMode::kNativeMining) {
         for (const std::uint32_t miner_index : miner_indexes) {
@@ -5679,15 +5756,16 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                 observed_peer_count));
       } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
         ApplyConnectPeerWorkload(
-            options, events_path, driver, nodes, scenario_workload.connect_peer,
+            options, events_path, driver, *peer_connectivity_controller, nodes,
+            scenario_workload.connect_peer,
             static_cast<uint32_t>(workload_index + 1U),
             static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kDisconnectPeer) {
-        ApplyDisconnectPeerWorkload(options, events_path, driver, nodes,
-                                    scenario_workload.disconnect_peer,
-                                    static_cast<uint32_t>(workload_index + 1U),
-                                    static_cast<uint32_t>(workloads.size()),
-                                    stop_token);
+        ApplyDisconnectPeerWorkload(
+            options, events_path, driver, *peer_connectivity_controller, nodes,
+            scenario_workload.disconnect_peer,
+            static_cast<uint32_t>(workload_index + 1U),
+            static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kSendRawTransaction) {
         ApplySendRawTransactionWorkload(
             options, events_path, driver, nodes,
@@ -5757,6 +5835,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     metrics_collector->Wait();
     ThrowIfStopRequested(stop_token);
     stop_command_processor();
+    stop_peer_connectivity();
     stop_block_production();
     WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
                          stop_token);

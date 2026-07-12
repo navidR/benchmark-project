@@ -12,10 +12,10 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 9> kCommandNames = {
-    "block-production", "mining-difficulty", "stop-mining",
-    "disconnect",       "reconnect",         "connect-peer",
-    "disconnect-peer",  "log-more",          "log-less",
+constexpr std::array<std::string_view, 10> kCommandNames = {
+    "block-production", "mining-difficulty", "stop-mining",     "disconnect",
+    "reconnect",        "connect-peer",      "disconnect-peer", "peer-policy",
+    "log-more",         "log-less",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -55,6 +55,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
                                     probability, block_production_seed),
           .mining_difficulty = std::nullopt,
           .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
       };
     }
     if (tokens[0] == "mining-difficulty") {
@@ -65,6 +66,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .mining_difficulty =
               MiningDifficulty(boost::lexical_cast<double>(tokens[1])),
           .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
       };
     }
     if (tokens[0] == "connect-peer" || tokens[0] == "disconnect-peer") {
@@ -76,6 +78,19 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .block_production_policy = std::nullopt,
           .mining_difficulty = std::nullopt,
           .peer_node_id = tokens[1],
+          .peer_count_policy = std::nullopt,
+      };
+    }
+    if (tokens[0] == "peer-policy") {
+      RequireArgumentCount(tokens, 3U, "peer-policy <minimum> <maximum>");
+      return ParsedTuiCommand{
+          .kind = SimulationCommandKind::kSetPeerCountPolicy,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy =
+              PeerCountPolicy(boost::lexical_cast<std::uint32_t>(tokens[1]),
+                              boost::lexical_cast<std::uint32_t>(tokens[2])),
       };
     }
 
@@ -99,6 +114,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         .block_production_policy = std::nullopt,
         .mining_difficulty = std::nullopt,
         .peer_node_id = std::nullopt,
+        .peer_count_policy = std::nullopt,
     };
   } catch (const boost::bad_lexical_cast&) {
     throw std::runtime_error("command contains an invalid numeric argument");

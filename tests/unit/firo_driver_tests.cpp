@@ -41,6 +41,17 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   std::filesystem::remove_all(test_dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    firo_peer_identity_rejects_multiple_candidates_on_the_same_host) {
+  bbp::FiroNodeConfig config;
+  config.id = "ambiguous-peer-test";
+
+  const bbp::FiroDriver driver(std::chrono::milliseconds(100));
+  BOOST_CHECK_THROW(driver.ConnectedPeerAddresses(
+                        config, {"127.0.0.1:18168", "127.0.0.1:18169"}),
+                    bbp::UnsupportedChainOperation);
+}
+
 BOOST_AUTO_TEST_CASE(firo_readiness_wait_honors_stop_token_promptly) {
   bbp::FiroNodeConfig config;
   config.id = "cancel-test";
