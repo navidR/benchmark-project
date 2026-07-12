@@ -26,6 +26,7 @@
 #include "bbp/run_report.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/tui_command_parser.h"
+#include "bbp/tui_view.h"
 
 namespace bbp {
 namespace {
@@ -40,6 +41,8 @@ constexpr int kDetailPaneRows = 10;
 
 struct TuiState {
   std::size_t selected_node = 0;
+  std::size_t selected_wallet = 0;
+  TuiView view = TuiView::kNodes;
   NodeLogPane node_log_pane;
   std::string command_status;
   std::uint64_t last_command_result_sequence = 0;
@@ -497,6 +500,41 @@ const boost::json::object* WalletForNode(const boost::json::object& report,
   return nullptr;
 }
 
+const boost::json::object* WalletAt(const boost::json::array& wallets,
+                                    std::size_t index) {
+  if (index >= wallets.size() || !wallets[index].is_object()) {
+    return nullptr;
+  }
+  return &wallets[index].as_object();
+}
+
+std::optional<std::size_t> WalletNodeIndex(const boost::json::object& wallet) {
+  const std::optional<std::uint64_t> one_based_node =
+      JsonUnsignedMetric(wallet, "node");
+  if (!one_based_node || *one_based_node == 0U) {
+    return std::nullopt;
+  }
+  return static_cast<std::size_t>(*one_based_node - 1U);
+}
+
+std::optional<std::size_t> SelectedNodeIndex(const boost::json::object& report,
+                                             const TuiState& state) {
+  if (state.view == TuiView::kNodes) {
+    const boost::json::array* nodes = NodeSummaries(report);
+    if (nodes == nullptr || state.selected_node >= nodes->size()) {
+      return std::nullopt;
+    }
+    return state.selected_node;
+  }
+  const boost::json::array* wallets = WalletSummaries(report);
+  const boost::json::object* wallet =
+      wallets == nullptr ? nullptr : WalletAt(*wallets, state.selected_wallet);
+  if (wallet == nullptr) {
+    return std::nullopt;
+  }
+  return WalletNodeIndex(*wallet);
+}
+
 std::size_t ClampNodeSelection(const boost::json::object& report,
                                std::size_t selected_node) {
   const boost::json::array* nodes = NodeSummaries(report);
@@ -504,6 +542,15 @@ std::size_t ClampNodeSelection(const boost::json::object& report,
     return 0;
   }
   return std::min(selected_node, nodes->size() - 1U);
+}
+
+std::size_t ClampWalletSelection(const boost::json::object& report,
+                                 std::size_t selected_wallet) {
+  const boost::json::array* wallets = WalletSummaries(report);
+  if (wallets == nullptr || wallets->empty()) {
+    return 0;
+  }
+  return std::min(selected_wallet, wallets->size() - 1U);
 }
 
 void DrawHorizontalLine(int y) {
@@ -775,6 +822,91 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
                 JsonString(*wallet, "address", "-"));
 }
 
+const boost::json::object& JsonObjectFieldOrEmpty(
+    const boost::json::object& object, std::string_view field,
+    const boost::json::object& empty) {
+  const boost::json::value* value = object.if_contains(field);
+  return value != nullptr && value->is_object() ? value->as_object() : empty;
+}
+
+void DrawSelectedWalletDetail(int top, int bottom, int cols,
+                              const boost::json::object* wallet) {
+  if (top < 0 || bottom - top < 4 || cols <= 0) {
+    return;
+  }
+  DrawHorizontalLine(top);
+  AddText(top + 1, 0, cols, "Selected Wallet", A_BOLD);
+  if (wallet == nullptr) {
+    AddText(top + 2, 0, cols, "No selectable wallet.", COLOR_PAIR(kColorMuted));
+    return;
+  }
+
+  const boost::json::object empty;
+  const boost::json::object& outgoing =
+      JsonObjectFieldOrEmpty(*wallet, "last_sent_transaction", empty);
+  const boost::json::object& incoming =
+      JsonObjectFieldOrEmpty(*wallet, "last_received_transaction", empty);
+  const int left_width = std::max(0, cols / 2);
+  const int right_width = std::max(0, cols - left_width);
+  int y = top + 2;
+  AddDetailPair(y, 0, left_width, "wallet",
+                "#" + JsonIntegerText(*wallet, "wallet_index"));
+  AddDetailPair(y, left_width, right_width, "node",
+                JsonIntegerText(*wallet, "node"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "mode", JsonString(*wallet, "mode", "-"));
+  AddDetailPair(y, left_width, right_width, "strategy",
+                JsonString(*wallet, "strategy", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "address", JsonString(*wallet, "address", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "outgoing count",
+                JsonIntegerText(*wallet, "transactions_sent", "0"));
+  AddDetailPair(y, left_width, right_width, "incoming count",
+                JsonIntegerText(*wallet, "transactions_received", "0"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "last outgoing",
+                JsonStringArrayText(outgoing, "txids"));
+  AddDetailPair(y, left_width, right_width, "amount",
+                JsonString(outgoing, "amount", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "to wallet",
+                JsonIntegerText(outgoing, "receiver_wallet_index"));
+  AddDetailPair(y, left_width, right_width, "mempool",
+                JsonIntegerText(outgoing, "mempool_size"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "last incoming",
+                JsonStringArrayText(incoming, "txids"));
+  AddDetailPair(y, left_width, right_width, "amount",
+                JsonString(incoming, "amount", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "from wallet",
+                JsonIntegerText(incoming, "sender_wallet_index"));
+  AddDetailPair(y, left_width, right_width, "miner node",
+                JsonIntegerText(incoming, "funding_miner_node"));
+}
+
 boost::json::object LoadReport(const std::filesystem::path& run_root,
                                std::string* error) {
   try {
@@ -793,8 +925,9 @@ boost::json::object LoadReport(const std::filesystem::path& run_root,
 
 void DrawSummary(const std::filesystem::path& run_root,
                  const boost::json::object& report, std::string_view error,
-                 const std::vector<std::string>& log_lines,
-                 std::size_t selected_node, const NodeLogPane& node_log_pane,
+                 const std::vector<std::string>& log_lines, TuiView view,
+                 std::size_t selected_node, std::size_t selected_wallet,
+                 const NodeLogPane& node_log_pane,
                  std::string_view command_status, bool command_error_open,
                  std::string_view command_error, bool command_palette_open,
                  std::string_view command_input,
@@ -863,21 +996,35 @@ void DrawSummary(const std::filesystem::path& run_root,
   AddText(9, 0, cols, WorkloadsSummaryText(report));
 
   DrawHorizontalLine(10);
-  AddText(11, 0, 10, "Node", A_BOLD);
-  AddText(11, 10, 10, "State", A_BOLD);
-  AddText(11, 20, 7, "Height", A_BOLD);
-  AddText(11, 27, 6, "Peers", A_BOLD);
-  AddText(11, 33, 7, "Blocks", A_BOLD);
-  AddText(11, 40, 7, "Pool", A_BOLD);
-  AddText(11, 47, 9, "Mem", A_BOLD);
-  AddText(11, 56, 9, "CPUms", A_BOLD);
-  AddText(11, 65, 8, "RX", A_BOLD);
-  AddText(11, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
+  if (view == TuiView::kNodes) {
+    AddText(11, 0, 10, "Node [n]", A_BOLD);
+    AddText(11, 10, 10, "State", A_BOLD);
+    AddText(11, 20, 7, "Height", A_BOLD);
+    AddText(11, 27, 6, "Peers", A_BOLD);
+    AddText(11, 33, 7, "Blocks", A_BOLD);
+    AddText(11, 40, 7, "Pool", A_BOLD);
+    AddText(11, 47, 9, "Mem", A_BOLD);
+    AddText(11, 56, 9, "CPUms", A_BOLD);
+    AddText(11, 65, 8, "RX", A_BOLD);
+    AddText(11, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
+  } else {
+    AddText(11, 0, 10, "Wallet [w]", A_BOLD);
+    AddText(11, 10, 7, "Node", A_BOLD);
+    AddText(11, 17, 10, "Mode", A_BOLD);
+    AddText(11, 27, 12, "Strategy", A_BOLD);
+    AddText(11, 39, 8, "Sent", A_BOLD);
+    AddText(11, 47, 8, "Recv", A_BOLD);
+    AddText(11, 55, std::max(0, cols - 55), "Address", A_BOLD);
+  }
   DrawHorizontalLine(12);
 
   const boost::json::array* nodes = NodeSummaries(report);
-  if (nodes == nullptr) {
-    AddText(13, 0, cols, "No node summaries in report.",
+  const boost::json::array* selected_items =
+      view == TuiView::kNodes ? nodes : wallets;
+  if (selected_items == nullptr) {
+    AddText(13, 0, cols,
+            view == TuiView::kNodes ? "No node summaries in report."
+                                    : "No wallet summaries in report.",
             COLOR_PAIR(kColorMuted));
     if (log_rows != 0) {
       DrawLogPane(log_top, rows, cols, log_lines);
@@ -896,53 +1043,81 @@ void DrawSummary(const std::filesystem::path& run_root,
       has_detail_pane ? content_bottom - kDetailPaneRows : content_bottom;
   const int table_bottom = has_detail_pane ? detail_top - 1 : content_bottom;
   const int table_capacity = std::max(0, table_bottom - data_top);
-  std::size_t first_node = 0;
+  const std::size_t selected_item =
+      view == TuiView::kNodes ? selected_node : selected_wallet;
+  std::size_t first_item = 0;
   if (table_capacity > 0 &&
-      selected_node >= static_cast<std::size_t>(table_capacity)) {
-    first_node = selected_node - static_cast<std::size_t>(table_capacity) + 1U;
+      selected_item >= static_cast<std::size_t>(table_capacity)) {
+    first_item = selected_item - static_cast<std::size_t>(table_capacity) + 1U;
   }
 
   int y = data_top;
-  for (std::size_t index = first_node; index < nodes->size(); ++index) {
+  for (std::size_t index = first_item; index < selected_items->size();
+       ++index) {
     if (y >= table_bottom) {
       break;
     }
-    const boost::json::object* node = NodeAt(*nodes, index);
-    if (node == nullptr) {
-      continue;
+    const int attributes = index == selected_item ? A_REVERSE : 0;
+    if (view == TuiView::kNodes) {
+      const boost::json::object* node = NodeAt(*selected_items, index);
+      if (node == nullptr) {
+        continue;
+      }
+      const boost::json::value* metrics_value =
+          node->if_contains("last_metrics");
+      const boost::json::object* metrics = nullptr;
+      if (metrics_value != nullptr && metrics_value->is_object()) {
+        metrics = &metrics_value->as_object();
+      }
+      const boost::json::object empty_metrics;
+      const boost::json::object& metric_object =
+          metrics == nullptr ? empty_metrics : *metrics;
+      AddText(y, 0, 10, JsonString(*node, "node_id", "-"), attributes);
+      AddText(y, 10, 10, JsonString(*node, "final_state", "-"), attributes);
+      AddText(y, 20, 7, JsonMetricText(metric_object, "height"), attributes);
+      AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"),
+              attributes);
+      AddText(y, 33, 7, JsonMetricText(metric_object, "generated_block_count"),
+              attributes);
+      AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"),
+              attributes);
+      AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"),
+              attributes);
+      AddText(y, 56, 9, JsonUsecMillisText(metric_object, "cpu_usage_usec"),
+              attributes);
+      AddText(y, 65, 8, JsonBytesKiBText(metric_object, "network_rx_bytes"),
+              attributes);
+      AddText(y, 73, std::max(0, cols - 73),
+              JsonMetricText(metric_object, "qdisc_kind"), attributes);
+    } else {
+      const boost::json::object* wallet = WalletAt(*selected_items, index);
+      if (wallet == nullptr) {
+        continue;
+      }
+      AddText(y, 0, 10, "#" + JsonIntegerText(*wallet, "wallet_index", "-"),
+              attributes);
+      AddText(y, 10, 7, JsonIntegerText(*wallet, "node"), attributes);
+      AddText(y, 17, 10, JsonString(*wallet, "mode", "-"), attributes);
+      AddText(y, 27, 12, JsonString(*wallet, "strategy", "-"), attributes);
+      AddText(y, 39, 8, JsonIntegerText(*wallet, "transactions_sent", "0"),
+              attributes);
+      AddText(y, 47, 8, JsonIntegerText(*wallet, "transactions_received", "0"),
+              attributes);
+      AddText(y, 55, std::max(0, cols - 55),
+              JsonString(*wallet, "address", "-"), attributes);
     }
-    const boost::json::value* metrics_value = node->if_contains("last_metrics");
-    const boost::json::object* metrics = nullptr;
-    if (metrics_value != nullptr && metrics_value->is_object()) {
-      metrics = &metrics_value->as_object();
-    }
-    const boost::json::object empty_metrics;
-    const boost::json::object& metric_object =
-        metrics == nullptr ? empty_metrics : *metrics;
-    const int attributes = index == selected_node ? A_REVERSE : 0;
-
-    AddText(y, 0, 10, JsonString(*node, "node_id", "-"), attributes);
-    AddText(y, 10, 10, JsonString(*node, "final_state", "-"), attributes);
-    AddText(y, 20, 7, JsonMetricText(metric_object, "height"), attributes);
-    AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"), attributes);
-    AddText(y, 33, 7, JsonMetricText(metric_object, "generated_block_count"),
-            attributes);
-    AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"),
-            attributes);
-    AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"),
-            attributes);
-    AddText(y, 56, 9, JsonUsecMillisText(metric_object, "cpu_usage_usec"),
-            attributes);
-    AddText(y, 65, 8, JsonBytesKiBText(metric_object, "network_rx_bytes"),
-            attributes);
-    AddText(y, 73, std::max(0, cols - 73),
-            JsonMetricText(metric_object, "qdisc_kind"), attributes);
     ++y;
   }
 
   if (has_detail_pane) {
-    DrawSelectedNodeDetail(detail_top, content_bottom, cols, report,
-                           selected_node, NodeAt(*nodes, selected_node));
+    if (view == TuiView::kNodes) {
+      DrawSelectedNodeDetail(detail_top, content_bottom, cols, report,
+                             selected_node, NodeAt(*nodes, selected_node));
+    } else {
+      DrawSelectedWalletDetail(
+          detail_top, content_bottom, cols,
+          wallets == nullptr ? nullptr : WalletAt(*wallets, selected_wallet));
+    }
   }
 
   if (log_rows != 0) {
@@ -957,7 +1132,7 @@ void DrawSummary(const std::filesystem::path& run_root,
   footer += node_log_pane.IsOpen()
                 ? "Node log: arrows/PgUp/PgDn/Home/End scroll. +/- verbosity. "
                   "l closes. q exits."
-                : "Arrows select. l log. c command. s stop mining. d/r "
+                : "Tab/n/w view. Arrows select. l log. c command. s stop. d/r "
                   "disconnect/reconnect. k kill. q or Esc exits.";
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
@@ -1011,10 +1186,13 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
           *parsed.block_production_policy);
     } else {
       const boost::json::array* nodes = NodeSummaries(report);
-      const boost::json::object* node =
-          nodes == nullptr ? nullptr : NodeAt(*nodes, state->selected_node);
+      const std::optional<std::size_t> selected_node =
+          SelectedNodeIndex(report, *state);
+      const boost::json::object* node = nodes == nullptr || !selected_node
+                                            ? nullptr
+                                            : NodeAt(*nodes, *selected_node);
       if (node == nullptr) {
-        state->command_input_error = "No node is selected.";
+        state->command_input_error = "No backing node is selected.";
         return false;
       }
       const std::string node_id = JsonString(*node, "node_id");
@@ -1104,10 +1282,13 @@ bool QueueSelectedNodeCommand(SimulationCommandKind kind,
                               SimulationCommandQueue* command_queue,
                               TuiState* state) {
   const boost::json::array* nodes = NodeSummaries(report);
-  const boost::json::object* node =
-      nodes == nullptr ? nullptr : NodeAt(*nodes, state->selected_node);
+  const std::optional<std::size_t> selected_node =
+      SelectedNodeIndex(report, *state);
+  const boost::json::object* node = nodes == nullptr || !selected_node
+                                        ? nullptr
+                                        : NodeAt(*nodes, *selected_node);
   if (node == nullptr) {
-    state->command_status = "No node is selected.";
+    state->command_status = "No backing node is selected.";
     return true;
   }
   if (command_queue == nullptr) {
@@ -1147,8 +1328,29 @@ bool HandleInput(int ch, const boost::json::object& report,
     return false;
   }
 
+  const boost::json::array* wallets = WalletSummaries(report);
+  if (ch == '\t') {
+    state->view =
+        state->view == TuiView::kNodes ? TuiView::kWallets : TuiView::kNodes;
+    return true;
+  }
+  if (ch == 'n' || ch == 'N') {
+    state->view = TuiView::kNodes;
+    return true;
+  }
+  if (ch == 'w' || ch == 'W') {
+    state->view = TuiView::kWallets;
+    return true;
+  }
+
   if (ch == 'l' || ch == 'L') {
-    state->node_log_pane.Toggle(report, state->selected_node);
+    const std::optional<std::size_t> selected_node =
+        SelectedNodeIndex(report, *state);
+    if (!selected_node) {
+      state->command_status = "No backing node is selected.";
+      return true;
+    }
+    state->node_log_pane.Toggle(report, *selected_node);
     return true;
   }
 
@@ -1207,12 +1409,19 @@ bool HandleInput(int ch, const boost::json::object& report,
     return true;
   }
 
-  if (ch == KEY_UP && state->selected_node > 0) {
-    --state->selected_node;
+  std::size_t* selected = state->view == TuiView::kNodes
+                              ? &state->selected_node
+                              : &state->selected_wallet;
+  const std::size_t item_count =
+      state->view == TuiView::kNodes
+          ? nodes->size()
+          : (wallets == nullptr ? 0U : wallets->size());
+  if (ch == KEY_UP && *selected > 0U) {
+    --*selected;
     return true;
   }
-  if (ch == KEY_DOWN && state->selected_node + 1U < nodes->size()) {
-    ++state->selected_node;
+  if (ch == KEY_DOWN && *selected + 1U < item_count) {
+    ++*selected;
     return true;
   }
   return false;
@@ -1231,17 +1440,22 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
     std::string error;
     const boost::json::object report = LoadReport(run_root, &error);
     state.selected_node = ClampNodeSelection(report, state.selected_node);
+    state.selected_wallet = ClampWalletSelection(report, state.selected_wallet);
     if (error.empty()) {
-      state.node_log_pane.Refresh(report, state.selected_node);
+      const std::optional<std::size_t> selected_node =
+          SelectedNodeIndex(report, state);
+      if (selected_node) {
+        state.node_log_pane.Refresh(report, *selected_node);
+      }
       RefreshCommandResults(report, &state);
     }
     const std::vector<std::string> log_lines =
         ReadRecentLogLines(RunLogPath(run_root), 256U);
-    DrawSummary(run_root, report, error, log_lines, state.selected_node,
-                state.node_log_pane, state.command_status,
-                state.command_error_open, state.command_error,
-                state.command_palette_open, state.command_input,
-                state.command_input_error);
+    DrawSummary(run_root, report, error, log_lines, state.view,
+                state.selected_node, state.selected_wallet, state.node_log_pane,
+                state.command_status, state.command_error_open,
+                state.command_error, state.command_palette_open,
+                state.command_input, state.command_input_error);
     if (once) {
       return error.empty() ? 0 : 1;
     }
