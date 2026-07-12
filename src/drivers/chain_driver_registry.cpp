@@ -44,8 +44,24 @@ const ChainDriverSpec& DefaultChainDriverSpec() {
   return spec;
 }
 
+const ChainDriverSpec& ChainDriverSpecFor(ChainKind chain) {
+  if (chain == ChainKind::kFiro) {
+    return DefaultChainDriverSpec();
+  }
+  throw std::runtime_error("chain driver is not implemented: " +
+                           std::string(ChainKindName(chain)));
+}
+
 std::unique_ptr<ChainDriver> CreateDefaultChainDriver() {
   return std::make_unique<FiroDriver>(std::chrono::seconds(5));
+}
+
+std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain) {
+  if (chain == ChainKind::kFiro) {
+    return CreateDefaultChainDriver();
+  }
+  throw std::runtime_error("chain driver is not implemented: " +
+                           std::string(ChainKindName(chain)));
 }
 
 ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,

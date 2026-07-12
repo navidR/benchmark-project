@@ -96,7 +96,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/bbp \
-     --chain-daemon "$FIROD" \
+     --chain firo \
+     --node-binary "$FIROD" \
      --benchmark-root runs \
      --run-id smoke1 \
      --replace-run \
@@ -115,7 +116,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/bbp \
-     --chain-daemon "$FIROD" \
+     --chain firo \
+     --node-binary "$FIROD" \
      --benchmark-root runs \
      --run-id smoke3 \
      --replace-run \
@@ -136,7 +138,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/bbp \
-     --chain-daemon "$FIROD" \
+     --chain firo \
+     --node-binary "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-smoke \
      --replace-run \
@@ -157,7 +160,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/bbp \
-     --chain-daemon "$FIROD" \
+     --chain firo \
+     --node-binary "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-delay \
      --replace-run \
@@ -178,7 +182,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
   benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/bbp \
-     --chain-daemon "$FIROD" \
+     --chain firo \
+     --node-binary "$FIROD" \
      --benchmark-root runs \
      --run-id isolated-bandwidth \
      --replace-run \
@@ -196,7 +201,8 @@ Per-node isolated network conditions use repeatable JSON objects:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id isolated-per-node \
   --replace-run \
@@ -214,7 +220,8 @@ running, while scheduled block production and metrics collection continue:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id live-netem \
   --replace-run \
@@ -234,7 +241,8 @@ while scheduled block production and metrics collection continue:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id live-block-unblock \
   --replace-run \
@@ -253,7 +261,8 @@ cross-group P2P block rules in both directions:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id live-partition-heal \
   --replace-run \
@@ -277,7 +286,8 @@ Default resource limits apply to each node cgroup:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id resource-smoke \
   --replace-run \
@@ -299,7 +309,8 @@ restores unlimited CPU quota.
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id live-resources \
   --replace-run \
@@ -316,7 +327,8 @@ cgroup/network/data directory, wait for RPC readiness, then continue the run:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id restart-smoke \
   --replace-run \
@@ -333,7 +345,8 @@ thawed states, then continue the run:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id freeze-smoke \
   --replace-run \
@@ -351,7 +364,8 @@ sample count is complete:
 
 ```bash
 ./build/bbp \
-  --chain-daemon "$FIROD" \
+  --chain firo \
+  --node-binary "$FIROD" \
   --benchmark-root runs \
   --run-id sampled-smoke \
   --replace-run \
@@ -517,13 +531,13 @@ formats use the same field names and validation rules.
 Run it:
 
 ```bash
-./build/bbp --scenario-json /path/to/scenario.json --replace-run
+./build/bbp --scenario /path/to/scenario.json --replace-run
 ```
 
 The equivalent YAML entry point is:
 
 ```bash
-./build/bbp --scenario-yaml /path/to/scenario.yaml --replace-run
+./build/bbp --scenario /path/to/scenario.yaml --replace-run
 ```
 
 Wallet and miner roles can be declared in the scenario topology. Counts resolve

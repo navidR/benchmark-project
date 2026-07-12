@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "bbp/block_production_config.h"
+#include "bbp/chain_kind.h"
 #include "bbp/network.h"
 #include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulation_registry.h"
@@ -21,6 +22,8 @@
 namespace bbp {
 
 struct Options {
+  ChainKind chain = ChainKind::kFiro;
+  std::filesystem::path scenario;
   std::filesystem::path scenario_json;
   std::filesystem::path scenario_yaml;
   std::filesystem::path chain_daemon;

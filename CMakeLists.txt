@@ -218,6 +218,7 @@ add_executable(bbp
   src/block_production_policy.cpp
   src/capability.cpp
   src/cgroup.cpp
+  src/chain_kind.cpp
   src/drivers/chain_driver.cpp
   src/drivers/chain_command_executor.cpp
   src/drivers/chain_driver_registry.cpp
@@ -279,6 +280,7 @@ if(BUILD_TESTING)
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
+    tests/unit/chain_kind_tests.cpp
     tests/unit/firo_driver_tests.cpp
     tests/unit/log_tail_tests.cpp
     tests/unit/logging_tests.cpp
@@ -299,9 +301,11 @@ if(BUILD_TESTING)
     tests/unit/util_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
+    src/chain_kind.cpp
     src/block_production_policy.cpp
     src/simulation_command.cpp
     src/drivers/chain_driver.cpp
+    src/drivers/chain_driver_registry.cpp
     src/drivers/firo_driver.cpp
     src/http_client.cpp
     src/log_tail.cpp
@@ -375,6 +379,22 @@ if(BUILD_TESTING)
     COMMAND bbp
       --scenario-yaml
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-yaml-scenario.yaml"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-canonical-json-scenario
+    COMMAND bbp
+      --scenario
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-role-topology-scenario.json"
+      --chain firo
+      --node-binary /tmp/not-used-by-probe
+      --probe-capabilities
+  )
+  add_test(NAME bbp-canonical-yaml-scenario
+    COMMAND bbp
+      --scenario
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-yaml-scenario.yaml"
+      --chain firo
+      --node-binary /tmp/not-used-by-probe
       --probe-capabilities
   )
   add_test(NAME bbp-valid-peer-churn-scenario

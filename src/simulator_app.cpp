@@ -1346,9 +1346,13 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         "scenario generate_blocks was removed; use block_production.enabled "
         "or an explicit block_generation workload");
   }
-  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
+  if (!OptionProvided(vm, "chain")) {
+    options.chain = ParseChainKind(JsonOptionalStringField(
+        scenario, "chain", std::string(ChainKindName(options.chain))));
+  }
+  const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   const bool chain_daemon_provided =
-      OptionProvided(vm, "chain-daemon") ||
+      OptionProvided(vm, "node-binary") || OptionProvided(vm, "chain-daemon") ||
       OptionProvided(vm, chain_spec.daemon_option_name.c_str());
   if (!chain_daemon_provided) {
     options.chain_daemon =
@@ -1881,7 +1885,8 @@ void ParseNodeNetworkConditions(Options& options) {
 Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
   Options options;
-  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
+  const ChainDriverSpec& default_chain_spec = DefaultChainDriverSpec();
+  std::string chain_name = std::string(ChainKindName(options.chain));
   std::uint32_t block_production_period_ms = 1000U;
   double block_production_probability = 0.5;
   std::uint64_t block_production_seed = 0U;
@@ -1890,18 +1895,24 @@ Options ParseOptions(int argc, char** argv) {
   bool native_mining = false;
 
   const std::string nodes_help =
-      "chain regtest nodes, 1.." + std::to_string(chain_spec.max_nodes);
+      "chain regtest nodes, 1.." + std::to_string(default_chain_spec.max_nodes);
   po::options_description desc("Allowed options");
   desc.add_options()("help", "show this help")(
+      "scenario", po::value<std::filesystem::path>(&options.scenario),
+      "JSON or YAML scenario file selected by extension")(
       "scenario-json", po::value<std::filesystem::path>(&options.scenario_json),
-      "Boost.JSON scenario file for the chain MVP")(
+      "legacy Boost.JSON scenario file option")(
       "scenario-yaml", po::value<std::filesystem::path>(&options.scenario_yaml),
-      "libyaml scenario file for the chain MVP")(
+      "legacy libyaml scenario file option")(
+      "chain", po::value<std::string>(&chain_name),
+      "chain driver: firo, bitcoin, or monero")(
+      "node-binary", po::value<std::filesystem::path>(&options.chain_daemon),
+      "daemon binary for the selected chain")(
       "chain-daemon", po::value<std::filesystem::path>(&options.chain_daemon),
-      "explicit chain daemon binary")(
-      chain_spec.daemon_option_name.c_str(),
+      "legacy alias for --node-binary")(
+      default_chain_spec.daemon_option_name.c_str(),
       po::value<std::filesystem::path>(&options.chain_daemon),
-      "legacy chain daemon binary alias")(
+      "legacy Firo daemon binary alias")(
       "benchmark-root", po::value<std::filesystem::path>(&options.output_dir),
       "root directory for run data, node directories, metrics, events, and "
       "logs")("output-dir",
@@ -2084,6 +2095,26 @@ Options ParseOptions(int argc, char** argv) {
   po::store(po::parse_command_line(argc, argv, desc), vm);
   po::notify(vm);
 
+  options.chain = ParseChainKind(chain_name);
+
+  if (OptionProvided(vm, "scenario")) {
+    if (OptionProvided(vm, "scenario-json") ||
+        OptionProvided(vm, "scenario-yaml")) {
+      throw std::runtime_error(
+          "--scenario cannot be combined with its legacy format-specific "
+          "aliases");
+    }
+    const std::string extension = options.scenario.extension().string();
+    if (extension == ".json") {
+      options.scenario_json = options.scenario;
+    } else if (extension == ".yaml" || extension == ".yml") {
+      options.scenario_yaml = options.scenario;
+    } else {
+      throw std::runtime_error(
+          "--scenario must use a .json, .yaml, or .yml extension");
+    }
+  }
+
   options.block_production.enabled = !no_mining;
   options.block_production.mode = native_mining
                                       ? MiningMode::kNativeMining
@@ -2099,7 +2130,7 @@ Options ParseOptions(int argc, char** argv) {
     BBP_LOG(info) << "Usage: " << argv[0] << " [options]\n" << desc;
     std::exit(0);
   }
-  if (vm.count("scenario-json") != 0U && vm.count("scenario-yaml") != 0U) {
+  if (!options.scenario_json.empty() && !options.scenario_yaml.empty()) {
     throw std::runtime_error(
         "--scenario-json and --scenario-yaml are mutually exclusive");
   }
@@ -2109,10 +2140,14 @@ Options ParseOptions(int argc, char** argv) {
         "--benchmark-root and --output-dir are aliases and must not both be "
         "provided");
   }
-  if (OptionProvided(vm, "chain-daemon") &&
-      OptionProvided(vm, chain_spec.daemon_option_name.c_str())) {
+  const std::uint32_t node_binary_option_count =
+      static_cast<std::uint32_t>(OptionProvided(vm, "node-binary")) +
+      static_cast<std::uint32_t>(OptionProvided(vm, "chain-daemon")) +
+      static_cast<std::uint32_t>(
+          OptionProvided(vm, default_chain_spec.daemon_option_name.c_str()));
+  if (node_binary_option_count > 1U) {
     throw std::runtime_error(
-        "--chain-daemon and its legacy alias must not both be provided");
+        "--node-binary and its legacy aliases must not be combined");
   }
   if (vm.count("run") != 0U && vm.count("report-run") != 0U) {
     throw std::runtime_error("--run and --report-run are mutually exclusive");
@@ -2127,7 +2162,7 @@ Options ParseOptions(int argc, char** argv) {
   if (options.tui_refresh_ms == 0U) {
     throw std::runtime_error("--refresh-ms must be greater than zero");
   }
-  if (vm.count("scenario-json") != 0U) {
+  if (!options.scenario_json.empty()) {
     const boost::json::value scenario =
         boost::json::parse(ReadText(options.scenario_json));
     if (!scenario.is_object()) {
@@ -2135,7 +2170,7 @@ Options ParseOptions(int argc, char** argv) {
     }
     ApplyScenarioJson(scenario.as_object(), vm, options);
   }
-  if (vm.count("scenario-yaml") != 0U) {
+  if (!options.scenario_yaml.empty()) {
     const boost::json::value scenario = ParseYamlDocument(
         ReadText(options.scenario_yaml), options.scenario_yaml);
     if (!scenario.is_object()) {
@@ -2155,6 +2190,7 @@ Options ParseOptions(int argc, char** argv) {
       vm.count("network-limit-packets") != 0U;
   options.cpu_quota_requested =
       options.cpu_quota_requested || vm.count("cpu-quota-us") != 0U;
+  const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   if (options.memory_high_bytes > options.memory_max_bytes) {
     throw std::runtime_error(
         "--memory-high-bytes must be less than or equal to --memory-max-bytes");
@@ -4188,6 +4224,8 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
                              resolved_path.string());
   }
   const boost::json::object& object = value.as_object();
+  options->chain = ParseChainKind(JsonOptionalStringField(
+      object, "chain", std::string(ChainKindName(options->chain))));
   options->nodes = JsonOptionalUint32Field(object, "nodes", options->nodes);
   const boost::json::value* isolated = object.if_contains("isolated_network");
   if (isolated != nullptr) {
@@ -4197,7 +4235,7 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
     }
     options->isolate_network = isolated->as_bool();
   }
-  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
+  const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options->chain);
   if (options->nodes < 1 || options->nodes > chain_spec.max_nodes) {
     throw std::runtime_error(
         "cleanup currently supports resolved node counts in 1.." +
@@ -4626,7 +4664,8 @@ void ApplySendRawTransactionWorkload(
       workload.amount_satoshis + workload.fee_satoshis;
   const ChainUtxo utxo = driver.FindSpendableOutput(
       funder.config, funding_hashes, workload.source_address, minimum_amount,
-      DefaultChainDriverSpec().coinbase_spendable_confirmations, stop_token);
+      ChainDriverSpecFor(options.chain).coinbase_spendable_confirmations,
+      stop_token);
   const ChainRawTransactionResult transaction = driver.SendRawTransaction(
       submitter.config, utxo, workload.source_address,
       workload.source_private_key, workload.destination_address,
@@ -5440,7 +5479,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
         options.run_id, options.nodes, ListIpv4Routes());
   }
-  const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
+  const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
       options.topology, options.wallet_initialization);
   WriteScenarioFiles(options, run_root, chain_spec);
@@ -5450,7 +5489,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   const auto wallet_metrics_path = run_root / "wallet-metrics.jsonl";
   WriteEvent(events_path, options.run_id, "sim", "run_started");
 
-  std::unique_ptr<ChainDriver> driver_owner = CreateDefaultChainDriver();
+  std::unique_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
   ChainDriver& driver = *driver_owner;
   std::vector<NodeRuntime> nodes;
   std::unique_ptr<NodeLogCollector> log_collector;

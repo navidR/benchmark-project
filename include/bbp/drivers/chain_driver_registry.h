@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "bbp/chain_kind.h"
 #include "bbp/drivers/chain_driver.h"
 
 namespace bbp {
@@ -33,6 +34,8 @@ struct ChainNodeConfigRequest {
 
 const ChainDriverSpec& DefaultChainDriverSpec();
 std::unique_ptr<ChainDriver> CreateDefaultChainDriver();
+const ChainDriverSpec& ChainDriverSpecFor(ChainKind chain);
+std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain);
 ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
                                     const ChainNodeConfigRequest& request);
 
