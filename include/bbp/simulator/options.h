@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -9,6 +10,7 @@
 
 #include "bbp/block_production_config.h"
 #include "bbp/chain_kind.h"
+#include "bbp/log_level.h"
 #include "bbp/network.h"
 #include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulation_registry.h"
@@ -23,6 +25,7 @@ namespace bbp {
 
 struct Options {
   ChainKind chain = ChainKind::kFiro;
+  LogLevel log_level = LogLevel::kInfo;
   std::filesystem::path scenario;
   std::filesystem::path scenario_json;
   std::filesystem::path scenario_yaml;
@@ -37,7 +40,7 @@ struct Options {
   std::uint32_t sync_timeout_sec = 30;
   std::uint32_t tui_refresh_ms = 1000;
   std::uint32_t metrics_sample_count = 0;
-  std::uint32_t metrics_interval_ms = 1000;
+  std::chrono::milliseconds metrics_interval = std::chrono::seconds(1);
   std::uint64_t memory_high_bytes = 1536ULL * 1024ULL * 1024ULL;
   std::uint64_t memory_max_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
   std::uint64_t cpu_period_us = 100000;

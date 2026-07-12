@@ -43,6 +43,7 @@
 #include "bbp/node_log_collector.h"
 #include "bbp/peer_connectivity_controller.h"
 #include "bbp/periodic_metrics_collector.h"
+#include "bbp/positive_duration.h"
 #include "bbp/probabilistic_block_scheduler.h"
 #include "bbp/process.h"
 #include "bbp/run_report.h"
@@ -1468,9 +1469,14 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     options.metrics_sample_count = JsonOptionalUint32Field(
         scenario, "metrics_sample_count", options.metrics_sample_count);
   }
-  if (!OptionProvided(vm, "metrics-interval-ms")) {
-    options.metrics_interval_ms = JsonOptionalUint32Field(
-        scenario, "metrics_interval_ms", options.metrics_interval_ms);
+  if (!OptionProvided(vm, "metrics-interval") &&
+      !OptionProvided(vm, "metrics-interval-ms")) {
+    options.metrics_interval =
+        PositiveDuration::FromMilliseconds(
+            JsonOptionalUint32Field(
+                scenario, "metrics_interval_ms",
+                static_cast<std::uint32_t>(options.metrics_interval.count())))
+            .value();
   }
   if (!OptionProvided(vm, "isolate-network")) {
     options.isolate_network = JsonOptionalBoolField(
@@ -1887,6 +1893,9 @@ Options ParseOptions(int argc, char** argv) {
   Options options;
   const ChainDriverSpec& default_chain_spec = DefaultChainDriverSpec();
   std::string chain_name = std::string(ChainKindName(options.chain));
+  std::string log_level_name = std::string(LogLevelName(options.log_level));
+  std::string metrics_interval_text = "1s";
+  std::uint32_t legacy_metrics_interval_ms = 1000U;
   std::uint32_t block_production_period_ms = 1000U;
   double block_production_probability = 0.5;
   std::uint64_t block_production_seed = 0U;
@@ -1906,8 +1915,11 @@ Options ParseOptions(int argc, char** argv) {
       "legacy libyaml scenario file option")(
       "chain", po::value<std::string>(&chain_name),
       "chain driver: firo, bitcoin, or monero")(
-      "node-binary", po::value<std::filesystem::path>(&options.chain_daemon),
-      "daemon binary for the selected chain")(
+      "log-level", po::value<std::string>(&log_level_name),
+      "minimum Boost.Log severity: trace, debug, info, warning, error, or "
+      "fatal")("node-binary",
+               po::value<std::filesystem::path>(&options.chain_daemon),
+               "daemon binary for the selected chain")(
       "chain-daemon", po::value<std::filesystem::path>(&options.chain_daemon),
       "legacy alias for --node-binary")(
       default_chain_spec.daemon_option_name.c_str(),
@@ -1955,10 +1967,12 @@ Options ParseOptions(int argc, char** argv) {
       "metrics-sample-count",
       po::value<uint32_t>(&options.metrics_sample_count),
       "periodic metric samples collected concurrently with workloads and "
-      "block production")("metrics-interval-ms",
-                          po::value<uint32_t>(&options.metrics_interval_ms),
-                          "milliseconds between metric and node-log "
-                          "samples")(
+      "block production")(
+      "metrics-interval", po::value<std::string>(&metrics_interval_text),
+      "typed interval between metric and node-log samples, such as 250ms or "
+      "1s")("metrics-interval-ms",
+            po::value<uint32_t>(&legacy_metrics_interval_ms),
+            "legacy millisecond alias for --metrics-interval")(
       "memory-high-bytes", po::value<uint64_t>(&options.memory_high_bytes),
       "cgroup memory.high soft pressure threshold in bytes")(
       "memory-max-bytes", po::value<uint64_t>(&options.memory_max_bytes),
@@ -2096,6 +2110,19 @@ Options ParseOptions(int argc, char** argv) {
   po::notify(vm);
 
   options.chain = ParseChainKind(chain_name);
+  options.log_level = ParseLogLevel(log_level_name);
+  if (OptionProvided(vm, "metrics-interval") &&
+      OptionProvided(vm, "metrics-interval-ms")) {
+    throw std::runtime_error(
+        "--metrics-interval and --metrics-interval-ms must not be combined");
+  }
+  if (OptionProvided(vm, "metrics-interval")) {
+    options.metrics_interval =
+        PositiveDuration::Parse(metrics_interval_text).value();
+  } else if (OptionProvided(vm, "metrics-interval-ms")) {
+    options.metrics_interval =
+        PositiveDuration::FromMilliseconds(legacy_metrics_interval_ms).value();
+  }
 
   if (OptionProvided(vm, "scenario")) {
     if (OptionProvided(vm, "scenario-json") ||
@@ -2203,9 +2230,6 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (options.pids_max == 0U) {
     throw std::runtime_error("--pids-max must be greater than zero");
-  }
-  if (options.metrics_interval_ms == 0U) {
-    throw std::runtime_error("--metrics-interval-ms must be greater than zero");
   }
   if ((options.network_condition_requested ||
        !options.node_network_condition_json.empty() ||
@@ -4083,7 +4107,7 @@ void WriteScenarioFiles(const Options& options,
     resolved["sync_timeout_sec"] = nullptr;
   }
   resolved["metrics_sample_count"] = options.metrics_sample_count;
-  resolved["metrics_interval_ms"] = options.metrics_interval_ms;
+  resolved["metrics_interval_ms"] = options.metrics_interval.count();
   boost::json::object block_production;
   block_production["enabled"] = options.block_production.enabled;
   block_production["native_mining"] =
@@ -5684,7 +5708,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
     peer_connectivity_controller = std::make_unique<PeerConnectivityController>(
         driver, log_nodes, InitialPeerCountPolicies(options, nodes),
-        std::chrono::milliseconds(options.metrics_interval_ms),
+        options.metrics_interval,
         [&](std::string_view node_id) {
           return FindNodeRuntimeById(nodes, std::string(node_id))
               .AllowsChainMetrics();
@@ -5837,8 +5861,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           });
     }
     log_collector = std::make_unique<NodeLogCollector>(
-        driver, std::move(log_nodes),
-        std::chrono::milliseconds(options.metrics_interval_ms),
+        driver, std::move(log_nodes), options.metrics_interval,
         kMaxLogTailBytes,
         [&](const ChainNodeConfig& config, ChainLogSource source,
             const LogTailChunk& chunk) {
@@ -5846,8 +5869,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         });
     log_collector->Start();
     metrics_collector = std::make_unique<PeriodicMetricsCollector>(
-        options.metrics_sample_count,
-        std::chrono::milliseconds(options.metrics_interval_ms),
+        options.metrics_sample_count, options.metrics_interval,
         [&](std::uint32_t sample) {
           WriteMetricsSnapshot(
               metrics_path, options, driver, nodes,
@@ -5890,7 +5912,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           boost::json::object detail;
           detail["sample"] = sample;
           detail["sample_count"] = options.metrics_sample_count;
-          detail["interval_ms"] = options.metrics_interval_ms;
+          detail["interval_ms"] = options.metrics_interval.count();
           WriteEvent(events_path, options.run_id, "sim", "metrics_sample",
                      boost::json::serialize(detail));
         },
@@ -6157,6 +6179,7 @@ int RunBenchmarkWithTui(Options options) {
 
 int SimulatorApp::Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);
+  SetMinimumLogLevel(options.log_level);
   RequireSafeOutputDirectory(options.output_dir);
   if (options.probe_network) {
     BBP_LOG(info) << NetworkProbeJson();

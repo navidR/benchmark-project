@@ -225,6 +225,7 @@ add_executable(bbp
   src/drivers/firo_driver.cpp
   src/http_client.cpp
   src/log_tail.cpp
+  src/log_level.cpp
   src/log_view.cpp
   src/logging.cpp
   src/main.cpp
@@ -236,6 +237,7 @@ add_executable(bbp
   src/peer_count_policy.cpp
   src/peer_connectivity_controller.cpp
   src/periodic_metrics_collector.cpp
+  src/positive_duration.cpp
   src/process.cpp
   src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
@@ -283,6 +285,7 @@ if(BUILD_TESTING)
     tests/unit/chain_kind_tests.cpp
     tests/unit/firo_driver_tests.cpp
     tests/unit/log_tail_tests.cpp
+    tests/unit/log_level_tests.cpp
     tests/unit/logging_tests.cpp
     tests/unit/network_tests.cpp
     tests/unit/simulation_network_address_plan_tests.cpp
@@ -291,6 +294,7 @@ if(BUILD_TESTING)
     tests/unit/peer_connectivity_controller_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/periodic_metrics_collector_tests.cpp
+    tests/unit/positive_duration_tests.cpp
     tests/unit/process_tests.cpp
     tests/unit/probabilistic_block_scheduler_tests.cpp
     tests/unit/run_report_tests.cpp
@@ -309,6 +313,7 @@ if(BUILD_TESTING)
     src/drivers/firo_driver.cpp
     src/http_client.cpp
     src/log_tail.cpp
+    src/log_level.cpp
     src/log_view.cpp
     src/logging.cpp
     src/mining_difficulty.cpp
@@ -318,6 +323,7 @@ if(BUILD_TESTING)
     src/peer_count_policy.cpp
     src/peer_connectivity_controller.cpp
     src/periodic_metrics_collector.cpp
+    src/positive_duration.cpp
     src/process.cpp
     src/probabilistic_block_scheduler.cpp
     src/run_report.cpp

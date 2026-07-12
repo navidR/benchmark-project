@@ -105,7 +105,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --block-production-probability 1 \
      --block-production-period-ms 250 \
      --metrics-sample-count 4 \
-     --metrics-interval-ms 250 \
+     --metrics-interval 250ms \
      --ready-timeout-sec 45'
 ```
 
@@ -125,7 +125,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --block-production-probability 1 \
      --block-production-period-ms 250 \
      --metrics-sample-count 4 \
-     --metrics-interval-ms 250 \
+     --metrics-interval 250ms \
      --generate-node 2 \
      --ready-timeout-sec 45 \
      --sync-timeout-sec 45'
@@ -147,7 +147,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --block-production-probability 1 \
      --block-production-period-ms 250 \
      --metrics-sample-count 4 \
-     --metrics-interval-ms 250 \
+     --metrics-interval 250ms \
      --ready-timeout-sec 45 \
      --sync-timeout-sec 45 \
      --isolate-network'
@@ -169,7 +169,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --block-production-probability 1 \
      --block-production-period-ms 250 \
      --metrics-sample-count 4 \
-     --metrics-interval-ms 250 \
+     --metrics-interval 250ms \
      --ready-timeout-sec 45 \
      --isolate-network \
      --network-delay-ms 5'
@@ -191,7 +191,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --block-production-probability 1 \
      --block-production-period-ms 250 \
      --metrics-sample-count 4 \
-     --metrics-interval-ms 250 \
+     --metrics-interval 250ms \
      --ready-timeout-sec 45 \
      --isolate-network \
      --network-bandwidth-mbps 20'
@@ -210,7 +210,7 @@ Per-node isolated network conditions use repeatable JSON objects:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --isolate-network \
   --node-network-condition-json '{"node":2,"bandwidth_mbps":20}'
 ```
@@ -229,7 +229,7 @@ running, while scheduled block production and metrics collection continue:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --isolate-network \
   --runtime-node-network-condition-json '{"node":2,"bandwidth_mbps":10}'
 ```
@@ -250,7 +250,7 @@ while scheduled block production and metrics collection continue:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --isolate-network \
   --runtime-node-block-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}' \
   --runtime-node-unblock-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}'
@@ -270,7 +270,7 @@ cross-group P2P block rules in both directions:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --isolate-network \
   --runtime-partition-json '{"group_a":[1,2],"group_b":[3]}' \
   --runtime-heal-partition-json '{"group_a":[1,2],"group_b":[3]}'
@@ -295,7 +295,7 @@ Default resource limits apply to each node cgroup:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --memory-high-bytes 1073741824 \
   --memory-max-bytes 1610612736 \
   --cpu-quota-us 75000 \
@@ -318,7 +318,7 @@ restores unlimited CPU quota.
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --runtime-node-resource-json '{"node":1,"memory_high_bytes":1073741824,"cpu_quota_us":50000,"cpu_period_us":100000,"pids_max":128}'
 ```
 
@@ -336,7 +336,7 @@ cgroup/network/data directory, wait for RPC readiness, then continue the run:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --runtime-node-restart-json '{"node":1}'
 ```
 
@@ -354,7 +354,7 @@ thawed states, then continue the run:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 4 \
-  --metrics-interval-ms 250 \
+  --metrics-interval 250ms \
   --runtime-node-freeze-json '{"node":1,"duration_ms":100}'
 ```
 
@@ -373,7 +373,7 @@ sample count is complete:
   --block-production-probability 1 \
   --block-production-period-ms 250 \
   --metrics-sample-count 5 \
-  --metrics-interval-ms 1000
+  --metrics-interval 1s
 ```
 
 Temporary chain RPC unavailability during restart or freeze is recorded as a

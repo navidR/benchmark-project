@@ -11,6 +11,7 @@
 #include <boost/log/utility/setup/file.hpp>
 #include <ios>
 #include <mutex>
+#include <stdexcept>
 
 #include "bbp/log_view.h"
 
@@ -37,6 +38,24 @@ auto LogFormatter() {
                       << expr::smessage;
 }
 
+boost::log::trivial::severity_level BoostSeverity(LogLevel level) {
+  switch (level) {
+    case LogLevel::kTrace:
+      return boost::log::trivial::trace;
+    case LogLevel::kDebug:
+      return boost::log::trivial::debug;
+    case LogLevel::kInfo:
+      return boost::log::trivial::info;
+    case LogLevel::kWarning:
+      return boost::log::trivial::warning;
+    case LogLevel::kError:
+      return boost::log::trivial::error;
+    case LogLevel::kFatal:
+      return boost::log::trivial::fatal;
+  }
+  throw std::logic_error("unknown log level");
+}
+
 }  // namespace
 
 void InitLogging() {
@@ -47,6 +66,12 @@ void InitLogging() {
     console_log_sink = std::move(sink);
     console_logging_enabled = true;
   });
+}
+
+void SetMinimumLogLevel(LogLevel level) {
+  InitLogging();
+  boost::log::core::get()->set_filter(boost::log::trivial::severity >=
+                                      BoostSeverity(level));
 }
 
 void SetConsoleLoggingEnabled(bool enabled) {
