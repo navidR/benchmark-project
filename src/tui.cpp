@@ -27,6 +27,7 @@
 #include "bbp/simulation_command_queue.h"
 #include "bbp/tui_command_parser.h"
 #include "bbp/tui_view.h"
+#include "bbp/util.h"
 
 namespace bbp {
 namespace {
@@ -37,7 +38,7 @@ constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
-constexpr int kDetailPaneRows = 10;
+constexpr int kDetailPaneRows = 13;
 
 struct TuiState {
   std::size_t selected_node = 0;
@@ -122,6 +123,26 @@ std::string JsonIntegerText(const boost::json::object& object,
     return std::to_string(value->as_int64());
   }
   return std::string(fallback);
+}
+
+std::string JsonSatoshisText(const boost::json::object& object,
+                             std::string_view field,
+                             std::string_view fallback = "-") {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return std::string(fallback);
+  }
+  if (value->is_uint64()) {
+    return FormatFixed8Amount(value->as_uint64());
+  }
+  if (!value->is_int64()) {
+    return std::string(fallback);
+  }
+  const std::int64_t amount = value->as_int64();
+  const std::uint64_t magnitude =
+      amount < 0 ? static_cast<std::uint64_t>(-(amount + 1)) + 1U
+                 : static_cast<std::uint64_t>(amount);
+  return std::string(amount < 0 ? "-" : "") + FormatFixed8Amount(magnitude);
 }
 
 std::string JsonMetricText(const boost::json::object& object,
@@ -829,6 +850,32 @@ const boost::json::object& JsonObjectFieldOrEmpty(
   return value != nullptr && value->is_object() ? value->as_object() : empty;
 }
 
+const boost::json::object* LastWalletTransaction(
+    const boost::json::object& metrics, std::string_view direction) {
+  const boost::json::value* value = metrics.if_contains("transactions");
+  if (value == nullptr || !value->is_array()) {
+    return nullptr;
+  }
+  const boost::json::object* latest = nullptr;
+  std::uint64_t latest_timestamp = 0;
+  for (const boost::json::value& item : value->as_array()) {
+    if (!item.is_object()) {
+      continue;
+    }
+    const boost::json::object& transaction = item.as_object();
+    if (JsonString(transaction, "direction") != direction) {
+      continue;
+    }
+    const std::optional<std::uint64_t> timestamp =
+        JsonUnsignedMetric(transaction, "timestamp");
+    if (latest == nullptr || timestamp.value_or(0U) >= latest_timestamp) {
+      latest = &transaction;
+      latest_timestamp = timestamp.value_or(0U);
+    }
+  }
+  return latest;
+}
+
 void DrawSelectedWalletDetail(int top, int bottom, int cols,
                               const boost::json::object* wallet) {
   if (top < 0 || bottom - top < 4 || cols <= 0) {
@@ -842,10 +889,16 @@ void DrawSelectedWalletDetail(int top, int bottom, int cols,
   }
 
   const boost::json::object empty;
-  const boost::json::object& outgoing =
-      JsonObjectFieldOrEmpty(*wallet, "last_sent_transaction", empty);
-  const boost::json::object& incoming =
-      JsonObjectFieldOrEmpty(*wallet, "last_received_transaction", empty);
+  const boost::json::object& metrics =
+      JsonObjectFieldOrEmpty(*wallet, "last_metrics", empty);
+  const boost::json::object* outgoing =
+      LastWalletTransaction(metrics, "outgoing");
+  const boost::json::object* incoming =
+      LastWalletTransaction(metrics, "incoming");
+  const boost::json::object& outgoing_object =
+      outgoing == nullptr ? empty : *outgoing;
+  const boost::json::object& incoming_object =
+      incoming == nullptr ? empty : *incoming;
   const int left_width = std::max(0, cols / 2);
   const int right_width = std::max(0, cols - left_width);
   int y = top + 2;
@@ -869,42 +922,69 @@ void DrawSelectedWalletDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "outgoing count",
-                JsonIntegerText(*wallet, "transactions_sent", "0"));
-  AddDetailPair(y, left_width, right_width, "incoming count",
-                JsonIntegerText(*wallet, "transactions_received", "0"));
+  AddDetailPair(y, 0, left_width, "available",
+                JsonSatoshisText(metrics, "available_balance_satoshis"));
+  AddDetailPair(y, left_width, right_width, "spent by benchmark",
+                JsonSatoshisText(*wallet, "simulated_amount_sent_satoshis",
+                                 "0.00000000"));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "last outgoing",
-                JsonStringArrayText(outgoing, "txids"));
-  AddDetailPair(y, left_width, right_width, "amount",
-                JsonString(outgoing, "amount", "-"));
+  AddDetailPair(y, 0, left_width, "unconfirmed",
+                JsonSatoshisText(metrics, "unconfirmed_balance_satoshis"));
+  AddDetailPair(y, left_width, right_width, "immature",
+                JsonSatoshisText(metrics, "immature_balance_satoshis"));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "to wallet",
-                JsonIntegerText(outgoing, "receiver_wallet_index"));
-  AddDetailPair(y, left_width, right_width, "mempool",
-                JsonIntegerText(outgoing, "mempool_size"));
+  AddDetailPair(y, 0, left_width, "benchmark sent/recv",
+                JsonIntegerText(*wallet, "transactions_sent", "0") + "/" +
+                    JsonIntegerText(*wallet, "transactions_received", "0"));
+  AddDetailPair(y, left_width, right_width, "driver tx count",
+                JsonIntegerText(metrics, "transaction_count") +
+                    (JsonBoolText(metrics, "transaction_history_truncated",
+                                  "false") == "true"
+                         ? " (history truncated)"
+                         : ""));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "last incoming",
-                JsonStringArrayText(incoming, "txids"));
-  AddDetailPair(y, left_width, right_width, "amount",
-                JsonString(incoming, "amount", "-"));
+  AddDetailPair(y, 0, cols, "last outgoing tx",
+                JsonString(outgoing_object, "txid", "-"));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "from wallet",
-                JsonIntegerText(incoming, "sender_wallet_index"));
-  AddDetailPair(y, left_width, right_width, "miner node",
-                JsonIntegerText(incoming, "funding_miner_node"));
+  AddDetailPair(y, 0, left_width, "out amount",
+                JsonSatoshisText(outgoing_object, "amount_satoshis"));
+  AddDetailPair(y, left_width, right_width, "out fee",
+                JsonSatoshisText(outgoing_object, "fee_satoshis"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "out confirmations",
+                JsonIntegerText(outgoing_object, "confirmations"));
+  AddDetailPair(y, left_width, right_width, "out destination",
+                JsonString(outgoing_object, "address", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "last incoming tx/address",
+                JsonString(incoming_object, "txid", "-") + " / " +
+                    JsonString(incoming_object, "address", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "in amount",
+                JsonSatoshisText(incoming_object, "amount_satoshis"));
+  AddDetailPair(y, left_width, right_width, "in confirmations",
+                JsonIntegerText(incoming_object, "confirmations"));
 }
 
 boost::json::object LoadReport(const std::filesystem::path& run_root,

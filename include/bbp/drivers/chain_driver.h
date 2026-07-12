@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "bbp/drivers/chain_wallet_snapshot.h"
 #include "bbp/http_client.h"
 #include "bbp/log_tail.h"
 #include "bbp/mining_difficulty.h"
@@ -146,6 +147,10 @@ class ChainDriver {
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       uint64_t minimum_balance_satoshis, uint64_t minimum_confirmations,
       std::chrono::seconds timeout, std::stop_token stop_token = {}) const = 0;
+  virtual ChainWalletSnapshot ReadWalletSnapshot(
+      const ChainNodeConfig& config, ChainWalletMode wallet_mode,
+      std::uint32_t transaction_limit,
+      std::stop_token stop_token = {}) const = 0;
   virtual ChainUtxo FindSpendableOutput(
       const ChainNodeConfig& config,
       const std::vector<std::string>& block_hashes,

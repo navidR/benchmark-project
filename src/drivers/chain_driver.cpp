@@ -21,4 +21,17 @@ std::string_view ChainLogSourceName(ChainLogSource source) {
   throw std::runtime_error("unknown chain log source");
 }
 
+std::string_view ChainWalletTransactionDirectionName(
+    ChainWalletTransactionDirection direction) {
+  switch (direction) {
+    case ChainWalletTransactionDirection::kIncoming:
+      return "incoming";
+    case ChainWalletTransactionDirection::kOutgoing:
+      return "outgoing";
+    case ChainWalletTransactionDirection::kInternal:
+      return "internal";
+  }
+  throw std::runtime_error("unknown chain wallet transaction direction");
+}
+
 }  // namespace bbp

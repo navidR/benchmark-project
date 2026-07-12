@@ -42,8 +42,11 @@ struct WalletReport {
   std::string mode;
   std::uint64_t transactions_sent = 0;
   std::uint64_t transactions_received = 0;
+  std::uint64_t simulated_amount_sent_satoshis = 0;
+  std::uint64_t simulated_amount_received_satoshis = 0;
   boost::json::object last_sent_transaction;
   boost::json::object last_received_transaction;
+  boost::json::object last_metrics;
 };
 
 std::string OptionalStringField(const boost::json::object& object,
@@ -375,10 +378,17 @@ void RememberWalletTransactionEvent(
       OptionalUint64Field(object, "sender_wallet_index");
   const std::optional<std::uint64_t> receiver_index =
       OptionalUint64Field(object, "receiver_wallet_index");
+  const std::uint64_t amount_satoshis =
+      OptionalUint64Field(object, "amount_satoshis").value_or(0U);
   if (sender_index) {
     WalletReport& sender = (*wallets)[*sender_index];
     sender.wallet_index = *sender_index;
     ++sender.transactions_sent;
+    if (sender.simulated_amount_sent_satoshis >
+        std::numeric_limits<std::uint64_t>::max() - amount_satoshis) {
+      throw std::runtime_error("wallet sent amount total overflow");
+    }
+    sender.simulated_amount_sent_satoshis += amount_satoshis;
     CopyOptionalUint64Field(object, "sender_node", &sender.node);
     CopyOptionalStringField(object, "sender_address", &sender.address);
     sender.last_sent_transaction = object;
@@ -387,6 +397,11 @@ void RememberWalletTransactionEvent(
     WalletReport& receiver = (*wallets)[*receiver_index];
     receiver.wallet_index = *receiver_index;
     ++receiver.transactions_received;
+    if (receiver.simulated_amount_received_satoshis >
+        std::numeric_limits<std::uint64_t>::max() - amount_satoshis) {
+      throw std::runtime_error("wallet received amount total overflow");
+    }
+    receiver.simulated_amount_received_satoshis += amount_satoshis;
     CopyOptionalUint64Field(object, "receiver_node", &receiver.node);
     CopyOptionalStringField(object, "receiver_address", &receiver.address);
     receiver.last_received_transaction = object;
@@ -413,11 +428,18 @@ boost::json::array WalletsJson(
     }
     object["transactions_sent"] = wallet.transactions_sent;
     object["transactions_received"] = wallet.transactions_received;
+    object["simulated_amount_sent_satoshis"] =
+        wallet.simulated_amount_sent_satoshis;
+    object["simulated_amount_received_satoshis"] =
+        wallet.simulated_amount_received_satoshis;
     if (!wallet.last_sent_transaction.empty()) {
       object["last_sent_transaction"] = wallet.last_sent_transaction;
     }
     if (!wallet.last_received_transaction.empty()) {
       object["last_received_transaction"] = wallet.last_received_transaction;
+    }
+    if (!wallet.last_metrics.empty()) {
+      object["last_metrics"] = wallet.last_metrics;
     }
     array.push_back(std::move(object));
   }
@@ -684,6 +706,20 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
         AddNodeBandwidthMetrics(metric, node, &node.last_metrics);
         RememberNodeBandwidthSample(metric, &node);
       });
+
+  ForEachJsonLine(run_root / "wallet-metrics.jsonl",
+                  [&](const boost::json::object& metric) {
+                    const std::optional<std::uint64_t> wallet_index =
+                        OptionalUint64Field(metric, "wallet_index");
+                    if (!wallet_index || *wallet_index == 0U) {
+                      return;
+                    }
+                    WalletReport& wallet = wallets[*wallet_index];
+                    wallet.wallet_index = *wallet_index;
+                    CopyOptionalUint64Field(metric, "node", &wallet.node);
+                    CopyOptionalStringField(metric, "mode", &wallet.mode);
+                    wallet.last_metrics = metric;
+                  });
 
   const bool ok = run_started && run_finished && !run_failed;
   report["ok"] = ok;

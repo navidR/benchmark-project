@@ -8,9 +8,11 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
+#include <boost/multiprecision/cpp_dec_float.hpp>
 #include <boost/url/parse.hpp>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <set>
 
@@ -188,6 +190,82 @@ uint64_t JsonUint64Member(const boost::json::object& object,
   }
   throw std::runtime_error("missing Firo RPC uint64 field: " +
                            std::string(field));
+}
+
+std::int64_t JsonInt64Member(const boost::json::object& object,
+                             std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value != nullptr && value->is_int64()) {
+    return value->as_int64();
+  }
+  if (value != nullptr && value->is_uint64() &&
+      value->as_uint64() <= static_cast<std::uint64_t>(
+                                std::numeric_limits<std::int64_t>::max())) {
+    return static_cast<std::int64_t>(value->as_uint64());
+  }
+  throw std::runtime_error("missing Firo RPC int64 field: " +
+                           std::string(field));
+}
+
+std::string OptionalJsonStringMember(const boost::json::object& object,
+                                     std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  return value != nullptr && value->is_string()
+             ? std::string(value->as_string())
+             : std::string();
+}
+
+std::optional<bool> OptionalJsonBoolMember(const boost::json::object& object,
+                                           std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  return value != nullptr && value->is_bool()
+             ? std::optional<bool>(value->as_bool())
+             : std::nullopt;
+}
+
+std::optional<std::int64_t> OptionalJsonSignedFixed8Amount(
+    const boost::json::object& object, std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || value->is_null()) {
+    return std::nullopt;
+  }
+  using Decimal = boost::multiprecision::cpp_dec_float_50;
+  const Decimal scaled =
+      Decimal(boost::json::serialize(*value)) * Decimal(100000000);
+  const Decimal integral = boost::multiprecision::trunc(scaled);
+  if (scaled != integral ||
+      integral < Decimal(std::numeric_limits<std::int64_t>::min()) ||
+      integral > Decimal(std::numeric_limits<std::int64_t>::max())) {
+    throw std::runtime_error("invalid Firo RPC fixed-8 field: " +
+                             std::string(field));
+  }
+  return integral.convert_to<std::int64_t>();
+}
+
+std::uint64_t JsonFixed8Member(const boost::json::object& object,
+                               std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("missing Firo RPC fixed-8 field: " +
+                             std::string(field));
+  }
+  return JsonFixed8Amount(*value, field);
+}
+
+ChainWalletTransactionDirection ParseWalletTransactionDirection(
+    std::string_view category) {
+  if (category == "send" || category == "spend" || category == "mint") {
+    return ChainWalletTransactionDirection::kOutgoing;
+  }
+  if (category == "receive" || category == "generate" ||
+      category == "immature" || category == "orphan" || category == "znode") {
+    return ChainWalletTransactionDirection::kIncoming;
+  }
+  if (category == "move") {
+    return ChainWalletTransactionDirection::kInternal;
+  }
+  throw std::runtime_error("unknown Firo wallet transaction category: " +
+                           std::string(category));
 }
 
 bool TxOutPaysAddress(const boost::json::object& txout,
@@ -553,6 +631,81 @@ uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
       FormatFixed8Amount(minimum_balance_satoshis) + " with " +
       std::to_string(minimum_confirmations) + " confirmations before timeout" +
       (last_error.empty() ? "" : ": " + last_error));
+}
+
+ChainWalletSnapshot FiroDriver::ReadWalletSnapshot(
+    const FiroNodeConfig& config, WalletMode wallet_mode,
+    std::uint32_t transaction_limit, std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  RequireSupportedWalletMode(wallet_mode, "wallet state inspection");
+  if (transaction_limit == 0U ||
+      transaction_limit >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(
+        "Firo wallet transaction limit must be in 1..INT_MAX");
+  }
+
+  const boost::json::value wallet_info =
+      RpcCall(config, "getwalletinfo", boost::json::array{}, stop_token);
+  if (!wallet_info.is_object()) {
+    throw std::runtime_error("Firo getwalletinfo returned non-object");
+  }
+  const boost::json::object& info = wallet_info.as_object();
+  ChainWalletSnapshot snapshot;
+  snapshot.available_balance_satoshis = JsonFixed8Member(info, "balance");
+  snapshot.unconfirmed_balance_satoshis =
+      JsonFixed8Member(info, "unconfirmed_balance");
+  snapshot.immature_balance_satoshis =
+      JsonFixed8Member(info, "immature_balance");
+  snapshot.transaction_count = JsonUint64Member(info, "txcount");
+
+  boost::json::array list_params;
+  list_params.emplace_back("*");
+  list_params.push_back(transaction_limit);
+  list_params.push_back(0);
+  list_params.push_back(true);
+  const boost::json::value transactions =
+      RpcCall(config, "listtransactions", list_params, stop_token);
+  if (!transactions.is_array()) {
+    throw std::runtime_error("Firo listtransactions returned non-array");
+  }
+  snapshot.transaction_history_truncated =
+      transactions.as_array().size() >= transaction_limit &&
+      snapshot.transaction_count > transaction_limit;
+  snapshot.transactions.reserve(transactions.as_array().size());
+  for (const boost::json::value& value : transactions.as_array()) {
+    if (!value.is_object()) {
+      throw std::runtime_error(
+          "Firo listtransactions returned a non-object entry");
+    }
+    const boost::json::object& object = value.as_object();
+    ChainWalletTransaction transaction;
+    transaction.direction =
+        ParseWalletTransactionDirection(JsonStringMember(object, "category"));
+    transaction.txid = OptionalJsonStringMember(object, "txid");
+    transaction.address = OptionalJsonStringMember(object, "address");
+    const std::optional<std::int64_t> amount =
+        OptionalJsonSignedFixed8Amount(object, "amount");
+    if (!amount) {
+      throw std::runtime_error(
+          "Firo listtransactions entry has no amount field");
+    }
+    transaction.amount_satoshis = *amount;
+    transaction.fee_satoshis = OptionalJsonSignedFixed8Amount(object, "fee");
+    const boost::json::value* confirmations =
+        object.if_contains("confirmations");
+    if (confirmations != nullptr) {
+      transaction.confirmations = JsonInt64Member(object, "confirmations");
+    }
+    transaction.block_hash = OptionalJsonStringMember(object, "blockhash");
+    const boost::json::value* timestamp = object.if_contains("time");
+    if (timestamp != nullptr) {
+      transaction.timestamp = JsonUint64Member(object, "time");
+    }
+    transaction.abandoned = OptionalJsonBoolMember(object, "abandoned");
+    snapshot.transactions.push_back(std::move(transaction));
+  }
+  return snapshot;
 }
 
 FiroUtxo FiroDriver::FindSpendableOutput(

@@ -52,76 +52,76 @@ std::uint64_t JsonIntegerValue(const boost::json::value& value) {
 BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const std::filesystem::path dir = MakeTestDir("run-report");
   bbp::WriteText(dir / "resolved-scenario.json",
-                  "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
-                  "\"generate_blocks\":3,\"generate_node\":null,"
-                  "\"isolated_network\":true,\"sync_timeout_sec\":null,"
-                  "\"topology\":{\"node_count\":1,"
-                  "\"wallet_node_count\":1,\"miner_node_count\":1,"
-                  "\"allow_miner_wallet_overlap\":true,"
-                  "\"wallet_nodes\":[1],\"miner_nodes\":[1]},"
-                  "\"resources\":{\"memory_max_bytes\":1024},"
-                  "\"default_network_condition\":{\"delay_ms\":2},"
-                  "\"node_network_conditions\":[{\"node\":1,\"delay_ms\":3}],"
-                  "\"runtime_node_resource_limits\":["
-                  "{\"node\":1,\"pids_max\":128}],"
-                  "\"runtime_node_restarts\":[{\"node\":1}],"
-                  "\"workloads\":["
-                  "{\"type\":\"block_generation\",\"node\":1,\"count\":1,"
-                  "\"sync_timeout_sec\":45},"
-                  "{\"type\":\"block_generation\",\"node\":2,\"count\":2,"
-                  "\"sync_timeout_sec\":60},"
-                  "{\"type\":\"wait_for_peers\",\"node\":1,"
-                  "\"peer_count\":1,\"timeout_sec\":30},"
-                  "{\"type\":\"restart_node\",\"node\":1},"
-                  "{\"type\":\"freeze_node\",\"node\":1,"
-                  "\"duration_ms\":25},"
-                  "{\"type\":\"update_resource_limits\",\"node\":1,"
-                  "\"pids_max\":128}]}\n");
+                 "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
+                 "\"generate_blocks\":3,\"generate_node\":null,"
+                 "\"isolated_network\":true,\"sync_timeout_sec\":null,"
+                 "\"topology\":{\"node_count\":1,"
+                 "\"wallet_node_count\":1,\"miner_node_count\":1,"
+                 "\"allow_miner_wallet_overlap\":true,"
+                 "\"wallet_nodes\":[1],\"miner_nodes\":[1]},"
+                 "\"resources\":{\"memory_max_bytes\":1024},"
+                 "\"default_network_condition\":{\"delay_ms\":2},"
+                 "\"node_network_conditions\":[{\"node\":1,\"delay_ms\":3}],"
+                 "\"runtime_node_resource_limits\":["
+                 "{\"node\":1,\"pids_max\":128}],"
+                 "\"runtime_node_restarts\":[{\"node\":1}],"
+                 "\"workloads\":["
+                 "{\"type\":\"block_generation\",\"node\":1,\"count\":1,"
+                 "\"sync_timeout_sec\":45},"
+                 "{\"type\":\"block_generation\",\"node\":2,\"count\":2,"
+                 "\"sync_timeout_sec\":60},"
+                 "{\"type\":\"wait_for_peers\",\"node\":1,"
+                 "\"peer_count\":1,\"timeout_sec\":30},"
+                 "{\"type\":\"restart_node\",\"node\":1},"
+                 "{\"type\":\"freeze_node\",\"node\":1,"
+                 "\"duration_ms\":25},"
+                 "{\"type\":\"update_resource_limits\",\"node\":1,"
+                 "\"pids_max\":128}]}\n");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"timestamp\":\"2026-07-09T00:00:00Z\","
-                   "\"event\":\"run_started\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"timestamp\":\"2026-07-09T00:00:00Z\","
+                  "\"event\":\"run_started\"}");
   bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"event\":\"state\","
       "\"detail\":\"Running\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"daemon_log_tail\","
-                   "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
-                   "\\\"start_offset\\\":0,\\\"next_offset\\\":4,"
-                   "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
-                   "\\\"text\\\":\\\"tail\\\"}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"daemon_log_tail\","
+                  "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
+                  "\\\"start_offset\\\":0,\\\"next_offset\\\":4,"
+                  "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
+                  "\\\"text\\\":\\\"tail\\\"}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"daemon_log_tail\","
-                   "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
-                   "\\\"start_offset\\\":4,\\\"next_offset\\\":9,"
-                   "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
-                   "\\\"text\\\":\\\" next\\\"}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"daemon_log_tail\","
+                  "\"detail\":\"{\\\"kind\\\":\\\"daemon_log\\\","
+                  "\\\"start_offset\\\":4,\\\"next_offset\\\":9,"
+                  "\\\"truncated\\\":false,\\\"offset_reset\\\":false,"
+                  "\\\"text\\\":\\\" next\\\"}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"timestamp\":\"2026-07-09T00:00:01Z\","
-                   "\"event\":\"generated_blocks\","
-                   "\"detail\":\"{\\\"workload_index\\\":1,"
-                   "\\\"workload_count\\\":6,\\\"generator_node\\\":1,"
-                   "\\\"count\\\":1,\\\"start_height\\\":0,"
-                   "\\\"target_height\\\":1,\\\"reward_address\\\":\\\"a\\\","
-                   "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"timestamp\":\"2026-07-09T00:00:01Z\","
+                  "\"event\":\"generated_blocks\","
+                  "\"detail\":\"{\\\"workload_index\\\":1,"
+                  "\\\"workload_count\\\":6,\\\"generator_node\\\":1,"
+                  "\\\"count\\\":1,\\\"start_height\\\":0,"
+                  "\\\"target_height\\\":1,\\\"reward_address\\\":\\\"a\\\","
+                  "\\\"hashes\\\":[\\\"abc\\\"]}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"height_reached\",\"detail\":\"1\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"height_reached\",\"detail\":\"1\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"timestamp\":\"2026-07-09T00:00:02Z\","
-                   "\"event\":\"scheduled_block_produced\","
-                   "\"detail\":\"{\\\"hashes\\\":[\\\"def\\\"]}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"timestamp\":\"2026-07-09T00:00:02Z\","
+                  "\"event\":\"scheduled_block_produced\","
+                  "\"detail\":\"{\\\"hashes\\\":[\\\"def\\\"]}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"height_wait_reached\","
-                   "\"detail\":\"{\\\"workload_index\\\":2,"
-                   "\\\"workload_count\\\":6,\\\"node\\\":1,"
-                   "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"height_wait_reached\","
+                  "\"detail\":\"{\\\"workload_index\\\":2,"
+                  "\\\"workload_count\\\":6,\\\"node\\\":1,"
+                  "\\\"target_height\\\":2,\\\"observed_height\\\":2}\"}");
   bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
@@ -130,66 +130,67 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\\\"workload_count\\\":6,\\\"node\\\":1,"
       "\\\"target_peer_count\\\":1,\\\"observed_peer_count\\\":1}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"node_restarted\","
-                   "\"detail\":\"{\\\"workload_index\\\":4,"
-                   "\\\"workload_count\\\":6,\\\"node\\\":1,"
-                   "\\\"restart_count\\\":1}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"node_restarted\","
+                  "\"detail\":\"{\\\"workload_index\\\":4,"
+                  "\\\"workload_count\\\":6,\\\"node\\\":1,"
+                  "\\\"restart_count\\\":1}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"node_freeze_completed\","
-                   "\"detail\":\"{\\\"workload_index\\\":5,"
-                   "\\\"workload_count\\\":6,\\\"node\\\":1,"
-                   "\\\"duration_ms\\\":25}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"node_freeze_completed\","
+                  "\"detail\":\"{\\\"workload_index\\\":5,"
+                  "\\\"workload_count\\\":6,\\\"node\\\":1,"
+                  "\\\"duration_ms\\\":25}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"resource_limits_updated\","
-                   "\"detail\":\"{\\\"workload_index\\\":6,"
-                   "\\\"workload_count\\\":6,\\\"node\\\":1,"
-                   "\\\"requested\\\":{\\\"pids_max\\\":128},"
-                   "\\\"previous\\\":{\\\"memory_high_bytes\\\":1024,"
-                   "\\\"memory_max_bytes\\\":2048,"
-                   "\\\"cpu_quota_us\\\":null,"
-                   "\\\"cpu_period_us\\\":100000,"
-                   "\\\"pids_max\\\":256},"
-                   "\\\"current\\\":{\\\"memory_high_bytes\\\":1024,"
-                   "\\\"memory_max_bytes\\\":2048,"
-                   "\\\"cpu_quota_us\\\":null,"
-                   "\\\"cpu_period_us\\\":100000,"
-                   "\\\"pids_max\\\":128}}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"resource_limits_updated\","
+                  "\"detail\":\"{\\\"workload_index\\\":6,"
+                  "\\\"workload_count\\\":6,\\\"node\\\":1,"
+                  "\\\"requested\\\":{\\\"pids_max\\\":128},"
+                  "\\\"previous\\\":{\\\"memory_high_bytes\\\":1024,"
+                  "\\\"memory_max_bytes\\\":2048,"
+                  "\\\"cpu_quota_us\\\":null,"
+                  "\\\"cpu_period_us\\\":100000,"
+                  "\\\"pids_max\\\":256},"
+                  "\\\"current\\\":{\\\"memory_high_bytes\\\":1024,"
+                  "\\\"memory_max_bytes\\\":2048,"
+                  "\\\"cpu_quota_us\\\":null,"
+                  "\\\"cpu_period_us\\\":100000,"
+                  "\\\"pids_max\\\":128}}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"wallet_address_created\","
-                   "\"detail\":\"{\\\"wallet_index\\\":1,"
-                   "\\\"node\\\":1,\\\"strategy\\\":\\\"driver_rpc\\\","
-                   "\\\"mode\\\":\\\"public\\\","
-                   "\\\"address\\\":\\\"addr1\\\"}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"wallet_address_created\","
+                  "\"detail\":\"{\\\"wallet_index\\\":1,"
+                  "\\\"node\\\":1,\\\"strategy\\\":\\\"driver_rpc\\\","
+                  "\\\"mode\\\":\\\"public\\\","
+                  "\\\"address\\\":\\\"addr1\\\"}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
-                   "\"event\":\"wallet_address_created\","
-                   "\"detail\":\"{\\\"wallet_index\\\":2,"
-                   "\\\"node\\\":2,\\\"strategy\\\":\\\"driver_rpc\\\","
-                   "\\\"mode\\\":\\\"public\\\","
-                   "\\\"address\\\":\\\"addr2\\\"}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+                  "\"event\":\"wallet_address_created\","
+                  "\"detail\":\"{\\\"wallet_index\\\":2,"
+                  "\\\"node\\\":2,\\\"strategy\\\":\\\"driver_rpc\\\","
+                  "\\\"mode\\\":\\\"public\\\","
+                  "\\\"address\\\":\\\"addr2\\\"}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
-                   "\"event\":\"wallet_transaction_submitted\","
-                   "\"detail\":\"{\\\"workload_index\\\":7,"
-                   "\\\"workload_count\\\":7,"
-                   "\\\"transaction_index\\\":1,"
-                   "\\\"transaction_count\\\":1,"
-                   "\\\"strategy\\\":\\\"random\\\","
-                   "\\\"seed\\\":42,"
-                   "\\\"sender_wallet_index\\\":1,"
-                   "\\\"receiver_wallet_index\\\":2,"
-                   "\\\"sender_node\\\":1,"
-                   "\\\"receiver_node\\\":2,"
-                   "\\\"sender_address\\\":\\\"addr1\\\","
-                   "\\\"receiver_address\\\":\\\"addr2\\\","
-                   "\\\"funding_miner_node\\\":1,"
-                   "\\\"amount\\\":\\\"1.00000000\\\","
-                   "\\\"txids\\\":[\\\"tx1\\\"],"
-                   "\\\"mempool_size\\\":1}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"wallet_transaction_submitted\","
+                  "\"detail\":\"{\\\"workload_index\\\":7,"
+                  "\\\"workload_count\\\":7,"
+                  "\\\"transaction_index\\\":1,"
+                  "\\\"transaction_count\\\":1,"
+                  "\\\"strategy\\\":\\\"random\\\","
+                  "\\\"seed\\\":42,"
+                  "\\\"sender_wallet_index\\\":1,"
+                  "\\\"receiver_wallet_index\\\":2,"
+                  "\\\"sender_node\\\":1,"
+                  "\\\"receiver_node\\\":2,"
+                  "\\\"sender_address\\\":\\\"addr1\\\","
+                  "\\\"receiver_address\\\":\\\"addr2\\\","
+                  "\\\"funding_miner_node\\\":1,"
+                  "\\\"amount\\\":\\\"1.00000000\\\","
+                  "\\\"amount_satoshis\\\":100000000,"
+                  "\\\"txids\\\":[\\\"tx1\\\"],"
+                  "\\\"mempool_size\\\":1}\"}");
   bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
@@ -200,9 +201,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\\\"error\\\":\\\"Firo does not support runtime log verbosity "
       "adjustment functionality.\\\"}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"timestamp\":\"2026-07-09T00:00:02Z\","
-                   "\"event\":\"run_finished\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"timestamp\":\"2026-07-09T00:00:02Z\","
+                  "\"event\":\"run_finished\"}");
   bbp::AppendLine(
       dir / "metrics.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":1,"
@@ -228,6 +229,16 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"qdisc_netem_limit_packets\":1000,\"qdisc_has_tbf_options\":true,"
       "\"qdisc_tbf_rate_bytes_per_sec\":1250000,"
       "\"qdisc_tbf_limit_bytes\":125000}");
+  bbp::AppendLine(dir / "wallet-metrics.jsonl",
+                  "{\"run_id\":\"r1\",\"timestamp_ms\":3000,\"wallet_index\":1,"
+                  "\"node\":1,\"mode\":\"public\","
+                  "\"available_balance_satoshis\":4900000000,"
+                  "\"unconfirmed_balance_satoshis\":100000000,"
+                  "\"immature_balance_satoshis\":0,\"transaction_count\":2,"
+                  "\"transaction_history_truncated\":false,"
+                  "\"transactions\":[{\"direction\":\"outgoing\","
+                  "\"amount_satoshis\":-100000000,\"confirmations\":0,"
+                  "\"timestamp\":2,\"txid\":\"tx1\"}]}");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));
@@ -372,6 +383,14 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(sender_wallet.at("mode").as_string() == "public");
   BOOST_TEST(JsonInteger(sender_wallet, "transactions_sent") == 1U);
   BOOST_TEST(JsonInteger(sender_wallet, "transactions_received") == 0U);
+  BOOST_TEST(JsonInteger(sender_wallet, "simulated_amount_sent_satoshis") ==
+             100000000U);
+  const boost::json::object& wallet_metrics =
+      sender_wallet.at("last_metrics").as_object();
+  BOOST_TEST(JsonInteger(wallet_metrics, "available_balance_satoshis") ==
+             4900000000U);
+  BOOST_TEST(JsonInteger(wallet_metrics, "transaction_count") == 2U);
+  BOOST_REQUIRE_EQUAL(wallet_metrics.at("transactions").as_array().size(), 1U);
   BOOST_TEST(JsonInteger(sender_wallet.at("last_sent_transaction").as_object(),
                          "receiver_wallet_index") == 2U);
   const boost::json::object& receiver_wallet = wallets[1].as_object();
@@ -380,6 +399,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(receiver_wallet.at("address").as_string() == "addr2");
   BOOST_TEST(JsonInteger(receiver_wallet, "transactions_sent") == 0U);
   BOOST_TEST(JsonInteger(receiver_wallet, "transactions_received") == 1U);
+  BOOST_TEST(JsonInteger(receiver_wallet,
+                         "simulated_amount_received_satoshis") == 100000000U);
   const boost::json::array& nodes = report.at("nodes_summary").as_array();
   BOOST_REQUIRE_EQUAL(nodes.size(), 1U);
   const boost::json::object& node = nodes.front().as_object();
@@ -429,35 +450,35 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
 BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-partition");
   bbp::WriteText(dir / "resolved-scenario.json",
-                  "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
-                  "\"isolated_network\":true,"
-                  "\"workloads\":["
-                  "{\"type\":\"partition_nodes\","
-                  "\"group_a\":[1],\"group_b\":[2]},"
-                  "{\"type\":\"heal_partition\","
-                  "\"group_a\":[1],\"group_b\":[2]}]}\n");
+                 "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
+                 "\"isolated_network\":true,"
+                 "\"workloads\":["
+                 "{\"type\":\"partition_nodes\","
+                 "\"group_a\":[1],\"group_b\":[2]},"
+                 "{\"type\":\"heal_partition\","
+                 "\"group_a\":[1],\"group_b\":[2]}]}\n");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"run_started\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_started\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"network_partition_applied\","
-                   "\"detail\":\"{\\\"workload_index\\\":1,"
-                   "\\\"workload_count\\\":2,"
-                   "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
-                   "\\\"scope\\\":\\\"source_aware_group\\\","
-                   "\\\"rules\\\":[]}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"network_partition_applied\","
+                  "\"detail\":\"{\\\"workload_index\\\":1,"
+                  "\\\"workload_count\\\":2,"
+                  "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
+                  "\\\"scope\\\":\\\"source_aware_group\\\","
+                  "\\\"rules\\\":[]}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"network_partition_healed\","
-                   "\"detail\":\"{\\\"workload_index\\\":2,"
-                   "\\\"workload_count\\\":2,"
-                   "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
-                   "\\\"scope\\\":\\\"source_aware_group\\\","
-                   "\\\"rules\\\":[]}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"network_partition_healed\","
+                  "\"detail\":\"{\\\"workload_index\\\":2,"
+                  "\\\"workload_count\\\":2,"
+                  "\\\"group_a\\\":[1],\\\"group_b\\\":[2],"
+                  "\\\"scope\\\":\\\"source_aware_group\\\","
+                  "\\\"rules\\\":[]}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"run_finished\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_finished\"}");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));
@@ -490,40 +511,40 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
 BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-peer-churn");
   bbp::WriteText(dir / "resolved-scenario.json",
-                  "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
-                  "\"isolated_network\":true,"
-                  "\"workloads\":["
-                  "{\"type\":\"disconnect_peer\",\"node\":2,\"peer\":1,"
-                  "\"timeout_sec\":5},"
-                  "{\"type\":\"connect_peer\",\"node\":2,\"peer\":1,"
-                  "\"timeout_sec\":5}]}\n");
+                 "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":2,"
+                 "\"isolated_network\":true,"
+                 "\"workloads\":["
+                 "{\"type\":\"disconnect_peer\",\"node\":2,\"peer\":1,"
+                 "\"timeout_sec\":5},"
+                 "{\"type\":\"connect_peer\",\"node\":2,\"peer\":1,"
+                 "\"timeout_sec\":5}]}\n");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"run_started\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_started\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
-                   "\"event\":\"peer_disconnected\","
-                   "\"detail\":\"{\\\"workload_index\\\":1,"
-                   "\\\"workload_count\\\":2,\\\"node\\\":2,"
-                   "\\\"peer\\\":1,\\\"address\\\":\\\"10.210.1.2:18168\\\","
-                   "\\\"before_peer_count\\\":1,"
-                   "\\\"after_peer_count\\\":0,"
-                   "\\\"connected_before\\\":true,"
-                   "\\\"connected_after\\\":false}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+                  "\"event\":\"peer_disconnected\","
+                  "\"detail\":\"{\\\"workload_index\\\":1,"
+                  "\\\"workload_count\\\":2,\\\"node\\\":2,"
+                  "\\\"peer\\\":1,\\\"address\\\":\\\"10.210.1.2:18168\\\","
+                  "\\\"before_peer_count\\\":1,"
+                  "\\\"after_peer_count\\\":0,"
+                  "\\\"connected_before\\\":true,"
+                  "\\\"connected_after\\\":false}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
-                   "\"event\":\"peer_connected\","
-                   "\"detail\":\"{\\\"workload_index\\\":2,"
-                   "\\\"workload_count\\\":2,\\\"node\\\":2,"
-                   "\\\"peer\\\":1,\\\"address\\\":\\\"10.210.1.2:18168\\\","
-                   "\\\"before_peer_count\\\":0,"
-                   "\\\"after_peer_count\\\":1,"
-                   "\\\"connected_before\\\":false,"
-                   "\\\"connected_after\\\":true,"
-                   "\\\"timeout_sec\\\":5}\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+                  "\"event\":\"peer_connected\","
+                  "\"detail\":\"{\\\"workload_index\\\":2,"
+                  "\\\"workload_count\\\":2,\\\"node\\\":2,"
+                  "\\\"peer\\\":1,\\\"address\\\":\\\"10.210.1.2:18168\\\","
+                  "\\\"before_peer_count\\\":0,"
+                  "\\\"after_peer_count\\\":1,"
+                  "\\\"connected_before\\\":false,"
+                  "\\\"connected_after\\\":true,"
+                  "\\\"timeout_sec\\\":5}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"run_finished\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_finished\"}");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));
@@ -569,8 +590,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
       "\"funding_blocks\":101,\"amount\":\"39.99000000\","
       "\"fee\":\"0.01000000\",\"timeout_sec\":30}]}\n");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"run_started\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_started\"}");
   bbp::AppendLine(
       dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
@@ -592,8 +613,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
       "\\\"txid\\\":\\\"tx123\\\",\\\"mempool_size\\\":1,"
       "\\\"timeout_sec\\\":30}\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"event\":\"run_finished\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_finished\"}");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));
@@ -623,14 +644,14 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
 BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   const std::filesystem::path dir = MakeTestDir("run-report-failed");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"timestamp\":\"2026-07-09T00:00:00Z\","
-                   "\"event\":\"run_started\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"timestamp\":\"2026-07-09T00:00:00Z\","
+                  "\"event\":\"run_started\"}");
   bbp::AppendLine(dir / "events.jsonl",
-                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
-                   "\"timestamp\":\"2026-07-09T00:00:01Z\","
-                   "\"event\":\"run_failed\","
-                   "\"detail\":\"peer wait timed out\"}");
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"timestamp\":\"2026-07-09T00:00:01Z\","
+                  "\"event\":\"run_failed\","
+                  "\"detail\":\"peer wait timed out\"}");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));
@@ -660,9 +681,9 @@ BOOST_AUTO_TEST_CASE(
   scenario["nodes"] = 1U;
   scenario["block_production"] = std::move(initial_policy);
   bbp::WriteText(dir / "resolved-scenario.json",
-                  boost::json::serialize(scenario) + "\n");
+                 boost::json::serialize(scenario) + "\n");
   bbp::AppendLine(dir / "events.jsonl",
-                   R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
+                  R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
   for (std::uint64_t index = 0U; index < 260U; ++index) {
     boost::json::array hashes;
     hashes.emplace_back("hash-" + std::to_string(index));
@@ -687,7 +708,7 @@ BOOST_AUTO_TEST_CASE(
   command_event["detail"] = boost::json::serialize(command_detail);
   bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(command_event));
   bbp::AppendLine(dir / "events.jsonl",
-                   R"({"run_id":"r1","node_id":"sim","event":"run_finished"})");
+                  R"({"run_id":"r1","node_id":"sim","event":"run_finished"})");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));

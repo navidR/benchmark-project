@@ -2,6 +2,9 @@
 
 #include <atomic>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/json/parse.hpp>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <condition_variable>
@@ -11,9 +14,38 @@
 #include <mutex>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 #include "bbp/drivers/firo_driver.h"
 #include "bbp/simulation_cancelled.h"
+
+namespace {
+
+std::vector<std::string> ServeRpcResponses(
+    boost::asio::ip::tcp::acceptor& acceptor,
+    const std::vector<std::string>& responses) {
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  std::vector<std::string> methods;
+  for (const std::string& body : responses) {
+    boost::asio::ip::tcp::socket socket(acceptor.get_executor());
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    const boost::json::value request_json = boost::json::parse(request.body());
+    methods.emplace_back(request_json.as_object().at("method").as_string());
+
+    http::response<http::string_body> response{http::status::ok, 11};
+    response.set(http::field::content_type, "application/json");
+    response.body() = body;
+    response.prepare_payload();
+    http::write(socket, response);
+  }
+  return methods;
+}
+
+}  // namespace
 
 BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   const std::filesystem::path test_dir =
@@ -152,4 +184,54 @@ BOOST_AUTO_TEST_CASE(firo_rpc_wait_honors_stop_while_server_is_silent) {
   BOOST_TEST(!static_cast<bool>(failure));
   BOOST_TEST(cancelled.load());
   BOOST_TEST(stop_duration.count() < 500);
+}
+
+BOOST_AUTO_TEST_CASE(firo_reads_public_wallet_snapshot_from_wallet_rpc) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"balance":49.00000000,"unconfirmed_balance":1.25000000,"immature_balance":2.00000000,"txcount":4},"error":null,"id":"bbp"})",
+      R"({"result":[{"category":"receive","amount":50.00000000,"confirmations":101,"time":10,"txid":"incoming","address":"receiver"},{"category":"send","amount":-1.00000000,"fee":-0.00001000,"confirmations":0,"time":20,"txid":"outgoing","address":"recipient","abandoned":false},{"category":"mint","amount":-0.50000000,"fee":-0.00002000,"confirmations":2,"time":30,"txid":"mint"},{"category":"znode","amount":0.75000000,"confirmations":5,"time":40,"txid":"reward"}],"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "wallet-snapshot-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  const bbp::ChainWalletSnapshot snapshot =
+      driver.ReadWalletSnapshot(config, bbp::WalletMode::kPublic, 4U);
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_TEST(snapshot.available_balance_satoshis == 4900000000ULL);
+  BOOST_TEST(snapshot.unconfirmed_balance_satoshis == 125000000ULL);
+  BOOST_TEST(snapshot.immature_balance_satoshis == 200000000ULL);
+  BOOST_TEST(snapshot.transaction_count == 4U);
+  BOOST_TEST(!snapshot.transaction_history_truncated);
+  BOOST_REQUIRE_EQUAL(snapshot.transactions.size(), 4U);
+  BOOST_CHECK(snapshot.transactions[0].direction ==
+              bbp::ChainWalletTransactionDirection::kIncoming);
+  BOOST_TEST(snapshot.transactions[0].amount_satoshis == 5000000000LL);
+  BOOST_TEST(snapshot.transactions[0].confirmations == 101);
+  BOOST_TEST(snapshot.transactions[0].txid == "incoming");
+  BOOST_CHECK(snapshot.transactions[1].direction ==
+              bbp::ChainWalletTransactionDirection::kOutgoing);
+  BOOST_REQUIRE(snapshot.transactions[1].fee_satoshis.has_value());
+  BOOST_TEST(*snapshot.transactions[1].fee_satoshis == -1000);
+  BOOST_CHECK(snapshot.transactions[2].direction ==
+              bbp::ChainWalletTransactionDirection::kOutgoing);
+  BOOST_CHECK(snapshot.transactions[3].direction ==
+              bbp::ChainWalletTransactionDirection::kIncoming);
+  BOOST_REQUIRE_EQUAL(methods.size(), 2U);
+  BOOST_TEST(methods[0] == "getwalletinfo");
+  BOOST_TEST(methods[1] == "listtransactions");
 }

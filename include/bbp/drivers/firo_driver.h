@@ -64,6 +64,10 @@ class FiroDriver final : public ChainDriver {
                                 uint64_t minimum_confirmations,
                                 std::chrono::seconds timeout,
                                 std::stop_token stop_token = {}) const override;
+  ChainWalletSnapshot ReadWalletSnapshot(
+      const FiroNodeConfig& config, WalletMode wallet_mode,
+      std::uint32_t transaction_limit,
+      std::stop_token stop_token = {}) const override;
   FiroUtxo FindSpendableOutput(const FiroNodeConfig& config,
                                const std::vector<std::string>& block_hashes,
                                const std::string& source_address,

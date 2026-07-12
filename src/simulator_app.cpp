@@ -3385,8 +3385,11 @@ std::string WalletTransactionDetail(
   detail["readiness_confirmations"] = workload.readiness_confirmations;
   detail["funding_ready_balance"] =
       FormatFixed8Amount(funding_ready_balance_satoshis);
+  detail["funding_ready_balance_satoshis"] = funding_ready_balance_satoshis;
   detail["amount"] = transaction.destination_amount;
+  detail["amount_satoshis"] = workload.amount_satoshis;
   detail["requested_fee_rate"] = transaction.requested_fee_rate;
+  detail["requested_fee_rate_satoshis"] = workload.fee_satoshis;
   detail["txids"] = TxIdsJson(transaction.txids);
   detail["mempool_size"] = transaction.mempool_size;
   detail["timeout_sec"] = workload.timeout_sec;
@@ -3510,6 +3513,103 @@ void WriteMetricsSnapshot(
                MetricsJson(options.run_id, node.config.id, chain,
                            node.GeneratedBlockCount(), node.RestartCount(), &cg,
                            link, qdisc));
+  }
+}
+
+boost::json::object WalletTransactionJson(
+    const ChainWalletTransaction& transaction) {
+  boost::json::object object;
+  object["direction"] =
+      ChainWalletTransactionDirectionName(transaction.direction);
+  object["amount_satoshis"] = transaction.amount_satoshis;
+  object["confirmations"] = transaction.confirmations;
+  object["timestamp"] = transaction.timestamp;
+  if (!transaction.txid.empty()) {
+    object["txid"] = transaction.txid;
+  }
+  if (!transaction.address.empty()) {
+    object["address"] = transaction.address;
+  }
+  if (transaction.fee_satoshis) {
+    object["fee_satoshis"] = *transaction.fee_satoshis;
+  }
+  if (!transaction.block_hash.empty()) {
+    object["block_hash"] = transaction.block_hash;
+  }
+  if (transaction.abandoned) {
+    object["abandoned"] = *transaction.abandoned;
+  }
+  return object;
+}
+
+std::string WalletMetricsJson(const Options& options,
+                              std::uint32_t wallet_index,
+                              std::uint32_t one_based_node,
+                              const ChainWalletSnapshot& snapshot) {
+  boost::json::object object;
+  object["run_id"] = options.run_id;
+  object["timestamp_ms"] = NowUnixMillis();
+  object["wallet_index"] = wallet_index;
+  object["node"] = one_based_node;
+  object["mode"] =
+      std::string(WalletPrivacyModeName(options.wallet_initialization.mode));
+  object["available_balance_satoshis"] = snapshot.available_balance_satoshis;
+  object["unconfirmed_balance_satoshis"] =
+      snapshot.unconfirmed_balance_satoshis;
+  object["immature_balance_satoshis"] = snapshot.immature_balance_satoshis;
+  object["transaction_count"] = snapshot.transaction_count;
+  object["transaction_history_truncated"] =
+      snapshot.transaction_history_truncated;
+  boost::json::array transactions;
+  transactions.reserve(snapshot.transactions.size());
+  for (const ChainWalletTransaction& transaction : snapshot.transactions) {
+    transactions.push_back(WalletTransactionJson(transaction));
+  }
+  object["transactions"] = std::move(transactions);
+  return boost::json::serialize(object);
+}
+
+using WalletMetricsFailureHandler =
+    std::function<void(std::uint32_t wallet_index, const NodeRuntime& node,
+                       std::string_view error)>;
+
+void WriteWalletMetricsSnapshot(
+    const std::filesystem::path& metrics_path, const Options& options,
+    const ChainDriver& driver, const std::vector<NodeRuntime>& nodes,
+    const WalletMetricsFailureHandler& failure_handler = {},
+    std::stop_token stop_token = {}) {
+  if (!options.wallet_backed_workload_requested) {
+    return;
+  }
+  constexpr std::uint32_t kTransactionLimit = 256U;
+  for (std::size_t index = 0; index < options.topology.wallet_nodes.size();
+       ++index) {
+    const std::uint32_t node_index = options.topology.wallet_nodes[index];
+    if (node_index >= nodes.size()) {
+      throw std::runtime_error("wallet metrics node is out of range");
+    }
+    const NodeRuntime& node = nodes[node_index];
+    if (!node.AllowsChainMetrics()) {
+      continue;
+    }
+    try {
+      const ChainWalletSnapshot snapshot = driver.ReadWalletSnapshot(
+          node.config, ToChainWalletMode(options.wallet_initialization),
+          kTransactionLimit, stop_token);
+      AppendLine(
+          metrics_path,
+          WalletMetricsJson(options, static_cast<std::uint32_t>(index + 1U),
+                            node_index + 1U, snapshot));
+    } catch (const std::exception& error) {
+      if (!node.AllowsChainMetrics()) {
+        continue;
+      }
+      if (!failure_handler) {
+        throw;
+      }
+      failure_handler(static_cast<std::uint32_t>(index + 1U), node,
+                      error.what());
+    }
   }
 }
 
@@ -5271,6 +5371,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
 
   const auto events_path = run_root / "events.jsonl";
   const auto metrics_path = run_root / "metrics.jsonl";
+  const auto wallet_metrics_path = run_root / "wallet-metrics.jsonl";
   WriteEvent(events_path, options.run_id, "sim", "run_started");
 
   std::unique_ptr<ChainDriver> driver_owner = CreateDefaultChainDriver();
@@ -5287,6 +5388,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::stop_source command_rpc_stop_source;
   std::stop_source block_production_rpc_stop_source;
   std::stop_source metrics_rpc_stop_source;
+  std::atomic<bool> wallets_initialized = false;
   std::stop_callback cancel_command_rpc(stop_token, [&command_rpc_stop_source] {
     command_rpc_stop_source.request_stop();
   });
@@ -5647,6 +5749,27 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           if (metrics_collector->StopRequested()) {
             return;
           }
+          if (wallets_initialized.load(std::memory_order_acquire)) {
+            WriteWalletMetricsSnapshot(
+                wallet_metrics_path, options, driver, nodes,
+                [&](std::uint32_t wallet_index, const NodeRuntime& node,
+                    std::string_view error) {
+                  boost::json::object detail;
+                  detail["sample"] = sample;
+                  detail["wallet_index"] = wallet_index;
+                  detail["error"] = error;
+                  WriteEvent(events_path, options.run_id, node.config.id,
+                             "wallet_metrics_unavailable",
+                             boost::json::serialize(detail));
+                  BBP_LOG(warning) << "wallet metrics sample " << sample
+                                   << " skipped #" << wallet_index << " on "
+                                   << node.config.id << ": " << error;
+                },
+                metrics_rpc_stop_source.get_token());
+          }
+          if (metrics_collector->StopRequested()) {
+            return;
+          }
           boost::json::object detail;
           detail["sample"] = sample;
           detail["sample_count"] = options.metrics_sample_count;
@@ -5658,6 +5781,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     metrics_collector->Start();
     InitializeWalletNodes(options, events_path, driver, nodes,
                           simulation_registry, stop_token);
+    wallets_initialized.store(true, std::memory_order_release);
 
     ThrowIfStopRequested(stop_token);
     peer_connectivity_controller->Start();
@@ -5679,6 +5803,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     ThrowIfStopRequested(stop_token);
     WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
                          stop_token);
+    WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},
+                               stop_token);
 
     ApplyRuntimeResourceLimitUpdates(options, events_path, nodes, stop_token);
     ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes,
@@ -5839,6 +5965,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     stop_block_production();
     WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
                          stop_token);
+    WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},
+                               stop_token);
 
     StopNodes(options, events_path, driver, nodes);
     log_collector->Stop();
@@ -5857,6 +5985,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   BBP_LOG(info) << "run_id=" << options.run_id << "\n"
                 << "output_dir=" << run_root << "\n"
                 << "metrics=" << metrics_path << "\n"
+                << "wallet_metrics=" << wallet_metrics_path << "\n"
                 << "events=" << events_path;
   return 0;
 }

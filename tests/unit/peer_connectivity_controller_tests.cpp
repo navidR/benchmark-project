@@ -83,6 +83,12 @@ class TestChainDriver final : public bbp::ChainDriver {
                                      std::stop_token) const override {
     return 0U;
   }
+  bbp::ChainWalletSnapshot ReadWalletSnapshot(const bbp::ChainNodeConfig&,
+                                              bbp::ChainWalletMode,
+                                              std::uint32_t,
+                                              std::stop_token) const override {
+    return {};
+  }
   bbp::ChainUtxo FindSpendableOutput(const bbp::ChainNodeConfig&,
                                      const std::vector<std::string>&,
                                      const std::string&, std::uint64_t,
