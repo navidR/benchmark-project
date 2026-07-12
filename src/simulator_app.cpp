@@ -39,6 +39,7 @@
 #include "bbp/log_tail.h"
 #include "bbp/logging.h"
 #include "bbp/network.h"
+#include "bbp/network_allocation_lock.h"
 #include "bbp/node_log_collector.h"
 #include "bbp/peer_connectivity_controller.h"
 #include "bbp/periodic_metrics_collector.h"
@@ -2718,12 +2719,12 @@ std::string NetworkConditionVerificationDetail(const NodeVethConfig& config,
   return boost::json::serialize(detail);
 }
 
-std::string NodeHostAddress(uint32_t node_index) {
-  return "10.210." + std::to_string(node_index + 1U) + ".1";
-}
-
-std::string NodeAddress(uint32_t node_index) {
-  return "10.210." + std::to_string(node_index + 1U) + ".2";
+const SimulationNetworkAddressPlan& NetworkAddressPlan(const Options& options) {
+  if (!options.network_address_plan) {
+    throw std::logic_error(
+        "isolated simulation network address plan is not initialized");
+  }
+  return *options.network_address_plan;
 }
 
 uint32_t StableRunHash(std::string_view run_id) {
@@ -2752,13 +2753,30 @@ std::string NodeInterfaceName(std::string_view run_id, uint32_t node_index,
          std::to_string(node_index + 1U) + suffix;
 }
 
+void RequireRunNetworkInterfacesAvailable(const Options& options) {
+  const std::vector<LinkInfo> links = ListNetworkLinks();
+  for (std::uint32_t node_index = 0; node_index < options.nodes; ++node_index) {
+    for (const char suffix : {'h', 'p'}) {
+      const std::string name =
+          NodeInterfaceName(options.run_id, node_index, suffix);
+      const auto collision =
+          std::find_if(links.begin(), links.end(),
+                       [&](const LinkInfo& link) { return link.name == name; });
+      if (collision != links.end()) {
+        throw std::runtime_error(
+            "isolated simulation network interface collision: " + name);
+      }
+    }
+  }
+}
+
 NodeVethConfig MakeNodeVethConfig(const Options& options, uint32_t node_index) {
   NodeVethConfig config;
   config.host_name = NodeInterfaceName(options.run_id, node_index, 'h');
   config.peer_name = NodeInterfaceName(options.run_id, node_index, 'p');
-  config.host_address = NodeHostAddress(node_index);
-  config.node_address = NodeAddress(node_index);
-  config.prefix_len = 30;
+  config.host_address = NetworkAddressPlan(options).HostAddress(node_index);
+  config.node_address = NetworkAddressPlan(options).NodeAddress(node_index);
+  config.prefix_len = NetworkAddressPlan(options).NodePrefixLength();
   const auto node_condition = options.node_network_conditions.find(node_index);
   if (node_condition != options.node_network_conditions.end()) {
     config.apply_condition = true;
@@ -2772,7 +2790,7 @@ NodeVethConfig MakeNodeVethConfig(const Options& options, uint32_t node_index) {
 
 std::string PeerHost(const Options& options, uint32_t node_index) {
   if (options.isolate_network) {
-    return NodeAddress(node_index);
+    return NetworkAddressPlan(options).NodeAddress(node_index);
   }
   return "127.0.0.1";
 }
@@ -4017,6 +4035,11 @@ void WriteScenarioFiles(const Options& options,
     resolved["scenario_yaml"] = options.scenario_yaml.string();
   }
   resolved["isolated_network"] = options.isolate_network;
+  if (options.network_address_plan) {
+    resolved["network_address_range"] = options.network_address_plan->Cidr();
+  } else {
+    resolved["network_address_range"] = nullptr;
+  }
   if (const std::optional<uint32_t> sync_timeout_sec =
           CommonBlockGenerationSyncTimeout(workloads)) {
     resolved["sync_timeout_sec"] = *sync_timeout_sec;
@@ -4188,8 +4211,16 @@ void CleanupRun(Options options) {
   LoadCleanupMetadata(run_root, &options);
   RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
 
+  std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
+  if (options.isolate_network) {
+    network_allocation_lock = std::make_unique<NetworkAllocationLock>();
+  }
+
   for (uint32_t i = 0; i < options.nodes; ++i) {
-    DeleteNodeVethNetwork(MakeNodeVethConfig(options, i));
+    NodeVethConfig config;
+    config.host_name = NodeInterfaceName(options.run_id, i, 'h');
+    config.peer_name = NodeInterfaceName(options.run_id, i, 'p');
+    DeleteNodeVethNetwork(config);
   }
   Cgroup::RemoveRun(options.run_id);
 
@@ -4866,8 +4897,12 @@ NetworkBlockRule MakeP2pBlockRule(uint32_t src_node_index,
   }
   NetworkBlockRule rule;
   rule.node_index = dst_node_index;
-  rule.src_address = NodeAddress(src_node_index);
-  rule.dst_address = NodeAddress(dst_node_index);
+  if (!nodes[src_node_index].network || !nodes[dst_node_index].network) {
+    throw std::runtime_error(
+        "partition nodes do not have isolated network addresses");
+  }
+  rule.src_address = nodes[src_node_index].network->node_address;
+  rule.dst_address = nodes[dst_node_index].network->node_address;
   rule.dst_port = nodes[dst_node_index].config.p2p_port;
   rule.handle = StableRuleHandle(rule);
   return rule;
@@ -5398,6 +5433,13 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   BBP_LOG(info) << "starting run " << options.run_id;
   WriteText(run_root / kRunMarkerFile, "bbp run\n");
   EnsureDirectory(run_root / "nodes");
+  std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
+  if (options.isolate_network) {
+    network_allocation_lock = std::make_unique<NetworkAllocationLock>();
+    RequireRunNetworkInterfacesAvailable(options);
+    options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
+        options.run_id, options.nodes, ListIpv4Routes());
+  }
   const ChainDriverSpec& chain_spec = DefaultChainDriverSpec();
   SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
       options.topology, options.wallet_initialization);
@@ -5547,6 +5589,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   try {
     StartNodes(options, run_root, events_path, chain_spec, driver, nodes,
                stop_token);
+    network_allocation_lock.reset();
     const std::vector<std::uint32_t> miner_indexes =
         ConfiguredMinerIndexes(options);
     if (options.block_production.enabled && miner_indexes.empty()) {

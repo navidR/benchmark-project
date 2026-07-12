@@ -229,6 +229,7 @@ add_executable(bbp
   src/main.cpp
   src/mining_difficulty.cpp
   src/network.cpp
+  src/network_allocation_lock.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
   src/peer_count_policy.cpp
@@ -241,6 +242,7 @@ add_executable(bbp
   src/simulation_command_processor.cpp
   src/simulation_command_queue.cpp
   src/simulation_registry.cpp
+  src/simulation_network_address_plan.cpp
   src/simulator_app.cpp
   src/tui.cpp
   src/tui_command_parser.cpp
@@ -281,6 +283,7 @@ if(BUILD_TESTING)
     tests/unit/log_tail_tests.cpp
     tests/unit/logging_tests.cpp
     tests/unit/network_tests.cpp
+    tests/unit/simulation_network_address_plan_tests.cpp
     tests/unit/node_log_pane_tests.cpp
     tests/unit/node_runtime_tests.cpp
     tests/unit/peer_connectivity_controller_tests.cpp
@@ -306,6 +309,7 @@ if(BUILD_TESTING)
     src/logging.cpp
     src/mining_difficulty.cpp
     src/network.cpp
+    src/network_allocation_lock.cpp
     src/node_log_pane.cpp
     src/peer_count_policy.cpp
     src/peer_connectivity_controller.cpp
@@ -316,6 +320,7 @@ if(BUILD_TESTING)
     src/simulation_command_processor.cpp
     src/simulation_command_queue.cpp
     src/simulation_registry.cpp
+    src/simulation_network_address_plan.cpp
     src/tui_command_parser.cpp
     src/util.cpp
   )

@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "bbp/block_production_config.h"
 #include "bbp/network.h"
+#include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulation_registry.h"
 #include "bbp/simulator/freeze_request.h"
 #include "bbp/simulator/network_block_rule.h"
@@ -44,6 +46,7 @@ struct Options {
   bool no_tui = false;
   bool tui_once = false;
   bool isolate_network = false;
+  std::optional<SimulationNetworkAddressPlan> network_address_plan;
   bool network_condition_requested = false;
   NetworkCondition network_condition;
   std::vector<std::string> node_network_condition_json;
