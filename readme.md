@@ -619,7 +619,7 @@ generation for that run.
 Summarize an existing run:
 
 ```bash
-./build/bbp --report-run runs/<run-id>
+./build/bbp --benchmark-root runs --report-run <run-id>
 ```
 
 The compact report includes the run status, lifecycle timestamps, failure
@@ -629,7 +629,7 @@ and latest log tails.
 View an existing run in the read-only TUI:
 
 ```bash
-./build/bbp --run runs/<run-id>
+./build/bbp --benchmark-root runs --run <run-id>
 ```
 
 The TUI shows run status, lifecycle timestamps, workload summary, node chain
@@ -648,7 +648,7 @@ selected chain does not support an operation, the TUI shows a dismissible
 Render one TUI frame and exit, useful for validation:
 
 ```bash
-TERM=xterm ./build/bbp --run runs/<run-id> --once
+TERM=xterm ./build/bbp --benchmark-root runs --run <run-id> --once
 ```
 
 ## Run Network Probes
@@ -711,8 +711,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
   'cd "$PROJECT_ROOT" &&
    ./build/bbp \
      --benchmark-root runs \
-     --run-id isolated-smoke \
-     --cleanup-run'
+     --cleanup-run isolated-smoke'
 ```
 
 ## License

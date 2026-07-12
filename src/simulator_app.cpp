@@ -1902,9 +1902,35 @@ Options ParseOptions(int argc, char** argv) {
   double mining_difficulty = 1.0;
   bool no_mining = false;
   bool native_mining = false;
+  std::string cleanup_run_id;
 
   const std::string nodes_help =
       "chain regtest nodes, 1.." + std::to_string(default_chain_spec.max_nodes);
+  po::options_description canonical_options(
+      "Blockchain Benchmark Project options");
+  canonical_options.add_options()("help", "show this help")(
+      "scenario", po::value<std::filesystem::path>(),
+      "JSON or YAML scenario file")("chain", po::value<std::string>(),
+                                    "firo, bitcoin, or monero")(
+      "node-binary", po::value<std::filesystem::path>(),
+      "daemon binary for the selected chain")(
+      "benchmark-root", po::value<std::filesystem::path>(),
+      "root directory for all benchmark artifacts")(
+      "run-id", po::value<std::string>(), "optional stable run identifier")(
+      "replace-run", "replace a validated simulator-owned run directory")(
+      "cleanup-run", po::value<std::string>()->implicit_value(""),
+      "clean a previous run, optionally by run id")(
+      "report-run", po::value<std::filesystem::path>(),
+      "report a previous run id or directory")(
+      "run", po::value<std::filesystem::path>(),
+      "view a previous run id or directory in the TUI")(
+      "no-tui", "run a new simulation headlessly")(
+      "log-level", po::value<std::string>(),
+      "trace, debug, info, warning, error, or fatal")(
+      "metrics-interval", po::value<std::string>(),
+      "metrics interval with an explicit unit, such as 250ms or 1s")(
+      "keep-artifacts", "preserve run artifacts")(
+      "once", "render one frame when viewing a previous run");
   po::options_description desc("Allowed options");
   desc.add_options()("help", "show this help")(
       "scenario", po::value<std::filesystem::path>(&options.scenario),
@@ -1983,12 +2009,19 @@ Options ParseOptions(int argc, char** argv) {
       "cgroup cpu.max period in microseconds")(
       "pids-max", po::value<uint64_t>(&options.pids_max),
       "cgroup pids.max process limit")(
+      "keep-artifacts",
+      po::value<bool>(&options.keep_artifacts)
+          ->zero_tokens()
+          ->implicit_value(true)
+          ->default_value(true),
+      "preserve run data, logs, metrics, events, and resolved scenarios")(
       "keep-cgroups", po::bool_switch(&options.keep_cgroups),
       "leave cgroups after exit for inspection")(
-      "cleanup-run", po::bool_switch(&options.cleanup_run),
-      "remove stale simulator-owned veth and cgroup objects for --run-id and "
-      "exit")("isolate-network", po::bool_switch(&options.isolate_network),
-              "run each chain node in its own network namespace and veth link")(
+      "cleanup-run",
+      po::value<std::string>(&cleanup_run_id)->implicit_value(""),
+      "remove stale simulator-owned objects for the optional run id and exit")(
+      "isolate-network", po::bool_switch(&options.isolate_network),
+      "run each chain node in its own network namespace and veth link")(
       "network-bandwidth-mbps",
       po::value<uint32_t>(&options.network_condition.bandwidth_mbps),
       "TBF bandwidth limit in megabits per second for each isolated node "
@@ -2123,6 +2156,16 @@ Options ParseOptions(int argc, char** argv) {
     options.metrics_interval =
         PositiveDuration::FromMilliseconds(legacy_metrics_interval_ms).value();
   }
+  if (OptionProvided(vm, "cleanup-run")) {
+    options.cleanup_run = true;
+    if (!cleanup_run_id.empty()) {
+      if (OptionProvided(vm, "run-id") && options.run_id != cleanup_run_id) {
+        throw std::runtime_error(
+            "--cleanup-run id and --run-id must match when both are provided");
+      }
+      options.run_id = cleanup_run_id;
+    }
+  }
 
   if (OptionProvided(vm, "scenario")) {
     if (OptionProvided(vm, "scenario-json") ||
@@ -2154,7 +2197,8 @@ Options ParseOptions(int argc, char** argv) {
   }
 
   if (vm.count("help") != 0U) {
-    BBP_LOG(info) << "Usage: " << argv[0] << " [options]\n" << desc;
+    BBP_LOG(info) << "Usage: " << argv[0] << " [options]\n"
+                  << canonical_options;
     std::exit(0);
   }
   if (!options.scenario_json.empty() && !options.scenario_yaml.empty()) {
@@ -2176,8 +2220,13 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error(
         "--node-binary and its legacy aliases must not be combined");
   }
-  if (vm.count("run") != 0U && vm.count("report-run") != 0U) {
-    throw std::runtime_error("--run and --report-run are mutually exclusive");
+  const std::uint32_t stored_run_operation_count =
+      static_cast<std::uint32_t>(OptionProvided(vm, "run")) +
+      static_cast<std::uint32_t>(OptionProvided(vm, "report-run")) +
+      static_cast<std::uint32_t>(options.cleanup_run);
+  if (stored_run_operation_count > 1U) {
+    throw std::runtime_error(
+        "--run, --report-run, and --cleanup-run are mutually exclusive");
   }
   if (vm.count("run") == 0U && OptionProvided(vm, "once")) {
     throw std::runtime_error("--once requires --run");
@@ -4108,6 +4157,7 @@ void WriteScenarioFiles(const Options& options,
   }
   resolved["metrics_sample_count"] = options.metrics_sample_count;
   resolved["metrics_interval_ms"] = options.metrics_interval.count();
+  resolved["keep_artifacts"] = options.keep_artifacts;
   boost::json::object block_production;
   block_production["enabled"] = options.block_production.enabled;
   block_production["native_mining"] =
@@ -6175,6 +6225,16 @@ int RunBenchmarkWithTui(Options options) {
   }
 }
 
+std::filesystem::path ResolveRunReference(
+    const std::filesystem::path& benchmark_root,
+    const std::filesystem::path& reference) {
+  if (reference.is_absolute() || reference.has_parent_path() ||
+      std::filesystem::exists(reference)) {
+    return reference;
+  }
+  return benchmark_root / reference;
+}
+
 }  // namespace
 
 int SimulatorApp::Run(int argc, char** argv) {
@@ -6186,12 +6246,14 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
   if (!options.report_run.empty()) {
-    BBP_LOG(info) << BuildRunReportJson(options.report_run);
+    BBP_LOG(info) << BuildRunReportJson(
+        ResolveRunReference(options.output_dir, options.report_run));
     return 0;
   }
   if (!options.tui_run.empty()) {
-    return RunTuiReport(options.tui_run, options.tui_once,
-                        options.tui_refresh_ms);
+    return RunTuiReport(
+        ResolveRunReference(options.output_dir, options.tui_run),
+        options.tui_once, options.tui_refresh_ms);
   }
   if (options.probe_capabilities) {
     BBP_LOG(info) << CapabilityProbeJson();

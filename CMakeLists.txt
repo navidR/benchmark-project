@@ -476,6 +476,28 @@ if(BUILD_TESTING)
       --run "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
       --once
   )
+  add_test(NAME bbp-report-run-id-under-benchmark-root
+    COMMAND bbp
+      --benchmark-root "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+      --report-run tui-run
+  )
+  add_test(NAME bbp-tui-run-id-under-benchmark-root
+    COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm
+      $<TARGET_FILE:bbp>
+      --benchmark-root "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+      --run tui-run
+      --once
+  )
+  add_test(NAME bbp-cleanup-run-id-conflict
+    COMMAND bbp
+      --cleanup-run cleanup-id
+      --run-id different-id
+      --probe-capabilities
+  )
+  set_tests_properties(bbp-cleanup-run-id-conflict
+    PROPERTIES
+      WILL_FAIL TRUE
+  )
   add_cli_failure_test(
     bbp-invalid-role-topology-miners
     tests/scenarios/invalid-role-topology-miners.json

@@ -48,6 +48,7 @@ struct Options {
   bool cpu_quota_requested = false;
   std::uint64_t pids_max = 256;
   bool keep_cgroups = false;
+  bool keep_artifacts = true;
   bool cleanup_run = false;
   bool no_tui = false;
   bool tui_once = false;
