@@ -218,7 +218,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"timestamp_ms\":3000,"
       "\"initial_block_download\":false,\"difficulty\":1.25,"
       "\"mempool_tx_count\":3,\"mempool_bytes\":450,"
-      "\"generated_block_count\":1,\"qdisc_kind\":\"tbf+netem\","
+      "\"generated_block_count\":1,\"mined_transaction_count\":2,"
+      "\"mined_transaction_count_complete\":true,"
+      "\"qdisc_kind\":\"tbf+netem\","
       "\"cpu_usage_usec\":10,\"memory_current\":20,"
       "\"memory_high_limit_bytes\":null,\"io_read_bytes\":30,"
       "\"pids_current\":2,\"oom_kill\":0,"
@@ -412,6 +414,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "mempool_tx_count") == 3U);
   BOOST_TEST(JsonInteger(last_metrics, "mempool_bytes") == 450U);
   BOOST_TEST(JsonInteger(last_metrics, "generated_block_count") == 1U);
+  BOOST_TEST(JsonInteger(last_metrics, "mined_transaction_count") == 2U);
+  BOOST_TEST(last_metrics.at("mined_transaction_count_complete").as_bool());
   BOOST_TEST(!last_metrics.at("initial_block_download").as_bool());
   BOOST_TEST(JsonInteger(last_metrics, "cpu_usage_usec") == 10U);
   BOOST_TEST(JsonInteger(last_metrics, "memory_current") == 20U);

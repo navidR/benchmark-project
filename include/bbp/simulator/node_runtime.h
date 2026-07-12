@@ -34,6 +34,26 @@ struct NodeRuntime {
         .fetch_add(count, std::memory_order_relaxed);
   }
 
+  std::uint64_t MinedTransactionCount() {
+    return std::atomic_ref<std::uint64_t>(mined_transaction_count_)
+        .load(std::memory_order_relaxed);
+  }
+
+  void AddMinedTransactions(std::uint64_t count) {
+    std::atomic_ref<std::uint64_t>(mined_transaction_count_)
+        .fetch_add(count, std::memory_order_relaxed);
+  }
+
+  bool MinedTransactionCountComplete() const {
+    return std::atomic_ref<bool>(mined_transaction_count_complete_)
+        .load(std::memory_order_relaxed);
+  }
+
+  void MarkMinedTransactionCountIncomplete() {
+    std::atomic_ref<bool>(mined_transaction_count_complete_)
+        .store(false, std::memory_order_relaxed);
+  }
+
   std::uint64_t RestartCount() {
     return std::atomic_ref<std::uint64_t>(restart_count_)
         .load(std::memory_order_relaxed);
@@ -62,6 +82,12 @@ struct NodeRuntime {
  private:
   alignas(std::atomic_ref<std::uint64_t>::required_alignment) std::uint64_t
       generated_block_count_ = 0;
+  alignas(std::atomic_ref<std::uint64_t>::required_alignment) std::uint64_t
+      mined_transaction_count_ = 0;
+  alignas(
+      std::atomic_ref<bool>::
+          required_alignment) mutable bool mined_transaction_count_complete_ =
+      true;
   alignas(std::atomic_ref<std::uint64_t>::required_alignment) std::uint64_t
       restart_count_ = 0;
   alignas(std::atomic_ref<NodeRuntimeLifecycle>::

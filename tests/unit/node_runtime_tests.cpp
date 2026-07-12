@@ -16,3 +16,17 @@ BOOST_AUTO_TEST_CASE(node_runtime_only_collects_chain_metrics_while_running) {
   node.SetLifecycle(bbp::NodeRuntimeLifecycle::kKilled);
   BOOST_TEST(!node.AllowsChainMetrics());
 }
+
+BOOST_AUTO_TEST_CASE(node_runtime_counts_generated_blocks_and_transactions) {
+  bbp::NodeRuntime node;
+  node.AddGeneratedBlocks(2U);
+  node.AddGeneratedBlocks(3U);
+  node.AddMinedTransactions(4U);
+  node.AddMinedTransactions(5U);
+
+  BOOST_TEST(node.GeneratedBlockCount() == 5U);
+  BOOST_TEST(node.MinedTransactionCount() == 9U);
+  BOOST_TEST(node.MinedTransactionCountComplete());
+  node.MarkMinedTransactionCountIncomplete();
+  BOOST_TEST(!node.MinedTransactionCountComplete());
+}

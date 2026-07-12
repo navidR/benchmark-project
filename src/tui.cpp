@@ -781,6 +781,37 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
+  AddDetailPair(y, 0, left_width, "generated blocks",
+                JsonMetricText(metric_object, "generated_block_count"));
+  AddDetailPair(
+      y, left_width, right_width, "mined non-reward tx",
+      JsonMetricText(metric_object, "mined_transaction_count") +
+          (JsonBoolText(metric_object, "mined_transaction_count_complete",
+                        "true") == "true"
+               ? ""
+               : "+"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "chain version",
+                JsonMetricText(metric_object, "chain_version") + " / " +
+                    JsonMetricText(metric_object, "chain_protocol_version") +
+                    " / " + JsonMetricText(metric_object, "chain_subversion"));
+  AddDetailPair(y, left_width, right_width, "RPC latency",
+                JsonMetricText(metric_object, "rpc_latency_ms") + " ms");
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "initial sync",
+                JsonMetricText(metric_object, "initial_block_download"));
+  AddDetailPair(y, left_width, right_width, "difficulty",
+                JsonMetricText(metric_object, "difficulty"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
   AddDetailPair(y, 0, left_width, "peers",
                 JsonMetricText(metric_object, "peer_count"));
   AddDetailPair(y, left_width, right_width, "mempool",

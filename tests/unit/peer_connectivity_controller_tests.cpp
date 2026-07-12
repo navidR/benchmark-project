@@ -72,6 +72,11 @@ class TestChainDriver final : public bbp::ChainDriver {
                                           std::stop_token) const override {
     return {};
   }
+  std::uint64_t ReadBlockNonRewardTransactionCount(
+      const bbp::ChainNodeConfig&, const std::string&,
+      std::stop_token) const override {
+    return 0U;
+  }
   std::string CreateWalletAddress(const bbp::ChainNodeConfig&,
                                   bbp::ChainWalletMode,
                                   std::stop_token) const override {

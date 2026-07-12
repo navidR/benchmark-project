@@ -55,6 +55,9 @@ class FiroDriver final : public ChainDriver {
   std::vector<std::string> GenerateBlocks(
       const FiroNodeConfig& config, uint32_t count, const std::string& address,
       std::stop_token stop_token = {}) const override;
+  std::uint64_t ReadBlockNonRewardTransactionCount(
+      const FiroNodeConfig& config, const std::string& block_hash,
+      std::stop_token stop_token = {}) const override;
   std::string CreateWalletAddress(
       const FiroNodeConfig& config, WalletMode wallet_mode,
       std::stop_token stop_token = {}) const override;

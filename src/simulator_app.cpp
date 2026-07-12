@@ -3099,9 +3099,11 @@ std::string AddressProbeJson() {
 
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
                         const ChainMetrics& chain,
-                        uint64_t generated_block_count, uint64_t restart_count,
-                        const CgroupMetrics* cgroup, const LinkInfo* link,
-                        const QdiscInfo* qdisc) {
+                        uint64_t generated_block_count,
+                        uint64_t mined_transaction_count,
+                        bool mined_transaction_count_complete,
+                        uint64_t restart_count, const CgroupMetrics* cgroup,
+                        const LinkInfo* link, const QdiscInfo* qdisc) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
@@ -3121,6 +3123,8 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
   object["mempool_tx_count"] = chain.mempool_tx_count;
   object["mempool_bytes"] = chain.mempool_bytes;
   object["generated_block_count"] = generated_block_count;
+  object["mined_transaction_count"] = mined_transaction_count;
+  object["mined_transaction_count_complete"] = mined_transaction_count_complete;
   object["restart_count"] = restart_count;
   if (chain.initial_block_download) {
     object["initial_block_download"] = *chain.initial_block_download;
@@ -3396,6 +3400,34 @@ std::string WalletTransactionDetail(
   return boost::json::serialize(detail);
 }
 
+void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
+                           const std::vector<std::string>& block_hashes,
+                           std::stop_token stop_token) {
+  node.AddGeneratedBlocks(static_cast<std::uint64_t>(block_hashes.size()));
+  std::uint64_t mined_transaction_count = 0;
+  for (const std::string& block_hash : block_hashes) {
+    std::uint64_t block_transaction_count = 0;
+    try {
+      block_transaction_count = driver.ReadBlockNonRewardTransactionCount(
+          node.config, block_hash, stop_token);
+    } catch (const SimulationCancelled&) {
+      throw;
+    } catch (const std::exception& error) {
+      node.MarkMinedTransactionCountIncomplete();
+      BBP_LOG(warning) << "could not count transactions in generated block "
+                       << block_hash << " for " << node.config.id << ": "
+                       << error.what();
+      continue;
+    }
+    if (mined_transaction_count >
+        std::numeric_limits<std::uint64_t>::max() - block_transaction_count) {
+      throw std::runtime_error("mined transaction count overflow");
+    }
+    mined_transaction_count += block_transaction_count;
+  }
+  node.AddMinedTransactions(mined_transaction_count);
+}
+
 std::string WalletAddressDetail(const WalletIdentity& wallet,
                                 const WalletInitialization& initialization) {
   boost::json::object detail;
@@ -3509,10 +3541,12 @@ void WriteMetricsSnapshot(
         qdisc = FindQdiscByInterfaceName(qdiscs, network->host_name);
       }
     }
-    AppendLine(metrics_path,
-               MetricsJson(options.run_id, node.config.id, chain,
-                           node.GeneratedBlockCount(), node.RestartCount(), &cg,
-                           link, qdisc));
+    AppendLine(
+        metrics_path,
+        MetricsJson(options.run_id, node.config.id, chain,
+                    node.GeneratedBlockCount(), node.MinedTransactionCount(),
+                    node.MinedTransactionCountComplete(), node.RestartCount(),
+                    &cg, link, qdisc));
   }
 }
 
@@ -4548,7 +4582,7 @@ void ApplySendRawTransactionWorkload(
   std::vector<std::string> funding_hashes =
       driver.GenerateBlocks(funder.config, workload.funding_blocks,
                             workload.source_address, stop_token);
-  funder.AddGeneratedBlocks(static_cast<std::uint64_t>(funding_hashes.size()));
+  RecordGeneratedBlocks(driver, funder, funding_hashes, stop_token);
   const uint64_t target_height =
       start_height + static_cast<uint64_t>(funding_hashes.size());
   for (auto& node : nodes) {
@@ -4638,7 +4672,7 @@ void ApplyWalletTransactionsWorkload(
     state.hashes =
         driver.GenerateBlocks(miner.config, workload.funding_blocks_per_wallet,
                               wallet.address, stop_token);
-    miner.AddGeneratedBlocks(static_cast<std::uint64_t>(state.hashes.size()));
+    RecordGeneratedBlocks(driver, miner, state.hashes, stop_token);
     state.target_height =
         state.start_height + static_cast<uint64_t>(state.hashes.size());
     for (NodeRuntime& node : nodes) {
@@ -5545,7 +5579,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             const std::vector<std::string> hashes = driver.GenerateBlocks(
                 miner.config, 1U, chain_spec.default_reward_address,
                 block_production_rpc_stop_source.get_token());
-            miner.AddGeneratedBlocks(static_cast<std::uint64_t>(hashes.size()));
+            RecordGeneratedBlocks(driver, miner, hashes,
+                                  block_production_rpc_stop_source.get_token());
             WriteEvent(events_path, options.run_id, node_id,
                        "scheduled_block_produced",
                        ScheduledBlockDetail(hashes));
@@ -5835,7 +5870,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         std::vector<std::string> hashes = driver.GenerateBlocks(
             generator.config, workload.count, chain_spec.default_reward_address,
             stop_token);
-        generator.AddGeneratedBlocks(static_cast<std::uint64_t>(hashes.size()));
+        RecordGeneratedBlocks(driver, generator, hashes, stop_token);
         const uint64_t target_height =
             start_height + static_cast<uint64_t>(hashes.size());
         WriteEvent(

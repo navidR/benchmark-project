@@ -235,3 +235,32 @@ BOOST_AUTO_TEST_CASE(firo_reads_public_wallet_snapshot_from_wallet_rpc) {
   BOOST_TEST(methods[0] == "getwalletinfo");
   BOOST_TEST(methods[1] == "listtransactions");
 }
+
+BOOST_AUTO_TEST_CASE(firo_counts_non_reward_transactions_in_generated_block) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"hash":"block-hash","tx":["reward","tx-1","tx-2"]},"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "block-transaction-count-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  BOOST_TEST(driver.ReadBlockNonRewardTransactionCount(config, "block-hash") ==
+             2U);
+  const std::vector<std::string> methods = served.get();
+  BOOST_REQUIRE_EQUAL(methods.size(), 1U);
+  BOOST_TEST(methods[0] == "getblock");
+}

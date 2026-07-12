@@ -585,6 +585,26 @@ std::vector<std::string> FiroDriver::GenerateBlocks(
       RpcCall(config, "generatetoaddress", params, stop_token));
 }
 
+std::uint64_t FiroDriver::ReadBlockNonRewardTransactionCount(
+    const FiroNodeConfig& config, const std::string& block_hash,
+    std::stop_token stop_token) const {
+  boost::json::array params;
+  params.emplace_back(block_hash);
+  params.emplace_back(1);
+  const boost::json::value block =
+      RpcCall(config, "getblock", params, stop_token);
+  if (!block.is_object()) {
+    throw std::runtime_error("Firo getblock returned non-object");
+  }
+  const boost::json::value* transactions = block.as_object().if_contains("tx");
+  if (transactions == nullptr || !transactions->is_array() ||
+      transactions->as_array().empty()) {
+    throw std::runtime_error(
+        "Firo getblock returned no reward transaction for " + block_hash);
+  }
+  return static_cast<std::uint64_t>(transactions->as_array().size() - 1U);
+}
+
 std::string FiroDriver::CreateWalletAddress(const FiroNodeConfig& config,
                                             WalletMode wallet_mode,
                                             std::stop_token stop_token) const {

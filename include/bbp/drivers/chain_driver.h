@@ -140,6 +140,9 @@ class ChainDriver {
   virtual std::vector<std::string> GenerateBlocks(
       const ChainNodeConfig& config, uint32_t count, const std::string& address,
       std::stop_token stop_token = {}) const = 0;
+  virtual std::uint64_t ReadBlockNonRewardTransactionCount(
+      const ChainNodeConfig& config, const std::string& block_hash,
+      std::stop_token stop_token = {}) const = 0;
   virtual std::string CreateWalletAddress(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       std::stop_token stop_token = {}) const = 0;
