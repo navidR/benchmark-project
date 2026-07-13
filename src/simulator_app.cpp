@@ -51,6 +51,7 @@
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
 #include "bbp/simulation_command_queue.h"
+#include "bbp/simulation_event_kind.h"
 #include "bbp/simulation_registry.h"
 #include "bbp/simulator/constants.h"
 #include "bbp/simulator/legacy_cli_inputs.h"
@@ -3314,12 +3315,12 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
 
 void WriteEvent(const std::filesystem::path& events_path,
                 const std::string& run_id, const std::string& node_id,
-                std::string_view event, std::string_view detail = "") {
+                SimulationEventKind event_kind, std::string_view detail = "") {
   boost::json::object object;
   object["timestamp"] = NowIso8601();
   object["run_id"] = run_id;
   object["node_id"] = node_id;
-  object["event"] = event;
+  object["event"] = SimulationEventKindName(event_kind);
   object["detail"] = detail;
   AppendLine(events_path, boost::json::serialize(object));
 }
@@ -3327,7 +3328,7 @@ void WriteEvent(const std::filesystem::path& events_path,
 void WriteNodeState(const std::filesystem::path& events_path,
                     const std::string& run_id, const std::string& node_id,
                     NodeRuntimeLifecycle state) {
-  WriteEvent(events_path, run_id, node_id, "state",
+  WriteEvent(events_path, run_id, node_id, SimulationEventKind::kState,
              NodeRuntimeLifecycleName(state));
 }
 
@@ -3749,13 +3750,25 @@ std::string LogTailDetail(std::string_view kind, const LogTailChunk& chunk) {
   return boost::json::serialize(detail);
 }
 
+SimulationEventKind LogTailEventKind(ChainLogSource source) {
+  switch (source) {
+    case ChainLogSource::kDaemon:
+      return SimulationEventKind::kDaemonLogTail;
+    case ChainLogSource::kStdout:
+      return SimulationEventKind::kStdoutTail;
+    case ChainLogSource::kStderr:
+      return SimulationEventKind::kStderrTail;
+  }
+  throw std::runtime_error("unknown chain log source");
+}
+
 void WriteLogTailChunkEvent(const std::filesystem::path& events_path,
                             const Options& options,
                             const ChainNodeConfig& config,
                             ChainLogSource source, const LogTailChunk& chunk) {
   const std::string_view kind = ChainLogSourceName(source);
-  WriteEvent(events_path, options.run_id, config.id,
-             std::string(kind) + "_tail", LogTailDetail(kind, chunk));
+  WriteEvent(events_path, options.run_id, config.id, LogTailEventKind(source),
+             LogTailDetail(kind, chunk));
 }
 
 void WriteLogTailEvent(const std::filesystem::path& events_path,
@@ -4353,7 +4366,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
           const QdiscInfo qdisc = VerifyNodeNetworkCondition(*runtime.network);
           WriteEvent(
               events_path, options.run_id, node_id,
-              "network_condition_verified",
+              SimulationEventKind::kNetworkConditionVerified,
               NetworkConditionVerificationDetail(*runtime.network, qdisc));
         }
         runtime.config.rpc_host = runtime.network->node_address;
@@ -4361,7 +4374,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         runtime.config.rpc_allow_ips = {runtime.network->host_address};
         runtime.config.p2p_host = runtime.network->node_address;
         runtime.config.p2p_bind = runtime.network->node_address;
-        WriteEvent(events_path, options.run_id, node_id, "network_ready",
+        WriteEvent(events_path, options.run_id, node_id,
+                   SimulationEventKind::kNetworkReady,
                    "node_ip=" + runtime.network->node_address +
                        " host_if=" + runtime.network->host_name +
                        " peer_if=" + runtime.network->peer_name);
@@ -4388,7 +4402,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
       BBP_LOG(info) << "started " << node_id
                     << " pid=" << runtime.process.pid();
-      WriteEvent(events_path, options.run_id, node_id, "process_started",
+      WriteEvent(events_path, options.run_id, node_id,
+                 SimulationEventKind::kProcessStarted,
                  "pid=" + std::to_string(runtime.process.pid()));
       nodes.push_back(std::move(runtime));
     } catch (...) {
@@ -4417,12 +4432,13 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     } catch (...) {
       if (!node.process.running()) {
         WriteEvent(events_path, options.run_id, node.config.id,
-                   "process_exited_before_rpc_ready",
+                   SimulationEventKind::kProcessExitedBeforeRpcReady,
                    ProcessExitDetail(node.process));
       }
       throw;
     }
-    WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kRpcReady);
     node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
     WriteNodeState(events_path, options.run_id, node.config.id,
                    NodeRuntimeLifecycle::kRunning);
@@ -4436,7 +4452,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                                 std::chrono::seconds(options.ready_timeout_sec),
                                 stop_token);
       WriteEvent(events_path, options.run_id, node.config.id,
-                 "startup_peer_connected", "address=" + peer);
+                 SimulationEventKind::kStartupPeerConnected, "address=" + peer);
     }
   }
 }
@@ -4469,7 +4485,7 @@ void InitializeWalletNodes(const Options& options,
           "wallet node was not started with wallet support enabled");
     }
     WriteEvent(events_path, options.run_id, node.config.id,
-               "wallet_address_requested",
+               SimulationEventKind::kWalletAddressRequested,
                WalletAddressDetail(wallet, registry.wallet_initialization()));
     wallet.address = driver.CreateWalletAddress(
         node.config, ToChainWalletMode(registry.wallet_initialization()),
@@ -4478,7 +4494,7 @@ void InitializeWalletNodes(const Options& options,
       throw std::runtime_error("chain wallet RPC returned an empty address");
     }
     WriteEvent(events_path, options.run_id, node.config.id,
-               "wallet_address_created",
+               SimulationEventKind::kWalletAddressCreated,
                WalletAddressDetail(wallet, registry.wallet_initialization()));
   }
 }
@@ -4520,7 +4536,7 @@ void ApplyResourceLimitUpdate(
   WriteResourceLimits(*node.cgroup, previous, next);
   node.resources = next;
   WriteEvent(events_path, options.run_id, node.config.id,
-             "resource_limits_updated",
+             SimulationEventKind::kResourceLimitsUpdated,
              ResourceLimitUpdateDetail(patch, previous, next, workload_index,
                                        workload_count, workload_node));
 }
@@ -4593,7 +4609,7 @@ void ApplyResourcePressureWorkload(
 
   try {
     WriteEvent(events_path, options.run_id, node.config.id,
-               "resource_pressure_started",
+               SimulationEventKind::kResourcePressureStarted,
                ResourcePressureDetail(workload, previous_limits,
                                       pressure_limits, pressure_limits,
                                       workload_index, workload_count));
@@ -4607,7 +4623,7 @@ void ApplyResourcePressureWorkload(
       WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
       node.resources = previous_limits;
       WriteEvent(events_path, options.run_id, node.config.id,
-                 "resource_pressure_restored_after_error",
+                 SimulationEventKind::kResourcePressureRestoredAfterError,
                  ResourcePressureDetail(workload, previous_limits,
                                         pressure_limits, previous_limits,
                                         workload_index, workload_count));
@@ -4624,7 +4640,8 @@ void ApplyResourcePressureWorkload(
   WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
   node.resources = previous_limits;
   WriteEvent(
-      events_path, options.run_id, node.config.id, "resource_pressure_finished",
+      events_path, options.run_id, node.config.id,
+      SimulationEventKind::kResourcePressureFinished,
       ResourcePressureDetail(workload, previous_limits, pressure_limits,
                              previous_limits, workload_index, workload_count));
 }
@@ -4652,7 +4669,8 @@ void ApplyConnectPeerWorkload(const Options& options,
   const bool connected_after =
       !driver.ConnectedPeerAddresses(node.config, {address}, stop_token)
            .empty();
-  WriteEvent(events_path, options.run_id, node.config.id, "peer_connected",
+  WriteEvent(events_path, options.run_id, node.config.id,
+             SimulationEventKind::kPeerConnected,
              PeerChurnDetail(
                  workload_index, workload_count, workload.node, workload.peer,
                  address, static_cast<uint64_t>(before_addresses.size()),
@@ -4681,7 +4699,8 @@ void ApplyDisconnectPeerWorkload(
   const bool connected_after =
       !driver.ConnectedPeerAddresses(node.config, {address}, stop_token)
            .empty();
-  WriteEvent(events_path, options.run_id, node.config.id, "peer_disconnected",
+  WriteEvent(events_path, options.run_id, node.config.id,
+             SimulationEventKind::kPeerDisconnected,
              PeerChurnDetail(
                  workload_index, workload_count, workload.node, workload.peer,
                  address, static_cast<uint64_t>(before_addresses.size()),
@@ -4722,7 +4741,7 @@ void ApplySendRawTransactionWorkload(
       workload.amount_satoshis, workload.fee_satoshis,
       std::chrono::seconds(workload.timeout_sec), stop_token);
   WriteEvent(events_path, options.run_id, submitter.config.id,
-             "raw_transaction_submitted",
+             SimulationEventKind::kRawTransactionSubmitted,
              RawTransactionDetail(workload_index, workload_count, workload,
                                   start_height, target_height, funding_hashes,
                                   transaction));
@@ -4835,7 +4854,7 @@ void ApplyWalletTransactionsWorkload(
       }
     }
     WriteEvent(events_path, options.run_id, sender_node.config.id,
-               "wallet_transaction_submitted",
+               SimulationEventKind::kWalletTransactionSubmitted,
                WalletTransactionDetail(
                    workload_index, workload_count, workload,
                    static_cast<uint32_t>(transaction_index + 1U), sender,
@@ -4878,7 +4897,7 @@ void ApplyRuntimeNetworkConditionUpdates(
       node.network = updated_network;
     }
     WriteEvent(events_path, options.run_id, node.config.id,
-               "network_condition_updated",
+               SimulationEventKind::kNetworkConditionUpdated,
                NetworkConditionVerificationDetail(updated_network, qdisc));
   }
 }
@@ -4944,7 +4963,8 @@ void ApplyRuntimeNetworkBlockRules(const Options& options,
           "runtime network block rule was not visible after apply");
     }
     WriteEvent(
-        events_path, options.run_id, node.config.id, "network_block_applied",
+        events_path, options.run_id, node.config.id,
+        SimulationEventKind::kNetworkBlockApplied,
         NetworkBlockRuleDetail(node, rule, existed_before, present_after));
   }
 }
@@ -4973,7 +4993,8 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
           "runtime network block rule remained after unblock");
     }
     WriteEvent(
-        events_path, options.run_id, node.config.id, "network_block_removed",
+        events_path, options.run_id, node.config.id,
+        SimulationEventKind::kNetworkBlockRemoved,
         NetworkBlockRuleDetail(node, rule, existed_before, present_after));
   }
 }
@@ -5082,8 +5103,10 @@ void ApplyRuntimeNetworkPartition(const Options& options,
         PartitionRuleResultJson(node, rule, existed_before, present_after));
   }
 
-  WriteEvent(events_path, options.run_id, "sim",
-             heal ? "network_partition_healed" : "network_partition_applied",
+  const SimulationEventKind event_kind =
+      heal ? SimulationEventKind::kNetworkPartitionHealed
+           : SimulationEventKind::kNetworkPartitionApplied;
+  WriteEvent(events_path, options.run_id, "sim", event_kind,
              NetworkPartitionDetail(partition, rule_results, workload_index,
                                     workload_count));
 }
@@ -5130,7 +5153,8 @@ void RestartNode(const Options& options,
   WriteNodeState(events_path, options.run_id, node.config.id,
                  NodeRuntimeLifecycle::kRestarting);
   node.SetLifecycle(NodeRuntimeLifecycle::kRestarting);
-  WriteEvent(events_path, options.run_id, node.config.id, "restart_requested",
+  WriteEvent(events_path, options.run_id, node.config.id,
+             SimulationEventKind::kRestartRequested,
              "restart_count=" + std::to_string(node.RestartCount() + 1U));
   driver.Stop(node.config, stop_token);
   const auto exit_deadline =
@@ -5140,7 +5164,8 @@ void RestartNode(const Options& options,
     WaitForDuration(std::chrono::milliseconds(50), stop_token);
   }
   if (node.process.running()) {
-    WriteEvent(events_path, options.run_id, node.config.id, "sigterm");
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kSigterm);
     node.process.Terminate(std::chrono::seconds(5));
   }
   ThrowIfStopRequested(stop_token);
@@ -5152,11 +5177,13 @@ void RestartNode(const Options& options,
                  NodeRuntimeLifecycle::kStarting);
   node.process = ChildProcess::Spawn(process, node.cgroup->path());
   const std::uint64_t restart_count = node.IncrementRestartCount();
-  WriteEvent(events_path, options.run_id, node.config.id, "process_restarted",
+  WriteEvent(events_path, options.run_id, node.config.id,
+             SimulationEventKind::kProcessRestarted,
              RestartDetail(node.process.pid(), restart_count));
   driver.WaitReady(node.config, std::chrono::seconds(options.ready_timeout_sec),
                    stop_token);
-  WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
+  WriteEvent(events_path, options.run_id, node.config.id,
+             SimulationEventKind::kRpcReady);
   node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
   WriteNodeState(events_path, options.run_id, node.config.id,
                  NodeRuntimeLifecycle::kRunning);
@@ -5210,7 +5237,8 @@ void FreezeNodeForDuration(const Options& options,
       throw std::runtime_error("node cgroup did not report frozen: " +
                                node.config.id);
     }
-    WriteEvent(events_path, options.run_id, node.config.id, "cgroup_frozen",
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kCgroupFrozen,
                FreezeDetail(duration_ms, true));
     WaitForDuration(std::chrono::milliseconds(duration_ms), stop_token);
     node.cgroup->Thaw();
@@ -5218,7 +5246,8 @@ void FreezeNodeForDuration(const Options& options,
       throw std::runtime_error("node cgroup did not report thawed: " +
                                node.config.id);
     }
-    WriteEvent(events_path, options.run_id, node.config.id, "cgroup_thawed",
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kCgroupThawed,
                FreezeDetail(duration_ms, false));
   } catch (...) {
     try {
@@ -5300,12 +5329,13 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
       running_processes.push_back(index);
       RunNodeCleanupStep(best_effort, "RPC stop event", [&] {
         WriteEvent(events_path, options.run_id, nodes[index].config.id,
-                   "rpc_stop");
+                   SimulationEventKind::kRpcStop);
       });
     } else {
       RunNodeCleanupStep(best_effort, "RPC stop skipped event", [&] {
         WriteEvent(events_path, options.run_id, nodes[index].config.id,
-                   "rpc_stop_skipped", "process is not running");
+                   SimulationEventKind::kRpcStopSkipped,
+                   "process is not running");
       });
     }
   }
@@ -5353,7 +5383,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
     running_processes.push_back(index);
     RunNodeCleanupStep(best_effort, "SIGTERM event", [&] {
       WriteEvent(events_path, options.run_id, nodes[index].config.id,
-                 "sigterm");
+                 SimulationEventKind::kSigterm);
     });
   }
   std::vector<std::exception_ptr> termination_failures(nodes.size());
@@ -5393,7 +5423,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
           node.cgroup->Remove();
         } catch (const std::exception& error) {
           WriteEvent(events_path, options.run_id, node.config.id,
-                     "cgroup_remove_failed", error.what());
+                     SimulationEventKind::kCgroupRemoveFailed, error.what());
         }
       }
     }
@@ -5402,7 +5432,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
                          [&] { DeleteNodeVethNetwork(*node.network); });
       RunNodeCleanupStep(best_effort, "network removal event", [&] {
         WriteEvent(events_path, options.run_id, node.config.id,
-                   "network_removed");
+                   SimulationEventKind::kNetworkRemoved);
       });
     }
     if (node.network_namespace) {
@@ -5423,7 +5453,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
         Cgroup::RemoveRun(options.run_id);
       } catch (const std::exception& error) {
         WriteEvent(events_path, options.run_id, "sim",
-                   "run_cgroup_remove_failed", error.what());
+                   SimulationEventKind::kRunCgroupRemoveFailed, error.what());
       }
     }
   }
@@ -5544,7 +5574,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   const auto events_path = run_root / "events.jsonl";
   const auto metrics_path = run_root / "metrics.jsonl";
   const auto wallet_metrics_path = run_root / "wallet-metrics.jsonl";
-  WriteEvent(events_path, options.run_id, "sim", "run_started");
+  WriteEvent(events_path, options.run_id, "sim",
+             SimulationEventKind::kRunStarted);
 
   std::unique_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
   ChainDriver& driver = *driver_owner;
@@ -5631,7 +5662,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       });
     }
     cleanup_step("run failure event", [&] {
-      WriteEvent(events_path, options.run_id, "sim", "run_failed", detail);
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kRunFailed, detail);
     });
     if (!log_collector) {
       cleanup_step("node log tail collection", [&] {
@@ -5667,7 +5699,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       }
     });
     cleanup_step("run cancellation event", [&] {
-      WriteEvent(events_path, options.run_id, "sim", "run_cancelled");
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kRunCancelled);
     });
     cleanup_step("node shutdown",
                  [&] { StopNodes(options, events_path, driver, nodes, true); });
@@ -5679,7 +5712,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       }
     });
     cleanup_step("run finished event", [&] {
-      WriteEvent(events_path, options.run_id, "sim", "run_finished");
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kRunFinished);
     });
     BBP_LOG(info) << "cancelled run " << options.run_id;
   };
@@ -5722,7 +5756,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             RecordGeneratedBlocks(driver, miner, hashes,
                                   block_production_rpc_stop_source.get_token());
             WriteEvent(events_path, options.run_id, node_id,
-                       "scheduled_block_produced",
+                       SimulationEventKind::kScheduledBlockProduced,
                        ScheduledBlockDetail(hashes));
           },
           [&](const std::string& node_id, std::string_view error) {
@@ -5730,7 +5764,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               return;
             }
             WriteEvent(events_path, options.run_id, node_id,
-                       "scheduled_block_failed", error);
+                       SimulationEventKind::kScheduledBlockFailed, error);
             BBP_LOG(warning) << "scheduled block production failed for "
                              << node_id << ": " << error;
           });
@@ -5753,17 +5787,18 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           detail["peer_node_id"] = peer_node_id;
           detail["minimum_peer_count"] = policy.minimum();
           detail["maximum_peer_count"] = policy.maximum();
-          const std::string_view event =
+          const SimulationEventKind event_kind =
               action == PeerConnectivityAction::kConnected
-                  ? "peer_policy_connected"
-                  : "peer_policy_disconnected";
-          WriteEvent(events_path, options.run_id, std::string(node_id), event,
-                     boost::json::serialize(detail));
-          BBP_LOG(info) << event << " " << node_id << " -> " << peer_node_id;
+                  ? SimulationEventKind::kPeerPolicyConnected
+                  : SimulationEventKind::kPeerPolicyDisconnected;
+          WriteEvent(events_path, options.run_id, std::string(node_id),
+                     event_kind, boost::json::serialize(detail));
+          BBP_LOG(info) << SimulationEventKindName(event_kind) << " " << node_id
+                        << " -> " << peer_node_id;
         },
         [&](std::string_view node_id, std::string_view error) {
           WriteEvent(events_path, options.run_id, std::string(node_id),
-                     "peer_policy_enforcement_failed", error);
+                     SimulationEventKind::kPeerPolicyEnforcementFailed, error);
           BBP_LOG(warning) << "peer policy enforcement failed for " << node_id
                            << ": " << error;
         });
@@ -5828,7 +5863,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           *command_queue,
           [&](const SimulationCommand& command) {
             WriteEvent(events_path, options.run_id, command.node_id,
-                       "operator_command_started",
+                       SimulationEventKind::kOperatorCommandStarted,
                        SimulationCommandDetail(command));
             if (command.kind == SimulationCommandKind::kKillNode) {
               NodeRuntime& node = FindNodeRuntimeById(nodes, command.node_id);
@@ -5851,7 +5886,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               WriteNodeState(events_path, options.run_id, command.node_id,
                              NodeRuntimeLifecycle::kKilling);
               WriteEvent(events_path, options.run_id, command.node_id,
-                         "process_kill_requested",
+                         SimulationEventKind::kProcessKillRequested,
                          "pid=" + std::to_string(pid));
               try {
                 node.process.Kill();
@@ -5867,7 +5902,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               }
               node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
               WriteEvent(events_path, options.run_id, command.node_id,
-                         "process_killed", "pid=" + std::to_string(pid));
+                         SimulationEventKind::kProcessKilled,
+                         "pid=" + std::to_string(pid));
               WriteNodeState(events_path, options.run_id, command.node_id,
                              NodeRuntimeLifecycle::kKilled);
             } else {
@@ -5875,7 +5911,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                   command, command_rpc_stop_source.get_token());
             }
             WriteEvent(events_path, options.run_id, command.node_id,
-                       "operator_command_completed",
+                       SimulationEventKind::kOperatorCommandCompleted,
                        SimulationCommandDetail(command));
             BBP_LOG(info) << "command #" << command.sequence << " "
                           << SimulationCommandKindName(command.kind) << " for "
@@ -5886,7 +5922,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               return;
             }
             WriteEvent(events_path, options.run_id, command.node_id,
-                       "operator_command_failed",
+                       SimulationEventKind::kOperatorCommandFailed,
                        SimulationCommandDetail(command, error));
             BBP_LOG(warning)
                 << "command #" << command.sequence << " "
@@ -5912,7 +5948,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 detail["sample"] = sample;
                 detail["error"] = error;
                 WriteEvent(events_path, options.run_id, node.config.id,
-                           "metrics_node_unavailable",
+                           SimulationEventKind::kMetricsNodeUnavailable,
                            boost::json::serialize(detail));
                 BBP_LOG(warning) << "metrics sample " << sample << " skipped "
                                  << node.config.id << ": " << error;
@@ -5932,7 +5968,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                   detail["wallet_index"] = wallet_index;
                   detail["error"] = error;
                   WriteEvent(events_path, options.run_id, node.config.id,
-                             "wallet_metrics_unavailable",
+                             SimulationEventKind::kWalletMetricsUnavailable,
                              boost::json::serialize(detail));
                   BBP_LOG(warning) << "wallet metrics sample " << sample
                                    << " skipped #" << wallet_index << " on "
@@ -5947,7 +5983,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           detail["sample"] = sample;
           detail["sample_count"] = options.metrics_sample_count;
           detail["interval_ms"] = options.metrics_interval.count();
-          WriteEvent(events_path, options.run_id, "sim", "metrics_sample",
+          WriteEvent(events_path, options.run_id, "sim",
+                     SimulationEventKind::kMetricsSample,
                      boost::json::serialize(detail));
         },
         [stop_token] { return stop_token.stop_requested(); });
@@ -6013,7 +6050,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             start_height + static_cast<uint64_t>(hashes.size());
         WriteEvent(
             events_path, options.run_id, generator.config.id,
-            "generated_blocks",
+            SimulationEventKind::kGeneratedBlocks,
             GeneratedBlocksDetail(static_cast<uint32_t>(workload_index + 1U),
                                   static_cast<uint32_t>(workloads.size()),
                                   workload.node, start_height, target_height,
@@ -6023,7 +6060,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                std::chrono::seconds(workload.sync_timeout_sec),
                                stop_token);
           WriteEvent(events_path, options.run_id, node.config.id,
-                     "height_reached", std::to_string(target_height));
+                     SimulationEventKind::kHeightReached,
+                     std::to_string(target_height));
         }
       } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
         const WaitUntilHeightWorkload& workload =
@@ -6035,7 +6073,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         const uint64_t observed_height =
             driver.ReadMetrics(node.config, stop_token).height;
         WriteEvent(
-            events_path, options.run_id, node.config.id, "height_wait_reached",
+            events_path, options.run_id, node.config.id,
+            SimulationEventKind::kHeightWaitReached,
             HeightWaitDetail(static_cast<uint32_t>(workload_index + 1U),
                              static_cast<uint32_t>(workloads.size()),
                              workload.node, workload.height, observed_height));
@@ -6047,12 +6086,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                 stop_token);
         const uint64_t observed_peer_count =
             driver.ReadMetrics(node.config, stop_token).peer_count;
-        WriteEvent(
-            events_path, options.run_id, node.config.id, "peer_count_reached",
-            PeerCountWaitDetail(static_cast<uint32_t>(workload_index + 1U),
-                                static_cast<uint32_t>(workloads.size()),
-                                workload.node, workload.peer_count,
-                                observed_peer_count));
+        WriteEvent(events_path, options.run_id, node.config.id,
+                   SimulationEventKind::kPeerCountReached,
+                   PeerCountWaitDetail(
+                       static_cast<uint32_t>(workload_index + 1U),
+                       static_cast<uint32_t>(workloads.size()), workload.node,
+                       workload.peer_count, observed_peer_count));
       } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
         ApplyConnectPeerWorkload(
             options, events_path, driver, *peer_connectivity_controller, nodes,
@@ -6085,7 +6124,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           RestartNode(options, events_path, driver, node, stop_token);
         }
         WriteEvent(events_path, options.run_id, node.config.id,
-                   "node_restarted",
+                   SimulationEventKind::kNodeRestarted,
                    RestartNodeWorkloadDetail(
                        static_cast<uint32_t>(workload_index + 1U),
                        static_cast<uint32_t>(workloads.size()), workload.node,
@@ -6097,7 +6136,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                               stop_token);
         WriteEvent(
             events_path, options.run_id, node.config.id,
-            "node_freeze_completed",
+            SimulationEventKind::kNodeFreezeCompleted,
             FreezeNodeWorkloadDetail(static_cast<uint32_t>(workload_index + 1U),
                                      static_cast<uint32_t>(workloads.size()),
                                      workload.node, workload.duration_ms));
@@ -6143,7 +6182,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
 
     StopNodes(options, events_path, driver, nodes);
     log_collector->Stop();
-    WriteEvent(events_path, options.run_id, "sim", "run_finished");
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kRunFinished);
     BBP_LOG(info) << "finished run " << options.run_id;
   } catch (const SimulationCancelled&) {
     handle_run_cancellation();
