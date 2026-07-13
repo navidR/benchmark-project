@@ -34,6 +34,7 @@
 
 #include "bbp/capability.h"
 #include "bbp/cgroup.h"
+#include "bbp/default_peer_topology.h"
 #include "bbp/drivers/chain_command_executor.h"
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/log_tail.h"
@@ -2883,19 +2884,12 @@ std::string StartupPeerAddress(const Options& options,
                         node_index);
 }
 
-std::vector<uint32_t> LegacyStartupPeerIndexes(uint32_t node_index) {
-  if (node_index == 0U) {
-    return {};
-  }
-  return {0U};
-}
-
 std::vector<uint32_t> ConfiguredStartupPeerIndexes(const Options& options,
                                                    uint32_t node_index) {
   const PeerConnectivityPolicy* policy =
       FindPeerConnectivityPolicy(options.topology, node_index);
   if (policy == nullptr) {
-    return LegacyStartupPeerIndexes(node_index);
+    return DefaultStartupPeerIndexes(options.nodes, node_index);
   }
   const uint32_t initial_peer_count = policy->peer_count.minimum();
   std::vector<uint32_t> peers;
@@ -2916,9 +2910,7 @@ std::vector<std::string> StartupPeerAddresses(const Options& options,
                                               const ChainDriverSpec& chain_spec,
                                               uint32_t node_index) {
   const std::vector<uint32_t> peer_indexes =
-      options.topology.configured
-          ? ConfiguredStartupPeerIndexes(options, node_index)
-          : LegacyStartupPeerIndexes(node_index);
+      ConfiguredStartupPeerIndexes(options, node_index);
   std::vector<std::string> peers;
   peers.reserve(peer_indexes.size());
   for (uint32_t peer_index : peer_indexes) {

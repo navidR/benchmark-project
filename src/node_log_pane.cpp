@@ -76,6 +76,8 @@ void NodeLogPane::Toggle(const boost::json::object& report,
   }
 }
 
+void NodeLogPane::Close() { open_ = false; }
+
 void NodeLogPane::Refresh(const boost::json::object& report,
                           std::size_t selected_node) {
   if (open_) {

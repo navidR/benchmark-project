@@ -219,6 +219,7 @@ add_executable(bbp
   src/capability.cpp
   src/cgroup.cpp
   src/chain_kind.cpp
+  src/default_peer_topology.cpp
   src/drivers/chain_driver.cpp
   src/drivers/chain_command_executor.cpp
   src/drivers/chain_driver_registry.cpp
@@ -236,6 +237,7 @@ add_executable(bbp
   src/node_log_pane.cpp
   src/peer_count_policy.cpp
   src/peer_connectivity_controller.cpp
+  src/peer_list_pane.cpp
   src/periodic_metrics_collector.cpp
   src/positive_duration.cpp
   src/process.cpp
@@ -283,6 +285,7 @@ if(BUILD_TESTING)
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
     tests/unit/chain_kind_tests.cpp
+    tests/unit/default_peer_topology_tests.cpp
     tests/unit/firo_driver_tests.cpp
     tests/unit/log_tail_tests.cpp
     tests/unit/log_level_tests.cpp
@@ -292,6 +295,7 @@ if(BUILD_TESTING)
     tests/unit/node_log_pane_tests.cpp
     tests/unit/node_runtime_tests.cpp
     tests/unit/peer_connectivity_controller_tests.cpp
+    tests/unit/peer_list_pane_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/positive_duration_tests.cpp
@@ -309,6 +313,7 @@ if(BUILD_TESTING)
     src/cgroup.cpp
     src/chain_kind.cpp
     src/block_production_policy.cpp
+    src/default_peer_topology.cpp
     src/simulation_command.cpp
     src/drivers/chain_driver.cpp
     src/drivers/chain_driver_registry.cpp
@@ -324,6 +329,7 @@ if(BUILD_TESTING)
     src/node_log_pane.cpp
     src/peer_count_policy.cpp
     src/peer_connectivity_controller.cpp
+    src/peer_list_pane.cpp
     src/periodic_metrics_collector.cpp
     src/positive_duration.cpp
     src/process.cpp

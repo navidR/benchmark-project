@@ -23,6 +23,7 @@
 
 #include "bbp/log_view.h"
 #include "bbp/node_log_pane.h"
+#include "bbp/peer_list_pane.h"
 #include "bbp/run_report.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulator/workload_kind.h"
@@ -46,6 +47,7 @@ struct TuiState {
   std::size_t selected_wallet = 0;
   TuiView view = TuiView::kNodes;
   NodeLogPane node_log_pane;
+  PeerListPane peer_list_pane;
   std::string command_status;
   std::uint64_t last_command_result_sequence = 0;
   bool command_error_open = false;
@@ -187,6 +189,18 @@ std::string JsonStringArrayText(const boost::json::object& object,
   }
   return values.empty() ? std::string(fallback)
                         : boost::algorithm::join(values, ", ");
+}
+
+std::string PeerListSummaryText(const boost::json::object& metrics) {
+  const boost::json::value* value = metrics.if_contains("peer_addresses");
+  if (value == nullptr || !value->is_array()) {
+    return "-";
+  }
+  const std::size_t count = value->as_array().size();
+  if (count > 1U) {
+    return std::to_string(count) + " addresses [p]";
+  }
+  return JsonStringArrayText(metrics, "peer_addresses");
 }
 
 std::optional<std::uint64_t> JsonUnsignedMetric(
@@ -684,6 +698,47 @@ void DrawNodeLogPane(int content_bottom, int cols,
   DrawHorizontalLine(content_bottom - 1);
 }
 
+void DrawPeerListPane(int content_bottom, int cols,
+                      const PeerListPane& peer_list_pane) {
+  constexpr int kPaneTop = 2;
+  if (!peer_list_pane.IsOpen() || cols <= 0 ||
+      NodeLogVisibleRows(content_bottom) <= 0) {
+    return;
+  }
+
+  for (int y = kPaneTop; y < content_bottom; ++y) {
+    mvhline(y, 0, ' ', cols);
+  }
+  DrawHorizontalLine(kPaneTop);
+
+  const std::size_t visible_rows =
+      static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
+  const std::size_t first = peer_list_pane.FirstVisiblePeer(visible_rows);
+  const std::size_t last = peer_list_pane.LastVisiblePeer(visible_rows);
+  std::string title = "Connected Peers: ";
+  title += peer_list_pane.NodeId().empty() ? "-" : peer_list_pane.NodeId();
+  title += " / " + std::to_string(peer_list_pane.PeerCount());
+  if (!peer_list_pane.Peers().empty()) {
+    title += " [" + std::to_string(first + 1U) + "-" + std::to_string(last) +
+             "/" + std::to_string(peer_list_pane.Peers().size()) + "]";
+  }
+  AddText(kPaneTop + 1, 0, cols, title, A_BOLD);
+
+  if (peer_list_pane.Peers().empty()) {
+    AddText(kPaneTop + 2, 0, cols, "No connected peer addresses reported.",
+            COLOR_PAIR(kColorMuted));
+  } else {
+    int y = kPaneTop + 2;
+    for (std::size_t index = first; index < last; ++index) {
+      AddText(
+          y, 0, cols,
+          std::to_string(index + 1U) + "  " + peer_list_pane.Peers()[index]);
+      ++y;
+    }
+  }
+  DrawHorizontalLine(content_bottom - 1);
+}
+
 void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
   constexpr int kPopupRows = 7;
   if (rows < kPopupRows + 2 || cols < 32) {
@@ -841,8 +896,7 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, cols, "peer set",
-                JsonStringArrayText(metric_object, "peer_addresses"));
+  AddDetailPair(y, 0, cols, "peer set", PeerListSummaryText(metric_object));
   ++y;
   if (y >= bottom) {
     return;
@@ -1059,6 +1113,7 @@ void DrawSummary(const std::filesystem::path& run_root,
                  const std::vector<std::string>& log_lines, TuiView view,
                  std::size_t selected_node, std::size_t selected_wallet,
                  const NodeLogPane& node_log_pane,
+                 const PeerListPane& peer_list_pane,
                  std::string_view command_status, bool command_error_open,
                  std::string_view command_error, bool command_palette_open,
                  std::string_view command_input,
@@ -1255,16 +1310,23 @@ void DrawSummary(const std::filesystem::path& run_root,
     DrawLogPane(log_top, rows, cols, log_lines);
   }
   DrawNodeLogPane(content_bottom, cols, node_log_pane);
+  DrawPeerListPane(content_bottom, cols, peer_list_pane);
   DrawHorizontalLine(rows - 2);
   std::string footer;
   if (!command_status.empty()) {
     footer = std::string(command_status) + " | ";
   }
-  footer += node_log_pane.IsOpen()
-                ? "Node log: arrows/PgUp/PgDn/Home/End scroll. +/- verbosity. "
-                  "l closes. q exits."
-                : "Tab/n/w view. Arrows select. l log. c command. s stop. d/r "
-                  "disconnect/reconnect. k kill. q or Esc exits.";
+  if (node_log_pane.IsOpen()) {
+    footer +=
+        "Node log: arrows/PgUp/PgDn/Home/End scroll. +/- verbosity. "
+        "l closes. q exits.";
+  } else if (peer_list_pane.IsOpen()) {
+    footer += "Peers: arrows/PgUp/PgDn/Home/End scroll. p closes. q exits.";
+  } else {
+    footer +=
+        "Tab/n/w view. Arrows select. p peers. l log. c command. s stop. "
+        "d/r disconnect/reconnect. k kill. q or Esc exits.";
+  }
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
     DrawCommandErrorPopup(rows, cols, command_error);
@@ -1481,7 +1543,20 @@ bool HandleInput(int ch, const boost::json::object& report,
       state->command_status = "No backing node is selected.";
       return true;
     }
+    state->peer_list_pane.Close();
     state->node_log_pane.Toggle(report, *selected_node);
+    return true;
+  }
+
+  if (ch == 'p' || ch == 'P') {
+    const std::optional<std::size_t> selected_node =
+        SelectedNodeIndex(report, *state);
+    if (!selected_node) {
+      state->command_status = "No backing node is selected.";
+      return true;
+    }
+    state->node_log_pane.Close();
+    state->peer_list_pane.Toggle(report, *selected_node);
     return true;
   }
 
@@ -1540,6 +1615,27 @@ bool HandleInput(int ch, const boost::json::object& report,
     return true;
   }
 
+  if (state->peer_list_pane.IsOpen()) {
+    const std::size_t visible_rows = CurrentNodeLogVisibleRows();
+    const std::size_t page_rows = std::max<std::size_t>(visible_rows, 1U);
+    if (ch == KEY_UP) {
+      state->peer_list_pane.ScrollUp(visible_rows, 1U);
+    } else if (ch == KEY_DOWN) {
+      state->peer_list_pane.ScrollDown(visible_rows, 1U);
+    } else if (ch == KEY_PPAGE) {
+      state->peer_list_pane.ScrollUp(visible_rows, page_rows);
+    } else if (ch == KEY_NPAGE) {
+      state->peer_list_pane.ScrollDown(visible_rows, page_rows);
+    } else if (ch == KEY_HOME) {
+      state->peer_list_pane.ScrollHome();
+    } else if (ch == KEY_END) {
+      state->peer_list_pane.ScrollEnd(visible_rows);
+    } else {
+      return false;
+    }
+    return true;
+  }
+
   std::size_t* selected = state->view == TuiView::kNodes
                               ? &state->selected_node
                               : &state->selected_wallet;
@@ -1577,6 +1673,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
           SelectedNodeIndex(report, state);
       if (selected_node) {
         state.node_log_pane.Refresh(report, *selected_node);
+        state.peer_list_pane.Refresh(report, *selected_node);
       }
       RefreshCommandResults(report, &state);
     }
@@ -1584,9 +1681,10 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         ReadRecentLogLines(RunLogPath(run_root), 256U);
     DrawSummary(run_root, report, error, log_lines, state.view,
                 state.selected_node, state.selected_wallet, state.node_log_pane,
-                state.command_status, state.command_error_open,
-                state.command_error, state.command_palette_open,
-                state.command_input, state.command_input_error);
+                state.peer_list_pane, state.command_status,
+                state.command_error_open, state.command_error,
+                state.command_palette_open, state.command_input,
+                state.command_input_error);
     if (once) {
       return error.empty() ? 0 : 1;
     }

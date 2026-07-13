@@ -634,9 +634,10 @@ View an existing run in the read-only TUI:
 
 The TUI shows run status, lifecycle timestamps, workload summary, node chain
 state, resource metrics, network counters, qdisc state, and simulator logs. Use
-the arrow keys to select a node and press `l` to toggle its separate log pane.
-The node pane supports arrow keys, Page Up, Page Down, Home, and End for
-scrolling; press `l` again to close it.
+the arrow keys to select a node. Press `p` to toggle its connected-peer pane or
+`l` to toggle its separate log pane. Both panes support arrow keys, Page Up,
+Page Down, Home, and End for scrolling; press the opening key again to close
+the pane.
 
 During a live benchmark launched without `--no-tui`, press `d` to disconnect
 the selected node from the simulated network or `s` to request that its mining
@@ -644,6 +645,10 @@ operation stop. While the node log pane is open, `+` and `-` request higher or
 lower daemon log verbosity. Commands pass through the chain driver; when the
 selected chain does not support an operation, the TUI shows a dismissible
 `Command error` popup instead of attempting a chain-specific fallback.
+
+Without an explicit topology policy, a multi-node run starts with every node
+connected to every other node. Scenario peer-count policies can replace that
+default with per-node minimum and maximum connection counts.
 
 Render one TUI frame and exit, useful for validation:
 
