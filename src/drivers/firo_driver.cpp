@@ -252,20 +252,69 @@ std::uint64_t JsonFixed8Member(const boost::json::object& object,
   return JsonFixed8Amount(*value, field);
 }
 
-ChainWalletTransactionDirection ParseWalletTransactionDirection(
+enum class FiroWalletTransactionCategory {
+  kSend,
+  kSpend,
+  kMint,
+  kReceive,
+  kGenerate,
+  kImmature,
+  kOrphan,
+  kZnode,
+  kMove,
+};
+
+FiroWalletTransactionCategory ParseWalletTransactionCategory(
     std::string_view category) {
   if (category == "send" || category == "spend" || category == "mint") {
-    return ChainWalletTransactionDirection::kOutgoing;
+    if (category == "send") {
+      return FiroWalletTransactionCategory::kSend;
+    }
+    if (category == "spend") {
+      return FiroWalletTransactionCategory::kSpend;
+    }
+    return FiroWalletTransactionCategory::kMint;
   }
   if (category == "receive" || category == "generate" ||
       category == "immature" || category == "orphan" || category == "znode") {
-    return ChainWalletTransactionDirection::kIncoming;
+    if (category == "receive") {
+      return FiroWalletTransactionCategory::kReceive;
+    }
+    if (category == "generate") {
+      return FiroWalletTransactionCategory::kGenerate;
+    }
+    if (category == "immature") {
+      return FiroWalletTransactionCategory::kImmature;
+    }
+    if (category == "orphan") {
+      return FiroWalletTransactionCategory::kOrphan;
+    }
+    return FiroWalletTransactionCategory::kZnode;
   }
   if (category == "move") {
-    return ChainWalletTransactionDirection::kInternal;
+    return FiroWalletTransactionCategory::kMove;
   }
   throw std::runtime_error("unknown Firo wallet transaction category: " +
                            std::string(category));
+}
+
+ChainWalletTransactionDirection WalletTransactionDirection(
+    FiroWalletTransactionCategory category) {
+  switch (category) {
+    case FiroWalletTransactionCategory::kSend:
+    case FiroWalletTransactionCategory::kSpend:
+    case FiroWalletTransactionCategory::kMint:
+      return ChainWalletTransactionDirection::kOutgoing;
+    case FiroWalletTransactionCategory::kReceive:
+    case FiroWalletTransactionCategory::kGenerate:
+    case FiroWalletTransactionCategory::kImmature:
+    case FiroWalletTransactionCategory::kOrphan:
+    case FiroWalletTransactionCategory::kZnode:
+      return ChainWalletTransactionDirection::kIncoming;
+    case FiroWalletTransactionCategory::kMove:
+      return ChainWalletTransactionDirection::kInternal;
+  }
+  return ChainWalletTransactionDirection::kInternal;
 }
 
 bool TxOutPaysAddress(const boost::json::object& txout,
@@ -700,8 +749,9 @@ ChainWalletSnapshot FiroDriver::ReadWalletSnapshot(
     }
     const boost::json::object& object = value.as_object();
     ChainWalletTransaction transaction;
-    transaction.direction =
-        ParseWalletTransactionDirection(JsonStringMember(object, "category"));
+    const FiroWalletTransactionCategory category =
+        ParseWalletTransactionCategory(JsonStringMember(object, "category"));
+    transaction.direction = WalletTransactionDirection(category);
     transaction.txid = OptionalJsonStringMember(object, "txid");
     transaction.address = OptionalJsonStringMember(object, "address");
     const std::optional<std::int64_t> amount =
