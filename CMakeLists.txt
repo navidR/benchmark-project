@@ -286,6 +286,7 @@ if(BUILD_TESTING)
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
     tests/unit/chain_kind_tests.cpp
+    tests/unit/chain_wallet_transaction_tests.cpp
     tests/unit/default_peer_topology_tests.cpp
     tests/unit/firo_driver_tests.cpp
     tests/unit/log_tail_tests.cpp

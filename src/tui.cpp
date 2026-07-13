@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "bbp/drivers/chain_wallet_transaction.h"
 #include "bbp/log_view.h"
 #include "bbp/node_log_pane.h"
 #include "bbp/operator_command_status.h"
@@ -966,7 +967,8 @@ const boost::json::object& JsonObjectFieldOrEmpty(
 }
 
 const boost::json::object* LastWalletTransaction(
-    const boost::json::object& metrics, std::string_view direction) {
+    const boost::json::object& metrics,
+    ChainWalletTransactionDirection direction) {
   const boost::json::value* value = metrics.if_contains("transactions");
   if (value == nullptr || !value->is_array()) {
     return nullptr;
@@ -978,7 +980,10 @@ const boost::json::object* LastWalletTransaction(
       continue;
     }
     const boost::json::object& transaction = item.as_object();
-    if (JsonString(transaction, "direction") != direction) {
+    const std::optional<ChainWalletTransactionDirection> transaction_direction =
+        ChainWalletTransactionDirectionFromName(
+            JsonString(transaction, "direction"));
+    if (!transaction_direction || *transaction_direction != direction) {
       continue;
     }
     const std::optional<std::uint64_t> timestamp =
@@ -1006,10 +1011,10 @@ void DrawSelectedWalletDetail(int top, int bottom, int cols,
   const boost::json::object empty;
   const boost::json::object& metrics =
       JsonObjectFieldOrEmpty(*wallet, "last_metrics", empty);
-  const boost::json::object* outgoing =
-      LastWalletTransaction(metrics, "outgoing");
-  const boost::json::object* incoming =
-      LastWalletTransaction(metrics, "incoming");
+  const boost::json::object* outgoing = LastWalletTransaction(
+      metrics, ChainWalletTransactionDirection::kOutgoing);
+  const boost::json::object* incoming = LastWalletTransaction(
+      metrics, ChainWalletTransactionDirection::kIncoming);
   const boost::json::object& outgoing_object =
       outgoing == nullptr ? empty : *outgoing;
   const boost::json::object& incoming_object =

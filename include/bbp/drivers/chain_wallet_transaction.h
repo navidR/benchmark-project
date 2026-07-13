@@ -28,5 +28,7 @@ struct ChainWalletTransaction {
 
 std::string_view ChainWalletTransactionDirectionName(
     ChainWalletTransactionDirection direction);
+std::optional<ChainWalletTransactionDirection>
+ChainWalletTransactionDirectionFromName(std::string_view name);
 
 }  // namespace bbp

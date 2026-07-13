@@ -34,4 +34,18 @@ std::string_view ChainWalletTransactionDirectionName(
   throw std::runtime_error("unknown chain wallet transaction direction");
 }
 
+std::optional<ChainWalletTransactionDirection>
+ChainWalletTransactionDirectionFromName(std::string_view name) {
+  if (name == "incoming") {
+    return ChainWalletTransactionDirection::kIncoming;
+  }
+  if (name == "outgoing") {
+    return ChainWalletTransactionDirection::kOutgoing;
+  }
+  if (name == "internal") {
+    return ChainWalletTransactionDirection::kInternal;
+  }
+  return std::nullopt;
+}
+
 }  // namespace bbp
