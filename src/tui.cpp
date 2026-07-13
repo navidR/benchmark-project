@@ -103,14 +103,13 @@ std::string JsonString(const boost::json::object& object,
   return std::string(value->as_string());
 }
 
-std::string JsonBoolText(const boost::json::object& object,
-                         std::string_view field,
-                         std::string_view fallback = "unknown") {
+std::optional<bool> JsonBool(const boost::json::object& object,
+                             std::string_view field) {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr || !value->is_bool()) {
-    return std::string(fallback);
+    return std::nullopt;
   }
-  return value->as_bool() ? "true" : "false";
+  return value->as_bool();
 }
 
 std::string JsonIntegerText(const boost::json::object& object,
@@ -535,7 +534,7 @@ std::string SelectedPeerPolicyText(const boost::json::object& report,
     if (!policy_node || *policy_node != selected_node + 1U) {
       continue;
     }
-    if (JsonBoolText(policy, "all_peers", "false") == "true") {
+    if (JsonBool(policy, "all_peers").value_or(false)) {
       const boost::json::array* nodes = NodeSummaries(report);
       const std::size_t count =
           nodes == nullptr || nodes->empty() ? 0U : nodes->size() - 1U;
@@ -870,13 +869,12 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   }
   AddDetailPair(y, 0, left_width, "generated blocks",
                 JsonMetricText(metric_object, "generated_block_count"));
-  AddDetailPair(
-      y, left_width, right_width, "mined non-reward tx",
-      JsonMetricText(metric_object, "mined_transaction_count") +
-          (JsonBoolText(metric_object, "mined_transaction_count_complete",
-                        "true") == "true"
-               ? ""
-               : "+"));
+  AddDetailPair(y, left_width, right_width, "mined non-reward tx",
+                JsonMetricText(metric_object, "mined_transaction_count") +
+                    (JsonBool(metric_object, "mined_transaction_count_complete")
+                             .value_or(true)
+                         ? ""
+                         : "+"));
   ++y;
   if (y >= bottom) {
     return;
@@ -1059,12 +1057,12 @@ void DrawSelectedWalletDetail(int top, int bottom, int cols,
   AddDetailPair(y, 0, left_width, "benchmark sent/recv",
                 JsonIntegerText(*wallet, "transactions_sent", "0") + "/" +
                     JsonIntegerText(*wallet, "transactions_received", "0"));
-  AddDetailPair(y, left_width, right_width, "driver tx count",
-                JsonIntegerText(metrics, "transaction_count") +
-                    (JsonBoolText(metrics, "transaction_history_truncated",
-                                  "false") == "true"
-                         ? " (history truncated)"
-                         : ""));
+  AddDetailPair(
+      y, left_width, right_width, "driver tx count",
+      JsonIntegerText(metrics, "transaction_count") +
+          (JsonBool(metrics, "transaction_history_truncated").value_or(false)
+               ? " (history truncated)"
+               : ""));
   ++y;
   if (y >= bottom) {
     return;
@@ -1157,7 +1155,7 @@ void DrawSummary(const std::filesystem::path& run_root,
   }
 
   const std::string status = JsonString(report, "status", "unknown");
-  const bool ok = JsonBoolText(report, "ok", "false") == "true";
+  const bool ok = JsonBool(report, "ok").value_or(false);
   const boost::json::array* wallets = WalletSummaries(report);
   AddText(3, 0, cols, "run: " + run_root.string(), A_BOLD);
   AddText(
@@ -1180,9 +1178,9 @@ void DrawSummary(const std::filesystem::path& run_root,
           ? block_production_value->as_object()
           : empty_block_production;
   const bool block_production_enabled =
-      JsonBoolText(block_production, "enabled", "false") == "true";
+      JsonBool(block_production, "enabled").value_or(false);
   const bool native_mining =
-      JsonBoolText(block_production, "native_mining", "false") == "true";
+      JsonBool(block_production, "native_mining").value_or(false);
   AddText(7, 0, cols / 2,
           "mining: " + std::string(!block_production_enabled ? "disabled"
                                    : native_mining           ? "native"
