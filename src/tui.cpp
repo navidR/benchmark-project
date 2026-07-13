@@ -25,6 +25,7 @@
 #include "bbp/node_log_pane.h"
 #include "bbp/run_report.h"
 #include "bbp/simulation_command_queue.h"
+#include "bbp/simulator/workload_kind.h"
 #include "bbp/tui_command_parser.h"
 #include "bbp/tui_view.h"
 #include "bbp/util.h"
@@ -265,72 +266,91 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
     const boost::json::object& workload = workload_value.as_object();
     text += index == 1 ? " " : ", ";
     text += "#" + std::to_string(index) + " ";
-    const std::string type = JsonString(workload, "type", "-");
-    if (type == "block_generation") {
-      text += "gen n";
-      text += JsonMetricText(workload, "node");
-      text += " x";
-      text += JsonMetricText(workload, "count");
-      text += " ";
-      text += JsonMetricText(workload, "sync_timeout_sec");
-      text += "s";
-    } else if (type == "wait_until_height") {
-      text += "height n";
-      text += JsonMetricText(workload, "node");
-      text += ">=";
-      text += JsonMetricText(workload, "height");
-      text += " ";
-      text += JsonMetricText(workload, "timeout_sec");
-      text += "s";
-    } else if (type == "wait_for_peers") {
-      text += "peers n";
-      text += JsonMetricText(workload, "node");
-      text += ">=";
-      text += JsonMetricText(workload, "peer_count");
-      text += " ";
-      text += JsonMetricText(workload, "timeout_sec");
-      text += "s";
-    } else if (type == "connect_peer") {
-      text += "connect n";
-      text += JsonMetricText(workload, "node");
-      text += "->n";
-      text += JsonMetricText(workload, "peer");
-      text += " ";
-      text += JsonMetricText(workload, "timeout_sec");
-      text += "s";
-    } else if (type == "disconnect_peer") {
-      text += "disconnect n";
-      text += JsonMetricText(workload, "node");
-      text += "->n";
-      text += JsonMetricText(workload, "peer");
-      text += " ";
-      text += JsonMetricText(workload, "timeout_sec");
-      text += "s";
-    } else if (type == "restart_node") {
-      text += "restart n";
-      text += JsonMetricText(workload, "node");
-    } else if (type == "freeze_node") {
-      text += "freeze n";
-      text += JsonMetricText(workload, "node");
-      text += " ";
-      text += JsonMetricText(workload, "duration_ms");
-      text += "ms";
-    } else if (type == "update_resource_limits") {
-      text += "limits n";
-      text += JsonMetricText(workload, "node");
-    } else if (type == "partition_nodes") {
-      text += "partition";
-    } else if (type == "heal_partition") {
-      text += "heal";
-    } else if (type == "send_raw_transaction") {
-      text += "tx n";
-      text += JsonMetricText(workload, "funding_node");
-      text += "->n";
-      text += JsonMetricText(workload, "submit_node");
-      text += " ";
-      text += JsonString(workload, "amount", "-");
-    } else {
-      text += type;
+    const std::string type_name = JsonString(workload, "type", "-");
+    const std::optional<WorkloadKind> kind = ParseWorkloadKind(type_name);
+    if (!kind) {
+      text += type_name;
+      continue;
+    }
+    switch (*kind) {
+      case WorkloadKind::kBlockGeneration:
+        text += "gen n";
+        text += JsonMetricText(workload, "node");
+        text += " x";
+        text += JsonMetricText(workload, "count");
+        text += " ";
+        text += JsonMetricText(workload, "sync_timeout_sec");
+        text += "s";
+        break;
+      case WorkloadKind::kWaitUntilHeight:
+        text += "height n";
+        text += JsonMetricText(workload, "node");
+        text += ">=";
+        text += JsonMetricText(workload, "height");
+        text += " ";
+        text += JsonMetricText(workload, "timeout_sec");
+        text += "s";
+        break;
+      case WorkloadKind::kWaitForPeers:
+        text += "peers n";
+        text += JsonMetricText(workload, "node");
+        text += ">=";
+        text += JsonMetricText(workload, "peer_count");
+        text += " ";
+        text += JsonMetricText(workload, "timeout_sec");
+        text += "s";
+        break;
+      case WorkloadKind::kConnectPeer:
+        text += "connect n";
+        text += JsonMetricText(workload, "node");
+        text += "->n";
+        text += JsonMetricText(workload, "peer");
+        text += " ";
+        text += JsonMetricText(workload, "timeout_sec");
+        text += "s";
+        break;
+      case WorkloadKind::kDisconnectPeer:
+        text += "disconnect n";
+        text += JsonMetricText(workload, "node");
+        text += "->n";
+        text += JsonMetricText(workload, "peer");
+        text += " ";
+        text += JsonMetricText(workload, "timeout_sec");
+        text += "s";
+        break;
+      case WorkloadKind::kRestartNode:
+        text += "restart n";
+        text += JsonMetricText(workload, "node");
+        break;
+      case WorkloadKind::kFreezeNode:
+        text += "freeze n";
+        text += JsonMetricText(workload, "node");
+        text += " ";
+        text += JsonMetricText(workload, "duration_ms");
+        text += "ms";
+        break;
+      case WorkloadKind::kUpdateResourceLimits:
+        text += "limits n";
+        text += JsonMetricText(workload, "node");
+        break;
+      case WorkloadKind::kPartitionNodes:
+        text += "partition";
+        break;
+      case WorkloadKind::kHealPartition:
+        text += "heal";
+        break;
+      case WorkloadKind::kSendRawTransaction:
+        text += "tx n";
+        text += JsonMetricText(workload, "funding_node");
+        text += "->n";
+        text += JsonMetricText(workload, "submit_node");
+        text += " ";
+        text += JsonString(workload, "amount", "-");
+        break;
+      case WorkloadKind::kResourcePressure:
+      case WorkloadKind::kWalletTransactions:
+        text += type_name;
+        break;
     }
   }
   return text;

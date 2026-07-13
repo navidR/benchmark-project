@@ -1109,8 +1109,13 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
           "scenario workloads entries must be JSON objects");
     }
     const boost::json::object& workload = value.as_object();
-    const std::string type = JsonStringField(workload, "type");
-    if (type == "block_generation") {
+    const std::string type_name = JsonStringField(workload, "type");
+    const std::optional<WorkloadKind> kind = ParseWorkloadKind(type_name);
+    if (!kind) {
+      throw std::runtime_error("unsupported scenario workload type: " +
+                               type_name);
+    }
+    if (*kind == WorkloadKind::kBlockGeneration) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP block_generation workload uses node, not nodes");
@@ -1131,7 +1136,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kBlockGeneration;
       scenario_workload.block_generation = block_generation;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "wait_until_height") {
+    } else if (*kind == WorkloadKind::kWaitUntilHeight) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP wait_until_height workload uses node, not nodes");
@@ -1148,7 +1153,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kWaitUntilHeight;
       scenario_workload.wait_until_height = wait;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "wait_for_peers") {
+    } else if (*kind == WorkloadKind::kWaitForPeers) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP wait_for_peers workload uses node, not nodes");
@@ -1165,7 +1170,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kWaitForPeers;
       scenario_workload.wait_for_peers = wait;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "connect_peer") {
+    } else if (*kind == WorkloadKind::kConnectPeer) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP connect_peer workload uses node, not nodes");
@@ -1182,7 +1187,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kConnectPeer;
       scenario_workload.connect_peer = connect;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "disconnect_peer") {
+    } else if (*kind == WorkloadKind::kDisconnectPeer) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP disconnect_peer workload uses node, not nodes");
@@ -1200,7 +1205,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kDisconnectPeer;
       scenario_workload.disconnect_peer = disconnect;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "restart_node") {
+    } else if (*kind == WorkloadKind::kRestartNode) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP restart_node workload uses node, not nodes");
@@ -1211,7 +1216,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kRestartNode;
       scenario_workload.restart_node = restart;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "freeze_node") {
+    } else if (*kind == WorkloadKind::kFreezeNode) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP freeze_node workload uses node, not nodes");
@@ -1223,7 +1228,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kFreezeNode;
       scenario_workload.freeze_node = freeze;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "update_resource_limits") {
+    } else if (*kind == WorkloadKind::kUpdateResourceLimits) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP update_resource_limits workload uses node, not "
@@ -1236,7 +1241,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kUpdateResourceLimits;
       scenario_workload.update_resource_limits = update;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "resource_pressure") {
+    } else if (*kind == WorkloadKind::kResourcePressure) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP resource_pressure workload uses node, not nodes");
@@ -1249,21 +1254,21 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kResourcePressure;
       scenario_workload.resource_pressure = pressure;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "partition_nodes") {
+    } else if (*kind == WorkloadKind::kPartitionNodes) {
       NetworkPartitionWorkload partition;
       partition.partition = ParseNetworkPartitionRuleObject(workload);
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kPartitionNodes;
       scenario_workload.network_partition = partition;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "heal_partition") {
+    } else if (*kind == WorkloadKind::kHealPartition) {
       NetworkPartitionWorkload partition;
       partition.partition = ParseNetworkPartitionRuleObject(workload);
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kHealPartition;
       scenario_workload.network_partition = partition;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "send_raw_transaction") {
+    } else if (*kind == WorkloadKind::kSendRawTransaction) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
             "current MVP send_raw_transaction workload uses "
@@ -1292,7 +1297,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kSendRawTransaction;
       scenario_workload.send_raw_transaction = transaction;
       options.workloads.push_back(scenario_workload);
-    } else if (type == "wallet_transactions") {
+    } else if (*kind == WorkloadKind::kWalletTransactions) {
       if (workload.if_contains("wallets") != nullptr ||
           workload.if_contains("private_key") != nullptr ||
           workload.if_contains("source_private_key") != nullptr ||
@@ -1334,8 +1339,6 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.wallet_transactions = std::move(transactions);
       options.workloads.push_back(std::move(scenario_workload));
       options.wallet_backed_workload_requested = true;
-    } else {
-      throw std::runtime_error("unsupported scenario workload type: " + type);
     }
   }
 }
@@ -3955,7 +3958,8 @@ std::optional<uint32_t> CommonBlockGenerationSyncTimeout(
 boost::json::object BlockGenerationWorkloadJson(
     const BlockGenerationWorkload& workload) {
   boost::json::object object;
-  object["type"] = "block_generation";
+  object["type"] =
+      std::string(WorkloadKindName(WorkloadKind::kBlockGeneration));
   object["node"] = workload.node;
   object["count"] = workload.count;
   object["sync_timeout_sec"] = workload.sync_timeout_sec;
@@ -3965,7 +3969,8 @@ boost::json::object BlockGenerationWorkloadJson(
 boost::json::object WaitUntilHeightWorkloadJson(
     const WaitUntilHeightWorkload& workload) {
   boost::json::object object;
-  object["type"] = "wait_until_height";
+  object["type"] =
+      std::string(WorkloadKindName(WorkloadKind::kWaitUntilHeight));
   object["node"] = workload.node;
   object["height"] = workload.height;
   object["timeout_sec"] = workload.timeout_sec;
@@ -3975,7 +3980,7 @@ boost::json::object WaitUntilHeightWorkloadJson(
 boost::json::object WaitForPeersWorkloadJson(
     const WaitForPeersWorkload& workload) {
   boost::json::object object;
-  object["type"] = "wait_for_peers";
+  object["type"] = std::string(WorkloadKindName(WorkloadKind::kWaitForPeers));
   object["node"] = workload.node;
   object["peer_count"] = workload.peer_count;
   object["timeout_sec"] = workload.timeout_sec;
@@ -3985,7 +3990,7 @@ boost::json::object WaitForPeersWorkloadJson(
 boost::json::object ConnectPeerWorkloadJson(
     const ConnectPeerWorkload& workload) {
   boost::json::object object;
-  object["type"] = "connect_peer";
+  object["type"] = std::string(WorkloadKindName(WorkloadKind::kConnectPeer));
   object["node"] = workload.node;
   object["peer"] = workload.peer;
   object["timeout_sec"] = workload.timeout_sec;
@@ -3995,7 +4000,7 @@ boost::json::object ConnectPeerWorkloadJson(
 boost::json::object DisconnectPeerWorkloadJson(
     const DisconnectPeerWorkload& workload) {
   boost::json::object object;
-  object["type"] = "disconnect_peer";
+  object["type"] = std::string(WorkloadKindName(WorkloadKind::kDisconnectPeer));
   object["node"] = workload.node;
   object["peer"] = workload.peer;
   object["timeout_sec"] = workload.timeout_sec;
@@ -4005,14 +4010,14 @@ boost::json::object DisconnectPeerWorkloadJson(
 boost::json::object RestartNodeWorkloadJson(
     const RestartNodeWorkload& workload) {
   boost::json::object object;
-  object["type"] = "restart_node";
+  object["type"] = std::string(WorkloadKindName(WorkloadKind::kRestartNode));
   object["node"] = workload.node;
   return object;
 }
 
 boost::json::object FreezeNodeWorkloadJson(const FreezeNodeWorkload& workload) {
   boost::json::object object;
-  object["type"] = "freeze_node";
+  object["type"] = std::string(WorkloadKindName(WorkloadKind::kFreezeNode));
   object["node"] = workload.node;
   object["duration_ms"] = workload.duration_ms;
   return object;
@@ -4021,7 +4026,8 @@ boost::json::object FreezeNodeWorkloadJson(const FreezeNodeWorkload& workload) {
 boost::json::object ResourceLimitUpdateWorkloadJson(
     const ResourceLimitUpdateWorkload& workload) {
   boost::json::object object = ResourceLimitPatchJson(workload.patch);
-  object["type"] = "update_resource_limits";
+  object["type"] =
+      std::string(WorkloadKindName(WorkloadKind::kUpdateResourceLimits));
   object["node"] = workload.node;
   return object;
 }
@@ -4029,23 +4035,25 @@ boost::json::object ResourceLimitUpdateWorkloadJson(
 boost::json::object ResourcePressureWorkloadJson(
     const ResourcePressureWorkload& workload) {
   boost::json::object object = ResourceLimitPatchJson(workload.patch);
-  object["type"] = "resource_pressure";
+  object["type"] =
+      std::string(WorkloadKindName(WorkloadKind::kResourcePressure));
   object["node"] = workload.node;
   object["duration_ms"] = workload.duration_ms;
   return object;
 }
 
 boost::json::object NetworkPartitionWorkloadJson(
-    const NetworkPartitionWorkload& workload, std::string_view type) {
+    const NetworkPartitionWorkload& workload, WorkloadKind kind) {
   boost::json::object object = NetworkPartitionRuleJson(workload.partition);
-  object["type"] = std::string(type);
+  object["type"] = std::string(WorkloadKindName(kind));
   return object;
 }
 
 boost::json::object SendRawTransactionWorkloadJson(
     const SendRawTransactionWorkload& workload) {
   boost::json::object object;
-  object["type"] = "send_raw_transaction";
+  object["type"] =
+      std::string(WorkloadKindName(WorkloadKind::kSendRawTransaction));
   object["funding_node"] = workload.funding_node;
   object["submit_node"] = workload.submit_node;
   object["source_address"] = workload.source_address;
@@ -4061,7 +4069,8 @@ boost::json::object SendRawTransactionWorkloadJson(
 boost::json::object WalletTransactionsWorkloadJson(
     const WalletTransactionsWorkload& workload) {
   boost::json::object object;
-  object["type"] = "wallet_transactions";
+  object["type"] =
+      std::string(WorkloadKindName(WorkloadKind::kWalletTransactions));
   object["strategy"] =
       std::string(WalletTransferStrategyName(workload.strategy));
   object["funding_blocks_per_wallet"] = workload.funding_blocks_per_wallet;
@@ -4104,11 +4113,11 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   }
   if (workload.kind == WorkloadKind::kPartitionNodes) {
     return NetworkPartitionWorkloadJson(workload.network_partition,
-                                        "partition_nodes");
+                                        WorkloadKind::kPartitionNodes);
   }
   if (workload.kind == WorkloadKind::kHealPartition) {
     return NetworkPartitionWorkloadJson(workload.network_partition,
-                                        "heal_partition");
+                                        WorkloadKind::kHealPartition);
   }
   if (workload.kind == WorkloadKind::kSendRawTransaction) {
     return SendRawTransactionWorkloadJson(workload.send_raw_transaction);

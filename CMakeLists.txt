@@ -303,6 +303,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_registry_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
+    tests/unit/workload_kind_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
     src/chain_kind.cpp
