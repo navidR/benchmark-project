@@ -1,4 +1,5 @@
 #include <boost/test/unit_test.hpp>
+#include <optional>
 
 #include "bbp/simulation_registry.h"
 
@@ -39,4 +40,28 @@ BOOST_AUTO_TEST_CASE(simulation_registry_accepts_private_wallet_mode) {
 
   BOOST_TEST(static_cast<int>(registry.wallet_initialization().mode) ==
              static_cast<int>(bbp::WalletPrivacyMode::kPrivate));
+}
+
+BOOST_AUTO_TEST_CASE(wallet_initialization_names_round_trip) {
+  const std::optional<bbp::WalletInitializationStrategy> strategy =
+      bbp::WalletInitializationStrategyFromName(
+          bbp::WalletInitializationStrategyName(
+              bbp::WalletInitializationStrategy::kDriverRpc));
+  BOOST_REQUIRE(strategy);
+  BOOST_CHECK(*strategy == bbp::WalletInitializationStrategy::kDriverRpc);
+
+  const std::optional<bbp::WalletPrivacyMode> public_mode =
+      bbp::WalletPrivacyModeFromName(
+          bbp::WalletPrivacyModeName(bbp::WalletPrivacyMode::kPublic));
+  BOOST_REQUIRE(public_mode);
+  BOOST_CHECK(*public_mode == bbp::WalletPrivacyMode::kPublic);
+
+  const std::optional<bbp::WalletPrivacyMode> private_mode =
+      bbp::WalletPrivacyModeFromName(
+          bbp::WalletPrivacyModeName(bbp::WalletPrivacyMode::kPrivate));
+  BOOST_REQUIRE(private_mode);
+  BOOST_CHECK(*private_mode == bbp::WalletPrivacyMode::kPrivate);
+
+  BOOST_TEST(!bbp::WalletInitializationStrategyFromName("unknown_strategy"));
+  BOOST_TEST(!bbp::WalletPrivacyModeFromName("unknown_mode"));
 }

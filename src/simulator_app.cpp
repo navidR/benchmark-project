@@ -651,62 +651,33 @@ const PeerConnectivityPolicy* FindPeerConnectivityPolicy(
 
 WalletInitializationStrategy ParseWalletInitializationStrategy(
     std::string_view value) {
-  if (value == "driver_rpc") {
-    return WalletInitializationStrategy::kDriverRpc;
+  const std::optional<WalletInitializationStrategy> strategy =
+      WalletInitializationStrategyFromName(value);
+  if (strategy) {
+    return *strategy;
   }
   throw std::runtime_error(
       "scenario topology.wallet_initialization strategy must be driver_rpc");
 }
 
 WalletPrivacyMode ParseWalletPrivacyMode(std::string_view value) {
-  if (value == "public") {
-    return WalletPrivacyMode::kPublic;
-  }
-  if (value == "private") {
-    return WalletPrivacyMode::kPrivate;
+  const std::optional<WalletPrivacyMode> mode =
+      WalletPrivacyModeFromName(value);
+  if (mode) {
+    return *mode;
   }
   throw std::runtime_error(
       "scenario topology.wallet_initialization mode must be public or private");
 }
 
 WalletTransferStrategy ParseWalletTransferStrategy(std::string_view value) {
-  if (value == "round_robin") {
-    return WalletTransferStrategy::kRoundRobin;
-  }
-  if (value == "random") {
-    return WalletTransferStrategy::kRandom;
+  const std::optional<WalletTransferStrategy> strategy =
+      WalletTransferStrategyFromName(value);
+  if (strategy) {
+    return *strategy;
   }
   throw std::runtime_error(
       "scenario wallet_transactions strategy must be round_robin or random");
-}
-
-std::string_view WalletInitializationStrategyName(
-    WalletInitializationStrategy strategy) {
-  switch (strategy) {
-    case WalletInitializationStrategy::kDriverRpc:
-      return "driver_rpc";
-  }
-  throw std::runtime_error("unknown wallet initialization strategy");
-}
-
-std::string_view WalletPrivacyModeName(WalletPrivacyMode mode) {
-  switch (mode) {
-    case WalletPrivacyMode::kPublic:
-      return "public";
-    case WalletPrivacyMode::kPrivate:
-      return "private";
-  }
-  throw std::runtime_error("unknown wallet privacy mode");
-}
-
-std::string_view WalletTransferStrategyName(WalletTransferStrategy strategy) {
-  switch (strategy) {
-    case WalletTransferStrategy::kRoundRobin:
-      return "round_robin";
-    case WalletTransferStrategy::kRandom:
-      return "random";
-  }
-  throw std::runtime_error("unknown wallet transfer strategy");
 }
 
 std::string_view PeerConnectivityModeName(PeerConnectivityMode mode) {

@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 
+#include "bbp/simulation_registry.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/util.h"
 
@@ -40,8 +41,10 @@ struct WalletReport {
   std::uint64_t wallet_index = 0;
   std::uint64_t node = 0;
   std::string address;
-  std::string strategy;
-  std::string mode;
+  std::optional<WalletInitializationStrategy> strategy;
+  std::string unknown_strategy;
+  std::optional<WalletPrivacyMode> mode;
+  std::string unknown_mode;
   std::uint64_t transactions_sent = 0;
   std::uint64_t transactions_received = 0;
   std::uint64_t simulated_amount_sent_satoshis = 0;
@@ -390,6 +393,41 @@ void CopyOptionalStringField(const boost::json::object& source,
   }
 }
 
+void CopyOptionalWalletStrategyField(const boost::json::object& source,
+                                     std::string_view field,
+                                     WalletReport* wallet) {
+  const std::string value = OptionalStringField(source, field);
+  if (value.empty()) {
+    return;
+  }
+  const std::optional<WalletInitializationStrategy> strategy =
+      WalletInitializationStrategyFromName(value);
+  if (strategy) {
+    wallet->strategy = *strategy;
+    wallet->unknown_strategy.clear();
+    return;
+  }
+  wallet->strategy = std::nullopt;
+  wallet->unknown_strategy = value;
+}
+
+void CopyOptionalWalletModeField(const boost::json::object& source,
+                                 std::string_view field, WalletReport* wallet) {
+  const std::string value = OptionalStringField(source, field);
+  if (value.empty()) {
+    return;
+  }
+  const std::optional<WalletPrivacyMode> mode =
+      WalletPrivacyModeFromName(value);
+  if (mode) {
+    wallet->mode = *mode;
+    wallet->unknown_mode.clear();
+    return;
+  }
+  wallet->mode = std::nullopt;
+  wallet->unknown_mode = value;
+}
+
 void CopyOptionalUint64Field(const boost::json::object& source,
                              std::string_view field, std::uint64_t* target) {
   const std::optional<std::uint64_t> value = OptionalUint64Field(source, field);
@@ -414,8 +452,8 @@ void RememberWalletAddressEvent(
   wallet.wallet_index = *wallet_index;
   CopyOptionalUint64Field(object, "node", &wallet.node);
   CopyOptionalStringField(object, "address", &wallet.address);
-  CopyOptionalStringField(object, "strategy", &wallet.strategy);
-  CopyOptionalStringField(object, "mode", &wallet.mode);
+  CopyOptionalWalletStrategyField(object, "strategy", &wallet);
+  CopyOptionalWalletModeField(object, "mode", &wallet);
 }
 
 void RememberWalletTransactionEvent(
@@ -471,11 +509,15 @@ boost::json::array WalletsJson(
     if (!wallet.address.empty()) {
       object["address"] = wallet.address;
     }
-    if (!wallet.strategy.empty()) {
-      object["strategy"] = wallet.strategy;
+    if (wallet.strategy) {
+      object["strategy"] = WalletInitializationStrategyName(*wallet.strategy);
+    } else if (!wallet.unknown_strategy.empty()) {
+      object["strategy"] = wallet.unknown_strategy;
     }
-    if (!wallet.mode.empty()) {
-      object["mode"] = wallet.mode;
+    if (wallet.mode) {
+      object["mode"] = WalletPrivacyModeName(*wallet.mode);
+    } else if (!wallet.unknown_mode.empty()) {
+      object["mode"] = wallet.unknown_mode;
     }
     object["transactions_sent"] = wallet.transactions_sent;
     object["transactions_received"] = wallet.transactions_received;
@@ -771,7 +813,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
                     WalletReport& wallet = wallets[*wallet_index];
                     wallet.wallet_index = *wallet_index;
                     CopyOptionalUint64Field(metric, "node", &wallet.node);
-                    CopyOptionalStringField(metric, "mode", &wallet.mode);
+                    CopyOptionalWalletModeField(metric, "mode", &wallet);
                     wallet.last_metrics = metric;
                   });
 

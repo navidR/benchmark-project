@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "bbp/peer_connectivity_policy.h"
@@ -24,10 +26,48 @@ enum class WalletInitializationStrategy {
   kDriverRpc,
 };
 
+constexpr std::string_view WalletInitializationStrategyName(
+    WalletInitializationStrategy strategy) {
+  switch (strategy) {
+    case WalletInitializationStrategy::kDriverRpc:
+      return "driver_rpc";
+  }
+  return "unknown";
+}
+
+constexpr std::optional<WalletInitializationStrategy>
+WalletInitializationStrategyFromName(std::string_view name) {
+  if (name == "driver_rpc") {
+    return WalletInitializationStrategy::kDriverRpc;
+  }
+  return std::nullopt;
+}
+
 enum class WalletPrivacyMode {
   kPublic,
   kPrivate,
 };
+
+constexpr std::string_view WalletPrivacyModeName(WalletPrivacyMode mode) {
+  switch (mode) {
+    case WalletPrivacyMode::kPublic:
+      return "public";
+    case WalletPrivacyMode::kPrivate:
+      return "private";
+  }
+  return "unknown";
+}
+
+constexpr std::optional<WalletPrivacyMode> WalletPrivacyModeFromName(
+    std::string_view name) {
+  if (name == "public") {
+    return WalletPrivacyMode::kPublic;
+  }
+  if (name == "private") {
+    return WalletPrivacyMode::kPrivate;
+  }
+  return std::nullopt;
+}
 
 struct WalletInitialization {
   WalletInitializationStrategy strategy =
