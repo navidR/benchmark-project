@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 
+#include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/util.h"
 
 namespace bbp {
@@ -26,7 +27,8 @@ constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
 
 struct NodeReport {
   std::uint64_t metric_samples = 0;
-  std::string final_state;
+  std::optional<NodeRuntimeLifecycle> final_state;
+  std::string unknown_final_state;
   boost::json::object last_metrics;
   boost::json::object log_tails;
   std::optional<std::uint64_t> previous_timestamp_ms;
@@ -48,6 +50,39 @@ struct WalletReport {
   boost::json::object last_received_transaction;
   boost::json::object last_metrics;
 };
+
+enum class RunReportStatus {
+  kFinished,
+  kFailed,
+  kIncomplete,
+};
+
+enum class OperatorCommandStatus {
+  kCompleted,
+  kFailed,
+};
+
+std::string_view RunReportStatusName(RunReportStatus status) {
+  switch (status) {
+    case RunReportStatus::kFinished:
+      return "finished";
+    case RunReportStatus::kFailed:
+      return "failed";
+    case RunReportStatus::kIncomplete:
+      return "incomplete";
+  }
+  return "incomplete";
+}
+
+std::string_view OperatorCommandStatusName(OperatorCommandStatus status) {
+  switch (status) {
+    case OperatorCommandStatus::kCompleted:
+      return "completed";
+    case OperatorCommandStatus::kFailed:
+      return "failed";
+  }
+  return "failed";
+}
 
 std::string OptionalStringField(const boost::json::object& object,
                                 std::string_view field) {
@@ -321,8 +356,10 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
     boost::json::object object;
     object["node_id"] = node_id;
     object["metric_samples"] = node.metric_samples;
-    if (!node.final_state.empty()) {
-      object["final_state"] = node.final_state;
+    if (node.final_state) {
+      object["final_state"] = NodeRuntimeLifecycleName(*node.final_state);
+    } else if (!node.unknown_final_state.empty()) {
+      object["final_state"] = node.unknown_final_state;
     }
     object["last_metrics"] = node.last_metrics;
     if (!node.log_tails.empty()) {
@@ -331,6 +368,18 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
     array.push_back(std::move(object));
   }
   return array;
+}
+
+void RememberNodeState(std::string_view state, NodeReport* node) {
+  const std::optional<NodeRuntimeLifecycle> lifecycle =
+      ParseNodeRuntimeLifecycleName(state);
+  if (lifecycle) {
+    node->final_state = *lifecycle;
+    node->unknown_final_state.clear();
+    return;
+  }
+  node->final_state = std::nullopt;
+  node->unknown_final_state = std::string(state);
 }
 
 void CopyOptionalStringField(const boost::json::object& source,
@@ -566,10 +615,10 @@ void ApplyBlockProductionPolicyEvent(const boost::json::object& event,
 }
 
 void AppendOperatorCommandSummary(const boost::json::object& event,
-                                  std::string_view status,
+                                  OperatorCommandStatus status,
                                   boost::json::array* summaries) {
   boost::json::object summary;
-  summary["status"] = status;
+  summary["status"] = OperatorCommandStatusName(status);
   const std::string node_id = OptionalStringField(event, "node_id");
   if (!node_id.empty()) {
     summary["node_id"] = node_id;
@@ -646,7 +695,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           failed_at = OptionalStringField(event, "timestamp");
           failure_detail = ParseEventDetail(event);
         } else if (event_name == "state" && !node_id.empty()) {
-          nodes[node_id].final_state = OptionalStringField(event, "detail");
+          RememberNodeState(OptionalStringField(event, "detail"),
+                            &nodes[node_id]);
         } else if (const std::optional<std::string_view> kind =
                        LogTailKind(event_name);
                    kind && !node_id.empty()) {
@@ -687,10 +737,12 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           RememberWalletTransactionEvent(detail, &wallets);
           AppendEventSummary(event, &wallet_transactions);
         } else if (event_name == "operator_command_completed") {
-          AppendOperatorCommandSummary(event, "completed", &operator_commands);
+          AppendOperatorCommandSummary(event, OperatorCommandStatus::kCompleted,
+                                       &operator_commands);
           ApplyBlockProductionPolicyEvent(event, &report);
         } else if (event_name == "operator_command_failed") {
-          AppendOperatorCommandSummary(event, "failed", &operator_commands);
+          AppendOperatorCommandSummary(event, OperatorCommandStatus::kFailed,
+                                       &operator_commands);
         }
       });
 
@@ -724,8 +776,12 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
                   });
 
   const bool ok = run_started && run_finished && !run_failed;
+  const RunReportStatus status =
+      ok ? RunReportStatus::kFinished
+         : (run_failed ? RunReportStatus::kFailed
+                       : RunReportStatus::kIncomplete);
   report["ok"] = ok;
-  report["status"] = ok ? "finished" : (run_failed ? "failed" : "incomplete");
+  report["status"] = RunReportStatusName(status);
   if (!started_at.empty()) {
     report["started_at"] = started_at;
   }

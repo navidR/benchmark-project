@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string_view>
 
 namespace bbp {
@@ -51,6 +52,50 @@ constexpr std::string_view NodeRuntimeLifecycleName(
       return "Killed";
   }
   return "Unknown";
+}
+
+constexpr std::optional<NodeRuntimeLifecycle> ParseNodeRuntimeLifecycleName(
+    std::string_view name) {
+  if (name == "Preparing") {
+    return NodeRuntimeLifecycle::kPreparing;
+  }
+  if (name == "Starting") {
+    return NodeRuntimeLifecycle::kStarting;
+  }
+  if (name == "NetnsReady") {
+    return NodeRuntimeLifecycle::kNetworkNamespaceReady;
+  }
+  if (name == "CgroupReady") {
+    return NodeRuntimeLifecycle::kCgroupReady;
+  }
+  if (name == "Running") {
+    return NodeRuntimeLifecycle::kRunning;
+  }
+  if (name == "Restarting") {
+    return NodeRuntimeLifecycle::kRestarting;
+  }
+  if (name == "Stopping") {
+    return NodeRuntimeLifecycle::kStopping;
+  }
+  if (name == "Stopped") {
+    return NodeRuntimeLifecycle::kStopped;
+  }
+  if (name == "Cleaning") {
+    return NodeRuntimeLifecycle::kCleaning;
+  }
+  if (name == "Cleaned") {
+    return NodeRuntimeLifecycle::kCleaned;
+  }
+  if (name == "Failed") {
+    return NodeRuntimeLifecycle::kFailed;
+  }
+  if (name == "Killing") {
+    return NodeRuntimeLifecycle::kKilling;
+  }
+  if (name == "Killed") {
+    return NodeRuntimeLifecycle::kKilled;
+  }
+  return std::nullopt;
 }
 
 }  // namespace bbp

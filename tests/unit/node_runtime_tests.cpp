@@ -1,4 +1,5 @@
 #include <boost/test/unit_test.hpp>
+#include <optional>
 
 #include "bbp/simulator/node_runtime.h"
 
@@ -18,13 +19,30 @@ BOOST_AUTO_TEST_CASE(node_runtime_only_collects_chain_metrics_while_running) {
 }
 
 BOOST_AUTO_TEST_CASE(node_runtime_lifecycle_names_match_event_states) {
-  BOOST_TEST(bbp::NodeRuntimeLifecycleName(
-                 bbp::NodeRuntimeLifecycle::kNetworkNamespaceReady) ==
-             "NetnsReady");
-  BOOST_TEST(bbp::NodeRuntimeLifecycleName(
-                 bbp::NodeRuntimeLifecycle::kRunning) == "Running");
-  BOOST_TEST(bbp::NodeRuntimeLifecycleName(
-                 bbp::NodeRuntimeLifecycle::kFailed) == "Failed");
+  constexpr bbp::NodeRuntimeLifecycle kStates[] = {
+      bbp::NodeRuntimeLifecycle::kPreparing,
+      bbp::NodeRuntimeLifecycle::kStarting,
+      bbp::NodeRuntimeLifecycle::kNetworkNamespaceReady,
+      bbp::NodeRuntimeLifecycle::kCgroupReady,
+      bbp::NodeRuntimeLifecycle::kRunning,
+      bbp::NodeRuntimeLifecycle::kRestarting,
+      bbp::NodeRuntimeLifecycle::kStopping,
+      bbp::NodeRuntimeLifecycle::kStopped,
+      bbp::NodeRuntimeLifecycle::kCleaning,
+      bbp::NodeRuntimeLifecycle::kCleaned,
+      bbp::NodeRuntimeLifecycle::kFailed,
+      bbp::NodeRuntimeLifecycle::kKilling,
+      bbp::NodeRuntimeLifecycle::kKilled,
+  };
+
+  for (const bbp::NodeRuntimeLifecycle state : kStates) {
+    const std::optional<bbp::NodeRuntimeLifecycle> parsed =
+        bbp::ParseNodeRuntimeLifecycleName(
+            bbp::NodeRuntimeLifecycleName(state));
+    BOOST_REQUIRE(parsed);
+    BOOST_CHECK(*parsed == state);
+  }
+  BOOST_TEST(!bbp::ParseNodeRuntimeLifecycleName("UnknownState"));
 }
 
 BOOST_AUTO_TEST_CASE(node_runtime_counts_generated_blocks_and_transactions) {
