@@ -1,0 +1,73 @@
+#pragma once
+
+#include <optional>
+#include <string_view>
+
+namespace bbp {
+
+enum class SimulationEventKind {
+  kState,
+  kStdoutTail,
+  kStderrTail,
+  kDaemonLogTail,
+  kNetworkConditionVerified,
+  kNetworkReady,
+  kProcessStarted,
+  kProcessExitedBeforeRpcReady,
+  kRpcReady,
+  kStartupPeerConnected,
+  kWalletAddressRequested,
+  kWalletAddressCreated,
+  kResourceLimitsUpdated,
+  kResourcePressureStarted,
+  kResourcePressureRestoredAfterError,
+  kResourcePressureFinished,
+  kPeerConnected,
+  kPeerDisconnected,
+  kRawTransactionSubmitted,
+  kWalletTransactionSubmitted,
+  kNetworkConditionUpdated,
+  kNetworkBlockApplied,
+  kNetworkBlockRemoved,
+  kNetworkPartitionApplied,
+  kNetworkPartitionHealed,
+  kRestartRequested,
+  kSigterm,
+  kProcessRestarted,
+  kCgroupFrozen,
+  kCgroupThawed,
+  kRpcStop,
+  kRpcStopSkipped,
+  kCgroupRemoveFailed,
+  kNetworkRemoved,
+  kRunCgroupRemoveFailed,
+  kRunStarted,
+  kRunFailed,
+  kRunCancelled,
+  kRunFinished,
+  kScheduledBlockProduced,
+  kScheduledBlockFailed,
+  kPeerPolicyConnected,
+  kPeerPolicyDisconnected,
+  kPeerPolicyEnforcementFailed,
+  kOperatorCommandStarted,
+  kProcessKillRequested,
+  kProcessKilled,
+  kOperatorCommandCompleted,
+  kOperatorCommandFailed,
+  kMetricsNodeUnavailable,
+  kWalletMetricsUnavailable,
+  kMetricsSample,
+  kGeneratedBlocks,
+  kHeightReached,
+  kHeightWaitReached,
+  kPeerCountReached,
+  kNodeRestarted,
+  kNodeFreezeCompleted,
+};
+
+std::string_view SimulationEventKindName(SimulationEventKind kind);
+std::optional<SimulationEventKind> SimulationEventKindFromName(
+    std::string_view name);
+
+}  // namespace bbp

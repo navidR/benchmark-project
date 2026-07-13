@@ -1,0 +1,74 @@
+#include <boost/test/unit_test.hpp>
+
+#include "bbp/simulation_event_kind.h"
+
+BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
+  constexpr bbp::SimulationEventKind kKinds[] = {
+      bbp::SimulationEventKind::kState,
+      bbp::SimulationEventKind::kStdoutTail,
+      bbp::SimulationEventKind::kStderrTail,
+      bbp::SimulationEventKind::kDaemonLogTail,
+      bbp::SimulationEventKind::kNetworkConditionVerified,
+      bbp::SimulationEventKind::kNetworkReady,
+      bbp::SimulationEventKind::kProcessStarted,
+      bbp::SimulationEventKind::kProcessExitedBeforeRpcReady,
+      bbp::SimulationEventKind::kRpcReady,
+      bbp::SimulationEventKind::kStartupPeerConnected,
+      bbp::SimulationEventKind::kWalletAddressRequested,
+      bbp::SimulationEventKind::kWalletAddressCreated,
+      bbp::SimulationEventKind::kResourceLimitsUpdated,
+      bbp::SimulationEventKind::kResourcePressureStarted,
+      bbp::SimulationEventKind::kResourcePressureRestoredAfterError,
+      bbp::SimulationEventKind::kResourcePressureFinished,
+      bbp::SimulationEventKind::kPeerConnected,
+      bbp::SimulationEventKind::kPeerDisconnected,
+      bbp::SimulationEventKind::kRawTransactionSubmitted,
+      bbp::SimulationEventKind::kWalletTransactionSubmitted,
+      bbp::SimulationEventKind::kNetworkConditionUpdated,
+      bbp::SimulationEventKind::kNetworkBlockApplied,
+      bbp::SimulationEventKind::kNetworkBlockRemoved,
+      bbp::SimulationEventKind::kNetworkPartitionApplied,
+      bbp::SimulationEventKind::kNetworkPartitionHealed,
+      bbp::SimulationEventKind::kRestartRequested,
+      bbp::SimulationEventKind::kSigterm,
+      bbp::SimulationEventKind::kProcessRestarted,
+      bbp::SimulationEventKind::kCgroupFrozen,
+      bbp::SimulationEventKind::kCgroupThawed,
+      bbp::SimulationEventKind::kRpcStop,
+      bbp::SimulationEventKind::kRpcStopSkipped,
+      bbp::SimulationEventKind::kCgroupRemoveFailed,
+      bbp::SimulationEventKind::kNetworkRemoved,
+      bbp::SimulationEventKind::kRunCgroupRemoveFailed,
+      bbp::SimulationEventKind::kRunStarted,
+      bbp::SimulationEventKind::kRunFailed,
+      bbp::SimulationEventKind::kRunCancelled,
+      bbp::SimulationEventKind::kRunFinished,
+      bbp::SimulationEventKind::kScheduledBlockProduced,
+      bbp::SimulationEventKind::kScheduledBlockFailed,
+      bbp::SimulationEventKind::kPeerPolicyConnected,
+      bbp::SimulationEventKind::kPeerPolicyDisconnected,
+      bbp::SimulationEventKind::kPeerPolicyEnforcementFailed,
+      bbp::SimulationEventKind::kOperatorCommandStarted,
+      bbp::SimulationEventKind::kProcessKillRequested,
+      bbp::SimulationEventKind::kProcessKilled,
+      bbp::SimulationEventKind::kOperatorCommandCompleted,
+      bbp::SimulationEventKind::kOperatorCommandFailed,
+      bbp::SimulationEventKind::kMetricsNodeUnavailable,
+      bbp::SimulationEventKind::kWalletMetricsUnavailable,
+      bbp::SimulationEventKind::kMetricsSample,
+      bbp::SimulationEventKind::kGeneratedBlocks,
+      bbp::SimulationEventKind::kHeightReached,
+      bbp::SimulationEventKind::kHeightWaitReached,
+      bbp::SimulationEventKind::kPeerCountReached,
+      bbp::SimulationEventKind::kNodeRestarted,
+      bbp::SimulationEventKind::kNodeFreezeCompleted,
+  };
+
+  for (const bbp::SimulationEventKind kind : kKinds) {
+    const std::optional<bbp::SimulationEventKind> parsed =
+        bbp::SimulationEventKindFromName(bbp::SimulationEventKindName(kind));
+    BOOST_REQUIRE(parsed);
+    BOOST_CHECK(*parsed == kind);
+  }
+  BOOST_TEST(!bbp::SimulationEventKindFromName("unknown_event"));
+}

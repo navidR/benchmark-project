@@ -17,6 +17,7 @@
 
 #include "bbp/operator_command_status.h"
 #include "bbp/simulation_command.h"
+#include "bbp/simulation_event_kind.h"
 #include "bbp/simulation_registry.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/util.h"
@@ -526,17 +527,17 @@ boost::json::array WalletsJson(
   return array;
 }
 
-std::optional<std::string_view> LogTailKind(std::string_view event_name) {
-  if (event_name == "stdout_tail") {
-    return "stdout";
+std::optional<std::string_view> LogTailKind(SimulationEventKind event_kind) {
+  switch (event_kind) {
+    case SimulationEventKind::kStdoutTail:
+      return "stdout";
+    case SimulationEventKind::kStderrTail:
+      return "stderr";
+    case SimulationEventKind::kDaemonLogTail:
+      return "daemon_log";
+    default:
+      return std::nullopt;
   }
-  if (event_name == "stderr_tail") {
-    return "stderr";
-  }
-  if (event_name == "daemon_log_tail") {
-    return "daemon_log";
-  }
-  return std::nullopt;
 }
 
 void RememberLogTail(boost::json::value detail, std::string_view kind,
@@ -715,65 +716,102 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
         const std::string event_name = OptionalStringField(event, "event");
         const std::string node_id = OptionalStringField(event, "node_id");
         ++event_counts[event_name];
-        if (event_name == "run_started") {
-          run_started = true;
-          started_at = OptionalStringField(event, "timestamp");
-        } else if (event_name == "run_finished") {
-          run_finished = true;
-          finished_at = OptionalStringField(event, "timestamp");
-        } else if (event_name == "run_failed") {
-          run_failed = true;
-          failed_at = OptionalStringField(event, "timestamp");
-          failure_detail = ParseEventDetail(event);
-        } else if (event_name == "state" && !node_id.empty()) {
-          RememberNodeState(OptionalStringField(event, "detail"),
-                            &nodes[node_id]);
-        } else if (const std::optional<std::string_view> kind =
-                       LogTailKind(event_name);
-                   kind && !node_id.empty()) {
-          RememberLogTail(ParseEventDetail(event), *kind,
-                          &nodes[node_id].log_tails);
-        } else if (event_name == "generated_blocks") {
-          AppendEventSummary(event, &generated_blocks);
-        } else if (event_name == "scheduled_block_produced") {
-          ++scheduled_block_count;
-          AppendScheduledBlockSummary(event, &scheduled_blocks);
-        } else if (event_name == "height_reached") {
-          AppendEventSummary(event, &height_reached);
-        } else if (event_name == "height_wait_reached") {
-          AppendEventSummary(event, &height_waits);
-        } else if (event_name == "peer_count_reached") {
-          AppendEventSummary(event, &peer_waits);
-        } else if (event_name == "peer_connected") {
-          AppendEventSummary(event, &peer_connects);
-        } else if (event_name == "peer_disconnected") {
-          AppendEventSummary(event, &peer_disconnects);
-        } else if (event_name == "raw_transaction_submitted") {
-          AppendEventSummary(event, &raw_transactions);
-        } else if (event_name == "node_restarted") {
-          AppendEventSummary(event, &node_restarts);
-        } else if (event_name == "node_freeze_completed") {
-          AppendEventSummary(event, &node_freezes);
-        } else if (event_name == "resource_limits_updated") {
-          AppendEventSummary(event, &resource_updates);
-        } else if (event_name == "network_partition_applied") {
-          AppendEventSummary(event, &network_partitions);
-        } else if (event_name == "network_partition_healed") {
-          AppendEventSummary(event, &network_partition_heals);
-        } else if (event_name == "wallet_address_requested" ||
-                   event_name == "wallet_address_created") {
-          RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
-        } else if (event_name == "wallet_transaction_submitted") {
-          boost::json::value detail = ParseEventDetail(event);
-          RememberWalletTransactionEvent(detail, &wallets);
-          AppendEventSummary(event, &wallet_transactions);
-        } else if (event_name == "operator_command_completed") {
-          AppendOperatorCommandSummary(event, OperatorCommandStatus::kCompleted,
-                                       &operator_commands);
-          ApplyBlockProductionPolicyEvent(event, &report);
-        } else if (event_name == "operator_command_failed") {
-          AppendOperatorCommandSummary(event, OperatorCommandStatus::kFailed,
-                                       &operator_commands);
+        const std::optional<SimulationEventKind> event_kind =
+            SimulationEventKindFromName(event_name);
+        if (!event_kind) {
+          return;
+        }
+        switch (*event_kind) {
+          case SimulationEventKind::kRunStarted:
+            run_started = true;
+            started_at = OptionalStringField(event, "timestamp");
+            break;
+          case SimulationEventKind::kRunFinished:
+            run_finished = true;
+            finished_at = OptionalStringField(event, "timestamp");
+            break;
+          case SimulationEventKind::kRunFailed:
+            run_failed = true;
+            failed_at = OptionalStringField(event, "timestamp");
+            failure_detail = ParseEventDetail(event);
+            break;
+          case SimulationEventKind::kState:
+            if (!node_id.empty()) {
+              RememberNodeState(OptionalStringField(event, "detail"),
+                                &nodes[node_id]);
+            }
+            break;
+          case SimulationEventKind::kStdoutTail:
+          case SimulationEventKind::kStderrTail:
+          case SimulationEventKind::kDaemonLogTail:
+            if (!node_id.empty()) {
+              const std::optional<std::string_view> log_kind =
+                  LogTailKind(*event_kind);
+              RememberLogTail(ParseEventDetail(event), *log_kind,
+                              &nodes[node_id].log_tails);
+            }
+            break;
+          case SimulationEventKind::kGeneratedBlocks:
+            AppendEventSummary(event, &generated_blocks);
+            break;
+          case SimulationEventKind::kScheduledBlockProduced:
+            ++scheduled_block_count;
+            AppendScheduledBlockSummary(event, &scheduled_blocks);
+            break;
+          case SimulationEventKind::kHeightReached:
+            AppendEventSummary(event, &height_reached);
+            break;
+          case SimulationEventKind::kHeightWaitReached:
+            AppendEventSummary(event, &height_waits);
+            break;
+          case SimulationEventKind::kPeerCountReached:
+            AppendEventSummary(event, &peer_waits);
+            break;
+          case SimulationEventKind::kPeerConnected:
+            AppendEventSummary(event, &peer_connects);
+            break;
+          case SimulationEventKind::kPeerDisconnected:
+            AppendEventSummary(event, &peer_disconnects);
+            break;
+          case SimulationEventKind::kRawTransactionSubmitted:
+            AppendEventSummary(event, &raw_transactions);
+            break;
+          case SimulationEventKind::kNodeRestarted:
+            AppendEventSummary(event, &node_restarts);
+            break;
+          case SimulationEventKind::kNodeFreezeCompleted:
+            AppendEventSummary(event, &node_freezes);
+            break;
+          case SimulationEventKind::kResourceLimitsUpdated:
+            AppendEventSummary(event, &resource_updates);
+            break;
+          case SimulationEventKind::kNetworkPartitionApplied:
+            AppendEventSummary(event, &network_partitions);
+            break;
+          case SimulationEventKind::kNetworkPartitionHealed:
+            AppendEventSummary(event, &network_partition_heals);
+            break;
+          case SimulationEventKind::kWalletAddressRequested:
+          case SimulationEventKind::kWalletAddressCreated:
+            RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
+            break;
+          case SimulationEventKind::kWalletTransactionSubmitted: {
+            boost::json::value detail = ParseEventDetail(event);
+            RememberWalletTransactionEvent(detail, &wallets);
+            AppendEventSummary(event, &wallet_transactions);
+            break;
+          }
+          case SimulationEventKind::kOperatorCommandCompleted:
+            AppendOperatorCommandSummary(
+                event, OperatorCommandStatus::kCompleted, &operator_commands);
+            ApplyBlockProductionPolicyEvent(event, &report);
+            break;
+          case SimulationEventKind::kOperatorCommandFailed:
+            AppendOperatorCommandSummary(event, OperatorCommandStatus::kFailed,
+                                         &operator_commands);
+            break;
+          default:
+            break;
         }
       });
 

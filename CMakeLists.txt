@@ -247,6 +247,7 @@ add_executable(bbp
   src/simulation_command.cpp
   src/simulation_command_processor.cpp
   src/simulation_command_queue.cpp
+  src/simulation_event_kind.cpp
   src/simulation_registry.cpp
   src/simulation_network_address_plan.cpp
   src/simulator_app.cpp
@@ -308,6 +309,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_command_processor_tests.cpp
     tests/unit/simulation_command_queue_tests.cpp
     tests/unit/simulation_command_tests.cpp
+    tests/unit/simulation_event_kind_tests.cpp
     tests/unit/simulation_registry_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
@@ -319,6 +321,7 @@ if(BUILD_TESTING)
     src/block_production_policy.cpp
     src/default_peer_topology.cpp
     src/simulation_command.cpp
+    src/simulation_event_kind.cpp
     src/drivers/chain_driver.cpp
     src/drivers/chain_driver_registry.cpp
     src/drivers/firo_driver.cpp
