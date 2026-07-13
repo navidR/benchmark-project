@@ -1,12 +1,31 @@
 #pragma once
 
-#include <cstdint>
-#include <string>
-#include <vector>
-
 #include <sys/types.h>
 
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
 namespace bbp {
+
+enum class QdiscKind {
+  kUnknown,
+  kPfifo,
+  kNetem,
+  kTbf,
+  kClsact,
+  kTbfNetem,
+};
+
+std::string_view QdiscKindName(QdiscKind kind);
+
+enum class TcFilterKind {
+  kUnknown,
+  kFlower,
+};
+
+std::string_view TcFilterKindName(TcFilterKind kind);
 
 struct LinkInfo {
   int index = 0;
@@ -45,7 +64,8 @@ struct RouteInfo {
 struct QdiscInfo {
   int if_index = 0;
   std::string if_name;
-  std::string kind;
+  QdiscKind kind = QdiscKind::kUnknown;
+  std::string kernel_kind;
   std::uint32_t handle = 0;
   std::uint32_t parent = 0;
   std::uint32_t info = 0;
@@ -75,7 +95,8 @@ struct QdiscInfo {
 struct TcFilterInfo {
   int if_index = 0;
   std::string if_name;
-  std::string kind;
+  TcFilterKind kind = TcFilterKind::kUnknown;
+  std::string kernel_kind;
   std::uint32_t handle = 0;
   std::uint32_t parent = 0;
   std::uint32_t priority = 0;
@@ -296,8 +317,7 @@ void DeleteIpv4Address(const std::string& if_name, const std::string& address,
 void AddIpv4Route(const std::string& if_name, const std::string& destination,
                   std::uint8_t prefix_len, const std::string& gateway = "");
 void DeleteIpv4Route(const std::string& if_name, const std::string& destination,
-                     std::uint8_t prefix_len,
-                     const std::string& gateway = "");
+                     std::uint8_t prefix_len, const std::string& gateway = "");
 void ReplaceRootPfifoQdisc(const std::string& if_name,
                            std::uint32_t limit_packets);
 void ReplaceRootNetemQdisc(const std::string& if_name,

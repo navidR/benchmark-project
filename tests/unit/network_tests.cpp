@@ -1,13 +1,13 @@
-#include "bbp/network.h"
-
-#include <algorithm>
-#include <string>
-#include <vector>
-
-#include <boost/test/unit_test.hpp>
 #include <linux/if_ether.h>
 #include <linux/pkt_sched.h>
 #include <netinet/in.h>
+
+#include <algorithm>
+#include <boost/test/unit_test.hpp>
+#include <string>
+#include <vector>
+
+#include "bbp/network.h"
 
 BOOST_AUTO_TEST_CASE(rtnetlink_lists_loopback_with_libmnl) {
   const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
@@ -38,12 +38,10 @@ BOOST_AUTO_TEST_CASE(rtnetlink_lists_ipv4_routes_with_libmnl) {
   const std::vector<bbp::RouteInfo> routes = bbp::ListIpv4Routes();
 
   BOOST_TEST(!routes.empty());
-  const auto valid_route =
-      std::find_if(routes.begin(), routes.end(),
-                   [](const bbp::RouteInfo& route) {
-                     return !route.destination.empty() &&
-                            route.prefix_len <= 32U;
-                   });
+  const auto valid_route = std::find_if(
+      routes.begin(), routes.end(), [](const bbp::RouteInfo& route) {
+        return !route.destination.empty() && route.prefix_len <= 32U;
+      });
   BOOST_REQUIRE(valid_route != routes.end());
 }
 
@@ -51,11 +49,10 @@ BOOST_AUTO_TEST_CASE(rtnetlink_lists_qdiscs_with_libmnl) {
   const std::vector<bbp::QdiscInfo> qdiscs = bbp::ListQdiscs();
 
   BOOST_TEST(!qdiscs.empty());
-  const auto parsed_qdisc =
-      std::find_if(qdiscs.begin(), qdiscs.end(),
-                   [](const bbp::QdiscInfo& qdisc) {
-                     return qdisc.if_index > 0 && !qdisc.kind.empty();
-                   });
+  const auto parsed_qdisc = std::find_if(
+      qdiscs.begin(), qdiscs.end(), [](const bbp::QdiscInfo& qdisc) {
+        return qdisc.if_index > 0 && !qdisc.kernel_kind.empty();
+      });
   BOOST_REQUIRE(parsed_qdisc != qdiscs.end());
 }
 
@@ -72,7 +69,8 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_matches_combined_tbf_netem_condition) {
 
   bbp::QdiscInfo tbf;
   tbf.if_name = "veth0";
-  tbf.kind = "tbf";
+  tbf.kind = bbp::QdiscKind::kTbf;
+  tbf.kernel_kind = "tbf";
   tbf.handle = TC_H_MAKE(1U << 16, 0U);
   tbf.parent = TC_H_ROOT;
   tbf.has_tbf_options = true;
@@ -81,7 +79,8 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_matches_combined_tbf_netem_condition) {
 
   bbp::QdiscInfo netem;
   netem.if_name = "veth0";
-  netem.kind = "netem";
+  netem.kind = bbp::QdiscKind::kNetem;
+  netem.kernel_kind = "netem";
   netem.handle = TC_H_MAKE(2U << 16, 0U);
   netem.parent = TC_H_MAKE(1U << 16, 1U);
   netem.has_netem_options = true;
@@ -96,9 +95,9 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_matches_combined_tbf_netem_condition) {
   const std::vector<bbp::QdiscInfo> qdiscs = {tbf, netem};
   bbp::QdiscInfo summary;
 
-  BOOST_TEST(bbp::QdiscsMatchNetworkCondition(qdiscs, "veth0", condition,
-                                               &summary));
-  BOOST_TEST(summary.kind == "tbf+netem");
+  BOOST_TEST(
+      bbp::QdiscsMatchNetworkCondition(qdiscs, "veth0", condition, &summary));
+  BOOST_CHECK(summary.kind == bbp::QdiscKind::kTbfNetem);
   BOOST_TEST(summary.has_tbf_options);
   BOOST_TEST(summary.has_netem_options);
   BOOST_TEST(summary.tbf_rate_bytes_per_sec == 2500000U);
@@ -113,7 +112,8 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_rejects_missing_child_netem) {
 
   bbp::QdiscInfo tbf;
   tbf.if_name = "veth0";
-  tbf.kind = "tbf";
+  tbf.kind = bbp::QdiscKind::kTbf;
+  tbf.kernel_kind = "tbf";
   tbf.handle = TC_H_MAKE(1U << 16, 0U);
   tbf.parent = TC_H_ROOT;
   tbf.has_tbf_options = true;
@@ -121,14 +121,15 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_rejects_missing_child_netem) {
   tbf.tbf_limit_bytes = 250000;
 
   bbp::QdiscInfo summary;
-  BOOST_TEST(!bbp::QdiscsMatchNetworkCondition({tbf}, "veth0", condition,
-                                                &summary));
+  BOOST_TEST(
+      !bbp::QdiscsMatchNetworkCondition({tbf}, "veth0", condition, &summary));
 }
 
 BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_egress_ipv4_tcp_drop) {
   bbp::TcFilterInfo filter;
   filter.if_name = "veth0";
-  filter.kind = "flower";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.kernel_kind = "flower";
   filter.handle = 1001;
   filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
   filter.protocol = ETH_P_IP;
@@ -150,7 +151,8 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_egress_ipv4_tcp_drop) {
 BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_source_aware_tcp_drop) {
   bbp::TcFilterInfo filter;
   filter.if_name = "veth0";
-  filter.kind = "flower";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.kernel_kind = "flower";
   filter.handle = 1001;
   filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
   filter.protocol = ETH_P_IP;
@@ -176,7 +178,8 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_source_aware_tcp_drop) {
 BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_source_filter_for_dst_only) {
   bbp::TcFilterInfo filter;
   filter.if_name = "veth0";
-  filter.kind = "flower";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.kernel_kind = "flower";
   filter.handle = 1001;
   filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
   filter.protocol = ETH_P_IP;
@@ -200,7 +203,8 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_source_filter_for_dst_only) {
 BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_wrong_port) {
   bbp::TcFilterInfo filter;
   filter.if_name = "veth0";
-  filter.kind = "flower";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.kernel_kind = "flower";
   filter.handle = 1001;
   filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
   filter.protocol = ETH_P_IP;

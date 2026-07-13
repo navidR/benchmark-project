@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <libmnl/libmnl.h>
 #include <linux/gen_stats.h>
 #include <linux/if_ether.h>
 #include <linux/if_link.h>
@@ -20,8 +21,8 @@
 
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <cctype>
+#include <cerrno>
 #include <cstddef>
 #include <cstring>
 #include <exception>
@@ -31,14 +32,41 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
-#include <libmnl/libmnl.h>
-
 namespace bbp {
+
+std::string_view QdiscKindName(QdiscKind kind) {
+  switch (kind) {
+    case QdiscKind::kUnknown:
+      return "unknown";
+    case QdiscKind::kPfifo:
+      return "pfifo";
+    case QdiscKind::kNetem:
+      return "netem";
+    case QdiscKind::kTbf:
+      return "tbf";
+    case QdiscKind::kClsact:
+      return "clsact";
+    case QdiscKind::kTbfNetem:
+      return "tbf+netem";
+  }
+  return "unknown";
+}
+
+std::string_view TcFilterKindName(TcFilterKind kind) {
+  switch (kind) {
+    case TcFilterKind::kUnknown:
+      return "unknown";
+    case TcFilterKind::kFlower:
+      return "flower";
+  }
+  return "unknown";
+}
+
 namespace {
 
 constexpr std::uint32_t kRootQdiscHandle = TC_H_MAKE(1U << 16, 0U);
@@ -50,6 +78,29 @@ constexpr std::uint32_t kClsactEgressParent =
 constexpr std::uint32_t kClsactIngressParent =
     TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS);
 constexpr std::uint32_t kDropFilterPriority = 10U;
+
+QdiscKind ParseQdiscKind(std::string_view kind) {
+  if (kind == "pfifo") {
+    return QdiscKind::kPfifo;
+  }
+  if (kind == "netem") {
+    return QdiscKind::kNetem;
+  }
+  if (kind == "tbf") {
+    return QdiscKind::kTbf;
+  }
+  if (kind == "clsact") {
+    return QdiscKind::kClsact;
+  }
+  return QdiscKind::kUnknown;
+}
+
+TcFilterKind ParseTcFilterKind(std::string_view kind) {
+  if (kind == "flower") {
+    return TcFilterKind::kFlower;
+  }
+  return TcFilterKind::kUnknown;
+}
 
 class UniqueFd {
  public:
@@ -242,8 +293,7 @@ bool HasIpv4Address(const std::vector<AddressInfo>& addresses,
 }
 
 bool HasIpv4Route(const std::vector<RouteInfo>& routes,
-                  const std::string& oif_name,
-                  const std::string& destination,
+                  const std::string& oif_name, const std::string& destination,
                   std::uint8_t prefix_len) {
   for (const RouteInfo& route : routes) {
     if (route.oif_name == oif_name && route.destination == destination &&
@@ -257,7 +307,7 @@ bool HasIpv4Route(const std::vector<RouteInfo>& routes,
 bool HasQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
                           const std::string& if_name) {
   for (const QdiscInfo& qdisc : qdiscs) {
-    if (qdisc.if_name == if_name && !qdisc.kind.empty()) {
+    if (qdisc.if_name == if_name && !qdisc.kernel_kind.empty()) {
       return true;
     }
   }
@@ -265,8 +315,7 @@ bool HasQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
 }
 
 bool HasQdiscKindForInterface(const std::vector<QdiscInfo>& qdiscs,
-                              const std::string& if_name,
-                              const std::string& kind) {
+                              const std::string& if_name, QdiscKind kind) {
   for (const QdiscInfo& qdisc : qdiscs) {
     if (qdisc.if_name == if_name && qdisc.kind == kind) {
       return true;
@@ -277,7 +326,7 @@ bool HasQdiscKindForInterface(const std::vector<QdiscInfo>& qdiscs,
 
 const QdiscInfo* FindQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
                                        const std::string& if_name,
-                                       const std::string& kind) {
+                                       QdiscKind kind) {
   for (const QdiscInfo& qdisc : qdiscs) {
     if (qdisc.if_name == if_name && qdisc.kind == kind) {
       return &qdisc;
@@ -288,7 +337,7 @@ const QdiscInfo* FindQdiscForInterface(const std::vector<QdiscInfo>& qdiscs,
 
 const QdiscInfo* FindQdiscForInterfaceParent(
     const std::vector<QdiscInfo>& qdiscs, const std::string& if_name,
-    const std::string& kind, std::uint32_t parent) {
+    QdiscKind kind, std::uint32_t parent) {
   for (const QdiscInfo& qdisc : qdiscs) {
     if (qdisc.if_name == if_name && qdisc.kind == kind &&
         qdisc.parent == parent) {
@@ -314,10 +363,12 @@ std::string DescribeTcFilters(const std::vector<TcFilterInfo>& filters) {
   std::ostringstream output;
   output << "count=" << filters.size();
   for (const TcFilterInfo& filter : filters) {
-    output << " [if=" << filter.if_name << " kind=" << filter.kind
+    const std::string_view kind = filter.kernel_kind.empty()
+                                      ? TcFilterKindName(filter.kind)
+                                      : std::string_view(filter.kernel_kind);
+    output << " [if=" << filter.if_name << " kind=" << kind
            << " handle=" << filter.handle << " parent=" << filter.parent
-           << " priority=" << filter.priority
-           << " protocol=" << filter.protocol
+           << " priority=" << filter.priority << " protocol=" << filter.protocol
            << " egress=" << (filter.egress ? "true" : "false")
            << " eth=" << (filter.has_eth_type ? filter.eth_type : 0U)
            << " ip_proto="
@@ -328,8 +379,7 @@ std::string DescribeTcFilters(const std::vector<TcFilterInfo>& filters) {
            << " ipv4_dst="
            << (filter.has_ipv4_dst ? filter.ipv4_dst : std::string(""))
            << " tcp_dst=" << (filter.has_tcp_dst ? filter.tcp_dst : 0U)
-           << " drop=" << (filter.has_drop_action ? "true" : "false")
-           << "]";
+           << " drop=" << (filter.has_drop_action ? "true" : "false") << "]";
   }
   return output.str();
 }
@@ -386,8 +436,7 @@ std::uint32_t TbfBurstBytes(const NetworkCondition& condition) {
 
 std::uint32_t TbfLimitBytes(const NetworkCondition& condition) {
   constexpr std::uint64_t kMinimumLimitBytes = 64ULL * 1024ULL;
-  const std::uint64_t rate_limit =
-      TbfRateBytesPerSecond(condition) / 10ULL;
+  const std::uint64_t rate_limit = TbfRateBytesPerSecond(condition) / 10ULL;
   const std::uint64_t burst_limit =
       static_cast<std::uint64_t>(TbfBurstBytes(condition)) * 4ULL;
   std::uint64_t limit = kMinimumLimitBytes;
@@ -402,14 +451,14 @@ std::uint32_t TbfLimitBytes(const NetworkCondition& condition) {
 
 bool QdiscMatchesTbfCondition(const QdiscInfo& qdisc,
                               const NetworkCondition& condition) {
-  return qdisc.kind == "tbf" && qdisc.has_tbf_options &&
+  return qdisc.kind == QdiscKind::kTbf && qdisc.has_tbf_options &&
          qdisc.tbf_rate_bytes_per_sec == TbfRateBytesPerSecond(condition) &&
          qdisc.tbf_limit_bytes == TbfLimitBytes(condition);
 }
 
 bool QdiscMatchesNetemCondition(const QdiscInfo& qdisc,
                                 const NetworkCondition& condition) {
-  return qdisc.kind == "netem" && qdisc.has_netem_options &&
+  return qdisc.kind == QdiscKind::kNetem && qdisc.has_netem_options &&
          qdisc.netem_latency_us == condition.delay_ms * 1000U &&
          qdisc.netem_jitter_us == condition.jitter_ms * 1000U &&
          qdisc.netem_loss == NetemProbability(condition.loss_basis_points) &&
@@ -450,10 +499,9 @@ void ValidateNetworkCondition(const NetworkCondition& condition) {
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition) {
   if (HasBandwidthCondition(condition) && HasNetemCondition(condition)) {
-    return qdisc.kind == "tbf+netem" && qdisc.has_tbf_options &&
+    return qdisc.kind == QdiscKind::kTbfNetem && qdisc.has_tbf_options &&
            qdisc.has_netem_options &&
-           qdisc.tbf_rate_bytes_per_sec ==
-               TbfRateBytesPerSecond(condition) &&
+           qdisc.tbf_rate_bytes_per_sec == TbfRateBytesPerSecond(condition) &&
            qdisc.tbf_limit_bytes == TbfLimitBytes(condition) &&
            qdisc.netem_latency_us == condition.delay_ms * 1000U &&
            qdisc.netem_jitter_us == condition.jitter_ms * 1000U &&
@@ -477,10 +525,10 @@ bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
                                  const NetworkCondition& condition,
                                  QdiscInfo* summary) {
   if (HasBandwidthCondition(condition) && HasNetemCondition(condition)) {
-    const QdiscInfo* tbf =
-        FindQdiscForInterfaceParent(qdiscs, if_name, "tbf", TC_H_ROOT);
+    const QdiscInfo* tbf = FindQdiscForInterfaceParent(
+        qdiscs, if_name, QdiscKind::kTbf, TC_H_ROOT);
     const QdiscInfo* netem = FindQdiscForInterfaceParent(
-        qdiscs, if_name, "netem", kTbfChildClassId);
+        qdiscs, if_name, QdiscKind::kNetem, kTbfChildClassId);
     if (tbf == nullptr || netem == nullptr ||
         !QdiscMatchesTbfCondition(*tbf, condition) ||
         !QdiscMatchesNetemCondition(*netem, condition)) {
@@ -488,7 +536,8 @@ bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
     }
     if (summary != nullptr) {
       *summary = *tbf;
-      summary->kind = "tbf+netem";
+      summary->kind = QdiscKind::kTbfNetem;
+      summary->kernel_kind = std::string(QdiscKindName(summary->kind));
       summary->has_netem_options = true;
       summary->netem_latency_us = netem->netem_latency_us;
       summary->netem_jitter_us = netem->netem_jitter_us;
@@ -503,9 +552,11 @@ bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
 
   const QdiscInfo* qdisc = nullptr;
   if (HasBandwidthCondition(condition)) {
-    qdisc = FindQdiscForInterfaceParent(qdiscs, if_name, "tbf", TC_H_ROOT);
+    qdisc = FindQdiscForInterfaceParent(qdiscs, if_name, QdiscKind::kTbf,
+                                        TC_H_ROOT);
   } else {
-    qdisc = FindQdiscForInterfaceParent(qdiscs, if_name, "netem", TC_H_ROOT);
+    qdisc = FindQdiscForInterfaceParent(qdiscs, if_name, QdiscKind::kNetem,
+                                        TC_H_ROOT);
   }
   if (qdisc == nullptr || !QdiscMatchesNetworkCondition(*qdisc, condition)) {
     return false;
@@ -535,12 +586,11 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
       src_address.empty()
           ? !filter.has_ipv4_src
           : (filter.has_ipv4_src && filter.ipv4_src == src_address);
-  return filter.if_name == if_name && filter.kind == "flower" &&
+  return filter.if_name == if_name && filter.kind == TcFilterKind::kFlower &&
          filter.handle == handle && filter.parent == kClsactEgressParent &&
-         filter.egress && filter.protocol == ETH_P_IP &&
-         filter.has_eth_type && filter.eth_type == ETH_P_IP &&
-         filter.has_ip_proto && filter.ip_proto == IPPROTO_TCP &&
-         source_matches &&
+         filter.egress && filter.protocol == ETH_P_IP && filter.has_eth_type &&
+         filter.eth_type == ETH_P_IP && filter.has_ip_proto &&
+         filter.ip_proto == IPPROTO_TCP && source_matches &&
          filter.has_ipv4_dst && filter.ipv4_dst == dst_address &&
          filter.has_tcp_dst && filter.tcp_dst == dst_port &&
          filter.has_drop_action;
@@ -549,8 +599,8 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
 namespace {
 
 template <typename Operation>
-auto ExecuteInNetworkNamespace(int netns_fd, Operation operation)
-    -> decltype(operation()) {
+auto ExecuteInNetworkNamespace(int netns_fd,
+                               Operation operation) -> decltype(operation()) {
   using Result = decltype(operation());
   std::promise<Result> promise;
   std::future<Result> result = promise.get_future();
@@ -581,9 +631,8 @@ void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence) {
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
   const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-  const int status =
-      mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence, port_id,
-                 nullptr, nullptr);
+  const int status = mnl_cb_run(buffer.data(), static_cast<size_t>(received),
+                                sequence, port_id, nullptr, nullptr);
   if (status == MNL_CB_ERROR) {
     throw std::runtime_error(std::string("netlink request failed: ") +
                              std::strerror(errno));
@@ -595,8 +644,7 @@ void PutRawPayload(nlmsghdr* nlh, const void* data, size_t size) {
   std::memcpy(tail, data, size);
   const size_t aligned_size = MNL_ALIGN(size);
   if (aligned_size >
-      static_cast<size_t>(std::numeric_limits<__u32>::max() -
-                          nlh->nlmsg_len)) {
+      static_cast<size_t>(std::numeric_limits<__u32>::max() - nlh->nlmsg_len)) {
     throw std::runtime_error("netlink message payload is too large");
   }
   if (aligned_size > size) {
@@ -676,7 +724,8 @@ UniqueFd StartNetworkNamespaceHelper(pid_t* helper_pid) {
 
   const pid_t pid = fork();
   if (pid < 0) {
-    throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
+    throw std::runtime_error(std::string("fork failed: ") +
+                             std::strerror(errno));
   }
 
   if (pid == 0) {
@@ -755,7 +804,8 @@ int ParseLinkMessage(const nlmsghdr* nlh, void* data) {
     return MNL_CB_OK;
   }
 
-  const auto* message = static_cast<const ifinfomsg*>(mnl_nlmsg_get_payload(nlh));
+  const auto* message =
+      static_cast<const ifinfomsg*>(mnl_nlmsg_get_payload(nlh));
   LinkInfo link;
   link.index = message->ifi_index;
   link.up = (message->ifi_flags & IFF_UP) != 0U;
@@ -771,7 +821,8 @@ struct AddressParseState {
   bool has_address = false;
 };
 
-int StoreIpv4Address(const nlattr* attr, AddressParseState* state, bool prefer) {
+int StoreIpv4Address(const nlattr* attr, AddressParseState* state,
+                     bool prefer) {
   if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0) {
     return MNL_CB_ERROR;
   }
@@ -1043,7 +1094,8 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
       if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
         return MNL_CB_ERROR;
       }
-      qdisc->kind = mnl_attr_get_str(attr);
+      qdisc->kernel_kind = mnl_attr_get_str(attr);
+      qdisc->kind = ParseQdiscKind(qdisc->kernel_kind);
       return MNL_CB_OK;
     case TCA_STATS:
       if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
@@ -1060,16 +1112,16 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
         qdisc->overlimits = stats->overlimits;
         qdisc->qlen = stats->qlen;
         qdisc->backlog = stats->backlog;
-    }
-    return MNL_CB_OK;
+      }
+      return MNL_CB_OK;
     case TCA_OPTIONS: {
-      if (qdisc->kind == "tbf") {
+      if (qdisc->kind == QdiscKind::kTbf) {
         if (mnl_attr_parse_nested(attr, ParseTbfOptionAttr, qdisc) < 0) {
           return MNL_CB_ERROR;
         }
         return MNL_CB_OK;
       }
-      if (qdisc->kind == "netem") {
+      if (qdisc->kind == QdiscKind::kNetem) {
         if (ParseNetemOptions(attr, qdisc) < 0) {
           return MNL_CB_ERROR;
         }
@@ -1165,7 +1217,7 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
       0) {
     return MNL_CB_ERROR;
   }
-  if (qdisc.kind != "netem") {
+  if (qdisc.kind != QdiscKind::kNetem) {
     qdisc.has_netem_options = false;
     qdisc.netem_latency_us = 0;
     qdisc.netem_jitter_us = 0;
@@ -1175,7 +1227,7 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
     qdisc.netem_reorder = 0;
     qdisc.netem_limit_packets = 0;
   }
-  if (qdisc.kind != "tbf") {
+  if (qdisc.kind != QdiscKind::kTbf) {
     qdisc.has_tbf_options = false;
     qdisc.tbf_rate_bytes_per_sec = 0;
     qdisc.tbf_limit_bytes = 0;
@@ -1186,8 +1238,17 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
   return MNL_CB_OK;
 }
 
+enum class ActionKind {
+  kUnknown,
+  kGact,
+};
+
+ActionKind ParseActionKind(std::string_view kind) {
+  return kind == "gact" ? ActionKind::kGact : ActionKind::kUnknown;
+}
+
 struct ActionParseState {
-  std::string kind;
+  ActionKind kind = ActionKind::kUnknown;
   bool drop = false;
 };
 
@@ -1207,8 +1268,7 @@ int ParseGactOptionAttr(const nlattr* attr, void* data) {
     return MNL_CB_ERROR;
   }
 
-  const auto* options =
-      static_cast<const tc_gact*>(mnl_attr_get_payload(attr));
+  const auto* options = static_cast<const tc_gact*>(mnl_attr_get_payload(attr));
   action->drop = options->action == TC_ACT_SHOT;
   return MNL_CB_OK;
 }
@@ -1225,7 +1285,7 @@ int ParseActionEntryAttr(const nlattr* attr, void* data) {
       if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
         return MNL_CB_ERROR;
       }
-      action->kind = mnl_attr_get_str(attr);
+      action->kind = ParseActionKind(mnl_attr_get_str(attr));
       return MNL_CB_OK;
     case TCA_ACT_OPTIONS:
       if (mnl_attr_parse_nested(attr, ParseGactOptionAttr, action) < 0) {
@@ -1243,7 +1303,7 @@ int ParseActionListEntry(const nlattr* attr, void* data) {
   if (mnl_attr_parse_nested(attr, ParseActionEntryAttr, &action) < 0) {
     return MNL_CB_ERROR;
   }
-  if (action.kind == "gact" && action.drop) {
+  if (action.kind == ActionKind::kGact && action.drop) {
     filter->has_drop_action = true;
   }
   return MNL_CB_OK;
@@ -1359,7 +1419,8 @@ int ParseFilterAttr(const nlattr* attr, void* data) {
       if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
         return MNL_CB_ERROR;
       }
-      filter->kind = mnl_attr_get_str(attr);
+      filter->kernel_kind = mnl_attr_get_str(attr);
+      filter->kind = ParseTcFilterKind(filter->kernel_kind);
       return MNL_CB_OK;
     case TCA_OPTIONS:
       if (mnl_attr_parse_nested(attr, ParseFlowerAttr, filter) < 0) {
@@ -1383,8 +1444,8 @@ int ParseFilterMessage(const nlmsghdr* nlh, void* data) {
   filter.handle = message->tcm_handle;
   filter.parent = message->tcm_parent;
   filter.priority = TC_H_MAJ(message->tcm_info) >> 16U;
-  filter.protocol = ntohs(static_cast<std::uint16_t>(
-      TC_H_MIN(message->tcm_info)));
+  filter.protocol =
+      ntohs(static_cast<std::uint16_t>(TC_H_MIN(message->tcm_info)));
   filter.egress = message->tcm_parent == kClsactEgressParent;
   filter.ingress = message->tcm_parent == kClsactIngressParent;
   if (filter.if_index > 0) {
@@ -1608,12 +1669,12 @@ std::vector<QdiscInfo> ListQdiscs() {
 std::vector<TcFilterInfo> ListTcFilters() {
   std::vector<TcFilterInfo> filters;
   const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-  const std::array<std::uint32_t, 2> clsact_parents = {
-      kClsactIngressParent, kClsactEgressParent};
+  const std::array<std::uint32_t, 2> clsact_parents = {kClsactIngressParent,
+                                                       kClsactEgressParent};
 
   for (const LinkInfo& link : ListNetworkLinks()) {
     if (link.index <= 0 ||
-        !HasQdiscKindForInterface(qdiscs, link.name, "clsact")) {
+        !HasQdiscKindForInterface(qdiscs, link.name, QdiscKind::kClsact)) {
       continue;
     }
 
@@ -1655,7 +1716,8 @@ std::vector<TcFilterInfo> ListTcFilters() {
   return filters;
 }
 
-void CreateVethPair(const std::string& host_name, const std::string& peer_name) {
+void CreateVethPair(const std::string& host_name,
+                    const std::string& peer_name) {
   RequireInterfaceName(host_name);
   RequireInterfaceName(peer_name);
 
@@ -2031,8 +2093,7 @@ void ReplaceRootTbfQdisc(const std::string& if_name,
                              std::strerror(errno));
   }
 
-  const std::uint64_t rate_bytes_per_second =
-      TbfRateBytesPerSecond(condition);
+  const std::uint64_t rate_bytes_per_second = TbfRateBytesPerSecond(condition);
   const std::uint32_t burst_bytes = TbfBurstBytes(condition);
   const std::uint32_t limit_bytes = TbfLimitBytes(condition);
 
@@ -2060,8 +2121,7 @@ void ReplaceRootTbfQdisc(const std::string& if_name,
   nlattr* tbf_options = mnl_attr_nest_start(nlh, TCA_OPTIONS);
   mnl_attr_put(nlh, TCA_TBF_PARMS, sizeof(options), &options);
   if (rate_bytes_per_second >
-      static_cast<std::uint64_t>(
-          std::numeric_limits<std::uint32_t>::max())) {
+      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
     mnl_attr_put_u64(nlh, TCA_TBF_RATE64, rate_bytes_per_second);
   }
   mnl_attr_put_u32(nlh, TCA_TBF_BURST, burst_bytes);
@@ -2098,7 +2158,7 @@ void DeleteRootQdisc(const std::string& if_name) {
 
 void EnsureClsactQdisc(const std::string& if_name) {
   RequireInterfaceName(if_name);
-  if (HasQdiscKindForInterface(ListQdiscs(), if_name, "clsact")) {
+  if (HasQdiscKindForInterface(ListQdiscs(), if_name, QdiscKind::kClsact)) {
     return;
   }
   const unsigned int if_index = if_nametoindex(if_name.c_str());
@@ -2188,8 +2248,7 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
   mnl_attr_put_u8(nlh, TCA_FLOWER_KEY_IP_PROTO,
                   static_cast<std::uint8_t>(IPPROTO_TCP));
   if (ipv4_source) {
-    mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_SRC,
-                     ipv4_source->s_addr);
+    mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_SRC, ipv4_source->s_addr);
     mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_SRC_MASK, ipv4_mask);
   }
   mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST, ipv4_address.s_addr);
@@ -2288,8 +2347,7 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
 
     ExecuteInNetworkNamespace(netns_fd, [&config]() {
       SetLinkUp("lo", true);
-      AddIpv4Address(config.peer_name, config.node_address,
-                     config.prefix_len);
+      AddIpv4Address(config.peer_name, config.node_address, config.prefix_len);
       SetLinkUp(config.peer_name, true);
       AddIpv4Route(config.peer_name, "0.0.0.0", 0, config.host_address);
     });
@@ -2306,27 +2364,21 @@ void DeleteNodeVethNetwork(const NodeVethConfig& config) {
 }
 
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd, []() {
-    return ListNetworkLinks();
-  });
+  return ExecuteInNetworkNamespace(netns_fd,
+                                   []() { return ListNetworkLinks(); });
 }
 
 std::vector<AddressInfo> ListIpv4AddressesInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd, []() {
-    return ListIpv4Addresses();
-  });
+  return ExecuteInNetworkNamespace(netns_fd,
+                                   []() { return ListIpv4Addresses(); });
 }
 
 std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd, []() {
-    return ListIpv4Routes();
-  });
+  return ExecuteInNetworkNamespace(netns_fd, []() { return ListIpv4Routes(); });
 }
 
 std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd, []() {
-    return ListQdiscs();
-  });
+  return ExecuteInNetworkNamespace(netns_fd, []() { return ListQdiscs(); });
 }
 
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {
@@ -2395,7 +2447,7 @@ NetworkConditionProbe ProbeNetworkCondition() {
       throw std::runtime_error("netem qdisc options did not match condition");
     }
     if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
-                                 probe.peer_name, "netem")) {
+                                 probe.peer_name, QdiscKind::kNetem)) {
       throw std::runtime_error("netem qdisc remained after delete");
     }
     if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
@@ -2468,13 +2520,13 @@ NetworkConditionProbe ProbeCombinedNetworkCondition() {
       throw std::runtime_error(
           "combined TBF/netem qdisc options did not match condition");
     }
-    if (summary.kind != "tbf+netem") {
+    if (summary.kind != QdiscKind::kTbfNetem) {
       throw std::runtime_error("combined qdisc summary kind was not tbf+netem");
     }
     if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
-                                 probe.peer_name, "tbf") ||
+                                 probe.peer_name, QdiscKind::kTbf) ||
         HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
-                                 probe.peer_name, "netem")) {
+                                 probe.peer_name, QdiscKind::kNetem)) {
       throw std::runtime_error("combined qdisc remained after delete");
     }
     if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
@@ -2535,7 +2587,7 @@ BandwidthLimitProbe ProbeBandwidthLimit() {
         std::move(namespace_state.qdiscs_after_delete);
 
     const QdiscInfo* tbf = FindQdiscForInterface(
-        probe.namespace_qdiscs_after_apply, probe.peer_name, "tbf");
+        probe.namespace_qdiscs_after_apply, probe.peer_name, QdiscKind::kTbf);
     if (tbf == nullptr) {
       throw std::runtime_error("TBF qdisc was not visible after apply");
     }
@@ -2543,7 +2595,7 @@ BandwidthLimitProbe ProbeBandwidthLimit() {
       throw std::runtime_error("TBF qdisc options did not match condition");
     }
     if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
-                                 probe.peer_name, "tbf")) {
+                                 probe.peer_name, QdiscKind::kTbf)) {
       throw std::runtime_error("TBF qdisc remained after delete");
     }
     if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
@@ -2600,7 +2652,7 @@ NetworkConditionUpdateProbe ProbeNetworkConditionUpdate() {
     ReplaceNetworkConditionQdisc(probe.host_name, probe.initial_condition);
     probe.parent_qdiscs_after_initial = ListQdiscs();
     const QdiscInfo* initial = FindQdiscForInterface(
-        probe.parent_qdiscs_after_initial, probe.host_name, "netem");
+        probe.parent_qdiscs_after_initial, probe.host_name, QdiscKind::kNetem);
     if (initial == nullptr ||
         !QdiscMatchesNetworkCondition(*initial, probe.initial_condition)) {
       throw std::runtime_error("initial live netem condition was not visible");
@@ -2609,7 +2661,7 @@ NetworkConditionUpdateProbe ProbeNetworkConditionUpdate() {
     ReplaceNetworkConditionQdisc(probe.host_name, probe.updated_condition);
     probe.parent_qdiscs_after_update = ListQdiscs();
     const QdiscInfo* updated = FindQdiscForInterface(
-        probe.parent_qdiscs_after_update, probe.host_name, "netem");
+        probe.parent_qdiscs_after_update, probe.host_name, QdiscKind::kNetem);
     if (updated == nullptr ||
         !QdiscMatchesNetworkCondition(*updated, probe.updated_condition)) {
       throw std::runtime_error("updated live netem condition was not visible");
@@ -2618,7 +2670,7 @@ NetworkConditionUpdateProbe ProbeNetworkConditionUpdate() {
     DeleteRootQdisc(probe.host_name);
     probe.parent_qdiscs_after_delete = ListQdiscs();
     if (HasQdiscKindForInterface(probe.parent_qdiscs_after_delete,
-                                 probe.host_name, "netem")) {
+                                 probe.host_name, QdiscKind::kNetem)) {
       throw std::runtime_error("live netem condition remained after delete");
     }
   } catch (...) {
@@ -2732,11 +2784,11 @@ QdiscMutationProbe ProbeQdiscMutation() {
         std::move(namespace_state.qdiscs_after_delete);
 
     if (!HasQdiscKindForInterface(probe.namespace_qdiscs_after_replace,
-                                  probe.peer_name, "pfifo")) {
+                                  probe.peer_name, QdiscKind::kPfifo)) {
       throw std::runtime_error("pfifo qdisc was not visible after replace");
     }
     if (HasQdiscKindForInterface(probe.namespace_qdiscs_after_delete,
-                                 probe.peer_name, "pfifo")) {
+                                 probe.peer_name, QdiscKind::kPfifo)) {
       throw std::runtime_error("pfifo qdisc remained after delete");
     }
     if (!HasQdiscForInterface(probe.namespace_qdiscs_after_delete,
@@ -2864,7 +2916,8 @@ RouteProbe ProbeIpv4RouteAssignment() {
     }
     if (!HasIpv4Address(probe.namespace_addresses, probe.peer_name,
                         probe.assigned_address, probe.assigned_prefix_len)) {
-      throw std::runtime_error("IPv4 address was not visible before route probe");
+      throw std::runtime_error(
+          "IPv4 address was not visible before route probe");
     }
     if (!HasIpv4Route(probe.namespace_routes, probe.peer_name,
                       probe.route_destination, probe.route_prefix_len)) {
@@ -2876,7 +2929,8 @@ RouteProbe ProbeIpv4RouteAssignment() {
     }
     if (HasIpv4Address(probe.namespace_addresses_after_delete, probe.peer_name,
                        probe.assigned_address, probe.assigned_prefix_len)) {
-      throw std::runtime_error("IPv4 address remained after route probe cleanup");
+      throw std::runtime_error(
+          "IPv4 address remained after route probe cleanup");
     }
 
     DeleteLink(probe.host_name);
@@ -2936,7 +2990,8 @@ AddressProbe ProbeIpv4AddressAssignment() {
     if (!HasLinkNamed(probe.parent_after_move, probe.host_name) ||
         HasLinkNamed(probe.parent_after_move, probe.peer_name) ||
         !HasLinkNamed(probe.namespace_links_after_address, probe.peer_name)) {
-      throw std::runtime_error("veth peer was not isolated before address probe");
+      throw std::runtime_error(
+          "veth peer was not isolated before address probe");
     }
     if (!HasIpv4Address(probe.namespace_addresses, probe.peer_name,
                         probe.assigned_address, probe.assigned_prefix_len)) {
@@ -2981,12 +3036,14 @@ VethProbe ProbeVethPair() {
     probe.parent_after_create = ListNetworkLinks();
     if (!HasLinkNamed(probe.parent_after_create, probe.host_name) ||
         !HasLinkNamed(probe.parent_after_create, probe.peer_name)) {
-      throw std::runtime_error("created veth pair was not visible in parent netns");
+      throw std::runtime_error(
+          "created veth pair was not visible in parent netns");
     }
 
     MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
     probe.parent_after_move = ListNetworkLinks();
-    probe.namespace_after_move = ListNetworkLinksInNamespace(namespace_fd.get());
+    probe.namespace_after_move =
+        ListNetworkLinksInNamespace(namespace_fd.get());
     if (!HasLinkNamed(probe.parent_after_move, probe.host_name) ||
         HasLinkNamed(probe.parent_after_move, probe.peer_name) ||
         !HasLinkNamed(probe.namespace_after_move, probe.peer_name)) {

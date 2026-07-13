@@ -2550,7 +2550,7 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
     boost::json::object qdisc_json;
     qdisc_json["if_index"] = qdisc.if_index;
     qdisc_json["if_name"] = qdisc.if_name;
-    qdisc_json["kind"] = qdisc.kind;
+    qdisc_json["kind"] = qdisc.kernel_kind;
     qdisc_json["handle"] = qdisc.handle;
     qdisc_json["parent"] = qdisc.parent;
     qdisc_json["info"] = qdisc.info;
@@ -2586,7 +2586,7 @@ boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
     boost::json::object filter_json;
     filter_json["if_index"] = filter.if_index;
     filter_json["if_name"] = filter.if_name;
-    filter_json["kind"] = filter.kind;
+    filter_json["kind"] = filter.kernel_kind;
     filter_json["handle"] = filter.handle;
     filter_json["parent"] = filter.parent;
     filter_json["priority"] = filter.priority;
@@ -2819,7 +2819,7 @@ std::string NetworkConditionVerificationDetail(const NodeVethConfig& config,
   boost::json::object detail;
   detail["host_if"] = config.host_name;
   detail["condition"] = NetworkConditionJson(config.condition);
-  detail["qdisc_kind"] = qdisc.kind;
+  detail["qdisc_kind"] = qdisc.kernel_kind;
   detail["qdisc_handle"] = qdisc.handle;
   detail["qdisc_parent"] = qdisc.parent;
   return boost::json::serialize(detail);
@@ -3318,7 +3318,7 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["network_tx_errors"] = link->tx_errors;
   }
   if (qdisc != nullptr) {
-    object["qdisc_kind"] = qdisc->kind;
+    object["qdisc_kind"] = qdisc->kernel_kind;
     object["qdisc_handle"] = qdisc->handle;
     object["qdisc_parent"] = qdisc->parent;
     object["qdisc_has_stats"] = qdisc->has_stats;
