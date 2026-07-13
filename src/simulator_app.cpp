@@ -3360,8 +3360,9 @@ void WriteEvent(const std::filesystem::path& events_path,
 
 void WriteNodeState(const std::filesystem::path& events_path,
                     const std::string& run_id, const std::string& node_id,
-                    std::string_view state) {
-  WriteEvent(events_path, run_id, node_id, "state", state);
+                    NodeRuntimeLifecycle state) {
+  WriteEvent(events_path, run_id, node_id, "state",
+             NodeRuntimeLifecycleName(state));
 }
 
 std::string GeneratedBlocksDetail(uint32_t workload_index,
@@ -4370,7 +4371,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     NodeRuntime runtime;
     try {
       runtime.config = config;
-      WriteNodeState(events_path, options.run_id, node_id, "Preparing");
+      WriteNodeState(events_path, options.run_id, node_id,
+                     NodeRuntimeLifecycle::kPreparing);
       if (options.isolate_network) {
         runtime.network_namespace = NetworkNamespace::Create();
         runtime.network = MakeNodeVethConfig(options, i);
@@ -4391,7 +4393,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                    "node_ip=" + runtime.network->node_address +
                        " host_if=" + runtime.network->host_name +
                        " peer_if=" + runtime.network->peer_name);
-        WriteNodeState(events_path, options.run_id, node_id, "NetnsReady");
+        WriteNodeState(events_path, options.run_id, node_id,
+                       NodeRuntimeLifecycle::kNetworkNamespaceReady);
       }
 
       runtime.cgroup = Cgroup::Create(options.run_id, node_id);
@@ -4401,13 +4404,15 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       runtime.cgroup->SetCpuMax(runtime.resources.cpu_quota_us,
                                 runtime.resources.cpu_period_us);
       runtime.cgroup->SetPidsMax(runtime.resources.pids_max);
-      WriteNodeState(events_path, options.run_id, node_id, "CgroupReady");
+      WriteNodeState(events_path, options.run_id, node_id,
+                     NodeRuntimeLifecycle::kCgroupReady);
 
       ProcessSpec process = driver.RenderProcess(runtime.config);
       if (runtime.network_namespace) {
         process.network_namespace_fd = runtime.network_namespace->fd();
       }
-      WriteNodeState(events_path, options.run_id, node_id, "Starting");
+      WriteNodeState(events_path, options.run_id, node_id,
+                     NodeRuntimeLifecycle::kStarting);
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
       BBP_LOG(info) << "started " << node_id
                     << " pid=" << runtime.process.pid();
@@ -4415,7 +4420,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                  "pid=" + std::to_string(runtime.process.pid()));
       nodes.push_back(std::move(runtime));
     } catch (...) {
-      WriteNodeState(events_path, options.run_id, node_id, "Failed");
+      WriteNodeState(events_path, options.run_id, node_id,
+                     NodeRuntimeLifecycle::kFailed);
       runtime.process.Kill();
       if (runtime.cgroup) {
         try {
@@ -4446,7 +4452,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     }
     WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
     node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
-    WriteNodeState(events_path, options.run_id, node.config.id, "Running");
+    WriteNodeState(events_path, options.run_id, node.config.id,
+                   NodeRuntimeLifecycle::kRunning);
   }
 
   for (auto& node : nodes) {
@@ -5148,7 +5155,8 @@ void RestartNode(const Options& options,
     throw std::runtime_error("node restart requires a node cgroup");
   }
 
-  WriteNodeState(events_path, options.run_id, node.config.id, "Restarting");
+  WriteNodeState(events_path, options.run_id, node.config.id,
+                 NodeRuntimeLifecycle::kRestarting);
   node.SetLifecycle(NodeRuntimeLifecycle::kRestarting);
   WriteEvent(events_path, options.run_id, node.config.id, "restart_requested",
              "restart_count=" + std::to_string(node.RestartCount() + 1U));
@@ -5168,7 +5176,8 @@ void RestartNode(const Options& options,
   if (node.network_namespace) {
     process.network_namespace_fd = node.network_namespace->fd();
   }
-  WriteNodeState(events_path, options.run_id, node.config.id, "Starting");
+  WriteNodeState(events_path, options.run_id, node.config.id,
+                 NodeRuntimeLifecycle::kStarting);
   node.process = ChildProcess::Spawn(process, node.cgroup->path());
   const std::uint64_t restart_count = node.IncrementRestartCount();
   WriteEvent(events_path, options.run_id, node.config.id, "process_restarted",
@@ -5177,7 +5186,8 @@ void RestartNode(const Options& options,
                    stop_token);
   WriteEvent(events_path, options.run_id, node.config.id, "rpc_ready");
   node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
-  WriteNodeState(events_path, options.run_id, node.config.id, "Running");
+  WriteNodeState(events_path, options.run_id, node.config.id,
+                 NodeRuntimeLifecycle::kRunning);
 }
 
 void ApplyRuntimeNodeRestarts(const Options& options,
@@ -5304,7 +5314,8 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
 
   for (auto& node : nodes) {
     RunNodeCleanupStep(best_effort, "stopping state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id, "Stopping");
+      WriteNodeState(events_path, options.run_id, node.config.id,
+                     NodeRuntimeLifecycle::kStopping);
     });
   }
 
@@ -5392,10 +5403,12 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
 
   for (auto& node : nodes) {
     RunNodeCleanupStep(best_effort, "stopped state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id, "Stopped");
+      WriteNodeState(events_path, options.run_id, node.config.id,
+                     NodeRuntimeLifecycle::kStopped);
     });
     RunNodeCleanupStep(best_effort, "cleaning state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id, "Cleaning");
+      WriteNodeState(events_path, options.run_id, node.config.id,
+                     NodeRuntimeLifecycle::kCleaning);
     });
     if (node.cgroup && !options.keep_cgroups) {
       RunNodeCleanupStep(best_effort, "cgroup process kill",
@@ -5425,7 +5438,8 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
                          [&] { node.network_namespace->Stop(); });
     }
     RunNodeCleanupStep(best_effort, "cleaned state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id, "Cleaned");
+      WriteNodeState(events_path, options.run_id, node.config.id,
+                     NodeRuntimeLifecycle::kCleaned);
     });
   }
   if (!options.keep_cgroups) {
@@ -5640,7 +5654,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     });
     for (auto& node : nodes) {
       cleanup_step("failed node state event", [&] {
-        WriteNodeState(events_path, options.run_id, node.config.id, "Failed");
+        WriteNodeState(events_path, options.run_id, node.config.id,
+                       NodeRuntimeLifecycle::kFailed);
       });
     }
     cleanup_step("run failure event", [&] {
@@ -5862,7 +5877,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               const pid_t pid = node.process.pid();
               node.SetLifecycle(NodeRuntimeLifecycle::kKilling);
               WriteNodeState(events_path, options.run_id, command.node_id,
-                             "Killing");
+                             NodeRuntimeLifecycle::kKilling);
               WriteEvent(events_path, options.run_id, command.node_id,
                          "process_kill_requested",
                          "pid=" + std::to_string(pid));
@@ -5882,7 +5897,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               WriteEvent(events_path, options.run_id, command.node_id,
                          "process_killed", "pid=" + std::to_string(pid));
               WriteNodeState(events_path, options.run_id, command.node_id,
-                             "Killed");
+                             NodeRuntimeLifecycle::kKilled);
             } else {
               chain_command_executor->Execute(
                   command, command_rpc_stop_source.get_token());

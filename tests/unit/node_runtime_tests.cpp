@@ -17,6 +17,16 @@ BOOST_AUTO_TEST_CASE(node_runtime_only_collects_chain_metrics_while_running) {
   BOOST_TEST(!node.AllowsChainMetrics());
 }
 
+BOOST_AUTO_TEST_CASE(node_runtime_lifecycle_names_match_event_states) {
+  BOOST_TEST(bbp::NodeRuntimeLifecycleName(
+                 bbp::NodeRuntimeLifecycle::kNetworkNamespaceReady) ==
+             "NetnsReady");
+  BOOST_TEST(bbp::NodeRuntimeLifecycleName(
+                 bbp::NodeRuntimeLifecycle::kRunning) == "Running");
+  BOOST_TEST(bbp::NodeRuntimeLifecycleName(
+                 bbp::NodeRuntimeLifecycle::kFailed) == "Failed");
+}
+
 BOOST_AUTO_TEST_CASE(node_runtime_counts_generated_blocks_and_transactions) {
   bbp::NodeRuntime node;
   node.AddGeneratedBlocks(2U);
