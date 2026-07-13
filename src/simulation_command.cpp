@@ -32,4 +32,42 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
   throw std::runtime_error("unknown simulation command kind");
 }
 
+std::optional<SimulationCommandKind> SimulationCommandKindFromName(
+    std::string_view name) {
+  if (name == "increase_log_verbosity") {
+    return SimulationCommandKind::kIncreaseLogVerbosity;
+  }
+  if (name == "decrease_log_verbosity") {
+    return SimulationCommandKind::kDecreaseLogVerbosity;
+  }
+  if (name == "stop_mining") {
+    return SimulationCommandKind::kStopMining;
+  }
+  if (name == "disconnect_node") {
+    return SimulationCommandKind::kDisconnectNode;
+  }
+  if (name == "reconnect_node") {
+    return SimulationCommandKind::kReconnectNode;
+  }
+  if (name == "set_block_production_policy") {
+    return SimulationCommandKind::kSetBlockProductionPolicy;
+  }
+  if (name == "set_mining_difficulty") {
+    return SimulationCommandKind::kSetMiningDifficulty;
+  }
+  if (name == "kill_node") {
+    return SimulationCommandKind::kKillNode;
+  }
+  if (name == "connect_peer") {
+    return SimulationCommandKind::kConnectPeer;
+  }
+  if (name == "disconnect_peer") {
+    return SimulationCommandKind::kDisconnectPeer;
+  }
+  if (name == "set_peer_count_policy") {
+    return SimulationCommandKind::kSetPeerCountPolicy;
+  }
+  return std::nullopt;
+}
+
 }  // namespace bbp

@@ -23,6 +23,7 @@
 
 #include "bbp/log_view.h"
 #include "bbp/node_log_pane.h"
+#include "bbp/operator_command_status.h"
 #include "bbp/peer_list_pane.h"
 #include "bbp/run_report.h"
 #include "bbp/simulation_command_queue.h"
@@ -460,15 +461,22 @@ void RefreshCommandResults(const boost::json::object& report, TuiState* state) {
       continue;
     }
     state->last_command_result_sequence = *sequence;
-    const std::string status = JsonString(command, "status");
-    if (status == "failed") {
-      state->command_error =
-          JsonString(detail, "error", "The chain rejected this command.");
-      state->command_error_open = true;
-    } else if (status == "completed") {
-      state->command_status =
-          "Command #" + std::to_string(*sequence) + " completed for " +
-          JsonString(command, "node_id", "selected node") + ".";
+    const std::optional<OperatorCommandStatus> status =
+        OperatorCommandStatusFromName(JsonString(command, "status"));
+    if (!status) {
+      continue;
+    }
+    switch (*status) {
+      case OperatorCommandStatus::kFailed:
+        state->command_error =
+            JsonString(detail, "error", "The chain rejected this command.");
+        state->command_error_open = true;
+        break;
+      case OperatorCommandStatus::kCompleted:
+        state->command_status =
+            "Command #" + std::to_string(*sequence) + " completed for " +
+            JsonString(command, "node_id", "selected node") + ".";
+        break;
     }
   }
 }
@@ -486,7 +494,9 @@ std::string SelectedPeerPolicyText(const boost::json::object& report,
         continue;
       }
       const boost::json::object& command_object = command->as_object();
-      if (JsonString(command_object, "status") != "completed" ||
+      const std::optional<OperatorCommandStatus> status =
+          OperatorCommandStatusFromName(JsonString(command_object, "status"));
+      if (!status || *status != OperatorCommandStatus::kCompleted ||
           JsonString(command_object, "node_id") != node_id) {
         continue;
       }
@@ -496,7 +506,9 @@ std::string SelectedPeerPolicyText(const boost::json::object& report,
         continue;
       }
       const boost::json::object& detail = detail_value->as_object();
-      if (JsonString(detail, "kind") != "set_peer_count_policy") {
+      const std::optional<SimulationCommandKind> kind =
+          SimulationCommandKindFromName(JsonString(detail, "kind"));
+      if (!kind || *kind != SimulationCommandKind::kSetPeerCountPolicy) {
         continue;
       }
       return "min " + JsonIntegerText(detail, "minimum_peer_count") +

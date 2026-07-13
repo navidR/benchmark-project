@@ -235,6 +235,7 @@ add_executable(bbp
   src/network_allocation_lock.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
+  src/operator_command_status.cpp
   src/peer_count_policy.cpp
   src/peer_connectivity_controller.cpp
   src/peer_list_pane.cpp
@@ -294,6 +295,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_network_address_plan_tests.cpp
     tests/unit/node_log_pane_tests.cpp
     tests/unit/node_runtime_tests.cpp
+    tests/unit/operator_command_status_tests.cpp
     tests/unit/peer_connectivity_controller_tests.cpp
     tests/unit/peer_list_pane_tests.cpp
     tests/unit/no_shellout_tests.cpp
@@ -304,6 +306,7 @@ if(BUILD_TESTING)
     tests/unit/run_report_tests.cpp
     tests/unit/simulation_command_processor_tests.cpp
     tests/unit/simulation_command_queue_tests.cpp
+    tests/unit/simulation_command_tests.cpp
     tests/unit/simulation_registry_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
@@ -327,6 +330,7 @@ if(BUILD_TESTING)
     src/network.cpp
     src/network_allocation_lock.cpp
     src/node_log_pane.cpp
+    src/operator_command_status.cpp
     src/peer_count_policy.cpp
     src/peer_connectivity_controller.cpp
     src/peer_list_pane.cpp

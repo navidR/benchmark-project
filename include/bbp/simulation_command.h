@@ -36,5 +36,7 @@ struct SimulationCommand {
 };
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind);
+std::optional<SimulationCommandKind> SimulationCommandKindFromName(
+    std::string_view name);
 
 }  // namespace bbp

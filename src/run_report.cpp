@@ -15,6 +15,8 @@
 #include <string>
 #include <string_view>
 
+#include "bbp/operator_command_status.h"
+#include "bbp/simulation_command.h"
 #include "bbp/simulation_registry.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/util.h"
@@ -60,11 +62,6 @@ enum class RunReportStatus {
   kIncomplete,
 };
 
-enum class OperatorCommandStatus {
-  kCompleted,
-  kFailed,
-};
-
 std::string_view RunReportStatusName(RunReportStatus status) {
   switch (status) {
     case RunReportStatus::kFinished:
@@ -75,16 +72,6 @@ std::string_view RunReportStatusName(RunReportStatus status) {
       return "incomplete";
   }
   return "incomplete";
-}
-
-std::string_view OperatorCommandStatusName(OperatorCommandStatus status) {
-  switch (status) {
-    case OperatorCommandStatus::kCompleted:
-      return "completed";
-    case OperatorCommandStatus::kFailed:
-      return "failed";
-  }
-  return "failed";
 }
 
 std::string OptionalStringField(const boost::json::object& object,
@@ -641,7 +628,9 @@ void ApplyBlockProductionPolicyEvent(const boost::json::object& event,
     return;
   }
   const boost::json::object& command = detail.as_object();
-  if (OptionalStringField(command, "kind") != "set_block_production_policy") {
+  const std::optional<SimulationCommandKind> kind =
+      SimulationCommandKindFromName(OptionalStringField(command, "kind"));
+  if (!kind || *kind != SimulationCommandKind::kSetBlockProductionPolicy) {
     return;
   }
   boost::json::value* block_production =
