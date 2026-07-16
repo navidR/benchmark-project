@@ -48,4 +48,16 @@ ChainWalletTransactionDirectionFromName(std::string_view name) {
   return std::nullopt;
 }
 
+std::string ChainDriver::CreateWalletFundingAddress(
+    const ChainNodeConfig&, ChainWalletMode, const std::string& wallet_address,
+    std::stop_token) const {
+  return wallet_address;
+}
+
+ChainWalletFundingResult ChainDriver::PrepareWalletFunding(
+    const ChainNodeConfig&, ChainWalletMode, const std::string&, std::uint64_t,
+    std::uint64_t, std::chrono::seconds, std::stop_token) const {
+  return {};
+}
+
 }  // namespace bbp

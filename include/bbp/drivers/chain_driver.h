@@ -103,6 +103,13 @@ struct ChainWalletTransactionResult {
   uint64_t mempool_size = 0;
 };
 
+struct ChainWalletFundingResult {
+  std::vector<std::string> txids;
+  std::uint32_t confirmation_blocks_required = 0;
+  // Minimum chain tip required before transactions may spend this balance.
+  std::uint64_t minimum_chain_height = 0;
+};
+
 class ChainDriver {
  public:
   virtual ~ChainDriver() = default;
@@ -146,6 +153,14 @@ class ChainDriver {
   virtual std::string CreateWalletAddress(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       std::stop_token stop_token = {}) const = 0;
+  virtual std::string CreateWalletFundingAddress(
+      const ChainNodeConfig& config, ChainWalletMode wallet_mode,
+      const std::string& wallet_address, std::stop_token stop_token = {}) const;
+  virtual ChainWalletFundingResult PrepareWalletFunding(
+      const ChainNodeConfig& config, ChainWalletMode wallet_mode,
+      const std::string& wallet_address, std::uint64_t minimum_balance_satoshis,
+      std::uint64_t minimum_confirmations, std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const;
   virtual uint64_t WaitForWalletBalance(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       uint64_t minimum_balance_satoshis, uint64_t minimum_confirmations,

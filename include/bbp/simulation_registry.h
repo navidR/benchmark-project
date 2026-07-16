@@ -80,6 +80,7 @@ struct WalletIdentity {
   uint32_t wallet_index = 0;
   uint32_t node = 1;
   std::string address;
+  std::string funding_address;
 };
 
 class SimulationRegistry {

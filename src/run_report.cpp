@@ -44,6 +44,7 @@ struct WalletReport {
   std::uint64_t wallet_index = 0;
   std::uint64_t node = 0;
   std::string address;
+  std::string funding_address;
   std::optional<WalletInitializationStrategy> strategy;
   std::string unknown_strategy;
   std::optional<WalletPrivacyMode> mode;
@@ -441,6 +442,7 @@ void RememberWalletAddressEvent(
   wallet.wallet_index = *wallet_index;
   CopyOptionalUint64Field(object, "node", &wallet.node);
   CopyOptionalStringField(object, "address", &wallet.address);
+  CopyOptionalStringField(object, "funding_address", &wallet.funding_address);
   CopyOptionalWalletStrategyField(object, "strategy", &wallet);
   CopyOptionalWalletModeField(object, "mode", &wallet);
 }
@@ -502,6 +504,7 @@ void RememberWalletFundingEvent(
   wallet.wallet_index = *wallet_index;
   CopyOptionalUint64Field(object, "node", &wallet.node);
   CopyOptionalStringField(object, "address", &wallet.address);
+  CopyOptionalStringField(object, "funding_address", &wallet.funding_address);
   wallet.last_funding = object;
 }
 
@@ -516,6 +519,9 @@ boost::json::array WalletsJson(
     }
     if (!wallet.address.empty()) {
       object["address"] = wallet.address;
+    }
+    if (!wallet.funding_address.empty()) {
+      object["funding_address"] = wallet.funding_address;
     }
     if (wallet.strategy) {
       object["strategy"] = WalletInitializationStrategyName(*wallet.strategy);

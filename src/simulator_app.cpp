@@ -3493,13 +3493,16 @@ std::string WalletFundingDetail(
     uint32_t workload_index, uint32_t workload_count,
     const WalletTransactionsWorkload& workload, const WalletIdentity& wallet,
     uint32_t miner_node, uint64_t start_height, uint64_t target_height,
-    uint64_t funding_hash_count, uint64_t ready_balance_satoshis) {
+    uint64_t funding_hash_count, uint64_t ready_height,
+    const ChainWalletFundingResult& preparation,
+    uint64_t preparation_hash_count, uint64_t ready_balance_satoshis) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
   detail["wallet_index"] = wallet.wallet_index;
   detail["node"] = wallet.node;
   detail["address"] = wallet.address;
+  detail["funding_address"] = wallet.funding_address;
   detail["miner_node"] = miner_node;
   detail["funding_strategy"] =
       std::string(WalletFundingStrategyName(workload.funding_strategy));
@@ -3508,6 +3511,13 @@ std::string WalletFundingDetail(
   detail["funding_hash_count"] = funding_hash_count;
   detail["funding_start_height"] = start_height;
   detail["funding_target_height"] = target_height;
+  detail["funding_ready_height"] = ready_height;
+  detail["funding_preparation_txids"] = TxIdsJson(preparation.txids);
+  detail["funding_preparation_confirmation_blocks"] =
+      preparation.confirmation_blocks_required;
+  detail["funding_preparation_minimum_chain_height"] =
+      preparation.minimum_chain_height;
+  detail["funding_preparation_hash_count"] = preparation_hash_count;
   detail["readiness_confirmations"] = workload.readiness_confirmations;
   detail["funding_threshold"] =
       FormatFixed8Amount(workload.funding_threshold_satoshis);
@@ -3523,6 +3533,9 @@ std::string WalletTransactionDetail(
     const WalletIdentity& sender, const WalletIdentity& receiver,
     uint32_t funding_miner_node, uint64_t funding_start_height,
     uint64_t funding_target_height, uint64_t funding_hash_count,
+    uint64_t funding_ready_height,
+    const ChainWalletFundingResult& funding_preparation,
+    uint64_t funding_preparation_hash_count,
     uint64_t funding_ready_balance_satoshis,
     const ChainWalletTransactionResult& transaction) {
   boost::json::object detail;
@@ -3546,6 +3559,13 @@ std::string WalletTransactionDetail(
   detail["funding_hash_count"] = funding_hash_count;
   detail["funding_start_height"] = funding_start_height;
   detail["funding_target_height"] = funding_target_height;
+  detail["funding_ready_height"] = funding_ready_height;
+  detail["funding_preparation_txids"] = TxIdsJson(funding_preparation.txids);
+  detail["funding_preparation_confirmation_blocks"] =
+      funding_preparation.confirmation_blocks_required;
+  detail["funding_preparation_minimum_chain_height"] =
+      funding_preparation.minimum_chain_height;
+  detail["funding_preparation_hash_count"] = funding_preparation_hash_count;
   detail["readiness_confirmations"] = workload.readiness_confirmations;
   detail["funding_threshold"] =
       FormatFixed8Amount(workload.funding_threshold_satoshis);
@@ -3601,6 +3621,9 @@ std::string WalletAddressDetail(const WalletIdentity& wallet,
   detail["mode"] = std::string(WalletPrivacyModeName(initialization.mode));
   if (!wallet.address.empty()) {
     detail["address"] = wallet.address;
+  }
+  if (!wallet.funding_address.empty()) {
+    detail["funding_address"] = wallet.funding_address;
   }
   return boost::json::serialize(detail);
 }
@@ -4568,6 +4591,13 @@ void InitializeWalletNodes(const Options& options,
     if (wallet.address.empty()) {
       throw std::runtime_error("chain wallet RPC returned an empty address");
     }
+    wallet.funding_address = driver.CreateWalletFundingAddress(
+        node.config, ToChainWalletMode(registry.wallet_initialization()),
+        wallet.address, stop_token);
+    if (wallet.funding_address.empty()) {
+      throw std::runtime_error(
+          "chain wallet RPC returned an empty funding address");
+    }
     WriteEvent(events_path, options.run_id, node.config.id,
                SimulationEventKind::kWalletAddressCreated,
                WalletAddressDetail(wallet, registry.wallet_initialization()));
@@ -4864,8 +4894,11 @@ void ApplyWalletTransactionsWorkload(
     uint32_t miner_node = 1;
     uint64_t start_height = 0;
     uint64_t target_height = 0;
+    uint64_t ready_height = 0;
     uint64_t ready_balance_satoshis = 0;
     std::vector<std::string> hashes;
+    ChainWalletFundingResult preparation;
+    std::vector<std::string> preparation_hashes;
   };
 
   const std::vector<WalletIdentity>& wallets = registry.wallets();
@@ -4877,9 +4910,10 @@ void ApplyWalletTransactionsWorkload(
   for (size_t wallet_index = 0; wallet_index < wallets.size(); ++wallet_index) {
     ThrowIfStopRequested(stop_token);
     const WalletIdentity& wallet = wallets[wallet_index];
-    if (wallet.address.empty()) {
+    if (wallet.address.empty() || wallet.funding_address.empty()) {
       throw std::runtime_error(
-          "wallet-backed workload requires initialized WalletNode addresses");
+          "wallet-backed workload requires initialized WalletNode addresses "
+          "and funding addresses");
     }
     const uint32_t miner_node = funding_miner_indexes[wallet_index] + 1U;
     NodeRuntime& miner = nodes[miner_node - 1U];
@@ -4888,8 +4922,12 @@ void ApplyWalletTransactionsWorkload(
     state.start_height = driver.ReadMetrics(miner.config, stop_token).height;
     state.hashes =
         driver.GenerateBlocks(miner.config, workload.funding_blocks_per_wallet,
-                              wallet.address, stop_token);
+                              wallet.funding_address, stop_token);
     RecordGeneratedBlocks(driver, miner, state.hashes, stop_token);
+    if (state.start_height >
+        std::numeric_limits<std::uint64_t>::max() - state.hashes.size()) {
+      throw std::runtime_error("wallet funding target height overflow");
+    }
     state.target_height =
         state.start_height + static_cast<uint64_t>(state.hashes.size());
     for (NodeRuntime& node : nodes) {
@@ -4898,17 +4936,75 @@ void ApplyWalletTransactionsWorkload(
                            stop_token);
     }
     NodeRuntime& wallet_node = nodes[wallet.node - 1U];
+    state.preparation = driver.PrepareWalletFunding(
+        wallet_node.config, ToChainWalletMode(registry.wallet_initialization()),
+        wallet.address, workload.funding_threshold_satoshis,
+        workload.readiness_confirmations,
+        std::chrono::seconds(workload.timeout_sec), stop_token);
+    for (const std::string& txid : state.preparation.txids) {
+      for (NodeRuntime& node : nodes) {
+        driver.WaitForMempoolTransaction(
+            node.config, txid, std::chrono::seconds(workload.timeout_sec),
+            stop_token);
+      }
+    }
+    state.ready_height = state.target_height;
+    if (state.preparation.confirmation_blocks_required != 0U &&
+        state.preparation.txids.empty()) {
+      throw std::runtime_error(
+          "wallet funding preparation requested confirmation blocks without "
+          "transaction ids");
+    }
+    std::uint64_t preparation_block_count =
+        state.preparation.confirmation_blocks_required;
+    if (state.preparation.minimum_chain_height > state.ready_height) {
+      preparation_block_count =
+          std::max(preparation_block_count,
+                   state.preparation.minimum_chain_height - state.ready_height);
+    }
+    if (preparation_block_count > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(
+          "wallet funding preparation block count exceeds uint32");
+    }
+    if (preparation_block_count != 0U) {
+      state.preparation_hashes = driver.GenerateBlocks(
+          miner.config, static_cast<std::uint32_t>(preparation_block_count),
+          wallet.funding_address, stop_token);
+      if (state.preparation_hashes.size() != preparation_block_count) {
+        throw std::runtime_error(
+            "wallet funding preparation returned an unexpected block count");
+      }
+      RecordGeneratedBlocks(driver, miner, state.preparation_hashes,
+                            stop_token);
+      if (state.ready_height > std::numeric_limits<std::uint64_t>::max() -
+                                   state.preparation_hashes.size()) {
+        throw std::runtime_error("wallet funding ready height overflow");
+      }
+      state.ready_height +=
+          static_cast<uint64_t>(state.preparation_hashes.size());
+      for (NodeRuntime& node : nodes) {
+        driver.WaitForHeight(node.config, state.ready_height,
+                             std::chrono::seconds(workload.timeout_sec),
+                             stop_token);
+      }
+    }
+    if (state.ready_height < state.preparation.minimum_chain_height) {
+      throw std::runtime_error(
+          "wallet funding preparation did not reach its minimum chain height");
+    }
     state.ready_balance_satoshis = driver.WaitForWalletBalance(
         wallet_node.config, ToChainWalletMode(registry.wallet_initialization()),
         workload.funding_threshold_satoshis, workload.readiness_confirmations,
         std::chrono::seconds(workload.timeout_sec), stop_token);
-    WriteEvent(
-        events_path, options.run_id, wallet_node.config.id,
-        SimulationEventKind::kWalletFunded,
-        WalletFundingDetail(workload_index, workload_count, workload, wallet,
-                            miner_node, state.start_height, state.target_height,
-                            static_cast<uint64_t>(state.hashes.size()),
-                            state.ready_balance_satoshis));
+    WriteEvent(events_path, options.run_id, wallet_node.config.id,
+               SimulationEventKind::kWalletFunded,
+               WalletFundingDetail(
+                   workload_index, workload_count, workload, wallet, miner_node,
+                   state.start_height, state.target_height,
+                   static_cast<uint64_t>(state.hashes.size()),
+                   state.ready_height, state.preparation,
+                   static_cast<uint64_t>(state.preparation_hashes.size()),
+                   state.ready_balance_satoshis));
     funding.push_back(std::move(state));
   }
 
@@ -4937,15 +5033,18 @@ void ApplyWalletTransactionsWorkload(
             stop_token);
       }
     }
-    WriteEvent(events_path, options.run_id, sender_node.config.id,
-               SimulationEventKind::kWalletTransactionSubmitted,
-               WalletTransactionDetail(
-                   workload_index, workload_count, workload,
-                   static_cast<uint32_t>(transaction_index + 1U), sender,
-                   receiver, sender_funding.miner_node,
-                   sender_funding.start_height, sender_funding.target_height,
-                   static_cast<uint64_t>(sender_funding.hashes.size()),
-                   sender_funding.ready_balance_satoshis, transaction));
+    WriteEvent(
+        events_path, options.run_id, sender_node.config.id,
+        SimulationEventKind::kWalletTransactionSubmitted,
+        WalletTransactionDetail(
+            workload_index, workload_count, workload,
+            static_cast<uint32_t>(transaction_index + 1U), sender, receiver,
+            sender_funding.miner_node, sender_funding.start_height,
+            sender_funding.target_height,
+            static_cast<uint64_t>(sender_funding.hashes.size()),
+            sender_funding.ready_height, sender_funding.preparation,
+            static_cast<uint64_t>(sender_funding.preparation_hashes.size()),
+            sender_funding.ready_balance_satoshis, transaction));
   }
 }
 

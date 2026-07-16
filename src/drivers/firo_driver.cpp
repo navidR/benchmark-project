@@ -22,6 +22,10 @@
 namespace bbp {
 namespace {
 
+// Regtest activates Spark mints at height 100, but its version-3 special
+// transaction gate rejects Spark spends until DIP0003Height.
+constexpr std::uint64_t kRegtestSparkSpendActivationHeight = 500U;
+
 std::string PeerHost(const std::string& endpoint) {
   const std::string uri = "tcp://" + endpoint;
   const boost::system::result<boost::urls::url_view> parsed =
@@ -122,16 +126,16 @@ std::vector<std::string> ParseStringArrayResult(
 
 std::vector<std::string> ParseTxIdResult(const boost::json::value& value,
                                          std::string_view method) {
-  if (value.is_string()) {
+  if (value.is_string() && !value.as_string().empty()) {
     return {std::string(value.as_string())};
   }
   if (value.is_array()) {
     std::vector<std::string> txids;
     txids.reserve(value.as_array().size());
     for (const boost::json::value& item : value.as_array()) {
-      if (!item.is_string()) {
+      if (!item.is_string() || item.as_string().empty()) {
         throw std::runtime_error("Firo RPC " + std::string(method) +
-                                 " returned a non-string txid");
+                                 " returned an invalid txid");
       }
       txids.emplace_back(item.as_string());
     }
@@ -143,6 +147,20 @@ std::vector<std::string> ParseTxIdResult(const boost::json::value& value,
   }
   throw std::runtime_error("Firo RPC " + std::string(method) +
                            " returned non-string txid result");
+}
+
+std::string ParseWalletAddressResult(const boost::json::value& value,
+                                     std::string_view method) {
+  if (value.is_string() && !value.as_string().empty()) {
+    return std::string(value.as_string());
+  }
+  if (value.is_array() && value.as_array().size() == 1U &&
+      value.as_array().front().is_string() &&
+      !value.as_array().front().as_string().empty()) {
+    return std::string(value.as_array().front().as_string());
+  }
+  throw std::runtime_error("Firo RPC " + std::string(method) +
+                           " returned an invalid wallet address");
 }
 
 bool ContainsPeerAddress(const std::vector<std::string>& addresses,
@@ -350,18 +368,6 @@ bool MempoolContains(const boost::json::value& mempool,
   return false;
 }
 
-void RequireSupportedWalletMode(WalletMode wallet_mode,
-                                std::string_view operation) {
-  if (wallet_mode == WalletMode::kPublic) {
-    return;
-  }
-  if (wallet_mode == WalletMode::kPrivate) {
-    throw std::runtime_error(
-        "Firo private wallet mode is not implemented for " +
-        std::string(operation));
-  }
-}
-
 }  // namespace
 
 ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
@@ -385,6 +391,7 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
       Arg("-listen", config.listen ? "1" : "0"),
       "-dnsseed=0",
       "-fixedseeds=0",
+      "-dandelion=0",
       "-listenonion=0",
       "-discover=0",
       "-upnp=0",
@@ -657,13 +664,66 @@ std::uint64_t FiroDriver::ReadBlockNonRewardTransactionCount(
 std::string FiroDriver::CreateWalletAddress(const FiroNodeConfig& config,
                                             WalletMode wallet_mode,
                                             std::stop_token stop_token) const {
-  RequireSupportedWalletMode(wallet_mode, "address creation");
-  const boost::json::value address =
-      RpcCall(config, "getnewaddress", boost::json::array{}, stop_token);
-  if (!address.is_string()) {
-    throw std::runtime_error("Firo getnewaddress returned non-string");
+  switch (wallet_mode) {
+    case WalletMode::kPublic:
+      return ParseWalletAddressResult(
+          RpcCall(config, "getnewaddress", boost::json::array{}, stop_token),
+          "getnewaddress");
+    case WalletMode::kPrivate:
+      return ParseWalletAddressResult(RpcCall(config, "getnewsparkaddress",
+                                              boost::json::array{}, stop_token),
+                                      "getnewsparkaddress");
   }
-  return std::string(address.as_string());
+  throw std::runtime_error("unknown Firo wallet mode");
+}
+
+std::string FiroDriver::CreateWalletFundingAddress(
+    const FiroNodeConfig& config, WalletMode wallet_mode,
+    const std::string& wallet_address, std::stop_token stop_token) const {
+  switch (wallet_mode) {
+    case WalletMode::kPublic:
+      return wallet_address;
+    case WalletMode::kPrivate:
+      return ParseWalletAddressResult(
+          RpcCall(config, "getnewaddress", boost::json::array{}, stop_token),
+          "getnewaddress");
+  }
+  throw std::runtime_error("unknown Firo wallet mode");
+}
+
+ChainWalletFundingResult FiroDriver::PrepareWalletFunding(
+    const FiroNodeConfig& config, WalletMode wallet_mode,
+    const std::string& wallet_address, uint64_t minimum_balance_satoshis,
+    uint64_t minimum_confirmations, std::chrono::seconds timeout,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  switch (wallet_mode) {
+    case WalletMode::kPublic:
+      return {};
+    case WalletMode::kPrivate:
+      break;
+  }
+  if (wallet_address.empty()) {
+    throw std::runtime_error(
+        "Firo Spark funding requires a non-empty wallet address");
+  }
+
+  WaitForWalletBalance(config, WalletMode::kPublic, minimum_balance_satoshis,
+                       minimum_confirmations, timeout, stop_token);
+  boost::json::object mint;
+  mint["amount"] = FormatFixed8Amount(minimum_balance_satoshis);
+  mint["memo"] = "";
+  boost::json::object recipients;
+  recipients[wallet_address] = std::move(mint);
+  boost::json::array params;
+  params.emplace_back(std::move(recipients));
+
+  ChainWalletFundingResult result;
+  result.txids = ParseTxIdResult(
+      RpcCall(config, "mintspark", params, stop_token), "mintspark");
+  result.confirmation_blocks_required = 1U;
+  result.minimum_chain_height = kRegtestSparkSpendActivationHeight;
+  return result;
 }
 
 uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
@@ -672,19 +732,30 @@ uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
                                           uint64_t minimum_confirmations,
                                           std::chrono::seconds timeout,
                                           std::stop_token stop_token) const {
-  RequireSupportedWalletMode(wallet_mode, "balance readiness");
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   uint64_t last_balance = 0;
   std::string last_error;
   while (std::chrono::steady_clock::now() < deadline) {
     ThrowIfStopRequested(stop_token);
     try {
-      boost::json::array params;
-      params.emplace_back("*");
-      params.push_back(minimum_confirmations);
-      const boost::json::value balance =
-          RpcCall(config, "getbalance", params, stop_token);
-      last_balance = JsonFixed8Amount(balance, "getbalance");
+      if (wallet_mode == WalletMode::kPublic) {
+        boost::json::array params;
+        params.emplace_back("*");
+        params.push_back(minimum_confirmations);
+        const boost::json::value balance =
+            RpcCall(config, "getbalance", params, stop_token);
+        last_balance = JsonFixed8Amount(balance, "getbalance");
+      } else if (wallet_mode == WalletMode::kPrivate) {
+        const boost::json::value balance = RpcCall(
+            config, "getsparkbalance", boost::json::array{}, stop_token);
+        if (!balance.is_object()) {
+          throw std::runtime_error("Firo getsparkbalance returned non-object");
+        }
+        last_balance =
+            JsonUint64Member(balance.as_object(), "availableBalance");
+      } else {
+        throw std::runtime_error("unknown Firo wallet mode");
+      }
       if (last_balance >= minimum_balance_satoshis) {
         return last_balance;
       }
@@ -698,15 +769,16 @@ uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,
       "Firo node " + config.id + " wallet balance " +
       FormatFixed8Amount(last_balance) + " remained below " +
       FormatFixed8Amount(minimum_balance_satoshis) + " with " +
-      std::to_string(minimum_confirmations) + " confirmations before timeout" +
-      (last_error.empty() ? "" : ": " + last_error));
+      (wallet_mode == WalletMode::kPrivate
+           ? std::string("driver-confirmed Spark availability")
+           : std::to_string(minimum_confirmations) + " confirmations") +
+      " before timeout" + (last_error.empty() ? "" : ": " + last_error));
 }
 
 ChainWalletSnapshot FiroDriver::ReadWalletSnapshot(
     const FiroNodeConfig& config, WalletMode wallet_mode,
     std::uint32_t transaction_limit, std::stop_token stop_token) const {
   ThrowIfStopRequested(stop_token);
-  RequireSupportedWalletMode(wallet_mode, "wallet state inspection");
   if (transaction_limit == 0U ||
       transaction_limit >
           static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
@@ -721,11 +793,25 @@ ChainWalletSnapshot FiroDriver::ReadWalletSnapshot(
   }
   const boost::json::object& info = wallet_info.as_object();
   ChainWalletSnapshot snapshot;
-  snapshot.available_balance_satoshis = JsonFixed8Member(info, "balance");
-  snapshot.unconfirmed_balance_satoshis =
-      JsonFixed8Member(info, "unconfirmed_balance");
-  snapshot.immature_balance_satoshis =
-      JsonFixed8Member(info, "immature_balance");
+  if (wallet_mode == WalletMode::kPublic) {
+    snapshot.available_balance_satoshis = JsonFixed8Member(info, "balance");
+    snapshot.unconfirmed_balance_satoshis =
+        JsonFixed8Member(info, "unconfirmed_balance");
+    snapshot.immature_balance_satoshis =
+        JsonFixed8Member(info, "immature_balance");
+  } else if (wallet_mode == WalletMode::kPrivate) {
+    const boost::json::value balance =
+        RpcCall(config, "getsparkbalance", boost::json::array{}, stop_token);
+    if (!balance.is_object()) {
+      throw std::runtime_error("Firo getsparkbalance returned non-object");
+    }
+    snapshot.available_balance_satoshis =
+        JsonUint64Member(balance.as_object(), "availableBalance");
+    snapshot.unconfirmed_balance_satoshis =
+        JsonUint64Member(balance.as_object(), "unconfirmedBalance");
+  } else {
+    throw std::runtime_error("unknown Firo wallet mode");
+  }
   snapshot.transaction_count = JsonUint64Member(info, "txcount");
 
   boost::json::array list_params;
@@ -934,24 +1020,39 @@ FiroWalletTransactionResult FiroDriver::SendWalletTransaction(
     uint64_t fee_satoshis, std::chrono::seconds timeout,
     std::stop_token stop_token) const {
   ThrowIfStopRequested(stop_token);
-  RequireSupportedWalletMode(wallet_mode, "transaction submission");
   boost::json::array fee_params;
   fee_params.emplace_back(FormatFixed8Amount(fee_satoshis));
   const boost::json::value fee_result =
       RpcCall(config, "settxfee", fee_params, stop_token);
-  if (fee_result.is_bool() && !fee_result.as_bool()) {
-    throw std::runtime_error("Firo settxfee returned false");
+  if (!fee_result.is_bool() || !fee_result.as_bool()) {
+    throw std::runtime_error("Firo settxfee did not return true");
   }
 
-  boost::json::array send_params;
-  send_params.emplace_back(destination_address);
-  send_params.emplace_back(FormatFixed8Amount(amount_satoshis));
-  send_params.emplace_back("");
-  send_params.emplace_back("");
-  send_params.emplace_back(false);
-  const std::vector<std::string> txids =
-      ParseTxIdResult(RpcCall(config, "sendtoaddress", send_params, stop_token),
-                      "sendtoaddress");
+  std::vector<std::string> txids;
+  if (wallet_mode == WalletMode::kPublic) {
+    boost::json::array send_params;
+    send_params.emplace_back(destination_address);
+    send_params.emplace_back(FormatFixed8Amount(amount_satoshis));
+    send_params.emplace_back("");
+    send_params.emplace_back("");
+    send_params.emplace_back(false);
+    txids = ParseTxIdResult(
+        RpcCall(config, "sendtoaddress", send_params, stop_token),
+        "sendtoaddress");
+  } else if (wallet_mode == WalletMode::kPrivate) {
+    boost::json::object recipient;
+    recipient["amount"] = FormatFixed8Amount(amount_satoshis);
+    recipient["memo"] = "";
+    recipient["subtractFee"] = false;
+    boost::json::object recipients;
+    recipients[destination_address] = std::move(recipient);
+    boost::json::array send_params;
+    send_params.emplace_back(std::move(recipients));
+    txids = ParseTxIdResult(
+        RpcCall(config, "spendspark", send_params, stop_token), "spendspark");
+  } else {
+    throw std::runtime_error("unknown Firo wallet mode");
+  }
 
   FiroWalletTransactionResult result;
   result.txids = txids;

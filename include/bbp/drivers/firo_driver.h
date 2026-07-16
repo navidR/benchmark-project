@@ -61,6 +61,15 @@ class FiroDriver final : public ChainDriver {
   std::string CreateWalletAddress(
       const FiroNodeConfig& config, WalletMode wallet_mode,
       std::stop_token stop_token = {}) const override;
+  std::string CreateWalletFundingAddress(
+      const FiroNodeConfig& config, WalletMode wallet_mode,
+      const std::string& wallet_address,
+      std::stop_token stop_token = {}) const override;
+  ChainWalletFundingResult PrepareWalletFunding(
+      const FiroNodeConfig& config, WalletMode wallet_mode,
+      const std::string& wallet_address, std::uint64_t minimum_balance_satoshis,
+      std::uint64_t minimum_confirmations, std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const override;
   uint64_t WaitForWalletBalance(const FiroNodeConfig& config,
                                 WalletMode wallet_mode,
                                 uint64_t minimum_balance_satoshis,
