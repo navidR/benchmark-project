@@ -24,8 +24,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
         failures.emplace_back(detail);
       });
 
-  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1");
-  queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2");
+  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1", true);
+  queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2", true);
   processor.Start();
   handled_all.get_future().wait();
   processor.Stop();
@@ -55,8 +55,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_reports_and_continues) {
         failures.emplace_back(command.sequence, detail);
       });
 
-  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1");
-  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-2");
+  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1", true);
+  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-2", true);
   processor.Start();
   handled_all.get_future().wait();
   processor.Stop();

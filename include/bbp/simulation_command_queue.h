@@ -13,14 +13,21 @@ namespace bbp {
 
 class SimulationCommandQueue {
  public:
-  std::uint64_t Push(SimulationCommandKind kind, std::string node_id);
+  std::uint64_t Push(SimulationCommandKind kind, std::string node_id,
+                     bool confirmed = false);
   std::uint64_t PushBlockProductionPolicy(BlockProductionPolicy policy);
   std::uint64_t PushMiningDifficulty(std::string node_id,
                                      MiningDifficulty difficulty);
   std::uint64_t PushPeerCommand(SimulationCommandKind kind, std::string node_id,
-                                std::string peer_node_id);
-  std::uint64_t PushPeerCountPolicy(std::string node_id,
-                                    PeerCountPolicy policy);
+                                std::string peer_node_id,
+                                bool confirmed = false);
+  std::uint64_t PushPeerCountPolicy(std::string node_id, PeerCountPolicy policy,
+                                    bool confirmed = false);
+  std::uint64_t PushGenerateBlocks(std::string node_id,
+                                   std::uint32_t block_count);
+  std::uint64_t PushProfileCommand(SimulationCommandKind kind,
+                                   std::string node_id, std::string profile,
+                                   bool confirmed = false);
   std::optional<SimulationCommand> TryPop();
   std::optional<SimulationCommand> WaitPop();
   void Close();

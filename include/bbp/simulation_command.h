@@ -23,6 +23,13 @@ enum class SimulationCommandKind {
   kConnectPeer,
   kDisconnectPeer,
   kSetPeerCountPolicy,
+  kFreezeNode,
+  kThawNode,
+  kStopNode,
+  kRestartNode,
+  kGenerateBlocks,
+  kSetResourceProfile,
+  kSetNetworkProfile,
 };
 
 struct SimulationCommand {
@@ -33,10 +40,14 @@ struct SimulationCommand {
   std::optional<MiningDifficulty> mining_difficulty;
   std::optional<std::string> peer_node_id;
   std::optional<PeerCountPolicy> peer_count_policy;
+  std::optional<std::uint32_t> block_count;
+  std::optional<std::string> profile;
+  bool confirmed = false;
 };
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind);
 std::optional<SimulationCommandKind> SimulationCommandKindFromName(
     std::string_view name);
+bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind);
 
 }  // namespace bbp

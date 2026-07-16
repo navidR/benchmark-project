@@ -12,10 +12,25 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 10> kCommandNames = {
-    "block-production", "mining-difficulty", "stop-mining",     "disconnect",
-    "reconnect",        "connect-peer",      "disconnect-peer", "peer-policy",
-    "log-more",         "log-less",
+constexpr std::array<std::string_view, 18> kCommandNames = {
+    "block-production",
+    "mining-difficulty",
+    "stop-mining",
+    "disconnect",
+    "reconnect",
+    "connect-peer",
+    "disconnect-peer",
+    "peer-policy",
+    "log-more",
+    "log-less",
+    "freeze",
+    "thaw",
+    "stop-node",
+    "restart",
+    "kill",
+    "generate-blocks",
+    "resource-profile",
+    "network-profile",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -56,6 +71,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .mining_difficulty = std::nullopt,
           .peer_node_id = std::nullopt,
           .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
       };
     }
     if (tokens[0] == "mining-difficulty") {
@@ -67,6 +84,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
               MiningDifficulty(boost::lexical_cast<double>(tokens[1])),
           .peer_node_id = std::nullopt,
           .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
       };
     }
     if (tokens[0] == "connect-peer" || tokens[0] == "disconnect-peer") {
@@ -79,6 +98,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .mining_difficulty = std::nullopt,
           .peer_node_id = tokens[1],
           .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
       };
     }
     if (tokens[0] == "peer-policy") {
@@ -91,6 +112,39 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy =
               PeerCountPolicy(boost::lexical_cast<std::uint32_t>(tokens[1]),
                               boost::lexical_cast<std::uint32_t>(tokens[2])),
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
+      };
+    }
+    if (tokens[0] == "generate-blocks") {
+      RequireArgumentCount(tokens, 2U, "generate-blocks <positive-count>");
+      const std::uint32_t block_count =
+          boost::lexical_cast<std::uint32_t>(tokens[1]);
+      if (block_count == 0U) {
+        throw std::runtime_error("generate-blocks count must be positive");
+      }
+      return ParsedTuiCommand{
+          .kind = SimulationCommandKind::kGenerateBlocks,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
+          .block_count = block_count,
+          .profile = std::nullopt,
+      };
+    }
+    if (tokens[0] == "resource-profile" || tokens[0] == "network-profile") {
+      RequireArgumentCount(tokens, 2U, tokens[0] + " <name>");
+      return ParsedTuiCommand{
+          .kind = tokens[0] == "resource-profile"
+                      ? SimulationCommandKind::kSetResourceProfile
+                      : SimulationCommandKind::kSetNetworkProfile,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = tokens[1],
       };
     }
 
@@ -106,6 +160,16 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       kind = SimulationCommandKind::kIncreaseLogVerbosity;
     } else if (tokens[0] == "log-less") {
       kind = SimulationCommandKind::kDecreaseLogVerbosity;
+    } else if (tokens[0] == "freeze") {
+      kind = SimulationCommandKind::kFreezeNode;
+    } else if (tokens[0] == "thaw") {
+      kind = SimulationCommandKind::kThawNode;
+    } else if (tokens[0] == "stop-node") {
+      kind = SimulationCommandKind::kStopNode;
+    } else if (tokens[0] == "restart") {
+      kind = SimulationCommandKind::kRestartNode;
+    } else if (tokens[0] == "kill") {
+      kind = SimulationCommandKind::kKillNode;
     } else {
       throw std::runtime_error("unknown command: " + tokens[0]);
     }
@@ -115,6 +179,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         .mining_difficulty = std::nullopt,
         .peer_node_id = std::nullopt,
         .peer_count_policy = std::nullopt,
+        .block_count = std::nullopt,
+        .profile = std::nullopt,
     };
   } catch (const boost::bad_lexical_cast&) {
     throw std::runtime_error("command contains an invalid numeric argument");

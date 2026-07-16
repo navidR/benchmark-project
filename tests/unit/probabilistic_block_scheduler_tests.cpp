@@ -168,3 +168,38 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(stop_returned.load());
   BOOST_TEST(production_count.load() == 1U);
 }
+
+BOOST_AUTO_TEST_CASE(probabilistic_block_scheduler_resumes_stopped_miner) {
+  std::mutex mutex;
+  std::condition_variable produced;
+  std::size_t production_count = 0U;
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1"}, bbp::BlockProductionPolicy(2ms, 1.0, 1U),
+      [&](const std::string&) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          ++production_count;
+        }
+        produced.notify_all();
+      },
+      [](const std::string&, std::string_view) {
+        BOOST_FAIL("block production should not fail");
+      });
+
+  scheduler.StopMiner("node-1");
+  scheduler.Start();
+  std::this_thread::sleep_for(15ms);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    BOOST_TEST(production_count == 0U);
+  }
+  scheduler.StartMiner("node-1");
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    BOOST_REQUIRE(produced.wait_for(
+        lock, 1s, [&production_count] { return production_count > 0U; }));
+  }
+  scheduler.Stop();
+
+  BOOST_CHECK_THROW(scheduler.StartMiner("unknown"), std::runtime_error);
+}

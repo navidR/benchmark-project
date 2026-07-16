@@ -5258,12 +5258,11 @@ void WriteNodeState(const std::filesystem::path& events_path,
              NodeRuntimeLifecycleName(state));
 }
 
-std::string GeneratedBlocksDetail(uint32_t workload_index,
-                                  uint32_t workload_count,
-                                  uint32_t generator_node,
-                                  uint64_t start_height, uint64_t target_height,
-                                  const std::vector<std::string>& hashes,
-                                  const std::string& reward_address) {
+std::string GeneratedBlocksDetail(
+    uint32_t workload_index, uint32_t workload_count, uint32_t generator_node,
+    uint64_t start_height, uint64_t target_height,
+    const std::vector<std::string>& hashes, const std::string& reward_address,
+    std::optional<std::uint64_t> operator_command_sequence = std::nullopt) {
   boost::json::array hash_array;
   for (const std::string& hash : hashes) {
     hash_array.emplace_back(hash);
@@ -5277,6 +5276,9 @@ std::string GeneratedBlocksDetail(uint32_t workload_index,
   detail["target_height"] = target_height;
   detail["reward_address"] = reward_address;
   detail["hashes"] = std::move(hash_array);
+  if (operator_command_sequence) {
+    detail["operator_command_sequence"] = *operator_command_sequence;
+  }
   return boost::json::serialize(detail);
 }
 
@@ -8282,6 +8284,12 @@ std::string RestartPeerConnectionDetail(std::string_view peer_address,
   return boost::json::serialize(detail);
 }
 
+bool WaitForNodeFrozenState(const Cgroup& cgroup, bool expected,
+                            std::stop_token stop_token);
+void SetNodeFrozen(const Options& options,
+                   const std::filesystem::path& events_path, NodeRuntime& node,
+                   bool frozen, std::stop_token stop_token);
+
 void RestartNode(const Options& options,
                  const std::filesystem::path& events_path,
                  const ChainDriver& driver, NodeRuntime& node,
@@ -8297,7 +8305,26 @@ void RestartNode(const Options& options,
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRestartRequested,
              "restart_count=" + std::to_string(node.RestartCount() + 1U));
-  driver.Stop(node.config, stop_token);
+  if (node.cgroup->Frozen()) {
+    SetNodeFrozen(options, events_path, node, false, stop_token);
+  }
+  if (node.process.running()) {
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kRpcStop);
+    try {
+      driver.Stop(node.config, stop_token);
+    } catch (...) {
+      if (node.process.running()) {
+        node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+        WriteNodeState(events_path, options.run_id, node.config.id,
+                       NodeRuntimeLifecycle::kRunning);
+      }
+      throw;
+    }
+  } else {
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kRpcStopSkipped, "process is not running");
+  }
   const auto exit_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(15);
   while (node.process.running() &&
@@ -8364,6 +8391,82 @@ bool WaitForNodeFrozenState(const Cgroup& cgroup, bool expected,
     WaitForDuration(std::chrono::milliseconds(20), stop_token);
   }
   return false;
+}
+
+std::string PersistentFreezeDetail(bool frozen) {
+  boost::json::object detail;
+  detail["frozen"] = frozen;
+  detail["persistent"] = true;
+  return boost::json::serialize(detail);
+}
+
+void SetNodeFrozen(const Options& options,
+                   const std::filesystem::path& events_path, NodeRuntime& node,
+                   bool frozen, std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
+  if (!node.cgroup) {
+    throw std::runtime_error("node freeze control requires a node cgroup");
+  }
+  if (frozen) {
+    node.cgroup->Freeze();
+  } else {
+    node.cgroup->Thaw();
+  }
+  if (!WaitForNodeFrozenState(*node.cgroup, frozen, stop_token)) {
+    throw std::runtime_error("node cgroup did not report " +
+                             std::string(frozen ? "frozen: " : "thawed: ") +
+                             node.config.id);
+  }
+  WriteEvent(events_path, options.run_id, node.config.id,
+             frozen ? SimulationEventKind::kCgroupFrozen
+                    : SimulationEventKind::kCgroupThawed,
+             PersistentFreezeDetail(frozen));
+}
+
+void StopNodeProcess(const Options& options,
+                     const std::filesystem::path& events_path,
+                     const ChainDriver& driver, NodeRuntime& node,
+                     std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
+  if (!node.process.running()) {
+    throw std::runtime_error("node process is not running: " + node.config.id);
+  }
+  if (node.cgroup && node.cgroup->Frozen()) {
+    SetNodeFrozen(options, events_path, node, false, stop_token);
+  }
+  node.SetLifecycle(NodeRuntimeLifecycle::kStopping);
+  WriteNodeState(events_path, options.run_id, node.config.id,
+                 NodeRuntimeLifecycle::kStopping);
+  WriteEvent(events_path, options.run_id, node.config.id,
+             SimulationEventKind::kRpcStop);
+  try {
+    driver.Stop(node.config, stop_token);
+    const auto exit_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (node.process.running() &&
+           std::chrono::steady_clock::now() < exit_deadline) {
+      WaitForDuration(std::chrono::milliseconds(50), stop_token);
+    }
+    if (node.process.running()) {
+      WriteEvent(events_path, options.run_id, node.config.id,
+                 SimulationEventKind::kSigterm);
+      node.process.Terminate(std::chrono::seconds(5));
+    }
+    if (node.process.running()) {
+      throw std::runtime_error("node process survived graceful stop: " +
+                               node.config.id);
+    }
+  } catch (...) {
+    if (node.process.running()) {
+      node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+      WriteNodeState(events_path, options.run_id, node.config.id,
+                     NodeRuntimeLifecycle::kRunning);
+    }
+    throw;
+  }
+  node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+  WriteNodeState(events_path, options.run_id, node.config.id,
+                 NodeRuntimeLifecycle::kStopped);
 }
 
 std::string FreezeDetail(uint32_t duration_ms, bool frozen) {
@@ -8700,6 +8803,13 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
     detail["minimum_peer_count"] = command.peer_count_policy->minimum();
     detail["maximum_peer_count"] = command.peer_count_policy->maximum();
   }
+  if (command.block_count) {
+    detail["block_count"] = *command.block_count;
+  }
+  if (command.profile) {
+    detail["profile"] = *command.profile;
+  }
+  detail["confirmed"] = command.confirmed;
   if (!error.empty()) {
     detail["error"] = error;
   }
@@ -8759,6 +8869,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::unique_ptr<ChainCommandExecutor> chain_command_executor;
   std::unique_ptr<SimulationCommandProcessor> command_processor;
   std::vector<std::string> active_native_miner_ids;
+  std::set<std::string> paused_scheduled_miners;
   std::mutex node_process_mutex;
   std::stop_source command_rpc_stop_source;
   std::stop_source block_production_rpc_stop_source;
@@ -8921,6 +9032,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       block_scheduler = std::make_unique<ProbabilisticBlockScheduler>(
           miner_node_ids, options.block_production.policy,
           [&](const std::string& node_id) {
+            std::lock_guard<std::mutex> process_lock(node_process_mutex);
             NodeRuntime& miner = FindNodeRuntimeById(nodes, node_id);
             const std::vector<std::string> hashes = driver.GenerateBlocks(
                 miner.config, 1U, chain_spec.default_reward_address,
@@ -9037,47 +9149,225 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             WriteEvent(events_path, options.run_id, command.node_id,
                        SimulationEventKind::kOperatorCommandStarted,
                        SimulationCommandDetail(command));
+            const bool scheduled_miner =
+                block_scheduler &&
+                std::find(miner_node_ids.begin(), miner_node_ids.end(),
+                          command.node_id) != miner_node_ids.end();
+            const auto stop_scheduled_miner = [&] {
+              return scheduled_miner
+                         ? block_scheduler->StopMiner(command.node_id)
+                         : false;
+            };
+            NodeRuntime& node =
+                command.node_id == "sim"
+                    ? nodes.front()
+                    : FindNodeRuntimeById(nodes, command.node_id);
             if (command.kind == SimulationCommandKind::kKillNode) {
-              NodeRuntime& node = FindNodeRuntimeById(nodes, command.node_id);
-              std::lock_guard<std::mutex> lock(node_process_mutex);
-              if (!node.process.running()) {
-                throw std::runtime_error("node process is not running: " +
-                                         command.node_id);
+              const bool resume_on_failure =
+                  stop_scheduled_miner() ||
+                  paused_scheduled_miners.contains(command.node_id);
+              try {
+                std::lock_guard<std::mutex> lock(node_process_mutex);
+                if (!node.process.running()) {
+                  throw std::runtime_error("node process is not running: " +
+                                           command.node_id);
+                }
+                if (node.cgroup && node.cgroup->Frozen()) {
+                  SetNodeFrozen(options, events_path, node, false,
+                                command_rpc_stop_source.get_token());
+                }
+                const pid_t pid = node.process.pid();
+                node.SetLifecycle(NodeRuntimeLifecycle::kKilling);
+                WriteNodeState(events_path, options.run_id, command.node_id,
+                               NodeRuntimeLifecycle::kKilling);
+                WriteEvent(events_path, options.run_id, command.node_id,
+                           SimulationEventKind::kProcessKillRequested,
+                           "pid=" + std::to_string(pid));
+                try {
+                  node.process.Kill();
+                  if (node.process.running()) {
+                    throw std::runtime_error("node process survived SIGKILL: " +
+                                             command.node_id);
+                  }
+                } catch (...) {
+                  if (node.process.running()) {
+                    node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+                    WriteNodeState(events_path, options.run_id, command.node_id,
+                                   NodeRuntimeLifecycle::kRunning);
+                  }
+                  throw;
+                }
+                node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
+                WriteEvent(events_path, options.run_id, command.node_id,
+                           SimulationEventKind::kProcessKilled,
+                           "pid=" + std::to_string(pid));
+                WriteNodeState(events_path, options.run_id, command.node_id,
+                               NodeRuntimeLifecycle::kKilled);
+              } catch (...) {
+                if (resume_on_failure && node.process.running()) {
+                  block_scheduler->StartMiner(command.node_id);
+                  paused_scheduled_miners.erase(command.node_id);
+                }
+                throw;
               }
-              if (block_scheduler &&
-                  std::find(miner_node_ids.begin(), miner_node_ids.end(),
-                            command.node_id) != miner_node_ids.end()) {
-                block_scheduler->StopMiner(command.node_id);
-              }
+              paused_scheduled_miners.erase(command.node_id);
               active_native_miner_ids.erase(
                   std::remove(active_native_miner_ids.begin(),
                               active_native_miner_ids.end(), command.node_id),
                   active_native_miner_ids.end());
-              const pid_t pid = node.process.pid();
-              node.SetLifecycle(NodeRuntimeLifecycle::kKilling);
-              WriteNodeState(events_path, options.run_id, command.node_id,
-                             NodeRuntimeLifecycle::kKilling);
-              WriteEvent(events_path, options.run_id, command.node_id,
-                         SimulationEventKind::kProcessKillRequested,
-                         "pid=" + std::to_string(pid));
+            } else if (command.kind == SimulationCommandKind::kStopNode) {
+              const bool resume_on_failure =
+                  stop_scheduled_miner() ||
+                  paused_scheduled_miners.contains(command.node_id);
               try {
-                node.process.Kill();
-                if (node.process.running()) {
-                  throw std::runtime_error("node process survived SIGKILL: " +
-                                           command.node_id);
-                }
+                std::lock_guard<std::mutex> lock(node_process_mutex);
+                StopNodeProcess(options, events_path, driver, node,
+                                command_rpc_stop_source.get_token());
               } catch (...) {
-                if (node.process.running()) {
-                  node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+                if (resume_on_failure && node.process.running()) {
+                  block_scheduler->StartMiner(command.node_id);
+                  paused_scheduled_miners.erase(command.node_id);
                 }
                 throw;
               }
-              node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
-              WriteEvent(events_path, options.run_id, command.node_id,
-                         SimulationEventKind::kProcessKilled,
-                         "pid=" + std::to_string(pid));
-              WriteNodeState(events_path, options.run_id, command.node_id,
-                             NodeRuntimeLifecycle::kKilled);
+              paused_scheduled_miners.erase(command.node_id);
+              active_native_miner_ids.erase(
+                  std::remove(active_native_miner_ids.begin(),
+                              active_native_miner_ids.end(), command.node_id),
+                  active_native_miner_ids.end());
+            } else if (command.kind == SimulationCommandKind::kRestartNode) {
+              const bool resume_scheduled_miner =
+                  stop_scheduled_miner() ||
+                  paused_scheduled_miners.contains(command.node_id);
+              if (resume_scheduled_miner) {
+                paused_scheduled_miners.insert(command.node_id);
+              }
+              const bool resume_native_miner =
+                  std::find(active_native_miner_ids.begin(),
+                            active_native_miner_ids.end(),
+                            command.node_id) != active_native_miner_ids.end();
+              try {
+                std::lock_guard<std::mutex> lock(node_process_mutex);
+                RestartNode(options, events_path, driver, node,
+                            command_rpc_stop_source.get_token());
+                if (resume_native_miner) {
+                  driver.StartMining(node.config,
+                                     chain_spec.default_reward_address,
+                                     command_rpc_stop_source.get_token());
+                }
+              } catch (...) {
+                if (resume_scheduled_miner && node.process.running()) {
+                  block_scheduler->StartMiner(command.node_id);
+                  paused_scheduled_miners.erase(command.node_id);
+                }
+                throw;
+              }
+              if (resume_scheduled_miner) {
+                block_scheduler->StartMiner(command.node_id);
+                paused_scheduled_miners.erase(command.node_id);
+              }
+            } else if (command.kind == SimulationCommandKind::kFreezeNode) {
+              const bool resume_on_thaw = stop_scheduled_miner();
+              try {
+                std::lock_guard<std::mutex> lock(node_process_mutex);
+                SetNodeFrozen(options, events_path, node, true,
+                              command_rpc_stop_source.get_token());
+              } catch (...) {
+                if (resume_on_thaw) {
+                  block_scheduler->StartMiner(command.node_id);
+                }
+                throw;
+              }
+              if (resume_on_thaw) {
+                paused_scheduled_miners.insert(command.node_id);
+              }
+            } else if (command.kind == SimulationCommandKind::kThawNode) {
+              {
+                std::lock_guard<std::mutex> lock(node_process_mutex);
+                SetNodeFrozen(options, events_path, node, false,
+                              command_rpc_stop_source.get_token());
+              }
+              if (paused_scheduled_miners.erase(command.node_id) != 0U) {
+                block_scheduler->StartMiner(command.node_id);
+              }
+            } else if (command.kind == SimulationCommandKind::kGenerateBlocks) {
+              if (!command.block_count || *command.block_count == 0U) {
+                throw std::runtime_error(
+                    "generate-blocks command requires a positive count");
+              }
+              std::lock_guard<std::mutex> lock(node_process_mutex);
+              const std::uint64_t start_height =
+                  driver
+                      .ReadMetrics(node.config,
+                                   command_rpc_stop_source.get_token())
+                      .height;
+              const std::vector<std::string> hashes =
+                  driver.GenerateBlocks(node.config, *command.block_count,
+                                        chain_spec.default_reward_address,
+                                        command_rpc_stop_source.get_token());
+              RecordGeneratedBlocks(driver, node, hashes,
+                                    command_rpc_stop_source.get_token());
+              if (start_height >
+                  std::numeric_limits<std::uint64_t>::max() - hashes.size()) {
+                throw std::runtime_error(
+                    "generated block target height overflows uint64");
+              }
+              const auto node_iter =
+                  std::find_if(nodes.begin(), nodes.end(),
+                               [&](const NodeRuntime& candidate) {
+                                 return candidate.config.id == command.node_id;
+                               });
+              const std::uint32_t one_based_node =
+                  static_cast<std::uint32_t>(
+                      std::distance(nodes.begin(), node_iter)) +
+                  1U;
+              WriteEvent(
+                  events_path, options.run_id, command.node_id,
+                  SimulationEventKind::kGeneratedBlocks,
+                  GeneratedBlocksDetail(
+                      0U, 0U, one_based_node, start_height,
+                      start_height + static_cast<std::uint64_t>(hashes.size()),
+                      hashes, chain_spec.default_reward_address,
+                      command.sequence));
+            } else if (command.kind ==
+                           SimulationCommandKind::kSetResourceProfile ||
+                       command.kind ==
+                           SimulationCommandKind::kSetNetworkProfile) {
+              if (!command.profile || command.profile->empty()) {
+                throw std::runtime_error(
+                    "profile command requires a profile name");
+              }
+              const auto node_iter =
+                  std::find_if(nodes.begin(), nodes.end(),
+                               [&](const NodeRuntime& candidate) {
+                                 return candidate.config.id == command.node_id;
+                               });
+              const std::uint32_t one_based_node =
+                  static_cast<std::uint32_t>(
+                      std::distance(nodes.begin(), node_iter)) +
+                  1U;
+              const ProfileSwitchWorkload workload{
+                  .nodes = {one_based_node},
+                  .node_ids = {command.node_id},
+                  .profile = *command.profile,
+              };
+              if (command.kind == SimulationCommandKind::kSetResourceProfile) {
+                if (!options.resource_profiles.contains(*command.profile)) {
+                  throw std::runtime_error("unknown resource profile: " +
+                                           *command.profile);
+                }
+                ApplyResourceProfileSwitch(options, events_path, nodes,
+                                           workload, 0U, 0U,
+                                           command_rpc_stop_source.get_token());
+              } else {
+                if (!options.network_profiles.contains(*command.profile)) {
+                  throw std::runtime_error("unknown network profile: " +
+                                           *command.profile);
+                }
+                ApplyNetworkProfileSwitch(options, events_path, nodes, workload,
+                                          0U, 0U,
+                                          command_rpc_stop_source.get_token());
+              }
             } else {
               chain_command_executor->Execute(
                   command, command_rpc_stop_source.get_token());
@@ -9255,12 +9545,17 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             continue;
           }
           NodeRuntime& generator = nodes[workload.node - 1U];
-          const uint64_t start_height =
-              driver.ReadMetrics(generator.config, stop_token).height;
-          std::vector<std::string> hashes = driver.GenerateBlocks(
-              generator.config, workload.count,
-              chain_spec.default_reward_address, stop_token);
-          RecordGeneratedBlocks(driver, generator, hashes, stop_token);
+          uint64_t start_height = 0U;
+          std::vector<std::string> hashes;
+          {
+            std::lock_guard<std::mutex> lock(node_process_mutex);
+            start_height =
+                driver.ReadMetrics(generator.config, stop_token).height;
+            hashes = driver.GenerateBlocks(generator.config, workload.count,
+                                           chain_spec.default_reward_address,
+                                           stop_token);
+            RecordGeneratedBlocks(driver, generator, hashes, stop_token);
+          }
           const uint64_t target_height =
               start_height + static_cast<uint64_t>(hashes.size());
           WriteEvent(

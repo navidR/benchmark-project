@@ -106,6 +106,15 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
                                  *command.peer_count_policy);
       return;
     }
+    case SimulationCommandKind::kFreezeNode:
+    case SimulationCommandKind::kThawNode:
+    case SimulationCommandKind::kStopNode:
+    case SimulationCommandKind::kRestartNode:
+    case SimulationCommandKind::kGenerateBlocks:
+    case SimulationCommandKind::kSetResourceProfile:
+    case SimulationCommandKind::kSetNetworkProfile:
+      throw std::runtime_error(
+          "command must be handled by the simulator resource owner");
   }
   throw std::runtime_error("unknown simulation command kind");
 }

@@ -15,6 +15,13 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kConnectPeer,
       bbp::SimulationCommandKind::kDisconnectPeer,
       bbp::SimulationCommandKind::kSetPeerCountPolicy,
+      bbp::SimulationCommandKind::kFreezeNode,
+      bbp::SimulationCommandKind::kThawNode,
+      bbp::SimulationCommandKind::kStopNode,
+      bbp::SimulationCommandKind::kRestartNode,
+      bbp::SimulationCommandKind::kGenerateBlocks,
+      bbp::SimulationCommandKind::kSetResourceProfile,
+      bbp::SimulationCommandKind::kSetNetworkProfile,
   };
 
   for (bbp::SimulationCommandKind kind : kKinds) {
@@ -25,4 +32,17 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
     BOOST_CHECK(*parsed == kind);
   }
   BOOST_TEST(!bbp::SimulationCommandKindFromName("unknown"));
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kKillNode));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kRestartNode));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kSetNetworkProfile));
+  BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kGenerateBlocks));
+  BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kThawNode));
 }

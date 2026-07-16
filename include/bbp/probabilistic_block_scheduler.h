@@ -30,7 +30,8 @@ class ProbabilisticBlockScheduler {
 
   void Start();
   void Stop();
-  void StopMiner(const std::string& node_id);
+  void StartMiner(const std::string& node_id);
+  bool StopMiner(const std::string& node_id);
   void UpdatePolicy(BlockProductionPolicy policy);
 
  private:

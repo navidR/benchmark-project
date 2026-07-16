@@ -44,6 +44,11 @@ constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
 constexpr int kDetailPaneRows = 15;
 
+struct PendingConfirmation {
+  ParsedTuiCommand command;
+  std::string target_node_id;
+};
+
 struct TuiState {
   std::size_t selected_node = 0;
   std::size_t selected_wallet = 0;
@@ -57,6 +62,7 @@ struct TuiState {
   bool command_palette_open = false;
   std::string command_input;
   std::string command_input_error;
+  std::optional<PendingConfirmation> pending_confirmation;
 };
 
 class CursesSession {
@@ -855,9 +861,39 @@ void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
           COLOR_PAIR(kColorMuted));
 }
 
+void DrawCommandConfirmationPopup(int rows, int cols,
+                                  const PendingConfirmation& pending) {
+  constexpr int kPopupRows = 8;
+  if (rows < kPopupRows + 2 || cols < 40) {
+    return;
+  }
+  const int popup_cols = std::min(cols - 4, 78);
+  const int top = (rows - kPopupRows) / 2;
+  const int left = (cols - popup_cols) / 2;
+  for (int row = 0; row < kPopupRows; ++row) {
+    mvhline(top + row, left, ' ', popup_cols);
+  }
+  mvhline(top, left + 1, ACS_HLINE, popup_cols - 2);
+  mvhline(top + kPopupRows - 1, left + 1, ACS_HLINE, popup_cols - 2);
+  mvvline(top + 1, left, ACS_VLINE, kPopupRows - 2);
+  mvvline(top + 1, left + popup_cols - 1, ACS_VLINE, kPopupRows - 2);
+  mvaddch(top, left, ACS_ULCORNER);
+  mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
+  mvaddch(top + kPopupRows - 1, left, ACS_LLCORNER);
+  mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
+  AddText(top + 1, left + 2, popup_cols - 4, "Confirm destructive action",
+          A_BOLD | COLOR_PAIR(kColorWarning));
+  AddText(top + 3, left + 2, popup_cols - 4,
+          std::string(SimulationCommandKindName(pending.command.kind)));
+  AddText(top + 4, left + 2, popup_cols - 4,
+          "Target: " + pending.target_node_id);
+  AddText(top + 6, left + 2, popup_cols - 4,
+          "Press y to confirm; n or Esc cancels.", COLOR_PAIR(kColorMuted));
+}
+
 void DrawCommandPalette(int rows, int cols, std::string_view input,
                         std::string_view error) {
-  constexpr int kPopupRows = 12;
+  constexpr int kPopupRows = 16;
   if (rows < kPopupRows + 2 || cols < 48) {
     return;
   }
@@ -884,13 +920,18 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   AddText(top + 5, left + 2, popup_cols - 4,
           "connect-peer <node-id>  disconnect-peer <node-id>");
   AddText(top + 6, left + 2, popup_cols - 4, "peer-policy <minimum> <maximum>");
-  AddText(top + 8, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+  AddText(top + 7, left + 2, popup_cols - 4,
+          "freeze  thaw  stop-node  restart  kill");
+  AddText(top + 8, left + 2, popup_cols - 4, "generate-blocks <count>");
+  AddText(top + 9, left + 2, popup_cols - 4,
+          "resource-profile <name>  network-profile <name>");
+  AddText(top + 11, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
           A_BOLD);
   if (!error.empty()) {
-    AddText(top + 9, left + 2, popup_cols - 4, error,
+    AddText(top + 12, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   }
-  AddText(top + 10, left + 2, popup_cols - 4,
+  AddText(top + 14, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
 }
 
@@ -1222,16 +1263,15 @@ boost::json::object LoadReport(const std::filesystem::path& run_root,
   }
 }
 
-void DrawSummary(const std::filesystem::path& run_root,
-                 const boost::json::object& report, std::string_view error,
-                 const std::vector<std::string>& log_lines, TuiView view,
-                 std::size_t selected_node, std::size_t selected_wallet,
-                 const NodeLogPane& node_log_pane,
-                 const PeerListPane& peer_list_pane,
-                 std::string_view command_status, bool command_error_open,
-                 std::string_view command_error, bool command_palette_open,
-                 std::string_view command_input,
-                 std::string_view command_input_error) {
+void DrawSummary(
+    const std::filesystem::path& run_root, const boost::json::object& report,
+    std::string_view error, const std::vector<std::string>& log_lines,
+    TuiView view, std::size_t selected_node, std::size_t selected_wallet,
+    const NodeLogPane& node_log_pane, const PeerListPane& peer_list_pane,
+    std::string_view command_status, bool command_error_open,
+    std::string_view command_error, bool command_palette_open,
+    std::string_view command_input, std::string_view command_input_error,
+    const std::optional<PendingConfirmation>& pending_confirmation) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -1438,8 +1478,8 @@ void DrawSummary(const std::filesystem::path& run_root,
     footer += "Peers: arrows/PgUp/PgDn/Home/End scroll. p closes. q exits.";
   } else {
     footer +=
-        "Tab/n/w view. Arrows select. p peers. l log. c command. s stop. "
-        "d/r disconnect/reconnect. k kill. q or Esc exits.";
+        "Tab/n/w view. Arrows select. c command. m mining. s stop. f/t "
+        "freeze/thaw. d/r net. R restart. k kill. q exits.";
   }
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
@@ -1447,6 +1487,9 @@ void DrawSummary(const std::filesystem::path& run_root,
   }
   if (command_palette_open) {
     DrawCommandPalette(rows, cols, command_input, command_input_error);
+  }
+  if (pending_confirmation) {
+    DrawCommandConfirmationPopup(rows, cols, *pending_confirmation);
   }
   refresh();
 }
@@ -1475,35 +1518,61 @@ std::uint64_t BlockProductionSeed(const boost::json::object& report) {
 bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
                             const boost::json::object& report,
                             SimulationCommandQueue* command_queue,
-                            TuiState* state) {
+                            TuiState* state, bool confirmed = false,
+                            std::string confirmed_target = {}) {
   if (command_queue == nullptr) {
     state->command_input_error =
         "Live commands are unavailable in report mode.";
+    state->command_status = state->command_input_error;
     return false;
   }
 
   try {
     std::uint64_t sequence = 0U;
     std::string target = "the simulation";
+    std::string node_id;
     if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
       if (!parsed.block_production_policy) {
         throw std::runtime_error("block production policy is missing");
       }
+    } else {
+      node_id = std::move(confirmed_target);
+      if (node_id.empty()) {
+        const boost::json::array* nodes = NodeSummaries(report);
+        const std::optional<std::size_t> selected_node =
+            SelectedNodeIndex(report, *state);
+        const boost::json::object* node = nodes == nullptr || !selected_node
+                                              ? nullptr
+                                              : NodeAt(*nodes, *selected_node);
+        if (node == nullptr) {
+          state->command_input_error = "No backing node is selected.";
+          state->command_status = state->command_input_error;
+          return false;
+        }
+        node_id = JsonString(*node, "node_id");
+      }
+      target = node_id;
+    }
+
+    if (SimulationCommandRequiresConfirmation(parsed.kind) && !confirmed) {
+      state->pending_confirmation = PendingConfirmation{
+          .command = parsed,
+          .target_node_id = target,
+      };
+      state->command_palette_open = false;
+      state->command_input.clear();
+      state->command_input_error.clear();
+      state->command_status =
+          "Confirmation required for " +
+          std::string(SimulationCommandKindName(parsed.kind)) + " on " +
+          target + ".";
+      return true;
+    }
+
+    if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
       sequence = command_queue->PushBlockProductionPolicy(
           *parsed.block_production_policy);
     } else {
-      const boost::json::array* nodes = NodeSummaries(report);
-      const std::optional<std::size_t> selected_node =
-          SelectedNodeIndex(report, *state);
-      const boost::json::object* node = nodes == nullptr || !selected_node
-                                            ? nullptr
-                                            : NodeAt(*nodes, *selected_node);
-      if (node == nullptr) {
-        state->command_input_error = "No backing node is selected.";
-        return false;
-      }
-      const std::string node_id = JsonString(*node, "node_id");
-      target = node_id;
       if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
         if (!parsed.mining_difficulty) {
           throw std::runtime_error("mining difficulty is missing");
@@ -1515,16 +1584,29 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
           throw std::runtime_error("peer count policy is missing");
         }
         sequence = command_queue->PushPeerCountPolicy(
-            node_id, *parsed.peer_count_policy);
+            node_id, *parsed.peer_count_policy, confirmed);
       } else if (parsed.kind == SimulationCommandKind::kConnectPeer ||
                  parsed.kind == SimulationCommandKind::kDisconnectPeer) {
         if (!parsed.peer_node_id) {
           throw std::runtime_error("peer target node is missing");
         }
-        sequence = command_queue->PushPeerCommand(parsed.kind, node_id,
-                                                  *parsed.peer_node_id);
+        sequence = command_queue->PushPeerCommand(
+            parsed.kind, node_id, *parsed.peer_node_id, confirmed);
+      } else if (parsed.kind == SimulationCommandKind::kGenerateBlocks) {
+        if (!parsed.block_count) {
+          throw std::runtime_error("generated block count is missing");
+        }
+        sequence =
+            command_queue->PushGenerateBlocks(node_id, *parsed.block_count);
+      } else if (parsed.kind == SimulationCommandKind::kSetResourceProfile ||
+                 parsed.kind == SimulationCommandKind::kSetNetworkProfile) {
+        if (!parsed.profile) {
+          throw std::runtime_error("profile name is missing");
+        }
+        sequence = command_queue->PushProfileCommand(
+            parsed.kind, node_id, *parsed.profile, confirmed);
       } else {
-        sequence = command_queue->Push(parsed.kind, node_id);
+        sequence = command_queue->Push(parsed.kind, node_id, confirmed);
       }
     }
     state->command_status =
@@ -1536,6 +1618,7 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
   } catch (const std::exception& error) {
     state->command_input_error =
         "Command rejected: " + std::string(error.what());
+    state->command_status = state->command_input_error;
     return false;
   }
 }
@@ -1588,35 +1671,37 @@ bool QueueSelectedNodeCommand(SimulationCommandKind kind,
                               const boost::json::object& report,
                               SimulationCommandQueue* command_queue,
                               TuiState* state) {
-  const boost::json::array* nodes = NodeSummaries(report);
-  const std::optional<std::size_t> selected_node =
-      SelectedNodeIndex(report, *state);
-  const boost::json::object* node = nodes == nullptr || !selected_node
-                                        ? nullptr
-                                        : NodeAt(*nodes, *selected_node);
-  if (node == nullptr) {
-    state->command_status = "No backing node is selected.";
-    return true;
-  }
-  if (command_queue == nullptr) {
-    state->command_status = "Live commands are unavailable in report mode.";
-    return true;
-  }
-
-  const std::string node_id = JsonString(*node, "node_id");
-  try {
-    const std::uint64_t sequence = command_queue->Push(kind, node_id);
-    state->command_status = "Queued #" + std::to_string(sequence) + " " +
-                            std::string(SimulationCommandKindName(kind)) +
-                            " for " + node_id + ".";
-  } catch (const std::exception& error) {
-    state->command_status = "Command rejected: " + std::string(error.what());
-  }
+  ParsedTuiCommand parsed;
+  parsed.kind = kind;
+  static_cast<void>(
+      QueueParsedNodeCommand(parsed, report, command_queue, state));
   return true;
+}
+
+bool HandleCommandConfirmationInput(int ch, const boost::json::object& report,
+                                    SimulationCommandQueue* command_queue,
+                                    TuiState* state) {
+  if (ch == 'n' || ch == 'N' || ch == 27) {
+    state->pending_confirmation.reset();
+    state->command_status = "Command cancelled.";
+    return true;
+  }
+  if (ch == 'y' || ch == 'Y') {
+    PendingConfirmation pending = std::move(*state->pending_confirmation);
+    state->pending_confirmation.reset();
+    static_cast<void>(
+        QueueParsedNodeCommand(pending.command, report, command_queue, state,
+                               true, std::move(pending.target_node_id)));
+    return true;
+  }
+  return ch != ERR;
 }
 
 bool HandleInput(int ch, const boost::json::object& report,
                  SimulationCommandQueue* command_queue, TuiState* state) {
+  if (state->pending_confirmation) {
+    return HandleCommandConfirmationInput(ch, report, command_queue, state);
+  }
   if (state->command_palette_open) {
     return HandleCommandPaletteInput(ch, report, command_queue, state);
   }
@@ -1682,6 +1767,10 @@ bool HandleInput(int ch, const boost::json::object& report,
   }
 
   if (ch == 's' || ch == 'S') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kStopNode, report,
+                                    command_queue, state);
+  }
+  if (ch == 'm' || ch == 'M') {
     return QueueSelectedNodeCommand(SimulationCommandKind::kStopMining, report,
                                     command_queue, state);
   }
@@ -1689,9 +1778,21 @@ bool HandleInput(int ch, const boost::json::object& report,
     return QueueSelectedNodeCommand(SimulationCommandKind::kDisconnectNode,
                                     report, command_queue, state);
   }
-  if (ch == 'r' || ch == 'R') {
+  if (ch == 'r') {
     return QueueSelectedNodeCommand(SimulationCommandKind::kReconnectNode,
                                     report, command_queue, state);
+  }
+  if (ch == 'R') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kRestartNode, report,
+                                    command_queue, state);
+  }
+  if (ch == 'f' || ch == 'F') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kFreezeNode, report,
+                                    command_queue, state);
+  }
+  if (ch == 't' || ch == 'T') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kThawNode, report,
+                                    command_queue, state);
   }
   if (ch == 'k' || ch == 'K') {
     return QueueSelectedNodeCommand(SimulationCommandKind::kKillNode, report,
@@ -1802,7 +1903,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
                 state.peer_list_pane, state.command_status,
                 state.command_error_open, state.command_error,
                 state.command_palette_open, state.command_input,
-                state.command_input_error);
+                state.command_input_error, state.pending_confirmation);
     if (once) {
       return error.empty() ? 0 : 1;
     }

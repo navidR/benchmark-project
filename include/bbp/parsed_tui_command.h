@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -16,6 +17,8 @@ struct ParsedTuiCommand {
   std::optional<MiningDifficulty> mining_difficulty;
   std::optional<std::string> peer_node_id;
   std::optional<PeerCountPolicy> peer_count_policy;
+  std::optional<std::uint32_t> block_count;
+  std::optional<std::string> profile;
 };
 
 }  // namespace bbp

@@ -80,7 +80,22 @@ void ProbabilisticBlockScheduler::Stop() {
   }
 }
 
-void ProbabilisticBlockScheduler::StopMiner(const std::string& node_id) {
+void ProbabilisticBlockScheduler::StartMiner(const std::string& node_id) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto miner =
+        std::find(miner_node_ids_.begin(), miner_node_ids_.end(), node_id);
+    if (miner == miner_node_ids_.end()) {
+      throw std::runtime_error("node is not a configured miner: " + node_id);
+    }
+    const std::size_t index =
+        static_cast<std::size_t>(std::distance(miner_node_ids_.begin(), miner));
+    active_miners_[index] = true;
+  }
+  condition_.notify_all();
+}
+
+bool ProbabilisticBlockScheduler::StopMiner(const std::string& node_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   const auto miner =
       std::find(miner_node_ids_.begin(), miner_node_ids_.end(), node_id);
@@ -89,8 +104,10 @@ void ProbabilisticBlockScheduler::StopMiner(const std::string& node_id) {
   }
   const std::size_t index =
       static_cast<std::size_t>(std::distance(miner_node_ids_.begin(), miner));
+  const bool was_active = active_miners_[index];
   active_miners_[index] = false;
   condition_.wait(lock, [this, index] { return !in_flight_miners_[index]; });
+  return was_active;
 }
 
 void ProbabilisticBlockScheduler::UpdatePolicy(BlockProductionPolicy policy) {

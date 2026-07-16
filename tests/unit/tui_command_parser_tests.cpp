@@ -39,6 +39,29 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
   BOOST_REQUIRE(policy.peer_count_policy);
   BOOST_TEST(policy.peer_count_policy->minimum() == 1U);
   BOOST_TEST(policy.peer_count_policy->maximum() == 3U);
+
+  const bbp::ParsedTuiCommand generate =
+      bbp::TuiCommandParser::Parse("generate-blocks 9", 0U);
+  BOOST_CHECK(generate.kind == bbp::SimulationCommandKind::kGenerateBlocks);
+  BOOST_REQUIRE(generate.block_count);
+  BOOST_TEST(*generate.block_count == 9U);
+
+  const bbp::ParsedTuiCommand resource =
+      bbp::TuiCommandParser::Parse("resource-profile constrained", 0U);
+  BOOST_CHECK(resource.kind == bbp::SimulationCommandKind::kSetResourceProfile);
+  BOOST_REQUIRE(resource.profile);
+  BOOST_TEST(*resource.profile == "constrained");
+
+  BOOST_CHECK(bbp::TuiCommandParser::Parse("freeze", 0U).kind ==
+              bbp::SimulationCommandKind::kFreezeNode);
+  BOOST_CHECK(bbp::TuiCommandParser::Parse("thaw", 0U).kind ==
+              bbp::SimulationCommandKind::kThawNode);
+  BOOST_CHECK(bbp::TuiCommandParser::Parse("stop-node", 0U).kind ==
+              bbp::SimulationCommandKind::kStopNode);
+  BOOST_CHECK(bbp::TuiCommandParser::Parse("restart", 0U).kind ==
+              bbp::SimulationCommandKind::kRestartNode);
+  BOOST_CHECK(bbp::TuiCommandParser::Parse("kill", 0U).kind ==
+              bbp::SimulationCommandKind::kKillNode);
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
@@ -52,5 +75,9 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("connect-peer", 0U),
                     std::runtime_error);
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("peer-policy 2 1", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("generate-blocks 0", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("resource-profile", 0U),
                     std::runtime_error);
 }

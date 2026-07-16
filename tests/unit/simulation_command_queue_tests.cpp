@@ -15,9 +15,9 @@ using namespace std::chrono_literals;
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_fifo_order) {
   bbp::SimulationCommandQueue queue;
   const std::uint64_t first_sequence =
-      queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1");
+      queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1", true);
   const std::uint64_t second_sequence =
-      queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2");
+      queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2", true);
 
   BOOST_TEST(first_sequence == 1U);
   BOOST_TEST(second_sequence == 2U);
@@ -40,7 +40,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_wakes_waiting_consumer) {
       std::async(std::launch::async, [&queue] { return queue.WaitPop(); });
 
   BOOST_CHECK(pending.wait_for(20ms) == std::future_status::timeout);
-  queue.Push(bbp::SimulationCommandKind::kStopMining, "firo-1");
+  queue.Push(bbp::SimulationCommandKind::kStopMining, "firo-1", true);
   BOOST_CHECK(pending.wait_for(1s) == std::future_status::ready);
   const std::optional<bbp::SimulationCommand> command = pending.get();
   BOOST_REQUIRE(command);
@@ -56,29 +56,31 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_closes_waiting_consumer) {
   BOOST_CHECK(pending.wait_for(1s) == std::future_status::ready);
   BOOST_TEST(!pending.get());
   BOOST_TEST(queue.IsClosed());
-  BOOST_CHECK_THROW(queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-1"),
-                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-1", true),
+      std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(
     simulation_command_queue_cancel_discards_pending_commands) {
   bbp::SimulationCommandQueue queue;
-  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1");
-  queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2");
+  queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1", true);
+  queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2", true);
 
   queue.Cancel();
 
   BOOST_TEST(queue.IsClosed());
   BOOST_TEST(!queue.TryPop());
   BOOST_TEST(!queue.WaitPop());
-  BOOST_CHECK_THROW(queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-3"),
-                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-3", true),
+      std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_queue_rejects_empty_node_id) {
   bbp::SimulationCommandQueue queue;
   BOOST_CHECK_THROW(
-      queue.Push(bbp::SimulationCommandKind::kKillNode, std::string{}),
+      queue.Push(bbp::SimulationCommandKind::kKillNode, std::string{}, true),
       std::runtime_error);
 }
 
@@ -103,7 +105,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_peer_target) {
   bbp::SimulationCommandQueue queue;
   queue.PushPeerCommand(bbp::SimulationCommandKind::kDisconnectPeer, "firo-1",
-                        "firo-2");
+                        "firo-2", true);
 
   const std::optional<bbp::SimulationCommand> command = queue.TryPop();
   BOOST_REQUIRE(command);
@@ -123,7 +125,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_peer_target) {
 
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_peer_count_policy) {
   bbp::SimulationCommandQueue queue;
-  queue.PushPeerCountPolicy("firo-2", bbp::PeerCountPolicy(1U, 3U));
+  queue.PushPeerCountPolicy("firo-2", bbp::PeerCountPolicy(1U, 3U), true);
 
   const std::optional<bbp::SimulationCommand> command = queue.TryPop();
   BOOST_REQUIRE(command);
@@ -132,4 +134,44 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_peer_count_policy) {
   BOOST_REQUIRE(command->peer_count_policy);
   BOOST_TEST(command->peer_count_policy->minimum() == 1U);
   BOOST_TEST(command->peer_count_policy->maximum() == 3U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_requires_destructive_confirmation) {
+  bbp::SimulationCommandQueue queue;
+  BOOST_CHECK_THROW(queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-1"),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushPeerCommand(bbp::SimulationCommandKind::kDisconnectPeer,
+                            "firo-1", "firo-2"),
+      std::runtime_error);
+  BOOST_TEST(!queue.TryPop());
+
+  queue.Push(bbp::SimulationCommandKind::kRestartNode, "firo-1", true);
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->confirmed);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_operator_payloads) {
+  bbp::SimulationCommandQueue queue;
+  queue.PushGenerateBlocks("firo-1", 7U);
+  queue.PushProfileCommand(bbp::SimulationCommandKind::kSetResourceProfile,
+                           "firo-2", "constrained", true);
+
+  const std::optional<bbp::SimulationCommand> generate = queue.TryPop();
+  const std::optional<bbp::SimulationCommand> profile = queue.TryPop();
+  BOOST_REQUIRE(generate);
+  BOOST_REQUIRE(generate->block_count);
+  BOOST_TEST(*generate->block_count == 7U);
+  BOOST_REQUIRE(profile);
+  BOOST_REQUIRE(profile->profile);
+  BOOST_TEST(*profile->profile == "constrained");
+  BOOST_TEST(profile->confirmed);
+
+  BOOST_CHECK_THROW(queue.PushGenerateBlocks("firo-1", 0U), std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushProfileCommand(bbp::SimulationCommandKind::kKillNode, "firo-1",
+                               "x", true),
+      std::runtime_error);
 }

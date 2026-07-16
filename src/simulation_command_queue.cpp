@@ -6,7 +6,31 @@
 namespace bbp {
 
 std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
-                                           std::string node_id) {
+                                           std::string node_id,
+                                           bool confirmed) {
+  switch (kind) {
+    case SimulationCommandKind::kIncreaseLogVerbosity:
+    case SimulationCommandKind::kDecreaseLogVerbosity:
+    case SimulationCommandKind::kStopMining:
+    case SimulationCommandKind::kDisconnectNode:
+    case SimulationCommandKind::kReconnectNode:
+    case SimulationCommandKind::kKillNode:
+    case SimulationCommandKind::kFreezeNode:
+    case SimulationCommandKind::kThawNode:
+    case SimulationCommandKind::kStopNode:
+    case SimulationCommandKind::kRestartNode:
+      break;
+    case SimulationCommandKind::kSetBlockProductionPolicy:
+    case SimulationCommandKind::kSetMiningDifficulty:
+    case SimulationCommandKind::kConnectPeer:
+    case SimulationCommandKind::kDisconnectPeer:
+    case SimulationCommandKind::kSetPeerCountPolicy:
+    case SimulationCommandKind::kGenerateBlocks:
+    case SimulationCommandKind::kSetResourceProfile:
+    case SimulationCommandKind::kSetNetworkProfile:
+      throw std::runtime_error(
+          "simulation command kind requires a typed payload method");
+  }
   return PushCommand(SimulationCommand{
       .sequence = 0U,
       .kind = kind,
@@ -15,6 +39,9 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .mining_difficulty = std::nullopt,
       .peer_node_id = std::nullopt,
       .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .confirmed = confirmed,
   });
 }
 
@@ -28,6 +55,9 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .mining_difficulty = std::nullopt,
       .peer_node_id = std::nullopt,
       .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .confirmed = false,
   });
 }
 
@@ -41,11 +71,15 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .mining_difficulty = difficulty,
       .peer_node_id = std::nullopt,
       .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .confirmed = false,
   });
 }
 
 std::uint64_t SimulationCommandQueue::PushPeerCommand(
-    SimulationCommandKind kind, std::string node_id, std::string peer_node_id) {
+    SimulationCommandKind kind, std::string node_id, std::string peer_node_id,
+    bool confirmed) {
   if (kind != SimulationCommandKind::kConnectPeer &&
       kind != SimulationCommandKind::kDisconnectPeer) {
     throw std::runtime_error("peer command requires a peer command kind");
@@ -64,11 +98,14 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .mining_difficulty = std::nullopt,
       .peer_node_id = std::move(peer_node_id),
       .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .confirmed = confirmed,
   });
 }
 
 std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
-    std::string node_id, PeerCountPolicy policy) {
+    std::string node_id, PeerCountPolicy policy, bool confirmed) {
   return PushCommand(SimulationCommand{
       .sequence = 0U,
       .kind = SimulationCommandKind::kSetPeerCountPolicy,
@@ -77,6 +114,52 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .mining_difficulty = std::nullopt,
       .peer_node_id = std::nullopt,
       .peer_count_policy = policy,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .confirmed = confirmed,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
+    std::string node_id, std::uint32_t block_count) {
+  if (block_count == 0U) {
+    throw std::runtime_error("generate-blocks count must be positive");
+  }
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kGenerateBlocks,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = block_count,
+      .profile = std::nullopt,
+      .confirmed = false,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushProfileCommand(
+    SimulationCommandKind kind, std::string node_id, std::string profile,
+    bool confirmed) {
+  if (kind != SimulationCommandKind::kSetResourceProfile &&
+      kind != SimulationCommandKind::kSetNetworkProfile) {
+    throw std::runtime_error("profile command requires a profile command kind");
+  }
+  if (profile.empty()) {
+    throw std::runtime_error("profile command requires a profile name");
+  }
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = kind,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::move(profile),
+      .confirmed = confirmed,
   });
 }
 
@@ -85,6 +168,10 @@ std::uint64_t SimulationCommandQueue::PushCommand(SimulationCommand command) {
   if (node_id.empty() &&
       command.kind != SimulationCommandKind::kSetBlockProductionPolicy) {
     throw std::runtime_error("simulation command requires a node id");
+  }
+  if (SimulationCommandRequiresConfirmation(command.kind) &&
+      !command.confirmed) {
+    throw std::runtime_error("destructive simulation command is unconfirmed");
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
