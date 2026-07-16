@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "bbp/default_peer_topology.h"
 #include "bbp/simulation_network_address_plan.h"
 
 BOOST_AUTO_TEST_CASE(simulation_network_plan_assigns_distinct_node_subnets) {
@@ -52,4 +53,39 @@ BOOST_AUTO_TEST_CASE(simulation_network_plan_rejects_invalid_persisted_range) {
   BOOST_CHECK_THROW(
       bbp::SimulationNetworkAddressPlan::FromCidr("10.210.0.1/26", 1U),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(directional_network_policies_keep_canonical_edge_bands) {
+  bbp::NetworkCondition delayed;
+  delayed.delay_ms = 25U;
+  bbp::NetworkCondition limited;
+  limited.bandwidth_mbps = 8U;
+
+  bbp::PeerTopologyConfig topology;
+  topology.kind = bbp::PeerTopologyKind::kCustomEdgeList;
+  topology.edges = {
+      {.from = 0U,
+       .to = 1U,
+       .bidirectional = false,
+       .active = true,
+       .condition = delayed},
+      {.from = 0U, .to = 2U, .bidirectional = false, .active = true},
+      {.from = 0U,
+       .to = 3U,
+       .bidirectional = false,
+       .active = true,
+       .condition = limited},
+  };
+  const bbp::SimulationNetworkAddressPlan plan =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.210.4.0/26", 4U);
+
+  const auto policies =
+      bbp::ResolveDirectionalNetworkPolicies(topology, plan, 4U, 0U);
+  BOOST_REQUIRE_EQUAL(policies.size(), 2U);
+  BOOST_TEST(policies[0].band == 1U);
+  BOOST_TEST(policies[0].destination_address == plan.NodeAddress(1U));
+  BOOST_CHECK(policies[0].condition == delayed);
+  BOOST_TEST(policies[1].band == 3U);
+  BOOST_TEST(policies[1].destination_address == plan.NodeAddress(3U));
+  BOOST_CHECK(policies[1].condition == limited);
 }

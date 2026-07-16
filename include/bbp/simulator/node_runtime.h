@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "bbp/cgroup.h"
 #include "bbp/drivers/chain_driver.h"
@@ -18,6 +19,7 @@ struct NodeRuntime {
   std::optional<Cgroup> cgroup;
   std::optional<NetworkNamespace> network_namespace;
   std::optional<NodeVethConfig> network;
+  std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
   ResourceLimits resources;
   LogTailCursor stdout_log_cursor;

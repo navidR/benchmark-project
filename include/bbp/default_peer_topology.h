@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 
+#include "bbp/network.h"
+
 namespace bbp {
 
 enum class PeerTopologyKind {
@@ -80,7 +82,8 @@ struct PeerTopologyEdge {
   std::uint32_t to = 0;
   bool bidirectional = true;
   bool active = true;
-  std::optional<std::uint32_t> latency_ms;
+  std::optional<std::uint32_t> latency_ms = std::nullopt;
+  std::optional<NetworkCondition> condition = std::nullopt;
 };
 
 struct PeerTopologyRegionEdge {
@@ -106,7 +109,8 @@ struct PeerTopologyConfig {
 struct ResolvedPeerTopologyEdge {
   std::uint32_t from = 0;
   std::uint32_t to = 0;
-  std::optional<std::uint32_t> latency_ms;
+  std::optional<std::uint32_t> latency_ms = std::nullopt;
+  std::optional<NetworkCondition> condition = std::nullopt;
 
   bool operator==(const ResolvedPeerTopologyEdge&) const = default;
 };

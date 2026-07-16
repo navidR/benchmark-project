@@ -29,6 +29,7 @@ constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
 constexpr std::size_t kMaximumOperatorCommandSummaries = 256U;
 constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
 constexpr std::size_t kMaximumScheduledEventSummaries = 256U;
+constexpr std::size_t kMaximumDirectionalPolicyVerifications = 256U;
 
 struct NodeReport {
   std::uint64_t metric_samples = 0;
@@ -676,6 +677,14 @@ void AppendScheduledEventSummary(const boost::json::object& event,
   }
 }
 
+void AppendDirectionalPolicyVerification(const boost::json::object& event,
+                                         boost::json::array* summaries) {
+  AppendEventSummary(event, summaries);
+  if (summaries->size() > kMaximumDirectionalPolicyVerifications) {
+    summaries->erase(summaries->begin());
+  }
+}
+
 void ApplyBlockProductionPolicyEvent(const boost::json::object& event,
                                      boost::json::object* report) {
   const boost::json::value detail = ParseEventDetail(event);
@@ -768,6 +777,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array resource_updates;
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
+  boost::json::array directional_network_policy_verifications;
   boost::json::array wallet_funding;
   boost::json::array wallet_transactions;
   boost::json::array operator_commands;
@@ -872,6 +882,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           case SimulationEventKind::kNetworkPartitionHealed:
             AppendEventSummary(event, &network_partition_heals);
             break;
+          case SimulationEventKind::kDirectionalNetworkPoliciesVerified:
+            AppendDirectionalPolicyVerification(
+                event, &directional_network_policy_verifications);
+            break;
           case SimulationEventKind::kWalletAddressRequested:
           case SimulationEventKind::kWalletAddressCreated:
             RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
@@ -975,6 +989,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["resource_updates"] = std::move(resource_updates);
   report["network_partitions"] = std::move(network_partitions);
   report["network_partition_heals"] = std::move(network_partition_heals);
+  report["directional_network_policy_verifications"] =
+      std::move(directional_network_policy_verifications);
   report["wallet_funding"] = std::move(wallet_funding);
   report["wallet_transactions"] = std::move(wallet_transactions);
   report["operator_commands"] = std::move(operator_commands);

@@ -16,6 +16,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "daemon_log_tail";
     case SimulationEventKind::kNetworkConditionVerified:
       return "network_condition_verified";
+    case SimulationEventKind::kDirectionalNetworkPoliciesVerified:
+      return "directional_network_policies_verified";
     case SimulationEventKind::kNetworkReady:
       return "network_ready";
     case SimulationEventKind::kProcessStarted:
@@ -146,6 +148,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
   if (name == "daemon_log_tail") return SimulationEventKind::kDaemonLogTail;
   if (name == "network_condition_verified")
     return SimulationEventKind::kNetworkConditionVerified;
+  if (name == "directional_network_policies_verified")
+    return SimulationEventKind::kDirectionalNetworkPoliciesVerified;
   if (name == "network_ready") return SimulationEventKind::kNetworkReady;
   if (name == "process_started") return SimulationEventKind::kProcessStarted;
   if (name == "process_exited_before_rpc_ready")

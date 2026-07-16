@@ -929,6 +929,34 @@ PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
   if (latency != nullptr) {
     edge.latency_ms = JsonUint32Value(*latency, "latency_ms");
   }
+  constexpr std::string_view kConditionFields[] = {
+      "bandwidth_mbps",
+      "delay_ms",
+      "jitter_ms",
+      "loss_basis_points",
+      "duplicate_basis_points",
+      "corrupt_basis_points",
+      "reorder_basis_points",
+      "limit_packets",
+  };
+  bool condition_present = edge.latency_ms.has_value();
+  for (std::string_view field : kConditionFields) {
+    condition_present =
+        condition_present || object.if_contains(field) != nullptr;
+  }
+  if (condition_present) {
+    NetworkCondition condition = ParseNetworkConditionObject(object);
+    if (edge.latency_ms) {
+      const boost::json::value* delay = object.if_contains("delay_ms");
+      if (delay != nullptr && condition.delay_ms != *edge.latency_ms) {
+        throw std::runtime_error(
+            "scenario topology edge latency_ms and delay_ms must match");
+      }
+      condition.delay_ms = *edge.latency_ms;
+    }
+    ValidateNetworkCondition(condition);
+    edge.condition = condition;
+  }
   return edge;
 }
 
@@ -2341,6 +2369,8 @@ void ParseLegacyCliInputs(const LegacyCliInputs& inputs, Options& options) {
                               options.runtime_node_freezes);
 }
 
+bool TopologyHasDirectionalNetworkConditions(const Options& options);
+
 Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
   Options options;
@@ -2755,6 +2785,7 @@ Options ParseOptions(int argc, char** argv) {
        !options.runtime_node_unblocks.empty() ||
        !options.runtime_partitions.empty() ||
        !options.runtime_partition_heals.empty() ||
+       TopologyHasDirectionalNetworkConditions(options) ||
        WorkloadsRequireIsolatedNetwork(options)) &&
       !options.isolate_network) {
     throw std::runtime_error(
@@ -3094,17 +3125,35 @@ boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
   return filters_json;
 }
 
+void AddNetworkConditionJsonFields(const NetworkCondition& condition,
+                                   boost::json::object* object) {
+  (*object)["bandwidth_mbps"] = condition.bandwidth_mbps;
+  (*object)["delay_ms"] = condition.delay_ms;
+  (*object)["jitter_ms"] = condition.jitter_ms;
+  (*object)["loss_basis_points"] = condition.loss_basis_points;
+  (*object)["duplicate_basis_points"] = condition.duplicate_basis_points;
+  (*object)["corrupt_basis_points"] = condition.corrupt_basis_points;
+  (*object)["reorder_basis_points"] = condition.reorder_basis_points;
+  (*object)["limit_packets"] = condition.limit_packets;
+}
+
 boost::json::object NetworkConditionJson(const NetworkCondition& condition) {
   boost::json::object object;
-  object["bandwidth_mbps"] = condition.bandwidth_mbps;
-  object["delay_ms"] = condition.delay_ms;
-  object["jitter_ms"] = condition.jitter_ms;
-  object["loss_basis_points"] = condition.loss_basis_points;
-  object["duplicate_basis_points"] = condition.duplicate_basis_points;
-  object["corrupt_basis_points"] = condition.corrupt_basis_points;
-  object["reorder_basis_points"] = condition.reorder_basis_points;
-  object["limit_packets"] = condition.limit_packets;
+  AddNetworkConditionJsonFields(condition, &object);
   return object;
+}
+
+boost::json::array DirectionalNetworkPoliciesJson(
+    const std::vector<DirectionalNetworkPolicy>& policies) {
+  boost::json::array array;
+  for (const DirectionalNetworkPolicy& policy : policies) {
+    boost::json::object object;
+    object["band"] = policy.band;
+    object["destination_address"] = policy.destination_address;
+    object["condition"] = NetworkConditionJson(policy.condition);
+    array.push_back(std::move(object));
+  }
+  return array;
 }
 
 boost::json::object NetworkBlockRuleJson(const NetworkBlockRule& rule) {
@@ -3190,6 +3239,9 @@ boost::json::array PeerTopologyEdgesJson(
     if (edge.latency_ms) {
       object["latency_ms"] = *edge.latency_ms;
     }
+    if (edge.condition) {
+      AddNetworkConditionJsonFields(*edge.condition, &object);
+    }
     array.push_back(std::move(object));
   }
   return array;
@@ -3236,6 +3288,9 @@ boost::json::array ResolvedPeerTopologyEdgesJson(
     object["to"] = edge.to + 1U;
     if (edge.latency_ms) {
       object["latency_ms"] = *edge.latency_ms;
+    }
+    if (edge.condition) {
+      AddNetworkConditionJsonFields(*edge.condition, &object);
     }
     array.push_back(std::move(object));
   }
@@ -3602,6 +3657,21 @@ std::vector<uint32_t> ConfiguredStartupPeerIndexes(const Options& options,
   return eligible;
 }
 
+bool TopologyHasDirectionalNetworkConditions(const Options& options) {
+  const std::vector<ResolvedPeerTopologyEdge> edges =
+      ResolvePeerTopologyEdges(options.topology.peer_topology, options.nodes);
+  return std::any_of(edges.begin(), edges.end(), [](const auto& edge) {
+    return edge.condition.has_value();
+  });
+}
+
+std::vector<DirectionalNetworkPolicy> DirectionalNetworkPoliciesForNode(
+    const Options& options, uint32_t node_index) {
+  return ResolveDirectionalNetworkPolicies(options.topology.peer_topology,
+                                           NetworkAddressPlan(options),
+                                           options.nodes, node_index);
+}
+
 std::vector<std::string> StartupPeerAddresses(const Options& options,
                                               const ChainDriverSpec& chain_spec,
                                               uint32_t node_index) {
@@ -3769,15 +3839,7 @@ std::string DirectionalNetworkPolicyProbeJson() {
   result["helper_pid"] = probe.helper_pid;
   result["host_name"] = probe.host_name;
   result["peer_name"] = probe.peer_name;
-  boost::json::array policies;
-  for (const DirectionalNetworkPolicy& policy : probe.policies) {
-    boost::json::object object;
-    object["band"] = policy.band;
-    object["destination_address"] = policy.destination_address;
-    object["condition"] = NetworkConditionJson(policy.condition);
-    policies.push_back(std::move(object));
-  }
-  result["policies"] = std::move(policies);
+  result["policies"] = DirectionalNetworkPoliciesJson(probe.policies);
   result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
   result["namespace_qdiscs_after_apply"] =
       QdiscsJson(probe.namespace_qdiscs_after_apply);
@@ -5349,6 +5411,22 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
               events_path, options.run_id, node_id,
               SimulationEventKind::kNetworkConditionVerified,
               NetworkConditionVerificationDetail(*runtime.network, qdisc));
+        }
+        runtime.directional_network_policies =
+            DirectionalNetworkPoliciesForNode(options, i);
+        if (!runtime.directional_network_policies.empty()) {
+          UpdateDirectionalNetworkPoliciesInNamespace(
+              runtime.network_namespace->fd(), runtime.network->peer_name, {},
+              runtime.directional_network_policies);
+          boost::json::object detail;
+          detail["source_node"] = i + 1U;
+          detail["peer_if"] = runtime.network->peer_name;
+          detail["verified"] = true;
+          detail["policies"] = DirectionalNetworkPoliciesJson(
+              runtime.directional_network_policies);
+          WriteEvent(events_path, options.run_id, node_id,
+                     SimulationEventKind::kDirectionalNetworkPoliciesVerified,
+                     boost::json::serialize(detail));
         }
         runtime.config.rpc_host = runtime.network->node_address;
         runtime.config.rpc_bind = runtime.network->node_address;

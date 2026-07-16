@@ -375,7 +375,6 @@ bool HasBandwidthCondition(const NetworkCondition& condition) {
 
 in_addr ParseIpv4Address(const std::string& address,
                          std::string_view field_name);
-void ValidateNetworkCondition(const NetworkCondition& condition);
 
 std::uint32_t DirectionalClassId(std::uint32_t band) {
   return TC_H_MAKE(TC_H_MAJ(kDirectionalRootHandle), band + 1U);
@@ -532,6 +531,8 @@ bool QdiscMatchesNetemCondition(const QdiscInfo& qdisc,
          qdisc.netem_limit_packets == condition.limit_packets;
 }
 
+}  // namespace
+
 void ValidateNetworkCondition(const NetworkCondition& condition) {
   constexpr std::uint32_t kMaxBasisPoints = 10000U;
   constexpr std::uint32_t kMaxDelayMs = 4294967U;
@@ -554,8 +555,6 @@ void ValidateNetworkCondition(const NetworkCondition& condition) {
     throw std::runtime_error("netem packet limit must be greater than zero");
   }
 }
-
-}  // namespace
 
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition) {

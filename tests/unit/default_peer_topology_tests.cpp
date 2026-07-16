@@ -148,9 +148,66 @@ BOOST_AUTO_TEST_CASE(peer_topology_latency_matrix_preserves_direction) {
   BOOST_TEST(!HasEdge(edges, 2U, 1U));
   BOOST_REQUIRE(edges[0].latency_ms.has_value());
   BOOST_TEST(*edges[0].latency_ms == 10U);
+  BOOST_REQUIRE(edges[0].condition.has_value());
+  BOOST_TEST(edges[0].condition->delay_ms == 10U);
 
   topology.latency_matrix_ms[2][2] = 1U;
   BOOST_CHECK_THROW(bbp::ResolvePeerTopologyEdges(topology, 3U),
+                    std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(peer_topology_custom_edges_preserve_typed_conditions) {
+  bbp::NetworkCondition condition;
+  condition.bandwidth_mbps = 7U;
+  condition.delay_ms = 23U;
+  condition.jitter_ms = 4U;
+  condition.loss_basis_points = 5U;
+  condition.duplicate_basis_points = 6U;
+  condition.corrupt_basis_points = 7U;
+  condition.reorder_basis_points = 8U;
+  condition.limit_packets = 900U;
+
+  bbp::PeerTopologyConfig topology;
+  topology.kind = bbp::PeerTopologyKind::kCustomEdgeList;
+  topology.edges = {{.from = 0U,
+                     .to = 1U,
+                     .bidirectional = true,
+                     .active = true,
+                     .latency_ms = 23U,
+                     .condition = condition}};
+
+  const auto edges = bbp::ResolvePeerTopologyEdges(topology, 2U);
+  BOOST_REQUIRE_EQUAL(edges.size(), 2U);
+  for (const auto& edge : edges) {
+    BOOST_REQUIRE(edge.condition.has_value());
+    BOOST_CHECK(*edge.condition == condition);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(peer_topology_rejects_conflicting_duplicate_conditions) {
+  bbp::NetworkCondition first;
+  first.delay_ms = 10U;
+  bbp::NetworkCondition second = first;
+  second.delay_ms = 20U;
+
+  bbp::PeerTopologyConfig topology;
+  topology.kind = bbp::PeerTopologyKind::kCustomEdgeList;
+  topology.edges = {
+      {.from = 0U,
+       .to = 1U,
+       .bidirectional = false,
+       .active = true,
+       .latency_ms = 10U,
+       .condition = first},
+      {.from = 0U,
+       .to = 1U,
+       .bidirectional = false,
+       .active = true,
+       .latency_ms = 20U,
+       .condition = second},
+  };
+
+  BOOST_CHECK_THROW(bbp::ResolvePeerTopologyEdges(topology, 2U),
                     std::runtime_error);
 }
 

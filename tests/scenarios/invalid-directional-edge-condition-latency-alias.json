@@ -1,0 +1,15 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "invalid-edge-condition-latency-alias",
+  "node_count": 2,
+  "block_production": {"enabled": false},
+  "network": {"isolated": true},
+  "topology": {
+    "node_count": 2,
+    "type": "custom_edge_list",
+    "edges": [
+      {"from": 1, "to": 2, "bidirectional": false, "latency_ms": 10, "delay_ms": 20}
+    ]
+  }
+}

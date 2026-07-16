@@ -9,6 +9,7 @@ BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
       bbp::SimulationEventKind::kStderrTail,
       bbp::SimulationEventKind::kDaemonLogTail,
       bbp::SimulationEventKind::kNetworkConditionVerified,
+      bbp::SimulationEventKind::kDirectionalNetworkPoliciesVerified,
       bbp::SimulationEventKind::kNetworkReady,
       bbp::SimulationEventKind::kProcessStarted,
       bbp::SimulationEventKind::kProcessExitedBeforeRpcReady,

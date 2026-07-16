@@ -1,0 +1,35 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "directional-edge-condition-smoke",
+  "node_count": 3,
+  "block_production": {"enabled": false},
+  "network": {"isolated": true},
+  "topology": {
+    "node_count": 3,
+    "type": "custom_edge_list",
+    "edges": [
+      {
+        "from": 1,
+        "to": 2,
+        "bidirectional": false,
+        "active": true,
+        "latency_ms": 25,
+        "delay_ms": 25,
+        "bandwidth_mbps": 8,
+        "jitter_ms": 3,
+        "loss_basis_points": 4,
+        "duplicate_basis_points": 5,
+        "corrupt_basis_points": 6,
+        "reorder_basis_points": 7,
+        "limit_packets": 800
+      },
+      {
+        "from": 2,
+        "to": 3,
+        "bidirectional": true,
+        "active": true
+      }
+    ]
+  }
+}

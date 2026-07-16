@@ -14,21 +14,34 @@ namespace {
 
 using EdgeKey = std::pair<std::uint32_t, std::uint32_t>;
 
+struct EdgeAttributes {
+  std::optional<std::uint32_t> latency_ms;
+  std::optional<NetworkCondition> condition;
+
+  bool operator==(const EdgeAttributes&) const = default;
+};
+
 class EdgeCollector {
  public:
   explicit EdgeCollector(std::uint32_t node_count) : node_count_(node_count) {}
 
   void Add(std::uint32_t from, std::uint32_t to,
-           std::optional<std::uint32_t> latency_ms = std::nullopt) {
+           std::optional<std::uint32_t> latency_ms = std::nullopt,
+           std::optional<NetworkCondition> condition = std::nullopt) {
     if (from >= node_count_ || to >= node_count_) {
       throw std::runtime_error("peer topology edge node is out of range");
     }
     if (from == to) {
       throw std::runtime_error("peer topology must not contain self edges");
     }
+    if (condition) {
+      ValidateNetworkCondition(*condition);
+    }
+    const EdgeAttributes attributes{.latency_ms = latency_ms,
+                                    .condition = condition};
     const auto [entry, inserted] =
-        edges_.emplace(EdgeKey{from, to}, latency_ms);
-    if (!inserted && entry->second != latency_ms) {
+        edges_.emplace(EdgeKey{from, to}, attributes);
+    if (!inserted && entry->second != attributes) {
       throw std::runtime_error(
           "peer topology contains conflicting duplicate edges");
     }
@@ -36,24 +49,28 @@ class EdgeCollector {
 
   void AddBidirectional(
       std::uint32_t left, std::uint32_t right,
-      std::optional<std::uint32_t> latency_ms = std::nullopt) {
-    Add(left, right, latency_ms);
-    Add(right, left, latency_ms);
+      std::optional<std::uint32_t> latency_ms = std::nullopt,
+      std::optional<NetworkCondition> condition = std::nullopt) {
+    Add(left, right, latency_ms, condition);
+    Add(right, left, latency_ms, condition);
   }
 
   std::vector<ResolvedPeerTopologyEdge> Resolve() const {
     std::vector<ResolvedPeerTopologyEdge> result;
     result.reserve(edges_.size());
-    for (const auto& [nodes, latency_ms] : edges_) {
-      result.push_back(ResolvedPeerTopologyEdge{
-          .from = nodes.first, .to = nodes.second, .latency_ms = latency_ms});
+    for (const auto& [nodes, attributes] : edges_) {
+      result.push_back(
+          ResolvedPeerTopologyEdge{.from = nodes.first,
+                                   .to = nodes.second,
+                                   .latency_ms = attributes.latency_ms,
+                                   .condition = attributes.condition});
     }
     return result;
   }
 
  private:
   std::uint32_t node_count_ = 0;
-  std::map<EdgeKey, std::optional<std::uint32_t>> edges_;
+  std::map<EdgeKey, EdgeAttributes> edges_;
 };
 
 void RequireNodeCount(std::uint32_t node_count) {
@@ -245,9 +262,9 @@ void AddConfiguredEdge(const PeerTopologyEdge& edge, std::uint32_t node_count,
   if (!edge.active) {
     return;
   }
-  edges->Add(edge.from, edge.to, edge.latency_ms);
+  edges->Add(edge.from, edge.to, edge.latency_ms, edge.condition);
   if (edge.bidirectional) {
-    edges->Add(edge.to, edge.from, edge.latency_ms);
+    edges->Add(edge.to, edge.from, edge.latency_ms, edge.condition);
   }
 }
 
@@ -318,7 +335,9 @@ std::vector<ResolvedPeerTopologyEdge> ResolvePeerTopologyEdges(
                   "latency matrix diagonal must be null or zero");
             }
           } else if (row[to]) {
-            edges.Add(from, to, row[to]);
+            NetworkCondition condition;
+            condition.delay_ms = *row[to];
+            edges.Add(from, to, row[to], condition);
           }
         }
       }

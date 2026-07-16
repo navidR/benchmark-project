@@ -9,6 +9,8 @@
 
 namespace bbp {
 
+struct PeerTopologyConfig;
+
 class SimulationNetworkAddressPlan {
  public:
   static SimulationNetworkAddressPlan Allocate(
@@ -29,5 +31,10 @@ class SimulationNetworkAddressPlan {
   std::uint32_t base_address_ = 0;
   std::uint32_t node_count_ = 0;
 };
+
+std::vector<DirectionalNetworkPolicy> ResolveDirectionalNetworkPolicies(
+    const PeerTopologyConfig& topology,
+    const SimulationNetworkAddressPlan& address_plan, std::uint32_t node_count,
+    std::uint32_t node_index);
 
 }  // namespace bbp

@@ -6,6 +6,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "bbp/default_peer_topology.h"
+
 namespace bbp {
 namespace {
 
@@ -139,6 +141,38 @@ std::string SimulationNetworkAddressPlan::NodeAddress(
 
 std::uint8_t SimulationNetworkAddressPlan::NodePrefixLength() const {
   return static_cast<std::uint8_t>(kNodePrefixLength);
+}
+
+std::vector<DirectionalNetworkPolicy> ResolveDirectionalNetworkPolicies(
+    const PeerTopologyConfig& topology,
+    const SimulationNetworkAddressPlan& address_plan, std::uint32_t node_count,
+    std::uint32_t node_index) {
+  if (node_index >= node_count) {
+    throw std::out_of_range("directional policy node index is out of range");
+  }
+
+  std::vector<DirectionalNetworkPolicy> policies;
+  std::uint32_t outgoing_band = 0U;
+  for (const ResolvedPeerTopologyEdge& edge :
+       ResolvePeerTopologyEdges(topology, node_count)) {
+    if (edge.from != node_index) {
+      continue;
+    }
+    ++outgoing_band;
+    if (outgoing_band > 15U) {
+      throw std::runtime_error(
+          "directional topology policy exceeds the 15-peer band limit");
+    }
+    if (!edge.condition) {
+      continue;
+    }
+    policies.push_back(DirectionalNetworkPolicy{
+        .band = outgoing_band,
+        .destination_address = address_plan.NodeAddress(edge.to),
+        .condition = *edge.condition,
+    });
+  }
+  return policies;
 }
 
 }  // namespace bbp

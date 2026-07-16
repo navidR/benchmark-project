@@ -4,6 +4,7 @@
   "run_id": "logical-topology-smoke",
   "node_count": 5,
   "block_production": {"enabled": false},
+  "network": {"isolated": true},
   "topology": {
     "node_count": 5,
     "type": "custom_edge_list",

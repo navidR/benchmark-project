@@ -582,12 +582,31 @@ directed `resolved_edges` array is written to `resolved-scenario.json`.
 `star` accepts `center_node`; `random_graph` accepts `seed` and
 `average_degree`; `scale_free_graph` accepts `seed` plus either
 `attachment_count` or `average_degree`. A custom edge has `from`, `to`,
-`bidirectional`, `active`, and optional `latency_ms` fields. Partition and
-region node groups must assign every simulated node exactly once. Region edges
-connect the first node in each region as its gateway; without explicit
-`region_edges`, all region gateways form a backbone mesh. A latency matrix uses
-`null` for an absent directed edge and a non-negative millisecond value for a
-present directed edge:
+`bidirectional`, and `active` fields. It may also define the flattened typed
+condition fields `bandwidth_mbps`, `delay_ms`, `jitter_ms`,
+`loss_basis_points`, `duplicate_basis_points`, `corrupt_basis_points`,
+`reorder_basis_points`, and `limit_packets`. The compatibility field
+`latency_ms` maps to `delay_ms`; when both are present, their values must match.
+Directional conditions require `network.isolated: true` and are validated
+before the simulator creates resources.
+
+For each source node, active outgoing edges receive deterministic bands in
+canonical destination order. Unconditioned edges retain their bands so adding
+or removing a condition does not renumber later destinations. The simulator
+applies each condition to an exact destination IPv4 `/32` on the source node's
+namespace-side veth through direct rtnetlink calls, verifies the qdisc and
+flower-filter state from the kernel, and records a
+`directional_network_policies_verified` event. The current 16-node isolated
+address plan permits at most 15 outgoing destination bands per source. The
+configured and resolved edge conditions are preserved in
+`resolved-scenario.json` and in the shared CLI/TUI run report.
+
+Partition and region node groups must assign every simulated node exactly once.
+Region edges connect the first node in each region as its gateway; without
+explicit `region_edges`, all region gateways form a backbone mesh. A latency
+matrix uses `null` for an absent directed edge and a non-negative millisecond
+value for a present directed edge; each off-diagonal value also resolves to the
+edge's typed `delay_ms` condition:
 
 ```json
 {

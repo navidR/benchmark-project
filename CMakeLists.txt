@@ -368,6 +368,32 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-logical-topology-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-directional-edge-condition
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-directional-edge-condition.json"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-directional-edge-condition-without-isolation
+    tests/scenarios/invalid-directional-edge-condition-without-isolation.json
+    "network runtime options require --isolate-network"
+  )
+  add_cli_failure_test(
+    bbp-invalid-directional-edge-condition-loss
+    tests/scenarios/invalid-directional-edge-condition-loss.json
+    "netem loss basis points must be 0..10000"
+  )
+  add_cli_failure_test(
+    bbp-invalid-directional-edge-condition-limit
+    tests/scenarios/invalid-directional-edge-condition-limit.json
+    "netem packet limit must be greater than zero"
+  )
+  add_cli_failure_test(
+    bbp-invalid-directional-edge-condition-latency-alias
+    tests/scenarios/invalid-directional-edge-condition-latency-alias.json
+    "scenario topology edge latency_ms and delay_ms must match"
+  )
   add_test(NAME bbp-valid-wallet-transactions-scenario
     COMMAND bbp
       --scenario-json

@@ -11,6 +11,7 @@ enum class SimulationEventKind {
   kStderrTail,
   kDaemonLogTail,
   kNetworkConditionVerified,
+  kDirectionalNetworkPoliciesVerified,
   kNetworkReady,
   kProcessStarted,
   kProcessExitedBeforeRpcReady,

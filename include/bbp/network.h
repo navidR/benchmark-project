@@ -162,6 +162,8 @@ struct DirectionalNetworkPolicy {
   bool operator==(const DirectionalNetworkPolicy&) const = default;
 };
 
+void ValidateNetworkCondition(const NetworkCondition& condition);
+
 class NetworkNamespace {
  public:
   static NetworkNamespace Create();

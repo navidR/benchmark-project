@@ -624,6 +624,74 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    run_report_preserves_topology_conditions_and_policy_verification) {
+  const std::filesystem::path dir = MakeTestDir("edge-condition");
+  boost::json::object condition;
+  condition["from"] = 1U;
+  condition["to"] = 2U;
+  condition["bandwidth_mbps"] = 9U;
+  condition["delay_ms"] = 40U;
+  condition["jitter_ms"] = 3U;
+  condition["loss_basis_points"] = 5U;
+  condition["duplicate_basis_points"] = 6U;
+  condition["corrupt_basis_points"] = 7U;
+  condition["reorder_basis_points"] = 8U;
+  condition["limit_packets"] = 777U;
+  boost::json::array resolved_edges;
+  resolved_edges.push_back(condition);
+  boost::json::object topology;
+  topology["type"] = "custom_edge_list";
+  topology["resolved_edges"] = std::move(resolved_edges);
+  boost::json::object scenario;
+  scenario["run_id"] = "r1";
+  scenario["nodes"] = 2U;
+  scenario["topology"] = std::move(topology);
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 boost::json::serialize(scenario) + "\n");
+
+  boost::json::object policy_condition = condition;
+  policy_condition.erase("from");
+  policy_condition.erase("to");
+  boost::json::object policy;
+  policy["band"] = 1U;
+  policy["destination_address"] = "10.210.1.6";
+  policy["condition"] = std::move(policy_condition);
+  boost::json::array policies;
+  policies.push_back(std::move(policy));
+  boost::json::object detail;
+  detail["source_node"] = 1U;
+  detail["peer_if"] = "bbptest1p";
+  detail["verified"] = true;
+  detail["policies"] = std::move(policies);
+  boost::json::object event;
+  event["timestamp"] = "2026-07-16T00:00:00Z";
+  event["run_id"] = "r1";
+  event["node_id"] = "node-001";
+  event["event"] = "directional_network_policies_verified";
+  event["detail"] = boost::json::serialize(detail);
+  bbp::WriteText(dir / "events.jsonl", boost::json::serialize(event) + "\n");
+  bbp::WriteText(dir / "metrics.jsonl", "");
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  const auto& report_edges =
+      report.at("topology").as_object().at("resolved_edges").as_array();
+  BOOST_REQUIRE_EQUAL(report_edges.size(), 1U);
+  BOOST_TEST(JsonInteger(report_edges[0].as_object(), "delay_ms") == 40U);
+  const auto& verifications =
+      report.at("directional_network_policy_verifications").as_array();
+  BOOST_REQUIRE_EQUAL(verifications.size(), 1U);
+  const auto& reported_detail =
+      verifications[0].as_object().at("detail").as_object();
+  BOOST_TEST(reported_detail.at("verified").as_bool());
+  BOOST_TEST(
+      JsonInteger(reported_detail.at("policies").as_array()[0].as_object(),
+                  "band") == 1U);
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-peer-churn");
   bbp::WriteText(dir / "resolved-scenario.json",
