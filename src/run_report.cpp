@@ -730,6 +730,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array peer_connects;
   boost::json::array peer_disconnects;
   boost::json::array raw_transactions;
+  boost::json::array transaction_visibility;
+  boost::json::array transaction_confirmations;
   boost::json::array node_restarts;
   boost::json::array node_freezes;
   boost::json::array resource_updates;
@@ -805,6 +807,12 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
             break;
           case SimulationEventKind::kRawTransactionSubmitted:
             AppendEventSummary(event, &raw_transactions);
+            break;
+          case SimulationEventKind::kTransactionVisible:
+            AppendEventSummary(event, &transaction_visibility);
+            break;
+          case SimulationEventKind::kTransactionConfirmed:
+            AppendEventSummary(event, &transaction_confirmations);
             break;
           case SimulationEventKind::kNodeRestarted:
             AppendEventSummary(event, &node_restarts);
@@ -911,6 +919,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["peer_connects"] = std::move(peer_connects);
   report["peer_disconnects"] = std::move(peer_disconnects);
   report["raw_transactions"] = std::move(raw_transactions);
+  report["transaction_visibility"] = std::move(transaction_visibility);
+  report["transaction_confirmations"] = std::move(transaction_confirmations);
   report["node_restarts"] = std::move(node_restarts);
   report["node_freezes"] = std::move(node_freezes);
   report["resource_updates"] = std::move(resource_updates);

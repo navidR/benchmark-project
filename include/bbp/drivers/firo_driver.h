@@ -97,6 +97,13 @@ class FiroDriver final : public ChainDriver {
       const std::string& destination_address, uint64_t amount_satoshis,
       uint64_t fee_satoshis, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const override;
+  ChainTransactionObservation ObserveTransaction(
+      const FiroNodeConfig& config, const std::string& txid,
+      std::stop_token stop_token = {}) const override;
+  ChainTransactionObservation WaitForTransaction(
+      const FiroNodeConfig& config, const std::string& txid,
+      std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const override;
   uint64_t WaitForMempoolTransaction(
       const FiroNodeConfig& config, const std::string& txid,
       std::chrono::seconds timeout,

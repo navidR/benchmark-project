@@ -113,6 +113,16 @@ class TestChainDriver final : public bbp::ChainDriver {
       std::stop_token) const override {
     return {};
   }
+  bbp::ChainTransactionObservation ObserveTransaction(
+      const bbp::ChainNodeConfig&, const std::string&,
+      std::stop_token) const override {
+    return {};
+  }
+  bbp::ChainTransactionObservation WaitForTransaction(
+      const bbp::ChainNodeConfig&, const std::string&, std::chrono::seconds,
+      std::stop_token) const override {
+    return {};
+  }
   std::uint64_t WaitForMempoolTransaction(const bbp::ChainNodeConfig&,
                                           const std::string&,
                                           std::chrono::seconds,

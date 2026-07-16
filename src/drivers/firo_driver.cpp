@@ -1,5 +1,6 @@
 #include "bbp/drivers/firo_driver.h"
 
+#include <algorithm>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/network_v4.hpp>
 #include <boost/asio/ip/network_v6.hpp>
@@ -25,6 +26,17 @@ namespace {
 // Regtest activates Spark mints at height 100, but its version-3 special
 // transaction gate rejects Spark spends until DIP0003Height.
 constexpr std::uint64_t kRegtestSparkSpendActivationHeight = 500U;
+
+class FiroRpcError final : public std::runtime_error {
+ public:
+  FiroRpcError(std::int64_t code, std::string message)
+      : std::runtime_error(std::move(message)), code_(code) {}
+
+  std::int64_t code() const noexcept { return code_; }
+
+ private:
+  std::int64_t code_;
+};
 
 std::string PeerHost(const std::string& endpoint) {
   const std::string uri = "tcp://" + endpoint;
@@ -103,9 +115,34 @@ boost::json::value ParseRpcResponse(std::string_view body,
   boost::json::value value = boost::json::parse(body);
   const boost::json::object& object = value.as_object();
   const boost::json::value* error = object.if_contains("error");
-  if (error == nullptr || !error->is_null()) {
+  if (error == nullptr) {
     throw std::runtime_error("Firo RPC " + std::string(method) +
-                             " returned error: " + std::string(body));
+                             " returned no error field: " + std::string(body));
+  }
+  if (!error->is_null()) {
+    if (!error->is_object()) {
+      throw std::runtime_error(
+          "Firo RPC " + std::string(method) +
+          " returned malformed error: " + std::string(body));
+    }
+    const boost::json::value* code = error->as_object().if_contains("code");
+    std::optional<std::int64_t> parsed_code;
+    if (code != nullptr && code->is_int64()) {
+      parsed_code = code->as_int64();
+    } else if (code != nullptr && code->is_uint64() &&
+               code->as_uint64() <=
+                   static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max())) {
+      parsed_code = static_cast<std::int64_t>(code->as_uint64());
+    }
+    if (!parsed_code) {
+      throw std::runtime_error(
+          "Firo RPC " + std::string(method) +
+          " returned error without an int64 code: " + std::string(body));
+    }
+    throw FiroRpcError(*parsed_code,
+                       "Firo RPC " + std::string(method) +
+                           " returned error: " + std::string(body));
   }
   const boost::json::value* result = object.if_contains("result");
   if (result == nullptr) {
@@ -355,19 +392,6 @@ std::string TxOutScriptPubKeyHex(const boost::json::object& txout) {
   return JsonStringMember(script->as_object(), "hex");
 }
 
-bool MempoolContains(const boost::json::value& mempool,
-                     const std::string& txid) {
-  if (!mempool.is_array()) {
-    return false;
-  }
-  for (const boost::json::value& item : mempool.as_array()) {
-    if (item.is_string() && std::string(item.as_string()) == txid) {
-      return true;
-    }
-  }
-  return false;
-}
-
 }  // namespace
 
 ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
@@ -392,6 +416,7 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
       "-dnsseed=0",
       "-fixedseeds=0",
       "-dandelion=0",
+      "-txindex=1",
       "-listenonion=0",
       "-discover=0",
       "-upnp=0",
@@ -1068,29 +1093,115 @@ FiroWalletTransactionResult FiroDriver::SendWalletTransaction(
 uint64_t FiroDriver::WaitForMempoolTransaction(
     const FiroNodeConfig& config, const std::string& txid,
     std::chrono::seconds timeout, std::stop_token stop_token) const {
+  return WaitForTransaction(config, txid, timeout, stop_token).mempool_size;
+}
+
+ChainTransactionObservation FiroDriver::ObserveTransaction(
+    const FiroNodeConfig& config, const std::string& txid,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  if (txid.empty()) {
+    throw std::runtime_error("cannot observe an empty Firo transaction id");
+  }
+
+  const boost::json::value height_value =
+      RpcCall(config, "getblockcount", boost::json::array{}, stop_token);
+  std::uint64_t observed_height = 0;
+  if (height_value.is_uint64()) {
+    observed_height = height_value.as_uint64();
+  } else if (height_value.is_int64() && height_value.as_int64() >= 0) {
+    observed_height = static_cast<std::uint64_t>(height_value.as_int64());
+  } else {
+    throw std::runtime_error("Firo getblockcount returned a non-uint64 height");
+  }
+
+  const boost::json::value mempool =
+      RpcCall(config, "getrawmempool", boost::json::array{}, stop_token);
+  if (!mempool.is_array()) {
+    throw std::runtime_error("Firo getrawmempool returned a non-array");
+  }
+
+  ChainTransactionObservation observation;
+  observation.observed_height = observed_height;
+  observation.mempool_size =
+      static_cast<std::uint64_t>(mempool.as_array().size());
+
+  boost::json::array params;
+  params.emplace_back(txid);
+  params.emplace_back(true);
+  boost::json::value transaction;
+  try {
+    transaction = RpcCall(config, "getrawtransaction", params, stop_token);
+  } catch (const FiroRpcError& error) {
+    if (error.code() == -5) {
+      return observation;
+    }
+    throw;
+  }
+  if (!transaction.is_object()) {
+    throw std::runtime_error("Firo getrawtransaction returned a non-object");
+  }
+  const boost::json::object& object = transaction.as_object();
+  if (JsonStringMember(object, "txid") != txid) {
+    throw std::runtime_error(
+        "Firo getrawtransaction returned a different transaction id");
+  }
+
+  const boost::json::value* block_hash = object.if_contains("blockhash");
+  const boost::json::value* height = object.if_contains("height");
+  const boost::json::value* confirmations = object.if_contains("confirmations");
+  const bool has_confirmation_field =
+      block_hash != nullptr || height != nullptr || confirmations != nullptr;
+  if (!has_confirmation_field) {
+    observation.state = ChainTransactionState::kMempool;
+    return observation;
+  }
+  if (block_hash == nullptr || !block_hash->is_string() ||
+      block_hash->as_string().empty()) {
+    throw std::runtime_error(
+        "Firo getrawtransaction returned an invalid block hash");
+  }
+  const std::uint64_t confirmation_height = JsonUint64Member(object, "height");
+  const std::uint64_t confirmation_count =
+      JsonUint64Member(object, "confirmations");
+  if (confirmation_count == 0U) {
+    throw std::runtime_error(
+        "Firo getrawtransaction returned zero confirmations for a block");
+  }
+  if (confirmation_height >
+      std::numeric_limits<std::uint64_t>::max() - (confirmation_count - 1U)) {
+    throw std::runtime_error(
+        "Firo transaction confirmation tip height overflow");
+  }
+  observation.state = ChainTransactionState::kConfirmed;
+  observation.block_hash = std::string(block_hash->as_string());
+  observation.confirmation_height = confirmation_height;
+  observation.confirmations = confirmation_count;
+  observation.observed_height =
+      std::max(observation.observed_height,
+               confirmation_height + confirmation_count - 1U);
+  return observation;
+}
+
+ChainTransactionObservation FiroDriver::WaitForTransaction(
+    const FiroNodeConfig& config, const std::string& txid,
+    std::chrono::seconds timeout, std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
-  uint64_t last_size = 0;
-  std::string last_error;
+  ChainTransactionObservation last_observation;
   while (std::chrono::steady_clock::now() < deadline) {
     ThrowIfStopRequested(stop_token);
-    try {
-      const boost::json::value mempool =
-          RpcCall(config, "getrawmempool", boost::json::array{}, stop_token);
-      if (mempool.is_array()) {
-        last_size = mempool.as_array().size();
-      }
-      if (MempoolContains(mempool, txid)) {
-        return last_size;
-      }
-    } catch (const std::exception& e) {
-      last_error = e.what();
+    last_observation = ObserveTransaction(config, txid, stop_token);
+    if (last_observation.state != ChainTransactionState::kUnknown) {
+      return last_observation;
     }
     WaitForNextPoll(stop_token);
   }
   ThrowIfStopRequested(stop_token);
   throw std::runtime_error(
-      "Firo node " + config.id + " did not report mempool transaction " + txid +
-      " before timeout" + (last_error.empty() ? "" : ": " + last_error));
+      "Firo node " + config.id + " did not report transaction " + txid +
+      " in its mempool or confirmed chain before timeout; last height " +
+      std::to_string(last_observation.observed_height) +
+      ", last mempool size " + std::to_string(last_observation.mempool_size));
 }
 
 void FiroDriver::ConnectPeer(const FiroNodeConfig& config,
@@ -1194,6 +1305,12 @@ boost::json::value FiroDriver::RpcCall(const FiroNodeConfig& config,
   HttpResponse response =
       http_.PostJson(Endpoint(config), "/", body, stop_token);
   if (response.status != 200) {
+    try {
+      static_cast<void>(ParseRpcResponse(response.body, method));
+    } catch (const FiroRpcError&) {
+      throw;
+    } catch (const std::exception&) {
+    }
     throw std::runtime_error("Firo RPC HTTP status " +
                              std::to_string(response.status) + " for " +
                              std::string(method) + ": " + response.body);

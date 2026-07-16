@@ -24,10 +24,12 @@ namespace {
 std::vector<std::string> ServeRpcResponses(
     boost::asio::ip::tcp::acceptor& acceptor,
     const std::vector<std::string>& responses,
-    std::vector<boost::json::value>* requests = nullptr) {
+    std::vector<boost::json::value>* requests = nullptr,
+    const std::vector<unsigned>* response_statuses = nullptr) {
   namespace beast = boost::beast;
   namespace http = beast::http;
   std::vector<std::string> methods;
+  std::size_t response_index = 0;
   for (const std::string& body : responses) {
     boost::asio::ip::tcp::socket socket(acceptor.get_executor());
     acceptor.accept(socket);
@@ -40,11 +42,16 @@ std::vector<std::string> ServeRpcResponses(
       requests->push_back(request_json);
     }
 
-    http::response<http::string_body> response{http::status::ok, 11};
+    const http::status status =
+        response_statuses == nullptr
+            ? http::status::ok
+            : static_cast<http::status>(response_statuses->at(response_index));
+    http::response<http::string_body> response{status, 11};
     response.set(http::field::content_type, "application/json");
     response.body() = body;
     response.prepare_payload();
     http::write(socket, response);
+    ++response_index;
   }
   return methods;
 }
@@ -189,13 +196,18 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   const bbp::FiroDriver driver(std::chrono::milliseconds(100));
   const bbp::ProcessSpec process = driver.RenderProcess(config);
   bool dandelion_disabled = false;
+  bool transaction_index_enabled = false;
   for (const std::string& argument : process.argv) {
     BOOST_TEST(!argument.starts_with("-connect="));
     if (argument == "-dandelion=0") {
       dandelion_disabled = true;
     }
+    if (argument == "-txindex=1") {
+      transaction_index_enabled = true;
+    }
   }
   BOOST_TEST(dandelion_disabled);
+  BOOST_TEST(transaction_index_enabled);
 
   std::filesystem::remove_all(test_dir);
 }
@@ -209,6 +221,200 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(driver.ConnectedPeerAddresses(
                         config, {"127.0.0.1:18168", "127.0.0.1:18169"}),
                     bbp::UnsupportedChainOperation);
+}
+
+BOOST_AUTO_TEST_CASE(firo_observes_mempool_transaction_with_exact_rpc_payload) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":25,"error":null,"id":"bbp"})",
+      R"({"result":["observed-tx","other-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"observed-tx","hex":"00"},"error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "mempool-observation-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const bbp::ChainTransactionObservation observation =
+      driver.ObserveTransaction(config, "observed-tx");
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_CHECK(observation.state == bbp::ChainTransactionState::kMempool);
+  BOOST_TEST(observation.observed_height == 25U);
+  BOOST_TEST(observation.mempool_size == 2U);
+  BOOST_TEST(observation.block_hash.empty());
+  BOOST_TEST(!observation.confirmation_height.has_value());
+  BOOST_TEST(observation.confirmations == 0U);
+  BOOST_REQUIRE_EQUAL(methods.size(), 3U);
+  BOOST_TEST(methods[0] == "getblockcount");
+  BOOST_TEST(methods[1] == "getrawmempool");
+  BOOST_TEST(methods[2] == "getrawtransaction");
+  const boost::json::array& params =
+      requests[2].as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(params.size(), 2U);
+  BOOST_TEST(params[0].as_string() == "observed-tx");
+  BOOST_TEST(params[1].as_bool());
+}
+
+BOOST_AUTO_TEST_CASE(firo_observes_confirmed_transaction) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":30,"error":null,"id":"bbp"})",
+      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"confirmed-tx","blockhash":"block-29","height":29,"confirmations":2},"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "confirmed-observation-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const bbp::ChainTransactionObservation observation =
+      driver.ObserveTransaction(config, "confirmed-tx");
+  static_cast<void>(served.get());
+
+  BOOST_CHECK(observation.state == bbp::ChainTransactionState::kConfirmed);
+  BOOST_TEST(observation.observed_height == 30U);
+  BOOST_TEST(observation.mempool_size == 0U);
+  BOOST_TEST(observation.block_hash == "block-29");
+  BOOST_REQUIRE(observation.confirmation_height.has_value());
+  BOOST_TEST(*observation.confirmation_height == 29U);
+  BOOST_TEST(observation.confirmations == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(firo_waits_through_temporary_transaction_not_found) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":10,"error":null,"id":"bbp"})",
+      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":null,"error":{"code":-5,"message":"No such mempool or blockchain transaction"},"id":"bbp"})",
+      R"({"result":10,"error":null,"id":"bbp"})",
+      R"({"result":["late-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"late-tx"},"error":null,"id":"bbp"})"};
+  const std::vector<unsigned> response_statuses = {200U, 200U, 500U,
+                                                   200U, 200U, 200U};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr,
+                                 &response_statuses);
+      });
+
+  bbp::FiroNodeConfig config;
+  config.id = "late-observation-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const bbp::ChainTransactionObservation observation =
+      driver.WaitForTransaction(config, "late-tx", std::chrono::seconds(1));
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_CHECK(observation.state == bbp::ChainTransactionState::kMempool);
+  BOOST_TEST(observation.observed_height == 10U);
+  BOOST_TEST(observation.mempool_size == 1U);
+  BOOST_REQUIRE_EQUAL(methods.size(), 6U);
+}
+
+BOOST_AUTO_TEST_CASE(firo_mempool_wait_accepts_transaction_mined_during_poll) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":30,"error":null,"id":"bbp"})",
+      R"({"result":["racing-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"racing-tx","blockhash":"block-31","height":31,"confirmations":1},"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "racing-observation-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  BOOST_TEST(driver.WaitForMempoolTransaction(config, "racing-tx",
+                                              std::chrono::seconds(1)) == 1U);
+  static_cast<void>(served.get());
+}
+
+BOOST_AUTO_TEST_CASE(firo_rejects_invalid_transaction_confirmation_numbers) {
+  const auto rejects = [](const std::string& transaction_response) {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+
+    asio::io_context server_context;
+    tcp::acceptor acceptor(
+        server_context,
+        tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+    const std::vector<std::string> responses = {
+        R"({"result":30,"error":null,"id":"bbp"})",
+        R"({"result":[],"error":null,"id":"bbp"})", transaction_response};
+    std::future<std::vector<std::string>> served =
+        std::async(std::launch::async,
+                   [&] { return ServeRpcResponses(acceptor, responses); });
+
+    bbp::FiroNodeConfig config;
+    config.id = "invalid-confirmation-test";
+    config.rpc_host = "127.0.0.1";
+    config.rpc_port = acceptor.local_endpoint().port();
+    config.rpc_user = "user";
+    config.rpc_password = "password";
+    const bbp::FiroDriver driver(std::chrono::seconds(1));
+    bool rejected = false;
+    try {
+      static_cast<void>(driver.ObserveTransaction(config, "invalid-tx"));
+    } catch (const std::exception&) {
+      rejected = true;
+    }
+    static_cast<void>(served.get());
+    return rejected;
+  };
+
+  BOOST_TEST(rejects(
+      R"({"result":{"txid":"invalid-tx","blockhash":"block","height":-1,"confirmations":1},"error":null,"id":"bbp"})"));
+  BOOST_TEST(rejects(
+      R"({"result":{"txid":"invalid-tx","blockhash":"block","height":1,"confirmations":-1},"error":null,"id":"bbp"})"));
+  BOOST_TEST(rejects(
+      R"({"result":{"txid":"invalid-tx","blockhash":"block","height":18446744073709551615,"confirmations":2},"error":null,"id":"bbp"})"));
 }
 
 BOOST_AUTO_TEST_CASE(firo_readiness_wait_honors_stop_token_promptly) {
@@ -416,7 +622,9 @@ BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {
   const std::vector<std::string> responses = {
       R"({"result":true,"error":null,"id":"bbp"})",
       R"({"result":"spark-spend-tx","error":null,"id":"bbp"})",
-      R"({"result":["spark-spend-tx"],"error":null,"id":"bbp"})"};
+      R"({"result":500,"error":null,"id":"bbp"})",
+      R"({"result":["spark-spend-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"spark-spend-tx"},"error":null,"id":"bbp"})"};
   std::vector<boost::json::value> requests;
   std::future<std::vector<std::string>> served = std::async(
       std::launch::async,
@@ -440,11 +648,13 @@ BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {
   BOOST_TEST(result.destination_amount == "0.50000000");
   BOOST_TEST(result.requested_fee_rate == "0.00001000");
   BOOST_TEST(result.mempool_size == 1U);
-  BOOST_REQUIRE_EQUAL(methods.size(), 3U);
+  BOOST_REQUIRE_EQUAL(methods.size(), 5U);
   BOOST_TEST(methods[0] == "settxfee");
   BOOST_TEST(methods[1] == "spendspark");
-  BOOST_TEST(methods[2] == "getrawmempool");
-  BOOST_REQUIRE_EQUAL(requests.size(), 3U);
+  BOOST_TEST(methods[2] == "getblockcount");
+  BOOST_TEST(methods[3] == "getrawmempool");
+  BOOST_TEST(methods[4] == "getrawtransaction");
+  BOOST_REQUIRE_EQUAL(requests.size(), 5U);
   const boost::json::array& spend_params =
       requests[1].as_object().at("params").as_array();
   BOOST_REQUIRE_EQUAL(spend_params.size(), 1U);
@@ -453,6 +663,11 @@ BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {
   BOOST_TEST(recipient.at("amount").as_string() == "0.50000000");
   BOOST_TEST(recipient.at("memo").as_string().empty());
   BOOST_TEST(!recipient.at("subtractFee").as_bool());
+  const boost::json::array& observe_params =
+      requests[4].as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(observe_params.size(), 2U);
+  BOOST_TEST(observe_params[0].as_string() == "spark-spend-tx");
+  BOOST_TEST(observe_params[1].as_bool());
 }
 
 BOOST_AUTO_TEST_CASE(firo_rejects_empty_private_spark_txid) {

@@ -48,6 +48,10 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "raw_transaction_submitted";
     case SimulationEventKind::kWalletTransactionSubmitted:
       return "wallet_transaction_submitted";
+    case SimulationEventKind::kTransactionVisible:
+      return "transaction_visible";
+    case SimulationEventKind::kTransactionConfirmed:
+      return "transaction_confirmed";
     case SimulationEventKind::kNetworkConditionUpdated:
       return "network_condition_updated";
     case SimulationEventKind::kNetworkBlockApplied:
@@ -163,6 +167,10 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
     return SimulationEventKind::kRawTransactionSubmitted;
   if (name == "wallet_transaction_submitted")
     return SimulationEventKind::kWalletTransactionSubmitted;
+  if (name == "transaction_visible")
+    return SimulationEventKind::kTransactionVisible;
+  if (name == "transaction_confirmed")
+    return SimulationEventKind::kTransactionConfirmed;
   if (name == "network_condition_updated")
     return SimulationEventKind::kNetworkConditionUpdated;
   if (name == "network_block_applied")

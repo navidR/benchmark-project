@@ -27,6 +27,8 @@ enum class SimulationEventKind {
   kPeerDisconnected,
   kRawTransactionSubmitted,
   kWalletTransactionSubmitted,
+  kTransactionVisible,
+  kTransactionConfirmed,
   kNetworkConditionUpdated,
   kNetworkBlockApplied,
   kNetworkBlockRemoved,

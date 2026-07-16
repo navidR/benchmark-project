@@ -24,6 +24,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -3583,6 +3584,130 @@ std::string WalletTransactionDetail(
   return boost::json::serialize(detail);
 }
 
+struct TrackedTransaction {
+  std::string txid;
+  std::string submission_kind;
+  std::uint32_t workload_index = 0;
+  std::uint32_t workload_count = 0;
+  std::uint32_t transaction_index = 0;
+  std::uint32_t transaction_count = 0;
+  std::uint32_t txid_index = 0;
+  std::uint32_t submission_node = 0;
+};
+
+std::string TransactionObservationDetail(
+    const TrackedTransaction& transaction, std::uint32_t node,
+    const std::string& node_id,
+    const ChainTransactionObservation& observation) {
+  boost::json::object detail;
+  detail["txid"] = transaction.txid;
+  detail["submission_kind"] = transaction.submission_kind;
+  detail["workload_index"] = transaction.workload_index;
+  detail["workload_count"] = transaction.workload_count;
+  detail["transaction_index"] = transaction.transaction_index;
+  detail["transaction_count"] = transaction.transaction_count;
+  detail["txid_index"] = transaction.txid_index;
+  detail["submission_node"] = transaction.submission_node;
+  detail["node"] = node;
+  detail["node_id"] = node_id;
+  detail["state"] = ChainTransactionStateName(observation.state);
+  detail["observed_height"] = observation.observed_height;
+  detail["mempool_size"] = observation.mempool_size;
+  if (observation.block_hash.empty()) {
+    detail["block_hash"] = nullptr;
+  } else {
+    detail["block_hash"] = observation.block_hash;
+  }
+  if (observation.confirmation_height) {
+    detail["confirmation_height"] = *observation.confirmation_height;
+  } else {
+    detail["confirmation_height"] = nullptr;
+  }
+  detail["confirmations"] = observation.confirmations;
+  return boost::json::serialize(detail);
+}
+
+class TransactionObservationTracker {
+ public:
+  void TrackAndWaitForVisibility(const Options& options,
+                                 const std::filesystem::path& events_path,
+                                 const ChainDriver& driver,
+                                 const std::vector<NodeRuntime>& nodes,
+                                 TrackedTransaction transaction,
+                                 std::chrono::seconds timeout,
+                                 std::stop_token stop_token) {
+    if (transaction.txid.empty()) {
+      throw std::runtime_error("cannot track an empty transaction id");
+    }
+    if (!tracked_txids_.insert(transaction.txid).second) {
+      throw std::runtime_error("duplicate submitted transaction id: " +
+                               transaction.txid);
+    }
+    transactions_.push_back(std::move(transaction));
+    const TrackedTransaction& tracked = transactions_.back();
+    for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+      const NodeRuntime& node = nodes[node_index];
+      const ChainTransactionObservation observation = driver.WaitForTransaction(
+          node.config, tracked.txid, timeout, stop_token);
+      RecordObservation(options, events_path, tracked,
+                        static_cast<std::uint32_t>(node_index + 1U),
+                        node.config.id, observation);
+    }
+  }
+
+  void ObserveAll(const Options& options,
+                  const std::filesystem::path& events_path,
+                  const ChainDriver& driver,
+                  const std::vector<NodeRuntime>& nodes,
+                  std::stop_token stop_token) {
+    for (const TrackedTransaction& transaction : transactions_) {
+      for (std::size_t node_index = 0; node_index < nodes.size();
+           ++node_index) {
+        const NodeRuntime& node = nodes[node_index];
+        const ChainTransactionObservation observation =
+            driver.ObserveTransaction(node.config, transaction.txid,
+                                      stop_token);
+        RecordObservation(options, events_path, transaction,
+                          static_cast<std::uint32_t>(node_index + 1U),
+                          node.config.id, observation);
+      }
+    }
+  }
+
+ private:
+  void RecordObservation(const Options& options,
+                         const std::filesystem::path& events_path,
+                         const TrackedTransaction& transaction,
+                         std::uint32_t node, const std::string& node_id,
+                         const ChainTransactionObservation& observation) {
+    if (observation.state == ChainTransactionState::kUnknown) {
+      return;
+    }
+    const std::pair<std::string, std::string> key{transaction.txid, node_id};
+    const std::string detail =
+        TransactionObservationDetail(transaction, node, node_id, observation);
+    if (visible_.insert(key).second) {
+      WriteEvent(events_path, options.run_id, node_id,
+                 SimulationEventKind::kTransactionVisible, detail);
+    }
+    if (observation.state == ChainTransactionState::kConfirmed &&
+        confirmed_.insert(key).second) {
+      if (!observation.confirmation_height || observation.block_hash.empty() ||
+          observation.confirmations == 0U) {
+        throw std::runtime_error(
+            "confirmed transaction observation is missing block metadata");
+      }
+      WriteEvent(events_path, options.run_id, node_id,
+                 SimulationEventKind::kTransactionConfirmed, detail);
+    }
+  }
+
+  std::vector<TrackedTransaction> transactions_;
+  std::set<std::string> tracked_txids_;
+  std::set<std::pair<std::string, std::string>> visible_;
+  std::set<std::pair<std::string, std::string>> confirmed_;
+};
+
 void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
                            const std::vector<std::string>& block_hashes,
                            std::stop_token stop_token) {
@@ -4816,6 +4941,7 @@ void ApplyDisconnectPeerWorkload(
 void ApplySendRawTransactionWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    TransactionObservationTracker& transaction_tracker,
     const SendRawTransactionWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& funder = nodes[workload.funding_node - 1U];
@@ -4850,6 +4976,19 @@ void ApplySendRawTransactionWorkload(
              RawTransactionDetail(workload_index, workload_count, workload,
                                   start_height, target_height, funding_hashes,
                                   transaction));
+  transaction_tracker.TrackAndWaitForVisibility(
+      options, events_path, driver, nodes,
+      TrackedTransaction{
+          .txid = transaction.txid,
+          .submission_kind = "raw_transaction_submitted",
+          .workload_index = workload_index,
+          .workload_count = workload_count,
+          .transaction_index = 1U,
+          .transaction_count = 1U,
+          .txid_index = 1U,
+          .submission_node = workload.submit_node,
+      },
+      std::chrono::seconds(workload.timeout_sec), stop_token);
 }
 
 std::vector<std::pair<size_t, size_t>> WalletTransferPlan(
@@ -4888,6 +5027,7 @@ void ApplyWalletTransactionsWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
     const SimulationRegistry& registry,
+    TransactionObservationTracker& transaction_tracker,
     const WalletTransactionsWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
   struct FundingState {
@@ -5026,13 +5166,6 @@ void ApplyWalletTransactionsWorkload(
             ToChainWalletMode(registry.wallet_initialization()),
             receiver.address, workload.amount_satoshis, workload.fee_satoshis,
             std::chrono::seconds(workload.timeout_sec), stop_token);
-    for (NodeRuntime& node : nodes) {
-      for (const std::string& txid : transaction.txids) {
-        driver.WaitForMempoolTransaction(
-            node.config, txid, std::chrono::seconds(workload.timeout_sec),
-            stop_token);
-      }
-    }
     WriteEvent(
         events_path, options.run_id, sender_node.config.id,
         SimulationEventKind::kWalletTransactionSubmitted,
@@ -5045,6 +5178,26 @@ void ApplyWalletTransactionsWorkload(
             sender_funding.ready_height, sender_funding.preparation,
             static_cast<uint64_t>(sender_funding.preparation_hashes.size()),
             sender_funding.ready_balance_satoshis, transaction));
+    if (transaction.txids.size() > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error("wallet transaction txid count exceeds uint32");
+    }
+    for (std::size_t txid_index = 0; txid_index < transaction.txids.size();
+         ++txid_index) {
+      transaction_tracker.TrackAndWaitForVisibility(
+          options, events_path, driver, nodes,
+          TrackedTransaction{
+              .txid = transaction.txids[txid_index],
+              .submission_kind = "wallet_transaction_submitted",
+              .workload_index = workload_index,
+              .workload_count = workload_count,
+              .transaction_index =
+                  static_cast<std::uint32_t>(transaction_index + 1U),
+              .transaction_count = workload.transaction_count,
+              .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
+              .submission_node = sender.node,
+          },
+          std::chrono::seconds(workload.timeout_sec), stop_token);
+    }
   }
 }
 
@@ -6212,6 +6365,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
     ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
     const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
+    TransactionObservationTracker transaction_tracker;
     for (size_t workload_index = 0; workload_index < workloads.size();
          ++workload_index) {
       ThrowIfStopRequested(stop_token);
@@ -6246,6 +6400,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                      SimulationEventKind::kHeightReached,
                      std::to_string(target_height));
         }
+        transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+                                       stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
         const WaitUntilHeightWorkload& workload =
             scenario_workload.wait_until_height;
@@ -6289,14 +6445,14 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kSendRawTransaction) {
         ApplySendRawTransactionWorkload(
-            options, events_path, driver, nodes,
+            options, events_path, driver, nodes, transaction_tracker,
             scenario_workload.send_raw_transaction,
             static_cast<uint32_t>(workload_index + 1U),
             static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kWalletTransactions) {
         ApplyWalletTransactionsWorkload(
             options, events_path, driver, nodes, simulation_registry,
-            scenario_workload.wallet_transactions,
+            transaction_tracker, scenario_workload.wallet_transactions,
             static_cast<uint32_t>(workload_index + 1U),
             static_cast<uint32_t>(workloads.size()), stop_token);
       } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
@@ -6358,6 +6514,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     stop_command_processor();
     stop_peer_connectivity();
     stop_block_production();
+    transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+                                   stop_token);
     WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
                          stop_token);
     WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},

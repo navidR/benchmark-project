@@ -202,6 +202,26 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "\\\"mempool_size\\\":1}\"}");
   bbp::AppendLine(
       dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+      "\"timestamp\":\"2026-07-09T00:00:01Z\","
+      "\"event\":\"transaction_visible\","
+      "\"detail\":\"{\\\"txid\\\":\\\"tx1\\\","
+      "\\\"submission_kind\\\":\\\"wallet_transaction_submitted\\\","
+      "\\\"node\\\":2,\\\"state\\\":\\\"mempool\\\","
+      "\\\"observed_height\\\":2,\\\"mempool_size\\\":1}\"}");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-2\","
+      "\"timestamp\":\"2026-07-09T00:00:02Z\","
+      "\"event\":\"transaction_confirmed\","
+      "\"detail\":\"{\\\"txid\\\":\\\"tx1\\\","
+      "\\\"submission_kind\\\":\\\"wallet_transaction_submitted\\\","
+      "\\\"node\\\":2,\\\"state\\\":\\\"confirmed\\\","
+      "\\\"observed_height\\\":3,\\\"mempool_size\\\":0,"
+      "\\\"block_hash\\\":\\\"block3\\\","
+      "\\\"confirmation_height\\\":3,\\\"confirmations\\\":1}\"}");
+  bbp::AppendLine(
+      dir / "events.jsonl",
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
       "\"timestamp\":\"2026-07-09T00:00:01Z\","
       "\"event\":\"operator_command_failed\","
@@ -259,7 +279,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
-  BOOST_TEST(JsonInteger(report, "event_count") == 18U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 20U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -393,6 +413,22 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(wallet_transaction, "receiver_wallet_index") == 2U);
   BOOST_TEST(wallet_transaction.at("strategy").as_string() == "random");
   BOOST_TEST(JsonInteger(wallet_transaction, "seed") == 42U);
+  const boost::json::array& transaction_visibility =
+      report.at("transaction_visibility").as_array();
+  BOOST_REQUIRE_EQUAL(transaction_visibility.size(), 1U);
+  const boost::json::object& visible =
+      transaction_visibility.front().as_object();
+  BOOST_TEST(visible.at("node_id").as_string() == "firo-2");
+  BOOST_TEST(visible.at("detail").as_object().at("txid").as_string() == "tx1");
+  BOOST_TEST(visible.at("detail").as_object().at("state").as_string() ==
+             "mempool");
+  const boost::json::array& transaction_confirmations =
+      report.at("transaction_confirmations").as_array();
+  BOOST_REQUIRE_EQUAL(transaction_confirmations.size(), 1U);
+  const boost::json::object& confirmed =
+      transaction_confirmations.front().as_object().at("detail").as_object();
+  BOOST_TEST(confirmed.at("block_hash").as_string() == "block3");
+  BOOST_TEST(JsonInteger(confirmed, "confirmation_height") == 3U);
   const boost::json::array& wallets = report.at("wallets_summary").as_array();
   BOOST_REQUIRE_EQUAL(wallets.size(), 2U);
   const boost::json::object& sender_wallet = wallets.front().as_object();

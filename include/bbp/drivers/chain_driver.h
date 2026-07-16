@@ -110,6 +110,23 @@ struct ChainWalletFundingResult {
   std::uint64_t minimum_chain_height = 0;
 };
 
+enum class ChainTransactionState {
+  kUnknown,
+  kMempool,
+  kConfirmed,
+};
+
+std::string_view ChainTransactionStateName(ChainTransactionState state);
+
+struct ChainTransactionObservation {
+  ChainTransactionState state = ChainTransactionState::kUnknown;
+  std::uint64_t observed_height = 0;
+  std::uint64_t mempool_size = 0;
+  std::string block_hash;
+  std::optional<std::uint64_t> confirmation_height;
+  std::uint64_t confirmations = 0;
+};
+
 class ChainDriver {
  public:
   virtual ~ChainDriver() = default;
@@ -186,6 +203,12 @@ class ChainDriver {
       const std::string& destination_address, uint64_t amount_satoshis,
       uint64_t fee_satoshis, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const = 0;
+  virtual ChainTransactionObservation ObserveTransaction(
+      const ChainNodeConfig& config, const std::string& txid,
+      std::stop_token stop_token = {}) const = 0;
+  virtual ChainTransactionObservation WaitForTransaction(
+      const ChainNodeConfig& config, const std::string& txid,
+      std::chrono::seconds timeout, std::stop_token stop_token = {}) const = 0;
   virtual uint64_t WaitForMempoolTransaction(
       const ChainNodeConfig& config, const std::string& txid,
       std::chrono::seconds timeout, std::stop_token stop_token = {}) const = 0;

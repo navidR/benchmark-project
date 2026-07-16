@@ -21,6 +21,18 @@ std::string_view ChainLogSourceName(ChainLogSource source) {
   throw std::runtime_error("unknown chain log source");
 }
 
+std::string_view ChainTransactionStateName(ChainTransactionState state) {
+  switch (state) {
+    case ChainTransactionState::kUnknown:
+      return "unknown";
+    case ChainTransactionState::kMempool:
+      return "mempool";
+    case ChainTransactionState::kConfirmed:
+      return "confirmed";
+  }
+  throw std::runtime_error("unknown chain transaction state");
+}
+
 std::string_view ChainWalletTransactionDirectionName(
     ChainWalletTransactionDirection direction) {
   switch (direction) {
