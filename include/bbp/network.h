@@ -162,6 +162,37 @@ struct DirectionalNetworkPolicy {
   bool operator==(const DirectionalNetworkPolicy&) const = default;
 };
 
+struct DirectionalNetworkPolicyCounter {
+  std::uint32_t band = 0;
+  std::string destination_address;
+  TcFilterInfo filter;
+  std::vector<QdiscInfo> qdiscs;
+  std::uint64_t qdisc_bytes = 0;
+  std::uint64_t qdisc_packets = 0;
+  std::uint64_t qdisc_drops = 0;
+  std::uint64_t qdisc_overlimits = 0;
+  std::uint64_t qdisc_qlen = 0;
+  std::uint64_t qdisc_backlog = 0;
+  std::uint64_t qdisc_requeues = 0;
+};
+
+struct DirectionalNetworkPolicyStats {
+  std::uint64_t policy_count = 0;
+  std::uint64_t policies_with_filter_stats = 0;
+  std::uint64_t filter_match_bytes = 0;
+  std::uint64_t filter_match_packets = 0;
+  std::uint64_t qdisc_count = 0;
+  std::uint64_t qdiscs_with_stats = 0;
+  std::uint64_t qdisc_bytes = 0;
+  std::uint64_t qdisc_packets = 0;
+  std::uint64_t qdisc_drops = 0;
+  std::uint64_t qdisc_overlimits = 0;
+  std::uint64_t qdisc_qlen = 0;
+  std::uint64_t qdisc_backlog = 0;
+  std::uint64_t qdisc_requeues = 0;
+  std::vector<DirectionalNetworkPolicyCounter> policies;
+};
+
 void ValidateNetworkCondition(const NetworkCondition& condition);
 
 class NetworkNamespace {
@@ -354,6 +385,13 @@ TcFilterStatsSummary SummarizeEgressIpv4TcpDropPolicies(
 bool DirectionalNetworkPoliciesMatch(
     const std::vector<QdiscInfo>& qdiscs,
     const std::vector<TcFilterInfo>& filters, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& policies);
+DirectionalNetworkPolicyStats SummarizeDirectionalNetworkPolicyStats(
+    const std::vector<QdiscInfo>& qdiscs,
+    const std::vector<TcFilterInfo>& filters, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& policies);
+DirectionalNetworkPolicyStats ReadDirectionalNetworkPolicyStatsInNamespace(
+    int netns_fd, const std::string& if_name,
     const std::vector<DirectionalNetworkPolicy>& policies);
 bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& if_name,

@@ -713,6 +713,31 @@ bool DirectionalNetworkPoliciesMatch(
     return false;
   }
 
+  std::size_t expected_owned_qdisc_count = 0;
+  for (const DirectionalNetworkPolicy& policy : policies) {
+    ++expected_owned_qdisc_count;
+    if (HasBandwidthCondition(policy.condition) &&
+        HasNetemCondition(policy.condition)) {
+      ++expected_owned_qdisc_count;
+    }
+  }
+  std::size_t owned_qdisc_count = 0;
+  for (const QdiscInfo& qdisc : qdiscs) {
+    if (qdisc.if_name != if_name) {
+      continue;
+    }
+    for (std::uint32_t band = 1U; band <= kMaximumDirectionalPolicies; ++band) {
+      if (qdisc.handle == DirectionalTbfHandle(band) ||
+          qdisc.handle == DirectionalNetemHandle(band)) {
+        ++owned_qdisc_count;
+        break;
+      }
+    }
+  }
+  if (owned_qdisc_count != expected_owned_qdisc_count) {
+    return false;
+  }
+
   std::size_t owned_filter_count = 0;
   for (const TcFilterInfo& filter : filters) {
     if (filter.if_name == if_name && filter.parent == kDirectionalRootHandle &&
@@ -789,6 +814,102 @@ bool DirectionalNetworkPoliciesMatch(
     }
   }
   return true;
+}
+
+DirectionalNetworkPolicyStats SummarizeDirectionalNetworkPolicyStats(
+    const std::vector<QdiscInfo>& qdiscs,
+    const std::vector<TcFilterInfo>& filters, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& policies) {
+  if (!DirectionalNetworkPoliciesMatch(qdiscs, filters, if_name, policies)) {
+    throw std::runtime_error(
+        "directional network policy counter state does not match the "
+        "configured kernel model on " +
+        if_name);
+  }
+
+  DirectionalNetworkPolicyStats stats;
+  stats.policy_count = policies.size();
+  stats.policies.reserve(policies.size());
+  const auto add = [](std::uint64_t value, std::uint64_t* total,
+                      std::string_view field) {
+    if (value > std::numeric_limits<std::uint64_t>::max() - *total) {
+      throw std::runtime_error("directional network " + std::string(field) +
+                               " counter overflow");
+    }
+    *total += value;
+  };
+
+  for (const DirectionalNetworkPolicy& policy : policies) {
+    const auto filter = std::find_if(
+        filters.begin(), filters.end(), [&](const TcFilterInfo& candidate) {
+          return candidate.if_name == if_name &&
+                 candidate.handle == DirectionalFilterHandle(policy.band) &&
+                 candidate.parent == kDirectionalRootHandle;
+        });
+    if (filter == filters.end()) {
+      throw std::runtime_error(
+          "directional network policy counter filter disappeared from " +
+          if_name);
+    }
+
+    DirectionalNetworkPolicyCounter counter;
+    counter.band = policy.band;
+    counter.destination_address = policy.destination_address;
+    counter.filter = *filter;
+    if (filter->has_stats) {
+      ++stats.policies_with_filter_stats;
+      add(filter->match_bytes, &stats.filter_match_bytes, "filter match bytes");
+      add(filter->match_packets, &stats.filter_match_packets,
+          "filter match packets");
+    }
+
+    const auto append_qdisc = [&](std::uint32_t handle) {
+      const auto qdisc = std::find_if(
+          qdiscs.begin(), qdiscs.end(), [&](const QdiscInfo& candidate) {
+            return candidate.if_name == if_name && candidate.handle == handle;
+          });
+      if (qdisc == qdiscs.end()) {
+        throw std::runtime_error(
+            "directional network policy counter qdisc disappeared from " +
+            if_name);
+      }
+      counter.qdiscs.push_back(*qdisc);
+      ++stats.qdisc_count;
+      if (qdisc->has_stats) {
+        ++stats.qdiscs_with_stats;
+      }
+      add(qdisc->drops, &counter.qdisc_drops, "qdisc drops");
+      add(qdisc->overlimits, &counter.qdisc_overlimits, "qdisc overlimits");
+      add(qdisc->qlen, &counter.qdisc_qlen, "qdisc queue length");
+      add(qdisc->backlog, &counter.qdisc_backlog, "qdisc backlog");
+      add(qdisc->requeues, &counter.qdisc_requeues, "qdisc requeues");
+      add(qdisc->drops, &stats.qdisc_drops, "qdisc drops");
+      add(qdisc->overlimits, &stats.qdisc_overlimits, "qdisc overlimits");
+      add(qdisc->qlen, &stats.qdisc_qlen, "qdisc queue length");
+      add(qdisc->backlog, &stats.qdisc_backlog, "qdisc backlog");
+      add(qdisc->requeues, &stats.qdisc_requeues, "qdisc requeues");
+    };
+
+    if (HasBandwidthCondition(policy.condition)) {
+      append_qdisc(DirectionalTbfHandle(policy.band));
+      if (HasNetemCondition(policy.condition)) {
+        append_qdisc(DirectionalNetemHandle(policy.band));
+      }
+    } else {
+      append_qdisc(DirectionalNetemHandle(policy.band));
+    }
+
+    // The first qdisc is the ingress stage for the edge. Its byte and packet
+    // counters represent the policy once; adding a child netem counter would
+    // double-count combined TBF-plus-netem traffic.
+    const QdiscInfo& primary = counter.qdiscs.front();
+    counter.qdisc_bytes = primary.bytes;
+    counter.qdisc_packets = primary.packets;
+    add(primary.bytes, &stats.qdisc_bytes, "qdisc bytes");
+    add(primary.packets, &stats.qdisc_packets, "qdisc packets");
+    stats.policies.push_back(std::move(counter));
+  }
+  return stats;
 }
 
 namespace {
@@ -2904,6 +3025,22 @@ std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd) {
 
 std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd) {
   return ExecuteInNetworkNamespace(netns_fd, []() { return ListQdiscs(); });
+}
+
+DirectionalNetworkPolicyStats ReadDirectionalNetworkPolicyStatsInNamespace(
+    int netns_fd, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& policies) {
+  if (netns_fd < 0) {
+    throw std::runtime_error("invalid network namespace fd");
+  }
+  RequireInterfaceName(if_name);
+  ValidateDirectionalNetworkPolicies(policies);
+  return ExecuteInNetworkNamespace(netns_fd, [&]() {
+    const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+    const std::vector<TcFilterInfo> filters = ListDirectionalFilters(if_name);
+    return SummarizeDirectionalNetworkPolicyStats(qdiscs, filters, if_name,
+                                                  policies);
+  });
 }
 
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace() {

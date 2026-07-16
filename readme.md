@@ -601,6 +601,17 @@ address plan permits at most 15 outgoing destination bands per source. The
 configured and resolved edge conditions are preserved in
 `resolved-scenario.json` and in the shared CLI/TUI run report.
 
+Every periodic node sample also reads the current simulator-owned flower and
+per-band qdisc objects inside that node's namespace. The metrics preserve exact
+per-edge classifier counters and every TBF/netem stage, plus checked aggregate
+packet, byte, drop, overlimit, queue, backlog, and requeue fields under
+`directional_network_*`. A combined TBF-plus-netem path uses its ingress TBF
+bytes and packets once while summing distinct drop/queue counters across both
+stages. Kernel state is matched against the synchronized current policy before
+publishing a sample. The report retains the complete final
+`directional_network_policy_counters` array, and the TUI node detail shows the
+current shaped-edge packet/drop summary.
+
 Active outgoing edges are also the authoritative allowed-peer set for each
 node. Background peer-count enforcement selects only allowed logical peers, and
 scenario or TUI `connect_peer` actions reject a target that is not an active
@@ -755,7 +766,8 @@ View an existing run in the read-only TUI:
 ```
 
 The TUI shows run status, lifecycle timestamps, workload summary, node chain
-state, resource metrics, network counters, qdisc state, and simulator logs. Use
+state, resource metrics, network counters, host qdisc state, directional edge
+qdisc packet/drop totals, and simulator logs. Use
 the arrow keys to select a node. Press `p` to toggle its connected-peer pane or
 `l` to toggle its separate log pane. Both panes support arrow keys, Page Up,
 Page Down, Home, and End for scrolling; press the opening key again to close

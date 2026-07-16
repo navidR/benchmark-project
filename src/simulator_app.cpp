@@ -4196,14 +4196,33 @@ boost::json::object NetworkPolicyCounterJson(const TcFilterInfo& filter) {
   return object;
 }
 
-std::string MetricsJson(const std::string& run_id, const std::string& node_id,
-                        const ChainMetrics& chain,
-                        uint64_t generated_block_count,
-                        uint64_t mined_transaction_count,
-                        bool mined_transaction_count_complete,
-                        uint64_t restart_count, const CgroupMetrics* cgroup,
-                        const LinkInfo* link, const QdiscInfo* qdisc,
-                        const std::vector<TcFilterInfo>* filters) {
+boost::json::object DirectionalNetworkPolicyCounterJson(
+    const DirectionalNetworkPolicyCounter& counter) {
+  boost::json::object object;
+  object["band"] = counter.band;
+  object["destination_address"] = counter.destination_address;
+  object["filter_handle"] = counter.filter.handle;
+  object["filter_has_stats"] = counter.filter.has_stats;
+  object["filter_match_bytes"] = counter.filter.match_bytes;
+  object["filter_match_packets"] = counter.filter.match_packets;
+  object["qdisc_bytes"] = counter.qdisc_bytes;
+  object["qdisc_packets"] = counter.qdisc_packets;
+  object["qdisc_drops"] = counter.qdisc_drops;
+  object["qdisc_overlimits"] = counter.qdisc_overlimits;
+  object["qdisc_qlen"] = counter.qdisc_qlen;
+  object["qdisc_backlog"] = counter.qdisc_backlog;
+  object["qdisc_requeues"] = counter.qdisc_requeues;
+  object["qdiscs"] = QdiscsJson(counter.qdiscs);
+  return object;
+}
+
+std::string MetricsJson(
+    const std::string& run_id, const std::string& node_id,
+    const ChainMetrics& chain, uint64_t generated_block_count,
+    uint64_t mined_transaction_count, bool mined_transaction_count_complete,
+    uint64_t restart_count, const CgroupMetrics* cgroup, const LinkInfo* link,
+    const QdiscInfo* qdisc, const std::vector<TcFilterInfo>* filters,
+    const DirectionalNetworkPolicyStats* directional_stats) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
@@ -4347,6 +4366,37 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     }
     object["network_policy_counters"] = policies;
     object["network_active_block_rules"] = std::move(policies);
+  }
+  if (directional_stats != nullptr) {
+    object["directional_network_policy_count"] =
+        directional_stats->policy_count;
+    object["directional_network_policies_with_filter_stats"] =
+        directional_stats->policies_with_filter_stats;
+    object["directional_network_filter_match_bytes"] =
+        directional_stats->filter_match_bytes;
+    object["directional_network_filter_match_packets"] =
+        directional_stats->filter_match_packets;
+    object["directional_network_qdisc_count"] = directional_stats->qdisc_count;
+    object["directional_network_qdiscs_with_stats"] =
+        directional_stats->qdiscs_with_stats;
+    object["directional_network_qdisc_bytes"] = directional_stats->qdisc_bytes;
+    object["directional_network_qdisc_packets"] =
+        directional_stats->qdisc_packets;
+    object["directional_network_qdisc_drops"] = directional_stats->qdisc_drops;
+    object["directional_network_qdisc_overlimits"] =
+        directional_stats->qdisc_overlimits;
+    object["directional_network_qdisc_qlen"] = directional_stats->qdisc_qlen;
+    object["directional_network_qdisc_backlog"] =
+        directional_stats->qdisc_backlog;
+    object["directional_network_qdisc_requeues"] =
+        directional_stats->qdisc_requeues;
+    boost::json::array policies;
+    policies.reserve(directional_stats->policies.size());
+    for (const DirectionalNetworkPolicyCounter& counter :
+         directional_stats->policies) {
+      policies.push_back(DirectionalNetworkPolicyCounterJson(counter));
+    }
+    object["directional_network_policy_counters"] = std::move(policies);
   }
   return boost::json::serialize(object);
 }
@@ -4830,9 +4880,15 @@ void WriteMetricsSnapshot(
     }
     CgroupMetrics cg = node.cgroup->ReadMetrics();
     std::optional<NodeVethConfig> network;
+    std::optional<DirectionalNetworkPolicyStats> directional_stats;
     {
       std::lock_guard<std::mutex> lock(node_network_state_mutex);
       network = node.network;
+      if (network && node.network_namespace) {
+        directional_stats = ReadDirectionalNetworkPolicyStatsInNamespace(
+            node.network_namespace->fd(), network->peer_name,
+            node.directional_network_policies);
+      }
     }
     const LinkInfo* link =
         network ? FindLinkByName(links, network->host_name) : nullptr;
@@ -4862,7 +4918,8 @@ void WriteMetricsSnapshot(
         MetricsJson(options.run_id, node.config.id, chain,
                     node.GeneratedBlockCount(), node.MinedTransactionCount(),
                     node.MinedTransactionCountComplete(), node.RestartCount(),
-                    &cg, link, qdisc, filter_metrics));
+                    &cg, link, qdisc, filter_metrics,
+                    directional_stats ? &*directional_stats : nullptr));
   }
 }
 
@@ -6149,6 +6206,7 @@ void ApplyTopologyEdgeWorkload(
   bool peer_transition_attempted = false;
   bool config_updated = false;
   std::vector<DirectionalNetworkPolicy> desired_policies;
+  std::vector<DirectionalNetworkPolicy> rollback_policy_state;
   std::vector<std::string> desired_allowed;
   std::vector<std::string> desired_restart_peers;
   try {
@@ -6186,6 +6244,7 @@ void ApplyTopologyEdgeWorkload(
     desired_restart_peers =
         StartupPeerAddresses(options, runtime_topology, chain_spec, from);
     controller.ValidateAllowedPeerUpdate(source.config.id, desired_allowed);
+    rollback_policy_state = desired_policies;
 
     ThrowIfStopRequested(stop_token);
     if (source.network) {
@@ -6193,9 +6252,11 @@ void ApplyTopologyEdgeWorkload(
         throw std::runtime_error(
             "runtime topology source has no network namespace");
       }
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
       UpdateDirectionalNetworkPoliciesInNamespace(
           source.network_namespace->fd(), source.network->peer_name,
           previous_policies, desired_policies);
+      source.directional_network_policies.swap(rollback_policy_state);
       kernel_updated = true;
     } else if (previous_policies != desired_policies) {
       throw std::runtime_error(
@@ -6224,10 +6285,6 @@ void ApplyTopologyEdgeWorkload(
       connected_after = attempted.active;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(node_network_state_mutex);
-      source.directional_network_policies = desired_policies;
-    }
     source.config.connect_peers = desired_restart_peers;
     config_updated = true;
 
@@ -6262,9 +6319,11 @@ void ApplyTopologyEdgeWorkload(
 
     if (kernel_updated) {
       rollback("kernel policy", [&] {
+        std::lock_guard<std::mutex> lock(node_network_state_mutex);
         UpdateDirectionalNetworkPoliciesInNamespace(
             source.network_namespace->fd(), source.network->peer_name,
             desired_policies, previous_policies);
+        source.directional_network_policies.swap(rollback_policy_state);
       });
     }
     // A deactivation removes the target from the allow-list before
@@ -6308,8 +6367,6 @@ void ApplyTopologyEdgeWorkload(
     }
     if (config_updated || model_mutated) {
       source.config.connect_peers = previous_restart_peers;
-      std::lock_guard<std::mutex> lock(node_network_state_mutex);
-      source.directional_network_policies = previous_policies;
     }
     if (model_mutated) {
       rollback("topology model",

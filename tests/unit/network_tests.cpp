@@ -393,6 +393,141 @@ BOOST_AUTO_TEST_CASE(directional_network_policy_matches_exact_kernel_model) {
                                                    "veth0", {policy}));
 }
 
+BOOST_AUTO_TEST_CASE(
+    directional_network_policy_stats_keep_stages_without_double_counting) {
+  constexpr std::uint32_t root_handle = TC_H_MAKE(0xBB00U << 16U, 0U);
+  constexpr std::uint32_t class_id = TC_H_MAKE(0xBB00U << 16U, 2U);
+  constexpr std::uint32_t tbf_handle = TC_H_MAKE(0xBB11U << 16U, 0U);
+  bbp::DirectionalNetworkPolicy policy;
+  policy.band = 1;
+  policy.destination_address = "198.51.100.7";
+  policy.condition.bandwidth_mbps = 10;
+  policy.condition.delay_ms = 2;
+
+  bbp::QdiscInfo root;
+  root.if_name = "veth0";
+  root.kind = bbp::QdiscKind::kPrio;
+  root.kernel_kind = "prio";
+  root.handle = root_handle;
+  root.parent = TC_H_ROOT;
+  root.has_prio_options = true;
+  root.prio_bands = TCQ_PRIO_BANDS;
+
+  bbp::QdiscInfo tbf;
+  tbf.if_name = "veth0";
+  tbf.kind = bbp::QdiscKind::kTbf;
+  tbf.kernel_kind = "tbf";
+  tbf.handle = tbf_handle;
+  tbf.parent = class_id;
+  tbf.has_tbf_options = true;
+  tbf.tbf_rate_bytes_per_sec = 1250000U;
+  tbf.tbf_limit_bytes = 125000U;
+  tbf.has_stats = true;
+  tbf.bytes = 100U;
+  tbf.packets = 10U;
+  tbf.drops = 1U;
+  tbf.overlimits = 3U;
+  tbf.qlen = 2U;
+  tbf.backlog = 20U;
+  tbf.requeues = 4U;
+
+  bbp::QdiscInfo netem;
+  netem.if_name = "veth0";
+  netem.kind = bbp::QdiscKind::kNetem;
+  netem.kernel_kind = "netem";
+  netem.handle = TC_H_MAKE(0xBB21U << 16U, 0U);
+  netem.parent = TC_H_MAKE(TC_H_MAJ(tbf_handle), 1U);
+  netem.has_netem_options = true;
+  netem.netem_latency_us = 2000U;
+  netem.netem_limit_packets = 1000U;
+  netem.has_stats = true;
+  netem.bytes = 90U;
+  netem.packets = 9U;
+  netem.drops = 2U;
+  netem.overlimits = 5U;
+  netem.qlen = 1U;
+  netem.backlog = 10U;
+  netem.requeues = 6U;
+
+  bbp::TcFilterInfo filter;
+  filter.if_name = "veth0";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.kernel_kind = "flower";
+  filter.handle = 0xBB000001U;
+  filter.parent = root_handle;
+  filter.priority = 11U;
+  filter.protocol = ETH_P_IP;
+  filter.has_eth_type = true;
+  filter.eth_type = ETH_P_IP;
+  filter.has_ipv4_dst = true;
+  filter.ipv4_dst = policy.destination_address;
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.255";
+  filter.has_class_id = true;
+  filter.class_id = class_id;
+  filter.has_stats = true;
+  filter.match_bytes = 100U;
+  filter.match_packets = 10U;
+
+  const bbp::DirectionalNetworkPolicyStats stats =
+      bbp::SummarizeDirectionalNetworkPolicyStats({root, tbf, netem}, {filter},
+                                                  "veth0", {policy});
+  BOOST_TEST(stats.policy_count == 1U);
+  BOOST_TEST(stats.policies_with_filter_stats == 1U);
+  BOOST_TEST(stats.filter_match_bytes == 100U);
+  BOOST_TEST(stats.filter_match_packets == 10U);
+  BOOST_TEST(stats.qdisc_count == 2U);
+  BOOST_TEST(stats.qdiscs_with_stats == 2U);
+  BOOST_TEST(stats.qdisc_bytes == 100U);
+  BOOST_TEST(stats.qdisc_packets == 10U);
+  BOOST_TEST(stats.qdisc_drops == 3U);
+  BOOST_TEST(stats.qdisc_overlimits == 8U);
+  BOOST_TEST(stats.qdisc_qlen == 3U);
+  BOOST_TEST(stats.qdisc_backlog == 30U);
+  BOOST_TEST(stats.qdisc_requeues == 10U);
+  BOOST_REQUIRE_EQUAL(stats.policies.size(), 1U);
+  const bbp::DirectionalNetworkPolicyCounter& counter = stats.policies.front();
+  BOOST_TEST(counter.band == 1U);
+  BOOST_TEST(counter.destination_address == "198.51.100.7");
+  BOOST_TEST(counter.qdisc_bytes == 100U);
+  BOOST_TEST(counter.qdisc_packets == 10U);
+  BOOST_TEST(counter.qdisc_drops == 3U);
+  BOOST_REQUIRE_EQUAL(counter.qdiscs.size(), 2U);
+  BOOST_TEST(counter.qdiscs[0].kernel_kind == "tbf");
+  BOOST_TEST(counter.qdiscs[1].kernel_kind == "netem");
+
+  BOOST_CHECK_THROW(bbp::SummarizeDirectionalNetworkPolicyStats(
+                        {root, tbf}, {filter}, "veth0", {policy}),
+                    std::runtime_error);
+
+  bbp::QdiscInfo stale = netem;
+  stale.handle = TC_H_MAKE(0xBB22U << 16U, 0U);
+  stale.parent = TC_H_MAKE(0xBB00U << 16U, 3U);
+  BOOST_CHECK_THROW(bbp::SummarizeDirectionalNetworkPolicyStats(
+                        {root, tbf, netem, stale}, {filter}, "veth0", {policy}),
+                    std::runtime_error);
+
+  bbp::DirectionalNetworkPolicy second_policy;
+  second_policy.band = 2;
+  second_policy.destination_address = "198.51.100.8";
+  second_policy.condition.delay_ms = 3;
+  bbp::QdiscInfo second_netem = netem;
+  second_netem.handle = TC_H_MAKE(0xBB22U << 16U, 0U);
+  second_netem.parent = TC_H_MAKE(0xBB00U << 16U, 3U);
+  second_netem.netem_latency_us = 3000U;
+  second_netem.bytes = 1U;
+  bbp::TcFilterInfo second_filter = filter;
+  second_filter.handle = 0xBB000002U;
+  second_filter.ipv4_dst = second_policy.destination_address;
+  second_filter.class_id = TC_H_MAKE(0xBB00U << 16U, 3U);
+  tbf.bytes = std::numeric_limits<std::uint64_t>::max();
+  BOOST_CHECK_THROW(
+      bbp::SummarizeDirectionalNetworkPolicyStats(
+          {root, tbf, netem, second_netem}, {filter, second_filter}, "veth0",
+          {policy, second_policy}),
+      std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(directional_network_policy_rejects_duplicate_bands) {
   bbp::DirectionalNetworkPolicy first;
   first.band = 1;

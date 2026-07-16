@@ -42,7 +42,7 @@ constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
-constexpr int kDetailPaneRows = 13;
+constexpr int kDetailPaneRows = 15;
 
 struct TuiState {
   std::size_t selected_node = 0;
@@ -606,6 +606,19 @@ std::string SelectedTopologyText(const boost::json::object& report,
   return topology_kind + " / " + std::to_string(eligible_count) + " eligible";
 }
 
+std::string DirectionalNetworkPolicyStatsText(
+    const boost::json::object& metrics) {
+  const std::optional<std::uint64_t> policy_count =
+      JsonUnsignedMetric(metrics, "directional_network_policy_count");
+  if (!policy_count) {
+    return "-";
+  }
+  return std::to_string(*policy_count) + " edge / " +
+         JsonMetricText(metrics, "directional_network_qdisc_packets") +
+         " pkt / " +
+         JsonMetricText(metrics, "directional_network_qdisc_drops") + " drop";
+}
+
 const boost::json::object* WalletForNode(const boost::json::object& report,
                                          std::size_t one_based_node) {
   const boost::json::array* wallets = WalletSummaries(report);
@@ -1019,9 +1032,9 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   AddDetailPair(y, 0, left_width, "peer policy",
                 SelectedPeerPolicyText(report, selected_node,
                                        JsonString(*node, "node_id")));
-  AddDetailPair(y, left_width, right_width, "qdisc",
-                JsonMetricText(metric_object, "qdisc_kind") + " drops " +
-                    JsonMetricText(metric_object, "qdisc_drops"));
+  AddDetailPair(y, left_width, right_width, "qdisc / edges",
+                JsonMetricText(metric_object, "qdisc_kind") + " / " +
+                    DirectionalNetworkPolicyStatsText(metric_object));
   ++y;
   if (y >= bottom) {
     return;

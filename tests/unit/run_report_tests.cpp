@@ -275,6 +275,28 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"dst_port\":18168,\"has_stats\":true,"
       "\"match_bytes\":180,\"match_packets\":3,"
       "\"drop_packets\":3}],"
+      "\"directional_network_policy_count\":1,"
+      "\"directional_network_policies_with_filter_stats\":1,"
+      "\"directional_network_filter_match_bytes\":900,"
+      "\"directional_network_filter_match_packets\":9,"
+      "\"directional_network_qdisc_count\":2,"
+      "\"directional_network_qdiscs_with_stats\":2,"
+      "\"directional_network_qdisc_bytes\":900,"
+      "\"directional_network_qdisc_packets\":9,"
+      "\"directional_network_qdisc_drops\":2,"
+      "\"directional_network_qdisc_overlimits\":4,"
+      "\"directional_network_qdisc_qlen\":1,"
+      "\"directional_network_qdisc_backlog\":64,"
+      "\"directional_network_qdisc_requeues\":3,"
+      "\"directional_network_policy_counters\":[{"
+      "\"band\":1,\"destination_address\":\"198.51.100.8\","
+      "\"filter_handle\":3137339393,\"filter_has_stats\":true,"
+      "\"filter_match_bytes\":900,\"filter_match_packets\":9,"
+      "\"qdisc_bytes\":900,\"qdisc_packets\":9,"
+      "\"qdisc_drops\":2,\"qdisc_overlimits\":4,"
+      "\"qdisc_qlen\":1,\"qdisc_backlog\":64,"
+      "\"qdisc_requeues\":3,\"qdiscs\":[{\"kind\":\"tbf\"},"
+      "{\"kind\":\"netem\"}]}],"
       "\"qdisc_bytes\":300,\"qdisc_drops\":1,"
       "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":2000,"
       "\"qdisc_netem_jitter_us\":500,\"qdisc_netem_reorder\":429496,"
@@ -537,6 +559,42 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(policy_counter, "drop_packets") == 3U);
   BOOST_REQUIRE_EQUAL(
       last_metrics.at("network_active_block_rules").as_array().size(), 1U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_policy_count") ==
+             1U);
+  BOOST_TEST(JsonInteger(last_metrics,
+                         "directional_network_policies_with_filter_stats") ==
+             1U);
+  BOOST_TEST(JsonInteger(last_metrics,
+                         "directional_network_filter_match_bytes") == 900U);
+  BOOST_TEST(JsonInteger(last_metrics,
+                         "directional_network_filter_match_packets") == 9U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_qdisc_count") ==
+             2U);
+  BOOST_TEST(
+      JsonInteger(last_metrics, "directional_network_qdiscs_with_stats") == 2U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_qdisc_bytes") ==
+             900U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_qdisc_packets") ==
+             9U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_qdisc_drops") ==
+             2U);
+  BOOST_TEST(
+      JsonInteger(last_metrics, "directional_network_qdisc_overlimits") == 4U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_qdisc_qlen") == 1U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_qdisc_backlog") ==
+             64U);
+  BOOST_TEST(JsonInteger(last_metrics, "directional_network_qdisc_requeues") ==
+             3U);
+  const boost::json::array& directional_counters =
+      last_metrics.at("directional_network_policy_counters").as_array();
+  BOOST_REQUIRE_EQUAL(directional_counters.size(), 1U);
+  const boost::json::object& directional_counter =
+      directional_counters.front().as_object();
+  BOOST_TEST(JsonInteger(directional_counter, "band") == 1U);
+  BOOST_TEST(directional_counter.at("destination_address").as_string() ==
+             "198.51.100.8");
+  BOOST_TEST(JsonInteger(directional_counter, "qdisc_packets") == 9U);
+  BOOST_REQUIRE_EQUAL(directional_counter.at("qdiscs").as_array().size(), 2U);
   BOOST_TEST(JsonInteger(last_metrics, "network_uplink_bytes") == 100U);
   BOOST_TEST(JsonInteger(last_metrics, "network_downlink_bytes") == 200U);
   BOOST_TEST(JsonInteger(last_metrics, "network_uplink_bytes_per_sec") == 37U);
