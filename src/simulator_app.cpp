@@ -49,6 +49,7 @@
 #include "bbp/probabilistic_block_scheduler.h"
 #include "bbp/process.h"
 #include "bbp/run_report.h"
+#include "bbp/runtime_peer_topology.h"
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
 #include "bbp/simulation_command_queue.h"
@@ -2796,6 +2797,8 @@ Options ParseOptions(int argc, char** argv) {
                              std::to_string(chain_spec.max_nodes) +
                              " for chain smoke runs");
   }
+  static_cast<void>(
+      RuntimePeerTopology(options.topology.peer_topology, options.nodes));
   if (options.generate_node == 0U || options.generate_node > options.nodes) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
   }
@@ -3639,10 +3642,11 @@ std::string StartupPeerAddress(const Options& options,
                         node_index);
 }
 
-std::vector<uint32_t> ConfiguredStartupPeerIndexes(const Options& options,
-                                                   uint32_t node_index) {
-  std::vector<uint32_t> eligible = ResolvePeerTopologyPeerIndexes(
-      options.topology.peer_topology, options.nodes, node_index);
+std::vector<uint32_t> ConfiguredStartupPeerIndexes(
+    const Options& options, const RuntimePeerTopology& runtime_topology,
+    uint32_t node_index) {
+  std::vector<uint32_t> eligible =
+      runtime_topology.ActivePeerIndexes(node_index);
   const PeerConnectivityPolicy* policy =
       FindPeerConnectivityPolicy(options.topology, node_index);
   if (policy == nullptr) {
@@ -3666,17 +3670,17 @@ bool TopologyHasDirectionalNetworkConditions(const Options& options) {
 }
 
 std::vector<DirectionalNetworkPolicy> DirectionalNetworkPoliciesForNode(
-    const Options& options, uint32_t node_index) {
-  return ResolveDirectionalNetworkPolicies(options.topology.peer_topology,
-                                           NetworkAddressPlan(options),
-                                           options.nodes, node_index);
+    const Options& options, const RuntimePeerTopology& runtime_topology,
+    uint32_t node_index) {
+  return runtime_topology.DirectionalPolicies(NetworkAddressPlan(options),
+                                              node_index);
 }
 
-std::vector<std::string> StartupPeerAddresses(const Options& options,
-                                              const ChainDriverSpec& chain_spec,
-                                              uint32_t node_index) {
+std::vector<std::string> StartupPeerAddresses(
+    const Options& options, const RuntimePeerTopology& topology,
+    const ChainDriverSpec& chain_spec, uint32_t node_index) {
   const std::vector<uint32_t> peer_indexes =
-      ConfiguredStartupPeerIndexes(options, node_index);
+      ConfiguredStartupPeerIndexes(options, topology, node_index);
   std::vector<std::string> peers;
   peers.reserve(peer_indexes.size());
   for (uint32_t peer_index : peer_indexes) {
@@ -5370,6 +5374,7 @@ void CleanupRun(Options options) {
 void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const std::filesystem::path& events_path,
                 const ChainDriverSpec& chain_spec, const ChainDriver& driver,
+                const RuntimePeerTopology& runtime_topology,
                 std::vector<NodeRuntime>& nodes, std::stop_token stop_token) {
   if (options.isolate_network) {
     RequireNetworkSetupCapabilities();
@@ -5391,7 +5396,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     config_request.wallet_enabled =
         options.wallet_backed_workload_requested &&
         NodeListContains(options.topology.wallet_nodes, i);
-    config_request.connect_peers = StartupPeerAddresses(options, chain_spec, i);
+    config_request.connect_peers =
+        StartupPeerAddresses(options, runtime_topology, chain_spec, i);
 
     ChainNodeConfig config = MakeChainNodeConfig(chain_spec, config_request);
     const std::string node_id = config.id;
@@ -5413,7 +5419,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
               NetworkConditionVerificationDetail(*runtime.network, qdisc));
         }
         runtime.directional_network_policies =
-            DirectionalNetworkPoliciesForNode(options, i);
+            DirectionalNetworkPoliciesForNode(options, runtime_topology, i);
         if (!runtime.directional_network_policies.empty()) {
           UpdateDirectionalNetworkPoliciesInNamespace(
               runtime.network_namespace->fd(), runtime.network->peer_name, {},
@@ -6713,12 +6719,13 @@ std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
 }
 
 PeerConnectivityController::AllowedPeerMap InitialAllowedPeers(
-    const Options& options, const std::vector<NodeRuntime>& nodes) {
+    const RuntimePeerTopology& topology,
+    const std::vector<NodeRuntime>& nodes) {
   PeerConnectivityController::AllowedPeerMap allowed;
   for (std::uint32_t node_index = 0; node_index < nodes.size(); ++node_index) {
     std::vector<std::string> peer_ids;
-    for (const std::uint32_t peer_index : ResolvePeerTopologyPeerIndexes(
-             options.topology.peer_topology, options.nodes, node_index)) {
+    for (const std::uint32_t peer_index :
+         topology.ActivePeerIndexes(node_index)) {
       if (peer_index >= nodes.size()) {
         throw std::runtime_error(
             "logical topology peer references an unknown running node");
@@ -6798,6 +6805,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         options.run_id, options.nodes, ListIpv4Routes());
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
+  RuntimePeerTopology runtime_topology(options.topology.peer_topology,
+                                       options.nodes);
   SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
       options.topology, options.wallet_initialization);
   WriteScenarioFiles(options, run_root, chain_spec);
@@ -6949,8 +6958,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     BBP_LOG(info) << "cancelled run " << options.run_id;
   };
   try {
-    StartNodes(options, run_root, events_path, chain_spec, driver, nodes,
-               stop_token);
+    StartNodes(options, run_root, events_path, chain_spec, driver,
+               runtime_topology, nodes, stop_token);
     network_allocation_lock.reset();
     const std::vector<std::uint32_t> miner_indexes =
         ConfiguredMinerIndexes(options);
@@ -7007,7 +7016,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
     peer_connectivity_controller = std::make_unique<PeerConnectivityController>(
         driver, log_nodes, InitialPeerCountPolicies(options, nodes),
-        InitialAllowedPeers(options, nodes), options.metrics_interval,
+        InitialAllowedPeers(runtime_topology, nodes), options.metrics_interval,
         [&](std::string_view node_id) {
           return FindNodeRuntimeById(nodes, std::string(node_id))
               .AllowsChainMetrics();
