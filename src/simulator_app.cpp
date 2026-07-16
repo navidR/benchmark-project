@@ -83,6 +83,73 @@ void WaitForDuration(std::chrono::milliseconds duration,
   ThrowIfStopRequested(stop_token);
 }
 
+void WaitUntil(std::chrono::steady_clock::time_point deadline,
+               std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
+  if (std::chrono::steady_clock::now() >= deadline) {
+    return;
+  }
+  std::condition_variable_any condition;
+  std::mutex mutex;
+  std::unique_lock<std::mutex> lock(mutex);
+  condition.wait_until(lock, stop_token, deadline, [] { return false; });
+  ThrowIfStopRequested(stop_token);
+}
+
+std::chrono::steady_clock::time_point SteadyDeadline(
+    std::chrono::steady_clock::time_point epoch,
+    std::chrono::milliseconds delay) {
+  const auto remaining = std::chrono::steady_clock::time_point::max() - epoch;
+  const auto maximum_delay =
+      std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+  if (delay > maximum_delay) {
+    throw std::runtime_error(
+        "scheduled event time exceeds monotonic clock range");
+  }
+  return epoch +
+         std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay);
+}
+
+std::uint64_t ElapsedMilliseconds(
+    std::chrono::steady_clock::time_point epoch,
+    std::chrono::steady_clock::time_point timestamp) {
+  if (timestamp <= epoch) {
+    return 0U;
+  }
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(timestamp - epoch)
+          .count();
+  return static_cast<std::uint64_t>(elapsed);
+}
+
+boost::json::object ScheduledEventLifecycleDetail(
+    const ScheduledScenarioEvent& event,
+    std::chrono::steady_clock::time_point epoch,
+    std::chrono::steady_clock::time_point started,
+    std::optional<std::chrono::steady_clock::time_point> finished,
+    std::optional<std::string_view> error = std::nullopt) {
+  const std::uint64_t scheduled_at_ms =
+      static_cast<std::uint64_t>(event.at.count());
+  const std::uint64_t started_at_ms = ElapsedMilliseconds(epoch, started);
+  boost::json::object detail;
+  detail["sequence"] = event.sequence;
+  detail["action"] = std::string(WorkloadKindName(event.action.kind));
+  detail["scheduled_at_ms"] = scheduled_at_ms;
+  detail["started_at_ms"] = started_at_ms;
+  detail["lateness_ms"] =
+      started_at_ms > scheduled_at_ms ? started_at_ms - scheduled_at_ms : 0U;
+  if (finished) {
+    const std::uint64_t finished_at_ms = ElapsedMilliseconds(epoch, *finished);
+    detail["finished_at_ms"] = finished_at_ms;
+    detail["duration_ms"] =
+        finished_at_ms > started_at_ms ? finished_at_ms - started_at_ms : 0U;
+  }
+  if (error) {
+    detail["error"] = *error;
+  }
+  return detail;
+}
+
 uint32_t JsonUint32Field(const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr) {
@@ -1355,6 +1422,56 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
   }
 }
 
+void ApplyScheduledScenarioEvents(
+    const boost::json::array& events,
+    const boost::program_options::variables_map& vm, Options& options) {
+  if (events.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error("scenario events exceeds uint32 sequence range");
+  }
+  for (std::size_t index = 0; index < events.size(); ++index) {
+    const boost::json::value& value = events[index];
+    if (!value.is_object()) {
+      throw std::runtime_error("scenario events entries must be JSON objects");
+    }
+    const boost::json::object& event = value.as_object();
+    const std::string at_text = JsonStringField(event, "at");
+    const std::string action_name = JsonStringField(event, "action");
+    if (!ParseWorkloadKind(action_name)) {
+      throw std::runtime_error("unsupported scheduled event action: " +
+                               action_name);
+    }
+    if (event.if_contains("type") != nullptr) {
+      throw std::runtime_error("scenario events entries use action, not type");
+    }
+
+    boost::json::object action_object = event;
+    action_object.erase("at");
+    action_object.erase("action");
+    action_object["type"] = action_name;
+    boost::json::array action_array;
+    action_array.push_back(std::move(action_object));
+    const std::size_t workload_count = options.workloads.size();
+    ApplyScenarioWorkloads(action_array, vm, options);
+    if (options.workloads.size() != workload_count + 1U) {
+      throw std::runtime_error("scheduled event did not produce one action");
+    }
+
+    ScheduledScenarioEvent scheduled;
+    scheduled.at = PositiveDuration::Parse(at_text).value();
+    const auto maximum_monotonic_delay =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::duration::max());
+    if (scheduled.at > maximum_monotonic_delay) {
+      throw std::runtime_error(
+          "scheduled event time exceeds monotonic clock range");
+    }
+    scheduled.sequence = static_cast<std::uint32_t>(index + 1U);
+    scheduled.action = std::move(options.workloads.back());
+    options.workloads.pop_back();
+    options.scheduled_events.push_back(std::move(scheduled));
+  }
+}
+
 void ApplyScenarioJson(const boost::json::object& scenario,
                        const boost::program_options::variables_map& vm,
                        Options& options) {
@@ -1505,6 +1622,13 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     options.workloads_configured = true;
     ApplyScenarioWorkloads(workloads->as_array(), vm, options);
+  }
+  const boost::json::value* events = scenario.if_contains("events");
+  if (events != nullptr) {
+    if (!events->is_array()) {
+      throw std::runtime_error("scenario events must be a JSON array");
+    }
+    ApplyScheduledScenarioEvents(events->as_array(), vm, options);
   }
 
   const boost::json::value* resources = scenario.if_contains("resources");
@@ -1745,7 +1869,26 @@ bool WorkloadsRequireIsolatedNetwork(const Options& options) {
       return true;
     }
   }
+  for (const ScheduledScenarioEvent& event : options.scheduled_events) {
+    if (event.action.kind == WorkloadKind::kPartitionNodes ||
+        event.action.kind == WorkloadKind::kHealPartition) {
+      return true;
+    }
+  }
   return false;
+}
+
+std::vector<const ScenarioWorkload*> ConfiguredScenarioActions(
+    const Options& options) {
+  std::vector<const ScenarioWorkload*> actions;
+  actions.reserve(options.workloads.size() + options.scheduled_events.size());
+  for (const ScenarioWorkload& workload : options.workloads) {
+    actions.push_back(&workload);
+  }
+  for (const ScheduledScenarioEvent& event : options.scheduled_events) {
+    actions.push_back(&event.action);
+  }
+  return actions;
 }
 
 void ParseNodeNetworkConditionTexts(
@@ -2319,7 +2462,13 @@ Options ParseOptions(int argc, char** argv) {
   if (options.generate_node == 0U || options.generate_node > options.nodes) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
   }
-  for (const ScenarioWorkload& workload : options.workloads) {
+  if (options.workloads.size() > std::numeric_limits<std::uint32_t>::max() -
+                                     options.scheduled_events.size()) {
+    throw std::runtime_error("scenario action count exceeds uint32 range");
+  }
+  for (const ScenarioWorkload* configured_workload :
+       ConfiguredScenarioActions(options)) {
+    const ScenarioWorkload& workload = *configured_workload;
     if (workload.kind == WorkloadKind::kBlockGeneration) {
       if (workload.block_generation.node == 0U ||
           workload.block_generation.node > options.nodes) {
@@ -4327,6 +4476,17 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   throw std::runtime_error("unknown scenario workload kind");
 }
 
+boost::json::object ScheduledScenarioEventJson(
+    const ScheduledScenarioEvent& event) {
+  boost::json::object object = WorkloadJson(event.action);
+  object.erase("type");
+  object["action"] = std::string(WorkloadKindName(event.action.kind));
+  object["sequence"] = event.sequence;
+  object["at"] = std::to_string(event.at.count()) + "ms";
+  object["at_ms"] = event.at.count();
+  return object;
+}
+
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root,
                         const ChainDriverSpec& chain_spec) {
@@ -4389,6 +4549,11 @@ void WriteScenarioFiles(const Options& options,
     workload_array.push_back(WorkloadJson(workload));
   }
   resolved["workloads"] = std::move(workload_array);
+  boost::json::array scheduled_event_array;
+  for (const ScheduledScenarioEvent& event : options.scheduled_events) {
+    scheduled_event_array.push_back(ScheduledScenarioEventJson(event));
+  }
+  resolved["events"] = std::move(scheduled_event_array);
   boost::json::object resources;
   resources["memory_high_bytes"] = options.memory_high_bytes;
   resources["memory_max_bytes"] = options.memory_max_bytes;
@@ -6364,148 +6529,207 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       ApplyRuntimeNodeRestarts(options, events_path, driver, nodes, stop_token);
     }
     ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
-    const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
+    std::vector<ScheduledScenarioEvent> runtime_actions;
+    runtime_actions.reserve(options.workloads.size() +
+                            options.scheduled_events.size());
+    for (const ScenarioWorkload& workload : EffectiveWorkloads(options)) {
+      runtime_actions.push_back(
+          ScheduledScenarioEvent{.at = std::chrono::milliseconds(0),
+                                 .sequence = 0U,
+                                 .action = workload});
+    }
+    std::vector<ScheduledScenarioEvent> scheduled_events =
+        OrderScheduledScenarioEvents(options.scheduled_events);
+    runtime_actions.insert(runtime_actions.end(), scheduled_events.begin(),
+                           scheduled_events.end());
+    const auto event_engine_epoch = std::chrono::steady_clock::now();
     TransactionObservationTracker transaction_tracker;
-    for (size_t workload_index = 0; workload_index < workloads.size();
+    for (size_t workload_index = 0; workload_index < runtime_actions.size();
          ++workload_index) {
       ThrowIfStopRequested(stop_token);
-      const ScenarioWorkload& scenario_workload = workloads[workload_index];
-      if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
-        const BlockGenerationWorkload& workload =
-            scenario_workload.block_generation;
-        if (workload.count == 0U) {
-          continue;
-        }
-        NodeRuntime& generator = nodes[workload.node - 1U];
-        const uint64_t start_height =
-            driver.ReadMetrics(generator.config, stop_token).height;
-        std::vector<std::string> hashes = driver.GenerateBlocks(
-            generator.config, workload.count, chain_spec.default_reward_address,
-            stop_token);
-        RecordGeneratedBlocks(driver, generator, hashes, stop_token);
-        const uint64_t target_height =
-            start_height + static_cast<uint64_t>(hashes.size());
-        WriteEvent(
-            events_path, options.run_id, generator.config.id,
-            SimulationEventKind::kGeneratedBlocks,
-            GeneratedBlocksDetail(static_cast<uint32_t>(workload_index + 1U),
-                                  static_cast<uint32_t>(workloads.size()),
-                                  workload.node, start_height, target_height,
-                                  hashes, chain_spec.default_reward_address));
-        for (auto& node : nodes) {
-          driver.WaitForHeight(node.config, target_height,
-                               std::chrono::seconds(workload.sync_timeout_sec),
+      const ScheduledScenarioEvent& runtime_action =
+          runtime_actions[workload_index];
+      const bool is_scheduled = runtime_action.sequence != 0U;
+      const std::uint32_t action_index =
+          is_scheduled ? runtime_action.sequence
+                       : static_cast<std::uint32_t>(workload_index + 1U);
+      const std::uint32_t action_count = static_cast<std::uint32_t>(
+          is_scheduled ? scheduled_events.size() : options.workloads.size());
+      if (is_scheduled) {
+        WaitUntil(SteadyDeadline(event_engine_epoch, runtime_action.at),
+                  stop_token);
+      }
+      const auto action_started = std::chrono::steady_clock::now();
+      if (is_scheduled) {
+        WriteEvent(events_path, options.run_id, "sim",
+                   SimulationEventKind::kScheduledEventStarted,
+                   boost::json::serialize(ScheduledEventLifecycleDetail(
+                       runtime_action, event_engine_epoch, action_started,
+                       std::nullopt)));
+      }
+      const ScenarioWorkload& scenario_workload = runtime_action.action;
+      try {
+        if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
+          const BlockGenerationWorkload& workload =
+              scenario_workload.block_generation;
+          if (workload.count == 0U) {
+            if (is_scheduled) {
+              const auto action_finished = std::chrono::steady_clock::now();
+              WriteEvent(events_path, options.run_id, "sim",
+                         SimulationEventKind::kScheduledEventCompleted,
+                         boost::json::serialize(ScheduledEventLifecycleDetail(
+                             runtime_action, event_engine_epoch, action_started,
+                             action_finished)));
+            }
+            continue;
+          }
+          NodeRuntime& generator = nodes[workload.node - 1U];
+          const uint64_t start_height =
+              driver.ReadMetrics(generator.config, stop_token).height;
+          std::vector<std::string> hashes = driver.GenerateBlocks(
+              generator.config, workload.count,
+              chain_spec.default_reward_address, stop_token);
+          RecordGeneratedBlocks(driver, generator, hashes, stop_token);
+          const uint64_t target_height =
+              start_height + static_cast<uint64_t>(hashes.size());
+          WriteEvent(
+              events_path, options.run_id, generator.config.id,
+              SimulationEventKind::kGeneratedBlocks,
+              GeneratedBlocksDetail(action_index, action_count, workload.node,
+                                    start_height, target_height, hashes,
+                                    chain_spec.default_reward_address));
+          for (auto& node : nodes) {
+            driver.WaitForHeight(
+                node.config, target_height,
+                std::chrono::seconds(workload.sync_timeout_sec), stop_token);
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kHeightReached,
+                       std::to_string(target_height));
+          }
+          transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+                                         stop_token);
+        } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
+          const WaitUntilHeightWorkload& workload =
+              scenario_workload.wait_until_height;
+          NodeRuntime& node = nodes[workload.node - 1U];
+          driver.WaitForHeight(node.config, workload.height,
+                               std::chrono::seconds(workload.timeout_sec),
                                stop_token);
+          const uint64_t observed_height =
+              driver.ReadMetrics(node.config, stop_token).height;
           WriteEvent(events_path, options.run_id, node.config.id,
-                     SimulationEventKind::kHeightReached,
-                     std::to_string(target_height));
+                     SimulationEventKind::kHeightWaitReached,
+                     HeightWaitDetail(action_index, action_count, workload.node,
+                                      workload.height, observed_height));
+        } else if (scenario_workload.kind == WorkloadKind::kWaitForPeers) {
+          const WaitForPeersWorkload& workload =
+              scenario_workload.wait_for_peers;
+          NodeRuntime& node = nodes[workload.node - 1U];
+          driver.WaitForPeerCount(node.config, workload.peer_count,
+                                  std::chrono::seconds(workload.timeout_sec),
+                                  stop_token);
+          const uint64_t observed_peer_count =
+              driver.ReadMetrics(node.config, stop_token).peer_count;
+          WriteEvent(
+              events_path, options.run_id, node.config.id,
+              SimulationEventKind::kPeerCountReached,
+              PeerCountWaitDetail(action_index, action_count, workload.node,
+                                  workload.peer_count, observed_peer_count));
+        } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
+          ApplyConnectPeerWorkload(options, events_path, driver,
+                                   *peer_connectivity_controller, nodes,
+                                   scenario_workload.connect_peer, action_index,
+                                   action_count, stop_token);
+        } else if (scenario_workload.kind == WorkloadKind::kDisconnectPeer) {
+          ApplyDisconnectPeerWorkload(options, events_path, driver,
+                                      *peer_connectivity_controller, nodes,
+                                      scenario_workload.disconnect_peer,
+                                      action_index, action_count, stop_token);
+        } else if (scenario_workload.kind ==
+                   WorkloadKind::kSendRawTransaction) {
+          ApplySendRawTransactionWorkload(
+              options, events_path, driver, nodes, transaction_tracker,
+              scenario_workload.send_raw_transaction, action_index,
+              action_count, stop_token);
+        } else if (scenario_workload.kind ==
+                   WorkloadKind::kWalletTransactions) {
+          ApplyWalletTransactionsWorkload(
+              options, events_path, driver, nodes, simulation_registry,
+              transaction_tracker, scenario_workload.wallet_transactions,
+              action_index, action_count, stop_token);
+        } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
+          const RestartNodeWorkload& workload = scenario_workload.restart_node;
+          NodeRuntime& node = nodes[workload.node - 1U];
+          {
+            std::lock_guard<std::mutex> lock(node_process_mutex);
+            RestartNode(options, events_path, driver, node, stop_token);
+          }
+          WriteEvent(
+              events_path, options.run_id, node.config.id,
+              SimulationEventKind::kNodeRestarted,
+              RestartNodeWorkloadDetail(action_index, action_count,
+                                        workload.node, node.RestartCount()));
+        } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
+          const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
+          NodeRuntime& node = nodes[workload.node - 1U];
+          FreezeNodeForDuration(options, events_path, node,
+                                workload.duration_ms, stop_token);
+          WriteEvent(
+              events_path, options.run_id, node.config.id,
+              SimulationEventKind::kNodeFreezeCompleted,
+              FreezeNodeWorkloadDetail(action_index, action_count,
+                                       workload.node, workload.duration_ms));
+        } else if (scenario_workload.kind ==
+                   WorkloadKind::kUpdateResourceLimits) {
+          const ResourceLimitUpdateWorkload& workload =
+              scenario_workload.update_resource_limits;
+          NodeRuntime& node = nodes[workload.node - 1U];
+          ApplyResourceLimitUpdate(options, events_path, node, workload.patch,
+                                   action_index, action_count, workload.node);
+        } else if (scenario_workload.kind == WorkloadKind::kResourcePressure) {
+          ApplyResourcePressureWorkload(options, events_path, metrics_path,
+                                        driver, nodes,
+                                        scenario_workload.resource_pressure,
+                                        action_index, action_count, stop_token);
+        } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
+          ApplyRuntimeNetworkPartition(
+              options, events_path, nodes,
+              scenario_workload.network_partition.partition, false,
+              action_index, action_count, stop_token);
+        } else if (scenario_workload.kind == WorkloadKind::kHealPartition) {
+          ApplyRuntimeNetworkPartition(
+              options, events_path, nodes,
+              scenario_workload.network_partition.partition, true, action_index,
+              action_count, stop_token);
         }
-        transaction_tracker.ObserveAll(options, events_path, driver, nodes,
-                                       stop_token);
-      } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
-        const WaitUntilHeightWorkload& workload =
-            scenario_workload.wait_until_height;
-        NodeRuntime& node = nodes[workload.node - 1U];
-        driver.WaitForHeight(node.config, workload.height,
-                             std::chrono::seconds(workload.timeout_sec),
-                             stop_token);
-        const uint64_t observed_height =
-            driver.ReadMetrics(node.config, stop_token).height;
-        WriteEvent(
-            events_path, options.run_id, node.config.id,
-            SimulationEventKind::kHeightWaitReached,
-            HeightWaitDetail(static_cast<uint32_t>(workload_index + 1U),
-                             static_cast<uint32_t>(workloads.size()),
-                             workload.node, workload.height, observed_height));
-      } else if (scenario_workload.kind == WorkloadKind::kWaitForPeers) {
-        const WaitForPeersWorkload& workload = scenario_workload.wait_for_peers;
-        NodeRuntime& node = nodes[workload.node - 1U];
-        driver.WaitForPeerCount(node.config, workload.peer_count,
-                                std::chrono::seconds(workload.timeout_sec),
-                                stop_token);
-        const uint64_t observed_peer_count =
-            driver.ReadMetrics(node.config, stop_token).peer_count;
-        WriteEvent(events_path, options.run_id, node.config.id,
-                   SimulationEventKind::kPeerCountReached,
-                   PeerCountWaitDetail(
-                       static_cast<uint32_t>(workload_index + 1U),
-                       static_cast<uint32_t>(workloads.size()), workload.node,
-                       workload.peer_count, observed_peer_count));
-      } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
-        ApplyConnectPeerWorkload(
-            options, events_path, driver, *peer_connectivity_controller, nodes,
-            scenario_workload.connect_peer,
-            static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()), stop_token);
-      } else if (scenario_workload.kind == WorkloadKind::kDisconnectPeer) {
-        ApplyDisconnectPeerWorkload(
-            options, events_path, driver, *peer_connectivity_controller, nodes,
-            scenario_workload.disconnect_peer,
-            static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()), stop_token);
-      } else if (scenario_workload.kind == WorkloadKind::kSendRawTransaction) {
-        ApplySendRawTransactionWorkload(
-            options, events_path, driver, nodes, transaction_tracker,
-            scenario_workload.send_raw_transaction,
-            static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()), stop_token);
-      } else if (scenario_workload.kind == WorkloadKind::kWalletTransactions) {
-        ApplyWalletTransactionsWorkload(
-            options, events_path, driver, nodes, simulation_registry,
-            transaction_tracker, scenario_workload.wallet_transactions,
-            static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()), stop_token);
-      } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
-        const RestartNodeWorkload& workload = scenario_workload.restart_node;
-        NodeRuntime& node = nodes[workload.node - 1U];
-        {
-          std::lock_guard<std::mutex> lock(node_process_mutex);
-          RestartNode(options, events_path, driver, node, stop_token);
+      } catch (const std::exception& e) {
+        if (is_scheduled) {
+          const auto action_finished = std::chrono::steady_clock::now();
+          WriteEvent(events_path, options.run_id, "sim",
+                     SimulationEventKind::kScheduledEventFailed,
+                     boost::json::serialize(ScheduledEventLifecycleDetail(
+                         runtime_action, event_engine_epoch, action_started,
+                         action_finished, e.what())));
         }
-        WriteEvent(events_path, options.run_id, node.config.id,
-                   SimulationEventKind::kNodeRestarted,
-                   RestartNodeWorkloadDetail(
-                       static_cast<uint32_t>(workload_index + 1U),
-                       static_cast<uint32_t>(workloads.size()), workload.node,
-                       node.RestartCount()));
-      } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
-        const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
-        NodeRuntime& node = nodes[workload.node - 1U];
-        FreezeNodeForDuration(options, events_path, node, workload.duration_ms,
-                              stop_token);
-        WriteEvent(
-            events_path, options.run_id, node.config.id,
-            SimulationEventKind::kNodeFreezeCompleted,
-            FreezeNodeWorkloadDetail(static_cast<uint32_t>(workload_index + 1U),
-                                     static_cast<uint32_t>(workloads.size()),
-                                     workload.node, workload.duration_ms));
-      } else if (scenario_workload.kind ==
-                 WorkloadKind::kUpdateResourceLimits) {
-        const ResourceLimitUpdateWorkload& workload =
-            scenario_workload.update_resource_limits;
-        NodeRuntime& node = nodes[workload.node - 1U];
-        ApplyResourceLimitUpdate(options, events_path, node, workload.patch,
-                                 static_cast<uint32_t>(workload_index + 1U),
-                                 static_cast<uint32_t>(workloads.size()),
-                                 workload.node);
-      } else if (scenario_workload.kind == WorkloadKind::kResourcePressure) {
-        ApplyResourcePressureWorkload(
-            options, events_path, metrics_path, driver, nodes,
-            scenario_workload.resource_pressure,
-            static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()), stop_token);
-      } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
-        ApplyRuntimeNetworkPartition(
-            options, events_path, nodes,
-            scenario_workload.network_partition.partition, false,
-            static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()), stop_token);
-      } else if (scenario_workload.kind == WorkloadKind::kHealPartition) {
-        ApplyRuntimeNetworkPartition(
-            options, events_path, nodes,
-            scenario_workload.network_partition.partition, true,
-            static_cast<uint32_t>(workload_index + 1U),
-            static_cast<uint32_t>(workloads.size()), stop_token);
+        throw;
+      } catch (...) {
+        if (is_scheduled) {
+          const auto action_finished = std::chrono::steady_clock::now();
+          WriteEvent(events_path, options.run_id, "sim",
+                     SimulationEventKind::kScheduledEventFailed,
+                     boost::json::serialize(ScheduledEventLifecycleDetail(
+                         runtime_action, event_engine_epoch, action_started,
+                         action_finished, "unknown exception")));
+        }
+        throw;
+      }
+      if (is_scheduled) {
+        const auto action_finished = std::chrono::steady_clock::now();
+        WriteEvent(events_path, options.run_id, "sim",
+                   SimulationEventKind::kScheduledEventCompleted,
+                   boost::json::serialize(ScheduledEventLifecycleDetail(
+                       runtime_action, event_engine_epoch, action_started,
+                       action_finished)));
       }
     }
 

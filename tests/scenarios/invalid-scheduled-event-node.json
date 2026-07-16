@@ -1,0 +1,10 @@
+{
+  "nodes": 1,
+  "events": [
+    {
+      "at": "1s",
+      "action": "restart_node",
+      "node": 2
+    }
+  ]
+}

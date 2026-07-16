@@ -21,6 +21,14 @@ workloads:
   - type: "heal_partition"
     group_a: [1]
     group_b: [2]
+events:
+  - at: "250ms"
+    action: "freeze_node"
+    node: 1
+    duration_ms: 10
+  - at: "1s"
+    action: "restart_node"
+    node: 2
 resources:
   memory_high_bytes: 1073741824
   memory_max_bytes: 1610612736

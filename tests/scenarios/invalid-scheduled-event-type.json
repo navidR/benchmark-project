@@ -1,0 +1,11 @@
+{
+  "nodes": 1,
+  "events": [
+    {
+      "at": "1s",
+      "action": "restart_node",
+      "type": "freeze_node",
+      "node": 1
+    }
+  ]
+}

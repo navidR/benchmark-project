@@ -1,0 +1,11 @@
+{
+  "nodes": 1,
+  "events": [
+    {
+      "at": "1s",
+      "action": "set_network_profile",
+      "node": 1,
+      "profile": "degraded"
+    }
+  ]
+}

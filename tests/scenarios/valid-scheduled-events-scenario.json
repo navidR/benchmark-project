@@ -1,0 +1,37 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "isolated_network": true,
+  "block_production": {"enabled": false},
+  "events": [
+    {
+      "at": "2s",
+      "action": "restart_node",
+      "node": 2
+    },
+    {
+      "at": "500ms",
+      "action": "freeze_node",
+      "node": 1,
+      "duration_ms": 10
+    },
+    {
+      "at": "2s",
+      "action": "update_resource_limits",
+      "node": 1,
+      "memory_high_bytes": 1073741824
+    },
+    {
+      "at": "3s",
+      "action": "partition_nodes",
+      "group_a": [1],
+      "group_b": [2]
+    },
+    {
+      "at": "4s",
+      "action": "heal_partition",
+      "group_a": [1],
+      "group_b": [2]
+    }
+  ]
+}

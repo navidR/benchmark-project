@@ -794,3 +794,49 @@ BOOST_AUTO_TEST_CASE(
 
   std::filesystem::remove_all(dir);
 }
+
+BOOST_AUTO_TEST_CASE(run_report_exposes_scheduled_event_lifecycle) {
+  const std::filesystem::path dir = MakeTestDir("run-report-scheduled-events");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"r1","nodes":1,"events":[{"sequence":1,"at":"10ms","at_ms":10,"action":"restart_node","node":1}]})"
+      "\n");
+  bbp::AppendLine(dir / "events.jsonl",
+                  R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"scheduled_event_started","detail":"{\"sequence\":1,\"action\":\"restart_node\",\"scheduled_at_ms\":10,\"started_at_ms\":12,\"lateness_ms\":2}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"scheduled_event_completed","detail":"{\"sequence\":1,\"action\":\"restart_node\",\"duration_ms\":5}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"scheduled_event_failed","detail":"{\"sequence\":2,\"action\":\"freeze_node\",\"error\":\"failed\"}"})");
+
+  const boost::json::value value =
+      boost::json::parse(bbp::BuildRunReportJson(dir));
+  const boost::json::object& report = value.as_object();
+
+  BOOST_REQUIRE_EQUAL(report.at("events").as_array().size(), 1U);
+  BOOST_TEST(JsonInteger(report, "scheduled_event_started_count") == 1U);
+  BOOST_TEST(JsonInteger(report, "scheduled_event_completed_count") == 1U);
+  BOOST_TEST(JsonInteger(report, "scheduled_event_failed_count") == 1U);
+  const boost::json::object& started = report.at("scheduled_events_started")
+                                           .as_array()
+                                           .front()
+                                           .as_object()
+                                           .at("detail")
+                                           .as_object();
+  BOOST_TEST(JsonInteger(started, "sequence") == 1U);
+  BOOST_TEST(JsonInteger(started, "lateness_ms") == 2U);
+  BOOST_TEST(report.at("scheduled_events_failed")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("detail")
+                 .as_object()
+                 .at("error")
+                 .as_string() == "failed");
+
+  std::filesystem::remove_all(dir);
+}

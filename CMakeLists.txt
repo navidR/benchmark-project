@@ -159,6 +159,7 @@ add_executable(bbp
   src/process.cpp
   src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
+  src/scheduled_scenario_event.cpp
   src/simulation_command.cpp
   src/simulation_command_processor.cpp
   src/simulation_command_queue.cpp
@@ -221,6 +222,7 @@ if(BUILD_TESTING)
     tests/unit/process_tests.cpp
     tests/unit/probabilistic_block_scheduler_tests.cpp
     tests/unit/run_report_tests.cpp
+    tests/unit/scheduled_scenario_event_tests.cpp
     tests/unit/simulation_command_processor_tests.cpp
     tests/unit/simulation_command_queue_tests.cpp
     tests/unit/simulation_command_tests.cpp
@@ -259,6 +261,7 @@ if(BUILD_TESTING)
     src/process.cpp
     src/probabilistic_block_scheduler.cpp
     src/run_report.cpp
+    src/scheduled_scenario_event.cpp
     src/simulation_command_processor.cpp
     src/simulation_command_queue.cpp
     src/simulation_registry.cpp
@@ -376,6 +379,57 @@ if(BUILD_TESTING)
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-resource-pressure-scenario.json"
       --probe-capabilities
+  )
+  add_test(NAME bbp-valid-scheduled-events-scenario
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-scheduled-events-scenario.json"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-events-not-array
+    tests/scenarios/invalid-scheduled-events-not-array.json
+    "scenario events must be a JSON array"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-entry
+    tests/scenarios/invalid-scheduled-event-entry.json
+    "scenario events entries must be JSON objects"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-missing-at
+    tests/scenarios/invalid-scheduled-event-missing-at.json
+    "missing or invalid string JSON field: at"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-missing-action
+    tests/scenarios/invalid-scheduled-event-missing-action.json
+    "missing or invalid string JSON field: action"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-time
+    tests/scenarios/invalid-scheduled-event-time.json
+    "duration must contain a positive integer and explicit unit"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-action
+    tests/scenarios/invalid-scheduled-event-action.json
+    "unsupported scheduled event action: set_network_profile"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-type
+    tests/scenarios/invalid-scheduled-event-type.json
+    "scenario events entries use action, not type"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-node
+    tests/scenarios/invalid-scheduled-event-node.json
+    "scenario restart_node workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-event-clock-overflow
+    tests/scenarios/invalid-scheduled-event-clock-overflow.json
+    "scheduled event time exceeds monotonic clock range"
   )
   add_cli_failure_test(
     bbp-invalid-legacy-generate-blocks

@@ -19,6 +19,7 @@
 #include "bbp/simulator/network_partition_rule.h"
 #include "bbp/simulator/resource_limit_patch.h"
 #include "bbp/simulator/scenario_workload.h"
+#include "bbp/simulator/scheduled_scenario_event.h"
 #include "bbp/util.h"
 
 namespace bbp {
@@ -66,6 +67,7 @@ struct Options {
   std::vector<std::uint32_t> runtime_node_restarts;
   std::vector<FreezeRequest> runtime_node_freezes;
   std::vector<ScenarioWorkload> workloads;
+  std::vector<ScheduledScenarioEvent> scheduled_events;
   bool workloads_configured = false;
   bool wallet_backed_workload_requested = false;
   bool replace_run = false;
