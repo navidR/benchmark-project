@@ -725,6 +725,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
    ./build/bbp --probe-bandwidth-limit &&
    ./build/bbp --probe-network-condition &&
    ./build/bbp --probe-combined-network-condition &&
+   ./build/bbp --probe-directional-network-condition &&
    ./build/bbp --probe-network-condition-update'
 ```
 
@@ -739,8 +740,15 @@ Useful focused probes:
 ./build/bbp --probe-bandwidth-limit
 ./build/bbp --probe-network-condition
 ./build/bbp --probe-combined-network-condition
+./build/bbp --probe-directional-network-condition
 ./build/bbp --probe-network-condition-update
 ```
+
+The directional probe enters a temporary node namespace on a worker thread,
+installs an owned 16-band `prio` root on the namespace-side veth, classifies
+exact IPv4 destinations with `flower`, and verifies independent netem and
+TBF-plus-netem branches through kernel read-back. It then removes the complete
+policy and proves that a foreign root qdisc is rejected and preserved.
 
 ## Cleanup Checks
 

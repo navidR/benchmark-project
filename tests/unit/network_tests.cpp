@@ -340,3 +340,79 @@ BOOST_AUTO_TEST_CASE(tc_filter_policy_requires_exact_masks) {
 
   BOOST_TEST(!bbp::TcFilterIsEgressIpv4TcpDropPolicy(filter, "veth0"));
 }
+
+BOOST_AUTO_TEST_CASE(directional_network_policy_matches_exact_kernel_model) {
+  constexpr std::uint32_t root_handle = TC_H_MAKE(0xBB00U << 16U, 0U);
+  bbp::DirectionalNetworkPolicy policy;
+  policy.band = 1;
+  policy.destination_address = "198.51.100.7";
+  policy.condition.delay_ms = 40;
+  policy.condition.jitter_ms = 5;
+
+  bbp::QdiscInfo root;
+  root.if_name = "veth0";
+  root.kind = bbp::QdiscKind::kPrio;
+  root.kernel_kind = "prio";
+  root.handle = root_handle;
+  root.parent = TC_H_ROOT;
+  root.has_prio_options = true;
+  root.prio_bands = TCQ_PRIO_BANDS;
+
+  bbp::QdiscInfo netem;
+  netem.if_name = "veth0";
+  netem.kind = bbp::QdiscKind::kNetem;
+  netem.kernel_kind = "netem";
+  netem.handle = TC_H_MAKE(0xBB21U << 16U, 0U);
+  netem.parent = TC_H_MAKE(0xBB00U << 16U, 2U);
+  netem.has_netem_options = true;
+  netem.netem_latency_us = 40000;
+  netem.netem_jitter_us = 5000;
+  netem.netem_limit_packets = 1000;
+
+  bbp::TcFilterInfo filter;
+  filter.if_name = "veth0";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.kernel_kind = "flower";
+  filter.handle = 0xBB000001U;
+  filter.parent = root_handle;
+  filter.priority = 11;
+  filter.protocol = ETH_P_IP;
+  filter.has_eth_type = true;
+  filter.eth_type = ETH_P_IP;
+  filter.has_ipv4_dst = true;
+  filter.ipv4_dst = policy.destination_address;
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.255";
+  filter.has_class_id = true;
+  filter.class_id = netem.parent;
+
+  BOOST_TEST(bbp::DirectionalNetworkPoliciesMatch({root, netem}, {filter},
+                                                  "veth0", {policy}));
+  filter.class_id = TC_H_MAKE(0xBB00U << 16U, 3U);
+  BOOST_TEST(!bbp::DirectionalNetworkPoliciesMatch({root, netem}, {filter},
+                                                   "veth0", {policy}));
+}
+
+BOOST_AUTO_TEST_CASE(directional_network_policy_rejects_duplicate_bands) {
+  bbp::DirectionalNetworkPolicy first;
+  first.band = 1;
+  first.destination_address = "198.51.100.7";
+  first.condition.delay_ms = 1;
+  bbp::DirectionalNetworkPolicy second = first;
+  second.destination_address = "198.51.100.8";
+
+  BOOST_CHECK_THROW(
+      bbp::DirectionalNetworkPoliciesMatch({}, {}, "veth0", {first, second}),
+      std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(directional_network_policy_rejects_invalid_destination) {
+  bbp::DirectionalNetworkPolicy policy;
+  policy.band = 1;
+  policy.destination_address = "not-an-address";
+  policy.condition.delay_ms = 1;
+
+  BOOST_CHECK_THROW(
+      bbp::DirectionalNetworkPoliciesMatch({}, {}, "veth0", {policy}),
+      std::runtime_error);
+}

@@ -50,6 +50,8 @@ std::string_view QdiscKindName(QdiscKind kind) {
       return "netem";
     case QdiscKind::kTbf:
       return "tbf";
+    case QdiscKind::kPrio:
+      return "prio";
     case QdiscKind::kClsact:
       return "clsact";
     case QdiscKind::kTbfNetem:
@@ -79,6 +81,14 @@ constexpr std::uint32_t kClsactEgressParent =
 constexpr std::uint32_t kClsactIngressParent =
     TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS);
 constexpr std::uint32_t kDropFilterPriority = 10U;
+constexpr std::uint32_t kDirectionalFilterPriority = 11U;
+constexpr std::uint32_t kDirectionalRootHandle = TC_H_MAKE(0xBB00U << 16U, 0U);
+constexpr std::uint32_t kDirectionalTbfHandleBase = 0xBB10U;
+constexpr std::uint32_t kDirectionalNetemHandleBase = 0xBB20U;
+constexpr std::uint32_t kDirectionalFilterHandleBase = 0xBB000000U;
+constexpr std::uint32_t kDirectionalBandCount = TCQ_PRIO_BANDS;
+constexpr std::uint32_t kMaximumDirectionalPolicies =
+    kDirectionalBandCount - 1U;
 
 QdiscKind ParseQdiscKind(std::string_view kind) {
   if (kind == "pfifo") {
@@ -89,6 +99,9 @@ QdiscKind ParseQdiscKind(std::string_view kind) {
   }
   if (kind == "tbf") {
     return QdiscKind::kTbf;
+  }
+  if (kind == "prio") {
+    return QdiscKind::kPrio;
   }
   if (kind == "clsact") {
     return QdiscKind::kClsact;
@@ -358,6 +371,53 @@ bool HasNetemCondition(const NetworkCondition& condition) {
 
 bool HasBandwidthCondition(const NetworkCondition& condition) {
   return condition.bandwidth_mbps != 0U;
+}
+
+in_addr ParseIpv4Address(const std::string& address,
+                         std::string_view field_name);
+void ValidateNetworkCondition(const NetworkCondition& condition);
+
+std::uint32_t DirectionalClassId(std::uint32_t band) {
+  return TC_H_MAKE(TC_H_MAJ(kDirectionalRootHandle), band + 1U);
+}
+
+std::uint32_t DirectionalTbfHandle(std::uint32_t band) {
+  return TC_H_MAKE((kDirectionalTbfHandleBase + band) << 16U, 0U);
+}
+
+std::uint32_t DirectionalNetemHandle(std::uint32_t band) {
+  return TC_H_MAKE((kDirectionalNetemHandleBase + band) << 16U, 0U);
+}
+
+std::uint32_t DirectionalFilterHandle(std::uint32_t band) {
+  return kDirectionalFilterHandleBase + band;
+}
+
+void ValidateDirectionalNetworkPolicies(
+    const std::vector<DirectionalNetworkPolicy>& policies) {
+  if (policies.size() > kMaximumDirectionalPolicies) {
+    throw std::runtime_error("directional network policy count exceeds 15");
+  }
+  std::array<bool, kDirectionalBandCount> bands{};
+  std::vector<std::string> destinations;
+  destinations.reserve(policies.size());
+  for (const DirectionalNetworkPolicy& policy : policies) {
+    if (policy.band == 0U || policy.band > kMaximumDirectionalPolicies) {
+      throw std::runtime_error("directional network policy band must be 1..15");
+    }
+    if (bands[policy.band]) {
+      throw std::runtime_error("duplicate directional network policy band");
+    }
+    bands[policy.band] = true;
+    ParseIpv4Address(policy.destination_address, "policy destination");
+    if (std::find(destinations.begin(), destinations.end(),
+                  policy.destination_address) != destinations.end()) {
+      throw std::runtime_error(
+          "duplicate directional network policy destination");
+    }
+    destinations.push_back(policy.destination_address);
+    ValidateNetworkCondition(policy.condition);
+  }
 }
 
 std::string DescribeTcFilters(const std::vector<TcFilterInfo>& filters) {
@@ -634,6 +694,102 @@ TcFilterStatsSummary SummarizeEgressIpv4TcpDropPolicies(
     add(filter.drop_packets, &summary.drop_packets, "drop packets");
   }
   return summary;
+}
+
+bool DirectionalNetworkPoliciesMatch(
+    const std::vector<QdiscInfo>& qdiscs,
+    const std::vector<TcFilterInfo>& filters, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& policies) {
+  ValidateDirectionalNetworkPolicies(policies);
+  const auto root =
+      std::find_if(qdiscs.begin(), qdiscs.end(), [&](const QdiscInfo& qdisc) {
+        return qdisc.if_name == if_name && qdisc.parent == TC_H_ROOT &&
+               qdisc.handle == kDirectionalRootHandle;
+      });
+  if (policies.empty()) {
+    return root == qdiscs.end();
+  }
+  if (root == qdiscs.end() || root->kind != QdiscKind::kPrio ||
+      !root->has_prio_options || root->prio_bands != kDirectionalBandCount) {
+    return false;
+  }
+
+  std::size_t owned_filter_count = 0;
+  for (const TcFilterInfo& filter : filters) {
+    if (filter.if_name == if_name && filter.parent == kDirectionalRootHandle &&
+        filter.priority == kDirectionalFilterPriority &&
+        filter.handle > kDirectionalFilterHandleBase &&
+        filter.handle <=
+            kDirectionalFilterHandleBase + kMaximumDirectionalPolicies) {
+      ++owned_filter_count;
+    }
+  }
+  if (owned_filter_count != policies.size()) {
+    return false;
+  }
+
+  for (const DirectionalNetworkPolicy& policy : policies) {
+    const std::uint32_t class_id = DirectionalClassId(policy.band);
+    const auto filter = std::find_if(
+        filters.begin(), filters.end(), [&](const TcFilterInfo& candidate) {
+          return candidate.if_name == if_name &&
+                 candidate.kind == TcFilterKind::kFlower &&
+                 candidate.handle == DirectionalFilterHandle(policy.band) &&
+                 candidate.parent == kDirectionalRootHandle &&
+                 candidate.priority == kDirectionalFilterPriority &&
+                 candidate.protocol == ETH_P_IP && candidate.has_eth_type &&
+                 candidate.eth_type == ETH_P_IP && !candidate.has_ipv4_src &&
+                 candidate.has_ipv4_dst &&
+                 candidate.ipv4_dst == policy.destination_address &&
+                 candidate.has_ipv4_dst_mask &&
+                 candidate.ipv4_dst_mask == "255.255.255.255" &&
+                 candidate.has_class_id && candidate.class_id == class_id &&
+                 !candidate.has_drop_action;
+        });
+    if (filter == filters.end()) {
+      return false;
+    }
+
+    if (HasBandwidthCondition(policy.condition)) {
+      const auto tbf = std::find_if(
+          qdiscs.begin(), qdiscs.end(), [&](const QdiscInfo& qdisc) {
+            return qdisc.if_name == if_name &&
+                   qdisc.handle == DirectionalTbfHandle(policy.band) &&
+                   qdisc.parent == class_id;
+          });
+      if (tbf == qdiscs.end() ||
+          !QdiscMatchesTbfCondition(*tbf, policy.condition)) {
+        return false;
+      }
+      if (HasNetemCondition(policy.condition)) {
+        const std::uint32_t tbf_child =
+            TC_H_MAKE(TC_H_MAJ(DirectionalTbfHandle(policy.band)), 1U);
+        const auto netem = std::find_if(
+            qdiscs.begin(), qdiscs.end(), [&](const QdiscInfo& qdisc) {
+              return qdisc.if_name == if_name &&
+                     qdisc.handle == DirectionalNetemHandle(policy.band) &&
+                     qdisc.parent == tbf_child;
+            });
+        if (netem == qdiscs.end() ||
+            !QdiscMatchesNetemCondition(*netem, policy.condition)) {
+          return false;
+        }
+      }
+      continue;
+    }
+
+    const auto netem =
+        std::find_if(qdiscs.begin(), qdiscs.end(), [&](const QdiscInfo& qdisc) {
+          return qdisc.if_name == if_name &&
+                 qdisc.handle == DirectionalNetemHandle(policy.band) &&
+                 qdisc.parent == class_id;
+        });
+    if (netem == qdiscs.end() ||
+        !QdiscMatchesNetemCondition(*netem, policy.condition)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 namespace {
@@ -1122,6 +1278,19 @@ int ParseNetemOptions(const nlattr* attr, QdiscInfo* qdisc) {
                                 ParseNetemNestedOptionAttr, qdisc);
 }
 
+int ParsePrioOptions(const nlattr* attr, QdiscInfo* qdisc) {
+  if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+      mnl_attr_get_payload_len(attr) < sizeof(tc_prio_qopt)) {
+    errno = EINVAL;
+    return MNL_CB_ERROR;
+  }
+  const auto* options =
+      static_cast<const tc_prio_qopt*>(mnl_attr_get_payload(attr));
+  qdisc->has_prio_options = true;
+  qdisc->prio_bands = options->bands;
+  return MNL_CB_OK;
+}
+
 int ParseQdiscAttr(const nlattr* attr, void* data) {
   auto* qdisc = static_cast<QdiscInfo*>(data);
   const uint16_t attr_type = mnl_attr_get_type(attr);
@@ -1163,6 +1332,12 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
       }
       if (qdisc->kind == QdiscKind::kNetem) {
         if (ParseNetemOptions(attr, qdisc) < 0) {
+          return MNL_CB_ERROR;
+        }
+        return MNL_CB_OK;
+      }
+      if (qdisc->kind == QdiscKind::kPrio) {
+        if (ParsePrioOptions(attr, qdisc) < 0) {
           return MNL_CB_ERROR;
         }
       }
@@ -1273,6 +1448,10 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
     qdisc.tbf_limit_bytes = 0;
     qdisc.tbf_buffer_ticks = 0;
     qdisc.tbf_mtu_ticks = 0;
+  }
+  if (qdisc.kind != QdiscKind::kPrio) {
+    qdisc.has_prio_options = false;
+    qdisc.prio_bands = 0;
   }
   qdiscs->push_back(std::move(qdisc));
   return MNL_CB_OK;
@@ -1415,6 +1594,13 @@ int ParseFlowerAttr(const nlattr* attr, void* data) {
   }
 
   switch (attr_type) {
+    case TCA_FLOWER_CLASSID:
+      if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0) {
+        return MNL_CB_ERROR;
+      }
+      filter->has_class_id = true;
+      filter->class_id = mnl_attr_get_u32(attr);
+      return MNL_CB_OK;
     case TCA_FLOWER_KEY_ETH_TYPE:
       if (mnl_attr_validate(attr, MNL_TYPE_U16) < 0) {
         return MNL_CB_ERROR;
@@ -1776,6 +1962,43 @@ std::vector<QdiscInfo> ListQdiscs() {
 
 namespace {
 
+void AppendTcFiltersForLinkParent(const LinkInfo& link, std::uint32_t parent,
+                                  std::vector<TcFilterInfo>* filters) {
+  if (link.index <= 0) {
+    return;
+  }
+  MnlSocket socket(NETLINK_ROUTE);
+  socket.Bind(0, MNL_SOCKET_AUTOPID);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_GETTFILTER;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+  message->tcm_ifindex = link.index;
+  message->tcm_parent = parent;
+
+  socket.Send(nlh, nlh->nlmsg_len);
+  while (true) {
+    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
+    const int status =
+        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
+                   socket.PortId(), ParseFilterMessage, filters);
+    if (status == MNL_CB_ERROR) {
+      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
+                               std::strerror(errno));
+    }
+    if (status == MNL_CB_STOP) {
+      break;
+    }
+  }
+}
+
 void AppendTcFiltersForLink(const LinkInfo& link,
                             const std::vector<QdiscInfo>& qdiscs,
                             std::vector<TcFilterInfo>* filters) {
@@ -1786,37 +2009,7 @@ void AppendTcFiltersForLink(const LinkInfo& link,
     return;
   }
   for (const std::uint32_t parent : clsact_parents) {
-    MnlSocket socket(NETLINK_ROUTE);
-    socket.Bind(0, MNL_SOCKET_AUTOPID);
-
-    std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
-    nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
-    nlh->nlmsg_type = RTM_GETTFILTER;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-    const uint32_t sequence = NextSequence();
-    nlh->nlmsg_seq = sequence;
-
-    auto* message =
-        static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
-    message->tcm_family = AF_UNSPEC;
-    message->tcm_ifindex = link.index;
-    message->tcm_parent = parent;
-
-    socket.Send(nlh, nlh->nlmsg_len);
-
-    while (true) {
-      const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-      const int status =
-          mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
-                     socket.PortId(), ParseFilterMessage, filters);
-      if (status == MNL_CB_ERROR) {
-        throw std::runtime_error(std::string("mnl_cb_run failed: ") +
-                                 std::strerror(errno));
-      }
-      if (status == MNL_CB_STOP) {
-        break;
-      }
-    }
+    AppendTcFiltersForLinkParent(link, parent, filters);
   }
 }
 
@@ -1844,6 +2037,26 @@ std::vector<TcFilterInfo> ListTcFiltersForInterface(
   std::vector<TcFilterInfo> filters;
   AppendTcFiltersForLink(*link, ListQdiscs(), &filters);
   return filters;
+}
+
+std::vector<TcFilterInfo> ListTcFiltersForInterfaceParentInNamespace(
+    int netns_fd, const std::string& if_name, std::uint32_t parent) {
+  if (netns_fd < 0) {
+    throw std::runtime_error("invalid network namespace fd");
+  }
+  return ExecuteInNetworkNamespace(netns_fd, [&]() {
+    RequireInterfaceName(if_name);
+    const std::vector<LinkInfo> links = ListNetworkLinks();
+    const auto link = std::find_if(
+        links.begin(), links.end(),
+        [&](const LinkInfo& candidate) { return candidate.name == if_name; });
+    if (link == links.end()) {
+      throw std::runtime_error("network interface not found: " + if_name);
+    }
+    std::vector<TcFilterInfo> filters;
+    AppendTcFiltersForLinkParent(*link, parent, &filters);
+    return filters;
+  });
 }
 
 void CreateVethPair(const std::string& host_name,
@@ -2210,8 +2423,8 @@ void ReplaceRootNetemQdisc(const std::string& if_name,
   ReplaceNetemQdisc(if_name, TC_H_ROOT, kRootQdiscHandle, condition);
 }
 
-void ReplaceRootTbfQdisc(const std::string& if_name,
-                         const NetworkCondition& condition) {
+void ReplaceTbfQdisc(const std::string& if_name, std::uint32_t parent,
+                     std::uint32_t handle, const NetworkCondition& condition) {
   RequireInterfaceName(if_name);
   ValidateNetworkCondition(condition);
   if (condition.bandwidth_mbps == 0U) {
@@ -2238,8 +2451,8 @@ void ReplaceRootTbfQdisc(const std::string& if_name,
       static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
   message->tcm_family = AF_UNSPEC;
   message->tcm_ifindex = static_cast<int>(if_index);
-  message->tcm_handle = kRootQdiscHandle;
-  message->tcm_parent = TC_H_ROOT;
+  message->tcm_handle = handle;
+  message->tcm_parent = parent;
   message->tcm_info = 0;
 
   tc_tbf_qopt options{};
@@ -2258,6 +2471,11 @@ void ReplaceRootTbfQdisc(const std::string& if_name,
   mnl_attr_nest_end(nlh, tbf_options);
 
   SendNetlinkRequest(nlh, sequence);
+}
+
+void ReplaceRootTbfQdisc(const std::string& if_name,
+                         const NetworkCondition& condition) {
+  ReplaceTbfQdisc(if_name, TC_H_ROOT, kRootQdiscHandle, condition);
 }
 
 void DeleteRootQdisc(const std::string& if_name) {
@@ -2284,6 +2502,184 @@ void DeleteRootQdisc(const std::string& if_name) {
   message->tcm_info = 0;
 
   SendNetlinkRequest(nlh, sequence);
+}
+
+namespace {
+
+void ReplaceDirectionalPrioQdisc(const std::string& if_name) {
+  RequireInterfaceName(if_name);
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWQDISC;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+  message->tcm_ifindex = static_cast<int>(if_index);
+  message->tcm_handle = kDirectionalRootHandle;
+  message->tcm_parent = TC_H_ROOT;
+
+  tc_prio_qopt options{};
+  options.bands = kDirectionalBandCount;
+  mnl_attr_put_strz(nlh, TCA_KIND, "prio");
+  mnl_attr_put(nlh, TCA_OPTIONS, sizeof(options), &options);
+  SendNetlinkRequest(nlh, sequence);
+}
+
+void ReplaceDirectionalFlowerFilter(const std::string& if_name,
+                                    const DirectionalNetworkPolicy& policy) {
+  RequireInterfaceName(if_name);
+  const unsigned int if_index = if_nametoindex(if_name.c_str());
+  if (if_index == 0U) {
+    throw std::runtime_error("if_nametoindex failed for " + if_name + ": " +
+                             std::strerror(errno));
+  }
+  const in_addr destination =
+      ParseIpv4Address(policy.destination_address, "policy destination");
+  const std::uint32_t exact_mask = 0xFFFFFFFFU;
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWTFILTER;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message =
+      static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+  message->tcm_family = AF_UNSPEC;
+  message->tcm_ifindex = static_cast<int>(if_index);
+  message->tcm_handle = DirectionalFilterHandle(policy.band);
+  message->tcm_parent = kDirectionalRootHandle;
+  message->tcm_info = TC_H_MAKE(
+      kDirectionalFilterPriority << 16U,
+      static_cast<std::uint32_t>(htons(static_cast<std::uint16_t>(ETH_P_IP))));
+
+  mnl_attr_put_strz(nlh, TCA_KIND, "flower");
+  nlattr* options = mnl_attr_nest_start(nlh, TCA_OPTIONS);
+  mnl_attr_put_u32(nlh, TCA_FLOWER_CLASSID, DirectionalClassId(policy.band));
+  mnl_attr_put_u16(nlh, TCA_FLOWER_KEY_ETH_TYPE,
+                   htons(static_cast<std::uint16_t>(ETH_P_IP)));
+  mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST, destination.s_addr);
+  mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST_MASK, exact_mask);
+  mnl_attr_nest_end(nlh, options);
+  SendNetlinkRequest(nlh, sequence);
+}
+
+std::vector<TcFilterInfo> ListDirectionalFilters(const std::string& if_name) {
+  const std::vector<LinkInfo> links = ListNetworkLinks();
+  const auto link = std::find_if(
+      links.begin(), links.end(),
+      [&](const LinkInfo& candidate) { return candidate.name == if_name; });
+  if (link == links.end()) {
+    throw std::runtime_error("network interface not found: " + if_name);
+  }
+  std::vector<TcFilterInfo> filters;
+  AppendTcFiltersForLinkParent(*link, kDirectionalRootHandle, &filters);
+  return filters;
+}
+
+bool HasOwnedDirectionalRoot(const std::vector<QdiscInfo>& qdiscs,
+                             const std::string& if_name) {
+  bool found = false;
+  for (const QdiscInfo& qdisc : qdiscs) {
+    if (qdisc.if_name != if_name || qdisc.parent != TC_H_ROOT ||
+        qdisc.handle == 0U) {
+      continue;
+    }
+    if (qdisc.handle != kDirectionalRootHandle ||
+        qdisc.kind != QdiscKind::kPrio || !qdisc.has_prio_options ||
+        qdisc.prio_bands != kDirectionalBandCount) {
+      throw std::runtime_error(
+          "refusing to replace a non-owned root qdisc on " + if_name);
+    }
+    found = true;
+  }
+  return found;
+}
+
+void ApplyDirectionalNetworkPolicies(
+    const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& policies) {
+  ValidateDirectionalNetworkPolicies(policies);
+  const bool had_owned_root = HasOwnedDirectionalRoot(ListQdiscs(), if_name);
+  if (had_owned_root) {
+    DeleteRootQdisc(if_name);
+  }
+  if (policies.empty()) {
+    return;
+  }
+
+  ReplaceDirectionalPrioQdisc(if_name);
+  for (const DirectionalNetworkPolicy& policy : policies) {
+    const std::uint32_t class_id = DirectionalClassId(policy.band);
+    if (HasBandwidthCondition(policy.condition)) {
+      const std::uint32_t tbf_handle = DirectionalTbfHandle(policy.band);
+      ReplaceTbfQdisc(if_name, class_id, tbf_handle, policy.condition);
+      if (HasNetemCondition(policy.condition)) {
+        ReplaceNetemQdisc(if_name, TC_H_MAKE(TC_H_MAJ(tbf_handle), 1U),
+                          DirectionalNetemHandle(policy.band),
+                          policy.condition);
+      }
+    } else {
+      ReplaceNetemQdisc(if_name, class_id, DirectionalNetemHandle(policy.band),
+                        policy.condition);
+    }
+    ReplaceDirectionalFlowerFilter(if_name, policy);
+  }
+
+  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+  const std::vector<TcFilterInfo> filters = ListDirectionalFilters(if_name);
+  if (!DirectionalNetworkPoliciesMatch(qdiscs, filters, if_name, policies)) {
+    throw std::runtime_error(
+        "directional network policy kernel read-back mismatch on " + if_name);
+  }
+}
+
+}  // namespace
+
+void UpdateDirectionalNetworkPoliciesInNamespace(
+    int netns_fd, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& previous,
+    const std::vector<DirectionalNetworkPolicy>& desired) {
+  if (netns_fd < 0) {
+    throw std::runtime_error("invalid network namespace fd");
+  }
+  RequireInterfaceName(if_name);
+  ValidateDirectionalNetworkPolicies(previous);
+  ValidateDirectionalNetworkPolicies(desired);
+  ExecuteInNetworkNamespace(netns_fd, [&]() {
+    const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+    static_cast<void>(HasOwnedDirectionalRoot(qdiscs, if_name));
+    const std::vector<TcFilterInfo> filters = ListDirectionalFilters(if_name);
+    if (!DirectionalNetworkPoliciesMatch(qdiscs, filters, if_name, previous)) {
+      throw std::runtime_error(
+          "directional network policy state does not match expected prior "
+          "state on " +
+          if_name);
+    }
+    try {
+      ApplyDirectionalNetworkPolicies(if_name, desired);
+    } catch (const std::exception& apply_error) {
+      const std::string apply_message = apply_error.what();
+      try {
+        ApplyDirectionalNetworkPolicies(if_name, previous);
+      } catch (const std::exception& rollback_error) {
+        throw std::runtime_error(apply_message +
+                                 "; rollback failed: " + rollback_error.what());
+      }
+      throw std::runtime_error(apply_message + "; prior state restored");
+    }
+  });
 }
 
 void EnsureClsactQdisc(const std::string& if_name) {
@@ -2880,6 +3276,104 @@ DropFilterProbe ProbeDropFilter() {
     throw;
   }
 
+  return probe;
+}
+
+DirectionalNetworkPolicyProbe ProbeDirectionalNetworkPolicies() {
+  DirectionalNetworkPolicyProbe probe;
+  probe.host_name = ProbeName('h');
+  probe.peer_name = ProbeName('p');
+  DirectionalNetworkPolicy delay_policy;
+  delay_policy.band = 1;
+  delay_policy.destination_address = "198.51.100.7";
+  delay_policy.condition.delay_ms = 40;
+  delay_policy.condition.jitter_ms = 5;
+  delay_policy.condition.loss_basis_points = 10;
+  DirectionalNetworkPolicy combined_policy;
+  combined_policy.band = 2;
+  combined_policy.destination_address = "198.51.100.11";
+  combined_policy.condition.bandwidth_mbps = 20;
+  combined_policy.condition.delay_ms = 15;
+  combined_policy.condition.limit_packets = 512;
+  probe.policies = {delay_policy, combined_policy};
+
+  UniqueFd namespace_fd = StartNetworkNamespaceHelper(&probe.helper_pid);
+  TryDeleteLink(probe.host_name);
+  TryDeleteLink(probe.peer_name);
+  try {
+    CreateVethPair(probe.host_name, probe.peer_name);
+    SetLinkUp(probe.host_name, true);
+    MoveLinkToNamespace(probe.peer_name, namespace_fd.get());
+    ExecuteInNetworkNamespace(namespace_fd.get(), [&]() {
+      SetLinkUp("lo", true);
+      SetLinkUp(probe.peer_name, true);
+    });
+
+    probe.namespace_qdiscs_before = ListQdiscsInNamespace(namespace_fd.get());
+    UpdateDirectionalNetworkPoliciesInNamespace(
+        namespace_fd.get(), probe.peer_name, {}, probe.policies);
+    probe.namespace_qdiscs_after_apply =
+        ListQdiscsInNamespace(namespace_fd.get());
+    probe.namespace_filters_after_apply =
+        ListTcFiltersForInterfaceParentInNamespace(
+            namespace_fd.get(), probe.peer_name, kDirectionalRootHandle);
+    if (!DirectionalNetworkPoliciesMatch(probe.namespace_qdiscs_after_apply,
+                                         probe.namespace_filters_after_apply,
+                                         probe.peer_name, probe.policies)) {
+      throw std::runtime_error(
+          "directional network policies did not match kernel state");
+    }
+
+    UpdateDirectionalNetworkPoliciesInNamespace(
+        namespace_fd.get(), probe.peer_name, probe.policies, {});
+    probe.namespace_qdiscs_after_delete =
+        ListQdiscsInNamespace(namespace_fd.get());
+    probe.namespace_filters_after_delete =
+        ListTcFiltersForInterfaceParentInNamespace(
+            namespace_fd.get(), probe.peer_name, kDirectionalRootHandle);
+    if (!DirectionalNetworkPoliciesMatch(probe.namespace_qdiscs_after_delete,
+                                         probe.namespace_filters_after_delete,
+                                         probe.peer_name, {})) {
+      throw std::runtime_error(
+          "directional network policies remained after delete");
+    }
+
+    ExecuteInNetworkNamespace(namespace_fd.get(), [&]() {
+      ReplaceRootPfifoQdisc(probe.peer_name, 64);
+    });
+    bool rejected_non_owned_root = false;
+    try {
+      UpdateDirectionalNetworkPoliciesInNamespace(
+          namespace_fd.get(), probe.peer_name, {}, probe.policies);
+    } catch (const std::exception&) {
+      rejected_non_owned_root = true;
+    }
+    const std::vector<QdiscInfo> after_rejection =
+        ListQdiscsInNamespace(namespace_fd.get());
+    probe.non_owned_root_preserved =
+        rejected_non_owned_root &&
+        HasQdiscKindForInterface(after_rejection, probe.peer_name,
+                                 QdiscKind::kPfifo);
+    if (!probe.non_owned_root_preserved) {
+      throw std::runtime_error(
+          "directional network update did not preserve a non-owned root "
+          "qdisc");
+    }
+    ExecuteInNetworkNamespace(namespace_fd.get(),
+                              [&]() { DeleteRootQdisc(probe.peer_name); });
+
+    DeleteLink(probe.host_name);
+    probe.parent_after_delete = ListNetworkLinks();
+  } catch (...) {
+    TryDeleteLink(probe.host_name);
+    TryDeleteLink(probe.peer_name);
+    kill(probe.helper_pid, SIGKILL);
+    WaitForPid(probe.helper_pid);
+    throw;
+  }
+
+  kill(probe.helper_pid, SIGKILL);
+  WaitForPid(probe.helper_pid);
   return probe;
 }
 

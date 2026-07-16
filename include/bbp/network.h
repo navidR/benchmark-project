@@ -14,6 +14,7 @@ enum class QdiscKind {
   kPfifo,
   kNetem,
   kTbf,
+  kPrio,
   kClsact,
   kTbfNetem,
 };
@@ -90,6 +91,8 @@ struct QdiscInfo {
   std::uint32_t tbf_limit_bytes = 0;
   std::uint32_t tbf_buffer_ticks = 0;
   std::uint32_t tbf_mtu_ticks = 0;
+  bool has_prio_options = false;
+  std::uint32_t prio_bands = 0;
 };
 
 struct TcFilterInfo {
@@ -119,6 +122,8 @@ struct TcFilterInfo {
   std::uint16_t tcp_dst = 0;
   bool has_tcp_dst_mask = false;
   std::uint16_t tcp_dst_mask = 0;
+  bool has_class_id = false;
+  std::uint32_t class_id = 0;
   bool has_drop_action = false;
   bool has_stats = false;
   std::uint64_t match_bytes = 0;
@@ -143,6 +148,18 @@ struct NetworkCondition {
   std::uint32_t corrupt_basis_points = 0;
   std::uint32_t reorder_basis_points = 0;
   std::uint32_t limit_packets = 1000;
+
+  bool operator==(const NetworkCondition&) const = default;
+};
+
+struct DirectionalNetworkPolicy {
+  // Band zero is the unclassified path. Simulator-owned directional policies
+  // use bands 1..15, which map to prio classes 2..16.
+  std::uint32_t band = 0;
+  std::string destination_address;
+  NetworkCondition condition;
+
+  bool operator==(const DirectionalNetworkPolicy&) const = default;
 };
 
 class NetworkNamespace {
@@ -291,6 +308,20 @@ struct DropFilterProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
+struct DirectionalNetworkPolicyProbe {
+  pid_t helper_pid = -1;
+  std::string host_name;
+  std::string peer_name;
+  std::vector<DirectionalNetworkPolicy> policies;
+  std::vector<QdiscInfo> namespace_qdiscs_before;
+  std::vector<QdiscInfo> namespace_qdiscs_after_apply;
+  std::vector<TcFilterInfo> namespace_filters_after_apply;
+  std::vector<QdiscInfo> namespace_qdiscs_after_delete;
+  std::vector<TcFilterInfo> namespace_filters_after_delete;
+  bool non_owned_root_preserved = false;
+  std::vector<LinkInfo> parent_after_delete;
+};
+
 std::vector<LinkInfo> ListNetworkLinks();
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
 std::vector<AddressInfo> ListIpv4Addresses();
@@ -301,6 +332,8 @@ std::vector<QdiscInfo> ListQdiscs();
 std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd);
 std::vector<TcFilterInfo> ListTcFilters();
 std::vector<TcFilterInfo> ListTcFiltersForInterface(const std::string& if_name);
+std::vector<TcFilterInfo> ListTcFiltersForInterfaceParentInNamespace(
+    int netns_fd, const std::string& if_name, std::uint32_t parent);
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition);
 bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
@@ -316,6 +349,10 @@ bool TcFilterIsEgressIpv4TcpDropPolicy(const TcFilterInfo& filter,
                                        const std::string& if_name);
 TcFilterStatsSummary SummarizeEgressIpv4TcpDropPolicies(
     const std::vector<TcFilterInfo>& filters, const std::string& if_name);
+bool DirectionalNetworkPoliciesMatch(
+    const std::vector<QdiscInfo>& qdiscs,
+    const std::vector<TcFilterInfo>& filters, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& policies);
 bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& if_name,
                                       const std::string& src_address,
@@ -355,6 +392,10 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
                                     std::uint32_t handle);
 void DeleteEgressIpv4TcpDropFilter(const std::string& if_name,
                                    std::uint32_t handle);
+void UpdateDirectionalNetworkPoliciesInNamespace(
+    int netns_fd, const std::string& if_name,
+    const std::vector<DirectionalNetworkPolicy>& previous,
+    const std::vector<DirectionalNetworkPolicy>& desired);
 void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config);
 void DeleteNodeVethNetwork(const NodeVethConfig& config);
 VethProbe ProbeVethPair();
@@ -367,5 +408,6 @@ NetworkConditionProbe ProbeCombinedNetworkCondition();
 NetworkConditionUpdateProbe ProbeNetworkConditionUpdate();
 BandwidthLimitProbe ProbeBandwidthLimit();
 DropFilterProbe ProbeDropFilter();
+DirectionalNetworkPolicyProbe ProbeDirectionalNetworkPolicies();
 
 }  // namespace bbp

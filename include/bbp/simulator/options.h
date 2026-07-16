@@ -79,6 +79,7 @@ struct Options {
   bool probe_capabilities = false;
   bool probe_cgroup_freeze = false;
   bool probe_drop_filter = false;
+  bool probe_directional_network_condition = false;
   bool probe_netns = false;
   bool probe_combined_network_condition = false;
   bool probe_network_condition = false;

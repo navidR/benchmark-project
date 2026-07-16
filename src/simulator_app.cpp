@@ -2571,9 +2571,14 @@ Options ParseOptions(int argc, char** argv) {
       "paths")(
       "probe-drop-filter", po::bool_switch(&options.probe_drop_filter),
       "apply and remove a flower/gact TCP drop filter on a temporary veth "
-      "through libmnl")("probe-netns", po::bool_switch(&options.probe_netns),
-                        "create a temporary network namespace and inspect it "
-                        "through setns/libmnl")(
+      "through libmnl")(
+      "probe-directional-network-condition",
+      po::bool_switch(&options.probe_directional_network_condition),
+      "apply and remove exact-destination prio/flower/TBF/netem policies "
+      "inside a temporary network namespace through libmnl")(
+      "probe-netns", po::bool_switch(&options.probe_netns),
+      "create a temporary network namespace and inspect it "
+      "through setns/libmnl")(
       "probe-network-condition",
       po::bool_switch(&options.probe_network_condition),
       "apply and remove a netem network condition on a temporary veth peer "
@@ -2941,7 +2946,8 @@ Options ParseOptions(int argc, char** argv) {
       !options.probe_network && options.report_run.empty() &&
       options.tui_run.empty() && !options.probe_bandwidth_limit &&
       !options.probe_capabilities && !options.probe_cgroup_freeze &&
-      !options.probe_drop_filter && !options.probe_netns &&
+      !options.probe_drop_filter &&
+      !options.probe_directional_network_condition && !options.probe_netns &&
       !options.probe_veth && !options.probe_address && !options.probe_route &&
       !options.probe_qdisc && !options.probe_qdisc_mutation &&
       !options.probe_network_condition &&
@@ -3040,6 +3046,8 @@ boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
     qdisc_json["tbf_limit_bytes"] = qdisc.tbf_limit_bytes;
     qdisc_json["tbf_buffer_ticks"] = qdisc.tbf_buffer_ticks;
     qdisc_json["tbf_mtu_ticks"] = qdisc.tbf_mtu_ticks;
+    qdisc_json["has_prio_options"] = qdisc.has_prio_options;
+    qdisc_json["prio_bands"] = qdisc.prio_bands;
     qdiscs_json.push_back(std::move(qdisc_json));
   }
   return qdiscs_json;
@@ -3074,6 +3082,8 @@ boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
     filter_json["tcp_dst"] = filter.tcp_dst;
     filter_json["has_tcp_dst_mask"] = filter.has_tcp_dst_mask;
     filter_json["tcp_dst_mask"] = filter.tcp_dst_mask;
+    filter_json["has_class_id"] = filter.has_class_id;
+    filter_json["class_id"] = filter.class_id;
     filter_json["has_drop_action"] = filter.has_drop_action;
     filter_json["has_stats"] = filter.has_stats;
     filter_json["match_bytes"] = filter.match_bytes;
@@ -3749,6 +3759,35 @@ std::string CombinedNetworkConditionProbeJson() {
       QdiscsJson(probe.namespace_qdiscs_after_apply);
   result["namespace_qdiscs_after_delete"] =
       QdiscsJson(probe.namespace_qdiscs_after_delete);
+  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
+  return boost::json::serialize(result);
+}
+
+std::string DirectionalNetworkPolicyProbeJson() {
+  DirectionalNetworkPolicyProbe probe = ProbeDirectionalNetworkPolicies();
+  boost::json::object result;
+  result["helper_pid"] = probe.helper_pid;
+  result["host_name"] = probe.host_name;
+  result["peer_name"] = probe.peer_name;
+  boost::json::array policies;
+  for (const DirectionalNetworkPolicy& policy : probe.policies) {
+    boost::json::object object;
+    object["band"] = policy.band;
+    object["destination_address"] = policy.destination_address;
+    object["condition"] = NetworkConditionJson(policy.condition);
+    policies.push_back(std::move(object));
+  }
+  result["policies"] = std::move(policies);
+  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
+  result["namespace_qdiscs_after_apply"] =
+      QdiscsJson(probe.namespace_qdiscs_after_apply);
+  result["namespace_filters_after_apply"] =
+      TcFiltersJson(probe.namespace_filters_after_apply);
+  result["namespace_qdiscs_after_delete"] =
+      QdiscsJson(probe.namespace_qdiscs_after_delete);
+  result["namespace_filters_after_delete"] =
+      TcFiltersJson(probe.namespace_filters_after_delete);
+  result["non_owned_root_preserved"] = probe.non_owned_root_preserved;
   result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
   return boost::json::serialize(result);
 }
@@ -7450,6 +7489,11 @@ int SimulatorApp::Run(int argc, char** argv) {
   if (options.probe_drop_filter) {
     RequireNetworkSetupCapabilities();
     BBP_LOG(info) << DropFilterProbeJson();
+    return 0;
+  }
+  if (options.probe_directional_network_condition) {
+    RequireNetworkSetupCapabilities();
+    BBP_LOG(info) << DirectionalNetworkPolicyProbeJson();
     return 0;
   }
   if (options.probe_netns) {
