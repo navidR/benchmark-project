@@ -3,7 +3,7 @@
   "events": [
     {
       "at": "1s",
-      "action": "set_network_profile",
+      "action": "unknown_action",
       "node": 1,
       "profile": "degraded"
     }

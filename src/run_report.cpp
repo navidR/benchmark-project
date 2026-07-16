@@ -31,6 +31,7 @@ constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
 constexpr std::size_t kMaximumScheduledEventSummaries = 256U;
 constexpr std::size_t kMaximumDirectionalPolicyVerifications = 256U;
 constexpr std::size_t kMaximumTopologyEdgeSummaries = 256U;
+constexpr std::size_t kMaximumProfileUpdateSummaries = 256U;
 
 struct NodeReport {
   std::uint64_t metric_samples = 0;
@@ -138,6 +139,8 @@ void CopySelectedMetricFields(const boost::json::object& source,
       "mined_transaction_count",
       "mined_transaction_count_complete",
       "restart_count",
+      "active_resource_profile",
+      "active_network_profile",
       "initial_block_download",
       "difficulty",
       "rpc_latency_ms",
@@ -747,6 +750,14 @@ void AppendBoundedTopologyEdgeSummary(const boost::json::object& event,
   }
 }
 
+void AppendBoundedProfileUpdateSummary(const boost::json::object& event,
+                                       boost::json::array* summaries) {
+  AppendEventSummary(event, summaries);
+  if (summaries->size() > kMaximumProfileUpdateSummaries) {
+    summaries->erase(summaries->begin());
+  }
+}
+
 void ApplyBlockProductionPolicyEvent(const boost::json::object& event,
                                      boost::json::object* report) {
   const boost::json::value detail = ParseEventDetail(event);
@@ -843,6 +854,9 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array node_restarts;
   boost::json::array node_freezes;
   boost::json::array resource_updates;
+  boost::json::array resource_profile_updates;
+  boost::json::array network_profile_updates;
+  boost::json::array profile_update_rollback_failures;
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
   boost::json::array directional_network_policy_verifications;
@@ -945,6 +959,16 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
             break;
           case SimulationEventKind::kResourceLimitsUpdated:
             AppendEventSummary(event, &resource_updates);
+            break;
+          case SimulationEventKind::kResourceProfileUpdated:
+            AppendBoundedProfileUpdateSummary(event, &resource_profile_updates);
+            break;
+          case SimulationEventKind::kNetworkProfileUpdated:
+            AppendBoundedProfileUpdateSummary(event, &network_profile_updates);
+            break;
+          case SimulationEventKind::kProfileUpdateRollbackFailed:
+            AppendBoundedProfileUpdateSummary(
+                event, &profile_update_rollback_failures);
             break;
           case SimulationEventKind::kNetworkPartitionApplied:
             AppendEventSummary(event, &network_partitions);
@@ -1065,6 +1089,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["node_restarts"] = std::move(node_restarts);
   report["node_freezes"] = std::move(node_freezes);
   report["resource_updates"] = std::move(resource_updates);
+  report["resource_profile_updates"] = std::move(resource_profile_updates);
+  report["network_profile_updates"] = std::move(network_profile_updates);
+  report["profile_update_rollback_failures"] =
+      std::move(profile_update_rollback_failures);
   report["network_partitions"] = std::move(network_partitions);
   report["network_partition_heals"] = std::move(network_partition_heals);
   report["directional_network_policy_verifications"] =

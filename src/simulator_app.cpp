@@ -69,6 +69,7 @@ namespace bbp {
 namespace {
 
 std::mutex node_network_state_mutex;
+std::mutex node_resource_state_mutex;
 
 void ThrowIfStopRequested(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
@@ -1812,6 +1813,33 @@ void ResolveNodeProfileAssignments(Options* options) {
   }
 }
 
+void ValidateProfileSwitchReferences(Options* options) {
+  const auto validate = [&](const ScenarioWorkload& workload) {
+    if (workload.kind == WorkloadKind::kSetResourceProfile) {
+      if (!options->resource_profiles.contains(
+              workload.profile_switch.profile)) {
+        throw std::runtime_error(
+            "scenario set_resource_profile references unknown profile: " +
+            workload.profile_switch.profile);
+      }
+    } else if (workload.kind == WorkloadKind::kSetNetworkProfile) {
+      if (!options->network_profiles.contains(
+              workload.profile_switch.profile)) {
+        throw std::runtime_error(
+            "scenario set_network_profile references unknown profile: " +
+            workload.profile_switch.profile);
+      }
+      options->isolate_network = true;
+    }
+  };
+  for (const ScenarioWorkload& workload : options->workloads) {
+    validate(workload);
+  }
+  for (const ScheduledScenarioEvent& event : options->scheduled_events) {
+    validate(event.action);
+  }
+}
+
 void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
                          std::string_view source,
                          std::map<uint32_t, NetworkCondition>& output) {
@@ -1878,6 +1906,111 @@ void ApplyResourceLimitPatches(const boost::json::array& updates,
     }
     output[node - 1U] = ParseResourceLimitPatchObject(object);
   }
+}
+
+std::string ScenarioNodeId(const Options& options, uint32_t node_index) {
+  if (node_index >= options.nodes) {
+    throw std::runtime_error("scenario node index is out of range");
+  }
+  if (!options.node_ids.empty()) {
+    return options.node_ids.at(node_index);
+  }
+  return ChainDriverSpecFor(options.chain).node_id_prefix + "-" +
+         std::to_string(node_index + 1U);
+}
+
+bool NodeHasScenarioRole(const Options& options, uint32_t node_index,
+                         std::string_view role) {
+  if (role == "miner") {
+    return NodeListContains(options.topology.miner_nodes, node_index);
+  }
+  if (role == "wallet") {
+    return NodeListContains(options.topology.wallet_nodes, node_index);
+  }
+  if (role == "base" || role == "node") {
+    return !NodeListContains(options.topology.miner_nodes, node_index) &&
+           !NodeListContains(options.topology.wallet_nodes, node_index);
+  }
+  throw std::runtime_error(
+      "profile switch role selector must be role:base, role:node, "
+      "role:wallet, or role:miner");
+}
+
+ProfileSwitchWorkload ParseProfileSwitchWorkload(
+    const boost::json::object& object, const Options& options,
+    WorkloadKind kind) {
+  ProfileSwitchWorkload workload;
+  workload.profile = JsonStringField(object, "profile");
+  RequireSafeScenarioIdentifier(workload.profile, "profile switch name");
+  const boost::json::value* targets = object.if_contains("nodes");
+  if (targets == nullptr) {
+    throw std::runtime_error("scenario " + std::string(WorkloadKindName(kind)) +
+                             " requires nodes");
+  }
+
+  std::vector<std::string> requested_ids;
+  if (targets->is_array()) {
+    if (targets->as_array().empty()) {
+      throw std::runtime_error("scenario " +
+                               std::string(WorkloadKindName(kind)) +
+                               " nodes must not be empty");
+    }
+    for (const boost::json::value& target : targets->as_array()) {
+      if (!target.is_string()) {
+        throw std::runtime_error("scenario " +
+                                 std::string(WorkloadKindName(kind)) +
+                                 " nodes entries must be node ID strings");
+      }
+      requested_ids.emplace_back(target.as_string());
+    }
+  } else if (targets->is_string()) {
+    const std::string selector(targets->as_string());
+    constexpr std::string_view kRolePrefix = "role:";
+    if (!std::string_view(selector).starts_with(kRolePrefix)) {
+      throw std::runtime_error("scenario " +
+                               std::string(WorkloadKindName(kind)) +
+                               " string nodes selector must start with role:");
+    }
+    const std::string_view role =
+        std::string_view(selector).substr(kRolePrefix.size());
+    for (uint32_t node_index = 0U; node_index < options.nodes; ++node_index) {
+      if (NodeHasScenarioRole(options, node_index, role)) {
+        requested_ids.push_back(ScenarioNodeId(options, node_index));
+      }
+    }
+    if (requested_ids.empty()) {
+      throw std::runtime_error("scenario " +
+                               std::string(WorkloadKindName(kind)) +
+                               " role selector resolved no nodes");
+    }
+  } else {
+    throw std::runtime_error("scenario " + std::string(WorkloadKindName(kind)) +
+                             " nodes must be an ID array or role selector");
+  }
+
+  std::set<std::string> unique_ids;
+  for (const std::string& requested_id : requested_ids) {
+    if (!unique_ids.insert(requested_id).second) {
+      throw std::runtime_error("scenario " +
+                               std::string(WorkloadKindName(kind)) +
+                               " nodes contains duplicate ID: " + requested_id);
+    }
+    bool found = false;
+    for (uint32_t node_index = 0U; node_index < options.nodes; ++node_index) {
+      if (ScenarioNodeId(options, node_index) == requested_id) {
+        workload.nodes.push_back(node_index + 1U);
+        workload.node_ids.push_back(requested_id);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("scenario " +
+                               std::string(WorkloadKindName(kind)) +
+                               " references unknown node ID: " + requested_id);
+    }
+  }
+  return workload;
 }
 
 void ApplyScenarioWorkloads(const boost::json::array& workloads,
@@ -2021,6 +2154,13 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kUpdateResourceLimits;
       scenario_workload.update_resource_limits = update;
       options.workloads.push_back(scenario_workload);
+    } else if (*kind == WorkloadKind::kSetResourceProfile ||
+               *kind == WorkloadKind::kSetNetworkProfile) {
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = *kind;
+      scenario_workload.profile_switch =
+          ParseProfileSwitchWorkload(workload, options, *kind);
+      options.workloads.push_back(std::move(scenario_workload));
     } else if (*kind == WorkloadKind::kResourcePressure) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
@@ -2633,18 +2773,21 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
   }
   ResolveNodeProfileAssignments(&options);
+  ValidateProfileSwitchReferences(&options);
 }
 
 bool WorkloadsRequireIsolatedNetwork(const Options& options) {
   for (const ScenarioWorkload& workload : options.workloads) {
     if (workload.kind == WorkloadKind::kPartitionNodes ||
-        workload.kind == WorkloadKind::kHealPartition) {
+        workload.kind == WorkloadKind::kHealPartition ||
+        workload.kind == WorkloadKind::kSetNetworkProfile) {
       return true;
     }
   }
   for (const ScheduledScenarioEvent& event : options.scheduled_events) {
     if (event.action.kind == WorkloadKind::kPartitionNodes ||
-        event.action.kind == WorkloadKind::kHealPartition) {
+        event.action.kind == WorkloadKind::kHealPartition ||
+        event.action.kind == WorkloadKind::kSetNetworkProfile) {
       return true;
     }
   }
@@ -3420,6 +3563,19 @@ Options ParseOptions(int argc, char** argv) {
             "scenario update_resource_limits workload node must be in "
             "1..--nodes");
       }
+    } else if (workload.kind == WorkloadKind::kSetResourceProfile ||
+               workload.kind == WorkloadKind::kSetNetworkProfile) {
+      if (workload.profile_switch.nodes.empty()) {
+        throw std::runtime_error(
+            "scenario profile switch workload requires target nodes");
+      }
+      for (const uint32_t node : workload.profile_switch.nodes) {
+        if (node == 0U || node > options.nodes) {
+          throw std::runtime_error(
+              "scenario profile switch workload node must be in "
+              "1..--nodes");
+        }
+      }
     } else if (workload.kind == WorkloadKind::kResourcePressure) {
       if (workload.resource_pressure.node == 0U ||
           workload.resource_pressure.node > options.nodes) {
@@ -3600,39 +3756,44 @@ boost::json::array RoutesJson(const std::vector<RouteInfo>& routes) {
   return routes_json;
 }
 
+boost::json::object QdiscJson(const QdiscInfo& qdisc) {
+  boost::json::object qdisc_json;
+  qdisc_json["if_index"] = qdisc.if_index;
+  qdisc_json["if_name"] = qdisc.if_name;
+  qdisc_json["kind"] = qdisc.kernel_kind;
+  qdisc_json["handle"] = qdisc.handle;
+  qdisc_json["parent"] = qdisc.parent;
+  qdisc_json["info"] = qdisc.info;
+  qdisc_json["has_stats"] = qdisc.has_stats;
+  qdisc_json["bytes"] = qdisc.bytes;
+  qdisc_json["packets"] = qdisc.packets;
+  qdisc_json["drops"] = qdisc.drops;
+  qdisc_json["overlimits"] = qdisc.overlimits;
+  qdisc_json["qlen"] = qdisc.qlen;
+  qdisc_json["backlog"] = qdisc.backlog;
+  qdisc_json["requeues"] = qdisc.requeues;
+  qdisc_json["has_netem_options"] = qdisc.has_netem_options;
+  qdisc_json["netem_latency_us"] = qdisc.netem_latency_us;
+  qdisc_json["netem_jitter_us"] = qdisc.netem_jitter_us;
+  qdisc_json["netem_loss"] = qdisc.netem_loss;
+  qdisc_json["netem_duplicate"] = qdisc.netem_duplicate;
+  qdisc_json["netem_corrupt"] = qdisc.netem_corrupt;
+  qdisc_json["netem_reorder"] = qdisc.netem_reorder;
+  qdisc_json["netem_limit_packets"] = qdisc.netem_limit_packets;
+  qdisc_json["has_tbf_options"] = qdisc.has_tbf_options;
+  qdisc_json["tbf_rate_bytes_per_sec"] = qdisc.tbf_rate_bytes_per_sec;
+  qdisc_json["tbf_limit_bytes"] = qdisc.tbf_limit_bytes;
+  qdisc_json["tbf_buffer_ticks"] = qdisc.tbf_buffer_ticks;
+  qdisc_json["tbf_mtu_ticks"] = qdisc.tbf_mtu_ticks;
+  qdisc_json["has_prio_options"] = qdisc.has_prio_options;
+  qdisc_json["prio_bands"] = qdisc.prio_bands;
+  return qdisc_json;
+}
+
 boost::json::array QdiscsJson(const std::vector<QdiscInfo>& qdiscs) {
   boost::json::array qdiscs_json;
   for (const QdiscInfo& qdisc : qdiscs) {
-    boost::json::object qdisc_json;
-    qdisc_json["if_index"] = qdisc.if_index;
-    qdisc_json["if_name"] = qdisc.if_name;
-    qdisc_json["kind"] = qdisc.kernel_kind;
-    qdisc_json["handle"] = qdisc.handle;
-    qdisc_json["parent"] = qdisc.parent;
-    qdisc_json["info"] = qdisc.info;
-    qdisc_json["has_stats"] = qdisc.has_stats;
-    qdisc_json["bytes"] = qdisc.bytes;
-    qdisc_json["packets"] = qdisc.packets;
-    qdisc_json["drops"] = qdisc.drops;
-    qdisc_json["overlimits"] = qdisc.overlimits;
-    qdisc_json["qlen"] = qdisc.qlen;
-    qdisc_json["backlog"] = qdisc.backlog;
-    qdisc_json["requeues"] = qdisc.requeues;
-    qdisc_json["has_netem_options"] = qdisc.has_netem_options;
-    qdisc_json["netem_latency_us"] = qdisc.netem_latency_us;
-    qdisc_json["netem_jitter_us"] = qdisc.netem_jitter_us;
-    qdisc_json["netem_loss"] = qdisc.netem_loss;
-    qdisc_json["netem_duplicate"] = qdisc.netem_duplicate;
-    qdisc_json["netem_corrupt"] = qdisc.netem_corrupt;
-    qdisc_json["netem_reorder"] = qdisc.netem_reorder;
-    qdisc_json["netem_limit_packets"] = qdisc.netem_limit_packets;
-    qdisc_json["has_tbf_options"] = qdisc.has_tbf_options;
-    qdisc_json["tbf_rate_bytes_per_sec"] = qdisc.tbf_rate_bytes_per_sec;
-    qdisc_json["tbf_limit_bytes"] = qdisc.tbf_limit_bytes;
-    qdisc_json["tbf_buffer_ticks"] = qdisc.tbf_buffer_ticks;
-    qdisc_json["tbf_mtu_ticks"] = qdisc.tbf_mtu_ticks;
-    qdisc_json["has_prio_options"] = qdisc.has_prio_options;
-    qdisc_json["prio_bands"] = qdisc.prio_bands;
+    boost::json::object qdisc_json = QdiscJson(qdisc);
     qdiscs_json.push_back(std::move(qdisc_json));
   }
   return qdiscs_json;
@@ -4075,6 +4236,34 @@ ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
   return next;
 }
 
+void VerifyResourceLimits(const Cgroup& cgroup,
+                          const ResourceLimits& expected) {
+  const CgroupMetrics actual = cgroup.ReadMetrics();
+  const auto finite_io_limits = [](const std::vector<IoLimit>& limits) {
+    std::map<BlockDeviceId, IoLimit> result;
+    for (const IoLimit& limit : limits) {
+      if (limit.read_bytes_per_sec || limit.write_bytes_per_sec ||
+          limit.read_operations_per_sec || limit.write_operations_per_sec) {
+        result.emplace(limit.device, limit);
+      }
+    }
+    return result;
+  };
+  if (actual.memory_high_limit_bytes != expected.memory_high_bytes ||
+      actual.memory_max_limit_bytes != expected.memory_max_bytes ||
+      actual.cpu_quota_us != expected.cpu_quota_us ||
+      actual.cpu_period_us != expected.cpu_period_us ||
+      actual.cpu_weight != expected.cpu_weight ||
+      actual.io_weight != expected.io_weight ||
+      finite_io_limits(actual.io_limits) !=
+          finite_io_limits(expected.io_limits) ||
+      actual.pids_max_limit != expected.pids_max) {
+    throw std::runtime_error(
+        "resource limit read-back verification failed for " +
+        cgroup.path().string());
+  }
+}
+
 void WriteResourceLimits(const Cgroup& cgroup, const ResourceLimits& previous,
                          const ResourceLimits& next) {
   if (next.memory_max_bytes != previous.memory_max_bytes &&
@@ -4128,6 +4317,7 @@ void WriteResourceLimits(const Cgroup& cgroup, const ResourceLimits& previous,
   if (next.pids_max != previous.pids_max) {
     cgroup.SetPidsMax(next.pids_max);
   }
+  VerifyResourceLimits(cgroup, next);
 }
 
 std::string NetworkConditionVerificationDetail(const NodeVethConfig& config,
@@ -4603,8 +4793,10 @@ std::string MetricsJson(
     const std::string& run_id, const std::string& node_id,
     const ChainMetrics& chain, uint64_t generated_block_count,
     uint64_t mined_transaction_count, bool mined_transaction_count_complete,
-    uint64_t restart_count, const CgroupMetrics* cgroup, const LinkInfo* link,
-    const QdiscInfo* qdisc, const std::vector<TcFilterInfo>* filters,
+    uint64_t restart_count, std::string_view resource_profile,
+    std::string_view network_profile, const CgroupMetrics* cgroup,
+    const LinkInfo* link, const QdiscInfo* qdisc,
+    const std::vector<TcFilterInfo>* filters,
     const DirectionalNetworkPolicyStats* directional_stats) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
@@ -4628,6 +4820,16 @@ std::string MetricsJson(
   object["mined_transaction_count"] = mined_transaction_count;
   object["mined_transaction_count_complete"] = mined_transaction_count_complete;
   object["restart_count"] = restart_count;
+  if (resource_profile.empty()) {
+    object["active_resource_profile"] = nullptr;
+  } else {
+    object["active_resource_profile"] = resource_profile;
+  }
+  if (network_profile.empty()) {
+    object["active_network_profile"] = nullptr;
+  } else {
+    object["active_network_profile"] = network_profile;
+  }
   if (chain.initial_block_download) {
     object["initial_block_download"] = *chain.initial_block_download;
   } else {
@@ -5239,9 +5441,28 @@ void WriteMetricsSnapshot(
     const NodeMetricsFailureHandler& node_failure_handler = {},
     const MetricsStopRequested& stop_requested = {},
     std::stop_token stop_token = {}) {
+  struct NetworkMetricsState {
+    std::optional<NodeVethConfig> network;
+    std::string profile;
+  };
   const std::vector<LinkInfo> links = ListNetworkLinks();
-  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-  for (auto& node : nodes) {
+  std::vector<QdiscInfo> qdiscs;
+  std::vector<NetworkMetricsState> network_states(nodes.size());
+  {
+    std::lock_guard<std::mutex> lock(node_network_state_mutex);
+    const bool has_isolated_node = std::any_of(
+        nodes.begin(), nodes.end(),
+        [](const NodeRuntime& node) { return node.network.has_value(); });
+    if (has_isolated_node) {
+      qdiscs = ListQdiscs();
+    }
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+      network_states[index].network = nodes[index].network;
+      network_states[index].profile = nodes[index].network_profile;
+    }
+  }
+  for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+    NodeRuntime& node = nodes[node_index];
     if (stop_requested && stop_requested()) {
       return;
     }
@@ -5261,17 +5482,21 @@ void WriteMetricsSnapshot(
       node_failure_handler(node, error.what());
       continue;
     }
-    CgroupMetrics cg = node.cgroup->ReadMetrics();
-    std::optional<NodeVethConfig> network;
-    std::optional<DirectionalNetworkPolicyStats> directional_stats;
+    CgroupMetrics cg;
+    std::string resource_profile;
     {
+      std::lock_guard<std::mutex> lock(node_resource_state_mutex);
+      cg = node.cgroup->ReadMetrics();
+      resource_profile = node.resource_profile;
+    }
+    const std::optional<NodeVethConfig>& network =
+        network_states[node_index].network;
+    std::optional<DirectionalNetworkPolicyStats> directional_stats;
+    if (network && node.network_namespace) {
       std::lock_guard<std::mutex> lock(node_network_state_mutex);
-      network = node.network;
-      if (network && node.network_namespace) {
-        directional_stats = ReadDirectionalNetworkPolicyStatsInNamespace(
-            node.network_namespace->fd(), network->peer_name,
-            node.directional_network_policies);
-      }
+      directional_stats = ReadDirectionalNetworkPolicyStatsInNamespace(
+          node.network_namespace->fd(), network->peer_name,
+          node.directional_network_policies);
     }
     const LinkInfo* link =
         network ? FindLinkByName(links, network->host_name) : nullptr;
@@ -5301,7 +5526,8 @@ void WriteMetricsSnapshot(
         MetricsJson(options.run_id, node.config.id, chain,
                     node.GeneratedBlockCount(), node.MinedTransactionCount(),
                     node.MinedTransactionCountComplete(), node.RestartCount(),
-                    &cg, link, qdisc, filter_metrics,
+                    resource_profile, network_states[node_index].profile, &cg,
+                    link, qdisc, filter_metrics,
                     directional_stats ? &*directional_stats : nullptr));
   }
 }
@@ -5672,6 +5898,19 @@ boost::json::object ResourceLimitUpdateWorkloadJson(
   return object;
 }
 
+boost::json::object ProfileSwitchWorkloadJson(
+    const ProfileSwitchWorkload& workload, WorkloadKind kind) {
+  boost::json::object object;
+  object["type"] = std::string(WorkloadKindName(kind));
+  boost::json::array nodes;
+  for (const std::string& node_id : workload.node_ids) {
+    nodes.emplace_back(node_id);
+  }
+  object["nodes"] = std::move(nodes);
+  object["profile"] = workload.profile;
+  return object;
+}
+
 boost::json::object ResourcePressureWorkloadJson(
     const ResourcePressureWorkload& workload) {
   boost::json::object object = ResourceLimitPatchJson(workload.patch);
@@ -5769,6 +6008,10 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   }
   if (workload.kind == WorkloadKind::kUpdateResourceLimits) {
     return ResourceLimitUpdateWorkloadJson(workload.update_resource_limits);
+  }
+  if (workload.kind == WorkloadKind::kSetResourceProfile ||
+      workload.kind == WorkloadKind::kSetNetworkProfile) {
+    return ProfileSwitchWorkloadJson(workload.profile_switch, workload.kind);
   }
   if (workload.kind == WorkloadKind::kResourcePressure) {
     return ResourcePressureWorkloadJson(workload.resource_pressure);
@@ -6138,6 +6381,14 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     NodeRuntime runtime;
     try {
       runtime.config = config;
+      const auto resource_profile = options.node_resource_profiles.find(i);
+      if (resource_profile != options.node_resource_profiles.end()) {
+        runtime.resource_profile = resource_profile->second;
+      }
+      const auto network_profile = options.node_network_profiles.find(i);
+      if (network_profile != options.node_network_profiles.end()) {
+        runtime.network_profile = network_profile->second;
+      }
       WriteNodeState(events_path, options.run_id, node_id,
                      NodeRuntimeLifecycle::kPreparing);
       if (options.isolate_network) {
@@ -6337,6 +6588,7 @@ void ApplyResourceLimitUpdate(
     std::optional<uint32_t> workload_index = std::nullopt,
     std::optional<uint32_t> workload_count = std::nullopt,
     std::optional<uint32_t> workload_node = std::nullopt) {
+  std::lock_guard<std::mutex> lock(node_resource_state_mutex);
   if (!node.cgroup) {
     throw std::runtime_error("resource update requires a node cgroup");
   }
@@ -6361,10 +6613,157 @@ void ApplyResourceLimitUpdate(
     std::rethrow_exception(apply_error);
   }
   node.resources = next;
+  node.resource_profile.clear();
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kResourceLimitsUpdated,
              ResourceLimitUpdateDetail(patch, previous, next, workload_index,
                                        workload_count, workload_node));
+}
+
+std::string ExceptionMessage(const std::exception_ptr& error);
+
+std::string ProfileRollbackFailureDetail(
+    WorkloadKind kind, std::string_view profile,
+    std::string_view original_error,
+    const std::vector<std::string>& rollback_errors) {
+  boost::json::object detail;
+  detail["action"] = WorkloadKindName(kind);
+  detail["profile"] = profile;
+  detail["original_error"] = original_error;
+  boost::json::array errors;
+  for (const std::string& error : rollback_errors) {
+    errors.emplace_back(error);
+  }
+  detail["rollback_errors"] = std::move(errors);
+  return boost::json::serialize(detail);
+}
+
+void WriteProfileRollbackFailureEventSafely(
+    const Options& options, const std::filesystem::path& events_path,
+    WorkloadKind kind, std::string_view profile,
+    const std::exception_ptr& original_error,
+    const std::vector<std::string>& rollback_errors) noexcept {
+  if (rollback_errors.empty()) {
+    return;
+  }
+  try {
+    WriteEvent(
+        events_path, options.run_id, "sim",
+        SimulationEventKind::kProfileUpdateRollbackFailed,
+        ProfileRollbackFailureDetail(
+            kind, profile, ExceptionMessage(original_error), rollback_errors));
+  } catch (const std::exception& event_error) {
+    BBP_LOG(error) << "failed to record profile rollback failure: "
+                   << event_error.what();
+  } catch (...) {
+    BBP_LOG(error) << "failed to record profile rollback failure: unknown "
+                      "exception";
+  }
+}
+
+std::string ResourceProfileUpdateDetail(const ProfileSwitchWorkload& workload,
+                                        uint32_t node,
+                                        std::string_view previous_profile,
+                                        const ResourceLimits& previous,
+                                        const ResourceLimits& current,
+                                        uint32_t workload_index,
+                                        uint32_t workload_count) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = node;
+  detail["profile"] = workload.profile;
+  if (previous_profile.empty()) {
+    detail["previous_profile"] = nullptr;
+  } else {
+    detail["previous_profile"] = previous_profile;
+  }
+  detail["previous"] = ResourceLimitsJson(previous);
+  detail["current"] = ResourceLimitsJson(current);
+  detail["kernel_verified"] = true;
+  return boost::json::serialize(detail);
+}
+
+void ApplyResourceProfileSwitch(const Options& options,
+                                const std::filesystem::path& events_path,
+                                std::vector<NodeRuntime>& nodes,
+                                const ProfileSwitchWorkload& workload,
+                                uint32_t workload_index,
+                                uint32_t workload_count,
+                                std::stop_token stop_token) {
+  const ResourceLimits& desired =
+      options.resource_profiles.at(workload.profile);
+  struct PreviousState {
+    uint32_t node = 0U;
+    ResourceLimits limits;
+    std::string profile;
+  };
+  std::vector<PreviousState> previous_states;
+  previous_states.reserve(workload.nodes.size());
+  std::vector<std::size_t> attempted;
+
+  {
+    std::lock_guard<std::mutex> lock(node_resource_state_mutex);
+    for (const uint32_t one_based_node : workload.nodes) {
+      if (one_based_node == 0U || one_based_node > nodes.size()) {
+        throw std::runtime_error(
+            "resource profile target node is out of range");
+      }
+      const NodeRuntime& runtime = nodes[one_based_node - 1U];
+      if (!runtime.cgroup) {
+        throw std::runtime_error("resource profile update requires a cgroup");
+      }
+      previous_states.push_back(PreviousState{
+          .node = one_based_node,
+          .limits = runtime.resources,
+          .profile = runtime.resource_profile,
+      });
+    }
+
+    try {
+      for (std::size_t index = 0; index < previous_states.size(); ++index) {
+        ThrowIfStopRequested(stop_token);
+        attempted.push_back(index);
+        NodeRuntime& runtime = nodes[previous_states[index].node - 1U];
+        WriteResourceLimits(*runtime.cgroup, previous_states[index].limits,
+                            desired);
+      }
+    } catch (...) {
+      const std::exception_ptr original_error = std::current_exception();
+      std::vector<std::string> rollback_errors;
+      for (auto iter = attempted.rbegin(); iter != attempted.rend(); ++iter) {
+        const PreviousState& previous = previous_states[*iter];
+        NodeRuntime& runtime = nodes[previous.node - 1U];
+        try {
+          WriteResourceLimits(*runtime.cgroup, desired, previous.limits);
+        } catch (const std::exception& error) {
+          rollback_errors.push_back(runtime.config.id + ": " + error.what());
+        } catch (...) {
+          rollback_errors.push_back(runtime.config.id +
+                                    ": unknown rollback error");
+        }
+      }
+      WriteProfileRollbackFailureEventSafely(
+          options, events_path, WorkloadKind::kSetResourceProfile,
+          workload.profile, original_error, rollback_errors);
+      std::rethrow_exception(original_error);
+    }
+
+    for (const PreviousState& previous : previous_states) {
+      NodeRuntime& runtime = nodes[previous.node - 1U];
+      runtime.resources = desired;
+      runtime.resource_profile = workload.profile;
+    }
+  }
+
+  for (const PreviousState& previous : previous_states) {
+    const NodeRuntime& runtime = nodes[previous.node - 1U];
+    WriteEvent(events_path, options.run_id, runtime.config.id,
+               SimulationEventKind::kResourceProfileUpdated,
+               ResourceProfileUpdateDetail(
+                   workload, previous.node, previous.profile, previous.limits,
+                   desired, workload_index, workload_count));
+  }
 }
 
 void ApplyRuntimeResourceLimitUpdates(const Options& options,
@@ -6411,27 +6810,35 @@ void ApplyResourcePressureWorkload(
     throw std::runtime_error("resource pressure requires a node cgroup");
   }
 
-  const ResourceLimits previous_limits = node.resources;
-  const ResourceLimits pressure_limits =
-      ApplyResourceLimitPatch(previous_limits, workload.patch, node.config.id);
-  try {
-    WriteResourceLimits(*node.cgroup, previous_limits, pressure_limits);
-  } catch (...) {
-    const std::exception_ptr apply_error = std::current_exception();
+  ResourceLimits previous_limits;
+  ResourceLimits pressure_limits;
+  std::string previous_profile;
+  {
+    std::lock_guard<std::mutex> lock(node_resource_state_mutex);
+    previous_limits = node.resources;
+    previous_profile = node.resource_profile;
+    pressure_limits = ApplyResourceLimitPatch(previous_limits, workload.patch,
+                                              node.config.id);
     try {
-      WriteResourceLimits(*node.cgroup, pressure_limits, previous_limits);
-    } catch (const std::exception& restore_error) {
-      BBP_LOG(error) << "failed to restore partially applied resource "
-                        "pressure limits for "
-                     << node.config.id << ": " << restore_error.what();
+      WriteResourceLimits(*node.cgroup, previous_limits, pressure_limits);
     } catch (...) {
-      BBP_LOG(error) << "failed to restore partially applied resource "
-                        "pressure limits for "
-                     << node.config.id << ": unknown exception";
+      const std::exception_ptr apply_error = std::current_exception();
+      try {
+        WriteResourceLimits(*node.cgroup, pressure_limits, previous_limits);
+      } catch (const std::exception& restore_error) {
+        BBP_LOG(error) << "failed to restore partially applied resource "
+                          "pressure limits for "
+                       << node.config.id << ": " << restore_error.what();
+      } catch (...) {
+        BBP_LOG(error) << "failed to restore partially applied resource "
+                          "pressure limits for "
+                       << node.config.id << ": unknown exception";
+      }
+      std::rethrow_exception(apply_error);
     }
-    std::rethrow_exception(apply_error);
+    node.resources = pressure_limits;
+    node.resource_profile.clear();
   }
-  node.resources = pressure_limits;
 
   try {
     WriteEvent(events_path, options.run_id, node.config.id,
@@ -6446,8 +6853,12 @@ void ApplyResourcePressureWorkload(
   } catch (...) {
     const std::exception_ptr original_error = std::current_exception();
     try {
-      WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
-      node.resources = previous_limits;
+      {
+        std::lock_guard<std::mutex> lock(node_resource_state_mutex);
+        WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
+        node.resources = previous_limits;
+        node.resource_profile = previous_profile;
+      }
       WriteEvent(events_path, options.run_id, node.config.id,
                  SimulationEventKind::kResourcePressureRestoredAfterError,
                  ResourcePressureDetail(workload, previous_limits,
@@ -6463,8 +6874,12 @@ void ApplyResourcePressureWorkload(
     std::rethrow_exception(original_error);
   }
 
-  WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
-  node.resources = previous_limits;
+  {
+    std::lock_guard<std::mutex> lock(node_resource_state_mutex);
+    WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
+    node.resources = previous_limits;
+    node.resource_profile = previous_profile;
+  }
   WriteEvent(
       events_path, options.run_id, node.config.id,
       SimulationEventKind::kResourcePressureFinished,
@@ -7110,6 +7525,65 @@ void ApplyWalletTransactionsWorkload(
   }
 }
 
+void RestoreNodeNetworkCondition(const NodeVethConfig& previous) {
+  if (previous.apply_condition) {
+    ReplaceNetworkConditionQdisc(previous.host_name, previous.condition);
+    static_cast<void>(VerifyNodeNetworkCondition(previous));
+    return;
+  }
+  std::exception_ptr delete_error;
+  try {
+    DeleteRootQdisc(previous.host_name);
+  } catch (...) {
+    delete_error = std::current_exception();
+  }
+  const QdiscInfo* qdisc =
+      FindQdiscByInterfaceName(ListQdiscs(), previous.host_name);
+  if (qdisc != nullptr &&
+      (qdisc->kind == QdiscKind::kNetem || qdisc->kind == QdiscKind::kTbf ||
+       qdisc->kind == QdiscKind::kTbfNetem)) {
+    if (delete_error) {
+      std::rethrow_exception(delete_error);
+    }
+    throw std::runtime_error(
+        "network condition qdisc remained after rollback removal");
+  }
+}
+
+QdiscInfo ReplaceNodeNetworkConditionTransactional(
+    NodeRuntime* node, const NetworkCondition& condition,
+    std::stop_token stop_token) {
+  if (!node->network) {
+    throw std::runtime_error(
+        "runtime network condition requires isolated networking");
+  }
+  const NodeVethConfig previous = *node->network;
+  NodeVethConfig updated = previous;
+  updated.apply_condition = true;
+  updated.condition = condition;
+  try {
+    ThrowIfStopRequested(stop_token);
+    ReplaceNetworkConditionQdisc(updated.host_name, updated.condition);
+    ThrowIfStopRequested(stop_token);
+    const QdiscInfo qdisc = VerifyNodeNetworkCondition(updated);
+    node->network = updated;
+    node->network_profile.clear();
+    return qdisc;
+  } catch (...) {
+    const std::exception_ptr original_error = std::current_exception();
+    try {
+      RestoreNodeNetworkCondition(previous);
+    } catch (const std::exception& restore_error) {
+      BBP_LOG(error) << "failed to restore network condition for "
+                     << node->config.id << ": " << restore_error.what();
+    } catch (...) {
+      BBP_LOG(error) << "failed to restore network condition for "
+                     << node->config.id << ": unknown exception";
+    }
+    std::rethrow_exception(original_error);
+  }
+}
+
 void ApplyRuntimeNetworkConditionUpdates(
     const Options& options, const std::filesystem::path& events_path,
     std::vector<NodeRuntime>& nodes, std::stop_token stop_token) {
@@ -7121,29 +7595,133 @@ void ApplyRuntimeNetworkConditionUpdates(
           "runtime network condition node is out of range");
     }
     NodeRuntime& node = nodes[node_index];
+    QdiscInfo qdisc;
     NodeVethConfig updated_network;
     {
       std::lock_guard<std::mutex> lock(node_network_state_mutex);
-      if (!node.network) {
-        throw std::runtime_error(
-            "runtime network condition requires isolated networking");
-      }
+      qdisc = ReplaceNodeNetworkConditionTransactional(&node, condition,
+                                                       stop_token);
       updated_network = *node.network;
-    }
-    updated_network.apply_condition = true;
-    updated_network.condition = condition;
-    ThrowIfStopRequested(stop_token);
-    ReplaceNetworkConditionQdisc(updated_network.host_name,
-                                 updated_network.condition);
-    ThrowIfStopRequested(stop_token);
-    const QdiscInfo qdisc = VerifyNodeNetworkCondition(updated_network);
-    {
-      std::lock_guard<std::mutex> lock(node_network_state_mutex);
-      node.network = updated_network;
     }
     WriteEvent(events_path, options.run_id, node.config.id,
                SimulationEventKind::kNetworkConditionUpdated,
                NetworkConditionVerificationDetail(updated_network, qdisc));
+  }
+}
+
+std::string NetworkProfileUpdateDetail(
+    const ProfileSwitchWorkload& workload, uint32_t node,
+    std::string_view previous_profile, const NodeVethConfig& previous,
+    const NodeVethConfig& current, const QdiscInfo& qdisc,
+    uint32_t workload_index, uint32_t workload_count) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["node"] = node;
+  detail["profile"] = workload.profile;
+  if (previous_profile.empty()) {
+    detail["previous_profile"] = nullptr;
+  } else {
+    detail["previous_profile"] = previous_profile;
+  }
+  detail["previous"] =
+      previous.apply_condition
+          ? boost::json::value(NetworkConditionJson(previous.condition))
+          : boost::json::value(nullptr);
+  detail["current"] = NetworkConditionJson(current.condition);
+  detail["qdisc"] = QdiscJson(qdisc);
+  detail["kernel_verified"] = true;
+  return boost::json::serialize(detail);
+}
+
+void ApplyNetworkProfileSwitch(const Options& options,
+                               const std::filesystem::path& events_path,
+                               std::vector<NodeRuntime>& nodes,
+                               const ProfileSwitchWorkload& workload,
+                               uint32_t workload_index, uint32_t workload_count,
+                               std::stop_token stop_token) {
+  const NetworkCondition& desired =
+      options.network_profiles.at(workload.profile);
+  struct PreviousState {
+    uint32_t node = 0U;
+    NodeVethConfig network;
+    std::string profile;
+    NodeVethConfig current_network;
+    QdiscInfo applied_qdisc{};
+  };
+  std::vector<PreviousState> previous_states;
+  previous_states.reserve(workload.nodes.size());
+  std::vector<std::size_t> attempted;
+
+  {
+    std::lock_guard<std::mutex> lock(node_network_state_mutex);
+    for (const uint32_t one_based_node : workload.nodes) {
+      if (one_based_node == 0U || one_based_node > nodes.size()) {
+        throw std::runtime_error("network profile target node is out of range");
+      }
+      const NodeRuntime& runtime = nodes[one_based_node - 1U];
+      if (!runtime.network) {
+        throw std::runtime_error(
+            "network profile update requires isolated networking");
+      }
+      previous_states.push_back(PreviousState{
+          .node = one_based_node,
+          .network = *runtime.network,
+          .profile = runtime.network_profile,
+          .current_network = {},
+          .applied_qdisc = {},
+      });
+    }
+
+    try {
+      for (std::size_t index = 0; index < previous_states.size(); ++index) {
+        ThrowIfStopRequested(stop_token);
+        attempted.push_back(index);
+        PreviousState& previous = previous_states[index];
+        NodeVethConfig desired_network = previous.network;
+        desired_network.apply_condition = true;
+        desired_network.condition = desired;
+        ReplaceNetworkConditionQdisc(desired_network.host_name, desired);
+        ThrowIfStopRequested(stop_token);
+        previous.applied_qdisc = VerifyNodeNetworkCondition(desired_network);
+        previous.current_network = std::move(desired_network);
+      }
+    } catch (...) {
+      const std::exception_ptr original_error = std::current_exception();
+      std::vector<std::string> rollback_errors;
+      for (auto iter = attempted.rbegin(); iter != attempted.rend(); ++iter) {
+        const PreviousState& previous = previous_states[*iter];
+        try {
+          RestoreNodeNetworkCondition(previous.network);
+        } catch (const std::exception& error) {
+          rollback_errors.push_back(nodes[previous.node - 1U].config.id + ": " +
+                                    error.what());
+        } catch (...) {
+          rollback_errors.push_back(nodes[previous.node - 1U].config.id +
+                                    ": unknown rollback error");
+        }
+      }
+      WriteProfileRollbackFailureEventSafely(
+          options, events_path, WorkloadKind::kSetNetworkProfile,
+          workload.profile, original_error, rollback_errors);
+      std::rethrow_exception(original_error);
+    }
+
+    for (PreviousState& previous : previous_states) {
+      NodeRuntime& runtime = nodes[previous.node - 1U];
+      runtime.network = previous.current_network;
+      runtime.network_profile = workload.profile;
+    }
+  }
+
+  for (const PreviousState& previous : previous_states) {
+    const NodeRuntime& runtime = nodes[previous.node - 1U];
+    WriteEvent(events_path, options.run_id, runtime.config.id,
+               SimulationEventKind::kNetworkProfileUpdated,
+               NetworkProfileUpdateDetail(
+                   workload, previous.node, previous.profile, previous.network,
+                   previous.current_network, previous.applied_qdisc,
+                   workload_index, workload_count));
   }
 }
 
@@ -8471,6 +9049,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           NodeRuntime& node = nodes[workload.node - 1U];
           ApplyResourceLimitUpdate(options, events_path, node, workload.patch,
                                    action_index, action_count, workload.node);
+        } else if (scenario_workload.kind ==
+                   WorkloadKind::kSetResourceProfile) {
+          ApplyResourceProfileSwitch(options, events_path, nodes,
+                                     scenario_workload.profile_switch,
+                                     action_index, action_count, stop_token);
+        } else if (scenario_workload.kind == WorkloadKind::kSetNetworkProfile) {
+          ApplyNetworkProfileSwitch(options, events_path, nodes,
+                                    scenario_workload.profile_switch,
+                                    action_index, action_count, stop_token);
         } else if (scenario_workload.kind == WorkloadKind::kResourcePressure) {
           ApplyResourcePressureWorkload(options, events_path, metrics_path,
                                         driver, nodes,

@@ -36,6 +36,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "wallet_funded";
     case SimulationEventKind::kResourceLimitsUpdated:
       return "resource_limits_updated";
+    case SimulationEventKind::kResourceProfileUpdated:
+      return "resource_profile_updated";
     case SimulationEventKind::kResourcePressureStarted:
       return "resource_pressure_started";
     case SimulationEventKind::kResourcePressureRestoredAfterError:
@@ -56,6 +58,10 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "transaction_confirmed";
     case SimulationEventKind::kNetworkConditionUpdated:
       return "network_condition_updated";
+    case SimulationEventKind::kNetworkProfileUpdated:
+      return "network_profile_updated";
+    case SimulationEventKind::kProfileUpdateRollbackFailed:
+      return "profile_update_rollback_failed";
     case SimulationEventKind::kNetworkBlockApplied:
       return "network_block_applied";
     case SimulationEventKind::kNetworkBlockRemoved:
@@ -168,6 +174,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
   if (name == "wallet_funded") return SimulationEventKind::kWalletFunded;
   if (name == "resource_limits_updated")
     return SimulationEventKind::kResourceLimitsUpdated;
+  if (name == "resource_profile_updated")
+    return SimulationEventKind::kResourceProfileUpdated;
   if (name == "resource_pressure_started")
     return SimulationEventKind::kResourcePressureStarted;
   if (name == "resource_pressure_restored_after_error")
@@ -187,6 +195,10 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
     return SimulationEventKind::kTransactionConfirmed;
   if (name == "network_condition_updated")
     return SimulationEventKind::kNetworkConditionUpdated;
+  if (name == "network_profile_updated")
+    return SimulationEventKind::kNetworkProfileUpdated;
+  if (name == "profile_update_rollback_failed")
+    return SimulationEventKind::kProfileUpdateRollbackFailed;
   if (name == "network_block_applied")
     return SimulationEventKind::kNetworkBlockApplied;
   if (name == "network_block_removed")

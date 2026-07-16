@@ -348,6 +348,12 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
         text += "limits n";
         text += JsonMetricText(workload, "node");
         break;
+      case WorkloadKind::kSetResourceProfile:
+      case WorkloadKind::kSetNetworkProfile:
+        text += type_name;
+        text += " ";
+        text += JsonString(workload, "profile", "-");
+        break;
       case WorkloadKind::kPartitionNodes:
         text += "partition";
         break;

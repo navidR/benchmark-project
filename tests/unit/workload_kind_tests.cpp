@@ -5,7 +5,7 @@
 #include "bbp/simulator/workload_kind.h"
 
 BOOST_AUTO_TEST_CASE(workload_kind_names_round_trip) {
-  constexpr std::array<bbp::WorkloadKind, 17> kKinds = {
+  constexpr std::array<bbp::WorkloadKind, 19> kKinds = {
       bbp::WorkloadKind::kBlockGeneration,
       bbp::WorkloadKind::kWaitUntilHeight,
       bbp::WorkloadKind::kWaitForPeers,
@@ -14,6 +14,8 @@ BOOST_AUTO_TEST_CASE(workload_kind_names_round_trip) {
       bbp::WorkloadKind::kRestartNode,
       bbp::WorkloadKind::kFreezeNode,
       bbp::WorkloadKind::kUpdateResourceLimits,
+      bbp::WorkloadKind::kSetResourceProfile,
+      bbp::WorkloadKind::kSetNetworkProfile,
       bbp::WorkloadKind::kResourcePressure,
       bbp::WorkloadKind::kPartitionNodes,
       bbp::WorkloadKind::kHealPartition,

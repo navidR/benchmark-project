@@ -5,6 +5,7 @@
 #include "bbp/simulator/disconnect_peer_workload.h"
 #include "bbp/simulator/freeze_node_workload.h"
 #include "bbp/simulator/network_partition_workload.h"
+#include "bbp/simulator/profile_switch_workload.h"
 #include "bbp/simulator/resource_limit_update_workload.h"
 #include "bbp/simulator/resource_pressure_workload.h"
 #include "bbp/simulator/restart_node_workload.h"
@@ -29,6 +30,7 @@ struct ScenarioWorkload {
   ResourceLimitUpdateWorkload update_resource_limits;
   ResourcePressureWorkload resource_pressure;
   NetworkPartitionWorkload network_partition;
+  ProfileSwitchWorkload profile_switch;
   TopologyEdgeWorkload topology_edge;
   SendRawTransactionWorkload send_raw_transaction;
   WalletTransactionsWorkload wallet_transactions;

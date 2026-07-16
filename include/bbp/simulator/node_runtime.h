@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "bbp/cgroup.h"
@@ -22,6 +23,8 @@ struct NodeRuntime {
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
   ResourceLimits resources;
+  std::string resource_profile;
+  std::string network_profile;
   LogTailCursor stdout_log_cursor;
   LogTailCursor stderr_log_cursor;
   LogTailCursor daemon_log_cursor;

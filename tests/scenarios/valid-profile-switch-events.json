@@ -1,0 +1,45 @@
+{
+  "resource_profiles": {
+    "small": {"memory_max": "1GiB", "cpu_weight": 80, "pids_max": 256},
+    "large": {"memory_max": "2GiB", "cpu_weight": 200, "pids_max": 512}
+  },
+  "network_profiles": {
+    "normal": {"bandwidth_mbps": 50, "delay_ms": 20, "jitter_ms": 2},
+    "degraded": {
+      "bandwidth_mbps": 5,
+      "delay_ms": 200,
+      "jitter_ms": 50,
+      "loss_percent": 1.25
+    }
+  },
+  "nodes": [
+    {
+      "id": "firo-a",
+      "chain": "firo",
+      "role": "miner",
+      "resources": {"profile": "small"},
+      "network": {"profile": "normal"}
+    },
+    {
+      "id": "firo-b",
+      "chain": "firo",
+      "role": "wallet",
+      "resources": {"profile": "small"},
+      "network": {"profile": "normal"}
+    }
+  ],
+  "events": [
+    {
+      "at": "100ms",
+      "action": "set_resource_profile",
+      "nodes": "role:miner",
+      "profile": "large"
+    },
+    {
+      "at": "200ms",
+      "action": "set_network_profile",
+      "nodes": ["firo-a", "firo-b"],
+      "profile": "degraded"
+    }
+  ]
+}

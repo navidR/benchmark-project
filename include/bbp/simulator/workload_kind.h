@@ -14,6 +14,8 @@ enum class WorkloadKind {
   kRestartNode,
   kFreezeNode,
   kUpdateResourceLimits,
+  kSetResourceProfile,
+  kSetNetworkProfile,
   kResourcePressure,
   kPartitionNodes,
   kHealPartition,
@@ -43,6 +45,10 @@ constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
       return "freeze_node";
     case WorkloadKind::kUpdateResourceLimits:
       return "update_resource_limits";
+    case WorkloadKind::kSetResourceProfile:
+      return "set_resource_profile";
+    case WorkloadKind::kSetNetworkProfile:
+      return "set_network_profile";
     case WorkloadKind::kResourcePressure:
       return "resource_pressure";
     case WorkloadKind::kPartitionNodes:
@@ -89,6 +95,12 @@ constexpr std::optional<WorkloadKind> ParseWorkloadKind(std::string_view name) {
   }
   if (name == "update_resource_limits") {
     return WorkloadKind::kUpdateResourceLimits;
+  }
+  if (name == "set_resource_profile") {
+    return WorkloadKind::kSetResourceProfile;
+  }
+  if (name == "set_network_profile") {
+    return WorkloadKind::kSetNetworkProfile;
   }
   if (name == "resource_pressure") {
     return WorkloadKind::kResourcePressure;

@@ -1131,3 +1131,71 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_scheduled_event_lifecycle) {
 
   std::filesystem::remove_all(dir);
 }
+
+BOOST_AUTO_TEST_CASE(run_report_reduces_profile_updates_and_active_profiles) {
+  const std::filesystem::path dir = MakeTestDir("run-report-profiles");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"r1","nodes":1,"resource_profiles":{"large":{"pids_max":512}},"network_profiles":{"degraded":{"delay_ms":200}},"events":[{"sequence":1,"at":"10ms","at_ms":10,"action":"set_resource_profile","nodes":["firo-a"],"profile":"large"},{"sequence":2,"at":"20ms","at_ms":20,"action":"set_network_profile","nodes":["firo-a"],"profile":"degraded"}]})"
+      "\n");
+  bbp::AppendLine(dir / "events.jsonl",
+                  R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-a","timestamp":"2026-07-16T00:00:01Z","event":"resource_profile_updated","detail":"{\"workload_index\":1,\"workload_count\":2,\"node\":1,\"profile\":\"large\",\"previous_profile\":\"small\",\"previous\":{\"pids_max\":256},\"current\":{\"pids_max\":512},\"kernel_verified\":true}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-a","timestamp":"2026-07-16T00:00:02Z","event":"network_profile_updated","detail":"{\"workload_index\":2,\"workload_count\":2,\"node\":1,\"profile\":\"degraded\",\"previous_profile\":\"normal\",\"previous\":{\"delay_ms\":20},\"current\":{\"delay_ms\":200},\"qdisc\":{\"kind\":\"tbf+netem\"},\"kernel_verified\":true}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-16T00:00:03Z","event":"profile_update_rollback_failed","detail":"{\"action\":\"set_network_profile\",\"profile\":\"degraded\",\"original_error\":\"apply failed\",\"rollback_errors\":[\"firo-a: restore failed\"]}"})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-a","timestamp_ms":1000,"active_resource_profile":"large","active_network_profile":"degraded"})");
+
+  const boost::json::value report_value =
+      boost::json::parse(bbp::BuildRunReportJson(dir));
+  const boost::json::object& report = report_value.as_object();
+  const boost::json::object& resource_action =
+      report.at("events").as_array().front().as_object();
+  BOOST_TEST(resource_action.at("action").as_string() ==
+             "set_resource_profile");
+  BOOST_TEST(resource_action.at("profile").as_string() == "large");
+  BOOST_TEST(resource_action.at("nodes").as_array().front().as_string() ==
+             "firo-a");
+  const boost::json::object& resource_update =
+      report.at("resource_profile_updates")
+          .as_array()
+          .front()
+          .as_object()
+          .at("detail")
+          .as_object();
+  BOOST_TEST(resource_update.at("previous_profile").as_string() == "small");
+  BOOST_TEST(resource_update.at("profile").as_string() == "large");
+  BOOST_TEST(JsonInteger(resource_update.at("current").as_object(),
+                         "pids_max") == 512U);
+  const boost::json::object& network_update =
+      report.at("network_profile_updates")
+          .as_array()
+          .front()
+          .as_object()
+          .at("detail")
+          .as_object();
+  BOOST_TEST(network_update.at("previous_profile").as_string() == "normal");
+  BOOST_TEST(network_update.at("profile").as_string() == "degraded");
+  BOOST_TEST(network_update.at("qdisc").as_object().at("kind").as_string() ==
+             "tbf+netem");
+  BOOST_REQUIRE_EQUAL(
+      report.at("profile_update_rollback_failures").as_array().size(), 1U);
+  const boost::json::object& last_metrics = report.at("nodes_summary")
+                                                .as_array()
+                                                .front()
+                                                .as_object()
+                                                .at("last_metrics")
+                                                .as_object();
+  BOOST_TEST(last_metrics.at("active_resource_profile").as_string() == "large");
+  BOOST_TEST(last_metrics.at("active_network_profile").as_string() ==
+             "degraded");
+
+  std::filesystem::remove_all(dir);
+}

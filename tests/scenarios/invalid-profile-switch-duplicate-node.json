@@ -1,0 +1,10 @@
+{
+  "resource_profiles": {"large": {"memory_max": "2GiB"}},
+  "nodes": [{"id": "firo-a", "chain": "firo", "role": "miner"}],
+  "events": [{
+    "at": "1s",
+    "action": "set_resource_profile",
+    "nodes": ["firo-a", "firo-a"],
+    "profile": "large"
+  }]
+}

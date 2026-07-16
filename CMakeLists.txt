@@ -514,6 +514,67 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-scheduled-events-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-profile-switch-events
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-profile-switch-events.json"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-unknown-resource-profile
+    tests/scenarios/invalid-profile-switch-unknown-resource-profile.json
+    "scenario set_resource_profile references unknown profile: missing"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-unknown-network-profile
+    tests/scenarios/invalid-profile-switch-unknown-network-profile.json
+    "scenario set_network_profile references unknown profile: missing"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-missing-nodes
+    tests/scenarios/invalid-profile-switch-missing-nodes.json
+    "scenario set_resource_profile requires nodes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-empty-nodes
+    tests/scenarios/invalid-profile-switch-empty-nodes.json
+    "scenario set_resource_profile nodes must not be empty"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-unknown-node
+    tests/scenarios/invalid-profile-switch-unknown-node.json
+    "scenario set_resource_profile references unknown node ID: firo-b"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-duplicate-node
+    tests/scenarios/invalid-profile-switch-duplicate-node.json
+    "scenario set_resource_profile nodes contains duplicate ID: firo-a"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-node-type
+    tests/scenarios/invalid-profile-switch-node-type.json
+    "scenario set_resource_profile nodes entries must be node ID strings"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-role
+    tests/scenarios/invalid-profile-switch-role.json
+    "profile switch role selector must be role:base, role:node, role:wallet, or role:miner"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-empty-role
+    tests/scenarios/invalid-profile-switch-empty-role.json
+    "scenario set_resource_profile role selector resolved no nodes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-missing-profile
+    tests/scenarios/invalid-profile-switch-missing-profile.json
+    "missing or invalid string JSON field: profile"
+  )
+  add_cli_failure_test(
+    bbp-invalid-profile-switch-unsafe-profile
+    tests/scenarios/invalid-profile-switch-unsafe-profile.json
+    "profile switch name contains an unsafe character"
+  )
   add_test(NAME bbp-valid-topology-edge-events
     COMMAND bbp
       --scenario-json
@@ -588,7 +649,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     bbp-invalid-scheduled-event-action
     tests/scenarios/invalid-scheduled-event-action.json
-    "unsupported scheduled event action: set_network_profile"
+    "unsupported scheduled event action: unknown_action"
   )
   add_cli_failure_test(
     bbp-invalid-scheduled-event-type
