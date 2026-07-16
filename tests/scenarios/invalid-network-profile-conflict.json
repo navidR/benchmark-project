@@ -1,0 +1,19 @@
+{
+  "network_profiles": {
+    "normal": {"delay_ms": 10}
+  },
+  "nodes": [
+    {
+      "id": "firo-a",
+      "chain": "firo",
+      "role": "miner",
+      "network": {"profile": "normal"}
+    }
+  ],
+  "network": {
+    "isolated": true,
+    "node_conditions": [
+      {"node": 1, "delay_ms": 20}
+    ]
+  }
+}

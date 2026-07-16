@@ -1,0 +1,6 @@
+{
+  "node_count": 2,
+  "nodes": [
+    {"id": "firo-a", "chain": "firo", "role": "miner"}
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "nodes": [
+    {"id": "firo-a", "chain": "firo", "role": "miner"},
+    {"id": "firo-b", "chain": "firo", "role": "wallet"}
+  ],
+  "topology": {
+    "node_count": 2,
+    "miner_nodes": [2],
+    "wallet_nodes": [1],
+    "type": "full_mesh"
+  }
+}

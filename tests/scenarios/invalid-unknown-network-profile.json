@@ -1,0 +1,10 @@
+{
+  "nodes": [
+    {
+      "id": "firo-miner-a",
+      "chain": "firo",
+      "role": "miner",
+      "network": {"profile": "missing"}
+    }
+  ]
+}

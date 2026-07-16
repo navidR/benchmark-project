@@ -13,6 +13,7 @@
 #include <boost/program_options.hpp>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
@@ -25,6 +26,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -238,6 +240,21 @@ std::optional<double> JsonOptionalNullableDoubleField(
     return std::nullopt;
   }
   return JsonOptionalDoubleField(object, field, 0.0);
+}
+
+uint32_t JsonPercentBasisPoints(const boost::json::object& object,
+                                const char* field) {
+  const double percent = JsonOptionalDoubleField(object, field, 0.0);
+  if (!std::isfinite(percent) || percent < 0.0 || percent > 100.0) {
+    throw std::runtime_error(std::string(field) + " must be in 0..100");
+  }
+  const double scaled = percent * 100.0;
+  const double integral = std::round(scaled);
+  if (std::fabs(scaled - integral) > 1e-9) {
+    throw std::runtime_error(std::string(field) +
+                             " must use at most 0.01 percent resolution");
+  }
+  return static_cast<uint32_t>(integral);
 }
 
 uint64_t JsonUint64Field(const boost::json::object& object, const char* field) {
@@ -472,6 +489,13 @@ boost::json::value ParseYamlPlainScalar(std::string_view text) {
     return false;
   }
   if (!IsDecimalInteger(text)) {
+    double value = 0.0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(),
+                                        value, std::chars_format::general);
+    if (result.ec == std::errc() && result.ptr == text.data() + text.size() &&
+        std::isfinite(value)) {
+      return value;
+    }
     return boost::json::string(text);
   }
   if (text.front() == '-') {
@@ -587,8 +611,20 @@ NetworkCondition ParseNetworkConditionObject(
       JsonOptionalUint32Field(object, "delay_ms", condition.delay_ms);
   condition.jitter_ms =
       JsonOptionalUint32Field(object, "jitter_ms", condition.jitter_ms);
-  condition.loss_basis_points = JsonOptionalUint32Field(
-      object, "loss_basis_points", condition.loss_basis_points);
+  const bool loss_basis_points_present =
+      object.if_contains("loss_basis_points") != nullptr;
+  const bool loss_percent_present =
+      object.if_contains("loss_percent") != nullptr;
+  if (loss_basis_points_present && loss_percent_present) {
+    throw std::runtime_error(
+        "network condition loss_percent and loss_basis_points must not both "
+        "be specified");
+  }
+  condition.loss_basis_points =
+      loss_percent_present
+          ? JsonPercentBasisPoints(object, "loss_percent")
+          : JsonOptionalUint32Field(object, "loss_basis_points",
+                                    condition.loss_basis_points);
   condition.duplicate_basis_points = JsonOptionalUint32Field(
       object, "duplicate_basis_points", condition.duplicate_basis_points);
   condition.corrupt_basis_points = JsonOptionalUint32Field(
@@ -1455,6 +1491,327 @@ ResourceLimitPatch ParseResourceLimitPatchObject(
   return patch;
 }
 
+ResourceLimits InitialResourceLimits(const Options& options);
+ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
+                                       const ResourceLimitPatch& patch,
+                                       const std::string& node_id);
+
+void RequireSafeScenarioIdentifier(std::string_view value,
+                                   std::string_view field) {
+  if (value.empty() || value.size() > 32U) {
+    throw std::runtime_error(std::string(field) + " must be 1..32 characters");
+  }
+  for (const char c : value) {
+    const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_';
+    if (!safe) {
+      throw std::runtime_error(std::string(field) +
+                               " contains an unsafe character");
+    }
+  }
+}
+
+uint64_t ParsePositiveUint64Text(std::string_view text,
+                                 std::string_view field) {
+  uint64_t value = 0U;
+  const char* const begin = text.data();
+  const char* const end = begin + text.size();
+  const auto [next, error] = std::from_chars(begin, end, value);
+  if (text.empty() || error != std::errc() || next != end || value == 0U) {
+    throw std::runtime_error(std::string(field) + " must be a positive uint64");
+  }
+  return value;
+}
+
+uint64_t ParseBinaryByteSize(const boost::json::value& value,
+                             std::string_view field) {
+  if (!value.is_string()) {
+    throw std::runtime_error(std::string(field) +
+                             " must be a binary byte-size string");
+  }
+  const std::string text(value.as_string());
+  const std::pair<std::string_view, uint64_t> suffixes[] = {
+      {"TiB", 1ULL << 40U},
+      {"GiB", 1ULL << 30U},
+      {"MiB", 1ULL << 20U},
+      {"KiB", 1ULL << 10U},
+      {"B", 1U}};
+  for (const auto& [suffix, multiplier] : suffixes) {
+    if (text.size() <= suffix.size() ||
+        std::string_view(text).substr(text.size() - suffix.size()) != suffix) {
+      continue;
+    }
+    const std::string_view magnitude(text.data(), text.size() - suffix.size());
+    const uint64_t parsed = ParsePositiveUint64Text(magnitude, field);
+    if (parsed > std::numeric_limits<uint64_t>::max() / multiplier) {
+      throw std::runtime_error(std::string(field) + " overflows uint64 bytes");
+    }
+    return parsed * multiplier;
+  }
+  throw std::runtime_error(std::string(field) +
+                           " must use B, KiB, MiB, GiB, or TiB");
+}
+
+void ApplyCpuMaxAlias(const boost::json::value& value, std::string_view field,
+                      boost::json::object* canonical) {
+  if (!value.is_string()) {
+    throw std::runtime_error(std::string(field) + " must be a string");
+  }
+  std::istringstream input(std::string(value.as_string()));
+  std::string quota_text;
+  std::string period_text;
+  std::string extra;
+  if (!(input >> quota_text >> period_text) || (input >> extra)) {
+    throw std::runtime_error(std::string(field) +
+                             " must contain exactly quota-or-max and period");
+  }
+  if (quota_text == "max") {
+    (*canonical)["cpu_quota_us"] = nullptr;
+  } else {
+    (*canonical)["cpu_quota_us"] = ParsePositiveUint64Text(quota_text, field);
+  }
+  (*canonical)["cpu_period_us"] = ParsePositiveUint64Text(period_text, field);
+}
+
+ResourceLimits ParseResourceProfile(const boost::json::object& object,
+                                    const ResourceLimits& defaults,
+                                    std::string_view profile_name) {
+  boost::json::object canonical = object;
+  const bool memory_high_alias = object.if_contains("memory_high") != nullptr;
+  const bool memory_max_alias = object.if_contains("memory_max") != nullptr;
+  if (memory_high_alias && object.if_contains("memory_high_bytes") != nullptr) {
+    throw std::runtime_error("resource profile " + std::string(profile_name) +
+                             " specifies both memory_high and "
+                             "memory_high_bytes");
+  }
+  if (memory_max_alias && object.if_contains("memory_max_bytes") != nullptr) {
+    throw std::runtime_error("resource profile " + std::string(profile_name) +
+                             " specifies both memory_max and "
+                             "memory_max_bytes");
+  }
+  if (memory_high_alias) {
+    canonical["memory_high_bytes"] = ParseBinaryByteSize(
+        object.at("memory_high"), "resource profile memory_high");
+    canonical.erase("memory_high");
+  }
+  if (memory_max_alias) {
+    canonical["memory_max_bytes"] = ParseBinaryByteSize(
+        object.at("memory_max"), "resource profile memory_max");
+    canonical.erase("memory_max");
+  }
+
+  const bool cpu_quota_alias = object.if_contains("cpu_quota") != nullptr;
+  const bool cpu_max_alias = object.if_contains("cpu_max") != nullptr;
+  if (cpu_quota_alias && cpu_max_alias) {
+    throw std::runtime_error("resource profile " + std::string(profile_name) +
+                             " specifies both cpu_quota and cpu_max");
+  }
+  if ((cpu_quota_alias || cpu_max_alias) &&
+      (object.if_contains("cpu_quota_us") != nullptr ||
+       object.if_contains("cpu_period_us") != nullptr)) {
+    throw std::runtime_error("resource profile " + std::string(profile_name) +
+                             " CPU aliases conflict with cpu_quota_us or "
+                             "cpu_period_us");
+  }
+  if (cpu_quota_alias || cpu_max_alias) {
+    const char* const alias = cpu_quota_alias ? "cpu_quota" : "cpu_max";
+    ApplyCpuMaxAlias(object.at(alias), "resource profile " + std::string(alias),
+                     &canonical);
+    canonical.erase(alias);
+  }
+
+  ResourceLimitPatch patch = ParseResourceLimitPatchObject(canonical);
+  if (patch.memory_max_bytes && !patch.memory_high_bytes &&
+      defaults.memory_high_bytes > *patch.memory_max_bytes) {
+    patch.memory_high_bytes = *patch.memory_max_bytes;
+  }
+  return ApplyResourceLimitPatch(
+      defaults, patch, "resource profile " + std::string(profile_name));
+}
+
+void ParseResourceProfiles(const boost::json::object& scenario,
+                           Options* options) {
+  const boost::json::value* value = scenario.if_contains("resource_profiles");
+  if (value == nullptr) {
+    return;
+  }
+  if (!value->is_object()) {
+    throw std::runtime_error("scenario resource_profiles must be an object");
+  }
+  const ResourceLimits defaults = InitialResourceLimits(*options);
+  for (const auto& [name_json, profile_value] : value->as_object()) {
+    const std::string name(name_json);
+    RequireSafeScenarioIdentifier(name, "resource profile name");
+    if (!profile_value.is_object()) {
+      throw std::runtime_error("scenario resource profile " + name +
+                               " must be an object");
+    }
+    options->resource_profiles.emplace(
+        name, ParseResourceProfile(profile_value.as_object(), defaults, name));
+  }
+}
+
+void ParseNetworkProfiles(const boost::json::object& scenario,
+                          Options* options) {
+  const boost::json::value* value = scenario.if_contains("network_profiles");
+  if (value == nullptr) {
+    return;
+  }
+  if (!value->is_object()) {
+    throw std::runtime_error("scenario network_profiles must be an object");
+  }
+  for (const auto& [name_json, profile_value] : value->as_object()) {
+    const std::string name(name_json);
+    RequireSafeScenarioIdentifier(name, "network profile name");
+    if (!profile_value.is_object()) {
+      throw std::runtime_error("scenario network profile " + name +
+                               " must be an object");
+    }
+    const NetworkCondition condition =
+        ParseNetworkConditionObject(profile_value.as_object());
+    ValidateNetworkCondition(condition);
+    options->network_profiles.emplace(name, condition);
+  }
+}
+
+struct ScenarioNodeRoles {
+  bool configured = false;
+  std::vector<uint32_t> wallet_nodes;
+  std::vector<uint32_t> miner_nodes;
+};
+
+ScenarioNodeRoles ParseScenarioNodes(
+    const boost::json::object& scenario,
+    const boost::program_options::variables_map& vm, Options* options) {
+  ScenarioNodeRoles roles;
+  const boost::json::value* nodes_value = scenario.if_contains("nodes");
+  if (nodes_value == nullptr || !nodes_value->is_array()) {
+    if (!OptionProvided(vm, "nodes")) {
+      const bool nodes_present = nodes_value != nullptr;
+      const bool node_count_present =
+          scenario.if_contains("node_count") != nullptr;
+      const uint32_t scenario_nodes =
+          JsonOptionalUint32Field(scenario, "nodes", options->nodes);
+      const uint32_t scenario_node_count =
+          JsonOptionalUint32Field(scenario, "node_count", scenario_nodes);
+      if (nodes_present && node_count_present &&
+          scenario_nodes != scenario_node_count) {
+        throw std::runtime_error("scenario nodes and node_count must match");
+      }
+      options->nodes =
+          node_count_present ? scenario_node_count : scenario_nodes;
+    }
+    return roles;
+  }
+
+  const boost::json::array& nodes = nodes_value->as_array();
+  if (nodes.empty()) {
+    throw std::runtime_error("scenario nodes array must not be empty");
+  }
+  if (nodes.size() > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error("scenario nodes array exceeds uint32 size");
+  }
+  const uint32_t node_count = static_cast<uint32_t>(nodes.size());
+  if (OptionProvided(vm, "nodes") && options->nodes != node_count) {
+    throw std::runtime_error("--nodes must match scenario nodes array size");
+  }
+  if (scenario.if_contains("node_count") != nullptr &&
+      JsonUint32Field(scenario, "node_count") != node_count) {
+    throw std::runtime_error(
+        "scenario node_count must match scenario nodes array size");
+  }
+  options->nodes = node_count;
+  options->node_ids.reserve(nodes.size());
+  options->node_roles.reserve(nodes.size());
+  std::set<std::string> node_ids;
+  for (std::size_t index = 0; index < nodes.size(); ++index) {
+    const boost::json::value& node_value = nodes[index];
+    if (!node_value.is_object()) {
+      throw std::runtime_error("scenario nodes entries must be objects");
+    }
+    const boost::json::object& node = node_value.as_object();
+    const std::string id = JsonStringField(node, "id");
+    RequireSafeScenarioIdentifier(id, "scenario node id");
+    if (!node_ids.insert(id).second) {
+      throw std::runtime_error("scenario nodes contains duplicate id: " + id);
+    }
+    if (ParseChainKind(JsonStringField(node, "chain")) != options->chain) {
+      throw std::runtime_error("scenario node " + id +
+                               " chain must match the active chain");
+    }
+    std::string role = JsonStringField(node, "role");
+    if (role == "node") {
+      role = "base";
+    }
+    if (role == "wallet") {
+      roles.wallet_nodes.push_back(static_cast<uint32_t>(index));
+    } else if (role == "miner") {
+      roles.miner_nodes.push_back(static_cast<uint32_t>(index));
+    } else if (role != "base") {
+      throw std::runtime_error("scenario node " + id +
+                               " role must be base, node, wallet, or miner");
+    }
+
+    const auto read_profile = [&](const char* section,
+                                  std::map<uint32_t, std::string>* output) {
+      const boost::json::value* section_value = node.if_contains(section);
+      if (section_value == nullptr) {
+        return;
+      }
+      if (!section_value->is_object()) {
+        throw std::runtime_error("scenario node " + id + " " + section +
+                                 " must be an object");
+      }
+      const std::string profile =
+          JsonStringField(section_value->as_object(), "profile");
+      RequireSafeScenarioIdentifier(profile,
+                                    std::string(section) + " profile name");
+      output->emplace(static_cast<uint32_t>(index), profile);
+    };
+    read_profile("resources", &options->node_resource_profiles);
+    read_profile("network", &options->node_network_profiles);
+    options->node_ids.push_back(id);
+    options->node_roles.push_back(role);
+  }
+  roles.configured = true;
+  return roles;
+}
+
+bool SameNodeSet(std::vector<uint32_t> left, std::vector<uint32_t> right) {
+  std::sort(left.begin(), left.end());
+  std::sort(right.begin(), right.end());
+  return left == right;
+}
+
+void ResolveNodeProfileAssignments(Options* options) {
+  for (const auto& [node_index, profile_name] :
+       options->node_resource_profiles) {
+    const auto profile = options->resource_profiles.find(profile_name);
+    if (profile == options->resource_profiles.end()) {
+      throw std::runtime_error(
+          "scenario node " + options->node_ids.at(node_index) +
+          " references unknown resource profile: " + profile_name);
+    }
+    options->node_resource_limits.emplace(node_index, profile->second);
+  }
+  for (const auto& [node_index, profile_name] :
+       options->node_network_profiles) {
+    const auto profile = options->network_profiles.find(profile_name);
+    if (profile == options->network_profiles.end()) {
+      throw std::runtime_error(
+          "scenario node " + options->node_ids.at(node_index) +
+          " references unknown network profile: " + profile_name);
+    }
+    if (options->node_network_conditions.contains(node_index)) {
+      throw std::runtime_error(
+          "scenario node " + options->node_ids.at(node_index) +
+          " cannot combine network.profile with network.node_conditions");
+    }
+    options->node_network_conditions.emplace(node_index, profile->second);
+    options->isolate_network = true;
+  }
+}
+
 void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
                          std::string_view source,
                          std::map<uint32_t, NetworkCondition>& output) {
@@ -1894,20 +2251,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       options.run_id = std::string(run_id->as_string());
     }
   }
-  if (!OptionProvided(vm, "nodes")) {
-    const bool nodes_present = scenario.if_contains("nodes") != nullptr;
-    const bool node_count_present =
-        scenario.if_contains("node_count") != nullptr;
-    const uint32_t scenario_nodes =
-        JsonOptionalUint32Field(scenario, "nodes", options.nodes);
-    const uint32_t scenario_node_count =
-        JsonOptionalUint32Field(scenario, "node_count", scenario_nodes);
-    if (nodes_present && node_count_present &&
-        scenario_nodes != scenario_node_count) {
-      throw std::runtime_error("scenario nodes and node_count must match");
-    }
-    options.nodes = node_count_present ? scenario_node_count : scenario_nodes;
-  }
+  const ScenarioNodeRoles node_roles =
+      ParseScenarioNodes(scenario, vm, &options);
   const boost::json::value* topology = scenario.if_contains("topology");
   if (topology != nullptr) {
     if (!topology->is_object()) {
@@ -1917,6 +2262,33 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         ParseNodeRoleTopologyObject(topology->as_object(), options.nodes);
     options.wallet_initialization =
         ParseWalletInitializationObject(topology->as_object());
+    if (node_roles.configured &&
+        (!SameNodeSet(options.topology.wallet_nodes, node_roles.wallet_nodes) ||
+         !SameNodeSet(options.topology.miner_nodes, node_roles.miner_nodes))) {
+      throw std::runtime_error(
+          "scenario nodes roles must match topology wallet_nodes and "
+          "miner_nodes");
+    }
+    if (!OptionProvided(vm, "generate-node") &&
+        !options.topology.miner_nodes.empty()) {
+      options.generate_node = options.topology.miner_nodes.front() + 1U;
+    }
+  } else if (node_roles.configured) {
+    boost::json::object derived_topology;
+    derived_topology["node_count"] = options.nodes;
+    boost::json::array wallet_nodes;
+    for (const uint32_t node_index : node_roles.wallet_nodes) {
+      wallet_nodes.push_back(node_index + 1U);
+    }
+    derived_topology["wallet_nodes"] = std::move(wallet_nodes);
+    boost::json::array miner_nodes;
+    for (const uint32_t node_index : node_roles.miner_nodes) {
+      miner_nodes.push_back(node_index + 1U);
+    }
+    derived_topology["miner_nodes"] = std::move(miner_nodes);
+    derived_topology["type"] = "full_mesh";
+    options.topology =
+        ParseNodeRoleTopologyObject(derived_topology, options.nodes);
     if (!OptionProvided(vm, "generate-node") &&
         !options.topology.miner_nodes.empty()) {
       options.generate_node = options.topology.miner_nodes.front() + 1U;
@@ -2077,6 +2449,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                                 options.runtime_node_resource_updates);
     }
   }
+  ParseResourceProfiles(scenario, &options);
 
   const boost::json::value* process = scenario.if_contains("process");
   if (process != nullptr) {
@@ -2139,6 +2512,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
   }
 
+  ParseNetworkProfiles(scenario, &options);
   const boost::json::value* network = scenario.if_contains("network");
   if (network != nullptr) {
     if (!network->is_object()) {
@@ -2258,6 +2632,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                                  options.runtime_partition_heals);
     }
   }
+  ResolveNodeProfileAssignments(&options);
 }
 
 bool WorkloadsRequireIsolatedNetwork(const Options& options) {
@@ -3646,6 +4021,14 @@ ResourceLimits InitialResourceLimits(const Options& options) {
       .io_limits = options.io_limits,
       .pids_max = options.pids_max,
   };
+}
+
+ResourceLimits InitialResourceLimits(const Options& options,
+                                     uint32_t node_index) {
+  const auto node_limits = options.node_resource_limits.find(node_index);
+  return node_limits == options.node_resource_limits.end()
+             ? InitialResourceLimits(options)
+             : node_limits->second;
 }
 
 ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
@@ -5480,6 +5863,73 @@ void WriteScenarioFiles(const Options& options,
   }
   resolved["topology_initial_edges"] = RuntimePeerTopologyEdgesJson(
       RuntimePeerTopology(options.topology.peer_topology, options.nodes));
+  if (!options.resource_profiles.empty()) {
+    boost::json::object profiles;
+    for (const auto& [name, limits] : options.resource_profiles) {
+      profiles[name] = ResourceLimitsJson(limits);
+    }
+    resolved["resource_profiles"] = std::move(profiles);
+  }
+  if (!options.network_profiles.empty()) {
+    boost::json::object profiles;
+    for (const auto& [name, condition] : options.network_profiles) {
+      profiles[name] = NetworkConditionJson(condition);
+    }
+    resolved["network_profiles"] = std::move(profiles);
+  }
+  boost::json::array node_configs;
+  for (uint32_t node_index = 0U; node_index < options.nodes; ++node_index) {
+    boost::json::object node;
+    node["index"] = node_index + 1U;
+    node["id"] = options.node_ids.empty() ? chain_spec.node_id_prefix + "-" +
+                                                std::to_string(node_index + 1U)
+                                          : options.node_ids.at(node_index);
+    node["chain"] = chain_spec.name;
+    if (!options.node_roles.empty()) {
+      node["role"] = options.node_roles.at(node_index);
+    } else {
+      const bool wallet =
+          NodeListContains(options.topology.wallet_nodes, node_index);
+      const bool miner =
+          NodeListContains(options.topology.miner_nodes, node_index);
+      node["role"] = wallet && miner ? "wallet_miner"
+                     : wallet        ? "wallet"
+                     : miner         ? "miner"
+                                     : "base";
+    }
+    boost::json::object resources_config;
+    const auto resource_profile =
+        options.node_resource_profiles.find(node_index);
+    if (resource_profile != options.node_resource_profiles.end()) {
+      resources_config["profile"] = resource_profile->second;
+    } else {
+      resources_config["profile"] = nullptr;
+    }
+    resources_config["resolved"] =
+        ResourceLimitsJson(InitialResourceLimits(options, node_index));
+    node["resources"] = std::move(resources_config);
+
+    boost::json::object network_config;
+    const auto network_profile = options.node_network_profiles.find(node_index);
+    if (network_profile != options.node_network_profiles.end()) {
+      network_config["profile"] = network_profile->second;
+    } else {
+      network_config["profile"] = nullptr;
+    }
+    const auto node_condition =
+        options.node_network_conditions.find(node_index);
+    if (node_condition != options.node_network_conditions.end()) {
+      network_config["resolved"] = NetworkConditionJson(node_condition->second);
+    } else if (options.network_condition_requested) {
+      network_config["resolved"] =
+          NetworkConditionJson(options.network_condition);
+    } else {
+      network_config["resolved"] = nullptr;
+    }
+    node["network"] = std::move(network_config);
+    node_configs.push_back(std::move(node));
+  }
+  resolved["node_configs"] = std::move(node_configs);
   boost::json::array workload_array;
   for (const ScenarioWorkload& workload : workloads) {
     workload_array.push_back(WorkloadJson(workload));
@@ -5673,6 +6123,9 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     config_request.run_root = run_root;
     config_request.daemon_binary = options.chain_daemon;
     config_request.node_index = i;
+    if (!options.node_ids.empty()) {
+      config_request.node_id = options.node_ids.at(i);
+    }
     config_request.wallet_enabled =
         options.wallet_backed_workload_requested &&
         NodeListContains(options.topology.wallet_nodes, i);
@@ -5729,7 +6182,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       }
 
       runtime.cgroup = Cgroup::Create(options.run_id, node_id);
-      runtime.resources = InitialResourceLimits(options);
+      runtime.resources = InitialResourceLimits(options, i);
       runtime.cgroup->SetMemoryHigh(runtime.resources.memory_high_bytes);
       runtime.cgroup->SetMemoryMax(runtime.resources.memory_max_bytes);
       runtime.cgroup->SetCpuMax(runtime.resources.cpu_quota_us,

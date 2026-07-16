@@ -1,0 +1,13 @@
+{
+  "resource_profiles": {
+    "broken": {"memory_max": "1GiB", "memory_max_bytes": 1073741824}
+  },
+  "nodes": [
+    {
+      "id": "firo-a",
+      "chain": "firo",
+      "role": "miner",
+      "resources": {"profile": "broken"}
+    }
+  ]
+}

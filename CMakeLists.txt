@@ -421,6 +421,93 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-cgroup-resource-controls.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-named-profiles
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-named-profiles.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-named-profiles-yaml
+    COMMAND bbp
+      --scenario-yaml
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-named-profiles.yaml"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-unknown-resource-profile
+    tests/scenarios/invalid-unknown-resource-profile.json
+    "references unknown resource profile: missing"
+  )
+  add_cli_failure_test(
+    bbp-invalid-unknown-network-profile
+    tests/scenarios/invalid-unknown-network-profile.json
+    "references unknown network profile: missing"
+  )
+  add_cli_failure_test(
+    bbp-invalid-duplicate-node-id
+    tests/scenarios/invalid-duplicate-node-id.json
+    "scenario nodes contains duplicate id: firo-a"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-array-count
+    tests/scenarios/invalid-node-array-count.json
+    "scenario node_count must match scenario nodes array size"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-id
+    tests/scenarios/invalid-node-id.json
+    "scenario node id contains an unsafe character"
+  )
+  add_cli_failure_test(
+    bbp-invalid-resource-profile-bytes
+    tests/scenarios/invalid-resource-profile-bytes.json
+    "resource profile memory_max overflows uint64 bytes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-resource-profile-cpu
+    tests/scenarios/invalid-resource-profile-cpu.json
+    "resource profile cpu_quota must contain exactly quota-or-max and period"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-profile-loss
+    tests/scenarios/invalid-network-profile-loss.json
+    "loss_percent must use at most 0.01 percent resolution"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-profile-loss-range
+    tests/scenarios/invalid-network-profile-loss-range.json
+    "loss_percent must be in 0..100"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-profile-loss-conflict
+    tests/scenarios/invalid-network-profile-loss-conflict.json
+    "loss_percent and loss_basis_points must not both be specified"
+  )
+  add_cli_failure_test(
+    bbp-invalid-resource-profile-memory-conflict
+    tests/scenarios/invalid-resource-profile-memory-conflict.json
+    "specifies both memory_max and memory_max_bytes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-resource-profile-cpu-conflict
+    tests/scenarios/invalid-resource-profile-cpu-conflict.json
+    "CPU aliases conflict with cpu_quota_us or cpu_period_us"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-role-topology
+    tests/scenarios/invalid-node-role-topology.json
+    "scenario nodes roles must match topology wallet_nodes and miner_nodes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain
+    tests/scenarios/invalid-node-chain.json
+    "chain must match the active chain"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-profile-conflict
+    tests/scenarios/invalid-network-profile-conflict.json
+    "cannot combine network.profile with network.node_conditions"
+  )
   add_test(NAME bbp-valid-scheduled-events-scenario
     COMMAND bbp
       --scenario-json

@@ -353,6 +353,9 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "sync_timeout_sec", report);
   CopyField(scenario, "topology", report);
   CopyField(scenario, "topology_initial_edges", report);
+  CopyField(scenario, "resource_profiles", report);
+  CopyField(scenario, "network_profiles", report);
+  CopyField(scenario, "node_configs", report);
   CopyField(scenario, "workloads", report);
   CopyField(scenario, "events", report);
   CopyField(scenario, "resources", report);

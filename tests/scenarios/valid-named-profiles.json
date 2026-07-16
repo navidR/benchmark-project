@@ -1,0 +1,47 @@
+{
+  "resource_profiles": {
+    "small": {
+      "memory_max": "1GiB",
+      "cpu_quota": "50000 100000",
+      "cpu_weight": 80,
+      "pids_max": 256
+    },
+    "medium": {
+      "memory_high": "1GiB",
+      "memory_max": "2GiB",
+      "cpu_max": "max 100000",
+      "io_weight": 200,
+      "pids_max": 512
+    }
+  },
+  "network_profiles": {
+    "normal": {
+      "bandwidth_mbps": 50,
+      "delay_ms": 20,
+      "jitter_ms": 2,
+      "loss_percent": 0.0
+    },
+    "degraded": {
+      "bandwidth_mbps": 5,
+      "delay_ms": 200,
+      "jitter_ms": 50,
+      "loss_percent": 1.25
+    }
+  },
+  "nodes": [
+    {
+      "id": "firo-miner-a",
+      "chain": "firo",
+      "role": "miner",
+      "resources": {"profile": "medium"},
+      "network": {"profile": "normal"}
+    },
+    {
+      "id": "firo-wallet-a",
+      "chain": "firo",
+      "role": "wallet",
+      "resources": {"profile": "small"},
+      "network": {"profile": "degraded"}
+    }
+  ]
+}

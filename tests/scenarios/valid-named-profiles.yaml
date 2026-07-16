@@ -1,0 +1,19 @@
+resource_profiles:
+  small:
+    memory_max: 1GiB
+    cpu_quota: "50000 100000"
+    pids_max: 256
+network_profiles:
+  normal:
+    bandwidth_mbps: 50
+    delay_ms: 20
+    jitter_ms: 2
+    loss_percent: 0.0
+nodes:
+  - id: firo-miner-yaml
+    chain: firo
+    role: miner
+    resources:
+      profile: small
+    network:
+      profile: normal

@@ -18,6 +18,7 @@
 #include "bbp/simulator/network_block_rule.h"
 #include "bbp/simulator/network_partition_rule.h"
 #include "bbp/simulator/resource_limit_patch.h"
+#include "bbp/simulator/resource_limits.h"
 #include "bbp/simulator/scenario_workload.h"
 #include "bbp/simulator/scheduled_scenario_event.h"
 #include "bbp/util.h"
@@ -36,6 +37,8 @@ struct Options {
   std::filesystem::path tui_run;
   std::string run_id = MakeRunId();
   std::uint32_t nodes = 1;
+  std::vector<std::string> node_ids;
+  std::vector<std::string> node_roles;
   std::uint32_t generate_node = 1;
   std::uint32_t ready_timeout_sec = 30;
   std::uint32_t sync_timeout_sec = 30;
@@ -51,6 +54,11 @@ struct Options {
   std::uint64_t io_weight = 100;
   std::vector<IoLimit> io_limits;
   std::uint64_t pids_max = 256;
+  std::map<std::string, ResourceLimits> resource_profiles;
+  std::map<std::string, NetworkCondition> network_profiles;
+  std::map<std::uint32_t, std::string> node_resource_profiles;
+  std::map<std::uint32_t, std::string> node_network_profiles;
+  std::map<std::uint32_t, ResourceLimits> node_resource_limits;
   bool keep_cgroups = false;
   bool keep_artifacts = true;
   bool cleanup_run = false;

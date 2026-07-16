@@ -67,7 +67,9 @@ std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain) {
 ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
                                     const ChainNodeConfigRequest& request) {
   const std::string node_id =
-      spec.node_id_prefix + "-" + std::to_string(request.node_index + 1U);
+      request.node_id.empty()
+          ? spec.node_id_prefix + "-" + std::to_string(request.node_index + 1U)
+          : request.node_id;
   const std::filesystem::path node_root = request.run_root / "nodes" / node_id;
 
   ChainNodeConfig config;

@@ -1,0 +1,13 @@
+{
+  "resource_profiles": {
+    "huge": {"memory_max": "16777216TiB"}
+  },
+  "nodes": [
+    {
+      "id": "firo-a",
+      "chain": "firo",
+      "role": "miner",
+      "resources": {"profile": "huge"}
+    }
+  ]
+}

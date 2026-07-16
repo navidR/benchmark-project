@@ -28,6 +28,7 @@ struct ChainNodeConfigRequest {
   std::filesystem::path run_root;
   std::filesystem::path daemon_binary;
   std::uint32_t node_index = 0;
+  std::string node_id;
   bool wallet_enabled = false;
   std::vector<std::string> connect_peers;
 };

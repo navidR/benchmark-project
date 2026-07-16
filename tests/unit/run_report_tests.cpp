@@ -59,6 +59,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                  "\"wallet_node_count\":1,\"miner_node_count\":1,"
                  "\"allow_miner_wallet_overlap\":true,"
                  "\"wallet_nodes\":[1],\"miner_nodes\":[1]},"
+                 "\"resource_profiles\":{\"small\":{\"pids_max\":128}},"
+                 "\"network_profiles\":{\"normal\":{\"delay_ms\":2}},"
+                 "\"node_configs\":[{\"index\":1,\"id\":\"custom-1\","
+                 "\"role\":\"miner\",\"resources\":{\"profile\":\"small\"},"
+                 "\"network\":{\"profile\":\"normal\"}}],"
                  "\"resources\":{\"memory_max_bytes\":1024},"
                  "\"default_network_condition\":{\"delay_ms\":2},"
                  "\"node_network_conditions\":[{\"node\":1,\"delay_ms\":3}],"
@@ -349,6 +354,20 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                          "memory_max_bytes") == 1024U);
   BOOST_TEST(JsonInteger(report.at("default_network_condition").as_object(),
                          "delay_ms") == 2U);
+  BOOST_TEST(
+      JsonInteger(
+          report.at("resource_profiles").as_object().at("small").as_object(),
+          "pids_max") == 128U);
+  BOOST_TEST(
+      JsonInteger(
+          report.at("network_profiles").as_object().at("normal").as_object(),
+          "delay_ms") == 2U);
+  const boost::json::object& node_config =
+      report.at("node_configs").as_array().front().as_object();
+  BOOST_TEST(node_config.at("id").as_string() == "custom-1");
+  BOOST_TEST(
+      node_config.at("resources").as_object().at("profile").as_string() ==
+      "small");
   BOOST_REQUIRE_EQUAL(report.at("node_network_conditions").as_array().size(),
                       1U);
   BOOST_REQUIRE_EQUAL(

@@ -1,0 +1,13 @@
+{
+  "resource_profiles": {
+    "broken": {"cpu_max": "max 100000", "cpu_period_us": 100000}
+  },
+  "nodes": [
+    {
+      "id": "firo-a",
+      "chain": "firo",
+      "role": "miner",
+      "resources": {"profile": "broken"}
+    }
+  ]
+}

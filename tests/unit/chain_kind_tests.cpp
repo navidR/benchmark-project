@@ -29,3 +29,37 @@ BOOST_AUTO_TEST_CASE(unimplemented_chain_driver_is_explicitly_rejected) {
   BOOST_CHECK_THROW(bbp::CreateChainDriver(bbp::ChainKind::kMonero),
                     std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(chain_node_config_uses_explicit_safe_scenario_id) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "profile-test";
+  request.run_root = "/tmp/profile-test";
+  request.daemon_binary = "/tmp/firod";
+  request.node_index = 1U;
+  request.node_id = "firo-wallet-a";
+
+  const bbp::ChainNodeConfig config =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request);
+
+  BOOST_TEST(config.id == "firo-wallet-a");
+  BOOST_TEST(
+      config.data_dir ==
+      std::filesystem::path("/tmp/profile-test/nodes/firo-wallet-a/data"));
+  BOOST_TEST(config.p2p_port == 18169U);
+  BOOST_TEST(config.rpc_port == 18889U);
+}
+
+BOOST_AUTO_TEST_CASE(chain_node_config_retains_generated_id_by_default) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "legacy-test";
+  request.run_root = "/tmp/legacy-test";
+  request.daemon_binary = "/tmp/firod";
+  request.node_index = 2U;
+
+  const bbp::ChainNodeConfig config =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request);
+
+  BOOST_TEST(config.id == "firo-3");
+  BOOST_TEST(config.data_dir ==
+             std::filesystem::path("/tmp/legacy-test/nodes/firo-3/data"));
+}

@@ -1,0 +1,13 @@
+{
+  "network_profiles": {
+    "broken": {"loss_percent": 1.0, "loss_basis_points": 100}
+  },
+  "nodes": [
+    {
+      "id": "firo-a",
+      "chain": "firo",
+      "role": "miner",
+      "network": {"profile": "broken"}
+    }
+  ]
+}
