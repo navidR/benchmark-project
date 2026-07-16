@@ -5642,6 +5642,15 @@ std::string RestartDetail(pid_t pid, uint64_t restart_count) {
   return boost::json::serialize(detail);
 }
 
+std::string RestartPeerConnectionDetail(std::string_view peer_address,
+                                        std::uint64_t restart_count) {
+  boost::json::object detail;
+  detail["reason"] = "restart_topology_restore";
+  detail["peer_address"] = std::string(peer_address);
+  detail["restart_count"] = restart_count;
+  return boost::json::serialize(detail);
+}
+
 void RestartNode(const Options& options,
                  const std::filesystem::path& events_path,
                  const ChainDriver& driver, NodeRuntime& node,
@@ -5685,6 +5694,16 @@ void RestartNode(const Options& options,
                    stop_token);
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRpcReady);
+  for (const std::string& peer : node.config.connect_peers) {
+    ThrowIfStopRequested(stop_token);
+    driver.ConnectPeer(node.config, peer, stop_token);
+    driver.WaitForPeerAddress(node.config, peer,
+                              std::chrono::seconds(options.ready_timeout_sec),
+                              stop_token);
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kPeerConnected,
+               RestartPeerConnectionDetail(peer, restart_count));
+  }
   node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
   WriteNodeState(events_path, options.run_id, node.config.id,
                  NodeRuntimeLifecycle::kRunning);
