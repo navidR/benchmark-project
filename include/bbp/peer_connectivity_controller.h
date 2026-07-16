@@ -22,6 +22,7 @@ enum class PeerConnectivityAction {
 
 class PeerConnectivityController {
  public:
+  using AllowedPeerMap = std::map<std::string, std::vector<std::string>>;
   using NodeAvailableHandler = std::function<bool(std::string_view node_id)>;
   using ActionHandler = std::function<void(
       std::string_view node_id, std::string_view peer_node_id,
@@ -32,6 +33,7 @@ class PeerConnectivityController {
   PeerConnectivityController(const ChainDriver& driver,
                              std::vector<ChainNodeConfig> nodes,
                              std::map<std::string, PeerCountPolicy> policies,
+                             AllowedPeerMap allowed_peers,
                              std::chrono::milliseconds interval,
                              NodeAvailableHandler node_available_handler,
                              ActionHandler action_handler,
@@ -44,6 +46,8 @@ class PeerConnectivityController {
   void Start();
   void Stop();
   void SetPolicy(std::string_view node_id, PeerCountPolicy policy);
+  void SetAllowedPeers(std::string_view node_id,
+                       std::vector<std::string> peer_node_ids);
   void ConnectPeer(std::string_view node_id, std::string_view peer_node_id,
                    std::chrono::seconds timeout,
                    std::stop_token stop_token = {});
@@ -53,6 +57,10 @@ class PeerConnectivityController {
 
  private:
   const ChainNodeConfig& FindNode(std::string_view node_id) const;
+  const std::vector<std::string>& AllowedPeers(std::string_view node_id) const;
+  void ValidateAllowedPeers(
+      std::string_view node_id,
+      const std::vector<std::string>& peer_node_ids) const;
   void RequireUnambiguousPeerIdentity(const ChainNodeConfig& node,
                                       std::stop_token stop_token) const;
   void ValidatePolicy(std::string_view node_id,
@@ -66,6 +74,7 @@ class PeerConnectivityController {
   const ChainDriver& driver_;
   std::vector<ChainNodeConfig> nodes_;
   std::map<std::string, PeerCountPolicy> policies_;
+  AllowedPeerMap allowed_peers_;
   std::chrono::milliseconds interval_;
   NodeAvailableHandler node_available_handler_;
   ActionHandler action_handler_;

@@ -20,12 +20,13 @@ std::string PeerEndpoint(const ChainNodeConfig& config) {
 PeerConnectivityController::PeerConnectivityController(
     const ChainDriver& driver, std::vector<ChainNodeConfig> nodes,
     std::map<std::string, PeerCountPolicy> policies,
-    std::chrono::milliseconds interval,
+    AllowedPeerMap allowed_peers, std::chrono::milliseconds interval,
     NodeAvailableHandler node_available_handler, ActionHandler action_handler,
     FailureHandler failure_handler)
     : driver_(driver),
       nodes_(std::move(nodes)),
       policies_(std::move(policies)),
+      allowed_peers_(std::move(allowed_peers)),
       interval_(interval),
       node_available_handler_(std::move(node_available_handler)),
       action_handler_(std::move(action_handler)),
@@ -41,6 +42,19 @@ PeerConnectivityController::PeerConnectivityController(
   if (!node_available_handler_ || !action_handler_ || !failure_handler_) {
     throw std::runtime_error(
         "peer connectivity controller requires all handlers");
+  }
+  if (allowed_peers_.size() != nodes_.size()) {
+    throw std::runtime_error(
+        "peer connectivity controller requires allowed peers for every node");
+  }
+  for (const ChainNodeConfig& node : nodes_) {
+    const auto allowed = allowed_peers_.find(node.id);
+    if (allowed == allowed_peers_.end()) {
+      throw std::runtime_error(
+          "peer connectivity controller is missing allowed peers for " +
+          node.id);
+    }
+    ValidateAllowedPeers(node.id, allowed->second);
   }
   for (const auto& [node_id, policy] : policies_) {
     ValidatePolicy(node_id, policy);
@@ -77,6 +91,22 @@ void PeerConnectivityController::SetPolicy(std::string_view node_id,
   last_failures_.erase(std::string(node_id));
 }
 
+void PeerConnectivityController::SetAllowedPeers(
+    std::string_view node_id, std::vector<std::string> peer_node_ids) {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  ValidateAllowedPeers(node_id, peer_node_ids);
+  const auto policy = policies_.find(std::string(node_id));
+  if (policy != policies_.end() &&
+      policy->second.minimum() > peer_node_ids.size()) {
+    throw std::runtime_error(
+        "peer policy minimum exceeds allowed logical peers for " +
+        std::string(node_id));
+  }
+  allowed_peers_.insert_or_assign(std::string(node_id),
+                                  std::move(peer_node_ids));
+  last_failures_.erase(std::string(node_id));
+}
+
 void PeerConnectivityController::ConnectPeer(std::string_view node_id,
                                              std::string_view peer_node_id,
                                              std::chrono::seconds timeout,
@@ -86,6 +116,11 @@ void PeerConnectivityController::ConnectPeer(std::string_view node_id,
   const ChainNodeConfig& peer = FindNode(peer_node_id);
   if (node.id == peer.id) {
     throw std::runtime_error("peer source and target must differ");
+  }
+  const std::vector<std::string>& allowed = AllowedPeers(node.id);
+  if (std::find(allowed.begin(), allowed.end(), peer.id) == allowed.end()) {
+    throw std::runtime_error("peer target is not an active logical edge from " +
+                             node.id + ": " + peer.id);
   }
   if (!node_available_handler_(node.id) || !node_available_handler_(peer.id)) {
     throw std::runtime_error("peer source and target must both be running");
@@ -127,6 +162,33 @@ const ChainNodeConfig& PeerConnectivityController::FindNode(
   return *node;
 }
 
+const std::vector<std::string>& PeerConnectivityController::AllowedPeers(
+    std::string_view node_id) const {
+  const auto allowed = allowed_peers_.find(std::string(node_id));
+  if (allowed == allowed_peers_.end()) {
+    throw std::runtime_error("missing allowed peer set for simulation node: " +
+                             std::string(node_id));
+  }
+  return allowed->second;
+}
+
+void PeerConnectivityController::ValidateAllowedPeers(
+    std::string_view node_id,
+    const std::vector<std::string>& peer_node_ids) const {
+  const ChainNodeConfig& node = FindNode(node_id);
+  std::set<std::string> unique;
+  for (const std::string& peer_node_id : peer_node_ids) {
+    const ChainNodeConfig& peer = FindNode(peer_node_id);
+    if (peer.id == node.id) {
+      throw std::runtime_error("allowed peer set must not contain its node");
+    }
+    if (!unique.insert(peer.id).second) {
+      throw std::runtime_error("allowed peer set contains a duplicate peer: " +
+                               peer.id);
+    }
+  }
+}
+
 void PeerConnectivityController::RequireUnambiguousPeerIdentity(
     const ChainNodeConfig& node, std::stop_token stop_token) const {
   std::vector<std::string> candidate_endpoints;
@@ -147,6 +209,10 @@ void PeerConnectivityController::ValidatePolicy(
   if (policy.maximum() > maximum_possible) {
     throw std::runtime_error("maximum peer count for " + std::string(node_id) +
                              " exceeds available simulation peers");
+  }
+  if (policy.minimum() > AllowedPeers(node_id).size()) {
+    throw std::runtime_error("minimum peer count for " + std::string(node_id) +
+                             " exceeds allowed logical peers");
   }
 }
 
@@ -188,8 +254,9 @@ void PeerConnectivityController::EnforcePolicy(const ChainNodeConfig& node,
                                                std::stop_token stop_token) {
   std::vector<const ChainNodeConfig*> candidates;
   std::vector<std::string> candidate_endpoints;
-  for (const ChainNodeConfig& candidate : nodes_) {
-    if (candidate.id == node.id || !node_available_handler_(candidate.id)) {
+  for (const std::string& peer_node_id : AllowedPeers(node.id)) {
+    const ChainNodeConfig& candidate = FindNode(peer_node_id);
+    if (!node_available_handler_(candidate.id)) {
       continue;
     }
     candidates.push_back(&candidate);

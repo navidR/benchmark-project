@@ -181,6 +181,14 @@ std::vector<bbp::ChainNodeConfig> TestNodes() {
   return nodes;
 }
 
+bbp::PeerConnectivityController::AllowedPeerMap FullAllowedPeers() {
+  return {
+      {"node-1", {"node-2", "node-3"}},
+      {"node-2", {"node-1", "node-3"}},
+      {"node-3", {"node-1", "node-2"}},
+  };
+}
+
 bool WaitFor(const std::function<bool()>& predicate) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -199,7 +207,8 @@ BOOST_AUTO_TEST_CASE(peer_connectivity_controller_enforces_typed_range) {
   TestChainDriver driver;
   bbp::PeerConnectivityController controller(
       driver, TestNodes(), {{"node-1", bbp::PeerCountPolicy(1U, 2U)}},
-      std::chrono::milliseconds(5), [](std::string_view) { return true; },
+      FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
       [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
          const bbp::PeerCountPolicy&) {},
       [](std::string_view, std::string_view) {});
@@ -224,7 +233,7 @@ BOOST_AUTO_TEST_CASE(peer_connectivity_controller_enforces_typed_range) {
 BOOST_AUTO_TEST_CASE(peer_connectivity_controller_rejects_impossible_policy) {
   TestChainDriver driver;
   bbp::PeerConnectivityController controller(
-      driver, TestNodes(), {}, std::chrono::milliseconds(5),
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
       [](std::string_view) { return true; },
       [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
          const bbp::PeerCountPolicy&) {},
@@ -236,4 +245,63 @@ BOOST_AUTO_TEST_CASE(peer_connectivity_controller_rejects_impossible_policy) {
   BOOST_CHECK_THROW(
       controller.SetPolicy("missing", bbp::PeerCountPolicy(0U, 1U)),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_enforces_logical_peer_eligibility) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController::AllowedPeerMap allowed = {
+      {"node-1", {"node-3"}},
+      {"node-2", {"node-1"}},
+      {"node-3", {"node-1"}},
+  };
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {{"node-1", bbp::PeerCountPolicy(1U, 1U)}}, allowed,
+      std::chrono::milliseconds(5), [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  controller.Start();
+  BOOST_REQUIRE(
+      WaitFor([&] { return driver.ConnectionCount("node-1") == 1U; }));
+  BOOST_TEST(driver.IsConnected("node-1", "10.0.0.3:18002"));
+  BOOST_CHECK_THROW(
+      controller.ConnectPeer("node-1", "node-2", std::chrono::seconds(1)),
+      std::runtime_error);
+
+  controller.SetAllowedPeers("node-1", {"node-2"});
+  controller.DisconnectPeer("node-1", "node-3", std::chrono::seconds(1));
+  controller.ConnectPeer("node-1", "node-2", std::chrono::seconds(1));
+  BOOST_TEST(driver.IsConnected("node-1", "10.0.0.2:18001"));
+  BOOST_TEST(!driver.IsConnected("node-1", "10.0.0.3:18002"));
+  controller.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(peer_connectivity_controller_validates_allowed_peer_sets) {
+  TestChainDriver driver;
+  BOOST_CHECK_THROW(
+      bbp::PeerConnectivityController(
+          driver, TestNodes(), {}, {{"node-1", {}}},
+          std::chrono::milliseconds(5), [](std::string_view) { return true; },
+          [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+             const bbp::PeerCountPolicy&) {},
+          [](std::string_view, std::string_view) {}),
+      std::runtime_error);
+
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+  BOOST_CHECK_THROW(controller.SetAllowedPeers("node-1", {"node-1"}),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(controller.SetAllowedPeers("node-1", {"node-2", "node-2"}),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(controller.SetAllowedPeers("node-1", {"missing"}),
+                    std::runtime_error);
+  controller.SetPolicy("node-1", bbp::PeerCountPolicy(2U, 2U));
+  BOOST_CHECK_THROW(controller.SetAllowedPeers("node-1", {"node-2"}),
+                    std::runtime_error);
 }

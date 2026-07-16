@@ -6712,6 +6712,24 @@ std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
   return policies;
 }
 
+PeerConnectivityController::AllowedPeerMap InitialAllowedPeers(
+    const Options& options, const std::vector<NodeRuntime>& nodes) {
+  PeerConnectivityController::AllowedPeerMap allowed;
+  for (std::uint32_t node_index = 0; node_index < nodes.size(); ++node_index) {
+    std::vector<std::string> peer_ids;
+    for (const std::uint32_t peer_index : ResolvePeerTopologyPeerIndexes(
+             options.topology.peer_topology, options.nodes, node_index)) {
+      if (peer_index >= nodes.size()) {
+        throw std::runtime_error(
+            "logical topology peer references an unknown running node");
+      }
+      peer_ids.push_back(nodes[peer_index].config.id);
+    }
+    allowed.emplace(nodes[node_index].config.id, std::move(peer_ids));
+  }
+  return allowed;
+}
+
 std::string ScheduledBlockDetail(const std::vector<std::string>& hashes) {
   boost::json::object detail;
   boost::json::array block_hashes;
@@ -6989,7 +7007,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
     peer_connectivity_controller = std::make_unique<PeerConnectivityController>(
         driver, log_nodes, InitialPeerCountPolicies(options, nodes),
-        options.metrics_interval,
+        InitialAllowedPeers(options, nodes), options.metrics_interval,
         [&](std::string_view node_id) {
           return FindNodeRuntimeById(nodes, std::string(node_id))
               .AllowsChainMetrics();

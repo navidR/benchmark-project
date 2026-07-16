@@ -601,6 +601,12 @@ address plan permits at most 15 outgoing destination bands per source. The
 configured and resolved edge conditions are preserved in
 `resolved-scenario.json` and in the shared CLI/TUI run report.
 
+Active outgoing edges are also the authoritative allowed-peer set for each
+node. Background peer-count enforcement selects only allowed logical peers, and
+scenario or TUI `connect_peer` actions reject a target that is not an active
+outgoing edge. `disconnect_peer` remains available for removing a stale session
+after topology changes.
+
 Partition and region node groups must assign every simulated node exactly once.
 Region edges connect the first node in each region as its gateway; without
 explicit `region_edges`, all region gateways form a backbone mesh. A latency
