@@ -1,0 +1,48 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "wallet-distribution-strategies",
+  "nodes": 5,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 5,
+    "wallet_node_count": 4,
+    "miner_node_count": 1,
+    "wallet_nodes": [1, 2, 3, 4],
+    "miner_nodes": [5],
+    "wallet_initialization": {"strategy": "driver_rpc", "mode": "public"}
+  },
+  "workloads": [
+    {
+      "type": "wallet_transactions",
+      "strategy": "fanout",
+      "sender_wallets": [1, 3],
+      "transaction_count": 8,
+      "amount": {
+        "distribution": "uniform",
+        "min": "0.10000000",
+        "max": "0.20000000"
+      },
+      "interval": {
+        "distribution": "uniform",
+        "min": "10ms",
+        "max": "25ms"
+      },
+      "fee": "0.00001000",
+      "funding_threshold": "0.20001000"
+    },
+    {
+      "type": "wallet_transactions",
+      "strategy": "hotspot",
+      "receiver_wallets": [2, 4],
+      "transaction_count": 8,
+      "amount": {
+        "distribution": "fixed",
+        "min": "0.15000000",
+        "max": "0.15000000"
+      },
+      "interval": "15ms",
+      "fee": "0.00001000"
+    }
+  ]
+}

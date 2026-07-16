@@ -1199,3 +1199,63 @@ BOOST_AUTO_TEST_CASE(run_report_reduces_profile_updates_and_active_profiles) {
 
   std::filesystem::remove_all(dir);
 }
+
+BOOST_AUTO_TEST_CASE(
+    run_report_aggregates_distributed_wallet_transaction_amounts) {
+  const std::filesystem::path dir =
+      MakeTestDir("run-report-wallet-distributions");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"r1","nodes":2,"workloads":[{"type":"wallet_transactions","strategy":"fanout","sender_wallets":[1],"transaction_count":2,"amount":{"distribution":"uniform","min":"0.00000011","max":"0.00000019"},"interval":{"distribution":"uniform","min":"5ms","max":"9ms"},"fee":"0.00000001","seed":7}]})"
+      "\n");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-1","event":"wallet_address_created","detail":"{\"wallet_index\":1,\"node\":1,\"strategy\":\"driver_rpc\",\"mode\":\"public\",\"address\":\"addr1\"}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-2","event":"wallet_address_created","detail":"{\"wallet_index\":2,\"node\":2,\"strategy\":\"driver_rpc\",\"mode\":\"public\",\"address\":\"addr2\"}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-1","event":"wallet_transaction_submitted","detail":"{\"transaction_index\":1,\"transaction_count\":2,\"strategy\":\"fanout\",\"seed\":7,\"sender_wallet_index\":1,\"receiver_wallet_index\":2,\"sender_node\":1,\"receiver_node\":2,\"amount_satoshis\":11,\"interval_before_ms\":0,\"amount_distribution\":{\"distribution\":\"uniform\",\"min_satoshis\":11,\"max_satoshis\":19}}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-1","event":"wallet_transaction_submitted","detail":"{\"transaction_index\":2,\"transaction_count\":2,\"strategy\":\"fanout\",\"seed\":7,\"sender_wallet_index\":1,\"receiver_wallet_index\":2,\"sender_node\":1,\"receiver_node\":2,\"amount_satoshis\":19,\"interval_before_ms\":7,\"amount_distribution\":{\"distribution\":\"uniform\",\"min_satoshis\":11,\"max_satoshis\":19}}"})");
+
+  const boost::json::value report_value =
+      boost::json::parse(bbp::BuildRunReportJson(dir));
+  const boost::json::object& report = report_value.as_object();
+  const boost::json::array& transactions =
+      report.at("wallet_transactions").as_array();
+  BOOST_REQUIRE_EQUAL(transactions.size(), 2U);
+  const boost::json::object& second =
+      transactions[1].as_object().at("detail").as_object();
+  BOOST_TEST(second.at("strategy").as_string() == "fanout");
+  BOOST_TEST(JsonInteger(second, "amount_satoshis") == 19U);
+  BOOST_TEST(JsonInteger(second, "interval_before_ms") == 7U);
+  BOOST_TEST(second.at("amount_distribution")
+                 .as_object()
+                 .at("distribution")
+                 .as_string() == "uniform");
+
+  const boost::json::array& wallets = report.at("wallets_summary").as_array();
+  BOOST_REQUIRE_EQUAL(wallets.size(), 2U);
+  BOOST_TEST(JsonInteger(wallets[0].as_object(), "transactions_sent") == 2U);
+  BOOST_TEST(JsonInteger(wallets[0].as_object(),
+                         "simulated_amount_sent_satoshis") == 30U);
+  BOOST_TEST(JsonInteger(wallets[1].as_object(), "transactions_received") ==
+             2U);
+  BOOST_TEST(JsonInteger(wallets[1].as_object(),
+                         "simulated_amount_received_satoshis") == 30U);
+
+  const boost::json::object& workload =
+      report.at("workloads").as_array().front().as_object();
+  BOOST_TEST(workload.at("strategy").as_string() == "fanout");
+  BOOST_TEST(
+      JsonIntegerValue(workload.at("sender_wallets").as_array().front()) == 1U);
+  BOOST_TEST(workload.at("amount").as_object().at("distribution").as_string() ==
+             "uniform");
+  BOOST_TEST(workload.at("interval").as_object().at("max").as_string() ==
+             "9ms");
+
+  std::filesystem::remove_all(dir);
+}

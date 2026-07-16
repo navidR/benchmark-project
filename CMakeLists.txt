@@ -172,6 +172,7 @@ add_executable(bbp
   src/tui_command_parser.cpp
   src/util.cpp
   src/wallet_funding_strategy.cpp
+  src/wallet_transaction_plan.cpp
   src/yaml_helpers.cpp
 )
 
@@ -233,6 +234,7 @@ if(BUILD_TESTING)
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
     tests/unit/wallet_funding_strategy_tests.cpp
+    tests/unit/wallet_transaction_plan_tests.cpp
     tests/unit/wallet_transfer_strategy_tests.cpp
     tests/unit/workload_kind_tests.cpp
     src/capability.cpp
@@ -272,6 +274,7 @@ if(BUILD_TESTING)
     src/tui_command_parser.cpp
     src/util.cpp
     src/wallet_funding_strategy.cpp
+    src/wallet_transaction_plan.cpp
   )
   target_include_directories(bbp-unit-tests PRIVATE include)
   target_compile_definitions(bbp-unit-tests PRIVATE
@@ -407,6 +410,12 @@ if(BUILD_TESTING)
     COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-random-transactions-scenario.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-wallet-distribution-strategies
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-distribution-strategies.json"
       --probe-capabilities
   )
   add_test(NAME bbp-valid-resource-pressure-scenario
@@ -843,6 +852,116 @@ if(BUILD_TESTING)
     bbp-invalid-wallet-funding-threshold
     tests/scenarios/invalid-wallet-funding-threshold.json
     "scenario wallet_transactions funding_threshold must cover amount plus fee"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-transfer-strategy
+    tests/scenarios/invalid-wallet-transfer-strategy.json
+    "scenario wallet_transactions strategy must be round_robin, random, fanout, or hotspot"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-amount-shape
+    tests/scenarios/invalid-wallet-amount-shape.json
+    "invalid fixed-8 amount JSON field: amount"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-amount-distribution
+    tests/scenarios/invalid-wallet-amount-distribution.json
+    "amount distribution must be fixed or uniform"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-amount-distribution-missing-bound
+    tests/scenarios/invalid-wallet-amount-distribution-missing-bound.json
+    "amount distribution requires min and max"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-amount-distribution-field
+    tests/scenarios/invalid-wallet-amount-distribution-field.json
+    "amount distribution contains unsupported field: mean"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-amount-distribution-zero
+    tests/scenarios/invalid-wallet-amount-distribution-zero.json
+    "scenario wallet_transactions amount must be greater than zero"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-amount-distribution-inverted
+    tests/scenarios/invalid-wallet-amount-distribution-inverted.json
+    "scenario wallet_transactions amount distribution min must be <= max"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-interval-shape
+    tests/scenarios/invalid-wallet-interval-shape.json
+    "interval must be a duration string"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-interval-distribution-missing-bound
+    tests/scenarios/invalid-wallet-interval-distribution-missing-bound.json
+    "interval distribution requires min and max"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-interval-distribution-inverted
+    tests/scenarios/invalid-wallet-interval-distribution-inverted.json
+    "scenario wallet_transactions interval distribution min must be <= max"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-selector-shape
+    tests/scenarios/invalid-wallet-selector-shape.json
+    "scenario wallet_transactions sender_wallets must be a JSON array"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-selector-range
+    tests/scenarios/invalid-wallet-selector-range.json
+    "scenario wallet_transactions sender_wallets values must be in 1..wallet_count"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-selector-duplicate
+    tests/scenarios/invalid-wallet-selector-duplicate.json
+    "scenario wallet_transactions sender_wallets contains a duplicate"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-fanout-missing-senders
+    tests/scenarios/invalid-wallet-fanout-missing-senders.json
+    "scenario wallet_transactions fanout requires sender_wallets"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-fanout-all-senders
+    tests/scenarios/invalid-wallet-fanout-all-senders.json
+    "scenario wallet_transactions fanout sender_wallets must leave at least one receiver"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-fanout-receivers
+    tests/scenarios/invalid-wallet-fanout-receivers.json
+    "scenario wallet_transactions fanout does not accept receiver_wallets"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-hotspot-missing-receivers
+    tests/scenarios/invalid-wallet-hotspot-missing-receivers.json
+    "scenario wallet_transactions hotspot requires receiver_wallets"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-hotspot-all-receivers
+    tests/scenarios/invalid-wallet-hotspot-all-receivers.json
+    "scenario wallet_transactions hotspot receiver_wallets must leave at least one sender"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-hotspot-senders
+    tests/scenarios/invalid-wallet-hotspot-senders.json
+    "scenario wallet_transactions hotspot does not accept sender_wallets"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-selector-strategy
+    tests/scenarios/invalid-wallet-selector-strategy.json
+    "scenario wallet_transactions wallet selectors require fanout or hotspot strategy"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-distribution-funding-threshold
+    tests/scenarios/invalid-wallet-distribution-funding-threshold.json
+    "scenario wallet_transactions funding_threshold must cover amount plus fee"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-distribution-overflow
+    tests/scenarios/invalid-wallet-distribution-overflow.json
+    "scenario wallet_transactions amount plus fee overflows uint64"
   )
   add_cli_failure_test(
     bbp-invalid-restart-node-node

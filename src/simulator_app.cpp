@@ -61,6 +61,7 @@
 #include "bbp/simulator/legacy_cli_inputs.h"
 #include "bbp/simulator/node_runtime.h"
 #include "bbp/simulator/options.h"
+#include "bbp/simulator/wallet_transaction_plan.h"
 #include "bbp/simulator/yaml_helpers.h"
 #include "bbp/tui.h"
 #include "bbp/util.h"
@@ -369,6 +370,159 @@ uint64_t JsonOptionalAmountField(const boost::json::object& object,
     return default_value;
   }
   return JsonFixed8Amount(*value, field);
+}
+
+ValueDistributionKind ParseValueDistributionKind(std::string_view value,
+                                                 std::string_view field) {
+  if (value == ValueDistributionKindName(ValueDistributionKind::kFixed)) {
+    return ValueDistributionKind::kFixed;
+  }
+  if (value == ValueDistributionKindName(ValueDistributionKind::kUniform)) {
+    return ValueDistributionKind::kUniform;
+  }
+  throw std::runtime_error(std::string(field) +
+                           " distribution must be fixed or uniform");
+}
+
+void ValidateDistributionObjectFields(const boost::json::object& object,
+                                      std::string_view field) {
+  for (const auto& [name, unused] : object) {
+    static_cast<void>(unused);
+    if (name != "distribution" && name != "min" && name != "max") {
+      throw std::runtime_error(
+          std::string(field) +
+          " distribution contains unsupported field: " + std::string(name));
+    }
+  }
+}
+
+AmountDistribution ParseAmountDistribution(const boost::json::object& object,
+                                           const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("missing wallet transaction amount");
+  }
+  if (!value->is_object()) {
+    const std::uint64_t amount = JsonFixed8Amount(*value, field);
+    return AmountDistribution{
+        .kind = ValueDistributionKind::kFixed,
+        .minimum_satoshis = amount,
+        .maximum_satoshis = amount,
+    };
+  }
+
+  const boost::json::object& distribution = value->as_object();
+  ValidateDistributionObjectFields(distribution, field);
+  const ValueDistributionKind kind = ParseValueDistributionKind(
+      JsonStringField(distribution, "distribution"), field);
+  const boost::json::value* minimum = distribution.if_contains("min");
+  const boost::json::value* maximum = distribution.if_contains("max");
+  if (minimum == nullptr || maximum == nullptr) {
+    throw std::runtime_error(std::string(field) +
+                             " distribution requires min and max");
+  }
+  AmountDistribution result{
+      .kind = kind,
+      .minimum_satoshis =
+          JsonFixed8Amount(*minimum, std::string(field) + ".min"),
+      .maximum_satoshis =
+          JsonFixed8Amount(*maximum, std::string(field) + ".max"),
+  };
+  if (result.minimum_satoshis == 0U) {
+    throw std::runtime_error(
+        "scenario wallet_transactions amount must be greater than zero");
+  }
+  if (result.minimum_satoshis > result.maximum_satoshis) {
+    throw std::runtime_error(
+        "scenario wallet_transactions amount distribution min must be <= max");
+  }
+  if (result.kind == ValueDistributionKind::kFixed &&
+      result.minimum_satoshis != result.maximum_satoshis) {
+    throw std::runtime_error(
+        "scenario wallet_transactions fixed amount distribution requires "
+        "equal min and max");
+  }
+  return result;
+}
+
+std::chrono::milliseconds ParseIntervalValue(const boost::json::value& value,
+                                             std::string_view field) {
+  if (!value.is_string()) {
+    throw std::runtime_error(std::string(field) + " must be a duration string");
+  }
+  return PositiveDuration::Parse(std::string_view(value.as_string())).value();
+}
+
+IntervalDistribution ParseIntervalDistribution(
+    const boost::json::object& object, const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return IntervalDistribution{};
+  }
+  if (!value->is_object()) {
+    const std::chrono::milliseconds interval =
+        ParseIntervalValue(*value, field);
+    return IntervalDistribution{
+        .kind = ValueDistributionKind::kFixed,
+        .minimum = interval,
+        .maximum = interval,
+    };
+  }
+
+  const boost::json::object& distribution = value->as_object();
+  ValidateDistributionObjectFields(distribution, field);
+  const ValueDistributionKind kind = ParseValueDistributionKind(
+      JsonStringField(distribution, "distribution"), field);
+  const boost::json::value* minimum = distribution.if_contains("min");
+  const boost::json::value* maximum = distribution.if_contains("max");
+  if (minimum == nullptr || maximum == nullptr) {
+    throw std::runtime_error(std::string(field) +
+                             " distribution requires min and max");
+  }
+  IntervalDistribution result{
+      .kind = kind,
+      .minimum = ParseIntervalValue(*minimum, std::string(field) + ".min"),
+      .maximum = ParseIntervalValue(*maximum, std::string(field) + ".max"),
+  };
+  if (result.minimum > result.maximum) {
+    throw std::runtime_error(
+        "scenario wallet_transactions interval distribution min must be <= "
+        "max");
+  }
+  if (result.kind == ValueDistributionKind::kFixed &&
+      result.minimum != result.maximum) {
+    throw std::runtime_error(
+        "scenario wallet_transactions fixed interval distribution requires "
+        "equal min and max");
+  }
+  return result;
+}
+
+std::vector<std::uint32_t> ParseWalletIndexList(
+    const boost::json::object& object, const char* field,
+    std::size_t wallet_count) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return {};
+  }
+  if (!value->is_array()) {
+    throw std::runtime_error(std::string("scenario wallet_transactions ") +
+                             field + " must be a JSON array");
+  }
+  std::vector<std::uint32_t> wallets;
+  for (const boost::json::value& entry : value->as_array()) {
+    const std::uint32_t wallet = JsonUint32Value(entry, field);
+    if (wallet == 0U || static_cast<std::size_t>(wallet) > wallet_count) {
+      throw std::runtime_error(std::string("scenario wallet_transactions ") +
+                               field + " values must be in 1..wallet_count");
+    }
+    if (std::find(wallets.begin(), wallets.end(), wallet) != wallets.end()) {
+      throw std::runtime_error(std::string("scenario wallet_transactions ") +
+                               field + " contains a duplicate");
+    }
+    wallets.push_back(wallet);
+  }
+  return wallets;
 }
 
 std::vector<uint32_t> JsonNodeGroupField(const boost::json::object& object,
@@ -815,7 +969,8 @@ WalletTransferStrategy ParseWalletTransferStrategy(std::string_view value) {
     return *strategy;
   }
   throw std::runtime_error(
-      "scenario wallet_transactions strategy must be round_robin or random");
+      "scenario wallet_transactions strategy must be round_robin, random, "
+      "fanout, or hotspot");
 }
 
 std::string_view PeerConnectivityModeName(PeerConnectivityMode mode) {
@@ -1344,21 +1499,43 @@ void ValidateWalletTransactionsWorkload(
         "scenario wallet_transactions funding_blocks_per_wallet must be >= "
         "readiness_confirmations");
   }
-  if (workload.amount_satoshis == 0U) {
+  if (workload.amount.minimum_satoshis == 0U) {
     throw std::runtime_error(
         "scenario wallet_transactions amount must be greater than zero");
+  }
+  if (workload.amount.minimum_satoshis > workload.amount.maximum_satoshis) {
+    throw std::runtime_error(
+        "scenario wallet_transactions amount distribution min must be <= max");
+  }
+  if (workload.amount.kind == ValueDistributionKind::kFixed &&
+      workload.amount.minimum_satoshis != workload.amount.maximum_satoshis) {
+    throw std::runtime_error(
+        "scenario wallet_transactions fixed amount distribution requires "
+        "equal min and max");
+  }
+  if (workload.interval.minimum.count() < 0 ||
+      workload.interval.minimum > workload.interval.maximum) {
+    throw std::runtime_error(
+        "scenario wallet_transactions interval distribution min must be <= "
+        "max");
+  }
+  if (workload.interval.kind == ValueDistributionKind::kFixed &&
+      workload.interval.minimum != workload.interval.maximum) {
+    throw std::runtime_error(
+        "scenario wallet_transactions fixed interval distribution requires "
+        "equal min and max");
   }
   if (workload.fee_satoshis == 0U) {
     throw std::runtime_error(
         "scenario wallet_transactions fee must be greater than zero");
   }
-  if (workload.amount_satoshis >
+  if (workload.amount.maximum_satoshis >
       std::numeric_limits<uint64_t>::max() - workload.fee_satoshis) {
     throw std::runtime_error(
         "scenario wallet_transactions amount plus fee overflows uint64");
   }
   const std::uint64_t minimum_funding_threshold =
-      workload.amount_satoshis + workload.fee_satoshis;
+      workload.amount.maximum_satoshis + workload.fee_satoshis;
   if (workload.funding_threshold_satoshis < minimum_funding_threshold) {
     throw std::runtime_error(
         "scenario wallet_transactions funding_threshold must cover amount "
@@ -1368,6 +1545,52 @@ void ValidateWalletTransactionsWorkload(
     throw std::runtime_error(
         "scenario wallet_transactions timeout_sec must be greater than zero");
   }
+
+  switch (workload.strategy) {
+    case WalletTransferStrategy::kRoundRobin:
+    case WalletTransferStrategy::kRandom:
+      if (!workload.sender_wallets.empty() ||
+          !workload.receiver_wallets.empty()) {
+        throw std::runtime_error(
+            "scenario wallet_transactions wallet selectors require fanout "
+            "or hotspot strategy");
+      }
+      break;
+    case WalletTransferStrategy::kFanout:
+      if (workload.sender_wallets.empty()) {
+        throw std::runtime_error(
+            "scenario wallet_transactions fanout requires sender_wallets");
+      }
+      if (!workload.receiver_wallets.empty()) {
+        throw std::runtime_error(
+            "scenario wallet_transactions fanout does not accept "
+            "receiver_wallets");
+      }
+      if (workload.sender_wallets.size() >= wallet_count) {
+        throw std::runtime_error(
+            "scenario wallet_transactions fanout sender_wallets must leave "
+            "at least one receiver");
+      }
+      break;
+    case WalletTransferStrategy::kHotspot:
+      if (workload.receiver_wallets.empty()) {
+        throw std::runtime_error(
+            "scenario wallet_transactions hotspot requires receiver_wallets");
+      }
+      if (!workload.sender_wallets.empty()) {
+        throw std::runtime_error(
+            "scenario wallet_transactions hotspot does not accept "
+            "sender_wallets");
+      }
+      if (workload.receiver_wallets.size() >= wallet_count) {
+        throw std::runtime_error(
+            "scenario wallet_transactions hotspot receiver_wallets must "
+            "leave at least one sender");
+      }
+      break;
+  }
+
+  static_cast<void>(BuildWalletTransactionPlan(wallet_count, workload));
 
   SimulationRegistry::FromTopology(options.topology,
                                    options.wallet_initialization);
@@ -2278,18 +2501,47 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
           options.topology.configured
               ? static_cast<uint32_t>(options.topology.wallet_nodes.size())
               : 0U);
-      transactions.amount_satoshis = JsonAmountField(workload, "amount");
+      transactions.amount = ParseAmountDistribution(workload, "amount");
+      transactions.interval = ParseIntervalDistribution(workload, "interval");
       transactions.fee_satoshis = JsonAmountField(workload, "fee");
       const std::uint64_t default_funding_threshold =
-          transactions.amount_satoshis <=
+          transactions.amount.maximum_satoshis <=
                   std::numeric_limits<std::uint64_t>::max() -
                       transactions.fee_satoshis
-              ? transactions.amount_satoshis + transactions.fee_satoshis
+              ? transactions.amount.maximum_satoshis + transactions.fee_satoshis
               : 0U;
       transactions.funding_threshold_satoshis = JsonOptionalAmountField(
           workload, "funding_threshold", default_funding_threshold);
       transactions.random_seed =
           JsonOptionalUint64Field(workload, "seed", transactions.random_seed);
+      const std::size_t wallet_count = options.topology.wallet_nodes.size();
+      transactions.sender_wallets =
+          ParseWalletIndexList(workload, "sender_wallets", wallet_count);
+      transactions.receiver_wallets =
+          ParseWalletIndexList(workload, "receiver_wallets", wallet_count);
+      const bool sender_wallets_present =
+          workload.if_contains("sender_wallets") != nullptr;
+      const bool receiver_wallets_present =
+          workload.if_contains("receiver_wallets") != nullptr;
+      if ((transactions.strategy == WalletTransferStrategy::kRoundRobin ||
+           transactions.strategy == WalletTransferStrategy::kRandom) &&
+          (sender_wallets_present || receiver_wallets_present)) {
+        throw std::runtime_error(
+            "scenario wallet_transactions wallet selectors require fanout "
+            "or hotspot strategy");
+      }
+      if (transactions.strategy == WalletTransferStrategy::kFanout &&
+          receiver_wallets_present) {
+        throw std::runtime_error(
+            "scenario wallet_transactions fanout does not accept "
+            "receiver_wallets");
+      }
+      if (transactions.strategy == WalletTransferStrategy::kHotspot &&
+          sender_wallets_present) {
+        throw std::runtime_error(
+            "scenario wallet_transactions hotspot does not accept "
+            "sender_wallets");
+      }
       transactions.timeout_sec =
           OptionProvided(vm, "sync-timeout-sec")
               ? options.sync_timeout_sec
@@ -5124,6 +5376,68 @@ boost::json::array TxIdsJson(const std::vector<std::string>& txids) {
   return array;
 }
 
+boost::json::array WalletIndexesJson(
+    const std::vector<std::uint32_t>& wallets) {
+  boost::json::array array;
+  array.reserve(wallets.size());
+  for (const std::uint32_t wallet : wallets) {
+    array.emplace_back(wallet);
+  }
+  return array;
+}
+
+boost::json::object AmountDistributionDetail(
+    const AmountDistribution& distribution) {
+  boost::json::object object;
+  object["distribution"] =
+      std::string(ValueDistributionKindName(distribution.kind));
+  object["min"] = FormatFixed8Amount(distribution.minimum_satoshis);
+  object["max"] = FormatFixed8Amount(distribution.maximum_satoshis);
+  object["min_satoshis"] = distribution.minimum_satoshis;
+  object["max_satoshis"] = distribution.maximum_satoshis;
+  return object;
+}
+
+boost::json::object IntervalDistributionDetail(
+    const IntervalDistribution& distribution) {
+  boost::json::object object;
+  object["distribution"] =
+      std::string(ValueDistributionKindName(distribution.kind));
+  object["min_ms"] = distribution.minimum.count();
+  object["max_ms"] = distribution.maximum.count();
+  return object;
+}
+
+boost::json::value AmountDistributionConfigurationJson(
+    const AmountDistribution& distribution) {
+  if (distribution.kind == ValueDistributionKind::kFixed) {
+    return boost::json::value(
+        FormatFixed8Amount(distribution.minimum_satoshis));
+  }
+  boost::json::object object;
+  object["distribution"] =
+      std::string(ValueDistributionKindName(distribution.kind));
+  object["min"] = FormatFixed8Amount(distribution.minimum_satoshis);
+  object["max"] = FormatFixed8Amount(distribution.maximum_satoshis);
+  return object;
+}
+
+boost::json::value IntervalDistributionConfigurationJson(
+    const IntervalDistribution& distribution) {
+  const auto duration_text = [](std::chrono::milliseconds duration) {
+    return std::to_string(duration.count()) + "ms";
+  };
+  if (distribution.kind == ValueDistributionKind::kFixed) {
+    return boost::json::value(duration_text(distribution.minimum));
+  }
+  boost::json::object object;
+  object["distribution"] =
+      std::string(ValueDistributionKindName(distribution.kind));
+  object["min"] = duration_text(distribution.minimum);
+  object["max"] = duration_text(distribution.maximum);
+  return object;
+}
+
 std::string WalletFundingDetail(
     uint32_t workload_index, uint32_t workload_count,
     const WalletTransactionsWorkload& workload, const WalletIdentity& wallet,
@@ -5159,6 +5473,9 @@ std::string WalletFundingDetail(
   detail["funding_threshold_satoshis"] = workload.funding_threshold_satoshis;
   detail["ready_balance"] = FormatFixed8Amount(ready_balance_satoshis);
   detail["ready_balance_satoshis"] = ready_balance_satoshis;
+  detail["amount_distribution"] = AmountDistributionDetail(workload.amount);
+  detail["interval_distribution"] =
+      IntervalDistributionDetail(workload.interval);
   return boost::json::serialize(detail);
 }
 
@@ -5171,7 +5488,8 @@ std::string WalletTransactionDetail(
     uint64_t funding_ready_height,
     const ChainWalletFundingResult& funding_preparation,
     uint64_t funding_preparation_hash_count,
-    uint64_t funding_ready_balance_satoshis,
+    uint64_t funding_ready_balance_satoshis, uint64_t amount_satoshis,
+    std::chrono::milliseconds interval_before,
     const ChainWalletTransactionResult& transaction) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
@@ -5208,8 +5526,12 @@ std::string WalletTransactionDetail(
   detail["funding_ready_balance"] =
       FormatFixed8Amount(funding_ready_balance_satoshis);
   detail["funding_ready_balance_satoshis"] = funding_ready_balance_satoshis;
-  detail["amount"] = transaction.destination_amount;
-  detail["amount_satoshis"] = workload.amount_satoshis;
+  detail["amount_distribution"] = AmountDistributionDetail(workload.amount);
+  detail["interval_distribution"] =
+      IntervalDistributionDetail(workload.interval);
+  detail["interval_before_ms"] = interval_before.count();
+  detail["amount"] = FormatFixed8Amount(amount_satoshis);
+  detail["amount_satoshis"] = amount_satoshis;
   detail["requested_fee_rate"] = transaction.requested_fee_rate;
   detail["requested_fee_rate_satoshis"] = workload.fee_satoshis;
   detail["txids"] = TxIdsJson(transaction.txids);
@@ -5977,9 +6299,20 @@ boost::json::object WalletTransactionsWorkloadJson(
   object["funding_threshold"] =
       FormatFixed8Amount(workload.funding_threshold_satoshis);
   object["transaction_count"] = workload.transaction_count;
-  object["amount"] = FormatFixed8Amount(workload.amount_satoshis);
+  object["amount"] = AmountDistributionConfigurationJson(workload.amount);
+  if (workload.interval.kind != ValueDistributionKind::kFixed ||
+      workload.interval.minimum != std::chrono::milliseconds(0)) {
+    object["interval"] =
+        IntervalDistributionConfigurationJson(workload.interval);
+  }
   object["fee"] = FormatFixed8Amount(workload.fee_satoshis);
   object["seed"] = workload.random_seed;
+  if (!workload.sender_wallets.empty()) {
+    object["sender_wallets"] = WalletIndexesJson(workload.sender_wallets);
+  }
+  if (!workload.receiver_wallets.empty()) {
+    object["receiver_wallets"] = WalletIndexesJson(workload.receiver_wallets);
+  }
   object["timeout_sec"] = workload.timeout_sec;
   return object;
 }
@@ -7315,38 +7648,6 @@ void ApplySendRawTransactionWorkload(
       std::chrono::seconds(workload.timeout_sec), stop_token);
 }
 
-std::vector<std::pair<size_t, size_t>> WalletTransferPlan(
-    const std::vector<WalletIdentity>& wallets,
-    const WalletTransactionsWorkload& workload) {
-  if (wallets.size() < 2U) {
-    throw std::runtime_error(
-        "wallet transfer plan requires at least two wallets");
-  }
-  std::vector<size_t> sender_order(wallets.size());
-  std::iota(sender_order.begin(), sender_order.end(), 0U);
-  switch (workload.strategy) {
-    case WalletTransferStrategy::kRoundRobin:
-      break;
-    case WalletTransferStrategy::kRandom: {
-      std::mt19937_64 rng(workload.random_seed);
-      std::shuffle(sender_order.begin(), sender_order.end(), rng);
-      break;
-    }
-  }
-
-  std::vector<std::pair<size_t, size_t>> plan;
-  plan.reserve(workload.transaction_count);
-  for (uint32_t transaction_index = 0;
-       transaction_index < workload.transaction_count; ++transaction_index) {
-    const size_t sender_position = transaction_index % sender_order.size();
-    const size_t receiver_position =
-        (sender_position + 1U) % sender_order.size();
-    plan.emplace_back(sender_order[sender_position],
-                      sender_order[receiver_position]);
-  }
-  return plan;
-}
-
 void ApplyWalletTransactionsWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
@@ -7472,13 +7773,18 @@ void ApplyWalletTransactionsWorkload(
     funding.push_back(std::move(state));
   }
 
-  const std::vector<std::pair<size_t, size_t>> transfer_plan =
-      WalletTransferPlan(wallets, workload);
+  const std::vector<WalletTransactionPlanEntry> transfer_plan =
+      BuildWalletTransactionPlan(wallets.size(), workload);
   for (size_t transaction_index = 0; transaction_index < transfer_plan.size();
        ++transaction_index) {
     ThrowIfStopRequested(stop_token);
-    const size_t sender_index = transfer_plan[transaction_index].first;
-    const size_t receiver_index = transfer_plan[transaction_index].second;
+    const WalletTransactionPlanEntry& plan_entry =
+        transfer_plan[transaction_index];
+    if (plan_entry.interval_before != std::chrono::milliseconds(0)) {
+      WaitForDuration(plan_entry.interval_before, stop_token);
+    }
+    const size_t sender_index = plan_entry.sender_index;
+    const size_t receiver_index = plan_entry.receiver_index;
     const WalletIdentity& sender = wallets[sender_index];
     const WalletIdentity& receiver = wallets[receiver_index];
     const FundingState& sender_funding = funding[sender_index];
@@ -7488,7 +7794,7 @@ void ApplyWalletTransactionsWorkload(
         driver.SendWalletTransaction(
             sender_node.config,
             ToChainWalletMode(registry.wallet_initialization()),
-            receiver.address, workload.amount_satoshis, workload.fee_satoshis,
+            receiver.address, plan_entry.amount_satoshis, workload.fee_satoshis,
             std::chrono::seconds(workload.timeout_sec), stop_token);
     WriteEvent(
         events_path, options.run_id, sender_node.config.id,
@@ -7501,7 +7807,8 @@ void ApplyWalletTransactionsWorkload(
             static_cast<uint64_t>(sender_funding.hashes.size()),
             sender_funding.ready_height, sender_funding.preparation,
             static_cast<uint64_t>(sender_funding.preparation_hashes.size()),
-            sender_funding.ready_balance_satoshis, transaction));
+            sender_funding.ready_balance_satoshis, plan_entry.amount_satoshis,
+            plan_entry.interval_before, transaction));
     if (transaction.txids.size() > std::numeric_limits<std::uint32_t>::max()) {
       throw std::runtime_error("wallet transaction txid count exceeds uint32");
     }
