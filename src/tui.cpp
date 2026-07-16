@@ -536,15 +536,53 @@ std::string SelectedPeerPolicyText(const boost::json::object& report,
       continue;
     }
     if (JsonBool(policy, "all_peers").value_or(false)) {
-      const boost::json::array* nodes = NodeSummaries(report);
-      const std::size_t count =
-          nodes == nullptr || nodes->empty() ? 0U : nodes->size() - 1U;
+      std::size_t count = 0U;
+      const boost::json::value* edges_value =
+          topology_value->as_object().if_contains("resolved_edges");
+      if (edges_value != nullptr && edges_value->is_array()) {
+        for (const boost::json::value& edge_value : edges_value->as_array()) {
+          if (!edge_value.is_object()) {
+            continue;
+          }
+          const std::optional<std::uint64_t> from =
+              JsonUnsignedMetric(edge_value.as_object(), "from");
+          if (from && *from == selected_node + 1U) {
+            ++count;
+          }
+        }
+      }
       return "all (" + std::to_string(count) + ")";
     }
     return "min " + JsonIntegerText(policy, "min_peer_count") + " / max " +
            JsonIntegerText(policy, "max_peer_count");
   }
   return "unmanaged";
+}
+
+std::string SelectedTopologyText(const boost::json::object& report,
+                                 std::size_t selected_node) {
+  const boost::json::value* topology_value = report.if_contains("topology");
+  if (topology_value == nullptr || !topology_value->is_object()) {
+    return "full_mesh";
+  }
+  const boost::json::object& topology = topology_value->as_object();
+  std::size_t eligible_count = 0U;
+  const boost::json::value* edges_value =
+      topology.if_contains("resolved_edges");
+  if (edges_value != nullptr && edges_value->is_array()) {
+    for (const boost::json::value& edge_value : edges_value->as_array()) {
+      if (!edge_value.is_object()) {
+        continue;
+      }
+      const std::optional<std::uint64_t> from =
+          JsonUnsignedMetric(edge_value.as_object(), "from");
+      if (from && *from == selected_node + 1U) {
+        ++eligible_count;
+      }
+    }
+  }
+  return JsonString(topology, "type", "full_mesh") + " / " +
+         std::to_string(eligible_count) + " eligible";
 }
 
 const boost::json::object* WalletForNode(const boost::json::object& report,
@@ -947,6 +985,12 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
       JsonMetricText(metric_object, "network_filter_match_packets") +
           " packets / " +
           JsonBytesKiBText(metric_object, "network_filter_match_bytes"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "topology",
+                SelectedTopologyText(report, selected_node));
   ++y;
   if (y >= bottom) {
     return;

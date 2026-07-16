@@ -266,6 +266,16 @@ uint64_t JsonUint64Value(const boost::json::value& value,
   throw std::runtime_error("invalid uint64 JSON field: " + std::string(field));
 }
 
+uint32_t JsonUint32Value(const boost::json::value& value,
+                         std::string_view field) {
+  const uint64_t parsed = JsonUint64Value(value, field);
+  if (parsed > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error("invalid uint32 JSON field: " +
+                             std::string(field));
+  }
+  return static_cast<uint32_t>(parsed);
+}
+
 std::optional<uint64_t> JsonOptionalUint64FieldValue(
     const boost::json::object& object, const char* field) {
   const boost::json::value* value = object.if_contains(field);
@@ -866,6 +876,208 @@ std::vector<PeerConnectivityPolicy> ParsePeerConnectivityPolicies(
   return policies;
 }
 
+PeerTopologyKind ParsePeerTopologyKind(std::string_view name) {
+  const std::optional<PeerTopologyKind> kind = PeerTopologyKindFromName(name);
+  if (!kind) {
+    throw std::runtime_error(
+        "scenario topology.type must be full_mesh, ring, star, random_graph, "
+        "scale_free_graph, latency_matrix, custom_edge_list, "
+        "partitioned_groups, or internet_like_region_graph");
+  }
+  return *kind;
+}
+
+std::vector<std::vector<uint32_t>> ParseTopologyNodeGroups(
+    const boost::json::object& object, const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || !value->is_array()) {
+    throw std::runtime_error("scenario topology." + std::string(field) +
+                             " must be a JSON array");
+  }
+  std::vector<std::vector<uint32_t>> groups;
+  for (const boost::json::value& group_value : value->as_array()) {
+    if (!group_value.is_array()) {
+      throw std::runtime_error("scenario topology." + std::string(field) +
+                               " entries must be JSON arrays");
+    }
+    boost::json::object wrapper;
+    wrapper["nodes"] = group_value;
+    groups.push_back(JsonNodeGroupField(wrapper, "nodes"));
+  }
+  return groups;
+}
+
+uint32_t ParseTopologyNode(const boost::json::object& object, const char* field,
+                           uint32_t node_count) {
+  const uint32_t node = JsonUint32Field(object, field);
+  if (node == 0U || node > node_count) {
+    throw std::runtime_error("scenario topology " + std::string(field) +
+                             " must be in 1..node_count");
+  }
+  return node - 1U;
+}
+
+PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
+                                       uint32_t node_count) {
+  PeerTopologyEdge edge;
+  edge.from = ParseTopologyNode(object, "from", node_count);
+  edge.to = ParseTopologyNode(object, "to", node_count);
+  edge.bidirectional =
+      JsonOptionalBoolField(object, "bidirectional", edge.bidirectional);
+  edge.active = JsonOptionalBoolField(object, "active", edge.active);
+  const boost::json::value* latency = object.if_contains("latency_ms");
+  if (latency != nullptr) {
+    edge.latency_ms = JsonUint32Value(*latency, "latency_ms");
+  }
+  return edge;
+}
+
+std::vector<PeerTopologyEdge> ParsePeerTopologyEdges(
+    const boost::json::object& object, uint32_t node_count) {
+  const boost::json::value* value = object.if_contains("edges");
+  if (value == nullptr || !value->is_array()) {
+    throw std::runtime_error("scenario topology.edges must be a JSON array");
+  }
+  std::vector<PeerTopologyEdge> edges;
+  for (const boost::json::value& edge_value : value->as_array()) {
+    if (!edge_value.is_object()) {
+      throw std::runtime_error(
+          "scenario topology.edges entries must be JSON objects");
+    }
+    edges.push_back(ParsePeerTopologyEdge(edge_value.as_object(), node_count));
+  }
+  return edges;
+}
+
+std::vector<std::vector<std::optional<uint32_t>>> ParseLatencyMatrix(
+    const boost::json::object& object) {
+  const boost::json::value* value = object.if_contains("latency_matrix_ms");
+  if (value == nullptr || !value->is_array()) {
+    throw std::runtime_error(
+        "scenario topology.latency_matrix_ms must be a JSON array");
+  }
+  std::vector<std::vector<std::optional<uint32_t>>> matrix;
+  for (const boost::json::value& row_value : value->as_array()) {
+    if (!row_value.is_array()) {
+      throw std::runtime_error(
+          "scenario topology.latency_matrix_ms rows must be JSON arrays");
+    }
+    std::vector<std::optional<uint32_t>> row;
+    for (const boost::json::value& cell : row_value.as_array()) {
+      if (cell.is_null()) {
+        row.push_back(std::nullopt);
+      } else {
+        row.push_back(JsonUint32Value(cell, "latency_matrix_ms"));
+      }
+    }
+    matrix.push_back(std::move(row));
+  }
+  return matrix;
+}
+
+std::vector<PeerTopologyRegionEdge> ParsePeerTopologyRegionEdges(
+    const boost::json::object& object, uint32_t region_count) {
+  const boost::json::value* value = object.if_contains("region_edges");
+  if (value == nullptr) {
+    return {};
+  }
+  if (!value->is_array()) {
+    throw std::runtime_error(
+        "scenario topology.region_edges must be a JSON array");
+  }
+  std::vector<PeerTopologyRegionEdge> edges;
+  for (const boost::json::value& edge_value : value->as_array()) {
+    if (!edge_value.is_object()) {
+      throw std::runtime_error(
+          "scenario topology.region_edges entries must be JSON objects");
+    }
+    const boost::json::object& edge_object = edge_value.as_object();
+    const uint32_t from = JsonUint32Field(edge_object, "from_region");
+    const uint32_t to = JsonUint32Field(edge_object, "to_region");
+    if (from == 0U || from > region_count || to == 0U || to > region_count) {
+      throw std::runtime_error(
+          "scenario topology region edge must reference a configured region");
+    }
+    PeerTopologyRegionEdge edge;
+    edge.from_region = from - 1U;
+    edge.to_region = to - 1U;
+    edge.bidirectional =
+        JsonOptionalBoolField(edge_object, "bidirectional", edge.bidirectional);
+    edge.active = JsonOptionalBoolField(edge_object, "active", edge.active);
+    edges.push_back(edge);
+  }
+  return edges;
+}
+
+PeerTopologyConfig ParsePeerTopologyConfig(const boost::json::object& object,
+                                           uint32_t node_count) {
+  PeerTopologyConfig topology;
+  topology.kind = ParsePeerTopologyKind(
+      JsonOptionalStringField(object, "type", "full_mesh"));
+  topology.seed = JsonOptionalUint64Field(object, "seed", 0U);
+  switch (topology.kind) {
+    case PeerTopologyKind::kFullMesh:
+    case PeerTopologyKind::kRing:
+      break;
+    case PeerTopologyKind::kStar: {
+      const uint32_t center_node =
+          JsonOptionalUint32Field(object, "center_node", 1U);
+      if (center_node == 0U || center_node > node_count) {
+        throw std::runtime_error(
+            "scenario topology center_node must be in 1..node_count");
+      }
+      topology.star_center = center_node - 1U;
+    } break;
+    case PeerTopologyKind::kRandomGraph:
+      topology.average_degree = JsonUint32Field(object, "average_degree");
+      break;
+    case PeerTopologyKind::kScaleFreeGraph:
+      topology.average_degree =
+          JsonOptionalUint32Field(object, "average_degree", 0U);
+      topology.attachment_count =
+          JsonOptionalUint32Field(object, "attachment_count", 0U);
+      break;
+    case PeerTopologyKind::kLatencyMatrix:
+      topology.latency_matrix_ms = ParseLatencyMatrix(object);
+      break;
+    case PeerTopologyKind::kCustomEdgeList:
+      topology.edges = ParsePeerTopologyEdges(object, node_count);
+      break;
+    case PeerTopologyKind::kPartitionedGroups:
+      topology.groups = ParseTopologyNodeGroups(object, "groups");
+      break;
+    case PeerTopologyKind::kInternetLikeRegionGraph:
+      topology.regions = ParseTopologyNodeGroups(object, "regions");
+      if (topology.regions.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error(
+            "scenario topology region count exceeds uint32");
+      }
+      topology.region_edges = ParsePeerTopologyRegionEdges(
+          object, static_cast<uint32_t>(topology.regions.size()));
+      break;
+  }
+  ResolvePeerTopologyEdges(topology, node_count);
+  return topology;
+}
+
+void ResolvePeerPolicyEligibility(NodeRoleTopology* topology) {
+  for (PeerConnectivityPolicy& policy : topology->peer_connectivity) {
+    const std::vector<uint32_t> eligible = ResolvePeerTopologyPeerIndexes(
+        topology->peer_topology, topology->node_count, policy.node);
+    if (policy.mode == PeerConnectivityMode::kAllPeers) {
+      if (eligible.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("eligible peer count exceeds uint32");
+      }
+      const uint32_t count = static_cast<uint32_t>(eligible.size());
+      policy.peer_count = PeerCountPolicy(count, count);
+    } else if (policy.peer_count.minimum() > eligible.size()) {
+      throw std::runtime_error(
+          "scenario topology.peer_connectivity min_peer_count exceeds the "
+          "node's eligible logical topology peers");
+    }
+  }
+}
+
 NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
                                              uint32_t nodes) {
   NodeRoleTopology topology;
@@ -945,8 +1157,10 @@ NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
         "scenario topology wallet_nodes and miner_nodes overlap but "
         "allow_miner_wallet_overlap is false");
   }
+  topology.peer_topology = ParsePeerTopologyConfig(object, topology.node_count);
   topology.peer_connectivity =
       ParsePeerConnectivityPolicies(object, topology.node_count);
+  ResolvePeerPolicyEligibility(&topology);
   return topology;
 }
 
@@ -2945,6 +3159,120 @@ boost::json::array PeerConnectivityPoliciesJson(
   return array;
 }
 
+boost::json::array TopologyGroupsJson(
+    const std::vector<std::vector<uint32_t>>& groups) {
+  boost::json::array array;
+  for (const std::vector<uint32_t>& group : groups) {
+    array.push_back(NodeGroupJson(group));
+  }
+  return array;
+}
+
+boost::json::array PeerTopologyEdgesJson(
+    const std::vector<PeerTopologyEdge>& edges) {
+  boost::json::array array;
+  for (const PeerTopologyEdge& edge : edges) {
+    boost::json::object object;
+    object["from"] = edge.from + 1U;
+    object["to"] = edge.to + 1U;
+    object["bidirectional"] = edge.bidirectional;
+    object["active"] = edge.active;
+    if (edge.latency_ms) {
+      object["latency_ms"] = *edge.latency_ms;
+    }
+    array.push_back(std::move(object));
+  }
+  return array;
+}
+
+boost::json::array PeerTopologyRegionEdgesJson(
+    const std::vector<PeerTopologyRegionEdge>& edges) {
+  boost::json::array array;
+  for (const PeerTopologyRegionEdge& edge : edges) {
+    boost::json::object object;
+    object["from_region"] = edge.from_region + 1U;
+    object["to_region"] = edge.to_region + 1U;
+    object["bidirectional"] = edge.bidirectional;
+    object["active"] = edge.active;
+    array.push_back(std::move(object));
+  }
+  return array;
+}
+
+boost::json::array LatencyMatrixJson(
+    const std::vector<std::vector<std::optional<uint32_t>>>& matrix) {
+  boost::json::array result;
+  for (const auto& input_row : matrix) {
+    boost::json::array row;
+    for (const std::optional<uint32_t>& latency_ms : input_row) {
+      if (latency_ms) {
+        row.push_back(*latency_ms);
+      } else {
+        row.push_back(nullptr);
+      }
+    }
+    result.push_back(std::move(row));
+  }
+  return result;
+}
+
+boost::json::array ResolvedPeerTopologyEdgesJson(
+    const PeerTopologyConfig& topology, uint32_t node_count) {
+  boost::json::array array;
+  for (const ResolvedPeerTopologyEdge& edge :
+       ResolvePeerTopologyEdges(topology, node_count)) {
+    boost::json::object object;
+    object["from"] = edge.from + 1U;
+    object["to"] = edge.to + 1U;
+    if (edge.latency_ms) {
+      object["latency_ms"] = *edge.latency_ms;
+    }
+    array.push_back(std::move(object));
+  }
+  return array;
+}
+
+void AddPeerTopologyJson(const PeerTopologyConfig& topology,
+                         uint32_t node_count, boost::json::object* object) {
+  (*object)["type"] = std::string(PeerTopologyKindName(topology.kind));
+  switch (topology.kind) {
+    case PeerTopologyKind::kFullMesh:
+    case PeerTopologyKind::kRing:
+      break;
+    case PeerTopologyKind::kStar:
+      (*object)["center_node"] = topology.star_center + 1U;
+      break;
+    case PeerTopologyKind::kRandomGraph:
+      (*object)["seed"] = topology.seed;
+      (*object)["average_degree"] = topology.average_degree;
+      break;
+    case PeerTopologyKind::kScaleFreeGraph:
+      (*object)["seed"] = topology.seed;
+      (*object)["average_degree"] = topology.average_degree;
+      (*object)["attachment_count"] = topology.attachment_count;
+      break;
+    case PeerTopologyKind::kLatencyMatrix:
+      (*object)["latency_matrix_ms"] =
+          LatencyMatrixJson(topology.latency_matrix_ms);
+      break;
+    case PeerTopologyKind::kCustomEdgeList:
+      (*object)["edges"] = PeerTopologyEdgesJson(topology.edges);
+      break;
+    case PeerTopologyKind::kPartitionedGroups:
+      (*object)["groups"] = TopologyGroupsJson(topology.groups);
+      break;
+    case PeerTopologyKind::kInternetLikeRegionGraph:
+      (*object)["regions"] = TopologyGroupsJson(topology.regions);
+      if (!topology.region_edges.empty()) {
+        (*object)["region_edges"] =
+            PeerTopologyRegionEdgesJson(topology.region_edges);
+      }
+      break;
+  }
+  (*object)["resolved_edges"] =
+      ResolvedPeerTopologyEdgesJson(topology, node_count);
+}
+
 boost::json::object NodeRoleTopologyJson(
     const NodeRoleTopology& topology,
     const WalletInitialization& wallet_initialization) {
@@ -2957,6 +3285,7 @@ boost::json::object NodeRoleTopologyJson(
   object["miner_nodes"] = NodeGroupJson(topology.miner_nodes);
   object["wallet_initialization"] =
       WalletInitializationJson(wallet_initialization);
+  AddPeerTopologyJson(topology.peer_topology, topology.node_count, &object);
   if (!topology.peer_connectivity.empty()) {
     object["peer_connectivity"] =
         PeerConnectivityPoliciesJson(topology.peer_connectivity);
@@ -3247,24 +3576,20 @@ std::string StartupPeerAddress(const Options& options,
 
 std::vector<uint32_t> ConfiguredStartupPeerIndexes(const Options& options,
                                                    uint32_t node_index) {
+  std::vector<uint32_t> eligible = ResolvePeerTopologyPeerIndexes(
+      options.topology.peer_topology, options.nodes, node_index);
   const PeerConnectivityPolicy* policy =
       FindPeerConnectivityPolicy(options.topology, node_index);
   if (policy == nullptr) {
-    return DefaultStartupPeerIndexes(options.nodes, node_index);
+    return eligible;
   }
   const uint32_t initial_peer_count = policy->peer_count.minimum();
-  std::vector<uint32_t> peers;
-  peers.reserve(initial_peer_count);
-  for (uint32_t peer_index = 0; peer_index < options.nodes; ++peer_index) {
-    if (peers.size() >= initial_peer_count) {
-      break;
-    }
-    if (peer_index == node_index) {
-      continue;
-    }
-    peers.push_back(peer_index);
+  if (initial_peer_count > eligible.size()) {
+    throw std::runtime_error(
+        "initial peer count exceeds eligible logical topology peers");
   }
-  return peers;
+  eligible.resize(initial_peer_count);
+  return eligible;
 }
 
 std::vector<std::string> StartupPeerAddresses(const Options& options,

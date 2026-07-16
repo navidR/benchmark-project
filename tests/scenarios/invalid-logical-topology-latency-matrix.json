@@ -1,0 +1,12 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "invalid-latency-matrix",
+  "node_count": 3,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 3,
+    "type": "latency_matrix",
+    "latency_matrix_ms": [[0, 10, null], [10, 0], [null, null, 1]]
+  }
+}

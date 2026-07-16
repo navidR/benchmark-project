@@ -559,6 +559,55 @@ single default miner.
 }
 ```
 
+Logical P2P topology is selected by the same typed `topology` object. The
+default is `full_mesh`; supported graph types are `ring`, `star`,
+`random_graph`, `scale_free_graph`, `latency_matrix`, `custom_edge_list`,
+`partitioned_groups`, and `internet_like_region_graph`. Seeded graph resolution
+is deterministic, node ids are 1-based in scenario files, and the canonical
+directed `resolved_edges` array is written to `resolved-scenario.json`.
+
+```json
+{
+  "node_count": 4,
+  "topology": {
+    "node_count": 4,
+    "type": "ring",
+    "peer_connectivity": [
+      {"node": 1, "all_peers": true}
+    ]
+  }
+}
+```
+
+`star` accepts `center_node`; `random_graph` accepts `seed` and
+`average_degree`; `scale_free_graph` accepts `seed` plus either
+`attachment_count` or `average_degree`. A custom edge has `from`, `to`,
+`bidirectional`, `active`, and optional `latency_ms` fields. Partition and
+region node groups must assign every simulated node exactly once. Region edges
+connect the first node in each region as its gateway; without explicit
+`region_edges`, all region gateways form a backbone mesh. A latency matrix uses
+`null` for an absent directed edge and a non-negative millisecond value for a
+present directed edge:
+
+```json
+{
+  "node_count": 3,
+  "topology": {
+    "node_count": 3,
+    "type": "latency_matrix",
+    "latency_matrix_ms": [
+      [0, 20, null],
+      [35, 0, 10],
+      [null, null, 0]
+    ]
+  }
+}
+```
+
+Peer-count policies are resolved against each node's eligible logical peers.
+`all_peers` means all active outgoing edges for that node, and an impossible
+minimum is rejected before any process or network resource is created.
+
 Raw Firo transactions can be driven without enabling the wallet. The workload
 mines mature funding to the source address, signs with the supplied regtest WIF,
 submits the transaction, and waits for it in the mempool:

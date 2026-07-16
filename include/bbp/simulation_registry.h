@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "bbp/default_peer_topology.h"
 #include "bbp/peer_connectivity_policy.h"
 
 namespace bbp {
@@ -19,6 +20,7 @@ struct NodeRoleTopology {
   bool allow_miner_wallet_overlap = false;
   std::vector<uint32_t> wallet_nodes;
   std::vector<uint32_t> miner_nodes;
+  PeerTopologyConfig peer_topology;
   std::vector<PeerConnectivityPolicy> peer_connectivity;
 };
 

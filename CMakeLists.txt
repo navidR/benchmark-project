@@ -362,6 +362,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-peer-connectivity-topology.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-logical-topology
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-logical-topology-scenario.json"
+      --probe-capabilities
+  )
   add_test(NAME bbp-valid-wallet-transactions-scenario
     COMMAND bbp
       --scenario-json
@@ -391,6 +397,16 @@ if(BUILD_TESTING)
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-scheduled-events-scenario.json"
       --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-logical-topology-latency-matrix
+    tests/scenarios/invalid-logical-topology-latency-matrix.json
+    "latency matrix column count must match node count"
+  )
+  add_cli_failure_test(
+    bbp-invalid-logical-topology-peer-policy
+    tests/scenarios/invalid-logical-topology-peer-policy.json
+    "min_peer_count exceeds the node's eligible logical topology peers"
   )
   add_cli_failure_test(
     bbp-invalid-scheduled-events-not-array

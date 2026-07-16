@@ -1,0 +1,15 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "invalid-topology-peer-policy",
+  "node_count": 4,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 4,
+    "type": "star",
+    "center_node": 1,
+    "peer_connectivity": [
+      {"node": 2, "min_peer_count": 2, "max_peer_count": 2}
+    ]
+  }
+}
