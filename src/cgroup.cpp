@@ -1,20 +1,26 @@
 #include "bbp/cgroup.h"
 
-#include "bbp/util.h"
-
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <cerrno>
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <charconv>
 #include <filesystem>
 #include <initializer_list>
+#include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
+
+#include "bbp/util.h"
 
 namespace bbp {
 namespace {
@@ -22,13 +28,19 @@ namespace {
 constexpr std::string_view kCgroupRoot = "/sys/fs/cgroup";
 constexpr std::string_view kSimulatorRootName = "bbp";
 
-std::filesystem::path CgroupRoot() { return std::filesystem::path(kCgroupRoot); }
+std::filesystem::path CgroupRoot() {
+  return std::filesystem::path(kCgroupRoot);
+}
 
 bool RunningInsideDocker() { return std::filesystem::exists("/.dockerenv"); }
 
 struct IoStatTotals {
   uint64_t read_bytes = 0;
   uint64_t write_bytes = 0;
+  uint64_t read_operations = 0;
+  uint64_t write_operations = 0;
+  uint64_t discard_bytes = 0;
+  uint64_t discard_operations = 0;
 };
 
 struct CpuMaxValue {
@@ -41,26 +53,51 @@ void WriteCgroupFile(const std::filesystem::path& dir, std::string_view file,
   WriteText(dir / std::string(file), value);
 }
 
-uint64_t ParseSingleUint(const std::filesystem::path& path) {
-  std::string text = ReadText(path);
-  size_t pos = 0;
-  while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) {
-    ++pos;
+uint64_t ParseUint64(std::string_view text, std::string_view context) {
+  if (text.empty()) {
+    throw std::runtime_error("empty uint64 value in " + std::string(context));
   }
-  return std::stoull(text.substr(pos));
+  uint64_t value = 0;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc() || end != text.data() + text.size()) {
+    throw std::runtime_error("invalid uint64 value in " + std::string(context) +
+                             ": " + std::string(text));
+  }
+  return value;
+}
+
+void CheckedAdd(uint64_t value, uint64_t* total, std::string_view context) {
+  if (value > std::numeric_limits<uint64_t>::max() - *total) {
+    throw std::runtime_error("uint64 overflow while summing " +
+                             std::string(context));
+  }
+  *total += value;
+}
+
+uint64_t ParseSingleUint(const std::filesystem::path& path) {
+  const std::vector<std::string> fields = SplitWhitespace(ReadText(path));
+  if (fields.size() != 1U) {
+    throw std::runtime_error("invalid single uint64 cgroup file: " +
+                             path.string());
+  }
+  return ParseUint64(fields.front(), path.string());
 }
 
 std::optional<uint64_t> ParseMaxOrUint(const std::filesystem::path& path) {
   const std::string text = ReadText(path);
   const std::vector<std::string> fields = SplitWhitespace(text);
   if (fields.empty()) {
-    throw std::runtime_error("empty cgroup max-or-uint file: " +
+    throw std::runtime_error("empty cgroup max-or-uint file: " + path.string());
+  }
+  if (fields.size() != 1U) {
+    throw std::runtime_error("invalid cgroup max-or-uint file: " +
                              path.string());
   }
   if (fields.front() == "max") {
     return std::nullopt;
   }
-  return std::stoull(fields.front());
+  return ParseUint64(fields.front(), path.string());
 }
 
 CpuMaxValue ParseCpuMax(const std::filesystem::path& path) {
@@ -70,29 +107,45 @@ CpuMaxValue ParseCpuMax(const std::filesystem::path& path) {
   }
   CpuMaxValue value;
   if (fields[0] != "max") {
-    value.quota_us = std::stoull(fields[0]);
+    value.quota_us = ParseUint64(fields[0], path.string());
   }
-  value.period_us = std::stoull(fields[1]);
+  value.period_us = ParseUint64(fields[1], path.string());
   return value;
 }
 
-uint64_t ParseKeyValue(const std::filesystem::path& path, std::string_view key) {
-  std::istringstream in(ReadText(path));
-  std::string name;
-  uint64_t value = 0;
-  while (in >> name >> value) {
-    if (name == key) {
-      return value;
+uint64_t ParseKeyValue(const std::filesystem::path& path,
+                       std::string_view key) {
+  std::istringstream lines(ReadText(path));
+  std::string line;
+  std::optional<uint64_t> result;
+  while (std::getline(lines, line)) {
+    const std::vector<std::string> fields = SplitWhitespace(line);
+    if (fields.empty()) {
+      continue;
+    }
+    if (fields.size() != 2U) {
+      throw std::runtime_error("invalid key/value cgroup line in " +
+                               path.string() + ": " + line);
+    }
+    const uint64_t value = ParseUint64(fields[1], path.string());
+    if (fields[0] == key) {
+      if (result) {
+        throw std::runtime_error("duplicate cgroup key in " + path.string() +
+                                 ": " + std::string(key));
+      }
+      result = value;
     }
   }
-  return 0;
+  return result.value_or(0U);
 }
 
-uint64_t ParseAssignmentUint(std::string_view token, std::string_view key) {
-  if (!token.starts_with(key) || token.size() == key.size()) {
-    return 0;
+std::optional<uint64_t> ParseAssignmentUint(std::string_view token,
+                                            std::string_view key,
+                                            const std::filesystem::path& path) {
+  if (!token.starts_with(key)) {
+    return std::nullopt;
   }
-  return std::stoull(std::string(token.substr(key.size())));
+  return ParseUint64(token.substr(key.size()), path.string());
 }
 
 IoStatTotals ParseIoStat(const std::filesystem::path& path) {
@@ -104,15 +157,125 @@ IoStatTotals ParseIoStat(const std::filesystem::path& path) {
   std::istringstream lines(ReadText(path));
   std::string line;
   while (std::getline(lines, line)) {
-    std::istringstream fields(line);
-    std::string token;
-    fields >> token;
-    while (fields >> token) {
-      totals.read_bytes += ParseAssignmentUint(token, "rbytes=");
-      totals.write_bytes += ParseAssignmentUint(token, "wbytes=");
+    const std::vector<std::string> fields = SplitWhitespace(line);
+    if (fields.empty()) {
+      continue;
+    }
+    ParseBlockDeviceId(fields.front());
+    std::set<std::string_view> seen;
+    for (size_t index = 1; index < fields.size(); ++index) {
+      const std::string_view token = fields[index];
+      const auto parse = [&](std::string_view key, uint64_t* total,
+                             std::string_view metric) {
+        const std::optional<uint64_t> value =
+            ParseAssignmentUint(token, key, path);
+        if (!value) {
+          return false;
+        }
+        if (!seen.insert(key).second) {
+          throw std::runtime_error("duplicate io.stat field in " +
+                                   path.string() + ": " + std::string(key));
+        }
+        CheckedAdd(*value, total, metric);
+        return true;
+      };
+      if (parse("rbytes=", &totals.read_bytes, "io read bytes") ||
+          parse("wbytes=", &totals.write_bytes, "io write bytes") ||
+          parse("rios=", &totals.read_operations, "io read operations") ||
+          parse("wios=", &totals.write_operations, "io write operations") ||
+          parse("dbytes=", &totals.discard_bytes, "io discard bytes") ||
+          parse("dios=", &totals.discard_operations, "io discard operations")) {
+        continue;
+      }
     }
   }
   return totals;
+}
+
+std::map<std::string, uint64_t> ParseMemoryStat(
+    const std::filesystem::path& path) {
+  std::map<std::string, uint64_t> result;
+  std::istringstream lines(ReadText(path));
+  std::string line;
+  while (std::getline(lines, line)) {
+    const std::vector<std::string> fields = SplitWhitespace(line);
+    if (fields.empty()) {
+      continue;
+    }
+    if (fields.size() != 2U || fields[0].empty()) {
+      throw std::runtime_error("invalid memory.stat line in " + path.string() +
+                               ": " + line);
+    }
+    const uint64_t value = ParseUint64(fields[1], path.string());
+    if (!result.emplace(fields[0], value).second) {
+      throw std::runtime_error("duplicate memory.stat key in " + path.string() +
+                               ": " + fields[0]);
+    }
+  }
+  return result;
+}
+
+std::vector<IoLimit> ParseIoMax(const std::filesystem::path& path) {
+  std::vector<IoLimit> limits;
+  if (!std::filesystem::exists(path)) {
+    return limits;
+  }
+  std::set<BlockDeviceId> devices;
+  std::istringstream lines(ReadText(path));
+  std::string line;
+  while (std::getline(lines, line)) {
+    const std::vector<std::string> fields = SplitWhitespace(line);
+    if (fields.empty()) {
+      continue;
+    }
+    IoLimit limit;
+    limit.device = ParseBlockDeviceId(fields.front());
+    if (!devices.insert(limit.device).second) {
+      throw std::runtime_error("duplicate device in " + path.string() + ": " +
+                               fields.front());
+    }
+    std::set<std::string_view> seen;
+    for (size_t index = 1; index < fields.size(); ++index) {
+      const std::string_view token = fields[index];
+      const auto assign = [&](std::string_view prefix,
+                              std::optional<uint64_t>* output) {
+        if (!token.starts_with(prefix)) {
+          return false;
+        }
+        if (!seen.insert(prefix).second) {
+          throw std::runtime_error("duplicate io.max field in " +
+                                   path.string() + ": " + std::string(prefix));
+        }
+        const std::string_view value = token.substr(prefix.size());
+        if (value == "max") {
+          output->reset();
+        } else {
+          *output = ParseUint64(value, path.string());
+        }
+        return true;
+      };
+      if (!assign("rbps=", &limit.read_bytes_per_sec) &&
+          !assign("wbps=", &limit.write_bytes_per_sec) &&
+          !assign("riops=", &limit.read_operations_per_sec) &&
+          !assign("wiops=", &limit.write_operations_per_sec)) {
+        throw std::runtime_error("unknown io.max field in " + path.string() +
+                                 ": " + std::string(token));
+      }
+    }
+    limits.push_back(std::move(limit));
+  }
+  return limits;
+}
+
+uint64_t ParseIoWeight(const std::filesystem::path& path) {
+  const std::vector<std::string> fields = SplitWhitespace(ReadText(path));
+  if (fields.size() == 2U && fields[0] == "default") {
+    return ParseUint64(fields[1], path.string());
+  }
+  if (fields.size() == 1U) {
+    return ParseUint64(fields[0], path.string());
+  }
+  throw std::runtime_error("invalid io.weight format: " + path.string());
 }
 
 uint64_t ParsePressureTotal(const std::filesystem::path& path,
@@ -123,6 +286,7 @@ uint64_t ParsePressureTotal(const std::filesystem::path& path,
 
   std::istringstream lines(ReadText(path));
   std::string line;
+  std::optional<uint64_t> result;
   while (std::getline(lines, line)) {
     std::istringstream fields(line);
     std::string token;
@@ -133,11 +297,16 @@ uint64_t ParsePressureTotal(const std::filesystem::path& path,
     while (fields >> token) {
       constexpr std::string_view kTotalPrefix = "total=";
       if (token.starts_with(kTotalPrefix)) {
-        return std::stoull(std::string(token.substr(kTotalPrefix.size())));
+        if (result) {
+          throw std::runtime_error("duplicate pressure total in " +
+                                   path.string() + ": " +
+                                   std::string(category));
+        }
+        result = ParseUint64(token.substr(kTotalPrefix.size()), path.string());
       }
     }
   }
-  return 0;
+  return result.value_or(0U);
 }
 
 void EnableControllers(const std::filesystem::path& dir) {
@@ -258,6 +427,30 @@ void MoveRootProcessesIntoContainerController(
 }
 
 }  // namespace
+
+BlockDeviceId ParseBlockDeviceId(std::string_view text) {
+  const size_t separator = text.find(':');
+  if (separator == std::string_view::npos || separator == 0U ||
+      separator + 1U >= text.size() ||
+      text.find(':', separator + 1U) != std::string_view::npos) {
+    throw std::runtime_error("invalid block device id: " + std::string(text));
+  }
+  const uint64_t major =
+      ParseUint64(text.substr(0U, separator), "block device major");
+  const uint64_t minor =
+      ParseUint64(text.substr(separator + 1U), "block device minor");
+  if (major > std::numeric_limits<uint32_t>::max() ||
+      minor > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error("block device id exceeds uint32: " +
+                             std::string(text));
+  }
+  return BlockDeviceId{.major = static_cast<uint32_t>(major),
+                       .minor = static_cast<uint32_t>(minor)};
+}
+
+std::string BlockDeviceIdText(const BlockDeviceId& device) {
+  return std::to_string(device.major) + ":" + std::to_string(device.minor);
+}
 
 Cgroup Cgroup::Create(const std::string& run_id, const std::string& node_id) {
   RequireSafeRunId(run_id);
@@ -384,6 +577,68 @@ void Cgroup::SetCpuMax(std::optional<uint64_t> quota_us,
   WriteCgroupFile(path_, "cpu.max", value);
 }
 
+void Cgroup::SetCpuWeight(uint64_t weight) const {
+  if (weight < 1U || weight > 10000U) {
+    throw std::runtime_error("cpu.weight must be in 1..10000");
+  }
+  WriteCgroupFile(path_, "cpu.weight", std::to_string(weight));
+  if (ParseSingleUint(path_ / "cpu.weight") != weight) {
+    throw std::runtime_error("cpu.weight read-back verification failed for " +
+                             path_.string());
+  }
+}
+
+void Cgroup::SetIoMax(const IoLimit& limit) const {
+  const auto require_positive = [](const std::optional<uint64_t>& value,
+                                   std::string_view name) {
+    if (value && *value == 0U) {
+      throw std::runtime_error(std::string(name) +
+                               " must be greater than zero");
+    }
+  };
+  require_positive(limit.read_bytes_per_sec, "io.max rbps");
+  require_positive(limit.write_bytes_per_sec, "io.max wbps");
+  require_positive(limit.read_operations_per_sec, "io.max riops");
+  require_positive(limit.write_operations_per_sec, "io.max wiops");
+
+  const auto value_text = [](const std::optional<uint64_t>& value) {
+    return value ? std::to_string(*value) : std::string("max");
+  };
+  const std::string value =
+      BlockDeviceIdText(limit.device) +
+      " rbps=" + value_text(limit.read_bytes_per_sec) +
+      " wbps=" + value_text(limit.write_bytes_per_sec) +
+      " riops=" + value_text(limit.read_operations_per_sec) +
+      " wiops=" + value_text(limit.write_operations_per_sec);
+  WriteCgroupFile(path_, "io.max", value);
+
+  const std::vector<IoLimit> actual = ParseIoMax(path_ / "io.max");
+  const auto found =
+      std::find_if(actual.begin(), actual.end(), [&](const IoLimit& candidate) {
+        return candidate.device == limit.device;
+      });
+  const bool unlimited =
+      !limit.read_bytes_per_sec && !limit.write_bytes_per_sec &&
+      !limit.read_operations_per_sec && !limit.write_operations_per_sec;
+  if ((found == actual.end() && !unlimited) ||
+      (found != actual.end() && *found != limit)) {
+    throw std::runtime_error("io.max read-back verification failed for " +
+                             path_.string() + " device " +
+                             BlockDeviceIdText(limit.device));
+  }
+}
+
+void Cgroup::SetIoWeight(uint64_t weight) const {
+  if (weight < 1U || weight > 10000U) {
+    throw std::runtime_error("io.weight must be in 1..10000");
+  }
+  WriteCgroupFile(path_, "io.weight", "default " + std::to_string(weight));
+  if (ParseIoWeight(path_ / "io.weight") != weight) {
+    throw std::runtime_error("io.weight read-back verification failed for " +
+                             path_.string());
+  }
+}
+
 void Cgroup::SetPidsMax(uint64_t n) const {
   WriteCgroupFile(path_, "pids.max", std::to_string(n));
 }
@@ -406,9 +661,16 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   const CpuMaxValue cpu_max = ParseCpuMax(path_ / "cpu.max");
   metrics.cpu_quota_us = cpu_max.quota_us;
   metrics.cpu_period_us = cpu_max.period_us;
+  metrics.cpu_weight = ParseSingleUint(path_ / "cpu.weight");
+  metrics.io_weight = ParseIoWeight(path_ / "io.weight");
+  metrics.io_limits = ParseIoMax(path_ / "io.max");
   const IoStatTotals io = ParseIoStat(path_ / "io.stat");
   metrics.io_read_bytes = io.read_bytes;
   metrics.io_write_bytes = io.write_bytes;
+  metrics.io_read_operations = io.read_operations;
+  metrics.io_write_operations = io.write_operations;
+  metrics.io_discard_bytes = io.discard_bytes;
+  metrics.io_discard_operations = io.discard_operations;
   metrics.io_pressure_some_total_usec =
       ParsePressureTotal(path_ / "io.pressure", "some");
   metrics.io_pressure_full_total_usec =
@@ -416,7 +678,8 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   metrics.pids_current = ParseSingleUint(path_ / "pids.current");
   metrics.pids_max_limit = ParseMaxOrUint(path_ / "pids.max");
   metrics.pids_max_events = ParseKeyValue(path_ / "pids.events", "max");
-  metrics.cgroup_populated = ParseKeyValue(path_ / "cgroup.events", "populated");
+  metrics.cgroup_populated =
+      ParseKeyValue(path_ / "cgroup.events", "populated");
   metrics.cgroup_frozen = ParseKeyValue(path_ / "cgroup.events", "frozen");
   metrics.memory_low = ParseKeyValue(path_ / "memory.events", "low");
   metrics.memory_high = ParseKeyValue(path_ / "memory.events", "high");
@@ -425,6 +688,7 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   metrics.oom_kill = ParseKeyValue(path_ / "memory.events", "oom_kill");
   metrics.oom_group_kill =
       ParseKeyValue(path_ / "memory.events", "oom_group_kill");
+  metrics.memory_stat = ParseMemoryStat(path_ / "memory.stat");
   return metrics;
 }
 

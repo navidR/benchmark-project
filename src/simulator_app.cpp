@@ -1046,13 +1046,68 @@ void ValidateWalletTransactionsWorkload(
 
 bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
   return !patch.memory_high_bytes && !patch.memory_max_bytes &&
-         !patch.cpu_quota_present && !patch.cpu_period_us && !patch.pids_max;
+         !patch.cpu_quota_present && !patch.cpu_period_us &&
+         !patch.cpu_weight && !patch.io_weight && !patch.io_limits_present &&
+         !patch.pids_max;
 }
 
 void RequireNonZero(uint64_t value, std::string_view field) {
   if (value == 0U) {
     throw std::runtime_error(std::string(field) + " must be greater than zero");
   }
+}
+
+void RequireCgroupWeight(uint64_t value, std::string_view field) {
+  if (value < 1U || value > 10000U) {
+    throw std::runtime_error(std::string(field) + " must be in 1..10000");
+  }
+}
+
+std::optional<uint64_t> JsonRequiredNullablePositiveUint64(
+    const boost::json::object& object, const char* field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("missing io.max field: " + std::string(field));
+  }
+  if (value->is_null()) {
+    return std::nullopt;
+  }
+  const uint64_t parsed = JsonUint64Value(*value, field);
+  RequireNonZero(parsed, field);
+  return parsed;
+}
+
+std::vector<IoLimit> ParseIoLimits(const boost::json::value& value,
+                                   std::string_view field) {
+  if (!value.is_array()) {
+    throw std::runtime_error(std::string(field) + " must be a JSON array");
+  }
+  std::vector<IoLimit> limits;
+  std::set<BlockDeviceId> devices;
+  for (const boost::json::value& entry : value.as_array()) {
+    if (!entry.is_object()) {
+      throw std::runtime_error(std::string(field) +
+                               " entries must be JSON objects");
+    }
+    const boost::json::object& object = entry.as_object();
+    IoLimit limit;
+    limit.device = ParseBlockDeviceId(JsonStringField(object, "device"));
+    if (!devices.insert(limit.device).second) {
+      throw std::runtime_error(std::string(field) +
+                               " contains a duplicate block device: " +
+                               BlockDeviceIdText(limit.device));
+    }
+    limit.read_bytes_per_sec =
+        JsonRequiredNullablePositiveUint64(object, "read_bytes_per_sec");
+    limit.write_bytes_per_sec =
+        JsonRequiredNullablePositiveUint64(object, "write_bytes_per_sec");
+    limit.read_operations_per_sec =
+        JsonRequiredNullablePositiveUint64(object, "read_operations_per_sec");
+    limit.write_operations_per_sec =
+        JsonRequiredNullablePositiveUint64(object, "write_operations_per_sec");
+    limits.push_back(std::move(limit));
+  }
+  return limits;
 }
 
 ResourceLimitPatch ParseResourceLimitPatchObject(
@@ -1070,6 +1125,13 @@ ResourceLimitPatch ParseResourceLimitPatchObject(
     }
   }
   patch.cpu_period_us = JsonOptionalUint64FieldValue(object, "cpu_period_us");
+  patch.cpu_weight = JsonOptionalUint64FieldValue(object, "cpu_weight");
+  patch.io_weight = JsonOptionalUint64FieldValue(object, "io_weight");
+  const boost::json::value* io_limits = object.if_contains("io_max");
+  if (io_limits != nullptr) {
+    patch.io_limits_present = true;
+    patch.io_limits = ParseIoLimits(*io_limits, "io_max");
+  }
   patch.pids_max = JsonOptionalUint64FieldValue(object, "pids_max");
 
   if (ResourceLimitPatchEmpty(patch)) {
@@ -1083,6 +1145,12 @@ ResourceLimitPatch ParseResourceLimitPatchObject(
   }
   if (patch.cpu_period_us) {
     RequireNonZero(*patch.cpu_period_us, "cpu_period_us");
+  }
+  if (patch.cpu_weight) {
+    RequireCgroupWeight(*patch.cpu_weight, "cpu_weight");
+  }
+  if (patch.io_weight) {
+    RequireCgroupWeight(*patch.io_weight, "io_weight");
   }
   if (patch.pids_max) {
     RequireNonZero(*patch.pids_max, "pids_max");
@@ -1649,6 +1717,19 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       options.cpu_period_us = JsonOptionalUint64Field(object, "cpu_period_us",
                                                       options.cpu_period_us);
     }
+    if (!OptionProvided(vm, "cpu-weight")) {
+      options.cpu_weight =
+          JsonOptionalUint64Field(object, "cpu_weight", options.cpu_weight);
+    }
+    if (!OptionProvided(vm, "io-weight")) {
+      options.io_weight =
+          JsonOptionalUint64Field(object, "io_weight", options.io_weight);
+    }
+    const boost::json::value* initial_io_limits = object.if_contains("io_max");
+    if (initial_io_limits != nullptr) {
+      options.io_limits =
+          ParseIoLimits(*initial_io_limits, "scenario resources.io_max");
+    }
     if (!OptionProvided(vm, "pids-max")) {
       options.pids_max =
           JsonOptionalUint64Field(object, "pids_max", options.pids_max);
@@ -2166,6 +2247,10 @@ Options ParseOptions(int argc, char** argv) {
       "optional cgroup cpu.max quota in microseconds per period")(
       "cpu-period-us", po::value<uint64_t>(&options.cpu_period_us),
       "cgroup cpu.max period in microseconds")(
+      "cpu-weight", po::value<uint64_t>(&options.cpu_weight),
+      "cgroup cpu.weight proportional share in 1..10000")(
+      "io-weight", po::value<uint64_t>(&options.io_weight),
+      "cgroup default io.weight proportional share in 1..10000")(
       "pids-max", po::value<uint64_t>(&options.pids_max),
       "cgroup pids.max process limit")(
       "keep-artifacts",
@@ -2439,6 +2524,8 @@ Options ParseOptions(int argc, char** argv) {
   if (options.cpu_quota_requested && options.cpu_quota_us == 0U) {
     throw std::runtime_error("--cpu-quota-us must be greater than zero");
   }
+  RequireCgroupWeight(options.cpu_weight, "--cpu-weight");
+  RequireCgroupWeight(options.io_weight, "--io-weight");
   if (options.pids_max == 0U) {
     throw std::runtime_error("--pids-max must be greater than zero");
   }
@@ -2873,6 +2960,28 @@ boost::json::object NodeRoleTopologyJson(
   return object;
 }
 
+boost::json::array IoLimitsJson(const std::vector<IoLimit>& io_limits) {
+  boost::json::array array;
+  for (const IoLimit& limit : io_limits) {
+    boost::json::object item;
+    item["device"] = BlockDeviceIdText(limit.device);
+    const auto add_limit = [&](const char* field,
+                               const std::optional<uint64_t>& value) {
+      if (value) {
+        item[field] = *value;
+      } else {
+        item[field] = nullptr;
+      }
+    };
+    add_limit("read_bytes_per_sec", limit.read_bytes_per_sec);
+    add_limit("write_bytes_per_sec", limit.write_bytes_per_sec);
+    add_limit("read_operations_per_sec", limit.read_operations_per_sec);
+    add_limit("write_operations_per_sec", limit.write_operations_per_sec);
+    array.push_back(std::move(item));
+  }
+  return array;
+}
+
 boost::json::object ResourceLimitsJson(const ResourceLimits& limits) {
   boost::json::object object;
   object["memory_high_bytes"] = limits.memory_high_bytes;
@@ -2883,6 +2992,9 @@ boost::json::object ResourceLimitsJson(const ResourceLimits& limits) {
     object["cpu_quota_us"] = nullptr;
   }
   object["cpu_period_us"] = limits.cpu_period_us;
+  object["cpu_weight"] = limits.cpu_weight;
+  object["io_weight"] = limits.io_weight;
+  object["io_max"] = IoLimitsJson(limits.io_limits);
   object["pids_max"] = limits.pids_max;
   return object;
 }
@@ -2905,6 +3017,15 @@ boost::json::object ResourceLimitPatchJson(const ResourceLimitPatch& patch) {
   if (patch.cpu_period_us) {
     object["cpu_period_us"] = *patch.cpu_period_us;
   }
+  if (patch.cpu_weight) {
+    object["cpu_weight"] = *patch.cpu_weight;
+  }
+  if (patch.io_weight) {
+    object["io_weight"] = *patch.io_weight;
+  }
+  if (patch.io_limits_present) {
+    object["io_max"] = IoLimitsJson(patch.io_limits);
+  }
   if (patch.pids_max) {
     object["pids_max"] = *patch.pids_max;
   }
@@ -2919,6 +3040,9 @@ ResourceLimits InitialResourceLimits(const Options& options) {
                           ? std::optional<uint64_t>(options.cpu_quota_us)
                           : std::nullopt,
       .cpu_period_us = options.cpu_period_us,
+      .cpu_weight = options.cpu_weight,
+      .io_weight = options.io_weight,
+      .io_limits = options.io_limits,
       .pids_max = options.pids_max,
   };
 }
@@ -2939,6 +3063,15 @@ ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
   if (patch.cpu_period_us) {
     next.cpu_period_us = *patch.cpu_period_us;
   }
+  if (patch.cpu_weight) {
+    next.cpu_weight = *patch.cpu_weight;
+  }
+  if (patch.io_weight) {
+    next.io_weight = *patch.io_weight;
+  }
+  if (patch.io_limits_present) {
+    next.io_limits = patch.io_limits;
+  }
   if (patch.pids_max) {
     next.pids_max = *patch.pids_max;
   }
@@ -2952,6 +3085,8 @@ ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
   if (next.cpu_quota_us) {
     RequireNonZero(*next.cpu_quota_us, "cpu_quota_us");
   }
+  RequireCgroupWeight(next.cpu_weight, "cpu_weight");
+  RequireCgroupWeight(next.io_weight, "io_weight");
   RequireNonZero(next.pids_max, "pids_max");
   return next;
 }
@@ -2972,6 +3107,39 @@ void WriteResourceLimits(const Cgroup& cgroup, const ResourceLimits& previous,
   if (next.cpu_quota_us != previous.cpu_quota_us ||
       next.cpu_period_us != previous.cpu_period_us) {
     cgroup.SetCpuMax(next.cpu_quota_us, next.cpu_period_us);
+  }
+  if (next.cpu_weight != previous.cpu_weight) {
+    cgroup.SetCpuWeight(next.cpu_weight);
+  }
+  if (next.io_weight != previous.io_weight) {
+    cgroup.SetIoWeight(next.io_weight);
+  }
+  for (const IoLimit& previous_limit : previous.io_limits) {
+    const auto next_limit =
+        std::find_if(next.io_limits.begin(), next.io_limits.end(),
+                     [&](const IoLimit& candidate) {
+                       return candidate.device == previous_limit.device;
+                     });
+    if (next_limit == next.io_limits.end()) {
+      cgroup.SetIoMax(IoLimit{
+          .device = previous_limit.device,
+          .read_bytes_per_sec = std::nullopt,
+          .write_bytes_per_sec = std::nullopt,
+          .read_operations_per_sec = std::nullopt,
+          .write_operations_per_sec = std::nullopt,
+      });
+    }
+  }
+  for (const IoLimit& next_limit : next.io_limits) {
+    const auto previous_limit =
+        std::find_if(previous.io_limits.begin(), previous.io_limits.end(),
+                     [&](const IoLimit& candidate) {
+                       return candidate.device == next_limit.device;
+                     });
+    if (previous_limit == previous.io_limits.end() ||
+        *previous_limit != next_limit) {
+      cgroup.SetIoMax(next_limit);
+    }
   }
   if (next.pids_max != previous.pids_max) {
     cgroup.SetPidsMax(next.pids_max);
@@ -3441,8 +3609,15 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
       object["cpu_quota_us"] = nullptr;
     }
     object["cpu_period_us"] = cgroup->cpu_period_us;
+    object["cpu_weight"] = cgroup->cpu_weight;
+    object["io_weight"] = cgroup->io_weight;
+    object["io_max"] = IoLimitsJson(cgroup->io_limits);
     object["io_read_bytes"] = cgroup->io_read_bytes;
     object["io_write_bytes"] = cgroup->io_write_bytes;
+    object["io_read_operations"] = cgroup->io_read_operations;
+    object["io_write_operations"] = cgroup->io_write_operations;
+    object["io_discard_bytes"] = cgroup->io_discard_bytes;
+    object["io_discard_operations"] = cgroup->io_discard_operations;
     object["io_pressure_some_total_usec"] = cgroup->io_pressure_some_total_usec;
     object["io_pressure_full_total_usec"] = cgroup->io_pressure_full_total_usec;
     object["pids_current"] = cgroup->pids_current;
@@ -3460,6 +3635,11 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["oom"] = cgroup->oom;
     object["oom_kill"] = cgroup->oom_kill;
     object["oom_group_kill"] = cgroup->oom_group_kill;
+    boost::json::object memory_stat;
+    for (const auto& [name, value] : cgroup->memory_stat) {
+      memory_stat[name] = value;
+    }
+    object["memory_stat"] = std::move(memory_stat);
   }
   if (link != nullptr) {
     object["network_has_stats"] = link->has_stats;
@@ -4563,6 +4743,9 @@ void WriteScenarioFiles(const Options& options,
     resources["cpu_quota_us"] = nullptr;
   }
   resources["cpu_period_us"] = options.cpu_period_us;
+  resources["cpu_weight"] = options.cpu_weight;
+  resources["io_weight"] = options.io_weight;
+  resources["io_max"] = IoLimitsJson(options.io_limits);
   resources["pids_max"] = options.pids_max;
   resolved["resources"] = std::move(resources);
   if (options.network_condition_requested) {
@@ -4777,6 +4960,11 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       runtime.cgroup->SetMemoryMax(runtime.resources.memory_max_bytes);
       runtime.cgroup->SetCpuMax(runtime.resources.cpu_quota_us,
                                 runtime.resources.cpu_period_us);
+      runtime.cgroup->SetCpuWeight(runtime.resources.cpu_weight);
+      runtime.cgroup->SetIoWeight(runtime.resources.io_weight);
+      for (const IoLimit& io_limit : runtime.resources.io_limits) {
+        runtime.cgroup->SetIoMax(io_limit);
+      }
       runtime.cgroup->SetPidsMax(runtime.resources.pids_max);
       WriteNodeState(events_path, options.run_id, node_id,
                      NodeRuntimeLifecycle::kCgroupReady);
@@ -4928,7 +5116,23 @@ void ApplyResourceLimitUpdate(
   const ResourceLimits previous = node.resources;
   const ResourceLimits next =
       ApplyResourceLimitPatch(previous, patch, node.config.id);
-  WriteResourceLimits(*node.cgroup, previous, next);
+  try {
+    WriteResourceLimits(*node.cgroup, previous, next);
+  } catch (...) {
+    const std::exception_ptr apply_error = std::current_exception();
+    try {
+      WriteResourceLimits(*node.cgroup, next, previous);
+    } catch (const std::exception& restore_error) {
+      BBP_LOG(error) << "failed to restore partially applied resource update "
+                        "for "
+                     << node.config.id << ": " << restore_error.what();
+    } catch (...) {
+      BBP_LOG(error) << "failed to restore partially applied resource update "
+                        "for "
+                     << node.config.id << ": unknown exception";
+    }
+    std::rethrow_exception(apply_error);
+  }
   node.resources = next;
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kResourceLimitsUpdated,

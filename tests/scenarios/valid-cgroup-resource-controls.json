@@ -1,0 +1,40 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "resources": {
+    "cpu_weight": 200,
+    "io_weight": 300,
+    "io_max": [
+      {
+        "device": "252:1",
+        "read_bytes_per_sec": 104857600,
+        "write_bytes_per_sec": 52428800,
+        "read_operations_per_sec": null,
+        "write_operations_per_sec": 500
+      }
+    ],
+    "runtime_node_limits": [
+      {
+        "node": 1,
+        "cpu_weight": 400,
+        "io_weight": 500,
+        "io_max": []
+      }
+    ]
+  },
+  "workloads": [
+    {
+      "type": "update_resource_limits",
+      "node": 2,
+      "io_max": [
+        {
+          "device": "259:0",
+          "read_bytes_per_sec": null,
+          "write_bytes_per_sec": 16777216,
+          "read_operations_per_sec": 250,
+          "write_operations_per_sec": null
+        }
+      ]
+    }
+  ]
+}

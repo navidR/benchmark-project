@@ -1,13 +1,37 @@
 #pragma once
 
-#include <cstdint>
-#include <filesystem>
-#include <optional>
-#include <string>
-
 #include <sys/types.h>
 
+#include <compare>
+#include <cstdint>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
 namespace bbp {
+
+struct BlockDeviceId {
+  std::uint32_t major = 0;
+  std::uint32_t minor = 0;
+
+  auto operator<=>(const BlockDeviceId&) const = default;
+};
+
+struct IoLimit {
+  BlockDeviceId device;
+  std::optional<std::uint64_t> read_bytes_per_sec;
+  std::optional<std::uint64_t> write_bytes_per_sec;
+  std::optional<std::uint64_t> read_operations_per_sec;
+  std::optional<std::uint64_t> write_operations_per_sec;
+
+  bool operator==(const IoLimit&) const = default;
+};
+
+BlockDeviceId ParseBlockDeviceId(std::string_view text);
+std::string BlockDeviceIdText(const BlockDeviceId& device);
 
 struct CgroupMetrics {
   uint64_t cpu_usage_usec = 0;
@@ -20,8 +44,15 @@ struct CgroupMetrics {
   std::optional<uint64_t> memory_max_limit_bytes;
   std::optional<uint64_t> cpu_quota_us;
   uint64_t cpu_period_us = 0;
+  uint64_t cpu_weight = 0;
+  uint64_t io_weight = 0;
+  std::vector<IoLimit> io_limits;
   uint64_t io_read_bytes = 0;
   uint64_t io_write_bytes = 0;
+  uint64_t io_read_operations = 0;
+  uint64_t io_write_operations = 0;
+  uint64_t io_discard_bytes = 0;
+  uint64_t io_discard_operations = 0;
   uint64_t io_pressure_some_total_usec = 0;
   uint64_t io_pressure_full_total_usec = 0;
   uint64_t pids_current = 0;
@@ -35,6 +66,7 @@ struct CgroupMetrics {
   uint64_t oom = 0;
   uint64_t oom_kill = 0;
   uint64_t oom_group_kill = 0;
+  std::map<std::string, uint64_t> memory_stat;
 };
 
 struct CgroupFreezeProbe {
@@ -59,6 +91,9 @@ class Cgroup {
   void SetMemoryMax(uint64_t bytes) const;
   void SetMemoryHigh(uint64_t bytes) const;
   void SetCpuMax(std::optional<uint64_t> quota_us, uint64_t period_us) const;
+  void SetCpuWeight(uint64_t weight) const;
+  void SetIoMax(const IoLimit& limit) const;
+  void SetIoWeight(uint64_t weight) const;
   void SetPidsMax(uint64_t n) const;
   CgroupMetrics ReadMetrics() const;
   void Freeze() const;

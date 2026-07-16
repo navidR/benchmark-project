@@ -1,0 +1,14 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "resources": {
+    "io_max": [
+      {
+        "device": "4294967296:1",
+        "read_bytes_per_sec": 1,
+        "write_bytes_per_sec": null,
+        "read_operations_per_sec": null,
+        "write_operations_per_sec": null
+      }
+    ]
+  }
+}

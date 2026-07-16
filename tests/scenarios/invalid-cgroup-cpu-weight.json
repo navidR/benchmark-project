@@ -1,0 +1,4 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "resources": {"cpu_weight": 10001}
+}

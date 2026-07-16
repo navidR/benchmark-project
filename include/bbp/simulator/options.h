@@ -47,6 +47,9 @@ struct Options {
   std::uint64_t cpu_period_us = 100000;
   std::uint64_t cpu_quota_us = 0;
   bool cpu_quota_requested = false;
+  std::uint64_t cpu_weight = 100;
+  std::uint64_t io_weight = 100;
+  std::vector<IoLimit> io_limits;
   std::uint64_t pids_max = 256;
   bool keep_cgroups = false;
   bool keep_artifacts = true;

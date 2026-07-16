@@ -250,8 +250,13 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"generated_block_count\":1,\"mined_transaction_count\":2,"
       "\"mined_transaction_count_complete\":true,"
       "\"qdisc_kind\":\"tbf+netem\","
-      "\"cpu_usage_usec\":10,\"memory_current\":20,"
+      "\"cpu_usage_usec\":10,\"cpu_weight\":250,\"io_weight\":300,"
+      "\"memory_current\":20,\"memory_stat\":{\"anon\":19},"
       "\"memory_high_limit_bytes\":null,\"io_read_bytes\":30,"
+      "\"io_read_operations\":4,\"io_write_operations\":5,"
+      "\"io_discard_bytes\":6,\"io_discard_operations\":7,"
+      "\"io_max\":[{\"device\":\"252:1\","
+      "\"read_bytes_per_sec\":1048576}],"
       "\"pids_current\":2,\"oom_kill\":0,"
       "\"network_rx_bytes\":100,\"network_tx_bytes\":200,"
       "\"qdisc_bytes\":300,\"qdisc_drops\":1,"
@@ -480,6 +485,20 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "memory_current") == 20U);
   BOOST_TEST(last_metrics.at("memory_high_limit_bytes").is_null());
   BOOST_TEST(JsonInteger(last_metrics, "io_read_bytes") == 30U);
+  BOOST_TEST(JsonInteger(last_metrics, "cpu_weight") == 250U);
+  BOOST_TEST(JsonInteger(last_metrics, "io_weight") == 300U);
+  BOOST_TEST(JsonInteger(last_metrics, "io_read_operations") == 4U);
+  BOOST_TEST(JsonInteger(last_metrics, "io_write_operations") == 5U);
+  BOOST_TEST(JsonInteger(last_metrics, "io_discard_bytes") == 6U);
+  BOOST_TEST(JsonInteger(last_metrics, "io_discard_operations") == 7U);
+  BOOST_TEST(JsonInteger(last_metrics.at("memory_stat").as_object(), "anon") ==
+             19U);
+  BOOST_REQUIRE_EQUAL(last_metrics.at("io_max").as_array().size(), 1U);
+  BOOST_TEST(last_metrics.at("io_max")
+                 .as_array()[0]
+                 .as_object()
+                 .at("device")
+                 .as_string() == "252:1");
   BOOST_TEST(JsonInteger(last_metrics, "pids_current") == 2U);
   BOOST_TEST(JsonInteger(last_metrics, "oom_kill") == 0U);
   BOOST_TEST(JsonInteger(last_metrics, "network_rx_bytes") == 100U);

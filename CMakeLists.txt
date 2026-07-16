@@ -380,6 +380,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-resource-pressure-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-cgroup-resource-controls
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-cgroup-resource-controls.json"
+      --probe-capabilities
+  )
   add_test(NAME bbp-valid-scheduled-events-scenario
     COMMAND bbp
       --scenario-json
@@ -643,6 +649,31 @@ if(BUILD_TESTING)
     bbp-invalid-update-resource-limits-empty
     tests/scenarios/invalid-update-resource-limits-empty.json
     "runtime resource update has no limit fields"
+  )
+  add_cli_failure_test(
+    bbp-invalid-cgroup-cpu-weight
+    tests/scenarios/invalid-cgroup-cpu-weight.json
+    "--cpu-weight must be in 1..10000"
+  )
+  add_cli_failure_test(
+    bbp-invalid-cgroup-io-device
+    tests/scenarios/invalid-cgroup-io-device.json
+    "block device id exceeds uint32"
+  )
+  add_cli_failure_test(
+    bbp-invalid-cgroup-io-duplicate
+    tests/scenarios/invalid-cgroup-io-duplicate.json
+    "scenario resources.io_max contains a duplicate block device: 252:1"
+  )
+  add_cli_failure_test(
+    bbp-invalid-cgroup-io-missing-field
+    tests/scenarios/invalid-cgroup-io-missing-field.json
+    "missing io.max field: write_operations_per_sec"
+  )
+  add_cli_failure_test(
+    bbp-invalid-cgroup-io-zero
+    tests/scenarios/invalid-cgroup-io-zero.json
+    "read_bytes_per_sec must be greater than zero"
   )
   add_cli_failure_test(
     bbp-invalid-update-resource-limits-node
