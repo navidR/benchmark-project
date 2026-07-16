@@ -1,7 +1,5 @@
 #include "bbp/process.h"
 
-#include "bbp/util.h"
-
 #include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
@@ -14,16 +12,10 @@
 #include <stdexcept>
 #include <thread>
 
+#include "bbp/util.h"
+
 namespace bbp {
 namespace {
-
-[[noreturn]] void ChildFail(const char* message) {
-  const char* prefix = "child setup failed: ";
-  write(STDERR_FILENO, prefix, std::strlen(prefix));
-  write(STDERR_FILENO, message, std::strlen(message));
-  write(STDERR_FILENO, "\n", 1);
-  _exit(127);
-}
 
 void WriteExactOrExit(int fd, const void* data, size_t size) {
   const char* cursor = static_cast<const char*>(data);
@@ -36,9 +28,21 @@ void WriteExactOrExit(int fd, const void* data, size_t size) {
       }
       _exit(127);
     }
+    if (written == 0) {
+      _exit(127);
+    }
     cursor += written;
     remaining -= static_cast<size_t>(written);
   }
+}
+
+[[noreturn]] void ChildFail(const char* message) {
+  constexpr char kPrefix[] = "child setup failed: ";
+  constexpr char kNewline[] = "\n";
+  WriteExactOrExit(STDERR_FILENO, kPrefix, sizeof(kPrefix) - 1U);
+  WriteExactOrExit(STDERR_FILENO, message, std::strlen(message));
+  WriteExactOrExit(STDERR_FILENO, kNewline, sizeof(kNewline) - 1U);
+  _exit(127);
 }
 
 [[noreturn]] void ChildSetupFail(const char* message, int status_fd) {
@@ -97,7 +101,8 @@ int PidfdOpen(pid_t pid) {
 
 int PidfdSendSignal(int pidfd, int sig) {
 #ifdef SYS_pidfd_send_signal
-  return static_cast<int>(syscall(SYS_pidfd_send_signal, pidfd, sig, nullptr, 0));
+  return static_cast<int>(
+      syscall(SYS_pidfd_send_signal, pidfd, sig, nullptr, 0));
 #else
   (void)pidfd;
   (void)sig;
@@ -124,13 +129,15 @@ ChildProcess ChildProcess::Spawn(
 
   int gate[2];
   if (pipe2(gate, O_CLOEXEC) != 0) {
-    throw std::runtime_error(std::string("pipe2 failed: ") + std::strerror(errno));
+    throw std::runtime_error(std::string("pipe2 failed: ") +
+                             std::strerror(errno));
   }
   int setup_status[2];
   if (pipe2(setup_status, O_CLOEXEC) != 0) {
     close(gate[0]);
     close(gate[1]);
-    throw std::runtime_error(std::string("pipe2 failed: ") + std::strerror(errno));
+    throw std::runtime_error(std::string("pipe2 failed: ") +
+                             std::strerror(errno));
   }
 
   pid_t pid = fork();
@@ -139,7 +146,8 @@ ChildProcess ChildProcess::Spawn(
     close(gate[1]);
     close(setup_status[0]);
     close(setup_status[1]);
-    throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
+    throw std::runtime_error(std::string("fork failed: ") +
+                             std::strerror(errno));
   }
 
   if (pid == 0) {
