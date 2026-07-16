@@ -1,4 +1,4 @@
-#include <sys/capability.h>
+#include <linux/capability.h>
 
 #include <boost/test/unit_test.hpp>
 #include <stdexcept>
@@ -7,7 +7,7 @@
 
 BOOST_AUTO_TEST_CASE(capability_check_rejects_invalid_capability_numbers) {
   BOOST_TEST(!bbp::HasEffectiveCapability(-1));
-  BOOST_TEST(!bbp::HasEffectiveCapability(cap_max_bits()));
+  BOOST_TEST(!bbp::HasEffectiveCapability(CAP_LAST_CAP + 1));
 }
 
 BOOST_AUTO_TEST_CASE(capability_check_reads_current_process_capabilities) {
@@ -17,6 +17,6 @@ BOOST_AUTO_TEST_CASE(capability_check_reads_current_process_capabilities) {
 
 BOOST_AUTO_TEST_CASE(capability_requirement_rejects_invalid_capability) {
   BOOST_CHECK_THROW(
-      bbp::RequireEffectiveCapability(cap_max_bits(), "invalid capability"),
+      bbp::RequireEffectiveCapability(CAP_LAST_CAP + 1, "invalid capability"),
       std::runtime_error);
 }

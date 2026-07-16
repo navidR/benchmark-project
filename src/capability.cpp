@@ -1,34 +1,18 @@
 #include "bbp/capability.h"
 
-#include <sys/capability.h>
+#include <linux/capability.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+#include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 
 namespace bbp {
 namespace {
-
-class ScopedCapabilities {
- public:
-  explicit ScopedCapabilities(cap_t capabilities)
-      : capabilities_(capabilities) {}
-
-  ScopedCapabilities(const ScopedCapabilities&) = delete;
-  ScopedCapabilities& operator=(const ScopedCapabilities&) = delete;
-
-  ~ScopedCapabilities() {
-    if (capabilities_ != nullptr) {
-      cap_free(capabilities_);
-    }
-  }
-
-  cap_t get() const { return capabilities_; }
-
- private:
-  cap_t capabilities_;
-};
 
 std::string ErrnoMessage(std::string_view prefix, int error_number) {
   return std::string(prefix) + ": " + std::strerror(error_number);
@@ -37,19 +21,24 @@ std::string ErrnoMessage(std::string_view prefix, int error_number) {
 }  // namespace
 
 bool HasEffectiveCapability(int capability) {
-  if (capability < 0 || capability >= cap_max_bits()) {
+  if (capability < 0 || capability > CAP_LAST_CAP) {
     return false;
   }
-  ScopedCapabilities capabilities(cap_get_proc());
-  if (capabilities.get() == nullptr) {
-    throw std::runtime_error(ErrnoMessage("cap_get_proc failed", errno));
+
+  __user_cap_header_struct header{};
+  header.version = _LINUX_CAPABILITY_VERSION_3;
+  header.pid = 0;
+  std::array<__user_cap_data_struct, _LINUX_CAPABILITY_U32S_3> data{};
+  if (::syscall(SYS_capget, &header, data.data()) == -1) {
+    const int error_number = errno;
+    throw std::runtime_error(ErrnoMessage("capget failed", error_number));
   }
-  cap_flag_value_t value = CAP_CLEAR;
-  if (cap_get_flag(capabilities.get(), capability, CAP_EFFECTIVE, &value) !=
-      0) {
-    throw std::runtime_error(ErrnoMessage("cap_get_flag failed", errno));
-  }
-  return value == CAP_SET;
+
+  constexpr int kBitsPerWord = 32;
+  const auto word = static_cast<std::size_t>(capability / kBitsPerWord);
+  const auto bit = static_cast<unsigned int>(capability % kBitsPerWord);
+  const std::uint32_t mask = std::uint32_t{1} << bit;
+  return (data.at(word).effective & mask) != 0;
 }
 
 void RequireEffectiveCapability(int capability, std::string_view name) {
