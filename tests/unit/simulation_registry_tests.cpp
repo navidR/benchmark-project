@@ -27,8 +27,6 @@ BOOST_AUTO_TEST_CASE(simulation_registry_initializes_wallet_nodes) {
   BOOST_TEST(registry.wallets()[0].node == 1U);
   BOOST_TEST(registry.wallets()[0].address.empty());
   BOOST_TEST(registry.wallets()[1].node == 3U);
-  BOOST_TEST(registry.MinerNodeForWalletIndex(0) == 2U);
-  BOOST_TEST(registry.MinerNodeForWalletIndex(5) == 2U);
 }
 
 BOOST_AUTO_TEST_CASE(simulation_registry_accepts_private_wallet_mode) {

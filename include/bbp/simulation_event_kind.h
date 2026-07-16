@@ -18,6 +18,7 @@ enum class SimulationEventKind {
   kStartupPeerConnected,
   kWalletAddressRequested,
   kWalletAddressCreated,
+  kWalletFunded,
   kResourceLimitsUpdated,
   kResourcePressureStarted,
   kResourcePressureRestoredAfterError,

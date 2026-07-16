@@ -265,6 +265,15 @@ uint64_t JsonAmountField(const boost::json::object& object, const char* field) {
   return JsonFixed8Amount(*value, field);
 }
 
+uint64_t JsonOptionalAmountField(const boost::json::object& object,
+                                 const char* field, uint64_t default_value) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return default_value;
+  }
+  return JsonFixed8Amount(*value, field);
+}
+
 std::vector<uint32_t> JsonNodeGroupField(const boost::json::object& object,
                                          const char* field) {
   const boost::json::value* value = object.if_contains(field);
@@ -672,6 +681,17 @@ WalletPrivacyMode ParseWalletPrivacyMode(std::string_view value) {
       "scenario topology.wallet_initialization mode must be public or private");
 }
 
+WalletFundingStrategy ParseWalletFundingStrategy(std::string_view value) {
+  const std::optional<WalletFundingStrategy> strategy =
+      WalletFundingStrategyFromName(value);
+  if (strategy) {
+    return *strategy;
+  }
+  throw std::runtime_error(
+      "scenario wallet_transactions funding_strategy must be round_robin or "
+      "random");
+}
+
 WalletTransferStrategy ParseWalletTransferStrategy(std::string_view value) {
   const std::optional<WalletTransferStrategy> strategy =
       WalletTransferStrategyFromName(value);
@@ -908,24 +928,19 @@ void ValidateWalletTransactionsWorkload(
         "scenario wallet_transactions transaction_count must be greater than "
         "zero");
   }
-  if (workload.transaction_count > static_cast<uint32_t>(wallet_count)) {
-    throw std::runtime_error(
-        "scenario wallet_transactions transaction_count currently must be <= "
-        "wallet node count");
-  }
-  if (workload.funding_blocks_per_wallet <
-      kDefaultCoinbaseSpendableConfirmations) {
+  const std::uint64_t coinbase_confirmations =
+      ChainDriverSpecFor(options.chain).coinbase_spendable_confirmations;
+  if (workload.funding_blocks_per_wallet < coinbase_confirmations) {
     throw std::runtime_error(
         "scenario wallet_transactions funding_blocks_per_wallet must be at "
         "least " +
-        std::to_string(kDefaultCoinbaseSpendableConfirmations));
+        std::to_string(coinbase_confirmations));
   }
-  if (workload.readiness_confirmations <
-      kDefaultCoinbaseSpendableConfirmations) {
+  if (workload.readiness_confirmations < coinbase_confirmations) {
     throw std::runtime_error(
         "scenario wallet_transactions readiness_confirmations must be at "
         "least " +
-        std::to_string(kDefaultCoinbaseSpendableConfirmations));
+        std::to_string(coinbase_confirmations));
   }
   if (workload.funding_blocks_per_wallet < workload.readiness_confirmations) {
     throw std::runtime_error(
@@ -944,6 +959,13 @@ void ValidateWalletTransactionsWorkload(
       std::numeric_limits<uint64_t>::max() - workload.fee_satoshis) {
     throw std::runtime_error(
         "scenario wallet_transactions amount plus fee overflows uint64");
+  }
+  const std::uint64_t minimum_funding_threshold =
+      workload.amount_satoshis + workload.fee_satoshis;
+  if (workload.funding_threshold_satoshis < minimum_funding_threshold) {
+    throw std::runtime_error(
+        "scenario wallet_transactions funding_threshold must cover amount "
+        "plus fee");
   }
   if (workload.timeout_sec == 0U) {
     throw std::runtime_error(
@@ -1283,6 +1305,14 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
             "addresses");
       }
       WalletTransactionsWorkload transactions;
+      const std::uint32_t coinbase_confirmations =
+          ChainDriverSpecFor(options.chain).coinbase_spendable_confirmations;
+      transactions.funding_blocks_per_wallet = coinbase_confirmations;
+      transactions.readiness_confirmations = coinbase_confirmations;
+      transactions.funding_strategy =
+          ParseWalletFundingStrategy(JsonOptionalStringField(
+              workload, "funding_strategy",
+              WalletFundingStrategyName(transactions.funding_strategy)));
       transactions.strategy =
           ParseWalletTransferStrategy(JsonOptionalStringField(
               workload, "strategy",
@@ -1300,6 +1330,14 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
               : 0U);
       transactions.amount_satoshis = JsonAmountField(workload, "amount");
       transactions.fee_satoshis = JsonAmountField(workload, "fee");
+      const std::uint64_t default_funding_threshold =
+          transactions.amount_satoshis <=
+                  std::numeric_limits<std::uint64_t>::max() -
+                      transactions.fee_satoshis
+              ? transactions.amount_satoshis + transactions.fee_satoshis
+              : 0U;
+      transactions.funding_threshold_satoshis = JsonOptionalAmountField(
+          workload, "funding_threshold", default_funding_threshold);
       transactions.random_seed =
           JsonOptionalUint64Field(workload, "seed", transactions.random_seed);
       transactions.timeout_sec =
@@ -3451,6 +3489,34 @@ boost::json::array TxIdsJson(const std::vector<std::string>& txids) {
   return array;
 }
 
+std::string WalletFundingDetail(
+    uint32_t workload_index, uint32_t workload_count,
+    const WalletTransactionsWorkload& workload, const WalletIdentity& wallet,
+    uint32_t miner_node, uint64_t start_height, uint64_t target_height,
+    uint64_t funding_hash_count, uint64_t ready_balance_satoshis) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["wallet_index"] = wallet.wallet_index;
+  detail["node"] = wallet.node;
+  detail["address"] = wallet.address;
+  detail["miner_node"] = miner_node;
+  detail["funding_strategy"] =
+      std::string(WalletFundingStrategyName(workload.funding_strategy));
+  detail["seed"] = workload.random_seed;
+  detail["funding_blocks_per_wallet"] = workload.funding_blocks_per_wallet;
+  detail["funding_hash_count"] = funding_hash_count;
+  detail["funding_start_height"] = start_height;
+  detail["funding_target_height"] = target_height;
+  detail["readiness_confirmations"] = workload.readiness_confirmations;
+  detail["funding_threshold"] =
+      FormatFixed8Amount(workload.funding_threshold_satoshis);
+  detail["funding_threshold_satoshis"] = workload.funding_threshold_satoshis;
+  detail["ready_balance"] = FormatFixed8Amount(ready_balance_satoshis);
+  detail["ready_balance_satoshis"] = ready_balance_satoshis;
+  return boost::json::serialize(detail);
+}
+
 std::string WalletTransactionDetail(
     uint32_t workload_index, uint32_t workload_count,
     const WalletTransactionsWorkload& workload, uint32_t transaction_index,
@@ -3466,6 +3532,8 @@ std::string WalletTransactionDetail(
   detail["transaction_count"] = workload.transaction_count;
   detail["strategy"] =
       std::string(WalletTransferStrategyName(workload.strategy));
+  detail["funding_strategy"] =
+      std::string(WalletFundingStrategyName(workload.funding_strategy));
   detail["seed"] = workload.random_seed;
   detail["sender_wallet_index"] = sender.wallet_index;
   detail["receiver_wallet_index"] = receiver.wallet_index;
@@ -3479,6 +3547,9 @@ std::string WalletTransactionDetail(
   detail["funding_start_height"] = funding_start_height;
   detail["funding_target_height"] = funding_target_height;
   detail["readiness_confirmations"] = workload.readiness_confirmations;
+  detail["funding_threshold"] =
+      FormatFixed8Amount(workload.funding_threshold_satoshis);
+  detail["funding_threshold_satoshis"] = workload.funding_threshold_satoshis;
   detail["funding_ready_balance"] =
       FormatFixed8Amount(funding_ready_balance_satoshis);
   detail["funding_ready_balance_satoshis"] = funding_ready_balance_satoshis;
@@ -4047,10 +4118,14 @@ boost::json::object WalletTransactionsWorkloadJson(
   boost::json::object object;
   object["type"] =
       std::string(WorkloadKindName(WorkloadKind::kWalletTransactions));
+  object["funding_strategy"] =
+      std::string(WalletFundingStrategyName(workload.funding_strategy));
   object["strategy"] =
       std::string(WalletTransferStrategyName(workload.strategy));
   object["funding_blocks_per_wallet"] = workload.funding_blocks_per_wallet;
   object["readiness_confirmations"] = workload.readiness_confirmations;
+  object["funding_threshold"] =
+      FormatFixed8Amount(workload.funding_threshold_satoshis);
   object["transaction_count"] = workload.transaction_count;
   object["amount"] = FormatFixed8Amount(workload.amount_satoshis);
   object["fee"] = FormatFixed8Amount(workload.fee_satoshis);
@@ -4794,6 +4869,9 @@ void ApplyWalletTransactionsWorkload(
   };
 
   const std::vector<WalletIdentity>& wallets = registry.wallets();
+  const std::vector<uint32_t> funding_miner_indexes =
+      WalletFundingMinerNodes(registry.topology().miner_nodes, wallets.size(),
+                              workload.funding_strategy, workload.random_seed);
   std::vector<FundingState> funding;
   funding.reserve(wallets.size());
   for (size_t wallet_index = 0; wallet_index < wallets.size(); ++wallet_index) {
@@ -4803,7 +4881,7 @@ void ApplyWalletTransactionsWorkload(
       throw std::runtime_error(
           "wallet-backed workload requires initialized WalletNode addresses");
     }
-    const uint32_t miner_node = registry.MinerNodeForWalletIndex(wallet_index);
+    const uint32_t miner_node = funding_miner_indexes[wallet_index] + 1U;
     NodeRuntime& miner = nodes[miner_node - 1U];
     FundingState state;
     state.miner_node = miner_node;
@@ -4822,9 +4900,15 @@ void ApplyWalletTransactionsWorkload(
     NodeRuntime& wallet_node = nodes[wallet.node - 1U];
     state.ready_balance_satoshis = driver.WaitForWalletBalance(
         wallet_node.config, ToChainWalletMode(registry.wallet_initialization()),
-        workload.amount_satoshis + workload.fee_satoshis,
-        workload.readiness_confirmations,
+        workload.funding_threshold_satoshis, workload.readiness_confirmations,
         std::chrono::seconds(workload.timeout_sec), stop_token);
+    WriteEvent(
+        events_path, options.run_id, wallet_node.config.id,
+        SimulationEventKind::kWalletFunded,
+        WalletFundingDetail(workload_index, workload_count, workload, wallet,
+                            miner_node, state.start_height, state.target_height,
+                            static_cast<uint64_t>(state.hashes.size()),
+                            state.ready_balance_satoshis));
     funding.push_back(std::move(state));
   }
 

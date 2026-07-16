@@ -48,13 +48,4 @@ const WalletIdentity& SimulationRegistry::WalletByIndex(
   return wallets_[wallet_index];
 }
 
-uint32_t SimulationRegistry::MinerNodeForWalletIndex(
-    size_t wallet_index) const {
-  if (topology_.miner_nodes.empty()) {
-    throw std::runtime_error("simulation registry has no miner nodes");
-  }
-  return topology_.miner_nodes[wallet_index % topology_.miner_nodes.size()] +
-         1U;
-}
-
 }  // namespace bbp

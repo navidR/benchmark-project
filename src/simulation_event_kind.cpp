@@ -30,6 +30,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "wallet_address_requested";
     case SimulationEventKind::kWalletAddressCreated:
       return "wallet_address_created";
+    case SimulationEventKind::kWalletFunded:
+      return "wallet_funded";
     case SimulationEventKind::kResourceLimitsUpdated:
       return "resource_limits_updated";
     case SimulationEventKind::kResourcePressureStarted:
@@ -145,6 +147,7 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
     return SimulationEventKind::kWalletAddressRequested;
   if (name == "wallet_address_created")
     return SimulationEventKind::kWalletAddressCreated;
+  if (name == "wallet_funded") return SimulationEventKind::kWalletFunded;
   if (name == "resource_limits_updated")
     return SimulationEventKind::kResourceLimitsUpdated;
   if (name == "resource_pressure_started")

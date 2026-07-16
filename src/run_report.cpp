@@ -54,6 +54,7 @@ struct WalletReport {
   std::uint64_t simulated_amount_received_satoshis = 0;
   boost::json::object last_sent_transaction;
   boost::json::object last_received_transaction;
+  boost::json::object last_funding;
   boost::json::object last_metrics;
 };
 
@@ -485,6 +486,25 @@ void RememberWalletTransactionEvent(
   }
 }
 
+void RememberWalletFundingEvent(
+    const boost::json::value& detail,
+    std::map<std::uint64_t, WalletReport>* wallets) {
+  if (!detail.is_object()) {
+    return;
+  }
+  const boost::json::object& object = detail.as_object();
+  const std::optional<std::uint64_t> wallet_index =
+      OptionalUint64Field(object, "wallet_index");
+  if (!wallet_index) {
+    return;
+  }
+  WalletReport& wallet = (*wallets)[*wallet_index];
+  wallet.wallet_index = *wallet_index;
+  CopyOptionalUint64Field(object, "node", &wallet.node);
+  CopyOptionalStringField(object, "address", &wallet.address);
+  wallet.last_funding = object;
+}
+
 boost::json::array WalletsJson(
     const std::map<std::uint64_t, WalletReport>& wallets) {
   boost::json::array array;
@@ -518,6 +538,9 @@ boost::json::array WalletsJson(
     }
     if (!wallet.last_received_transaction.empty()) {
       object["last_received_transaction"] = wallet.last_received_transaction;
+    }
+    if (!wallet.last_funding.empty()) {
+      object["last_funding"] = wallet.last_funding;
     }
     if (!wallet.last_metrics.empty()) {
       object["last_metrics"] = wallet.last_metrics;
@@ -706,6 +729,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array resource_updates;
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
+  boost::json::array wallet_funding;
   boost::json::array wallet_transactions;
   boost::json::array operator_commands;
   std::map<std::uint64_t, WalletReport> wallets;
@@ -795,6 +819,12 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           case SimulationEventKind::kWalletAddressCreated:
             RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
             break;
+          case SimulationEventKind::kWalletFunded: {
+            boost::json::value detail = ParseEventDetail(event);
+            RememberWalletFundingEvent(detail, &wallets);
+            AppendEventSummary(event, &wallet_funding);
+            break;
+          }
           case SimulationEventKind::kWalletTransactionSubmitted: {
             boost::json::value detail = ParseEventDetail(event);
             RememberWalletTransactionEvent(detail, &wallets);
@@ -880,6 +910,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["resource_updates"] = std::move(resource_updates);
   report["network_partitions"] = std::move(network_partitions);
   report["network_partition_heals"] = std::move(network_partition_heals);
+  report["wallet_funding"] = std::move(wallet_funding);
   report["wallet_transactions"] = std::move(wallet_transactions);
   report["operator_commands"] = std::move(operator_commands);
   report["wallets_summary"] = WalletsJson(wallets);

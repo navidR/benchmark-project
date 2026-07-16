@@ -16,6 +16,7 @@ BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
       bbp::SimulationEventKind::kStartupPeerConnected,
       bbp::SimulationEventKind::kWalletAddressRequested,
       bbp::SimulationEventKind::kWalletAddressCreated,
+      bbp::SimulationEventKind::kWalletFunded,
       bbp::SimulationEventKind::kResourceLimitsUpdated,
       bbp::SimulationEventKind::kResourcePressureStarted,
       bbp::SimulationEventKind::kResourcePressureRestoredAfterError,

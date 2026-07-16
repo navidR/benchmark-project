@@ -254,6 +254,7 @@ add_executable(bbp
   src/tui.cpp
   src/tui_command_parser.cpp
   src/util.cpp
+  src/wallet_funding_strategy.cpp
   src/yaml_helpers.cpp
 )
 
@@ -313,6 +314,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_registry_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
+    tests/unit/wallet_funding_strategy_tests.cpp
     tests/unit/wallet_transfer_strategy_tests.cpp
     tests/unit/workload_kind_tests.cpp
     src/capability.cpp
@@ -349,6 +351,7 @@ if(BUILD_TESTING)
     src/simulation_network_address_plan.cpp
     src/tui_command_parser.cpp
     src/util.cpp
+    src/wallet_funding_strategy.cpp
   )
   target_include_directories(bbp-unit-tests PRIVATE include)
   target_compile_definitions(bbp-unit-tests PRIVATE
@@ -628,6 +631,16 @@ if(BUILD_TESTING)
     bbp-invalid-wallet-transactions-wallet-material
     tests/scenarios/invalid-wallet-transactions-wallet-material.json
     "scenario wallet_transactions workload must use topology.wallet_initialization instead of wallet keys or addresses"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-funding-strategy
+    tests/scenarios/invalid-wallet-funding-strategy.json
+    "scenario wallet_transactions funding_strategy must be round_robin or random"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-funding-threshold
+    tests/scenarios/invalid-wallet-funding-threshold.json
+    "scenario wallet_transactions funding_threshold must cover amount plus fee"
   )
   add_cli_failure_test(
     bbp-invalid-restart-node-node

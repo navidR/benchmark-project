@@ -97,8 +97,6 @@ class SimulationRegistry {
     return topology_.miner_nodes;
   }
 
-  uint32_t MinerNodeForWalletIndex(size_t wallet_index) const;
-
   void AddWallet(WalletIdentity wallet);
   WalletIdentity& MutableWalletByIndex(size_t wallet_index);
   const WalletIdentity& WalletByIndex(size_t wallet_index) const;

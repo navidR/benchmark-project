@@ -20,13 +20,15 @@
   "workloads": [
     {
       "type": "wallet_transactions",
+      "funding_strategy": "random",
       "strategy": "random",
       "seed": 42,
       "funding_blocks_per_wallet": 101,
       "readiness_confirmations": 101,
-      "transaction_count": 2,
+      "transaction_count": 5,
       "amount": "1.00000000",
       "fee": "0.00001000",
+      "funding_threshold": "1.00001000",
       "timeout_sec": 30
     }
   ]

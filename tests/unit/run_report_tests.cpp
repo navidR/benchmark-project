@@ -173,6 +173,15 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "\\\"address\\\":\\\"addr2\\\"}\"}");
   bbp::AppendLine(dir / "events.jsonl",
                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"wallet_funded\","
+                  "\"detail\":\"{\\\"wallet_index\\\":1,"
+                  "\\\"node\\\":1,\\\"address\\\":\\\"addr1\\\","
+                  "\\\"miner_node\\\":1,"
+                  "\\\"funding_strategy\\\":\\\"round_robin\\\","
+                  "\\\"funding_threshold_satoshis\\\":100001000,"
+                  "\\\"ready_balance_satoshis\\\":5000000000}\"}");
+  bbp::AppendLine(dir / "events.jsonl",
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                   "\"event\":\"wallet_transaction_submitted\","
                   "\"detail\":\"{\\\"workload_index\\\":7,"
                   "\\\"workload_count\\\":7,"
@@ -250,7 +259,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(report.at("status").as_string() == "finished");
   BOOST_TEST(report.at("started_at").as_string() == "2026-07-09T00:00:00Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-09T00:00:02Z");
-  BOOST_TEST(JsonInteger(report, "event_count") == 17U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 18U);
   BOOST_TEST(JsonInteger(report, "metric_count") == 2U);
   BOOST_TEST(JsonInteger(report, "generate_blocks") == 3U);
   BOOST_TEST(report.at("generate_node").is_null());
@@ -366,6 +375,15 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(resource_update, "node") == 1U);
   BOOST_TEST(JsonInteger(resource_update.at("requested").as_object(),
                          "pids_max") == 128U);
+  const boost::json::array& wallet_funding =
+      report.at("wallet_funding").as_array();
+  BOOST_REQUIRE_EQUAL(wallet_funding.size(), 1U);
+  const boost::json::object& wallet_funding_detail =
+      wallet_funding.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(wallet_funding_detail, "wallet_index") == 1U);
+  BOOST_TEST(JsonInteger(wallet_funding_detail, "miner_node") == 1U);
+  BOOST_TEST(wallet_funding_detail.at("funding_strategy").as_string() ==
+             "round_robin");
   const boost::json::array& wallet_transactions =
       report.at("wallet_transactions").as_array();
   BOOST_REQUIRE_EQUAL(wallet_transactions.size(), 1U);
@@ -387,6 +405,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(sender_wallet, "transactions_received") == 0U);
   BOOST_TEST(JsonInteger(sender_wallet, "simulated_amount_sent_satoshis") ==
              100000000U);
+  const boost::json::object& last_funding =
+      sender_wallet.at("last_funding").as_object();
+  BOOST_TEST(JsonInteger(last_funding, "miner_node") == 1U);
+  BOOST_TEST(JsonInteger(last_funding, "ready_balance_satoshis") ==
+             5000000000U);
   const boost::json::object& wallet_metrics =
       sender_wallet.at("last_metrics").as_object();
   BOOST_TEST(JsonInteger(wallet_metrics, "available_balance_satoshis") ==

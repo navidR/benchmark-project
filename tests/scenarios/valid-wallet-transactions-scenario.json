@@ -20,12 +20,14 @@
   "workloads": [
     {
       "type": "wallet_transactions",
+      "funding_strategy": "round_robin",
       "strategy": "round_robin",
       "funding_blocks_per_wallet": 101,
       "readiness_confirmations": 101,
       "transaction_count": 2,
       "amount": "1.00000000",
       "fee": "0.00001000",
+      "funding_threshold": "1.00001000",
       "timeout_sec": 30
     }
   ]
