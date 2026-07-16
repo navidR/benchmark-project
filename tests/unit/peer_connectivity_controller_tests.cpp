@@ -301,7 +301,15 @@ BOOST_AUTO_TEST_CASE(peer_connectivity_controller_validates_allowed_peer_sets) {
                     std::runtime_error);
   BOOST_CHECK_THROW(controller.SetAllowedPeers("node-1", {"missing"}),
                     std::runtime_error);
+  BOOST_TEST(controller.AllowedPeersFor("node-1") ==
+                 std::vector<std::string>({"node-2", "node-3"}),
+             boost::test_tools::per_element());
   controller.SetPolicy("node-1", bbp::PeerCountPolicy(2U, 2U));
+  BOOST_CHECK_THROW(controller.ValidateAllowedPeerUpdate("node-1", {"node-2"}),
+                    std::runtime_error);
   BOOST_CHECK_THROW(controller.SetAllowedPeers("node-1", {"node-2"}),
                     std::runtime_error);
+  BOOST_TEST(controller.AllowedPeersFor("node-1") ==
+                 std::vector<std::string>({"node-2", "node-3"}),
+             boost::test_tools::per_element());
 }

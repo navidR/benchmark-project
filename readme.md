@@ -607,6 +607,54 @@ scenario or TUI `connect_peer` actions reject a target that is not an active
 outgoing edge. `disconnect_peer` remains available for removing a stale session
 after topology changes.
 
+The ordered `events` array can mutate an inventory edge with
+`set_edge_condition`, `activate_edge`, `deactivate_edge`, or `restore_edge`.
+`from` and `to` are required 1-based node ids. Condition updates use the same
+flattened typed fields as custom edges; activation, deactivation, and restore
+instead accept a positive `timeout_sec` for the verified driver peer action.
+Inactive custom edges remain in the inventory and reserve their canonical band,
+so later activation never renumbers another destination. `restore_edge` restores
+both the configured active state and configured condition.
+
+```json
+{
+  "events": [
+    {
+      "at": "5s",
+      "action": "set_edge_condition",
+      "from": 1,
+      "to": 2,
+      "bandwidth_mbps": 10,
+      "delay_ms": 40
+    },
+    {
+      "at": "10s",
+      "action": "deactivate_edge",
+      "from": 1,
+      "to": 2,
+      "timeout_sec": 15
+    },
+    {
+      "at": "15s",
+      "action": "restore_edge",
+      "from": 1,
+      "to": 2,
+      "timeout_sec": 15
+    }
+  ]
+}
+```
+
+The complete ordered action sequence is validated before resource creation,
+including edge existence/state and peer-policy feasibility. Each live change is
+transactional across kernel policy read-back, the synchronized logical
+allow-list, driver peer state, and restart peer configuration. Successful
+changes emit `topology_edge_updated`; incomplete rollback emits
+`topology_edge_update_rollback_failed`. The resolved scenario preserves
+`topology_initial_edges`, while the shared report exposes bounded
+`topology_edge_updates` and the event-reduced `topology_current_edges`; the TUI
+uses that current state for its eligible-edge count.
+
 Partition and region node groups must assign every simulated node exactly once.
 Region edges connect the first node in each region as its gateway; without
 explicit `region_edges`, all region gateways form a backbone mesh. A latency

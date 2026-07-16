@@ -9,6 +9,7 @@
 #include "bbp/simulator/resource_pressure_workload.h"
 #include "bbp/simulator/restart_node_workload.h"
 #include "bbp/simulator/send_raw_transaction_workload.h"
+#include "bbp/simulator/topology_edge_workload.h"
 #include "bbp/simulator/wait_for_peers_workload.h"
 #include "bbp/simulator/wait_until_height_workload.h"
 #include "bbp/simulator/wallet_transactions_workload.h"
@@ -28,6 +29,7 @@ struct ScenarioWorkload {
   ResourceLimitUpdateWorkload update_resource_limits;
   ResourcePressureWorkload resource_pressure;
   NetworkPartitionWorkload network_partition;
+  TopologyEdgeWorkload topology_edge;
   SendRawTransactionWorkload send_raw_transaction;
   WalletTransactionsWorkload wallet_transactions;
 };

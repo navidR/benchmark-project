@@ -35,6 +35,8 @@ enum class SimulationEventKind {
   kNetworkBlockRemoved,
   kNetworkPartitionApplied,
   kNetworkPartitionHealed,
+  kTopologyEdgeUpdated,
+  kTopologyEdgeUpdateRollbackFailed,
   kRestartRequested,
   kSigterm,
   kProcessRestarted,

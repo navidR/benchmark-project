@@ -961,6 +961,55 @@ PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
   return edge;
 }
 
+constexpr std::string_view kTopologyEdgeConditionFields[] = {
+    "latency_ms",
+    "bandwidth_mbps",
+    "delay_ms",
+    "jitter_ms",
+    "loss_basis_points",
+    "duplicate_basis_points",
+    "corrupt_basis_points",
+    "reorder_basis_points",
+    "limit_packets",
+};
+
+bool HasTopologyEdgeConditionField(const boost::json::object& object) {
+  return std::any_of(std::begin(kTopologyEdgeConditionFields),
+                     std::end(kTopologyEdgeConditionFields),
+                     [&](std::string_view field) {
+                       return object.if_contains(field) != nullptr;
+                     });
+}
+
+NetworkCondition ParseTopologyEdgeWorkloadCondition(
+    const boost::json::object& object) {
+  if (!HasTopologyEdgeConditionField(object)) {
+    throw std::runtime_error(
+        "scenario set_edge_condition requires condition fields");
+  }
+  NetworkCondition condition = ParseNetworkConditionObject(object);
+  const boost::json::value* latency = object.if_contains("latency_ms");
+  if (latency != nullptr) {
+    const std::uint32_t latency_ms = JsonUint32Value(*latency, "latency_ms");
+    const boost::json::value* delay = object.if_contains("delay_ms");
+    if (delay != nullptr && condition.delay_ms != latency_ms) {
+      throw std::runtime_error(
+          "scenario topology edge action latency_ms and delay_ms must match");
+    }
+    condition.delay_ms = latency_ms;
+  }
+  ValidateNetworkCondition(condition);
+  return condition;
+}
+
+void RejectTopologyEdgeConditionFields(const boost::json::object& object,
+                                       std::string_view action) {
+  if (HasTopologyEdgeConditionField(object)) {
+    throw std::runtime_error("scenario " + std::string(action) +
+                             " does not accept condition fields");
+  }
+}
+
 std::vector<PeerTopologyEdge> ParsePeerTopologyEdges(
     const boost::json::object& object, uint32_t node_count) {
   const boost::json::value* value = object.if_contains("edges");
@@ -1642,6 +1691,31 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kHealPartition;
       scenario_workload.network_partition = partition;
       options.workloads.push_back(scenario_workload);
+    } else if (*kind == WorkloadKind::kSetEdgeCondition ||
+               *kind == WorkloadKind::kActivateEdge ||
+               *kind == WorkloadKind::kDeactivateEdge ||
+               *kind == WorkloadKind::kRestoreEdge) {
+      TopologyEdgeWorkload edge;
+      edge.from = JsonUint32Field(workload, "from");
+      edge.to = JsonUint32Field(workload, "to");
+      if (*kind == WorkloadKind::kSetEdgeCondition) {
+        if (workload.if_contains("timeout_sec") != nullptr) {
+          throw std::runtime_error(
+              "scenario set_edge_condition does not accept timeout_sec");
+        }
+        edge.condition = ParseTopologyEdgeWorkloadCondition(workload);
+      } else {
+        RejectTopologyEdgeConditionFields(workload, WorkloadKindName(*kind));
+        edge.timeout_sec =
+            OptionProvided(vm, "sync-timeout-sec")
+                ? options.sync_timeout_sec
+                : JsonOptionalUint32Field(workload, "timeout_sec",
+                                          options.sync_timeout_sec);
+      }
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = *kind;
+      scenario_workload.topology_edge = edge;
+      options.workloads.push_back(std::move(scenario_workload));
     } else if (*kind == WorkloadKind::kSendRawTransaction) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
@@ -2213,6 +2287,77 @@ std::vector<const ScenarioWorkload*> ConfiguredScenarioActions(
     actions.push_back(&event.action);
   }
   return actions;
+}
+
+bool IsTopologyEdgeAction(WorkloadKind kind) {
+  return kind == WorkloadKind::kSetEdgeCondition ||
+         kind == WorkloadKind::kActivateEdge ||
+         kind == WorkloadKind::kDeactivateEdge ||
+         kind == WorkloadKind::kRestoreEdge;
+}
+
+std::vector<ScenarioWorkload> OrderedConfiguredScenarioActions(
+    const Options& options) {
+  std::vector<ScenarioWorkload> actions = options.workloads;
+  for (const ScheduledScenarioEvent& event :
+       OrderScheduledScenarioEvents(options.scheduled_events)) {
+    actions.push_back(event.action);
+  }
+  return actions;
+}
+
+void ValidateRuntimeTopologyPeerPolicy(
+    const Options& options, const RuntimePeerTopology& runtime_topology,
+    std::uint32_t node_index) {
+  const PeerConnectivityPolicy* policy =
+      FindPeerConnectivityPolicy(options.topology, node_index);
+  if (policy != nullptr &&
+      policy->peer_count.minimum() >
+          runtime_topology.ActivePeerIndexes(node_index).size()) {
+    throw std::runtime_error(
+        "peer policy minimum exceeds allowed logical peers after topology "
+        "edge action");
+  }
+}
+
+bool ValidateRuntimeTopologyActionSequence(
+    const Options& options, RuntimePeerTopology* runtime_topology) {
+  bool requires_isolated_network = false;
+  for (const ScenarioWorkload& action :
+       OrderedConfiguredScenarioActions(options)) {
+    if (IsTopologyEdgeAction(action.kind)) {
+      const TopologyEdgeWorkload& edge = action.topology_edge;
+      const std::uint32_t from = edge.from - 1U;
+      const std::uint32_t to = edge.to - 1U;
+      if (action.kind == WorkloadKind::kSetEdgeCondition) {
+        if (!edge.condition) {
+          throw std::runtime_error(
+              "set_edge_condition action is missing its typed condition");
+        }
+        static_cast<void>(
+            runtime_topology->SetCondition(from, to, *edge.condition));
+      } else if (action.kind == WorkloadKind::kActivateEdge) {
+        static_cast<void>(runtime_topology->SetActive(from, to, true));
+      } else if (action.kind == WorkloadKind::kDeactivateEdge) {
+        static_cast<void>(runtime_topology->SetActive(from, to, false));
+      } else {
+        static_cast<void>(runtime_topology->RestoreBaseline(from, to));
+      }
+      ValidateRuntimeTopologyPeerPolicy(options, *runtime_topology, from);
+      const RuntimePeerTopologyEdge& current = runtime_topology->Edge(from, to);
+      requires_isolated_network =
+          requires_isolated_network || (current.active && current.condition);
+    } else if (action.kind == WorkloadKind::kConnectPeer) {
+      const std::uint32_t from = action.connect_peer.node - 1U;
+      const std::uint32_t to = action.connect_peer.peer - 1U;
+      if (!runtime_topology->Edge(from, to).active) {
+        throw std::runtime_error(
+            "scenario connect_peer target is not active at this point in "
+            "the topology action sequence");
+      }
+    }
+  }
+  return requires_isolated_network;
 }
 
 void ParseNodeNetworkConditionTexts(
@@ -2797,8 +2942,8 @@ Options ParseOptions(int argc, char** argv) {
                              std::to_string(chain_spec.max_nodes) +
                              " for chain smoke runs");
   }
-  static_cast<void>(
-      RuntimePeerTopology(options.topology.peer_topology, options.nodes));
+  RuntimePeerTopology validated_runtime_topology(options.topology.peer_topology,
+                                                 options.nodes);
   if (options.generate_node == 0U || options.generate_node > options.nodes) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
   }
@@ -2920,6 +3065,31 @@ Options ParseOptions(int argc, char** argv) {
       ValidateNetworkPartitionRule(workload.network_partition.partition,
                                    options.nodes,
                                    "scenario heal_partition workload");
+    } else if (IsTopologyEdgeAction(workload.kind)) {
+      const TopologyEdgeWorkload& edge = workload.topology_edge;
+      if (edge.from == 0U || edge.from > options.nodes) {
+        throw std::runtime_error(
+            "scenario topology edge action from must be in 1..--nodes");
+      }
+      if (edge.to == 0U || edge.to > options.nodes) {
+        throw std::runtime_error(
+            "scenario topology edge action to must be in 1..--nodes");
+      }
+      if (edge.from == edge.to) {
+        throw std::runtime_error(
+            "scenario topology edge action from and to must differ");
+      }
+      if (workload.kind == WorkloadKind::kSetEdgeCondition) {
+        if (!edge.condition) {
+          throw std::runtime_error(
+              "scenario set_edge_condition requires condition fields");
+        }
+        ValidateNetworkCondition(*edge.condition);
+      } else if (edge.timeout_sec == 0U) {
+        throw std::runtime_error(
+            "scenario topology edge action timeout_sec must be greater than "
+            "zero");
+      }
     } else if (workload.kind == WorkloadKind::kSendRawTransaction) {
       const SendRawTransactionWorkload& transaction =
           workload.send_raw_transaction;
@@ -2965,6 +3135,12 @@ Options ParseOptions(int argc, char** argv) {
     } else if (workload.kind == WorkloadKind::kWalletTransactions) {
       ValidateWalletTransactionsWorkload(workload.wallet_transactions, options);
     }
+  }
+  if (ValidateRuntimeTopologyActionSequence(options,
+                                            &validated_runtime_topology) &&
+      !options.isolate_network) {
+    throw std::runtime_error(
+        "network runtime options require --isolate-network");
   }
   if (options.topology.configured) {
     SimulationRegistry::FromTopology(options.topology,
@@ -3296,6 +3472,30 @@ boost::json::array ResolvedPeerTopologyEdgesJson(
       AddNetworkConditionJsonFields(*edge.condition, &object);
     }
     array.push_back(std::move(object));
+  }
+  return array;
+}
+
+boost::json::object RuntimePeerTopologyEdgeJson(
+    const RuntimePeerTopologyEdge& edge) {
+  boost::json::object object;
+  object["from"] = edge.from + 1U;
+  object["to"] = edge.to + 1U;
+  object["band"] = edge.band;
+  object["active"] = edge.active;
+  if (edge.condition) {
+    object["condition"] = NetworkConditionJson(*edge.condition);
+  } else {
+    object["condition"] = nullptr;
+  }
+  return object;
+}
+
+boost::json::array RuntimePeerTopologyEdgesJson(
+    const RuntimePeerTopology& topology) {
+  boost::json::array array;
+  for (const RuntimePeerTopologyEdge& edge : topology.edges()) {
+    array.push_back(RuntimePeerTopologyEdgeJson(edge));
   }
   return array;
 }
@@ -5049,6 +5249,24 @@ boost::json::object NetworkPartitionWorkloadJson(
   return object;
 }
 
+boost::json::object TopologyEdgeWorkloadJson(
+    const TopologyEdgeWorkload& workload, WorkloadKind kind) {
+  boost::json::object object;
+  object["type"] = std::string(WorkloadKindName(kind));
+  object["from"] = workload.from;
+  object["to"] = workload.to;
+  if (kind == WorkloadKind::kSetEdgeCondition) {
+    if (!workload.condition) {
+      throw std::runtime_error(
+          "set_edge_condition workload is missing its condition");
+    }
+    AddNetworkConditionJsonFields(*workload.condition, &object);
+  } else {
+    object["timeout_sec"] = workload.timeout_sec;
+  }
+  return object;
+}
+
 boost::json::object SendRawTransactionWorkloadJson(
     const SendRawTransactionWorkload& workload) {
   boost::json::object object;
@@ -5122,6 +5340,9 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kHealPartition) {
     return NetworkPartitionWorkloadJson(workload.network_partition,
                                         WorkloadKind::kHealPartition);
+  }
+  if (IsTopologyEdgeAction(workload.kind)) {
+    return TopologyEdgeWorkloadJson(workload.topology_edge, workload.kind);
   }
   if (workload.kind == WorkloadKind::kSendRawTransaction) {
     return SendRawTransactionWorkloadJson(workload.send_raw_transaction);
@@ -5200,6 +5421,8 @@ void WriteScenarioFiles(const Options& options,
     resolved["topology"] =
         NodeRoleTopologyJson(options.topology, options.wallet_initialization);
   }
+  resolved["topology_initial_edges"] = RuntimePeerTopologyEdgesJson(
+      RuntimePeerTopology(options.topology.peer_topology, options.nodes));
   boost::json::array workload_array;
   for (const ScenarioWorkload& workload : workloads) {
     workload_array.push_back(WorkloadJson(workload));
@@ -5799,6 +6022,319 @@ void ApplyDisconnectPeerWorkload(
                  address, static_cast<uint64_t>(before_addresses.size()),
                  static_cast<uint64_t>(after_addresses.size()),
                  connected_before, connected_after, workload.timeout_sec));
+}
+
+std::vector<std::string> RuntimeTopologyAllowedPeers(
+    const RuntimePeerTopology& topology, const std::vector<NodeRuntime>& nodes,
+    std::uint32_t node_index) {
+  std::vector<std::string> allowed;
+  for (const std::uint32_t peer_index :
+       topology.ActivePeerIndexes(node_index)) {
+    if (peer_index >= nodes.size()) {
+      throw std::runtime_error(
+          "runtime topology peer references an unknown node");
+    }
+    allowed.push_back(nodes[peer_index].config.id);
+  }
+  return allowed;
+}
+
+std::string TopologyEdgeUpdateDetail(WorkloadKind action,
+                                     std::uint32_t workload_index,
+                                     std::uint32_t workload_count,
+                                     const RuntimePeerTopologyEdge& previous,
+                                     const RuntimePeerTopologyEdge& current,
+                                     bool kernel_verified, bool peer_verified,
+                                     std::uint32_t timeout_sec) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["action"] = WorkloadKindName(action);
+  detail["from"] = current.from + 1U;
+  detail["to"] = current.to + 1U;
+  detail["previous"] = RuntimePeerTopologyEdgeJson(previous);
+  detail["current"] = RuntimePeerTopologyEdgeJson(current);
+  detail["kernel_verified"] = kernel_verified;
+  detail["peer_verified"] = peer_verified;
+  if (action != WorkloadKind::kSetEdgeCondition) {
+    detail["timeout_sec"] = timeout_sec;
+  }
+  return boost::json::serialize(detail);
+}
+
+std::string TopologyEdgeRollbackFailureDetail(
+    WorkloadKind action, const RuntimePeerTopologyEdge& previous,
+    const RuntimePeerTopologyEdge& attempted, std::string_view original_error,
+    const std::vector<std::string>& rollback_errors) {
+  boost::json::object detail;
+  detail["action"] = WorkloadKindName(action);
+  detail["from"] = previous.from + 1U;
+  detail["to"] = previous.to + 1U;
+  detail["previous"] = RuntimePeerTopologyEdgeJson(previous);
+  detail["attempted"] = RuntimePeerTopologyEdgeJson(attempted);
+  detail["original_error"] = original_error;
+  boost::json::array errors;
+  for (const std::string& error : rollback_errors) {
+    errors.emplace_back(error);
+  }
+  detail["rollback_errors"] = std::move(errors);
+  return boost::json::serialize(detail);
+}
+
+std::string ExceptionMessage(const std::exception_ptr& error) {
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::exception& exception) {
+    return exception.what();
+  } catch (...) {
+    return "unknown exception";
+  }
+}
+
+void ApplyTopologyEdgeWorkload(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriverSpec& chain_spec, const ChainDriver& driver,
+    PeerConnectivityController& controller,
+    RuntimePeerTopology& runtime_topology, std::vector<NodeRuntime>& nodes,
+    const TopologyEdgeWorkload& workload, WorkloadKind action,
+    std::uint32_t workload_index, std::uint32_t workload_count,
+    std::stop_token stop_token) {
+  ThrowIfStopRequested(stop_token);
+  const std::uint32_t from = workload.from - 1U;
+  const std::uint32_t to = workload.to - 1U;
+  if (from >= nodes.size() || to >= nodes.size() || from == to) {
+    throw std::runtime_error("runtime topology edge action node is invalid");
+  }
+
+  NodeRuntime& source = nodes[from];
+  NodeRuntime& target = nodes[to];
+  const RuntimePeerTopologyEdge previous = runtime_topology.Edge(from, to);
+  RuntimePeerTopologyEdge attempted = previous;
+  const std::vector<DirectionalNetworkPolicy> expected_previous_policies =
+      runtime_topology.DirectionalPolicies(NetworkAddressPlan(options), from);
+  std::vector<DirectionalNetworkPolicy> previous_policies;
+  {
+    std::lock_guard<std::mutex> lock(node_network_state_mutex);
+    previous_policies = source.directional_network_policies;
+  }
+  if (previous_policies != expected_previous_policies) {
+    throw std::runtime_error(
+        "runtime directional policy state does not match topology model");
+  }
+  const std::vector<std::string> expected_previous_allowed =
+      RuntimeTopologyAllowedPeers(runtime_topology, nodes, from);
+  const std::vector<std::string> previous_allowed =
+      controller.AllowedPeersFor(source.config.id);
+  if (previous_allowed != expected_previous_allowed) {
+    throw std::runtime_error(
+        "runtime allowed-peer state does not match topology model");
+  }
+  const std::vector<std::string> expected_previous_restart_peers =
+      StartupPeerAddresses(options, runtime_topology, chain_spec, from);
+  const std::vector<std::string> previous_restart_peers =
+      source.config.connect_peers;
+  if (previous_restart_peers != expected_previous_restart_peers) {
+    throw std::runtime_error(
+        "runtime restart-peer state does not match topology model");
+  }
+
+  const std::string peer_address = PeerAddress(options, nodes, workload.to);
+  std::vector<std::string> before_peer_addresses;
+  bool connected_before = false;
+
+  bool model_mutated = false;
+  bool active_transition = false;
+  bool kernel_updated = false;
+  bool allowed_updated = false;
+  bool peer_transition_attempted = false;
+  bool config_updated = false;
+  std::vector<DirectionalNetworkPolicy> desired_policies;
+  std::vector<std::string> desired_allowed;
+  std::vector<std::string> desired_restart_peers;
+  try {
+    if (action == WorkloadKind::kSetEdgeCondition) {
+      if (!workload.condition) {
+        throw std::runtime_error(
+            "set_edge_condition action is missing its condition");
+      }
+      static_cast<void>(
+          runtime_topology.SetCondition(from, to, *workload.condition));
+    } else if (action == WorkloadKind::kActivateEdge) {
+      static_cast<void>(runtime_topology.SetActive(from, to, true));
+    } else if (action == WorkloadKind::kDeactivateEdge) {
+      static_cast<void>(runtime_topology.SetActive(from, to, false));
+    } else if (action == WorkloadKind::kRestoreEdge) {
+      static_cast<void>(runtime_topology.RestoreBaseline(from, to));
+    } else {
+      throw std::runtime_error("unknown runtime topology edge action");
+    }
+    model_mutated = true;
+    attempted = runtime_topology.Edge(from, to);
+    active_transition = previous.active != attempted.active;
+    if (active_transition) {
+      before_peer_addresses = driver.PeerAddresses(source.config, stop_token);
+      connected_before = !driver
+                              .ConnectedPeerAddresses(
+                                  source.config, {peer_address}, stop_token)
+                              .empty();
+    }
+
+    desired_policies =
+        runtime_topology.DirectionalPolicies(NetworkAddressPlan(options), from);
+    desired_allowed =
+        RuntimeTopologyAllowedPeers(runtime_topology, nodes, from);
+    desired_restart_peers =
+        StartupPeerAddresses(options, runtime_topology, chain_spec, from);
+    controller.ValidateAllowedPeerUpdate(source.config.id, desired_allowed);
+
+    ThrowIfStopRequested(stop_token);
+    if (source.network) {
+      if (!source.network_namespace) {
+        throw std::runtime_error(
+            "runtime topology source has no network namespace");
+      }
+      UpdateDirectionalNetworkPoliciesInNamespace(
+          source.network_namespace->fd(), source.network->peer_name,
+          previous_policies, desired_policies);
+      kernel_updated = true;
+    } else if (previous_policies != desired_policies) {
+      throw std::runtime_error(
+          "runtime topology conditions require isolated networking");
+    }
+
+    if (previous_allowed != desired_allowed) {
+      controller.SetAllowedPeers(source.config.id, desired_allowed);
+      allowed_updated = true;
+    }
+
+    std::vector<std::string> after_peer_addresses;
+    bool connected_after = connected_before;
+    if (active_transition) {
+      peer_transition_attempted = true;
+      if (attempted.active) {
+        controller.ConnectPeer(source.config.id, target.config.id,
+                               std::chrono::seconds(workload.timeout_sec),
+                               stop_token);
+      } else {
+        controller.DisconnectPeer(source.config.id, target.config.id,
+                                  std::chrono::seconds(workload.timeout_sec),
+                                  stop_token);
+      }
+      after_peer_addresses = driver.PeerAddresses(source.config, stop_token);
+      connected_after = attempted.active;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      source.directional_network_policies = desired_policies;
+    }
+    source.config.connect_peers = desired_restart_peers;
+    config_updated = true;
+
+    if (active_transition) {
+      WriteEvent(events_path, options.run_id, source.config.id,
+                 attempted.active ? SimulationEventKind::kPeerConnected
+                                  : SimulationEventKind::kPeerDisconnected,
+                 PeerChurnDetail(
+                     workload_index, workload_count, workload.from, workload.to,
+                     peer_address,
+                     static_cast<std::uint64_t>(before_peer_addresses.size()),
+                     static_cast<std::uint64_t>(after_peer_addresses.size()),
+                     connected_before, connected_after, workload.timeout_sec));
+    }
+    WriteEvent(events_path, options.run_id, source.config.id,
+               SimulationEventKind::kTopologyEdgeUpdated,
+               TopologyEdgeUpdateDetail(action, workload_index, workload_count,
+                                        previous, attempted, true, true,
+                                        workload.timeout_sec));
+  } catch (...) {
+    const std::exception_ptr original_error = std::current_exception();
+    std::vector<std::string> rollback_errors;
+    const auto rollback = [&](std::string_view step, const auto& operation) {
+      try {
+        operation();
+      } catch (const std::exception& error) {
+        rollback_errors.push_back(std::string(step) + ": " + error.what());
+      } catch (...) {
+        rollback_errors.push_back(std::string(step) + ": unknown exception");
+      }
+    };
+
+    if (kernel_updated) {
+      rollback("kernel policy", [&] {
+        UpdateDirectionalNetworkPoliciesInNamespace(
+            source.network_namespace->fd(), source.network->peer_name,
+            desired_policies, previous_policies);
+      });
+    }
+    // A deactivation removes the target from the allow-list before
+    // disconnecting it.  Restore that list before attempting a compensating
+    // reconnect.  For an activation, keep the target eligible until any
+    // compensating disconnect has completed, then restore the prior (inactive)
+    // allow-list.
+    const bool restore_allowed_before_peer = allowed_updated && previous.active;
+    if (restore_allowed_before_peer) {
+      rollback("allowed peers", [&] {
+        controller.SetAllowedPeers(source.config.id, previous_allowed);
+      });
+      allowed_updated = false;
+    }
+    if (peer_transition_attempted) {
+      rollback("peer state", [&] {
+        const bool connected_now =
+            !driver.ConnectedPeerAddresses(source.config, {peer_address})
+                 .empty();
+        if (connected_now == connected_before) {
+          return;
+        }
+        if (connected_before) {
+          if (!previous.active) {
+            throw std::runtime_error(
+                "cannot restore a pre-existing physical session for an "
+                "inactive logical edge");
+          }
+          controller.ConnectPeer(source.config.id, target.config.id,
+                                 std::chrono::seconds(workload.timeout_sec));
+        } else {
+          controller.DisconnectPeer(source.config.id, target.config.id,
+                                    std::chrono::seconds(workload.timeout_sec));
+        }
+      });
+    }
+    if (allowed_updated) {
+      rollback("allowed peers", [&] {
+        controller.SetAllowedPeers(source.config.id, previous_allowed);
+      });
+    }
+    if (config_updated || model_mutated) {
+      source.config.connect_peers = previous_restart_peers;
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      source.directional_network_policies = previous_policies;
+    }
+    if (model_mutated) {
+      rollback("topology model",
+               [&] { runtime_topology.RestoreState(previous); });
+    }
+
+    if (!rollback_errors.empty()) {
+      const std::string original_message = ExceptionMessage(original_error);
+      for (const std::string& rollback_error : rollback_errors) {
+        BBP_LOG(error) << "topology edge rollback failed after "
+                       << original_message << ": " << rollback_error;
+      }
+      try {
+        WriteEvent(events_path, options.run_id, source.config.id,
+                   SimulationEventKind::kTopologyEdgeUpdateRollbackFailed,
+                   TopologyEdgeRollbackFailureDetail(
+                       action, previous, attempted, original_message,
+                       rollback_errors));
+      } catch (const std::exception& event_error) {
+        BBP_LOG(error) << "failed to record topology rollback failure: "
+                       << event_error.what();
+      }
+    }
+    std::rethrow_exception(original_error);
+  }
 }
 
 void ApplySendRawTransactionWorkload(
@@ -7440,6 +7976,13 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               options, events_path, nodes,
               scenario_workload.network_partition.partition, true, action_index,
               action_count, stop_token);
+        } else if (IsTopologyEdgeAction(scenario_workload.kind)) {
+          std::lock_guard<std::mutex> lock(node_process_mutex);
+          ApplyTopologyEdgeWorkload(
+              options, events_path, chain_spec, driver,
+              *peer_connectivity_controller, runtime_topology, nodes,
+              scenario_workload.topology_edge, scenario_workload.kind,
+              action_index, action_count, stop_token);
         }
       } catch (const std::exception& e) {
         if (is_scheduled) {

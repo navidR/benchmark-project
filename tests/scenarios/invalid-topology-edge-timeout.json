@@ -1,0 +1,21 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "isolated_network": true,
+  "topology": {
+    "node_count": 2,
+    "type": "custom_edge_list",
+    "edges": [
+      {"from": 1, "to": 2, "bidirectional": false, "active": false}
+    ]
+  },
+  "events": [
+    {
+      "at": "1ms",
+      "action": "activate_edge",
+      "from": 1,
+      "to": 2,
+      "timeout_sec": 0
+    }
+  ]
+}

@@ -64,6 +64,10 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "network_partition_applied";
     case SimulationEventKind::kNetworkPartitionHealed:
       return "network_partition_healed";
+    case SimulationEventKind::kTopologyEdgeUpdated:
+      return "topology_edge_updated";
+    case SimulationEventKind::kTopologyEdgeUpdateRollbackFailed:
+      return "topology_edge_update_rollback_failed";
     case SimulationEventKind::kRestartRequested:
       return "restart_requested";
     case SimulationEventKind::kSigterm:
@@ -191,6 +195,10 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
     return SimulationEventKind::kNetworkPartitionApplied;
   if (name == "network_partition_healed")
     return SimulationEventKind::kNetworkPartitionHealed;
+  if (name == "topology_edge_updated")
+    return SimulationEventKind::kTopologyEdgeUpdated;
+  if (name == "topology_edge_update_rollback_failed")
+    return SimulationEventKind::kTopologyEdgeUpdateRollbackFailed;
   if (name == "restart_requested")
     return SimulationEventKind::kRestartRequested;
   if (name == "sigterm") return SimulationEventKind::kSigterm;

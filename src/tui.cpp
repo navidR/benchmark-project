@@ -354,6 +354,16 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
       case WorkloadKind::kHealPartition:
         text += "heal";
         break;
+      case WorkloadKind::kSetEdgeCondition:
+      case WorkloadKind::kActivateEdge:
+      case WorkloadKind::kDeactivateEdge:
+      case WorkloadKind::kRestoreEdge:
+        text += type_name;
+        text += " n";
+        text += JsonMetricText(workload, "from");
+        text += "->n";
+        text += JsonMetricText(workload, "to");
+        break;
       case WorkloadKind::kSendRawTransaction:
         text += "tx n";
         text += JsonMetricText(workload, "funding_node");
@@ -538,7 +548,10 @@ std::string SelectedPeerPolicyText(const boost::json::object& report,
     if (JsonBool(policy, "all_peers").value_or(false)) {
       std::size_t count = 0U;
       const boost::json::value* edges_value =
-          topology_value->as_object().if_contains("resolved_edges");
+          report.if_contains("topology_current_edges");
+      if (edges_value == nullptr || !edges_value->is_array()) {
+        edges_value = topology_value->as_object().if_contains("resolved_edges");
+      }
       if (edges_value != nullptr && edges_value->is_array()) {
         for (const boost::json::value& edge_value : edges_value->as_array()) {
           if (!edge_value.is_object()) {
@@ -546,7 +559,8 @@ std::string SelectedPeerPolicyText(const boost::json::object& report,
           }
           const std::optional<std::uint64_t> from =
               JsonUnsignedMetric(edge_value.as_object(), "from");
-          if (from && *from == selected_node + 1U) {
+          if (from && *from == selected_node + 1U &&
+              JsonBool(edge_value.as_object(), "active").value_or(true)) {
             ++count;
           }
         }
@@ -562,13 +576,17 @@ std::string SelectedPeerPolicyText(const boost::json::object& report,
 std::string SelectedTopologyText(const boost::json::object& report,
                                  std::size_t selected_node) {
   const boost::json::value* topology_value = report.if_contains("topology");
-  if (topology_value == nullptr || !topology_value->is_object()) {
-    return "full_mesh";
-  }
-  const boost::json::object& topology = topology_value->as_object();
+  const boost::json::object* topology =
+      topology_value != nullptr && topology_value->is_object()
+          ? &topology_value->as_object()
+          : nullptr;
   std::size_t eligible_count = 0U;
   const boost::json::value* edges_value =
-      topology.if_contains("resolved_edges");
+      report.if_contains("topology_current_edges");
+  if ((edges_value == nullptr || !edges_value->is_array()) &&
+      topology != nullptr) {
+    edges_value = topology->if_contains("resolved_edges");
+  }
   if (edges_value != nullptr && edges_value->is_array()) {
     for (const boost::json::value& edge_value : edges_value->as_array()) {
       if (!edge_value.is_object()) {
@@ -576,13 +594,16 @@ std::string SelectedTopologyText(const boost::json::object& report,
       }
       const std::optional<std::uint64_t> from =
           JsonUnsignedMetric(edge_value.as_object(), "from");
-      if (from && *from == selected_node + 1U) {
+      if (from && *from == selected_node + 1U &&
+          JsonBool(edge_value.as_object(), "active").value_or(true)) {
         ++eligible_count;
       }
     }
   }
-  return JsonString(topology, "type", "full_mesh") + " / " +
-         std::to_string(eligible_count) + " eligible";
+  const std::string topology_kind =
+      topology == nullptr ? "full_mesh"
+                          : JsonString(*topology, "type", "full_mesh");
+  return topology_kind + " / " + std::to_string(eligible_count) + " eligible";
 }
 
 const boost::json::object* WalletForNode(const boost::json::object& report,

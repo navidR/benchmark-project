@@ -1,0 +1,81 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 3,
+  "isolated_network": true,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 3,
+    "type": "custom_edge_list",
+    "edges": [
+      {
+        "from": 1,
+        "to": 2,
+        "bidirectional": false,
+        "active": true,
+        "delay_ms": 10
+      },
+      {
+        "from": 1,
+        "to": 3,
+        "bidirectional": false,
+        "active": false
+      },
+      {"from": 2, "to": 1, "bidirectional": false, "active": true},
+      {"from": 3, "to": 1, "bidirectional": false, "active": true}
+    ]
+  },
+  "events": [
+    {
+      "at": "100ms",
+      "action": "set_edge_condition",
+      "from": 1,
+      "to": 2,
+      "bandwidth_mbps": 20,
+      "delay_ms": 25,
+      "jitter_ms": 2
+    },
+    {
+      "at": "200ms",
+      "action": "deactivate_edge",
+      "from": 1,
+      "to": 2,
+      "timeout_sec": 5
+    },
+    {
+      "at": "300ms",
+      "action": "activate_edge",
+      "from": 1,
+      "to": 3,
+      "timeout_sec": 5
+    },
+    {
+      "at": "400ms",
+      "action": "set_edge_condition",
+      "from": 1,
+      "to": 3,
+      "latency_ms": 30,
+      "delay_ms": 30
+    },
+    {
+      "at": "500ms",
+      "action": "restore_edge",
+      "from": 1,
+      "to": 3,
+      "timeout_sec": 5
+    },
+    {
+      "at": "600ms",
+      "action": "activate_edge",
+      "from": 1,
+      "to": 2,
+      "timeout_sec": 5
+    },
+    {
+      "at": "700ms",
+      "action": "restore_edge",
+      "from": 1,
+      "to": 2,
+      "timeout_sec": 5
+    }
+  ]
+}

@@ -17,6 +17,10 @@ enum class WorkloadKind {
   kResourcePressure,
   kPartitionNodes,
   kHealPartition,
+  kSetEdgeCondition,
+  kActivateEdge,
+  kDeactivateEdge,
+  kRestoreEdge,
   kSendRawTransaction,
   kWalletTransactions,
 };
@@ -45,6 +49,14 @@ constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
       return "partition_nodes";
     case WorkloadKind::kHealPartition:
       return "heal_partition";
+    case WorkloadKind::kSetEdgeCondition:
+      return "set_edge_condition";
+    case WorkloadKind::kActivateEdge:
+      return "activate_edge";
+    case WorkloadKind::kDeactivateEdge:
+      return "deactivate_edge";
+    case WorkloadKind::kRestoreEdge:
+      return "restore_edge";
     case WorkloadKind::kSendRawTransaction:
       return "send_raw_transaction";
     case WorkloadKind::kWalletTransactions:
@@ -86,6 +98,18 @@ constexpr std::optional<WorkloadKind> ParseWorkloadKind(std::string_view name) {
   }
   if (name == "heal_partition") {
     return WorkloadKind::kHealPartition;
+  }
+  if (name == "set_edge_condition") {
+    return WorkloadKind::kSetEdgeCondition;
+  }
+  if (name == "activate_edge") {
+    return WorkloadKind::kActivateEdge;
+  }
+  if (name == "deactivate_edge") {
+    return WorkloadKind::kDeactivateEdge;
+  }
+  if (name == "restore_edge") {
+    return WorkloadKind::kRestoreEdge;
   }
   if (name == "send_raw_transaction") {
     return WorkloadKind::kSendRawTransaction;

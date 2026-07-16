@@ -94,17 +94,22 @@ void PeerConnectivityController::SetPolicy(std::string_view node_id,
 void PeerConnectivityController::SetAllowedPeers(
     std::string_view node_id, std::vector<std::string> peer_node_ids) {
   std::lock_guard<std::mutex> lock(operation_mutex_);
-  ValidateAllowedPeers(node_id, peer_node_ids);
-  const auto policy = policies_.find(std::string(node_id));
-  if (policy != policies_.end() &&
-      policy->second.minimum() > peer_node_ids.size()) {
-    throw std::runtime_error(
-        "peer policy minimum exceeds allowed logical peers for " +
-        std::string(node_id));
-  }
+  ValidateAllowedPeerUpdateUnlocked(node_id, peer_node_ids);
   allowed_peers_.insert_or_assign(std::string(node_id),
                                   std::move(peer_node_ids));
   last_failures_.erase(std::string(node_id));
+}
+
+void PeerConnectivityController::ValidateAllowedPeerUpdate(
+    std::string_view node_id, const std::vector<std::string>& peer_node_ids) {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  ValidateAllowedPeerUpdateUnlocked(node_id, peer_node_ids);
+}
+
+std::vector<std::string> PeerConnectivityController::AllowedPeersFor(
+    std::string_view node_id) {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  return AllowedPeers(node_id);
 }
 
 void PeerConnectivityController::ConnectPeer(std::string_view node_id,
@@ -186,6 +191,19 @@ void PeerConnectivityController::ValidateAllowedPeers(
       throw std::runtime_error("allowed peer set contains a duplicate peer: " +
                                peer.id);
     }
+  }
+}
+
+void PeerConnectivityController::ValidateAllowedPeerUpdateUnlocked(
+    std::string_view node_id,
+    const std::vector<std::string>& peer_node_ids) const {
+  ValidateAllowedPeers(node_id, peer_node_ids);
+  const auto policy = policies_.find(std::string(node_id));
+  if (policy != policies_.end() &&
+      policy->second.minimum() > peer_node_ids.size()) {
+    throw std::runtime_error(
+        "peer policy minimum exceeds allowed logical peers for " +
+        std::string(node_id));
   }
 }
 

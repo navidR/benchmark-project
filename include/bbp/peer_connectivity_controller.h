@@ -48,6 +48,9 @@ class PeerConnectivityController {
   void SetPolicy(std::string_view node_id, PeerCountPolicy policy);
   void SetAllowedPeers(std::string_view node_id,
                        std::vector<std::string> peer_node_ids);
+  void ValidateAllowedPeerUpdate(std::string_view node_id,
+                                 const std::vector<std::string>& peer_node_ids);
+  std::vector<std::string> AllowedPeersFor(std::string_view node_id);
   void ConnectPeer(std::string_view node_id, std::string_view peer_node_id,
                    std::chrono::seconds timeout,
                    std::stop_token stop_token = {});
@@ -59,6 +62,9 @@ class PeerConnectivityController {
   const ChainNodeConfig& FindNode(std::string_view node_id) const;
   const std::vector<std::string>& AllowedPeers(std::string_view node_id) const;
   void ValidateAllowedPeers(
+      std::string_view node_id,
+      const std::vector<std::string>& peer_node_ids) const;
+  void ValidateAllowedPeerUpdateUnlocked(
       std::string_view node_id,
       const std::vector<std::string>& peer_node_ids) const;
   void RequireUnambiguousPeerIdentity(const ChainNodeConfig& node,

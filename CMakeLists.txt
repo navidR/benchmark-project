@@ -427,6 +427,42 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-scheduled-events-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-topology-edge-events
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-topology-edge-events.json"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-edge-inactive-condition
+    tests/scenarios/invalid-topology-edge-inactive-condition.json
+    "cannot set a condition on an inactive runtime topology edge"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-edge-already-active
+    tests/scenarios/invalid-topology-edge-already-active.json
+    "runtime topology edge is already active"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-edge-condition-without-isolation
+    tests/scenarios/invalid-topology-edge-condition-without-isolation.json
+    "network runtime options require --isolate-network"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-edge-condition-on-activate
+    tests/scenarios/invalid-topology-edge-condition-on-activate.json
+    "scenario activate_edge does not accept condition fields"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-edge-peer-policy
+    tests/scenarios/invalid-topology-edge-peer-policy.json
+    "peer policy minimum exceeds allowed logical peers after topology edge action"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-edge-timeout
+    tests/scenarios/invalid-topology-edge-timeout.json
+    "scenario topology edge action timeout_sec must be greater than zero"
+  )
   add_cli_failure_test(
     bbp-invalid-logical-topology-latency-matrix
     tests/scenarios/invalid-logical-topology-latency-matrix.json

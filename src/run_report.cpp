@@ -30,6 +30,7 @@ constexpr std::size_t kMaximumOperatorCommandSummaries = 256U;
 constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
 constexpr std::size_t kMaximumScheduledEventSummaries = 256U;
 constexpr std::size_t kMaximumDirectionalPolicyVerifications = 256U;
+constexpr std::size_t kMaximumTopologyEdgeSummaries = 256U;
 
 struct NodeReport {
   std::uint64_t metric_samples = 0;
@@ -337,6 +338,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "isolated_network", report);
   CopyField(scenario, "sync_timeout_sec", report);
   CopyField(scenario, "topology", report);
+  CopyField(scenario, "topology_initial_edges", report);
   CopyField(scenario, "workloads", report);
   CopyField(scenario, "events", report);
   CopyField(scenario, "resources", report);
@@ -685,6 +687,49 @@ void AppendDirectionalPolicyVerification(const boost::json::object& event,
   }
 }
 
+void RememberTopologyEdgeUpdate(const boost::json::object& event,
+                                boost::json::array* summaries,
+                                boost::json::array* current_edges) {
+  AppendEventSummary(event, summaries);
+  if (summaries->size() > kMaximumTopologyEdgeSummaries) {
+    summaries->erase(summaries->begin());
+  }
+  const boost::json::value detail = ParseEventDetail(event);
+  if (!detail.is_object()) {
+    return;
+  }
+  const boost::json::value* current = detail.as_object().if_contains("current");
+  if (current == nullptr || !current->is_object()) {
+    return;
+  }
+  const std::optional<std::uint64_t> from =
+      OptionalUint64Field(current->as_object(), "from");
+  const std::optional<std::uint64_t> to =
+      OptionalUint64Field(current->as_object(), "to");
+  if (!from || !to) {
+    return;
+  }
+  for (boost::json::value& edge : *current_edges) {
+    if (!edge.is_object()) {
+      continue;
+    }
+    if (OptionalUint64Field(edge.as_object(), "from") == from &&
+        OptionalUint64Field(edge.as_object(), "to") == to) {
+      edge = *current;
+      return;
+    }
+  }
+  current_edges->push_back(*current);
+}
+
+void AppendBoundedTopologyEdgeSummary(const boost::json::object& event,
+                                      boost::json::array* summaries) {
+  AppendEventSummary(event, summaries);
+  if (summaries->size() > kMaximumTopologyEdgeSummaries) {
+    summaries->erase(summaries->begin());
+  }
+}
+
 void ApplyBlockProductionPolicyEvent(const boost::json::object& event,
                                      boost::json::object* report) {
   const boost::json::value detail = ParseEventDetail(event);
@@ -743,6 +788,12 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::object report;
   report["run_root"] = std::filesystem::absolute(run_root).string();
   LoadResolvedScenario(run_root / "resolved-scenario.json", &report);
+  boost::json::array topology_current_edges;
+  const boost::json::value* topology_initial_edges =
+      report.if_contains("topology_initial_edges");
+  if (topology_initial_edges != nullptr && topology_initial_edges->is_array()) {
+    topology_current_edges = topology_initial_edges->as_array();
+  }
 
   std::uint64_t event_count = 0;
   std::uint64_t metric_count = 0;
@@ -778,6 +829,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
   boost::json::array directional_network_policy_verifications;
+  boost::json::array topology_edge_updates;
+  boost::json::array topology_edge_rollback_failures;
   boost::json::array wallet_funding;
   boost::json::array wallet_transactions;
   boost::json::array operator_commands;
@@ -886,6 +939,14 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
             AppendDirectionalPolicyVerification(
                 event, &directional_network_policy_verifications);
             break;
+          case SimulationEventKind::kTopologyEdgeUpdated:
+            RememberTopologyEdgeUpdate(event, &topology_edge_updates,
+                                       &topology_current_edges);
+            break;
+          case SimulationEventKind::kTopologyEdgeUpdateRollbackFailed:
+            AppendBoundedTopologyEdgeSummary(event,
+                                             &topology_edge_rollback_failures);
+            break;
           case SimulationEventKind::kWalletAddressRequested:
           case SimulationEventKind::kWalletAddressCreated:
             RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
@@ -991,6 +1052,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["network_partition_heals"] = std::move(network_partition_heals);
   report["directional_network_policy_verifications"] =
       std::move(directional_network_policy_verifications);
+  report["topology_edge_updates"] = std::move(topology_edge_updates);
+  report["topology_edge_rollback_failures"] =
+      std::move(topology_edge_rollback_failures);
+  report["topology_current_edges"] = std::move(topology_current_edges);
   report["wallet_funding"] = std::move(wallet_funding);
   report["wallet_transactions"] = std::move(wallet_transactions);
   report["operator_commands"] = std::move(operator_commands);

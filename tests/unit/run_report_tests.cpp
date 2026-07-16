@@ -692,6 +692,99 @@ BOOST_AUTO_TEST_CASE(
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_reduces_successful_topology_edge_updates) {
+  const std::filesystem::path dir = MakeTestDir("topology-edge-updates");
+  boost::json::object initial_first;
+  initial_first["from"] = 1U;
+  initial_first["to"] = 2U;
+  initial_first["band"] = 1U;
+  initial_first["active"] = true;
+  initial_first["condition"] = nullptr;
+  boost::json::object initial_second;
+  initial_second["from"] = 1U;
+  initial_second["to"] = 3U;
+  initial_second["band"] = 2U;
+  initial_second["active"] = false;
+  initial_second["condition"] = nullptr;
+  boost::json::array initial_edges;
+  initial_edges.push_back(initial_first);
+  initial_edges.push_back(initial_second);
+  boost::json::object scenario;
+  scenario["run_id"] = "r1";
+  scenario["nodes"] = 3U;
+  scenario["topology_initial_edges"] = initial_edges;
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 boost::json::serialize(scenario) + "\n");
+
+  bbp::AppendLine(dir / "events.jsonl",
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_started\"}");
+  boost::json::object conditioned = initial_first;
+  boost::json::object condition;
+  condition["bandwidth_mbps"] = 12U;
+  condition["delay_ms"] = 35U;
+  conditioned["condition"] = condition;
+  boost::json::object condition_detail;
+  condition_detail["action"] = "set_edge_condition";
+  condition_detail["from"] = 1U;
+  condition_detail["to"] = 2U;
+  condition_detail["previous"] = initial_first;
+  condition_detail["current"] = conditioned;
+  condition_detail["kernel_verified"] = true;
+  condition_detail["peer_verified"] = true;
+  boost::json::object condition_event;
+  condition_event["run_id"] = "r1";
+  condition_event["node_id"] = "firo-1";
+  condition_event["event"] = "topology_edge_updated";
+  condition_event["detail"] = boost::json::serialize(condition_detail);
+  bbp::AppendLine(dir / "events.jsonl",
+                  boost::json::serialize(condition_event));
+
+  boost::json::object inactive = conditioned;
+  inactive["active"] = false;
+  boost::json::object deactivate_detail;
+  deactivate_detail["action"] = "deactivate_edge";
+  deactivate_detail["from"] = 1U;
+  deactivate_detail["to"] = 2U;
+  deactivate_detail["previous"] = conditioned;
+  deactivate_detail["current"] = inactive;
+  deactivate_detail["kernel_verified"] = true;
+  deactivate_detail["peer_verified"] = true;
+  boost::json::object deactivate_event;
+  deactivate_event["run_id"] = "r1";
+  deactivate_event["node_id"] = "firo-1";
+  deactivate_event["event"] = "topology_edge_updated";
+  deactivate_event["detail"] = boost::json::serialize(deactivate_detail);
+  bbp::AppendLine(dir / "events.jsonl",
+                  boost::json::serialize(deactivate_event));
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+      "\"event\":\"topology_edge_update_rollback_failed\","
+      "\"detail\":\"{\\\"original_error\\\":\\\"rpc failed\\\"}\"}");
+  bbp::AppendLine(dir / "events.jsonl",
+                  "{\"run_id\":\"r1\",\"node_id\":\"sim\","
+                  "\"event\":\"run_finished\"}");
+  bbp::WriteText(dir / "metrics.jsonl", "");
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  BOOST_REQUIRE_EQUAL(report.at("topology_edge_updates").as_array().size(), 2U);
+  BOOST_REQUIRE_EQUAL(
+      report.at("topology_edge_rollback_failures").as_array().size(), 1U);
+  const boost::json::array& current =
+      report.at("topology_current_edges").as_array();
+  BOOST_REQUIRE_EQUAL(current.size(), 2U);
+  BOOST_TEST(JsonInteger(current[0].as_object(), "band") == 1U);
+  BOOST_TEST(!current[0].as_object().at("active").as_bool());
+  BOOST_TEST(JsonInteger(current[0].as_object().at("condition").as_object(),
+                         "delay_ms") == 35U);
+  BOOST_TEST(JsonInteger(current[1].as_object(), "band") == 2U);
+  BOOST_TEST(!current[1].as_object().at("active").as_bool());
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-peer-churn");
   bbp::WriteText(dir / "resolved-scenario.json",
