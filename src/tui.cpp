@@ -936,6 +936,21 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
+  AddDetailPair(
+      y, 0, left_width, "block rules",
+      JsonMetricText(metric_object, "network_filter_policy_count") +
+          " active / " +
+          JsonMetricText(metric_object, "network_filter_drop_packets") +
+          " drops");
+  AddDetailPair(
+      y, left_width, right_width, "filter matches",
+      JsonMetricText(metric_object, "network_filter_match_packets") +
+          " packets / " +
+          JsonBytesKiBText(metric_object, "network_filter_match_bytes"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
   AddDetailPair(y, 0, left_width, "peer policy",
                 SelectedPeerPolicyText(report, selected_node,
                                        JsonString(*node, "node_id")));

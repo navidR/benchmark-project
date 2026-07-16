@@ -2861,6 +2861,10 @@ boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
     filter_json["has_tcp_dst_mask"] = filter.has_tcp_dst_mask;
     filter_json["tcp_dst_mask"] = filter.tcp_dst_mask;
     filter_json["has_drop_action"] = filter.has_drop_action;
+    filter_json["has_stats"] = filter.has_stats;
+    filter_json["match_bytes"] = filter.match_bytes;
+    filter_json["match_packets"] = filter.match_packets;
+    filter_json["drop_packets"] = filter.drop_packets;
     filters_json.push_back(std::move(filter_json));
   }
   return filters_json;
@@ -3544,13 +3548,32 @@ std::string AddressProbeJson() {
   return boost::json::serialize(result);
 }
 
+boost::json::object NetworkPolicyCounterJson(const TcFilterInfo& filter) {
+  boost::json::object object;
+  object["kind"] = "ipv4_tcp_drop";
+  object["handle"] = filter.handle;
+  if (filter.has_ipv4_src) {
+    object["src_address"] = filter.ipv4_src;
+  } else {
+    object["src_address"] = nullptr;
+  }
+  object["dst_address"] = filter.ipv4_dst;
+  object["dst_port"] = filter.tcp_dst;
+  object["has_stats"] = filter.has_stats;
+  object["match_bytes"] = filter.match_bytes;
+  object["match_packets"] = filter.match_packets;
+  object["drop_packets"] = filter.drop_packets;
+  return object;
+}
+
 std::string MetricsJson(const std::string& run_id, const std::string& node_id,
                         const ChainMetrics& chain,
                         uint64_t generated_block_count,
                         uint64_t mined_transaction_count,
                         bool mined_transaction_count_complete,
                         uint64_t restart_count, const CgroupMetrics* cgroup,
-                        const LinkInfo* link, const QdiscInfo* qdisc) {
+                        const LinkInfo* link, const QdiscInfo* qdisc,
+                        const std::vector<TcFilterInfo>* filters) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
@@ -3677,6 +3700,23 @@ std::string MetricsJson(const std::string& run_id, const std::string& node_id,
     object["qdisc_tbf_limit_bytes"] = qdisc->tbf_limit_bytes;
     object["qdisc_tbf_buffer_ticks"] = qdisc->tbf_buffer_ticks;
     object["qdisc_tbf_mtu_ticks"] = qdisc->tbf_mtu_ticks;
+  }
+  if (filters != nullptr) {
+    const TcFilterStatsSummary summary =
+        SummarizeEgressIpv4TcpDropPolicies(*filters, link->name);
+    object["network_filter_policy_count"] = summary.policy_count;
+    object["network_filter_policies_with_stats"] = summary.policies_with_stats;
+    object["network_filter_match_bytes"] = summary.match_bytes;
+    object["network_filter_match_packets"] = summary.match_packets;
+    object["network_filter_drop_packets"] = summary.drop_packets;
+    boost::json::array policies;
+    for (const TcFilterInfo& filter : *filters) {
+      if (TcFilterIsEgressIpv4TcpDropPolicy(filter, link->name)) {
+        policies.push_back(NetworkPolicyCounterJson(filter));
+      }
+    }
+    object["network_policy_counters"] = policies;
+    object["network_active_block_rules"] = std::move(policies);
   }
   return boost::json::serialize(object);
 }
@@ -4168,6 +4208,8 @@ void WriteMetricsSnapshot(
         network ? FindLinkByName(links, network->host_name) : nullptr;
     std::optional<QdiscInfo> qdisc_summary;
     const QdiscInfo* qdisc = nullptr;
+    std::vector<TcFilterInfo> filters;
+    const std::vector<TcFilterInfo>* filter_metrics = nullptr;
     if (network) {
       if (network->apply_condition) {
         QdiscInfo candidate;
@@ -4180,13 +4222,17 @@ void WriteMetricsSnapshot(
       if (qdisc == nullptr) {
         qdisc = FindQdiscByInterfaceName(qdiscs, network->host_name);
       }
+      if (link != nullptr) {
+        filters = ListTcFiltersForInterface(network->host_name);
+        filter_metrics = &filters;
+      }
     }
     AppendLine(
         metrics_path,
         MetricsJson(options.run_id, node.config.id, chain,
                     node.GeneratedBlockCount(), node.MinedTransactionCount(),
                     node.MinedTransactionCountComplete(), node.RestartCount(),
-                    &cg, link, qdisc));
+                    &cg, link, qdisc, filter_metrics));
   }
 }
 
@@ -5612,7 +5658,8 @@ bool NetworkBlockRulePresent(const NodeRuntime& node,
   if (!node.network) {
     return false;
   }
-  const std::vector<TcFilterInfo> filters = ListTcFilters();
+  const std::vector<TcFilterInfo> filters =
+      ListTcFiltersForInterface(node.network->host_name);
   for (const TcFilterInfo& filter : filters) {
     if (TcFilterMatchesEgressIpv4TcpDrop(filter, node.network->host_name,
                                          rule.src_address, rule.dst_address,

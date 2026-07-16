@@ -259,6 +259,22 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"read_bytes_per_sec\":1048576}],"
       "\"pids_current\":2,\"oom_kill\":0,"
       "\"network_rx_bytes\":100,\"network_tx_bytes\":200,"
+      "\"network_filter_policy_count\":1,"
+      "\"network_filter_policies_with_stats\":1,"
+      "\"network_filter_match_bytes\":180,"
+      "\"network_filter_match_packets\":3,"
+      "\"network_filter_drop_packets\":3,"
+      "\"network_policy_counters\":[{\"kind\":\"ipv4_tcp_drop\","
+      "\"handle\":1001,\"src_address\":null,"
+      "\"dst_address\":\"198.51.100.7\",\"dst_port\":18168,"
+      "\"has_stats\":true,\"match_bytes\":180,"
+      "\"match_packets\":3,\"drop_packets\":3}],"
+      "\"network_active_block_rules\":[{"
+      "\"kind\":\"ipv4_tcp_drop\",\"handle\":1001,"
+      "\"src_address\":null,\"dst_address\":\"198.51.100.7\","
+      "\"dst_port\":18168,\"has_stats\":true,"
+      "\"match_bytes\":180,\"match_packets\":3,"
+      "\"drop_packets\":3}],"
       "\"qdisc_bytes\":300,\"qdisc_drops\":1,"
       "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":2000,"
       "\"qdisc_netem_jitter_us\":500,\"qdisc_netem_reorder\":429496,"
@@ -503,6 +519,24 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "oom_kill") == 0U);
   BOOST_TEST(JsonInteger(last_metrics, "network_rx_bytes") == 100U);
   BOOST_TEST(JsonInteger(last_metrics, "network_tx_bytes") == 200U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_filter_policy_count") == 1U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_filter_policies_with_stats") ==
+             1U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_filter_match_bytes") == 180U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_filter_match_packets") == 3U);
+  BOOST_TEST(JsonInteger(last_metrics, "network_filter_drop_packets") == 3U);
+  const boost::json::array& policy_counters =
+      last_metrics.at("network_policy_counters").as_array();
+  BOOST_REQUIRE_EQUAL(policy_counters.size(), 1U);
+  const boost::json::object& policy_counter = policy_counters[0].as_object();
+  BOOST_TEST(JsonInteger(policy_counter, "handle") == 1001U);
+  BOOST_TEST(policy_counter.at("src_address").is_null());
+  BOOST_TEST(policy_counter.at("dst_address").as_string() == "198.51.100.7");
+  BOOST_TEST(JsonInteger(policy_counter, "dst_port") == 18168U);
+  BOOST_TEST(policy_counter.at("has_stats").as_bool());
+  BOOST_TEST(JsonInteger(policy_counter, "drop_packets") == 3U);
+  BOOST_REQUIRE_EQUAL(
+      last_metrics.at("network_active_block_rules").as_array().size(), 1U);
   BOOST_TEST(JsonInteger(last_metrics, "network_uplink_bytes") == 100U);
   BOOST_TEST(JsonInteger(last_metrics, "network_downlink_bytes") == 200U);
   BOOST_TEST(JsonInteger(last_metrics, "network_uplink_bytes_per_sec") == 37U);

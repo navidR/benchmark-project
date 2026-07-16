@@ -120,6 +120,18 @@ struct TcFilterInfo {
   bool has_tcp_dst_mask = false;
   std::uint16_t tcp_dst_mask = 0;
   bool has_drop_action = false;
+  bool has_stats = false;
+  std::uint64_t match_bytes = 0;
+  std::uint64_t match_packets = 0;
+  std::uint64_t drop_packets = 0;
+};
+
+struct TcFilterStatsSummary {
+  std::uint64_t policy_count = 0;
+  std::uint64_t policies_with_stats = 0;
+  std::uint64_t match_bytes = 0;
+  std::uint64_t match_packets = 0;
+  std::uint64_t drop_packets = 0;
 };
 
 struct NetworkCondition {
@@ -288,6 +300,7 @@ std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd);
 std::vector<QdiscInfo> ListQdiscs();
 std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd);
 std::vector<TcFilterInfo> ListTcFilters();
+std::vector<TcFilterInfo> ListTcFiltersForInterface(const std::string& if_name);
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition);
 bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
@@ -299,6 +312,10 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& dst_address,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle);
+bool TcFilterIsEgressIpv4TcpDropPolicy(const TcFilterInfo& filter,
+                                       const std::string& if_name);
+TcFilterStatsSummary SummarizeEgressIpv4TcpDropPolicies(
+    const std::vector<TcFilterInfo>& filters, const std::string& if_name);
 bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& if_name,
                                       const std::string& src_address,

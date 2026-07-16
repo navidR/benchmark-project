@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <boost/test/unit_test.hpp>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -140,8 +141,12 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_egress_ipv4_tcp_drop) {
   filter.ip_proto = IPPROTO_TCP;
   filter.has_ipv4_dst = true;
   filter.ipv4_dst = "198.51.100.7";
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.255";
   filter.has_tcp_dst = true;
   filter.tcp_dst = 18168;
+  filter.has_tcp_dst_mask = true;
+  filter.tcp_dst_mask = 0xFFFFU;
   filter.has_drop_action = true;
 
   BOOST_TEST(bbp::TcFilterMatchesEgressIpv4TcpDrop(
@@ -163,10 +168,16 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_source_aware_tcp_drop) {
   filter.ip_proto = IPPROTO_TCP;
   filter.has_ipv4_src = true;
   filter.ipv4_src = "198.51.100.11";
+  filter.has_ipv4_src_mask = true;
+  filter.ipv4_src_mask = "255.255.255.255";
   filter.has_ipv4_dst = true;
   filter.ipv4_dst = "198.51.100.7";
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.255";
   filter.has_tcp_dst = true;
   filter.tcp_dst = 18168;
+  filter.has_tcp_dst_mask = true;
+  filter.tcp_dst_mask = 0xFFFFU;
   filter.has_drop_action = true;
 
   BOOST_TEST(bbp::TcFilterMatchesEgressIpv4TcpDrop(
@@ -190,10 +201,16 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_source_filter_for_dst_only) {
   filter.ip_proto = IPPROTO_TCP;
   filter.has_ipv4_src = true;
   filter.ipv4_src = "198.51.100.11";
+  filter.has_ipv4_src_mask = true;
+  filter.ipv4_src_mask = "255.255.255.255";
   filter.has_ipv4_dst = true;
   filter.ipv4_dst = "198.51.100.7";
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.255";
   filter.has_tcp_dst = true;
   filter.tcp_dst = 18168;
+  filter.has_tcp_dst_mask = true;
+  filter.tcp_dst_mask = 0xFFFFU;
   filter.has_drop_action = true;
 
   BOOST_TEST(!bbp::TcFilterMatchesEgressIpv4TcpDrop(
@@ -215,10 +232,111 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_wrong_port) {
   filter.ip_proto = IPPROTO_TCP;
   filter.has_ipv4_dst = true;
   filter.ipv4_dst = "198.51.100.7";
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.255";
   filter.has_tcp_dst = true;
   filter.tcp_dst = 18168;
+  filter.has_tcp_dst_mask = true;
+  filter.tcp_dst_mask = 0xFFFFU;
   filter.has_drop_action = true;
 
   BOOST_TEST(!bbp::TcFilterMatchesEgressIpv4TcpDrop(
       filter, "veth0", "198.51.100.7", 18169, 1001));
+}
+
+BOOST_AUTO_TEST_CASE(tc_filter_policy_summary_aggregates_owned_drop_counters) {
+  bbp::TcFilterInfo first;
+  first.if_name = "veth0";
+  first.kind = bbp::TcFilterKind::kFlower;
+  first.handle = 1001;
+  first.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
+  first.protocol = ETH_P_IP;
+  first.egress = true;
+  first.has_eth_type = true;
+  first.eth_type = ETH_P_IP;
+  first.has_ip_proto = true;
+  first.ip_proto = IPPROTO_TCP;
+  first.has_ipv4_dst = true;
+  first.ipv4_dst = "198.51.100.7";
+  first.has_ipv4_dst_mask = true;
+  first.ipv4_dst_mask = "255.255.255.255";
+  first.has_tcp_dst = true;
+  first.tcp_dst = 18168;
+  first.has_tcp_dst_mask = true;
+  first.tcp_dst_mask = 0xFFFFU;
+  first.has_drop_action = true;
+  first.has_stats = true;
+  first.match_bytes = 100;
+  first.match_packets = 2;
+  first.drop_packets = 2;
+
+  bbp::TcFilterInfo second = first;
+  second.handle = 1002;
+  second.match_bytes = 250;
+  second.match_packets = 3;
+  second.drop_packets = 3;
+  bbp::TcFilterInfo unrelated = first;
+  unrelated.if_name = "veth1";
+
+  const bbp::TcFilterStatsSummary summary =
+      bbp::SummarizeEgressIpv4TcpDropPolicies({first, second, unrelated},
+                                              "veth0");
+  BOOST_TEST(summary.policy_count == 2U);
+  BOOST_TEST(summary.policies_with_stats == 2U);
+  BOOST_TEST(summary.match_bytes == 350U);
+  BOOST_TEST(summary.match_packets == 5U);
+  BOOST_TEST(summary.drop_packets == 5U);
+}
+
+BOOST_AUTO_TEST_CASE(tc_filter_policy_summary_rejects_counter_overflow) {
+  bbp::TcFilterInfo first;
+  first.if_name = "veth0";
+  first.kind = bbp::TcFilterKind::kFlower;
+  first.handle = 1001;
+  first.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
+  first.protocol = ETH_P_IP;
+  first.egress = true;
+  first.has_eth_type = true;
+  first.eth_type = ETH_P_IP;
+  first.has_ip_proto = true;
+  first.ip_proto = IPPROTO_TCP;
+  first.has_ipv4_dst = true;
+  first.has_ipv4_dst_mask = true;
+  first.ipv4_dst_mask = "255.255.255.255";
+  first.has_tcp_dst = true;
+  first.has_tcp_dst_mask = true;
+  first.tcp_dst_mask = 0xFFFFU;
+  first.has_drop_action = true;
+  first.has_stats = true;
+  first.match_bytes = std::numeric_limits<std::uint64_t>::max();
+  bbp::TcFilterInfo second = first;
+  second.handle = 1002;
+  second.match_bytes = 1;
+
+  BOOST_CHECK_THROW(
+      bbp::SummarizeEgressIpv4TcpDropPolicies({first, second}, "veth0"),
+      std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(tc_filter_policy_requires_exact_masks) {
+  bbp::TcFilterInfo filter;
+  filter.if_name = "veth0";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.handle = 1001;
+  filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
+  filter.protocol = ETH_P_IP;
+  filter.egress = true;
+  filter.has_eth_type = true;
+  filter.eth_type = ETH_P_IP;
+  filter.has_ip_proto = true;
+  filter.ip_proto = IPPROTO_TCP;
+  filter.has_ipv4_dst = true;
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.0";
+  filter.has_tcp_dst = true;
+  filter.has_tcp_dst_mask = true;
+  filter.tcp_dst_mask = 0xFFFFU;
+  filter.has_drop_action = true;
+
+  BOOST_TEST(!bbp::TcFilterIsEgressIpv4TcpDropPolicy(filter, "veth0"));
 }

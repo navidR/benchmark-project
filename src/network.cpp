@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -586,14 +587,53 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
       src_address.empty()
           ? !filter.has_ipv4_src
           : (filter.has_ipv4_src && filter.ipv4_src == src_address);
+  return TcFilterIsEgressIpv4TcpDropPolicy(filter, if_name) &&
+         filter.handle == handle && source_matches && filter.has_ipv4_dst &&
+         filter.ipv4_dst == dst_address && filter.has_tcp_dst &&
+         filter.tcp_dst == dst_port;
+}
+
+bool TcFilterIsEgressIpv4TcpDropPolicy(const TcFilterInfo& filter,
+                                       const std::string& if_name) {
+  const bool source_mask_is_exact =
+      !filter.has_ipv4_src ||
+      (filter.has_ipv4_src_mask && filter.ipv4_src_mask == "255.255.255.255");
   return filter.if_name == if_name && filter.kind == TcFilterKind::kFlower &&
-         filter.handle == handle && filter.parent == kClsactEgressParent &&
+         filter.handle != 0U && filter.parent == kClsactEgressParent &&
          filter.egress && filter.protocol == ETH_P_IP && filter.has_eth_type &&
          filter.eth_type == ETH_P_IP && filter.has_ip_proto &&
-         filter.ip_proto == IPPROTO_TCP && source_matches &&
-         filter.has_ipv4_dst && filter.ipv4_dst == dst_address &&
-         filter.has_tcp_dst && filter.tcp_dst == dst_port &&
+         filter.ip_proto == IPPROTO_TCP && source_mask_is_exact &&
+         filter.has_ipv4_dst && filter.has_ipv4_dst_mask &&
+         filter.ipv4_dst_mask == "255.255.255.255" && filter.has_tcp_dst &&
+         filter.has_tcp_dst_mask && filter.tcp_dst_mask == 0xFFFFU &&
          filter.has_drop_action;
+}
+
+TcFilterStatsSummary SummarizeEgressIpv4TcpDropPolicies(
+    const std::vector<TcFilterInfo>& filters, const std::string& if_name) {
+  TcFilterStatsSummary summary;
+  const auto add = [](std::uint64_t value, std::uint64_t* total,
+                      std::string_view field) {
+    if (value > std::numeric_limits<std::uint64_t>::max() - *total) {
+      throw std::runtime_error("tc filter " + std::string(field) +
+                               " counter overflow");
+    }
+    *total += value;
+  };
+  for (const TcFilterInfo& filter : filters) {
+    if (!TcFilterIsEgressIpv4TcpDropPolicy(filter, if_name)) {
+      continue;
+    }
+    ++summary.policy_count;
+    if (!filter.has_stats) {
+      continue;
+    }
+    ++summary.policies_with_stats;
+    add(filter.match_bytes, &summary.match_bytes, "match bytes");
+    add(filter.match_packets, &summary.match_packets, "match packets");
+    add(filter.drop_packets, &summary.drop_packets, "drop packets");
+  }
+  return summary;
 }
 
 namespace {
@@ -1238,6 +1278,52 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
   return MNL_CB_OK;
 }
 
+int ParseFilterStats2Attr(const nlattr* attr, void* data) {
+  auto* filter = static_cast<TcFilterInfo*>(data);
+  const uint16_t attr_type = mnl_attr_get_type(attr);
+  if (mnl_attr_type_valid(attr, TCA_STATS_MAX) < 0) {
+    return MNL_CB_OK;
+  }
+
+  switch (attr_type) {
+    case TCA_STATS_BASIC:
+      if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+          mnl_attr_get_payload_len(attr) < sizeof(gnet_stats_basic)) {
+        errno = EINVAL;
+        return MNL_CB_ERROR;
+      } else {
+        const auto* stats =
+            static_cast<const gnet_stats_basic*>(mnl_attr_get_payload(attr));
+        filter->has_stats = true;
+        filter->match_bytes = stats->bytes;
+        filter->match_packets = stats->packets;
+      }
+      return MNL_CB_OK;
+    case TCA_STATS_PKT64:
+      if (mnl_attr_validate(attr, MNL_TYPE_U64) < 0) {
+        return MNL_CB_ERROR;
+      }
+      filter->has_stats = true;
+      filter->match_packets = mnl_attr_get_u64(attr);
+      return MNL_CB_OK;
+    default:
+      return MNL_CB_OK;
+  }
+}
+
+int ParseLegacyFilterStats(const nlattr* attr, TcFilterInfo* filter) {
+  if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
+      mnl_attr_get_payload_len(attr) < sizeof(tc_stats)) {
+    errno = EINVAL;
+    return MNL_CB_ERROR;
+  }
+  const auto* stats = static_cast<const tc_stats*>(mnl_attr_get_payload(attr));
+  filter->has_stats = true;
+  filter->match_bytes = stats->bytes;
+  filter->match_packets = stats->packets;
+  return MNL_CB_OK;
+}
+
 enum class ActionKind {
   kUnknown,
   kGact,
@@ -1250,6 +1336,7 @@ ActionKind ParseActionKind(std::string_view kind) {
 struct ActionParseState {
   ActionKind kind = ActionKind::kUnknown;
   bool drop = false;
+  TcFilterInfo stats;
 };
 
 int ParseGactOptionAttr(const nlattr* attr, void* data) {
@@ -1292,6 +1379,12 @@ int ParseActionEntryAttr(const nlattr* attr, void* data) {
         return MNL_CB_ERROR;
       }
       return MNL_CB_OK;
+    case TCA_ACT_STATS:
+      if (mnl_attr_parse_nested(attr, ParseFilterStats2Attr, &action->stats) <
+          0) {
+        return MNL_CB_ERROR;
+      }
+      return MNL_CB_OK;
     default:
       return MNL_CB_OK;
   }
@@ -1305,6 +1398,11 @@ int ParseActionListEntry(const nlattr* attr, void* data) {
   }
   if (action.kind == ActionKind::kGact && action.drop) {
     filter->has_drop_action = true;
+    if (action.stats.has_stats) {
+      filter->has_stats = true;
+      filter->match_bytes = action.stats.match_bytes;
+      filter->match_packets = action.stats.match_packets;
+    }
   }
   return MNL_CB_OK;
 }
@@ -1427,6 +1525,13 @@ int ParseFilterAttr(const nlattr* attr, void* data) {
         return MNL_CB_ERROR;
       }
       return MNL_CB_OK;
+    case TCA_STATS:
+      return ParseLegacyFilterStats(attr, filter);
+    case TCA_STATS2:
+      if (mnl_attr_parse_nested(attr, ParseFilterStats2Attr, filter) < 0) {
+        return MNL_CB_ERROR;
+      }
+      return MNL_CB_OK;
     default:
       return MNL_CB_OK;
   }
@@ -1457,6 +1562,9 @@ int ParseFilterMessage(const nlmsghdr* nlh, void* data) {
   }
   if (mnl_attr_parse(nlh, sizeof(*message), ParseFilterAttr, &filter) < 0) {
     return MNL_CB_ERROR;
+  }
+  if (filter.has_drop_action && filter.has_stats) {
+    filter.drop_packets = filter.match_packets;
   }
   filters->push_back(std::move(filter));
   return MNL_CB_OK;
@@ -1666,53 +1774,75 @@ std::vector<QdiscInfo> ListQdiscs() {
   return qdiscs;
 }
 
-std::vector<TcFilterInfo> ListTcFilters() {
-  std::vector<TcFilterInfo> filters;
-  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+namespace {
+
+void AppendTcFiltersForLink(const LinkInfo& link,
+                            const std::vector<QdiscInfo>& qdiscs,
+                            std::vector<TcFilterInfo>* filters) {
   const std::array<std::uint32_t, 2> clsact_parents = {kClsactIngressParent,
                                                        kClsactEgressParent};
+  if (link.index <= 0 ||
+      !HasQdiscKindForInterface(qdiscs, link.name, QdiscKind::kClsact)) {
+    return;
+  }
+  for (const std::uint32_t parent : clsact_parents) {
+    MnlSocket socket(NETLINK_ROUTE);
+    socket.Bind(0, MNL_SOCKET_AUTOPID);
 
-  for (const LinkInfo& link : ListNetworkLinks()) {
-    if (link.index <= 0 ||
-        !HasQdiscKindForInterface(qdiscs, link.name, QdiscKind::kClsact)) {
-      continue;
-    }
+    std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+    nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+    nlh->nlmsg_type = RTM_GETTFILTER;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    const uint32_t sequence = NextSequence();
+    nlh->nlmsg_seq = sequence;
 
-    for (const std::uint32_t parent : clsact_parents) {
-      MnlSocket socket(NETLINK_ROUTE);
-      socket.Bind(0, MNL_SOCKET_AUTOPID);
+    auto* message =
+        static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
+    message->tcm_family = AF_UNSPEC;
+    message->tcm_ifindex = link.index;
+    message->tcm_parent = parent;
 
-      std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
-      nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
-      nlh->nlmsg_type = RTM_GETTFILTER;
-      nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-      const uint32_t sequence = NextSequence();
-      nlh->nlmsg_seq = sequence;
+    socket.Send(nlh, nlh->nlmsg_len);
 
-      auto* message =
-          static_cast<tcmsg*>(mnl_nlmsg_put_extra_header(nlh, sizeof(tcmsg)));
-      message->tcm_family = AF_UNSPEC;
-      message->tcm_ifindex = link.index;
-      message->tcm_parent = parent;
-
-      socket.Send(nlh, nlh->nlmsg_len);
-
-      while (true) {
-        const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-        const int status =
-            mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
-                       socket.PortId(), ParseFilterMessage, &filters);
-        if (status == MNL_CB_ERROR) {
-          throw std::runtime_error(std::string("mnl_cb_run failed: ") +
-                                   std::strerror(errno));
-        }
-        if (status == MNL_CB_STOP) {
-          break;
-        }
+    while (true) {
+      const ssize_t received = socket.Receive(buffer.data(), buffer.size());
+      const int status =
+          mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
+                     socket.PortId(), ParseFilterMessage, filters);
+      if (status == MNL_CB_ERROR) {
+        throw std::runtime_error(std::string("mnl_cb_run failed: ") +
+                                 std::strerror(errno));
+      }
+      if (status == MNL_CB_STOP) {
+        break;
       }
     }
   }
+}
 
+}  // namespace
+
+std::vector<TcFilterInfo> ListTcFilters() {
+  std::vector<TcFilterInfo> filters;
+  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+  for (const LinkInfo& link : ListNetworkLinks()) {
+    AppendTcFiltersForLink(link, qdiscs, &filters);
+  }
+  return filters;
+}
+
+std::vector<TcFilterInfo> ListTcFiltersForInterface(
+    const std::string& if_name) {
+  RequireInterfaceName(if_name);
+  const std::vector<LinkInfo> links = ListNetworkLinks();
+  const auto link = std::find_if(
+      links.begin(), links.end(),
+      [&](const LinkInfo& candidate) { return candidate.name == if_name; });
+  if (link == links.end()) {
+    throw std::runtime_error("network interface not found: " + if_name);
+  }
+  std::vector<TcFilterInfo> filters;
+  AppendTcFiltersForLink(*link, ListQdiscs(), &filters);
   return filters;
 }
 
@@ -2705,16 +2835,21 @@ DropFilterProbe ProbeDropFilter() {
     SetLinkUp(probe.host_name, true);
     SetLinkUp(probe.peer_name, true);
 
-    probe.parent_filters_before = ListTcFilters();
+    probe.parent_filters_before = ListTcFiltersForInterface(probe.host_name);
     ReplaceEgressIpv4TcpDropFilter(probe.host_name, probe.dst_address,
                                    probe.dst_port, probe.handle);
-    probe.parent_filters_after_apply = ListTcFilters();
+    probe.parent_filters_after_apply =
+        ListTcFiltersForInterface(probe.host_name);
 
     bool found = false;
     for (const TcFilterInfo& filter : probe.parent_filters_after_apply) {
       if (TcFilterMatchesEgressIpv4TcpDrop(filter, probe.host_name,
                                            probe.dst_address, probe.dst_port,
                                            probe.handle)) {
+        if (!filter.has_stats) {
+          throw std::runtime_error(
+              "flower gact drop filter did not expose kernel statistics");
+        }
         found = true;
         break;
       }
@@ -2726,7 +2861,8 @@ DropFilterProbe ProbeDropFilter() {
     }
 
     DeleteEgressIpv4TcpDropFilter(probe.host_name, probe.handle);
-    probe.parent_filters_after_delete = ListTcFilters();
+    probe.parent_filters_after_delete =
+        ListTcFiltersForInterface(probe.host_name);
     for (const TcFilterInfo& filter : probe.parent_filters_after_delete) {
       if (TcFilterMatchesEgressIpv4TcpDrop(filter, probe.host_name,
                                            probe.dst_address, probe.dst_port,
