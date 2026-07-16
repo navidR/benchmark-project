@@ -1,5 +1,6 @@
 #include "bbp/run_report.h"
 
+#include <algorithm>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
@@ -34,6 +35,10 @@ constexpr std::size_t kMaximumTopologyEdgeSummaries = 256U;
 constexpr std::size_t kMaximumProfileUpdateSummaries = 256U;
 
 struct NodeReport {
+  std::optional<std::uint64_t> index;
+  std::string chain;
+  std::string role;
+  std::string last_error;
   std::uint64_t metric_samples = 0;
   std::optional<NodeRuntimeLifecycle> final_state;
   std::string unknown_final_state;
@@ -42,6 +47,10 @@ struct NodeReport {
   std::optional<std::uint64_t> previous_timestamp_ms;
   std::optional<std::uint64_t> previous_network_rx_bytes;
   std::optional<std::uint64_t> previous_network_tx_bytes;
+  std::optional<std::uint64_t> previous_cpu_usage_usec;
+  std::optional<std::uint64_t> previous_cpu_throttled_usec;
+  std::optional<std::uint64_t> previous_io_read_bytes;
+  std::optional<std::uint64_t> previous_io_write_bytes;
 };
 
 struct WalletReport {
@@ -125,11 +134,81 @@ boost::json::value ParseEventDetail(const boost::json::object& event) {
   }
 }
 
+bool IsNodeErrorEvent(SimulationEventKind kind) {
+  switch (kind) {
+    case SimulationEventKind::kProcessExitedBeforeRpcReady:
+    case SimulationEventKind::kResourcePressureRestoredAfterError:
+    case SimulationEventKind::kProfileUpdateRollbackFailed:
+    case SimulationEventKind::kTopologyEdgeUpdateRollbackFailed:
+    case SimulationEventKind::kCgroupRemoveFailed:
+    case SimulationEventKind::kScheduledEventFailed:
+    case SimulationEventKind::kScheduledBlockFailed:
+    case SimulationEventKind::kPeerPolicyEnforcementFailed:
+    case SimulationEventKind::kOperatorCommandFailed:
+    case SimulationEventKind::kMetricsNodeUnavailable:
+    case SimulationEventKind::kWalletMetricsUnavailable:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::string NodeErrorText(const boost::json::object& event) {
+  boost::json::value detail = ParseEventDetail(event);
+  std::string text;
+  if (detail.is_object()) {
+    const boost::json::object& object = detail.as_object();
+    text = OptionalStringField(object, "error");
+    if (text.empty()) {
+      text = OptionalStringField(object, "original_error");
+    }
+  }
+  if (text.empty() && detail.is_string()) {
+    text = std::string(detail.as_string());
+  }
+  if (text.empty() && !detail.is_null()) {
+    text = boost::json::serialize(detail);
+  }
+  const std::string event_name = OptionalStringField(event, "event");
+  if (text.empty()) {
+    return event_name;
+  }
+  constexpr std::size_t kMaximumLastErrorBytes = 1024U;
+  if (text.size() > kMaximumLastErrorBytes) {
+    text.resize(kMaximumLastErrorBytes);
+  }
+  return event_name + ": " + text;
+}
+
 void CopySelectedMetricFields(const boost::json::object& source,
                               boost::json::object* target) {
   constexpr std::string_view kFields[] = {
       "timestamp_ms",
+      "node_index",
+      "chain",
+      "role",
+      "lifecycle",
+      "pid",
+      "pidfd_available",
+      "process_group",
+      "process_running",
+      "exit_status",
+      "uptime_ms",
+      "cgroup_path",
+      "data_dir",
+      "log_dir",
+      "rpc_host",
+      "rpc_port",
+      "network_namespace_inode",
+      "network_namespace_helper_pid",
+      "host_interface",
+      "child_interface",
+      "host_address",
+      "node_address",
+      "network_prefix_length",
+      "network_routes",
       "height",
+      "headers",
       "best_hash",
       "peer_count",
       "peer_addresses",
@@ -143,7 +222,14 @@ void CopySelectedMetricFields(const boost::json::object& source,
       "active_network_profile",
       "network_condition",
       "initial_block_download",
+      "sync_status",
+      "verification_progress",
       "difficulty",
+      "hashrate_estimate",
+      "last_block_time",
+      "median_time",
+      "chainwork",
+      "reorg_count",
       "rpc_latency_ms",
       "chain_version",
       "chain_protocol_version",
@@ -235,6 +321,7 @@ void CopySelectedMetricFields(const boost::json::object& source,
       "qdisc_tbf_limit_bytes",
       "qdisc_tbf_buffer_ticks",
       "qdisc_tbf_mtu_ticks",
+      "network_qdiscs",
   };
   for (std::string_view field : kFields) {
     CopyField(source, field, target);
@@ -254,15 +341,41 @@ std::optional<std::uint64_t> BytesPerSecond(std::uint64_t current_bytes,
   return (delta_bytes * 1000ULL) / elapsed_ms;
 }
 
-void AddNodeBandwidthMetrics(const boost::json::object& metric,
-                             const NodeReport& node,
-                             boost::json::object* target) {
+std::optional<double> CounterPercent(std::uint64_t current,
+                                     std::uint64_t previous,
+                                     std::uint64_t elapsed_ms) {
+  if (elapsed_ms == 0U || current < previous) {
+    return std::nullopt;
+  }
+  const long double elapsed_usec =
+      static_cast<long double>(elapsed_ms) * 1000.0L;
+  return static_cast<double>(
+      (static_cast<long double>(current - previous) * 100.0L) / elapsed_usec);
+}
+
+std::uint64_t SaturatingAdd(std::uint64_t left, std::uint64_t right) {
+  if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return left + right;
+}
+
+void AddNodeDerivedMetrics(const boost::json::object& metric,
+                           const NodeReport& node,
+                           boost::json::object* target) {
   const std::optional<std::uint64_t> timestamp_ms =
       OptionalUint64Field(metric, "timestamp_ms");
   const std::optional<std::uint64_t> network_rx_bytes =
       OptionalUint64Field(metric, "network_rx_bytes");
   const std::optional<std::uint64_t> network_tx_bytes =
       OptionalUint64Field(metric, "network_tx_bytes");
+
+  (*target)["cpu_percent"] = nullptr;
+  (*target)["cpu_throttled_percent"] = nullptr;
+  (*target)["io_read_bytes_per_sec"] = nullptr;
+  (*target)["io_write_bytes_per_sec"] = nullptr;
+  (*target)["network_downlink_bytes_per_sec"] = nullptr;
+  (*target)["network_uplink_bytes_per_sec"] = nullptr;
 
   if (network_tx_bytes) {
     (*target)["network_downlink_bytes"] = *network_tx_bytes;
@@ -272,33 +385,80 @@ void AddNodeBandwidthMetrics(const boost::json::object& metric,
   }
   if (!timestamp_ms || !node.previous_timestamp_ms ||
       *timestamp_ms <= *node.previous_timestamp_ms) {
-    return;
+  } else {
+    const std::uint64_t elapsed_ms =
+        *timestamp_ms - *node.previous_timestamp_ms;
+    const auto add_rate = [&](std::string_view output, std::string_view input,
+                              const std::optional<std::uint64_t>& previous) {
+      const std::optional<std::uint64_t> current =
+          OptionalUint64Field(metric, input);
+      if (current && previous) {
+        const std::optional<std::uint64_t> rate =
+            BytesPerSecond(*current, *previous, elapsed_ms);
+        if (rate) {
+          (*target)[output] = *rate;
+        }
+      }
+    };
+    add_rate("network_downlink_bytes_per_sec", "network_tx_bytes",
+             node.previous_network_tx_bytes);
+    add_rate("network_uplink_bytes_per_sec", "network_rx_bytes",
+             node.previous_network_rx_bytes);
+    add_rate("io_read_bytes_per_sec", "io_read_bytes",
+             node.previous_io_read_bytes);
+    add_rate("io_write_bytes_per_sec", "io_write_bytes",
+             node.previous_io_write_bytes);
+
+    const auto add_percent = [&](std::string_view output,
+                                 std::string_view input,
+                                 const std::optional<std::uint64_t>& previous) {
+      const std::optional<std::uint64_t> current =
+          OptionalUint64Field(metric, input);
+      if (current && previous) {
+        const std::optional<double> percent =
+            CounterPercent(*current, *previous, elapsed_ms);
+        if (percent) {
+          (*target)[output] = *percent;
+        }
+      }
+    };
+    add_percent("cpu_percent", "cpu_usage_usec", node.previous_cpu_usage_usec);
+    add_percent("cpu_throttled_percent", "cpu_throttled_usec",
+                node.previous_cpu_throttled_usec);
   }
 
-  const std::uint64_t elapsed_ms = *timestamp_ms - *node.previous_timestamp_ms;
-  if (network_tx_bytes && node.previous_network_tx_bytes) {
-    const std::optional<std::uint64_t> rate = BytesPerSecond(
-        *network_tx_bytes, *node.previous_network_tx_bytes, elapsed_ms);
-    if (rate) {
-      (*target)["network_downlink_bytes_per_sec"] = *rate;
+  std::uint64_t drop_count = 0U;
+  bool has_drop_count = false;
+  constexpr std::string_view kDropFields[] = {
+      "network_rx_dropped", "network_tx_dropped", "qdisc_drops",
+      "network_filter_drop_packets", "directional_network_qdisc_drops"};
+  for (std::string_view field : kDropFields) {
+    const std::optional<std::uint64_t> count =
+        OptionalUint64Field(metric, field);
+    if (count) {
+      drop_count = SaturatingAdd(drop_count, *count);
+      has_drop_count = true;
     }
   }
-  if (network_rx_bytes && node.previous_network_rx_bytes) {
-    const std::optional<std::uint64_t> rate = BytesPerSecond(
-        *network_rx_bytes, *node.previous_network_rx_bytes, elapsed_ms);
-    if (rate) {
-      (*target)["network_uplink_bytes_per_sec"] = *rate;
-    }
+  if (has_drop_count) {
+    (*target)["network_drop_count"] = drop_count;
+  } else {
+    (*target)["network_drop_count"] = nullptr;
   }
 }
 
-void RememberNodeBandwidthSample(const boost::json::object& metric,
-                                 NodeReport* node) {
+void RememberNodeMetricSample(const boost::json::object& metric,
+                              NodeReport* node) {
   node->previous_timestamp_ms = OptionalUint64Field(metric, "timestamp_ms");
   node->previous_network_rx_bytes =
       OptionalUint64Field(metric, "network_rx_bytes");
   node->previous_network_tx_bytes =
       OptionalUint64Field(metric, "network_tx_bytes");
+  node->previous_cpu_usage_usec = OptionalUint64Field(metric, "cpu_usage_usec");
+  node->previous_cpu_throttled_usec =
+      OptionalUint64Field(metric, "cpu_throttled_usec");
+  node->previous_io_read_bytes = OptionalUint64Field(metric, "io_read_bytes");
+  node->previous_io_write_bytes = OptionalUint64Field(metric, "io_write_bytes");
 }
 
 boost::json::object ParseJsonObjectLine(const std::filesystem::path& path,
@@ -375,6 +535,32 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "runtime_node_freezes", report);
 }
 
+void SeedConfiguredNodes(const boost::json::object& report,
+                         std::map<std::string, NodeReport>* nodes) {
+  const boost::json::value* configs_value = report.if_contains("node_configs");
+  if (configs_value == nullptr || !configs_value->is_array()) {
+    return;
+  }
+  for (const boost::json::value& config_value : configs_value->as_array()) {
+    if (!config_value.is_object()) {
+      continue;
+    }
+    const boost::json::object& config = config_value.as_object();
+    const std::string node_id = OptionalStringField(config, "id");
+    if (node_id.empty()) {
+      continue;
+    }
+    const auto found = nodes->find(node_id);
+    if (found == nodes->end()) {
+      continue;
+    }
+    NodeReport& node = found->second;
+    node.index = OptionalUint64Field(config, "index");
+    node.chain = OptionalStringField(config, "chain");
+    node.role = OptionalStringField(config, "role");
+  }
+}
+
 boost::json::object EventCountsJson(
     const std::map<std::string, std::uint64_t>& event_counts) {
   boost::json::object object;
@@ -386,9 +572,35 @@ boost::json::object EventCountsJson(
 
 boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
   boost::json::array array;
+  std::vector<std::pair<std::string_view, const NodeReport*>> ordered;
+  ordered.reserve(nodes.size());
   for (const auto& [node_id, node] : nodes) {
+    ordered.emplace_back(node_id, &node);
+  }
+  std::stable_sort(
+      ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
+        if (left.second->index && right.second->index &&
+            left.second->index != right.second->index) {
+          return *left.second->index < *right.second->index;
+        }
+        if (left.second->index.has_value() != right.second->index.has_value()) {
+          return left.second->index.has_value();
+        }
+        return left.first < right.first;
+      });
+  for (const auto& [node_id, node_pointer] : ordered) {
+    const NodeReport& node = *node_pointer;
     boost::json::object object;
     object["node_id"] = node_id;
+    if (node.index) {
+      object["node_index"] = *node.index;
+    }
+    if (!node.chain.empty()) {
+      object["chain"] = node.chain;
+    }
+    if (!node.role.empty()) {
+      object["role"] = node.role;
+    }
     object["metric_samples"] = node.metric_samples;
     if (node.final_state) {
       object["final_state"] = NodeRuntimeLifecycleName(*node.final_state);
@@ -398,6 +610,11 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
     object["last_metrics"] = node.last_metrics;
     if (!node.log_tails.empty()) {
       object["log_tails"] = node.log_tails;
+    }
+    if (!node.last_error.empty()) {
+      object["last_error"] = node.last_error;
+    } else {
+      object["last_error"] = nullptr;
     }
     array.push_back(std::move(object));
   }
@@ -882,6 +1099,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
         if (!event_kind) {
           return;
         }
+        if (!node_id.empty() && node_id != "sim" &&
+            IsNodeErrorEvent(*event_kind)) {
+          nodes[node_id].last_error = NodeErrorText(event);
+        }
         switch (*event_kind) {
           case SimulationEventKind::kRunStarted:
             run_started = true;
@@ -1039,11 +1260,20 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           return;
         }
         NodeReport& node = nodes[node_id];
+        if (!node.index) {
+          node.index = OptionalUint64Field(metric, "node_index");
+        }
+        if (node.chain.empty()) {
+          node.chain = OptionalStringField(metric, "chain");
+        }
+        if (node.role.empty()) {
+          node.role = OptionalStringField(metric, "role");
+        }
         ++node.metric_samples;
         node.last_metrics = {};
         CopySelectedMetricFields(metric, &node.last_metrics);
-        AddNodeBandwidthMetrics(metric, node, &node.last_metrics);
-        RememberNodeBandwidthSample(metric, &node);
+        AddNodeDerivedMetrics(metric, node, &node.last_metrics);
+        RememberNodeMetricSample(metric, &node);
       });
 
   ForEachJsonLine(run_root / "wallet-metrics.jsonl",
@@ -1065,6 +1295,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
       ok ? RunReportStatus::kFinished
          : (run_failed ? RunReportStatus::kFailed
                        : RunReportStatus::kIncomplete);
+  SeedConfiguredNodes(report, &nodes);
   report["ok"] = ok;
   report["status"] = RunReportStatusName(status);
   if (!started_at.empty()) {

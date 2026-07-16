@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -22,6 +23,7 @@ struct NodeRuntime {
   std::optional<NodeVethConfig> network;
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
+  std::optional<std::chrono::steady_clock::time_point> process_started_at;
   ResourceLimits resources;
   std::string resource_profile;
   std::string network_profile;

@@ -14,7 +14,9 @@
 #include <clocale>
 #include <cstdint>
 #include <filesystem>
+#include <iomanip>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -43,7 +45,7 @@ constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
-constexpr int kDetailPaneRows = 15;
+constexpr int kDetailPaneRows = 23;
 
 struct PendingConfirmation {
   ParsedTuiCommand command;
@@ -260,13 +262,86 @@ std::string JsonBytesPerSecondText(const boost::json::object& object,
   return std::to_string((*bytes + kKiB - 1U) / kKiB) + "K/s";
 }
 
-std::string JsonUsecMillisText(const boost::json::object& object,
-                               std::string_view field) {
-  const std::optional<std::uint64_t> usec = JsonUnsignedMetric(object, field);
-  if (!usec) {
+std::optional<double> JsonNumber(const boost::json::object& object,
+                                 std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || value->is_null()) {
+    return std::nullopt;
+  }
+  if (value->is_double()) {
+    return value->as_double();
+  }
+  if (value->is_uint64()) {
+    return static_cast<double>(value->as_uint64());
+  }
+  if (value->is_int64()) {
+    return static_cast<double>(value->as_int64());
+  }
+  return std::nullopt;
+}
+
+std::string JsonPercentText(const boost::json::object& object,
+                            std::string_view field) {
+  const std::optional<double> value = JsonNumber(object, field);
+  if (!value) {
     return "-";
   }
-  return std::to_string(*usec / 1000ULL);
+  std::ostringstream output;
+  output << std::fixed << std::setprecision(1) << *value << '%';
+  return output.str();
+}
+
+std::string JsonUptimeText(const boost::json::object& object) {
+  const std::optional<std::uint64_t> uptime =
+      JsonUnsignedMetric(object, "uptime_ms");
+  if (!uptime) {
+    return "-";
+  }
+  const std::uint64_t seconds = *uptime / 1000U;
+  if (seconds < 60U) {
+    return std::to_string(seconds) + "s";
+  }
+  if (seconds < 3600U) {
+    return std::to_string(seconds / 60U) + "m" + std::to_string(seconds % 60U) +
+           "s";
+  }
+  return std::to_string(seconds / 3600U) + "h" +
+         std::to_string((seconds % 3600U) / 60U) + "m";
+}
+
+const boost::json::object* JsonObject(const boost::json::object& object,
+                                      std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  return value != nullptr && value->is_object() ? &value->as_object() : nullptr;
+}
+
+std::string NetworkConditionText(const boost::json::object& metrics,
+                                 std::string_view field,
+                                 std::string_view suffix = {}) {
+  const boost::json::object* condition =
+      JsonObject(metrics, "network_condition");
+  if (condition == nullptr) {
+    return "-";
+  }
+  const std::string value = JsonIntegerText(*condition, field);
+  return value == "-" ? value : value + std::string(suffix);
+}
+
+std::string NetworkLossText(const boost::json::object& metrics) {
+  const boost::json::object* condition =
+      JsonObject(metrics, "network_condition");
+  if (condition == nullptr) {
+    return "-";
+  }
+  const std::optional<std::uint64_t> basis_points =
+      JsonUnsignedMetric(*condition, "loss_basis_points");
+  if (!basis_points) {
+    return "-";
+  }
+  std::ostringstream output;
+  output << std::fixed << std::setprecision(2)
+         << static_cast<double>(*basis_points) / 100.0 << '%';
+  return output.str();
 }
 
 std::string WorkloadsSummaryText(const boost::json::object& report) {
@@ -647,26 +722,6 @@ std::string DirectionalNetworkPolicyStatsText(
          JsonMetricText(metrics, "directional_network_qdisc_drops") + " drop";
 }
 
-const boost::json::object* WalletForNode(const boost::json::object& report,
-                                         std::size_t one_based_node) {
-  const boost::json::array* wallets = WalletSummaries(report);
-  if (wallets == nullptr) {
-    return nullptr;
-  }
-  for (const boost::json::value& wallet_value : *wallets) {
-    if (!wallet_value.is_object()) {
-      continue;
-    }
-    const boost::json::object& wallet = wallet_value.as_object();
-    const std::optional<std::uint64_t> node =
-        JsonUnsignedMetric(wallet, "node");
-    if (node && *node == one_based_node) {
-      return &wallet;
-    }
-  }
-  return nullptr;
-}
-
 const boost::json::object* WalletAt(const boost::json::array& wallets,
                                     std::size_t index) {
   if (index >= wallets.size() || !wallets[index].is_object()) {
@@ -1045,40 +1100,59 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "height",
-                JsonMetricText(metric_object, "height"));
+  AddDetailPair(
+      y, 0, left_width, "chain / role",
+      JsonString(*node, "chain", "-") + " / " + JsonString(*node, "role", "-"));
+  AddDetailPair(y, left_width, right_width, "pid / process group",
+                JsonMetricText(metric_object, "pid") + " / " +
+                    JsonMetricText(metric_object, "process_group"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "pidfd / running",
+                JsonMetricText(metric_object, "pidfd_available") + " / " +
+                    JsonMetricText(metric_object, "process_running"));
+  AddDetailPair(y, left_width, right_width, "uptime / restarts / exit",
+                JsonUptimeText(metric_object) + " / " +
+                    JsonMetricText(metric_object, "restart_count") + " / " +
+                    JsonMetricText(metric_object, "exit_status"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "height / headers",
+                JsonMetricText(metric_object, "height") + " / " +
+                    JsonMetricText(metric_object, "headers"));
   AddDetailPair(y, left_width, right_width, "best",
                 JsonMetricText(metric_object, "best_hash"));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "generated blocks",
-                JsonMetricText(metric_object, "generated_block_count"));
-  AddDetailPair(y, left_width, right_width, "mined non-reward tx",
-                JsonMetricText(metric_object, "mined_transaction_count") +
-                    (JsonBool(metric_object, "mined_transaction_count_complete")
-                             .value_or(true)
-                         ? ""
-                         : "+"));
+  AddDetailPair(y, 0, left_width, "sync / progress",
+                JsonMetricText(metric_object, "sync_status") + " / " +
+                    JsonMetricText(metric_object, "verification_progress"));
+  AddDetailPair(y, left_width, right_width, "block time / median",
+                JsonMetricText(metric_object, "last_block_time") + " / " +
+                    JsonMetricText(metric_object, "median_time"));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "chain version",
-                JsonMetricText(metric_object, "chain_version") + " / " +
-                    JsonMetricText(metric_object, "chain_protocol_version") +
-                    " / " + JsonMetricText(metric_object, "chain_subversion"));
+  AddDetailPair(y, 0, left_width, "hashrate / difficulty",
+                JsonMetricText(metric_object, "hashrate_estimate") + " / " +
+                    JsonMetricText(metric_object, "difficulty"));
   AddDetailPair(y, left_width, right_width, "RPC latency",
                 JsonMetricText(metric_object, "rpc_latency_ms") + " ms");
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "initial sync",
-                JsonMetricText(metric_object, "initial_block_download"));
-  AddDetailPair(y, left_width, right_width, "difficulty",
-                JsonMetricText(metric_object, "difficulty"));
+  AddDetailPair(y, 0, cols, "version / protocol / agent",
+                JsonMetricText(metric_object, "chain_version") + " / " +
+                    JsonMetricText(metric_object, "chain_protocol_version") +
+                    " / " + JsonMetricText(metric_object, "chain_subversion"));
   ++y;
   if (y >= bottom) {
     return;
@@ -1092,77 +1166,136 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, cols, "peer set", PeerListSummaryText(metric_object));
+  AddDetailPair(y, 0, left_width, "generated / mined tx",
+                JsonMetricText(metric_object, "generated_block_count") + " / " +
+                    JsonMetricText(metric_object, "mined_transaction_count") +
+                    (JsonBool(metric_object, "mined_transaction_count_complete")
+                             .value_or(true)
+                         ? ""
+                         : "+"));
+  AddDetailPair(y, left_width, right_width, "peer set",
+                PeerListSummaryText(metric_object));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, left_width, "memory",
+  AddDetailPair(y, 0, cols, "cgroup",
+                JsonMetricText(metric_object, "cgroup_path"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "memory current / peak",
                 JsonBytesMiBText(metric_object, "memory_current") + " cur / " +
                     JsonBytesMiBText(metric_object, "memory_peak") + " peak");
-  AddDetailPair(y, left_width, right_width, "cpu",
-                JsonUsecMillisText(metric_object, "cpu_usage_usec") + " ms");
+  AddDetailPair(y, left_width, right_width, "memory max / high",
+                JsonBytesMiBText(metric_object, "memory_max_limit_bytes") +
+                    " / " +
+                    JsonBytesMiBText(metric_object, "memory_high_limit_bytes"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "CPU / throttled",
+                JsonPercentText(metric_object, "cpu_percent") + " / " +
+                    JsonPercentText(metric_object, "cpu_throttled_percent"));
+  AddDetailPair(y, left_width, right_width, "CPU quota / period / weight",
+                JsonMetricText(metric_object, "cpu_quota_us", "max") + " / " +
+                    JsonMetricText(metric_object, "cpu_period_us") + " / " +
+                    JsonMetricText(metric_object, "cpu_weight"));
   ++y;
   if (y >= bottom) {
     return;
   }
   AddDetailPair(
-      y, 0, left_width, "net total",
-      "down " + JsonBytesKiBText(metric_object, "network_downlink_bytes") +
-          " / up " + JsonBytesKiBText(metric_object, "network_uplink_bytes"));
-  AddDetailPair(y, left_width, right_width, "net rate",
-                "down " +
-                    JsonBytesPerSecondText(metric_object,
-                                           "network_downlink_bytes_per_sec") +
-                    " / up " +
-                    JsonBytesPerSecondText(metric_object,
-                                           "network_uplink_bytes_per_sec"));
+      y, 0, left_width, "IO read / write rate",
+      JsonBytesPerSecondText(metric_object, "io_read_bytes_per_sec") + " / " +
+          JsonBytesPerSecondText(metric_object, "io_write_bytes_per_sec"));
+  AddDetailPair(y, left_width, right_width, "IO read / write total",
+                JsonBytesKiBText(metric_object, "io_read_bytes") + " / " +
+                    JsonBytesKiBText(metric_object, "io_write_bytes"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "IO limits / weight",
+                JsonMetricText(metric_object, "io_max") + " / " +
+                    JsonMetricText(metric_object, "io_weight"));
+  AddDetailPair(y, left_width, right_width, "pids current / max",
+                JsonMetricText(metric_object, "pids_current") + " / " +
+                    JsonMetricText(metric_object, "pids_max_limit"));
   ++y;
   if (y >= bottom) {
     return;
   }
   AddDetailPair(
-      y, 0, left_width, "block rules",
-      JsonMetricText(metric_object, "network_filter_policy_count") +
-          " active / " +
-          JsonMetricText(metric_object, "network_filter_drop_packets") +
-          " drops");
-  AddDetailPair(
-      y, left_width, right_width, "filter matches",
-      JsonMetricText(metric_object, "network_filter_match_packets") +
-          " packets / " +
-          JsonBytesKiBText(metric_object, "network_filter_match_bytes"));
+      y, 0, left_width, "netns inode / helper",
+      JsonMetricText(metric_object, "network_namespace_inode") + " / " +
+          JsonMetricText(metric_object, "network_namespace_helper_pid"));
+  AddDetailPair(y, left_width, right_width, "RPC endpoint",
+                JsonMetricText(metric_object, "rpc_host") + ":" +
+                    JsonMetricText(metric_object, "rpc_port"));
   ++y;
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, cols, "topology",
+  AddDetailPair(y, 0, left_width, "host / child veth",
+                JsonMetricText(metric_object, "host_interface") + " / " +
+                    JsonMetricText(metric_object, "child_interface"));
+  AddDetailPair(y, left_width, right_width, "node / host address",
+                JsonMetricText(metric_object, "node_address") + " / " +
+                    JsonMetricText(metric_object, "host_address"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "routes",
+                JsonMetricText(metric_object, "network_routes"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "net total down / up",
+                JsonBytesKiBText(metric_object, "network_downlink_bytes") +
+                    " / " +
+                    JsonBytesKiBText(metric_object, "network_uplink_bytes"));
+  AddDetailPair(
+      y, left_width, right_width, "net rate down / up",
+      JsonBytesPerSecondText(metric_object, "network_downlink_bytes_per_sec") +
+          " / " +
+          JsonBytesPerSecondText(metric_object,
+                                 "network_uplink_bytes_per_sec"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "condition bw / delay / loss",
+                NetworkConditionText(metric_object, "bandwidth_mbps", "M") +
+                    " / " +
+                    NetworkConditionText(metric_object, "delay_ms", "ms") +
+                    " / " + NetworkLossText(metric_object));
+  AddDetailPair(y, left_width, right_width, "qdisc / drops",
+                JsonMetricText(metric_object, "qdisc_kind") + " / " +
+                    JsonMetricText(metric_object, "network_drop_count"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(
+      y, 0, left_width, "block rules / drops",
+      JsonMetricText(metric_object, "network_filter_policy_count") + " / " +
+          JsonMetricText(metric_object, "network_filter_drop_packets"));
+  AddDetailPair(y, left_width, right_width, "directional edges",
+                DirectionalNetworkPolicyStatsText(metric_object));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "topology",
                 SelectedTopologyText(report, selected_node));
-  ++y;
-  if (y >= bottom) {
-    return;
-  }
-  AddDetailPair(y, 0, left_width, "peer policy",
+  AddDetailPair(y, left_width, right_width, "peer policy",
                 SelectedPeerPolicyText(report, selected_node,
                                        JsonString(*node, "node_id")));
-  AddDetailPair(y, left_width, right_width, "qdisc / edges",
-                JsonMetricText(metric_object, "qdisc_kind") + " / " +
-                    DirectionalNetworkPolicyStatsText(metric_object));
-  ++y;
-  if (y >= bottom) {
-    return;
-  }
-  const boost::json::object* wallet = WalletForNode(report, selected_node + 1U);
-  if (wallet == nullptr) {
-    AddDetailPair(y, 0, left_width, "wallet", "-");
-    return;
-  }
-  AddDetailPair(y, 0, left_width, "wallet",
-                "#" + JsonMetricText(*wallet, "wallet_index") + " sent " +
-                    JsonMetricText(*wallet, "transactions_sent") + " recv " +
-                    JsonMetricText(*wallet, "transactions_received"));
-  AddDetailPair(y, left_width, right_width, "addr",
-                JsonString(*wallet, "address", "-"));
 }
 
 const boost::json::object& JsonObjectFieldOrEmpty(
@@ -1404,16 +1537,41 @@ void DrawSummary(
 
   DrawHorizontalLine(10);
   if (view == TuiView::kNodes) {
-    AddText(11, 0, 10, "Node [n]", A_BOLD);
-    AddText(11, 10, 10, "State", A_BOLD);
-    AddText(11, 20, 7, "Height", A_BOLD);
-    AddText(11, 27, 6, "Peers", A_BOLD);
-    AddText(11, 33, 7, "Blocks", A_BOLD);
-    AddText(11, 40, 7, "Pool", A_BOLD);
-    AddText(11, 47, 9, "Mem", A_BOLD);
-    AddText(11, 56, 9, "CPUms", A_BOLD);
-    AddText(11, 65, 8, "RX", A_BOLD);
-    AddText(11, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
+    if (cols >= 210) {
+      AddText(11, 0, 12, "Node [n]", A_BOLD);
+      AddText(11, 12, 7, "Chain", A_BOLD);
+      AddText(11, 19, 13, "Role", A_BOLD);
+      AddText(11, 32, 10, "State", A_BOLD);
+      AddText(11, 42, 8, "PID", A_BOLD);
+      AddText(11, 50, 9, "Uptime", A_BOLD);
+      AddText(11, 59, 8, "Height", A_BOLD);
+      AddText(11, 67, 6, "Peers", A_BOLD);
+      AddText(11, 73, 7, "Pool", A_BOLD);
+      AddText(11, 80, 8, "CPU", A_BOLD);
+      AddText(11, 88, 8, "Thr", A_BOLD);
+      AddText(11, 96, 9, "Mem", A_BOLD);
+      AddText(11, 105, 9, "Limit", A_BOLD);
+      AddText(11, 114, 9, "Read/s", A_BOLD);
+      AddText(11, 123, 9, "Write/s", A_BOLD);
+      AddText(11, 132, 9, "RX/s", A_BOLD);
+      AddText(11, 141, 9, "TX/s", A_BOLD);
+      AddText(11, 150, 8, "Drops", A_BOLD);
+      AddText(11, 158, 8, "Delay", A_BOLD);
+      AddText(11, 166, 8, "Loss", A_BOLD);
+      AddText(11, 174, 10, "Bandwidth", A_BOLD);
+      AddText(11, 184, std::max(0, cols - 184), "Last error", A_BOLD);
+    } else {
+      AddText(11, 0, 10, "Node [n]", A_BOLD);
+      AddText(11, 10, 10, "State", A_BOLD);
+      AddText(11, 20, 7, "Height", A_BOLD);
+      AddText(11, 27, 6, "Peers", A_BOLD);
+      AddText(11, 33, 7, "Blocks", A_BOLD);
+      AddText(11, 40, 7, "Pool", A_BOLD);
+      AddText(11, 47, 9, "Mem", A_BOLD);
+      AddText(11, 56, 9, "CPU", A_BOLD);
+      AddText(11, 65, 8, "RX/s", A_BOLD);
+      AddText(11, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
+    }
   } else {
     AddText(11, 0, 10, "Wallet [w]", A_BOLD);
     AddText(11, 10, 7, "Node", A_BOLD);
@@ -1479,23 +1637,79 @@ void DrawSummary(
       const boost::json::object empty_metrics;
       const boost::json::object& metric_object =
           metrics == nullptr ? empty_metrics : *metrics;
-      AddText(y, 0, 10, JsonString(*node, "node_id", "-"), attributes);
-      AddText(y, 10, 10, JsonString(*node, "final_state", "-"), attributes);
-      AddText(y, 20, 7, JsonMetricText(metric_object, "height"), attributes);
-      AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"),
-              attributes);
-      AddText(y, 33, 7, JsonMetricText(metric_object, "generated_block_count"),
-              attributes);
-      AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"),
-              attributes);
-      AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"),
-              attributes);
-      AddText(y, 56, 9, JsonUsecMillisText(metric_object, "cpu_usage_usec"),
-              attributes);
-      AddText(y, 65, 8, JsonBytesKiBText(metric_object, "network_rx_bytes"),
-              attributes);
-      AddText(y, 73, std::max(0, cols - 73),
-              JsonMetricText(metric_object, "qdisc_kind"), attributes);
+      if (cols >= 210) {
+        AddText(y, 0, 12, JsonString(*node, "node_id", "-"), attributes);
+        AddText(y, 12, 7, JsonString(*node, "chain", "-"), attributes);
+        AddText(y, 19, 13, JsonString(*node, "role", "-"), attributes);
+        AddText(y, 32, 10, JsonString(*node, "final_state", "-"), attributes);
+        AddText(y, 42, 8,
+                JsonBool(metric_object, "process_running").value_or(false)
+                    ? JsonIntegerText(metric_object, "pid")
+                    : "-",
+                attributes);
+        AddText(y, 50, 9, JsonUptimeText(metric_object), attributes);
+        AddText(y, 59, 8, JsonMetricText(metric_object, "height"), attributes);
+        AddText(y, 67, 6, JsonMetricText(metric_object, "peer_count"),
+                attributes);
+        AddText(y, 73, 7, JsonMetricText(metric_object, "mempool_tx_count"),
+                attributes);
+        AddText(y, 80, 8, JsonPercentText(metric_object, "cpu_percent"),
+                attributes);
+        AddText(y, 88, 8,
+                JsonPercentText(metric_object, "cpu_throttled_percent"),
+                attributes);
+        AddText(y, 96, 9, JsonBytesMiBText(metric_object, "memory_current"),
+                attributes);
+        AddText(y, 105, 9,
+                JsonBytesMiBText(metric_object, "memory_max_limit_bytes"),
+                attributes);
+        AddText(y, 114, 9,
+                JsonBytesPerSecondText(metric_object, "io_read_bytes_per_sec"),
+                attributes);
+        AddText(y, 123, 9,
+                JsonBytesPerSecondText(metric_object, "io_write_bytes_per_sec"),
+                attributes);
+        AddText(y, 132, 9,
+                JsonBytesPerSecondText(metric_object,
+                                       "network_downlink_bytes_per_sec"),
+                attributes);
+        AddText(y, 141, 9,
+                JsonBytesPerSecondText(metric_object,
+                                       "network_uplink_bytes_per_sec"),
+                attributes);
+        AddText(y, 150, 8, JsonMetricText(metric_object, "network_drop_count"),
+                attributes);
+        AddText(y, 158, 8,
+                NetworkConditionText(metric_object, "delay_ms", "ms"),
+                attributes);
+        AddText(y, 166, 8, NetworkLossText(metric_object), attributes);
+        AddText(y, 174, 10,
+                NetworkConditionText(metric_object, "bandwidth_mbps", "M"),
+                attributes);
+        AddText(y, 184, std::max(0, cols - 184),
+                JsonMetricText(*node, "last_error"), attributes);
+      } else {
+        AddText(y, 0, 10, JsonString(*node, "node_id", "-"), attributes);
+        AddText(y, 10, 10, JsonString(*node, "final_state", "-"), attributes);
+        AddText(y, 20, 7, JsonMetricText(metric_object, "height"), attributes);
+        AddText(y, 27, 6, JsonMetricText(metric_object, "peer_count"),
+                attributes);
+        AddText(y, 33, 7,
+                JsonMetricText(metric_object, "generated_block_count"),
+                attributes);
+        AddText(y, 40, 7, JsonMetricText(metric_object, "mempool_tx_count"),
+                attributes);
+        AddText(y, 47, 9, JsonBytesMiBText(metric_object, "memory_current"),
+                attributes);
+        AddText(y, 56, 9, JsonPercentText(metric_object, "cpu_percent"),
+                attributes);
+        AddText(y, 65, 8,
+                JsonBytesPerSecondText(metric_object,
+                                       "network_downlink_bytes_per_sec"),
+                attributes);
+        AddText(y, 73, std::max(0, cols - 73),
+                JsonMetricText(metric_object, "qdisc_kind"), attributes);
+      }
     } else {
       const boost::json::object* wallet = WalletAt(*selected_items, index);
       if (wallet == nullptr) {

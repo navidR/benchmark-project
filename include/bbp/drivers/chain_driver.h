@@ -18,6 +18,14 @@
 
 namespace bbp {
 
+enum class ChainSyncStatus {
+  kUnknown,
+  kSyncing,
+  kSynced,
+};
+
+std::string_view ChainSyncStatusName(ChainSyncStatus status);
+
 struct ChainMetrics {
   uint64_t version = 0;
   uint64_t protocol_version = 0;
@@ -28,8 +36,16 @@ struct ChainMetrics {
   std::vector<std::string> peer_addresses;
   uint64_t mempool_tx_count = 0;
   uint64_t mempool_bytes = 0;
+  std::optional<uint64_t> headers;
   std::optional<bool> initial_block_download;
+  ChainSyncStatus sync_status = ChainSyncStatus::kUnknown;
+  std::optional<double> verification_progress;
   std::optional<double> difficulty;
+  std::optional<double> hashrate_estimate;
+  std::optional<uint64_t> last_block_time;
+  std::optional<uint64_t> median_time;
+  std::optional<std::string> chainwork;
+  std::optional<uint64_t> reorg_count;
   uint64_t rpc_latency_ms = 0;
 };
 

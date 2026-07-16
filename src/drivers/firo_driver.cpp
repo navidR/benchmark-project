@@ -11,6 +11,7 @@
 #include <boost/json/value.hpp>
 #include <boost/multiprecision/cpp_dec_float.hpp>
 #include <boost/url/parse.hpp>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <limits>
@@ -276,6 +277,26 @@ std::optional<bool> OptionalJsonBoolMember(const boost::json::object& object,
   return value != nullptr && value->is_bool()
              ? std::optional<bool>(value->as_bool())
              : std::nullopt;
+}
+
+double JsonNonNegativeFiniteNumber(const boost::json::value& value,
+                                   std::string_view field) {
+  double parsed = 0.0;
+  if (value.is_double()) {
+    parsed = value.as_double();
+  } else if (value.is_int64()) {
+    parsed = static_cast<double>(value.as_int64());
+  } else if (value.is_uint64()) {
+    parsed = static_cast<double>(value.as_uint64());
+  } else {
+    throw std::runtime_error("Firo RPC field is not numeric: " +
+                             std::string(field));
+  }
+  if (!std::isfinite(parsed) || parsed < 0.0) {
+    throw std::runtime_error("Firo RPC field is not finite and non-negative: " +
+                             std::string(field));
+  }
+  return parsed;
 }
 
 std::optional<std::int64_t> OptionalJsonSignedFixed8Amount(
@@ -594,21 +615,64 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config,
       RpcCall(config, "getnetworkinfo", boost::json::array{}, stop_token);
   const boost::json::value mempool =
       RpcCall(config, "getmempoolinfo", boost::json::array{}, stop_token);
-  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  const std::string best_hash = JsonString(blockchain, "bestblockhash");
+  boost::json::array header_params;
+  header_params.emplace_back(best_hash);
+  header_params.emplace_back(true);
+  const boost::json::value header =
+      RpcCall(config, "getblockheader", header_params, stop_token);
+  const boost::json::value network_hashrate =
+      RpcCall(config, "getnetworkhashps", boost::json::array{}, stop_token);
+  const std::vector<std::string> peer_addresses =
+      PeerAddresses(config, stop_token);
 
   FiroMetrics metrics;
   metrics.version = JsonUint(network, "version");
   metrics.protocol_version = JsonUint(network, "protocolversion");
   metrics.subversion = JsonString(network, "subversion");
   metrics.height = JsonUint(blockchain, "blocks");
-  metrics.best_hash = JsonString(blockchain, "bestblockhash");
+  metrics.headers = JsonUint(blockchain, "headers");
+  metrics.best_hash = best_hash;
   metrics.peer_count = JsonUint(network, "connections");
-  metrics.peer_addresses = PeerAddresses(config, stop_token);
+  metrics.peer_addresses = peer_addresses;
   metrics.mempool_tx_count = JsonUint(mempool, "size");
   metrics.mempool_bytes = JsonUint(mempool, "bytes");
   metrics.initial_block_download =
       JsonOptionalBool(blockchain, "initialblockdownload");
+  metrics.verification_progress =
+      JsonOptionalDouble(blockchain, "verificationprogress");
+  if (!metrics.verification_progress ||
+      !std::isfinite(*metrics.verification_progress) ||
+      *metrics.verification_progress < 0.0 ||
+      *metrics.verification_progress > 1.0) {
+    throw std::runtime_error(
+        "Firo verificationprogress must be finite and in 0..1");
+  }
   metrics.difficulty = JsonOptionalDouble(blockchain, "difficulty");
+  if (!metrics.difficulty || !std::isfinite(*metrics.difficulty) ||
+      *metrics.difficulty < 0.0) {
+    throw std::runtime_error("Firo difficulty must be finite and non-negative");
+  }
+  metrics.hashrate_estimate =
+      JsonNonNegativeFiniteNumber(network_hashrate, "getnetworkhashps result");
+  metrics.last_block_time = JsonUint(header, "time");
+  metrics.median_time = JsonUint(blockchain, "mediantime");
+  metrics.chainwork = JsonString(blockchain, "chainwork");
+  if (metrics.chainwork->empty()) {
+    throw std::runtime_error("Firo chainwork must not be empty");
+  }
+  if (metrics.initial_block_download) {
+    metrics.sync_status = *metrics.initial_block_download
+                              ? ChainSyncStatus::kSyncing
+                              : ChainSyncStatus::kSynced;
+  } else {
+    metrics.sync_status = *metrics.headers <= metrics.height &&
+                                  *metrics.verification_progress >= 1.0
+                              ? ChainSyncStatus::kSynced
+                              : ChainSyncStatus::kSyncing;
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
   metrics.rpc_latency_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
   return metrics;

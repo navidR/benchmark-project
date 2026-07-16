@@ -58,6 +58,108 @@ std::vector<std::string> ServeRpcResponses(
 
 }  // namespace
 
+BOOST_AUTO_TEST_CASE(firo_reads_normalized_chain_metrics) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"blocks":12,"headers":12,"bestblockhash":"best-12","difficulty":2.5,"mediantime":1700000000,"verificationprogress":1.0,"chainwork":"000abc"},"error":null,"id":"bbp"})",
+      R"({"result":{"version":14100500,"protocolversion":70015,"subversion":"/Firo:0.14.1/","connections":2},"error":null,"id":"bbp"})",
+      R"({"result":{"size":3,"bytes":450},"error":null,"id":"bbp"})",
+      R"({"result":{"hash":"best-12","time":1700000100},"error":null,"id":"bbp"})",
+      R"({"result":12345.5,"error":null,"id":"bbp"})",
+      R"({"result":[{"addr":"10.20.0.2:18168"},{"addr":"10.20.0.3:18168"}],"error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "metrics-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const bbp::FiroMetrics metrics = driver.ReadMetrics(config);
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_TEST(metrics.version == 14100500U);
+  BOOST_TEST(metrics.protocol_version == 70015U);
+  BOOST_TEST(metrics.subversion == "/Firo:0.14.1/");
+  BOOST_TEST(metrics.height == 12U);
+  BOOST_REQUIRE(metrics.headers.has_value());
+  BOOST_TEST(*metrics.headers == 12U);
+  BOOST_TEST(metrics.best_hash == "best-12");
+  BOOST_TEST(metrics.peer_count == 2U);
+  BOOST_REQUIRE_EQUAL(metrics.peer_addresses.size(), 2U);
+  BOOST_TEST(metrics.mempool_tx_count == 3U);
+  BOOST_TEST(metrics.mempool_bytes == 450U);
+  BOOST_CHECK(metrics.sync_status == bbp::ChainSyncStatus::kSynced);
+  BOOST_REQUIRE(metrics.verification_progress.has_value());
+  BOOST_TEST(*metrics.verification_progress == 1.0);
+  BOOST_REQUIRE(metrics.difficulty.has_value());
+  BOOST_TEST(*metrics.difficulty == 2.5);
+  BOOST_REQUIRE(metrics.hashrate_estimate.has_value());
+  BOOST_TEST(*metrics.hashrate_estimate == 12345.5);
+  BOOST_REQUIRE(metrics.last_block_time.has_value());
+  BOOST_TEST(*metrics.last_block_time == 1700000100U);
+  BOOST_REQUIRE(metrics.median_time.has_value());
+  BOOST_TEST(*metrics.median_time == 1700000000U);
+  BOOST_REQUIRE(metrics.chainwork.has_value());
+  BOOST_TEST(*metrics.chainwork == "000abc");
+  BOOST_TEST(!metrics.reorg_count.has_value());
+  BOOST_REQUIRE_EQUAL(methods.size(), 6U);
+  BOOST_TEST(methods[0] == "getblockchaininfo");
+  BOOST_TEST(methods[1] == "getnetworkinfo");
+  BOOST_TEST(methods[2] == "getmempoolinfo");
+  BOOST_TEST(methods[3] == "getblockheader");
+  BOOST_TEST(methods[4] == "getnetworkhashps");
+  BOOST_TEST(methods[5] == "getpeerinfo");
+  BOOST_REQUIRE_EQUAL(requests[3].as_object().at("params").as_array().size(),
+                      2U);
+  BOOST_TEST(requests[3].as_object().at("params").as_array()[0].as_string() ==
+             "best-12");
+  BOOST_TEST(requests[3].as_object().at("params").as_array()[1].as_bool());
+  BOOST_TEST(requests[4].as_object().at("params").as_array().empty());
+}
+
+BOOST_AUTO_TEST_CASE(firo_rejects_out_of_range_verification_progress) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"blocks":1,"headers":1,"bestblockhash":"best-1","difficulty":1,"mediantime":10,"verificationprogress":1.1,"chainwork":"01"},"error":null,"id":"bbp"})",
+      R"({"result":{"version":1,"protocolversion":2,"subversion":"/Firo:test/","connections":0},"error":null,"id":"bbp"})",
+      R"({"result":{"size":0,"bytes":0},"error":null,"id":"bbp"})",
+      R"({"result":{"time":11},"error":null,"id":"bbp"})",
+      R"({"result":0,"error":null,"id":"bbp"})",
+      R"({"result":[],"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "invalid-progress-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  BOOST_CHECK_THROW(driver.ReadMetrics(config), std::runtime_error);
+  BOOST_REQUIRE_EQUAL(served.get().size(), 6U);
+}
+
 BOOST_AUTO_TEST_CASE(firo_creates_private_spark_and_funding_addresses) {
   namespace asio = boost::asio;
   using tcp = asio::ip::tcp;

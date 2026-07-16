@@ -1248,6 +1248,63 @@ BOOST_AUTO_TEST_CASE(run_report_reduces_profile_updates_and_active_profiles) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_orders_nodes_and_derives_resource_rates) {
+  const std::filesystem::path dir = MakeTestDir("run-report-node-rates");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"r1","chain":"firo","nodes":10,"node_configs":[{"index":10,"id":"firo-10","chain":"firo","role":"base"},{"index":2,"id":"firo-2","chain":"firo","role":"miner"}]})"
+      "\n");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-10","event":"state","detail":"Running"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-2","event":"state","detail":"Running"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-2","event":"metrics_node_unavailable","detail":"{\"sample\":3,\"error\":\"RPC timeout\"}"})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-10","timestamp_ms":1000,"cpu_usage_usec":1,"io_read_bytes":1,"network_rx_bytes":1,"network_tx_bytes":1})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":1000,"cpu_usage_usec":100000,"cpu_throttled_usec":1000,"io_read_bytes":1000,"io_write_bytes":2000,"network_rx_bytes":3000,"network_tx_bytes":4000})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":3000,"cpu_usage_usec":1100000,"cpu_throttled_usec":101000,"io_read_bytes":5000,"io_write_bytes":10000,"network_rx_bytes":7000,"network_tx_bytes":10000,"network_rx_dropped":1,"network_tx_dropped":2,"qdisc_drops":3,"network_filter_drop_packets":4,"directional_network_qdisc_drops":5})");
+
+  const boost::json::value report_value =
+      boost::json::parse(bbp::BuildRunReportJson(dir));
+  const boost::json::object& report = report_value.as_object();
+  const boost::json::array& nodes = report.at("nodes_summary").as_array();
+  BOOST_REQUIRE_EQUAL(nodes.size(), 2U);
+  BOOST_TEST(nodes[0].as_object().at("node_id").as_string() == "firo-2");
+  BOOST_TEST(JsonInteger(nodes[0].as_object(), "node_index") == 2U);
+  BOOST_TEST(nodes[0].as_object().at("chain").as_string() == "firo");
+  BOOST_TEST(nodes[0].as_object().at("role").as_string() == "miner");
+  BOOST_TEST(nodes[1].as_object().at("node_id").as_string() == "firo-10");
+  BOOST_TEST(JsonInteger(nodes[1].as_object(), "node_index") == 10U);
+  BOOST_TEST(nodes[0].as_object().at("last_error").as_string() ==
+             "metrics_node_unavailable: RPC timeout");
+
+  const boost::json::object& metrics =
+      nodes[0].as_object().at("last_metrics").as_object();
+  BOOST_TEST(metrics.at("cpu_percent").as_double() == 50.0);
+  BOOST_TEST(metrics.at("cpu_throttled_percent").as_double() == 5.0);
+  BOOST_TEST(JsonInteger(metrics, "io_read_bytes_per_sec") == 2000U);
+  BOOST_TEST(JsonInteger(metrics, "io_write_bytes_per_sec") == 4000U);
+  BOOST_TEST(JsonInteger(metrics, "network_uplink_bytes_per_sec") == 2000U);
+  BOOST_TEST(JsonInteger(metrics, "network_downlink_bytes_per_sec") == 3000U);
+  BOOST_TEST(JsonInteger(metrics, "network_drop_count") == 15U);
+  const boost::json::object& first_only_metrics =
+      nodes[1].as_object().at("last_metrics").as_object();
+  BOOST_TEST(first_only_metrics.at("cpu_percent").is_null());
+  BOOST_TEST(first_only_metrics.at("io_read_bytes_per_sec").is_null());
+  BOOST_TEST(first_only_metrics.at("network_uplink_bytes_per_sec").is_null());
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(
     run_report_aggregates_distributed_wallet_transaction_amounts) {
   const std::filesystem::path dir =

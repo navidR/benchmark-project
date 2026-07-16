@@ -1,6 +1,7 @@
 #include "bbp/simulator_app.h"
 
 #include <linux/capability.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <yaml.h>
 
@@ -923,6 +924,19 @@ bool NodeListContains(const std::vector<uint32_t>& nodes, uint32_t node_index) {
     }
   }
   return false;
+}
+
+std::string NodeRoleName(const Options& options, std::uint32_t node_index) {
+  if (!options.node_roles.empty()) {
+    return options.node_roles.at(node_index);
+  }
+  const bool wallet =
+      NodeListContains(options.topology.wallet_nodes, node_index);
+  const bool miner = NodeListContains(options.topology.miner_nodes, node_index);
+  return wallet && miner ? "wallet_miner"
+         : wallet        ? "wallet"
+         : miner         ? "miner"
+                         : "base";
 }
 
 const PeerConnectivityPolicy* FindPeerConnectivityPolicy(
@@ -5102,19 +5116,96 @@ boost::json::object DirectionalNetworkPolicyCounterJson(
   return object;
 }
 
+struct NodeRuntimeMetrics {
+  std::uint32_t node_index = 0;
+  std::string chain;
+  std::string role;
+  std::string lifecycle;
+  pid_t pid = -1;
+  bool pidfd_available = false;
+  bool process_running = false;
+  std::optional<int> exit_status;
+  std::optional<std::uint64_t> uptime_ms;
+  std::string cgroup_path;
+  std::string data_dir;
+  std::string log_dir;
+  std::string rpc_host;
+  std::uint16_t rpc_port = 0;
+  std::optional<std::uint64_t> network_namespace_inode;
+  pid_t network_namespace_helper_pid = -1;
+  std::string host_interface;
+  std::string child_interface;
+  std::string host_address;
+  std::string node_address;
+  std::uint8_t prefix_length = 0;
+  std::vector<RouteInfo> routes;
+};
+
 std::string MetricsJson(
     const std::string& run_id, const std::string& node_id,
-    const ChainMetrics& chain, uint64_t generated_block_count,
-    uint64_t mined_transaction_count, bool mined_transaction_count_complete,
-    uint64_t restart_count, std::string_view resource_profile,
-    std::string_view network_profile, const NetworkCondition* network_condition,
-    const CgroupMetrics* cgroup, const LinkInfo* link, const QdiscInfo* qdisc,
+    const NodeRuntimeMetrics& runtime, const ChainMetrics& chain,
+    uint64_t generated_block_count, uint64_t mined_transaction_count,
+    bool mined_transaction_count_complete, uint64_t restart_count,
+    std::string_view resource_profile, std::string_view network_profile,
+    const NetworkCondition* network_condition, const CgroupMetrics* cgroup,
+    const LinkInfo* link, const QdiscInfo* qdisc,
+    const std::vector<QdiscInfo>* qdisc_tree,
     const std::vector<TcFilterInfo>* filters,
     const DirectionalNetworkPolicyStats* directional_stats) {
   boost::json::object object;
   object["timestamp_ms"] = NowUnixMillis();
   object["run_id"] = run_id;
   object["node_id"] = node_id;
+  object["node_index"] = runtime.node_index;
+  object["chain"] = runtime.chain;
+  object["role"] = runtime.role;
+  object["lifecycle"] = runtime.lifecycle;
+  object["pid"] = runtime.pid;
+  object["pidfd_available"] = runtime.pidfd_available;
+  object["process_group"] = runtime.pid;
+  object["process_running"] = runtime.process_running;
+  if (runtime.exit_status) {
+    object["exit_status"] = *runtime.exit_status;
+  } else {
+    object["exit_status"] = nullptr;
+  }
+  if (runtime.uptime_ms) {
+    object["uptime_ms"] = *runtime.uptime_ms;
+  } else {
+    object["uptime_ms"] = nullptr;
+  }
+  object["restart_count"] = restart_count;
+  object["cgroup_path"] = runtime.cgroup_path;
+  object["data_dir"] = runtime.data_dir;
+  object["log_dir"] = runtime.log_dir;
+  object["rpc_host"] = runtime.rpc_host;
+  object["rpc_port"] = runtime.rpc_port;
+  if (runtime.network_namespace_inode) {
+    object["network_namespace_inode"] = *runtime.network_namespace_inode;
+  } else {
+    object["network_namespace_inode"] = nullptr;
+  }
+  if (runtime.network_namespace_helper_pid > 0) {
+    object["network_namespace_helper_pid"] =
+        runtime.network_namespace_helper_pid;
+  } else {
+    object["network_namespace_helper_pid"] = nullptr;
+  }
+  if (runtime.host_interface.empty()) {
+    object["host_interface"] = nullptr;
+    object["child_interface"] = nullptr;
+    object["host_address"] = nullptr;
+    object["node_address"] = nullptr;
+    object["network_prefix_length"] = nullptr;
+    object["network_routes"] = boost::json::array{};
+  } else {
+    object["host_interface"] = runtime.host_interface;
+    object["child_interface"] = runtime.child_interface;
+    object["host_address"] = runtime.host_address;
+    object["node_address"] = runtime.node_address;
+    object["network_prefix_length"] = runtime.prefix_length;
+    object["network_routes"] = RoutesJson(runtime.routes);
+  }
   object["chain_version"] = chain.version;
   object["chain_protocol_version"] = chain.protocol_version;
   object["chain_subversion"] = chain.subversion;
@@ -5132,7 +5223,6 @@ std::string MetricsJson(
   object["generated_block_count"] = generated_block_count;
   object["mined_transaction_count"] = mined_transaction_count;
   object["mined_transaction_count_complete"] = mined_transaction_count_complete;
-  object["restart_count"] = restart_count;
   if (resource_profile.empty()) {
     object["active_resource_profile"] = nullptr;
   } else {
@@ -5153,10 +5243,46 @@ std::string MetricsJson(
   } else {
     object["initial_block_download"] = nullptr;
   }
+  if (chain.headers) {
+    object["headers"] = *chain.headers;
+  } else {
+    object["headers"] = nullptr;
+  }
+  object["sync_status"] = ChainSyncStatusName(chain.sync_status);
+  if (chain.verification_progress) {
+    object["verification_progress"] = *chain.verification_progress;
+  } else {
+    object["verification_progress"] = nullptr;
+  }
   if (chain.difficulty) {
     object["difficulty"] = *chain.difficulty;
   } else {
     object["difficulty"] = nullptr;
+  }
+  if (chain.hashrate_estimate) {
+    object["hashrate_estimate"] = *chain.hashrate_estimate;
+  } else {
+    object["hashrate_estimate"] = nullptr;
+  }
+  if (chain.last_block_time) {
+    object["last_block_time"] = *chain.last_block_time;
+  } else {
+    object["last_block_time"] = nullptr;
+  }
+  if (chain.median_time) {
+    object["median_time"] = *chain.median_time;
+  } else {
+    object["median_time"] = nullptr;
+  }
+  if (chain.chainwork) {
+    object["chainwork"] = *chain.chainwork;
+  } else {
+    object["chainwork"] = nullptr;
+  }
+  if (chain.reorg_count) {
+    object["reorg_count"] = *chain.reorg_count;
+  } else {
+    object["reorg_count"] = nullptr;
   }
   object["rpc_latency_ms"] = chain.rpc_latency_ms;
   if (cgroup != nullptr) {
@@ -5252,6 +5378,11 @@ std::string MetricsJson(
     object["qdisc_tbf_limit_bytes"] = qdisc->tbf_limit_bytes;
     object["qdisc_tbf_buffer_ticks"] = qdisc->tbf_buffer_ticks;
     object["qdisc_tbf_mtu_ticks"] = qdisc->tbf_mtu_ticks;
+  }
+  if (qdisc_tree != nullptr) {
+    object["network_qdiscs"] = QdiscsJson(*qdisc_tree);
+  } else {
+    object["network_qdiscs"] = boost::json::array{};
   }
   if (filters != nullptr) {
     const TcFilterStatsSummary summary =
@@ -5828,6 +5959,7 @@ using MetricsStopRequested = std::function<bool()>;
 void WriteMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    std::mutex& node_process_mutex,
     const NodeMetricsFailureHandler& node_failure_handler = {},
     const MetricsStopRequested& stop_requested = {},
     std::stop_token stop_token = {}) {
@@ -5872,6 +6004,46 @@ void WriteMetricsSnapshot(
       node_failure_handler(node, error.what());
       continue;
     }
+    NodeRuntimeMetrics runtime;
+    runtime.node_index = static_cast<std::uint32_t>(node_index + 1U);
+    runtime.chain = std::string(ChainKindName(options.chain));
+    runtime.role =
+        NodeRoleName(options, static_cast<std::uint32_t>(node_index));
+    runtime.lifecycle = NodeRuntimeLifecycleName(node.Lifecycle());
+    runtime.data_dir = node.config.data_dir.string();
+    runtime.log_dir = node.config.log_dir.string();
+    const RpcEndpoint rpc_endpoint = driver.Endpoint(node.config);
+    runtime.rpc_host = rpc_endpoint.host;
+    runtime.rpc_port = rpc_endpoint.port;
+    {
+      std::lock_guard<std::mutex> lock(node_process_mutex);
+      runtime.pid = node.process.pid();
+      runtime.pidfd_available = node.process.pidfd() >= 0;
+      runtime.process_running = node.process.running();
+      runtime.exit_status = node.process.exit_status();
+      if (node.process_started_at) {
+        const auto now = std::chrono::steady_clock::now();
+        runtime.uptime_ms =
+            now <= *node.process_started_at
+                ? 0U
+                : static_cast<std::uint64_t>(
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - *node.process_started_at)
+                          .count());
+      }
+    }
+    if (node.cgroup) {
+      runtime.cgroup_path = node.cgroup->path().string();
+    }
+    if (node.network_namespace) {
+      struct stat namespace_stat {};
+      if (fstat(node.network_namespace->fd(), &namespace_stat) != 0) {
+        throw std::runtime_error("fstat node network namespace failed");
+      }
+      runtime.network_namespace_inode = namespace_stat.st_ino;
+      runtime.network_namespace_helper_pid =
+          node.network_namespace->helper_pid();
+    }
     CgroupMetrics cg;
     std::string resource_profile;
     {
@@ -5881,6 +6053,17 @@ void WriteMetricsSnapshot(
     }
     const std::optional<NodeVethConfig>& network =
         network_states[node_index].network;
+    if (network) {
+      runtime.host_interface = network->host_name;
+      runtime.child_interface = network->peer_name;
+      runtime.host_address = network->host_address;
+      runtime.node_address = network->node_address;
+      runtime.prefix_length = network->prefix_len;
+      if (node.network_namespace) {
+        runtime.routes =
+            ListIpv4RoutesInNamespace(node.network_namespace->fd());
+      }
+    }
     std::optional<DirectionalNetworkPolicyStats> directional_stats;
     if (network && node.network_namespace) {
       std::lock_guard<std::mutex> lock(node_network_state_mutex);
@@ -5892,9 +6075,15 @@ void WriteMetricsSnapshot(
         network ? FindLinkByName(links, network->host_name) : nullptr;
     std::optional<QdiscInfo> qdisc_summary;
     const QdiscInfo* qdisc = nullptr;
+    std::vector<QdiscInfo> qdisc_tree;
     std::vector<TcFilterInfo> filters;
     const std::vector<TcFilterInfo>* filter_metrics = nullptr;
     if (network) {
+      for (const QdiscInfo& candidate : qdiscs) {
+        if (candidate.if_name == network->host_name) {
+          qdisc_tree.push_back(candidate);
+        }
+      }
       if (network->apply_condition) {
         QdiscInfo candidate;
         if (QdiscsMatchNetworkCondition(qdiscs, network->host_name,
@@ -5915,12 +6104,12 @@ void WriteMetricsSnapshot(
     AppendLine(
         metrics_path,
         MetricsJson(
-            options.run_id, node.config.id, chain, node.GeneratedBlockCount(),
-            node.MinedTransactionCount(), node.MinedTransactionCountComplete(),
-            node.RestartCount(), resource_profile,
-            network_states[node_index].profile,
+            options.run_id, node.config.id, runtime, chain,
+            node.GeneratedBlockCount(), node.MinedTransactionCount(),
+            node.MinedTransactionCountComplete(), node.RestartCount(),
+            resource_profile, network_states[node_index].profile,
             network && network->apply_condition ? &network->condition : nullptr,
-            &cg, link, qdisc, filter_metrics,
+            &cg, link, qdisc, network ? &qdisc_tree : nullptr, filter_metrics,
             directional_stats ? &*directional_stats : nullptr));
   }
 }
@@ -6881,6 +7070,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       WriteNodeState(events_path, options.run_id, node_id,
                      NodeRuntimeLifecycle::kStarting);
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
+      runtime.process_started_at = std::chrono::steady_clock::now();
       BBP_LOG(info) << "started " << node_id
                     << " pid=" << runtime.process.pid();
       WriteEvent(events_path, options.run_id, node_id,
@@ -7229,9 +7419,9 @@ std::string ResourcePressureDetail(const ResourcePressureWorkload& workload,
 void ApplyResourcePressureWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const std::filesystem::path& metrics_path, const ChainDriver& driver,
-    std::vector<NodeRuntime>& nodes, const ResourcePressureWorkload& workload,
-    uint32_t workload_index, uint32_t workload_count,
-    std::stop_token stop_token) {
+    std::vector<NodeRuntime>& nodes, std::mutex& node_process_mutex,
+    const ResourcePressureWorkload& workload, uint32_t workload_index,
+    uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
   if (!node.cgroup) {
     throw std::runtime_error("resource pressure requires a node cgroup");
@@ -7275,8 +7465,8 @@ void ApplyResourcePressureWorkload(
                                       workload_index, workload_count));
     WaitForDuration(std::chrono::milliseconds(workload.duration_ms),
                     stop_token);
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
-                         stop_token);
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes,
+                         node_process_mutex, {}, {}, stop_token);
   } catch (...) {
     const std::exception_ptr original_error = std::current_exception();
     try {
@@ -8634,6 +8824,7 @@ void RestartNode(const Options& options,
   WriteNodeState(events_path, options.run_id, node.config.id,
                  NodeRuntimeLifecycle::kStarting);
   node.process = ChildProcess::Spawn(process, node.cgroup->path());
+  node.process_started_at = std::chrono::steady_clock::now();
   const std::uint64_t restart_count = node.IncrementRestartCount();
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kProcessRestarted,
@@ -9836,7 +10027,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         options.metrics_sample_count, options.metrics_interval,
         [&](std::uint32_t sample) {
           WriteMetricsSnapshot(
-              metrics_path, options, driver, nodes,
+              metrics_path, options, driver, nodes, node_process_mutex,
               [&](const NodeRuntime& node, std::string_view error) {
                 boost::json::object detail;
                 detail["sample"] = sample;
@@ -9905,8 +10096,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
 
     ThrowIfStopRequested(stop_token);
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
-                         stop_token);
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes,
+                         node_process_mutex, {}, {}, stop_token);
     WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},
                                stop_token);
 
@@ -10095,7 +10286,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                     action_index, action_count, stop_token);
         } else if (scenario_workload.kind == WorkloadKind::kResourcePressure) {
           ApplyResourcePressureWorkload(options, events_path, metrics_path,
-                                        driver, nodes,
+                                        driver, nodes, node_process_mutex,
                                         scenario_workload.resource_pressure,
                                         action_index, action_count, stop_token);
         } else if (scenario_workload.kind ==
@@ -10191,8 +10382,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     stop_block_production();
     transaction_tracker.ObserveAll(options, events_path, driver, nodes,
                                    stop_token);
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes, {}, {},
-                         stop_token);
+    WriteMetricsSnapshot(metrics_path, options, driver, nodes,
+                         node_process_mutex, {}, {}, stop_token);
     WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},
                                stop_token);
 

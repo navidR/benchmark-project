@@ -4,6 +4,18 @@
 
 namespace bbp {
 
+std::string_view ChainSyncStatusName(ChainSyncStatus status) {
+  switch (status) {
+    case ChainSyncStatus::kUnknown:
+      return "unknown";
+    case ChainSyncStatus::kSyncing:
+      return "syncing";
+    case ChainSyncStatus::kSynced:
+      return "synced";
+  }
+  throw std::runtime_error("unknown chain sync status");
+}
+
 UnsupportedChainOperation::UnsupportedChainOperation(std::string_view chain,
                                                      std::string_view operation)
     : std::runtime_error(std::string(chain) + " does not support " +
