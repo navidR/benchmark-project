@@ -1,5 +1,3 @@
-#include "bbp/process.h"
-
 #include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
@@ -7,6 +5,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <boost/test/unit_test.hpp>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -15,7 +14,7 @@
 #include <stdexcept>
 #include <string>
 
-#include <boost/test/unit_test.hpp>
+#include "bbp/process.h"
 
 namespace {
 
@@ -143,7 +142,8 @@ std::optional<NetworkNamespaceHelper> StartHelper() {
 
   const pid_t pid = fork();
   if (pid < 0) {
-    throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
+    throw std::runtime_error(std::string("fork failed: ") +
+                             std::strerror(errno));
   }
 
   if (pid == 0) {
@@ -194,7 +194,8 @@ std::optional<NetworkNamespaceHelper> StartHelper() {
 
 std::string ReadLink(const std::string& path) {
   std::array<char, 256> buffer{};
-  const ssize_t size = readlink(path.c_str(), buffer.data(), buffer.size() - 1U);
+  const ssize_t size =
+      readlink(path.c_str(), buffer.data(), buffer.size() - 1U);
   if (size < 0) {
     throw std::runtime_error("readlink failed for " + path + ": " +
                              std::strerror(errno));
@@ -233,5 +234,42 @@ BOOST_AUTO_TEST_CASE(child_process_enters_configured_network_namespace) {
   BOOST_TEST(child_netns == helper_netns);
 
   child.Terminate(std::chrono::seconds(1));
+  std::filesystem::remove_all(run_dir);
+}
+
+BOOST_AUTO_TEST_CASE(child_process_does_not_inherit_blocked_signal_mask) {
+  sigset_t blocked;
+  sigset_t previous;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGTERM);
+  BOOST_REQUIRE(pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0);
+
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-signal-mask-" + std::to_string(getpid()));
+  std::filesystem::create_directories(run_dir);
+
+  bbp::ProcessSpec spec;
+  spec.binary = "/bin/sleep";
+  spec.argv = {"10"};
+  spec.cwd = run_dir;
+  spec.stdout_path = run_dir / "stdout.log";
+  spec.stderr_path = run_dir / "stderr.log";
+
+  bbp::ChildProcess child;
+  try {
+    child = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  } catch (...) {
+    static_cast<void>(pthread_sigmask(SIG_SETMASK, &previous, nullptr));
+    std::filesystem::remove_all(run_dir);
+    throw;
+  }
+  BOOST_REQUIRE(pthread_sigmask(SIG_SETMASK, &previous, nullptr) == 0);
+
+  child.Terminate(std::chrono::seconds(1));
+  const std::optional<int> status = child.exit_status();
+  BOOST_REQUIRE(status);
+  BOOST_REQUIRE(WIFSIGNALED(*status));
+  BOOST_TEST(WTERMSIG(*status) == SIGTERM);
   std::filesystem::remove_all(run_dir);
 }

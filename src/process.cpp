@@ -153,6 +153,11 @@ ChildProcess ChildProcess::Spawn(
   if (pid == 0) {
     close(gate[1]);
     close(setup_status[0]);
+    sigset_t empty_signal_mask;
+    sigemptyset(&empty_signal_mask);
+    if (sigprocmask(SIG_SETMASK, &empty_signal_mask, nullptr) != 0) {
+      ChildSetupFail("reset signal mask", setup_status[1]);
+    }
     if (spec.network_namespace_fd &&
         setns(*spec.network_namespace_fd, CLONE_NEWNET) != 0) {
       ChildSetupFail("setns network namespace", setup_status[1]);

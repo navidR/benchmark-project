@@ -1772,12 +1772,16 @@ bool HandleInput(int ch, const boost::json::object& report,
 
 int RunTuiReport(const std::filesystem::path& run_root, bool once,
                  std::uint32_t refresh_ms,
-                 SimulationCommandQueue* command_queue) {
+                 SimulationCommandQueue* command_queue,
+                 std::stop_token stop_token) {
   CursesSession curses;
   const std::uint32_t sleep_step_ms = 50;
   TuiState state;
 
   while (true) {
+    if (stop_token.stop_requested()) {
+      return 0;
+    }
     std::string error;
     const boost::json::object report = LoadReport(run_root, &error);
     state.selected_node = ClampNodeSelection(report, state.selected_node);
@@ -1805,6 +1809,9 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
 
     std::uint32_t slept_ms = 0;
     while (slept_ms < refresh_ms) {
+      if (stop_token.stop_requested()) {
+        return 0;
+      }
       const int ch = getch();
       if (HandleInput(ch, report, command_queue, &state)) {
         break;

@@ -52,6 +52,7 @@
 #include "bbp/process.h"
 #include "bbp/run_report.h"
 #include "bbp/runtime_peer_topology.h"
+#include "bbp/signal_stop_monitor.h"
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
 #include "bbp/simulation_command_queue.h"
@@ -9454,7 +9455,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   return 0;
 }
 
-int RunBenchmarkWithTui(Options options) {
+int RunBenchmarkWithTui(Options options, std::stop_token signal_stop_token) {
   SetConsoleLoggingEnabled(false);
   try {
     const auto run_root = BenchmarkRunRoot(options);
@@ -9463,6 +9464,10 @@ int RunBenchmarkWithTui(Options options) {
     int simulation_result = 1;
     SimulationCommandQueue command_queue;
     std::stop_source stop_source;
+    std::stop_callback cancel_on_signal(signal_stop_token, [&] {
+      stop_source.request_stop();
+      command_queue.Close();
+    });
 
     std::thread simulation_thread([&options, &simulation_failure,
                                    &simulation_result, &command_queue,
@@ -9477,8 +9482,8 @@ int RunBenchmarkWithTui(Options options) {
 
     int tui_result = 1;
     try {
-      tui_result =
-          RunTuiReport(run_root, false, options.tui_refresh_ms, &command_queue);
+      tui_result = RunTuiReport(run_root, false, options.tui_refresh_ms,
+                                &command_queue, stop_source.get_token());
     } catch (...) {
       tui_failure = std::current_exception();
     }
@@ -9603,9 +9608,22 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
   if (options.no_tui) {
-    return RunBenchmarkHeadless(options, nullptr);
+    SignalStopMonitor signal_monitor;
+    const int result =
+        RunBenchmarkHeadless(options, nullptr, signal_monitor.GetToken());
+    if (signal_monitor.ReceivedSignal() != 0) {
+      BBP_LOG(info) << "graceful shutdown completed after signal "
+                    << signal_monitor.ReceivedSignal();
+    }
+    return result;
   }
-  return RunBenchmarkWithTui(options);
+  SignalStopMonitor signal_monitor;
+  const int result = RunBenchmarkWithTui(options, signal_monitor.GetToken());
+  if (signal_monitor.ReceivedSignal() != 0) {
+    BBP_LOG(info) << "graceful shutdown completed after signal "
+                  << signal_monitor.ReceivedSignal();
+  }
+  return result;
 }
 
 }  // namespace bbp

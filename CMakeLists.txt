@@ -167,6 +167,7 @@ add_executable(bbp
   src/simulation_event_kind.cpp
   src/simulation_registry.cpp
   src/simulation_network_address_plan.cpp
+  src/signal_stop_monitor.cpp
   src/simulator_app.cpp
   src/tui.cpp
   src/tui_command_parser.cpp
@@ -231,6 +232,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_command_tests.cpp
     tests/unit/simulation_event_kind_tests.cpp
     tests/unit/simulation_registry_tests.cpp
+    tests/unit/signal_stop_monitor_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
     tests/unit/wallet_funding_strategy_tests.cpp
@@ -271,6 +273,7 @@ if(BUILD_TESTING)
     src/simulation_command_queue.cpp
     src/simulation_registry.cpp
     src/simulation_network_address_plan.cpp
+    src/signal_stop_monitor.cpp
     src/tui_command_parser.cpp
     src/util.cpp
     src/wallet_funding_strategy.cpp
