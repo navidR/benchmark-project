@@ -141,6 +141,7 @@ void CopySelectedMetricFields(const boost::json::object& source,
       "restart_count",
       "active_resource_profile",
       "active_network_profile",
+      "network_condition",
       "initial_block_download",
       "difficulty",
       "rpc_latency_ms",
@@ -857,6 +858,9 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array resource_profile_updates;
   boost::json::array network_profile_updates;
   boost::json::array profile_update_rollback_failures;
+  boost::json::array network_condition_updates;
+  boost::json::array network_blocks;
+  boost::json::array network_unblocks;
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
   boost::json::array directional_network_policy_verifications;
@@ -969,6 +973,15 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           case SimulationEventKind::kProfileUpdateRollbackFailed:
             AppendBoundedProfileUpdateSummary(
                 event, &profile_update_rollback_failures);
+            break;
+          case SimulationEventKind::kNetworkConditionUpdated:
+            AppendEventSummary(event, &network_condition_updates);
+            break;
+          case SimulationEventKind::kNetworkBlockApplied:
+            AppendEventSummary(event, &network_blocks);
+            break;
+          case SimulationEventKind::kNetworkBlockRemoved:
+            AppendEventSummary(event, &network_unblocks);
             break;
           case SimulationEventKind::kNetworkPartitionApplied:
             AppendEventSummary(event, &network_partitions);
@@ -1093,6 +1106,9 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["network_profile_updates"] = std::move(network_profile_updates);
   report["profile_update_rollback_failures"] =
       std::move(profile_update_rollback_failures);
+  report["network_condition_updates"] = std::move(network_condition_updates);
+  report["network_blocks"] = std::move(network_blocks);
+  report["network_unblocks"] = std::move(network_unblocks);
   report["network_partitions"] = std::move(network_partitions);
   report["network_partition_heals"] = std::move(network_partition_heals);
   report["directional_network_policy_verifications"] =

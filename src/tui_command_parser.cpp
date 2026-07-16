@@ -12,7 +12,7 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 18> kCommandNames = {
+constexpr std::array<std::string_view, 24> kCommandNames = {
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -31,6 +31,12 @@ constexpr std::array<std::string_view, 18> kCommandNames = {
     "generate-blocks",
     "resource-profile",
     "network-profile",
+    "network-condition",
+    "block",
+    "unblock",
+    "clear-rule",
+    "partition",
+    "heal",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -73,6 +79,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
       };
     }
     if (tokens[0] == "mining-difficulty") {
@@ -86,6 +94,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
       };
     }
     if (tokens[0] == "connect-peer" || tokens[0] == "disconnect-peer") {
@@ -100,6 +110,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
       };
     }
     if (tokens[0] == "peer-policy") {
@@ -114,6 +126,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
                               boost::lexical_cast<std::uint32_t>(tokens[2])),
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
       };
     }
     if (tokens[0] == "generate-blocks") {
@@ -131,6 +145,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = block_count,
           .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
       };
     }
     if (tokens[0] == "resource-profile" || tokens[0] == "network-profile") {
@@ -145,6 +161,118 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = tokens[1],
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
+      };
+    }
+    if (tokens[0] == "network-condition") {
+      if (tokens.size() != 8U && tokens.size() != 9U) {
+        throw std::runtime_error(
+            "usage: network-condition <bandwidth-mbps> <delay-ms> "
+            "<jitter-ms> <loss-bps> <duplicate-bps> <corrupt-bps> "
+            "<reorder-bps> [limit-packets]");
+      }
+      NetworkCondition condition;
+      condition.bandwidth_mbps = boost::lexical_cast<std::uint32_t>(tokens[1]);
+      condition.delay_ms = boost::lexical_cast<std::uint32_t>(tokens[2]);
+      condition.jitter_ms = boost::lexical_cast<std::uint32_t>(tokens[3]);
+      condition.loss_basis_points =
+          boost::lexical_cast<std::uint32_t>(tokens[4]);
+      condition.duplicate_basis_points =
+          boost::lexical_cast<std::uint32_t>(tokens[5]);
+      condition.corrupt_basis_points =
+          boost::lexical_cast<std::uint32_t>(tokens[6]);
+      condition.reorder_basis_points =
+          boost::lexical_cast<std::uint32_t>(tokens[7]);
+      if (tokens.size() == 9U) {
+        condition.limit_packets = boost::lexical_cast<std::uint32_t>(tokens[8]);
+      }
+      ValidateNetworkCondition(condition);
+      return ParsedTuiCommand{
+          .kind = SimulationCommandKind::kSetNetworkCondition,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
+          .network_condition = condition,
+          .network_flow = std::nullopt,
+      };
+    }
+    if (tokens[0] == "block" || tokens[0] == "unblock") {
+      if (tokens.size() != 3U && tokens.size() != 4U) {
+        throw std::runtime_error("usage: " + tokens[0] +
+                                 " <dst-ipv4> <dst-port> [src-ipv4]");
+      }
+      const std::uint32_t dst_port =
+          boost::lexical_cast<std::uint32_t>(tokens[2]);
+      if (dst_port == 0U || dst_port > 65535U) {
+        throw std::runtime_error("network flow port must be 1..65535");
+      }
+      ValidateIpv4Address(tokens[1], "network flow destination");
+      if (tokens.size() == 4U) {
+        ValidateIpv4Address(tokens[3], "network flow source");
+      }
+      return ParsedTuiCommand{
+          .kind = tokens[0] == "block"
+                      ? SimulationCommandKind::kBlockNetworkFlow
+                      : SimulationCommandKind::kUnblockNetworkFlow,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow =
+              SimulationNetworkFlow{
+                  .src_address = tokens.size() == 4U ? tokens[3] : "",
+                  .dst_address = tokens[1],
+                  .dst_port = static_cast<std::uint16_t>(dst_port),
+                  .handle = 0U,
+              },
+      };
+    }
+    if (tokens[0] == "clear-rule") {
+      RequireArgumentCount(tokens, 2U, "clear-rule <handle>");
+      const std::uint32_t handle =
+          boost::lexical_cast<std::uint32_t>(tokens[1]);
+      if (handle == 0U) {
+        throw std::runtime_error("network rule handle must be positive");
+      }
+      return ParsedTuiCommand{
+          .kind = SimulationCommandKind::kUnblockNetworkFlow,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow =
+              SimulationNetworkFlow{
+                  .src_address = {},
+                  .dst_address = {},
+                  .dst_port = 0U,
+                  .handle = handle,
+              },
+      };
+    }
+    if (tokens[0] == "partition" || tokens[0] == "heal") {
+      RequireArgumentCount(tokens, 2U, tokens[0] + " <simulation-node-id>");
+      return ParsedTuiCommand{
+          .kind = tokens[0] == "partition"
+                      ? SimulationCommandKind::kPartitionNodes
+                      : SimulationCommandKind::kHealPartition,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = tokens[1],
+          .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
       };
     }
 
@@ -181,6 +309,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         .peer_count_policy = std::nullopt,
         .block_count = std::nullopt,
         .profile = std::nullopt,
+        .network_condition = std::nullopt,
+        .network_flow = std::nullopt,
     };
   } catch (const boost::bad_lexical_cast&) {
     throw std::runtime_error("command contains an invalid numeric argument");

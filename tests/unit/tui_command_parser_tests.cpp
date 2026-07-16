@@ -81,3 +81,89 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("resource-profile", 0U),
                     std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(tui_command_parser_builds_network_commands) {
+  const bbp::ParsedTuiCommand condition = bbp::TuiCommandParser::Parse(
+      "network-condition 20 80 10 11 12 13 14 900", 0U);
+  BOOST_CHECK(condition.kind ==
+              bbp::SimulationCommandKind::kSetNetworkCondition);
+  BOOST_REQUIRE(condition.network_condition);
+  BOOST_TEST(condition.network_condition->bandwidth_mbps == 20U);
+  BOOST_TEST(condition.network_condition->delay_ms == 80U);
+  BOOST_TEST(condition.network_condition->jitter_ms == 10U);
+  BOOST_TEST(condition.network_condition->loss_basis_points == 11U);
+  BOOST_TEST(condition.network_condition->duplicate_basis_points == 12U);
+  BOOST_TEST(condition.network_condition->corrupt_basis_points == 13U);
+  BOOST_TEST(condition.network_condition->reorder_basis_points == 14U);
+  BOOST_TEST(condition.network_condition->limit_packets == 900U);
+
+  const bbp::ParsedTuiCommand default_limit =
+      bbp::TuiCommandParser::Parse("network-condition 0 0 0 0 0 0 0", 0U);
+  BOOST_REQUIRE(default_limit.network_condition);
+  BOOST_TEST(default_limit.network_condition->limit_packets == 1000U);
+
+  const bbp::ParsedTuiCommand block =
+      bbp::TuiCommandParser::Parse("block 10.210.1.6 18168 10.210.1.2", 0U);
+  BOOST_CHECK(block.kind == bbp::SimulationCommandKind::kBlockNetworkFlow);
+  BOOST_REQUIRE(block.network_flow);
+  BOOST_TEST(block.network_flow->src_address == "10.210.1.2");
+  BOOST_TEST(block.network_flow->dst_address == "10.210.1.6");
+  BOOST_TEST(block.network_flow->dst_port == 18168U);
+
+  const bbp::ParsedTuiCommand unblock =
+      bbp::TuiCommandParser::Parse("unblock 10.210.1.6 18168", 0U);
+  BOOST_CHECK(unblock.kind == bbp::SimulationCommandKind::kUnblockNetworkFlow);
+  BOOST_REQUIRE(unblock.network_flow);
+  BOOST_TEST(unblock.network_flow->src_address.empty());
+
+  const bbp::ParsedTuiCommand clear =
+      bbp::TuiCommandParser::Parse("clear-rule 77", 0U);
+  BOOST_REQUIRE(clear.network_flow);
+  BOOST_TEST(clear.network_flow->dst_address.empty());
+  BOOST_TEST(clear.network_flow->handle == 77U);
+
+  const bbp::ParsedTuiCommand partition =
+      bbp::TuiCommandParser::Parse("partition firo-2", 0U);
+  BOOST_CHECK(partition.kind == bbp::SimulationCommandKind::kPartitionNodes);
+  BOOST_REQUIRE(partition.peer_node_id);
+  BOOST_TEST(*partition.peer_node_id == "firo-2");
+  BOOST_CHECK(bbp::TuiCommandParser::Parse("heal firo-2", 0U).kind ==
+              bbp::SimulationCommandKind::kHealPartition);
+}
+
+BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_network_commands) {
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1 4294968 0 0 0 0 0", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1 0 4294968 0 0 0 0", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1 0 0 10001 0 0 0", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1 0 0 0 10001 0 0", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1 0 0 0 0 10001 0", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1 0 0 0 0 0 10001", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1 0 0 0 0 0 0 0", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("block 10.0.0.1 0", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("unblock 10.0.0.1 65536", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("block invalid 18168", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("block 10.0.0.1 18168 invalid", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("clear-rule 0", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("partition", 0U),
+                    std::runtime_error);
+}

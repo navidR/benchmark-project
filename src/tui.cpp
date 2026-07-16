@@ -23,6 +23,7 @@
 
 #include "bbp/drivers/chain_wallet_transaction.h"
 #include "bbp/log_view.h"
+#include "bbp/network_rule_pane.h"
 #include "bbp/node_log_pane.h"
 #include "bbp/operator_command_status.h"
 #include "bbp/peer_list_pane.h"
@@ -55,6 +56,7 @@ struct TuiState {
   TuiView view = TuiView::kNodes;
   NodeLogPane node_log_pane;
   PeerListPane peer_list_pane;
+  NetworkRulePane network_rule_pane;
   std::string command_status;
   std::uint64_t last_command_result_sequence = 0;
   bool command_error_open = false;
@@ -359,6 +361,20 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
         text += type_name;
         text += " ";
         text += JsonString(workload, "profile", "-");
+        break;
+      case WorkloadKind::kSetNetworkCondition:
+        text += "network n";
+        text += JsonMetricText(workload, "node");
+        break;
+      case WorkloadKind::kBlockNetworkFlow:
+      case WorkloadKind::kUnblockNetworkFlow:
+        text += type_name;
+        text += " n";
+        text += JsonMetricText(workload, "node");
+        text += " ";
+        text += JsonString(workload, "dst_address", "-");
+        text += ":";
+        text += JsonMetricText(workload, "dst_port");
         break;
       case WorkloadKind::kPartitionNodes:
         text += "partition";
@@ -835,6 +851,49 @@ void DrawPeerListPane(int content_bottom, int cols,
   DrawHorizontalLine(content_bottom - 1);
 }
 
+void DrawNetworkRulePane(int content_bottom, int cols,
+                         const NetworkRulePane& rule_pane) {
+  constexpr int kPaneTop = 2;
+  if (!rule_pane.IsOpen() || cols <= 0 ||
+      NodeLogVisibleRows(content_bottom) <= 0) {
+    return;
+  }
+  for (int y = kPaneTop; y < content_bottom; ++y) {
+    mvhline(y, 0, ' ', cols);
+  }
+  DrawHorizontalLine(kPaneTop);
+  const std::size_t visible_rows =
+      static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
+  const std::size_t first = rule_pane.FirstVisibleRule(visible_rows);
+  const std::size_t last = rule_pane.LastVisibleRule(visible_rows);
+  std::string title = "Active Network Rules: ";
+  title += rule_pane.NodeId().empty() ? "-" : rule_pane.NodeId();
+  if (!rule_pane.Rules().empty()) {
+    title += " [" + std::to_string(first + 1U) + "-" + std::to_string(last) +
+             "/" + std::to_string(rule_pane.Rules().size()) + "]";
+  }
+  AddText(kPaneTop + 1, 0, cols, title, A_BOLD);
+  if (rule_pane.Rules().empty()) {
+    AddText(kPaneTop + 2, 0, cols, "No active simulator-owned block rules.",
+            COLOR_PAIR(kColorMuted));
+  } else {
+    int y = kPaneTop + 2;
+    for (std::size_t index = first; index < last; ++index) {
+      const NetworkRuleSummary& rule = rule_pane.Rules()[index];
+      const std::string source =
+          rule.source_address.empty() ? "*" : rule.source_address;
+      AddText(y, 0, cols,
+              std::to_string(rule.handle) + "  " + source + " -> " +
+                  rule.destination_address + ":" +
+                  std::to_string(rule.destination_port) + "  match " +
+                  std::to_string(rule.match_packets) + " / drop " +
+                  std::to_string(rule.drop_packets));
+      ++y;
+    }
+  }
+  DrawHorizontalLine(content_bottom - 1);
+}
+
 void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
   constexpr int kPopupRows = 7;
   if (rows < kPopupRows + 2 || cols < 32) {
@@ -893,7 +952,7 @@ void DrawCommandConfirmationPopup(int rows, int cols,
 
 void DrawCommandPalette(int rows, int cols, std::string_view input,
                         std::string_view error) {
-  constexpr int kPopupRows = 16;
+  constexpr int kPopupRows = 21;
   if (rows < kPopupRows + 2 || cols < 48) {
     return;
   }
@@ -925,13 +984,20 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   AddText(top + 8, left + 2, popup_cols - 4, "generate-blocks <count>");
   AddText(top + 9, left + 2, popup_cols - 4,
           "resource-profile <name>  network-profile <name>");
-  AddText(top + 11, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+  AddText(top + 10, left + 2, popup_cols - 4,
+          "network-condition <mbps> <delay> <jitter> <loss> <dup> <corrupt> "
+          "<reorder> [limit]");
+  AddText(top + 11, left + 2, popup_cols - 4,
+          "block|unblock <dst-ip> <port> [src-ip]  clear-rule <handle>");
+  AddText(top + 12, left + 2, popup_cols - 4,
+          "partition <node-id>  heal <node-id>");
+  AddText(top + 16, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
           A_BOLD);
   if (!error.empty()) {
-    AddText(top + 12, left + 2, popup_cols - 4, error,
+    AddText(top + 17, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   }
-  AddText(top + 14, left + 2, popup_cols - 4,
+  AddText(top + 19, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
 }
 
@@ -1268,9 +1334,10 @@ void DrawSummary(
     std::string_view error, const std::vector<std::string>& log_lines,
     TuiView view, std::size_t selected_node, std::size_t selected_wallet,
     const NodeLogPane& node_log_pane, const PeerListPane& peer_list_pane,
-    std::string_view command_status, bool command_error_open,
-    std::string_view command_error, bool command_palette_open,
-    std::string_view command_input, std::string_view command_input_error,
+    const NetworkRulePane& network_rule_pane, std::string_view command_status,
+    bool command_error_open, std::string_view command_error,
+    bool command_palette_open, std::string_view command_input,
+    std::string_view command_input_error,
     const std::optional<PendingConfirmation>& pending_confirmation) {
   int rows = 0;
   int cols = 0;
@@ -1465,6 +1532,7 @@ void DrawSummary(
   }
   DrawNodeLogPane(content_bottom, cols, node_log_pane);
   DrawPeerListPane(content_bottom, cols, peer_list_pane);
+  DrawNetworkRulePane(content_bottom, cols, network_rule_pane);
   DrawHorizontalLine(rows - 2);
   std::string footer;
   if (!command_status.empty()) {
@@ -1476,10 +1544,14 @@ void DrawSummary(
         "l closes. q exits.";
   } else if (peer_list_pane.IsOpen()) {
     footer += "Peers: arrows/PgUp/PgDn/Home/End scroll. p closes. q exits.";
+  } else if (network_rule_pane.IsOpen()) {
+    footer +=
+        "Rules: arrows/PgUp/PgDn/Home/End scroll. a closes. Use "
+        "clear-rule <handle>.";
   } else {
     footer +=
-        "Tab/n/w view. Arrows select. c command. m mining. s stop. f/t "
-        "freeze/thaw. d/r net. R restart. k kill. q exits.";
+        "Tab/n/w view. Arrows select. p peers. a rules. c command. m mining. "
+        "s stop. f/t freeze/thaw. d/r net. R restart. k kill. q exits.";
   }
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
@@ -1605,6 +1677,26 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
         }
         sequence = command_queue->PushProfileCommand(
             parsed.kind, node_id, *parsed.profile, confirmed);
+      } else if (parsed.kind == SimulationCommandKind::kSetNetworkCondition) {
+        if (!parsed.network_condition) {
+          throw std::runtime_error("network condition is missing");
+        }
+        sequence = command_queue->PushNetworkCondition(
+            node_id, *parsed.network_condition, confirmed);
+      } else if (parsed.kind == SimulationCommandKind::kBlockNetworkFlow ||
+                 parsed.kind == SimulationCommandKind::kUnblockNetworkFlow) {
+        if (!parsed.network_flow) {
+          throw std::runtime_error("network flow is missing");
+        }
+        sequence = command_queue->PushNetworkFlowCommand(
+            parsed.kind, node_id, *parsed.network_flow, confirmed);
+      } else if (parsed.kind == SimulationCommandKind::kPartitionNodes ||
+                 parsed.kind == SimulationCommandKind::kHealPartition) {
+        if (!parsed.peer_node_id) {
+          throw std::runtime_error("partition peer node is missing");
+        }
+        sequence = command_queue->PushPartitionCommand(
+            parsed.kind, node_id, *parsed.peer_node_id, confirmed);
       } else {
         sequence = command_queue->Push(parsed.kind, node_id, confirmed);
       }
@@ -1743,6 +1835,7 @@ bool HandleInput(int ch, const boost::json::object& report,
       return true;
     }
     state->peer_list_pane.Close();
+    state->network_rule_pane.Close();
     state->node_log_pane.Toggle(report, *selected_node);
     return true;
   }
@@ -1755,7 +1848,21 @@ bool HandleInput(int ch, const boost::json::object& report,
       return true;
     }
     state->node_log_pane.Close();
+    state->network_rule_pane.Close();
     state->peer_list_pane.Toggle(report, *selected_node);
+    return true;
+  }
+
+  if (ch == 'a' || ch == 'A') {
+    const std::optional<std::size_t> selected_node =
+        SelectedNodeIndex(report, *state);
+    if (!selected_node) {
+      state->command_status = "No backing node is selected.";
+      return true;
+    }
+    state->node_log_pane.Close();
+    state->peer_list_pane.Close();
+    state->network_rule_pane.Toggle(report, *selected_node);
     return true;
   }
 
@@ -1851,6 +1958,27 @@ bool HandleInput(int ch, const boost::json::object& report,
     return true;
   }
 
+  if (state->network_rule_pane.IsOpen()) {
+    const std::size_t visible_rows = CurrentNodeLogVisibleRows();
+    const std::size_t page_rows = std::max<std::size_t>(visible_rows, 1U);
+    if (ch == KEY_UP) {
+      state->network_rule_pane.ScrollUp(visible_rows, 1U);
+    } else if (ch == KEY_DOWN) {
+      state->network_rule_pane.ScrollDown(visible_rows, 1U);
+    } else if (ch == KEY_PPAGE) {
+      state->network_rule_pane.ScrollUp(visible_rows, page_rows);
+    } else if (ch == KEY_NPAGE) {
+      state->network_rule_pane.ScrollDown(visible_rows, page_rows);
+    } else if (ch == KEY_HOME) {
+      state->network_rule_pane.ScrollHome();
+    } else if (ch == KEY_END) {
+      state->network_rule_pane.ScrollEnd(visible_rows);
+    } else {
+      return false;
+    }
+    return true;
+  }
+
   std::size_t* selected = state->view == TuiView::kNodes
                               ? &state->selected_node
                               : &state->selected_wallet;
@@ -1893,17 +2021,18 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       if (selected_node) {
         state.node_log_pane.Refresh(report, *selected_node);
         state.peer_list_pane.Refresh(report, *selected_node);
+        state.network_rule_pane.Refresh(report, *selected_node);
       }
       RefreshCommandResults(report, &state);
     }
     const std::vector<std::string> log_lines =
         ReadRecentLogLines(RunLogPath(run_root), 256U);
-    DrawSummary(run_root, report, error, log_lines, state.view,
-                state.selected_node, state.selected_wallet, state.node_log_pane,
-                state.peer_list_pane, state.command_status,
-                state.command_error_open, state.command_error,
-                state.command_palette_open, state.command_input,
-                state.command_input_error, state.pending_confirmation);
+    DrawSummary(
+        run_root, report, error, log_lines, state.view, state.selected_node,
+        state.selected_wallet, state.node_log_pane, state.peer_list_pane,
+        state.network_rule_pane, state.command_status, state.command_error_open,
+        state.command_error, state.command_palette_open, state.command_input,
+        state.command_input_error, state.pending_confirmation);
     if (once) {
       return error.empty() ? 0 : 1;
     }

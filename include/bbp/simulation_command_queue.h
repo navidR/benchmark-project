@@ -28,6 +28,17 @@ class SimulationCommandQueue {
   std::uint64_t PushProfileCommand(SimulationCommandKind kind,
                                    std::string node_id, std::string profile,
                                    bool confirmed = false);
+  std::uint64_t PushNetworkCondition(std::string node_id,
+                                     NetworkCondition condition,
+                                     bool confirmed = false);
+  std::uint64_t PushNetworkFlowCommand(SimulationCommandKind kind,
+                                       std::string node_id,
+                                       SimulationNetworkFlow flow,
+                                       bool confirmed = false);
+  std::uint64_t PushPartitionCommand(SimulationCommandKind kind,
+                                     std::string node_id,
+                                     std::string peer_node_id,
+                                     bool confirmed = false);
   std::optional<SimulationCommand> TryPop();
   std::optional<SimulationCommand> WaitPop();
   void Close();

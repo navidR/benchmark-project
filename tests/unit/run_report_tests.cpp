@@ -264,6 +264,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"read_bytes_per_sec\":1048576}],"
       "\"pids_current\":2,\"oom_kill\":0,"
       "\"network_rx_bytes\":100,\"network_tx_bytes\":200,"
+      "\"network_condition\":{\"bandwidth_mbps\":20,"
+      "\"delay_ms\":80,\"jitter_ms\":10,"
+      "\"loss_basis_points\":11,\"duplicate_basis_points\":12,"
+      "\"corrupt_basis_points\":13,\"reorder_basis_points\":14,"
+      "\"limit_packets\":900},"
       "\"network_filter_policy_count\":1,"
       "\"network_filter_policies_with_stats\":1,"
       "\"network_filter_match_bytes\":180,"
@@ -560,6 +565,16 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "oom_kill") == 0U);
   BOOST_TEST(JsonInteger(last_metrics, "network_rx_bytes") == 100U);
   BOOST_TEST(JsonInteger(last_metrics, "network_tx_bytes") == 200U);
+  const boost::json::object& network_condition =
+      last_metrics.at("network_condition").as_object();
+  BOOST_TEST(JsonInteger(network_condition, "bandwidth_mbps") == 20U);
+  BOOST_TEST(JsonInteger(network_condition, "delay_ms") == 80U);
+  BOOST_TEST(JsonInteger(network_condition, "jitter_ms") == 10U);
+  BOOST_TEST(JsonInteger(network_condition, "loss_basis_points") == 11U);
+  BOOST_TEST(JsonInteger(network_condition, "duplicate_basis_points") == 12U);
+  BOOST_TEST(JsonInteger(network_condition, "corrupt_basis_points") == 13U);
+  BOOST_TEST(JsonInteger(network_condition, "reorder_basis_points") == 14U);
+  BOOST_TEST(JsonInteger(network_condition, "limit_packets") == 900U);
   BOOST_TEST(JsonInteger(last_metrics, "network_filter_policy_count") == 1U);
   BOOST_TEST(JsonInteger(last_metrics, "network_filter_policies_with_stats") ==
              1U);
@@ -662,6 +677,21 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
                   "\\\"scope\\\":\\\"source_aware_group\\\","
                   "\\\"rules\\\":[]}\"}");
   bbp::AppendLine(dir / "events.jsonl",
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"network_condition_updated\","
+                  "\"detail\":\"{\\\"bandwidth_mbps\\\":20,"
+                  "\\\"operator_command_sequence\\\":7}\"}");
+  bbp::AppendLine(dir / "events.jsonl",
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"network_block_applied\","
+                  "\"detail\":\"{\\\"handle\\\":77,"
+                  "\\\"present_after\\\":true}\"}");
+  bbp::AppendLine(dir / "events.jsonl",
+                  "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
+                  "\"event\":\"network_block_removed\","
+                  "\"detail\":\"{\\\"handle\\\":77,"
+                  "\\\"present_after\\\":false}\"}");
+  bbp::AppendLine(dir / "events.jsonl",
                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                   "\"event\":\"network_partition_healed\","
                   "\"detail\":\"{\\\"workload_index\\\":2,"
@@ -678,7 +708,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
   const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
-  BOOST_TEST(JsonInteger(report, "event_count") == 4U);
+  BOOST_TEST(JsonInteger(report, "event_count") == 7U);
   const boost::json::array& workloads = report.at("workloads").as_array();
   BOOST_REQUIRE_EQUAL(workloads.size(), 2U);
   BOOST_TEST(workloads.front().as_object().at("type").as_string() ==
@@ -697,6 +727,24 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
   const boost::json::object& heal_detail =
       heals.front().as_object().at("detail").as_object();
   BOOST_TEST(JsonInteger(heal_detail, "workload_index") == 2U);
+  const boost::json::array& condition_updates =
+      report.at("network_condition_updates").as_array();
+  BOOST_REQUIRE_EQUAL(condition_updates.size(), 1U);
+  BOOST_TEST(JsonInteger(
+                 condition_updates.front().as_object().at("detail").as_object(),
+                 "operator_command_sequence") == 7U);
+  const boost::json::array& blocks = report.at("network_blocks").as_array();
+  BOOST_REQUIRE_EQUAL(blocks.size(), 1U);
+  BOOST_TEST(JsonInteger(blocks.front().as_object().at("detail").as_object(),
+                         "handle") == 77U);
+  const boost::json::array& unblocks = report.at("network_unblocks").as_array();
+  BOOST_REQUIRE_EQUAL(unblocks.size(), 1U);
+  BOOST_TEST(!unblocks.front()
+                  .as_object()
+                  .at("detail")
+                  .as_object()
+                  .at("present_after")
+                  .as_bool());
 
   std::filesystem::remove_all(dir);
 }

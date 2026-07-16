@@ -1,0 +1,12 @@
+{
+  "nodes": 2,
+  "isolated_network": true,
+  "workloads": [
+    {
+      "type": "block_network_flow",
+      "node": 3,
+      "dst_address": "10.210.1.6",
+      "dst_port": 18168
+    }
+  ]
+}

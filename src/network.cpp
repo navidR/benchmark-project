@@ -556,6 +556,16 @@ void ValidateNetworkCondition(const NetworkCondition& condition) {
   }
 }
 
+void ValidateIpv4Address(std::string_view address,
+                         std::string_view field_name) {
+  const std::string text(address);
+  in_addr ipv4_address{};
+  if (text.empty() || inet_pton(AF_INET, text.c_str(), &ipv4_address) != 1) {
+    throw std::runtime_error("invalid IPv4 " + std::string(field_name) + ": " +
+                             text);
+  }
+}
+
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition) {
   if (HasBandwidthCondition(condition) && HasNetemCondition(condition)) {

@@ -28,6 +28,11 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kSetResourceProfile:
     case SimulationCommandKind::kSetNetworkProfile:
+    case SimulationCommandKind::kSetNetworkCondition:
+    case SimulationCommandKind::kBlockNetworkFlow:
+    case SimulationCommandKind::kUnblockNetworkFlow:
+    case SimulationCommandKind::kPartitionNodes:
+    case SimulationCommandKind::kHealPartition:
       throw std::runtime_error(
           "simulation command kind requires a typed payload method");
   }
@@ -41,6 +46,8 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -57,6 +64,8 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
       .confirmed = false,
   });
 }
@@ -73,6 +82,8 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
       .confirmed = false,
   });
 }
@@ -100,6 +111,8 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -116,6 +129,8 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .peer_count_policy = policy,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -135,6 +150,8 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .peer_count_policy = std::nullopt,
       .block_count = block_count,
       .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
       .confirmed = false,
   });
 }
@@ -159,6 +176,97 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::move(profile),
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
+      .confirmed = confirmed,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushNetworkCondition(
+    std::string node_id, NetworkCondition condition, bool confirmed) {
+  ValidateNetworkCondition(condition);
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kSetNetworkCondition,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .network_condition = condition,
+      .network_flow = std::nullopt,
+      .confirmed = confirmed,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
+    SimulationCommandKind kind, std::string node_id, SimulationNetworkFlow flow,
+    bool confirmed) {
+  if (kind != SimulationCommandKind::kBlockNetworkFlow &&
+      kind != SimulationCommandKind::kUnblockNetworkFlow) {
+    throw std::runtime_error(
+        "network flow command requires a block or unblock kind");
+  }
+  const bool complete_match = !flow.dst_address.empty() && flow.dst_port != 0U;
+  if (kind == SimulationCommandKind::kBlockNetworkFlow && !complete_match) {
+    throw std::runtime_error(
+        "block network flow requires a destination address and port");
+  }
+  if (kind == SimulationCommandKind::kUnblockNetworkFlow && flow.handle == 0U &&
+      !complete_match) {
+    throw std::runtime_error(
+        "unblock network flow requires a handle or complete match");
+  }
+  if (complete_match) {
+    ValidateIpv4Address(flow.dst_address, "network flow destination");
+  }
+  if (!flow.src_address.empty()) {
+    ValidateIpv4Address(flow.src_address, "network flow source");
+  }
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = kind,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::move(flow),
+      .confirmed = confirmed,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushPartitionCommand(
+    SimulationCommandKind kind, std::string node_id, std::string peer_node_id,
+    bool confirmed) {
+  if (kind != SimulationCommandKind::kPartitionNodes &&
+      kind != SimulationCommandKind::kHealPartition) {
+    throw std::runtime_error(
+        "partition command requires a partition or heal kind");
+  }
+  if (peer_node_id.empty()) {
+    throw std::runtime_error("partition command requires a peer node id");
+  }
+  if (node_id == peer_node_id) {
+    throw std::runtime_error("partition command nodes must differ");
+  }
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = kind,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::move(peer_node_id),
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
       .confirmed = confirmed,
   });
 }

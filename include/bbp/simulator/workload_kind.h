@@ -17,6 +17,9 @@ enum class WorkloadKind {
   kSetResourceProfile,
   kSetNetworkProfile,
   kResourcePressure,
+  kSetNetworkCondition,
+  kBlockNetworkFlow,
+  kUnblockNetworkFlow,
   kPartitionNodes,
   kHealPartition,
   kSetEdgeCondition,
@@ -51,6 +54,12 @@ constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
       return "set_network_profile";
     case WorkloadKind::kResourcePressure:
       return "resource_pressure";
+    case WorkloadKind::kSetNetworkCondition:
+      return "set_network_condition";
+    case WorkloadKind::kBlockNetworkFlow:
+      return "block_network_flow";
+    case WorkloadKind::kUnblockNetworkFlow:
+      return "unblock_network_flow";
     case WorkloadKind::kPartitionNodes:
       return "partition_nodes";
     case WorkloadKind::kHealPartition:
@@ -104,6 +113,15 @@ constexpr std::optional<WorkloadKind> ParseWorkloadKind(std::string_view name) {
   }
   if (name == "resource_pressure") {
     return WorkloadKind::kResourcePressure;
+  }
+  if (name == "set_network_condition") {
+    return WorkloadKind::kSetNetworkCondition;
+  }
+  if (name == "block_network_flow") {
+    return WorkloadKind::kBlockNetworkFlow;
+  }
+  if (name == "unblock_network_flow") {
+    return WorkloadKind::kUnblockNetworkFlow;
   }
   if (name == "partition_nodes") {
     return WorkloadKind::kPartitionNodes;

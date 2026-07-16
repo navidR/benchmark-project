@@ -1,0 +1,10 @@
+{
+  "nodes": 1,
+  "workloads": [
+    {
+      "type": "set_network_condition",
+      "node": 1,
+      "delay_ms": 1
+    }
+  ]
+}

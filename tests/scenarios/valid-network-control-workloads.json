@@ -1,0 +1,50 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "isolated_network": true,
+  "block_production": {"enabled": false},
+  "workloads": [
+    {
+      "type": "set_network_condition",
+      "node": 1,
+      "bandwidth_mbps": 20,
+      "delay_ms": 80,
+      "jitter_ms": 10,
+      "loss_basis_points": 11,
+      "duplicate_basis_points": 12,
+      "corrupt_basis_points": 13,
+      "reorder_basis_points": 14,
+      "limit_packets": 900
+    },
+    {
+      "type": "block_network_flow",
+      "node": 1,
+      "src_address": "10.210.1.2",
+      "dst_address": "10.210.1.6",
+      "dst_port": 18168,
+      "handle": 77
+    },
+    {
+      "type": "unblock_network_flow",
+      "node": 1,
+      "src_address": "10.210.1.2",
+      "dst_address": "10.210.1.6",
+      "dst_port": 18168,
+      "handle": 77
+    }
+  ],
+  "events": [
+    {
+      "at": "100ms",
+      "action": "partition_nodes",
+      "group_a": [1],
+      "group_b": [2]
+    },
+    {
+      "at": "200ms",
+      "action": "heal_partition",
+      "group_a": [1],
+      "group_b": [2]
+    }
+  ]
+}

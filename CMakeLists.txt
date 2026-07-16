@@ -147,6 +147,7 @@ add_executable(bbp
   src/main.cpp
   src/mining_difficulty.cpp
   src/network.cpp
+  src/network_rule_pane.cpp
   src/network_allocation_lock.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
@@ -213,6 +214,7 @@ if(BUILD_TESTING)
     tests/unit/log_level_tests.cpp
     tests/unit/logging_tests.cpp
     tests/unit/network_tests.cpp
+    tests/unit/network_rule_pane_tests.cpp
     tests/unit/simulation_network_address_plan_tests.cpp
     tests/unit/node_log_pane_tests.cpp
     tests/unit/node_runtime_tests.cpp
@@ -256,6 +258,7 @@ if(BUILD_TESTING)
     src/logging.cpp
     src/mining_difficulty.cpp
     src/network.cpp
+    src/network_rule_pane.cpp
     src/network_allocation_lock.cpp
     src/node_log_pane.cpp
     src/operator_command_status.cpp
@@ -425,6 +428,12 @@ if(BUILD_TESTING)
     COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-resource-pressure-scenario.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-network-control-workloads
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-network-control-workloads.json"
       --probe-capabilities
   )
   add_test(NAME bbp-valid-cgroup-resource-controls
@@ -1060,6 +1069,41 @@ if(BUILD_TESTING)
     bbp-invalid-partition-workload-requires-isolate
     tests/scenarios/invalid-partition-workload-requires-isolate.json
     "network runtime options require --isolate-network"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-control-without-isolation
+    tests/scenarios/invalid-network-control-without-isolation.json
+    "network runtime options require --isolate-network"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-condition-node
+    tests/scenarios/invalid-network-condition-node.json
+    "scenario set_network_condition workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-condition-basis-points
+    tests/scenarios/invalid-network-condition-basis-points.json
+    "netem loss basis points must be 0..10000"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-condition-limit
+    tests/scenarios/invalid-network-condition-limit.json
+    "netem packet limit must be greater than zero"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-flow-node
+    tests/scenarios/invalid-network-flow-node.json
+    "scenario network flow workload node must be in 1..--nodes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-flow-port
+    tests/scenarios/invalid-network-flow-port.json
+    "network block rule dst_port must be 1..65535"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-flow-address
+    tests/scenarios/invalid-network-flow-address.json
+    "invalid IPv4 network block destination: invalid"
   )
   add_cli_failure_test(
     bbp-invalid-partition-workload-node

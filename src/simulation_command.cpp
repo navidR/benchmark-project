@@ -42,6 +42,16 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "set_resource_profile";
     case SimulationCommandKind::kSetNetworkProfile:
       return "set_network_profile";
+    case SimulationCommandKind::kSetNetworkCondition:
+      return "set_network_condition";
+    case SimulationCommandKind::kBlockNetworkFlow:
+      return "block_network_flow";
+    case SimulationCommandKind::kUnblockNetworkFlow:
+      return "unblock_network_flow";
+    case SimulationCommandKind::kPartitionNodes:
+      return "partition_nodes";
+    case SimulationCommandKind::kHealPartition:
+      return "heal_partition";
   }
   throw std::runtime_error("unknown simulation command kind");
 }
@@ -102,6 +112,21 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "set_network_profile") {
     return SimulationCommandKind::kSetNetworkProfile;
   }
+  if (name == "set_network_condition") {
+    return SimulationCommandKind::kSetNetworkCondition;
+  }
+  if (name == "block_network_flow") {
+    return SimulationCommandKind::kBlockNetworkFlow;
+  }
+  if (name == "unblock_network_flow") {
+    return SimulationCommandKind::kUnblockNetworkFlow;
+  }
+  if (name == "partition_nodes") {
+    return SimulationCommandKind::kPartitionNodes;
+  }
+  if (name == "heal_partition") {
+    return SimulationCommandKind::kHealPartition;
+  }
   return std::nullopt;
 }
 
@@ -117,6 +142,9 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kRestartNode:
     case SimulationCommandKind::kSetResourceProfile:
     case SimulationCommandKind::kSetNetworkProfile:
+    case SimulationCommandKind::kSetNetworkCondition:
+    case SimulationCommandKind::kBlockNetworkFlow:
+    case SimulationCommandKind::kPartitionNodes:
       return true;
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:
@@ -126,6 +154,8 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kConnectPeer:
     case SimulationCommandKind::kThawNode:
     case SimulationCommandKind::kGenerateBlocks:
+    case SimulationCommandKind::kUnblockNetworkFlow:
+    case SimulationCommandKind::kHealPartition:
       return false;
   }
   throw std::runtime_error("unknown simulation command kind");

@@ -194,6 +194,7 @@ struct DirectionalNetworkPolicyStats {
 };
 
 void ValidateNetworkCondition(const NetworkCondition& condition);
+void ValidateIpv4Address(std::string_view address, std::string_view field_name);
 
 class NetworkNamespace {
  public:

@@ -1,0 +1,11 @@
+{
+  "nodes": 2,
+  "isolated_network": true,
+  "workloads": [
+    {
+      "type": "set_network_condition",
+      "node": 3,
+      "delay_ms": 1
+    }
+  ]
+}

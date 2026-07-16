@@ -6,6 +6,7 @@
 
 #include "bbp/block_production_policy.h"
 #include "bbp/mining_difficulty.h"
+#include "bbp/network.h"
 #include "bbp/peer_count_policy.h"
 #include "bbp/simulation_command.h"
 
@@ -19,6 +20,8 @@ struct ParsedTuiCommand {
   std::optional<PeerCountPolicy> peer_count_policy;
   std::optional<std::uint32_t> block_count;
   std::optional<std::string> profile;
+  std::optional<NetworkCondition> network_condition;
+  std::optional<SimulationNetworkFlow> network_flow;
 };
 
 }  // namespace bbp

@@ -838,6 +838,10 @@ NetworkBlockRule ParseNetworkBlockRuleObject(
     rule.src_address = std::string(src_address->as_string());
   }
   rule.dst_address = JsonStringField(object, "dst_address");
+  ValidateIpv4Address(rule.dst_address, "network block destination");
+  if (!rule.src_address.empty()) {
+    ValidateIpv4Address(rule.src_address, "network block source");
+  }
   rule.dst_port = static_cast<uint16_t>(dst_port);
   rule.handle = JsonOptionalUint32Field(object, "handle", 0U);
   if (rule.handle == 0U) {
@@ -2398,6 +2402,31 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.kind = WorkloadKind::kResourcePressure;
       scenario_workload.resource_pressure = pressure;
       options.workloads.push_back(scenario_workload);
+    } else if (*kind == WorkloadKind::kSetNetworkCondition) {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current MVP set_network_condition workload uses node, not "
+            "nodes");
+      }
+      NetworkConditionWorkload update;
+      update.node = JsonOptionalUint32Field(workload, "node", update.node);
+      update.condition = ParseNetworkConditionObject(workload);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kSetNetworkCondition;
+      scenario_workload.network_condition = update;
+      options.workloads.push_back(std::move(scenario_workload));
+    } else if (*kind == WorkloadKind::kBlockNetworkFlow ||
+               *kind == WorkloadKind::kUnblockNetworkFlow) {
+      if (workload.if_contains("nodes") != nullptr) {
+        throw std::runtime_error(
+            "current MVP network flow workload uses node, not nodes");
+      }
+      NetworkBlockWorkload flow;
+      flow.rule = ParseNetworkBlockRuleObject(workload);
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = *kind;
+      scenario_workload.network_block = std::move(flow);
+      options.workloads.push_back(std::move(scenario_workload));
     } else if (*kind == WorkloadKind::kPartitionNodes) {
       NetworkPartitionWorkload partition;
       partition.partition = ParseNetworkPartitionRuleObject(workload);
@@ -3033,6 +3062,9 @@ bool WorkloadsRequireIsolatedNetwork(const Options& options) {
   for (const ScenarioWorkload& workload : options.workloads) {
     if (workload.kind == WorkloadKind::kPartitionNodes ||
         workload.kind == WorkloadKind::kHealPartition ||
+        workload.kind == WorkloadKind::kSetNetworkCondition ||
+        workload.kind == WorkloadKind::kBlockNetworkFlow ||
+        workload.kind == WorkloadKind::kUnblockNetworkFlow ||
         workload.kind == WorkloadKind::kSetNetworkProfile) {
       return true;
     }
@@ -3040,6 +3072,9 @@ bool WorkloadsRequireIsolatedNetwork(const Options& options) {
   for (const ScheduledScenarioEvent& event : options.scheduled_events) {
     if (event.action.kind == WorkloadKind::kPartitionNodes ||
         event.action.kind == WorkloadKind::kHealPartition ||
+        event.action.kind == WorkloadKind::kSetNetworkCondition ||
+        event.action.kind == WorkloadKind::kBlockNetworkFlow ||
+        event.action.kind == WorkloadKind::kUnblockNetworkFlow ||
         event.action.kind == WorkloadKind::kSetNetworkProfile) {
       return true;
     }
@@ -3841,6 +3876,20 @@ Options ParseOptions(int argc, char** argv) {
             "scenario resource_pressure duration_ms must be greater than "
             "zero");
       }
+    } else if (workload.kind == WorkloadKind::kSetNetworkCondition) {
+      if (workload.network_condition.node == 0U ||
+          workload.network_condition.node > options.nodes) {
+        throw std::runtime_error(
+            "scenario set_network_condition workload node must be in "
+            "1..--nodes");
+      }
+      ValidateNetworkCondition(workload.network_condition.condition);
+    } else if (workload.kind == WorkloadKind::kBlockNetworkFlow ||
+               workload.kind == WorkloadKind::kUnblockNetworkFlow) {
+      if (workload.network_block.rule.node_index >= options.nodes) {
+        throw std::runtime_error(
+            "scenario network flow workload node must be in 1..--nodes");
+      }
     } else if (workload.kind == WorkloadKind::kPartitionNodes) {
       ValidateNetworkPartitionRule(workload.network_partition.partition,
                                    options.nodes,
@@ -4573,14 +4622,25 @@ void WriteResourceLimits(const Cgroup& cgroup, const ResourceLimits& previous,
   VerifyResourceLimits(cgroup, next);
 }
 
-std::string NetworkConditionVerificationDetail(const NodeVethConfig& config,
-                                               const QdiscInfo& qdisc) {
+std::string NetworkConditionVerificationDetail(
+    const NodeVethConfig& config, const QdiscInfo& qdisc,
+    std::uint32_t workload_index = 0, std::uint32_t workload_count = 0,
+    std::optional<std::uint64_t> operator_sequence = std::nullopt) {
   boost::json::object detail;
   detail["host_if"] = config.host_name;
   detail["condition"] = NetworkConditionJson(config.condition);
   detail["qdisc_kind"] = qdisc.kernel_kind;
   detail["qdisc_handle"] = qdisc.handle;
   detail["qdisc_parent"] = qdisc.parent;
+  if (workload_index != 0U) {
+    detail["workload_index"] = workload_index;
+  }
+  if (workload_count != 0U) {
+    detail["workload_count"] = workload_count;
+  }
+  if (operator_sequence) {
+    detail["operator_command_sequence"] = *operator_sequence;
+  }
   return boost::json::serialize(detail);
 }
 
@@ -5047,8 +5107,8 @@ std::string MetricsJson(
     const ChainMetrics& chain, uint64_t generated_block_count,
     uint64_t mined_transaction_count, bool mined_transaction_count_complete,
     uint64_t restart_count, std::string_view resource_profile,
-    std::string_view network_profile, const CgroupMetrics* cgroup,
-    const LinkInfo* link, const QdiscInfo* qdisc,
+    std::string_view network_profile, const NetworkCondition* network_condition,
+    const CgroupMetrics* cgroup, const LinkInfo* link, const QdiscInfo* qdisc,
     const std::vector<TcFilterInfo>* filters,
     const DirectionalNetworkPolicyStats* directional_stats) {
   boost::json::object object;
@@ -5082,6 +5142,11 @@ std::string MetricsJson(
     object["active_network_profile"] = nullptr;
   } else {
     object["active_network_profile"] = network_profile;
+  }
+  if (network_condition == nullptr) {
+    object["network_condition"] = nullptr;
+  } else {
+    object["network_condition"] = NetworkConditionJson(*network_condition);
   }
   if (chain.initial_block_download) {
     object["initial_block_download"] = *chain.initial_block_download;
@@ -5842,18 +5907,21 @@ void WriteMetricsSnapshot(
         qdisc = FindQdiscByInterfaceName(qdiscs, network->host_name);
       }
       if (link != nullptr) {
+        std::lock_guard<std::mutex> lock(node_network_state_mutex);
         filters = ListTcFiltersForInterface(network->host_name);
         filter_metrics = &filters;
       }
     }
     AppendLine(
         metrics_path,
-        MetricsJson(options.run_id, node.config.id, chain,
-                    node.GeneratedBlockCount(), node.MinedTransactionCount(),
-                    node.MinedTransactionCountComplete(), node.RestartCount(),
-                    resource_profile, network_states[node_index].profile, &cg,
-                    link, qdisc, filter_metrics,
-                    directional_stats ? &*directional_stats : nullptr));
+        MetricsJson(
+            options.run_id, node.config.id, chain, node.GeneratedBlockCount(),
+            node.MinedTransactionCount(), node.MinedTransactionCountComplete(),
+            node.RestartCount(), resource_profile,
+            network_states[node_index].profile,
+            network && network->apply_condition ? &network->condition : nullptr,
+            &cg, link, qdisc, filter_metrics,
+            directional_stats ? &*directional_stats : nullptr));
   }
 }
 
@@ -6253,6 +6321,22 @@ boost::json::object NetworkPartitionWorkloadJson(
   return object;
 }
 
+boost::json::object NetworkConditionWorkloadJson(
+    const NetworkConditionWorkload& workload) {
+  boost::json::object object = NetworkConditionJson(workload.condition);
+  object["type"] =
+      std::string(WorkloadKindName(WorkloadKind::kSetNetworkCondition));
+  object["node"] = workload.node;
+  return object;
+}
+
+boost::json::object NetworkBlockWorkloadJson(
+    const NetworkBlockWorkload& workload, WorkloadKind kind) {
+  boost::json::object object = NetworkBlockRuleJson(workload.rule);
+  object["type"] = std::string(WorkloadKindName(kind));
+  return object;
+}
+
 boost::json::object TopologyEdgeWorkloadJson(
     const TopologyEdgeWorkload& workload, WorkloadKind kind) {
   boost::json::object object;
@@ -6351,6 +6435,13 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   }
   if (workload.kind == WorkloadKind::kResourcePressure) {
     return ResourcePressureWorkloadJson(workload.resource_pressure);
+  }
+  if (workload.kind == WorkloadKind::kSetNetworkCondition) {
+    return NetworkConditionWorkloadJson(workload.network_condition);
+  }
+  if (workload.kind == WorkloadKind::kBlockNetworkFlow ||
+      workload.kind == WorkloadKind::kUnblockNetworkFlow) {
+    return NetworkBlockWorkloadJson(workload.network_block, workload.kind);
   }
   if (workload.kind == WorkloadKind::kPartitionNodes) {
     return NetworkPartitionWorkloadJson(workload.network_partition,
@@ -7881,14 +7972,22 @@ QdiscInfo ReplaceNodeNetworkConditionTransactional(
     return qdisc;
   } catch (...) {
     const std::exception_ptr original_error = std::current_exception();
+    std::string rollback_error;
     try {
       RestoreNodeNetworkCondition(previous);
     } catch (const std::exception& restore_error) {
+      rollback_error = restore_error.what();
       BBP_LOG(error) << "failed to restore network condition for "
                      << node->config.id << ": " << restore_error.what();
     } catch (...) {
+      rollback_error = "unknown exception";
       BBP_LOG(error) << "failed to restore network condition for "
                      << node->config.id << ": unknown exception";
+    }
+    if (!rollback_error.empty()) {
+      throw std::runtime_error("network condition update failed: " +
+                               ExceptionMessage(original_error) +
+                               "; rollback failed: " + rollback_error);
     }
     std::rethrow_exception(original_error);
   }
@@ -8052,9 +8151,54 @@ bool NetworkBlockRulePresent(const NodeRuntime& node,
   return false;
 }
 
-std::string NetworkBlockRuleDetail(const NodeRuntime& node,
-                                   const NetworkBlockRule& rule,
-                                   bool existed_before, bool present_after) {
+std::optional<NetworkBlockRule> NetworkBlockRuleForHandle(
+    const NodeRuntime& node, std::uint32_t handle) {
+  if (!node.network) {
+    return std::nullopt;
+  }
+  const std::vector<TcFilterInfo> filters =
+      ListTcFiltersForInterface(node.network->host_name);
+  for (const TcFilterInfo& filter : filters) {
+    if (filter.handle != handle ||
+        !TcFilterIsEgressIpv4TcpDropPolicy(filter, node.network->host_name)) {
+      continue;
+    }
+    NetworkBlockRule rule;
+    rule.src_address = filter.has_ipv4_src ? filter.ipv4_src : "";
+    rule.dst_address = filter.ipv4_dst;
+    rule.dst_port = filter.tcp_dst;
+    rule.handle = filter.handle;
+    return rule;
+  }
+  return std::nullopt;
+}
+
+void RequireNetworkBlockHandleAvailable(const NodeRuntime& node,
+                                        const NetworkBlockRule& rule) {
+  if (!node.network) {
+    return;
+  }
+  const std::vector<TcFilterInfo> filters =
+      ListTcFiltersForInterface(node.network->host_name);
+  for (const TcFilterInfo& filter : filters) {
+    if (filter.handle != rule.handle) {
+      continue;
+    }
+    if (!TcFilterMatchesEgressIpv4TcpDrop(filter, node.network->host_name,
+                                          rule.src_address, rule.dst_address,
+                                          rule.dst_port, rule.handle)) {
+      throw std::runtime_error(
+          "network block rule handle is already used by different filter: " +
+          std::to_string(rule.handle));
+    }
+  }
+}
+
+std::string NetworkBlockRuleDetail(
+    const NodeRuntime& node, const NetworkBlockRule& rule, bool existed_before,
+    bool present_after, std::uint32_t workload_index = 0,
+    std::uint32_t workload_count = 0,
+    std::optional<std::uint64_t> operator_sequence = std::nullopt) {
   boost::json::object detail = NetworkBlockRuleJson(rule);
   if (node.network) {
     detail["host_if"] = node.network->host_name;
@@ -8063,6 +8207,15 @@ std::string NetworkBlockRuleDetail(const NodeRuntime& node,
   }
   detail["existed_before"] = existed_before;
   detail["present_after"] = present_after;
+  if (workload_index != 0U) {
+    detail["workload_index"] = workload_index;
+  }
+  if (workload_count != 0U) {
+    detail["workload_count"] = workload_count;
+  }
+  if (operator_sequence) {
+    detail["operator_command_sequence"] = *operator_sequence;
+  }
   return boost::json::serialize(detail);
 }
 
@@ -8070,6 +8223,83 @@ void RequireNetworkBlockNode(const NodeRuntime& node) {
   if (!node.network) {
     throw std::runtime_error(
         "runtime network block rule requires isolated networking");
+  }
+}
+
+struct NetworkBlockMutationResult {
+  bool existed_before = false;
+  bool present_after = false;
+};
+
+void RestoreNetworkBlockRule(const NodeRuntime& node,
+                             const NetworkBlockRule& rule,
+                             bool should_be_present) {
+  RequireNetworkBlockHandleAvailable(node, rule);
+  const bool present = NetworkBlockRulePresent(node, rule);
+  if (should_be_present && !present) {
+    ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
+                                   rule.dst_address, rule.dst_port,
+                                   rule.handle);
+  } else if (!should_be_present && present) {
+    DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
+  }
+  if (NetworkBlockRulePresent(node, rule) != should_be_present) {
+    throw std::runtime_error(
+        "network block rule rollback did not restore prior state");
+  }
+}
+
+NetworkBlockMutationResult MutateNetworkBlockRuleTransactional(
+    const NodeRuntime& node, const NetworkBlockRule& rule, bool remove,
+    std::stop_token stop_token) {
+  RequireNetworkBlockNode(node);
+  ThrowIfStopRequested(stop_token);
+  RequireNetworkBlockHandleAvailable(node, rule);
+  const bool existed_before = NetworkBlockRulePresent(node, rule);
+  try {
+    if (remove) {
+      if (existed_before) {
+        DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
+      }
+    } else {
+      ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
+                                     rule.dst_address, rule.dst_port,
+                                     rule.handle);
+    }
+    ThrowIfStopRequested(stop_token);
+    const bool present_after = NetworkBlockRulePresent(node, rule);
+    if (!remove && !present_after) {
+      throw std::runtime_error(
+          "runtime network block rule was not visible after apply");
+    }
+    if (remove && present_after) {
+      throw std::runtime_error(
+          "runtime network block rule remained after unblock");
+    }
+    return NetworkBlockMutationResult{
+        .existed_before = existed_before,
+        .present_after = present_after,
+    };
+  } catch (...) {
+    const std::exception_ptr original_error = std::current_exception();
+    std::string rollback_error;
+    try {
+      RestoreNetworkBlockRule(node, rule, existed_before);
+    } catch (const std::exception& error) {
+      rollback_error = error.what();
+      BBP_LOG(error) << "failed to restore network block rule " << rule.handle
+                     << " on " << node.config.id << ": " << error.what();
+    } catch (...) {
+      rollback_error = "unknown exception";
+      BBP_LOG(error) << "failed to restore network block rule " << rule.handle
+                     << " on " << node.config.id << ": unknown exception";
+    }
+    if (!rollback_error.empty()) {
+      throw std::runtime_error(
+          "network block mutation failed: " + ExceptionMessage(original_error) +
+          "; rollback failed: " + rollback_error);
+    }
+    std::rethrow_exception(original_error);
   }
 }
 
@@ -8083,23 +8313,16 @@ void ApplyRuntimeNetworkBlockRules(const Options& options,
       throw std::runtime_error("runtime network block node is out of range");
     }
     NodeRuntime& node = nodes[rule.node_index];
-    RequireNetworkBlockNode(node);
-    ThrowIfStopRequested(stop_token);
-    const bool existed_before = NetworkBlockRulePresent(node, rule);
-    ThrowIfStopRequested(stop_token);
-    ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
-                                   rule.dst_address, rule.dst_port,
-                                   rule.handle);
-    ThrowIfStopRequested(stop_token);
-    const bool present_after = NetworkBlockRulePresent(node, rule);
-    if (!present_after) {
-      throw std::runtime_error(
-          "runtime network block rule was not visible after apply");
+    NetworkBlockMutationResult result;
+    {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      result =
+          MutateNetworkBlockRuleTransactional(node, rule, false, stop_token);
     }
-    WriteEvent(
-        events_path, options.run_id, node.config.id,
-        SimulationEventKind::kNetworkBlockApplied,
-        NetworkBlockRuleDetail(node, rule, existed_before, present_after));
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kNetworkBlockApplied,
+               NetworkBlockRuleDetail(node, rule, result.existed_before,
+                                      result.present_after));
   }
 }
 
@@ -8113,23 +8336,16 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
       throw std::runtime_error("runtime network unblock node is out of range");
     }
     NodeRuntime& node = nodes[rule.node_index];
-    RequireNetworkBlockNode(node);
-    ThrowIfStopRequested(stop_token);
-    const bool existed_before = NetworkBlockRulePresent(node, rule);
-    if (existed_before) {
-      ThrowIfStopRequested(stop_token);
-      DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
+    NetworkBlockMutationResult result;
+    {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      result =
+          MutateNetworkBlockRuleTransactional(node, rule, true, stop_token);
     }
-    ThrowIfStopRequested(stop_token);
-    const bool present_after = NetworkBlockRulePresent(node, rule);
-    if (present_after) {
-      throw std::runtime_error(
-          "runtime network block rule remained after unblock");
-    }
-    WriteEvent(
-        events_path, options.run_id, node.config.id,
-        SimulationEventKind::kNetworkBlockRemoved,
-        NetworkBlockRuleDetail(node, rule, existed_before, present_after));
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kNetworkBlockRemoved,
+               NetworkBlockRuleDetail(node, rule, result.existed_before,
+                                      result.present_after));
   }
 }
 
@@ -8182,10 +8398,11 @@ boost::json::object PartitionRuleResultJson(const NodeRuntime& node,
   return object;
 }
 
-std::string NetworkPartitionDetail(const NetworkPartitionRule& partition,
-                                   const boost::json::array& rule_results,
-                                   uint32_t workload_index = 0,
-                                   uint32_t workload_count = 0) {
+std::string NetworkPartitionDetail(
+    const NetworkPartitionRule& partition,
+    const boost::json::array& rule_results, uint32_t workload_index = 0,
+    uint32_t workload_count = 0,
+    std::optional<std::uint64_t> operator_sequence = std::nullopt) {
   boost::json::object detail = NetworkPartitionRuleJson(partition);
   if (workload_index != 0U) {
     detail["workload_index"] = workload_index;
@@ -8195,46 +8412,119 @@ std::string NetworkPartitionDetail(const NetworkPartitionRule& partition,
   }
   detail["rules"] = rule_results;
   detail["scope"] = "source_aware_group";
+  if (operator_sequence) {
+    detail["operator_command_sequence"] = *operator_sequence;
+  }
   return boost::json::serialize(detail);
 }
 
-void ApplyRuntimeNetworkPartition(const Options& options,
-                                  const std::filesystem::path& events_path,
-                                  std::vector<NodeRuntime>& nodes,
-                                  const NetworkPartitionRule& partition,
-                                  bool heal, uint32_t workload_index = 0,
-                                  uint32_t workload_count = 0,
-                                  std::stop_token stop_token = {}) {
+void ApplyRuntimeNetworkPartition(
+    const Options& options, const std::filesystem::path& events_path,
+    std::vector<NodeRuntime>& nodes, const NetworkPartitionRule& partition,
+    bool heal, uint32_t workload_index = 0, uint32_t workload_count = 0,
+    std::stop_token stop_token = {},
+    std::optional<std::uint64_t> operator_sequence = std::nullopt) {
+  struct PartitionRuleState {
+    NetworkBlockRule rule;
+    bool existed_before = false;
+    bool present_after = false;
+  };
+  const std::vector<NetworkBlockRule> rules =
+      PartitionBlockRules(partition, nodes);
+  std::vector<PartitionRuleState> states;
+  states.reserve(rules.size());
   boost::json::array rule_results;
-  for (const NetworkBlockRule& rule : PartitionBlockRules(partition, nodes)) {
-    ThrowIfStopRequested(stop_token);
-    NodeRuntime& node = nodes[rule.node_index];
-    RequireNetworkBlockNode(node);
-    ThrowIfStopRequested(stop_token);
-    const bool existed_before = NetworkBlockRulePresent(node, rule);
-    if (heal) {
-      if (existed_before) {
-        ThrowIfStopRequested(stop_token);
-        DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
-      }
-    } else {
+  {
+    std::lock_guard<std::mutex> lock(node_network_state_mutex);
+    std::set<std::pair<std::uint32_t, std::uint32_t>> planned_handles;
+    for (const NetworkBlockRule& rule : rules) {
       ThrowIfStopRequested(stop_token);
-      ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
-                                     rule.dst_address, rule.dst_port,
-                                     rule.handle);
+      NodeRuntime& node = nodes[rule.node_index];
+      RequireNetworkBlockNode(node);
+      if (!planned_handles.emplace(rule.node_index, rule.handle).second) {
+        throw std::runtime_error(
+            "network partition produced a duplicate rule handle: " +
+            std::to_string(rule.handle));
+      }
+      RequireNetworkBlockHandleAvailable(node, rule);
+      states.push_back(PartitionRuleState{
+          .rule = rule,
+          .existed_before = NetworkBlockRulePresent(node, rule),
+          .present_after = false,
+      });
     }
-    ThrowIfStopRequested(stop_token);
-    const bool present_after = NetworkBlockRulePresent(node, rule);
-    if (!heal && !present_after) {
-      throw std::runtime_error(
-          "runtime network partition rule was not visible after apply");
+
+    std::vector<std::size_t> attempted;
+    try {
+      for (std::size_t index = 0; index < states.size(); ++index) {
+        ThrowIfStopRequested(stop_token);
+        attempted.push_back(index);
+        PartitionRuleState& state = states[index];
+        NodeRuntime& node = nodes[state.rule.node_index];
+        if (heal) {
+          if (state.existed_before) {
+            DeleteEgressIpv4TcpDropFilter(node.network->host_name,
+                                          state.rule.handle);
+          }
+        } else {
+          ReplaceEgressIpv4TcpDropFilter(
+              node.network->host_name, state.rule.src_address,
+              state.rule.dst_address, state.rule.dst_port, state.rule.handle);
+        }
+        ThrowIfStopRequested(stop_token);
+        state.present_after = NetworkBlockRulePresent(node, state.rule);
+        if (!heal && !state.present_after) {
+          throw std::runtime_error(
+              "runtime network partition rule was not visible after apply");
+        }
+        if (heal && state.present_after) {
+          throw std::runtime_error(
+              "runtime network partition rule remained after heal");
+        }
+      }
+    } catch (...) {
+      const std::exception_ptr original_error = std::current_exception();
+      std::vector<std::string> rollback_errors;
+      for (auto iter = attempted.rbegin(); iter != attempted.rend(); ++iter) {
+        const PartitionRuleState& state = states[*iter];
+        try {
+          RestoreNetworkBlockRule(nodes[state.rule.node_index], state.rule,
+                                  state.existed_before);
+        } catch (const std::exception& error) {
+          rollback_errors.push_back(std::to_string(state.rule.handle) + " on " +
+                                    nodes[state.rule.node_index].config.id +
+                                    ": " + error.what());
+          BBP_LOG(error) << "failed to roll back partition rule "
+                         << state.rule.handle << " on "
+                         << nodes[state.rule.node_index].config.id << ": "
+                         << error.what();
+        } catch (...) {
+          rollback_errors.push_back(std::to_string(state.rule.handle) + " on " +
+                                    nodes[state.rule.node_index].config.id +
+                                    ": unknown exception");
+          BBP_LOG(error) << "failed to roll back partition rule "
+                         << state.rule.handle << " on "
+                         << nodes[state.rule.node_index].config.id
+                         << ": unknown exception";
+        }
+      }
+      if (!rollback_errors.empty()) {
+        std::string message = "network partition mutation failed: " +
+                              ExceptionMessage(original_error) +
+                              "; rollback failed:";
+        for (const std::string& rollback_error : rollback_errors) {
+          message += " [" + rollback_error + "]";
+        }
+        throw std::runtime_error(message);
+      }
+      std::rethrow_exception(original_error);
     }
-    if (heal && present_after) {
-      throw std::runtime_error(
-          "runtime network partition rule remained after heal");
-    }
-    rule_results.push_back(
-        PartitionRuleResultJson(node, rule, existed_before, present_after));
+  }
+
+  for (const PartitionRuleState& state : states) {
+    const NodeRuntime& node = nodes[state.rule.node_index];
+    rule_results.push_back(PartitionRuleResultJson(
+        node, state.rule, state.existed_before, state.present_after));
   }
 
   const SimulationEventKind event_kind =
@@ -8242,7 +8532,7 @@ void ApplyRuntimeNetworkPartition(const Options& options,
            : SimulationEventKind::kNetworkPartitionApplied;
   WriteEvent(events_path, options.run_id, "sim", event_kind,
              NetworkPartitionDetail(partition, rule_results, workload_index,
-                                    workload_count));
+                                    workload_count, operator_sequence));
 }
 
 void ApplyRuntimeNetworkPartitions(const Options& options,
@@ -8809,6 +9099,26 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
   if (command.profile) {
     detail["profile"] = *command.profile;
   }
+  if (command.network_condition) {
+    detail["network_condition"] =
+        NetworkConditionJson(*command.network_condition);
+  }
+  if (command.network_flow) {
+    boost::json::object flow;
+    if (!command.network_flow->src_address.empty()) {
+      flow["src_address"] = command.network_flow->src_address;
+    }
+    if (!command.network_flow->dst_address.empty()) {
+      flow["dst_address"] = command.network_flow->dst_address;
+    }
+    if (command.network_flow->dst_port != 0U) {
+      flow["dst_port"] = command.network_flow->dst_port;
+    }
+    if (command.network_flow->handle != 0U) {
+      flow["handle"] = command.network_flow->handle;
+    }
+    detail["network_flow"] = std::move(flow);
+  }
   detail["confirmed"] = command.confirmed;
   if (!error.empty()) {
     detail["error"] = error;
@@ -9330,6 +9640,128 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                       hashes, chain_spec.default_reward_address,
                       command.sequence));
             } else if (command.kind ==
+                       SimulationCommandKind::kSetNetworkCondition) {
+              if (!command.network_condition) {
+                throw std::runtime_error(
+                    "set-network-condition command requires a condition");
+              }
+              QdiscInfo qdisc;
+              NodeVethConfig updated_network;
+              {
+                std::lock_guard<std::mutex> lock(node_network_state_mutex);
+                qdisc = ReplaceNodeNetworkConditionTransactional(
+                    &node, *command.network_condition,
+                    command_rpc_stop_source.get_token());
+                updated_network = *node.network;
+              }
+              WriteEvent(events_path, options.run_id, command.node_id,
+                         SimulationEventKind::kNetworkConditionUpdated,
+                         NetworkConditionVerificationDetail(
+                             updated_network, qdisc, 0U, 0U, command.sequence));
+            } else if (command.kind ==
+                           SimulationCommandKind::kBlockNetworkFlow ||
+                       command.kind ==
+                           SimulationCommandKind::kUnblockNetworkFlow) {
+              if (!command.network_flow) {
+                throw std::runtime_error(
+                    "network flow command requires a typed flow");
+              }
+              const auto node_iter =
+                  std::find_if(nodes.begin(), nodes.end(),
+                               [&](const NodeRuntime& candidate) {
+                                 return candidate.config.id == command.node_id;
+                               });
+              if (node_iter == nodes.end()) {
+                throw std::runtime_error("unknown network flow node: " +
+                                         command.node_id);
+              }
+              const std::size_t zero_based_node = static_cast<std::size_t>(
+                  std::distance(nodes.begin(), node_iter));
+              if (zero_based_node > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    "network flow node index exceeds uint32");
+              }
+              NetworkBlockRule rule;
+              NetworkBlockMutationResult result;
+              {
+                std::lock_guard<std::mutex> lock(node_network_state_mutex);
+                if (command.network_flow->dst_address.empty()) {
+                  if (command.kind !=
+                          SimulationCommandKind::kUnblockNetworkFlow ||
+                      command.network_flow->handle == 0U) {
+                    throw std::runtime_error(
+                        "handle-only network flow command must be unblock");
+                  }
+                  const std::optional<NetworkBlockRule> existing =
+                      NetworkBlockRuleForHandle(node,
+                                                command.network_flow->handle);
+                  if (!existing) {
+                    throw std::runtime_error(
+                        "active network block rule handle was not found: " +
+                        std::to_string(command.network_flow->handle));
+                  }
+                  rule = *existing;
+                } else {
+                  rule.src_address = command.network_flow->src_address;
+                  rule.dst_address = command.network_flow->dst_address;
+                  rule.dst_port = command.network_flow->dst_port;
+                  rule.handle = command.network_flow->handle;
+                }
+                rule.node_index = static_cast<std::uint32_t>(zero_based_node);
+                if (rule.handle == 0U) {
+                  rule.handle = StableRuleHandle(rule);
+                }
+                result = MutateNetworkBlockRuleTransactional(
+                    node, rule,
+                    command.kind == SimulationCommandKind::kUnblockNetworkFlow,
+                    command_rpc_stop_source.get_token());
+              }
+              WriteEvent(
+                  events_path, options.run_id, command.node_id,
+                  command.kind == SimulationCommandKind::kUnblockNetworkFlow
+                      ? SimulationEventKind::kNetworkBlockRemoved
+                      : SimulationEventKind::kNetworkBlockApplied,
+                  NetworkBlockRuleDetail(node, rule, result.existed_before,
+                                         result.present_after, 0U, 0U,
+                                         command.sequence));
+            } else if (command.kind == SimulationCommandKind::kPartitionNodes ||
+                       command.kind == SimulationCommandKind::kHealPartition) {
+              if (!command.peer_node_id) {
+                throw std::runtime_error(
+                    "partition command requires a peer node id");
+              }
+              const auto node_iter =
+                  std::find_if(nodes.begin(), nodes.end(),
+                               [&](const NodeRuntime& candidate) {
+                                 return candidate.config.id == command.node_id;
+                               });
+              const auto peer_iter = std::find_if(
+                  nodes.begin(), nodes.end(),
+                  [&](const NodeRuntime& candidate) {
+                    return candidate.config.id == *command.peer_node_id;
+                  });
+              if (node_iter == nodes.end() || peer_iter == nodes.end()) {
+                throw std::runtime_error(
+                    "partition command references an unknown node");
+              }
+              const std::size_t node_index = static_cast<std::size_t>(
+                  std::distance(nodes.begin(), node_iter));
+              const std::size_t peer_index = static_cast<std::size_t>(
+                  std::distance(nodes.begin(), peer_iter));
+              if (node_index > std::numeric_limits<std::uint32_t>::max() ||
+                  peer_index > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    "partition command node index exceeds uint32");
+              }
+              const NetworkPartitionRule partition{
+                  .group_a = {static_cast<std::uint32_t>(node_index)},
+                  .group_b = {static_cast<std::uint32_t>(peer_index)},
+              };
+              ApplyRuntimeNetworkPartition(
+                  options, events_path, nodes, partition,
+                  command.kind == SimulationCommandKind::kHealPartition, 0U, 0U,
+                  command_rpc_stop_source.get_token(), command.sequence);
+            } else if (command.kind ==
                            SimulationCommandKind::kSetResourceProfile ||
                        command.kind ==
                            SimulationCommandKind::kSetNetworkProfile) {
@@ -9666,6 +10098,43 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                         driver, nodes,
                                         scenario_workload.resource_pressure,
                                         action_index, action_count, stop_token);
+        } else if (scenario_workload.kind ==
+                   WorkloadKind::kSetNetworkCondition) {
+          const NetworkConditionWorkload& workload =
+              scenario_workload.network_condition;
+          NodeRuntime& node = nodes[workload.node - 1U];
+          QdiscInfo qdisc;
+          NodeVethConfig updated_network;
+          {
+            std::lock_guard<std::mutex> lock(node_network_state_mutex);
+            qdisc = ReplaceNodeNetworkConditionTransactional(
+                &node, workload.condition, stop_token);
+            updated_network = *node.network;
+          }
+          WriteEvent(events_path, options.run_id, node.config.id,
+                     SimulationEventKind::kNetworkConditionUpdated,
+                     NetworkConditionVerificationDetail(
+                         updated_network, qdisc, action_index, action_count));
+        } else if (scenario_workload.kind == WorkloadKind::kBlockNetworkFlow ||
+                   scenario_workload.kind ==
+                       WorkloadKind::kUnblockNetworkFlow) {
+          const NetworkBlockRule& rule = scenario_workload.network_block.rule;
+          NodeRuntime& node = nodes[rule.node_index];
+          NetworkBlockMutationResult result;
+          {
+            std::lock_guard<std::mutex> lock(node_network_state_mutex);
+            result = MutateNetworkBlockRuleTransactional(
+                node, rule,
+                scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow,
+                stop_token);
+          }
+          WriteEvent(events_path, options.run_id, node.config.id,
+                     scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow
+                         ? SimulationEventKind::kNetworkBlockRemoved
+                         : SimulationEventKind::kNetworkBlockApplied,
+                     NetworkBlockRuleDetail(node, rule, result.existed_before,
+                                            result.present_after, action_index,
+                                            action_count));
         } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
           ApplyRuntimeNetworkPartition(
               options, events_path, nodes,

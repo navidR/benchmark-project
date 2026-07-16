@@ -7,6 +7,7 @@
 
 #include "bbp/block_production_policy.h"
 #include "bbp/mining_difficulty.h"
+#include "bbp/network.h"
 #include "bbp/peer_count_policy.h"
 
 namespace bbp {
@@ -30,6 +31,18 @@ enum class SimulationCommandKind {
   kGenerateBlocks,
   kSetResourceProfile,
   kSetNetworkProfile,
+  kSetNetworkCondition,
+  kBlockNetworkFlow,
+  kUnblockNetworkFlow,
+  kPartitionNodes,
+  kHealPartition,
+};
+
+struct SimulationNetworkFlow {
+  std::string src_address;
+  std::string dst_address;
+  std::uint16_t dst_port = 0;
+  std::uint32_t handle = 0;
 };
 
 struct SimulationCommand {
@@ -42,6 +55,8 @@ struct SimulationCommand {
   std::optional<PeerCountPolicy> peer_count_policy;
   std::optional<std::uint32_t> block_count;
   std::optional<std::string> profile;
+  std::optional<NetworkCondition> network_condition;
+  std::optional<SimulationNetworkFlow> network_flow;
   bool confirmed = false;
 };
 

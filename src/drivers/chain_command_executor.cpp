@@ -113,6 +113,11 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kSetResourceProfile:
     case SimulationCommandKind::kSetNetworkProfile:
+    case SimulationCommandKind::kSetNetworkCondition:
+    case SimulationCommandKind::kBlockNetworkFlow:
+    case SimulationCommandKind::kUnblockNetworkFlow:
+    case SimulationCommandKind::kPartitionNodes:
+    case SimulationCommandKind::kHealPartition:
       throw std::runtime_error(
           "command must be handled by the simulator resource owner");
   }

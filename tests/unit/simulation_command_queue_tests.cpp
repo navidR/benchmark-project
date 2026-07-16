@@ -175,3 +175,144 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_operator_payloads) {
                                "x", true),
       std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_preserves_typed_network_condition) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::NetworkCondition condition{
+      .bandwidth_mbps = 20U,
+      .delay_ms = 80U,
+      .jitter_ms = 10U,
+      .loss_basis_points = 11U,
+      .duplicate_basis_points = 12U,
+      .corrupt_basis_points = 13U,
+      .reorder_basis_points = 14U,
+      .limit_packets = 900U,
+  };
+  queue.PushNetworkCondition("firo-1", condition, true);
+
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_CHECK(command->kind ==
+              bbp::SimulationCommandKind::kSetNetworkCondition);
+  BOOST_REQUIRE(command->network_condition);
+  BOOST_CHECK(*command->network_condition == condition);
+  BOOST_TEST(command->confirmed);
+
+  bbp::NetworkCondition invalid = condition;
+  invalid.limit_packets = 0U;
+  BOOST_CHECK_THROW(queue.PushNetworkCondition("firo-1", invalid, true),
+                    std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_network_flows) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationNetworkFlow flow{
+      .src_address = "10.210.1.2",
+      .dst_address = "10.210.1.6",
+      .dst_port = 18168U,
+      .handle = 77U,
+  };
+  queue.PushNetworkFlowCommand(bbp::SimulationCommandKind::kBlockNetworkFlow,
+                               "firo-1", flow, true);
+  queue.PushNetworkFlowCommand(bbp::SimulationCommandKind::kUnblockNetworkFlow,
+                               "firo-1", flow);
+  queue.PushNetworkFlowCommand(bbp::SimulationCommandKind::kUnblockNetworkFlow,
+                               "firo-1",
+                               bbp::SimulationNetworkFlow{
+                                   .src_address = {},
+                                   .dst_address = {},
+                                   .dst_port = 0U,
+                                   .handle = 77U,
+                               });
+
+  const std::optional<bbp::SimulationCommand> block = queue.TryPop();
+  const std::optional<bbp::SimulationCommand> unblock = queue.TryPop();
+  const std::optional<bbp::SimulationCommand> clear = queue.TryPop();
+  BOOST_REQUIRE(block);
+  BOOST_REQUIRE(block->network_flow);
+  BOOST_TEST(block->network_flow->src_address == "10.210.1.2");
+  BOOST_TEST(block->network_flow->dst_address == "10.210.1.6");
+  BOOST_TEST(block->network_flow->dst_port == 18168U);
+  BOOST_TEST(block->network_flow->handle == 77U);
+  BOOST_REQUIRE(unblock);
+  BOOST_CHECK(unblock->kind == bbp::SimulationCommandKind::kUnblockNetworkFlow);
+  BOOST_REQUIRE(clear);
+  BOOST_REQUIRE(clear->network_flow);
+  BOOST_TEST(clear->network_flow->dst_address.empty());
+  BOOST_TEST(clear->network_flow->handle == 77U);
+
+  BOOST_CHECK_THROW(queue.PushNetworkFlowCommand(
+                        bbp::SimulationCommandKind::kBlockNetworkFlow, "firo-1",
+                        bbp::SimulationNetworkFlow{}, true),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(queue.PushNetworkFlowCommand(
+                        bbp::SimulationCommandKind::kUnblockNetworkFlow,
+                        "firo-1", bbp::SimulationNetworkFlow{}),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushNetworkFlowCommand(bbp::SimulationCommandKind::kKillNode,
+                                   "firo-1", flow, true),
+      std::runtime_error);
+  bbp::SimulationNetworkFlow invalid_address = flow;
+  invalid_address.dst_address = "invalid";
+  BOOST_CHECK_THROW(queue.PushNetworkFlowCommand(
+                        bbp::SimulationCommandKind::kBlockNetworkFlow, "firo-1",
+                        invalid_address, true),
+                    std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_partitions) {
+  bbp::SimulationCommandQueue queue;
+  queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
+                             "firo-1", "firo-2", true);
+  queue.PushPartitionCommand(bbp::SimulationCommandKind::kHealPartition,
+                             "firo-1", "firo-2");
+
+  const std::optional<bbp::SimulationCommand> partition = queue.TryPop();
+  const std::optional<bbp::SimulationCommand> heal = queue.TryPop();
+  BOOST_REQUIRE(partition);
+  BOOST_REQUIRE(partition->peer_node_id);
+  BOOST_TEST(*partition->peer_node_id == "firo-2");
+  BOOST_TEST(partition->confirmed);
+  BOOST_REQUIRE(heal);
+  BOOST_CHECK(heal->kind == bbp::SimulationCommandKind::kHealPartition);
+  BOOST_REQUIRE(heal->peer_node_id);
+  BOOST_TEST(*heal->peer_node_id == "firo-2");
+
+  BOOST_CHECK_THROW(
+      queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
+                                 "firo-1", "", true),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
+                                 "firo-1", "firo-1", true),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushPartitionCommand(bbp::SimulationCommandKind::kKillNode,
+                                 "firo-1", "firo-2", true),
+      std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_requires_network_mutation_confirmation) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::NetworkCondition condition{};
+  const bbp::SimulationNetworkFlow flow{
+      .src_address = {},
+      .dst_address = "10.210.1.6",
+      .dst_port = 18168U,
+      .handle = 0U,
+  };
+  BOOST_CHECK_THROW(queue.PushNetworkCondition("firo-1", condition),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushNetworkFlowCommand(
+          bbp::SimulationCommandKind::kBlockNetworkFlow, "firo-1", flow),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
+                                 "firo-1", "firo-2"),
+      std::runtime_error);
+  BOOST_TEST(!queue.TryPop());
+}
