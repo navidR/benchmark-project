@@ -212,6 +212,7 @@ add_executable(bbp
   src/block_production_policy.cpp
   src/capability.cpp
   src/cgroup.cpp
+  src/chain_network.cpp
   src/chain_kind.cpp
   src/default_peer_topology.cpp
   src/drivers/chain_driver.cpp
@@ -295,6 +296,7 @@ if(BUILD_TESTING)
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
+    tests/unit/chain_network_tests.cpp
     tests/unit/chain_kind_tests.cpp
     tests/unit/chain_wallet_transaction_tests.cpp
     tests/unit/default_peer_topology_tests.cpp
@@ -341,6 +343,7 @@ if(BUILD_TESTING)
     tests/unit/workload_kind_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
+    src/chain_network.cpp
     src/chain_kind.cpp
     src/block_production_policy.cpp
     src/default_peer_topology.cpp
@@ -660,6 +663,38 @@ if(BUILD_TESTING)
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-executable-config.json"
       --probe-capabilities
+  )
+  add_test(NAME bbp-valid-node-chain-config-json
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-chain-config.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-node-chain-config-yaml
+    COMMAND bbp
+      --scenario-yaml
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-chain-config.yaml"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-config-shape
+    tests/scenarios/invalid-node-chain-config-shape.json
+    "scenario node firo-1 chain_config must be an object"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-network-shape
+    tests/scenarios/invalid-node-chain-network-shape.json
+    "scenario node firo-1 chain_config.network must be a string"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-network
+    tests/scenarios/invalid-node-chain-network.json
+    "unsupported chain network: mainnet"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-config-field
+    tests/scenarios/invalid-node-chain-config-field.json
+    "scenario node firo-1 has unsupported chain_config field: untyped_option"
   )
   add_cli_failure_test(
     bbp-invalid-node-binary-shape

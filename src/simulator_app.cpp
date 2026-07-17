@@ -2082,6 +2082,30 @@ ScenarioNodeRoles ParseScenarioNodes(
       ValidateScenarioNodeDataDirectory(*node_config.data_dir, id);
       node_config.data_dir = node_config.data_dir->lexically_normal();
     }
+    const boost::json::value* chain_config_value =
+        node.if_contains("chain_config");
+    if (chain_config_value != nullptr) {
+      if (!chain_config_value->is_object()) {
+        throw std::runtime_error("scenario node " + id +
+                                 " chain_config must be an object");
+      }
+      const boost::json::object& chain_config = chain_config_value->as_object();
+      for (const auto& member : chain_config) {
+        if (member.key() != "network") {
+          throw std::runtime_error("scenario node " + id +
+                                   " has unsupported chain_config field: " +
+                                   std::string(member.key()));
+        }
+      }
+      const boost::json::value* network = chain_config.if_contains("network");
+      if (network != nullptr) {
+        if (!network->is_string()) {
+          throw std::runtime_error("scenario node " + id +
+                                   " chain_config.network must be a string");
+        }
+        node_config.network = ParseChainNetwork(network->as_string());
+      }
+    }
 
     const auto read_profile = [&](const char* section,
                                   std::map<uint32_t, std::string>* output) {
@@ -2276,6 +2300,12 @@ std::filesystem::path NodeDataDirectoryRelative(const Options& options,
   }
   return std::filesystem::path("nodes") / ScenarioNodeId(options, node_index) /
          "data";
+}
+
+ChainNetwork EffectiveNodeChainNetwork(const Options& options,
+                                       uint32_t node_index) {
+  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
+  return config == nullptr ? ChainNetwork::kRegtest : config->network;
 }
 
 bool NodeHasScenarioRole(const Options& options, uint32_t node_index,
@@ -7318,6 +7348,10 @@ void WriteScenarioFiles(const Options& options,
     node["binary"] = EffectiveNodeBinary(options, node_index).string();
     node["data_dir"] =
         NodeDataDirectoryRelative(options, node_index).generic_string();
+    boost::json::object chain_config;
+    chain_config["network"] =
+        ChainNetworkName(EffectiveNodeChainNetwork(options, node_index));
+    node["chain_config"] = std::move(chain_config);
     if (!options.node_roles.empty()) {
       node["role"] = options.node_roles.at(node_index);
     } else {
@@ -7546,6 +7580,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     config_request.daemon_binary = EffectiveNodeBinary(options, i);
     config_request.data_dir = NodeDataDirectoryRelative(options, i);
     config_request.node_index = i;
+    config_request.network = EffectiveNodeChainNetwork(options, i);
     if (!options.node_ids.empty()) {
       config_request.node_id = options.node_ids.at(i);
     }

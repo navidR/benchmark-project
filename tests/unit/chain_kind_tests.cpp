@@ -47,6 +47,22 @@ BOOST_AUTO_TEST_CASE(chain_node_config_uses_explicit_safe_scenario_id) {
       std::filesystem::path("/tmp/profile-test/nodes/firo-wallet-a/data"));
   BOOST_TEST(config.p2p_port == 18169U);
   BOOST_TEST(config.rpc_port == 18889U);
+  BOOST_TEST(static_cast<int>(config.network) ==
+             static_cast<int>(bbp::ChainNetwork::kRegtest));
+}
+
+BOOST_AUTO_TEST_CASE(chain_node_config_retains_requested_network) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "network-test";
+  request.run_root = "/tmp/network-test";
+  request.daemon_binary = "/tmp/firod";
+  request.network = bbp::ChainNetwork::kRegtest;
+
+  const bbp::ChainNodeConfig config =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request);
+
+  BOOST_TEST(static_cast<int>(config.network) ==
+             static_cast<int>(bbp::ChainNetwork::kRegtest));
 }
 
 BOOST_AUTO_TEST_CASE(chain_node_config_retains_generated_id_by_default) {

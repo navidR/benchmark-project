@@ -1,0 +1,22 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "block_production": {
+    "enabled": false,
+    "probability": 0.0
+  },
+  "nodes": [
+    {
+      "id": "firo-explicit-regtest",
+      "chain": "firo",
+      "role": "base",
+      "chain_config": {
+        "network": "regtest"
+      }
+    }
+  ]
+}

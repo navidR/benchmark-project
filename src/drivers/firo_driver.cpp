@@ -416,6 +416,9 @@ std::string TxOutScriptPubKeyHex(const boost::json::object& txout) {
 }  // namespace
 
 ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
+  if (config.network != ChainNetwork::kRegtest) {
+    throw std::runtime_error("Firo driver supports only regtest network");
+  }
   EnsureDirectory(config.data_dir);
   EnsureDirectory(config.log_dir);
 
@@ -458,6 +461,9 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
 std::optional<LogTailChunk> FiroDriver::ReadLogTail(
     const FiroNodeConfig& config, ChainLogSource source,
     const LogTailCursor& cursor, std::uint64_t max_bytes) const {
+  if (config.network != ChainNetwork::kRegtest) {
+    throw std::runtime_error("Firo driver supports only regtest network");
+  }
   std::filesystem::path path;
   switch (source) {
     case ChainLogSource::kDaemon:

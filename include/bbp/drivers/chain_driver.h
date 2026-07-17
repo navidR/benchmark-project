@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "bbp/chain_network.h"
 #include "bbp/drivers/chain_wallet_snapshot.h"
 #include "bbp/http_client.h"
 #include "bbp/log_tail.h"
@@ -51,6 +52,7 @@ struct ChainMetrics {
 
 struct ChainNodeConfig {
   std::string id;
+  ChainNetwork network = ChainNetwork::kRegtest;
   std::filesystem::path binary;
   std::filesystem::path data_dir;
   std::filesystem::path log_dir;

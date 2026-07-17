@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "bbp/chain_kind.h"
+#include "bbp/chain_network.h"
 #include "bbp/drivers/chain_driver.h"
 
 namespace bbp {
@@ -31,6 +32,7 @@ struct ChainNodeConfigRequest {
   std::optional<std::filesystem::path> data_dir;
   std::uint32_t node_index = 0;
   std::string node_id;
+  ChainNetwork network = ChainNetwork::kRegtest;
   bool wallet_enabled = false;
   std::vector<std::string> connect_peers;
 };

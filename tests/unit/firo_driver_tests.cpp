@@ -299,6 +299,7 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   const bbp::ProcessSpec process = driver.RenderProcess(config);
   bool dandelion_disabled = false;
   bool transaction_index_enabled = false;
+  bool regtest_selected = false;
   for (const std::string& argument : process.argv) {
     BOOST_TEST(!argument.starts_with("-connect="));
     if (argument == "-dandelion=0") {
@@ -307,9 +308,16 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
     if (argument == "-txindex=1") {
       transaction_index_enabled = true;
     }
+    if (argument == "-regtest") {
+      regtest_selected = true;
+    }
   }
   BOOST_TEST(dandelion_disabled);
   BOOST_TEST(transaction_index_enabled);
+  BOOST_TEST(regtest_selected);
+
+  config.network = static_cast<bbp::ChainNetwork>(999);
+  BOOST_CHECK_THROW(driver.RenderProcess(config), std::runtime_error);
 
   std::filesystem::remove_all(test_dir);
 }
