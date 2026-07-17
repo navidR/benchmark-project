@@ -100,6 +100,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "run_failed";
     case SimulationEventKind::kRunCancelled:
       return "run_cancelled";
+    case SimulationEventKind::kSimulationDurationReached:
+      return "simulation_duration_reached";
     case SimulationEventKind::kRunFinished:
       return "run_finished";
     case SimulationEventKind::kScheduledEventStarted:
@@ -230,6 +232,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
   if (name == "run_started") return SimulationEventKind::kRunStarted;
   if (name == "run_failed") return SimulationEventKind::kRunFailed;
   if (name == "run_cancelled") return SimulationEventKind::kRunCancelled;
+  if (name == "simulation_duration_reached")
+    return SimulationEventKind::kSimulationDurationReached;
   if (name == "run_finished") return SimulationEventKind::kRunFinished;
   if (name == "scheduled_event_started")
     return SimulationEventKind::kScheduledEventStarted;

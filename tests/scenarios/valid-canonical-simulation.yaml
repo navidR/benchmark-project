@@ -1,0 +1,14 @@
+firod: /tmp/not-used-by-probe
+simulation:
+  name: scaled-firo-yaml
+  seed: 67890
+  duration: 300ms
+  time_scale: 1.5
+  tick_interval: 25ms
+  output_dir: /tmp/bbp-canonical-simulation-yaml
+  tui_refresh_interval: 50ms
+nodes: 1
+events:
+  - at: 100ms
+    action: checkpoint
+    name: yaml-midpoint

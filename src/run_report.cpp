@@ -596,6 +596,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   }
   const boost::json::object& scenario = value.as_object();
   CopyField(scenario, "run_id", report);
+  CopyField(scenario, "simulation", report);
   CopyField(scenario, "chain", report);
   CopyField(scenario, "nodes", report);
   CopyField(scenario, "generate_blocks", report);
@@ -1777,10 +1778,12 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   bool run_started = false;
   bool run_finished = false;
   bool run_failed = false;
+  bool simulation_duration_reached = false;
   std::string started_at;
   std::string finished_at;
   std::string failed_at;
   boost::json::value failure_detail;
+  boost::json::value simulation_duration_detail;
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;
   boost::json::array generated_blocks;
@@ -1845,6 +1848,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
             run_failed = true;
             failed_at = OptionalStringField(event, "timestamp");
             failure_detail = ParseEventDetail(event);
+            break;
+          case SimulationEventKind::kSimulationDurationReached:
+            simulation_duration_reached = true;
+            simulation_duration_detail = ParseEventDetail(event);
             break;
           case SimulationEventKind::kState:
             if (!node_id.empty()) {
@@ -2034,6 +2041,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   SeedConfiguredNodes(report, &nodes);
   report["ok"] = ok;
   report["status"] = RunReportStatusName(status);
+  report["simulation_duration_reached"] = simulation_duration_reached;
+  if (!simulation_duration_detail.is_null()) {
+    report["simulation_duration"] = std::move(simulation_duration_detail);
+  }
   if (!started_at.empty()) {
     report["started_at"] = started_at;
   }

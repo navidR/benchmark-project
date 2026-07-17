@@ -1,0 +1,8 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "duration": "1s"
+  },
+  "nodes": 1,
+  "metrics_sample_count": 1
+}

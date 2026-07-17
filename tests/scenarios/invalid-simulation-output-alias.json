@@ -1,0 +1,8 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "/tmp/legacy",
+  "simulation": {
+    "output_dir": "/tmp/canonical"
+  },
+  "nodes": 1
+}

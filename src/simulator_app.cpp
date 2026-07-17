@@ -133,20 +133,25 @@ std::uint64_t ElapsedMilliseconds(
 
 boost::json::object ScheduledEventLifecycleDetail(
     const ScheduledScenarioEvent& event,
+    std::chrono::milliseconds scheduled_wall_delay,
     std::chrono::steady_clock::time_point epoch,
     std::chrono::steady_clock::time_point started,
     std::optional<std::chrono::steady_clock::time_point> finished,
     std::optional<std::string_view> error = std::nullopt) {
   const std::uint64_t scheduled_at_ms =
       static_cast<std::uint64_t>(event.at.count());
+  const std::uint64_t scheduled_wall_at_ms =
+      static_cast<std::uint64_t>(scheduled_wall_delay.count());
   const std::uint64_t started_at_ms = ElapsedMilliseconds(epoch, started);
   boost::json::object detail;
   detail["sequence"] = event.sequence;
   detail["action"] = std::string(WorkloadKindName(event.action.kind));
   detail["scheduled_at_ms"] = scheduled_at_ms;
+  detail["scheduled_wall_at_ms"] = scheduled_wall_at_ms;
   detail["started_at_ms"] = started_at_ms;
-  detail["lateness_ms"] =
-      started_at_ms > scheduled_at_ms ? started_at_ms - scheduled_at_ms : 0U;
+  detail["lateness_ms"] = started_at_ms > scheduled_wall_at_ms
+                              ? started_at_ms - scheduled_wall_at_ms
+                              : 0U;
   if (finished) {
     const std::uint64_t finished_at_ms = ElapsedMilliseconds(epoch, *finished);
     detail["finished_at_ms"] = finished_at_ms;
@@ -1301,11 +1306,12 @@ std::vector<PeerTopologyRegionEdge> ParsePeerTopologyRegionEdges(
 }
 
 PeerTopologyConfig ParsePeerTopologyConfig(const boost::json::object& object,
-                                           uint32_t node_count) {
+                                           uint32_t node_count,
+                                           std::uint64_t default_seed) {
   PeerTopologyConfig topology;
   topology.kind = ParsePeerTopologyKind(
       JsonOptionalStringField(object, "type", "full_mesh"));
-  topology.seed = JsonOptionalUint64Field(object, "seed", 0U);
+  topology.seed = JsonOptionalUint64Field(object, "seed", default_seed);
   switch (topology.kind) {
     case PeerTopologyKind::kFullMesh:
     case PeerTopologyKind::kRing:
@@ -1370,7 +1376,8 @@ void ResolvePeerPolicyEligibility(NodeRoleTopology* topology) {
 }
 
 NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
-                                             uint32_t nodes) {
+                                             uint32_t nodes,
+                                             std::uint64_t default_seed) {
   NodeRoleTopology topology;
   topology.configured = true;
   topology.node_count = JsonOptionalUint32Field(object, "node_count", nodes);
@@ -1448,7 +1455,8 @@ NodeRoleTopology ParseNodeRoleTopologyObject(const boost::json::object& object,
         "scenario topology wallet_nodes and miner_nodes overlap but "
         "allow_miner_wallet_overlap is false");
   }
-  topology.peer_topology = ParsePeerTopologyConfig(object, topology.node_count);
+  topology.peer_topology =
+      ParsePeerTopologyConfig(object, topology.node_count, default_seed);
   topology.peer_connectivity =
       ParsePeerConnectivityPolicies(object, topology.node_count);
   ResolvePeerPolicyEligibility(&topology);
@@ -2527,7 +2535,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       transactions.funding_threshold_satoshis = JsonOptionalAmountField(
           workload, "funding_threshold", default_funding_threshold);
       transactions.random_seed =
-          JsonOptionalUint64Field(workload, "seed", transactions.random_seed);
+          JsonOptionalUint64Field(workload, "seed", options.simulation_seed);
       const std::size_t wallet_count = options.topology.wallet_nodes.size();
       transactions.sender_wallets =
           ParseWalletIndexList(workload, "sender_wallets", wallet_count);
@@ -2616,12 +2624,19 @@ void ApplyScheduledScenarioEvents(
 
     ScheduledScenarioEvent scheduled;
     scheduled.at = PositiveDuration::Parse(at_text).value();
+    const std::chrono::milliseconds scheduled_wall_at =
+        options.time_scale.WallDuration(scheduled.at);
     const auto maximum_monotonic_delay =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::duration::max());
-    if (scheduled.at > maximum_monotonic_delay) {
+    if (scheduled_wall_at > maximum_monotonic_delay) {
       throw std::runtime_error(
           "scheduled event time exceeds monotonic clock range");
+    }
+    if (options.simulation_duration &&
+        scheduled.at >= *options.simulation_duration) {
+      throw std::runtime_error(
+          "scheduled event time must be less than simulation duration");
     }
     scheduled.sequence = static_cast<std::uint32_t>(index + 1U);
     scheduled.action = std::move(options.workloads.back());
@@ -2637,6 +2652,92 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     throw std::runtime_error(
         "scenario generate_blocks was removed; use block_production.enabled "
         "or an explicit block_generation workload");
+  }
+  const boost::json::value* simulation_value =
+      scenario.if_contains("simulation");
+  const boost::json::object* simulation = nullptr;
+  if (simulation_value != nullptr) {
+    if (!simulation_value->is_object()) {
+      throw std::runtime_error("scenario simulation must be a JSON object");
+    }
+    simulation = &simulation_value->as_object();
+    if (simulation->if_contains("name") != nullptr) {
+      options.simulation_name = JsonStringField(*simulation, "name");
+      RequireSafeScenarioIdentifier(options.simulation_name, "simulation name");
+    }
+    options.simulation_seed =
+        JsonOptionalUint64Field(*simulation, "seed", options.simulation_seed);
+    const boost::json::value* duration = simulation->if_contains("duration");
+    if (duration != nullptr) {
+      if (!duration->is_string()) {
+        throw std::runtime_error(
+            "scenario simulation.duration must be a duration string");
+      }
+      options.simulation_duration =
+          PositiveDuration::Parse(
+              std::string_view(duration->as_string().data(),
+                               duration->as_string().size()))
+              .value();
+    }
+    options.time_scale =
+        SimulationTimeScale::FromDouble(JsonOptionalDoubleField(
+            *simulation, "time_scale", options.time_scale.value()));
+
+    const bool has_metrics_interval =
+        simulation->if_contains("metrics_interval") != nullptr;
+    const bool has_tick_interval =
+        simulation->if_contains("tick_interval") != nullptr;
+    if (has_metrics_interval && has_tick_interval) {
+      throw std::runtime_error(
+          "scenario simulation.metrics_interval and tick_interval are "
+          "aliases and must not both be provided");
+    }
+    if ((has_metrics_interval || has_tick_interval) &&
+        scenario.if_contains("metrics_interval_ms") != nullptr) {
+      throw std::runtime_error(
+          "scenario simulation metrics interval and top-level "
+          "metrics_interval_ms must not be combined");
+    }
+    if (!OptionProvided(vm, "metrics-interval") &&
+        !OptionProvided(vm, "metrics-interval-ms") &&
+        (has_metrics_interval || has_tick_interval)) {
+      const char* field =
+          has_metrics_interval ? "metrics_interval" : "tick_interval";
+      options.metrics_interval =
+          PositiveDuration::Parse(JsonStringField(*simulation, field)).value();
+    }
+
+    if (simulation->if_contains("output_dir") != nullptr &&
+        scenario.if_contains("output_dir") != nullptr) {
+      throw std::runtime_error(
+          "scenario simulation.output_dir and top-level output_dir must not "
+          "be combined");
+    }
+    if (!OptionProvided(vm, "benchmark-root") &&
+        !OptionProvided(vm, "output-dir")) {
+      options.output_dir =
+          JsonOptionalPathField(*simulation, "output_dir", options.output_dir);
+    }
+
+    if (simulation->if_contains("tui_refresh_interval") != nullptr &&
+        !OptionProvided(vm, "refresh-ms")) {
+      const auto refresh = PositiveDuration::Parse(
+          JsonStringField(*simulation, "tui_refresh_interval"));
+      if (refresh.value().count() >
+          static_cast<std::chrono::milliseconds::rep>(
+              std::numeric_limits<std::uint32_t>::max())) {
+        throw std::runtime_error(
+            "scenario simulation.tui_refresh_interval exceeds uint32 "
+            "milliseconds");
+      }
+      options.tui_refresh_ms =
+          static_cast<std::uint32_t>(refresh.value().count());
+    }
+  }
+  if (!OptionProvided(vm, "block-production-seed")) {
+    options.block_production.policy = BlockProductionPolicy(
+        options.block_production.policy.period(),
+        options.block_production.policy.probability(), options.simulation_seed);
   }
   if (!OptionProvided(vm, "chain")) {
     options.chain = ParseChainKind(JsonOptionalStringField(
@@ -2654,7 +2755,9 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         options.chain_daemon);
   }
   if (!OptionProvided(vm, "benchmark-root") &&
-      !OptionProvided(vm, "output-dir")) {
+      !OptionProvided(vm, "output-dir") &&
+      (simulation == nullptr ||
+       simulation->if_contains("output_dir") == nullptr)) {
     options.output_dir =
         JsonOptionalPathField(scenario, "output_dir", options.output_dir);
   }
@@ -2667,6 +2770,9 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       options.run_id = std::string(run_id->as_string());
     }
   }
+  if (options.simulation_name.empty()) {
+    options.simulation_name = options.run_id;
+  }
   const ScenarioNodeRoles node_roles =
       ParseScenarioNodes(scenario, vm, &options);
   const boost::json::value* topology = scenario.if_contains("topology");
@@ -2674,8 +2780,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     if (!topology->is_object()) {
       throw std::runtime_error("scenario topology must be a JSON object");
     }
-    options.topology =
-        ParseNodeRoleTopologyObject(topology->as_object(), options.nodes);
+    options.topology = ParseNodeRoleTopologyObject(
+        topology->as_object(), options.nodes, options.simulation_seed);
     options.wallet_initialization =
         ParseWalletInitializationObject(topology->as_object());
     if (node_roles.configured &&
@@ -2703,8 +2809,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     derived_topology["miner_nodes"] = std::move(miner_nodes);
     derived_topology["type"] = "full_mesh";
-    options.topology =
-        ParseNodeRoleTopologyObject(derived_topology, options.nodes);
+    options.topology = ParseNodeRoleTopologyObject(
+        derived_topology, options.nodes, options.simulation_seed);
     if (!OptionProvided(vm, "generate-node") &&
         !options.topology.miner_nodes.empty()) {
       options.generate_node = options.topology.miner_nodes.front() + 1U;
@@ -2776,7 +2882,10 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         scenario, "metrics_sample_count", options.metrics_sample_count);
   }
   if (!OptionProvided(vm, "metrics-interval") &&
-      !OptionProvided(vm, "metrics-interval-ms")) {
+      !OptionProvided(vm, "metrics-interval-ms") &&
+      (simulation == nullptr ||
+       (simulation->if_contains("metrics_interval") == nullptr &&
+        simulation->if_contains("tick_interval") == nullptr))) {
     options.metrics_interval =
         PositiveDuration::FromMilliseconds(
             JsonOptionalUint32Field(
@@ -3648,6 +3757,25 @@ Options ParseOptions(int argc, char** argv) {
       throw std::runtime_error("--scenario-yaml root must be a YAML mapping");
     }
     ApplyScenarioJson(scenario.as_object(), vm, options);
+  }
+  if (options.simulation_name.empty()) {
+    options.simulation_name = options.run_id;
+  }
+  if (options.simulation_duration) {
+    if (options.metrics_sample_count != 0U) {
+      throw std::runtime_error(
+          "simulation duration and metrics_sample_count must not be "
+          "combined");
+    }
+    const std::chrono::milliseconds wall_duration =
+        options.time_scale.WallDuration(*options.simulation_duration);
+    const auto maximum_monotonic_delay =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::duration::max());
+    if (wall_duration > maximum_monotonic_delay) {
+      throw std::runtime_error(
+          "scaled simulation duration exceeds monotonic clock range");
+    }
   }
   options.network_condition_requested =
       options.network_condition_requested ||
@@ -6109,6 +6237,9 @@ std::uint32_t WriteMetricsSnapshot(
     try {
       chain = driver.ReadMetrics(node.config, stop_token);
     } catch (const std::exception& error) {
+      if (stop_token.stop_requested() || (stop_requested && stop_requested())) {
+        return sample_count;
+      }
       if (!node.AllowsChainMetrics()) {
         continue;
       }
@@ -6349,6 +6480,9 @@ std::uint32_t WriteWalletMetricsSnapshot(
                             node_index + 1U, snapshot));
       ++sample_count;
     } catch (const std::exception& error) {
+      if (stop_token.stop_requested()) {
+        return sample_count;
+      }
       if (!node.AllowsChainMetrics()) {
         continue;
       }
@@ -6816,13 +6950,15 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
 }
 
 boost::json::object ScheduledScenarioEventJson(
-    const ScheduledScenarioEvent& event) {
+    const ScheduledScenarioEvent& event,
+    const SimulationTimeScale& time_scale) {
   boost::json::object object = WorkloadJson(event.action);
   object.erase("type");
   object["action"] = std::string(WorkloadKindName(event.action.kind));
   object["sequence"] = event.sequence;
   object["at"] = std::to_string(event.at.count()) + "ms";
   object["at_ms"] = event.at.count();
+  object["wall_at_ms"] = time_scale.WallDuration(event.at).count();
   return object;
 }
 
@@ -6832,6 +6968,31 @@ void WriteScenarioFiles(const Options& options,
   const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
+  boost::json::object simulation;
+  simulation["name"] = options.simulation_name;
+  simulation["seed"] = options.simulation_seed;
+  if (options.simulation_duration) {
+    simulation["duration"] =
+        std::to_string(options.simulation_duration->count()) + "ms";
+    simulation["duration_ms"] = options.simulation_duration->count();
+    simulation["wall_duration_ms"] =
+        options.time_scale.WallDuration(*options.simulation_duration).count();
+  } else {
+    simulation["duration"] = nullptr;
+    simulation["duration_ms"] = nullptr;
+    simulation["wall_duration_ms"] = nullptr;
+  }
+  simulation["time_scale"] = options.time_scale.value();
+  simulation["time_scale_millionths"] = options.time_scale.millionths();
+  simulation["metrics_interval"] =
+      std::to_string(options.metrics_interval.count()) + "ms";
+  simulation["metrics_interval_ms"] = options.metrics_interval.count();
+  simulation["output_dir"] =
+      std::filesystem::absolute(options.output_dir).string();
+  simulation["tui_refresh_interval"] =
+      std::to_string(options.tui_refresh_ms) + "ms";
+  simulation["tui_refresh_interval_ms"] = options.tui_refresh_ms;
+  resolved["simulation"] = std::move(simulation);
   resolved["chain"] = chain_spec.name;
   resolved["nodes"] = options.nodes;
   if (const std::optional<uint32_t> generate_node =
@@ -6959,7 +7120,8 @@ void WriteScenarioFiles(const Options& options,
   resolved["workloads"] = std::move(workload_array);
   boost::json::array scheduled_event_array;
   for (const ScheduledScenarioEvent& event : options.scheduled_events) {
-    scheduled_event_array.push_back(ScheduledScenarioEventJson(event));
+    scheduled_event_array.push_back(
+        ScheduledScenarioEventJson(event, options.time_scale));
   }
   resolved["events"] = std::move(scheduled_event_array);
   boost::json::object resources;
@@ -9747,7 +9909,12 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
 }
 
 int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
-                         std::stop_token stop_token = {}) {
+                         std::stop_token external_stop_token = {}) {
+  std::stop_source simulation_stop_source;
+  std::stop_callback stop_simulation_on_external_request(
+      external_stop_token,
+      [&simulation_stop_source] { simulation_stop_source.request_stop(); });
+  const std::stop_token stop_token = simulation_stop_source.get_token();
   const auto run_root = BenchmarkRunRoot(options);
   if (std::filesystem::exists(run_root)) {
     if (!options.replace_run) {
@@ -9798,6 +9965,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::unique_ptr<PeerConnectivityController> peer_connectivity_controller;
   std::unique_ptr<ChainCommandExecutor> chain_command_executor;
   std::unique_ptr<SimulationCommandProcessor> command_processor;
+  std::optional<std::jthread> duration_timer;
+  std::optional<std::chrono::steady_clock::time_point> simulation_epoch;
+  std::atomic<bool> simulation_duration_reached = false;
+  std::atomic<std::uint64_t> duration_stop_requested_at_ms = 0U;
   std::vector<std::string> active_native_miner_ids;
   std::set<std::string> paused_scheduled_miners;
   std::mutex node_process_mutex;
@@ -9815,6 +9986,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::stop_callback cancel_metrics_rpc(stop_token, [&metrics_rpc_stop_source] {
     metrics_rpc_stop_source.request_stop();
   });
+  const auto stop_duration_timer = [&]() {
+    if (duration_timer) {
+      duration_timer->request_stop();
+      if (duration_timer->joinable()) {
+        duration_timer->join();
+      }
+      duration_timer.reset();
+    }
+  };
   const auto stop_command_processor = [&]() {
     command_rpc_stop_source.request_stop();
     if (command_processor) {
@@ -9859,6 +10039,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
   };
   const auto handle_run_failure = [&](std::string_view detail) {
+    stop_duration_timer();
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
     cleanup_step("block production shutdown", stop_block_production);
@@ -9902,6 +10083,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
   };
   const auto handle_run_cancellation = [&]() {
+    stop_duration_timer();
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
     cleanup_step("block production shutdown", stop_block_production);
@@ -9929,6 +10111,49 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                  SimulationEventKind::kRunFinished);
     });
     BBP_LOG(info) << "cancelled run " << options.run_id;
+  };
+  const auto handle_simulation_duration = [&]() {
+    stop_duration_timer();
+    cleanup_step("command processor shutdown", stop_command_processor);
+    cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
+    cleanup_step("block production shutdown", stop_block_production);
+    cleanup_step("metrics collector shutdown", [&] {
+      if (metrics_collector) {
+        metrics_rpc_stop_source.request_stop();
+        metrics_collector->Stop();
+      }
+    });
+    cleanup_step("simulation duration event", [&] {
+      boost::json::object detail;
+      detail["duration_ms"] = options.simulation_duration->count();
+      detail["wall_duration_ms"] =
+          options.time_scale.WallDuration(*options.simulation_duration).count();
+      detail["time_scale"] = options.time_scale.value();
+      detail["stop_requested_at_ms"] =
+          duration_stop_requested_at_ms.load(std::memory_order_acquire);
+      detail["elapsed_wall_ms"] =
+          simulation_epoch
+              ? ElapsedMilliseconds(*simulation_epoch,
+                                    std::chrono::steady_clock::now())
+              : 0U;
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kSimulationDurationReached,
+                 boost::json::serialize(detail));
+    });
+    cleanup_step("node shutdown",
+                 [&] { StopNodes(options, events_path, driver, nodes, true); });
+    cleanup_step("node log collector shutdown", [&] {
+      if (log_collector) {
+        log_collector->Stop();
+      } else {
+        WriteNodeLogTails(events_path, options, driver, nodes);
+      }
+    });
+    cleanup_step("run finished event", [&] {
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kRunFinished);
+    });
+    BBP_LOG(info) << "simulation duration reached for run " << options.run_id;
   };
   try {
     StartNodes(options, run_root, events_path, chain_spec, driver,
@@ -10571,6 +10796,29 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     runtime_actions.insert(runtime_actions.end(), scheduled_events.begin(),
                            scheduled_events.end());
     const auto event_engine_epoch = std::chrono::steady_clock::now();
+    simulation_epoch = event_engine_epoch;
+    if (options.simulation_duration) {
+      const std::chrono::milliseconds wall_duration =
+          options.time_scale.WallDuration(*options.simulation_duration);
+      const auto duration_deadline =
+          SteadyDeadline(event_engine_epoch, wall_duration);
+      duration_timer.emplace(
+          [duration_deadline, &simulation_duration_reached,
+           &duration_stop_requested_at_ms, &simulation_stop_source,
+           event_engine_epoch](std::stop_token timer_stop_token) {
+            try {
+              WaitUntil(duration_deadline, timer_stop_token);
+            } catch (const SimulationCancelled&) {
+              return;
+            }
+            duration_stop_requested_at_ms.store(
+                ElapsedMilliseconds(event_engine_epoch,
+                                    std::chrono::steady_clock::now()),
+                std::memory_order_release);
+            simulation_duration_reached.store(true, std::memory_order_release);
+            simulation_stop_source.request_stop();
+          });
+    }
     TransactionObservationTracker transaction_tracker;
     for (size_t workload_index = 0; workload_index < runtime_actions.size();
          ++workload_index) {
@@ -10583,8 +10831,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                        : static_cast<std::uint32_t>(workload_index + 1U);
       const std::uint32_t action_count = static_cast<std::uint32_t>(
           is_scheduled ? scheduled_events.size() : options.workloads.size());
+      const std::chrono::milliseconds scheduled_wall_at =
+          options.time_scale.WallDuration(runtime_action.at);
       if (is_scheduled) {
-        WaitUntil(SteadyDeadline(event_engine_epoch, runtime_action.at),
+        WaitUntil(SteadyDeadline(event_engine_epoch, scheduled_wall_at),
                   stop_token);
       }
       const auto action_started = std::chrono::steady_clock::now();
@@ -10592,8 +10842,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         WriteEvent(events_path, options.run_id, "sim",
                    SimulationEventKind::kScheduledEventStarted,
                    boost::json::serialize(ScheduledEventLifecycleDetail(
-                       runtime_action, event_engine_epoch, action_started,
-                       std::nullopt)));
+                       runtime_action, scheduled_wall_at, event_engine_epoch,
+                       action_started, std::nullopt)));
       }
       const ScenarioWorkload& scenario_workload = runtime_action.action;
       try {
@@ -10603,11 +10853,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           if (workload.count == 0U) {
             if (is_scheduled) {
               const auto action_finished = std::chrono::steady_clock::now();
-              WriteEvent(events_path, options.run_id, "sim",
-                         SimulationEventKind::kScheduledEventCompleted,
-                         boost::json::serialize(ScheduledEventLifecycleDetail(
-                             runtime_action, event_engine_epoch, action_started,
-                             action_finished)));
+              WriteEvent(
+                  events_path, options.run_id, "sim",
+                  SimulationEventKind::kScheduledEventCompleted,
+                  boost::json::serialize(ScheduledEventLifecycleDetail(
+                      runtime_action, scheduled_wall_at, event_engine_epoch,
+                      action_started, action_finished)));
             }
             continue;
           }
@@ -10813,18 +11064,19 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           WriteEvent(events_path, options.run_id, "sim",
                      SimulationEventKind::kScheduledEventFailed,
                      boost::json::serialize(ScheduledEventLifecycleDetail(
-                         runtime_action, event_engine_epoch, action_started,
-                         action_finished, e.what())));
+                         runtime_action, scheduled_wall_at, event_engine_epoch,
+                         action_started, action_finished, e.what())));
         }
         throw;
       } catch (...) {
         if (is_scheduled) {
           const auto action_finished = std::chrono::steady_clock::now();
-          WriteEvent(events_path, options.run_id, "sim",
-                     SimulationEventKind::kScheduledEventFailed,
-                     boost::json::serialize(ScheduledEventLifecycleDetail(
-                         runtime_action, event_engine_epoch, action_started,
-                         action_finished, "unknown exception")));
+          WriteEvent(
+              events_path, options.run_id, "sim",
+              SimulationEventKind::kScheduledEventFailed,
+              boost::json::serialize(ScheduledEventLifecycleDetail(
+                  runtime_action, scheduled_wall_at, event_engine_epoch,
+                  action_started, action_finished, "unknown exception")));
         }
         throw;
       }
@@ -10833,13 +11085,14 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         WriteEvent(events_path, options.run_id, "sim",
                    SimulationEventKind::kScheduledEventCompleted,
                    boost::json::serialize(ScheduledEventLifecycleDetail(
-                       runtime_action, event_engine_epoch, action_started,
-                       action_finished)));
+                       runtime_action, scheduled_wall_at, event_engine_epoch,
+                       action_started, action_finished)));
       }
     }
 
     metrics_collector->Wait();
     ThrowIfStopRequested(stop_token);
+    stop_duration_timer();
     stop_command_processor();
     stop_peer_connectivity();
     stop_block_production();
@@ -10856,7 +11109,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                SimulationEventKind::kRunFinished);
     BBP_LOG(info) << "finished run " << options.run_id;
   } catch (const SimulationCancelled&) {
-    handle_run_cancellation();
+    if (simulation_duration_reached.load(std::memory_order_acquire) &&
+        !external_stop_token.stop_requested()) {
+      handle_simulation_duration();
+    } else {
+      handle_run_cancellation();
+    }
   } catch (const std::exception& e) {
     handle_run_failure(e.what());
     throw;

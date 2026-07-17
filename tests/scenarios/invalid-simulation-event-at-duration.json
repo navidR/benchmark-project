@@ -1,0 +1,13 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "duration": "1s"
+  },
+  "nodes": 1,
+  "events": [
+    {
+      "at": "1s",
+      "action": "checkpoint"
+    }
+  ]
+}

@@ -53,6 +53,7 @@ enum class SimulationEventKind {
   kRunStarted,
   kRunFailed,
   kRunCancelled,
+  kSimulationDurationReached,
   kRunFinished,
   kScheduledEventStarted,
   kScheduledEventCompleted,

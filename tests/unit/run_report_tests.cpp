@@ -1279,7 +1279,7 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_scheduled_event_lifecycle) {
   const std::filesystem::path dir = MakeTestDir("run-report-scheduled-events");
   bbp::WriteText(
       dir / "resolved-scenario.json",
-      R"({"run_id":"r1","nodes":1,"events":[{"sequence":1,"at":"10ms","at_ms":10,"action":"restart_node","node":1}]})"
+      R"({"run_id":"r1","simulation":{"name":"scaled","seed":7,"duration":"100ms","duration_ms":100,"wall_duration_ms":50,"time_scale":2.0},"nodes":1,"events":[{"sequence":1,"at":"10ms","at_ms":10,"action":"restart_node","node":1}]})"
       "\n");
   bbp::AppendLine(dir / "events.jsonl",
                   R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
@@ -1295,16 +1295,26 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_scheduled_event_lifecycle) {
   bbp::AppendLine(
       dir / "events.jsonl",
       R"({"run_id":"r1","node_id":"sim","event":"checkpoint_recorded","detail":"{\"workload_index\":1,\"workload_count\":1,\"name\":\"after-heal\",\"node_metric_samples\":1,\"wallet_metric_samples\":0,\"total_metric_samples\":1}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"simulation_duration_reached","detail":"{\"duration_ms\":100,\"wall_duration_ms\":50,\"time_scale\":2.0,\"stop_requested_at_ms\":50,\"elapsed_wall_ms\":50}"})");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
 
   BOOST_REQUIRE_EQUAL(report.at("events").as_array().size(), 1U);
+  BOOST_TEST(report.at("simulation").as_object().at("name").as_string() ==
+             "scaled");
   BOOST_TEST(JsonInteger(report, "scheduled_event_started_count") == 1U);
   BOOST_TEST(JsonInteger(report, "scheduled_event_completed_count") == 1U);
   BOOST_TEST(JsonInteger(report, "scheduled_event_failed_count") == 1U);
   BOOST_TEST(JsonInteger(report, "checkpoint_count") == 1U);
+  BOOST_TEST(report.at("simulation_duration_reached").as_bool());
+  BOOST_TEST(JsonInteger(report.at("simulation_duration").as_object(),
+                         "wall_duration_ms") == 50U);
+  BOOST_TEST(JsonInteger(report.at("simulation_duration").as_object(),
+                         "stop_requested_at_ms") == 50U);
   const boost::json::object& checkpoint = report.at("checkpoints")
                                               .as_array()
                                               .front()

@@ -254,6 +254,7 @@ add_executable(bbp
   src/simulation_event_kind.cpp
   src/simulation_registry.cpp
   src/simulation_network_address_plan.cpp
+  src/simulation_time_scale.cpp
   src/signal_stop_monitor.cpp
   src/simulator_app.cpp
   src/tui.cpp
@@ -328,6 +329,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_command_tests.cpp
     tests/unit/simulation_event_kind_tests.cpp
     tests/unit/simulation_registry_tests.cpp
+    tests/unit/simulation_time_scale_tests.cpp
     tests/unit/signal_stop_monitor_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
@@ -377,6 +379,7 @@ if(BUILD_TESTING)
     src/simulation_command_queue.cpp
     src/simulation_registry.cpp
     src/simulation_network_address_plan.cpp
+    src/simulation_time_scale.cpp
     src/signal_stop_monitor.cpp
     src/tui_command_parser.cpp
     src/util.cpp
@@ -636,6 +639,53 @@ if(BUILD_TESTING)
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-scheduled-events-scenario.json"
       --probe-capabilities
+  )
+  add_test(NAME bbp-valid-canonical-simulation
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-canonical-simulation.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-canonical-simulation-yaml
+    COMMAND bbp
+      --scenario-yaml
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-canonical-simulation.yaml"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-duration-samples
+    tests/scenarios/invalid-simulation-duration-samples.json
+    "simulation duration and metrics_sample_count must not be combined"
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-event-at-duration
+    tests/scenarios/invalid-simulation-event-at-duration.json
+    "scheduled event time must be less than simulation duration"
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-metrics-alias
+    tests/scenarios/invalid-simulation-metrics-alias.json
+    "simulation.metrics_interval and tick_interval are aliases"
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-name
+    tests/scenarios/invalid-simulation-name.json
+    "simulation name contains an unsafe character"
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-output-alias
+    tests/scenarios/invalid-simulation-output-alias.json
+    "simulation.output_dir and top-level output_dir must not be combined"
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-scaled-duration
+    tests/scenarios/invalid-simulation-scaled-duration.json
+    "scaled simulation duration exceeds milliseconds range"
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-time-scale
+    tests/scenarios/invalid-simulation-time-scale.json
+    "simulation time_scale supports at most six decimal places"
   )
   add_test(NAME bbp-valid-profile-switch-events
     COMMAND bbp

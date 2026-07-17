@@ -422,6 +422,46 @@ error detail; unavailable counters are never reported as zero.
 The same run settings can be loaded from a JSON or YAML scenario file. Both
 formats use the same field names and validation rules.
 
+Canonical global run policy belongs in the typed `simulation` object:
+
+```json
+{
+  "simulation": {
+    "name": "firo-regtest-100",
+    "seed": 12345,
+    "duration": "2h",
+    "time_scale": 2.0,
+    "metrics_interval": "1s",
+    "output_dir": "runs",
+    "tui_refresh_interval": "250ms"
+  }
+}
+```
+
+Durations require a positive integer plus `ms`, `s`, `m`, or `h`.
+`time_scale` is a positive fixed-point multiplier with at most six decimal
+places: `2.0` advances scheduled simulation time twice as fast as monotonic
+wall time, while `0.5` advances it at half speed. Conversion rounds wall
+deadlines up to the next millisecond. Scheduled lifecycle details preserve
+`scheduled_at_ms` in simulation time and `scheduled_wall_at_ms` for the scaled
+monotonic deadline; lateness is measured against the latter. Metrics and TUI
+refresh intervals remain wall-clock intervals.
+
+A configured duration is measured from the active event-engine epoch, after
+nodes and wallets are ready. It is a hard, stop-aware boundary and ends with
+`simulation_duration_reached` followed by the normal node cleanup and
+`run_finished` lifecycle. Scheduled events must occur strictly before that
+boundary. `duration` cannot be combined with the legacy positive
+`metrics_sample_count` finite-run mechanism. The global seed is the default for
+block scheduling, seeded topology resolution, and wallet transaction strategy;
+an explicitly configured subsystem seed still takes precedence. CLI
+`--benchmark-root`, `--metrics-interval`, `--refresh-ms`, and block-production
+seed settings override scenario values.
+
+The historical top-level `output_dir`, `metrics_interval_ms`, and
+`metrics_sample_count` fields remain compatibility inputs. Canonical and legacy
+aliases cannot be combined in one scenario.
+
 ```json
 {
   "chain_daemon": "/path/to/firod",

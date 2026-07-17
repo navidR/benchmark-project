@@ -14,6 +14,7 @@
 #include "bbp/network.h"
 #include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulation_registry.h"
+#include "bbp/simulation_time_scale.h"
 #include "bbp/simulator/freeze_request.h"
 #include "bbp/simulator/network_block_rule.h"
 #include "bbp/simulator/network_partition_rule.h"
@@ -36,6 +37,10 @@ struct Options {
   std::filesystem::path report_run;
   std::filesystem::path tui_run;
   std::string run_id = MakeRunId();
+  std::string simulation_name;
+  std::uint64_t simulation_seed = 0U;
+  std::optional<std::chrono::milliseconds> simulation_duration;
+  SimulationTimeScale time_scale = SimulationTimeScale::FromDouble(1.0);
   std::uint32_t nodes = 1;
   std::vector<std::string> node_ids;
   std::vector<std::string> node_roles;

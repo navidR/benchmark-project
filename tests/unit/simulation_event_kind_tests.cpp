@@ -54,6 +54,7 @@ BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
       bbp::SimulationEventKind::kRunStarted,
       bbp::SimulationEventKind::kRunFailed,
       bbp::SimulationEventKind::kRunCancelled,
+      bbp::SimulationEventKind::kSimulationDurationReached,
       bbp::SimulationEventKind::kRunFinished,
       bbp::SimulationEventKind::kScheduledBlockProduced,
       bbp::SimulationEventKind::kScheduledBlockFailed,

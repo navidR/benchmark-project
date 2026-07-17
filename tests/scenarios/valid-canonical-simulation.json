@@ -1,0 +1,20 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "name": "scaled-firo",
+    "seed": 12345,
+    "duration": "200ms",
+    "time_scale": 2.0,
+    "metrics_interval": "25ms",
+    "output_dir": "/tmp/bbp-canonical-simulation",
+    "tui_refresh_interval": "50ms"
+  },
+  "nodes": 1,
+  "events": [
+    {
+      "at": "100ms",
+      "action": "checkpoint",
+      "name": "midpoint"
+    }
+  ]
+}

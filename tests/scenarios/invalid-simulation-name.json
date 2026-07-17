@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "name": "../unsafe"
+  },
+  "nodes": 1
+}

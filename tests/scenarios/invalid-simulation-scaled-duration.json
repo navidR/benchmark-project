@@ -1,0 +1,8 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "duration": "9223372036855ms",
+    "time_scale": 0.000001
+  },
+  "nodes": 1
+}
