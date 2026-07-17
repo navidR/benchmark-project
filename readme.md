@@ -30,6 +30,8 @@ the Firo path is working end to end.
   workloads complete.
 - Record optional periodic metric samples concurrently with wallet setup,
   runtime events, and workloads.
+- Record nine process performance counters through the official Linux
+  `libperf` API, including raw/scaled values and multiplexing times.
 - Record cgroup usage, pressure, event counters, and configured limits.
 - Record Firo daemon version, protocol version, and subversion in metrics.
 - Record event and metric files under a run directory.
@@ -47,6 +49,10 @@ the Firo path is working end to end.
 - A compiled `firod` binary for Firo smoke runs.
 - Privileges/capabilities for network probes, usually `CAP_SYS_ADMIN` and
   `CAP_NET_ADMIN`.
+- Permission to use `perf_event_open(2)` for daemon processes. Prefer
+  `CAP_PERFMON` on kernels that provide it; `CAP_SYS_ADMIN` also grants access
+  on older kernels. The host's `kernel.perf_event_paranoid` and container
+  seccomp policy must permit the call.
 
 The normal development path is a Docker container with the project mounted. The
 examples below use `benchmark-project-codex` as the container name.
@@ -386,6 +392,24 @@ disables scheduled production without disabling metrics.
 `generated_block_count` counts blocks explicitly requested by the simulator;
 native-mining output is reflected in chain height and is not attributed to a
 specific miner unless that chain driver can report the attribution.
+
+Every node sample attempts to include `cycles`, `instructions`, cache and
+branch references/misses, context switches, page faults, and task clock. The
+simulator uses its owned daemon PID and reopens the counters after a restart.
+`perf_counter_target_pid`, `perf_counter_attached_pid`, and
+`perf_counter_process_generation` identify that attachment. Each counter keeps
+its raw value, safely scaled value, enabled time, and running time so
+multiplexing remains visible.
+
+For a Docker run, grant perf access explicitly when it is not already covered
+by the privileged simulator environment, for example with `--cap-add PERFMON`
+(or `--cap-add SYS_ADMIN` on older kernels). Some Docker seccomp profiles also
+deny `perf_event_open`; use an administrator-approved profile that permits the
+syscall. The current host policy can be inspected without changing it at
+`/proc/sys/kernel/perf_event_paranoid`. If the kernel denies or does not support
+the events, the benchmark continues to collect its other metrics and records
+`perf_counters_available: false` with a typed `perf_counter_error_kind` and
+error detail; unavailable counters are never reported as zero.
 
 The same run settings can be loaded from a JSON or YAML scenario file. Both
 formats use the same field names and validation rules.

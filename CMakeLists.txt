@@ -63,6 +63,82 @@ set_target_properties(vendored_libmnl PROPERTIES
   C_VISIBILITY_PRESET hidden
 )
 
+set(LIBPERF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libperf")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|i[3-6]86)$")
+  set(LIBPERF_ARCH x86)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  set(LIBPERF_ARCH arm64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+  set(LIBPERF_ARCH arm)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc|ppc64|ppc64le|powerpc.*)$")
+  set(LIBPERF_ARCH powerpc)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+  set(LIBPERF_ARCH riscv)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^s390")
+  set(LIBPERF_ARCH s390)
+else()
+  message(FATAL_ERROR
+    "vendored libperf has no architecture mapping for ${CMAKE_SYSTEM_PROCESSOR}"
+  )
+endif()
+
+set(LIBPERF_INCLUDE_DIRS
+  "${LIBPERF_ROOT}/tools/lib/perf/include"
+  "${LIBPERF_ROOT}/tools/lib"
+  "${LIBPERF_ROOT}/tools/include"
+  "${LIBPERF_ROOT}/tools/arch/${LIBPERF_ARCH}/include"
+  "${LIBPERF_ROOT}/tools/arch/${LIBPERF_ARCH}/include/uapi"
+  "${LIBPERF_ROOT}/tools/include/uapi"
+)
+
+add_library(vendored_libapi STATIC
+  third_party/libperf/tools/lib/api/cpu.c
+  third_party/libperf/tools/lib/api/debug.c
+  third_party/libperf/tools/lib/api/fd/array.c
+  third_party/libperf/tools/lib/api/fs/cgroup.c
+  third_party/libperf/tools/lib/api/fs/fs.c
+  third_party/libperf/tools/lib/api/fs/tracing_path.c
+  third_party/libperf/tools/lib/str_error_r.c
+)
+target_compile_features(vendored_libapi PRIVATE c_std_99)
+target_compile_definitions(vendored_libapi PRIVATE
+  _LARGEFILE64_SOURCE
+  _FILE_OFFSET_BITS=64
+)
+target_include_directories(vendored_libapi SYSTEM PRIVATE
+  "${LIBPERF_ROOT}/tools/lib/api"
+  "${LIBPERF_ROOT}/tools/include"
+)
+set_target_properties(vendored_libapi PROPERTIES
+  C_EXTENSIONS ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_library(vendored_libperf STATIC
+  third_party/libperf/tools/lib/perf/core.c
+  third_party/libperf/tools/lib/perf/cpumap.c
+  third_party/libperf/tools/lib/perf/evlist.c
+  third_party/libperf/tools/lib/perf/evsel.c
+  third_party/libperf/tools/lib/perf/lib.c
+  third_party/libperf/tools/lib/perf/mmap.c
+  third_party/libperf/tools/lib/perf/threadmap.c
+  third_party/libperf/tools/lib/perf/xyarray.c
+  third_party/libperf/tools/lib/zalloc.c
+)
+add_library(libperf::libperf ALIAS vendored_libperf)
+target_compile_features(vendored_libperf PRIVATE c_std_99)
+target_include_directories(vendored_libperf
+  SYSTEM PUBLIC "${LIBPERF_ROOT}/tools/lib/perf/include"
+  SYSTEM PRIVATE ${LIBPERF_INCLUDE_DIRS}
+)
+target_link_libraries(vendored_libperf PUBLIC vendored_libapi)
+set_target_properties(vendored_libperf PROPERTIES
+  C_EXTENSIONS ON
+  C_VISIBILITY_PRESET hidden
+  POSITION_INDEPENDENT_CODE ON
+  OUTPUT_NAME perf
+)
+
 find_program(MAKE_EXECUTABLE make REQUIRED)
 set(NCURSES_INSTALL_DIR
   "${CMAKE_CURRENT_BINARY_DIR}/third_party/ncurses/install"
@@ -155,6 +231,7 @@ add_executable(bbp
   src/peer_count_policy.cpp
   src/peer_connectivity_controller.cpp
   src/peer_list_pane.cpp
+  src/perf_counter.cpp
   src/periodic_metrics_collector.cpp
   src/positive_duration.cpp
   src/process.cpp
@@ -189,6 +266,7 @@ target_link_libraries(bbp PRIVATE
   Boost::random
   Boost::system
   Boost::url
+  libperf::libperf
   libmnl::libmnl
   ncurses::ncursesw
   yaml::yaml
@@ -221,6 +299,7 @@ if(BUILD_TESTING)
     tests/unit/operator_command_status_tests.cpp
     tests/unit/peer_connectivity_controller_tests.cpp
     tests/unit/peer_list_pane_tests.cpp
+    tests/unit/perf_counter_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/positive_duration_tests.cpp
@@ -265,6 +344,7 @@ if(BUILD_TESTING)
     src/peer_count_policy.cpp
     src/peer_connectivity_controller.cpp
     src/peer_list_pane.cpp
+    src/perf_counter.cpp
     src/periodic_metrics_collector.cpp
     src/positive_duration.cpp
     src/process.cpp
@@ -296,6 +376,7 @@ if(BUILD_TESTING)
     Boost::unit_test_framework
     Boost::system
     Boost::url
+    libperf::libperf
     libmnl::libmnl
   )
   target_compile_options(bbp-unit-tests PRIVATE

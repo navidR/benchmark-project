@@ -10,6 +10,7 @@
 #include "bbp/cgroup.h"
 #include "bbp/drivers/chain_driver.h"
 #include "bbp/network.h"
+#include "bbp/perf_counter.h"
 #include "bbp/process.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/simulator/resource_limits.h"
@@ -24,6 +25,13 @@ struct NodeRuntime {
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
   std::optional<std::chrono::steady_clock::time_point> process_started_at;
+  std::vector<PerfCounterKind> perf_counter_kinds = DefaultPerfCounterKinds();
+  std::optional<ProcessPerfCounters> process_perf_counters;
+  pid_t perf_counter_target_pid = -1;
+  pid_t perf_counter_attached_pid = -1;
+  std::uint64_t perf_counter_process_generation = 0;
+  std::optional<PerfCounterErrorKind> perf_counter_error_kind;
+  std::string perf_counter_error;
   ResourceLimits resources;
   std::string resource_profile;
   std::string network_profile;

@@ -47,6 +47,7 @@
 #include "bbp/network_allocation_lock.h"
 #include "bbp/node_log_collector.h"
 #include "bbp/peer_connectivity_controller.h"
+#include "bbp/perf_counter.h"
 #include "bbp/periodic_metrics_collector.h"
 #include "bbp/positive_duration.h"
 #include "bbp/probabilistic_block_scheduler.h"
@@ -5116,6 +5117,84 @@ boost::json::object DirectionalNetworkPolicyCounterJson(
   return object;
 }
 
+void ResetNodePerfCounters(NodeRuntime& node) {
+  node.process_perf_counters.reset();
+  node.perf_counter_target_pid = -1;
+  node.perf_counter_attached_pid = -1;
+  node.perf_counter_error_kind.reset();
+  node.perf_counter_error.clear();
+}
+
+void SetNodePerfCounterError(NodeRuntime& node, PerfCounterErrorKind kind,
+                             std::string_view error) {
+  node.process_perf_counters.reset();
+  node.perf_counter_attached_pid = -1;
+  node.perf_counter_error_kind = kind;
+  node.perf_counter_error = error;
+}
+
+void AttachNodePerfCounters(NodeRuntime& node) {
+  ResetNodePerfCounters(node);
+  node.perf_counter_target_pid = node.process.pid();
+  node.perf_counter_process_generation = node.RestartCount();
+  if (node.perf_counter_target_pid <= 0 || !node.process.running()) {
+    SetNodePerfCounterError(node, PerfCounterErrorKind::kProcessUnavailable,
+                            "node process is not running");
+    return;
+  }
+
+  const pid_t target_pid = node.perf_counter_target_pid;
+  try {
+    ProcessPerfCounters counters =
+        ProcessPerfCounters::Open(target_pid, node.perf_counter_kinds);
+    if (node.process.pid() != target_pid || !node.process.running()) {
+      SetNodePerfCounterError(
+          node, PerfCounterErrorKind::kProcessUnavailable,
+          "node process exited or changed while perf counters were opening");
+      return;
+    }
+    node.perf_counter_attached_pid = target_pid;
+    node.process_perf_counters.emplace(std::move(counters));
+  } catch (const PerfCounterError& error) {
+    SetNodePerfCounterError(node, error.kind(), error.what());
+    BBP_LOG(warning) << "perf counters unavailable for " << node.config.id
+                     << " pid=" << target_pid << ": " << error.what();
+  }
+}
+
+boost::json::array PerfCounterNamesJson(
+    const std::vector<PerfCounterKind>& kinds) {
+  boost::json::array names;
+  names.reserve(kinds.size());
+  for (const PerfCounterKind kind : kinds) {
+    names.emplace_back(PerfCounterKindName(kind));
+  }
+  return names;
+}
+
+boost::json::array PerfCounterValuesJson(
+    const std::vector<PerfCounterValue>& values) {
+  boost::json::array counters;
+  counters.reserve(values.size());
+  for (const PerfCounterValue& value : values) {
+    boost::json::object counter;
+    counter["name"] = PerfCounterKindName(value.kind);
+    counter["raw_value"] = value.raw_value;
+    if (value.scaled_value) {
+      counter["scaled_value"] = *value.scaled_value;
+    } else {
+      counter["scaled_value"] = nullptr;
+    }
+    counter["time_enabled_ns"] = value.time_enabled_ns;
+    counter["time_running_ns"] = value.time_running_ns;
+    counter["multiplexed"] = value.multiplexed;
+    counter["scaled"] = value.scaled;
+    counter["scaled_overflow"] = value.scaled_overflow;
+    counters.push_back(std::move(counter));
+  }
+  return counters;
+}
+
 struct NodeRuntimeMetrics {
   std::uint32_t node_index = 0;
   std::string chain;
@@ -5139,6 +5218,14 @@ struct NodeRuntimeMetrics {
   std::string node_address;
   std::uint8_t prefix_length = 0;
   std::vector<RouteInfo> routes;
+  std::vector<PerfCounterKind> perf_counter_kinds;
+  pid_t perf_counter_target_pid = -1;
+  pid_t perf_counter_attached_pid = -1;
+  std::uint64_t perf_counter_process_generation = 0;
+  bool perf_counters_available = false;
+  std::optional<PerfCounterErrorKind> perf_counter_error_kind;
+  std::string perf_counter_error;
+  std::vector<PerfCounterValue> perf_counter_values;
 };
 
 std::string MetricsJson(
@@ -5175,6 +5262,33 @@ std::string MetricsJson(
     object["uptime_ms"] = nullptr;
   }
   object["restart_count"] = restart_count;
+  object["perf_counter_names"] =
+      PerfCounterNamesJson(runtime.perf_counter_kinds);
+  if (runtime.perf_counter_target_pid > 0) {
+    object["perf_counter_target_pid"] = runtime.perf_counter_target_pid;
+  } else {
+    object["perf_counter_target_pid"] = nullptr;
+  }
+  if (runtime.perf_counter_attached_pid > 0) {
+    object["perf_counter_attached_pid"] = runtime.perf_counter_attached_pid;
+  } else {
+    object["perf_counter_attached_pid"] = nullptr;
+  }
+  object["perf_counter_process_generation"] =
+      runtime.perf_counter_process_generation;
+  object["perf_counters_available"] = runtime.perf_counters_available;
+  if (runtime.perf_counter_error_kind) {
+    object["perf_counter_error_kind"] =
+        PerfCounterErrorKindName(*runtime.perf_counter_error_kind);
+  } else {
+    object["perf_counter_error_kind"] = nullptr;
+  }
+  if (runtime.perf_counter_error.empty()) {
+    object["perf_counter_error"] = nullptr;
+  } else {
+    object["perf_counter_error"] = runtime.perf_counter_error;
+  }
+  object["perf_counters"] = PerfCounterValuesJson(runtime.perf_counter_values);
   object["cgroup_path"] = runtime.cgroup_path;
   object["data_dir"] = runtime.data_dir;
   object["log_dir"] = runtime.log_dir;
@@ -6021,6 +6135,24 @@ void WriteMetricsSnapshot(
       runtime.pidfd_available = node.process.pidfd() >= 0;
       runtime.process_running = node.process.running();
       runtime.exit_status = node.process.exit_status();
+      runtime.perf_counter_kinds = node.perf_counter_kinds;
+      runtime.perf_counter_target_pid = node.perf_counter_target_pid;
+      runtime.perf_counter_attached_pid = node.perf_counter_attached_pid;
+      runtime.perf_counter_process_generation =
+          node.perf_counter_process_generation;
+      runtime.perf_counter_error_kind = node.perf_counter_error_kind;
+      runtime.perf_counter_error = node.perf_counter_error;
+      if (node.process_perf_counters) {
+        try {
+          runtime.perf_counter_values = node.process_perf_counters->Read();
+          runtime.perf_counters_available = true;
+          runtime.perf_counter_error_kind.reset();
+          runtime.perf_counter_error.clear();
+        } catch (const PerfCounterError& error) {
+          runtime.perf_counter_error_kind = error.kind();
+          runtime.perf_counter_error = error.what();
+        }
+      }
       if (node.process_started_at) {
         const auto now = std::chrono::steady_clock::now();
         runtime.uptime_ms =
@@ -7071,6 +7203,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                      NodeRuntimeLifecycle::kStarting);
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
       runtime.process_started_at = std::chrono::steady_clock::now();
+      AttachNodePerfCounters(runtime);
       BBP_LOG(info) << "started " << node_id
                     << " pid=" << runtime.process.pid();
       WriteEvent(events_path, options.run_id, node_id,
@@ -8785,6 +8918,7 @@ void RestartNode(const Options& options,
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRestartRequested,
              "restart_count=" + std::to_string(node.RestartCount() + 1U));
+  ResetNodePerfCounters(node);
   if (node.cgroup->Frozen()) {
     SetNodeFrozen(options, events_path, node, false, stop_token);
   }
@@ -8795,6 +8929,7 @@ void RestartNode(const Options& options,
       driver.Stop(node.config, stop_token);
     } catch (...) {
       if (node.process.running()) {
+        AttachNodePerfCounters(node);
         node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
         WriteNodeState(events_path, options.run_id, node.config.id,
                        NodeRuntimeLifecycle::kRunning);
@@ -8826,6 +8961,7 @@ void RestartNode(const Options& options,
   node.process = ChildProcess::Spawn(process, node.cgroup->path());
   node.process_started_at = std::chrono::steady_clock::now();
   const std::uint64_t restart_count = node.IncrementRestartCount();
+  AttachNodePerfCounters(node);
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kProcessRestarted,
              RestartDetail(node.process.pid(), restart_count));
@@ -8915,6 +9051,7 @@ void StopNodeProcess(const Options& options,
   if (node.cgroup && node.cgroup->Frozen()) {
     SetNodeFrozen(options, events_path, node, false, stop_token);
   }
+  ResetNodePerfCounters(node);
   node.SetLifecycle(NodeRuntimeLifecycle::kStopping);
   WriteNodeState(events_path, options.run_id, node.config.id,
                  NodeRuntimeLifecycle::kStopping);
@@ -8939,6 +9076,7 @@ void StopNodeProcess(const Options& options,
     }
   } catch (...) {
     if (node.process.running()) {
+      AttachNodePerfCounters(node);
       node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
       WriteNodeState(events_path, options.run_id, node.config.id,
                      NodeRuntimeLifecycle::kRunning);
@@ -9049,6 +9187,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
   };
 
   for (auto& node : nodes) {
+    ResetNodePerfCounters(node);
     RunNodeCleanupStep(best_effort, "stopping state event", [&] {
       WriteNodeState(events_path, options.run_id, node.config.id,
                      NodeRuntimeLifecycle::kStopping);

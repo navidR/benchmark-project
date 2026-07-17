@@ -258,6 +258,17 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"cpu_usage_usec\":10,\"cpu_weight\":250,\"io_weight\":300,"
       "\"memory_current\":20,\"memory_stat\":{\"anon\":19},"
       "\"memory_high_limit_bytes\":null,\"io_read_bytes\":30,"
+      "\"perf_counter_names\":[\"cycles\",\"task-clock\"],"
+      "\"perf_counter_target_pid\":123,"
+      "\"perf_counter_attached_pid\":123,"
+      "\"perf_counter_process_generation\":1,"
+      "\"perf_counters_available\":true,"
+      "\"perf_counter_error_kind\":null,\"perf_counter_error\":null,"
+      "\"perf_counters\":[{\"name\":\"cycles\","
+      "\"raw_value\":100,\"scaled_value\":125,"
+      "\"time_enabled_ns\":1000,\"time_running_ns\":800,"
+      "\"multiplexed\":true,\"scaled\":true,"
+      "\"scaled_overflow\":false}],"
       "\"io_read_operations\":4,\"io_write_operations\":5,"
       "\"io_discard_bytes\":6,\"io_discard_operations\":7,"
       "\"io_max\":[{\"device\":\"252:1\","
@@ -547,6 +558,25 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "memory_current") == 20U);
   BOOST_TEST(last_metrics.at("memory_high_limit_bytes").is_null());
   BOOST_TEST(JsonInteger(last_metrics, "io_read_bytes") == 30U);
+  BOOST_TEST(last_metrics.at("perf_counters_available").as_bool());
+  BOOST_TEST(JsonInteger(last_metrics, "perf_counter_target_pid") == 123U);
+  BOOST_TEST(JsonInteger(last_metrics, "perf_counter_attached_pid") == 123U);
+  BOOST_TEST(JsonInteger(last_metrics, "perf_counter_process_generation") ==
+             1U);
+  BOOST_REQUIRE_EQUAL(last_metrics.at("perf_counter_names").as_array().size(),
+                      2U);
+  BOOST_TEST(last_metrics.at("perf_counter_error_kind").is_null());
+  BOOST_REQUIRE_EQUAL(last_metrics.at("perf_counters").as_array().size(), 1U);
+  const boost::json::object& perf_counter =
+      last_metrics.at("perf_counters").as_array()[0].as_object();
+  BOOST_TEST(perf_counter.at("name").as_string() == "cycles");
+  BOOST_TEST(JsonInteger(perf_counter, "raw_value") == 100U);
+  BOOST_TEST(JsonInteger(perf_counter, "scaled_value") == 125U);
+  BOOST_TEST(JsonInteger(perf_counter, "time_enabled_ns") == 1000U);
+  BOOST_TEST(JsonInteger(perf_counter, "time_running_ns") == 800U);
+  BOOST_TEST(perf_counter.at("multiplexed").as_bool());
+  BOOST_TEST(perf_counter.at("scaled").as_bool());
+  BOOST_TEST(!perf_counter.at("scaled_overflow").as_bool());
   BOOST_TEST(JsonInteger(last_metrics, "cpu_weight") == 250U);
   BOOST_TEST(JsonInteger(last_metrics, "io_weight") == 300U);
   BOOST_TEST(JsonInteger(last_metrics, "io_read_operations") == 4U);

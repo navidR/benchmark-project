@@ -45,7 +45,7 @@ constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
-constexpr int kDetailPaneRows = 23;
+constexpr int kDetailPaneRows = 25;
 
 struct PendingConfirmation {
   ParsedTuiCommand command;
@@ -1098,6 +1098,36 @@ void AddDetailPair(int y, int x, int width, std::string_view label,
   AddText(y, x, width, text);
 }
 
+std::string PerfCounterSummaryText(const boost::json::object& metrics) {
+  const boost::json::value* counters_value =
+      metrics.if_contains("perf_counters");
+  std::vector<std::string> summaries;
+  if (counters_value != nullptr && counters_value->is_array()) {
+    for (const boost::json::value& value : counters_value->as_array()) {
+      if (!value.is_object()) {
+        continue;
+      }
+      const boost::json::object& counter = value.as_object();
+      const std::string name = JsonString(counter, "name");
+      if (name.empty()) {
+        continue;
+      }
+      std::string count = JsonIntegerText(counter, "scaled_value");
+      if (count == "-") {
+        count = JsonIntegerText(counter, "raw_value");
+      }
+      summaries.push_back(name + "=" + count);
+    }
+  }
+  if (!summaries.empty()) {
+    return boost::algorithm::join(summaries, " ");
+  }
+  const std::string configured =
+      JsonStringArrayText(metrics, "perf_counter_names");
+  const std::string error = JsonString(metrics, "perf_counter_error");
+  return error.empty() ? configured : configured + "; " + error;
+}
+
 void DrawSelectedNodeDetail(int top, int bottom, int cols,
                             const boost::json::object& report,
                             std::size_t selected_node,
@@ -1327,6 +1357,26 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   AddDetailPair(y, left_width, right_width, "peer policy",
                 SelectedPeerPolicyText(report, selected_node,
                                        JsonString(*node, "node_id")));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(
+      y, 0, left_width, "perf status",
+      JsonBool(metric_object, "perf_counters_available").value_or(false)
+          ? "available"
+          : JsonMetricText(metric_object, "perf_counter_error_kind"));
+  AddDetailPair(
+      y, left_width, right_width, "perf target / attached / gen",
+      JsonMetricText(metric_object, "perf_counter_target_pid") + " / " +
+          JsonMetricText(metric_object, "perf_counter_attached_pid") + " / " +
+          JsonMetricText(metric_object, "perf_counter_process_generation"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "perf counters",
+                PerfCounterSummaryText(metric_object));
 }
 
 const boost::json::object& JsonObjectFieldOrEmpty(
