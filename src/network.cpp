@@ -1090,6 +1090,25 @@ UniqueFd StartNetworkNamespaceHelper(pid_t* helper_pid) {
   }
 }
 
+template <typename Payload>
+Payload CopyAttributePayload(const nlattr* attr) {
+  static_assert(std::is_trivially_copyable_v<Payload>);
+  Payload payload{};
+  std::memcpy(&payload, mnl_attr_get_payload(attr), sizeof(payload));
+  return payload;
+}
+
+template <typename Payload>
+bool CopyMessagePayload(const nlmsghdr* message, Payload* payload) {
+  static_assert(std::is_trivially_copyable_v<Payload>);
+  if (mnl_nlmsg_get_payload_len(message) < sizeof(*payload)) {
+    errno = EINVAL;
+    return false;
+  }
+  std::memcpy(payload, mnl_nlmsg_get_payload(message), sizeof(*payload));
+  return true;
+}
+
 int ParseLinkAttr(const nlattr* attr, void* data) {
   auto* link = static_cast<LinkInfo*>(data);
   const uint16_t type = mnl_attr_get_type(attr);
@@ -1108,9 +1127,7 @@ int ParseLinkAttr(const nlattr* attr, void* data) {
       errno = EINVAL;
       return MNL_CB_ERROR;
     }
-    StoreLinkStats64(
-        *static_cast<const rtnl_link_stats64*>(mnl_attr_get_payload(attr)),
-        link);
+    StoreLinkStats64(CopyAttributePayload<rtnl_link_stats64>(attr), link);
   }
   if (type == IFLA_STATS && !link->has_stats) {
     if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
@@ -1118,8 +1135,7 @@ int ParseLinkAttr(const nlattr* attr, void* data) {
       errno = EINVAL;
       return MNL_CB_ERROR;
     }
-    StoreLinkStats32(
-        *static_cast<const rtnl_link_stats*>(mnl_attr_get_payload(attr)), link);
+    StoreLinkStats32(CopyAttributePayload<rtnl_link_stats>(attr), link);
   }
   return MNL_CB_OK;
 }
@@ -1130,12 +1146,14 @@ int ParseLinkMessage(const nlmsghdr* nlh, void* data) {
     return MNL_CB_OK;
   }
 
-  const auto* message =
-      static_cast<const ifinfomsg*>(mnl_nlmsg_get_payload(nlh));
+  ifinfomsg message{};
+  if (!CopyMessagePayload(nlh, &message)) {
+    return MNL_CB_ERROR;
+  }
   LinkInfo link;
-  link.index = message->ifi_index;
-  link.up = (message->ifi_flags & IFF_UP) != 0U;
-  if (mnl_attr_parse(nlh, sizeof(*message), ParseLinkAttr, &link) < 0) {
+  link.index = message.ifi_index;
+  link.up = (message.ifi_flags & IFF_UP) != 0U;
+  if (mnl_attr_parse(nlh, sizeof(message), ParseLinkAttr, &link) < 0) {
     return MNL_CB_ERROR;
   }
   links->push_back(std::move(link));
@@ -1196,21 +1214,23 @@ int ParseAddressMessage(const nlmsghdr* nlh, void* data) {
     return MNL_CB_OK;
   }
 
-  const auto* message =
-      static_cast<const ifaddrmsg*>(mnl_nlmsg_get_payload(nlh));
-  if (message->ifa_family != AF_INET) {
+  ifaddrmsg message{};
+  if (!CopyMessagePayload(nlh, &message)) {
+    return MNL_CB_ERROR;
+  }
+  if (message.ifa_family != AF_INET) {
     return MNL_CB_OK;
   }
 
   AddressParseState state;
-  state.address.if_index = static_cast<int>(message->ifa_index);
-  state.address.prefix_len = message->ifa_prefixlen;
-  if (mnl_attr_parse(nlh, sizeof(*message), ParseAddressAttr, &state) < 0) {
+  state.address.if_index = static_cast<int>(message.ifa_index);
+  state.address.prefix_len = message.ifa_prefixlen;
+  if (mnl_attr_parse(nlh, sizeof(message), ParseAddressAttr, &state) < 0) {
     return MNL_CB_ERROR;
   }
   if (state.address.if_name.empty()) {
     char if_name[IF_NAMESIZE] = {};
-    if (if_indextoname(message->ifa_index, if_name) != nullptr) {
+    if (if_indextoname(message.ifa_index, if_name) != nullptr) {
       state.address.if_name = if_name;
     }
   }
@@ -1275,19 +1295,22 @@ int ParseRouteMessage(const nlmsghdr* nlh, void* data) {
     return MNL_CB_OK;
   }
 
-  const auto* message = static_cast<const rtmsg*>(mnl_nlmsg_get_payload(nlh));
-  if (message->rtm_family != AF_INET) {
+  rtmsg message{};
+  if (!CopyMessagePayload(nlh, &message)) {
+    return MNL_CB_ERROR;
+  }
+  if (message.rtm_family != AF_INET) {
     return MNL_CB_OK;
   }
 
   RouteInfo route;
   route.destination = "0.0.0.0";
-  route.prefix_len = message->rtm_dst_len;
-  route.table = message->rtm_table;
-  route.protocol = message->rtm_protocol;
-  route.scope = message->rtm_scope;
-  route.type = message->rtm_type;
-  if (mnl_attr_parse(nlh, sizeof(*message), ParseRouteAttr, &route) < 0) {
+  route.prefix_len = message.rtm_dst_len;
+  route.table = message.rtm_table;
+  route.protocol = message.rtm_protocol;
+  route.scope = message.rtm_scope;
+  route.type = message.rtm_type;
+  if (mnl_attr_parse(nlh, sizeof(message), ParseRouteAttr, &route) < 0) {
     return MNL_CB_ERROR;
   }
   if (route.oif_index > 0) {
@@ -1323,13 +1346,12 @@ int ParseTbfOptionAttr(const nlattr* attr, void* data) {
         errno = EINVAL;
         return MNL_CB_ERROR;
       } else {
-        const auto* options =
-            static_cast<const tc_tbf_qopt*>(mnl_attr_get_payload(attr));
+        const tc_tbf_qopt options = CopyAttributePayload<tc_tbf_qopt>(attr);
         qdisc->has_tbf_options = true;
-        qdisc->tbf_rate_bytes_per_sec = options->rate.rate;
-        qdisc->tbf_limit_bytes = options->limit;
-        qdisc->tbf_buffer_ticks = options->buffer;
-        qdisc->tbf_mtu_ticks = options->mtu;
+        qdisc->tbf_rate_bytes_per_sec = options.rate.rate;
+        qdisc->tbf_limit_bytes = options.limit;
+        qdisc->tbf_buffer_ticks = options.buffer;
+        qdisc->tbf_mtu_ticks = options.mtu;
       }
       return MNL_CB_OK;
     case TCA_TBF_RATE64:
@@ -1358,10 +1380,10 @@ int ParseNetemNestedOptionAttr(const nlattr* attr, void* data) {
         errno = EINVAL;
         return MNL_CB_ERROR;
       } else {
-        const auto* options =
-            static_cast<const tc_netem_reorder*>(mnl_attr_get_payload(attr));
+        const tc_netem_reorder options =
+            CopyAttributePayload<tc_netem_reorder>(attr);
         qdisc->has_netem_options = true;
-        qdisc->netem_reorder = options->probability;
+        qdisc->netem_reorder = options.probability;
       }
       return MNL_CB_OK;
     case TCA_NETEM_CORRUPT:
@@ -1370,10 +1392,10 @@ int ParseNetemNestedOptionAttr(const nlattr* attr, void* data) {
         errno = EINVAL;
         return MNL_CB_ERROR;
       } else {
-        const auto* options =
-            static_cast<const tc_netem_corrupt*>(mnl_attr_get_payload(attr));
+        const tc_netem_corrupt options =
+            CopyAttributePayload<tc_netem_corrupt>(attr);
         qdisc->has_netem_options = true;
-        qdisc->netem_corrupt = options->probability;
+        qdisc->netem_corrupt = options.probability;
       }
       return MNL_CB_OK;
     default:
@@ -1388,14 +1410,13 @@ int ParseNetemOptions(const nlattr* attr, QdiscInfo* qdisc) {
     return MNL_CB_OK;
   }
 
-  const auto* options =
-      static_cast<const tc_netem_qopt*>(mnl_attr_get_payload(attr));
+  const tc_netem_qopt options = CopyAttributePayload<tc_netem_qopt>(attr);
   qdisc->has_netem_options = true;
-  qdisc->netem_latency_us = options->latency;
-  qdisc->netem_jitter_us = options->jitter;
-  qdisc->netem_loss = options->loss;
-  qdisc->netem_duplicate = options->duplicate;
-  qdisc->netem_limit_packets = options->limit;
+  qdisc->netem_latency_us = options.latency;
+  qdisc->netem_jitter_us = options.jitter;
+  qdisc->netem_loss = options.loss;
+  qdisc->netem_duplicate = options.duplicate;
+  qdisc->netem_limit_packets = options.limit;
 
   const std::size_t nested_offset = MNL_ALIGN(sizeof(tc_netem_qopt));
   if (payload_len <= nested_offset) {
@@ -1414,10 +1435,9 @@ int ParsePrioOptions(const nlattr* attr, QdiscInfo* qdisc) {
     errno = EINVAL;
     return MNL_CB_ERROR;
   }
-  const auto* options =
-      static_cast<const tc_prio_qopt*>(mnl_attr_get_payload(attr));
+  const tc_prio_qopt options = CopyAttributePayload<tc_prio_qopt>(attr);
   qdisc->has_prio_options = true;
-  qdisc->prio_bands = options->bands;
+  qdisc->prio_bands = options.bands;
   return MNL_CB_OK;
 }
 
@@ -1442,15 +1462,14 @@ int ParseQdiscAttr(const nlattr* attr, void* data) {
         errno = EINVAL;
         return MNL_CB_ERROR;
       } else {
-        const auto* stats =
-            static_cast<const tc_stats*>(mnl_attr_get_payload(attr));
+        const tc_stats stats = CopyAttributePayload<tc_stats>(attr);
         qdisc->has_stats = true;
-        qdisc->bytes = stats->bytes;
-        qdisc->packets = stats->packets;
-        qdisc->drops = stats->drops;
-        qdisc->overlimits = stats->overlimits;
-        qdisc->qlen = stats->qlen;
-        qdisc->backlog = stats->backlog;
+        qdisc->bytes = stats.bytes;
+        qdisc->packets = stats.packets;
+        qdisc->drops = stats.drops;
+        qdisc->overlimits = stats.overlimits;
+        qdisc->qlen = stats.qlen;
+        qdisc->backlog = stats.backlog;
       }
       return MNL_CB_OK;
     case TCA_OPTIONS: {
@@ -1492,11 +1511,11 @@ int ParseQdiscStats2Attr(const nlattr* attr, void* data) {
         errno = EINVAL;
         return MNL_CB_ERROR;
       } else {
-        const auto* stats =
-            static_cast<const gnet_stats_basic*>(mnl_attr_get_payload(attr));
+        const gnet_stats_basic stats =
+            CopyAttributePayload<gnet_stats_basic>(attr);
         qdisc->has_stats = true;
-        qdisc->bytes = stats->bytes;
-        qdisc->packets = stats->packets;
+        qdisc->bytes = stats.bytes;
+        qdisc->packets = stats.packets;
       }
       return MNL_CB_OK;
     case TCA_STATS_PKT64:
@@ -1512,14 +1531,14 @@ int ParseQdiscStats2Attr(const nlattr* attr, void* data) {
         errno = EINVAL;
         return MNL_CB_ERROR;
       } else {
-        const auto* stats =
-            static_cast<const gnet_stats_queue*>(mnl_attr_get_payload(attr));
+        const gnet_stats_queue stats =
+            CopyAttributePayload<gnet_stats_queue>(attr);
         qdisc->has_stats = true;
-        qdisc->qlen = stats->qlen;
-        qdisc->backlog = stats->backlog;
-        qdisc->drops = stats->drops;
-        qdisc->requeues = stats->requeues;
-        qdisc->overlimits = stats->overlimits;
+        qdisc->qlen = stats.qlen;
+        qdisc->backlog = stats.backlog;
+        qdisc->drops = stats.drops;
+        qdisc->requeues = stats.requeues;
+        qdisc->overlimits = stats.overlimits;
       }
       return MNL_CB_OK;
     default:
@@ -1545,12 +1564,15 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
     return MNL_CB_OK;
   }
 
-  const auto* message = static_cast<const tcmsg*>(mnl_nlmsg_get_payload(nlh));
+  tcmsg message{};
+  if (!CopyMessagePayload(nlh, &message)) {
+    return MNL_CB_ERROR;
+  }
   QdiscInfo qdisc;
-  qdisc.if_index = message->tcm_ifindex;
-  qdisc.handle = message->tcm_handle;
-  qdisc.parent = message->tcm_parent;
-  qdisc.info = message->tcm_info;
+  qdisc.if_index = message.tcm_ifindex;
+  qdisc.handle = message.tcm_handle;
+  qdisc.parent = message.tcm_parent;
+  qdisc.info = message.tcm_info;
   if (qdisc.if_index > 0) {
     char if_name[IF_NAMESIZE] = {};
     if (if_indextoname(static_cast<unsigned int>(qdisc.if_index), if_name) !=
@@ -1558,7 +1580,7 @@ int ParseQdiscMessage(const nlmsghdr* nlh, void* data) {
       qdisc.if_name = if_name;
     }
   }
-  if (mnl_attr_parse(nlh, sizeof(*message), ParseQdiscTopLevelAttr, &qdisc) <
+  if (mnl_attr_parse(nlh, sizeof(message), ParseQdiscTopLevelAttr, &qdisc) <
       0) {
     return MNL_CB_ERROR;
   }
@@ -1601,11 +1623,11 @@ int ParseFilterStats2Attr(const nlattr* attr, void* data) {
         errno = EINVAL;
         return MNL_CB_ERROR;
       } else {
-        const auto* stats =
-            static_cast<const gnet_stats_basic*>(mnl_attr_get_payload(attr));
+        const gnet_stats_basic stats =
+            CopyAttributePayload<gnet_stats_basic>(attr);
         filter->has_stats = true;
-        filter->match_bytes = stats->bytes;
-        filter->match_packets = stats->packets;
+        filter->match_bytes = stats.bytes;
+        filter->match_packets = stats.packets;
       }
       return MNL_CB_OK;
     case TCA_STATS_PKT64:
@@ -1626,10 +1648,10 @@ int ParseLegacyFilterStats(const nlattr* attr, TcFilterInfo* filter) {
     errno = EINVAL;
     return MNL_CB_ERROR;
   }
-  const auto* stats = static_cast<const tc_stats*>(mnl_attr_get_payload(attr));
+  const tc_stats stats = CopyAttributePayload<tc_stats>(attr);
   filter->has_stats = true;
-  filter->match_bytes = stats->bytes;
-  filter->match_packets = stats->packets;
+  filter->match_bytes = stats.bytes;
+  filter->match_packets = stats.packets;
   return MNL_CB_OK;
 }
 
@@ -1664,8 +1686,8 @@ int ParseGactOptionAttr(const nlattr* attr, void* data) {
     return MNL_CB_ERROR;
   }
 
-  const auto* options = static_cast<const tc_gact*>(mnl_attr_get_payload(attr));
-  action->drop = options->action == TC_ACT_SHOT;
+  const tc_gact options = CopyAttributePayload<tc_gact>(attr);
+  action->drop = options.action == TC_ACT_SHOT;
   return MNL_CB_OK;
 }
 
@@ -1859,16 +1881,19 @@ int ParseFilterMessage(const nlmsghdr* nlh, void* data) {
     return MNL_CB_OK;
   }
 
-  const auto* message = static_cast<const tcmsg*>(mnl_nlmsg_get_payload(nlh));
+  tcmsg message{};
+  if (!CopyMessagePayload(nlh, &message)) {
+    return MNL_CB_ERROR;
+  }
   TcFilterInfo filter;
-  filter.if_index = message->tcm_ifindex;
-  filter.handle = message->tcm_handle;
-  filter.parent = message->tcm_parent;
-  filter.priority = TC_H_MAJ(message->tcm_info) >> 16U;
+  filter.if_index = message.tcm_ifindex;
+  filter.handle = message.tcm_handle;
+  filter.parent = message.tcm_parent;
+  filter.priority = TC_H_MAJ(message.tcm_info) >> 16U;
   filter.protocol =
-      ntohs(static_cast<std::uint16_t>(TC_H_MIN(message->tcm_info)));
-  filter.egress = message->tcm_parent == kClsactEgressParent;
-  filter.ingress = message->tcm_parent == kClsactIngressParent;
+      ntohs(static_cast<std::uint16_t>(TC_H_MIN(message.tcm_info)));
+  filter.egress = message.tcm_parent == kClsactEgressParent;
+  filter.ingress = message.tcm_parent == kClsactIngressParent;
   if (filter.if_index > 0) {
     char if_name[IF_NAMESIZE] = {};
     if (if_indextoname(static_cast<unsigned int>(filter.if_index), if_name) !=
@@ -1876,7 +1901,7 @@ int ParseFilterMessage(const nlmsghdr* nlh, void* data) {
       filter.if_name = if_name;
     }
   }
-  if (mnl_attr_parse(nlh, sizeof(*message), ParseFilterAttr, &filter) < 0) {
+  if (mnl_attr_parse(nlh, sizeof(message), ParseFilterAttr, &filter) < 0) {
     return MNL_CB_ERROR;
   }
   if (filter.has_drop_action && filter.has_stats) {
