@@ -229,6 +229,8 @@ add_executable(bbp
   src/network.cpp
   src/network_rule_pane.cpp
   src/network_allocation_lock.cpp
+  src/node_artifact_inventory.cpp
+  src/node_file_pane.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
   src/operator_command_status.cpp
@@ -301,6 +303,8 @@ if(BUILD_TESTING)
     tests/unit/metric_sparkline_tests.cpp
     tests/unit/network_tests.cpp
     tests/unit/network_rule_pane_tests.cpp
+    tests/unit/node_artifact_inventory_tests.cpp
+    tests/unit/node_file_pane_tests.cpp
     tests/unit/simulation_network_address_plan_tests.cpp
     tests/unit/node_log_pane_tests.cpp
     tests/unit/node_runtime_tests.cpp
@@ -351,6 +355,8 @@ if(BUILD_TESTING)
     src/network.cpp
     src/network_rule_pane.cpp
     src/network_allocation_lock.cpp
+    src/node_artifact_inventory.cpp
+    src/node_file_pane.cpp
     src/node_log_pane.cpp
     src/operator_command_status.cpp
     src/peer_count_policy.cpp

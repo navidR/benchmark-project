@@ -28,6 +28,7 @@
 #include "bbp/log_view.h"
 #include "bbp/metric_sparkline.h"
 #include "bbp/network_rule_pane.h"
+#include "bbp/node_file_pane.h"
 #include "bbp/node_log_pane.h"
 #include "bbp/operator_command_status.h"
 #include "bbp/peer_list_pane.h"
@@ -60,6 +61,7 @@ struct TuiState {
   std::size_t selected_wallet = 0;
   std::size_t selected_topology_group = 0;
   TuiView view = TuiView::kNodes;
+  NodeFilePane node_file_pane;
   NodeLogPane node_log_pane;
   PeerListPane peer_list_pane;
   NetworkRulePane network_rule_pane;
@@ -1119,6 +1121,43 @@ void DrawNetworkRulePane(int content_bottom, int cols,
   DrawHorizontalLine(content_bottom - 1);
 }
 
+void DrawNodeFilePane(int content_bottom, int cols,
+                      const NodeFilePane& file_pane) {
+  constexpr int kPaneTop = 2;
+  if (!file_pane.IsOpen() || cols <= 0 ||
+      NodeLogVisibleRows(content_bottom) <= 0) {
+    return;
+  }
+  for (int y = kPaneTop; y < content_bottom; ++y) {
+    mvhline(y, 0, ' ', cols);
+  }
+  DrawHorizontalLine(kPaneTop);
+  const std::size_t visible_rows =
+      static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
+  const std::size_t first = file_pane.FirstVisibleLine(visible_rows);
+  const std::size_t last = file_pane.LastVisibleLine(visible_rows);
+  std::string title = "Node Files: ";
+  title += file_pane.NodeId().empty() ? "-" : file_pane.NodeId();
+  title += " / ";
+  title += NodeFileSectionName(file_pane.Section());
+  title += " [left/right section]";
+  if (!file_pane.Lines().empty()) {
+    title += " [" + std::to_string(first + 1U) + "-" + std::to_string(last) +
+             "/" + std::to_string(file_pane.Lines().size()) + "]";
+  }
+  AddText(kPaneTop + 1, 0, cols, title, A_BOLD);
+  if (file_pane.Lines().empty()) {
+    AddText(kPaneTop + 2, 0, cols, "No entries.", COLOR_PAIR(kColorMuted));
+  } else {
+    int y = kPaneTop + 2;
+    for (std::size_t index = first; index < last; ++index) {
+      AddText(y, 0, cols, file_pane.Lines()[index]);
+      ++y;
+    }
+  }
+  DrawHorizontalLine(content_bottom - 1);
+}
+
 void DrawCommandErrorPopup(int rows, int cols, std::string_view message) {
   constexpr int kPopupRows = 7;
   if (rows < kPopupRows + 2 || cols < 32) {
@@ -1820,7 +1859,8 @@ void DrawSummary(
     TuiView view, std::size_t selected_node, std::size_t selected_wallet,
     std::size_t selected_topology_group, const NodeLogPane& node_log_pane,
     const PeerListPane& peer_list_pane,
-    const NetworkRulePane& network_rule_pane, std::string_view command_status,
+    const NetworkRulePane& network_rule_pane,
+    const NodeFilePane& node_file_pane, std::string_view command_status,
     bool command_error_open, std::string_view command_error,
     bool command_palette_open, std::string_view command_input,
     std::string_view command_input_error,
@@ -1829,7 +1869,9 @@ void DrawSummary(
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
   erase();
-  const int log_rows = view == TuiView::kMetrics ? 0 : LogPaneRows(rows);
+  const int log_rows = view == TuiView::kMetrics || node_file_pane.IsOpen()
+                           ? 0
+                           : LogPaneRows(rows);
   const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
   const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
 
@@ -2165,6 +2207,7 @@ void DrawSummary(
   DrawNodeLogPane(content_bottom, cols, node_log_pane);
   DrawPeerListPane(content_bottom, cols, peer_list_pane);
   DrawNetworkRulePane(content_bottom, cols, network_rule_pane);
+  DrawNodeFilePane(content_bottom, cols, node_file_pane);
   DrawHorizontalLine(rows - 2);
   std::string footer;
   if (!command_status.empty()) {
@@ -2180,10 +2223,14 @@ void DrawSummary(
     footer +=
         "Rules: arrows/PgUp/PgDn/Home/End scroll. a closes. Use "
         "clear-rule <handle>.";
+  } else if (node_file_pane.IsOpen()) {
+    footer +=
+        "Files: left/right or [/] section; arrows/PgUp/PgDn/Home/End scroll; "
+        "u reloads; b closes.";
   } else {
     footer +=
-        "Tab/n/w/g/h view. Arrows select. p peers. a rules. c command. e "
-        "export. "
+        "Tab/n/w/g/h view. Arrows select. b files. p peers. a rules. c "
+        "command. e export. "
         "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. q "
         "exits.";
   }
@@ -2211,6 +2258,14 @@ std::size_t CurrentNodeLogVisibleRows() {
   const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
   const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
   return static_cast<std::size_t>(NodeLogVisibleRows(content_bottom));
+}
+
+std::size_t CurrentNodeFileVisibleRows() {
+  int rows = 0;
+  int cols = 0;
+  getmaxyx(stdscr, rows, cols);
+  static_cast<void>(cols);
+  return static_cast<std::size_t>(NodeLogVisibleRows(rows - 2));
 }
 
 std::uint64_t BlockProductionSeed(const boost::json::object& report) {
@@ -2446,7 +2501,8 @@ bool HandleCommandConfirmationInput(int ch, const boost::json::object& report,
   return ch != ERR;
 }
 
-bool HandleInput(int ch, const boost::json::object& report,
+bool HandleInput(int ch, const std::filesystem::path& run_root,
+                 const boost::json::object& report,
                  SimulationCommandQueue* command_queue, TuiState* state) {
   if (state->pending_confirmation) {
     return HandleCommandConfirmationInput(ch, report, command_queue, state);
@@ -2480,6 +2536,7 @@ bool HandleInput(int ch, const boost::json::object& report,
         state->node_log_pane.Close();
         state->peer_list_pane.Close();
         state->network_rule_pane.Close();
+        state->node_file_pane.Close();
         break;
       case TuiView::kTopology:
         state->view = TuiView::kMetrics;
@@ -2503,6 +2560,7 @@ bool HandleInput(int ch, const boost::json::object& report,
     state->node_log_pane.Close();
     state->peer_list_pane.Close();
     state->network_rule_pane.Close();
+    state->node_file_pane.Close();
     return true;
   }
   if (ch == 'h' || ch == 'H') {
@@ -2510,6 +2568,7 @@ bool HandleInput(int ch, const boost::json::object& report,
     state->node_log_pane.Close();
     state->peer_list_pane.Close();
     state->network_rule_pane.Close();
+    state->node_file_pane.Close();
     return true;
   }
 
@@ -2522,6 +2581,7 @@ bool HandleInput(int ch, const boost::json::object& report,
     }
     state->peer_list_pane.Close();
     state->network_rule_pane.Close();
+    state->node_file_pane.Close();
     state->node_log_pane.Toggle(report, *selected_node);
     return true;
   }
@@ -2535,6 +2595,7 @@ bool HandleInput(int ch, const boost::json::object& report,
     }
     state->node_log_pane.Close();
     state->network_rule_pane.Close();
+    state->node_file_pane.Close();
     state->peer_list_pane.Toggle(report, *selected_node);
     return true;
   }
@@ -2548,7 +2609,53 @@ bool HandleInput(int ch, const boost::json::object& report,
     }
     state->node_log_pane.Close();
     state->peer_list_pane.Close();
+    state->node_file_pane.Close();
     state->network_rule_pane.Toggle(report, *selected_node);
+    return true;
+  }
+
+  if (ch == 'b' || ch == 'B') {
+    const std::optional<std::size_t> selected_node =
+        SelectedNodeIndex(report, *state);
+    if (!selected_node) {
+      state->command_status = "No backing node is selected.";
+      return true;
+    }
+    state->node_log_pane.Close();
+    state->peer_list_pane.Close();
+    state->network_rule_pane.Close();
+    state->node_file_pane.Toggle(run_root, report, *selected_node);
+    return true;
+  }
+
+  if (state->node_file_pane.IsOpen()) {
+    const std::size_t visible_rows = CurrentNodeFileVisibleRows();
+    const std::size_t page_rows = std::max<std::size_t>(visible_rows, 1U);
+    if (ch == KEY_LEFT || ch == '[') {
+      state->node_file_pane.PreviousSection();
+    } else if (ch == KEY_RIGHT || ch == ']') {
+      state->node_file_pane.NextSection();
+    } else if (ch == KEY_UP) {
+      state->node_file_pane.ScrollUp(visible_rows, 1U);
+    } else if (ch == KEY_DOWN) {
+      state->node_file_pane.ScrollDown(visible_rows, 1U);
+    } else if (ch == KEY_PPAGE) {
+      state->node_file_pane.ScrollUp(visible_rows, page_rows);
+    } else if (ch == KEY_NPAGE) {
+      state->node_file_pane.ScrollDown(visible_rows, page_rows);
+    } else if (ch == KEY_HOME) {
+      state->node_file_pane.ScrollHome();
+    } else if (ch == KEY_END) {
+      state->node_file_pane.ScrollEnd(visible_rows);
+    } else if (ch == 'u' || ch == 'U') {
+      const std::optional<std::size_t> selected_node =
+          SelectedNodeIndex(report, *state);
+      if (selected_node) {
+        state->node_file_pane.Reload(run_root, report, *selected_node);
+      }
+    } else {
+      return false;
+    }
     return true;
   }
 
@@ -2719,6 +2826,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         state.node_log_pane.Refresh(report, *selected_node);
         state.peer_list_pane.Refresh(report, *selected_node);
         state.network_rule_pane.Refresh(report, *selected_node);
+        state.node_file_pane.Refresh(run_root, report, *selected_node);
       }
       RefreshCommandResults(report, &state);
     }
@@ -2728,8 +2836,8 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         run_root, report, error, log_lines, state.view, state.selected_node,
         state.selected_wallet, state.selected_topology_group,
         state.node_log_pane, state.peer_list_pane, state.network_rule_pane,
-        state.command_status, state.command_error_open, state.command_error,
-        state.command_palette_open, state.command_input,
+        state.node_file_pane, state.command_status, state.command_error_open,
+        state.command_error, state.command_palette_open, state.command_input,
         state.command_input_error, state.pending_confirmation);
     if (once) {
       return error.empty() ? 0 : 1;
@@ -2742,7 +2850,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       }
       const int ch = getch();
       const bool palette_was_open = state.command_palette_open;
-      if (HandleInput(ch, report, command_queue, &state)) {
+      if (HandleInput(ch, run_root, report, command_queue, &state)) {
         if (state.command_palette_open) {
           int rows = 0;
           int cols = 0;

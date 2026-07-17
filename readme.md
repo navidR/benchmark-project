@@ -812,6 +812,17 @@ are on the right and each row shows its latest and retained min/max values.
 `Tab` cycles node, wallet, topology, and metric views, while `n`, `w`, `g`, and
 `h` select them directly.
 
+Press `b` to open the selected node's safe artifact browser. The data view
+lists a bounded inventory below that run's `nodes/<node-id>/data` directory;
+the configuration view shows the canonical resolved node configuration and
+latest normalized runtime paths/endpoints; and the log view lists regular
+`.log` files while directing log contents through the existing bounded driver
+tails. Left/Right or `[`/`]` cycles these sections, the standard arrow,
+Page Up, Page Down, Home, and End keys scroll, `u` reloads the inventory, and
+`b` closes it. The browser rejects unsafe node IDs, opens each directory with
+no-follow semantics, never traverses symlinks, escapes control bytes, redacts
+password/secret/token/cookie fields, and bounds traversal depth and results.
+
 During a live benchmark launched without `--no-tui`, press `d` to disconnect
 the selected node from the simulated network or `s` to request that its mining
 operation stop. While the node log pane is open, `+` and `-` request higher or
