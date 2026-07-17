@@ -1,0 +1,9 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": ""
+    }
+  },
+  "nodes": 1
+}

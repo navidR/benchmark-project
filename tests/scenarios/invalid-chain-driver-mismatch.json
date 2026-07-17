@@ -1,0 +1,9 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "bitcoin",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "nodes": 1
+}

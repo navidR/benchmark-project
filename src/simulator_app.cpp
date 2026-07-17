@@ -1895,6 +1895,55 @@ void ParseNetworkProfiles(const boost::json::object& scenario,
   }
 }
 
+void ParseScenarioChains(const boost::json::object& scenario,
+                         Options* options) {
+  const boost::json::value* value = scenario.if_contains("chains");
+  if (value == nullptr) {
+    return;
+  }
+  if (!value->is_object()) {
+    throw std::runtime_error("scenario chains must be an object");
+  }
+  const boost::json::object& chains = value->as_object();
+  if (chains.empty()) {
+    throw std::runtime_error("scenario chains must not be empty");
+  }
+  for (const auto& [name_json, definition_value] : chains) {
+    const std::string name(name_json);
+    RequireSafeScenarioIdentifier(name, "scenario chain name");
+    const ChainKind chain = ParseChainKind(name);
+    if (!definition_value.is_object()) {
+      throw std::runtime_error("scenario chain " + name +
+                               " definition must be an object");
+    }
+    const boost::json::object& definition = definition_value.as_object();
+    const ChainKind driver =
+        ParseChainKind(JsonStringField(definition, "driver"));
+    if (driver != chain) {
+      throw std::runtime_error("scenario chain " + name +
+                               " driver must match the registry key");
+    }
+    const std::string default_binary =
+        JsonStringField(definition, "default_binary");
+    if (default_binary.empty()) {
+      throw std::runtime_error("scenario chain " + name +
+                               " default_binary must not be empty");
+    }
+    if (default_binary.find('\0') != std::string::npos) {
+      throw std::runtime_error("scenario chain " + name +
+                               " default_binary must not contain NUL");
+    }
+    const auto [unused, inserted] = options->chains.emplace(
+        name,
+        ScenarioChain{.driver = driver, .default_binary = default_binary});
+    static_cast<void>(unused);
+    if (!inserted) {
+      throw std::runtime_error("scenario chains contains duplicate name: " +
+                               name);
+    }
+  }
+}
+
 struct ScenarioNodeRoles {
   bool configured = false;
   std::vector<uint32_t> wallet_nodes;
@@ -2777,20 +2826,52 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         options.block_production.policy.period(),
         options.block_production.policy.probability(), options.simulation_seed);
   }
+  ParseScenarioChains(scenario, &options);
   if (!OptionProvided(vm, "chain")) {
-    options.chain = ParseChainKind(JsonOptionalStringField(
-        scenario, "chain", std::string(ChainKindName(options.chain))));
+    if (scenario.if_contains("chain") != nullptr) {
+      options.chain = ParseChainKind(JsonStringField(scenario, "chain"));
+    } else if (options.chains.size() == 1U) {
+      options.chain = options.chains.begin()->second.driver;
+    } else if (!options.chains.empty()) {
+      throw std::runtime_error(
+          "scenario with multiple chains requires an active chain");
+    }
+  }
+  const std::string active_chain_name(ChainKindName(options.chain));
+  const auto active_chain = options.chains.find(active_chain_name);
+  if (!options.chains.empty() && active_chain == options.chains.end()) {
+    throw std::runtime_error("scenario chains does not define active chain: " +
+                             active_chain_name);
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   const bool chain_daemon_provided =
       OptionProvided(vm, "node-binary") || OptionProvided(vm, "chain-daemon") ||
       OptionProvided(vm, chain_spec.daemon_option_name.c_str());
+  const bool legacy_chain_daemon =
+      scenario.if_contains("chain_daemon") != nullptr;
+  const bool legacy_driver_daemon =
+      scenario.if_contains(chain_spec.daemon_scenario_field) != nullptr;
+  if (!options.chains.empty() &&
+      (legacy_chain_daemon || legacy_driver_daemon)) {
+    throw std::runtime_error(
+        "scenario chains default_binary must not be combined with legacy "
+        "daemon fields");
+  }
   if (!chain_daemon_provided) {
-    options.chain_daemon =
-        JsonOptionalPathField(scenario, "chain_daemon", options.chain_daemon);
-    options.chain_daemon = JsonOptionalPathField(
-        scenario, chain_spec.daemon_scenario_field.c_str(),
-        options.chain_daemon);
+    if (active_chain != options.chains.end()) {
+      options.chain_daemon = active_chain->second.default_binary;
+    } else {
+      if (legacy_chain_daemon && legacy_driver_daemon) {
+        throw std::runtime_error(
+            "scenario chain_daemon and its driver-specific alias must not "
+            "both be provided");
+      }
+      options.chain_daemon =
+          JsonOptionalPathField(scenario, "chain_daemon", options.chain_daemon);
+      options.chain_daemon = JsonOptionalPathField(
+          scenario, chain_spec.daemon_scenario_field.c_str(),
+          options.chain_daemon);
+    }
   }
   if (!OptionProvided(vm, "benchmark-root") &&
       !OptionProvided(vm, "output-dir") &&
@@ -3803,6 +3884,13 @@ Options ParseOptions(int argc, char** argv) {
   if (options.simulation_name.empty()) {
     options.simulation_name = options.run_id;
   }
+  const std::string active_chain_name(ChainKindName(options.chain));
+  auto [active_chain, inserted] = options.chains.try_emplace(
+      active_chain_name, ScenarioChain{.driver = options.chain,
+                                       .default_binary = options.chain_daemon});
+  static_cast<void>(inserted);
+  active_chain->second.driver = options.chain;
+  active_chain->second.default_binary = options.chain_daemon;
   if (options.simulation_duration) {
     if (options.metrics_sample_count != 0U) {
       throw std::runtime_error(
@@ -7042,6 +7130,14 @@ void WriteScenarioFiles(const Options& options,
   simulation["tui_refresh_interval_ms"] = options.tui_refresh_ms;
   resolved["simulation"] = std::move(simulation);
   resolved["chain"] = chain_spec.name;
+  boost::json::object chains;
+  for (const auto& [name, chain] : options.chains) {
+    boost::json::object definition;
+    definition["driver"] = std::string(ChainKindName(chain.driver));
+    definition["default_binary"] = chain.default_binary.string();
+    chains[name] = std::move(definition);
+  }
+  resolved["chains"] = std::move(chains);
   resolved["nodes"] = options.nodes;
   if (const std::optional<uint32_t> generate_node =
           CommonBlockGenerationNode(workloads)) {

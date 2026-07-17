@@ -1,4 +1,7 @@
-firod: /tmp/not-used-by-probe
+chains:
+  firo:
+    driver: firo
+    default_binary: /tmp/not-used-by-probe
 simulation:
   name: scaled-firo-yaml
   seed: 67890

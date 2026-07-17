@@ -1,5 +1,15 @@
 {
-  "firod": "/tmp/not-used-by-probe",
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    },
+    "bitcoin": {
+      "driver": "bitcoin",
+      "default_binary": "/tmp/inactive-not-used-by-probe"
+    }
+  },
+  "chain": "firo",
   "simulation": {
     "name": "scaled-firo",
     "seed": 12345,

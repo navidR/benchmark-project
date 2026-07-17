@@ -1,0 +1,8 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo"
+    }
+  },
+  "nodes": 1
+}

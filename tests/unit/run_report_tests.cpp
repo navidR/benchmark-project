@@ -86,6 +86,20 @@ BOOST_AUTO_TEST_CASE(run_report_normalizes_process_control_schema) {
   BOOST_CHECK_THROW(bbp::BuildRunReportJson(conflicting), std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_preserves_canonical_chain_registry) {
+  const std::filesystem::path dir = MakeTestDir("run-report-chain-registry");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"registry","chain":"firo","chains":{"firo":{"driver":"firo","default_binary":"/opt/firod"}},"nodes":1})");
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  const boost::json::object& definition =
+      report.at("chains").as_object().at("firo").as_object();
+  BOOST_TEST(definition.at("driver").as_string() == "firo");
+  BOOST_TEST(definition.at("default_binary").as_string() == "/opt/firod");
+}
+
 BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const std::filesystem::path dir = MakeTestDir("run-report");
   bbp::WriteText(dir / "resolved-scenario.json",

@@ -598,6 +598,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "run_id", report);
   CopyField(scenario, "simulation", report);
   CopyField(scenario, "chain", report);
+  CopyField(scenario, "chains", report);
   CopyField(scenario, "nodes", report);
   CopyField(scenario, "generate_blocks", report);
   CopyField(scenario, "generate_node", report);

@@ -1,0 +1,9 @@
+{
+  "chains": {
+    "firo/unsafe": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "nodes": 1
+}

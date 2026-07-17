@@ -12,6 +12,7 @@
 #include "bbp/chain_kind.h"
 #include "bbp/log_level.h"
 #include "bbp/network.h"
+#include "bbp/scenario_chain.h"
 #include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulation_policy.h"
 #include "bbp/simulation_registry.h"
@@ -34,6 +35,7 @@ struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path scenario_yaml;
   std::filesystem::path chain_daemon;
+  std::map<std::string, ScenarioChain> chains;
   std::filesystem::path output_dir = "runs";
   std::filesystem::path report_run;
   std::filesystem::path tui_run;

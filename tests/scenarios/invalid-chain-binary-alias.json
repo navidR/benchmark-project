@@ -1,0 +1,10 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "firod": "/tmp/legacy-not-used-by-probe",
+  "nodes": 1
+}

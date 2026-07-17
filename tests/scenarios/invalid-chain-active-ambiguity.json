@@ -1,0 +1,13 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/firod"
+    },
+    "bitcoin": {
+      "driver": "bitcoin",
+      "default_binary": "/tmp/bitcoind"
+    }
+  },
+  "nodes": 1
+}

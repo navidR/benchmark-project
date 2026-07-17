@@ -656,6 +656,66 @@ if(BUILD_TESTING)
       --probe-capabilities
   )
   add_cli_failure_test(
+    bbp-invalid-chains-shape
+    tests/scenarios/invalid-chains-shape.json
+    "scenario chains must be an object"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chains-empty
+    tests/scenarios/invalid-chains-empty.json
+    "scenario chains must not be empty"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-definition-shape
+    tests/scenarios/invalid-chain-definition-shape.json
+    "scenario chain firo definition must be an object"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-missing-driver
+    tests/scenarios/invalid-chain-missing-driver.json
+    "missing or invalid string JSON field: driver"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-missing-default-binary
+    tests/scenarios/invalid-chain-missing-default-binary.json
+    "missing or invalid string JSON field: default_binary"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-name
+    tests/scenarios/invalid-chain-name.json
+    "scenario chain name contains an unsafe character"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-driver-mismatch
+    tests/scenarios/invalid-chain-driver-mismatch.json
+    "scenario chain firo driver must match the registry key"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-default-binary
+    tests/scenarios/invalid-chain-default-binary.json
+    "scenario chain firo default_binary must not be empty"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-default-binary-shape
+    tests/scenarios/invalid-chain-default-binary-shape.json
+    "missing or invalid string JSON field: default_binary"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-binary-alias
+    tests/scenarios/invalid-chain-binary-alias.json
+    "scenario chains default_binary must not be combined with legacy daemon fields"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-active-ambiguity
+    tests/scenarios/invalid-chain-active-ambiguity.json
+    "scenario with multiple chains requires an active chain"
+  )
+  add_cli_failure_test(
+    bbp-invalid-chain-active-missing
+    tests/scenarios/invalid-chain-active-missing.json
+    "scenario chains does not define active chain: bitcoin"
+  )
+  add_cli_failure_test(
     bbp-invalid-simulation-cleanup-policy
     tests/scenarios/invalid-simulation-cleanup-policy.json
     "scenario simulation.cleanup_policy must be automatic or retain_cgroups"
