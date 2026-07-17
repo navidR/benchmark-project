@@ -64,6 +64,7 @@
 #include "bbp/simulator/legacy_cli_inputs.h"
 #include "bbp/simulator/node_runtime.h"
 #include "bbp/simulator/options.h"
+#include "bbp/simulator/process_control_config.h"
 #include "bbp/simulator/wallet_transaction_plan.h"
 #include "bbp/simulator/yaml_helpers.h"
 #include "bbp/tui.h"
@@ -2893,60 +2894,14 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     if (!process->is_object()) {
       throw std::runtime_error("scenario process must be a JSON object");
     }
-    const boost::json::object& object = process->as_object();
-    const boost::json::value* runtime_node_restarts =
-        object.if_contains("runtime_node_restarts");
-    if (runtime_node_restarts != nullptr) {
-      if (!runtime_node_restarts->is_array()) {
-        throw std::runtime_error(
-            "scenario process.runtime_node_restarts must be a JSON array");
-      }
-      for (const boost::json::value& value :
-           runtime_node_restarts->as_array()) {
-        if (!value.is_object()) {
-          throw std::runtime_error(
-              "scenario process.runtime_node_restarts entries must be JSON "
-              "objects");
-        }
-        const uint32_t node = JsonUint32Field(value.as_object(), "node");
-        if (node == 0 || node > options.nodes) {
-          throw std::runtime_error(
-              "scenario process.runtime_node_restarts node must be in 1.." +
-              std::to_string(options.nodes));
-        }
-        options.runtime_node_restarts.push_back(node - 1U);
-      }
-    }
-    const boost::json::value* runtime_node_freezes =
-        object.if_contains("runtime_node_freezes");
-    if (runtime_node_freezes != nullptr) {
-      if (!runtime_node_freezes->is_array()) {
-        throw std::runtime_error(
-            "scenario process.runtime_node_freezes must be a JSON array");
-      }
-      for (const boost::json::value& value : runtime_node_freezes->as_array()) {
-        if (!value.is_object()) {
-          throw std::runtime_error(
-              "scenario process.runtime_node_freezes entries must be JSON "
-              "objects");
-        }
-        const boost::json::object& freeze = value.as_object();
-        const uint32_t node = JsonUint32Field(freeze, "node");
-        if (node == 0 || node > options.nodes) {
-          throw std::runtime_error(
-              "scenario process.runtime_node_freezes node must be in 1.." +
-              std::to_string(options.nodes));
-        }
-        const uint32_t duration_ms = JsonUint32Field(freeze, "duration_ms");
-        if (duration_ms == 0U) {
-          throw std::runtime_error(
-              "scenario process.runtime_node_freezes duration_ms must be "
-              "greater than zero");
-        }
-        options.runtime_node_freezes.push_back(
-            FreezeRequest{.node_index = node - 1U, .duration_ms = duration_ms});
-      }
-    }
+    ProcessControlConfig config =
+        ParseProcessControlConfig(process->as_object(), options.nodes);
+    options.runtime_node_restarts.insert(options.runtime_node_restarts.end(),
+                                         config.restart_node_indexes.begin(),
+                                         config.restart_node_indexes.end());
+    options.runtime_node_freezes.insert(options.runtime_node_freezes.end(),
+                                        config.freezes.begin(),
+                                        config.freezes.end());
   }
 
   ParseNetworkProfiles(scenario, &options);
@@ -7074,24 +7029,12 @@ void WriteScenarioFiles(const Options& options,
     }
     resolved["runtime_node_resource_limits"] = std::move(runtime_node_limits);
   }
-  if (!options.runtime_node_restarts.empty()) {
-    boost::json::array runtime_node_restarts;
-    for (uint32_t node_index : options.runtime_node_restarts) {
-      boost::json::object restart;
-      restart["node"] = node_index + 1U;
-      runtime_node_restarts.push_back(std::move(restart));
-    }
-    resolved["runtime_node_restarts"] = std::move(runtime_node_restarts);
-  }
-  if (!options.runtime_node_freezes.empty()) {
-    boost::json::array runtime_node_freezes;
-    for (const FreezeRequest& freeze : options.runtime_node_freezes) {
-      boost::json::object object;
-      object["node"] = freeze.node_index + 1U;
-      object["duration_ms"] = freeze.duration_ms;
-      runtime_node_freezes.push_back(std::move(object));
-    }
-    resolved["runtime_node_freezes"] = std::move(runtime_node_freezes);
+  if (!options.runtime_node_restarts.empty() ||
+      !options.runtime_node_freezes.empty()) {
+    resolved["process"] = ProcessControlConfigJson(ProcessControlConfig{
+        .restart_node_indexes = options.runtime_node_restarts,
+        .freezes = options.runtime_node_freezes,
+    });
   }
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");

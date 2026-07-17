@@ -50,6 +50,42 @@ std::uint64_t JsonIntegerValue(const boost::json::value& value) {
 
 }  // namespace
 
+BOOST_AUTO_TEST_CASE(run_report_normalizes_process_control_schema) {
+  const std::filesystem::path canonical =
+      MakeTestDir("run-report-process-canonical");
+  bbp::WriteText(
+      canonical / "resolved-scenario.json",
+      R"({"run_id":"canonical","chain":"firo","nodes":1,"process":{"runtime_node_restarts":[{"node":1}],"runtime_node_freezes":[{"node":1,"duration_ms":10}]}})");
+  const boost::json::object canonical_report =
+      boost::json::parse(bbp::BuildRunReportJson(canonical)).as_object();
+  const boost::json::object& process =
+      canonical_report.at("process").as_object();
+  BOOST_TEST(process.at("runtime_node_restarts") ==
+             canonical_report.at("runtime_node_restarts"));
+  BOOST_TEST(process.at("runtime_node_freezes") ==
+             canonical_report.at("runtime_node_freezes"));
+
+  const std::filesystem::path legacy = MakeTestDir("run-report-process-legacy");
+  bbp::WriteText(
+      legacy / "resolved-scenario.json",
+      R"({"run_id":"legacy","chain":"firo","nodes":1,"runtime_node_restarts":[{"node":1}],"runtime_node_freezes":[{"node":1,"duration_ms":20}]})");
+  const boost::json::object legacy_report =
+      boost::json::parse(bbp::BuildRunReportJson(legacy)).as_object();
+  const boost::json::object& normalized =
+      legacy_report.at("process").as_object();
+  BOOST_TEST(normalized.at("runtime_node_restarts") ==
+             legacy_report.at("runtime_node_restarts"));
+  BOOST_TEST(normalized.at("runtime_node_freezes") ==
+             legacy_report.at("runtime_node_freezes"));
+
+  const std::filesystem::path conflicting =
+      MakeTestDir("run-report-process-conflicting");
+  bbp::WriteText(
+      conflicting / "resolved-scenario.json",
+      R"({"run_id":"conflicting","chain":"firo","nodes":1,"process":{"runtime_node_restarts":[{"node":1}]},"runtime_node_restarts":[]})");
+  BOOST_CHECK_THROW(bbp::BuildRunReportJson(conflicting), std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   const std::filesystem::path dir = MakeTestDir("run-report");
   bbp::WriteText(dir / "resolved-scenario.json",
@@ -70,7 +106,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                  "\"node_network_conditions\":[{\"node\":1,\"delay_ms\":3}],"
                  "\"runtime_node_resource_limits\":["
                  "{\"node\":1,\"pids_max\":128}],"
-                 "\"runtime_node_restarts\":[{\"node\":1}],"
+                 "\"process\":{\"runtime_node_restarts\":[{\"node\":1}],"
+                 "\"runtime_node_freezes\":["
+                 "{\"node\":1,\"duration_ms\":25}]},"
                  "\"workloads\":["
                  "{\"type\":\"block_generation\",\"node\":1,\"count\":1,"
                  "\"sync_timeout_sec\":45},"
@@ -394,6 +432,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_REQUIRE_EQUAL(
       report.at("runtime_node_resource_limits").as_array().size(), 1U);
   BOOST_REQUIRE_EQUAL(report.at("runtime_node_restarts").as_array().size(), 1U);
+  BOOST_REQUIRE_EQUAL(report.at("runtime_node_freezes").as_array().size(), 1U);
+  const boost::json::object& process = report.at("process").as_object();
+  BOOST_REQUIRE_EQUAL(process.at("runtime_node_restarts").as_array().size(),
+                      1U);
+  BOOST_REQUIRE_EQUAL(process.at("runtime_node_freezes").as_array().size(), 1U);
   const boost::json::array& operator_commands =
       report.at("operator_commands").as_array();
   BOOST_REQUIRE_EQUAL(operator_commands.size(), 1U);

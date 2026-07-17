@@ -512,6 +512,47 @@ void ForEachJsonLine(const std::filesystem::path& path, Callback callback) {
   }
 }
 
+void LoadProcessControlFields(const boost::json::object& scenario,
+                              boost::json::object* report) {
+  boost::json::object canonical;
+  bool has_process = false;
+  if (const boost::json::value* process = scenario.if_contains("process")) {
+    if (!process->is_object()) {
+      throw std::runtime_error(
+          "resolved scenario process is not a JSON object");
+    }
+    canonical = process->as_object();
+    has_process = true;
+  }
+
+  constexpr std::string_view kFields[] = {
+      "runtime_node_restarts",
+      "runtime_node_freezes",
+  };
+  for (const std::string_view field : kFields) {
+    const boost::json::value* nested = canonical.if_contains(field);
+    const boost::json::value* legacy = scenario.if_contains(field);
+    if (nested != nullptr && legacy != nullptr && *nested != *legacy) {
+      throw std::runtime_error("resolved scenario has conflicting process." +
+                               std::string(field) + " and legacy " +
+                               std::string(field));
+    }
+    const boost::json::value* selected = nested != nullptr ? nested : legacy;
+    if (selected == nullptr) {
+      continue;
+    }
+    if (!selected->is_array()) {
+      throw std::runtime_error("resolved scenario process." +
+                               std::string(field) + " is not a JSON array");
+    }
+    canonical[field] = *selected;
+    (*report)[field] = *selected;
+  }
+  if (has_process || !canonical.empty()) {
+    (*report)["process"] = std::move(canonical);
+  }
+}
+
 void LoadResolvedScenario(const std::filesystem::path& path,
                           boost::json::object* report) {
   if (!std::filesystem::exists(path)) {
@@ -547,8 +588,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "runtime_partitions", report);
   CopyField(scenario, "runtime_partition_heals", report);
   CopyField(scenario, "runtime_node_resource_limits", report);
-  CopyField(scenario, "runtime_node_restarts", report);
-  CopyField(scenario, "runtime_node_freezes", report);
+  LoadProcessControlFields(scenario, report);
 }
 
 void SeedConfiguredNodes(const boost::json::object& report,

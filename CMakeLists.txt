@@ -239,6 +239,7 @@ add_executable(bbp
   src/periodic_metrics_collector.cpp
   src/positive_duration.cpp
   src/process.cpp
+  src/process_control_config.cpp
   src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
   src/runtime_peer_topology.cpp
@@ -309,6 +310,7 @@ if(BUILD_TESTING)
     tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/positive_duration_tests.cpp
     tests/unit/process_tests.cpp
+    tests/unit/process_control_config_tests.cpp
     tests/unit/probabilistic_block_scheduler_tests.cpp
     tests/unit/run_report_tests.cpp
     tests/unit/runtime_peer_topology_tests.cpp
@@ -354,6 +356,7 @@ if(BUILD_TESTING)
     src/periodic_metrics_collector.cpp
     src/positive_duration.cpp
     src/process.cpp
+    src/process_control_config.cpp
     src/probabilistic_block_scheduler.cpp
     src/run_report.cpp
     src/runtime_peer_topology.cpp
