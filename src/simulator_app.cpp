@@ -1617,13 +1617,6 @@ void ValidateWalletTransactionsWorkload(
                                    options.wallet_initialization);
 }
 
-bool ResourceLimitPatchEmpty(const ResourceLimitPatch& patch) {
-  return !patch.memory_high_bytes && !patch.memory_max_bytes &&
-         !patch.cpu_quota_present && !patch.cpu_period_us &&
-         !patch.cpu_weight && !patch.io_weight && !patch.io_limits_present &&
-         !patch.pids_max;
-}
-
 void RequireNonZero(uint64_t value, std::string_view field) {
   if (value == 0U) {
     throw std::runtime_error(std::string(field) + " must be greater than zero");
@@ -1707,32 +1700,7 @@ ResourceLimitPatch ParseResourceLimitPatchObject(
   }
   patch.pids_max = JsonOptionalUint64FieldValue(object, "pids_max");
 
-  if (ResourceLimitPatchEmpty(patch)) {
-    throw std::runtime_error("runtime resource update has no limit fields");
-  }
-  if (patch.memory_max_bytes) {
-    RequireNonZero(*patch.memory_max_bytes, "memory_max_bytes");
-  }
-  if (patch.cpu_quota_us) {
-    RequireNonZero(*patch.cpu_quota_us, "cpu_quota_us");
-  }
-  if (patch.cpu_period_us) {
-    RequireNonZero(*patch.cpu_period_us, "cpu_period_us");
-  }
-  if (patch.cpu_weight) {
-    RequireCgroupWeight(*patch.cpu_weight, "cpu_weight");
-  }
-  if (patch.io_weight) {
-    RequireCgroupWeight(*patch.io_weight, "io_weight");
-  }
-  if (patch.pids_max) {
-    RequireNonZero(*patch.pids_max, "pids_max");
-  }
-  if (patch.memory_high_bytes && patch.memory_max_bytes &&
-      *patch.memory_high_bytes > *patch.memory_max_bytes) {
-    throw std::runtime_error(
-        "memory_high_bytes must be less than or equal to memory_max_bytes");
-  }
+  ValidateResourceLimitPatch(patch);
   return patch;
 }
 
@@ -7323,7 +7291,8 @@ std::string ResourceLimitUpdateDetail(
     const ResourceLimits& current,
     std::optional<uint32_t> workload_index = std::nullopt,
     std::optional<uint32_t> workload_count = std::nullopt,
-    std::optional<uint32_t> node = std::nullopt) {
+    std::optional<uint32_t> node = std::nullopt,
+    std::optional<std::uint64_t> operator_sequence = std::nullopt) {
   boost::json::object detail;
   if (workload_index) {
     detail["workload_index"] = *workload_index;
@@ -7333,6 +7302,9 @@ std::string ResourceLimitUpdateDetail(
   }
   if (node) {
     detail["node"] = *node;
+  }
+  if (operator_sequence) {
+    detail["operator_command_sequence"] = *operator_sequence;
   }
   detail["requested"] = ResourceLimitPatchJson(patch);
   detail["previous"] = ResourceLimitsJson(previous);
@@ -7345,14 +7317,20 @@ void ApplyResourceLimitUpdate(
     NodeRuntime& node, const ResourceLimitPatch& patch,
     std::optional<uint32_t> workload_index = std::nullopt,
     std::optional<uint32_t> workload_count = std::nullopt,
-    std::optional<uint32_t> workload_node = std::nullopt) {
+    std::optional<uint32_t> workload_node = std::nullopt,
+    std::optional<std::uint64_t> operator_sequence = std::nullopt,
+    bool resolve_operator_io_limit = false) {
   std::lock_guard<std::mutex> lock(node_resource_state_mutex);
   if (!node.cgroup) {
     throw std::runtime_error("resource update requires a node cgroup");
   }
   const ResourceLimits previous = node.resources;
+  const ResourceLimitPatch effective_patch =
+      resolve_operator_io_limit
+          ? ResolveOperatorResourceLimitPatch(previous, patch)
+          : patch;
   const ResourceLimits next =
-      ApplyResourceLimitPatch(previous, patch, node.config.id);
+      ApplyResourceLimitPatch(previous, effective_patch, node.config.id);
   try {
     WriteResourceLimits(*node.cgroup, previous, next);
   } catch (...) {
@@ -7375,7 +7353,8 @@ void ApplyResourceLimitUpdate(
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kResourceLimitsUpdated,
              ResourceLimitUpdateDetail(patch, previous, next, workload_index,
-                                       workload_count, workload_node));
+                                       workload_count, workload_node,
+                                       operator_sequence));
 }
 
 std::string ExceptionMessage(const std::exception_ptr& error);
@@ -9672,6 +9651,10 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
   if (command.profile) {
     detail["profile"] = *command.profile;
   }
+  if (command.resource_limit_patch) {
+    detail["resource_limits"] =
+        ResourceLimitPatchJson(*command.resource_limit_patch);
+  }
   if (command.network_condition) {
     detail["network_condition"] =
         NetworkConditionJson(*command.network_condition);
@@ -10070,6 +10053,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                        SimulationCommandKind::kSetPerfCounters) {
               std::lock_guard<std::mutex> lock(node_process_mutex);
               ApplyPerfCounterCommand(command, nodes);
+            } else if (command.kind ==
+                       SimulationCommandKind::kSetResourceLimits) {
+              if (!command.resource_limit_patch) {
+                throw std::runtime_error("resource limit patch is missing");
+              }
+              ApplyResourceLimitUpdate(options, events_path, node,
+                                       *command.resource_limit_patch,
+                                       std::nullopt, std::nullopt, std::nullopt,
+                                       command.sequence, true);
             } else if (command.kind == SimulationCommandKind::kKillNode) {
               const bool resume_on_failure =
                   stop_scheduled_miner() ||

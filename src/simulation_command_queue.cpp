@@ -29,6 +29,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kSetPeerCountPolicy:
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kSetResourceProfile:
+    case SimulationCommandKind::kSetResourceLimits:
     case SimulationCommandKind::kSetNetworkProfile:
     case SimulationCommandKind::kSetNetworkCondition:
     case SimulationCommandKind::kBlockNetworkFlow:
@@ -49,6 +50,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -69,6 +71,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -89,6 +92,7 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -120,6 +124,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -140,6 +145,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .peer_count_policy = policy,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -163,6 +169,7 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .peer_count_policy = std::nullopt,
       .block_count = block_count,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -191,6 +198,33 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::move(profile),
+      .resource_limit_patch = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
+      .confirmed = confirmed,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushResourceLimits(
+    std::string node_id, ResourceLimitPatch patch, bool confirmed) {
+  ValidateResourceLimitPatch(patch, "operator resource update");
+  if (patch.io_limits_present && patch.io_limits.size() != 1U) {
+    throw std::runtime_error(
+        "operator io resource update requires exactly one block device");
+  }
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kSetResourceLimits,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .resource_limit_patch = std::move(patch),
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -212,6 +246,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkCondition(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = condition,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -254,6 +289,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::move(flow),
       .perf_counter_target = std::nullopt,
@@ -286,6 +322,7 @@ std::uint64_t SimulationCommandQueue::PushPartitionCommand(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::nullopt,
@@ -336,6 +373,7 @@ std::uint64_t SimulationCommandQueue::PushPerfCounters(
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
       .perf_counter_target = std::move(target),

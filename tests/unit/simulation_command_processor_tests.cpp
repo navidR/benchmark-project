@@ -80,3 +80,27 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_requires_handlers) {
                         bbp::SimulationCommandProcessor::FailureHandler{}),
                     std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_preserves_resource_command_payload) {
+  bbp::SimulationCommandQueue queue;
+  std::promise<bbp::SimulationCommand> handled;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&handled](const bbp::SimulationCommand& command) {
+        handled.set_value(command);
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {});
+  bbp::ResourceLimitPatch patch;
+  patch.memory_max_bytes = 4096U;
+
+  queue.PushResourceLimits("firo-2", patch, true);
+  processor.Start();
+  const bbp::SimulationCommand command = handled.get_future().get();
+  processor.Stop();
+
+  BOOST_CHECK(command.kind == bbp::SimulationCommandKind::kSetResourceLimits);
+  BOOST_REQUIRE(command.resource_limit_patch);
+  BOOST_CHECK(*command.resource_limit_patch == patch);
+  BOOST_TEST(command.confirmed);
+}

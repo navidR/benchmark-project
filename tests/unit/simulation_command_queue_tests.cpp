@@ -262,6 +262,43 @@ BOOST_AUTO_TEST_CASE(
                     std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_resource_limit_patch) {
+  bbp::SimulationCommandQueue queue;
+  bbp::ResourceLimitPatch patch;
+  patch.cpu_quota_present = true;
+  patch.cpu_period_us = 100000U;
+  const std::uint64_t sequence =
+      queue.PushResourceLimits("firo-1", patch, true);
+
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->sequence == sequence);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kSetResourceLimits);
+  BOOST_TEST(command->node_id == "firo-1");
+  BOOST_REQUIRE(command->resource_limit_patch);
+  BOOST_CHECK(*command->resource_limit_patch == patch);
+  BOOST_TEST(command->confirmed);
+
+  BOOST_CHECK_THROW(queue.PushResourceLimits("firo-1", patch),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushResourceLimits("firo-1", bbp::ResourceLimitPatch{}, true),
+      std::runtime_error);
+  BOOST_CHECK_THROW(queue.Push(bbp::SimulationCommandKind::kSetResourceLimits,
+                               "firo-1", true),
+                    std::runtime_error);
+  bbp::ResourceLimitPatch io_patch;
+  io_patch.io_limits_present = true;
+  bbp::IoLimit first;
+  first.device = {.major = 8U, .minor = 0U};
+  bbp::IoLimit second;
+  second.device = {.major = 8U, .minor = 1U};
+  io_patch.io_limits = {first, second};
+  BOOST_CHECK_THROW(
+      queue.PushResourceLimits("firo-1", std::move(io_patch), true),
+      std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_network_flows) {
   bbp::SimulationCommandQueue queue;
   const bbp::SimulationNetworkFlow flow{

@@ -190,6 +190,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
                   "\"event\":\"resource_limits_updated\","
                   "\"detail\":\"{\\\"workload_index\\\":6,"
                   "\\\"workload_count\\\":6,\\\"node\\\":1,"
+                  "\\\"operator_command_sequence\\\":8,"
                   "\\\"requested\\\":{\\\"pids_max\\\":128},"
                   "\\\"previous\\\":{\\\"memory_high_bytes\\\":1024,"
                   "\\\"memory_max_bytes\\\":2048,"
@@ -519,6 +520,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       resource_updates.front().as_object().at("detail").as_object();
   BOOST_TEST(JsonInteger(resource_update, "workload_index") == 6U);
   BOOST_TEST(JsonInteger(resource_update, "node") == 1U);
+  BOOST_TEST(JsonInteger(resource_update, "operator_command_sequence") == 8U);
   BOOST_TEST(JsonInteger(resource_update.at("requested").as_object(),
                          "pids_max") == 128U);
   const boost::json::array& wallet_funding =

@@ -4,6 +4,7 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/tokenizer.hpp>
+#include <charconv>
 #include <chrono>
 #include <set>
 #include <stdexcept>
@@ -14,7 +15,7 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 26> kCommandNames = {
+constexpr std::array<std::string_view, 27> kCommandNames = {
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -32,6 +33,7 @@ constexpr std::array<std::string_view, 26> kCommandNames = {
     "kill",
     "generate-blocks",
     "resource-profile",
+    "resource-limit",
     "network-profile",
     "network-condition",
     "block",
@@ -88,6 +90,38 @@ std::vector<PerfCounterKind> ParsePerfCounterKinds(std::string_view text) {
   return kinds;
 }
 
+std::uint64_t ParseUnsignedToken(std::string_view text,
+                                 std::string_view field) {
+  std::uint64_t value = 0U;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value, 10);
+  if (error == std::errc::result_out_of_range) {
+    throw std::runtime_error(std::string(field) + " exceeds uint64");
+  }
+  if (error != std::errc{} || end != text.data() + text.size()) {
+    throw std::runtime_error(std::string(field) +
+                             " must be an unsigned decimal integer");
+  }
+  return value;
+}
+
+std::uint64_t ParsePositiveToken(std::string_view text,
+                                 std::string_view field) {
+  const std::uint64_t value = ParseUnsignedToken(text, field);
+  if (value == 0U) {
+    throw std::runtime_error(std::string(field) + " must be greater than zero");
+  }
+  return value;
+}
+
+std::optional<std::uint64_t> ParsePositiveOrMaxToken(std::string_view text,
+                                                     std::string_view field) {
+  if (text == "max") {
+    return std::nullopt;
+  }
+  return ParsePositiveToken(text, field);
+}
+
 }  // namespace
 
 ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
@@ -98,6 +132,65 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
   }
 
   try {
+    if (tokens[0] == "resource-limit") {
+      ResourceLimitPatch patch;
+      if (tokens.size() < 3U) {
+        throw std::runtime_error(
+            "usage: resource-limit <memory-high|memory-max|cpu-max|"
+            "cpu-weight|io-max|io-weight|pids-max> <value...>");
+      }
+      if (tokens[1] == "memory-high") {
+        RequireArgumentCount(tokens, 3U, "resource-limit memory-high <bytes>");
+        patch.memory_high_bytes =
+            ParseUnsignedToken(tokens[2], "memory-high bytes");
+      } else if (tokens[1] == "memory-max") {
+        RequireArgumentCount(tokens, 3U, "resource-limit memory-max <bytes>");
+        patch.memory_max_bytes =
+            ParsePositiveToken(tokens[2], "memory-max bytes");
+      } else if (tokens[1] == "cpu-max") {
+        RequireArgumentCount(
+            tokens, 4U, "resource-limit cpu-max <quota-us|max> <period-us>");
+        patch.cpu_quota_present = true;
+        patch.cpu_quota_us =
+            ParsePositiveOrMaxToken(tokens[2], "cpu-max quota");
+        patch.cpu_period_us = ParsePositiveToken(tokens[3], "cpu-max period");
+      } else if (tokens[1] == "cpu-weight") {
+        RequireArgumentCount(tokens, 3U,
+                             "resource-limit cpu-weight <1..10000>");
+        patch.cpu_weight = ParseUnsignedToken(tokens[2], "cpu-weight value");
+      } else if (tokens[1] == "io-max") {
+        RequireArgumentCount(
+            tokens, 7U,
+            "resource-limit io-max <major:minor> <rbps|max> <wbps|max> "
+            "<riops|max> <wiops|max>");
+        patch.io_limits_present = true;
+        patch.io_limits.push_back(IoLimit{
+            .device = ParseBlockDeviceId(tokens[2]),
+            .read_bytes_per_sec =
+                ParsePositiveOrMaxToken(tokens[3], "io-max rbps"),
+            .write_bytes_per_sec =
+                ParsePositiveOrMaxToken(tokens[4], "io-max wbps"),
+            .read_operations_per_sec =
+                ParsePositiveOrMaxToken(tokens[5], "io-max riops"),
+            .write_operations_per_sec =
+                ParsePositiveOrMaxToken(tokens[6], "io-max wiops"),
+        });
+      } else if (tokens[1] == "io-weight") {
+        RequireArgumentCount(tokens, 3U, "resource-limit io-weight <1..10000>");
+        patch.io_weight = ParseUnsignedToken(tokens[2], "io-weight value");
+      } else if (tokens[1] == "pids-max") {
+        RequireArgumentCount(tokens, 3U,
+                             "resource-limit pids-max <positive-count>");
+        patch.pids_max = ParsePositiveToken(tokens[2], "pids-max value");
+      } else {
+        throw std::runtime_error("unknown resource limit: " + tokens[1]);
+      }
+      ValidateResourceLimitPatch(patch, "operator resource update");
+      ParsedTuiCommand parsed;
+      parsed.kind = SimulationCommandKind::kSetResourceLimits;
+      parsed.resource_limit_patch = std::move(patch);
+      return parsed;
+    }
     if (tokens[0] == "perf-counters") {
       if (tokens.size() < 2U || tokens.size() > 4U) {
         throw std::runtime_error(
@@ -127,6 +220,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = target_kind,
@@ -150,6 +244,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -168,6 +263,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -187,6 +283,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -206,6 +303,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
                               boost::lexical_cast<std::uint32_t>(tokens[2])),
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -228,6 +326,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = block_count,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -247,6 +346,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = tokens[1],
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -285,6 +385,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = condition,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -316,6 +417,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow =
               SimulationNetworkFlow{
@@ -344,6 +446,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow =
               SimulationNetworkFlow{
@@ -369,6 +472,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .peer_count_policy = std::nullopt,
           .block_count = std::nullopt,
           .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
           .perf_counter_target_kind = std::nullopt,
@@ -412,6 +516,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         .peer_count_policy = std::nullopt,
         .block_count = std::nullopt,
         .profile = std::nullopt,
+        .resource_limit_patch = std::nullopt,
         .network_condition = std::nullopt,
         .network_flow = std::nullopt,
         .perf_counter_target_kind = std::nullopt,

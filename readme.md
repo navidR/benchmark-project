@@ -835,6 +835,28 @@ transactional: if any member cannot be attached, every member retains its
 previous live session and configuration. The selected configuration is
 preserved and reopened across node restarts.
 
+Per-node cgroup limits can also be changed live through typed, confirmed
+commands:
+
+```text
+resource-limit memory-high 1073741824
+resource-limit memory-max 2147483648
+resource-limit cpu-max 50000 100000
+resource-limit cpu-max max 100000
+resource-limit cpu-weight 250
+resource-limit io-max 259:0 10485760 max 1000 max
+resource-limit io-max 259:0 max max max max
+resource-limit io-weight 300
+resource-limit pids-max 128
+```
+
+All values are exact unsigned decimals. CPU quota and each `io-max` dimension
+accept `max`; all-`max` IO values clear only the named device and preserve
+limits for every other device. Weights use the cgroup-v2 range `1..10000`.
+Each successful change is read back from the owned cgroup, emits a
+`resource_limits_updated` event correlated with the operator command sequence,
+and rolls the complete prior resource state back if a partial write fails.
+
 Metrics record `perf_counter_target_kind`, `perf_counter_target_id`, the
 process PID fields or `perf_counter_cgroup_path` and `perf_counter_cpus`, and
 the exact ordered counter selection. Topology group summaries publish an

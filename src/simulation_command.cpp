@@ -40,6 +40,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "generate_blocks";
     case SimulationCommandKind::kSetResourceProfile:
       return "set_resource_profile";
+    case SimulationCommandKind::kSetResourceLimits:
+      return "set_resource_limits";
     case SimulationCommandKind::kSetNetworkProfile:
       return "set_network_profile";
     case SimulationCommandKind::kSetNetworkCondition:
@@ -113,6 +115,9 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "set_resource_profile") {
     return SimulationCommandKind::kSetResourceProfile;
   }
+  if (name == "set_resource_limits") {
+    return SimulationCommandKind::kSetResourceLimits;
+  }
   if (name == "set_network_profile") {
     return SimulationCommandKind::kSetNetworkProfile;
   }
@@ -151,6 +156,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kStopNode:
     case SimulationCommandKind::kRestartNode:
     case SimulationCommandKind::kSetResourceProfile:
+    case SimulationCommandKind::kSetResourceLimits:
     case SimulationCommandKind::kSetNetworkProfile:
     case SimulationCommandKind::kSetNetworkCondition:
     case SimulationCommandKind::kBlockNetworkFlow:

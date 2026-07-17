@@ -21,6 +21,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kRestartNode,
       bbp::SimulationCommandKind::kGenerateBlocks,
       bbp::SimulationCommandKind::kSetResourceProfile,
+      bbp::SimulationCommandKind::kSetResourceLimits,
       bbp::SimulationCommandKind::kSetNetworkProfile,
       bbp::SimulationCommandKind::kSetNetworkCondition,
       bbp::SimulationCommandKind::kBlockNetworkFlow,
@@ -50,6 +51,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kSetNetworkProfile));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kSetNetworkCondition));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kSetResourceLimits));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kBlockNetworkFlow));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(

@@ -108,6 +108,112 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_perf_counter_commands) {
       std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(tui_command_parser_builds_resource_limit_commands) {
+  const bbp::ParsedTuiCommand memory_high =
+      bbp::TuiCommandParser::Parse("resource-limit memory-high 0", 0U);
+  BOOST_CHECK(memory_high.kind ==
+              bbp::SimulationCommandKind::kSetResourceLimits);
+  BOOST_REQUIRE(memory_high.resource_limit_patch);
+  BOOST_REQUIRE(memory_high.resource_limit_patch->memory_high_bytes);
+  BOOST_TEST(*memory_high.resource_limit_patch->memory_high_bytes == 0U);
+
+  const bbp::ParsedTuiCommand memory_max = bbp::TuiCommandParser::Parse(
+      "resource-limit memory-max 18446744073709551615", 0U);
+  BOOST_REQUIRE(memory_max.resource_limit_patch);
+  BOOST_REQUIRE(memory_max.resource_limit_patch->memory_max_bytes);
+  BOOST_TEST(*memory_max.resource_limit_patch->memory_max_bytes ==
+             18446744073709551615ULL);
+
+  const bbp::ParsedTuiCommand cpu =
+      bbp::TuiCommandParser::Parse("resource-limit cpu-max 50000 100000", 0U);
+  BOOST_REQUIRE(cpu.resource_limit_patch);
+  BOOST_TEST(cpu.resource_limit_patch->cpu_quota_present);
+  BOOST_REQUIRE(cpu.resource_limit_patch->cpu_quota_us);
+  BOOST_TEST(*cpu.resource_limit_patch->cpu_quota_us == 50000U);
+  BOOST_REQUIRE(cpu.resource_limit_patch->cpu_period_us);
+  BOOST_TEST(*cpu.resource_limit_patch->cpu_period_us == 100000U);
+
+  const bbp::ParsedTuiCommand unlimited =
+      bbp::TuiCommandParser::Parse("resource-limit cpu-max max 250000", 0U);
+  BOOST_REQUIRE(unlimited.resource_limit_patch);
+  BOOST_TEST(unlimited.resource_limit_patch->cpu_quota_present);
+  BOOST_TEST(!unlimited.resource_limit_patch->cpu_quota_us);
+  BOOST_REQUIRE(unlimited.resource_limit_patch->cpu_period_us);
+  BOOST_TEST(*unlimited.resource_limit_patch->cpu_period_us == 250000U);
+
+  const bbp::ParsedTuiCommand cpu_weight =
+      bbp::TuiCommandParser::Parse("resource-limit cpu-weight 10000", 0U);
+  BOOST_REQUIRE(cpu_weight.resource_limit_patch);
+  BOOST_REQUIRE(cpu_weight.resource_limit_patch->cpu_weight);
+  BOOST_TEST(*cpu_weight.resource_limit_patch->cpu_weight == 10000U);
+
+  const bbp::ParsedTuiCommand io = bbp::TuiCommandParser::Parse(
+      "resource-limit io-max 259:7 1000 max 30 max", 0U);
+  BOOST_REQUIRE(io.resource_limit_patch);
+  BOOST_TEST(io.resource_limit_patch->io_limits_present);
+  BOOST_REQUIRE_EQUAL(io.resource_limit_patch->io_limits.size(), 1U);
+  const bbp::IoLimit& io_limit = io.resource_limit_patch->io_limits.front();
+  BOOST_TEST(io_limit.device.major == 259U);
+  BOOST_TEST(io_limit.device.minor == 7U);
+  BOOST_REQUIRE(io_limit.read_bytes_per_sec);
+  BOOST_TEST(*io_limit.read_bytes_per_sec == 1000U);
+  BOOST_TEST(!io_limit.write_bytes_per_sec);
+  BOOST_REQUIRE(io_limit.read_operations_per_sec);
+  BOOST_TEST(*io_limit.read_operations_per_sec == 30U);
+  BOOST_TEST(!io_limit.write_operations_per_sec);
+
+  const bbp::ParsedTuiCommand clear_io = bbp::TuiCommandParser::Parse(
+      "resource-limit io-max 259:7 max max max max", 0U);
+  BOOST_REQUIRE(clear_io.resource_limit_patch);
+  BOOST_REQUIRE_EQUAL(clear_io.resource_limit_patch->io_limits.size(), 1U);
+  const bbp::IoLimit& clear = clear_io.resource_limit_patch->io_limits.front();
+  BOOST_TEST(!clear.read_bytes_per_sec);
+  BOOST_TEST(!clear.write_bytes_per_sec);
+  BOOST_TEST(!clear.read_operations_per_sec);
+  BOOST_TEST(!clear.write_operations_per_sec);
+
+  const bbp::ParsedTuiCommand io_weight =
+      bbp::TuiCommandParser::Parse("resource-limit io-weight 1", 0U);
+  BOOST_REQUIRE(io_weight.resource_limit_patch);
+  BOOST_REQUIRE(io_weight.resource_limit_patch->io_weight);
+  BOOST_TEST(*io_weight.resource_limit_patch->io_weight == 1U);
+
+  const bbp::ParsedTuiCommand pids =
+      bbp::TuiCommandParser::Parse("resource-limit pids-max 128", 0U);
+  BOOST_REQUIRE(pids.resource_limit_patch);
+  BOOST_REQUIRE(pids.resource_limit_patch->pids_max);
+  BOOST_TEST(*pids.resource_limit_patch->pids_max == 128U);
+}
+
+BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_resource_limits) {
+  constexpr std::string_view kInvalidCommands[] = {
+      "resource-limit",
+      "resource-limit unknown 1",
+      "resource-limit memory-high",
+      "resource-limit memory-high -1",
+      "resource-limit memory-high +1",
+      "resource-limit memory-high 18446744073709551616",
+      "resource-limit memory-max 0",
+      "resource-limit cpu-max 0 100000",
+      "resource-limit cpu-max max 0",
+      "resource-limit cpu-max MAX 100000",
+      "resource-limit cpu-weight 0",
+      "resource-limit cpu-weight 10001",
+      "resource-limit io-weight 0",
+      "resource-limit io-weight 10001",
+      "resource-limit pids-max 0",
+      "resource-limit io-max 259 1 2 3 4",
+      "resource-limit io-max 4294967296:0 1 2 3 4",
+      "resource-limit io-max 259:0 0 2 3 4",
+      "resource-limit io-max 259:0 1 2 3",
+      "resource-limit io-max 259:0 1 2 3 4 extra",
+  };
+  for (const std::string_view command : kInvalidCommands) {
+    BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse(command, 0U),
+                      std::runtime_error);
+  }
+}
+
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
   BOOST_TEST(bbp::TuiCommandParser::Complete("reco") == "reconnect ");
   BOOST_TEST(bbp::TuiCommandParser::Complete("log-") == "log-");

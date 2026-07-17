@@ -243,6 +243,7 @@ add_executable(bbp
   src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
   src/runtime_peer_topology.cpp
+  src/resource_limit_patch.cpp
   src/scheduled_scenario_event.cpp
   src/simulation_command.cpp
   src/simulation_command_processor.cpp
@@ -314,6 +315,7 @@ if(BUILD_TESTING)
     tests/unit/probabilistic_block_scheduler_tests.cpp
     tests/unit/run_report_tests.cpp
     tests/unit/runtime_peer_topology_tests.cpp
+    tests/unit/resource_limit_patch_tests.cpp
     tests/unit/scheduled_scenario_event_tests.cpp
     tests/unit/simulation_command_processor_tests.cpp
     tests/unit/simulation_command_queue_tests.cpp
@@ -358,6 +360,7 @@ if(BUILD_TESTING)
     src/process.cpp
     src/process_control_config.cpp
     src/probabilistic_block_scheduler.cpp
+    src/resource_limit_patch.cpp
     src/run_report.cpp
     src/runtime_peer_topology.cpp
     src/scheduled_scenario_event.cpp

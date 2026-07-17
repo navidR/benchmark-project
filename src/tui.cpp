@@ -1039,7 +1039,7 @@ void DrawCommandConfirmationPopup(int rows, int cols,
 
 void DrawCommandPalette(int rows, int cols, std::string_view input,
                         std::string_view error) {
-  constexpr int kPopupRows = 21;
+  constexpr int kPopupRows = 22;
   if (rows < kPopupRows + 2 || cols < 48) {
     return;
   }
@@ -1072,39 +1072,47 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   AddText(top + 9, left + 2, popup_cols - 4,
           "resource-profile <name>  network-profile <name>");
   AddText(top + 10, left + 2, popup_cols - 4,
+          "resource-limit memory-high|memory-max <bytes>");
+  AddText(top + 11, left + 2, popup_cols - 4,
+          "resource-limit cpu-max <quota|max> <period>  cpu-weight <weight>");
+  AddText(top + 12, left + 2, popup_cols - 4,
+          "resource-limit io-max <dev> <rbps> <wbps> <riops> <wiops>");
+  AddText(top + 13, left + 2, popup_cols - 4,
+          "resource-limit io-weight <weight>  pids-max <count>");
+  AddText(top + 14, left + 2, popup_cols - 4,
           "network-condition <mbps> <delay> <jitter> <loss> <dup> <corrupt> "
           "<reorder> [limit]");
-  AddText(top + 11, left + 2, popup_cols - 4,
+  AddText(top + 15, left + 2, popup_cols - 4,
           "block|unblock <dst-ip> <port> [src-ip]  clear-rule <handle>");
-  AddText(top + 12, left + 2, popup_cols - 4,
+  AddText(top + 16, left + 2, popup_cols - 4,
           "partition <node-id>  heal <node-id>");
-  AddText(top + 13, left + 2, popup_cols - 4,
+  AddText(top + 17, left + 2, popup_cols - 4,
           "perf-counters [node|wallet|group|cgroup [id]] <name[,name...]>");
-  AddText(top + 16, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+  AddText(top + 18, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
           A_BOLD);
   if (!error.empty()) {
-    AddText(top + 17, left + 2, popup_cols - 4, error,
+    AddText(top + 19, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   }
-  AddText(top + 19, left + 2, popup_cols - 4,
+  AddText(top + 20, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
 }
 
 void DrawCommandPaletteInput(int rows, int cols, std::string_view input,
                              std::string_view error) {
-  constexpr int kPopupRows = 21;
+  constexpr int kPopupRows = 22;
   if (rows < kPopupRows + 2 || cols < 48) {
     return;
   }
   const int popup_cols = std::min(cols - 4, 78);
   const int top = (rows - kPopupRows) / 2;
   const int left = (cols - popup_cols) / 2;
-  mvhline(top + 16, left + 1, ' ', popup_cols - 2);
-  mvhline(top + 17, left + 1, ' ', popup_cols - 2);
-  AddText(top + 16, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+  mvhline(top + 18, left + 1, ' ', popup_cols - 2);
+  mvhline(top + 19, left + 1, ' ', popup_cols - 2);
+  AddText(top + 18, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
           A_BOLD);
   if (!error.empty()) {
-    AddText(top + 17, left + 2, popup_cols - 4, error,
+    AddText(top + 19, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   }
 }
@@ -2157,6 +2165,12 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
         }
         sequence =
             command_queue->PushGenerateBlocks(node_id, *parsed.block_count);
+      } else if (parsed.kind == SimulationCommandKind::kSetResourceLimits) {
+        if (!parsed.resource_limit_patch) {
+          throw std::runtime_error("resource limit patch is missing");
+        }
+        sequence = command_queue->PushResourceLimits(
+            node_id, *parsed.resource_limit_patch, confirmed);
       } else if (parsed.kind == SimulationCommandKind::kSetResourceProfile ||
                  parsed.kind == SimulationCommandKind::kSetNetworkProfile) {
         if (!parsed.profile) {

@@ -112,6 +112,7 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
     case SimulationCommandKind::kRestartNode:
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kSetResourceProfile:
+    case SimulationCommandKind::kSetResourceLimits:
     case SimulationCommandKind::kSetNetworkProfile:
     case SimulationCommandKind::kSetNetworkCondition:
     case SimulationCommandKind::kBlockNetworkFlow:

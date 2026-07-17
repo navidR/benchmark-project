@@ -10,6 +10,7 @@
 #include "bbp/network.h"
 #include "bbp/peer_count_policy.h"
 #include "bbp/simulation_command.h"
+#include "bbp/simulator/resource_limit_patch.h"
 
 namespace bbp {
 
@@ -21,6 +22,7 @@ struct ParsedTuiCommand {
   std::optional<PeerCountPolicy> peer_count_policy;
   std::optional<std::uint32_t> block_count;
   std::optional<std::string> profile;
+  std::optional<ResourceLimitPatch> resource_limit_patch;
   std::optional<NetworkCondition> network_condition;
   std::optional<SimulationNetworkFlow> network_flow;
   std::optional<PerfCounterTargetKind> perf_counter_target_kind;

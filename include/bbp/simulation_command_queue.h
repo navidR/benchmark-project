@@ -28,6 +28,9 @@ class SimulationCommandQueue {
   std::uint64_t PushProfileCommand(SimulationCommandKind kind,
                                    std::string node_id, std::string profile,
                                    bool confirmed = false);
+  std::uint64_t PushResourceLimits(std::string node_id,
+                                   ResourceLimitPatch patch,
+                                   bool confirmed = false);
   std::uint64_t PushNetworkCondition(std::string node_id,
                                      NetworkCondition condition,
                                      bool confirmed = false);

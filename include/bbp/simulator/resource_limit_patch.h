@@ -2,9 +2,11 @@
 
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include "bbp/cgroup.h"
+#include "bbp/simulator/resource_limits.h"
 
 namespace bbp {
 
@@ -19,6 +21,15 @@ struct ResourceLimitPatch {
   bool io_limits_present = false;
   std::vector<IoLimit> io_limits;
   std::optional<std::uint64_t> pids_max;
+
+  bool operator==(const ResourceLimitPatch&) const = default;
 };
+
+bool ResourceLimitPatchIsEmpty(const ResourceLimitPatch& patch);
+void ValidateResourceLimitPatch(
+    const ResourceLimitPatch& patch,
+    std::string_view context = "runtime resource update");
+ResourceLimitPatch ResolveOperatorResourceLimitPatch(
+    const ResourceLimits& current, const ResourceLimitPatch& requested);
 
 }  // namespace bbp
