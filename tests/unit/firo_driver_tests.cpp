@@ -294,12 +294,14 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   config.rpc_user = "user";
   config.rpc_password = "password";
   config.connect_peers = {"127.0.0.1:18169"};
+  config.extra_args = bbp::ChainExtraArgs({"-dbcache=64", "-maxmempool=128"});
 
   const bbp::FiroDriver driver(std::chrono::milliseconds(100));
   const bbp::ProcessSpec process = driver.RenderProcess(config);
   bool dandelion_disabled = false;
   bool transaction_index_enabled = false;
   bool regtest_selected = false;
+  bool exact_extra_arguments = false;
   for (const std::string& argument : process.argv) {
     BOOST_TEST(!argument.starts_with("-connect="));
     if (argument == "-dandelion=0") {
@@ -312,9 +314,14 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
       regtest_selected = true;
     }
   }
+  exact_extra_arguments =
+      process.argv.size() >= 2U &&
+      process.argv[process.argv.size() - 2U] == "-dbcache=64" &&
+      process.argv.back() == "-maxmempool=128";
   BOOST_TEST(dandelion_disabled);
   BOOST_TEST(transaction_index_enabled);
   BOOST_TEST(regtest_selected);
+  BOOST_TEST(exact_extra_arguments);
 
   config.network = static_cast<bbp::ChainNetwork>(999);
   BOOST_CHECK_THROW(driver.RenderProcess(config), std::runtime_error);

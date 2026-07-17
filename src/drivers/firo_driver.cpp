@@ -455,6 +455,8 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
   if (!config.p2p_bind.empty()) {
     spec.argv.push_back(Arg("-bind", config.p2p_bind));
   }
+  spec.argv.insert(spec.argv.end(), config.extra_args.arguments().begin(),
+                   config.extra_args.arguments().end());
   return spec;
 }
 

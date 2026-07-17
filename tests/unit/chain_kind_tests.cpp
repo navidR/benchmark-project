@@ -65,6 +65,20 @@ BOOST_AUTO_TEST_CASE(chain_node_config_retains_requested_network) {
              static_cast<int>(bbp::ChainNetwork::kRegtest));
 }
 
+BOOST_AUTO_TEST_CASE(chain_node_config_retains_protected_extra_args) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "extra-args-test";
+  request.run_root = "/tmp/extra-args-test";
+  request.daemon_binary = "/tmp/firod";
+  request.extra_args = bbp::ChainExtraArgs({"-dbcache=64"});
+
+  const bbp::ChainNodeConfig config =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request);
+
+  BOOST_REQUIRE_EQUAL(config.extra_args.arguments().size(), 1U);
+  BOOST_TEST(config.extra_args.arguments()[0] == "-dbcache=64");
+}
+
 BOOST_AUTO_TEST_CASE(chain_node_config_retains_generated_id_by_default) {
   bbp::ChainNodeConfigRequest request;
   request.run_id = "legacy-test";

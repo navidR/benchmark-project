@@ -124,6 +124,7 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
   ChainNodeConfig config;
   config.id = node_id;
   config.network = request.network;
+  config.extra_args = request.extra_args;
   config.binary = request.daemon_binary;
   config.data_dir = ResolveNodeDataDirectory(request, node_id);
   config.log_dir = node_root;

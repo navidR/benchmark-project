@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "bbp/chain_extra_args.h"
 #include "bbp/chain_kind.h"
 #include "bbp/chain_network.h"
 #include "bbp/drivers/chain_driver.h"
@@ -33,6 +34,7 @@ struct ChainNodeConfigRequest {
   std::uint32_t node_index = 0;
   std::string node_id;
   ChainNetwork network = ChainNetwork::kRegtest;
+  ChainExtraArgs extra_args;
   bool wallet_enabled = false;
   std::vector<std::string> connect_peers;
 };

@@ -212,6 +212,7 @@ add_executable(bbp
   src/block_production_policy.cpp
   src/capability.cpp
   src/cgroup.cpp
+  src/chain_extra_args.cpp
   src/chain_network.cpp
   src/chain_kind.cpp
   src/default_peer_topology.cpp
@@ -296,6 +297,7 @@ if(BUILD_TESTING)
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
+    tests/unit/chain_extra_args_tests.cpp
     tests/unit/chain_network_tests.cpp
     tests/unit/chain_kind_tests.cpp
     tests/unit/chain_wallet_transaction_tests.cpp
@@ -343,6 +345,7 @@ if(BUILD_TESTING)
     tests/unit/workload_kind_tests.cpp
     src/capability.cpp
     src/cgroup.cpp
+    src/chain_extra_args.cpp
     src/chain_network.cpp
     src/chain_kind.cpp
     src/block_production_policy.cpp
@@ -695,6 +698,31 @@ if(BUILD_TESTING)
     bbp-invalid-node-chain-config-field
     tests/scenarios/invalid-node-chain-config-field.json
     "scenario node firo-1 has unsupported chain_config field: untyped_option"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-extra-args-shape
+    tests/scenarios/invalid-node-chain-extra-args-shape.json
+    "scenario node firo-1 chain_config.extra_args must be an array"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-extra-arg-entry
+    tests/scenarios/invalid-node-chain-extra-arg-entry.json
+    "scenario node firo-1 chain_config.extra_args entries must be strings"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-extra-arg-owned
+    tests/scenarios/invalid-node-chain-extra-arg-owned.json
+    "chain extra argument uses simulator-owned option: rpcpassword"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-extra-arg-positional
+    tests/scenarios/invalid-node-chain-extra-arg-positional.json
+    "chain extra argument must be a named daemon option"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-chain-extra-arg-control
+    tests/scenarios/invalid-node-chain-extra-arg-control.json
+    "chain extra argument must not contain control characters"
   )
   add_cli_failure_test(
     bbp-invalid-node-binary-shape

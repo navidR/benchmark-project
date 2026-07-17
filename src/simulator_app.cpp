@@ -2091,7 +2091,7 @@ ScenarioNodeRoles ParseScenarioNodes(
       }
       const boost::json::object& chain_config = chain_config_value->as_object();
       for (const auto& member : chain_config) {
-        if (member.key() != "network") {
+        if (member.key() != "network" && member.key() != "extra_args") {
           throw std::runtime_error("scenario node " + id +
                                    " has unsupported chain_config field: " +
                                    std::string(member.key()));
@@ -2104,6 +2104,25 @@ ScenarioNodeRoles ParseScenarioNodes(
                                    " chain_config.network must be a string");
         }
         node_config.network = ParseChainNetwork(network->as_string());
+      }
+      const boost::json::value* extra_args =
+          chain_config.if_contains("extra_args");
+      if (extra_args != nullptr) {
+        if (!extra_args->is_array()) {
+          throw std::runtime_error("scenario node " + id +
+                                   " chain_config.extra_args must be an array");
+        }
+        std::vector<std::string> arguments;
+        arguments.reserve(extra_args->as_array().size());
+        for (const boost::json::value& argument : extra_args->as_array()) {
+          if (!argument.is_string()) {
+            throw std::runtime_error(
+                "scenario node " + id +
+                " chain_config.extra_args entries must be strings");
+          }
+          arguments.emplace_back(argument.as_string());
+        }
+        node_config.extra_args = ChainExtraArgs(std::move(arguments));
       }
     }
 
@@ -2306,6 +2325,13 @@ ChainNetwork EffectiveNodeChainNetwork(const Options& options,
                                        uint32_t node_index) {
   const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
   return config == nullptr ? ChainNetwork::kRegtest : config->network;
+}
+
+const ChainExtraArgs& EffectiveNodeExtraArgs(const Options& options,
+                                             uint32_t node_index) {
+  static const ChainExtraArgs empty;
+  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
+  return config == nullptr ? empty : config->extra_args;
 }
 
 bool NodeHasScenarioRole(const Options& options, uint32_t node_index,
@@ -7351,6 +7377,12 @@ void WriteScenarioFiles(const Options& options,
     boost::json::object chain_config;
     chain_config["network"] =
         ChainNetworkName(EffectiveNodeChainNetwork(options, node_index));
+    boost::json::array extra_args;
+    for (const std::string& argument :
+         EffectiveNodeExtraArgs(options, node_index).arguments()) {
+      extra_args.emplace_back(argument);
+    }
+    chain_config["extra_args"] = std::move(extra_args);
     node["chain_config"] = std::move(chain_config);
     if (!options.node_roles.empty()) {
       node["role"] = options.node_roles.at(node_index);
@@ -7581,6 +7613,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     config_request.data_dir = NodeDataDirectoryRelative(options, i);
     config_request.node_index = i;
     config_request.network = EffectiveNodeChainNetwork(options, i);
+    config_request.extra_args = EffectiveNodeExtraArgs(options, i);
     if (!options.node_ids.empty()) {
       config_request.node_id = options.node_ids.at(i);
     }

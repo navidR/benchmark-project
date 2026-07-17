@@ -11,3 +11,6 @@ nodes:
     role: base
     chain_config:
       network: regtest
+      extra_args:
+        - -dbcache=64
+        - -maxmempool=128
