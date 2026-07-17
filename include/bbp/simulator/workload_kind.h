@@ -28,6 +28,7 @@ enum class WorkloadKind {
   kRestoreEdge,
   kSendRawTransaction,
   kWalletTransactions,
+  kCheckpoint,
 };
 
 constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
@@ -76,6 +77,8 @@ constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
       return "send_raw_transaction";
     case WorkloadKind::kWalletTransactions:
       return "wallet_transactions";
+    case WorkloadKind::kCheckpoint:
+      return "checkpoint";
   }
   return "unknown";
 }
@@ -146,6 +149,9 @@ constexpr std::optional<WorkloadKind> ParseWorkloadKind(std::string_view name) {
   }
   if (name == "wallet_transactions") {
     return WorkloadKind::kWalletTransactions;
+  }
+  if (name == "checkpoint") {
+    return WorkloadKind::kCheckpoint;
   }
   return std::nullopt;
 }

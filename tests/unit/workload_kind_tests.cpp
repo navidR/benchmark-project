@@ -5,7 +5,7 @@
 #include "bbp/simulator/workload_kind.h"
 
 BOOST_AUTO_TEST_CASE(workload_kind_names_round_trip) {
-  constexpr std::array<bbp::WorkloadKind, 22> kKinds = {
+  constexpr std::array<bbp::WorkloadKind, 23> kKinds = {
       bbp::WorkloadKind::kBlockGeneration,
       bbp::WorkloadKind::kWaitUntilHeight,
       bbp::WorkloadKind::kWaitForPeers,
@@ -28,6 +28,7 @@ BOOST_AUTO_TEST_CASE(workload_kind_names_round_trip) {
       bbp::WorkloadKind::kRestoreEdge,
       bbp::WorkloadKind::kSendRawTransaction,
       bbp::WorkloadKind::kWalletTransactions,
+      bbp::WorkloadKind::kCheckpoint,
   };
 
   for (const bbp::WorkloadKind kind : kKinds) {

@@ -485,6 +485,10 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
       case WorkloadKind::kWalletTransactions:
         text += type_name;
         break;
+      case WorkloadKind::kCheckpoint:
+        text += "checkpoint ";
+        text += JsonString(workload, "name", "-");
+        break;
     }
   }
   return text;

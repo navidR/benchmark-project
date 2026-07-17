@@ -146,6 +146,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "node_restarted";
     case SimulationEventKind::kNodeFreezeCompleted:
       return "node_freeze_completed";
+    case SimulationEventKind::kCheckpointRecorded:
+      return "checkpoint_recorded";
   }
   throw std::runtime_error("unknown simulation event kind");
 }
@@ -268,6 +270,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
   if (name == "node_restarted") return SimulationEventKind::kNodeRestarted;
   if (name == "node_freeze_completed")
     return SimulationEventKind::kNodeFreezeCompleted;
+  if (name == "checkpoint_recorded")
+    return SimulationEventKind::kCheckpointRecorded;
   return std::nullopt;
 }
 

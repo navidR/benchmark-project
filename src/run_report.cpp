@@ -35,6 +35,7 @@ constexpr std::size_t kMaximumNodeMetricHistorySamples = 120U;
 constexpr std::size_t kMaximumOperatorCommandSummaries = 256U;
 constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
 constexpr std::size_t kMaximumScheduledEventSummaries = 256U;
+constexpr std::size_t kMaximumCheckpointSummaries = 256U;
 constexpr std::size_t kMaximumDirectionalPolicyVerifications = 256U;
 constexpr std::size_t kMaximumTopologyEdgeSummaries = 256U;
 constexpr std::size_t kMaximumProfileUpdateSummaries = 256U;
@@ -1634,6 +1635,14 @@ void AppendScheduledEventSummary(const boost::json::object& event,
   }
 }
 
+void AppendCheckpointSummary(const boost::json::object& event,
+                             boost::json::array* summaries) {
+  AppendEventSummary(event, summaries);
+  if (summaries->size() > kMaximumCheckpointSummaries) {
+    summaries->erase(summaries->begin());
+  }
+}
+
 void AppendDirectionalPolicyVerification(const boost::json::object& event,
                                          boost::json::array* summaries) {
   AppendEventSummary(event, summaries);
@@ -1764,6 +1773,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   std::uint64_t scheduled_event_started_count = 0;
   std::uint64_t scheduled_event_completed_count = 0;
   std::uint64_t scheduled_event_failed_count = 0;
+  std::uint64_t checkpoint_count = 0;
   bool run_started = false;
   bool run_finished = false;
   bool run_failed = false;
@@ -1778,6 +1788,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array scheduled_events_started;
   boost::json::array scheduled_events_completed;
   boost::json::array scheduled_events_failed;
+  boost::json::array checkpoints;
   boost::json::array height_reached;
   boost::json::array height_waits;
   boost::json::array peer_waits;
@@ -1869,6 +1880,10 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
           case SimulationEventKind::kScheduledEventFailed:
             ++scheduled_event_failed_count;
             AppendScheduledEventSummary(event, &scheduled_events_failed);
+            break;
+          case SimulationEventKind::kCheckpointRecorded:
+            ++checkpoint_count;
+            AppendCheckpointSummary(event, &checkpoints);
             break;
           case SimulationEventKind::kHeightReached:
             AppendEventSummary(event, &height_reached);
@@ -2043,6 +2058,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["scheduled_events_started"] = std::move(scheduled_events_started);
   report["scheduled_events_completed"] = std::move(scheduled_events_completed);
   report["scheduled_events_failed"] = std::move(scheduled_events_failed);
+  report["checkpoint_count"] = checkpoint_count;
+  report["checkpoints"] = std::move(checkpoints);
   report["height_reached"] = std::move(height_reached);
   report["height_waits"] = std::move(height_waits);
   report["peer_waits"] = std::move(peer_waits);

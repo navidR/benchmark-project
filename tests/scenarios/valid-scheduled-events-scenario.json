@@ -32,6 +32,11 @@
       "action": "heal_partition",
       "group_a": [1],
       "group_b": [2]
+    },
+    {
+      "at": "5s",
+      "action": "checkpoint",
+      "name": "after-heal"
     }
   ]
 }

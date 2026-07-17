@@ -2566,6 +2566,16 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.wallet_transactions = std::move(transactions);
       options.workloads.push_back(std::move(scenario_workload));
       options.wallet_backed_workload_requested = true;
+    } else if (*kind == WorkloadKind::kCheckpoint) {
+      CheckpointWorkload checkpoint;
+      if (workload.if_contains("name") != nullptr) {
+        checkpoint.name = JsonStringField(workload, "name");
+        RequireSafeScenarioIdentifier(checkpoint.name, "checkpoint name");
+      }
+      ScenarioWorkload scenario_workload;
+      scenario_workload.kind = WorkloadKind::kCheckpoint;
+      scenario_workload.checkpoint = std::move(checkpoint);
+      options.workloads.push_back(std::move(scenario_workload));
     }
   }
 }
@@ -6038,17 +6048,35 @@ std::string FreezeNodeWorkloadDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
+std::string CheckpointWorkloadDetail(std::uint32_t workload_index,
+                                     std::uint32_t workload_count,
+                                     std::string_view name,
+                                     std::uint32_t node_metric_samples,
+                                     std::uint32_t wallet_metric_samples) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["name"] = name;
+  detail["node_metric_samples"] = node_metric_samples;
+  detail["wallet_metric_samples"] = wallet_metric_samples;
+  detail["total_metric_samples"] =
+      static_cast<std::uint64_t>(node_metric_samples) +
+      static_cast<std::uint64_t>(wallet_metric_samples);
+  return boost::json::serialize(detail);
+}
+
 using NodeMetricsFailureHandler =
     std::function<void(const NodeRuntime&, std::string_view)>;
 using MetricsStopRequested = std::function<bool()>;
 
-void WriteMetricsSnapshot(
+std::uint32_t WriteMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
     std::mutex& node_process_mutex,
     const NodeMetricsFailureHandler& node_failure_handler = {},
     const MetricsStopRequested& stop_requested = {},
     std::stop_token stop_token = {}) {
+  std::uint32_t sample_count = 0U;
   struct NetworkMetricsState {
     std::optional<NodeVethConfig> network;
     std::string profile;
@@ -6072,7 +6100,7 @@ void WriteMetricsSnapshot(
   for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
     NodeRuntime& node = nodes[node_index];
     if (stop_requested && stop_requested()) {
-      return;
+      return sample_count;
     }
     if (!node.AllowsChainMetrics()) {
       continue;
@@ -6229,7 +6257,9 @@ void WriteMetricsSnapshot(
             network && network->apply_condition ? &network->condition : nullptr,
             &cg, link, qdisc, network ? &qdisc_tree : nullptr, filter_metrics,
             directional_stats ? &*directional_stats : nullptr));
+    ++sample_count;
   }
+  return sample_count;
 }
 
 boost::json::object WalletTransactionJson(
@@ -6289,14 +6319,15 @@ using WalletMetricsFailureHandler =
     std::function<void(std::uint32_t wallet_index, const NodeRuntime& node,
                        std::string_view error)>;
 
-void WriteWalletMetricsSnapshot(
+std::uint32_t WriteWalletMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
     const ChainDriver& driver, const std::vector<NodeRuntime>& nodes,
     const WalletMetricsFailureHandler& failure_handler = {},
     std::stop_token stop_token = {}) {
   if (!options.wallet_backed_workload_requested) {
-    return;
+    return 0U;
   }
+  std::uint32_t sample_count = 0U;
   constexpr std::uint32_t kTransactionLimit = 256U;
   for (std::size_t index = 0; index < options.topology.wallet_nodes.size();
        ++index) {
@@ -6316,6 +6347,7 @@ void WriteWalletMetricsSnapshot(
           metrics_path,
           WalletMetricsJson(options, static_cast<std::uint32_t>(index + 1U),
                             node_index + 1U, snapshot));
+      ++sample_count;
     } catch (const std::exception& error) {
       if (!node.AllowsChainMetrics()) {
         continue;
@@ -6327,6 +6359,7 @@ void WriteWalletMetricsSnapshot(
                       error.what());
     }
   }
+  return sample_count;
 }
 
 std::string LogTailDetail(std::string_view kind, const LogTailChunk& chunk) {
@@ -6711,6 +6744,15 @@ boost::json::object WalletTransactionsWorkloadJson(
   return object;
 }
 
+boost::json::object CheckpointWorkloadJson(const CheckpointWorkload& workload) {
+  boost::json::object object;
+  object["type"] = std::string(WorkloadKindName(WorkloadKind::kCheckpoint));
+  if (!workload.name.empty()) {
+    object["name"] = workload.name;
+  }
+  return object;
+}
+
 boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   if (workload.kind == WorkloadKind::kBlockGeneration) {
     return BlockGenerationWorkloadJson(workload.block_generation);
@@ -6766,6 +6808,9 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   }
   if (workload.kind == WorkloadKind::kWalletTransactions) {
     return WalletTransactionsWorkloadJson(workload.wallet_transactions);
+  }
+  if (workload.kind == WorkloadKind::kCheckpoint) {
+    return CheckpointWorkloadJson(workload.checkpoint);
   }
   throw std::runtime_error("unknown scenario workload kind");
 }
@@ -10735,6 +10780,25 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               options, events_path, nodes,
               scenario_workload.network_partition.partition, true, action_index,
               action_count, stop_token);
+        } else if (scenario_workload.kind == WorkloadKind::kCheckpoint) {
+          const CheckpointWorkload& workload = scenario_workload.checkpoint;
+          const std::string name =
+              workload.name.empty()
+                  ? "checkpoint-" + std::to_string(action_index)
+                  : workload.name;
+          transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+                                         stop_token);
+          const std::uint32_t node_metric_samples =
+              WriteMetricsSnapshot(metrics_path, options, driver, nodes,
+                                   node_process_mutex, {}, {}, stop_token);
+          const std::uint32_t wallet_metric_samples =
+              WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver,
+                                         nodes, {}, stop_token);
+          WriteEvent(events_path, options.run_id, "sim",
+                     SimulationEventKind::kCheckpointRecorded,
+                     CheckpointWorkloadDetail(action_index, action_count, name,
+                                              node_metric_samples,
+                                              wallet_metric_samples));
         } else if (IsTopologyEdgeAction(scenario_workload.kind)) {
           std::lock_guard<std::mutex> lock(node_process_mutex);
           ApplyTopologyEdgeWorkload(

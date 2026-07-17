@@ -698,6 +698,17 @@ changes emit `topology_edge_updated`; incomplete rollback emits
 `topology_edge_updates` and the event-reduced `topology_current_edges`; the TUI
 uses that current state for its eligible-edge count.
 
+Use a typed `checkpoint` action to force a correlated observation point. It
+refreshes transaction visibility, writes one current resource/network/chain
+metric sample for every available node, writes wallet samples when wallet roles
+are active, and records a `checkpoint_recorded` event with exact sample counts.
+An optional safe `name` is preserved in the resolved scenario and shared run
+report:
+
+```json
+{"at":"30s","action":"checkpoint","name":"before-partition"}
+```
+
 Partition and region node groups must assign every simulated node exactly once.
 Region edges connect the first node in each region as its gateway; without
 explicit `region_edges`, all region gateways form a backbone mesh. A latency

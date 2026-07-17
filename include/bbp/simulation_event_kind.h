@@ -76,6 +76,7 @@ enum class SimulationEventKind {
   kPeerCountReached,
   kNodeRestarted,
   kNodeFreezeCompleted,
+  kCheckpointRecorded,
 };
 
 std::string_view SimulationEventKindName(SimulationEventKind kind);

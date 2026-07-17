@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bbp/simulator/block_generation_workload.h"
+#include "bbp/simulator/checkpoint_workload.h"
 #include "bbp/simulator/connect_peer_workload.h"
 #include "bbp/simulator/disconnect_peer_workload.h"
 #include "bbp/simulator/freeze_node_workload.h"
@@ -38,6 +39,7 @@ struct ScenarioWorkload {
   TopologyEdgeWorkload topology_edge;
   SendRawTransactionWorkload send_raw_transaction;
   WalletTransactionsWorkload wallet_transactions;
+  CheckpointWorkload checkpoint;
 };
 
 }  // namespace bbp

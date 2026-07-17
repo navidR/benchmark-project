@@ -74,6 +74,7 @@ BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
       bbp::SimulationEventKind::kPeerCountReached,
       bbp::SimulationEventKind::kNodeRestarted,
       bbp::SimulationEventKind::kNodeFreezeCompleted,
+      bbp::SimulationEventKind::kCheckpointRecorded,
   };
 
   for (const bbp::SimulationEventKind kind : kKinds) {

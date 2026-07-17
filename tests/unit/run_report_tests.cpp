@@ -1292,6 +1292,9 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_scheduled_event_lifecycle) {
   bbp::AppendLine(
       dir / "events.jsonl",
       R"({"run_id":"r1","node_id":"sim","event":"scheduled_event_failed","detail":"{\"sequence\":2,\"action\":\"freeze_node\",\"error\":\"failed\"}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"checkpoint_recorded","detail":"{\"workload_index\":1,\"workload_count\":1,\"name\":\"after-heal\",\"node_metric_samples\":1,\"wallet_metric_samples\":0,\"total_metric_samples\":1}"})");
 
   const boost::json::value value =
       boost::json::parse(bbp::BuildRunReportJson(dir));
@@ -1301,6 +1304,15 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_scheduled_event_lifecycle) {
   BOOST_TEST(JsonInteger(report, "scheduled_event_started_count") == 1U);
   BOOST_TEST(JsonInteger(report, "scheduled_event_completed_count") == 1U);
   BOOST_TEST(JsonInteger(report, "scheduled_event_failed_count") == 1U);
+  BOOST_TEST(JsonInteger(report, "checkpoint_count") == 1U);
+  const boost::json::object& checkpoint = report.at("checkpoints")
+                                              .as_array()
+                                              .front()
+                                              .as_object()
+                                              .at("detail")
+                                              .as_object();
+  BOOST_TEST(checkpoint.at("name").as_string() == "after-heal");
+  BOOST_TEST(JsonInteger(checkpoint, "total_metric_samples") == 1U);
   const boost::json::object& started = report.at("scheduled_events_started")
                                            .as_array()
                                            .front()

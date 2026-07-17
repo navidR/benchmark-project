@@ -790,6 +790,11 @@ if(BUILD_TESTING)
     "scheduled event time exceeds monotonic clock range"
   )
   add_cli_failure_test(
+    bbp-invalid-checkpoint-name
+    tests/scenarios/invalid-checkpoint-name.json
+    "checkpoint name contains an unsafe character"
+  )
+  add_cli_failure_test(
     bbp-invalid-legacy-generate-blocks
     tests/scenarios/invalid-legacy-generate-blocks.json
     "scenario generate_blocks was removed"
