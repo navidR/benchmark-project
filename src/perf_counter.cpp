@@ -25,6 +25,9 @@ extern "C" {
 namespace bbp {
 namespace {
 
+static_assert(sizeof(perf_event_attr) == 144U,
+              "perf_event_attr must match the vendored libperf ABI");
+
 struct PerfEventEncoding {
   std::uint32_t type;
   std::uint64_t config;
@@ -115,7 +118,6 @@ struct EvselDeleter {
     if (event == nullptr) {
       return;
     }
-    (void)perf_evsel__disable(event);
     perf_evsel__close(event);
     perf_evsel__delete(event);
   }

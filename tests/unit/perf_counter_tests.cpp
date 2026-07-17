@@ -139,6 +139,16 @@ BOOST_AUTO_TEST_CASE(perf_counter_open_validates_pid_and_selection) {
   }
 }
 
+BOOST_AUTO_TEST_CASE(perf_counter_open_handles_unavailable_process) {
+  try {
+    (void)bbp::ProcessPerfCounters::Open(std::numeric_limits<pid_t>::max(),
+                                         {bbp::PerfCounterKind::kTaskClock});
+    BOOST_FAIL("unavailable PID unexpectedly accepted perf counters");
+  } catch (const bbp::PerfCounterError& error) {
+    BOOST_TEST(error.error_number() != 0);
+  }
+}
+
 BOOST_AUTO_TEST_CASE(perf_counter_collects_task_clock_for_owned_process) {
   try {
     bbp::ProcessPerfCounters counters = bbp::ProcessPerfCounters::Open(

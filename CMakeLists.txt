@@ -127,9 +127,12 @@ add_library(vendored_libperf STATIC
 )
 add_library(libperf::libperf ALIAS vendored_libperf)
 target_compile_features(vendored_libperf PRIVATE c_std_99)
-target_include_directories(vendored_libperf
-  SYSTEM PUBLIC "${LIBPERF_ROOT}/tools/lib/perf/include"
-  SYSTEM PRIVATE ${LIBPERF_INCLUDE_DIRS}
+target_include_directories(vendored_libperf SYSTEM PRIVATE
+  ${LIBPERF_INCLUDE_DIRS}
+)
+target_include_directories(vendored_libperf SYSTEM INTERFACE
+  "${LIBPERF_ROOT}/tools/lib/perf/include"
+  "${LIBPERF_ROOT}/tools/include/uapi"
 )
 target_link_libraries(vendored_libperf PUBLIC vendored_libapi)
 set_target_properties(vendored_libperf PROPERTIES
