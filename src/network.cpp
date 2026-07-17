@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -1175,7 +1176,18 @@ void WaitForPid(pid_t pid) {
   }
 }
 
-UniqueFd StartNetworkNamespaceHelper(pid_t* helper_pid) {
+UniqueFd StartNetworkNamespaceHelper(
+    pid_t* helper_pid,
+    const std::filesystem::path* owner_cgroup_path = nullptr) {
+  UniqueFd cgroup_procs;
+  if (owner_cgroup_path != nullptr) {
+    cgroup_procs = UniqueFd(open(
+        ((*owner_cgroup_path) / "cgroup.procs").c_str(), O_WRONLY | O_CLOEXEC));
+    if (cgroup_procs.get() < 0) {
+      throw std::runtime_error("open network namespace helper cgroup failed: " +
+                               std::string(std::strerror(errno)));
+    }
+  }
   int pipe_fds[2];
   if (pipe2(pipe_fds, O_CLOEXEC) != 0) {
     throw std::runtime_error(std::string("pipe2 failed: ") +
@@ -1193,7 +1205,25 @@ UniqueFd StartNetworkNamespaceHelper(pid_t* helper_pid) {
   if (pid == 0) {
     read_end.Reset();
     int status = 0;
-    if (unshare(CLONE_NEWNET) != 0) {
+    if (cgroup_procs.get() >= 0) {
+      std::array<char, 32> own_pid{};
+      const auto [end, conversion_error] = std::to_chars(
+          own_pid.data(), own_pid.data() + own_pid.size(), getpid());
+      if (conversion_error != std::errc()) {
+        status = EIO;
+      } else {
+        const ssize_t written =
+            write(cgroup_procs.get(), own_pid.data(),
+                  static_cast<std::size_t>(end - own_pid.data()));
+        if (written < 0) {
+          status = errno;
+        } else if (written != end - own_pid.data()) {
+          status = EIO;
+        }
+      }
+    }
+    cgroup_procs.Reset();
+    if (status == 0 && unshare(CLONE_NEWNET) != 0) {
       status = errno;
     }
     WriteExact(write_end.get(), &status, sizeof(status));
@@ -1206,12 +1236,15 @@ UniqueFd StartNetworkNamespaceHelper(pid_t* helper_pid) {
   }
 
   write_end.Reset();
+  cgroup_procs.Reset();
   const int status = ReadNamespaceStatus(read_end.get());
   read_end.Reset();
   if (status != 0) {
     WaitForPid(pid);
-    throw std::runtime_error(std::string("unshare(CLONE_NEWNET) failed: ") +
-                             std::strerror(status));
+    const std::string operation = owner_cgroup_path == nullptr
+                                      ? "unshare(CLONE_NEWNET)"
+                                      : "network namespace helper setup";
+    throw std::runtime_error(operation + " failed: " + std::strerror(status));
   }
 
   try {
@@ -2130,6 +2163,13 @@ void ValidateNetlinkAcknowledgementForTest(
 NetworkNamespace NetworkNamespace::Create() {
   pid_t helper_pid = -1;
   UniqueFd netns = StartNetworkNamespaceHelper(&helper_pid);
+  return NetworkNamespace(helper_pid, netns.Release());
+}
+
+NetworkNamespace NetworkNamespace::Create(
+    const std::filesystem::path& owner_cgroup_path) {
+  pid_t helper_pid = -1;
+  UniqueFd netns = StartNetworkNamespaceHelper(&helper_pid, &owner_cgroup_path);
   return NetworkNamespace(helper_pid, netns.Release());
 }
 

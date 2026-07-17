@@ -3,6 +3,7 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -199,6 +200,8 @@ void ValidateIpv4Address(std::string_view address, std::string_view field_name);
 class NetworkNamespace {
  public:
   static NetworkNamespace Create();
+  static NetworkNamespace Create(
+      const std::filesystem::path& owner_cgroup_path);
 
   NetworkNamespace() = default;
   NetworkNamespace(const NetworkNamespace&) = delete;

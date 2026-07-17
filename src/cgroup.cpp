@@ -8,10 +8,12 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -27,9 +29,46 @@ namespace {
 
 constexpr std::string_view kCgroupRoot = "/sys/fs/cgroup";
 constexpr std::string_view kSimulatorRootName = "bbp";
+constexpr std::string_view kRunOwnershipMarker = ".bbp-run";
+constexpr std::string_view kRunOwnershipMarkerContents = "bbp run\n";
+
+std::mutex prepared_runs_mutex;
+std::set<std::string> prepared_runs;
+
+struct CgroupPaths {
+  std::filesystem::path root;
+  std::filesystem::path simulator;
+  std::filesystem::path run;
+};
 
 std::filesystem::path CgroupRoot() {
   return std::filesystem::path(kCgroupRoot);
+}
+
+CgroupPaths CgroupPathsForRun(const std::string& run_id) {
+  const std::filesystem::path root = CgroupRoot();
+  const std::filesystem::path simulator =
+      root / std::string(kSimulatorRootName);
+  return CgroupPaths{
+      .root = root, .simulator = simulator, .run = simulator / run_id};
+}
+
+bool RunWasPrepared(const std::string& run_id) {
+  std::lock_guard<std::mutex> lock(prepared_runs_mutex);
+  return prepared_runs.contains(run_id);
+}
+
+void RecordPreparedRun(const std::string& run_id) {
+  std::lock_guard<std::mutex> lock(prepared_runs_mutex);
+  if (!prepared_runs.insert(run_id).second) {
+    throw std::runtime_error(
+        "run cgroup is already prepared by this process: " + run_id);
+  }
+}
+
+void ForgetPreparedRun(const std::string& run_id) {
+  std::lock_guard<std::mutex> lock(prepared_runs_mutex);
+  prepared_runs.erase(run_id);
 }
 
 bool RunningInsideDocker() { return std::filesystem::exists("/.dockerenv"); }
@@ -370,6 +409,8 @@ void WaitForCgroupProcsEmpty(const std::filesystem::path& dir) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
+  throw std::runtime_error("cgroup still contains processes after kill: " +
+                           dir.string());
 }
 
 void KillCgroupIfSupported(const std::filesystem::path& dir) {
@@ -426,6 +467,120 @@ void MoveRootProcessesIntoContainerController(
       "could not delegate Docker cgroup root; root cgroup still has processes");
 }
 
+void CreateCgroupDirectoryExclusive(const std::filesystem::path& path,
+                                    std::string_view kind) {
+  std::error_code ec;
+  const bool created = std::filesystem::create_directory(path, ec);
+  if (ec) {
+    throw std::runtime_error("create " + std::string(kind) +
+                             " cgroup failed for " + path.string() + ": " +
+                             ec.message());
+  }
+  if (!created) {
+    throw std::runtime_error("refusing to adopt pre-existing " +
+                             std::string(kind) + " cgroup: " + path.string());
+  }
+}
+
+std::vector<std::filesystem::path> DescendantCgroupsDeepestFirst(
+    const std::filesystem::path& run_root) {
+  std::vector<std::filesystem::path> paths;
+  std::error_code ec;
+  std::filesystem::recursive_directory_iterator iterator(
+      run_root, std::filesystem::directory_options::none, ec);
+  const std::filesystem::recursive_directory_iterator end;
+  if (ec) {
+    throw std::runtime_error("list run cgroup failed for " + run_root.string() +
+                             ": " + ec.message());
+  }
+  while (iterator != end) {
+    const bool is_directory = iterator->is_directory(ec);
+    if (ec) {
+      throw std::runtime_error("inspect run cgroup entry failed for " +
+                               iterator->path().string() + ": " + ec.message());
+    }
+    if (is_directory) {
+      paths.push_back(iterator->path());
+    }
+    iterator.increment(ec);
+    if (ec) {
+      throw std::runtime_error("list run cgroup failed for " +
+                               run_root.string() + ": " + ec.message());
+    }
+  }
+  const auto depth = [](const std::filesystem::path& path) {
+    return static_cast<std::size_t>(std::distance(path.begin(), path.end()));
+  };
+  std::sort(paths.begin(), paths.end(), [&](const auto& lhs, const auto& rhs) {
+    const std::size_t lhs_depth = depth(lhs);
+    const std::size_t rhs_depth = depth(rhs);
+    if (lhs_depth != rhs_depth) {
+      return lhs_depth > rhs_depth;
+    }
+    return lhs.generic_string() < rhs.generic_string();
+  });
+  return paths;
+}
+
+void RemoveCgroupDirectory(const std::filesystem::path& path,
+                           std::string_view kind) {
+  std::error_code ec;
+  const bool removed = std::filesystem::remove(path, ec);
+  if (ec) {
+    throw std::runtime_error("remove " + std::string(kind) +
+                             " cgroup failed for " + path.string() + ": " +
+                             ec.message());
+  }
+  if (!removed) {
+    throw std::runtime_error(
+        std::string(kind) +
+        " cgroup disappeared during removal: " + path.string());
+  }
+}
+
+void RemoveRunCgroup(const std::string& run_id) {
+  const std::filesystem::path run_root = CgroupPathsForRun(run_id).run;
+  if (!std::filesystem::exists(run_root)) {
+    return;
+  }
+  KillCgroupIfSupported(run_root);
+  for (const std::filesystem::path& path :
+       DescendantCgroupsDeepestFirst(run_root)) {
+    KillCgroupIfSupported(path);
+    RemoveCgroupDirectory(path, "descendant");
+  }
+  RemoveCgroupDirectory(run_root, "run");
+}
+
+void RequireStaleRunOwnership(
+    const std::string& run_id,
+    const std::filesystem::path& owned_run_directory) {
+  if (owned_run_directory.filename() != run_id) {
+    throw std::runtime_error(
+        "run directory does not match stale cgroup run id: " +
+        owned_run_directory.string());
+  }
+  std::error_code ec;
+  const std::filesystem::file_status run_status =
+      std::filesystem::symlink_status(owned_run_directory, ec);
+  if (ec || !std::filesystem::is_directory(run_status)) {
+    throw std::runtime_error(
+        "stale cgroup cleanup requires an owned run "
+        "directory: " +
+        owned_run_directory.string());
+  }
+  const std::filesystem::path marker =
+      owned_run_directory / std::string(kRunOwnershipMarker);
+  const std::filesystem::file_status marker_status =
+      std::filesystem::symlink_status(marker, ec);
+  if (ec || !std::filesystem::is_regular_file(marker_status) ||
+      ReadText(marker) != kRunOwnershipMarkerContents) {
+    throw std::runtime_error(
+        "stale cgroup cleanup requires an exact simulator ownership marker: " +
+        marker.string());
+  }
+}
+
 }  // namespace
 
 BlockDeviceId ParseBlockDeviceId(std::string_view text) {
@@ -452,58 +607,76 @@ std::string BlockDeviceIdText(const BlockDeviceId& device) {
   return std::to_string(device.major) + ":" + std::to_string(device.minor);
 }
 
+void Cgroup::PrepareRun(const std::string& run_id) {
+  RequireSafeRunId(run_id);
+
+  const CgroupPaths paths = CgroupPathsForRun(run_id);
+  if (!std::filesystem::exists(paths.root / "cgroup.controllers")) {
+    throw std::runtime_error("cgroup v2 is not mounted at " +
+                             paths.root.string());
+  }
+
+  RequireControllersAvailable(paths.root, {"cpu", "io", "memory", "pids"});
+  EnsureDirectory(paths.simulator);
+  if (!CgroupProcsEmpty(paths.root)) {
+    MoveRootProcessesIntoContainerController(paths.simulator);
+  }
+  EnableControllers(paths.root);
+  RequireControllersAvailable(paths.simulator, {"cpu", "io", "memory", "pids"});
+  EnableControllers(paths.simulator);
+  CreateCgroupDirectoryExclusive(paths.run, "run");
+  try {
+    RequireControllersAvailable(paths.run, {"cpu", "io", "memory", "pids"});
+    EnableControllers(paths.run);
+    RecordPreparedRun(run_id);
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(paths.run, ignored);
+    throw;
+  }
+}
+
 Cgroup Cgroup::Create(const std::string& run_id, const std::string& node_id) {
   RequireSafeRunId(run_id);
   RequireSafeRunId(node_id);
 
-  const std::filesystem::path root = CgroupRoot();
-  if (!std::filesystem::exists(root / "cgroup.controllers")) {
-    throw std::runtime_error("cgroup v2 is not mounted at " + root.string());
+  const CgroupPaths paths = CgroupPathsForRun(run_id);
+  if (!RunWasPrepared(run_id)) {
+    throw std::runtime_error("refusing to adopt an unprepared run cgroup: " +
+                             paths.run.string());
   }
-
-  const std::filesystem::path sim_root = root / std::string(kSimulatorRootName);
-  const std::filesystem::path run_root = sim_root / run_id;
-  const std::filesystem::path node_root = run_root / node_id;
-
-  RequireControllersAvailable(root, {"cpu", "io", "memory", "pids"});
-  EnsureDirectory(sim_root);
-  if (!CgroupProcsEmpty(root)) {
-    MoveRootProcessesIntoContainerController(sim_root);
+  if (!std::filesystem::is_directory(paths.run)) {
+    throw std::runtime_error("run cgroup was not prepared: " +
+                             paths.run.string());
   }
-  EnableControllers(root);
-  RequireControllersAvailable(sim_root, {"cpu", "io", "memory", "pids"});
-  EnsureDirectory(run_root);
-  EnableControllers(sim_root);
-  RequireControllersAvailable(run_root, {"cpu", "io", "memory", "pids"});
-  EnsureDirectory(node_root);
-  EnableControllers(run_root);
+  RequireControllersAvailable(paths.run, {"cpu", "io", "memory", "pids"});
+  EnableControllers(paths.run);
+  const std::filesystem::path node_root = paths.run / node_id;
+  CreateCgroupDirectoryExclusive(node_root, "node");
 
   return Cgroup(node_root);
 }
 
 void Cgroup::RemoveRun(const std::string& run_id) {
   RequireSafeRunId(run_id);
-  const std::filesystem::path run_root =
-      CgroupRoot() / std::string(kSimulatorRootName) / run_id;
-  if (!std::filesystem::exists(run_root)) {
-    return;
-  }
-  std::error_code ec;
-  for (const auto& entry : std::filesystem::directory_iterator(run_root, ec)) {
-    if (ec) {
-      break;
+  const std::filesystem::path run_root = CgroupPathsForRun(run_id).run;
+  if (!RunWasPrepared(run_id)) {
+    if (!std::filesystem::exists(run_root)) {
+      return;
     }
-    if (entry.is_directory()) {
-      KillCgroupIfSupported(entry.path());
-      std::filesystem::remove(entry.path(), ec);
-    }
+    throw std::runtime_error("refusing to remove an unowned run cgroup: " +
+                             run_root.string());
   }
-  ec.clear();
-  std::filesystem::remove(run_root, ec);
-  if (ec) {
-    throw std::runtime_error("remove run cgroup failed for " +
-                             run_root.string() + ": " + ec.message());
-  }
+  RemoveRunCgroup(run_id);
+  ForgetPreparedRun(run_id);
+}
+
+void Cgroup::RemoveStaleRun(const std::string& run_id,
+                            const std::filesystem::path& owned_run_directory) {
+  RequireSafeRunId(run_id);
+  RequireStaleRunOwnership(run_id, owned_run_directory);
+  RemoveRunCgroup(run_id);
+  ForgetPreparedRun(run_id);
 }
 
 CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {
@@ -511,7 +684,7 @@ CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {
   probe.run_id = "freeze-" + std::to_string(getpid());
   probe.node_id = "node-1";
 
-  Cgroup::RemoveRun(probe.run_id);
+  Cgroup::PrepareRun(probe.run_id);
   Cgroup cgroup = Cgroup::Create(probe.run_id, probe.node_id);
   pid_t child = fork();
   if (child < 0) {

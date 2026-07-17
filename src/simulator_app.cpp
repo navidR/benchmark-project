@@ -5310,8 +5310,17 @@ void RequireSafeOutputDirectory(const std::filesystem::path& output_dir) {
 }
 
 bool IsOwnedRunDirectory(const std::filesystem::path& run_root) {
-  return std::filesystem::exists(run_root / kRunMarkerFile) ||
-         std::filesystem::exists(run_root / "resolved-scenario.json");
+  std::error_code ec;
+  const std::filesystem::file_status run_status =
+      std::filesystem::symlink_status(run_root, ec);
+  if (ec || !std::filesystem::is_directory(run_status)) {
+    return false;
+  }
+  const std::filesystem::path marker = run_root / kRunMarkerFile;
+  const std::filesystem::file_status marker_status =
+      std::filesystem::symlink_status(marker, ec);
+  return !ec && std::filesystem::is_regular_file(marker_status) &&
+         ReadText(marker) == "bbp run\n";
 }
 
 void RequireOwnedRunDirectory(const std::filesystem::path& run_root) {
@@ -7756,6 +7765,7 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
 void CleanupRun(Options options) {
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
+  RequireOwnedRunDirectory(run_root);
   LoadCleanupMetadata(run_root, &options);
   RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
 
@@ -7764,13 +7774,13 @@ void CleanupRun(Options options) {
     network_allocation_lock = std::make_unique<NetworkAllocationLock>();
   }
 
+  Cgroup::RemoveStaleRun(options.run_id, run_root);
   for (uint32_t i = 0; i < options.nodes; ++i) {
     NodeVethConfig config;
     config.host_name = NodeInterfaceName(options.run_id, i, 'h');
     config.peer_name = NodeInterfaceName(options.run_id, i, 'p');
     DeleteNodeVethNetwork(config);
   }
-  Cgroup::RemoveRun(options.run_id);
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   const std::unique_ptr<ChainDriver> driver = CreateChainDriver(options.chain);
   for (uint32_t i = 0; i < options.nodes; ++i) {
@@ -7839,8 +7849,22 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       }
       WriteNodeState(events_path, options.run_id, node_id,
                      NodeRuntimeLifecycle::kPreparing);
+      runtime.cgroup = Cgroup::Create(options.run_id, node_id);
+      runtime.resources = InitialResourceLimits(options, i);
+      runtime.cgroup->SetMemoryHigh(runtime.resources.memory_high_bytes);
+      runtime.cgroup->SetMemoryMax(runtime.resources.memory_max_bytes);
+      runtime.cgroup->SetCpuMax(runtime.resources.cpu_quota_us,
+                                runtime.resources.cpu_period_us);
+      runtime.cgroup->SetCpuWeight(runtime.resources.cpu_weight);
+      runtime.cgroup->SetIoWeight(runtime.resources.io_weight);
+      for (const IoLimit& io_limit : runtime.resources.io_limits) {
+        runtime.cgroup->SetIoMax(io_limit);
+      }
+      runtime.cgroup->SetPidsMax(runtime.resources.pids_max);
+
       if (options.isolate_network) {
-        runtime.network_namespace = NetworkNamespace::Create();
+        runtime.network_namespace =
+            NetworkNamespace::Create(runtime.cgroup->path());
         runtime.network = MakeNodeVethConfig(options, i);
         SetupNodeVethNetwork(runtime.network_namespace->fd(), *runtime.network);
         if (runtime.network->apply_condition) {
@@ -7879,19 +7903,6 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         WriteNodeState(events_path, options.run_id, node_id,
                        NodeRuntimeLifecycle::kNetworkNamespaceReady);
       }
-
-      runtime.cgroup = Cgroup::Create(options.run_id, node_id);
-      runtime.resources = InitialResourceLimits(options, i);
-      runtime.cgroup->SetMemoryHigh(runtime.resources.memory_high_bytes);
-      runtime.cgroup->SetMemoryMax(runtime.resources.memory_max_bytes);
-      runtime.cgroup->SetCpuMax(runtime.resources.cpu_quota_us,
-                                runtime.resources.cpu_period_us);
-      runtime.cgroup->SetCpuWeight(runtime.resources.cpu_weight);
-      runtime.cgroup->SetIoWeight(runtime.resources.io_weight);
-      for (const IoLimit& io_limit : runtime.resources.io_limits) {
-        runtime.cgroup->SetIoMax(io_limit);
-      }
-      runtime.cgroup->SetPidsMax(runtime.resources.pids_max);
       WriteNodeState(events_path, options.run_id, node_id,
                      NodeRuntimeLifecycle::kCgroupReady);
 
@@ -10451,13 +10462,13 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           " (use --replace-run to remove it)");
     }
     RequireOwnedRunDirectory(run_root);
+    Cgroup::RemoveStaleRun(options.run_id, run_root);
     std::error_code ec;
     std::filesystem::remove_all(run_root, ec);
     if (ec) {
       throw std::runtime_error("remove existing run directory failed: " +
                                ec.message());
     }
-    Cgroup::RemoveRun(options.run_id);
   }
   EnsureDirectory(run_root);
   AttachRunLogFile(run_root);
@@ -10683,6 +10694,13 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     });
     BBP_LOG(info) << "simulation duration reached for run " << options.run_id;
   };
+  try {
+    Cgroup::PrepareRun(options.run_id);
+  } catch (const std::exception& error) {
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kRunFailed, error.what());
+    throw;
+  }
   try {
     StartNodes(options, run_root, events_path, chain_spec, driver,
                runtime_topology, nodes, stop_token);

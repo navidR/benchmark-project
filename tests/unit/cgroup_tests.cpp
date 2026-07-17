@@ -1,11 +1,19 @@
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <boost/test/unit_test.hpp>
+#include <cerrno>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "bbp/cgroup.h"
+#include "bbp/network.h"
 #include "bbp/util.h"
 
 namespace {
@@ -14,6 +22,85 @@ std::filesystem::path TestDirectory(std::string_view suffix) {
   return std::filesystem::temp_directory_path() /
          ("bbp-cgroup-test-" + std::to_string(getpid()) + "-" +
           std::string(suffix));
+}
+
+std::string UniqueRunId(std::string_view suffix) {
+  static std::atomic<std::uint64_t> sequence{0U};
+  return "cgt-" + std::to_string(getpid()) + "-" +
+         std::to_string(sequence.fetch_add(1U)) + "-" + std::string(suffix);
+}
+
+std::filesystem::path RunCgroupPath(std::string_view run_id) {
+  return std::filesystem::path("/sys/fs/cgroup/bbp") / run_id;
+}
+
+class PreparedRunGuard {
+ public:
+  explicit PreparedRunGuard(std::string run_id) : run_id_(std::move(run_id)) {
+    bbp::Cgroup::PrepareRun(run_id_);
+  }
+
+  PreparedRunGuard(const PreparedRunGuard&) = delete;
+  PreparedRunGuard& operator=(const PreparedRunGuard&) = delete;
+
+  ~PreparedRunGuard() {
+    if (!active_) {
+      return;
+    }
+    try {
+      bbp::Cgroup::RemoveRun(run_id_);
+    } catch (const std::exception&) {
+    }
+  }
+
+  const std::string& run_id() const { return run_id_; }
+  void Release() { active_ = false; }
+
+ private:
+  std::string run_id_;
+  bool active_ = true;
+};
+
+class ChildGuard {
+ public:
+  explicit ChildGuard(pid_t pid) : pid_(pid) {}
+  ChildGuard(const ChildGuard&) = delete;
+  ChildGuard& operator=(const ChildGuard&) = delete;
+
+  ~ChildGuard() {
+    if (pid_ <= 0) {
+      return;
+    }
+    kill(pid_, SIGKILL);
+    int ignored = 0;
+    while (waitpid(pid_, &ignored, 0) < 0 && errno == EINTR) {
+    }
+  }
+
+  int Wait() {
+    int status = 0;
+    pid_t waited = -1;
+    do {
+      waited = waitpid(pid_, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid_) {
+      throw std::runtime_error("waitpid failed for cgroup test child");
+    }
+    pid_ = -1;
+    return status;
+  }
+
+ private:
+  pid_t pid_ = -1;
+};
+
+std::unique_ptr<PreparedRunGuard> PreparePrivilegedTestRun(std::string run_id) {
+  try {
+    return std::make_unique<PreparedRunGuard>(std::move(run_id));
+  } catch (const std::exception& error) {
+    BOOST_TEST_MESSAGE("skipping privileged cgroup test: " << error.what());
+    return nullptr;
+  }
 }
 
 void WriteMetricFixture(const std::filesystem::path& dir,
@@ -171,4 +258,132 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_reject_duplicate_memory_stat_keys) {
   WriteMetricFixture(dir, "", "anon 1\nanon 2\n");
   BOOST_CHECK_THROW(bbp::Cgroup(dir).ReadMetrics(), std::runtime_error);
   std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(cgroup_refuses_unprepared_and_preexisting_run_ownership) {
+  const std::string run_id = UniqueRunId("foreign");
+  const std::filesystem::path run_path = RunCgroupPath(run_id);
+  std::error_code ec;
+  const bool created = std::filesystem::create_directory(run_path, ec);
+  if (ec) {
+    BOOST_TEST_MESSAGE(
+        "skipping privileged cgroup ownership test: " << ec.message());
+    return;
+  }
+  BOOST_REQUIRE(created);
+
+  try {
+    BOOST_CHECK_EXCEPTION(
+        bbp::Cgroup::PrepareRun(run_id), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what())
+                     .find("refusing to adopt pre-existing run cgroup") !=
+                 std::string::npos;
+        });
+    BOOST_CHECK_EXCEPTION(
+        bbp::Cgroup::Create(run_id, "node-1"), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what())
+                     .find("refusing to adopt an unprepared run cgroup") !=
+                 std::string::npos;
+        });
+    BOOST_CHECK_EXCEPTION(
+        bbp::Cgroup::RemoveRun(run_id), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what())
+                     .find("refusing to remove an unowned run cgroup") !=
+                 std::string::npos;
+        });
+    BOOST_TEST(std::filesystem::is_directory(run_path));
+    BOOST_TEST(!std::filesystem::exists(run_path / "node-1"));
+  } catch (...) {
+    std::filesystem::remove(run_path, ec);
+    throw;
+  }
+  ec.clear();
+  BOOST_REQUIRE(std::filesystem::remove(run_path, ec));
+  BOOST_REQUIRE(!ec);
+}
+
+BOOST_AUTO_TEST_CASE(stale_cgroup_cleanup_requires_exact_run_marker) {
+  const std::string run_id = UniqueRunId("stale-owner");
+  const std::filesystem::path parent = TestDirectory("stale-owner");
+  const std::filesystem::path run_directory = parent / run_id;
+  std::filesystem::remove_all(parent);
+  std::filesystem::create_directories(run_directory);
+  bbp::WriteText(run_directory / ".bbp-run", "not a simulator marker\n");
+
+  BOOST_CHECK_EXCEPTION(
+      bbp::Cgroup::RemoveStaleRun(run_id, run_directory), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what())
+                   .find("exact simulator ownership marker") !=
+               std::string::npos;
+      });
+
+  std::filesystem::remove_all(parent);
+}
+
+BOOST_AUTO_TEST_CASE(cgroup_recursively_kills_and_removes_nested_descendants) {
+  std::unique_ptr<PreparedRunGuard> run =
+      PreparePrivilegedTestRun(UniqueRunId("nested"));
+  if (!run) {
+    return;
+  }
+  const bbp::Cgroup node = bbp::Cgroup::Create(run->run_id(), "node-1");
+  BOOST_CHECK_THROW(bbp::Cgroup::Create(run->run_id(), "node-1"),
+                    std::runtime_error);
+  const std::filesystem::path child = node.path() / "worker";
+  const std::filesystem::path leaf = child / "leaf";
+  std::filesystem::create_directory(child);
+  std::filesystem::create_directory(leaf);
+
+  const pid_t pid = fork();
+  BOOST_REQUIRE(pid >= 0);
+  if (pid == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+  ChildGuard process(pid);
+  bbp::WriteText(leaf / "cgroup.procs", std::to_string(pid));
+  BOOST_TEST(bbp::ReadText(leaf / "cgroup.procs").find(std::to_string(pid)) !=
+             std::string::npos);
+
+  bbp::Cgroup::RemoveRun(run->run_id());
+  run->Release();
+  const int status = process.Wait();
+  BOOST_REQUIRE(WIFSIGNALED(status));
+  BOOST_TEST(WTERMSIG(status) == SIGKILL);
+  BOOST_TEST(!std::filesystem::exists(RunCgroupPath(run->run_id())));
+
+  // A completed removal remains harmless when a caller retries it.
+  bbp::Cgroup::RemoveRun(run->run_id());
+}
+
+BOOST_AUTO_TEST_CASE(network_namespace_helper_is_owned_by_node_cgroup) {
+  std::unique_ptr<PreparedRunGuard> run =
+      PreparePrivilegedTestRun(UniqueRunId("netns"));
+  if (!run) {
+    return;
+  }
+  const bbp::Cgroup node = bbp::Cgroup::Create(run->run_id(), "node-1");
+  bbp::NetworkNamespace network_namespace;
+  try {
+    network_namespace = bbp::NetworkNamespace::Create(node.path());
+  } catch (const std::exception& error) {
+    BOOST_TEST_MESSAGE(
+        "skipping privileged network namespace test: " << error.what());
+    return;
+  }
+  const std::string helper_pid = std::to_string(network_namespace.helper_pid());
+  const std::vector<std::string> node_pids =
+      bbp::SplitWhitespace(bbp::ReadText(node.path() / "cgroup.procs"));
+  BOOST_CHECK(std::find(node_pids.begin(), node_pids.end(), helper_pid) !=
+              node_pids.end());
+
+  bbp::Cgroup::RemoveRun(run->run_id());
+  run->Release();
+  network_namespace.Stop();
+  BOOST_TEST(!std::filesystem::exists(RunCgroupPath(run->run_id())));
 }
