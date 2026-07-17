@@ -269,6 +269,39 @@ bool ContainsPeerAddress(const std::vector<std::string>& addresses,
   return false;
 }
 
+bool HasCompletedHandshake(const boost::json::object& peer) {
+  const boost::json::value* received = peer.if_contains("bytesrecv_per_msg");
+  if (received == nullptr || !received->is_object()) {
+    return false;
+  }
+  const boost::json::value* verack =
+      received->as_object().if_contains("verack");
+  return verack != nullptr &&
+         ((verack->is_uint64() && verack->as_uint64() > 0U) ||
+          (verack->is_int64() && verack->as_int64() > 0));
+}
+
+std::vector<std::string> ParsePeerAddresses(const boost::json::value& peers,
+                                            bool require_completed_handshake,
+                                            std::string_view driver_name) {
+  if (!peers.is_array()) {
+    throw std::runtime_error(std::string(driver_name) +
+                             " RPC getpeerinfo returned non-array");
+  }
+  std::vector<std::string> addresses;
+  for (const boost::json::value& peer : peers.as_array()) {
+    if (!peer.is_object() || (require_completed_handshake &&
+                              !HasCompletedHandshake(peer.as_object()))) {
+      continue;
+    }
+    const boost::json::value* address = peer.as_object().if_contains("addr");
+    if (address != nullptr && address->is_string()) {
+      addresses.emplace_back(address->as_string());
+    }
+  }
+  return addresses;
+}
+
 bool JsonStringArrayContains(const boost::json::value& value,
                              const std::string& needle) {
   if (!value.is_array()) {
@@ -619,9 +652,9 @@ void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
   while (std::chrono::steady_clock::now() < deadline) {
     ThrowIfStopRequested(stop_token);
     try {
-      FiroMetrics metrics = ReadMetrics(config, stop_token);
-      last_peer_count = metrics.peer_count;
-      if (metrics.peer_count >= peer_count) {
+      last_peer_count =
+          HandshakeCompletePeerAddresses(config, stop_token).size();
+      if (last_peer_count >= peer_count) {
         return;
       }
     } catch (const std::exception& e) {
@@ -647,7 +680,7 @@ void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
     ThrowIfStopRequested(stop_token);
     try {
       const std::vector<std::string> addresses =
-          PeerAddresses(config, stop_token);
+          HandshakeCompletePeerAddresses(config, stop_token);
       if (ContainsPeerAddress(addresses, address, driver_name_)) {
         return;
       }
@@ -765,19 +798,16 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config,
 
 std::vector<std::string> FiroDriver::PeerAddresses(
     const FiroNodeConfig& config, std::stop_token stop_token) const {
-  const boost::json::value peers =
-      RpcCall(config, "getpeerinfo", boost::json::array{}, stop_token);
-  std::vector<std::string> addresses;
-  for (const boost::json::value& peer : peers.as_array()) {
-    if (!peer.is_object()) {
-      continue;
-    }
-    const boost::json::value* address = peer.as_object().if_contains("addr");
-    if (address != nullptr && address->is_string()) {
-      addresses.emplace_back(address->as_string());
-    }
-  }
-  return addresses;
+  return ParsePeerAddresses(
+      RpcCall(config, "getpeerinfo", boost::json::array{}, stop_token), false,
+      driver_name_);
+}
+
+std::vector<std::string> FiroDriver::HandshakeCompletePeerAddresses(
+    const FiroNodeConfig& config, std::stop_token stop_token) const {
+  return ParsePeerAddresses(
+      RpcCall(config, "getpeerinfo", boost::json::array{}, stop_token), true,
+      driver_name_);
 }
 
 std::vector<std::string> FiroDriver::ConnectedPeerAddresses(
@@ -794,7 +824,8 @@ std::vector<std::string> FiroDriver::ConnectedPeerAddresses(
           "--isolate-network");
     }
   }
-  const std::vector<std::string> reported = PeerAddresses(config, stop_token);
+  const std::vector<std::string> reported =
+      HandshakeCompletePeerAddresses(config, stop_token);
   std::vector<std::string> connected;
   connected.reserve(candidate_addresses.size());
   for (const std::string& candidate : candidate_addresses) {

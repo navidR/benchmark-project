@@ -198,6 +198,44 @@ BOOST_AUTO_TEST_CASE(firo_creates_private_spark_and_funding_addresses) {
   BOOST_TEST(methods[1] == "getnewaddress");
 }
 
+BOOST_AUTO_TEST_CASE(
+    firo_creates_public_wallet_address_with_exact_rpc_payload) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":"public-wallet-address","error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "public-address-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const std::string address =
+      driver.CreateWalletAddress(config, bbp::WalletMode::kPublic);
+  const std::string funding_address = driver.CreateWalletFundingAddress(
+      config, bbp::WalletMode::kPublic, address);
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_TEST(address == "public-wallet-address");
+  BOOST_TEST(funding_address == address);
+  BOOST_REQUIRE_EQUAL(methods.size(), 1U);
+  BOOST_TEST(methods[0] == "getnewaddress");
+  BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+  BOOST_TEST(requests[0].as_object().at("params").as_array().empty());
+}
+
 BOOST_AUTO_TEST_CASE(firo_prepares_private_spark_funding) {
   namespace asio = boost::asio;
   using tcp = asio::ip::tcp;
@@ -363,6 +401,123 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(driver.ConnectedPeerAddresses(
                         config, {"127.0.0.1:18168", "127.0.0.1:18169"}),
                     bbp::UnsupportedChainOperation);
+}
+
+BOOST_AUTO_TEST_CASE(firo_waits_for_peer_verack_before_reporting_ready) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":[{"addr":"10.20.0.2:18168","version":70028,"bytesrecv_per_msg":{"version":126}}],"error":null,"id":"bbp"})",
+      R"({"result":[{"addr":"10.20.0.2:18168","version":70028,"bytesrecv_per_msg":{"version":126,"verack":24}}],"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "peer-handshake-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  driver.WaitForPeerAddress(config, "10.20.0.2:18168", std::chrono::seconds(1));
+  const std::vector<std::string> methods = served.get();
+  BOOST_REQUIRE_EQUAL(methods.size(), 2U);
+  BOOST_TEST(methods[0] == "getpeerinfo");
+  BOOST_TEST(methods[1] == "getpeerinfo");
+}
+
+BOOST_AUTO_TEST_CASE(firo_peer_count_wait_requires_completed_handshakes) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":[{"addr":"10.20.0.2:18168","version":70028,"bytesrecv_per_msg":{"version":126}}],"error":null,"id":"bbp"})",
+      R"({"result":[{"addr":"10.20.0.2:18168","version":70028,"bytesrecv_per_msg":{"version":126,"verack":24}}],"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "peer-count-handshake-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  driver.WaitForPeerCount(config, 1U, std::chrono::seconds(1));
+  BOOST_REQUIRE_EQUAL(served.get().size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(firo_connectivity_uses_only_handshake_complete_peers) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":[{"addr":"10.20.0.2:18168","version":70028,"bytesrecv_per_msg":{"version":126}}],"error":null,"id":"bbp"})",
+      R"({"result":[{"addr":"10.20.0.2:18168","version":70028,"bytesrecv_per_msg":{"version":126,"verack":24}}],"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "peer-connectivity-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  const std::vector<std::string> candidates = {"10.20.0.2:18168"};
+
+  BOOST_TEST(driver.ConnectedPeerAddresses(config, candidates).empty());
+  const std::vector<std::string> connected =
+      driver.ConnectedPeerAddresses(config, candidates);
+  BOOST_REQUIRE_EQUAL(connected.size(), 1U);
+  BOOST_TEST(connected[0] == candidates[0]);
+  BOOST_REQUIRE_EQUAL(served.get().size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(firo_absence_wait_observes_pre_verack_socket) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":[{"addr":"10.20.0.2:18168","version":70028,"bytesrecv_per_msg":{"version":126}}],"error":null,"id":"bbp"})",
+      R"({"result":[],"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "peer-absence-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  driver.WaitForPeerAddressAbsent(config, "10.20.0.2:18168",
+                                  std::chrono::seconds(1));
+  BOOST_REQUIRE_EQUAL(served.get().size(), 2U);
 }
 
 BOOST_AUTO_TEST_CASE(firo_rpc_cookie_cleanup_is_safe_and_idempotent) {
@@ -841,6 +996,64 @@ BOOST_AUTO_TEST_CASE(firo_reads_private_spark_wallet_snapshot) {
   BOOST_TEST(methods[0] == "getwalletinfo");
   BOOST_TEST(methods[1] == "getsparkbalance");
   BOOST_TEST(methods[2] == "listtransactions");
+}
+
+BOOST_AUTO_TEST_CASE(firo_submits_public_transfer_with_exact_rpc_payload) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":"public-transfer-tx","error":null,"id":"bbp"})",
+      R"({"result":202,"error":null,"id":"bbp"})",
+      R"({"result":["public-transfer-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"public-transfer-tx"},"error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "public-transfer-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const bbp::FiroWalletTransactionResult result = driver.SendWalletTransaction(
+      config, bbp::WalletMode::kPublic, "public-destination", 50000000ULL,
+      1000ULL, std::chrono::seconds(1));
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_REQUIRE_EQUAL(result.txids.size(), 1U);
+  BOOST_TEST(result.txids[0] == "public-transfer-tx");
+  BOOST_TEST(result.destination_amount == "0.50000000");
+  BOOST_TEST(result.requested_fee_rate == "0.00001000");
+  BOOST_TEST(result.mempool_size == 1U);
+  BOOST_REQUIRE_EQUAL(methods.size(), 5U);
+  BOOST_TEST(methods[0] == "settxfee");
+  BOOST_TEST(methods[1] == "sendtoaddress");
+  BOOST_TEST(methods[2] == "getblockcount");
+  BOOST_TEST(methods[3] == "getrawmempool");
+  BOOST_TEST(methods[4] == "getrawtransaction");
+  BOOST_REQUIRE_EQUAL(requests.size(), 5U);
+  const boost::json::array& fee_params =
+      requests[0].as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(fee_params.size(), 1U);
+  BOOST_TEST(fee_params[0].as_string() == "0.00001000");
+  const boost::json::array& send_params =
+      requests[1].as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(send_params.size(), 5U);
+  BOOST_TEST(send_params[0].as_string() == "public-destination");
+  BOOST_TEST(send_params[1].as_string() == "0.50000000");
+  BOOST_TEST(send_params[2].as_string().empty());
+  BOOST_TEST(send_params[3].as_string().empty());
+  BOOST_TEST(!send_params[4].as_bool());
 }
 
 BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {

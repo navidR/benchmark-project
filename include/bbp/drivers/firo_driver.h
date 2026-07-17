@@ -130,6 +130,8 @@ class FiroDriver final : public ChainDriver {
   void CleanupRpcCredentials(const FiroNodeConfig& config) const override;
 
  private:
+  std::vector<std::string> HandshakeCompletePeerAddresses(
+      const FiroNodeConfig& config, std::stop_token stop_token = {}) const;
   boost::json::value RpcCall(const FiroNodeConfig& config,
                              std::string_view method,
                              const boost::json::array& params,
