@@ -3,6 +3,7 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -90,6 +91,29 @@ class ProcessPerfCounters {
  private:
   class Impl;
   explicit ProcessPerfCounters(std::unique_ptr<Impl> impl);
+
+  std::unique_ptr<Impl> impl_;
+};
+
+class CgroupPerfCounters {
+ public:
+  static CgroupPerfCounters Open(const std::filesystem::path& cgroup_path,
+                                 const std::vector<PerfCounterKind>& kinds);
+
+  CgroupPerfCounters(const CgroupPerfCounters&) = delete;
+  CgroupPerfCounters& operator=(const CgroupPerfCounters&) = delete;
+  CgroupPerfCounters(CgroupPerfCounters&&) noexcept;
+  CgroupPerfCounters& operator=(CgroupPerfCounters&&) noexcept;
+  ~CgroupPerfCounters();
+
+  const std::filesystem::path& cgroup_path() const;
+  const std::vector<PerfCounterKind>& kinds() const;
+  const std::vector<int>& cpus() const;
+  std::vector<PerfCounterValue> Read() const;
+
+ private:
+  class Impl;
+  explicit CgroupPerfCounters(std::unique_ptr<Impl> impl);
 
   std::unique_ptr<Impl> impl_;
 };

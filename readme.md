@@ -401,6 +401,14 @@ simulator uses its owned daemon PID and reopens the counters after a restart.
 its raw value, safely scaled value, enabled time, and running time so
 multiplexing remains visible.
 
+The perf layer also supports cgroup-v2 attachment for live group/cgroup
+requests. Per-process attachment continues to use the official libperf API;
+the cgroup-only path opens the simulator-owned cgroup directory and calls
+`perf_event_open(2)` with `PERF_FLAG_PID_CGROUP` once per counter and allowed
+CPU, because libperf's public counting API does not expose that flag. CPU
+selection comes from the simulator's kernel affinity mask so container cpuset
+restrictions and file-descriptor use remain explicit.
+
 For a Docker run, grant perf access explicitly when it is not already covered
 by the privileged simulator environment, for example with `--cap-add PERFMON`
 (or `--cap-add SYS_ADMIN` on older kernels). Some Docker seccomp profiles also
