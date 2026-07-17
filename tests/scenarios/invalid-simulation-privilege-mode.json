@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "privilege_mode": "helper"
+  },
+  "nodes": 1
+}

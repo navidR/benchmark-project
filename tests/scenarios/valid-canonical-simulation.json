@@ -5,6 +5,9 @@
     "seed": 12345,
     "duration": "200ms",
     "time_scale": 2.0,
+    "cleanup_policy": "automatic",
+    "privilege_mode": "direct",
+    "log_retention_policy": "preserve",
     "metrics_interval": "25ms",
     "output_dir": "/tmp/bbp-canonical-simulation",
     "tui_refresh_interval": "50ms"

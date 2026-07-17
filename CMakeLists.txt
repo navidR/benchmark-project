@@ -254,6 +254,7 @@ add_executable(bbp
   src/simulation_event_kind.cpp
   src/simulation_registry.cpp
   src/simulation_network_address_plan.cpp
+  src/simulation_policy.cpp
   src/simulation_time_scale.cpp
   src/signal_stop_monitor.cpp
   src/simulator_app.cpp
@@ -329,6 +330,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_command_tests.cpp
     tests/unit/simulation_event_kind_tests.cpp
     tests/unit/simulation_registry_tests.cpp
+    tests/unit/simulation_policy_tests.cpp
     tests/unit/simulation_time_scale_tests.cpp
     tests/unit/signal_stop_monitor_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
@@ -379,6 +381,7 @@ if(BUILD_TESTING)
     src/simulation_command_queue.cpp
     src/simulation_registry.cpp
     src/simulation_network_address_plan.cpp
+    src/simulation_policy.cpp
     src/simulation_time_scale.cpp
     src/signal_stop_monitor.cpp
     src/tui_command_parser.cpp
@@ -653,14 +656,29 @@ if(BUILD_TESTING)
       --probe-capabilities
   )
   add_cli_failure_test(
+    bbp-invalid-simulation-cleanup-policy
+    tests/scenarios/invalid-simulation-cleanup-policy.json
+    "scenario simulation.cleanup_policy must be automatic or retain_cgroups"
+  )
+  add_cli_failure_test(
     bbp-invalid-simulation-duration-samples
     tests/scenarios/invalid-simulation-duration-samples.json
     "simulation duration and metrics_sample_count must not be combined"
   )
   add_cli_failure_test(
+    bbp-invalid-simulation-log-retention-policy
+    tests/scenarios/invalid-simulation-log-retention-policy.json
+    "scenario simulation.log_retention_policy currently supports only preserve"
+  )
+  add_cli_failure_test(
     bbp-invalid-simulation-event-at-duration
     tests/scenarios/invalid-simulation-event-at-duration.json
     "scheduled event time must be less than simulation duration"
+  )
+  add_cli_failure_test(
+    bbp-invalid-simulation-privilege-mode
+    tests/scenarios/invalid-simulation-privilege-mode.json
+    "scenario simulation.privilege_mode currently supports only direct"
   )
   add_cli_failure_test(
     bbp-invalid-simulation-metrics-alias

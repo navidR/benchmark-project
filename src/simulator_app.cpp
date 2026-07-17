@@ -2683,6 +2683,44 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         SimulationTimeScale::FromDouble(JsonOptionalDoubleField(
             *simulation, "time_scale", options.time_scale.value()));
 
+    if (!OptionProvided(vm, "keep-cgroups")) {
+      const std::string cleanup_policy = JsonOptionalStringField(
+          *simulation, "cleanup_policy",
+          std::string(CleanupPolicyName(options.cleanup_policy)));
+      const std::optional<CleanupPolicy> parsed_cleanup_policy =
+          CleanupPolicyFromName(cleanup_policy);
+      if (!parsed_cleanup_policy) {
+        throw std::runtime_error(
+            "scenario simulation.cleanup_policy must be automatic or "
+            "retain_cgroups");
+      }
+      options.cleanup_policy = *parsed_cleanup_policy;
+    }
+
+    const std::string privilege_mode = JsonOptionalStringField(
+        *simulation, "privilege_mode",
+        std::string(PrivilegeModeName(options.privilege_mode)));
+    const std::optional<PrivilegeMode> parsed_privilege_mode =
+        PrivilegeModeFromName(privilege_mode);
+    if (!parsed_privilege_mode) {
+      throw std::runtime_error(
+          "scenario simulation.privilege_mode currently supports only "
+          "direct");
+    }
+    options.privilege_mode = *parsed_privilege_mode;
+
+    const std::string log_retention_policy = JsonOptionalStringField(
+        *simulation, "log_retention_policy",
+        std::string(LogRetentionPolicyName(options.log_retention_policy)));
+    const std::optional<LogRetentionPolicy> parsed_log_retention_policy =
+        LogRetentionPolicyFromName(log_retention_policy);
+    if (!parsed_log_retention_policy) {
+      throw std::runtime_error(
+          "scenario simulation.log_retention_policy currently supports only "
+          "preserve");
+    }
+    options.log_retention_policy = *parsed_log_retention_policy;
+
     const bool has_metrics_interval =
         simulation->if_contains("metrics_interval") != nullptr;
     const bool has_tick_interval =
@@ -3395,6 +3433,7 @@ Options ParseOptions(int argc, char** argv) {
   double mining_difficulty = 1.0;
   bool no_mining = false;
   bool native_mining = false;
+  bool keep_cgroups = false;
   std::string cleanup_run_id;
 
   const std::string nodes_help =
@@ -3512,7 +3551,7 @@ Options ParseOptions(int argc, char** argv) {
           ->implicit_value(true)
           ->default_value(true),
       "preserve run data, logs, metrics, events, and resolved scenarios")(
-      "keep-cgroups", po::bool_switch(&options.keep_cgroups),
+      "keep-cgroups", po::bool_switch(&keep_cgroups),
       "leave cgroups after exit for inspection")(
       "cleanup-run",
       po::value<std::string>(&cleanup_run_id)->implicit_value(""),
@@ -3648,6 +3687,9 @@ Options ParseOptions(int argc, char** argv) {
 
   options.chain = ParseChainKind(chain_name);
   options.log_level = ParseLogLevel(log_level_name);
+  if (keep_cgroups) {
+    options.cleanup_policy = CleanupPolicy::kRetainCgroups;
+  }
   if (OptionProvided(vm, "metrics-interval") &&
       OptionProvided(vm, "metrics-interval-ms")) {
     throw std::runtime_error(
@@ -6984,6 +7026,12 @@ void WriteScenarioFiles(const Options& options,
   }
   simulation["time_scale"] = options.time_scale.value();
   simulation["time_scale_millionths"] = options.time_scale.millionths();
+  simulation["cleanup_policy"] =
+      std::string(CleanupPolicyName(options.cleanup_policy));
+  simulation["privilege_mode"] =
+      std::string(PrivilegeModeName(options.privilege_mode));
+  simulation["log_retention_policy"] =
+      std::string(LogRetentionPolicyName(options.log_retention_policy));
   simulation["metrics_interval"] =
       std::to_string(options.metrics_interval.count()) + "ms";
   simulation["metrics_interval_ms"] = options.metrics_interval.count();
@@ -9480,18 +9528,20 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
       WriteNodeState(events_path, options.run_id, node.config.id,
                      NodeRuntimeLifecycle::kCleaning);
     });
-    if (node.cgroup && !options.keep_cgroups) {
+    if (node.cgroup) {
       RunNodeCleanupStep(best_effort, "cgroup process kill",
                          [&] { node.cgroup->KillAll(); });
-      if (best_effort) {
-        RunNodeCleanupStep(true, "cgroup removal",
-                           [&] { node.cgroup->Remove(); });
-      } else {
-        try {
-          node.cgroup->Remove();
-        } catch (const std::exception& error) {
-          WriteEvent(events_path, options.run_id, node.config.id,
-                     SimulationEventKind::kCgroupRemoveFailed, error.what());
+      if (options.cleanup_policy != CleanupPolicy::kRetainCgroups) {
+        if (best_effort) {
+          RunNodeCleanupStep(true, "cgroup removal",
+                             [&] { node.cgroup->Remove(); });
+        } else {
+          try {
+            node.cgroup->Remove();
+          } catch (const std::exception& error) {
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kCgroupRemoveFailed, error.what());
+          }
         }
       }
     }
@@ -9512,7 +9562,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
                      NodeRuntimeLifecycle::kCleaned);
     });
   }
-  if (!options.keep_cgroups) {
+  if (options.cleanup_policy != CleanupPolicy::kRetainCgroups) {
     if (best_effort) {
       RunNodeCleanupStep(true, "run cgroup removal",
                          [&] { Cgroup::RemoveRun(options.run_id); });

@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "log_retention_policy": "delete"
+  },
+  "nodes": 1
+}

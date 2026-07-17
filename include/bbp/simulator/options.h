@@ -13,6 +13,7 @@
 #include "bbp/log_level.h"
 #include "bbp/network.h"
 #include "bbp/simulation_network_address_plan.h"
+#include "bbp/simulation_policy.h"
 #include "bbp/simulation_registry.h"
 #include "bbp/simulation_time_scale.h"
 #include "bbp/simulator/freeze_request.h"
@@ -41,6 +42,9 @@ struct Options {
   std::uint64_t simulation_seed = 0U;
   std::optional<std::chrono::milliseconds> simulation_duration;
   SimulationTimeScale time_scale = SimulationTimeScale::FromDouble(1.0);
+  CleanupPolicy cleanup_policy = CleanupPolicy::kAutomatic;
+  PrivilegeMode privilege_mode = PrivilegeMode::kDirect;
+  LogRetentionPolicy log_retention_policy = LogRetentionPolicy::kPreserve;
   std::uint32_t nodes = 1;
   std::vector<std::string> node_ids;
   std::vector<std::string> node_roles;
@@ -64,7 +68,6 @@ struct Options {
   std::map<std::uint32_t, std::string> node_resource_profiles;
   std::map<std::uint32_t, std::string> node_network_profiles;
   std::map<std::uint32_t, ResourceLimits> node_resource_limits;
-  bool keep_cgroups = false;
   bool keep_artifacts = true;
   bool cleanup_run = false;
   bool no_tui = false;

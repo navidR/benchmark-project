@@ -462,6 +462,30 @@ The historical top-level `output_dir`, `metrics_interval_ms`, and
 `metrics_sample_count` fields remain compatibility inputs. Canonical and legacy
 aliases cannot be combined in one scenario.
 
+The remaining canonical global policies use explicit values that match the
+implemented Linux MVP:
+
+```json
+{
+  "simulation": {
+    "cleanup_policy": "automatic",
+    "privilege_mode": "direct",
+    "log_retention_policy": "preserve"
+  }
+}
+```
+
+`automatic` stops owned processes and removes owned network and cgroup runtime
+resources on every normal, failed, or cancelled run. The diagnostic
+`retain_cgroups` cleanup policy maps to the legacy `--keep-cgroups` behavior;
+the CLI option takes precedence and a later owned `--cleanup-run` removes the
+retained run cgroup. Network resources and processes are never retained.
+`direct` records that the simulator process itself uses the required Linux
+capabilities; helper and rootless modes are not implemented. `preserve` keeps
+daemon logs, normalized log events, metrics, events, and resolved scenario data
+inside the validated run directory. Unsupported policy names are rejected
+rather than silently selecting an unimplemented helper or deletion mode.
+
 ```json
 {
   "chain_daemon": "/path/to/firod",
