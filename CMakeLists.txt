@@ -410,6 +410,7 @@ if(BUILD_TESTING)
   add_dependencies(bbp-unit-tests bbp-process-tree-helper)
   target_include_directories(bbp-unit-tests PRIVATE include)
   target_compile_definitions(bbp-unit-tests PRIVATE
+    BBP_ENABLE_TEST_HOOKS=1
     BBP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   )
   target_link_libraries(bbp-unit-tests PRIVATE

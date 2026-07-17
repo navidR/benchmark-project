@@ -1,14 +1,343 @@
+#include <libmnl/libmnl.h>
 #include <linux/if_ether.h>
 #include <linux/pkt_sched.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <boost/test/unit_test.hpp>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bbp/network.h"
+
+namespace {
+
+constexpr std::uint32_t kDirectionalRootHandle = TC_H_MAKE(0xBB00U << 16U, 0U);
+
+struct NamespaceIdentity {
+  dev_t device = 0;
+  ino_t inode = 0;
+
+  bool operator==(const NamespaceIdentity&) const = default;
+};
+
+NamespaceIdentity CurrentThreadNetworkNamespace() {
+  const long thread_id = syscall(SYS_gettid);
+  if (thread_id <= 0) {
+    throw std::runtime_error("gettid failed");
+  }
+  const std::string path =
+      "/proc/self/task/" + std::to_string(thread_id) + "/ns/net";
+  struct stat status {};
+  if (stat(path.c_str(), &status) != 0) {
+    throw std::runtime_error("stat failed for " + path + ": " +
+                             std::strerror(errno));
+  }
+  return {status.st_dev, status.st_ino};
+}
+
+bbp::NodeVethConfig UniqueVethConfig() {
+  static std::atomic<unsigned int> next{1U};
+  const unsigned int ordinal = next.fetch_add(1U);
+  const std::string token =
+      std::to_string(static_cast<unsigned long long>(getpid()) % 10000ULL) +
+      std::to_string(ordinal % 1000U);
+  bbp::NodeVethConfig config;
+  config.host_name = "bbpt" + token + "h";
+  config.peer_name = "bbpt" + token + "p";
+  const unsigned int subnet = 32U + (ordinal % 192U);
+  config.host_address = "198.18." + std::to_string(subnet) + ".1";
+  config.node_address = "198.18." + std::to_string(subnet) + ".2";
+  config.prefix_len = 30;
+  return config;
+}
+
+bool ExplicitPrivilegeFailure(const std::exception& error) {
+  const std::string message = error.what();
+  return message.find(std::strerror(EPERM)) != std::string::npos ||
+         message.find(std::strerror(EACCES)) != std::string::npos;
+}
+
+class ScopedNamespaceVeth {
+ public:
+  ScopedNamespaceVeth()
+      : network_namespace_(bbp::NetworkNamespace::Create()),
+        config_(UniqueVethConfig()) {
+    bbp::SetupNodeVethNetwork(network_namespace_.fd(), config_);
+    setup_ = true;
+  }
+
+  ScopedNamespaceVeth(const ScopedNamespaceVeth&) = delete;
+  ScopedNamespaceVeth& operator=(const ScopedNamespaceVeth&) = delete;
+
+  ~ScopedNamespaceVeth() {
+    if (setup_) {
+      bbp::DeleteNodeVethNetwork(config_);
+    }
+  }
+
+  int namespace_fd() const { return network_namespace_.fd(); }
+  const bbp::NodeVethConfig& config() const { return config_; }
+
+ private:
+  bbp::NetworkNamespace network_namespace_;
+  bbp::NodeVethConfig config_;
+  bool setup_ = false;
+};
+
+class ScopedParentVeth {
+ public:
+  explicit ScopedParentVeth(bbp::NodeVethConfig config)
+      : config_(std::move(config)) {
+    bbp::CreateVethPair(config_.host_name, config_.peer_name);
+    created_ = true;
+  }
+
+  ScopedParentVeth(const ScopedParentVeth&) = delete;
+  ScopedParentVeth& operator=(const ScopedParentVeth&) = delete;
+
+  ~ScopedParentVeth() {
+    if (created_) {
+      try {
+        bbp::DeleteLink(config_.host_name);
+      } catch (const std::exception&) {
+      }
+    }
+  }
+
+ private:
+  bbp::NodeVethConfig config_;
+  bool created_ = false;
+};
+
+std::vector<std::uint8_t> NetlinkAcknowledgement(
+    std::uint32_t sequence, std::uint32_t port_id, int error = 0,
+    std::uint16_t message_type = NLMSG_ERROR) {
+  std::vector<std::uint8_t> reply(NLMSG_LENGTH(sizeof(nlmsgerr)));
+  nlmsghdr header{};
+  header.nlmsg_len = static_cast<std::uint32_t>(reply.size());
+  header.nlmsg_type = message_type;
+  header.nlmsg_seq = sequence;
+  header.nlmsg_pid = port_id;
+  std::memcpy(reply.data(), &header, sizeof(header));
+  nlmsgerr acknowledgement{};
+  acknowledgement.error = error;
+  std::memcpy(reply.data() + NLMSG_HDRLEN, &acknowledgement,
+              sizeof(acknowledgement));
+  return reply;
+}
+
+bbp::DirectionalNetworkPolicy DelayPolicy() {
+  bbp::DirectionalNetworkPolicy policy;
+  policy.band = 1;
+  policy.destination_address = "198.51.100.7";
+  policy.condition.delay_ms = 5;
+  return policy;
+}
+
+bool HasQdiscHandle(const std::vector<bbp::QdiscInfo>& qdiscs,
+                    const std::string& if_name, std::uint32_t handle) {
+  return std::any_of(
+      qdiscs.begin(), qdiscs.end(), [&](const bbp::QdiscInfo& qdisc) {
+        return qdisc.if_name == if_name && qdisc.handle == handle;
+      });
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(
+    netlink_mutations_require_an_exact_success_acknowledgement) {
+  constexpr std::uint32_t sequence = 41U;
+  constexpr std::uint32_t port_id = 73U;
+  const std::vector<std::uint8_t> success =
+      NetlinkAcknowledgement(sequence, port_id);
+  BOOST_CHECK_NO_THROW(
+      bbp::ValidateNetlinkAcknowledgementForTest(success, sequence, port_id));
+
+  const std::vector<std::uint8_t> done =
+      NetlinkAcknowledgement(sequence, port_id, 0, NLMSG_DONE);
+  BOOST_CHECK_THROW(
+      bbp::ValidateNetlinkAcknowledgementForTest(done, sequence, port_id),
+      std::runtime_error);
+
+  std::vector<std::uint8_t> truncated(sizeof(nlmsghdr));
+  nlmsghdr truncated_header{};
+  truncated_header.nlmsg_len = static_cast<std::uint32_t>(truncated.size());
+  truncated_header.nlmsg_type = NLMSG_ERROR;
+  truncated_header.nlmsg_seq = sequence;
+  truncated_header.nlmsg_pid = port_id;
+  std::memcpy(truncated.data(), &truncated_header, sizeof(truncated_header));
+  BOOST_CHECK_THROW(
+      bbp::ValidateNetlinkAcknowledgementForTest(truncated, sequence, port_id),
+      std::runtime_error);
+
+  std::vector<std::uint8_t> trailing = success;
+  trailing.resize(trailing.size() + NLMSG_ALIGN(sizeof(nlmsghdr)));
+  BOOST_CHECK_THROW(
+      bbp::ValidateNetlinkAcknowledgementForTest(trailing, sequence, port_id),
+      std::runtime_error);
+
+  BOOST_CHECK_THROW(bbp::ValidateNetlinkAcknowledgementForTest(
+                        success, sequence + 1U, port_id),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::ValidateNetlinkAcknowledgementForTest(
+                        success, sequence, port_id + 1U),
+                    std::runtime_error);
+
+  const std::vector<std::uint8_t> kernel_error =
+      NetlinkAcknowledgement(sequence, port_id, -EPERM);
+  BOOST_CHECK_EXCEPTION(
+      bbp::ValidateNetlinkAcknowledgementForTest(kernel_error, sequence,
+                                                 port_id),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()).find(std::strerror(EPERM)) !=
+               std::string::npos;
+      });
+}
+
+BOOST_AUTO_TEST_CASE(directional_netlink_failure_rolls_back_applied_mutations) {
+  std::optional<ScopedNamespaceVeth> topology;
+  try {
+    topology.emplace();
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE("skipping privileged rollback test: " << error.what());
+      return;
+    }
+    throw;
+  }
+
+  std::string failure;
+  {
+    bbp::ScopedNetlinkFailurePlan plan(
+        {{2U, bbp::NetlinkFailurePhase::kAfterSend}});
+    try {
+      bbp::UpdateDirectionalNetworkPoliciesInNamespace(
+          topology->namespace_fd(), topology->config().peer_name, {},
+          {DelayPolicy()});
+      BOOST_FAIL("injected post-send netlink failure did not fail the update");
+    } catch (const std::runtime_error& error) {
+      failure = error.what();
+    }
+  }
+
+  BOOST_TEST(failure.find("injected netlink failure after send at request 2") !=
+             std::string::npos);
+  BOOST_TEST(failure.find("prior state restored") != std::string::npos);
+  const std::vector<bbp::QdiscInfo> after =
+      bbp::ListQdiscsInNamespace(topology->namespace_fd());
+  BOOST_TEST(!HasQdiscHandle(after, topology->config().peer_name,
+                             kDirectionalRootHandle));
+}
+
+BOOST_AUTO_TEST_CASE(directional_netlink_reports_a_failed_rollback) {
+  std::optional<ScopedNamespaceVeth> topology;
+  try {
+    topology.emplace();
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE("skipping privileged rollback test: " << error.what());
+      return;
+    }
+    throw;
+  }
+
+  std::string failure;
+  {
+    bbp::ScopedNetlinkFailurePlan plan(
+        {{2U, bbp::NetlinkFailurePhase::kAfterSend},
+         {3U, bbp::NetlinkFailurePhase::kBeforeSend}});
+    try {
+      bbp::UpdateDirectionalNetworkPoliciesInNamespace(
+          topology->namespace_fd(), topology->config().peer_name, {},
+          {DelayPolicy()});
+      BOOST_FAIL("injected rollback failure did not fail the update");
+    } catch (const std::runtime_error& error) {
+      failure = error.what();
+    }
+  }
+
+  BOOST_TEST(failure.find("injected netlink failure after send at request 2") !=
+             std::string::npos);
+  BOOST_TEST(failure.find("; rollback failed: injected netlink failure before "
+                          "send at request 3") != std::string::npos);
+  const std::vector<bbp::QdiscInfo> after =
+      bbp::ListQdiscsInNamespace(topology->namespace_fd());
+  BOOST_TEST(HasQdiscHandle(after, topology->config().peer_name,
+                            kDirectionalRootHandle));
+}
+
+BOOST_AUTO_TEST_CASE(main_thread_never_enters_a_node_network_namespace) {
+  const NamespaceIdentity before = CurrentThreadNetworkNamespace();
+  std::optional<ScopedNamespaceVeth> topology;
+  try {
+    topology.emplace();
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged namespace test: " << error.what());
+      return;
+    }
+    throw;
+  }
+  NamespaceIdentity current = CurrentThreadNetworkNamespace();
+  BOOST_TEST(current.device == before.device);
+  BOOST_TEST(current.inode == before.inode);
+
+  {
+    bbp::ScopedNetlinkFailurePlan plan(
+        {{1U, bbp::NetlinkFailurePhase::kBeforeSend}});
+    BOOST_CHECK_THROW(bbp::UpdateDirectionalNetworkPoliciesInNamespace(
+                          topology->namespace_fd(),
+                          topology->config().peer_name, {}, {DelayPolicy()}),
+                      std::runtime_error);
+  }
+  current = CurrentThreadNetworkNamespace();
+  BOOST_TEST(current.device == before.device);
+  BOOST_TEST(current.inode == before.inode);
+}
+
+BOOST_AUTO_TEST_CASE(veth_setup_refuses_and_preserves_name_collisions) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  try {
+    bbp::NetworkNamespace network_namespace = bbp::NetworkNamespace::Create();
+    ScopedParentVeth foreign(config);
+    BOOST_CHECK_EXCEPTION(
+        bbp::SetupNodeVethNetwork(network_namespace.fd(), config),
+        std::runtime_error, [](const std::runtime_error& error) {
+          return std::string(error.what()).find("non-owned veth") !=
+                 std::string::npos;
+        });
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    BOOST_TEST(
+        std::any_of(links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.name == config.host_name;
+        }));
+    BOOST_TEST(
+        std::any_of(links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.name == config.peer_name;
+        }));
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged ownership test: " << error.what());
+      return;
+    }
+    throw;
+  }
+}
 
 BOOST_AUTO_TEST_CASE(rtnetlink_lists_loopback_with_libmnl) {
   const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
@@ -391,6 +720,11 @@ BOOST_AUTO_TEST_CASE(directional_network_policy_matches_exact_kernel_model) {
   filter.class_id = TC_H_MAKE(0xBB00U << 16U, 3U);
   BOOST_TEST(!bbp::DirectionalNetworkPoliciesMatch({root, netem}, {filter},
                                                    "veth0", {policy}));
+  filter.class_id = netem.parent;
+  bbp::TcFilterInfo foreign = filter;
+  foreign.handle = 0x12345678U;
+  BOOST_TEST(!bbp::DirectionalNetworkPoliciesMatch(
+      {root, netem}, {filter, foreign}, "veth0", {policy}));
 }
 
 BOOST_AUTO_TEST_CASE(

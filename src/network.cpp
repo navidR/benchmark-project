@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -24,11 +25,13 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <exception>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -182,6 +185,25 @@ class MnlSocket {
   }
 
   unsigned int PortId() const { return mnl_socket_get_portid(socket_); }
+
+  void SetReceiveTimeout(std::chrono::milliseconds timeout) {
+    const auto whole_seconds = timeout.count() / 1000;
+    if (timeout.count() <= 0 ||
+        whole_seconds >
+            static_cast<decltype(timeout.count())>(
+                std::numeric_limits<decltype(timeval::tv_sec)>::max())) {
+      throw std::runtime_error("invalid netlink receive timeout");
+    }
+    timeval value{};
+    value.tv_sec = static_cast<decltype(value.tv_sec)>(timeout.count() / 1000);
+    value.tv_usec =
+        static_cast<decltype(value.tv_usec)>((timeout.count() % 1000) * 1000);
+    if (setsockopt(mnl_socket_get_fd(socket_), SOL_SOCKET, SO_RCVTIMEO, &value,
+                   sizeof(value)) != 0) {
+      throw std::runtime_error(std::string("setsockopt(SO_RCVTIMEO) failed: ") +
+                               std::strerror(errno));
+    }
+  }
 
   void Send(const void* data, size_t size) const {
     const ssize_t sent = mnl_socket_sendto(socket_, data, size);
@@ -750,13 +772,22 @@ bool DirectionalNetworkPoliciesMatch(
 
   std::size_t owned_filter_count = 0;
   for (const TcFilterInfo& filter : filters) {
-    if (filter.if_name == if_name && filter.parent == kDirectionalRootHandle &&
-        filter.priority == kDirectionalFilterPriority &&
-        filter.handle > kDirectionalFilterHandleBase &&
-        filter.handle <=
-            kDirectionalFilterHandleBase + kMaximumDirectionalPolicies) {
-      ++owned_filter_count;
+    if (filter.if_name != if_name || filter.parent != kDirectionalRootHandle) {
+      continue;
     }
+    // RTM_GETTFILTER emits one handle-zero chain descriptor before the
+    // concrete flower classifiers. It is kernel metadata, not a mutable
+    // policy object.
+    if (filter.handle == 0U) {
+      continue;
+    }
+    if (filter.priority != kDirectionalFilterPriority ||
+        filter.handle <= kDirectionalFilterHandleBase ||
+        filter.handle >
+            kDirectionalFilterHandleBase + kMaximumDirectionalPolicies) {
+      return false;
+    }
+    ++owned_filter_count;
   }
   if (owned_filter_count != policies.size()) {
     return false;
@@ -924,6 +955,107 @@ DirectionalNetworkPolicyStats SummarizeDirectionalNetworkPolicyStats(
 
 namespace {
 
+constexpr std::chrono::milliseconds kNetlinkAcknowledgementTimeout{5000};
+
+#ifdef BBP_ENABLE_TEST_HOOKS
+struct NetlinkFailurePlanState {
+  bool installed = false;
+  std::uint64_t request_count = 0;
+  std::vector<NetlinkFailurePoint> points;
+};
+
+std::mutex& NetlinkFailurePlanMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+NetlinkFailurePlanState& MutableNetlinkFailurePlan() {
+  static NetlinkFailurePlanState state;
+  return state;
+}
+
+std::uint64_t BeginNetlinkRequestForTest() {
+  std::lock_guard lock(NetlinkFailurePlanMutex());
+  NetlinkFailurePlanState& state = MutableNetlinkFailurePlan();
+  if (!state.installed) {
+    return 0;
+  }
+  return ++state.request_count;
+}
+
+void MaybeInjectNetlinkFailure(std::uint64_t request_number,
+                               NetlinkFailurePhase phase) {
+  if (request_number == 0) {
+    return;
+  }
+  std::lock_guard lock(NetlinkFailurePlanMutex());
+  const NetlinkFailurePlanState& state = MutableNetlinkFailurePlan();
+  const auto point =
+      std::find_if(state.points.begin(), state.points.end(),
+                   [&](const NetlinkFailurePoint& candidate) {
+                     return candidate.request_number == request_number &&
+                            candidate.phase == phase;
+                   });
+  if (point == state.points.end()) {
+    return;
+  }
+  const std::string phase_name =
+      phase == NetlinkFailurePhase::kBeforeSend ? "before send" : "after send";
+  throw std::runtime_error("injected netlink failure " + phase_name +
+                           " at request " + std::to_string(request_number));
+}
+#endif
+
+void ValidateNetlinkAcknowledgement(const void* reply, size_t reply_size,
+                                    std::uint32_t sequence,
+                                    std::uint32_t port_id) {
+  if (reply_size < sizeof(nlmsghdr)) {
+    throw std::runtime_error(
+        "netlink acknowledgement is shorter than its message header");
+  }
+
+  nlmsghdr header{};
+  std::memcpy(&header, reply, sizeof(header));
+  if (header.nlmsg_len < sizeof(nlmsghdr) || header.nlmsg_len > reply_size ||
+      NLMSG_ALIGN(header.nlmsg_len) != reply_size) {
+    throw std::runtime_error(
+        "netlink acknowledgement is not exactly one complete message");
+  }
+  if (header.nlmsg_type != NLMSG_ERROR) {
+    throw std::runtime_error(
+        "netlink mutation reply is not an NLMSG_ERROR acknowledgement");
+  }
+  if (header.nlmsg_len < NLMSG_LENGTH(sizeof(nlmsgerr))) {
+    throw std::runtime_error(
+        "netlink acknowledgement has a truncated nlmsgerr payload");
+  }
+  if (header.nlmsg_seq != sequence) {
+    throw std::runtime_error("netlink acknowledgement sequence mismatch");
+  }
+  if (header.nlmsg_pid != port_id) {
+    throw std::runtime_error("netlink acknowledgement port ID mismatch");
+  }
+
+  const int status =
+      mnl_cb_run(reply, reply_size, sequence, port_id, nullptr, nullptr);
+  if (status == MNL_CB_ERROR) {
+    throw std::runtime_error(std::string("netlink request failed: ") +
+                             std::strerror(errno));
+  }
+  if (status != MNL_CB_STOP) {
+    throw std::runtime_error(
+        "netlink mutation reply did not contain a completed acknowledgement");
+  }
+
+  nlmsgerr acknowledgement{};
+  const auto* bytes = static_cast<const unsigned char*>(reply);
+  std::memcpy(&acknowledgement, bytes + NLMSG_HDRLEN, sizeof(acknowledgement));
+  if (acknowledgement.error != 0) {
+    throw std::runtime_error(
+        "netlink error acknowledgement was not rejected by libmnl");
+  }
+}
+
 template <typename Operation>
 auto ExecuteInNetworkNamespace(int netns_fd,
                                Operation operation) -> decltype(operation()) {
@@ -950,19 +1082,23 @@ auto ExecuteInNetworkNamespace(int netns_fd,
 }
 
 void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence) {
+#ifdef BBP_ENABLE_TEST_HOOKS
+  const std::uint64_t request_number = BeginNetlinkRequestForTest();
+  MaybeInjectNetlinkFailure(request_number, NetlinkFailurePhase::kBeforeSend);
+#endif
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
+  socket.SetReceiveTimeout(kNetlinkAcknowledgementTimeout);
   const unsigned int port_id = socket.PortId();
   socket.Send(nlh, nlh->nlmsg_len);
+#ifdef BBP_ENABLE_TEST_HOOKS
+  MaybeInjectNetlinkFailure(request_number, NetlinkFailurePhase::kAfterSend);
+#endif
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
   const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-  const int status = mnl_cb_run(buffer.data(), static_cast<size_t>(received),
-                                sequence, port_id, nullptr, nullptr);
-  if (status == MNL_CB_ERROR) {
-    throw std::runtime_error(std::string("netlink request failed: ") +
-                             std::strerror(errno));
-  }
+  ValidateNetlinkAcknowledgement(buffer.data(), static_cast<size_t>(received),
+                                 sequence, port_id);
 }
 
 void PutRawPayload(nlmsghdr* nlh, const void* data, size_t size) {
@@ -1936,6 +2072,61 @@ struct NamespaceBandwidthLimitState {
 
 }  // namespace
 
+#ifdef BBP_ENABLE_TEST_HOOKS
+ScopedNetlinkFailurePlan::ScopedNetlinkFailurePlan(
+    std::vector<NetlinkFailurePoint> failure_points) {
+  for (const NetlinkFailurePoint& point : failure_points) {
+    if (point.request_number == 0) {
+      throw std::invalid_argument(
+          "netlink failure request number must be greater than zero");
+    }
+  }
+  std::sort(
+      failure_points.begin(), failure_points.end(),
+      [](const NetlinkFailurePoint& left, const NetlinkFailurePoint& right) {
+        if (left.request_number != right.request_number) {
+          return left.request_number < right.request_number;
+        }
+        return left.phase < right.phase;
+      });
+  if (std::adjacent_find(failure_points.begin(), failure_points.end(),
+                         [](const NetlinkFailurePoint& left,
+                            const NetlinkFailurePoint& right) {
+                           return left.request_number == right.request_number &&
+                                  left.phase == right.phase;
+                         }) != failure_points.end()) {
+    throw std::invalid_argument("duplicate netlink failure point");
+  }
+
+  std::lock_guard lock(NetlinkFailurePlanMutex());
+  NetlinkFailurePlanState& state = MutableNetlinkFailurePlan();
+  if (state.installed) {
+    throw std::logic_error("a netlink failure plan is already installed");
+  }
+  state.installed = true;
+  state.request_count = 0;
+  state.points = std::move(failure_points);
+  installed_ = true;
+}
+
+ScopedNetlinkFailurePlan::~ScopedNetlinkFailurePlan() {
+  if (!installed_) {
+    return;
+  }
+  std::lock_guard lock(NetlinkFailurePlanMutex());
+  NetlinkFailurePlanState& state = MutableNetlinkFailurePlan();
+  state.installed = false;
+  state.request_count = 0;
+  state.points.clear();
+}
+
+void ValidateNetlinkAcknowledgementForTest(
+    const std::vector<std::uint8_t>& reply, std::uint32_t sequence,
+    std::uint32_t port_id) {
+  ValidateNetlinkAcknowledgement(reply.data(), reply.size(), sequence, port_id);
+}
+#endif
+
 NetworkNamespace NetworkNamespace::Create() {
   pid_t helper_pid = -1;
   UniqueFd netns = StartNetworkNamespaceHelper(&helper_pid);
@@ -2795,8 +2986,15 @@ void ApplyDirectionalNetworkPolicies(
   const std::vector<QdiscInfo> qdiscs = ListQdiscs();
   const std::vector<TcFilterInfo> filters = ListDirectionalFilters(if_name);
   if (!DirectionalNetworkPoliciesMatch(qdiscs, filters, if_name, policies)) {
-    throw std::runtime_error(
-        "directional network policy kernel read-back mismatch on " + if_name);
+    std::ostringstream detail;
+    detail << "directional network policy kernel read-back mismatch on "
+           << if_name << "; filters=" << filters.size();
+    for (const TcFilterInfo& filter : filters) {
+      detail << " [kind=" << filter.kernel_kind << " handle=" << filter.handle
+             << " parent=" << filter.parent << " priority=" << filter.priority
+             << " protocol=" << filter.protocol << ']';
+    }
+    throw std::runtime_error(detail.str());
   }
 }
 
@@ -3013,12 +3211,21 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
   if (config.prefix_len > 32U) {
     throw std::runtime_error("node network prefix length must be 0..32");
   }
+  if (config.host_name == config.peer_name) {
+    throw std::runtime_error("node veth endpoint names must be distinct");
+  }
 
-  TryDeleteLink(config.host_name);
-  TryDeleteLink(config.peer_name);
+  const std::vector<LinkInfo> existing_links = ListNetworkLinks();
+  if (HasLinkNamed(existing_links, config.host_name) ||
+      HasLinkNamed(existing_links, config.peer_name)) {
+    throw std::runtime_error(
+        "refusing to replace a pre-existing, non-owned veth endpoint");
+  }
 
+  bool pair_created = false;
   try {
     CreateVethPair(config.host_name, config.peer_name);
+    pair_created = true;
     AddIpv4Address(config.host_name, config.host_address, config.prefix_len);
     SetLinkUp(config.host_name, true);
     if (config.apply_condition) {
@@ -3033,8 +3240,9 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
       AddIpv4Route(config.peer_name, "0.0.0.0", 0, config.host_address);
     });
   } catch (...) {
-    TryDeleteLink(config.host_name);
-    TryDeleteLink(config.peer_name);
+    if (pair_created) {
+      TryDeleteLink(config.host_name);
+    }
     throw;
   }
 }

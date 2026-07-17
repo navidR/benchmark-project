@@ -229,6 +229,34 @@ struct NodeVethConfig {
   NetworkCondition condition;
 };
 
+#ifdef BBP_ENABLE_TEST_HOOKS
+enum class NetlinkFailurePhase {
+  kBeforeSend,
+  kAfterSend,
+};
+
+struct NetlinkFailurePoint {
+  std::uint64_t request_number = 0;
+  NetlinkFailurePhase phase = NetlinkFailurePhase::kBeforeSend;
+};
+
+class ScopedNetlinkFailurePlan {
+ public:
+  explicit ScopedNetlinkFailurePlan(
+      std::vector<NetlinkFailurePoint> failure_points);
+  ScopedNetlinkFailurePlan(const ScopedNetlinkFailurePlan&) = delete;
+  ScopedNetlinkFailurePlan& operator=(const ScopedNetlinkFailurePlan&) = delete;
+  ~ScopedNetlinkFailurePlan();
+
+ private:
+  bool installed_ = false;
+};
+
+void ValidateNetlinkAcknowledgementForTest(
+    const std::vector<std::uint8_t>& reply, std::uint32_t sequence,
+    std::uint32_t port_id);
+#endif
+
 struct NetworkNamespaceProbe {
   pid_t helper_pid = -1;
   std::vector<LinkInfo> parent_links;
