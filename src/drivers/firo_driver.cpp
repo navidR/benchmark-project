@@ -44,22 +44,26 @@ class FiroRpcError final : public std::runtime_error {
   std::int64_t code_;
 };
 
-std::string PeerHost(const std::string& endpoint) {
+std::string PeerHost(const std::string& endpoint,
+                     std::string_view driver_name) {
   const std::string uri = "tcp://" + endpoint;
   const boost::system::result<boost::urls::url_view> parsed =
       boost::urls::parse_uri(uri);
   if (!parsed) {
-    throw std::runtime_error("invalid Firo peer endpoint: " + endpoint);
+    throw std::runtime_error("invalid " + std::string(driver_name) +
+                             " peer endpoint: " + endpoint);
   }
   const std::string host(parsed->host());
   if (host.empty()) {
-    throw std::runtime_error("Firo peer endpoint has no host: " + endpoint);
+    throw std::runtime_error(std::string(driver_name) +
+                             " peer endpoint has no host: " + endpoint);
   }
   boost::system::error_code error;
   boost::asio::ip::make_address(host, error);
   if (error) {
-    throw std::runtime_error("Firo peer endpoint host is not an IP address: " +
-                             endpoint);
+    throw std::runtime_error(
+        std::string(driver_name) +
+        " peer endpoint host is not an IP address: " + endpoint);
   }
   return host;
 }
@@ -118,42 +122,53 @@ std::string Arg(std::string key, const std::string& value) {
 
 constexpr const char* kRpcCookieFileName = ".bbp-rpc-cookie";
 
-void ValidateRpcCookieConfiguration(const FiroNodeConfig& config) {
+void ValidateRpcCookieConfiguration(const FiroNodeConfig& config,
+                                    std::string_view driver_name) {
   if (config.rpc_authentication != RpcAuthenticationMode::kCookieFile) {
-    throw std::runtime_error(
-        "Firo daemon launch requires cookie-file RPC authentication");
+    throw std::runtime_error(std::string(driver_name) +
+                             " daemon launch requires cookie-file RPC "
+                             "authentication");
   }
   if (!config.rpc_user.empty() || !config.rpc_password.empty()) {
-    throw std::runtime_error(
-        "Firo cookie authentication rejects inline RPC credentials");
+    throw std::runtime_error(std::string(driver_name) +
+                             " cookie authentication rejects inline RPC "
+                             "credentials");
   }
   if (config.log_dir.empty() || !config.log_dir.is_absolute() ||
       config.rpc_cookie_file.empty() || !config.rpc_cookie_file.is_absolute()) {
-    throw std::runtime_error(
-        "Firo RPC cookie path must be absolute and below the node log "
-        "directory");
+    throw std::runtime_error(std::string(driver_name) +
+                             " RPC cookie path must be absolute and below "
+                             "the node log directory");
   }
   const std::filesystem::path expected =
       (config.log_dir / kRpcCookieFileName).lexically_normal();
   if (config.rpc_cookie_file.lexically_normal() != expected) {
-    throw std::runtime_error(
-        "Firo RPC cookie path must use the owned node credential file");
+    throw std::runtime_error(std::string(driver_name) +
+                             " RPC cookie path must use the owned node "
+                             "credential file");
   }
 }
 
 boost::json::value ParseRpcResponse(std::string_view body,
-                                    std::string_view method) {
+                                    std::string_view method,
+                                    std::string_view driver_name) {
   boost::json::value value = boost::json::parse(body);
+  if (!value.is_object()) {
+    throw std::runtime_error(std::string(driver_name) + " RPC " +
+                             std::string(method) +
+                             " returned a non-object response");
+  }
   const boost::json::object& object = value.as_object();
   const boost::json::value* error = object.if_contains("error");
   if (error == nullptr) {
-    throw std::runtime_error("Firo RPC " + std::string(method) +
+    throw std::runtime_error(std::string(driver_name) + " RPC " +
+                             std::string(method) +
                              " returned no error field: " + std::string(body));
   }
   if (!error->is_null()) {
     if (!error->is_object()) {
       throw std::runtime_error(
-          "Firo RPC " + std::string(method) +
+          std::string(driver_name) + " RPC " + std::string(method) +
           " returned malformed error: " + std::string(body));
     }
     const boost::json::value* code = error->as_object().if_contains("code");
@@ -168,25 +183,36 @@ boost::json::value ParseRpcResponse(std::string_view body,
     }
     if (!parsed_code) {
       throw std::runtime_error(
-          "Firo RPC " + std::string(method) +
+          std::string(driver_name) + " RPC " + std::string(method) +
           " returned error without an int64 code: " + std::string(body));
     }
-    throw FiroRpcError(*parsed_code,
-                       "Firo RPC " + std::string(method) +
-                           " returned error: " + std::string(body));
+    throw FiroRpcError(
+        *parsed_code, std::string(driver_name) + " RPC " + std::string(method) +
+                          " returned error: " + std::string(body));
   }
   const boost::json::value* result = object.if_contains("result");
   if (result == nullptr) {
-    throw std::runtime_error("Firo RPC " + std::string(method) +
+    throw std::runtime_error(std::string(driver_name) + " RPC " +
+                             std::string(method) +
                              " returned no result: " + std::string(body));
   }
   return *result;
 }
 
-std::vector<std::string> ParseStringArrayResult(
-    const boost::json::value& value) {
+std::vector<std::string> ParseStringArrayResult(const boost::json::value& value,
+                                                std::string_view method,
+                                                std::string_view driver_name) {
+  if (!value.is_array()) {
+    throw std::runtime_error(std::string(driver_name) + " RPC " +
+                             std::string(method) + " returned non-array");
+  }
   std::vector<std::string> values;
   for (const boost::json::value& item : value.as_array()) {
+    if (!item.is_string() || item.as_string().empty()) {
+      throw std::runtime_error(std::string(driver_name) + " RPC " +
+                               std::string(method) +
+                               " returned an invalid string entry");
+    }
     values.emplace_back(item.as_string());
   }
   return values;
@@ -232,10 +258,11 @@ std::string ParseWalletAddressResult(const boost::json::value& value,
 }
 
 bool ContainsPeerAddress(const std::vector<std::string>& addresses,
-                         const std::string& address) {
-  const std::string expected_host = PeerHost(address);
+                         const std::string& address,
+                         std::string_view driver_name) {
+  const std::string expected_host = PeerHost(address, driver_name);
   for (const std::string& candidate : addresses) {
-    if (PeerHost(candidate) == expected_host) {
+    if (PeerHost(candidate, driver_name) == expected_host) {
       return true;
     }
   }
@@ -256,17 +283,19 @@ bool JsonStringArrayContains(const boost::json::value& value,
 }
 
 std::string JsonStringMember(const boost::json::object& object,
-                             std::string_view field) {
+                             std::string_view field,
+                             std::string_view driver_name = "Firo") {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr || !value->is_string()) {
-    throw std::runtime_error("missing Firo RPC string field: " +
-                             std::string(field));
+    throw std::runtime_error("missing " + std::string(driver_name) +
+                             " RPC string field: " + std::string(field));
   }
   return std::string(value->as_string());
 }
 
 uint64_t JsonUint64Member(const boost::json::object& object,
-                          std::string_view field) {
+                          std::string_view field,
+                          std::string_view driver_name = "Firo") {
   const boost::json::value* value = object.if_contains(field);
   if (value != nullptr && value->is_uint64()) {
     return value->as_uint64();
@@ -274,8 +303,8 @@ uint64_t JsonUint64Member(const boost::json::object& object,
   if (value != nullptr && value->is_int64() && value->as_int64() >= 0) {
     return static_cast<uint64_t>(value->as_int64());
   }
-  throw std::runtime_error("missing Firo RPC uint64 field: " +
-                           std::string(field));
+  throw std::runtime_error("missing " + std::string(driver_name) +
+                           " RPC uint64 field: " + std::string(field));
 }
 
 std::int64_t JsonInt64Member(const boost::json::object& object,
@@ -310,7 +339,8 @@ std::optional<bool> OptionalJsonBoolMember(const boost::json::object& object,
 }
 
 double JsonNonNegativeFiniteNumber(const boost::json::value& value,
-                                   std::string_view field) {
+                                   std::string_view field,
+                                   std::string_view driver_name = "Firo") {
   double parsed = 0.0;
   if (value.is_double()) {
     parsed = value.as_double();
@@ -319,12 +349,14 @@ double JsonNonNegativeFiniteNumber(const boost::json::value& value,
   } else if (value.is_uint64()) {
     parsed = static_cast<double>(value.as_uint64());
   } else {
-    throw std::runtime_error("Firo RPC field is not numeric: " +
-                             std::string(field));
+    throw std::runtime_error(
+        std::string(driver_name) +
+        " RPC field is not numeric: " + std::string(field));
   }
   if (!std::isfinite(parsed) || parsed < 0.0) {
-    throw std::runtime_error("Firo RPC field is not finite and non-negative: " +
-                             std::string(field));
+    throw std::runtime_error(
+        std::string(driver_name) +
+        " RPC field is not finite and non-negative: " + std::string(field));
   }
   return parsed;
 }
@@ -445,13 +477,21 @@ std::string TxOutScriptPubKeyHex(const boost::json::object& txout) {
 
 }  // namespace
 
+FiroDriver::FiroDriver(std::chrono::milliseconds rpc_timeout,
+                       std::string driver_name)
+    : driver_name_(std::move(driver_name)), http_(rpc_timeout) {
+  if (driver_name_.empty()) {
+    throw std::invalid_argument("chain driver display name must not be empty");
+  }
+}
+
 ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
   if (config.network != ChainNetwork::kRegtest) {
     throw std::runtime_error("Firo driver supports only regtest network");
   }
   EnsureDirectory(config.data_dir);
   EnsureDirectory(config.log_dir);
-  ValidateRpcCookieConfiguration(config);
+  ValidateRpcCookieConfiguration(config, driver_name_);
   CleanupRpcCredentials(config);
 
   ProcessSpec spec;
@@ -539,7 +579,7 @@ void FiroDriver::WaitReady(const FiroNodeConfig& config,
     WaitForNextPoll(stop_token);
   }
   ThrowIfStopRequested(stop_token);
-  throw std::runtime_error("Firo node " + config.id +
+  throw std::runtime_error(driver_name_ + " node " + config.id +
                            " did not become RPC-ready: " + last_error);
 }
 
@@ -563,10 +603,10 @@ void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
     WaitForNextPoll(stop_token);
   }
   ThrowIfStopRequested(stop_token);
-  throw std::runtime_error("Firo node " + config.id + " reached height " +
-                           std::to_string(last_height) + " before timeout; " +
-                           "target height " + std::to_string(height) +
-                           (last_error.empty() ? "" : ": " + last_error));
+  throw std::runtime_error(
+      driver_name_ + " node " + config.id + " reached height " +
+      std::to_string(last_height) + " before timeout; " + "target height " +
+      std::to_string(height) + (last_error.empty() ? "" : ": " + last_error));
 }
 
 void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
@@ -590,11 +630,11 @@ void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
     WaitForNextPoll(stop_token);
   }
   ThrowIfStopRequested(stop_token);
-  throw std::runtime_error("Firo node " + config.id + " reached peer count " +
-                           std::to_string(last_peer_count) +
-                           " before timeout; target peer count " +
-                           std::to_string(peer_count) +
-                           (last_error.empty() ? "" : ": " + last_error));
+  throw std::runtime_error(
+      driver_name_ + " node " + config.id + " reached peer count " +
+      std::to_string(last_peer_count) + " before timeout; target peer count " +
+      std::to_string(peer_count) +
+      (last_error.empty() ? "" : ": " + last_error));
 }
 
 void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
@@ -608,7 +648,7 @@ void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
     try {
       const std::vector<std::string> addresses =
           PeerAddresses(config, stop_token);
-      if (ContainsPeerAddress(addresses, address)) {
+      if (ContainsPeerAddress(addresses, address, driver_name_)) {
         return;
       }
     } catch (const std::exception& e) {
@@ -617,9 +657,10 @@ void FiroDriver::WaitForPeerAddress(const FiroNodeConfig& config,
     WaitForNextPoll(stop_token);
   }
   ThrowIfStopRequested(stop_token);
-  throw std::runtime_error(
-      "Firo node " + config.id + " did not connect to peer " + address +
-      " before timeout" + (last_error.empty() ? "" : ": " + last_error));
+  throw std::runtime_error(driver_name_ + " node " + config.id +
+                           " did not connect to peer " + address +
+                           " before timeout" +
+                           (last_error.empty() ? "" : ": " + last_error));
 }
 
 void FiroDriver::WaitForPeerAddressAbsent(const FiroNodeConfig& config,
@@ -633,7 +674,7 @@ void FiroDriver::WaitForPeerAddressAbsent(const FiroNodeConfig& config,
     try {
       const std::vector<std::string> addresses =
           PeerAddresses(config, stop_token);
-      if (!ContainsPeerAddress(addresses, address)) {
+      if (!ContainsPeerAddress(addresses, address, driver_name_)) {
         return;
       }
     } catch (const std::exception& e) {
@@ -642,9 +683,10 @@ void FiroDriver::WaitForPeerAddressAbsent(const FiroNodeConfig& config,
     WaitForNextPoll(stop_token);
   }
   ThrowIfStopRequested(stop_token);
-  throw std::runtime_error(
-      "Firo node " + config.id + " remained connected to peer " + address +
-      " before timeout" + (last_error.empty() ? "" : ": " + last_error));
+  throw std::runtime_error(driver_name_ + " node " + config.id +
+                           " remained connected to peer " + address +
+                           " before timeout" +
+                           (last_error.empty() ? "" : ": " + last_error));
 }
 
 FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config,
@@ -687,21 +729,23 @@ FiroMetrics FiroDriver::ReadMetrics(const FiroNodeConfig& config,
       !std::isfinite(*metrics.verification_progress) ||
       *metrics.verification_progress < 0.0 ||
       *metrics.verification_progress > 1.0) {
-    throw std::runtime_error(
-        "Firo verificationprogress must be finite and in 0..1");
+    throw std::runtime_error(driver_name_ +
+                             " verificationprogress must be finite and in "
+                             "0..1");
   }
   metrics.difficulty = JsonOptionalDouble(blockchain, "difficulty");
   if (!metrics.difficulty || !std::isfinite(*metrics.difficulty) ||
       *metrics.difficulty < 0.0) {
-    throw std::runtime_error("Firo difficulty must be finite and non-negative");
+    throw std::runtime_error(driver_name_ +
+                             " difficulty must be finite and non-negative");
   }
-  metrics.hashrate_estimate =
-      JsonNonNegativeFiniteNumber(network_hashrate, "getnetworkhashps result");
+  metrics.hashrate_estimate = JsonNonNegativeFiniteNumber(
+      network_hashrate, "getnetworkhashps result", driver_name_);
   metrics.last_block_time = JsonUint(header, "time");
   metrics.median_time = JsonUint(blockchain, "mediantime");
   metrics.chainwork = JsonString(blockchain, "chainwork");
   if (metrics.chainwork->empty()) {
-    throw std::runtime_error("Firo chainwork must not be empty");
+    throw std::runtime_error(driver_name_ + " chainwork must not be empty");
   }
   if (metrics.initial_block_download) {
     metrics.sync_status = *metrics.initial_block_download
@@ -743,9 +787,9 @@ std::vector<std::string> FiroDriver::ConnectedPeerAddresses(
   ThrowIfStopRequested(stop_token);
   std::set<std::string> candidate_hosts;
   for (const std::string& candidate : candidate_addresses) {
-    if (!candidate_hosts.insert(PeerHost(candidate)).second) {
+    if (!candidate_hosts.insert(PeerHost(candidate, driver_name_)).second) {
       throw UnsupportedChainOperation(
-          "Firo",
+          driver_name_,
           "per-node peer identity without isolated networking; rerun with "
           "--isolate-network");
     }
@@ -754,7 +798,7 @@ std::vector<std::string> FiroDriver::ConnectedPeerAddresses(
   std::vector<std::string> connected;
   connected.reserve(candidate_addresses.size());
   for (const std::string& candidate : candidate_addresses) {
-    if (ContainsPeerAddress(reported, candidate)) {
+    if (ContainsPeerAddress(reported, candidate, driver_name_)) {
       connected.push_back(candidate);
     }
   }
@@ -767,8 +811,15 @@ std::vector<std::string> FiroDriver::GenerateBlocks(
   boost::json::array params;
   params.push_back(count);
   params.emplace_back(address);
-  return ParseStringArrayResult(
-      RpcCall(config, "generatetoaddress", params, stop_token));
+  std::vector<std::string> hashes = ParseStringArrayResult(
+      RpcCall(config, "generatetoaddress", params, stop_token),
+      "generatetoaddress", driver_name_);
+  if (hashes.size() != count) {
+    throw std::runtime_error(driver_name_ + " RPC generatetoaddress returned " +
+                             std::to_string(hashes.size()) + " hashes for " +
+                             std::to_string(count) + " requested blocks");
+  }
+  return hashes;
 }
 
 std::uint64_t FiroDriver::ReadBlockNonRewardTransactionCount(
@@ -780,13 +831,14 @@ std::uint64_t FiroDriver::ReadBlockNonRewardTransactionCount(
   const boost::json::value block =
       RpcCall(config, "getblock", params, stop_token);
   if (!block.is_object()) {
-    throw std::runtime_error("Firo getblock returned non-object");
+    throw std::runtime_error(driver_name_ + " getblock returned non-object");
   }
   const boost::json::value* transactions = block.as_object().if_contains("tx");
   if (transactions == nullptr || !transactions->is_array() ||
       transactions->as_array().empty()) {
-    throw std::runtime_error(
-        "Firo getblock returned no reward transaction for " + block_hash);
+    throw std::runtime_error(driver_name_ +
+                             " getblock returned no reward transaction for " +
+                             block_hash);
   }
   return static_cast<std::uint64_t>(transactions->as_array().size() - 1U);
 }
@@ -1206,7 +1258,8 @@ ChainTransactionObservation FiroDriver::ObserveTransaction(
     std::stop_token stop_token) const {
   ThrowIfStopRequested(stop_token);
   if (txid.empty()) {
-    throw std::runtime_error("cannot observe an empty Firo transaction id");
+    throw std::runtime_error("cannot observe an empty " + driver_name_ +
+                             " transaction id");
   }
 
   const boost::json::value height_value =
@@ -1217,13 +1270,15 @@ ChainTransactionObservation FiroDriver::ObserveTransaction(
   } else if (height_value.is_int64() && height_value.as_int64() >= 0) {
     observed_height = static_cast<std::uint64_t>(height_value.as_int64());
   } else {
-    throw std::runtime_error("Firo getblockcount returned a non-uint64 height");
+    throw std::runtime_error(driver_name_ +
+                             " getblockcount returned a non-uint64 height");
   }
 
   const boost::json::value mempool =
       RpcCall(config, "getrawmempool", boost::json::array{}, stop_token);
   if (!mempool.is_array()) {
-    throw std::runtime_error("Firo getrawmempool returned a non-array");
+    throw std::runtime_error(driver_name_ +
+                             " getrawmempool returned a non-array");
   }
 
   ChainTransactionObservation observation;
@@ -1244,12 +1299,14 @@ ChainTransactionObservation FiroDriver::ObserveTransaction(
     throw;
   }
   if (!transaction.is_object()) {
-    throw std::runtime_error("Firo getrawtransaction returned a non-object");
+    throw std::runtime_error(driver_name_ +
+                             " getrawtransaction returned a non-object");
   }
   const boost::json::object& object = transaction.as_object();
-  if (JsonStringMember(object, "txid") != txid) {
-    throw std::runtime_error(
-        "Firo getrawtransaction returned a different transaction id");
+  if (JsonStringMember(object, "txid", driver_name_) != txid) {
+    throw std::runtime_error(driver_name_ +
+                             " getrawtransaction returned a different "
+                             "transaction id");
   }
 
   const boost::json::value* block_hash = object.if_contains("blockhash");
@@ -1263,20 +1320,23 @@ ChainTransactionObservation FiroDriver::ObserveTransaction(
   }
   if (block_hash == nullptr || !block_hash->is_string() ||
       block_hash->as_string().empty()) {
-    throw std::runtime_error(
-        "Firo getrawtransaction returned an invalid block hash");
+    throw std::runtime_error(driver_name_ +
+                             " getrawtransaction returned an invalid block "
+                             "hash");
   }
-  const std::uint64_t confirmation_height = JsonUint64Member(object, "height");
+  const std::uint64_t confirmation_height =
+      JsonUint64Member(object, "height", driver_name_);
   const std::uint64_t confirmation_count =
-      JsonUint64Member(object, "confirmations");
+      JsonUint64Member(object, "confirmations", driver_name_);
   if (confirmation_count == 0U) {
-    throw std::runtime_error(
-        "Firo getrawtransaction returned zero confirmations for a block");
+    throw std::runtime_error(driver_name_ +
+                             " getrawtransaction returned zero "
+                             "confirmations for a block");
   }
   if (confirmation_height >
       std::numeric_limits<std::uint64_t>::max() - (confirmation_count - 1U)) {
-    throw std::runtime_error(
-        "Firo transaction confirmation tip height overflow");
+    throw std::runtime_error(driver_name_ +
+                             " transaction confirmation tip height overflow");
   }
   observation.state = ChainTransactionState::kConfirmed;
   observation.block_hash = std::string(block_hash->as_string());
@@ -1303,8 +1363,8 @@ ChainTransactionObservation FiroDriver::WaitForTransaction(
   }
   ThrowIfStopRequested(stop_token);
   throw std::runtime_error(
-      "Firo node " + config.id + " did not report transaction " + txid +
-      " in its mempool or confirmed chain before timeout; last height " +
+      driver_name_ + " node " + config.id + " did not report transaction " +
+      txid + " in its mempool or confirmed chain before timeout; last height " +
       std::to_string(last_observation.observed_height) +
       ", last mempool size " + std::to_string(last_observation.mempool_size));
 }
@@ -1312,10 +1372,11 @@ ChainTransactionObservation FiroDriver::WaitForTransaction(
 void FiroDriver::ConnectPeer(const FiroNodeConfig& config,
                              const std::string& address,
                              std::stop_token stop_token) const {
-  if (ContainsPeerAddress(PeerAddresses(config, stop_token), address)) {
+  if (ContainsPeerAddress(PeerAddresses(config, stop_token), address,
+                          driver_name_)) {
     return;
   }
-  const std::string host = PeerHost(address);
+  const std::string host = PeerHost(address, driver_name_);
   const boost::json::value bans =
       RpcCall(config, "listbanned", boost::json::array{}, stop_token);
   if (IsPeerHostBanned(bans, host)) {
@@ -1333,7 +1394,7 @@ void FiroDriver::ConnectPeer(const FiroNodeConfig& config,
 void FiroDriver::DisconnectPeer(const FiroNodeConfig& config,
                                 const std::string& address,
                                 std::stop_token stop_token) const {
-  const std::string host = PeerHost(address);
+  const std::string host = PeerHost(address, driver_name_);
   const boost::json::value bans =
       RpcCall(config, "listbanned", boost::json::array{}, stop_token);
   if (IsPeerHostBanned(bans, host)) {
@@ -1398,14 +1459,15 @@ void FiroDriver::Stop(const FiroNodeConfig& config,
 }
 
 void FiroDriver::CleanupRpcCredentials(const FiroNodeConfig& config) const {
-  ValidateRpcCookieConfiguration(config);
+  ValidateRpcCookieConfiguration(config, driver_name_);
   const int directory = open(config.log_dir.c_str(),
                              O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   if (directory < 0) {
     if (errno == ENOENT) {
       return;
     }
-    throw std::runtime_error("open Firo node credential directory failed: " +
+    throw std::runtime_error("open " + driver_name_ +
+                             " node credential directory failed: " +
                              std::string(std::strerror(errno)));
   }
   const int result = unlinkat(directory, kRpcCookieFileName, 0);
@@ -1413,11 +1475,13 @@ void FiroDriver::CleanupRpcCredentials(const FiroNodeConfig& config) const {
   const int close_result = close(directory);
   const int close_error = errno;
   if (result != 0 && unlink_error != ENOENT) {
-    throw std::runtime_error("remove Firo RPC credential file failed: " +
+    throw std::runtime_error("remove " + driver_name_ +
+                             " RPC credential file failed: " +
                              std::string(std::strerror(unlink_error)));
   }
   if (close_result != 0) {
-    throw std::runtime_error("close Firo node credential directory failed: " +
+    throw std::runtime_error("close " + driver_name_ +
+                             " node credential directory failed: " +
                              std::string(std::strerror(close_error)));
   }
 }
@@ -1436,16 +1500,16 @@ boost::json::value FiroDriver::RpcCall(const FiroNodeConfig& config,
       http_.PostJson(Endpoint(config), "/", body, stop_token);
   if (response.status != 200) {
     try {
-      static_cast<void>(ParseRpcResponse(response.body, method));
+      static_cast<void>(ParseRpcResponse(response.body, method, driver_name_));
     } catch (const FiroRpcError&) {
       throw;
     } catch (const std::exception&) {
     }
-    throw std::runtime_error("Firo RPC HTTP status " +
+    throw std::runtime_error(driver_name_ + " RPC HTTP status " +
                              std::to_string(response.status) + " for " +
                              std::string(method) + ": " + response.body);
   }
-  return ParseRpcResponse(response.body, method);
+  return ParseRpcResponse(response.body, method, driver_name_);
 }
 
 }  // namespace bbp

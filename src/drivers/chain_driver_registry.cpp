@@ -5,6 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "bbp/drivers/bitcoin_driver.h"
 #include "bbp/drivers/firo_driver.h"
 
 namespace bbp {
@@ -19,6 +20,15 @@ constexpr std::uint32_t kFiroMaxNodes = 16;
 constexpr std::uint32_t kFiroCoinbaseSpendableConfirmations = 101;
 constexpr std::uint16_t kFiroP2pPortBase = 18168;
 constexpr std::uint16_t kFiroRpcPortBase = 18888;
+constexpr const char* kBitcoinChainName = "bitcoin";
+constexpr const char* kBitcoinDaemonOptionName = "bitcoind";
+constexpr const char* kBitcoinNodeIdPrefix = "bitcoin";
+constexpr const char* kBitcoinDefaultRewardAddress =
+    "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn";
+constexpr std::uint32_t kBitcoinMaxNodes = 16;
+constexpr std::uint32_t kBitcoinCoinbaseSpendableConfirmations = 101;
+constexpr std::uint16_t kBitcoinP2pPortBase = 18444;
+constexpr std::uint16_t kBitcoinRpcPortBase = 18443;
 
 std::uint16_t AddPortOffset(std::uint16_t base, std::uint32_t offset) {
   const std::uint32_t port = static_cast<std::uint32_t>(base) + offset;
@@ -93,9 +103,30 @@ const ChainDriverSpec& DefaultChainDriverSpec() {
   return spec;
 }
 
+const ChainDriverSpec& BitcoinChainDriverSpec() {
+  static const ChainDriverSpec spec{
+      .name = kBitcoinChainName,
+      .daemon_option_name = kBitcoinDaemonOptionName,
+      .daemon_scenario_field = kBitcoinDaemonOptionName,
+      .node_id_prefix = kBitcoinNodeIdPrefix,
+      .default_reward_address = kBitcoinDefaultRewardAddress,
+      .max_nodes = kBitcoinMaxNodes,
+      .coinbase_spendable_confirmations =
+          kBitcoinCoinbaseSpendableConfirmations,
+      .p2p_port_base = kBitcoinP2pPortBase,
+      .rpc_port_base = kBitcoinRpcPortBase,
+  };
+  return spec;
+}
+
 const ChainDriverSpec& ChainDriverSpecFor(ChainKind chain) {
-  if (chain == ChainKind::kFiro) {
-    return DefaultChainDriverSpec();
+  switch (chain) {
+    case ChainKind::kFiro:
+      return DefaultChainDriverSpec();
+    case ChainKind::kBitcoin:
+      return BitcoinChainDriverSpec();
+    case ChainKind::kMonero:
+      break;
   }
   throw std::runtime_error("chain driver is not implemented: " +
                            std::string(ChainKindName(chain)));
@@ -106,8 +137,13 @@ std::unique_ptr<ChainDriver> CreateDefaultChainDriver() {
 }
 
 std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain) {
-  if (chain == ChainKind::kFiro) {
-    return CreateDefaultChainDriver();
+  switch (chain) {
+    case ChainKind::kFiro:
+      return CreateDefaultChainDriver();
+    case ChainKind::kBitcoin:
+      return std::make_unique<BitcoinDriver>(std::chrono::seconds(5));
+    case ChainKind::kMonero:
+      break;
   }
   throw std::runtime_error("chain driver is not implemented: " +
                            std::string(ChainKindName(chain)));

@@ -1,0 +1,26 @@
+{
+  "chains": {
+    "bitcoin": {
+      "driver": "bitcoin",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "chain": "bitcoin",
+  "simulation": {
+    "name": "bitcoin-regtest-driver"
+  },
+  "block_production": {
+    "enabled": false
+  },
+  "nodes": [
+    {
+      "id": "bitcoin-1",
+      "chain": "bitcoin",
+      "role": "base",
+      "chain_config": {
+        "network": "regtest",
+        "extra_args": ["-dbcache=64"]
+      }
+    }
+  ]
+}

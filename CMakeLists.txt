@@ -219,6 +219,7 @@ add_executable(bbp
   src/drivers/chain_driver.cpp
   src/drivers/chain_command_executor.cpp
   src/drivers/chain_driver_registry.cpp
+  src/drivers/bitcoin_driver.cpp
   src/drivers/firo_driver.cpp
   src/http_client.cpp
   src/log_tail.cpp
@@ -313,6 +314,7 @@ if(BUILD_TESTING)
     tests/unit/chain_kind_tests.cpp
     tests/unit/chain_wallet_transaction_tests.cpp
     tests/unit/default_peer_topology_tests.cpp
+    tests/unit/bitcoin_driver_tests.cpp
     tests/unit/firo_driver_tests.cpp
     tests/unit/http_client_tests.cpp
     tests/unit/log_tail_tests.cpp
@@ -366,6 +368,7 @@ if(BUILD_TESTING)
     src/simulation_event_kind.cpp
     src/drivers/chain_driver.cpp
     src/drivers/chain_driver_registry.cpp
+    src/drivers/bitcoin_driver.cpp
     src/drivers/firo_driver.cpp
     src/http_client.cpp
     src/log_tail.cpp
@@ -685,6 +688,12 @@ if(BUILD_TESTING)
     COMMAND bbp
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-chain-config.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-bitcoin-driver
+    COMMAND bbp
+      --scenario
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-bitcoin-driver.json"
       --probe-capabilities
   )
   add_test(NAME bbp-valid-node-chain-config-yaml

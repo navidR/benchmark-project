@@ -2,6 +2,7 @@
 #include <stdexcept>
 
 #include "bbp/chain_kind.h"
+#include "bbp/drivers/bitcoin_driver.h"
 #include "bbp/drivers/chain_driver_registry.h"
 
 BOOST_AUTO_TEST_CASE(chain_kind_parses_supported_names) {
@@ -23,11 +24,38 @@ BOOST_AUTO_TEST_CASE(chain_kind_has_canonical_names) {
   BOOST_TEST(bbp::ChainKindName(bbp::ChainKind::kMonero) == "monero");
 }
 
-BOOST_AUTO_TEST_CASE(unimplemented_chain_driver_is_explicitly_rejected) {
-  BOOST_CHECK_THROW(bbp::ChainDriverSpecFor(bbp::ChainKind::kBitcoin),
-                    std::runtime_error);
+BOOST_AUTO_TEST_CASE(bitcoin_driver_is_registered_and_monero_is_rejected) {
+  const bbp::ChainDriverSpec& bitcoin =
+      bbp::ChainDriverSpecFor(bbp::ChainKind::kBitcoin);
+  BOOST_TEST(bitcoin.name == "bitcoin");
+  BOOST_TEST(bitcoin.daemon_option_name == "bitcoind");
+  BOOST_TEST(bitcoin.max_nodes == 16U);
+  BOOST_TEST(bitcoin.p2p_port_base == 18444U);
+  BOOST_TEST(bitcoin.rpc_port_base == 18443U);
+  const std::unique_ptr<bbp::ChainDriver> driver =
+      bbp::CreateChainDriver(bbp::ChainKind::kBitcoin);
+  BOOST_REQUIRE(driver != nullptr);
+  BOOST_CHECK(dynamic_cast<bbp::BitcoinDriver*>(driver.get()) != nullptr);
   BOOST_CHECK_THROW(bbp::CreateChainDriver(bbp::ChainKind::kMonero),
                     std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(bitcoin_node_config_uses_chain_ports_and_prefix) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "bitcoin-test";
+  request.run_root = "/tmp/bitcoin-test";
+  request.daemon_binary = "/tmp/bitcoind";
+  request.node_index = 2U;
+
+  const bbp::ChainNodeConfig config = bbp::MakeChainNodeConfig(
+      bbp::ChainDriverSpecFor(bbp::ChainKind::kBitcoin), request);
+
+  BOOST_TEST(config.id == "bitcoin-3");
+  BOOST_TEST(config.p2p_port == 18446U);
+  BOOST_TEST(config.rpc_port == 18445U);
+  BOOST_TEST(config.rpc_cookie_file ==
+             std::filesystem::path(
+                 "/tmp/bitcoin-test/nodes/bitcoin-3/.bbp-rpc-cookie"));
 }
 
 BOOST_AUTO_TEST_CASE(chain_node_config_uses_explicit_safe_scenario_id) {

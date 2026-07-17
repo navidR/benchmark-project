@@ -19,8 +19,8 @@ using WalletMode = ChainWalletMode;
 
 class FiroDriver final : public ChainDriver {
  public:
-  explicit FiroDriver(std::chrono::milliseconds rpc_timeout)
-      : http_(rpc_timeout) {}
+  explicit FiroDriver(std::chrono::milliseconds rpc_timeout,
+                      std::string driver_name = "Firo");
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const override;
   std::optional<LogTailChunk> ReadLogTail(
@@ -135,6 +135,7 @@ class FiroDriver final : public ChainDriver {
                              const boost::json::array& params,
                              std::stop_token stop_token = {}) const;
 
+  std::string driver_name_;
   HttpClient http_;
 };
 
