@@ -60,6 +60,17 @@ bbp::RpcEndpoint CookieEndpoint(const std::filesystem::path& cookie_file,
   };
 }
 
+bbp::RpcEndpoint DigestEndpoint(std::uint16_t port) {
+  return bbp::RpcEndpoint{
+      .host = "127.0.0.1",
+      .port = port,
+      .authentication = bbp::RpcAuthenticationMode::kDigest,
+      .user = "bbp-user",
+      .password = "digest-secret",
+      .cookie_file = {},
+  };
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(http_client_uses_secure_cookie_credentials) {
@@ -183,4 +194,103 @@ BOOST_AUTO_TEST_CASE(http_client_rejects_conflicting_authentication_sources) {
   endpoint.authentication = bbp::RpcAuthenticationMode::kBasic;
   endpoint.cookie_file = "/tmp/must-not-be-present";
   BOOST_CHECK_THROW(client.PostJson(endpoint, "/", "{}"), std::runtime_error);
+
+  endpoint.authentication = bbp::RpcAuthenticationMode::kDigest;
+  BOOST_CHECK_THROW(client.PostJson(endpoint, "/", "{}"), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(http_client_completes_monero_digest_authentication) {
+  namespace asio = boost::asio;
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context context;
+  tcp::acceptor acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::future<std::string> authorization = std::async(std::launch::async, [&] {
+    for (std::uint32_t request_index = 0U; request_index < 2U;
+         ++request_index) {
+      tcp::socket socket(acceptor.get_executor());
+      acceptor.accept(socket);
+      beast::flat_buffer buffer;
+      http::request<http::string_body> request;
+      http::read(socket, buffer, request);
+      if (request_index == 0U) {
+        BOOST_CHECK(request.find(http::field::authorization) == request.end());
+        http::response<http::string_body> response{http::status::unauthorized,
+                                                   11};
+        response.insert(
+            http::field::www_authenticate,
+            "Digest qop=\"auth\",algorithm=MD5-sess,realm=\"monero-rpc\","
+            "nonce=\"fixed-nonce\",stale=false");
+        response.insert(
+            http::field::www_authenticate,
+            "Digest qop=\"auth\",algorithm=MD5,realm=\"monero-rpc\","
+            "nonce=\"fixed-nonce\",stale=false");
+        response.body() = "unauthorized";
+        response.prepare_payload();
+        http::write(socket, response);
+        continue;
+      }
+      const std::string header(request.at(http::field::authorization));
+      http::response<http::string_body> response{http::status::ok, 11};
+      response.body() = "{\"ok\":true}";
+      response.prepare_payload();
+      http::write(socket, response);
+      return header;
+    }
+    throw std::runtime_error("digest test did not receive authentication");
+  });
+
+  const bbp::HttpClient client(std::chrono::seconds(1));
+  const bbp::HttpResponse response = client.PostJson(
+      DigestEndpoint(acceptor.local_endpoint().port()), "/json_rpc", "{}");
+
+  BOOST_TEST(response.status == 200);
+  BOOST_TEST(response.body == "{\"ok\":true}");
+  const std::string header = authorization.get();
+  BOOST_TEST(header.find("Digest algorithm=MD5") == 0U);
+  BOOST_TEST(header.find("nonce=\"fixed-nonce\"") != std::string::npos);
+  BOOST_TEST(header.find("realm=\"monero-rpc\"") != std::string::npos);
+  BOOST_TEST(header.find("uri=\"/json_rpc\"") != std::string::npos);
+  BOOST_TEST(header.find("username=\"bbp-user\"") != std::string::npos);
+  BOOST_TEST(header.find("qop=auth,nc=00000001") != std::string::npos);
+  BOOST_TEST(header.find("response=\"a7ecb5f91bb89b778c32d8b1a58ce427\"") !=
+             std::string::npos);
+  BOOST_TEST(header.find("digest-secret") == std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(http_client_rejects_malformed_digest_challenges) {
+  namespace asio = boost::asio;
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context context;
+  tcp::acceptor acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::future<void> server = std::async(std::launch::async, [&] {
+    tcp::socket socket(acceptor.get_executor());
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    http::response<http::string_body> response{http::status::unauthorized, 11};
+    response.insert(http::field::www_authenticate,
+                    "Digest qop=\"auth\",algorithm=MD5,realm=\"monero-rpc\"");
+    response.prepare_payload();
+    http::write(socket, response);
+  });
+
+  const bbp::HttpClient client(std::chrono::seconds(1));
+  try {
+    static_cast<void>(client.PostJson(
+        DigestEndpoint(acceptor.local_endpoint().port()), "/json_rpc", "{}"));
+    BOOST_FAIL("malformed digest challenge was accepted");
+  } catch (const std::exception& error) {
+    BOOST_TEST(std::string(error.what()).find("digest-secret") ==
+               std::string::npos);
+  }
+  server.get();
 }

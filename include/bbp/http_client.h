@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -17,6 +18,7 @@ struct HttpResponse {
 enum class RpcAuthenticationMode {
   kBasic,
   kCookieFile,
+  kDigest,
 };
 
 struct RpcEndpoint {
@@ -38,6 +40,7 @@ class HttpClient {
 
  private:
   std::chrono::milliseconds timeout_;
+  mutable std::mutex digest_mutex_;
 };
 
 }  // namespace bbp

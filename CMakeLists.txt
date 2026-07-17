@@ -12,6 +12,7 @@ include(ExternalProject)
 set(BOOST_INCLUDE_LIBRARIES
   asio
   beast
+  hash2
   json
   log
   program_options
@@ -273,6 +274,7 @@ target_include_directories(bbp PRIVATE include)
 target_link_libraries(bbp PRIVATE
   Boost::asio
   Boost::beast
+  Boost::hash2
   Boost::json
   Boost::log
   Boost::log_setup
@@ -419,6 +421,7 @@ if(BUILD_TESTING)
   target_link_libraries(bbp-unit-tests PRIVATE
     Boost::asio
     Boost::beast
+    Boost::hash2
     Boost::json
     Boost::log
     Boost::log_setup
