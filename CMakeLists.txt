@@ -1006,6 +1006,15 @@ if(BUILD_TESTING)
       --run tui-run
       --once
   )
+  add_test(NAME bbp-tui-invalid-terminal-fails-gracefully
+    COMMAND "${CMAKE_COMMAND}" -E env TERM=bbp-missing-terminal
+      "${CMAKE_COMMAND}"
+      "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+      "-DSCENARIO_OPTION=--run"
+      "-DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+      "-DREGEX=bbp: ncurses initialization failed"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_failure.cmake"
+  )
   add_test(NAME bbp-cleanup-run-id-conflict
     COMMAND bbp
       --cleanup-run cleanup-id

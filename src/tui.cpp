@@ -14,6 +14,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <iomanip>
 #include <optional>
@@ -79,9 +80,11 @@ class CursesSession {
  public:
   CursesSession() {
     std::setlocale(LC_ALL, "");
-    if (initscr() == nullptr) {
+    screen_ = newterm(nullptr, stdout, stdin);
+    if (screen_ == nullptr) {
       throw std::runtime_error("ncurses initialization failed");
     }
+    set_term(screen_);
     active_ = true;
     cbreak();
     noecho();
@@ -105,9 +108,13 @@ class CursesSession {
     if (active_) {
       endwin();
     }
+    if (screen_ != nullptr) {
+      delscreen(screen_);
+    }
   }
 
  private:
+  SCREEN* screen_ = nullptr;
   bool active_ = false;
 };
 
