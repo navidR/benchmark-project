@@ -47,8 +47,36 @@ BOOST_AUTO_TEST_CASE(chain_node_config_uses_explicit_safe_scenario_id) {
       std::filesystem::path("/tmp/profile-test/nodes/firo-wallet-a/data"));
   BOOST_TEST(config.p2p_port == 18169U);
   BOOST_TEST(config.rpc_port == 18889U);
+  BOOST_CHECK(config.rpc_authentication ==
+              bbp::RpcAuthenticationMode::kCookieFile);
+  BOOST_TEST(config.rpc_user.empty());
+  BOOST_TEST(config.rpc_password.empty());
+  BOOST_TEST(config.rpc_cookie_file ==
+             std::filesystem::path(
+                 "/tmp/profile-test/nodes/firo-wallet-a/.bbp-rpc-cookie"));
   BOOST_TEST(static_cast<int>(config.network) ==
              static_cast<int>(bbp::ChainNetwork::kRegtest));
+}
+
+BOOST_AUTO_TEST_CASE(chain_node_rpc_cookie_paths_are_node_scoped) {
+  bbp::ChainNodeConfigRequest first_request;
+  first_request.run_id = "same-run";
+  first_request.run_root = "/tmp/same-run";
+  first_request.daemon_binary = "/tmp/firod";
+  first_request.node_index = 0U;
+  bbp::ChainNodeConfigRequest second_request = first_request;
+  second_request.node_index = 1U;
+
+  const bbp::ChainNodeConfig first =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), first_request);
+  const bbp::ChainNodeConfig second =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), second_request);
+
+  BOOST_TEST(first.rpc_cookie_file != second.rpc_cookie_file);
+  BOOST_TEST(first.rpc_user.empty());
+  BOOST_TEST(first.rpc_password.empty());
+  BOOST_TEST(second.rpc_user.empty());
+  BOOST_TEST(second.rpc_password.empty());
 }
 
 BOOST_AUTO_TEST_CASE(chain_node_config_retains_requested_network) {

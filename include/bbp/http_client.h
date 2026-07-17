@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -13,11 +14,18 @@ struct HttpResponse {
   std::string body;
 };
 
+enum class RpcAuthenticationMode {
+  kBasic,
+  kCookieFile,
+};
+
 struct RpcEndpoint {
   std::string host = "127.0.0.1";
   uint16_t port = 0;
+  RpcAuthenticationMode authentication = RpcAuthenticationMode::kBasic;
   std::string user;
   std::string password;
+  std::filesystem::path cookie_file;
 };
 
 class HttpClient {

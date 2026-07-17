@@ -62,6 +62,8 @@ struct ChainNodeConfig {
   uint16_t rpc_port = 0;
   std::string rpc_user;
   std::string rpc_password;
+  RpcAuthenticationMode rpc_authentication = RpcAuthenticationMode::kBasic;
+  std::filesystem::path rpc_cookie_file;
   std::string rpc_host = "127.0.0.1";
   std::string rpc_bind = "127.0.0.1";
   std::vector<std::string> rpc_allow_ips = {"127.0.0.1"};
@@ -253,6 +255,7 @@ class ChainDriver {
                                 std::stop_token stop_token = {}) const = 0;
   virtual void Stop(const ChainNodeConfig& config,
                     std::stop_token stop_token = {}) const = 0;
+  virtual void CleanupRpcCredentials(const ChainNodeConfig& config) const;
 };
 
 }  // namespace bbp

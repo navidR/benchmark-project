@@ -7520,6 +7520,13 @@ void WriteScenarioFiles(const Options& options,
     }
     chain_config["extra_args"] = std::move(extra_args);
     node["chain_config"] = std::move(chain_config);
+    boost::json::object rpc;
+    rpc["authentication"] = "cookie";
+    rpc["credentials"] = "<generated-redacted>";
+    rpc["credential_file_lifecycle"] = "ephemeral";
+    rpc["binding_scope"] =
+        options.isolate_network ? "node_veth_only" : "loopback_only";
+    node["rpc"] = std::move(rpc);
     node["wallet"] = ScenarioNodeWalletConfigJson(
         EffectiveNodeWalletConfig(options, node_index));
     if (!options.node_roles.empty()) {
@@ -7701,6 +7708,31 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
         "cleanup currently supports resolved node counts in 1.." +
         std::to_string(chain_spec.max_nodes));
   }
+  const boost::json::value* node_configs = object.if_contains("node_configs");
+  if (node_configs != nullptr) {
+    if (!node_configs->is_array() ||
+        node_configs->as_array().size() != options->nodes) {
+      throw std::runtime_error(
+          "resolved scenario node_configs must match the node count");
+    }
+    options->node_ids.clear();
+    options->node_ids.reserve(options->nodes);
+    std::set<std::string> unique_ids;
+    for (const boost::json::value& node_value : node_configs->as_array()) {
+      if (!node_value.is_object()) {
+        throw std::runtime_error(
+            "resolved scenario node config is not an object");
+      }
+      const std::string id =
+          JsonOptionalStringField(node_value.as_object(), "id", "");
+      RequireSafeScenarioIdentifier(id, "resolved scenario node id");
+      if (!unique_ids.insert(id).second) {
+        throw std::runtime_error(
+            "resolved scenario contains duplicate node ids");
+      }
+      options->node_ids.push_back(id);
+    }
+  }
 }
 
 void CleanupRun(Options options) {
@@ -7721,7 +7753,18 @@ void CleanupRun(Options options) {
     DeleteNodeVethNetwork(config);
   }
   Cgroup::RemoveRun(options.run_id);
-
+  const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
+  const std::unique_ptr<ChainDriver> driver = CreateChainDriver(options.chain);
+  for (uint32_t i = 0; i < options.nodes; ++i) {
+    ChainNodeConfigRequest request;
+    request.run_id = options.run_id;
+    request.run_root = run_root;
+    request.node_index = i;
+    if (!options.node_ids.empty()) {
+      request.node_id = options.node_ids.at(i);
+    }
+    driver->CleanupRpcCredentials(MakeChainNodeConfig(chain_spec, request));
+  }
   BBP_LOG(info) << "cleanup_run=" << options.run_id << "\n"
                 << "nodes=" << options.nodes << "\n"
                 << "run_dir=" << run_root;
@@ -7853,6 +7896,10 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       WriteNodeState(events_path, options.run_id, node_id,
                      NodeRuntimeLifecycle::kFailed);
       runtime.process.Kill();
+      try {
+        driver.CleanupRpcCredentials(runtime.config);
+      } catch (const std::exception&) {
+      }
       if (runtime.cgroup) {
         try {
           runtime.cgroup->KillAll();
@@ -9952,6 +9999,11 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
           }
         }
       }
+    }
+    try {
+      driver.CleanupRpcCredentials(node.config);
+    } catch (...) {
+      record_failure("RPC credential removal", std::current_exception());
     }
     if (node.network) {
       RunNodeCleanupStep(best_effort, "node network removal",

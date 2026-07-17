@@ -84,4 +84,6 @@ ChainWalletFundingResult ChainDriver::PrepareWalletFunding(
   return {};
 }
 
+void ChainDriver::CleanupRpcCredentials(const ChainNodeConfig&) const {}
+
 }  // namespace bbp

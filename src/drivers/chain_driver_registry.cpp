@@ -130,9 +130,8 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
   config.log_dir = node_root;
   config.p2p_port = AddPortOffset(spec.p2p_port_base, request.node_index);
   config.rpc_port = AddPortOffset(spec.rpc_port_base, request.node_index);
-  config.rpc_user = "sim-" + request.run_id;
-  config.rpc_password =
-      "pass-" + request.run_id + "-" + std::to_string(request.node_index);
+  config.rpc_authentication = RpcAuthenticationMode::kCookieFile;
+  config.rpc_cookie_file = node_root / ".bbp-rpc-cookie";
   config.listen = true;
   config.wallet_enabled = request.wallet_enabled;
   config.connect_peers = request.connect_peers;

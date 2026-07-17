@@ -127,6 +127,7 @@ class FiroDriver final : public ChainDriver {
                         std::stop_token stop_token = {}) const override;
   void Stop(const FiroNodeConfig& config,
             std::stop_token stop_token = {}) const override;
+  void CleanupRpcCredentials(const FiroNodeConfig& config) const override;
 
  private:
   boost::json::value RpcCall(const FiroNodeConfig& config,

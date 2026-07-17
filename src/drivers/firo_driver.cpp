@@ -1,5 +1,8 @@
 #include "bbp/drivers/firo_driver.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/network_v4.hpp>
@@ -11,9 +14,11 @@
 #include <boost/json/value.hpp>
 #include <boost/multiprecision/cpp_dec_float.hpp>
 #include <boost/url/parse.hpp>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -109,6 +114,31 @@ std::string Arg(std::string key, const std::string& value) {
   key += "=";
   key += value;
   return key;
+}
+
+constexpr const char* kRpcCookieFileName = ".bbp-rpc-cookie";
+
+void ValidateRpcCookieConfiguration(const FiroNodeConfig& config) {
+  if (config.rpc_authentication != RpcAuthenticationMode::kCookieFile) {
+    throw std::runtime_error(
+        "Firo daemon launch requires cookie-file RPC authentication");
+  }
+  if (!config.rpc_user.empty() || !config.rpc_password.empty()) {
+    throw std::runtime_error(
+        "Firo cookie authentication rejects inline RPC credentials");
+  }
+  if (config.log_dir.empty() || !config.log_dir.is_absolute() ||
+      config.rpc_cookie_file.empty() || !config.rpc_cookie_file.is_absolute()) {
+    throw std::runtime_error(
+        "Firo RPC cookie path must be absolute and below the node log "
+        "directory");
+  }
+  const std::filesystem::path expected =
+      (config.log_dir / kRpcCookieFileName).lexically_normal();
+  if (config.rpc_cookie_file.lexically_normal() != expected) {
+    throw std::runtime_error(
+        "Firo RPC cookie path must use the owned node credential file");
+  }
 }
 
 boost::json::value ParseRpcResponse(std::string_view body,
@@ -421,6 +451,8 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
   }
   EnsureDirectory(config.data_dir);
   EnsureDirectory(config.log_dir);
+  ValidateRpcCookieConfiguration(config);
+  CleanupRpcCredentials(config);
 
   ProcessSpec spec;
   spec.binary = config.binary;
@@ -431,8 +463,7 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
       "-regtest",
       Arg("-datadir", config.data_dir.string()),
       "-server=1",
-      Arg("-rpcuser", config.rpc_user),
-      Arg("-rpcpassword", config.rpc_password),
+      Arg("-rpccookiefile", config.rpc_cookie_file.string()),
       Arg("-rpcbind", config.rpc_bind),
       Arg("-rpcport", std::to_string(config.rpc_port)),
       Arg("-port", std::to_string(config.p2p_port)),
@@ -485,8 +516,10 @@ RpcEndpoint FiroDriver::Endpoint(const FiroNodeConfig& config) const {
   return RpcEndpoint{
       .host = config.rpc_host,
       .port = config.rpc_port,
+      .authentication = config.rpc_authentication,
       .user = config.rpc_user,
       .password = config.rpc_password,
+      .cookie_file = config.rpc_cookie_file,
   };
 }
 
@@ -1361,6 +1394,31 @@ void FiroDriver::Stop(const FiroNodeConfig& config,
   } catch (const SimulationCancelled&) {
     throw;
   } catch (const std::exception&) {
+  }
+}
+
+void FiroDriver::CleanupRpcCredentials(const FiroNodeConfig& config) const {
+  ValidateRpcCookieConfiguration(config);
+  const int directory = open(config.log_dir.c_str(),
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (directory < 0) {
+    if (errno == ENOENT) {
+      return;
+    }
+    throw std::runtime_error("open Firo node credential directory failed: " +
+                             std::string(std::strerror(errno)));
+  }
+  const int result = unlinkat(directory, kRpcCookieFileName, 0);
+  const int unlink_error = errno;
+  const int close_result = close(directory);
+  const int close_error = errno;
+  if (result != 0 && unlink_error != ENOENT) {
+    throw std::runtime_error("remove Firo RPC credential file failed: " +
+                             std::string(std::strerror(unlink_error)));
+  }
+  if (close_result != 0) {
+    throw std::runtime_error("close Firo node credential directory failed: " +
+                             std::string(std::strerror(close_error)));
   }
 }
 

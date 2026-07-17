@@ -303,6 +303,7 @@ if(BUILD_TESTING)
     tests/unit/chain_wallet_transaction_tests.cpp
     tests/unit/default_peer_topology_tests.cpp
     tests/unit/firo_driver_tests.cpp
+    tests/unit/http_client_tests.cpp
     tests/unit/log_tail_tests.cpp
     tests/unit/log_level_tests.cpp
     tests/unit/logging_tests.cpp

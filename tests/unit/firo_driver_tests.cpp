@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <stop_token>
@@ -292,8 +293,8 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   config.log_dir = test_dir / "logs";
   config.rpc_port = 18888U;
   config.p2p_port = 18168U;
-  config.rpc_user = "user";
-  config.rpc_password = "password";
+  config.rpc_authentication = bbp::RpcAuthenticationMode::kCookieFile;
+  config.rpc_cookie_file = config.log_dir / ".bbp-rpc-cookie";
   config.wallet_enabled = true;
   config.connect_peers = {"127.0.0.1:18169"};
   config.extra_args = bbp::ChainExtraArgs({"-dbcache=64", "-maxmempool=128"});
@@ -304,6 +305,8 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   bool transaction_index_enabled = false;
   bool regtest_selected = false;
   bool wallet_disabled = false;
+  bool cookie_authentication = false;
+  bool inline_credentials = false;
   bool exact_extra_arguments = false;
   for (const std::string& argument : process.argv) {
     BOOST_TEST(!argument.starts_with("-connect="));
@@ -319,6 +322,13 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
     if (argument == "-disablewallet") {
       wallet_disabled = true;
     }
+    if (argument == "-rpccookiefile=" + config.rpc_cookie_file.string()) {
+      cookie_authentication = true;
+    }
+    if (argument.starts_with("-rpcuser=") ||
+        argument.starts_with("-rpcpassword=")) {
+      inline_credentials = true;
+    }
   }
   exact_extra_arguments =
       process.argv.size() >= 2U &&
@@ -328,6 +338,8 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   BOOST_TEST(transaction_index_enabled);
   BOOST_TEST(regtest_selected);
   BOOST_TEST(!wallet_disabled);
+  BOOST_TEST(cookie_authentication);
+  BOOST_TEST(!inline_credentials);
   BOOST_TEST(exact_extra_arguments);
 
   config.wallet_enabled = false;
@@ -351,6 +363,96 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(driver.ConnectedPeerAddresses(
                         config, {"127.0.0.1:18168", "127.0.0.1:18169"}),
                     bbp::UnsupportedChainOperation);
+}
+
+BOOST_AUTO_TEST_CASE(firo_rpc_cookie_cleanup_is_safe_and_idempotent) {
+  const std::filesystem::path test_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-firo-cookie-cleanup-" + std::to_string(getpid()));
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::create_directories(test_dir / "logs");
+
+  bbp::FiroNodeConfig config;
+  config.id = "cookie-cleanup-test";
+  config.log_dir = test_dir / "logs";
+  config.rpc_authentication = bbp::RpcAuthenticationMode::kCookieFile;
+  config.rpc_cookie_file = config.log_dir / ".bbp-rpc-cookie";
+  const bbp::FiroDriver driver(std::chrono::milliseconds(100));
+
+  const std::filesystem::path target = test_dir / "must-remain";
+  {
+    std::ofstream output(target);
+    output << "not-a-cookie";
+  }
+  std::filesystem::create_symlink(target, config.rpc_cookie_file);
+  driver.CleanupRpcCredentials(config);
+  BOOST_TEST(std::filesystem::exists(target));
+  BOOST_TEST(!std::filesystem::exists(config.rpc_cookie_file));
+
+  {
+    std::ofstream output(config.rpc_cookie_file);
+    output << "user:password";
+  }
+  driver.CleanupRpcCredentials(config);
+  driver.CleanupRpcCredentials(config);
+  BOOST_TEST(!std::filesystem::exists(config.rpc_cookie_file));
+
+  config.rpc_cookie_file = test_dir / "outside-cookie";
+  BOOST_CHECK_THROW(driver.CleanupRpcCredentials(config), std::runtime_error);
+  config.rpc_cookie_file = config.log_dir / ".bbp-rpc-cookie";
+  config.rpc_user = "inline";
+  BOOST_CHECK_THROW(driver.CleanupRpcCredentials(config), std::runtime_error);
+
+  std::filesystem::remove_all(test_dir);
+}
+
+BOOST_AUTO_TEST_CASE(firo_rpc_authentication_failures_do_not_expose_cookie) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":null,"error":{"code":-32600,"message":"authorization failed"},"id":"bbp"})"};
+  const std::vector<unsigned> statuses = {401U};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr, &statuses);
+      });
+
+  const std::filesystem::path test_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-firo-cookie-auth-failure-" + std::to_string(getpid()));
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::create_directories(test_dir);
+  const std::filesystem::path cookie = test_dir / ".cookie";
+  const std::string secret = "cookie-auth-failure-secret";
+  {
+    std::ofstream output(cookie);
+    output << "__cookie__:" << secret;
+  }
+  std::filesystem::permissions(
+      cookie,
+      std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+      std::filesystem::perm_options::replace);
+
+  bbp::FiroNodeConfig config;
+  config.id = "cookie-auth-failure-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_authentication = bbp::RpcAuthenticationMode::kCookieFile;
+  config.rpc_cookie_file = cookie;
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  try {
+    driver.SetNetworkActive(config, true);
+    BOOST_FAIL("Firo RPC authentication failure was accepted");
+  } catch (const std::exception& error) {
+    BOOST_TEST(std::string(error.what()).find(secret) == std::string::npos);
+  }
+  BOOST_REQUIRE_EQUAL(served.get().size(), 1U);
+  std::filesystem::remove_all(test_dir);
 }
 
 BOOST_AUTO_TEST_CASE(firo_observes_mempool_transaction_with_exact_rpc_payload) {
