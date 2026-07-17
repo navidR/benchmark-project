@@ -75,6 +75,19 @@ bool IsSafeNodeId(std::string_view node_id) {
   });
 }
 
+bool IsSafeDataPathComponent(std::string_view component) {
+  if (component.empty() || component.size() > 64U || component == "." ||
+      component == "..") {
+    return false;
+  }
+  return std::all_of(component.begin(), component.end(), [](char character) {
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9') || character == '-' ||
+           character == '_' || character == '.';
+  });
+}
+
 std::string ErrnoText(std::string_view operation, int error) {
   return std::string(operation) + ": " +
          std::error_code(error, std::generic_category()).message();
@@ -202,6 +215,7 @@ void AppendLogFile(NodeArtifactEntry entry, ScanState* state) {
 }
 
 void ScanDataDirectory(int directory_fd, std::string_view relative_parent,
+                       std::string_view node_relative_data_directory,
                        std::size_t depth, ScanState* state) {
   const std::vector<std::string> names =
       ReadDirectoryNames(directory_fd, state);
@@ -227,7 +241,8 @@ void ScanDataDirectory(int directory_fd, std::string_view relative_parent,
     AppendDataEntry(entry, state);
     if (entry.type == NodeArtifactType::kRegularFile && HasLogSuffix(name)) {
       NodeArtifactEntry log = entry;
-      log.relative_path = "data/" + relative_path;
+      log.relative_path =
+          std::string(node_relative_data_directory) + "/" + relative_path;
       AppendLogFile(std::move(log), state);
     }
 
@@ -244,7 +259,8 @@ void ScanDataDirectory(int directory_fd, std::string_view relative_parent,
       RememberWarning(ErrnoText("open node artifact directory", errno), state);
       continue;
     }
-    ScanDataDirectory(child.get(), relative_path, depth + 1U, state);
+    ScanDataDirectory(child.get(), relative_path, node_relative_data_directory,
+                      depth + 1U, state);
   }
 }
 
@@ -292,14 +308,43 @@ std::string_view NodeArtifactTypeName(NodeArtifactType type) {
 }
 
 NodeArtifactInventory InspectNodeArtifacts(
-    const std::filesystem::path& run_root, std::string_view node_id) {
+    const std::filesystem::path& run_root, std::string_view node_id,
+    const std::filesystem::path& data_directory) {
   NodeArtifactInventory inventory;
   inventory.node_id = std::string(node_id);
   if (!IsSafeNodeId(node_id)) {
     inventory.error = "node artifact browser rejected an unsafe node id";
     return inventory;
   }
-  inventory.data_directory = "nodes/" + std::string(node_id) + "/data";
+  const std::filesystem::path selected_data_directory =
+      data_directory.empty() ? std::filesystem::path("nodes") / node_id / "data"
+                             : data_directory;
+  std::vector<std::string> data_components;
+  if (selected_data_directory.generic_string().size() > 1024U) {
+    inventory.error = "node artifact browser rejected an excessive data path";
+    return inventory;
+  }
+  if (selected_data_directory.is_absolute() ||
+      selected_data_directory.has_root_path()) {
+    inventory.error = "node artifact browser rejected an absolute data path";
+    return inventory;
+  }
+  for (const std::filesystem::path& component : selected_data_directory) {
+    const std::string text = component.string();
+    if (!IsSafeDataPathComponent(text)) {
+      inventory.error =
+          "node artifact browser rejected an unsafe data path component";
+      return inventory;
+    }
+    data_components.push_back(text);
+  }
+  if (data_components.size() < 3U || data_components[0] != "nodes" ||
+      data_components[1] != node_id) {
+    inventory.error =
+        "node artifact browser rejected data outside the owned node directory";
+    return inventory;
+  }
+  inventory.data_directory = selected_data_directory.generic_string();
 
   UniqueFd run = OpenDirectory(run_root);
   if (!run.valid()) {
@@ -320,12 +365,21 @@ NodeArtifactInventory InspectNodeArtifacts(
 
   ScanState state{.inventory = &inventory};
   ScanNodeRootLogs(node.get(), &state);
-  UniqueFd data = OpenDirectoryAt(node.get(), "data");
-  if (!data.valid()) {
-    RememberWarning(ErrnoText("open node data directory", errno), &state);
-    return inventory;
+  UniqueFd data;
+  std::string node_relative_data_directory;
+  for (std::size_t index = 2U; index < data_components.size(); ++index) {
+    node_relative_data_directory =
+        node_relative_data_directory.empty()
+            ? data_components[index]
+            : node_relative_data_directory + "/" + data_components[index];
+    data = OpenDirectoryAt(index == 2U ? node.get() : data.get(),
+                           data_components[index].c_str());
+    if (!data.valid()) {
+      RememberWarning(ErrnoText("open node data directory", errno), &state);
+      return inventory;
+    }
   }
-  ScanDataDirectory(data.get(), {}, 0U, &state);
+  ScanDataDirectory(data.get(), {}, node_relative_data_directory, 0U, &state);
   std::sort(inventory.log_files.begin(), inventory.log_files.end(),
             [](const NodeArtifactEntry& left, const NodeArtifactEntry& right) {
               return left.relative_path < right.relative_path;

@@ -134,6 +134,28 @@ BOOST_AUTO_TEST_CASE(node_file_pane_scrolls_and_reloads) {
   std::filesystem::remove_all(run_root);
 }
 
+BOOST_AUTO_TEST_CASE(node_file_pane_uses_resolved_custom_data_directory) {
+  const std::filesystem::path run_root = MakeTestDir("custom-data");
+  std::filesystem::create_directories(run_root / "nodes" / "firo-1" /
+                                      "state.v1" / "regtest");
+  bbp::WriteText(
+      run_root / "nodes" / "firo-1" / "state.v1" / "regtest" / "debug.log",
+      "debug\n");
+  boost::json::object report = MakeReport();
+  report.at("node_configs").as_array().front().as_object()["data_dir"] =
+      "nodes/firo-1/state.v1";
+
+  bbp::NodeFilePane pane;
+  pane.Toggle(run_root, report, 0U);
+  BOOST_TEST(
+      HasLineContaining(pane.Lines(), "directory: nodes/firo-1/state.v1"));
+  BOOST_TEST(HasLineContaining(pane.Lines(), "regtest/debug.log"));
+  pane.PreviousSection();
+  BOOST_TEST(HasLineContaining(pane.Lines(), "state.v1/regtest/debug.log"));
+
+  std::filesystem::remove_all(run_root);
+}
+
 BOOST_AUTO_TEST_CASE(
     node_file_pane_redacts_sensitive_containers_and_bounds_nesting) {
   const std::filesystem::path run_root = MakeTestDir("safe-config");

@@ -85,6 +85,38 @@ BOOST_AUTO_TEST_CASE(node_artifact_inventory_never_follows_symbolic_links) {
   std::filesystem::remove_all(outside);
 }
 
+BOOST_AUTO_TEST_CASE(node_artifact_inventory_uses_custom_owned_data_path) {
+  const std::filesystem::path run_root = MakeTestDir("custom-data");
+  const std::filesystem::path data_root =
+      run_root / "nodes" / "firo-1" / "state.v1" / "chain";
+  std::filesystem::create_directories(data_root);
+  bbp::WriteText(data_root / "debug.log", "daemon\n");
+
+  const bbp::NodeArtifactInventory inventory = bbp::InspectNodeArtifacts(
+      run_root, "firo-1", "nodes/firo-1/state.v1/chain");
+  BOOST_TEST(inventory.error.empty());
+  BOOST_TEST(inventory.warning.empty());
+  BOOST_TEST(inventory.data_directory == "nodes/firo-1/state.v1/chain");
+  BOOST_REQUIRE(FindEntry(inventory.data_entries, "debug.log") != nullptr);
+  BOOST_REQUIRE(FindEntry(inventory.log_files, "state.v1/chain/debug.log") !=
+                nullptr);
+
+  const bbp::NodeArtifactInventory outside =
+      bbp::InspectNodeArtifacts(run_root, "firo-1", "nodes/firo-2/data");
+  BOOST_TEST(!outside.error.empty());
+
+  std::filesystem::path excessive = std::filesystem::path("nodes") / "firo-1";
+  for (std::size_t index = 0U; index < 17U; ++index) {
+    excessive /= std::string(64U, 'a');
+  }
+  const bbp::NodeArtifactInventory excessive_inventory =
+      bbp::InspectNodeArtifacts(run_root, "firo-1", excessive);
+  BOOST_TEST(excessive_inventory.error ==
+             "node artifact browser rejected an excessive data path");
+
+  std::filesystem::remove_all(run_root);
+}
+
 BOOST_AUTO_TEST_CASE(node_artifact_inventory_rejects_unsafe_and_linked_nodes) {
   const std::filesystem::path run_root = MakeTestDir("unsafe");
   const std::filesystem::path outside = MakeTestDir("linked-node");

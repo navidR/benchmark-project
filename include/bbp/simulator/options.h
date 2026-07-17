@@ -13,6 +13,7 @@
 #include "bbp/log_level.h"
 #include "bbp/network.h"
 #include "bbp/scenario_chain.h"
+#include "bbp/scenario_node_config.h"
 #include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulation_policy.h"
 #include "bbp/simulation_registry.h"
@@ -35,6 +36,7 @@ struct Options {
   std::filesystem::path scenario_json;
   std::filesystem::path scenario_yaml;
   std::filesystem::path chain_daemon;
+  bool chain_daemon_cli_override = false;
   std::map<std::string, ScenarioChain> chains;
   std::filesystem::path output_dir = "runs";
   std::filesystem::path report_run;
@@ -50,6 +52,7 @@ struct Options {
   std::uint32_t nodes = 1;
   std::vector<std::string> node_ids;
   std::vector<std::string> node_roles;
+  std::vector<ScenarioNodeConfig> scenario_node_configs;
   std::uint32_t generate_node = 1;
   std::uint32_t ready_timeout_sec = 30;
   std::uint32_t sync_timeout_sec = 30;

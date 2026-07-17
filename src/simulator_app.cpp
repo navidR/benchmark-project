@@ -1732,6 +1732,56 @@ void RequireSafeScenarioIdentifier(std::string_view value,
   }
 }
 
+std::filesystem::path ParseScenarioNodePath(const boost::json::object& node,
+                                            const char* field,
+                                            std::string_view node_id) {
+  const std::string text = JsonStringField(node, field);
+  if (text.empty()) {
+    throw std::runtime_error("scenario node " + std::string(node_id) + " " +
+                             field + " must not be empty");
+  }
+  if (text.size() > 4096U || text.find('\0') != std::string::npos) {
+    throw std::runtime_error("scenario node " + std::string(node_id) + " " +
+                             field + " is not a safe path");
+  }
+  return std::filesystem::path(text);
+}
+
+void ValidateScenarioNodeDataDirectory(const std::filesystem::path& data_dir,
+                                       std::string_view node_id) {
+  if (data_dir.string().size() > 1024U) {
+    throw std::runtime_error("scenario node " + std::string(node_id) +
+                             " data_dir is not a safe path");
+  }
+  if (data_dir.is_absolute() || data_dir.has_root_path()) {
+    throw std::runtime_error("scenario node " + std::string(node_id) +
+                             " data_dir must be run-relative");
+  }
+  std::vector<std::string> components;
+  for (const std::filesystem::path& component : data_dir) {
+    const std::string text = component.string();
+    bool safe =
+        !text.empty() && text.size() <= 64U && text != "." && text != "..";
+    for (const char character : text) {
+      safe = safe && ((character >= 'a' && character <= 'z') ||
+                      (character >= 'A' && character <= 'Z') ||
+                      (character >= '0' && character <= '9') ||
+                      character == '-' || character == '_' || character == '.');
+    }
+    if (!safe) {
+      throw std::runtime_error("scenario node " + std::string(node_id) +
+                               " data_dir contains an unsafe component");
+    }
+    components.push_back(text);
+  }
+  if (components.size() < 3U || components[0] != "nodes" ||
+      components[1] != node_id) {
+    throw std::runtime_error(
+        "scenario node " + std::string(node_id) +
+        " data_dir must be below its owned nodes/<id> directory");
+  }
+}
+
 uint64_t ParsePositiveUint64Text(std::string_view text,
                                  std::string_view field) {
   uint64_t value = 0U;
@@ -1993,6 +2043,7 @@ ScenarioNodeRoles ParseScenarioNodes(
   options->nodes = node_count;
   options->node_ids.reserve(nodes.size());
   options->node_roles.reserve(nodes.size());
+  options->scenario_node_configs.reserve(nodes.size());
   std::set<std::string> node_ids;
   for (std::size_t index = 0; index < nodes.size(); ++index) {
     const boost::json::value& node_value = nodes[index];
@@ -2022,6 +2073,16 @@ ScenarioNodeRoles ParseScenarioNodes(
                                " role must be base, node, wallet, or miner");
     }
 
+    ScenarioNodeConfig node_config;
+    if (node.if_contains("binary") != nullptr) {
+      node_config.binary = ParseScenarioNodePath(node, "binary", id);
+    }
+    if (node.if_contains("data_dir") != nullptr) {
+      node_config.data_dir = ParseScenarioNodePath(node, "data_dir", id);
+      ValidateScenarioNodeDataDirectory(*node_config.data_dir, id);
+      node_config.data_dir = node_config.data_dir->lexically_normal();
+    }
+
     const auto read_profile = [&](const char* section,
                                   std::map<uint32_t, std::string>* output) {
       const boost::json::value* section_value = node.if_contains(section);
@@ -2042,6 +2103,7 @@ ScenarioNodeRoles ParseScenarioNodes(
     read_profile("network", &options->node_network_profiles);
     options->node_ids.push_back(id);
     options->node_roles.push_back(role);
+    options->scenario_node_configs.push_back(std::move(node_config));
   }
   roles.configured = true;
   return roles;
@@ -2186,6 +2248,34 @@ std::string ScenarioNodeId(const Options& options, uint32_t node_index) {
   }
   return ChainDriverSpecFor(options.chain).node_id_prefix + "-" +
          std::to_string(node_index + 1U);
+}
+
+const ScenarioNodeConfig* ScenarioNodeConfigAt(const Options& options,
+                                               uint32_t node_index) {
+  if (options.scenario_node_configs.empty()) {
+    return nullptr;
+  }
+  return &options.scenario_node_configs.at(node_index);
+}
+
+std::filesystem::path EffectiveNodeBinary(const Options& options,
+                                          uint32_t node_index) {
+  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
+  if (!options.chain_daemon_cli_override && config != nullptr &&
+      config->binary) {
+    return *config->binary;
+  }
+  return options.chain_daemon;
+}
+
+std::filesystem::path NodeDataDirectoryRelative(const Options& options,
+                                                uint32_t node_index) {
+  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
+  if (config != nullptr && config->data_dir) {
+    return *config->data_dir;
+  }
+  return std::filesystem::path("nodes") / ScenarioNodeId(options, node_index) /
+         "data";
 }
 
 bool NodeHasScenarioRole(const Options& options, uint32_t node_index,
@@ -3847,6 +3937,7 @@ Options ParseOptions(int argc, char** argv) {
     throw std::runtime_error(
         "--node-binary and its legacy aliases must not be combined");
   }
+  options.chain_daemon_cli_override = node_binary_option_count == 1U;
   const std::uint32_t stored_run_operation_count =
       static_cast<std::uint32_t>(OptionProvided(vm, "run")) +
       static_cast<std::uint32_t>(OptionProvided(vm, "report-run")) +
@@ -4207,7 +4298,19 @@ Options ParseOptions(int argc, char** argv) {
                              chain_spec.daemon_option_name);
   }
   if (needs_chain_daemon) {
-    RequireExecutable(options.chain_daemon);
+    std::set<std::filesystem::path> checked_binaries;
+    for (uint32_t node_index = 0U; node_index < options.nodes; ++node_index) {
+      const std::filesystem::path binary =
+          EffectiveNodeBinary(options, node_index);
+      if (binary.empty()) {
+        throw std::runtime_error("scenario node " +
+                                 ScenarioNodeId(options, node_index) +
+                                 " requires an explicit binary");
+      }
+      if (checked_binaries.insert(binary).second) {
+        RequireExecutable(binary);
+      }
+    }
   }
   return options;
 }
@@ -7212,6 +7315,9 @@ void WriteScenarioFiles(const Options& options,
                                                 std::to_string(node_index + 1U)
                                           : options.node_ids.at(node_index);
     node["chain"] = chain_spec.name;
+    node["binary"] = EffectiveNodeBinary(options, node_index).string();
+    node["data_dir"] =
+        NodeDataDirectoryRelative(options, node_index).generic_string();
     if (!options.node_roles.empty()) {
       node["role"] = options.node_roles.at(node_index);
     } else {
@@ -7437,7 +7543,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     ChainNodeConfigRequest config_request;
     config_request.run_id = options.run_id;
     config_request.run_root = run_root;
-    config_request.daemon_binary = options.chain_daemon;
+    config_request.daemon_binary = EffectiveNodeBinary(options, i);
+    config_request.data_dir = NodeDataDirectoryRelative(options, i);
     config_request.node_index = i;
     if (!options.node_ids.empty()) {
       config_request.node_id = options.node_ids.at(i);

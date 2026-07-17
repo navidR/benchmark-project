@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,7 @@ struct ChainNodeConfigRequest {
   std::string run_id;
   std::filesystem::path run_root;
   std::filesystem::path daemon_binary;
+  std::optional<std::filesystem::path> data_dir;
   std::uint32_t node_index = 0;
   std::string node_id;
   bool wallet_enabled = false;

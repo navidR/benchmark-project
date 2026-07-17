@@ -273,3 +273,26 @@ BOOST_AUTO_TEST_CASE(child_process_does_not_inherit_blocked_signal_mask) {
   BOOST_TEST(WTERMSIG(*status) == SIGTERM);
   std::filesystem::remove_all(run_dir);
 }
+
+BOOST_AUTO_TEST_CASE(child_process_resolves_relative_binary_before_chdir) {
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-relative-binary-" + std::to_string(getpid()));
+  std::filesystem::create_directories(run_dir);
+
+  bbp::ProcessSpec spec;
+  spec.binary =
+      std::filesystem::relative("/bin/true", std::filesystem::current_path());
+  spec.cwd = run_dir;
+  spec.stdout_path = run_dir / "stdout.log";
+  spec.stderr_path = run_dir / "stderr.log";
+
+  bbp::ChildProcess child = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  BOOST_REQUIRE(child.WaitForExit(std::chrono::seconds(1)));
+  const std::optional<int> status = child.exit_status();
+  BOOST_REQUIRE(status);
+  BOOST_REQUIRE(WIFEXITED(*status));
+  BOOST_TEST(WEXITSTATUS(*status) == 0);
+
+  std::filesystem::remove_all(run_dir);
+}

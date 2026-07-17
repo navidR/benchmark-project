@@ -655,6 +655,47 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-canonical-simulation.yaml"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-node-executable-config
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-executable-config.json"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-binary-shape
+    tests/scenarios/invalid-node-binary-shape.json
+    "missing or invalid string JSON field: binary"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-binary-empty
+    tests/scenarios/invalid-node-binary-empty.json
+    "scenario node firo-1 binary must not be empty"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-data-dir-shape
+    tests/scenarios/invalid-node-data-dir-shape.json
+    "missing or invalid string JSON field: data_dir"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-data-dir-absolute
+    tests/scenarios/invalid-node-data-dir-absolute.json
+    "scenario node firo-1 data_dir must be run-relative"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-data-dir-escape
+    tests/scenarios/invalid-node-data-dir-escape.json
+    "scenario node firo-1 data_dir contains an unsafe component"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-data-dir-owner
+    tests/scenarios/invalid-node-data-dir-owner.json
+    "scenario node firo-1 data_dir must be below its owned nodes/<id> directory"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-data-dir-length
+    tests/scenarios/invalid-node-data-dir-length.json
+    "scenario node firo-1 data_dir is not a safe path"
+  )
   add_cli_failure_test(
     bbp-invalid-chains-shape
     tests/scenarios/invalid-chains-shape.json

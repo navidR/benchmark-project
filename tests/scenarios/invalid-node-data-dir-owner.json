@@ -1,0 +1,11 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": [
+    {
+      "id": "firo-1",
+      "chain": "firo",
+      "role": "base",
+      "data_dir": "nodes/firo-2/data"
+    }
+  ]
+}

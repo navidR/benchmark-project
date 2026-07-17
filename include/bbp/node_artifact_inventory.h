@@ -35,6 +35,7 @@ struct NodeArtifactInventory {
 };
 
 NodeArtifactInventory InspectNodeArtifacts(
-    const std::filesystem::path& run_root, std::string_view node_id);
+    const std::filesystem::path& run_root, std::string_view node_id,
+    const std::filesystem::path& data_directory = {});
 
 }  // namespace bbp

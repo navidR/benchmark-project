@@ -121,6 +121,9 @@ void RequireExecutable(const std::filesystem::path& path) {
   if (path.empty() || !std::filesystem::exists(path)) {
     throw std::runtime_error("binary does not exist: " + path.string());
   }
+  if (!std::filesystem::is_regular_file(path)) {
+    throw std::runtime_error("binary is not a regular file: " + path.string());
+  }
   if (access(path.c_str(), X_OK) != 0) {
     throw IoError(path, "access(X_OK)");
   }

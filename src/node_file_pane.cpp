@@ -392,8 +392,13 @@ void NodeFilePane::Load(const std::filesystem::path& run_root,
     return;
   }
 
+  const boost::json::object* config = FindNodeConfig(report, node_id_);
+  const std::filesystem::path data_directory =
+      config == nullptr
+          ? std::filesystem::path{}
+          : std::filesystem::path(JsonString(*config, "data_dir"));
   const NodeArtifactInventory inventory =
-      InspectNodeArtifacts(run_root, node_id_);
+      InspectNodeArtifacts(run_root, node_id_, data_directory);
   data_lines_.push_back("directory: " + inventory.data_directory);
   if (!inventory.error.empty()) {
     data_lines_.push_back("error: " + inventory.error);
@@ -414,7 +419,6 @@ void NodeFilePane::Load(const std::filesystem::path& run_root,
   ConfigurationAppendState configuration_state{.lines = &configuration_lines_};
   static_cast<void>(AppendConfigurationLine(
       "source: resolved-scenario.json / node_configs", &configuration_state));
-  const boost::json::object* config = FindNodeConfig(report, node_id_);
   if (config == nullptr) {
     static_cast<void>(AppendConfigurationLine(
         "No canonical node configuration is present in the report.",

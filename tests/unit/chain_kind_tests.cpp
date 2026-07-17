@@ -63,3 +63,38 @@ BOOST_AUTO_TEST_CASE(chain_node_config_retains_generated_id_by_default) {
   BOOST_TEST(config.data_dir ==
              std::filesystem::path("/tmp/legacy-test/nodes/firo-3/data"));
 }
+
+BOOST_AUTO_TEST_CASE(chain_node_config_accepts_only_owned_custom_data_dirs) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "custom-data";
+  request.run_root = "/tmp/custom-data";
+  request.daemon_binary = "/tmp/firod";
+  request.node_id = "node-a";
+  request.data_dir = "nodes/node-a/state.v1/chain";
+
+  const bbp::ChainNodeConfig config =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request);
+  BOOST_TEST(
+      config.data_dir ==
+      std::filesystem::path("/tmp/custom-data/nodes/node-a/state.v1/chain"));
+
+  request.data_dir = "/tmp/outside";
+  BOOST_CHECK_THROW(
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request),
+      std::runtime_error);
+  request.data_dir = "nodes/other/data";
+  BOOST_CHECK_THROW(
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request),
+      std::runtime_error);
+  request.data_dir = "nodes/node-a/../escape";
+  BOOST_CHECK_THROW(
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request),
+      std::runtime_error);
+  request.data_dir = std::filesystem::path("nodes") / "node-a";
+  for (std::size_t index = 0U; index < 17U; ++index) {
+    *request.data_dir /= std::string(64U, 'a');
+  }
+  BOOST_CHECK_THROW(
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request),
+      std::runtime_error);
+}

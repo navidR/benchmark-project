@@ -1,6 +1,7 @@
 #include "bbp/drivers/chain_driver_registry.h"
 
 #include <chrono>
+#include <cstddef>
 #include <limits>
 #include <stdexcept>
 
@@ -25,6 +26,54 @@ std::uint16_t AddPortOffset(std::uint16_t base, std::uint32_t offset) {
     throw std::runtime_error("chain node port allocation exceeded uint16");
   }
   return static_cast<std::uint16_t>(port);
+}
+
+bool IsSafeDataDirectoryComponent(std::string_view component) {
+  if (component.empty() || component.size() > 64U || component == "." ||
+      component == "..") {
+    return false;
+  }
+  for (const char character : component) {
+    const bool safe = (character >= 'a' && character <= 'z') ||
+                      (character >= 'A' && character <= 'Z') ||
+                      (character >= '0' && character <= '9') ||
+                      character == '-' || character == '_' || character == '.';
+    if (!safe) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::filesystem::path ResolveNodeDataDirectory(
+    const ChainNodeConfigRequest& request, std::string_view node_id) {
+  const std::filesystem::path default_relative =
+      std::filesystem::path("nodes") / node_id / "data";
+  if (!request.data_dir) {
+    return request.run_root / default_relative;
+  }
+  const std::filesystem::path& relative = *request.data_dir;
+  const std::string native = relative.string();
+  if (native.empty() || native.size() > 1024U ||
+      native.find('\0') != std::string::npos || relative.is_absolute() ||
+      relative.has_root_path()) {
+    throw std::runtime_error(
+        "node data_dir must be a nonempty run-relative path");
+  }
+  std::vector<std::string> components;
+  for (const std::filesystem::path& component : relative) {
+    const std::string text = component.string();
+    if (!IsSafeDataDirectoryComponent(text)) {
+      throw std::runtime_error("node data_dir contains an unsafe component");
+    }
+    components.push_back(text);
+  }
+  if (components.size() < 3U || components[0] != "nodes" ||
+      components[1] != node_id) {
+    throw std::runtime_error(
+        "node data_dir must be below its owned nodes/<id> directory");
+  }
+  return request.run_root / relative.lexically_normal();
 }
 
 }  // namespace
@@ -75,7 +124,7 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
   ChainNodeConfig config;
   config.id = node_id;
   config.binary = request.daemon_binary;
-  config.data_dir = node_root / "data";
+  config.data_dir = ResolveNodeDataDirectory(request, node_id);
   config.log_dir = node_root;
   config.p2p_port = AddPortOffset(spec.p2p_port_base, request.node_index);
   config.rpc_port = AddPortOffset(spec.rpc_port_base, request.node_index);

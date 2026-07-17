@@ -121,6 +121,8 @@ ChildProcess ChildProcess::Spawn(
     const ProcessSpec& spec,
     const std::optional<std::filesystem::path>& cgroup) {
   RequireExecutable(spec.binary);
+  const std::filesystem::path executable =
+      std::filesystem::absolute(spec.binary);
   EnsureDirectory(spec.stdout_path.parent_path());
   EnsureDirectory(spec.stderr_path.parent_path());
   if (!spec.cwd.empty()) {
@@ -189,7 +191,7 @@ ChildProcess ChildProcess::Spawn(
 
     std::vector<std::string> argv_storage;
     argv_storage.reserve(spec.argv.size() + 1);
-    argv_storage.push_back(spec.binary.string());
+    argv_storage.push_back(executable.string());
     for (const auto& arg : spec.argv) {
       argv_storage.push_back(arg);
     }
@@ -201,7 +203,7 @@ ChildProcess ChildProcess::Spawn(
     }
     argv.push_back(nullptr);
 
-    execv(spec.binary.c_str(), argv.data());
+    execv(executable.c_str(), argv.data());
     ChildFail("execv");
   }
 

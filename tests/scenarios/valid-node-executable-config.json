@@ -1,0 +1,21 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/default-not-used-by-probe"
+    }
+  },
+  "block_production": {
+    "enabled": false,
+    "probability": 0.0
+  },
+  "nodes": [
+    {
+      "id": "custom-node",
+      "chain": "firo",
+      "role": "base",
+      "binary": "/tmp/node-not-used-by-probe",
+      "data_dir": "nodes/custom-node/state.v1/chain"
+    }
+  ]
+}

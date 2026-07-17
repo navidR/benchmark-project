@@ -1,12 +1,12 @@
 #define BOOST_TEST_MODULE BlockchainBenchmarkProjectUtilTests
 
-#include "bbp/util.h"
-
+#include <boost/json/object.hpp>
+#include <boost/test/unit_test.hpp>
+#include <filesystem>
 #include <string>
 #include <vector>
 
-#include <boost/json/object.hpp>
-#include <boost/test/unit_test.hpp>
+#include "bbp/util.h"
 
 BOOST_AUTO_TEST_CASE(json_escape_uses_boost_json) {
   BOOST_TEST(bbp::JsonEscape("a\"b\\c\n") == "a\\\"b\\\\c\\n");
@@ -28,4 +28,10 @@ BOOST_AUTO_TEST_CASE(split_whitespace_reads_cgroup_controller_lists) {
   BOOST_REQUIRE_EQUAL(words.size(), 3U);
   BOOST_TEST(words[0] == "cpu");
   BOOST_TEST(words[2] == "pids");
+}
+
+BOOST_AUTO_TEST_CASE(require_executable_rejects_directories) {
+  BOOST_CHECK_THROW(
+      bbp::RequireExecutable(std::filesystem::temp_directory_path()),
+      std::runtime_error);
 }
