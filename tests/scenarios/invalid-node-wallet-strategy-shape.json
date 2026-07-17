@@ -1,0 +1,13 @@
+{
+  "nodes": [
+    {
+      "id": "firo-1",
+      "chain": "firo",
+      "role": "wallet",
+      "wallet": {
+        "enabled": true,
+        "initialization": {"strategy": 1}
+      }
+    }
+  ]
+}

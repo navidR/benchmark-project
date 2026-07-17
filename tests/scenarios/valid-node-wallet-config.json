@@ -1,0 +1,45 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "block_production": {
+    "enabled": false,
+    "probability": 0.0
+  },
+  "nodes": [
+    {
+      "id": "firo-wallet-miner",
+      "chain": "firo",
+      "role": "wallet_miner",
+      "wallet": {
+        "enabled": true,
+        "initialization": {
+          "strategy": "driver_rpc",
+          "mode": "public"
+        }
+      }
+    },
+    {
+      "id": "firo-miner",
+      "chain": "firo",
+      "role": "miner",
+      "wallet": {
+        "enabled": false
+      }
+    }
+  ],
+  "topology": {
+    "node_count": 2,
+    "wallet_nodes": [1],
+    "miner_nodes": [1, 2],
+    "allow_miner_wallet_overlap": true,
+    "wallet_initialization": {
+      "strategy": "driver_rpc",
+      "mode": "public"
+    },
+    "type": "full_mesh"
+  }
+}

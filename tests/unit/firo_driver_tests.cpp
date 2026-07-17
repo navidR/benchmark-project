@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core.hpp>
@@ -293,6 +294,7 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   config.p2p_port = 18168U;
   config.rpc_user = "user";
   config.rpc_password = "password";
+  config.wallet_enabled = true;
   config.connect_peers = {"127.0.0.1:18169"};
   config.extra_args = bbp::ChainExtraArgs({"-dbcache=64", "-maxmempool=128"});
 
@@ -301,6 +303,7 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   bool dandelion_disabled = false;
   bool transaction_index_enabled = false;
   bool regtest_selected = false;
+  bool wallet_disabled = false;
   bool exact_extra_arguments = false;
   for (const std::string& argument : process.argv) {
     BOOST_TEST(!argument.starts_with("-connect="));
@@ -313,6 +316,9 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
     if (argument == "-regtest") {
       regtest_selected = true;
     }
+    if (argument == "-disablewallet") {
+      wallet_disabled = true;
+    }
   }
   exact_extra_arguments =
       process.argv.size() >= 2U &&
@@ -321,7 +327,14 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   BOOST_TEST(dandelion_disabled);
   BOOST_TEST(transaction_index_enabled);
   BOOST_TEST(regtest_selected);
+  BOOST_TEST(!wallet_disabled);
   BOOST_TEST(exact_extra_arguments);
+
+  config.wallet_enabled = false;
+  const bbp::ProcessSpec wallet_disabled_process = driver.RenderProcess(config);
+  BOOST_TEST(std::count(wallet_disabled_process.argv.begin(),
+                        wallet_disabled_process.argv.end(),
+                        "-disablewallet") == 1U);
 
   config.network = static_cast<bbp::ChainNetwork>(999);
   BOOST_CHECK_THROW(driver.RenderProcess(config), std::runtime_error);

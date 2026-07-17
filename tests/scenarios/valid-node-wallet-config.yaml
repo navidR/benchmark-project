@@ -1,0 +1,29 @@
+chains:
+  firo:
+    driver: firo
+    default_binary: /tmp/not-used-by-probe
+block_production:
+  enabled: false
+  probability: 0.0
+nodes:
+  - id: firo-wallet
+    chain: firo
+    role: wallet
+    wallet:
+      enabled: true
+      initialization:
+        strategy: driver_rpc
+        mode: private
+  - id: firo-miner
+    chain: firo
+    role: miner
+    wallet:
+      enabled: false
+topology:
+  node_count: 2
+  wallet_nodes: [1]
+  miner_nodes: [2]
+  wallet_initialization:
+    strategy: driver_rpc
+    mode: private
+  type: full_mesh

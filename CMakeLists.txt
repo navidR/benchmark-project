@@ -679,6 +679,83 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-chain-config.yaml"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-node-wallet-config-json
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-wallet-config.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-node-wallet-config-yaml
+    COMMAND bbp
+      --scenario-yaml
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-wallet-config.yaml"
+      --probe-capabilities
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-shape
+    tests/scenarios/invalid-node-wallet-shape.json
+    "scenario node firo-1 wallet must be an object"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-enabled-shape
+    tests/scenarios/invalid-node-wallet-enabled-shape.json
+    "invalid bool JSON field: enabled"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-role-disabled
+    tests/scenarios/invalid-node-wallet-role-disabled.json
+    "wallet.enabled must match whether the node has a wallet role"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-role-enabled
+    tests/scenarios/invalid-node-wallet-role-enabled.json
+    "wallet.enabled must match whether the node has a wallet role"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-initialization-shape
+    tests/scenarios/invalid-node-wallet-initialization-shape.json
+    "wallet.initialization must be an object"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-strategy
+    tests/scenarios/invalid-node-wallet-strategy.json
+    "wallet.initialization.strategy must be driver_rpc"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-strategy-shape
+    tests/scenarios/invalid-node-wallet-strategy-shape.json
+    "wallet.initialization.strategy must be a string"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-mode
+    tests/scenarios/invalid-node-wallet-mode.json
+    "wallet.initialization.mode must be public or private"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-mode-shape
+    tests/scenarios/invalid-node-wallet-mode-shape.json
+    "wallet.initialization.mode must be a string"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-mode-mismatch
+    tests/scenarios/invalid-node-wallet-mode-mismatch.json
+    "wallet initialization mode must match topology"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-field
+    tests/scenarios/invalid-node-wallet-field.json
+    "has unsupported wallet field: seed"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-material
+    tests/scenarios/invalid-node-wallet-material.json
+    "has unsupported wallet.initialization field: mnemonic"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-wallet-disabled-initialization
+    tests/scenarios/invalid-node-wallet-disabled-initialization.json
+    "disabled wallet must not specify initialization"
+  )
   add_cli_failure_test(
     bbp-invalid-node-chain-config-shape
     tests/scenarios/invalid-node-chain-config-shape.json

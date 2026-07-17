@@ -79,6 +79,19 @@ BOOST_AUTO_TEST_CASE(chain_node_config_retains_protected_extra_args) {
   BOOST_TEST(config.extra_args.arguments()[0] == "-dbcache=64");
 }
 
+BOOST_AUTO_TEST_CASE(chain_node_config_retains_wallet_enablement) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "wallet-config-test";
+  request.run_root = "/tmp/wallet-config-test";
+  request.daemon_binary = "/tmp/firod";
+  request.wallet_enabled = true;
+
+  const bbp::ChainNodeConfig config =
+      bbp::MakeChainNodeConfig(bbp::DefaultChainDriverSpec(), request);
+
+  BOOST_TEST(config.wallet_enabled);
+}
+
 BOOST_AUTO_TEST_CASE(chain_node_config_retains_generated_id_by_default) {
   bbp::ChainNodeConfigRequest request;
   request.run_id = "legacy-test";

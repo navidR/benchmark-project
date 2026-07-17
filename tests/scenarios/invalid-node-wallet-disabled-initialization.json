@@ -1,0 +1,13 @@
+{
+  "nodes": [
+    {
+      "id": "firo-1",
+      "chain": "firo",
+      "role": "base",
+      "wallet": {
+        "enabled": false,
+        "initialization": {"strategy": "driver_rpc", "mode": "public"}
+      }
+    }
+  ]
+}

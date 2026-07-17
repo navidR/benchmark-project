@@ -1,0 +1,5 @@
+{
+  "nodes": [
+    {"id": "firo-1", "chain": "firo", "role": "wallet", "wallet": []}
+  ]
+}

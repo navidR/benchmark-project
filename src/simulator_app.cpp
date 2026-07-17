@@ -977,6 +977,104 @@ WalletPrivacyMode ParseWalletPrivacyMode(std::string_view value) {
       "scenario topology.wallet_initialization mode must be public or private");
 }
 
+std::optional<ScenarioNodeWalletConfig> ParseScenarioNodeWalletConfig(
+    const boost::json::object& node, std::string_view node_id, bool wallet_role,
+    const WalletInitialization& global_initialization) {
+  const boost::json::value* value = node.if_contains("wallet");
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (!value->is_object()) {
+    throw std::runtime_error("scenario node " + std::string(node_id) +
+                             " wallet must be an object");
+  }
+  const boost::json::object& object = value->as_object();
+  for (const auto& member : object) {
+    if (member.key() != "enabled" && member.key() != "initialization") {
+      throw std::runtime_error(
+          "scenario node " + std::string(node_id) +
+          " has unsupported wallet field: " + std::string(member.key()));
+    }
+  }
+
+  ScenarioNodeWalletConfig config;
+  config.enabled = JsonOptionalBoolField(object, "enabled", wallet_role);
+  config.strategy = global_initialization.strategy;
+  config.mode = global_initialization.mode;
+  if (config.enabled != wallet_role) {
+    throw std::runtime_error(
+        "scenario node " + std::string(node_id) +
+        " wallet.enabled must match whether the node has a wallet role");
+  }
+
+  const boost::json::value* initialization =
+      object.if_contains("initialization");
+  if (initialization == nullptr) {
+    return config;
+  }
+  if (!config.enabled) {
+    throw std::runtime_error(
+        "scenario node " + std::string(node_id) +
+        " disabled wallet must not specify initialization");
+  }
+  if (!initialization->is_object()) {
+    throw std::runtime_error("scenario node " + std::string(node_id) +
+                             " wallet.initialization must be an object");
+  }
+  const boost::json::object& initialization_object =
+      initialization->as_object();
+  for (const auto& member : initialization_object) {
+    if (member.key() != "strategy" && member.key() != "mode") {
+      throw std::runtime_error(
+          "scenario node " + std::string(node_id) +
+          " has unsupported wallet.initialization field: " +
+          std::string(member.key()));
+    }
+  }
+
+  if (const boost::json::value* strategy =
+          initialization_object.if_contains("strategy")) {
+    if (!strategy->is_string()) {
+      throw std::runtime_error(
+          "scenario node " + std::string(node_id) +
+          " wallet.initialization.strategy must be a string");
+    }
+    const std::optional<WalletInitializationStrategy> parsed =
+        WalletInitializationStrategyFromName(strategy->as_string());
+    if (!parsed) {
+      throw std::runtime_error(
+          "scenario node " + std::string(node_id) +
+          " wallet.initialization.strategy must be driver_rpc");
+    }
+    config.strategy = *parsed;
+  }
+  if (const boost::json::value* mode =
+          initialization_object.if_contains("mode")) {
+    if (!mode->is_string()) {
+      throw std::runtime_error("scenario node " + std::string(node_id) +
+                               " wallet.initialization.mode must be a string");
+    }
+    const std::optional<WalletPrivacyMode> parsed =
+        WalletPrivacyModeFromName(mode->as_string());
+    if (!parsed) {
+      throw std::runtime_error(
+          "scenario node " + std::string(node_id) +
+          " wallet.initialization.mode must be public or private");
+    }
+    config.mode = *parsed;
+  }
+  if (config.strategy != global_initialization.strategy) {
+    throw std::runtime_error(
+        "scenario node " + std::string(node_id) +
+        " wallet initialization strategy must match topology");
+  }
+  if (config.mode != global_initialization.mode) {
+    throw std::runtime_error("scenario node " + std::string(node_id) +
+                             " wallet initialization mode must match topology");
+  }
+  return config;
+}
+
 WalletFundingStrategy ParseWalletFundingStrategy(std::string_view value) {
   const std::optional<WalletFundingStrategy> strategy =
       WalletFundingStrategyFromName(value);
@@ -2064,16 +2162,23 @@ ScenarioNodeRoles ParseScenarioNodes(
     if (role == "node") {
       role = "base";
     }
-    if (role == "wallet") {
+    const bool wallet_role = role == "wallet" || role == "wallet_miner";
+    const bool miner_role = role == "miner" || role == "wallet_miner";
+    if (wallet_role) {
       roles.wallet_nodes.push_back(static_cast<uint32_t>(index));
-    } else if (role == "miner") {
+    }
+    if (miner_role) {
       roles.miner_nodes.push_back(static_cast<uint32_t>(index));
-    } else if (role != "base") {
+    }
+    if (!wallet_role && !miner_role && role != "base") {
       throw std::runtime_error("scenario node " + id +
-                               " role must be base, node, wallet, or miner");
+                               " role must be base, node, wallet, miner, or "
+                               "wallet_miner");
     }
 
     ScenarioNodeConfig node_config;
+    node_config.wallet = ParseScenarioNodeWalletConfig(
+        node, id, wallet_role, options->wallet_initialization);
     if (node.if_contains("binary") != nullptr) {
       node_config.binary = ParseScenarioNodePath(node, "binary", id);
     }
@@ -2332,6 +2437,19 @@ const ChainExtraArgs& EffectiveNodeExtraArgs(const Options& options,
   static const ChainExtraArgs empty;
   const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
   return config == nullptr ? empty : config->extra_args;
+}
+
+ScenarioNodeWalletConfig EffectiveNodeWalletConfig(const Options& options,
+                                                   uint32_t node_index) {
+  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
+  if (config != nullptr && config->wallet) {
+    return *config->wallet;
+  }
+  ScenarioNodeWalletConfig wallet;
+  wallet.enabled = NodeListContains(options.topology.wallet_nodes, node_index);
+  wallet.strategy = options.wallet_initialization.strategy;
+  wallet.mode = options.wallet_initialization.mode;
+  return wallet;
 }
 
 bool NodeHasScenarioRole(const Options& options, uint32_t node_index,
@@ -3038,17 +3156,19 @@ void ApplyScenarioJson(const boost::json::object& scenario,
   if (options.simulation_name.empty()) {
     options.simulation_name = options.run_id;
   }
-  const ScenarioNodeRoles node_roles =
-      ParseScenarioNodes(scenario, vm, &options);
   const boost::json::value* topology = scenario.if_contains("topology");
   if (topology != nullptr) {
     if (!topology->is_object()) {
       throw std::runtime_error("scenario topology must be a JSON object");
     }
-    options.topology = ParseNodeRoleTopologyObject(
-        topology->as_object(), options.nodes, options.simulation_seed);
     options.wallet_initialization =
         ParseWalletInitializationObject(topology->as_object());
+  }
+  const ScenarioNodeRoles node_roles =
+      ParseScenarioNodes(scenario, vm, &options);
+  if (topology != nullptr) {
+    options.topology = ParseNodeRoleTopologyObject(
+        topology->as_object(), options.nodes, options.simulation_seed);
     if (node_roles.configured &&
         (!SameNodeSet(options.topology.wallet_nodes, node_roles.wallet_nodes) ||
          !SameNodeSet(options.topology.miner_nodes, node_roles.miner_nodes))) {
@@ -3073,6 +3193,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       miner_nodes.push_back(node_index + 1U);
     }
     derived_topology["miner_nodes"] = std::move(miner_nodes);
+    derived_topology["allow_miner_wallet_overlap"] =
+        NodeListsOverlap(node_roles.wallet_nodes, node_roles.miner_nodes);
     derived_topology["type"] = "full_mesh";
     options.topology = ParseNodeRoleTopologyObject(
         derived_topology, options.nodes, options.simulation_seed);
@@ -4573,6 +4695,20 @@ boost::json::object WalletInitializationJson(
   object["mode"] = std::string(WalletPrivacyModeName(initialization.mode));
   if (!initialization.seed.empty()) {
     object["seed"] = initialization.seed;
+  }
+  return object;
+}
+
+boost::json::object ScenarioNodeWalletConfigJson(
+    const ScenarioNodeWalletConfig& config) {
+  boost::json::object object;
+  object["enabled"] = config.enabled;
+  if (config.enabled) {
+    boost::json::object initialization;
+    initialization["strategy"] =
+        std::string(WalletInitializationStrategyName(config.strategy));
+    initialization["mode"] = std::string(WalletPrivacyModeName(config.mode));
+    object["initialization"] = std::move(initialization);
   }
   return object;
 }
@@ -7384,6 +7520,8 @@ void WriteScenarioFiles(const Options& options,
     }
     chain_config["extra_args"] = std::move(extra_args);
     node["chain_config"] = std::move(chain_config);
+    node["wallet"] = ScenarioNodeWalletConfigJson(
+        EffectiveNodeWalletConfig(options, node_index));
     if (!options.node_roles.empty()) {
       node["role"] = options.node_roles.at(node_index);
     } else {
@@ -7618,8 +7756,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       config_request.node_id = options.node_ids.at(i);
     }
     config_request.wallet_enabled =
-        options.wallet_backed_workload_requested &&
-        NodeListContains(options.topology.wallet_nodes, i);
+        EffectiveNodeWalletConfig(options, i).enabled;
     config_request.connect_peers =
         StartupPeerAddresses(options, runtime_topology, chain_spec, i);
 
