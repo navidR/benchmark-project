@@ -55,6 +55,7 @@ struct PendingConfirmation {
 struct TuiState {
   std::size_t selected_node = 0;
   std::size_t selected_wallet = 0;
+  std::size_t selected_topology_group = 0;
   TuiView view = TuiView::kNodes;
   NodeLogPane node_log_pane;
   PeerListPane peer_list_pane;
@@ -544,12 +545,30 @@ const boost::json::array* WalletSummaries(const boost::json::object& report) {
   return &wallets_value->as_array();
 }
 
+const boost::json::array* TopologyGroupSummaries(
+    const boost::json::object& report) {
+  const boost::json::value* groups_value =
+      report.if_contains("topology_groups_summary");
+  if (groups_value == nullptr || !groups_value->is_array()) {
+    return nullptr;
+  }
+  return &groups_value->as_array();
+}
+
 const boost::json::object* NodeAt(const boost::json::array& nodes,
                                   std::size_t index) {
   if (index >= nodes.size() || !nodes[index].is_object()) {
     return nullptr;
   }
   return &nodes[index].as_object();
+}
+
+const boost::json::object* TopologyGroupAt(const boost::json::array& groups,
+                                           std::size_t index) {
+  if (index >= groups.size() || !groups[index].is_object()) {
+    return nullptr;
+  }
+  return &groups[index].as_object();
 }
 
 void RefreshCommandResults(const boost::json::object& report, TuiState* state) {
@@ -748,6 +767,9 @@ std::optional<std::size_t> SelectedNodeIndex(const boost::json::object& report,
     }
     return state.selected_node;
   }
+  if (state.view == TuiView::kTopology) {
+    return std::nullopt;
+  }
   const boost::json::array* wallets = WalletSummaries(report);
   const boost::json::object* wallet =
       wallets == nullptr ? nullptr : WalletAt(*wallets, state.selected_wallet);
@@ -773,6 +795,15 @@ std::size_t ClampWalletSelection(const boost::json::object& report,
     return 0;
   }
   return std::min(selected_wallet, wallets->size() - 1U);
+}
+
+std::size_t ClampTopologyGroupSelection(const boost::json::object& report,
+                                        std::size_t selected_group) {
+  const boost::json::array* groups = TopologyGroupSummaries(report);
+  if (groups == nullptr || groups->empty()) {
+    return 0;
+  }
+  return std::min(selected_group, groups->size() - 1U);
 }
 
 void DrawHorizontalLine(int y) {
@@ -1446,6 +1477,82 @@ void DrawSelectedWalletDetail(int top, int bottom, int cols,
                 JsonIntegerText(incoming_object, "confirmations"));
 }
 
+std::string JsonArrayCountText(const boost::json::object& object,
+                               std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  return value != nullptr && value->is_array()
+             ? std::to_string(value->as_array().size())
+             : "0";
+}
+
+void DrawSelectedTopologyDetail(int top, int bottom, int cols,
+                                const boost::json::object& report,
+                                const boost::json::object* group) {
+  if (top < 0 || bottom - top < 4 || cols <= 0) {
+    return;
+  }
+  DrawHorizontalLine(top);
+  AddText(top + 1, 0, cols, "Selected Topology Group", A_BOLD);
+  if (group == nullptr) {
+    AddText(top + 2, 0, cols, "No topology group summary.",
+            COLOR_PAIR(kColorMuted));
+    return;
+  }
+  const int left_width = std::max(0, cols / 2);
+  const int right_width = std::max(0, cols - left_width);
+  int y = top + 2;
+  AddDetailPair(y, 0, left_width, "group", JsonString(*group, "group", "-"));
+  AddDetailPair(y, left_width, right_width, "kind",
+                JsonString(*group, "kind", "-"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "nodes", JsonStringArrayText(*group, "node_ids"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "active partitions",
+                JsonIntegerText(*group, "active_partition_count", "0"));
+  AddDetailPair(y, left_width, right_width, "degraded links / blocked rules",
+                JsonIntegerText(*group, "degraded_link_count", "0") + " / " +
+                    JsonIntegerText(*group, "blocked_rule_count", "0"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(
+      y, 0, left_width, "aggregate down / up rate",
+      JsonBytesPerSecondText(*group, "network_downlink_bytes_per_sec") + " / " +
+          JsonBytesPerSecondText(*group, "network_uplink_bytes_per_sec"));
+  AddDetailPair(y, left_width, right_width, "aggregate drops",
+                JsonMetricText(*group, "network_drop_count"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "aggregate down / up total",
+                JsonBytesKiBText(*group, "network_downlink_bytes") + " / " +
+                    JsonBytesKiBText(*group, "network_uplink_bytes"));
+  const boost::json::object* topology = JsonObject(report, "topology");
+  AddDetailPair(y, left_width, right_width, "topology type",
+                topology == nullptr
+                    ? "full_mesh"
+                    : JsonString(*topology, "type", "full_mesh"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "current directed edges",
+                JsonArrayCountText(report, "topology_current_edges"));
+  AddDetailPair(
+      y, left_width, right_width, "global partitions / degraded / blocked",
+      JsonArrayCountText(report, "active_network_partitions") + " / " +
+          JsonArrayCountText(report, "topology_degraded_links") + " / " +
+          JsonArrayCountText(report, "topology_blocked_rules"));
+}
+
 boost::json::object LoadReport(const std::filesystem::path& run_root,
                                std::string* error) {
   try {
@@ -1466,7 +1573,8 @@ void DrawSummary(
     const std::filesystem::path& run_root, const boost::json::object& report,
     std::string_view error, const std::vector<std::string>& log_lines,
     TuiView view, std::size_t selected_node, std::size_t selected_wallet,
-    const NodeLogPane& node_log_pane, const PeerListPane& peer_list_pane,
+    std::size_t selected_topology_group, const NodeLogPane& node_log_pane,
+    const PeerListPane& peer_list_pane,
     const NetworkRulePane& network_rule_pane, std::string_view command_status,
     bool command_error_open, std::string_view command_error,
     bool command_palette_open, std::string_view command_input,
@@ -1572,7 +1680,7 @@ void DrawSummary(
       AddText(11, 65, 8, "RX/s", A_BOLD);
       AddText(11, 73, std::max(0, cols - 73), "Qdisc", A_BOLD);
     }
-  } else {
+  } else if (view == TuiView::kWallets) {
     AddText(11, 0, 10, "Wallet [w]", A_BOLD);
     AddText(11, 10, 7, "Node", A_BOLD);
     AddText(11, 17, 10, "Mode", A_BOLD);
@@ -1580,17 +1688,32 @@ void DrawSummary(
     AddText(11, 39, 8, "Sent", A_BOLD);
     AddText(11, 47, 8, "Recv", A_BOLD);
     AddText(11, 55, std::max(0, cols - 55), "Address", A_BOLD);
+  } else {
+    AddText(11, 0, 20, "Group [g]", A_BOLD);
+    AddText(11, 20, 16, "Kind", A_BOLD);
+    AddText(11, 36, 8, "Nodes", A_BOLD);
+    AddText(11, 44, 12, "Partitions", A_BOLD);
+    AddText(11, 56, 11, "Degraded", A_BOLD);
+    AddText(11, 67, 10, "Blocked", A_BOLD);
+    AddText(11, 77, 12, "Down/s", A_BOLD);
+    AddText(11, 89, 12, "Up/s", A_BOLD);
+    AddText(11, 101, 12, "Down total", A_BOLD);
+    AddText(11, 113, std::max(0, cols - 113), "Up total", A_BOLD);
   }
   DrawHorizontalLine(12);
 
   const boost::json::array* nodes = NodeSummaries(report);
-  const boost::json::array* selected_items =
-      view == TuiView::kNodes ? nodes : wallets;
+  const boost::json::array* topology_groups = TopologyGroupSummaries(report);
+  const boost::json::array* selected_items = view == TuiView::kNodes ? nodes
+                                             : view == TuiView::kWallets
+                                                 ? wallets
+                                                 : topology_groups;
   if (selected_items == nullptr) {
-    AddText(13, 0, cols,
-            view == TuiView::kNodes ? "No node summaries in report."
-                                    : "No wallet summaries in report.",
-            COLOR_PAIR(kColorMuted));
+    const std::string_view empty_text =
+        view == TuiView::kNodes     ? "No node summaries in report."
+        : view == TuiView::kWallets ? "No wallet summaries in report."
+                                    : "No topology group summaries in report.";
+    AddText(13, 0, cols, empty_text, COLOR_PAIR(kColorMuted));
     if (log_rows != 0) {
       DrawLogPane(log_top, rows, cols, log_lines);
     }
@@ -1608,8 +1731,10 @@ void DrawSummary(
       has_detail_pane ? content_bottom - kDetailPaneRows : content_bottom;
   const int table_bottom = has_detail_pane ? detail_top - 1 : content_bottom;
   const int table_capacity = std::max(0, table_bottom - data_top);
-  const std::size_t selected_item =
-      view == TuiView::kNodes ? selected_node : selected_wallet;
+  const std::size_t selected_item = view == TuiView::kNodes ? selected_node
+                                    : view == TuiView::kWallets
+                                        ? selected_wallet
+                                        : selected_topology_group;
   std::size_t first_item = 0;
   if (table_capacity > 0 &&
       selected_item >= static_cast<std::size_t>(table_capacity)) {
@@ -1710,7 +1835,7 @@ void DrawSummary(
         AddText(y, 73, std::max(0, cols - 73),
                 JsonMetricText(metric_object, "qdisc_kind"), attributes);
       }
-    } else {
+    } else if (view == TuiView::kWallets) {
       const boost::json::object* wallet = WalletAt(*selected_items, index);
       if (wallet == nullptr) {
         continue;
@@ -1726,6 +1851,31 @@ void DrawSummary(
               attributes);
       AddText(y, 55, std::max(0, cols - 55),
               JsonString(*wallet, "address", "-"), attributes);
+    } else {
+      const boost::json::object* group =
+          TopologyGroupAt(*selected_items, index);
+      if (group == nullptr) {
+        continue;
+      }
+      AddText(y, 0, 20, JsonString(*group, "group", "-"), attributes);
+      AddText(y, 20, 16, JsonString(*group, "kind", "-"), attributes);
+      AddText(y, 36, 8, JsonIntegerText(*group, "node_count", "0"), attributes);
+      AddText(y, 44, 12, JsonIntegerText(*group, "active_partition_count", "0"),
+              attributes);
+      AddText(y, 56, 11, JsonIntegerText(*group, "degraded_link_count", "0"),
+              attributes);
+      AddText(y, 67, 10, JsonIntegerText(*group, "blocked_rule_count", "0"),
+              attributes);
+      AddText(y, 77, 12,
+              JsonBytesPerSecondText(*group, "network_downlink_bytes_per_sec"),
+              attributes);
+      AddText(y, 89, 12,
+              JsonBytesPerSecondText(*group, "network_uplink_bytes_per_sec"),
+              attributes);
+      AddText(y, 101, 12, JsonBytesKiBText(*group, "network_downlink_bytes"),
+              attributes);
+      AddText(y, 113, std::max(0, cols - 113),
+              JsonBytesKiBText(*group, "network_uplink_bytes"), attributes);
     }
     ++y;
   }
@@ -1734,10 +1884,16 @@ void DrawSummary(
     if (view == TuiView::kNodes) {
       DrawSelectedNodeDetail(detail_top, content_bottom, cols, report,
                              selected_node, NodeAt(*nodes, selected_node));
-    } else {
+    } else if (view == TuiView::kWallets) {
       DrawSelectedWalletDetail(
           detail_top, content_bottom, cols,
           wallets == nullptr ? nullptr : WalletAt(*wallets, selected_wallet));
+    } else {
+      DrawSelectedTopologyDetail(
+          detail_top, content_bottom, cols, report,
+          topology_groups == nullptr
+              ? nullptr
+              : TopologyGroupAt(*topology_groups, selected_topology_group));
     }
   }
 
@@ -1764,8 +1920,9 @@ void DrawSummary(
         "clear-rule <handle>.";
   } else {
     footer +=
-        "Tab/n/w view. Arrows select. p peers. a rules. c command. m mining. "
-        "s stop. f/t freeze/thaw. d/r net. R restart. k kill. q exits.";
+        "Tab/n/w/g view. Arrows select. p peers. a rules. c command. e export. "
+        "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. q "
+        "exits.";
   }
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
@@ -2028,8 +2185,20 @@ bool HandleInput(int ch, const boost::json::object& report,
 
   const boost::json::array* wallets = WalletSummaries(report);
   if (ch == '\t') {
-    state->view =
-        state->view == TuiView::kNodes ? TuiView::kWallets : TuiView::kNodes;
+    switch (state->view) {
+      case TuiView::kNodes:
+        state->view = TuiView::kWallets;
+        break;
+      case TuiView::kWallets:
+        state->view = TuiView::kTopology;
+        state->node_log_pane.Close();
+        state->peer_list_pane.Close();
+        state->network_rule_pane.Close();
+        break;
+      case TuiView::kTopology:
+        state->view = TuiView::kNodes;
+        break;
+    }
     return true;
   }
   if (ch == 'n' || ch == 'N') {
@@ -2038,6 +2207,13 @@ bool HandleInput(int ch, const boost::json::object& report,
   }
   if (ch == 'w' || ch == 'W') {
     state->view = TuiView::kWallets;
+    return true;
+  }
+  if (ch == 'g' || ch == 'G') {
+    state->view = TuiView::kTopology;
+    state->node_log_pane.Close();
+    state->peer_list_pane.Close();
+    state->network_rule_pane.Close();
     return true;
   }
 
@@ -2119,6 +2295,10 @@ bool HandleInput(int ch, const boost::json::object& report,
     return QueueSelectedNodeCommand(SimulationCommandKind::kKillNode, report,
                                     command_queue, state);
   }
+  if (ch == 'e' || ch == 'E') {
+    return QueueSelectedNodeCommand(SimulationCommandKind::kExportNodeReport,
+                                    report, command_queue, state);
+  }
 
   if (state->node_log_pane.IsOpen()) {
     if (ch == '+') {
@@ -2193,13 +2373,16 @@ bool HandleInput(int ch, const boost::json::object& report,
     return true;
   }
 
-  std::size_t* selected = state->view == TuiView::kNodes
-                              ? &state->selected_node
-                              : &state->selected_wallet;
+  std::size_t* selected = state->view == TuiView::kNodes ? &state->selected_node
+                          : state->view == TuiView::kWallets
+                              ? &state->selected_wallet
+                              : &state->selected_topology_group;
+  const boost::json::array* topology_groups = TopologyGroupSummaries(report);
   const std::size_t item_count =
-      state->view == TuiView::kNodes
-          ? nodes->size()
-          : (wallets == nullptr ? 0U : wallets->size());
+      state->view == TuiView::kNodes ? nodes->size()
+      : state->view == TuiView::kWallets
+          ? (wallets == nullptr ? 0U : wallets->size())
+          : (topology_groups == nullptr ? 0U : topology_groups->size());
   if (ch == KEY_UP && *selected > 0U) {
     --*selected;
     return true;
@@ -2229,6 +2412,8 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
     const boost::json::object report = LoadReport(run_root, &error);
     state.selected_node = ClampNodeSelection(report, state.selected_node);
     state.selected_wallet = ClampWalletSelection(report, state.selected_wallet);
+    state.selected_topology_group =
+        ClampTopologyGroupSelection(report, state.selected_topology_group);
     if (error.empty()) {
       const std::optional<std::size_t> selected_node =
           SelectedNodeIndex(report, state);
@@ -2243,9 +2428,10 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         ReadRecentLogLines(RunLogPath(run_root), 256U);
     DrawSummary(
         run_root, report, error, log_lines, state.view, state.selected_node,
-        state.selected_wallet, state.node_log_pane, state.peer_list_pane,
-        state.network_rule_pane, state.command_status, state.command_error_open,
-        state.command_error, state.command_palette_open, state.command_input,
+        state.selected_wallet, state.selected_topology_group,
+        state.node_log_pane, state.peer_list_pane, state.network_rule_pane,
+        state.command_status, state.command_error_open, state.command_error,
+        state.command_palette_open, state.command_input,
         state.command_input_error, state.pending_confirmation);
     if (once) {
       return error.empty() ? 0 : 1;

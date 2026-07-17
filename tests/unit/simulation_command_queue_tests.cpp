@@ -84,6 +84,19 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_rejects_empty_node_id) {
       std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_node_report_exports) {
+  bbp::SimulationCommandQueue queue;
+  const std::uint64_t sequence =
+      queue.Push(bbp::SimulationCommandKind::kExportNodeReport, "firo-2");
+
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->sequence == sequence);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kExportNodeReport);
+  BOOST_TEST(command->node_id == "firo-2");
+  BOOST_TEST(!command->confirmed);
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
   bbp::SimulationCommandQueue queue;
   queue.PushBlockProductionPolicy(

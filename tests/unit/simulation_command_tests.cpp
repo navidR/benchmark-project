@@ -27,6 +27,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kUnblockNetworkFlow,
       bbp::SimulationCommandKind::kPartitionNodes,
       bbp::SimulationCommandKind::kHealPartition,
+      bbp::SimulationCommandKind::kExportNodeReport,
   };
 
   for (bbp::SimulationCommandKind kind : kKinds) {
@@ -60,4 +61,6 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kUnblockNetworkFlow));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kHealPartition));
+  BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kExportNodeReport));
 }

@@ -52,6 +52,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "partition_nodes";
     case SimulationCommandKind::kHealPartition:
       return "heal_partition";
+    case SimulationCommandKind::kExportNodeReport:
+      return "export_node_report";
   }
   throw std::runtime_error("unknown simulation command kind");
 }
@@ -127,6 +129,9 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "heal_partition") {
     return SimulationCommandKind::kHealPartition;
   }
+  if (name == "export_node_report") {
+    return SimulationCommandKind::kExportNodeReport;
+  }
   return std::nullopt;
 }
 
@@ -156,6 +161,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kUnblockNetworkFlow:
     case SimulationCommandKind::kHealPartition:
+    case SimulationCommandKind::kExportNodeReport:
       return false;
   }
   throw std::runtime_error("unknown simulation command kind");

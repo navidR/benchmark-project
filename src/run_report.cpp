@@ -12,9 +12,11 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "bbp/operator_command_status.h"
 #include "bbp/simulation_command.h"
@@ -621,6 +623,393 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
   return array;
 }
 
+const boost::json::object* ObjectField(const boost::json::object& object,
+                                       std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  return value != nullptr && value->is_object() ? &value->as_object() : nullptr;
+}
+
+const boost::json::array* ArrayField(const boost::json::object& object,
+                                     std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  return value != nullptr && value->is_array() ? &value->as_array() : nullptr;
+}
+
+bool PositiveNumericField(const boost::json::object& object,
+                          std::string_view field) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    return false;
+  }
+  if (value->is_uint64()) {
+    return value->as_uint64() != 0U;
+  }
+  if (value->is_int64()) {
+    return value->as_int64() > 0;
+  }
+  return value->is_double() && value->as_double() > 0.0;
+}
+
+bool IsDegradedCondition(const boost::json::object& condition) {
+  constexpr std::string_view kFields[] = {
+      "bandwidth_mbps",
+      "delay_ms",
+      "jitter_ms",
+      "loss_basis_points",
+      "duplicate_basis_points",
+      "corrupt_basis_points",
+      "reorder_basis_points",
+  };
+  for (const std::string_view field : kFields) {
+    if (PositiveNumericField(condition, field)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::uint64_t NodeSummaryIndex(const boost::json::object& node,
+                               std::size_t fallback_index) {
+  return OptionalUint64Field(node, "node_index")
+      .value_or(static_cast<std::uint64_t>(fallback_index + 1U));
+}
+
+std::vector<std::uint64_t> NodeIndexesFromArray(
+    const boost::json::array& values,
+    const std::set<std::uint64_t>& known_nodes) {
+  std::vector<std::uint64_t> result;
+  for (const boost::json::value& value : values) {
+    std::optional<std::uint64_t> index;
+    if (value.is_uint64()) {
+      index = value.as_uint64();
+    } else if (value.is_int64() && value.as_int64() > 0) {
+      index = static_cast<std::uint64_t>(value.as_int64());
+    }
+    if (index && known_nodes.contains(*index)) {
+      result.push_back(*index);
+    }
+  }
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+struct TopologyGroupDefinition {
+  std::string name;
+  std::string kind;
+  std::vector<std::uint64_t> node_indexes;
+};
+
+std::vector<TopologyGroupDefinition> TopologyGroupDefinitions(
+    const boost::json::object& report, const boost::json::array& nodes) {
+  std::set<std::uint64_t> known_nodes;
+  std::map<std::string, std::vector<std::uint64_t>> role_nodes;
+  for (std::size_t position = 0; position < nodes.size(); ++position) {
+    if (!nodes[position].is_object()) {
+      continue;
+    }
+    const boost::json::object& node = nodes[position].as_object();
+    const std::uint64_t index = NodeSummaryIndex(node, position);
+    known_nodes.insert(index);
+    const std::string role = OptionalStringField(node, "role");
+    if (!role.empty()) {
+      role_nodes[role].push_back(index);
+    }
+  }
+
+  std::vector<TopologyGroupDefinition> groups;
+  if (!known_nodes.empty()) {
+    std::vector<std::uint64_t> all_nodes(known_nodes.begin(),
+                                         known_nodes.end());
+    groups.push_back(TopologyGroupDefinition{
+        .name = "all",
+        .kind = "all",
+        .node_indexes = std::move(all_nodes),
+    });
+  }
+
+  const boost::json::object* topology = ObjectField(report, "topology");
+  const auto append_configured_groups = [&](std::string_view field,
+                                            std::string_view name_prefix,
+                                            std::string_view kind) {
+    const boost::json::array* configured =
+        topology == nullptr ? nullptr : ArrayField(*topology, field);
+    if (configured == nullptr) {
+      return;
+    }
+    for (std::size_t index = 0; index < configured->size(); ++index) {
+      if (!(*configured)[index].is_array()) {
+        continue;
+      }
+      std::vector<std::uint64_t> members =
+          NodeIndexesFromArray((*configured)[index].as_array(), known_nodes);
+      if (members.empty()) {
+        continue;
+      }
+      groups.push_back(TopologyGroupDefinition{
+          .name = std::string(name_prefix) + std::to_string(index + 1U),
+          .kind = std::string(kind),
+          .node_indexes = std::move(members),
+      });
+    }
+  };
+  append_configured_groups("groups", "topology-", "partition_group");
+  append_configured_groups("regions", "region-", "region");
+  for (auto& [role, indexes] : role_nodes) {
+    std::sort(indexes.begin(), indexes.end());
+    groups.push_back(TopologyGroupDefinition{
+        .name = "role-" + role,
+        .kind = "role",
+        .node_indexes = std::move(indexes),
+    });
+  }
+  return groups;
+}
+
+boost::json::array ActiveBlockRules(const boost::json::array& nodes) {
+  boost::json::array rules;
+  for (std::size_t position = 0; position < nodes.size(); ++position) {
+    if (!nodes[position].is_object()) {
+      continue;
+    }
+    const boost::json::object& node = nodes[position].as_object();
+    const boost::json::object* metrics = ObjectField(node, "last_metrics");
+    const boost::json::array* node_rules =
+        metrics == nullptr ? nullptr
+                           : ArrayField(*metrics, "network_active_block_rules");
+    if (node_rules == nullptr) {
+      continue;
+    }
+    for (const boost::json::value& rule_value : *node_rules) {
+      if (!rule_value.is_object()) {
+        continue;
+      }
+      boost::json::object rule = rule_value.as_object();
+      rule["node_id"] = OptionalStringField(node, "node_id");
+      rule["node_index"] = NodeSummaryIndex(node, position);
+      rules.push_back(std::move(rule));
+    }
+  }
+  return rules;
+}
+
+boost::json::array DegradedLinks(const boost::json::object& report,
+                                 const boost::json::array& nodes) {
+  boost::json::array degraded;
+  for (std::size_t position = 0; position < nodes.size(); ++position) {
+    if (!nodes[position].is_object()) {
+      continue;
+    }
+    const boost::json::object& node = nodes[position].as_object();
+    const boost::json::object* metrics = ObjectField(node, "last_metrics");
+    const boost::json::object* condition =
+        metrics == nullptr ? nullptr
+                           : ObjectField(*metrics, "network_condition");
+    if (condition == nullptr || !IsDegradedCondition(*condition)) {
+      continue;
+    }
+    boost::json::object link;
+    link["scope"] = "node";
+    link["node_id"] = OptionalStringField(node, "node_id");
+    link["node_index"] = NodeSummaryIndex(node, position);
+    link["condition"] = *condition;
+    degraded.push_back(std::move(link));
+  }
+
+  const boost::json::array* edges =
+      ArrayField(report, "topology_current_edges");
+  if (edges == nullptr) {
+    return degraded;
+  }
+  for (const boost::json::value& edge_value : *edges) {
+    if (!edge_value.is_object()) {
+      continue;
+    }
+    const boost::json::object& edge = edge_value.as_object();
+    const boost::json::value* active = edge.if_contains("active");
+    if (active != nullptr && active->is_bool() && !active->as_bool()) {
+      continue;
+    }
+    const boost::json::object* condition = ObjectField(edge, "condition");
+    if (condition == nullptr || !IsDegradedCondition(*condition)) {
+      continue;
+    }
+    boost::json::object link;
+    link["scope"] = "edge";
+    CopyField(edge, "from", &link);
+    CopyField(edge, "to", &link);
+    CopyField(edge, "band", &link);
+    link["condition"] = *condition;
+    degraded.push_back(std::move(link));
+  }
+  return degraded;
+}
+
+bool GroupContainsAny(const std::set<std::uint64_t>& members,
+                      const boost::json::array& indexes) {
+  for (const boost::json::value& index_value : indexes) {
+    if (index_value.is_uint64() && members.contains(index_value.as_uint64())) {
+      return true;
+    }
+    if (index_value.is_int64() && index_value.as_int64() > 0 &&
+        members.contains(static_cast<std::uint64_t>(index_value.as_int64()))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool PartitionReferencesGroup(const boost::json::object& partition,
+                              const std::set<std::uint64_t>& members) {
+  const boost::json::object* detail = ObjectField(partition, "detail");
+  if (detail == nullptr) {
+    return false;
+  }
+  const boost::json::array* group_a = ArrayField(*detail, "group_a");
+  const boost::json::array* group_b = ArrayField(*detail, "group_b");
+  return (group_a != nullptr && GroupContainsAny(members, *group_a)) ||
+         (group_b != nullptr && GroupContainsAny(members, *group_b));
+}
+
+bool LinkReferencesGroup(const boost::json::object& link,
+                         const std::set<std::uint64_t>& members) {
+  const std::optional<std::uint64_t> node =
+      OptionalUint64Field(link, "node_index");
+  const std::optional<std::uint64_t> from = OptionalUint64Field(link, "from");
+  const std::optional<std::uint64_t> to = OptionalUint64Field(link, "to");
+  return (node && members.contains(*node)) ||
+         (from && members.contains(*from)) || (to && members.contains(*to));
+}
+
+std::uint64_t ReferencedObjectCount(const boost::json::array& values,
+                                    const std::set<std::uint64_t>& members,
+                                    bool partition_shape) {
+  std::uint64_t count = 0U;
+  for (const boost::json::value& value : values) {
+    if (!value.is_object()) {
+      continue;
+    }
+    const bool referenced =
+        partition_shape ? PartitionReferencesGroup(value.as_object(), members)
+                        : LinkReferencesGroup(value.as_object(), members);
+    if (referenced && count != std::numeric_limits<std::uint64_t>::max()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::optional<std::uint64_t> AggregateNodeMetric(
+    const boost::json::array& nodes, const std::set<std::uint64_t>& members,
+    std::string_view field) {
+  std::uint64_t total = 0U;
+  std::size_t matched = 0U;
+  for (std::size_t position = 0; position < nodes.size(); ++position) {
+    if (!nodes[position].is_object()) {
+      continue;
+    }
+    const boost::json::object& node = nodes[position].as_object();
+    if (!members.contains(NodeSummaryIndex(node, position))) {
+      continue;
+    }
+    ++matched;
+    const boost::json::object* metrics = ObjectField(node, "last_metrics");
+    const std::optional<std::uint64_t> value =
+        metrics == nullptr ? std::nullopt
+                           : OptionalUint64Field(*metrics, field);
+    if (!value) {
+      return std::nullopt;
+    }
+    total = SaturatingAdd(total, *value);
+  }
+  return matched == members.size() && matched != 0U
+             ? std::optional<std::uint64_t>(total)
+             : std::nullopt;
+}
+
+void AddOptionalUint(std::string_view field,
+                     const std::optional<std::uint64_t>& value,
+                     boost::json::object* object) {
+  if (value) {
+    (*object)[field] = *value;
+  } else {
+    (*object)[field] = nullptr;
+  }
+}
+
+void AddTopologyViewSummaries(boost::json::object* report) {
+  const boost::json::array* nodes = ArrayField(*report, "nodes_summary");
+  if (nodes == nullptr) {
+    (*report)["topology_blocked_rules"] = boost::json::array{};
+    (*report)["topology_degraded_links"] = boost::json::array{};
+    (*report)["topology_groups_summary"] = boost::json::array{};
+    return;
+  }
+  boost::json::array blocked_rules = ActiveBlockRules(*nodes);
+  boost::json::array degraded_links = DegradedLinks(*report, *nodes);
+  const boost::json::array* active_partitions =
+      ArrayField(*report, "active_network_partitions");
+  const boost::json::array no_partitions;
+  if (active_partitions == nullptr) {
+    active_partitions = &no_partitions;
+  }
+
+  boost::json::array group_summaries;
+  for (const TopologyGroupDefinition& definition :
+       TopologyGroupDefinitions(*report, *nodes)) {
+    const std::set<std::uint64_t> members(definition.node_indexes.begin(),
+                                          definition.node_indexes.end());
+    boost::json::object summary;
+    summary["group"] = definition.name;
+    summary["kind"] = definition.kind;
+    boost::json::array node_indexes;
+    boost::json::array node_ids;
+    for (const std::uint64_t index : definition.node_indexes) {
+      node_indexes.push_back(index);
+      for (std::size_t position = 0; position < nodes->size(); ++position) {
+        if ((*nodes)[position].is_object() &&
+            NodeSummaryIndex((*nodes)[position].as_object(), position) ==
+                index) {
+          node_ids.emplace_back(
+              OptionalStringField((*nodes)[position].as_object(), "node_id"));
+          break;
+        }
+      }
+    }
+    summary["node_indexes"] = std::move(node_indexes);
+    summary["node_ids"] = std::move(node_ids);
+    summary["node_count"] = definition.node_indexes.size();
+    summary["active_partition_count"] =
+        ReferencedObjectCount(*active_partitions, members, true);
+    summary["degraded_link_count"] =
+        ReferencedObjectCount(degraded_links, members, false);
+    summary["blocked_rule_count"] =
+        ReferencedObjectCount(blocked_rules, members, false);
+    AddOptionalUint(
+        "network_downlink_bytes",
+        AggregateNodeMetric(*nodes, members, "network_downlink_bytes"),
+        &summary);
+    AddOptionalUint(
+        "network_uplink_bytes",
+        AggregateNodeMetric(*nodes, members, "network_uplink_bytes"), &summary);
+    AddOptionalUint(
+        "network_downlink_bytes_per_sec",
+        AggregateNodeMetric(*nodes, members, "network_downlink_bytes_per_sec"),
+        &summary);
+    AddOptionalUint(
+        "network_uplink_bytes_per_sec",
+        AggregateNodeMetric(*nodes, members, "network_uplink_bytes_per_sec"),
+        &summary);
+    AddOptionalUint("network_drop_count",
+                    AggregateNodeMetric(*nodes, members, "network_drop_count"),
+                    &summary);
+    group_summaries.push_back(std::move(summary));
+  }
+  (*report)["topology_blocked_rules"] = std::move(blocked_rules);
+  (*report)["topology_degraded_links"] = std::move(degraded_links);
+  (*report)["topology_groups_summary"] = std::move(group_summaries);
+}
+
 void RememberNodeState(std::string_view state, NodeReport* node) {
   const std::optional<NodeRuntimeLifecycle> lifecycle =
       ParseNodeRuntimeLifecycleName(state);
@@ -901,6 +1290,90 @@ void AppendEventSummary(const boost::json::object& event,
   summaries->push_back(std::move(summary));
 }
 
+std::optional<std::vector<std::uint64_t>> PartitionGroup(
+    const boost::json::object& detail, std::string_view field) {
+  const boost::json::value* value = detail.if_contains(field);
+  if (value == nullptr || !value->is_array() || value->as_array().empty()) {
+    return std::nullopt;
+  }
+  std::vector<std::uint64_t> nodes;
+  nodes.reserve(value->as_array().size());
+  for (const boost::json::value& node_value : value->as_array()) {
+    std::optional<std::uint64_t> node;
+    if (node_value.is_uint64()) {
+      node = node_value.as_uint64();
+    } else if (node_value.is_int64() && node_value.as_int64() > 0) {
+      node = static_cast<std::uint64_t>(node_value.as_int64());
+    }
+    if (!node || *node == 0U) {
+      return std::nullopt;
+    }
+    nodes.push_back(*node);
+  }
+  std::sort(nodes.begin(), nodes.end());
+  nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+  return nodes;
+}
+
+std::string PartitionGroupKey(const std::vector<std::uint64_t>& nodes) {
+  std::string key;
+  for (const std::uint64_t node : nodes) {
+    if (!key.empty()) {
+      key.push_back(',');
+    }
+    key += std::to_string(node);
+  }
+  return key;
+}
+
+std::optional<std::string> PartitionKey(const boost::json::object& detail) {
+  const std::optional<std::vector<std::uint64_t>> group_a =
+      PartitionGroup(detail, "group_a");
+  const std::optional<std::vector<std::uint64_t>> group_b =
+      PartitionGroup(detail, "group_b");
+  if (!group_a || !group_b) {
+    return std::nullopt;
+  }
+  std::string left = PartitionGroupKey(*group_a);
+  std::string right = PartitionGroupKey(*group_b);
+  if (right < left) {
+    std::swap(left, right);
+  }
+  return left + '|' + right;
+}
+
+void RememberActivePartition(
+    const boost::json::object& event, bool active,
+    std::map<std::string, boost::json::object>* active_partitions) {
+  const boost::json::value detail = ParseEventDetail(event);
+  if (!detail.is_object()) {
+    return;
+  }
+  const std::optional<std::string> key = PartitionKey(detail.as_object());
+  if (!key) {
+    return;
+  }
+  if (!active) {
+    active_partitions->erase(*key);
+    return;
+  }
+  boost::json::array summary;
+  AppendEventSummary(event, &summary);
+  active_partitions->insert_or_assign(*key,
+                                      std::move(summary.front()).as_object());
+}
+
+boost::json::array ActivePartitionsJson(
+    const std::map<std::string, boost::json::object>& active_partitions) {
+  boost::json::array result;
+  result.reserve(active_partitions.size());
+  for (const auto& [key, partition] : active_partitions) {
+    static_cast<void>(key);
+    result.push_back(partition);
+  }
+  return result;
+}
+
 void AppendScheduledBlockSummary(const boost::json::object& event,
                                  boost::json::array* summaries) {
   AppendEventSummary(event, summaries);
@@ -1080,6 +1553,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   boost::json::array network_unblocks;
   boost::json::array network_partitions;
   boost::json::array network_partition_heals;
+  std::map<std::string, boost::json::object> active_network_partitions;
   boost::json::array directional_network_policy_verifications;
   boost::json::array topology_edge_updates;
   boost::json::array topology_edge_rollback_failures;
@@ -1206,9 +1680,11 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
             break;
           case SimulationEventKind::kNetworkPartitionApplied:
             AppendEventSummary(event, &network_partitions);
+            RememberActivePartition(event, true, &active_network_partitions);
             break;
           case SimulationEventKind::kNetworkPartitionHealed:
             AppendEventSummary(event, &network_partition_heals);
+            RememberActivePartition(event, false, &active_network_partitions);
             break;
           case SimulationEventKind::kDirectionalNetworkPoliciesVerified:
             AppendDirectionalPolicyVerification(
@@ -1342,6 +1818,8 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["network_unblocks"] = std::move(network_unblocks);
   report["network_partitions"] = std::move(network_partitions);
   report["network_partition_heals"] = std::move(network_partition_heals);
+  report["active_network_partitions"] =
+      ActivePartitionsJson(active_network_partitions);
   report["directional_network_policy_verifications"] =
       std::move(directional_network_policy_verifications);
   report["topology_edge_updates"] = std::move(topology_edge_updates);
@@ -1353,6 +1831,67 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   report["operator_commands"] = std::move(operator_commands);
   report["wallets_summary"] = WalletsJson(wallets);
   report["nodes_summary"] = NodesJson(nodes);
+  AddTopologyViewSummaries(&report);
+  return boost::json::serialize(report);
+}
+
+std::string BuildNodeReportJson(const std::filesystem::path& run_root,
+                                std::string_view node_id,
+                                std::uint64_t operator_command_sequence) {
+  if (node_id.empty()) {
+    throw std::runtime_error("node report requires a node id");
+  }
+  const boost::json::value full_report_value =
+      boost::json::parse(BuildRunReportJson(run_root));
+  if (!full_report_value.is_object()) {
+    throw std::runtime_error("run report root is not an object");
+  }
+  const boost::json::object& full_report = full_report_value.as_object();
+  const boost::json::array* nodes = ArrayField(full_report, "nodes_summary");
+  if (nodes == nullptr) {
+    throw std::runtime_error("run report has no node summaries");
+  }
+  const boost::json::object* selected_node = nullptr;
+  for (const boost::json::value& node_value : *nodes) {
+    if (node_value.is_object() &&
+        OptionalStringField(node_value.as_object(), "node_id") == node_id) {
+      selected_node = &node_value.as_object();
+      break;
+    }
+  }
+  if (selected_node == nullptr) {
+    throw std::runtime_error("node report references unknown node: " +
+                             std::string(node_id));
+  }
+
+  boost::json::object report;
+  constexpr std::string_view kContextFields[] = {
+      "run_root",
+      "run_id",
+      "chain",
+      "status",
+      "ok",
+      "started_at",
+      "finished_at",
+      "failed_at",
+      "failure",
+      "event_count",
+      "event_counts",
+      "metric_count",
+      "topology",
+      "topology_current_edges",
+      "active_network_partitions",
+      "topology_degraded_links",
+      "topology_blocked_rules",
+      "topology_groups_summary",
+      "resource_profiles",
+      "network_profiles",
+  };
+  for (const std::string_view field : kContextFields) {
+    CopyField(full_report, field, &report);
+  }
+  report["operator_command_sequence"] = operator_command_sequence;
+  report["node"] = *selected_node;
   return boost::json::serialize(report);
 }
 

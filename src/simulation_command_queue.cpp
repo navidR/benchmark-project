@@ -19,6 +19,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kThawNode:
     case SimulationCommandKind::kStopNode:
     case SimulationCommandKind::kRestartNode:
+    case SimulationCommandKind::kExportNodeReport:
       break;
     case SimulationCommandKind::kSetBlockProductionPolicy:
     case SimulationCommandKind::kSetMiningDifficulty:

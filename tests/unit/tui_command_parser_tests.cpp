@@ -62,6 +62,8 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
               bbp::SimulationCommandKind::kRestartNode);
   BOOST_CHECK(bbp::TuiCommandParser::Parse("kill", 0U).kind ==
               bbp::SimulationCommandKind::kKillNode);
+  BOOST_CHECK(bbp::TuiCommandParser::Parse("export-node-report", 0U).kind ==
+              bbp::SimulationCommandKind::kExportNodeReport);
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {

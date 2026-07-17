@@ -9264,6 +9264,35 @@ std::string ScheduledBlockDetail(const std::vector<std::string>& hashes) {
   return boost::json::serialize(detail);
 }
 
+std::filesystem::path NodeReportRelativePath(const SimulationCommand& command) {
+  return std::filesystem::path("node-reports") /
+         (command.node_id + "-" + std::to_string(command.sequence) + ".json");
+}
+
+void ExportNodeReport(const std::filesystem::path& run_root,
+                      const SimulationCommand& command) {
+  const std::filesystem::path relative = NodeReportRelativePath(command);
+  const std::filesystem::path output = run_root / relative;
+  EnsureDirectory(output.parent_path());
+  std::filesystem::path temporary = output;
+  temporary += ".tmp";
+  std::error_code ec;
+  std::filesystem::remove(temporary, ec);
+  ec.clear();
+  try {
+    WriteText(temporary,
+              BuildNodeReportJson(run_root, command.node_id, command.sequence) +
+                  "\n");
+    std::filesystem::rename(temporary, output, ec);
+    if (ec) {
+      throw std::runtime_error("rename node report failed: " + ec.message());
+    }
+  } catch (...) {
+    std::filesystem::remove(temporary, ec);
+    throw;
+  }
+}
+
 std::string SimulationCommandDetail(const SimulationCommand& command,
                                     std::string_view error = {}) {
   boost::json::object detail;
@@ -9309,6 +9338,9 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
       flow["handle"] = command.network_flow->handle;
     }
     detail["network_flow"] = std::move(flow);
+  }
+  if (command.kind == SimulationCommandKind::kExportNodeReport) {
+    detail["output_path"] = NodeReportRelativePath(command).generic_string();
   }
   detail["confirmed"] = command.confirmed;
   if (!error.empty()) {
@@ -9663,7 +9695,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 command.node_id == "sim"
                     ? nodes.front()
                     : FindNodeRuntimeById(nodes, command.node_id);
-            if (command.kind == SimulationCommandKind::kKillNode) {
+            if (command.kind == SimulationCommandKind::kExportNodeReport) {
+              ExportNodeReport(run_root, command);
+            } else if (command.kind == SimulationCommandKind::kKillNode) {
               const bool resume_on_failure =
                   stop_scheduled_miner() ||
                   paused_scheduled_miners.contains(command.node_id);

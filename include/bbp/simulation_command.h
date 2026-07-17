@@ -36,6 +36,7 @@ enum class SimulationCommandKind {
   kUnblockNetworkFlow,
   kPartitionNodes,
   kHealPartition,
+  kExportNodeReport,
 };
 
 struct SimulationNetworkFlow {

@@ -12,7 +12,7 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 24> kCommandNames = {
+constexpr std::array<std::string_view, 25> kCommandNames = {
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -37,6 +37,7 @@ constexpr std::array<std::string_view, 24> kCommandNames = {
     "clear-rule",
     "partition",
     "heal",
+    "export-node-report",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -298,6 +299,8 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       kind = SimulationCommandKind::kRestartNode;
     } else if (tokens[0] == "kill") {
       kind = SimulationCommandKind::kKillNode;
+    } else if (tokens[0] == "export-node-report") {
+      kind = SimulationCommandKind::kExportNodeReport;
     } else {
       throw std::runtime_error("unknown command: " + tokens[0]);
     }

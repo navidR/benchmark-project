@@ -1305,6 +1305,90 @@ BOOST_AUTO_TEST_CASE(run_report_orders_nodes_and_derives_resource_rates) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_builds_topology_groups_and_node_exports) {
+  const std::filesystem::path dir = MakeTestDir("run-report-topology-groups");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"r1","chain":"firo","nodes":3,"topology":{"type":"partitioned_groups","groups":[[1,2],[3]]},"topology_initial_edges":[{"from":1,"to":2,"band":1,"active":true,"condition":{"bandwidth_mbps":5,"delay_ms":10}},{"from":2,"to":1,"band":1,"active":true,"condition":null}],"node_configs":[{"index":1,"id":"firo-1","chain":"firo","role":"miner"},{"index":2,"id":"firo-2","chain":"firo","role":"base"},{"index":3,"id":"firo-3","chain":"firo","role":"wallet"}]})"
+      "\n");
+  for (const std::string_view node_id : {"firo-1", "firo-2", "firo-3"}) {
+    bbp::AppendLine(dir / "events.jsonl",
+                    "{\"run_id\":\"r1\",\"node_id\":\"" + std::string(node_id) +
+                        "\",\"event\":\"state\",\"detail\":\"Running\"}");
+  }
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"network_partition_applied","detail":"{\"group_a\":[1],\"group_b\":[3],\"rules\":[]}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"network_partition_healed","detail":"{\"group_a\":[3],\"group_b\":[1],\"rules\":[]}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","event":"network_partition_applied","detail":"{\"group_a\":[2],\"group_b\":[3],\"rules\":[]}"})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":1000,"network_rx_bytes":100,"network_tx_bytes":200})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":2000,"network_rx_bytes":300,"network_tx_bytes":600,"network_condition":{"bandwidth_mbps":0,"delay_ms":80},"network_active_block_rules":[{"handle":77,"dst_address":"10.0.0.2","dst_port":18168}]})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":1000,"network_rx_bytes":50,"network_tx_bytes":100})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":2000,"network_rx_bytes":150,"network_tx_bytes":300})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-3","timestamp_ms":1000,"network_rx_bytes":10,"network_tx_bytes":20})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"r1","node_id":"firo-3","timestamp_ms":2000,"network_rx_bytes":20,"network_tx_bytes":40})");
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  BOOST_REQUIRE_EQUAL(report.at("active_network_partitions").as_array().size(),
+                      1U);
+  BOOST_REQUIRE_EQUAL(report.at("topology_degraded_links").as_array().size(),
+                      2U);
+  BOOST_REQUIRE_EQUAL(report.at("topology_blocked_rules").as_array().size(),
+                      1U);
+  const boost::json::array& groups =
+      report.at("topology_groups_summary").as_array();
+  BOOST_REQUIRE_EQUAL(groups.size(), 6U);
+  BOOST_TEST(groups[0].as_object().at("group").as_string() == "all");
+  BOOST_TEST(JsonInteger(groups[0].as_object(), "active_partition_count") ==
+             1U);
+  BOOST_TEST(JsonInteger(groups[0].as_object(), "degraded_link_count") == 2U);
+  BOOST_TEST(JsonInteger(groups[0].as_object(), "blocked_rule_count") == 1U);
+  const boost::json::object& topology_one = groups[1].as_object();
+  BOOST_TEST(topology_one.at("group").as_string() == "topology-1");
+  BOOST_TEST(JsonInteger(topology_one, "node_count") == 2U);
+  BOOST_TEST(JsonInteger(topology_one, "network_downlink_bytes") == 900U);
+  BOOST_TEST(JsonInteger(topology_one, "network_uplink_bytes") == 450U);
+  BOOST_TEST(JsonInteger(topology_one, "network_downlink_bytes_per_sec") ==
+             600U);
+  BOOST_TEST(JsonInteger(topology_one, "network_uplink_bytes_per_sec") == 300U);
+  BOOST_TEST(JsonInteger(topology_one, "active_partition_count") == 1U);
+  BOOST_TEST(JsonInteger(topology_one, "degraded_link_count") == 2U);
+  BOOST_TEST(JsonInteger(topology_one, "blocked_rule_count") == 1U);
+
+  const boost::json::object node_report =
+      boost::json::parse(bbp::BuildNodeReportJson(dir, "firo-2", 9U))
+          .as_object();
+  BOOST_TEST(JsonInteger(node_report, "operator_command_sequence") == 9U);
+  BOOST_REQUIRE(node_report.at("event_counts").is_object());
+  BOOST_TEST(JsonInteger(node_report.at("event_counts").as_object(), "state") ==
+             3U);
+  BOOST_TEST(node_report.at("node").as_object().at("node_id").as_string() ==
+             "firo-2");
+  BOOST_REQUIRE_EQUAL(
+      node_report.at("topology_groups_summary").as_array().size(), 6U);
+  BOOST_CHECK_THROW(bbp::BuildNodeReportJson(dir, "missing", 10U),
+                    std::runtime_error);
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(
     run_report_aggregates_distributed_wallet_transaction_amounts) {
   const std::filesystem::path dir =
