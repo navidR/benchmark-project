@@ -778,6 +778,26 @@ if(BUILD_TESTING)
     "scenario node firo-1 has unsupported chain_config field: untyped_option"
   )
   add_cli_failure_test(
+    bbp-invalid-node-field
+    tests/scenarios/invalid-node-field.json
+    "scenario node firo-1 has unsupported field: restart_policy"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-rpc-field
+    tests/scenarios/invalid-node-rpc-field.json
+    "scenario node firo-1 has unsupported field: rpc"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-resources-field
+    tests/scenarios/invalid-node-resources-field.json
+    "scenario node firo-1 has unsupported resources field: memory_max"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-network-field
+    tests/scenarios/invalid-node-network-field.json
+    "scenario node firo-1 has unsupported network field: delay_ms"
+  )
+  add_cli_failure_test(
     bbp-invalid-node-chain-extra-args-shape
     tests/scenarios/invalid-node-chain-extra-args-shape.json
     "scenario node firo-1 chain_config.extra_args must be an array"

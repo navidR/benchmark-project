@@ -1,0 +1,19 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": [
+    {
+      "id": "firo-1",
+      "chain": "firo",
+      "role": "base",
+      "resources": {
+        "profile": "small",
+        "memory_max": "1GiB"
+      }
+    }
+  ],
+  "resource_profiles": {
+    "small": {
+      "memory_max": "1GiB"
+    }
+  }
+}

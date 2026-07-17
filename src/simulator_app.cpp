@@ -2154,6 +2154,17 @@ ScenarioNodeRoles ParseScenarioNodes(
     if (!node_ids.insert(id).second) {
       throw std::runtime_error("scenario nodes contains duplicate id: " + id);
     }
+    for (const auto& member : node) {
+      if (member.key() != "id" && member.key() != "chain" &&
+          member.key() != "role" && member.key() != "binary" &&
+          member.key() != "data_dir" && member.key() != "resources" &&
+          member.key() != "network" && member.key() != "chain_config" &&
+          member.key() != "wallet") {
+        throw std::runtime_error(
+            "scenario node " + id +
+            " has unsupported field: " + std::string(member.key()));
+      }
+    }
     if (ParseChainKind(JsonStringField(node, "chain")) != options->chain) {
       throw std::runtime_error("scenario node " + id +
                                " chain must match the active chain");
@@ -2240,6 +2251,13 @@ ScenarioNodeRoles ParseScenarioNodes(
       if (!section_value->is_object()) {
         throw std::runtime_error("scenario node " + id + " " + section +
                                  " must be an object");
+      }
+      for (const auto& member : section_value->as_object()) {
+        if (member.key() != "profile") {
+          throw std::runtime_error("scenario node " + id + " has unsupported " +
+                                   section +
+                                   " field: " + std::string(member.key()));
+        }
       }
       const std::string profile =
           JsonStringField(section_value->as_object(), "profile");

@@ -1,0 +1,13 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": [
+    {
+      "id": "firo-1",
+      "chain": "firo",
+      "role": "base",
+      "rpc": {
+        "user": "unsafe-user-supplied-credential"
+      }
+    }
+  ]
+}
