@@ -31,6 +31,7 @@ namespace bbp {
 namespace {
 
 constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
+constexpr std::size_t kMaximumNodeMetricHistorySamples = 120U;
 constexpr std::size_t kMaximumOperatorCommandSummaries = 256U;
 constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
 constexpr std::size_t kMaximumScheduledEventSummaries = 256U;
@@ -47,6 +48,7 @@ struct NodeReport {
   std::optional<NodeRuntimeLifecycle> final_state;
   std::string unknown_final_state;
   boost::json::object last_metrics;
+  boost::json::array metrics_history;
   boost::json::object log_tails;
   std::optional<std::uint64_t> previous_timestamp_ms;
   std::optional<std::uint64_t> previous_network_rx_bytes;
@@ -463,6 +465,34 @@ void AddNodeDerivedMetrics(const boost::json::object& metric,
   }
 }
 
+void AppendNodeMetricHistory(const boost::json::object& metric,
+                             NodeReport* node) {
+  boost::json::object sample;
+  constexpr std::string_view kFields[] = {
+      "timestamp_ms",
+      "cpu_percent",
+      "cpu_throttled_percent",
+      "memory_current",
+      "memory_max_limit_bytes",
+      "io_read_bytes_per_sec",
+      "io_write_bytes_per_sec",
+      "network_downlink_bytes_per_sec",
+      "network_uplink_bytes_per_sec",
+      "network_drop_count",
+      "height",
+      "peer_count",
+      "mempool_tx_count",
+      "rpc_latency_ms",
+  };
+  for (const std::string_view field : kFields) {
+    CopyField(metric, field, &sample);
+  }
+  if (node->metrics_history.size() >= kMaximumNodeMetricHistorySamples) {
+    node->metrics_history.erase(node->metrics_history.begin());
+  }
+  node->metrics_history.emplace_back(std::move(sample));
+}
+
 void RememberNodeMetricSample(const boost::json::object& metric,
                               NodeReport* node) {
   node->previous_timestamp_ms = OptionalUint64Field(metric, "timestamp_ms");
@@ -664,6 +694,7 @@ boost::json::array NodesJson(const std::map<std::string, NodeReport>& nodes) {
       object["final_state"] = node.unknown_final_state;
     }
     object["last_metrics"] = node.last_metrics;
+    object["metrics_history"] = node.metrics_history;
     if (!node.log_tails.empty()) {
       object["log_tails"] = node.log_tails;
     }
@@ -1962,6 +1993,7 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
         node.last_metrics = {};
         CopySelectedMetricFields(metric, &node.last_metrics);
         AddNodeDerivedMetrics(metric, node, &node.last_metrics);
+        AppendNodeMetricHistory(node.last_metrics, &node);
         RememberNodeMetricSample(metric, &node);
       });
 

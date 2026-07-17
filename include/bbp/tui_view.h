@@ -6,6 +6,7 @@ enum class TuiView {
   kNodes,
   kWallets,
   kTopology,
+  kMetrics,
 };
 
 }  // namespace bbp

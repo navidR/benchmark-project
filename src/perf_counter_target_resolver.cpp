@@ -252,7 +252,8 @@ PerfCounterTarget ResolvePerfCounterTarget(
   }
 
   switch (selection.view) {
-    case TuiView::kNodes: {
+    case TuiView::kNodes:
+    case TuiView::kMetrics: {
       const PerfCounterTargetKind kind =
           requested_kind.value_or(PerfCounterTargetKind::kNode);
       if (kind != PerfCounterTargetKind::kNode &&

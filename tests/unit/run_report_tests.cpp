@@ -283,6 +283,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "{\"run_id\":\"r1\",\"node_id\":\"firo-1\",\"height\":1,"
       "\"timestamp_ms\":1000,"
       "\"generated_block_count\":0,\"qdisc_kind\":\"netem\","
+      "\"cpu_usage_usec\":0,\"cpu_throttled_usec\":0,"
+      "\"memory_current\":10,\"io_read_bytes\":0,"
+      "\"io_write_bytes\":0,\"mempool_tx_count\":0,"
       "\"network_rx_bytes\":25,\"network_tx_bytes\":50,"
       "\"qdisc_has_netem_options\":true,\"qdisc_netem_latency_us\":1000,"
       "\"qdisc_netem_reorder\":0}");
@@ -295,9 +298,11 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"generated_block_count\":1,\"mined_transaction_count\":2,"
       "\"mined_transaction_count_complete\":true,"
       "\"qdisc_kind\":\"tbf+netem\","
-      "\"cpu_usage_usec\":10,\"cpu_weight\":250,\"io_weight\":300,"
+      "\"cpu_usage_usec\":10,\"cpu_throttled_usec\":2,"
+      "\"cpu_weight\":250,\"io_weight\":300,\"rpc_latency_ms\":7,"
       "\"memory_current\":20,\"memory_stat\":{\"anon\":19},"
       "\"memory_high_limit_bytes\":null,\"io_read_bytes\":30,"
+      "\"io_write_bytes\":40,"
       "\"perf_counter_names\":[\"cycles\",\"task-clock\"],"
       "\"perf_counter_target_kind\":\"node\","
       "\"perf_counter_target_id\":\"firo-1\","
@@ -596,6 +601,28 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(node.at("node_id").as_string() == "firo-1");
   BOOST_TEST(JsonInteger(node, "metric_samples") == 2U);
   BOOST_TEST(node.at("final_state").as_string() == "Running");
+  const boost::json::array& metrics_history =
+      node.at("metrics_history").as_array();
+  BOOST_REQUIRE_EQUAL(metrics_history.size(), 2U);
+  const boost::json::object& first_metric = metrics_history.front().as_object();
+  BOOST_TEST(JsonInteger(first_metric, "timestamp_ms") == 1000U);
+  BOOST_TEST(first_metric.at("cpu_percent").is_null());
+  BOOST_TEST(first_metric.at("network_downlink_bytes_per_sec").is_null());
+  const boost::json::object& second_metric = metrics_history.back().as_object();
+  BOOST_TEST(JsonInteger(second_metric, "timestamp_ms") == 3000U);
+  BOOST_TEST(JsonInteger(second_metric, "memory_current") == 20U);
+  BOOST_TEST(JsonInteger(second_metric, "io_read_bytes_per_sec") == 15U);
+  BOOST_TEST(JsonInteger(second_metric, "io_write_bytes_per_sec") == 20U);
+  BOOST_TEST(JsonInteger(second_metric, "network_downlink_bytes_per_sec") ==
+             75U);
+  BOOST_TEST(JsonInteger(second_metric, "network_uplink_bytes_per_sec") == 37U);
+  BOOST_TEST(second_metric.at("cpu_percent").as_double() == 0.0005,
+             boost::test_tools::tolerance(0.000001));
+  BOOST_TEST(second_metric.at("cpu_throttled_percent").as_double() == 0.0001,
+             boost::test_tools::tolerance(0.000001));
+  BOOST_TEST(JsonInteger(second_metric, "height") == 2U);
+  BOOST_TEST(JsonInteger(second_metric, "mempool_tx_count") == 3U);
+  BOOST_TEST(JsonInteger(second_metric, "rpc_latency_ms") == 7U);
   const boost::json::object& last_metrics = node.at("last_metrics").as_object();
   BOOST_TEST(JsonInteger(last_metrics, "height") == 2U);
   BOOST_TEST(JsonInteger(last_metrics, "mempool_tx_count") == 3U);
@@ -735,6 +762,36 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(daemon_log_tail.at("text").as_string() == "tail next");
   BOOST_TEST(JsonInteger(daemon_log_tail, "start_offset") == 0U);
   BOOST_TEST(JsonInteger(daemon_log_tail, "next_offset") == 9U);
+
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(run_report_bounds_metric_history_per_node) {
+  const std::filesystem::path dir = MakeTestDir("run-report-metric-history");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"r1","chain":"firo","nodes":1})");
+  for (std::uint64_t sample = 1U; sample <= 125U; ++sample) {
+    boost::json::object metric;
+    metric["run_id"] = "r1";
+    metric["node_id"] = "firo-1";
+    metric["timestamp_ms"] = sample * 1000U;
+    metric["height"] = sample;
+    metric["memory_current"] = sample * 1024U;
+    bbp::AppendLine(dir / "metrics.jsonl", boost::json::serialize(metric));
+  }
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  const boost::json::object& node =
+      report.at("nodes_summary").as_array().front().as_object();
+  BOOST_TEST(JsonInteger(node, "metric_samples") == 125U);
+  const boost::json::array& history = node.at("metrics_history").as_array();
+  BOOST_REQUIRE_EQUAL(history.size(), 120U);
+  BOOST_TEST(JsonInteger(history.front().as_object(), "timestamp_ms") == 6000U);
+  BOOST_TEST(JsonInteger(history.front().as_object(), "height") == 6U);
+  BOOST_TEST(JsonInteger(history.back().as_object(), "timestamp_ms") ==
+             125000U);
+  BOOST_TEST(JsonInteger(history.back().as_object(), "height") == 125U);
 
   std::filesystem::remove_all(dir);
 }

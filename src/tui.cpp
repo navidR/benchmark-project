@@ -12,6 +12,7 @@
 #include <cctype>
 #include <chrono>
 #include <clocale>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
@@ -25,6 +26,7 @@
 
 #include "bbp/drivers/chain_wallet_transaction.h"
 #include "bbp/log_view.h"
+#include "bbp/metric_sparkline.h"
 #include "bbp/network_rule_pane.h"
 #include "bbp/node_log_pane.h"
 #include "bbp/operator_command_status.h"
@@ -572,6 +574,142 @@ const boost::json::object* TopologyGroupAt(const boost::json::array& groups,
   return &groups[index].as_object();
 }
 
+const boost::json::array* MetricHistory(const boost::json::object& node) {
+  const boost::json::value* history = node.if_contains("metrics_history");
+  return history != nullptr && history->is_array() ? &history->as_array()
+                                                   : nullptr;
+}
+
+enum class MetricChartUnit {
+  kPercent,
+  kBytes,
+  kBytesPerSecond,
+  kCount,
+  kMilliseconds,
+};
+
+std::string MetricChartValueText(const std::optional<double>& value,
+                                 MetricChartUnit unit) {
+  if (!value || !std::isfinite(*value) || *value < 0.0) {
+    return "-";
+  }
+  std::ostringstream output;
+  if (unit == MetricChartUnit::kPercent) {
+    output << std::fixed << std::setprecision(1) << *value << '%';
+    return output.str();
+  }
+  if (unit == MetricChartUnit::kMilliseconds) {
+    output << std::fixed << std::setprecision(*value < 10.0 ? 1 : 0) << *value
+           << "ms";
+    return output.str();
+  }
+  if (unit == MetricChartUnit::kCount) {
+    output << std::fixed << std::setprecision(0) << *value;
+    return output.str();
+  }
+
+  constexpr double kKiB = 1024.0;
+  constexpr double kMiB = kKiB * 1024.0;
+  constexpr double kGiB = kMiB * 1024.0;
+  double scaled = *value;
+  std::string_view suffix = "B";
+  if (*value >= kGiB) {
+    scaled = *value / kGiB;
+    suffix = "G";
+  } else if (*value >= kMiB) {
+    scaled = *value / kMiB;
+    suffix = "M";
+  } else if (*value >= kKiB) {
+    scaled = *value / kKiB;
+    suffix = "K";
+  }
+  output << std::fixed
+         << std::setprecision(scaled < 10.0 && suffix != "B" ? 1 : 0) << scaled
+         << suffix;
+  if (unit == MetricChartUnit::kBytesPerSecond) {
+    output << "/s";
+  }
+  return output.str();
+}
+
+void DrawMetricSparklineLine(int y, int cols, const boost::json::array& history,
+                             std::string_view label, std::string_view field,
+                             MetricChartUnit unit) {
+  if (cols <= 0) {
+    return;
+  }
+  const int label_width = std::min(cols, 12);
+  const int stats_width = cols >= 64 ? 30 : 0;
+  const int chart_width = std::max(0, cols - label_width - stats_width);
+  const MetricSparkline chart = BuildMetricSparkline(
+      history, field, static_cast<std::size_t>(chart_width));
+  AddText(y, 0, label_width, label, A_BOLD);
+  AddText(y, label_width, chart_width, chart.text);
+  if (stats_width > 0) {
+    const std::string stats = " " + MetricChartValueText(chart.latest, unit) +
+                              " [" + MetricChartValueText(chart.minimum, unit) +
+                              ".." + MetricChartValueText(chart.maximum, unit) +
+                              "]";
+    AddText(y, label_width + chart_width, stats_width, stats,
+            COLOR_PAIR(kColorMuted));
+  }
+}
+
+void DrawMetricHistoryView(int top, int bottom, int cols,
+                           const boost::json::object* node) {
+  if (top >= bottom || cols <= 0) {
+    return;
+  }
+  if (node == nullptr) {
+    AddText(top, 0, cols, "No node is selected.", COLOR_PAIR(kColorMuted));
+    return;
+  }
+  const boost::json::array* history = MetricHistory(*node);
+  if (history == nullptr || history->empty()) {
+    AddText(top, 0, cols,
+            "No metric history is available for " +
+                JsonString(*node, "node_id", "selected node") + ".",
+            COLOR_PAIR(kColorMuted));
+    return;
+  }
+
+  AddText(top, 0, cols,
+          "Metric history [h]: " + JsonString(*node, "node_id", "-") +
+              " | retained " + std::to_string(history->size()) + " of " +
+              JsonIntegerText(*node, "metric_samples", "0") + " samples",
+          A_BOLD);
+  struct Series {
+    std::string_view label;
+    std::string_view field;
+    MetricChartUnit unit;
+  };
+  constexpr Series kSeries[] = {
+      {"CPU", "cpu_percent", MetricChartUnit::kPercent},
+      {"Memory", "memory_current", MetricChartUnit::kBytes},
+      {"IO read", "io_read_bytes_per_sec", MetricChartUnit::kBytesPerSecond},
+      {"IO write", "io_write_bytes_per_sec", MetricChartUnit::kBytesPerSecond},
+      {"Net down", "network_downlink_bytes_per_sec",
+       MetricChartUnit::kBytesPerSecond},
+      {"Net up", "network_uplink_bytes_per_sec",
+       MetricChartUnit::kBytesPerSecond},
+      {"Height", "height", MetricChartUnit::kCount},
+      {"Mempool", "mempool_tx_count", MetricChartUnit::kCount},
+      {"CPU throttle", "cpu_throttled_percent", MetricChartUnit::kPercent},
+      {"Peers", "peer_count", MetricChartUnit::kCount},
+      {"RPC latency", "rpc_latency_ms", MetricChartUnit::kMilliseconds},
+      {"Drops", "network_drop_count", MetricChartUnit::kCount},
+  };
+  int y = top + 1;
+  for (const Series& series : kSeries) {
+    if (y >= bottom) {
+      break;
+    }
+    DrawMetricSparklineLine(y, cols, *history, series.label, series.field,
+                            series.unit);
+    ++y;
+  }
+}
+
 void RefreshCommandResults(const boost::json::object& report, TuiState* state) {
   const boost::json::value* commands_value =
       report.if_contains("operator_commands");
@@ -761,7 +899,7 @@ std::optional<std::size_t> WalletNodeIndex(const boost::json::object& wallet) {
 
 std::optional<std::size_t> SelectedNodeIndex(const boost::json::object& report,
                                              const TuiState& state) {
-  if (state.view == TuiView::kNodes) {
+  if (state.view == TuiView::kNodes || state.view == TuiView::kMetrics) {
     const boost::json::array* nodes = NodeSummaries(report);
     if (nodes == nullptr || state.selected_node >= nodes->size()) {
       return std::nullopt;
@@ -1691,7 +1829,7 @@ void DrawSummary(
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
   erase();
-  const int log_rows = LogPaneRows(rows);
+  const int log_rows = view == TuiView::kMetrics ? 0 : LogPaneRows(rows);
   const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
   const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
 
@@ -1795,7 +1933,7 @@ void DrawSummary(
     AddText(11, 39, 8, "Sent", A_BOLD);
     AddText(11, 47, 8, "Recv", A_BOLD);
     AddText(11, 55, std::max(0, cols - 55), "Address", A_BOLD);
-  } else {
+  } else if (view == TuiView::kTopology) {
     AddText(11, 0, 20, "Group [g]", A_BOLD);
     AddText(11, 20, 16, "Kind", A_BOLD);
     AddText(11, 36, 8, "Nodes", A_BOLD);
@@ -1806,20 +1944,30 @@ void DrawSummary(
     AddText(11, 89, 12, "Up/s", A_BOLD);
     AddText(11, 101, 12, "Down total", A_BOLD);
     AddText(11, 113, std::max(0, cols - 113), "Up total", A_BOLD);
+  } else {
+    AddText(11, 0, cols,
+            "Metrics [h] - arrows select a node; newest samples are on the "
+            "right",
+            A_BOLD);
   }
   DrawHorizontalLine(12);
 
   const boost::json::array* nodes = NodeSummaries(report);
   const boost::json::array* topology_groups = TopologyGroupSummaries(report);
-  const boost::json::array* selected_items = view == TuiView::kNodes ? nodes
-                                             : view == TuiView::kWallets
-                                                 ? wallets
-                                                 : topology_groups;
+  const boost::json::array* selected_items = nullptr;
+  if (view == TuiView::kNodes || view == TuiView::kMetrics) {
+    selected_items = nodes;
+  } else if (view == TuiView::kWallets) {
+    selected_items = wallets;
+  } else {
+    selected_items = topology_groups;
+  }
   if (selected_items == nullptr) {
     const std::string_view empty_text =
-        view == TuiView::kNodes     ? "No node summaries in report."
-        : view == TuiView::kWallets ? "No wallet summaries in report."
-                                    : "No topology group summaries in report.";
+        view == TuiView::kNodes      ? "No node summaries in report."
+        : view == TuiView::kWallets  ? "No wallet summaries in report."
+        : view == TuiView::kTopology ? "No topology group summaries in report."
+                                     : "No node metric histories in report.";
     AddText(13, 0, cols, empty_text, COLOR_PAIR(kColorMuted));
     if (log_rows != 0) {
       DrawLogPane(log_top, rows, cols, log_lines);
@@ -1833,18 +1981,21 @@ void DrawSummary(
 
   const int data_top = 13;
   const int available_data_rows = content_bottom - data_top;
-  const bool has_detail_pane = available_data_rows >= kDetailPaneRows + 3;
+  const bool has_detail_pane =
+      view != TuiView::kMetrics && available_data_rows >= kDetailPaneRows + 3;
   const int detail_top =
       has_detail_pane ? content_bottom - kDetailPaneRows : content_bottom;
   const int table_bottom = has_detail_pane ? detail_top - 1 : content_bottom;
   const int table_capacity = std::max(0, table_bottom - data_top);
-  const std::size_t selected_item = view == TuiView::kNodes ? selected_node
-                                    : view == TuiView::kWallets
-                                        ? selected_wallet
-                                        : selected_topology_group;
+  const std::size_t selected_item =
+      view == TuiView::kNodes || view == TuiView::kMetrics ? selected_node
+      : view == TuiView::kWallets                          ? selected_wallet
+                                  : selected_topology_group;
   std::size_t first_item = 0;
-  if (table_capacity > 0 &&
-      selected_item >= static_cast<std::size_t>(table_capacity)) {
+  if (view == TuiView::kMetrics) {
+    first_item = selected_node;
+  } else if (table_capacity > 0 &&
+             selected_item >= static_cast<std::size_t>(table_capacity)) {
     first_item = selected_item - static_cast<std::size_t>(table_capacity) + 1U;
   }
 
@@ -1958,7 +2109,7 @@ void DrawSummary(
               attributes);
       AddText(y, 55, std::max(0, cols - 55),
               JsonString(*wallet, "address", "-"), attributes);
-    } else {
+    } else if (view == TuiView::kTopology) {
       const boost::json::object* group =
           TopologyGroupAt(*selected_items, index);
       if (group == nullptr) {
@@ -1983,6 +2134,10 @@ void DrawSummary(
               attributes);
       AddText(y, 113, std::max(0, cols - 113),
               JsonBytesKiBText(*group, "network_uplink_bytes"), attributes);
+    } else {
+      DrawMetricHistoryView(y, table_bottom, cols,
+                            NodeAt(*selected_items, selected_node));
+      break;
     }
     ++y;
   }
@@ -1995,7 +2150,7 @@ void DrawSummary(
       DrawSelectedWalletDetail(
           detail_top, content_bottom, cols,
           wallets == nullptr ? nullptr : WalletAt(*wallets, selected_wallet));
-    } else {
+    } else if (view == TuiView::kTopology) {
       DrawSelectedTopologyDetail(
           detail_top, content_bottom, cols, report,
           topology_groups == nullptr
@@ -2027,7 +2182,8 @@ void DrawSummary(
         "clear-rule <handle>.";
   } else {
     footer +=
-        "Tab/n/w/g view. Arrows select. p peers. a rules. c command. e export. "
+        "Tab/n/w/g/h view. Arrows select. p peers. a rules. c command. e "
+        "export. "
         "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. q "
         "exits.";
   }
@@ -2326,6 +2482,9 @@ bool HandleInput(int ch, const boost::json::object& report,
         state->network_rule_pane.Close();
         break;
       case TuiView::kTopology:
+        state->view = TuiView::kMetrics;
+        break;
+      case TuiView::kMetrics:
         state->view = TuiView::kNodes;
         break;
     }
@@ -2341,6 +2500,13 @@ bool HandleInput(int ch, const boost::json::object& report,
   }
   if (ch == 'g' || ch == 'G') {
     state->view = TuiView::kTopology;
+    state->node_log_pane.Close();
+    state->peer_list_pane.Close();
+    state->network_rule_pane.Close();
+    return true;
+  }
+  if (ch == 'h' || ch == 'H') {
+    state->view = TuiView::kMetrics;
     state->node_log_pane.Close();
     state->peer_list_pane.Close();
     state->network_rule_pane.Close();
@@ -2503,13 +2669,15 @@ bool HandleInput(int ch, const boost::json::object& report,
     return true;
   }
 
-  std::size_t* selected = state->view == TuiView::kNodes ? &state->selected_node
-                          : state->view == TuiView::kWallets
-                              ? &state->selected_wallet
-                              : &state->selected_topology_group;
+  std::size_t* selected =
+      state->view == TuiView::kNodes || state->view == TuiView::kMetrics
+          ? &state->selected_node
+      : state->view == TuiView::kWallets ? &state->selected_wallet
+                                         : &state->selected_topology_group;
   const boost::json::array* topology_groups = TopologyGroupSummaries(report);
   const std::size_t item_count =
-      state->view == TuiView::kNodes ? nodes->size()
+      state->view == TuiView::kNodes || state->view == TuiView::kMetrics
+          ? nodes->size()
       : state->view == TuiView::kWallets
           ? (wallets == nullptr ? 0U : wallets->size())
           : (topology_groups == nullptr ? 0U : topology_groups->size());

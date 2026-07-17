@@ -23,6 +23,14 @@ BOOST_AUTO_TEST_CASE(perf_counter_target_resolver_infers_selected_targets) {
   BOOST_REQUIRE_EQUAL(target.node_ids.size(), 1U);
 
   target = bbp::ResolvePerfCounterTarget(
+      report, {.view = bbp::TuiView::kMetrics, .selected_node = 0U},
+      std::nullopt, std::nullopt);
+  BOOST_CHECK(target.kind == bbp::PerfCounterTargetKind::kNode);
+  BOOST_TEST(target.id == "firo-1");
+  BOOST_REQUIRE_EQUAL(target.node_ids.size(), 1U);
+  BOOST_TEST(target.node_ids.front() == "firo-1");
+
+  target = bbp::ResolvePerfCounterTarget(
       report, {.view = bbp::TuiView::kWallets, .selected_wallet = 0U},
       std::nullopt, std::nullopt);
   BOOST_CHECK(target.kind == bbp::PerfCounterTargetKind::kWallet);

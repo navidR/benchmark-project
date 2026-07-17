@@ -789,7 +789,9 @@ Summarize an existing run:
 
 The compact report includes the run status, lifecycle timestamps, failure
 detail when present, event counts, workload summaries, final per-node metrics,
-and latest log tails.
+latest log tails, and the newest 120 derived metric samples per node under
+`metrics_history`. The bounded history retains its original timestamps and
+exposes the total unbounded sample count separately as `metric_samples`.
 
 View an existing run in the read-only TUI:
 
@@ -803,7 +805,12 @@ qdisc packet/drop totals, and simulator logs. Use
 the arrow keys to select a node. Press `p` to toggle its connected-peer pane or
 `l` to toggle its separate log pane. Both panes support arrow keys, Page Up,
 Page Down, Home, and End for scrolling; press the opening key again to close
-the pane.
+the pane. Press `h` for the selected node's metric-history charts. The ASCII
+sparklines show CPU, memory, IO and network rates, height, mempool size, and—on
+taller terminals—throttling, peers, RPC latency, and drops; the newest samples
+are on the right and each row shows its latest and retained min/max values.
+`Tab` cycles node, wallet, topology, and metric views, while `n`, `w`, `g`, and
+`h` select them directly.
 
 During a live benchmark launched without `--no-tui`, press `d` to disconnect
 the selected node from the simulated network or `s` to request that its mining
