@@ -331,6 +331,38 @@ const std::vector<PerfCounterKind>& DefaultPerfCounterKinds() {
   return kinds;
 }
 
+std::string_view PerfCounterTargetKindName(PerfCounterTargetKind kind) {
+  switch (kind) {
+    case PerfCounterTargetKind::kNode:
+      return "node";
+    case PerfCounterTargetKind::kWallet:
+      return "wallet";
+    case PerfCounterTargetKind::kGroup:
+      return "group";
+    case PerfCounterTargetKind::kCgroup:
+      return "cgroup";
+  }
+  throw PerfCounterError(PerfCounterErrorKind::kInvalidArgument, EINVAL,
+                         "unknown perf counter target kind");
+}
+
+std::optional<PerfCounterTargetKind> PerfCounterTargetKindFromName(
+    std::string_view name) {
+  if (name == "node") {
+    return PerfCounterTargetKind::kNode;
+  }
+  if (name == "wallet") {
+    return PerfCounterTargetKind::kWallet;
+  }
+  if (name == "group") {
+    return PerfCounterTargetKind::kGroup;
+  }
+  if (name == "cgroup") {
+    return PerfCounterTargetKind::kCgroup;
+  }
+  return std::nullopt;
+}
+
 std::string_view PerfCounterErrorKindName(PerfCounterErrorKind kind) {
   switch (kind) {
     case PerfCounterErrorKind::kInvalidArgument:

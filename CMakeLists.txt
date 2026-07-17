@@ -232,6 +232,7 @@ add_executable(bbp
   src/peer_connectivity_controller.cpp
   src/peer_list_pane.cpp
   src/perf_counter.cpp
+  src/perf_counter_target_resolver.cpp
   src/periodic_metrics_collector.cpp
   src/positive_duration.cpp
   src/process.cpp
@@ -300,6 +301,7 @@ if(BUILD_TESTING)
     tests/unit/peer_connectivity_controller_tests.cpp
     tests/unit/peer_list_pane_tests.cpp
     tests/unit/perf_counter_tests.cpp
+    tests/unit/perf_counter_target_resolver_tests.cpp
     tests/unit/no_shellout_tests.cpp
     tests/unit/periodic_metrics_collector_tests.cpp
     tests/unit/positive_duration_tests.cpp
@@ -345,6 +347,7 @@ if(BUILD_TESTING)
     src/peer_connectivity_controller.cpp
     src/peer_list_pane.cpp
     src/perf_counter.cpp
+    src/perf_counter_target_resolver.cpp
     src/periodic_metrics_collector.cpp
     src/positive_duration.cpp
     src/process.cpp

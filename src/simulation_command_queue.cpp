@@ -1,5 +1,6 @@
 #include "bbp/simulation_command_queue.h"
 
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -34,6 +35,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kUnblockNetworkFlow:
     case SimulationCommandKind::kPartitionNodes:
     case SimulationCommandKind::kHealPartition:
+    case SimulationCommandKind::kSetPerfCounters:
       throw std::runtime_error(
           "simulation command kind requires a typed payload method");
   }
@@ -49,6 +51,8 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = confirmed,
   });
 }
@@ -67,6 +71,8 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = false,
   });
 }
@@ -85,6 +91,8 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = false,
   });
 }
@@ -114,6 +122,8 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = confirmed,
   });
 }
@@ -132,6 +142,8 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = confirmed,
   });
 }
@@ -153,6 +165,8 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = false,
   });
 }
@@ -179,6 +193,8 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .profile = std::move(profile),
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = confirmed,
   });
 }
@@ -198,6 +214,8 @@ std::uint64_t SimulationCommandQueue::PushNetworkCondition(
       .profile = std::nullopt,
       .network_condition = condition,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = confirmed,
   });
 }
@@ -238,6 +256,8 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::move(flow),
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = confirmed,
   });
 }
@@ -268,7 +288,59 @@ std::uint64_t SimulationCommandQueue::PushPartitionCommand(
       .profile = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
       .confirmed = confirmed,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushPerfCounters(
+    PerfCounterTarget target, std::vector<PerfCounterKind> kinds) {
+  if (target.id.empty()) {
+    throw std::runtime_error("perf counter target id must not be empty");
+  }
+  if (target.node_ids.empty()) {
+    throw std::runtime_error("perf counter target must resolve to a node");
+  }
+  std::set<std::string> unique_nodes;
+  for (const std::string& node_id : target.node_ids) {
+    if (node_id.empty()) {
+      throw std::runtime_error("perf counter target node id must not be empty");
+    }
+    if (!unique_nodes.insert(node_id).second) {
+      throw std::runtime_error("perf counter target contains duplicate nodes");
+    }
+  }
+  if (target.kind != PerfCounterTargetKind::kGroup &&
+      target.node_ids.size() != 1U) {
+    throw std::runtime_error(
+        "non-group perf counter target must resolve to one node");
+  }
+  if (kinds.empty()) {
+    throw std::runtime_error("perf counter selection must not be empty");
+  }
+  const std::set<PerfCounterKind> unique_kinds(kinds.begin(), kinds.end());
+  if (unique_kinds.size() != kinds.size()) {
+    throw std::runtime_error("perf counter selection contains duplicates");
+  }
+  const std::string event_node_id = target.kind == PerfCounterTargetKind::kGroup
+                                        ? "sim"
+                                        : target.node_ids.front();
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kSetPerfCounters,
+      .node_id = event_node_id,
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
+      .perf_counter_target = std::move(target),
+      .perf_counter_kinds = std::move(kinds),
+      .confirmed = false,
   });
 }
 

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bbp/operator_command_status.h"
@@ -221,9 +223,13 @@ void CopySelectedMetricFields(const boost::json::object& source,
       "mined_transaction_count_complete",
       "restart_count",
       "perf_counter_names",
+      "perf_counter_target_kind",
+      "perf_counter_target_id",
       "perf_counter_target_pid",
       "perf_counter_attached_pid",
       "perf_counter_process_generation",
+      "perf_counter_cgroup_path",
+      "perf_counter_cpus",
       "perf_counters_available",
       "perf_counter_error_kind",
       "perf_counter_error",
@@ -945,6 +951,159 @@ void AddOptionalUint(std::string_view field,
   }
 }
 
+struct AggregatedPerfCounter {
+  std::string name;
+  std::uint64_t raw_value = 0U;
+  std::optional<std::uint64_t> scaled_value = 0U;
+  std::uint64_t time_enabled_ns = 0U;
+  std::uint64_t time_running_ns = 0U;
+  bool multiplexed = false;
+  bool scaled = false;
+  bool scaled_overflow = false;
+  bool aggregation_overflow = false;
+};
+
+void AddPerfCounterValue(std::uint64_t next, std::uint64_t* total,
+                         bool* overflow) {
+  if (next > std::numeric_limits<std::uint64_t>::max() - *total) {
+    *total = std::numeric_limits<std::uint64_t>::max();
+    *overflow = true;
+    return;
+  }
+  *total += next;
+}
+
+bool AggregateGroupPerfCounters(const boost::json::array& nodes,
+                                const std::set<std::uint64_t>& members,
+                                std::string_view group_id,
+                                boost::json::object* summary) {
+  std::optional<boost::json::array> expected_names;
+  std::vector<AggregatedPerfCounter> totals;
+  std::size_t matched = 0U;
+  for (std::size_t position = 0; position < nodes.size(); ++position) {
+    if (!nodes[position].is_object()) {
+      continue;
+    }
+    const boost::json::object& node = nodes[position].as_object();
+    if (!members.contains(NodeSummaryIndex(node, position))) {
+      continue;
+    }
+    ++matched;
+    const boost::json::object* metrics = ObjectField(node, "last_metrics");
+    if (metrics == nullptr ||
+        OptionalStringField(*metrics, "perf_counter_target_kind") != "group" ||
+        OptionalStringField(*metrics, "perf_counter_target_id") != group_id) {
+      return false;
+    }
+    const boost::json::value* available =
+        metrics->if_contains("perf_counters_available");
+    const boost::json::array* names =
+        ArrayField(*metrics, "perf_counter_names");
+    const boost::json::array* counters = ArrayField(*metrics, "perf_counters");
+    if (available == nullptr || !available->is_bool() ||
+        !available->as_bool() || names == nullptr || names->empty() ||
+        counters == nullptr || counters->size() != names->size()) {
+      return false;
+    }
+    if (!expected_names) {
+      expected_names = *names;
+      totals.resize(names->size());
+      for (std::size_t index = 0; index < names->size(); ++index) {
+        if (!(*names)[index].is_string() ||
+            (*names)[index].as_string().empty()) {
+          return false;
+        }
+        totals[index].name = std::string((*names)[index].as_string());
+      }
+    } else if (*expected_names != *names) {
+      return false;
+    }
+
+    for (std::size_t index = 0; index < counters->size(); ++index) {
+      if (!(*counters)[index].is_object()) {
+        return false;
+      }
+      const boost::json::object& counter = (*counters)[index].as_object();
+      AggregatedPerfCounter& total = totals[index];
+      if (OptionalStringField(counter, "name") != total.name) {
+        return false;
+      }
+      const std::optional<std::uint64_t> raw =
+          OptionalUint64Field(counter, "raw_value");
+      const std::optional<std::uint64_t> enabled =
+          OptionalUint64Field(counter, "time_enabled_ns");
+      const std::optional<std::uint64_t> running =
+          OptionalUint64Field(counter, "time_running_ns");
+      if (!raw || !enabled || !running) {
+        return false;
+      }
+      AddPerfCounterValue(*raw, &total.raw_value, &total.aggregation_overflow);
+      AddPerfCounterValue(*enabled, &total.time_enabled_ns,
+                          &total.aggregation_overflow);
+      AddPerfCounterValue(*running, &total.time_running_ns,
+                          &total.aggregation_overflow);
+
+      const boost::json::value* scaled_value =
+          counter.if_contains("scaled_value");
+      if (scaled_value == nullptr || scaled_value->is_null()) {
+        total.scaled_value.reset();
+      } else {
+        const std::optional<std::uint64_t> scaled =
+            OptionalUint64Field(counter, "scaled_value");
+        if (!scaled) {
+          return false;
+        }
+        if (total.scaled_value) {
+          AddPerfCounterValue(*scaled, &*total.scaled_value,
+                              &total.aggregation_overflow);
+        }
+      }
+      for (const auto& [field, destination] :
+           std::initializer_list<std::pair<std::string_view, bool*>>{
+               {"multiplexed", &total.multiplexed},
+               {"scaled", &total.scaled},
+               {"scaled_overflow", &total.scaled_overflow}}) {
+        const boost::json::value* flag = counter.if_contains(field);
+        if (flag == nullptr || !flag->is_bool()) {
+          return false;
+        }
+        *destination = *destination || flag->as_bool();
+      }
+    }
+  }
+  if (!expected_names || matched == 0U || matched != members.size()) {
+    return false;
+  }
+
+  boost::json::array counters;
+  counters.reserve(totals.size());
+  bool aggregate_overflow = false;
+  for (const AggregatedPerfCounter& total : totals) {
+    boost::json::object counter;
+    counter["name"] = total.name;
+    counter["raw_value"] = total.raw_value;
+    if (total.scaled_value) {
+      counter["scaled_value"] = *total.scaled_value;
+    } else {
+      counter["scaled_value"] = nullptr;
+    }
+    counter["time_enabled_ns"] = total.time_enabled_ns;
+    counter["time_running_ns"] = total.time_running_ns;
+    counter["multiplexed"] = total.multiplexed;
+    counter["scaled"] = total.scaled;
+    counter["scaled_overflow"] =
+        total.scaled_overflow || total.aggregation_overflow;
+    counter["aggregation_overflow"] = total.aggregation_overflow;
+    aggregate_overflow = aggregate_overflow || total.aggregation_overflow;
+    counters.push_back(std::move(counter));
+  }
+  (*summary)["perf_counters_available"] = true;
+  (*summary)["perf_counter_names"] = std::move(*expected_names);
+  (*summary)["perf_counters"] = std::move(counters);
+  (*summary)["perf_counter_aggregation_overflow"] = aggregate_overflow;
+  return true;
+}
+
 void AddTopologyViewSummaries(boost::json::object* report) {
   const boost::json::array* nodes = ArrayField(*report, "nodes_summary");
   if (nodes == nullptr) {
@@ -1011,6 +1170,12 @@ void AddTopologyViewSummaries(boost::json::object* report) {
     AddOptionalUint("network_drop_count",
                     AggregateNodeMetric(*nodes, members, "network_drop_count"),
                     &summary);
+    summary["perf_counters_available"] = false;
+    summary["perf_counter_names"] = boost::json::array{};
+    summary["perf_counters"] = boost::json::array{};
+    summary["perf_counter_aggregation_overflow"] = false;
+    static_cast<void>(
+        AggregateGroupPerfCounters(*nodes, members, definition.name, &summary));
     group_summaries.push_back(std::move(summary));
   }
   (*report)["topology_blocked_rules"] = std::move(blocked_rules);

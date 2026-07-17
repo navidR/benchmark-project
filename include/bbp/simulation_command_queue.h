@@ -39,6 +39,8 @@ class SimulationCommandQueue {
                                      std::string node_id,
                                      std::string peer_node_id,
                                      bool confirmed = false);
+  std::uint64_t PushPerfCounters(PerfCounterTarget target,
+                                 std::vector<PerfCounterKind> kinds);
   std::optional<SimulationCommand> TryPop();
   std::optional<SimulationCommand> WaitPop();
   void Close();

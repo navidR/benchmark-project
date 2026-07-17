@@ -29,6 +29,7 @@
 #include "bbp/node_log_pane.h"
 #include "bbp/operator_command_status.h"
 #include "bbp/peer_list_pane.h"
+#include "bbp/perf_counter_target_resolver.h"
 #include "bbp/run_report.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulator/workload_kind.h"
@@ -45,7 +46,7 @@ constexpr int kColorWarning = 3;
 constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
-constexpr int kDetailPaneRows = 25;
+constexpr int kDetailPaneRows = 26;
 
 struct PendingConfirmation {
   ParsedTuiCommand command;
@@ -1056,7 +1057,7 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
   mvaddch(top + kPopupRows - 1, left, ACS_LLCORNER);
   mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
-  AddText(top + 1, left + 2, popup_cols - 4, "Node command", A_BOLD);
+  AddText(top + 1, left + 2, popup_cols - 4, "Live command", A_BOLD);
   AddText(top + 2, left + 2, popup_cols - 4,
           "block-production <probability> <period-ms>");
   AddText(top + 3, left + 2, popup_cols - 4, "mining-difficulty <value>");
@@ -1077,6 +1078,8 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
           "block|unblock <dst-ip> <port> [src-ip]  clear-rule <handle>");
   AddText(top + 12, left + 2, popup_cols - 4,
           "partition <node-id>  heal <node-id>");
+  AddText(top + 13, left + 2, popup_cols - 4,
+          "perf-counters [node|wallet|group|cgroup [id]] <name[,name...]>");
   AddText(top + 16, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
           A_BOLD);
   if (!error.empty()) {
@@ -1085,6 +1088,25 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   }
   AddText(top + 19, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
+}
+
+void DrawCommandPaletteInput(int rows, int cols, std::string_view input,
+                             std::string_view error) {
+  constexpr int kPopupRows = 21;
+  if (rows < kPopupRows + 2 || cols < 48) {
+    return;
+  }
+  const int popup_cols = std::min(cols - 4, 78);
+  const int top = (rows - kPopupRows) / 2;
+  const int left = (cols - popup_cols) / 2;
+  mvhline(top + 16, left + 1, ' ', popup_cols - 2);
+  mvhline(top + 17, left + 1, ' ', popup_cols - 2);
+  AddText(top + 16, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
+          A_BOLD);
+  if (!error.empty()) {
+    AddText(top + 17, left + 2, popup_cols - 4, error,
+            COLOR_PAIR(kColorWarning));
+  }
 }
 
 void AddDetailPair(int y, int x, int width, std::string_view label,
@@ -1375,6 +1397,17 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
+  AddDetailPair(y, 0, left_width, "perf kind / id",
+                JsonMetricText(metric_object, "perf_counter_target_kind") +
+                    " / " +
+                    JsonMetricText(metric_object, "perf_counter_target_id"));
+  AddDetailPair(y, left_width, right_width, "perf cgroup / CPUs",
+                JsonMetricText(metric_object, "perf_counter_cgroup_path") +
+                    " / " + JsonMetricText(metric_object, "perf_counter_cpus"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
   AddDetailPair(y, 0, cols, "perf counters",
                 PerfCounterSummaryText(metric_object));
 }
@@ -1601,6 +1634,22 @@ void DrawSelectedTopologyDetail(int top, int bottom, int cols,
       JsonArrayCountText(report, "active_network_partitions") + " / " +
           JsonArrayCountText(report, "topology_degraded_links") + " / " +
           JsonArrayCountText(report, "topology_blocked_rules"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, left_width, "group perf status",
+                JsonBool(*group, "perf_counters_available").value_or(false)
+                    ? "available"
+                    : "not collected");
+  AddDetailPair(y, left_width, right_width, "group perf overflow",
+                JsonMetricText(*group, "perf_counter_aggregation_overflow"));
+  ++y;
+  if (y >= bottom) {
+    return;
+  }
+  AddDetailPair(y, 0, cols, "group perf counters",
+                PerfCounterSummaryText(*group));
 }
 
 boost::json::object LoadReport(const std::filesystem::path& run_root,
@@ -2024,10 +2073,21 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
     std::uint64_t sequence = 0U;
     std::string target = "the simulation";
     std::string node_id;
+    std::optional<PerfCounterTarget> perf_target;
     if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
       if (!parsed.block_production_policy) {
         throw std::runtime_error("block production policy is missing");
       }
+    } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
+      perf_target = ResolvePerfCounterTarget(
+          report,
+          {.view = state->view,
+           .selected_node = state->selected_node,
+           .selected_wallet = state->selected_wallet,
+           .selected_topology_group = state->selected_topology_group},
+          parsed.perf_counter_target_kind, parsed.perf_counter_target_id);
+      target = std::string(PerfCounterTargetKindName(perf_target->kind)) + ":" +
+               perf_target->id;
     } else {
       node_id = std::move(confirmed_target);
       if (node_id.empty()) {
@@ -2065,6 +2125,12 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
     if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
       sequence = command_queue->PushBlockProductionPolicy(
           *parsed.block_production_policy);
+    } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
+      if (!perf_target) {
+        throw std::runtime_error("perf counter target is missing");
+      }
+      sequence = command_queue->PushPerfCounters(std::move(*perf_target),
+                                                 parsed.perf_counter_kinds);
     } else {
       if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
         if (!parsed.mining_difficulty) {
@@ -2493,7 +2559,22 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         return 0;
       }
       const int ch = getch();
+      const bool palette_was_open = state.command_palette_open;
       if (HandleInput(ch, report, command_queue, &state)) {
+        if (state.command_palette_open) {
+          int rows = 0;
+          int cols = 0;
+          getmaxyx(stdscr, rows, cols);
+          if (palette_was_open) {
+            DrawCommandPaletteInput(rows, cols, state.command_input,
+                                    state.command_input_error);
+          } else {
+            DrawCommandPalette(rows, cols, state.command_input,
+                               state.command_input_error);
+          }
+          refresh();
+          continue;
+        }
         break;
       }
       if (ShouldExit(ch)) {

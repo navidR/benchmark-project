@@ -812,6 +812,37 @@ lower daemon log verbosity. Commands pass through the chain driver; when the
 selected chain does not support an operation, the TUI shows a dismissible
 `Command error` popup instead of attempting a chain-specific fallback.
 
+Press `c` to open the typed command palette. Live performance collection can
+be retargeted without restarting the benchmark:
+
+```text
+perf-counters cycles,instructions,task-clock
+perf-counters cgroup page-faults
+perf-counters node firo-1 cycles,instructions
+perf-counters wallet 1 task-clock,page-faults
+perf-counters group topology-1 cache-misses,branch-misses
+perf-counters cgroup firo-2 cycles
+```
+
+With only a counter list, the target is inferred from the selected node,
+wallet, or topology group. A target kind without an ID resolves through the
+current compatible selection. Explicit node and cgroup IDs are owned node IDs;
+wallet IDs are positive one-based indexes (optionally prefixed with `#`); group
+IDs are the exact names shown by the topology view. Node and wallet targets use
+the daemon process through libperf. Cgroup and group targets attach to each
+resolved simulator-owned node cgroup on every allowed CPU. A group change is
+transactional: if any member cannot be attached, every member retains its
+previous live session and configuration. The selected configuration is
+preserved and reopened across node restarts.
+
+Metrics record `perf_counter_target_kind`, `perf_counter_target_id`, the
+process PID fields or `perf_counter_cgroup_path` and `perf_counter_cpus`, and
+the exact ordered counter selection. Topology group summaries publish an
+aggregate only when every member reports the matching group target and ordered
+selection. Sums saturate explicitly at `uint64` and expose
+`aggregation_overflow` and `perf_counter_aggregation_overflow` rather than
+wrapping.
+
 Without an explicit topology policy, a multi-node run starts with every node
 connected to every other node. Scenario peer-count policies can replace that
 default with per-node minimum and maximum connection counts.

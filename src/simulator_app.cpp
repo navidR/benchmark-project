@@ -5119,8 +5119,11 @@ boost::json::object DirectionalNetworkPolicyCounterJson(
 
 void ResetNodePerfCounters(NodeRuntime& node) {
   node.process_perf_counters.reset();
+  node.cgroup_perf_counters.reset();
   node.perf_counter_target_pid = -1;
   node.perf_counter_attached_pid = -1;
+  node.perf_counter_cgroup_path.clear();
+  node.perf_counter_cpus.clear();
   node.perf_counter_error_kind.reset();
   node.perf_counter_error.clear();
 }
@@ -5128,37 +5131,65 @@ void ResetNodePerfCounters(NodeRuntime& node) {
 void SetNodePerfCounterError(NodeRuntime& node, PerfCounterErrorKind kind,
                              std::string_view error) {
   node.process_perf_counters.reset();
+  node.cgroup_perf_counters.reset();
   node.perf_counter_attached_pid = -1;
+  node.perf_counter_cgroup_path.clear();
+  node.perf_counter_cpus.clear();
   node.perf_counter_error_kind = kind;
   node.perf_counter_error = error;
 }
 
 void AttachNodePerfCounters(NodeRuntime& node) {
   ResetNodePerfCounters(node);
-  node.perf_counter_target_pid = node.process.pid();
   node.perf_counter_process_generation = node.RestartCount();
-  if (node.perf_counter_target_pid <= 0 || !node.process.running()) {
+  if (node.process.pid() <= 0 || !node.process.running()) {
     SetNodePerfCounterError(node, PerfCounterErrorKind::kProcessUnavailable,
                             "node process is not running");
     return;
   }
 
-  const pid_t target_pid = node.perf_counter_target_pid;
   try {
-    ProcessPerfCounters counters =
-        ProcessPerfCounters::Open(target_pid, node.perf_counter_kinds);
-    if (node.process.pid() != target_pid || !node.process.running()) {
-      SetNodePerfCounterError(
-          node, PerfCounterErrorKind::kProcessUnavailable,
-          "node process exited or changed while perf counters were opening");
+    if (node.perf_counter_target_kind == PerfCounterTargetKind::kNode ||
+        node.perf_counter_target_kind == PerfCounterTargetKind::kWallet) {
+      const pid_t target_pid = node.process.pid();
+      node.perf_counter_target_pid = target_pid;
+      ProcessPerfCounters counters =
+          ProcessPerfCounters::Open(target_pid, node.perf_counter_kinds);
+      if (node.process.pid() != target_pid || !node.process.running()) {
+        SetNodePerfCounterError(
+            node, PerfCounterErrorKind::kProcessUnavailable,
+            "node process exited or changed while perf counters were opening");
+        return;
+      }
+      node.perf_counter_attached_pid = target_pid;
+      node.process_perf_counters.emplace(std::move(counters));
       return;
     }
-    node.perf_counter_attached_pid = target_pid;
-    node.process_perf_counters.emplace(std::move(counters));
+
+    if (!node.cgroup) {
+      SetNodePerfCounterError(node, PerfCounterErrorKind::kProcessUnavailable,
+                              "node cgroup is unavailable");
+      return;
+    }
+    CgroupPerfCounters counters =
+        CgroupPerfCounters::Open(node.cgroup->path(), node.perf_counter_kinds);
+    if (!node.process.running() || !node.cgroup ||
+        counters.cgroup_path() != node.cgroup->path()) {
+      SetNodePerfCounterError(
+          node, PerfCounterErrorKind::kProcessUnavailable,
+          "node process or cgroup changed while perf counters were opening");
+      return;
+    }
+    node.perf_counter_cgroup_path = counters.cgroup_path();
+    node.perf_counter_cpus = counters.cpus();
+    node.cgroup_perf_counters.emplace(std::move(counters));
   } catch (const PerfCounterError& error) {
     SetNodePerfCounterError(node, error.kind(), error.what());
     BBP_LOG(warning) << "perf counters unavailable for " << node.config.id
-                     << " pid=" << target_pid << ": " << error.what();
+                     << " target="
+                     << PerfCounterTargetKindName(node.perf_counter_target_kind)
+                     << ":" << node.perf_counter_target_id << ": "
+                     << error.what();
   }
 }
 
@@ -5219,9 +5250,13 @@ struct NodeRuntimeMetrics {
   std::uint8_t prefix_length = 0;
   std::vector<RouteInfo> routes;
   std::vector<PerfCounterKind> perf_counter_kinds;
+  PerfCounterTargetKind perf_counter_target_kind = PerfCounterTargetKind::kNode;
+  std::string perf_counter_target_id;
   pid_t perf_counter_target_pid = -1;
   pid_t perf_counter_attached_pid = -1;
   std::uint64_t perf_counter_process_generation = 0;
+  std::string perf_counter_cgroup_path;
+  std::vector<int> perf_counter_cpus;
   bool perf_counters_available = false;
   std::optional<PerfCounterErrorKind> perf_counter_error_kind;
   std::string perf_counter_error;
@@ -5264,6 +5299,9 @@ std::string MetricsJson(
   object["restart_count"] = restart_count;
   object["perf_counter_names"] =
       PerfCounterNamesJson(runtime.perf_counter_kinds);
+  object["perf_counter_target_kind"] =
+      PerfCounterTargetKindName(runtime.perf_counter_target_kind);
+  object["perf_counter_target_id"] = runtime.perf_counter_target_id;
   if (runtime.perf_counter_target_pid > 0) {
     object["perf_counter_target_pid"] = runtime.perf_counter_target_pid;
   } else {
@@ -5276,6 +5314,17 @@ std::string MetricsJson(
   }
   object["perf_counter_process_generation"] =
       runtime.perf_counter_process_generation;
+  if (runtime.perf_counter_cgroup_path.empty()) {
+    object["perf_counter_cgroup_path"] = nullptr;
+  } else {
+    object["perf_counter_cgroup_path"] = runtime.perf_counter_cgroup_path;
+  }
+  boost::json::array perf_counter_cpus;
+  perf_counter_cpus.reserve(runtime.perf_counter_cpus.size());
+  for (const int cpu : runtime.perf_counter_cpus) {
+    perf_counter_cpus.emplace_back(cpu);
+  }
+  object["perf_counter_cpus"] = std::move(perf_counter_cpus);
   object["perf_counters_available"] = runtime.perf_counters_available;
   if (runtime.perf_counter_error_kind) {
     object["perf_counter_error_kind"] =
@@ -6136,15 +6185,29 @@ void WriteMetricsSnapshot(
       runtime.process_running = node.process.running();
       runtime.exit_status = node.process.exit_status();
       runtime.perf_counter_kinds = node.perf_counter_kinds;
+      runtime.perf_counter_target_kind = node.perf_counter_target_kind;
+      runtime.perf_counter_target_id = node.perf_counter_target_id;
       runtime.perf_counter_target_pid = node.perf_counter_target_pid;
       runtime.perf_counter_attached_pid = node.perf_counter_attached_pid;
       runtime.perf_counter_process_generation =
           node.perf_counter_process_generation;
+      runtime.perf_counter_cgroup_path = node.perf_counter_cgroup_path.string();
+      runtime.perf_counter_cpus = node.perf_counter_cpus;
       runtime.perf_counter_error_kind = node.perf_counter_error_kind;
       runtime.perf_counter_error = node.perf_counter_error;
       if (node.process_perf_counters) {
         try {
           runtime.perf_counter_values = node.process_perf_counters->Read();
+          runtime.perf_counters_available = true;
+          runtime.perf_counter_error_kind.reset();
+          runtime.perf_counter_error.clear();
+        } catch (const PerfCounterError& error) {
+          runtime.perf_counter_error_kind = error.kind();
+          runtime.perf_counter_error = error.what();
+        }
+      } else if (node.cgroup_perf_counters) {
+        try {
+          runtime.perf_counter_values = node.cgroup_perf_counters->Read();
           runtime.perf_counters_available = true;
           runtime.perf_counter_error_kind.reset();
           runtime.perf_counter_error.clear();
@@ -7129,6 +7192,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     NodeRuntime runtime;
     try {
       runtime.config = config;
+      runtime.perf_counter_target_kind = PerfCounterTargetKind::kNode;
+      runtime.perf_counter_target_id = node_id;
       const auto resource_profile = options.node_resource_profiles.find(i);
       if (resource_profile != options.node_resource_profiles.end()) {
         runtime.resource_profile = resource_profile->second;
@@ -9359,6 +9424,212 @@ NodeRuntime& FindNodeRuntimeById(std::vector<NodeRuntime>& nodes,
   return *node;
 }
 
+bool IsCanonicalWalletPerfTargetId(std::string_view id) {
+  constexpr std::string_view kPrefix = "wallet-";
+  if (!id.starts_with(kPrefix)) {
+    return false;
+  }
+  id.remove_prefix(kPrefix.size());
+  if (id.empty() || (id.size() > 1U && id.front() == '0')) {
+    return false;
+  }
+  std::uint64_t value = 0U;
+  const auto [end, error] =
+      std::from_chars(id.data(), id.data() + id.size(), value);
+  return error == std::errc() && end == id.data() + id.size() && value > 0U;
+}
+
+struct NodePerfCounterSnapshot {
+  explicit NodePerfCounterSnapshot(NodeRuntime& runtime,
+                                   const PerfCounterTarget& target,
+                                   const std::vector<PerfCounterKind>& kinds)
+      : node(&runtime),
+        configuration_kinds(kinds),
+        configuration_id(target.id) {}
+
+  NodeRuntime* node;
+  std::vector<PerfCounterKind> configuration_kinds;
+  PerfCounterTargetKind configuration_kind = PerfCounterTargetKind::kNode;
+  std::string configuration_id;
+  std::optional<ProcessPerfCounters> process_counters;
+  std::optional<CgroupPerfCounters> cgroup_counters;
+  pid_t target_pid = -1;
+  pid_t attached_pid = -1;
+  std::uint64_t process_generation = 0U;
+  std::filesystem::path cgroup_path;
+  std::vector<int> cpus;
+  std::optional<PerfCounterErrorKind> error_kind;
+  std::string error;
+  bool replacement_started = false;
+};
+
+void BeginNodePerfCounterReplacement(NodePerfCounterSnapshot& snapshot,
+                                     PerfCounterTargetKind target_kind) {
+  NodeRuntime& node = *snapshot.node;
+  snapshot.configuration_kind = node.perf_counter_target_kind;
+  node.perf_counter_kinds.swap(snapshot.configuration_kinds);
+  node.perf_counter_target_id.swap(snapshot.configuration_id);
+  node.perf_counter_target_kind = target_kind;
+  if (node.process_perf_counters) {
+    snapshot.process_counters.emplace(std::move(*node.process_perf_counters));
+    node.process_perf_counters.reset();
+  }
+  if (node.cgroup_perf_counters) {
+    snapshot.cgroup_counters.emplace(std::move(*node.cgroup_perf_counters));
+    node.cgroup_perf_counters.reset();
+  }
+  snapshot.target_pid = node.perf_counter_target_pid;
+  snapshot.attached_pid = node.perf_counter_attached_pid;
+  snapshot.process_generation = node.perf_counter_process_generation;
+  snapshot.cgroup_path = std::move(node.perf_counter_cgroup_path);
+  snapshot.cpus = std::move(node.perf_counter_cpus);
+  snapshot.error_kind = node.perf_counter_error_kind;
+  snapshot.error = std::move(node.perf_counter_error);
+  snapshot.replacement_started = true;
+}
+
+void RestoreNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot) {
+  if (!snapshot.replacement_started) {
+    return;
+  }
+  NodeRuntime& node = *snapshot.node;
+  node.process_perf_counters.reset();
+  node.cgroup_perf_counters.reset();
+  node.perf_counter_kinds.swap(snapshot.configuration_kinds);
+  node.perf_counter_target_kind = snapshot.configuration_kind;
+  node.perf_counter_target_id.swap(snapshot.configuration_id);
+  node.process_perf_counters = std::move(snapshot.process_counters);
+  node.cgroup_perf_counters = std::move(snapshot.cgroup_counters);
+  node.perf_counter_target_pid = snapshot.target_pid;
+  node.perf_counter_attached_pid = snapshot.attached_pid;
+  node.perf_counter_process_generation = snapshot.process_generation;
+  node.perf_counter_cgroup_path = std::move(snapshot.cgroup_path);
+  node.perf_counter_cpus = std::move(snapshot.cpus);
+  node.perf_counter_error_kind = snapshot.error_kind;
+  node.perf_counter_error = std::move(snapshot.error);
+}
+
+void RequireNodePerfCounterAttachment(const NodeRuntime& node) {
+  if (node.perf_counter_error_kind || !node.perf_counter_error.empty()) {
+    throw std::runtime_error(
+        "perf counter attachment failed for " + node.config.id + ": " +
+        (node.perf_counter_error.empty() ? std::string(PerfCounterErrorKindName(
+                                               *node.perf_counter_error_kind))
+                                         : node.perf_counter_error));
+  }
+  const bool process_target =
+      node.perf_counter_target_kind == PerfCounterTargetKind::kNode ||
+      node.perf_counter_target_kind == PerfCounterTargetKind::kWallet;
+  if (process_target) {
+    if (!node.process_perf_counters || node.cgroup_perf_counters ||
+        node.perf_counter_target_pid <= 0 ||
+        node.perf_counter_attached_pid != node.perf_counter_target_pid) {
+      throw std::runtime_error(
+          "process perf counter attachment is incomplete "
+          "for " +
+          node.config.id);
+    }
+    return;
+  }
+  if (!node.cgroup_perf_counters || node.process_perf_counters ||
+      node.perf_counter_cgroup_path.empty() || node.perf_counter_cpus.empty()) {
+    throw std::runtime_error(
+        "cgroup perf counter attachment is incomplete for " + node.config.id);
+  }
+}
+
+void ApplyPerfCounterCommand(const SimulationCommand& command,
+                             std::vector<NodeRuntime>& nodes) {
+  if (!command.perf_counter_target) {
+    throw std::runtime_error("perf counter command requires a typed target");
+  }
+  const PerfCounterTarget& target = *command.perf_counter_target;
+  if (target.id.empty()) {
+    throw std::runtime_error("perf counter target id must not be empty");
+  }
+  if (target.node_ids.empty()) {
+    throw std::runtime_error("perf counter target must resolve to a node");
+  }
+  if (command.perf_counter_kinds.empty()) {
+    throw std::runtime_error("perf counter selection must not be empty");
+  }
+  const std::set<PerfCounterKind> unique_kinds(
+      command.perf_counter_kinds.begin(), command.perf_counter_kinds.end());
+  if (unique_kinds.size() != command.perf_counter_kinds.size()) {
+    throw std::runtime_error("perf counter selection contains duplicates");
+  }
+  if (target.kind == PerfCounterTargetKind::kGroup) {
+    if (command.node_id != "sim") {
+      throw std::runtime_error("group perf counter command must target sim");
+    }
+  } else {
+    if (target.node_ids.size() != 1U ||
+        command.node_id != target.node_ids.front()) {
+      throw std::runtime_error(
+          "non-group perf counter command must target its resolved node");
+    }
+    if ((target.kind == PerfCounterTargetKind::kNode ||
+         target.kind == PerfCounterTargetKind::kCgroup) &&
+        target.id != target.node_ids.front()) {
+      throw std::runtime_error(
+          "node and cgroup perf target ids must equal their resolved node");
+    }
+    if (target.kind == PerfCounterTargetKind::kWallet &&
+        !IsCanonicalWalletPerfTargetId(target.id)) {
+      throw std::runtime_error(
+          "wallet perf target id must be wallet-<positive-index>");
+    }
+  }
+
+  std::vector<NodeRuntime*> target_nodes;
+  target_nodes.reserve(target.node_ids.size());
+  std::set<std::string> unique_nodes;
+  for (const std::string& node_id : target.node_ids) {
+    if (node_id.empty() || !unique_nodes.insert(node_id).second) {
+      throw std::runtime_error(
+          "perf counter target contains an empty or duplicate node id");
+    }
+    const auto node = std::find_if(nodes.begin(), nodes.end(),
+                                   [&](const NodeRuntime& candidate) {
+                                     return candidate.config.id == node_id;
+                                   });
+    if (node == nodes.end()) {
+      throw std::runtime_error("perf counter target references unknown node: " +
+                               node_id);
+    }
+    if (!node->process.running()) {
+      throw std::runtime_error("perf counter target node is not running: " +
+                               node_id);
+    }
+    if ((target.kind == PerfCounterTargetKind::kGroup ||
+         target.kind == PerfCounterTargetKind::kCgroup) &&
+        !node->cgroup) {
+      throw std::runtime_error(
+          "perf counter target node has no owned cgroup: " + node_id);
+    }
+    target_nodes.push_back(&*node);
+  }
+
+  std::vector<NodePerfCounterSnapshot> snapshots;
+  snapshots.reserve(target_nodes.size());
+  for (NodeRuntime* node : target_nodes) {
+    snapshots.emplace_back(*node, target, command.perf_counter_kinds);
+  }
+
+  try {
+    for (NodePerfCounterSnapshot& snapshot : snapshots) {
+      BeginNodePerfCounterReplacement(snapshot, target.kind);
+      AttachNodePerfCounters(*snapshot.node);
+      RequireNodePerfCounterAttachment(*snapshot.node);
+    }
+  } catch (...) {
+    for (NodePerfCounterSnapshot& snapshot : snapshots) {
+      RestoreNodePerfCounterSnapshot(snapshot);
+    }
+    throw;
+  }
+}
+
 std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
     const Options& options, const std::vector<NodeRuntime>& nodes) {
   std::map<std::string, PeerCountPolicy> policies;
@@ -9477,6 +9748,22 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
       flow["handle"] = command.network_flow->handle;
     }
     detail["network_flow"] = std::move(flow);
+  }
+  if (command.perf_counter_target) {
+    boost::json::object target;
+    target["kind"] =
+        PerfCounterTargetKindName(command.perf_counter_target->kind);
+    target["id"] = command.perf_counter_target->id;
+    boost::json::array node_ids;
+    node_ids.reserve(command.perf_counter_target->node_ids.size());
+    for (const std::string& node_id : command.perf_counter_target->node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    target["node_ids"] = std::move(node_ids);
+    detail["perf_target"] = std::move(target);
+  }
+  if (!command.perf_counter_kinds.empty()) {
+    detail["perf_counters"] = PerfCounterNamesJson(command.perf_counter_kinds);
   }
   if (command.kind == SimulationCommandKind::kExportNodeReport) {
     detail["output_path"] = NodeReportRelativePath(command).generic_string();
@@ -9836,6 +10123,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                     : FindNodeRuntimeById(nodes, command.node_id);
             if (command.kind == SimulationCommandKind::kExportNodeReport) {
               ExportNodeReport(run_root, command);
+            } else if (command.kind ==
+                       SimulationCommandKind::kSetPerfCounters) {
+              std::lock_guard<std::mutex> lock(node_process_mutex);
+              ApplyPerfCounterCommand(command, nodes);
             } else if (command.kind == SimulationCommandKind::kKillNode) {
               const bool resume_on_failure =
                   stop_scheduled_miner() ||

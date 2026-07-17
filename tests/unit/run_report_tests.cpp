@@ -7,6 +7,7 @@
 #include <boost/test/unit_test.hpp>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -259,9 +260,13 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"memory_current\":20,\"memory_stat\":{\"anon\":19},"
       "\"memory_high_limit_bytes\":null,\"io_read_bytes\":30,"
       "\"perf_counter_names\":[\"cycles\",\"task-clock\"],"
+      "\"perf_counter_target_kind\":\"node\","
+      "\"perf_counter_target_id\":\"firo-1\","
       "\"perf_counter_target_pid\":123,"
       "\"perf_counter_attached_pid\":123,"
       "\"perf_counter_process_generation\":1,"
+      "\"perf_counter_cgroup_path\":null,"
+      "\"perf_counter_cpus\":[],"
       "\"perf_counters_available\":true,"
       "\"perf_counter_error_kind\":null,\"perf_counter_error\":null,"
       "\"perf_counters\":[{\"name\":\"cycles\","
@@ -559,10 +564,14 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(last_metrics.at("memory_high_limit_bytes").is_null());
   BOOST_TEST(JsonInteger(last_metrics, "io_read_bytes") == 30U);
   BOOST_TEST(last_metrics.at("perf_counters_available").as_bool());
+  BOOST_TEST(last_metrics.at("perf_counter_target_kind").as_string() == "node");
+  BOOST_TEST(last_metrics.at("perf_counter_target_id").as_string() == "firo-1");
   BOOST_TEST(JsonInteger(last_metrics, "perf_counter_target_pid") == 123U);
   BOOST_TEST(JsonInteger(last_metrics, "perf_counter_attached_pid") == 123U);
   BOOST_TEST(JsonInteger(last_metrics, "perf_counter_process_generation") ==
              1U);
+  BOOST_TEST(last_metrics.at("perf_counter_cgroup_path").is_null());
+  BOOST_TEST(last_metrics.at("perf_counter_cpus").as_array().empty());
   BOOST_REQUIRE_EQUAL(last_metrics.at("perf_counter_names").as_array().size(),
                       2U);
   BOOST_TEST(last_metrics.at("perf_counter_error_kind").is_null());
@@ -1360,13 +1369,13 @@ BOOST_AUTO_TEST_CASE(run_report_builds_topology_groups_and_node_exports) {
       R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":1000,"network_rx_bytes":100,"network_tx_bytes":200})");
   bbp::AppendLine(
       dir / "metrics.jsonl",
-      R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":2000,"network_rx_bytes":300,"network_tx_bytes":600,"network_condition":{"bandwidth_mbps":0,"delay_ms":80},"network_active_block_rules":[{"handle":77,"dst_address":"10.0.0.2","dst_port":18168}]})");
+      R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":2000,"network_rx_bytes":300,"network_tx_bytes":600,"network_condition":{"bandwidth_mbps":0,"delay_ms":80},"network_active_block_rules":[{"handle":77,"dst_address":"10.0.0.2","dst_port":18168}],"perf_counter_target_kind":"group","perf_counter_target_id":"topology-1","perf_counters_available":true,"perf_counter_names":["cycles"],"perf_counters":[{"name":"cycles","raw_value":18446744073709551610,"scaled_value":18446744073709551613,"time_enabled_ns":18446744073709551614,"time_running_ns":100,"multiplexed":true,"scaled":true,"scaled_overflow":false}]})");
   bbp::AppendLine(
       dir / "metrics.jsonl",
       R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":1000,"network_rx_bytes":50,"network_tx_bytes":100})");
   bbp::AppendLine(
       dir / "metrics.jsonl",
-      R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":2000,"network_rx_bytes":150,"network_tx_bytes":300})");
+      R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":2000,"network_rx_bytes":150,"network_tx_bytes":300,"perf_counter_target_kind":"group","perf_counter_target_id":"topology-1","perf_counters_available":true,"perf_counter_names":["cycles"],"perf_counters":[{"name":"cycles","raw_value":10,"scaled_value":10,"time_enabled_ns":10,"time_running_ns":20,"multiplexed":false,"scaled":false,"scaled_overflow":false}]})");
   bbp::AppendLine(
       dir / "metrics.jsonl",
       R"({"run_id":"r1","node_id":"firo-3","timestamp_ms":1000,"network_rx_bytes":10,"network_tx_bytes":20})");
@@ -1401,6 +1410,23 @@ BOOST_AUTO_TEST_CASE(run_report_builds_topology_groups_and_node_exports) {
   BOOST_TEST(JsonInteger(topology_one, "active_partition_count") == 1U);
   BOOST_TEST(JsonInteger(topology_one, "degraded_link_count") == 2U);
   BOOST_TEST(JsonInteger(topology_one, "blocked_rule_count") == 1U);
+  BOOST_TEST(topology_one.at("perf_counters_available").as_bool());
+  BOOST_REQUIRE_EQUAL(topology_one.at("perf_counter_names").as_array().size(),
+                      1U);
+  const boost::json::object& group_counter =
+      topology_one.at("perf_counters").as_array().front().as_object();
+  BOOST_TEST(JsonInteger(group_counter, "raw_value") ==
+             std::numeric_limits<std::uint64_t>::max());
+  BOOST_TEST(JsonInteger(group_counter, "scaled_value") ==
+             std::numeric_limits<std::uint64_t>::max());
+  BOOST_TEST(JsonInteger(group_counter, "time_enabled_ns") ==
+             std::numeric_limits<std::uint64_t>::max());
+  BOOST_TEST(JsonInteger(group_counter, "time_running_ns") == 120U);
+  BOOST_TEST(group_counter.at("multiplexed").as_bool());
+  BOOST_TEST(group_counter.at("scaled").as_bool());
+  BOOST_TEST(group_counter.at("scaled_overflow").as_bool());
+  BOOST_TEST(group_counter.at("aggregation_overflow").as_bool());
+  BOOST_TEST(topology_one.at("perf_counter_aggregation_overflow").as_bool());
 
   const boost::json::object node_report =
       boost::json::parse(bbp::BuildNodeReportJson(dir, "firo-2", 9U))

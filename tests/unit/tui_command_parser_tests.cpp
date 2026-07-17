@@ -66,6 +66,48 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
               bbp::SimulationCommandKind::kExportNodeReport);
 }
 
+BOOST_AUTO_TEST_CASE(tui_command_parser_builds_perf_counter_commands) {
+  const bbp::ParsedTuiCommand selected = bbp::TuiCommandParser::Parse(
+      "perf-counters cycles,instructions,task-clock", 0U);
+  BOOST_CHECK(selected.kind == bbp::SimulationCommandKind::kSetPerfCounters);
+  BOOST_TEST(!selected.perf_counter_target_kind);
+  BOOST_TEST(!selected.perf_counter_target_id);
+  BOOST_REQUIRE_EQUAL(selected.perf_counter_kinds.size(), 3U);
+  BOOST_CHECK(selected.perf_counter_kinds[0] == bbp::PerfCounterKind::kCycles);
+  BOOST_CHECK(selected.perf_counter_kinds[2] ==
+              bbp::PerfCounterKind::kTaskClock);
+
+  const bbp::ParsedTuiCommand selected_cgroup =
+      bbp::TuiCommandParser::Parse("perf-counters cgroup page-faults", 0U);
+  BOOST_REQUIRE(selected_cgroup.perf_counter_target_kind);
+  BOOST_CHECK(*selected_cgroup.perf_counter_target_kind ==
+              bbp::PerfCounterTargetKind::kCgroup);
+  BOOST_TEST(!selected_cgroup.perf_counter_target_id);
+
+  const bbp::ParsedTuiCommand group = bbp::TuiCommandParser::Parse(
+      "perf-counters group topology-1 cache-misses,branch-misses", 0U);
+  BOOST_REQUIRE(group.perf_counter_target_kind);
+  BOOST_CHECK(*group.perf_counter_target_kind ==
+              bbp::PerfCounterTargetKind::kGroup);
+  BOOST_REQUIRE(group.perf_counter_target_id);
+  BOOST_TEST(*group.perf_counter_target_id == "topology-1");
+  BOOST_REQUIRE_EQUAL(group.perf_counter_kinds.size(), 2U);
+
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("perf-counters", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("perf-counters unknown cycles", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("perf-counters cycles,cycles", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("perf-counters cycles,", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("perf-counters cpu-cycles", 0U),
+      std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
   BOOST_TEST(bbp::TuiCommandParser::Complete("reco") == "reconnect ");
   BOOST_TEST(bbp::TuiCommandParser::Complete("log-") == "log-");

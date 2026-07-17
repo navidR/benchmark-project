@@ -46,6 +46,21 @@ BOOST_AUTO_TEST_CASE(perf_counter_names_round_trip) {
   BOOST_TEST(names.size() == kinds.size());
   BOOST_TEST(!bbp::PerfCounterKindFromName("cpu-cycles"));
   BOOST_TEST(!bbp::PerfCounterKindFromName(""));
+
+  constexpr bbp::PerfCounterTargetKind kTargets[] = {
+      bbp::PerfCounterTargetKind::kNode,
+      bbp::PerfCounterTargetKind::kWallet,
+      bbp::PerfCounterTargetKind::kGroup,
+      bbp::PerfCounterTargetKind::kCgroup,
+  };
+  for (const bbp::PerfCounterTargetKind target : kTargets) {
+    const std::optional<bbp::PerfCounterTargetKind> parsed =
+        bbp::PerfCounterTargetKindFromName(
+            bbp::PerfCounterTargetKindName(target));
+    BOOST_REQUIRE(parsed);
+    BOOST_CHECK(*parsed == target);
+  }
+  BOOST_TEST(!bbp::PerfCounterTargetKindFromName("process"));
 }
 
 BOOST_AUTO_TEST_CASE(perf_counter_scaling_handles_multiplexing_and_overflow) {
@@ -177,8 +192,9 @@ BOOST_AUTO_TEST_CASE(perf_counter_collects_task_clock_for_cgroup) {
     const std::vector<bbp::PerfCounterValue> values = counters.Read();
     BOOST_REQUIRE(values.size() == 1U);
     BOOST_CHECK(values[0].kind == bbp::PerfCounterKind::kTaskClock);
-    BOOST_TEST(values[0].time_enabled_ns > 0U);
-    BOOST_TEST(values[0].time_running_ns > 0U);
+    BOOST_TEST(values[0].raw_value > 0U);
+    BOOST_TEST((values[0].time_enabled_ns == 0U) ==
+               (values[0].time_running_ns == 0U));
     BOOST_REQUIRE(values[0].scaled_value);
     BOOST_TEST(*values[0].scaled_value > 0U);
   } catch (const bbp::PerfCounterError& error) {

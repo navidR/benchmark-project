@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,10 +27,15 @@ struct NodeRuntime {
   ChildProcess process;
   std::optional<std::chrono::steady_clock::time_point> process_started_at;
   std::vector<PerfCounterKind> perf_counter_kinds = DefaultPerfCounterKinds();
+  PerfCounterTargetKind perf_counter_target_kind = PerfCounterTargetKind::kNode;
+  std::string perf_counter_target_id;
   std::optional<ProcessPerfCounters> process_perf_counters;
+  std::optional<CgroupPerfCounters> cgroup_perf_counters;
   pid_t perf_counter_target_pid = -1;
   pid_t perf_counter_attached_pid = -1;
   std::uint64_t perf_counter_process_generation = 0;
+  std::filesystem::path perf_counter_cgroup_path;
+  std::vector<int> perf_counter_cpus;
   std::optional<PerfCounterErrorKind> perf_counter_error_kind;
   std::string perf_counter_error;
   ResourceLimits resources;

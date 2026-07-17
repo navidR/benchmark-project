@@ -5,14 +5,16 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/tokenizer.hpp>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 25> kCommandNames = {
+constexpr std::array<std::string_view, 26> kCommandNames = {
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -38,6 +40,7 @@ constexpr std::array<std::string_view, 25> kCommandNames = {
     "partition",
     "heal",
     "export-node-report",
+    "perf-counters",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -54,6 +57,37 @@ void RequireArgumentCount(const std::vector<std::string>& tokens,
   }
 }
 
+std::vector<PerfCounterKind> ParsePerfCounterKinds(std::string_view text) {
+  if (text.empty()) {
+    throw std::runtime_error("perf counter selection must not be empty");
+  }
+  std::vector<PerfCounterKind> kinds;
+  std::set<PerfCounterKind> unique;
+  std::size_t begin = 0U;
+  while (begin <= text.size()) {
+    const std::size_t comma = text.find(',', begin);
+    const std::size_t end =
+        comma == std::string_view::npos ? text.size() : comma;
+    const std::string_view name = text.substr(begin, end - begin);
+    if (name.empty()) {
+      throw std::runtime_error("perf counter selection contains an empty name");
+    }
+    const std::optional<PerfCounterKind> kind = PerfCounterKindFromName(name);
+    if (!kind) {
+      throw std::runtime_error("unknown perf counter: " + std::string(name));
+    }
+    if (!unique.insert(*kind).second) {
+      throw std::runtime_error("duplicate perf counter: " + std::string(name));
+    }
+    kinds.push_back(*kind);
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    begin = comma + 1U;
+  }
+  return kinds;
+}
+
 }  // namespace
 
 ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
@@ -64,6 +98,42 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
   }
 
   try {
+    if (tokens[0] == "perf-counters") {
+      if (tokens.size() < 2U || tokens.size() > 4U) {
+        throw std::runtime_error(
+            "usage: perf-counters [node|wallet|group|cgroup [target-id]] "
+            "<counter[,counter...]>");
+      }
+      std::optional<PerfCounterTargetKind> target_kind;
+      std::optional<std::string> target_id;
+      if (tokens.size() >= 3U) {
+        target_kind = PerfCounterTargetKindFromName(tokens[1]);
+        if (!target_kind) {
+          throw std::runtime_error("unknown perf counter target kind: " +
+                                   tokens[1]);
+        }
+      }
+      if (tokens.size() == 4U) {
+        if (tokens[2].empty()) {
+          throw std::runtime_error("perf counter target id must not be empty");
+        }
+        target_id = tokens[2];
+      }
+      return ParsedTuiCommand{
+          .kind = SimulationCommandKind::kSetPerfCounters,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
+          .perf_counter_target_kind = target_kind,
+          .perf_counter_target_id = std::move(target_id),
+          .perf_counter_kinds = ParsePerfCounterKinds(tokens.back()),
+      };
+    }
     if (tokens[0] == "block-production") {
       RequireArgumentCount(tokens, 3U,
                            "block-production <probability> <period-ms>");
@@ -82,6 +152,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "mining-difficulty") {
@@ -97,6 +170,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "connect-peer" || tokens[0] == "disconnect-peer") {
@@ -113,6 +189,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "peer-policy") {
@@ -129,6 +208,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "generate-blocks") {
@@ -148,6 +230,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "resource-profile" || tokens[0] == "network-profile") {
@@ -164,6 +249,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = tokens[1],
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "network-condition") {
@@ -199,6 +287,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = std::nullopt,
           .network_condition = condition,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "block" || tokens[0] == "unblock") {
@@ -233,6 +324,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
                   .dst_port = static_cast<std::uint16_t>(dst_port),
                   .handle = 0U,
               },
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "clear-rule") {
@@ -258,6 +352,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
                   .dst_port = 0U,
                   .handle = handle,
               },
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
     if (tokens[0] == "partition" || tokens[0] == "heal") {
@@ -274,6 +371,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .profile = std::nullopt,
           .network_condition = std::nullopt,
           .network_flow = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
       };
     }
 
@@ -314,6 +414,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         .profile = std::nullopt,
         .network_condition = std::nullopt,
         .network_flow = std::nullopt,
+        .perf_counter_target_kind = std::nullopt,
+        .perf_counter_target_id = std::nullopt,
+        .perf_counter_kinds = {},
     };
   } catch (const boost::bad_lexical_cast&) {
     throw std::runtime_error("command contains an invalid numeric argument");

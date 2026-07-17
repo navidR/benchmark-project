@@ -9,6 +9,7 @@
 #include "bbp/mining_difficulty.h"
 #include "bbp/network.h"
 #include "bbp/peer_count_policy.h"
+#include "bbp/perf_counter.h"
 
 namespace bbp {
 
@@ -37,6 +38,7 @@ enum class SimulationCommandKind {
   kPartitionNodes,
   kHealPartition,
   kExportNodeReport,
+  kSetPerfCounters,
 };
 
 struct SimulationNetworkFlow {
@@ -58,6 +60,8 @@ struct SimulationCommand {
   std::optional<std::string> profile;
   std::optional<NetworkCondition> network_condition;
   std::optional<SimulationNetworkFlow> network_flow;
+  std::optional<PerfCounterTarget> perf_counter_target;
+  std::vector<PerfCounterKind> perf_counter_kinds;
   bool confirmed = false;
 };
 

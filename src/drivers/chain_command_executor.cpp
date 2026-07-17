@@ -119,6 +119,7 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
     case SimulationCommandKind::kPartitionNodes:
     case SimulationCommandKind::kHealPartition:
     case SimulationCommandKind::kExportNodeReport:
+    case SimulationCommandKind::kSetPerfCounters:
       throw std::runtime_error(
           "command must be handled by the simulator resource owner");
   }

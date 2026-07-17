@@ -97,6 +97,50 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_node_report_exports) {
   BOOST_TEST(!command->confirmed);
 }
 
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_perf_counter_target) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::PerfCounterTarget target{
+      .kind = bbp::PerfCounterTargetKind::kGroup,
+      .id = "topology-1",
+      .node_ids = {"firo-1", "firo-2"},
+  };
+  const std::uint64_t sequence = queue.PushPerfCounters(
+      target,
+      {bbp::PerfCounterKind::kCycles, bbp::PerfCounterKind::kInstructions});
+
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->sequence == sequence);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kSetPerfCounters);
+  BOOST_TEST(command->node_id == "sim");
+  BOOST_REQUIRE(command->perf_counter_target);
+  BOOST_CHECK(*command->perf_counter_target == target);
+  BOOST_REQUIRE_EQUAL(command->perf_counter_kinds.size(), 2U);
+  BOOST_TEST(!command->confirmed);
+
+  BOOST_CHECK_THROW(
+      queue.PushPerfCounters(
+          bbp::PerfCounterTarget{.kind = bbp::PerfCounterTargetKind::kNode,
+                                 .id = "firo-1",
+                                 .node_ids = {"firo-1", "firo-2"}},
+          {bbp::PerfCounterKind::kCycles}),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushPerfCounters(
+          bbp::PerfCounterTarget{.kind = bbp::PerfCounterTargetKind::kGroup,
+                                 .id = "all",
+                                 .node_ids = {"firo-1", "firo-1"}},
+          {bbp::PerfCounterKind::kCycles}),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.PushPerfCounters(
+          bbp::PerfCounterTarget{.kind = bbp::PerfCounterTargetKind::kNode,
+                                 .id = "firo-1",
+                                 .node_ids = {"firo-1"}},
+          {bbp::PerfCounterKind::kCycles, bbp::PerfCounterKind::kCycles}),
+      std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
   bbp::SimulationCommandQueue queue;
   queue.PushBlockProductionPolicy(

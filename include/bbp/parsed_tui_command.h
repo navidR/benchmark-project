@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "bbp/block_production_policy.h"
 #include "bbp/mining_difficulty.h"
@@ -22,6 +23,9 @@ struct ParsedTuiCommand {
   std::optional<std::string> profile;
   std::optional<NetworkCondition> network_condition;
   std::optional<SimulationNetworkFlow> network_flow;
+  std::optional<PerfCounterTargetKind> perf_counter_target_kind;
+  std::optional<std::string> perf_counter_target_id;
+  std::vector<PerfCounterKind> perf_counter_kinds;
 };
 
 }  // namespace bbp

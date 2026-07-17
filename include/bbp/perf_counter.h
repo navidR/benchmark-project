@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -27,6 +28,25 @@ enum class PerfCounterKind {
 std::string_view PerfCounterKindName(PerfCounterKind kind);
 std::optional<PerfCounterKind> PerfCounterKindFromName(std::string_view name);
 const std::vector<PerfCounterKind>& DefaultPerfCounterKinds();
+
+enum class PerfCounterTargetKind {
+  kNode,
+  kWallet,
+  kGroup,
+  kCgroup,
+};
+
+std::string_view PerfCounterTargetKindName(PerfCounterTargetKind kind);
+std::optional<PerfCounterTargetKind> PerfCounterTargetKindFromName(
+    std::string_view name);
+
+struct PerfCounterTarget {
+  PerfCounterTargetKind kind = PerfCounterTargetKind::kNode;
+  std::string id;
+  std::vector<std::string> node_ids;
+
+  bool operator==(const PerfCounterTarget&) const = default;
+};
 
 enum class PerfCounterErrorKind {
   kInvalidArgument,
