@@ -87,6 +87,21 @@ BOOST_AUTO_TEST_CASE(process_control_config_rejects_malformed_input) {
               R"({"runtime_node_freezes":[{"node":1,"duration_ms":0}]})"),
           2U),
       std::runtime_error);
+  BOOST_CHECK_THROW(bbp::ParseProcessControlConfig(
+                        ParseObject(R"({"restart_policy":"always"})"), 2U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::ParseProcessControlConfig(
+          ParseObject(
+              R"({"runtime_node_restarts":[{"node":1,"delay_ms":10}]})"),
+          2U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::ParseProcessControlConfig(
+          ParseObject(
+              R"({"runtime_node_freezes":[{"node":1,"duration_ms":10,"persistent":true}]})"),
+          2U),
+      std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(process_control_config_rejects_unrenderable_state) {

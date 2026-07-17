@@ -111,6 +111,32 @@ int PidfdSendSignal(int pidfd, int sig) {
 #endif
 }
 
+void SignalProcessGroupAndLeader(pid_t pid, int pidfd, int signal) {
+  // Spawn establishes a process group whose ID is the leader PID before the
+  // child is released from its start gate. Signal the complete owned group so
+  // daemon helpers receive the same lifecycle request. The pidfd signal keeps
+  // leader selection race-free and covers an unexpectedly missing group.
+  int group_error = 0;
+  if (kill(-pid, signal) != 0 && errno != ESRCH) {
+    group_error = errno;
+  }
+  int leader_error = 0;
+  if (pidfd >= 0) {
+    if (PidfdSendSignal(pidfd, signal) != 0 && errno != ESRCH) {
+      leader_error = errno;
+    }
+  }
+  if (group_error != 0) {
+    throw std::runtime_error(
+        std::string("signal child process group failed: ") +
+        std::strerror(group_error));
+  }
+  if (leader_error != 0) {
+    throw std::runtime_error(std::string("signal child pidfd failed: ") +
+                             std::strerror(leader_error));
+  }
+}
+
 void AttachPidToCgroup(const std::filesystem::path& cgroup, pid_t pid) {
   WriteText(cgroup / "cgroup.procs", std::to_string(pid));
 }
@@ -242,9 +268,13 @@ ChildProcess::ChildProcess(ChildProcess&& other) noexcept {
   *this = std::move(other);
 }
 
-ChildProcess& ChildProcess::operator=(ChildProcess&& other) noexcept {
+ChildProcess& ChildProcess::operator=(ChildProcess&& other) {
   if (this == &other) {
     return *this;
+  }
+  if (running()) {
+    throw std::logic_error(
+        "cannot replace ownership of a running child process");
   }
   if (pidfd_ >= 0) {
     close(pidfd_);
@@ -299,15 +329,9 @@ void ChildProcess::Terminate(std::chrono::milliseconds graceful_timeout) {
   if (!running()) {
     return;
   }
-  if (pidfd_ >= 0 && PidfdSendSignal(pidfd_, SIGTERM) == 0) {
-    if (WaitForExit(graceful_timeout)) {
-      return;
-    }
-  } else {
-    kill(-pid_, SIGTERM);
-    if (WaitForExit(graceful_timeout)) {
-      return;
-    }
+  SignalProcessGroupAndLeader(pid_, pidfd_, SIGTERM);
+  if (WaitForExit(graceful_timeout)) {
+    return;
   }
   Kill();
 }
@@ -316,11 +340,7 @@ void ChildProcess::Kill() {
   if (!running()) {
     return;
   }
-  if (pidfd_ >= 0 && PidfdSendSignal(pidfd_, SIGKILL) == 0) {
-    WaitForExit(std::chrono::seconds(5));
-    return;
-  }
-  kill(-pid_, SIGKILL);
+  SignalProcessGroupAndLeader(pid_, pidfd_, SIGKILL);
   WaitForExit(std::chrono::seconds(5));
 }
 

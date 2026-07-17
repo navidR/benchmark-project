@@ -1,12 +1,12 @@
 #pragma once
 
+#include <sys/types.h>
+
 #include <chrono>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <sys/types.h>
 
 namespace bbp {
 
@@ -28,7 +28,7 @@ class ChildProcess {
   ChildProcess(const ChildProcess&) = delete;
   ChildProcess& operator=(const ChildProcess&) = delete;
   ChildProcess(ChildProcess&& other) noexcept;
-  ChildProcess& operator=(ChildProcess&& other) noexcept;
+  ChildProcess& operator=(ChildProcess&& other);
   ~ChildProcess();
 
   pid_t pid() const { return pid_; }

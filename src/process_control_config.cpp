@@ -82,6 +82,15 @@ ProcessControlConfig ParseProcessControlConfig(
                              " requires at least one node");
   }
 
+  for (const auto& member : object) {
+    if (member.key() != "runtime_node_restarts" &&
+        member.key() != "runtime_node_freezes") {
+      throw std::runtime_error(
+          std::string(context) +
+          " has unsupported field: " + std::string(member.key()));
+    }
+  }
+
   ProcessControlConfig config;
   if (const boost::json::array* restarts =
           OptionalArray(object, "runtime_node_restarts", context)) {
@@ -89,6 +98,14 @@ ProcessControlConfig ParseProcessControlConfig(
     for (const boost::json::value& value : *restarts) {
       const boost::json::object& restart =
           RequireEntryObject(value, "runtime_node_restarts", context);
+      for (const auto& member : restart) {
+        if (member.key() != "node") {
+          throw std::runtime_error(
+              std::string(context) +
+              ".runtime_node_restarts entry has unsupported field: " +
+              std::string(member.key()));
+        }
+      }
       config.restart_node_indexes.push_back(ParseNodeIndex(
           restart, node_count, "runtime_node_restarts", context));
     }
@@ -100,6 +117,14 @@ ProcessControlConfig ParseProcessControlConfig(
     for (const boost::json::value& value : *freezes) {
       const boost::json::object& freeze =
           RequireEntryObject(value, "runtime_node_freezes", context);
+      for (const auto& member : freeze) {
+        if (member.key() != "node" && member.key() != "duration_ms") {
+          throw std::runtime_error(
+              std::string(context) +
+              ".runtime_node_freezes entry has unsupported field: " +
+              std::string(member.key()));
+        }
+      }
       const std::uint32_t node_index =
           ParseNodeIndex(freeze, node_count, "runtime_node_freezes", context);
       const std::uint32_t duration_ms =

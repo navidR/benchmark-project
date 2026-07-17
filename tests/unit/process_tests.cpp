@@ -7,14 +7,17 @@
 #include <array>
 #include <boost/test/unit_test.hpp>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "bbp/process.h"
+#include "bbp/util.h"
 
 namespace {
 
@@ -203,6 +206,64 @@ std::string ReadLink(const std::string& path) {
   return std::string(buffer.data(), static_cast<size_t>(size));
 }
 
+bool WaitForFile(const std::filesystem::path& path,
+                 std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (std::filesystem::exists(path)) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return std::filesystem::exists(path);
+}
+
+pid_t ReadPid(const std::filesystem::path& path) {
+  const std::string text = bbp::ReadText(path);
+  pid_t pid = -1;
+  const char* const begin = text.data();
+  const char* const end = begin + text.size();
+  const auto [next, error] = std::from_chars(begin, end, pid);
+  if (error != std::errc() || next != end || pid <= 0) {
+    throw std::runtime_error("process-tree helper wrote an invalid PID");
+  }
+  return pid;
+}
+
+std::optional<char> ProcessState(pid_t pid) {
+  try {
+    const std::string stat =
+        bbp::ReadText("/proc/" + std::to_string(pid) + "/stat");
+    const std::size_t name_end = stat.rfind(')');
+    if (name_end == std::string::npos || name_end + 2U >= stat.size() ||
+        stat[name_end + 1U] != ' ') {
+      throw std::runtime_error("malformed process stat");
+    }
+    return stat[name_end + 2U];
+  } catch (const std::filesystem::filesystem_error&) {
+    return std::nullopt;
+  } catch (const std::runtime_error&) {
+    if (access(("/proc/" + std::to_string(pid)).c_str(), F_OK) != 0 &&
+        errno == ENOENT) {
+      return std::nullopt;
+    }
+    throw;
+  }
+}
+
+bool WaitForProcessGoneOrZombie(pid_t pid, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const std::optional<char> state = ProcessState(pid);
+    if (!state || *state == 'Z') {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const std::optional<char> state = ProcessState(pid);
+  return !state || *state == 'Z';
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(child_process_enters_configured_network_namespace) {
@@ -294,5 +355,121 @@ BOOST_AUTO_TEST_CASE(child_process_resolves_relative_binary_before_chdir) {
   BOOST_REQUIRE(WIFEXITED(*status));
   BOOST_TEST(WEXITSTATUS(*status) == 0);
 
+  std::filesystem::remove_all(run_dir);
+}
+
+BOOST_AUTO_TEST_CASE(child_process_termination_signals_complete_process_group) {
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-group-" + std::to_string(getpid()));
+  std::filesystem::remove_all(run_dir);
+  std::filesystem::create_directories(run_dir);
+  const std::filesystem::path descendant_pid_path = run_dir / "descendant.pid";
+  const std::filesystem::path leader_marker = run_dir / "leader.term";
+  const std::filesystem::path descendant_marker = run_dir / "descendant.term";
+  const std::filesystem::path helper =
+      std::filesystem::canonical("/proc/self/exe").parent_path() /
+      "bbp-process-tree-helper";
+
+  bbp::ProcessSpec spec;
+  spec.binary = helper;
+  spec.argv = {descendant_pid_path.string(), leader_marker.string(),
+               descendant_marker.string()};
+  spec.cwd = run_dir;
+  spec.stdout_path = run_dir / "stdout.log";
+  spec.stderr_path = run_dir / "stderr.log";
+
+  bbp::ChildProcess child = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  if (!WaitForFile(descendant_pid_path, std::chrono::seconds(2))) {
+    child.Kill();
+    std::filesystem::remove_all(run_dir);
+    BOOST_FAIL("process-tree helper did not report its descendant");
+  }
+  const pid_t descendant = ReadPid(descendant_pid_path);
+  BOOST_REQUIRE_EQUAL(getpgid(descendant), child.pid());
+
+  child.Terminate(std::chrono::seconds(2));
+  const bool leader_signalled =
+      WaitForFile(leader_marker, std::chrono::seconds(1));
+  const bool descendant_signalled =
+      WaitForFile(descendant_marker, std::chrono::seconds(1));
+  if (!descendant_signalled) {
+    kill(descendant, SIGKILL);
+  }
+  BOOST_TEST(leader_signalled);
+  BOOST_TEST(descendant_signalled);
+  const std::optional<int> status = child.exit_status();
+  BOOST_REQUIRE(status);
+  BOOST_REQUIRE(WIFEXITED(*status));
+  BOOST_TEST(WEXITSTATUS(*status) == 0);
+  std::filesystem::remove_all(run_dir);
+}
+
+BOOST_AUTO_TEST_CASE(child_process_move_assignment_refuses_live_owner_loss) {
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-move-" + std::to_string(getpid()));
+  std::filesystem::remove_all(run_dir);
+  std::filesystem::create_directories(run_dir);
+
+  const auto spawn = [&](std::string_view name) {
+    bbp::ProcessSpec spec;
+    spec.binary = "/bin/sleep";
+    spec.argv = {"10"};
+    spec.cwd = run_dir;
+    spec.stdout_path = run_dir / (std::string(name) + ".out");
+    spec.stderr_path = run_dir / (std::string(name) + ".err");
+    return bbp::ChildProcess::Spawn(spec, std::nullopt);
+  };
+
+  bbp::ChildProcess first = spawn("first");
+  bbp::ChildProcess second = spawn("second");
+  BOOST_CHECK_THROW(first = std::move(second), std::logic_error);
+  BOOST_TEST(first.running());
+  BOOST_TEST(second.running());
+  first.Kill();
+  second.Kill();
+  std::filesystem::remove_all(run_dir);
+}
+
+BOOST_AUTO_TEST_CASE(child_process_timeout_force_kills_complete_process_group) {
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-group-kill-" + std::to_string(getpid()));
+  std::filesystem::remove_all(run_dir);
+  std::filesystem::create_directories(run_dir);
+  const std::filesystem::path descendant_pid_path = run_dir / "descendant.pid";
+  const std::filesystem::path helper =
+      std::filesystem::canonical("/proc/self/exe").parent_path() /
+      "bbp-process-tree-helper";
+
+  bbp::ProcessSpec spec;
+  spec.binary = helper;
+  spec.argv = {descendant_pid_path.string(), (run_dir / "leader.term").string(),
+               (run_dir / "descendant.term").string(), "--ignore-term"};
+  spec.cwd = run_dir;
+  spec.stdout_path = run_dir / "stdout.log";
+  spec.stderr_path = run_dir / "stderr.log";
+
+  bbp::ChildProcess child = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  if (!WaitForFile(descendant_pid_path, std::chrono::seconds(2))) {
+    child.Kill();
+    std::filesystem::remove_all(run_dir);
+    BOOST_FAIL("process-tree helper did not report its descendant");
+  }
+  const pid_t descendant = ReadPid(descendant_pid_path);
+  BOOST_REQUIRE_EQUAL(getpgid(descendant), child.pid());
+
+  child.Terminate(std::chrono::milliseconds(50));
+  const bool descendant_stopped =
+      WaitForProcessGoneOrZombie(descendant, std::chrono::seconds(1));
+  if (!descendant_stopped) {
+    kill(descendant, SIGKILL);
+  }
+  BOOST_TEST(descendant_stopped);
+  const std::optional<int> status = child.exit_status();
+  BOOST_REQUIRE(status);
+  BOOST_REQUIRE(WIFSIGNALED(*status));
+  BOOST_TEST(WTERMSIG(*status) == SIGKILL);
   std::filesystem::remove_all(run_dir);
 }

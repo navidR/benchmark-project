@@ -293,6 +293,17 @@ target_compile_options(bbp PRIVATE
 )
 
 if(BUILD_TESTING)
+  add_executable(bbp-process-tree-helper
+    tests/helpers/process_tree_helper.cpp
+  )
+  target_compile_options(bbp-process-tree-helper PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion
+    -Werror
+  )
+
   add_executable(bbp-unit-tests
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
@@ -396,6 +407,7 @@ if(BUILD_TESTING)
     src/wallet_funding_strategy.cpp
     src/wallet_transaction_plan.cpp
   )
+  add_dependencies(bbp-unit-tests bbp-process-tree-helper)
   target_include_directories(bbp-unit-tests PRIVATE include)
   target_compile_definitions(bbp-unit-tests PRIVATE
     BBP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
