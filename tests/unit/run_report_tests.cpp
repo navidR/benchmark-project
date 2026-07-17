@@ -1642,3 +1642,131 @@ BOOST_AUTO_TEST_CASE(
 
   std::filesystem::remove_all(dir);
 }
+
+BOOST_AUTO_TEST_CASE(
+    incremental_run_report_bounds_refresh_work_and_matches_full_report) {
+  const std::filesystem::path dir = MakeTestDir("run-report-incremental");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"incremental","chain":"firo","nodes":1,"node_configs":[{"index":1,"id":"firo-1","chain":"firo","role":"wallet"}]})");
+
+  constexpr std::uint64_t kInitialRecords = 1024U;
+  for (std::uint64_t index = 0; index < kInitialRecords; ++index) {
+    bbp::AppendLine(
+        dir / "events.jsonl",
+        R"({"run_id":"incremental","node_id":"sim","event":"unrecognized_test_event","detail":")" +
+            std::to_string(index) + R"("})");
+    bbp::AppendLine(
+        dir / "metrics.jsonl",
+        R"({"run_id":"incremental","node_id":"firo-1","node_index":1,"chain":"firo","role":"wallet","timestamp_ms":)" +
+            std::to_string(1000U + index) + R"(,"cpu_usage_usec":)" +
+            std::to_string(index) + R"(,"network_rx_bytes":)" +
+            std::to_string(index * 2U) + R"(,"network_tx_bytes":)" +
+            std::to_string(index * 3U) + "}");
+  }
+  bbp::AppendLine(
+      dir / "wallet-metrics.jsonl",
+      R"({"run_id":"incremental","wallet_index":1,"node":1,"mode":"public","available_balance_satoshis":100})");
+
+  bbp::IncrementalRunReport incremental(dir);
+  constexpr std::size_t kBatchSize = 64U;
+  const boost::json::object* report = nullptr;
+  std::uint64_t refresh_count = 0U;
+  do {
+    report = &incremental.Refresh(kBatchSize);
+    const bbp::RunReportRefreshStats& stats = incremental.last_refresh_stats();
+    BOOST_TEST(stats.event_records <= kBatchSize);
+    BOOST_TEST(stats.metric_records <= kBatchSize);
+    BOOST_TEST(stats.wallet_metric_records <= kBatchSize);
+    ++refresh_count;
+  } while (incremental.last_refresh_stats().has_backlog);
+
+  BOOST_REQUIRE(report != nullptr);
+  BOOST_TEST(refresh_count == kInitialRecords / kBatchSize);
+  BOOST_TEST(JsonInteger(*report, "event_count") == kInitialRecords);
+  BOOST_TEST(JsonInteger(*report, "metric_count") == kInitialRecords);
+
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"incremental","node_id":"sim","event":"run_finished","timestamp":"2026-07-17T12:00:00Z"})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"incremental","node_id":"firo-1","node_index":1,"chain":"firo","role":"wallet","timestamp_ms":3000,"cpu_usage_usec":2000,"network_rx_bytes":4000,"network_tx_bytes":6000})");
+  bbp::AppendLine(
+      dir / "wallet-metrics.jsonl",
+      R"({"run_id":"incremental","wallet_index":1,"node":1,"mode":"public","available_balance_satoshis":200})");
+
+  const boost::json::object& updated = incremental.Refresh(kBatchSize);
+  const bbp::RunReportRefreshStats& update_stats =
+      incremental.last_refresh_stats();
+  BOOST_TEST(update_stats.event_records == 1U);
+  BOOST_TEST(update_stats.metric_records == 1U);
+  BOOST_TEST(update_stats.wallet_metric_records == 1U);
+  BOOST_TEST(!update_stats.has_backlog);
+  BOOST_TEST(JsonInteger(updated, "event_count") == kInitialRecords + 1U);
+  BOOST_TEST(JsonInteger(updated, "metric_count") == kInitialRecords + 1U);
+
+  const boost::json::object full = bbp::BuildRunReport(dir);
+  BOOST_TEST(updated == full);
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(incremental_run_report_waits_for_complete_jsonl_lines) {
+  const std::filesystem::path dir = MakeTestDir("run-report-partial-line");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"partial-line","nodes":0})");
+  bbp::WriteText(
+      dir / "events.jsonl",
+      R"({"run_id":"partial-line","node_id":"sim","event":"run_started"})");
+
+  bbp::IncrementalRunReport incremental(dir);
+  const boost::json::object& incomplete = incremental.Refresh(16U);
+  BOOST_TEST(JsonInteger(incomplete, "event_count") == 0U);
+  BOOST_TEST(incremental.last_refresh_stats().event_records == 0U);
+  BOOST_TEST(incremental.last_refresh_stats().has_backlog);
+
+  bbp::AppendLine(dir / "events.jsonl", "");
+  const boost::json::object& complete = incremental.Refresh(16U);
+  BOOST_TEST(JsonInteger(complete, "event_count") == 1U);
+  BOOST_TEST(incremental.last_refresh_stats().event_records == 1U);
+  BOOST_TEST(!incremental.last_refresh_stats().has_backlog);
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(incremental_run_report_replays_atomically_replaced_input) {
+  const std::filesystem::path dir = MakeTestDir("run-report-replaced-input");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"replaced-input","nodes":0})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"replaced-input","node_id":"sim","event":"run_started"})");
+
+  bbp::IncrementalRunReport incremental(dir);
+  BOOST_TEST(JsonInteger(incremental.Refresh(), "event_count") == 1U);
+
+  const std::filesystem::path replacement = dir / "replacement.jsonl";
+  bbp::AppendLine(
+      replacement,
+      R"({"run_id":"replaced-input","node_id":"sim","event":"run_started","timestamp":"2026-07-17T12:00:00Z"})");
+  bbp::AppendLine(
+      replacement,
+      R"({"run_id":"replaced-input","node_id":"sim","event":"run_finished","timestamp":"2026-07-17T12:00:01Z"})");
+  std::filesystem::rename(replacement, dir / "events.jsonl");
+
+  const boost::json::object& replayed = incremental.Refresh();
+  BOOST_TEST(JsonInteger(replayed, "event_count") == 2U);
+  BOOST_TEST(bbp::JsonString(replayed, "status") == "finished");
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(incremental_run_report_does_not_skip_invalid_jsonl) {
+  const std::filesystem::path dir = MakeTestDir("run-report-invalid-jsonl");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"invalid-jsonl","nodes":0})");
+  bbp::AppendLine(dir / "events.jsonl", "not-json");
+
+  bbp::IncrementalRunReport incremental(dir);
+  BOOST_CHECK_THROW(incremental.Refresh(), std::exception);
+  BOOST_CHECK_THROW(incremental.Refresh(), std::exception);
+  std::filesystem::remove_all(dir);
+}

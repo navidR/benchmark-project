@@ -1,11 +1,14 @@
 #include "bbp/run_report.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
+#include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -1753,22 +1757,531 @@ void AppendOperatorCommandSummary(const boost::json::object& event,
 
 }  // namespace
 
-std::string BuildRunReportJson(const std::filesystem::path& run_root) {
-  if (!std::filesystem::is_directory(run_root)) {
-    throw std::runtime_error("run root is not a directory: " +
-                             run_root.string());
+struct IncrementalRunReport::Impl {
+  struct FileObservation {
+    std::uintmax_t device = 0;
+    std::uintmax_t inode = 0;
+    std::uintmax_t size = 0;
+    std::int64_t modified_seconds = 0;
+    std::int64_t modified_nanoseconds = 0;
+  };
+
+  struct InputCursor {
+    std::uint64_t offset = 0;
+    std::uint64_t line_number = 0;
+    FileObservation observation;
+    bool observed_exists = false;
+  };
+
+  explicit Impl(std::filesystem::path root) : run_root(std::move(root)) {
+    if (!std::filesystem::is_directory(run_root)) {
+      throw std::runtime_error("run root is not a directory: " +
+                               run_root.string());
+    }
+    Reset();
   }
 
+  boost::json::array& Array(std::string_view field) {
+    boost::json::value* value = report.if_contains(field);
+    if (value == nullptr || !value->is_array()) {
+      report[field] = boost::json::array{};
+      value = report.if_contains(field);
+    }
+    return value->as_array();
+  }
+
+  void Reset() {
+    report = {};
+    report["run_root"] = std::filesystem::absolute(run_root).string();
+    LoadResolvedScenario(run_root / "resolved-scenario.json", &report);
+
+    boost::json::array topology_current_edges;
+    const boost::json::value* topology_initial_edges =
+        report.if_contains("topology_initial_edges");
+    if (topology_initial_edges != nullptr &&
+        topology_initial_edges->is_array()) {
+      topology_current_edges = topology_initial_edges->as_array();
+    }
+    report["topology_current_edges"] = std::move(topology_current_edges);
+
+    constexpr std::string_view kArrayFields[] = {
+        "generated_blocks",
+        "scheduled_blocks",
+        "scheduled_events_started",
+        "scheduled_events_completed",
+        "scheduled_events_failed",
+        "checkpoints",
+        "height_reached",
+        "height_waits",
+        "peer_waits",
+        "peer_connects",
+        "peer_disconnects",
+        "raw_transactions",
+        "transaction_visibility",
+        "transaction_confirmations",
+        "node_restarts",
+        "node_freezes",
+        "resource_updates",
+        "resource_profile_updates",
+        "network_profile_updates",
+        "profile_update_rollback_failures",
+        "network_condition_updates",
+        "network_blocks",
+        "network_unblocks",
+        "network_partitions",
+        "network_partition_heals",
+        "directional_network_policy_verifications",
+        "topology_edge_updates",
+        "topology_edge_rollback_failures",
+        "wallet_funding",
+        "wallet_transactions",
+        "operator_commands",
+    };
+    for (const std::string_view field : kArrayFields) {
+      report[field] = boost::json::array{};
+    }
+
+    event_count = 0;
+    metric_count = 0;
+    scheduled_block_count = 0;
+    scheduled_event_started_count = 0;
+    scheduled_event_completed_count = 0;
+    scheduled_event_failed_count = 0;
+    checkpoint_count = 0;
+    run_started = false;
+    run_finished = false;
+    run_failed = false;
+    simulation_duration_reached = false;
+    event_counts.clear();
+    nodes.clear();
+    wallets.clear();
+    active_network_partitions.clear();
+    event_cursor = {};
+    metric_cursor = {};
+    wallet_metric_cursor = {};
+    stats = {};
+    RememberScenarioFile();
+    UpdateReport();
+  }
+
+  void RememberScenarioFile() {
+    const std::filesystem::path path = run_root / "resolved-scenario.json";
+    scenario_exists = std::filesystem::exists(path);
+    if (!scenario_exists) {
+      scenario_size = 0;
+      scenario_write_time.reset();
+      return;
+    }
+    scenario_size = std::filesystem::file_size(path);
+    scenario_write_time = std::filesystem::last_write_time(path);
+  }
+
+  bool ScenarioFileChanged() const {
+    const std::filesystem::path path = run_root / "resolved-scenario.json";
+    const bool exists = std::filesystem::exists(path);
+    if (exists != scenario_exists) {
+      return true;
+    }
+    if (!exists) {
+      return false;
+    }
+    return std::filesystem::file_size(path) != scenario_size ||
+           std::filesystem::last_write_time(path) != scenario_write_time;
+  }
+
+  static std::optional<FileObservation> ObserveFile(
+      const std::filesystem::path& path) {
+    struct stat status {};
+    if (::stat(path.c_str(), &status) != 0) {
+      const int error = errno;
+      if (error == ENOENT) {
+        return std::nullopt;
+      }
+      throw std::filesystem::filesystem_error(
+          "stat failed", path, std::error_code(error, std::generic_category()));
+    }
+    if (!S_ISREG(status.st_mode) || status.st_size < 0) {
+      throw std::runtime_error("JSONL input is not a regular file: " +
+                               path.string());
+    }
+    return FileObservation{
+        .device = static_cast<std::uintmax_t>(status.st_dev),
+        .inode = static_cast<std::uintmax_t>(status.st_ino),
+        .size = static_cast<std::uintmax_t>(status.st_size),
+        .modified_seconds = static_cast<std::int64_t>(status.st_mtim.tv_sec),
+        .modified_nanoseconds =
+            static_cast<std::int64_t>(status.st_mtim.tv_nsec),
+    };
+  }
+
+  static bool SameFile(const FileObservation& left,
+                       const FileObservation& right) {
+    return left.device == right.device && left.inode == right.inode;
+  }
+
+  bool InputFileWasReplaced(const std::filesystem::path& path,
+                            const InputCursor& cursor) const {
+    const std::optional<FileObservation> current = ObserveFile(path);
+    if (!cursor.observed_exists) {
+      return false;
+    }
+    if (!current) {
+      return true;
+    }
+    if (!SameFile(*current, cursor.observation) ||
+        current->size < cursor.observation.size ||
+        current->size < cursor.offset) {
+      return true;
+    }
+    return current->size == cursor.observation.size &&
+           (current->modified_seconds != cursor.observation.modified_seconds ||
+            current->modified_nanoseconds !=
+                cursor.observation.modified_nanoseconds);
+  }
+
+  bool AnyInputFileWasReplaced() const {
+    return InputFileWasReplaced(run_root / "events.jsonl", event_cursor) ||
+           InputFileWasReplaced(run_root / "metrics.jsonl", metric_cursor) ||
+           InputFileWasReplaced(run_root / "wallet-metrics.jsonl",
+                                wallet_metric_cursor);
+  }
+
+  template <typename Callback>
+  bool ConsumeFile(const std::filesystem::path& path, InputCursor* cursor,
+                   std::size_t maximum_records, std::uint64_t* records_read,
+                   Callback callback) {
+    const std::optional<FileObservation> initial_observation =
+        ObserveFile(path);
+    if (!initial_observation) {
+      cursor->observed_exists = false;
+      cursor->observation = {};
+      return false;
+    }
+    if (cursor->offset > static_cast<std::uint64_t>(
+                             std::numeric_limits<std::streamoff>::max())) {
+      throw std::runtime_error("JSONL offset exceeds stream range for " +
+                               path.string());
+    }
+
+    std::ifstream input(path);
+    if (!input) {
+      throw std::runtime_error("open failed for " + path.string());
+    }
+    input.seekg(static_cast<std::streamoff>(cursor->offset));
+    if (!input) {
+      throw std::runtime_error("seek failed for " + path.string());
+    }
+
+    std::string line;
+    std::size_t lines_consumed = 0;
+    while (lines_consumed < maximum_records) {
+      const std::uint64_t line_offset = cursor->offset;
+      if (!std::getline(input, line)) {
+        break;
+      }
+      if (input.eof()) {
+        cursor->offset = line_offset;
+        break;
+      }
+      const std::streampos next_offset = input.tellg();
+      if (next_offset < 0) {
+        throw std::runtime_error("tell failed for " + path.string());
+      }
+      const std::uint64_t next_line_number = cursor->line_number + 1U;
+      if (!line.empty()) {
+        const boost::json::object object =
+            ParseJsonObjectLine(path, line, next_line_number);
+        callback(object);
+        ++*records_read;
+      }
+      cursor->offset = static_cast<std::uint64_t>(next_offset);
+      cursor->line_number = next_line_number;
+      ++lines_consumed;
+    }
+
+    cursor->observed_exists = true;
+    const std::optional<FileObservation> final_observation = ObserveFile(path);
+    if (!final_observation ||
+        !SameFile(*initial_observation, *final_observation)) {
+      cursor->observation = *initial_observation;
+      return true;
+    }
+    cursor->observation = *final_observation;
+    return cursor->offset < cursor->observation.size;
+  }
+
+  void ProcessEvent(const boost::json::object& event) {
+    ++event_count;
+    const std::string event_name = OptionalStringField(event, "event");
+    const std::string node_id = OptionalStringField(event, "node_id");
+    ++event_counts[event_name];
+    const std::optional<SimulationEventKind> event_kind =
+        SimulationEventKindFromName(event_name);
+    if (!event_kind) {
+      return;
+    }
+    if (!node_id.empty() && node_id != "sim" && IsNodeErrorEvent(*event_kind)) {
+      nodes[node_id].last_error = NodeErrorText(event);
+    }
+    switch (*event_kind) {
+      case SimulationEventKind::kRunStarted:
+        run_started = true;
+        report["started_at"] = OptionalStringField(event, "timestamp");
+        break;
+      case SimulationEventKind::kRunFinished:
+        run_finished = true;
+        report["finished_at"] = OptionalStringField(event, "timestamp");
+        break;
+      case SimulationEventKind::kRunFailed: {
+        run_failed = true;
+        report["failed_at"] = OptionalStringField(event, "timestamp");
+        boost::json::value detail = ParseEventDetail(event);
+        if (!detail.is_null()) {
+          report["failure"] = std::move(detail);
+        }
+        break;
+      }
+      case SimulationEventKind::kSimulationDurationReached: {
+        simulation_duration_reached = true;
+        boost::json::value detail = ParseEventDetail(event);
+        if (!detail.is_null()) {
+          report["simulation_duration"] = std::move(detail);
+        }
+        break;
+      }
+      case SimulationEventKind::kState:
+        if (!node_id.empty()) {
+          RememberNodeState(OptionalStringField(event, "detail"),
+                            &nodes[node_id]);
+        }
+        break;
+      case SimulationEventKind::kStdoutTail:
+      case SimulationEventKind::kStderrTail:
+      case SimulationEventKind::kDaemonLogTail:
+        if (!node_id.empty()) {
+          const std::optional<std::string_view> log_kind =
+              LogTailKind(*event_kind);
+          RememberLogTail(ParseEventDetail(event), *log_kind,
+                          &nodes[node_id].log_tails);
+        }
+        break;
+      case SimulationEventKind::kGeneratedBlocks:
+        AppendEventSummary(event, &Array("generated_blocks"));
+        break;
+      case SimulationEventKind::kScheduledBlockProduced:
+        ++scheduled_block_count;
+        AppendScheduledBlockSummary(event, &Array("scheduled_blocks"));
+        break;
+      case SimulationEventKind::kScheduledEventStarted:
+        ++scheduled_event_started_count;
+        AppendScheduledEventSummary(event, &Array("scheduled_events_started"));
+        break;
+      case SimulationEventKind::kScheduledEventCompleted:
+        ++scheduled_event_completed_count;
+        AppendScheduledEventSummary(event,
+                                    &Array("scheduled_events_completed"));
+        break;
+      case SimulationEventKind::kScheduledEventFailed:
+        ++scheduled_event_failed_count;
+        AppendScheduledEventSummary(event, &Array("scheduled_events_failed"));
+        break;
+      case SimulationEventKind::kCheckpointRecorded:
+        ++checkpoint_count;
+        AppendCheckpointSummary(event, &Array("checkpoints"));
+        break;
+      case SimulationEventKind::kHeightReached:
+        AppendEventSummary(event, &Array("height_reached"));
+        break;
+      case SimulationEventKind::kHeightWaitReached:
+        AppendEventSummary(event, &Array("height_waits"));
+        break;
+      case SimulationEventKind::kPeerCountReached:
+        AppendEventSummary(event, &Array("peer_waits"));
+        break;
+      case SimulationEventKind::kPeerConnected:
+        AppendEventSummary(event, &Array("peer_connects"));
+        break;
+      case SimulationEventKind::kPeerDisconnected:
+        AppendEventSummary(event, &Array("peer_disconnects"));
+        break;
+      case SimulationEventKind::kRawTransactionSubmitted:
+        AppendEventSummary(event, &Array("raw_transactions"));
+        break;
+      case SimulationEventKind::kTransactionVisible:
+        AppendEventSummary(event, &Array("transaction_visibility"));
+        break;
+      case SimulationEventKind::kTransactionConfirmed:
+        AppendEventSummary(event, &Array("transaction_confirmations"));
+        break;
+      case SimulationEventKind::kNodeRestarted:
+        AppendEventSummary(event, &Array("node_restarts"));
+        break;
+      case SimulationEventKind::kNodeFreezeCompleted:
+        AppendEventSummary(event, &Array("node_freezes"));
+        break;
+      case SimulationEventKind::kResourceLimitsUpdated:
+        AppendEventSummary(event, &Array("resource_updates"));
+        break;
+      case SimulationEventKind::kResourceProfileUpdated:
+        AppendBoundedProfileUpdateSummary(event,
+                                          &Array("resource_profile_updates"));
+        break;
+      case SimulationEventKind::kNetworkProfileUpdated:
+        AppendBoundedProfileUpdateSummary(event,
+                                          &Array("network_profile_updates"));
+        break;
+      case SimulationEventKind::kProfileUpdateRollbackFailed:
+        AppendBoundedProfileUpdateSummary(
+            event, &Array("profile_update_rollback_failures"));
+        break;
+      case SimulationEventKind::kNetworkConditionUpdated:
+        AppendEventSummary(event, &Array("network_condition_updates"));
+        break;
+      case SimulationEventKind::kNetworkBlockApplied:
+        AppendEventSummary(event, &Array("network_blocks"));
+        break;
+      case SimulationEventKind::kNetworkBlockRemoved:
+        AppendEventSummary(event, &Array("network_unblocks"));
+        break;
+      case SimulationEventKind::kNetworkPartitionApplied:
+        AppendEventSummary(event, &Array("network_partitions"));
+        RememberActivePartition(event, true, &active_network_partitions);
+        break;
+      case SimulationEventKind::kNetworkPartitionHealed:
+        AppendEventSummary(event, &Array("network_partition_heals"));
+        RememberActivePartition(event, false, &active_network_partitions);
+        break;
+      case SimulationEventKind::kDirectionalNetworkPoliciesVerified:
+        AppendDirectionalPolicyVerification(
+            event, &Array("directional_network_policy_verifications"));
+        break;
+      case SimulationEventKind::kTopologyEdgeUpdated:
+        RememberTopologyEdgeUpdate(event, &Array("topology_edge_updates"),
+                                   &Array("topology_current_edges"));
+        break;
+      case SimulationEventKind::kTopologyEdgeUpdateRollbackFailed:
+        AppendBoundedTopologyEdgeSummary(
+            event, &Array("topology_edge_rollback_failures"));
+        break;
+      case SimulationEventKind::kWalletAddressRequested:
+      case SimulationEventKind::kWalletAddressCreated:
+        RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
+        break;
+      case SimulationEventKind::kWalletFunded: {
+        boost::json::value detail = ParseEventDetail(event);
+        RememberWalletFundingEvent(detail, &wallets);
+        AppendEventSummary(event, &Array("wallet_funding"));
+        break;
+      }
+      case SimulationEventKind::kWalletTransactionSubmitted: {
+        boost::json::value detail = ParseEventDetail(event);
+        RememberWalletTransactionEvent(detail, &wallets);
+        AppendEventSummary(event, &Array("wallet_transactions"));
+        break;
+      }
+      case SimulationEventKind::kOperatorCommandCompleted:
+        AppendOperatorCommandSummary(event, OperatorCommandStatus::kCompleted,
+                                     &Array("operator_commands"));
+        ApplyBlockProductionPolicyEvent(event, &report);
+        break;
+      case SimulationEventKind::kOperatorCommandFailed:
+        AppendOperatorCommandSummary(event, OperatorCommandStatus::kFailed,
+                                     &Array("operator_commands"));
+        break;
+      default:
+        break;
+    }
+  }
+
+  void ProcessMetric(const boost::json::object& metric) {
+    ++metric_count;
+    const std::string node_id = OptionalStringField(metric, "node_id");
+    if (node_id.empty()) {
+      return;
+    }
+    NodeReport& node = nodes[node_id];
+    if (!node.index) {
+      node.index = OptionalUint64Field(metric, "node_index");
+    }
+    if (node.chain.empty()) {
+      node.chain = OptionalStringField(metric, "chain");
+    }
+    if (node.role.empty()) {
+      node.role = OptionalStringField(metric, "role");
+    }
+    ++node.metric_samples;
+    node.last_metrics = {};
+    CopySelectedMetricFields(metric, &node.last_metrics);
+    AddNodeDerivedMetrics(metric, node, &node.last_metrics);
+    AppendNodeMetricHistory(node.last_metrics, &node);
+    RememberNodeMetricSample(metric, &node);
+  }
+
+  void ProcessWalletMetric(const boost::json::object& metric) {
+    const std::optional<std::uint64_t> wallet_index =
+        OptionalUint64Field(metric, "wallet_index");
+    if (!wallet_index || *wallet_index == 0U) {
+      return;
+    }
+    WalletReport& wallet = wallets[*wallet_index];
+    wallet.wallet_index = *wallet_index;
+    CopyOptionalUint64Field(metric, "node", &wallet.node);
+    CopyOptionalWalletModeField(metric, "mode", &wallet);
+    wallet.last_metrics = metric;
+  }
+
+  void UpdateReport() {
+    const bool ok = run_started && run_finished && !run_failed;
+    const RunReportStatus status =
+        ok ? RunReportStatus::kFinished
+           : (run_failed ? RunReportStatus::kFailed
+                         : RunReportStatus::kIncomplete);
+    SeedConfiguredNodes(report, &nodes);
+    report["ok"] = ok;
+    report["status"] = RunReportStatusName(status);
+    report["simulation_duration_reached"] = simulation_duration_reached;
+    report["event_count"] = event_count;
+    report["metric_count"] = metric_count;
+    report["event_counts"] = EventCountsJson(event_counts);
+    report["scheduled_block_count"] = scheduled_block_count;
+    report["scheduled_event_started_count"] = scheduled_event_started_count;
+    report["scheduled_event_completed_count"] = scheduled_event_completed_count;
+    report["scheduled_event_failed_count"] = scheduled_event_failed_count;
+    report["checkpoint_count"] = checkpoint_count;
+    report["active_network_partitions"] =
+        ActivePartitionsJson(active_network_partitions);
+    report["wallets_summary"] = WalletsJson(wallets);
+    report["nodes_summary"] = NodesJson(nodes);
+    AddTopologyViewSummaries(&report);
+  }
+
+  const boost::json::object& Refresh(std::size_t maximum_records_per_file) {
+    if (ScenarioFileChanged() || AnyInputFileWasReplaced()) {
+      Reset();
+    }
+    stats = {};
+    const bool event_backlog = ConsumeFile(
+        run_root / "events.jsonl", &event_cursor, maximum_records_per_file,
+        &stats.event_records,
+        [this](const boost::json::object& event) { ProcessEvent(event); });
+    const bool metric_backlog = ConsumeFile(
+        run_root / "metrics.jsonl", &metric_cursor, maximum_records_per_file,
+        &stats.metric_records,
+        [this](const boost::json::object& metric) { ProcessMetric(metric); });
+    const bool wallet_metric_backlog =
+        ConsumeFile(run_root / "wallet-metrics.jsonl", &wallet_metric_cursor,
+                    maximum_records_per_file, &stats.wallet_metric_records,
+                    [this](const boost::json::object& metric) {
+                      ProcessWalletMetric(metric);
+                    });
+    stats.has_backlog =
+        event_backlog || metric_backlog || wallet_metric_backlog;
+    UpdateReport();
+    return report;
+  }
+
+  std::filesystem::path run_root;
   boost::json::object report;
-  report["run_root"] = std::filesystem::absolute(run_root).string();
-  LoadResolvedScenario(run_root / "resolved-scenario.json", &report);
-  boost::json::array topology_current_edges;
-  const boost::json::value* topology_initial_edges =
-      report.if_contains("topology_initial_edges");
-  if (topology_initial_edges != nullptr && topology_initial_edges->is_array()) {
-    topology_current_edges = topology_initial_edges->as_array();
-  }
-
   std::uint64_t event_count = 0;
   std::uint64_t metric_count = 0;
   std::uint64_t scheduled_block_count = 0;
@@ -1780,333 +2293,47 @@ std::string BuildRunReportJson(const std::filesystem::path& run_root) {
   bool run_finished = false;
   bool run_failed = false;
   bool simulation_duration_reached = false;
-  std::string started_at;
-  std::string finished_at;
-  std::string failed_at;
-  boost::json::value failure_detail;
-  boost::json::value simulation_duration_detail;
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;
-  boost::json::array generated_blocks;
-  boost::json::array scheduled_blocks;
-  boost::json::array scheduled_events_started;
-  boost::json::array scheduled_events_completed;
-  boost::json::array scheduled_events_failed;
-  boost::json::array checkpoints;
-  boost::json::array height_reached;
-  boost::json::array height_waits;
-  boost::json::array peer_waits;
-  boost::json::array peer_connects;
-  boost::json::array peer_disconnects;
-  boost::json::array raw_transactions;
-  boost::json::array transaction_visibility;
-  boost::json::array transaction_confirmations;
-  boost::json::array node_restarts;
-  boost::json::array node_freezes;
-  boost::json::array resource_updates;
-  boost::json::array resource_profile_updates;
-  boost::json::array network_profile_updates;
-  boost::json::array profile_update_rollback_failures;
-  boost::json::array network_condition_updates;
-  boost::json::array network_blocks;
-  boost::json::array network_unblocks;
-  boost::json::array network_partitions;
-  boost::json::array network_partition_heals;
-  std::map<std::string, boost::json::object> active_network_partitions;
-  boost::json::array directional_network_policy_verifications;
-  boost::json::array topology_edge_updates;
-  boost::json::array topology_edge_rollback_failures;
-  boost::json::array wallet_funding;
-  boost::json::array wallet_transactions;
-  boost::json::array operator_commands;
   std::map<std::uint64_t, WalletReport> wallets;
+  std::map<std::string, boost::json::object> active_network_partitions;
+  InputCursor event_cursor;
+  InputCursor metric_cursor;
+  InputCursor wallet_metric_cursor;
+  bool scenario_exists = false;
+  std::uintmax_t scenario_size = 0;
+  std::optional<std::filesystem::file_time_type> scenario_write_time;
+  RunReportRefreshStats stats;
+};
 
-  ForEachJsonLine(
-      run_root / "events.jsonl", [&](const boost::json::object& event) {
-        ++event_count;
-        const std::string event_name = OptionalStringField(event, "event");
-        const std::string node_id = OptionalStringField(event, "node_id");
-        ++event_counts[event_name];
-        const std::optional<SimulationEventKind> event_kind =
-            SimulationEventKindFromName(event_name);
-        if (!event_kind) {
-          return;
-        }
-        if (!node_id.empty() && node_id != "sim" &&
-            IsNodeErrorEvent(*event_kind)) {
-          nodes[node_id].last_error = NodeErrorText(event);
-        }
-        switch (*event_kind) {
-          case SimulationEventKind::kRunStarted:
-            run_started = true;
-            started_at = OptionalStringField(event, "timestamp");
-            break;
-          case SimulationEventKind::kRunFinished:
-            run_finished = true;
-            finished_at = OptionalStringField(event, "timestamp");
-            break;
-          case SimulationEventKind::kRunFailed:
-            run_failed = true;
-            failed_at = OptionalStringField(event, "timestamp");
-            failure_detail = ParseEventDetail(event);
-            break;
-          case SimulationEventKind::kSimulationDurationReached:
-            simulation_duration_reached = true;
-            simulation_duration_detail = ParseEventDetail(event);
-            break;
-          case SimulationEventKind::kState:
-            if (!node_id.empty()) {
-              RememberNodeState(OptionalStringField(event, "detail"),
-                                &nodes[node_id]);
-            }
-            break;
-          case SimulationEventKind::kStdoutTail:
-          case SimulationEventKind::kStderrTail:
-          case SimulationEventKind::kDaemonLogTail:
-            if (!node_id.empty()) {
-              const std::optional<std::string_view> log_kind =
-                  LogTailKind(*event_kind);
-              RememberLogTail(ParseEventDetail(event), *log_kind,
-                              &nodes[node_id].log_tails);
-            }
-            break;
-          case SimulationEventKind::kGeneratedBlocks:
-            AppendEventSummary(event, &generated_blocks);
-            break;
-          case SimulationEventKind::kScheduledBlockProduced:
-            ++scheduled_block_count;
-            AppendScheduledBlockSummary(event, &scheduled_blocks);
-            break;
-          case SimulationEventKind::kScheduledEventStarted:
-            ++scheduled_event_started_count;
-            AppendScheduledEventSummary(event, &scheduled_events_started);
-            break;
-          case SimulationEventKind::kScheduledEventCompleted:
-            ++scheduled_event_completed_count;
-            AppendScheduledEventSummary(event, &scheduled_events_completed);
-            break;
-          case SimulationEventKind::kScheduledEventFailed:
-            ++scheduled_event_failed_count;
-            AppendScheduledEventSummary(event, &scheduled_events_failed);
-            break;
-          case SimulationEventKind::kCheckpointRecorded:
-            ++checkpoint_count;
-            AppendCheckpointSummary(event, &checkpoints);
-            break;
-          case SimulationEventKind::kHeightReached:
-            AppendEventSummary(event, &height_reached);
-            break;
-          case SimulationEventKind::kHeightWaitReached:
-            AppendEventSummary(event, &height_waits);
-            break;
-          case SimulationEventKind::kPeerCountReached:
-            AppendEventSummary(event, &peer_waits);
-            break;
-          case SimulationEventKind::kPeerConnected:
-            AppendEventSummary(event, &peer_connects);
-            break;
-          case SimulationEventKind::kPeerDisconnected:
-            AppendEventSummary(event, &peer_disconnects);
-            break;
-          case SimulationEventKind::kRawTransactionSubmitted:
-            AppendEventSummary(event, &raw_transactions);
-            break;
-          case SimulationEventKind::kTransactionVisible:
-            AppendEventSummary(event, &transaction_visibility);
-            break;
-          case SimulationEventKind::kTransactionConfirmed:
-            AppendEventSummary(event, &transaction_confirmations);
-            break;
-          case SimulationEventKind::kNodeRestarted:
-            AppendEventSummary(event, &node_restarts);
-            break;
-          case SimulationEventKind::kNodeFreezeCompleted:
-            AppendEventSummary(event, &node_freezes);
-            break;
-          case SimulationEventKind::kResourceLimitsUpdated:
-            AppendEventSummary(event, &resource_updates);
-            break;
-          case SimulationEventKind::kResourceProfileUpdated:
-            AppendBoundedProfileUpdateSummary(event, &resource_profile_updates);
-            break;
-          case SimulationEventKind::kNetworkProfileUpdated:
-            AppendBoundedProfileUpdateSummary(event, &network_profile_updates);
-            break;
-          case SimulationEventKind::kProfileUpdateRollbackFailed:
-            AppendBoundedProfileUpdateSummary(
-                event, &profile_update_rollback_failures);
-            break;
-          case SimulationEventKind::kNetworkConditionUpdated:
-            AppendEventSummary(event, &network_condition_updates);
-            break;
-          case SimulationEventKind::kNetworkBlockApplied:
-            AppendEventSummary(event, &network_blocks);
-            break;
-          case SimulationEventKind::kNetworkBlockRemoved:
-            AppendEventSummary(event, &network_unblocks);
-            break;
-          case SimulationEventKind::kNetworkPartitionApplied:
-            AppendEventSummary(event, &network_partitions);
-            RememberActivePartition(event, true, &active_network_partitions);
-            break;
-          case SimulationEventKind::kNetworkPartitionHealed:
-            AppendEventSummary(event, &network_partition_heals);
-            RememberActivePartition(event, false, &active_network_partitions);
-            break;
-          case SimulationEventKind::kDirectionalNetworkPoliciesVerified:
-            AppendDirectionalPolicyVerification(
-                event, &directional_network_policy_verifications);
-            break;
-          case SimulationEventKind::kTopologyEdgeUpdated:
-            RememberTopologyEdgeUpdate(event, &topology_edge_updates,
-                                       &topology_current_edges);
-            break;
-          case SimulationEventKind::kTopologyEdgeUpdateRollbackFailed:
-            AppendBoundedTopologyEdgeSummary(event,
-                                             &topology_edge_rollback_failures);
-            break;
-          case SimulationEventKind::kWalletAddressRequested:
-          case SimulationEventKind::kWalletAddressCreated:
-            RememberWalletAddressEvent(ParseEventDetail(event), &wallets);
-            break;
-          case SimulationEventKind::kWalletFunded: {
-            boost::json::value detail = ParseEventDetail(event);
-            RememberWalletFundingEvent(detail, &wallets);
-            AppendEventSummary(event, &wallet_funding);
-            break;
-          }
-          case SimulationEventKind::kWalletTransactionSubmitted: {
-            boost::json::value detail = ParseEventDetail(event);
-            RememberWalletTransactionEvent(detail, &wallets);
-            AppendEventSummary(event, &wallet_transactions);
-            break;
-          }
-          case SimulationEventKind::kOperatorCommandCompleted:
-            AppendOperatorCommandSummary(
-                event, OperatorCommandStatus::kCompleted, &operator_commands);
-            ApplyBlockProductionPolicyEvent(event, &report);
-            break;
-          case SimulationEventKind::kOperatorCommandFailed:
-            AppendOperatorCommandSummary(event, OperatorCommandStatus::kFailed,
-                                         &operator_commands);
-            break;
-          default:
-            break;
-        }
-      });
+IncrementalRunReport::IncrementalRunReport(
+    const std::filesystem::path& run_root)
+    : impl_(std::make_unique<Impl>(run_root)) {}
 
-  ForEachJsonLine(
-      run_root / "metrics.jsonl", [&](const boost::json::object& metric) {
-        ++metric_count;
-        const std::string node_id = OptionalStringField(metric, "node_id");
-        if (node_id.empty()) {
-          return;
-        }
-        NodeReport& node = nodes[node_id];
-        if (!node.index) {
-          node.index = OptionalUint64Field(metric, "node_index");
-        }
-        if (node.chain.empty()) {
-          node.chain = OptionalStringField(metric, "chain");
-        }
-        if (node.role.empty()) {
-          node.role = OptionalStringField(metric, "role");
-        }
-        ++node.metric_samples;
-        node.last_metrics = {};
-        CopySelectedMetricFields(metric, &node.last_metrics);
-        AddNodeDerivedMetrics(metric, node, &node.last_metrics);
-        AppendNodeMetricHistory(node.last_metrics, &node);
-        RememberNodeMetricSample(metric, &node);
-      });
+IncrementalRunReport::~IncrementalRunReport() = default;
 
-  ForEachJsonLine(run_root / "wallet-metrics.jsonl",
-                  [&](const boost::json::object& metric) {
-                    const std::optional<std::uint64_t> wallet_index =
-                        OptionalUint64Field(metric, "wallet_index");
-                    if (!wallet_index || *wallet_index == 0U) {
-                      return;
-                    }
-                    WalletReport& wallet = wallets[*wallet_index];
-                    wallet.wallet_index = *wallet_index;
-                    CopyOptionalUint64Field(metric, "node", &wallet.node);
-                    CopyOptionalWalletModeField(metric, "mode", &wallet);
-                    wallet.last_metrics = metric;
-                  });
+IncrementalRunReport::IncrementalRunReport(IncrementalRunReport&&) noexcept =
+    default;
 
-  const bool ok = run_started && run_finished && !run_failed;
-  const RunReportStatus status =
-      ok ? RunReportStatus::kFinished
-         : (run_failed ? RunReportStatus::kFailed
-                       : RunReportStatus::kIncomplete);
-  SeedConfiguredNodes(report, &nodes);
-  report["ok"] = ok;
-  report["status"] = RunReportStatusName(status);
-  report["simulation_duration_reached"] = simulation_duration_reached;
-  if (!simulation_duration_detail.is_null()) {
-    report["simulation_duration"] = std::move(simulation_duration_detail);
-  }
-  if (!started_at.empty()) {
-    report["started_at"] = started_at;
-  }
-  if (!finished_at.empty()) {
-    report["finished_at"] = finished_at;
-  }
-  if (!failed_at.empty()) {
-    report["failed_at"] = failed_at;
-  }
-  if (!failure_detail.is_null()) {
-    report["failure"] = std::move(failure_detail);
-  }
-  report["event_count"] = event_count;
-  report["metric_count"] = metric_count;
-  report["event_counts"] = EventCountsJson(event_counts);
-  report["generated_blocks"] = std::move(generated_blocks);
-  report["scheduled_block_count"] = scheduled_block_count;
-  report["scheduled_blocks"] = std::move(scheduled_blocks);
-  report["scheduled_event_started_count"] = scheduled_event_started_count;
-  report["scheduled_event_completed_count"] = scheduled_event_completed_count;
-  report["scheduled_event_failed_count"] = scheduled_event_failed_count;
-  report["scheduled_events_started"] = std::move(scheduled_events_started);
-  report["scheduled_events_completed"] = std::move(scheduled_events_completed);
-  report["scheduled_events_failed"] = std::move(scheduled_events_failed);
-  report["checkpoint_count"] = checkpoint_count;
-  report["checkpoints"] = std::move(checkpoints);
-  report["height_reached"] = std::move(height_reached);
-  report["height_waits"] = std::move(height_waits);
-  report["peer_waits"] = std::move(peer_waits);
-  report["peer_connects"] = std::move(peer_connects);
-  report["peer_disconnects"] = std::move(peer_disconnects);
-  report["raw_transactions"] = std::move(raw_transactions);
-  report["transaction_visibility"] = std::move(transaction_visibility);
-  report["transaction_confirmations"] = std::move(transaction_confirmations);
-  report["node_restarts"] = std::move(node_restarts);
-  report["node_freezes"] = std::move(node_freezes);
-  report["resource_updates"] = std::move(resource_updates);
-  report["resource_profile_updates"] = std::move(resource_profile_updates);
-  report["network_profile_updates"] = std::move(network_profile_updates);
-  report["profile_update_rollback_failures"] =
-      std::move(profile_update_rollback_failures);
-  report["network_condition_updates"] = std::move(network_condition_updates);
-  report["network_blocks"] = std::move(network_blocks);
-  report["network_unblocks"] = std::move(network_unblocks);
-  report["network_partitions"] = std::move(network_partitions);
-  report["network_partition_heals"] = std::move(network_partition_heals);
-  report["active_network_partitions"] =
-      ActivePartitionsJson(active_network_partitions);
-  report["directional_network_policy_verifications"] =
-      std::move(directional_network_policy_verifications);
-  report["topology_edge_updates"] = std::move(topology_edge_updates);
-  report["topology_edge_rollback_failures"] =
-      std::move(topology_edge_rollback_failures);
-  report["topology_current_edges"] = std::move(topology_current_edges);
-  report["wallet_funding"] = std::move(wallet_funding);
-  report["wallet_transactions"] = std::move(wallet_transactions);
-  report["operator_commands"] = std::move(operator_commands);
-  report["wallets_summary"] = WalletsJson(wallets);
-  report["nodes_summary"] = NodesJson(nodes);
-  AddTopologyViewSummaries(&report);
-  return boost::json::serialize(report);
+IncrementalRunReport& IncrementalRunReport::operator=(
+    IncrementalRunReport&&) noexcept = default;
+
+const boost::json::object& IncrementalRunReport::Refresh(
+    std::size_t maximum_records_per_file) {
+  return impl_->Refresh(maximum_records_per_file);
+}
+
+const RunReportRefreshStats& IncrementalRunReport::last_refresh_stats() const {
+  return impl_->stats;
+}
+
+boost::json::object BuildRunReport(const std::filesystem::path& run_root) {
+  IncrementalRunReport report(run_root);
+  return report.Refresh();
+}
+
+std::string BuildRunReportJson(const std::filesystem::path& run_root) {
+  return boost::json::serialize(BuildRunReport(run_root));
 }
 
 std::string BuildNodeReportJson(const std::filesystem::path& run_root,
@@ -2115,12 +2342,7 @@ std::string BuildNodeReportJson(const std::filesystem::path& run_root,
   if (node_id.empty()) {
     throw std::runtime_error("node report requires a node id");
   }
-  const boost::json::value full_report_value =
-      boost::json::parse(BuildRunReportJson(run_root));
-  if (!full_report_value.is_object()) {
-    throw std::runtime_error("run report root is not an object");
-  }
-  const boost::json::object& full_report = full_report_value.as_object();
+  const boost::json::object full_report = BuildRunReport(run_root);
   const boost::json::array* nodes = ArrayField(full_report, "nodes_summary");
   if (nodes == nullptr) {
     throw std::runtime_error("run report has no node summaries");

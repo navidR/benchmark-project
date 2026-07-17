@@ -4,8 +4,10 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "bbp/log_tail.h"
+#include "bbp/log_view.h"
 #include "bbp/util.h"
 
 namespace {
@@ -53,8 +55,7 @@ BOOST_AUTO_TEST_CASE(log_tail_reports_truncated_bounded_reads) {
   const std::filesystem::path log = dir / "daemon.log";
   bbp::WriteText(log, "0123456789");
 
-  const std::optional<bbp::LogTailChunk> result =
-      bbp::TailLogFile(log, {}, 4);
+  const std::optional<bbp::LogTailChunk> result = bbp::TailLogFile(log, {}, 4);
   BOOST_REQUIRE(result.has_value());
   const bbp::LogTailChunk& chunk = *result;
   BOOST_TEST(chunk.start_offset == 0U);
@@ -96,7 +97,7 @@ BOOST_AUTO_TEST_CASE(log_tail_detects_truncate_and_regrow_on_same_inode) {
   BOOST_REQUIRE(before.has_value());
 
   bbp::WriteText(log,
-                  "new process contents are longer than the previous log\n");
+                 "new process contents are longer than the previous log\n");
   const std::optional<bbp::LogTailChunk> after =
       bbp::TailLogFile(log, before->next_cursor, 1024);
   BOOST_REQUIRE(after.has_value());
@@ -113,4 +114,19 @@ BOOST_AUTO_TEST_CASE(log_tail_returns_empty_for_missing_file) {
       MakeTestDir("log-tail-missing") / "missing.log";
   BOOST_TEST(!bbp::TailLogFile(missing, {}, 1024).has_value());
   std::filesystem::remove_all(missing.parent_path());
+}
+
+BOOST_AUTO_TEST_CASE(recent_log_view_reads_only_the_requested_tail_lines) {
+  const std::filesystem::path dir = MakeTestDir("recent-log-view");
+  const std::filesystem::path log = dir / "simulator.log";
+  std::string contents(128U * 1024U, 'x');
+  contents += "\nfirst\nsecond\nthird\nfourth";
+  bbp::WriteText(log, contents);
+
+  const std::vector<std::string> lines = bbp::ReadRecentLogLines(log, 3U);
+  const std::vector<std::string> expected = {"second", "third", "fourth"};
+  BOOST_TEST(lines == expected, boost::test_tools::per_element());
+  BOOST_TEST(bbp::ReadRecentLogLines(log, 0U).empty());
+
+  std::filesystem::remove_all(dir);
 }

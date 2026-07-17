@@ -6,7 +6,6 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
-#include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
 #include <cctype>
@@ -17,6 +16,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -51,6 +51,7 @@ constexpr int kColorMuted = 4;
 constexpr int kMinLogPaneRows = 5;
 constexpr int kMaxLogPaneRows = 10;
 constexpr int kDetailPaneRows = 26;
+constexpr std::size_t kMaximumReportRecordsPerLiveRefresh = 256U;
 
 struct PendingConfirmation {
   ParsedTuiCommand command;
@@ -1848,22 +1849,6 @@ void DrawSelectedTopologyDetail(int top, int bottom, int cols,
                 PerfCounterSummaryText(*group));
 }
 
-boost::json::object LoadReport(const std::filesystem::path& run_root,
-                               std::string* error) {
-  try {
-    boost::json::value value = boost::json::parse(BuildRunReportJson(run_root));
-    if (!value.is_object()) {
-      *error = "run report root is not a JSON object";
-      return {};
-    }
-    error->clear();
-    return value.as_object();
-  } catch (const std::exception& e) {
-    *error = e.what();
-    return {};
-  }
-}
-
 void DrawSummary(
     const std::filesystem::path& run_root, const boost::json::object& report,
     std::string_view error, const std::vector<std::string>& log_lines,
@@ -2819,32 +2804,47 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
   CursesSession curses;
   const std::uint32_t sleep_step_ms = 50;
   TuiState state;
+  std::optional<IncrementalRunReport> live_report;
+  const boost::json::object empty_report;
 
   while (true) {
     if (stop_token.stop_requested()) {
       return 0;
     }
     std::string error;
-    const boost::json::object report = LoadReport(run_root, &error);
-    state.selected_node = ClampNodeSelection(report, state.selected_node);
-    state.selected_wallet = ClampWalletSelection(report, state.selected_wallet);
+    const boost::json::object* report = &empty_report;
+    bool report_has_backlog = false;
+    try {
+      if (!live_report) {
+        live_report.emplace(run_root);
+      }
+      report =
+          &live_report->Refresh(once ? std::numeric_limits<std::size_t>::max()
+                                     : kMaximumReportRecordsPerLiveRefresh);
+      report_has_backlog = live_report->last_refresh_stats().has_backlog;
+    } catch (const std::exception& e) {
+      error = e.what();
+    }
+    state.selected_node = ClampNodeSelection(*report, state.selected_node);
+    state.selected_wallet =
+        ClampWalletSelection(*report, state.selected_wallet);
     state.selected_topology_group =
-        ClampTopologyGroupSelection(report, state.selected_topology_group);
+        ClampTopologyGroupSelection(*report, state.selected_topology_group);
     if (error.empty()) {
       const std::optional<std::size_t> selected_node =
-          SelectedNodeIndex(report, state);
+          SelectedNodeIndex(*report, state);
       if (selected_node) {
-        state.node_log_pane.Refresh(report, *selected_node);
-        state.peer_list_pane.Refresh(report, *selected_node);
-        state.network_rule_pane.Refresh(report, *selected_node);
-        state.node_file_pane.Refresh(run_root, report, *selected_node);
+        state.node_log_pane.Refresh(*report, *selected_node);
+        state.peer_list_pane.Refresh(*report, *selected_node);
+        state.network_rule_pane.Refresh(*report, *selected_node);
+        state.node_file_pane.Refresh(run_root, *report, *selected_node);
       }
-      RefreshCommandResults(report, &state);
+      RefreshCommandResults(*report, &state);
     }
     const std::vector<std::string> log_lines =
         ReadRecentLogLines(RunLogPath(run_root), 256U);
     DrawSummary(
-        run_root, report, error, log_lines, state.view, state.selected_node,
+        run_root, *report, error, log_lines, state.view, state.selected_node,
         state.selected_wallet, state.selected_topology_group,
         state.node_log_pane, state.peer_list_pane, state.network_rule_pane,
         state.node_file_pane, state.command_status, state.command_error_open,
@@ -2854,14 +2854,16 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       return error.empty() ? 0 : 1;
     }
 
+    const std::uint32_t refresh_wait_ms =
+        report_has_backlog ? sleep_step_ms : refresh_ms;
     std::uint32_t slept_ms = 0;
-    while (slept_ms < refresh_ms) {
+    while (slept_ms < refresh_wait_ms) {
       if (stop_token.stop_requested()) {
         return 0;
       }
       const int ch = getch();
       const bool palette_was_open = state.command_palette_open;
-      if (HandleInput(ch, run_root, report, command_queue, &state)) {
+      if (HandleInput(ch, run_root, *report, command_queue, &state)) {
         if (state.command_palette_open) {
           int rows = 0;
           int cols = 0;
