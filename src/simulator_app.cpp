@@ -1602,10 +1602,12 @@ void ValidateWalletTransactionsWorkload(
         "scenario wallet_transactions workload requires at least two "
         "WalletNode roles");
   }
-  if (workload.transaction_count == 0U) {
+  const bool has_transaction_count = workload.transaction_count != 0U;
+  const bool has_transaction_rate = workload.transaction_rate.has_value();
+  if (has_transaction_count == has_transaction_rate) {
     throw std::runtime_error(
-        "scenario wallet_transactions transaction_count must be greater than "
-        "zero");
+        "scenario wallet_transactions must specify exactly one of "
+        "transaction_count or transaction_rate");
   }
   const std::uint64_t coinbase_confirmations =
       ChainDriverSpecFor(options.chain).coinbase_spendable_confirmations;
@@ -1717,7 +1719,11 @@ void ValidateWalletTransactionsWorkload(
       break;
   }
 
-  static_cast<void>(BuildWalletTransactionPlan(wallet_count, workload));
+  if (has_transaction_count) {
+    static_cast<void>(BuildWalletTransactionPlan(wallet_count, workload));
+  } else {
+    static_cast<void>(WalletTransactionPlanner(wallet_count, workload));
+  }
 
   SimulationRegistry::FromTopology(options.topology,
                                    options.wallet_initialization);
@@ -2849,11 +2855,30 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       transactions.readiness_confirmations =
           JsonOptionalUint64Field(workload, "readiness_confirmations",
                                   transactions.readiness_confirmations);
-      transactions.transaction_count = JsonOptionalUint32Field(
-          workload, "transaction_count",
-          options.topology.configured
-              ? static_cast<uint32_t>(options.topology.wallet_nodes.size())
-              : 0U);
+      const bool transaction_count_present =
+          workload.if_contains("transaction_count") != nullptr;
+      const bool transaction_rate_present =
+          workload.if_contains("transaction_rate") != nullptr;
+      if (transaction_count_present && transaction_rate_present) {
+        throw std::runtime_error(
+            "scenario wallet_transactions transaction_count and "
+            "transaction_rate are mutually exclusive");
+      }
+      if (transaction_rate_present) {
+        transactions.transaction_rate = WalletTransactionRate::FromDouble(
+            JsonOptionalDoubleField(workload, "transaction_rate", 0.0));
+        if (workload.if_contains("interval") != nullptr) {
+          throw std::runtime_error(
+              "scenario wallet_transactions transaction_rate does not accept "
+              "interval");
+        }
+      } else {
+        transactions.transaction_count = JsonOptionalUint32Field(
+            workload, "transaction_count",
+            options.topology.configured
+                ? static_cast<uint32_t>(options.topology.wallet_nodes.size())
+                : 0U);
+      }
       transactions.amount = ParseAmountDistribution(workload, "amount");
       transactions.interval = ParseIntervalDistribution(workload, "interval");
       transactions.fee_satoshis = JsonAmountField(workload, "fee");
@@ -6356,7 +6381,7 @@ std::string WalletFundingDetail(
 
 std::string WalletTransactionDetail(
     uint32_t workload_index, uint32_t workload_count,
-    const WalletTransactionsWorkload& workload, uint32_t transaction_index,
+    const WalletTransactionsWorkload& workload, uint64_t transaction_index,
     const WalletIdentity& sender, const WalletIdentity& receiver,
     uint32_t funding_miner_node, uint64_t funding_start_height,
     uint64_t funding_target_height, uint64_t funding_hash_count,
@@ -6365,12 +6390,23 @@ std::string WalletTransactionDetail(
     uint64_t funding_preparation_hash_count,
     uint64_t funding_ready_balance_satoshis, uint64_t amount_satoshis,
     std::chrono::milliseconds interval_before,
+    std::optional<std::chrono::milliseconds> scheduled_simulation_elapsed,
+    std::optional<std::chrono::milliseconds> scheduled_wall_elapsed,
     const ChainWalletTransactionResult& transaction) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
   detail["transaction_index"] = transaction_index;
-  detail["transaction_count"] = workload.transaction_count;
+  if (workload.transaction_count != 0U) {
+    detail["transaction_count"] = workload.transaction_count;
+  } else {
+    detail["transaction_count"] = nullptr;
+  }
+  if (workload.transaction_rate) {
+    detail["transaction_rate"] = workload.transaction_rate->value();
+  } else {
+    detail["transaction_rate"] = nullptr;
+  }
   detail["strategy"] =
       std::string(WalletTransferStrategyName(workload.strategy));
   detail["funding_strategy"] =
@@ -6405,6 +6441,17 @@ std::string WalletTransactionDetail(
   detail["interval_distribution"] =
       IntervalDistributionDetail(workload.interval);
   detail["interval_before_ms"] = interval_before.count();
+  if (scheduled_simulation_elapsed) {
+    detail["scheduled_simulation_elapsed_ms"] =
+        scheduled_simulation_elapsed->count();
+  } else {
+    detail["scheduled_simulation_elapsed_ms"] = nullptr;
+  }
+  if (scheduled_wall_elapsed) {
+    detail["scheduled_wall_elapsed_ms"] = scheduled_wall_elapsed->count();
+  } else {
+    detail["scheduled_wall_elapsed_ms"] = nullptr;
+  }
   detail["amount"] = FormatFixed8Amount(amount_satoshis);
   detail["amount_satoshis"] = amount_satoshis;
   detail["requested_fee_rate"] = transaction.requested_fee_rate;
@@ -6420,8 +6467,9 @@ struct TrackedTransaction {
   std::string submission_kind;
   std::uint32_t workload_index = 0;
   std::uint32_t workload_count = 0;
-  std::uint32_t transaction_index = 0;
-  std::uint32_t transaction_count = 0;
+  std::uint64_t transaction_index = 0;
+  std::optional<std::uint32_t> transaction_count;
+  std::optional<double> transaction_rate;
   std::uint32_t txid_index = 0;
   std::uint32_t submission_node = 0;
 };
@@ -6436,7 +6484,16 @@ std::string TransactionObservationDetail(
   detail["workload_index"] = transaction.workload_index;
   detail["workload_count"] = transaction.workload_count;
   detail["transaction_index"] = transaction.transaction_index;
-  detail["transaction_count"] = transaction.transaction_count;
+  if (transaction.transaction_count) {
+    detail["transaction_count"] = *transaction.transaction_count;
+  } else {
+    detail["transaction_count"] = nullptr;
+  }
+  if (transaction.transaction_rate) {
+    detail["transaction_rate"] = *transaction.transaction_rate;
+  } else {
+    detail["transaction_rate"] = nullptr;
+  }
   detail["txid_index"] = transaction.txid_index;
   detail["submission_node"] = transaction.submission_node;
   detail["node"] = node;
@@ -6460,13 +6517,7 @@ std::string TransactionObservationDetail(
 
 class TransactionObservationTracker {
  public:
-  void TrackAndWaitForVisibility(const Options& options,
-                                 const std::filesystem::path& events_path,
-                                 const ChainDriver& driver,
-                                 const std::vector<NodeRuntime>& nodes,
-                                 TrackedTransaction transaction,
-                                 std::chrono::seconds timeout,
-                                 std::stop_token stop_token) {
+  void Track(TrackedTransaction transaction) {
     if (transaction.txid.empty()) {
       throw std::runtime_error("cannot track an empty transaction id");
     }
@@ -6475,6 +6526,16 @@ class TransactionObservationTracker {
                                transaction.txid);
     }
     transactions_.push_back(std::move(transaction));
+  }
+
+  void TrackAndWaitForVisibility(const Options& options,
+                                 const std::filesystem::path& events_path,
+                                 const ChainDriver& driver,
+                                 const std::vector<NodeRuntime>& nodes,
+                                 TrackedTransaction transaction,
+                                 std::chrono::seconds timeout,
+                                 std::stop_token stop_token) {
+    Track(std::move(transaction));
     const TrackedTransaction& tracked = transactions_.back();
     for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
       const NodeRuntime& node = nodes[node_index];
@@ -7311,7 +7372,19 @@ boost::json::object WalletTransactionsWorkloadJson(
   object["readiness_confirmations"] = workload.readiness_confirmations;
   object["funding_threshold"] =
       FormatFixed8Amount(workload.funding_threshold_satoshis);
-  object["transaction_count"] = workload.transaction_count;
+  if (workload.transaction_count != 0U) {
+    object["transaction_count"] = workload.transaction_count;
+  } else {
+    object["transaction_count"] = nullptr;
+  }
+  if (workload.transaction_rate) {
+    object["transaction_rate"] = workload.transaction_rate->value();
+    object["transaction_rate_millionths"] =
+        workload.transaction_rate->millionths();
+  } else {
+    object["transaction_rate"] = nullptr;
+    object["transaction_rate_millionths"] = nullptr;
+  }
   object["amount"] = AmountDistributionConfigurationJson(workload.amount);
   if (workload.interval.kind != ValueDistributionKind::kFixed ||
       workload.interval.minimum != std::chrono::milliseconds(0)) {
@@ -8785,6 +8858,7 @@ void ApplySendRawTransactionWorkload(
           .workload_count = workload_count,
           .transaction_index = 1U,
           .transaction_count = 1U,
+          .transaction_rate = std::nullopt,
           .txid_index = 1U,
           .submission_node = workload.submit_node,
       },
@@ -8916,14 +8990,23 @@ void ApplyWalletTransactionsWorkload(
     funding.push_back(std::move(state));
   }
 
-  const std::vector<WalletTransactionPlanEntry> transfer_plan =
-      BuildWalletTransactionPlan(wallets.size(), workload);
-  for (size_t transaction_index = 0; transaction_index < transfer_plan.size();
-       ++transaction_index) {
+  WalletTransactionPlanner transaction_planner(wallets.size(), workload);
+  const auto rate_epoch = std::chrono::steady_clock::now();
+  std::uint64_t transaction_index = 0U;
+  while (workload.transaction_rate ||
+         transaction_index < workload.transaction_count) {
     ThrowIfStopRequested(stop_token);
-    const WalletTransactionPlanEntry& plan_entry =
-        transfer_plan[transaction_index];
-    if (plan_entry.interval_before != std::chrono::milliseconds(0)) {
+    const WalletTransactionPlanEntry plan_entry = transaction_planner.Next();
+    std::optional<std::chrono::milliseconds> scheduled_simulation_elapsed;
+    std::optional<std::chrono::milliseconds> scheduled_wall_elapsed;
+    if (workload.transaction_rate) {
+      scheduled_simulation_elapsed =
+          workload.transaction_rate->SimulationElapsedBefore(transaction_index);
+      scheduled_wall_elapsed =
+          options.time_scale.WallDuration(*scheduled_simulation_elapsed);
+      WaitUntil(SteadyDeadline(rate_epoch, *scheduled_wall_elapsed),
+                stop_token);
+    } else if (plan_entry.interval_before != std::chrono::milliseconds(0)) {
       WaitForDuration(plan_entry.interval_before, stop_token);
     }
     const size_t sender_index = plan_entry.sender_index;
@@ -8943,35 +9026,53 @@ void ApplyWalletTransactionsWorkload(
         events_path, options.run_id, sender_node.config.id,
         SimulationEventKind::kWalletTransactionSubmitted,
         WalletTransactionDetail(
-            workload_index, workload_count, workload,
-            static_cast<uint32_t>(transaction_index + 1U), sender, receiver,
-            sender_funding.miner_node, sender_funding.start_height,
-            sender_funding.target_height,
+            workload_index, workload_count, workload, transaction_index + 1U,
+            sender, receiver, sender_funding.miner_node,
+            sender_funding.start_height, sender_funding.target_height,
             static_cast<uint64_t>(sender_funding.hashes.size()),
             sender_funding.ready_height, sender_funding.preparation,
             static_cast<uint64_t>(sender_funding.preparation_hashes.size()),
             sender_funding.ready_balance_satoshis, plan_entry.amount_satoshis,
-            plan_entry.interval_before, transaction));
+            plan_entry.interval_before, scheduled_simulation_elapsed,
+            scheduled_wall_elapsed, transaction));
     if (transaction.txids.size() > std::numeric_limits<std::uint32_t>::max()) {
       throw std::runtime_error("wallet transaction txid count exceeds uint32");
     }
     for (std::size_t txid_index = 0; txid_index < transaction.txids.size();
          ++txid_index) {
-      transaction_tracker.TrackAndWaitForVisibility(
-          options, events_path, driver, nodes,
-          TrackedTransaction{
-              .txid = transaction.txids[txid_index],
-              .submission_kind = "wallet_transaction_submitted",
-              .workload_index = workload_index,
-              .workload_count = workload_count,
-              .transaction_index =
-                  static_cast<std::uint32_t>(transaction_index + 1U),
-              .transaction_count = workload.transaction_count,
-              .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
-              .submission_node = sender.node,
-          },
-          std::chrono::seconds(workload.timeout_sec), stop_token);
+      TrackedTransaction tracked{
+          .txid = transaction.txids[txid_index],
+          .submission_kind = "wallet_transaction_submitted",
+          .workload_index = workload_index,
+          .workload_count = workload_count,
+          .transaction_index = transaction_index + 1U,
+          .transaction_count =
+              workload.transaction_count == 0U
+                  ? std::nullopt
+                  : std::optional<std::uint32_t>(workload.transaction_count),
+          .transaction_rate =
+              workload.transaction_rate
+                  ? std::optional<double>(workload.transaction_rate->value())
+                  : std::nullopt,
+          .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
+          .submission_node = sender.node,
+      };
+      if (workload.transaction_rate) {
+        transaction_tracker.Track(std::move(tracked));
+      } else {
+        transaction_tracker.TrackAndWaitForVisibility(
+            options, events_path, driver, nodes, std::move(tracked),
+            std::chrono::seconds(workload.timeout_sec), stop_token);
+      }
     }
+    if (workload.transaction_rate) {
+      transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+                                     stop_token);
+    }
+    if (transaction_index == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::runtime_error("wallet transaction index exceeds uint64");
+    }
+    ++transaction_index;
   }
 }
 

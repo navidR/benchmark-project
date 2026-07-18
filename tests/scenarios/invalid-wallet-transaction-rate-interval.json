@@ -1,0 +1,1 @@
+{"firod":"/tmp/not-used-by-probe","nodes":3,"topology":{"node_count":3,"wallet_node_count":2,"miner_node_count":1,"wallet_nodes":[1,2],"miner_nodes":[3]},"workloads":[{"type":"wallet_transactions","transaction_rate":1,"interval":"1s","amount":"1.00000000","fee":"0.00001000"}]}

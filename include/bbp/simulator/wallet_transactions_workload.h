@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -39,6 +40,21 @@ struct IntervalDistribution {
   std::chrono::milliseconds maximum{0};
 };
 
+class WalletTransactionRate {
+ public:
+  static WalletTransactionRate FromDouble(double value);
+
+  [[nodiscard]] double value() const;
+  [[nodiscard]] std::uint64_t millionths() const;
+  [[nodiscard]] std::chrono::milliseconds SimulationElapsedBefore(
+      std::uint64_t zero_based_transaction_index) const;
+
+ private:
+  explicit WalletTransactionRate(std::uint64_t millionths);
+
+  std::uint64_t millionths_ = 1U;
+};
+
 struct WalletTransactionsWorkload {
   WalletFundingStrategy funding_strategy = WalletFundingStrategy::kRoundRobin;
   WalletTransferStrategy strategy = WalletTransferStrategy::kRoundRobin;
@@ -48,6 +64,7 @@ struct WalletTransactionsWorkload {
       kDefaultCoinbaseSpendableConfirmations;
   std::uint64_t funding_threshold_satoshis = 0;
   std::uint32_t transaction_count = 0;
+  std::optional<WalletTransactionRate> transaction_rate;
   AmountDistribution amount;
   IntervalDistribution interval;
   std::uint64_t fee_satoshis = 0;

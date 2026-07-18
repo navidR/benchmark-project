@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -139,6 +140,67 @@ BOOST_AUTO_TEST_CASE(wallet_transaction_plan_uniform_distributions_are_seeded) {
   BOOST_TEST(saw_amount_maximum);
   BOOST_TEST(saw_interval_minimum);
   BOOST_TEST(saw_interval_maximum);
+}
+
+BOOST_AUTO_TEST_CASE(
+    wallet_transaction_planner_incremental_sequence_matches_plan) {
+  bbp::WalletTransactionsWorkload workload =
+      FixedWorkload(bbp::WalletTransferStrategy::kRandom, 128U);
+  workload.random_seed = 112233U;
+  workload.amount = bbp::AmountDistribution{
+      .kind = bbp::ValueDistributionKind::kUniform,
+      .minimum_satoshis = 10U,
+      .maximum_satoshis = 20U,
+  };
+  workload.interval = bbp::IntervalDistribution{
+      .kind = bbp::ValueDistributionKind::kUniform,
+      .minimum = std::chrono::milliseconds(5),
+      .maximum = std::chrono::milliseconds(9),
+  };
+  const auto complete = bbp::BuildWalletTransactionPlan(5U, workload);
+  bbp::WalletTransactionPlanner planner(5U, workload);
+  std::vector<bbp::WalletTransactionPlanEntry> incremental;
+  incremental.reserve(complete.size());
+  for (std::size_t index = 0; index < complete.size(); ++index) {
+    incremental.push_back(planner.Next());
+  }
+  BOOST_CHECK(incremental == complete);
+}
+
+BOOST_AUTO_TEST_CASE(wallet_transaction_rate_is_fixed_resolution_and_paced) {
+  const bbp::WalletTransactionRate rate =
+      bbp::WalletTransactionRate::FromDouble(2.5);
+  BOOST_TEST(rate.value() == 2.5);
+  BOOST_TEST(rate.millionths() == 2'500'000U);
+  BOOST_TEST(rate.SimulationElapsedBefore(0U).count() == 0);
+  BOOST_TEST(rate.SimulationElapsedBefore(1U).count() == 400);
+  BOOST_TEST(rate.SimulationElapsedBefore(2U).count() == 800);
+
+  const bbp::WalletTransactionRate fractional =
+      bbp::WalletTransactionRate::FromDouble(0.3);
+  BOOST_TEST(fractional.SimulationElapsedBefore(1U).count() == 3334);
+  BOOST_TEST(fractional.SimulationElapsedBefore(2U).count() == 6667);
+
+  const bbp::WalletTransactionRate maximum =
+      bbp::WalletTransactionRate::FromDouble(1000.0);
+  BOOST_TEST(maximum.SimulationElapsedBefore(1U).count() == 1);
+}
+
+BOOST_AUTO_TEST_CASE(wallet_transaction_rate_rejects_invalid_values) {
+  BOOST_CHECK_THROW(bbp::WalletTransactionRate::FromDouble(0.0),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::WalletTransactionRate::FromDouble(0.0000001),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::WalletTransactionRate::FromDouble(0.1234567),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::WalletTransactionRate::FromDouble(1000.000001),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::WalletTransactionRate::FromDouble(
+                        std::numeric_limits<double>::infinity()),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(bbp::WalletTransactionRate::FromDouble(
+                        std::numeric_limits<double>::quiet_NaN()),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(wallet_transaction_plan_validates_ranges_and_selectors) {

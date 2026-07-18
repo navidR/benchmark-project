@@ -546,6 +546,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transactions-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-wallet-transaction-rate
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transaction-rate.json"
+      --probe-capabilities
+  )
   add_test(NAME bbp-valid-wallet-random-transactions-scenario
     COMMAND bbp
       --scenario-json
@@ -1340,6 +1346,26 @@ if(BUILD_TESTING)
     bbp-invalid-wallet-transfer-strategy
     tests/scenarios/invalid-wallet-transfer-strategy.json
     "scenario wallet_transactions strategy must be round_robin, random, fanout, or hotspot"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-transaction-count-and-rate
+    tests/scenarios/invalid-wallet-transaction-count-and-rate.json
+    "scenario wallet_transactions transaction_count and transaction_rate are mutually exclusive"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-transaction-rate-zero
+    tests/scenarios/invalid-wallet-transaction-rate-zero.json
+    "scenario wallet_transactions transaction_rate must be finite and in 0.000001..1000"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-transaction-rate-precision
+    tests/scenarios/invalid-wallet-transaction-rate-precision.json
+    "scenario wallet_transactions transaction_rate supports at most six decimal places"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-transaction-rate-interval
+    tests/scenarios/invalid-wallet-transaction-rate-interval.json
+    "scenario wallet_transactions transaction_rate does not accept interval"
   )
   add_cli_failure_test(
     bbp-invalid-wallet-amount-shape
