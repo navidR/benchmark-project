@@ -113,7 +113,7 @@ struct NodeRuntime {
       restart_count_ = 0;
   alignas(std::atomic_ref<NodeRuntimeLifecycle>::
               required_alignment) mutable NodeRuntimeLifecycle lifecycle_ =
-      NodeRuntimeLifecycle::kStarting;
+      NodeRuntimeLifecycle::kDefined;
 };
 
 }  // namespace bbp

@@ -6148,10 +6148,11 @@ void WriteEvent(const std::filesystem::path& events_path,
   AppendLine(events_path, boost::json::serialize(object));
 }
 
-void WriteNodeState(const std::filesystem::path& events_path,
-                    const std::string& run_id, const std::string& node_id,
-                    NodeRuntimeLifecycle state) {
-  WriteEvent(events_path, run_id, node_id, SimulationEventKind::kState,
+void TransitionNodeState(const std::filesystem::path& events_path,
+                         const std::string& run_id, NodeRuntime& node,
+                         NodeRuntimeLifecycle state) {
+  node.SetLifecycle(state);
+  WriteEvent(events_path, run_id, node.config.id, SimulationEventKind::kState,
              NodeRuntimeLifecycleName(state));
 }
 
@@ -7920,8 +7921,10 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
       if (network_profile != options.node_network_profiles.end()) {
         runtime.network_profile = network_profile->second;
       }
-      WriteNodeState(events_path, options.run_id, node_id,
-                     NodeRuntimeLifecycle::kPreparing);
+      TransitionNodeState(events_path, options.run_id, runtime,
+                          NodeRuntimeLifecycle::kDefined);
+      TransitionNodeState(events_path, options.run_id, runtime,
+                          NodeRuntimeLifecycle::kPreparing);
       runtime.cgroup = Cgroup::Create(options.run_id, node_id);
       runtime.resources = InitialResourceLimits(options, i);
       runtime.cgroup->SetMemoryHigh(runtime.resources.memory_high_bytes);
@@ -7973,18 +7976,18 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                    "node_ip=" + runtime.network->node_address +
                        " host_if=" + runtime.network->host_name +
                        " peer_if=" + runtime.network->peer_name);
-        WriteNodeState(events_path, options.run_id, node_id,
-                       NodeRuntimeLifecycle::kNetworkNamespaceReady);
+        TransitionNodeState(events_path, options.run_id, runtime,
+                            NodeRuntimeLifecycle::kNetworkNamespaceReady);
       }
-      WriteNodeState(events_path, options.run_id, node_id,
-                     NodeRuntimeLifecycle::kCgroupReady);
+      TransitionNodeState(events_path, options.run_id, runtime,
+                          NodeRuntimeLifecycle::kCgroupReady);
 
       ProcessSpec process = driver.RenderProcess(runtime.config);
       if (runtime.network_namespace) {
         process.network_namespace_fd = runtime.network_namespace->fd();
       }
-      WriteNodeState(events_path, options.run_id, node_id,
-                     NodeRuntimeLifecycle::kStarting);
+      TransitionNodeState(events_path, options.run_id, runtime,
+                          NodeRuntimeLifecycle::kStarting);
       runtime.process = ChildProcess::Spawn(process, runtime.cgroup->path());
       runtime.process_started_at = std::chrono::steady_clock::now();
       AttachNodePerfCounters(runtime);
@@ -7995,8 +7998,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                  "pid=" + std::to_string(runtime.process.pid()));
       nodes.push_back(std::move(runtime));
     } catch (...) {
-      WriteNodeState(events_path, options.run_id, node_id,
-                     NodeRuntimeLifecycle::kFailed);
+      TransitionNodeState(events_path, options.run_id, runtime,
+                          NodeRuntimeLifecycle::kFailed);
       runtime.process.Kill();
       try {
         driver.CleanupRpcCredentials(runtime.config);
@@ -8031,9 +8034,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     }
     WriteEvent(events_path, options.run_id, node.config.id,
                SimulationEventKind::kRpcReady);
-    node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
-    WriteNodeState(events_path, options.run_id, node.config.id,
-                   NodeRuntimeLifecycle::kRunning);
+    TransitionNodeState(events_path, options.run_id, node,
+                        NodeRuntimeLifecycle::kRunning);
   }
 
   for (auto& node : nodes) {
@@ -9739,9 +9741,8 @@ void RestartNode(const Options& options,
     throw std::runtime_error("node restart requires a node cgroup");
   }
 
-  WriteNodeState(events_path, options.run_id, node.config.id,
-                 NodeRuntimeLifecycle::kRestarting);
-  node.SetLifecycle(NodeRuntimeLifecycle::kRestarting);
+  TransitionNodeState(events_path, options.run_id, node,
+                      NodeRuntimeLifecycle::kRestarting);
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRestartRequested,
              "restart_count=" + std::to_string(node.RestartCount() + 1U));
@@ -9757,9 +9758,8 @@ void RestartNode(const Options& options,
     } catch (...) {
       if (node.process.running()) {
         AttachNodePerfCounters(node);
-        node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
-        WriteNodeState(events_path, options.run_id, node.config.id,
-                       NodeRuntimeLifecycle::kRunning);
+        TransitionNodeState(events_path, options.run_id, node,
+                            NodeRuntimeLifecycle::kRunning);
       }
       throw;
     }
@@ -9783,8 +9783,8 @@ void RestartNode(const Options& options,
   if (node.network_namespace) {
     process.network_namespace_fd = node.network_namespace->fd();
   }
-  WriteNodeState(events_path, options.run_id, node.config.id,
-                 NodeRuntimeLifecycle::kStarting);
+  TransitionNodeState(events_path, options.run_id, node,
+                      NodeRuntimeLifecycle::kStarting);
   node.process = ChildProcess::Spawn(process, node.cgroup->path());
   node.process_started_at = std::chrono::steady_clock::now();
   const std::uint64_t restart_count = node.IncrementRestartCount();
@@ -9806,9 +9806,8 @@ void RestartNode(const Options& options,
                SimulationEventKind::kPeerConnected,
                RestartPeerConnectionDetail(peer, restart_count));
   }
-  node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
-  WriteNodeState(events_path, options.run_id, node.config.id,
-                 NodeRuntimeLifecycle::kRunning);
+  TransitionNodeState(events_path, options.run_id, node,
+                      NodeRuntimeLifecycle::kRunning);
 }
 
 void ApplyRuntimeNodeRestarts(const Options& options,
@@ -9879,9 +9878,8 @@ void StopNodeProcess(const Options& options,
     SetNodeFrozen(options, events_path, node, false, stop_token);
   }
   ResetNodePerfCounters(node);
-  node.SetLifecycle(NodeRuntimeLifecycle::kStopping);
-  WriteNodeState(events_path, options.run_id, node.config.id,
-                 NodeRuntimeLifecycle::kStopping);
+  TransitionNodeState(events_path, options.run_id, node,
+                      NodeRuntimeLifecycle::kStopping);
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRpcStop);
   try {
@@ -9904,15 +9902,13 @@ void StopNodeProcess(const Options& options,
   } catch (...) {
     if (node.process.running()) {
       AttachNodePerfCounters(node);
-      node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
-      WriteNodeState(events_path, options.run_id, node.config.id,
-                     NodeRuntimeLifecycle::kRunning);
+      TransitionNodeState(events_path, options.run_id, node,
+                          NodeRuntimeLifecycle::kRunning);
     }
     throw;
   }
-  node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
-  WriteNodeState(events_path, options.run_id, node.config.id,
-                 NodeRuntimeLifecycle::kStopped);
+  TransitionNodeState(events_path, options.run_id, node,
+                      NodeRuntimeLifecycle::kStopped);
 }
 
 std::string FreezeDetail(uint32_t duration_ms, bool frozen) {
@@ -10016,8 +10012,8 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
   for (auto& node : nodes) {
     ResetNodePerfCounters(node);
     RunNodeCleanupStep(best_effort, "stopping state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id,
-                     NodeRuntimeLifecycle::kStopping);
+      TransitionNodeState(events_path, options.run_id, node,
+                          NodeRuntimeLifecycle::kStopping);
     });
   }
 
@@ -10106,12 +10102,12 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
 
   for (auto& node : nodes) {
     RunNodeCleanupStep(best_effort, "stopped state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id,
-                     NodeRuntimeLifecycle::kStopped);
+      TransitionNodeState(events_path, options.run_id, node,
+                          NodeRuntimeLifecycle::kStopped);
     });
     RunNodeCleanupStep(best_effort, "cleaning state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id,
-                     NodeRuntimeLifecycle::kCleaning);
+      TransitionNodeState(events_path, options.run_id, node,
+                          NodeRuntimeLifecycle::kCleaning);
     });
     if (node.cgroup) {
       RunNodeCleanupStep(best_effort, "cgroup process kill",
@@ -10148,8 +10144,8 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
                          [&] { node.network_namespace->Stop(); });
     }
     RunNodeCleanupStep(best_effort, "cleaned state event", [&] {
-      WriteNodeState(events_path, options.run_id, node.config.id,
-                     NodeRuntimeLifecycle::kCleaned);
+      TransitionNodeState(events_path, options.run_id, node,
+                          NodeRuntimeLifecycle::kCleaned);
     });
   }
   if (options.cleanup_policy != CleanupPolicy::kRetainCgroups) {
@@ -10691,8 +10687,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     });
     for (auto& node : nodes) {
       cleanup_step("failed node state event", [&] {
-        WriteNodeState(events_path, options.run_id, node.config.id,
-                       NodeRuntimeLifecycle::kFailed);
+        TransitionNodeState(events_path, options.run_id, node,
+                            NodeRuntimeLifecycle::kFailed);
       });
     }
     cleanup_step("run failure event", [&] {
@@ -10994,9 +10990,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                 command_rpc_stop_source.get_token());
                 }
                 const pid_t pid = node.process.pid();
-                node.SetLifecycle(NodeRuntimeLifecycle::kKilling);
-                WriteNodeState(events_path, options.run_id, command.node_id,
-                               NodeRuntimeLifecycle::kKilling);
+                TransitionNodeState(events_path, options.run_id, node,
+                                    NodeRuntimeLifecycle::kKilling);
                 WriteEvent(events_path, options.run_id, command.node_id,
                            SimulationEventKind::kProcessKillRequested,
                            "pid=" + std::to_string(pid));
@@ -11008,18 +11003,16 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                   }
                 } catch (...) {
                   if (node.process.running()) {
-                    node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
-                    WriteNodeState(events_path, options.run_id, command.node_id,
-                                   NodeRuntimeLifecycle::kRunning);
+                    TransitionNodeState(events_path, options.run_id, node,
+                                        NodeRuntimeLifecycle::kRunning);
                   }
                   throw;
                 }
-                node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
                 WriteEvent(events_path, options.run_id, command.node_id,
                            SimulationEventKind::kProcessKilled,
                            "pid=" + std::to_string(pid));
-                WriteNodeState(events_path, options.run_id, command.node_id,
-                               NodeRuntimeLifecycle::kKilled);
+                TransitionNodeState(events_path, options.run_id, node,
+                                    NodeRuntimeLifecycle::kKilled);
               } catch (...) {
                 if (resume_on_failure && node.process.running()) {
                   block_scheduler->StartMiner(command.node_id);

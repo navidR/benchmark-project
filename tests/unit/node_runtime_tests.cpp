@@ -5,7 +5,7 @@
 
 BOOST_AUTO_TEST_CASE(node_runtime_only_collects_chain_metrics_while_running) {
   bbp::NodeRuntime node;
-  BOOST_CHECK(node.Lifecycle() == bbp::NodeRuntimeLifecycle::kStarting);
+  BOOST_CHECK(node.Lifecycle() == bbp::NodeRuntimeLifecycle::kDefined);
   BOOST_TEST(!node.AllowsChainMetrics());
 
   node.SetLifecycle(bbp::NodeRuntimeLifecycle::kRunning);
@@ -20,6 +20,7 @@ BOOST_AUTO_TEST_CASE(node_runtime_only_collects_chain_metrics_while_running) {
 
 BOOST_AUTO_TEST_CASE(node_runtime_lifecycle_names_match_event_states) {
   constexpr bbp::NodeRuntimeLifecycle kStates[] = {
+      bbp::NodeRuntimeLifecycle::kDefined,
       bbp::NodeRuntimeLifecycle::kPreparing,
       bbp::NodeRuntimeLifecycle::kStarting,
       bbp::NodeRuntimeLifecycle::kNetworkNamespaceReady,

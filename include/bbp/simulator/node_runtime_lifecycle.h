@@ -6,6 +6,7 @@
 namespace bbp {
 
 enum class NodeRuntimeLifecycle {
+  kDefined,
   kPreparing,
   kStarting,
   kNetworkNamespaceReady,
@@ -24,6 +25,8 @@ enum class NodeRuntimeLifecycle {
 constexpr std::string_view NodeRuntimeLifecycleName(
     NodeRuntimeLifecycle lifecycle) {
   switch (lifecycle) {
+    case NodeRuntimeLifecycle::kDefined:
+      return "Defined";
     case NodeRuntimeLifecycle::kPreparing:
       return "Preparing";
     case NodeRuntimeLifecycle::kStarting:
@@ -56,6 +59,9 @@ constexpr std::string_view NodeRuntimeLifecycleName(
 
 constexpr std::optional<NodeRuntimeLifecycle> ParseNodeRuntimeLifecycleName(
     std::string_view name) {
+  if (name == "Defined") {
+    return NodeRuntimeLifecycle::kDefined;
+  }
   if (name == "Preparing") {
     return NodeRuntimeLifecycle::kPreparing;
   }
