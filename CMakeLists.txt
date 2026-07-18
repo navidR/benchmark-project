@@ -1364,6 +1364,57 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-checkpoint-name.json
     "checkpoint name contains an unsafe character"
   )
+  foreach(action_kind IN ITEMS
+      block_generation
+      wait_until_height
+      wait_for_peers
+      connect_peer
+      disconnect_peer
+      restart_node
+      freeze_node
+      update_resource_limits
+      set_resource_profile
+      set_network_profile
+      resource_pressure
+      set_network_condition
+      block_network_flow
+      unblock_network_flow
+      partition_nodes
+      heal_partition
+      set_edge_condition
+      activate_edge
+      deactivate_edge
+      restore_edge
+      send_raw_transaction
+      wallet_transactions
+      checkpoint)
+    set(generated_action_scenario
+      "${CMAKE_CURRENT_BINARY_DIR}/invalid-${action_kind}-workload-field.json")
+    file(GENERATE OUTPUT "${generated_action_scenario}"
+      CONTENT
+        "{\"firod\":\"/tmp/not-used-by-probe\",\"nodes\":2,\"workloads\":[{\"type\":\"${action_kind}\",\"unexpected\":true}]}\n"
+    )
+    add_test(NAME "bbp-invalid-${action_kind}-workload-field"
+      COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+        "-DSCENARIO=${generated_action_scenario}"
+        "-DREGEX=scenario workload ${action_kind} has unsupported field: unexpected"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_failure.cmake"
+    )
+  endforeach()
+  set(generated_scheduled_action_scenario
+    "${CMAKE_CURRENT_BINARY_DIR}/invalid-scheduled-action-field.json")
+  file(GENERATE OUTPUT "${generated_scheduled_action_scenario}"
+    CONTENT
+      "{\"firod\":\"/tmp/not-used-by-probe\",\"nodes\":2,\"events\":[{\"at\":\"1s\",\"action\":\"checkpoint\",\"unexpected\":true}]}\n"
+  )
+  add_test(NAME bbp-invalid-scheduled-action-field
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+      "-DSCENARIO=${generated_scheduled_action_scenario}"
+      "-DREGEX=scenario scheduled action checkpoint has unsupported field: unexpected"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_failure.cmake"
+  )
   add_cli_failure_test(
     bbp-invalid-legacy-generate-blocks
     tests/scenarios/invalid-legacy-generate-blocks.json

@@ -2757,6 +2757,116 @@ ProfileSwitchWorkload ParseProfileSwitchWorkload(
   return workload;
 }
 
+bool IsOneOf(std::string_view field,
+             std::initializer_list<std::string_view> fields) {
+  return std::find(fields.begin(), fields.end(), field) != fields.end();
+}
+
+bool IsResourceLimitPatchField(std::string_view field) {
+  return IsOneOf(field, {"memory_high_bytes", "memory_max_bytes",
+                         "cpu_quota_us", "cpu_period_us", "cpu_weight",
+                         "io_weight", "io_max", "pids_max"});
+}
+
+bool IsNetworkConditionField(std::string_view field) {
+  return IsOneOf(
+      field, {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+              "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
+              "reorder_basis_points", "limit_packets"});
+}
+
+bool IsTopologyEdgeConditionField(std::string_view field) {
+  return field == "latency_ms" || IsNetworkConditionField(field);
+}
+
+bool IsScenarioActionPayloadField(WorkloadKind kind, std::string_view field) {
+  switch (kind) {
+    case WorkloadKind::kBlockGeneration:
+      return IsOneOf(field, {"node", "nodes", "count", "sync_timeout_sec"});
+    case WorkloadKind::kWaitUntilHeight:
+      return IsOneOf(field, {"node", "nodes", "height", "timeout_sec"});
+    case WorkloadKind::kWaitForPeers:
+      return IsOneOf(field, {"node", "nodes", "peer_count", "timeout_sec"});
+    case WorkloadKind::kConnectPeer:
+    case WorkloadKind::kDisconnectPeer:
+      return IsOneOf(field, {"node", "nodes", "peer", "timeout_sec"});
+    case WorkloadKind::kRestartNode:
+      return IsOneOf(field, {"node", "nodes"});
+    case WorkloadKind::kFreezeNode:
+      return IsOneOf(field, {"node", "nodes", "duration_ms"});
+    case WorkloadKind::kUpdateResourceLimits:
+      return IsOneOf(field, {"node", "nodes"}) ||
+             IsResourceLimitPatchField(field);
+    case WorkloadKind::kSetResourceProfile:
+    case WorkloadKind::kSetNetworkProfile:
+      return IsOneOf(field, {"nodes", "profile"});
+    case WorkloadKind::kResourcePressure:
+      return IsOneOf(field, {"node", "nodes", "duration_ms"}) ||
+             IsResourceLimitPatchField(field);
+    case WorkloadKind::kSetNetworkCondition:
+      return IsOneOf(field, {"node", "nodes"}) ||
+             IsNetworkConditionField(field);
+    case WorkloadKind::kBlockNetworkFlow:
+    case WorkloadKind::kUnblockNetworkFlow:
+      return IsOneOf(field, {"node", "nodes", "src_address", "src_port",
+                             "dst_address", "dst_port", "handle"});
+    case WorkloadKind::kPartitionNodes:
+    case WorkloadKind::kHealPartition:
+      return IsOneOf(field, {"group_a", "group_b"});
+    case WorkloadKind::kSetEdgeCondition:
+    case WorkloadKind::kActivateEdge:
+    case WorkloadKind::kDeactivateEdge:
+    case WorkloadKind::kRestoreEdge:
+      return IsOneOf(field, {"from", "to", "timeout_sec"}) ||
+             IsTopologyEdgeConditionField(field);
+    case WorkloadKind::kSendRawTransaction:
+      return IsOneOf(
+          field, {"nodes", "funding_node", "submit_node", "source_address",
+                  "source_private_key", "destination_address", "funding_blocks",
+                  "amount", "fee", "timeout_sec"});
+    case WorkloadKind::kWalletTransactions:
+      return IsOneOf(field, {"funding_strategy",
+                             "strategy",
+                             "funding_blocks_per_wallet",
+                             "readiness_confirmations",
+                             "transaction_count",
+                             "transaction_rate",
+                             "amount",
+                             "interval",
+                             "fee",
+                             "funding_threshold",
+                             "seed",
+                             "sender_wallets",
+                             "receiver_wallets",
+                             "timeout_sec",
+                             "wallets",
+                             "private_key",
+                             "source_private_key",
+                             "address",
+                             "source_address",
+                             "destination_address"});
+    case WorkloadKind::kCheckpoint:
+      return field == "name";
+  }
+  return false;
+}
+
+void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
+                                           WorkloadKind kind, bool scheduled) {
+  for (const auto& member : object) {
+    const bool structural =
+        scheduled ? member.key() == "at" || member.key() == "action"
+                  : member.key() == "type";
+    if (!structural && !IsScenarioActionPayloadField(kind, member.key())) {
+      throw std::runtime_error(
+          std::string(scheduled ? "scenario scheduled action "
+                                : "scenario workload ") +
+          std::string(WorkloadKindName(kind)) +
+          " has unsupported field: " + std::string(member.key()));
+    }
+  }
+}
+
 void ApplyScenarioWorkloads(const boost::json::array& workloads,
                             const boost::program_options::variables_map& vm,
                             Options& options) {
@@ -2772,6 +2882,7 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       throw std::runtime_error("unsupported scenario workload type: " +
                                type_name);
     }
+    RejectUnsupportedScenarioActionFields(workload, *kind, false);
     if (*kind == WorkloadKind::kBlockGeneration) {
       if (workload.if_contains("nodes") != nullptr) {
         throw std::runtime_error(
@@ -3145,13 +3256,15 @@ void ApplyScheduledScenarioEvents(
     const boost::json::object& event = value.as_object();
     const std::string at_text = JsonStringField(event, "at");
     const std::string action_name = JsonStringField(event, "action");
-    if (!ParseWorkloadKind(action_name)) {
+    const std::optional<WorkloadKind> kind = ParseWorkloadKind(action_name);
+    if (!kind) {
       throw std::runtime_error("unsupported scheduled event action: " +
                                action_name);
     }
     if (event.if_contains("type") != nullptr) {
       throw std::runtime_error("scenario events entries use action, not type");
     }
+    RejectUnsupportedScenarioActionFields(event, *kind, true);
 
     boost::json::object action_object = event;
     action_object.erase("at");
