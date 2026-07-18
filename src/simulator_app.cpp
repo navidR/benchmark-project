@@ -4018,6 +4018,12 @@ void ParseNodeNetworkConditionTexts(
                                " must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(
+        object,
+        {"node", "bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
+         "reorder_basis_points", "limit_packets"},
+        option_name);
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(std::string(option_name) +
@@ -4037,6 +4043,11 @@ void ParseRuntimeNodeResourceTexts(
           "--runtime-node-resource-json must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(
+        object,
+        {"node", "memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
+         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max"},
+        "--runtime-node-resource-json");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(
@@ -4055,7 +4066,12 @@ void ParseRuntimeNodeBlockTexts(const std::vector<std::string>& texts,
       throw std::runtime_error(std::string(option_name) +
                                " must be a JSON object");
     }
-    NetworkBlockRule rule = ParseNetworkBlockRuleObject(value.as_object());
+    const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(object,
+                            {"node", "src_address", "src_port", "dst_address",
+                             "dst_port", "handle"},
+                            option_name);
+    NetworkBlockRule rule = ParseNetworkBlockRuleObject(object);
     if (rule.node_index >= nodes) {
       throw std::runtime_error(std::string(option_name) +
                                " node must be in 1..--nodes");
@@ -4073,8 +4089,9 @@ void ParseRuntimePartitionTexts(const std::vector<std::string>& texts,
       throw std::runtime_error(std::string(option_name) +
                                " must be a JSON object");
     }
-    NetworkPartitionRule rule =
-        ParseNetworkPartitionRuleObject(value.as_object());
+    const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(object, {"group_a", "group_b"}, option_name);
+    NetworkPartitionRule rule = ParseNetworkPartitionRuleObject(object);
     for (uint32_t node_index : rule.group_a) {
       if (node_index >= nodes) {
         throw std::runtime_error(std::string(option_name) +
@@ -4100,7 +4117,9 @@ void ParseRuntimeNodeRestartTexts(const std::vector<std::string>& texts,
       throw std::runtime_error(
           "--runtime-node-restart-json must be a JSON object");
     }
-    const uint32_t node = JsonUint32Field(value.as_object(), "node");
+    const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(object, {"node"}, "--runtime-node-restart-json");
+    const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(
           "--runtime-node-restart-json node must be in 1..--nodes");
@@ -4119,6 +4138,8 @@ void ParseRuntimeNodeFreezeTexts(const std::vector<std::string>& texts,
           "--runtime-node-freeze-json must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(object, {"node", "duration_ms"},
+                            "--runtime-node-freeze-json");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(

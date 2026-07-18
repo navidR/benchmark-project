@@ -471,6 +471,17 @@ if(BUILD_TESTING)
     )
   endfunction()
 
+  function(add_repeatable_json_failure_test name option regex)
+    add_test(NAME "${name}"
+      COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+        "-DSCENARIO_OPTION=${option}"
+        "-DSCENARIO={\"unexpected\":true}"
+        "-DREGEX=${regex}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_failure.cmake"
+    )
+  endfunction()
+
   add_test(NAME bbp-valid-yaml-scenario
     COMMAND bbp
       --scenario-yaml
@@ -484,6 +495,51 @@ if(BUILD_TESTING)
       --chain firo
       --node-binary /tmp/not-used-by-probe
       --probe-capabilities
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-node-network-condition-json-field
+    --node-network-condition-json
+    "--node-network-condition-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-node-network-condition-json-field
+    --runtime-node-network-condition-json
+    "--runtime-node-network-condition-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-node-resource-json-field
+    --runtime-node-resource-json
+    "--runtime-node-resource-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-node-block-json-field
+    --runtime-node-block-json
+    "--runtime-node-block-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-node-unblock-json-field
+    --runtime-node-unblock-json
+    "--runtime-node-unblock-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-partition-json-field
+    --runtime-partition-json
+    "--runtime-partition-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-heal-partition-json-field
+    --runtime-heal-partition-json
+    "--runtime-heal-partition-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-node-restart-json-field
+    --runtime-node-restart-json
+    "--runtime-node-restart-json has unsupported field: unexpected"
+  )
+  add_repeatable_json_failure_test(
+    bbp-invalid-runtime-node-freeze-json-field
+    --runtime-node-freeze-json
+    "--runtime-node-freeze-json has unsupported field: unexpected"
   )
   add_test(NAME bbp-canonical-yaml-scenario
     COMMAND bbp
