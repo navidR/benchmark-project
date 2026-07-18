@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "block_production": {
+    "interval_ms": 1000
+  },
+  "nodes": 1
+}

@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "resources": {
+    "memory_limit": 1073741824
+  },
+  "nodes": 1
+}

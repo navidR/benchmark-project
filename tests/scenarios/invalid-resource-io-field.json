@@ -1,0 +1,12 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "resources": {
+    "io_max": [
+      {
+        "device": "252:1",
+        "burst_bytes": 4096
+      }
+    ]
+  },
+  "nodes": 1
+}

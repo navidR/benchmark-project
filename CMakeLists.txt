@@ -1107,6 +1107,66 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-top-level-field.json
     "scenario has unsupported field: metrics_interval"
   )
+  add_cli_failure_test(
+    bbp-invalid-chain-definition-field
+    tests/scenarios/invalid-chain-definition-field.json
+    "scenario chain firo definition has unsupported field: version"
+  )
+  add_cli_failure_test(
+    bbp-invalid-block-production-field
+    tests/scenarios/invalid-block-production-field.json
+    "scenario block_production has unsupported field: interval_ms"
+  )
+  add_cli_failure_test(
+    bbp-invalid-resources-field
+    tests/scenarios/invalid-resources-field.json
+    "scenario resources has unsupported field: memory_limit"
+  )
+  add_cli_failure_test(
+    bbp-invalid-resource-profile-field
+    tests/scenarios/invalid-resource-profile-field.json
+    "scenario resource profile small has unsupported field: memory_limit"
+  )
+  add_cli_failure_test(
+    bbp-invalid-resource-io-field
+    tests/scenarios/invalid-resource-io-field.json
+    "scenario resources.io_max entry has unsupported field: burst_bytes"
+  )
+  add_cli_failure_test(
+    bbp-invalid-runtime-resource-field
+    tests/scenarios/invalid-runtime-resource-field.json
+    "scenario resources.runtime_node_limits entry has unsupported field: duration_ms"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-field
+    tests/scenarios/invalid-network-field.json
+    "scenario network has unsupported field: isolate"
+  )
+  add_cli_failure_test(
+    bbp-invalid-network-profile-field
+    tests/scenarios/invalid-network-profile-field.json
+    "scenario network profile normal has unsupported field: latency_ms"
+  )
+  add_cli_failure_test(
+    bbp-invalid-default-network-condition-field
+    tests/scenarios/invalid-default-network-condition-field.json
+    "scenario network.default_condition has unsupported field: latency_ms"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-network-condition-entry-field
+    tests/scenarios/invalid-node-network-condition-entry-field.json
+    "scenario network.node_conditions entry has unsupported field: latency_ms"
+  )
+  add_cli_failure_test(
+    bbp-invalid-runtime-network-flow-field
+    tests/scenarios/invalid-runtime-network-flow-field.json
+    "scenario network.runtime_node_blocks entry has unsupported field: protocol"
+  )
+  add_cli_failure_test(
+    bbp-invalid-runtime-partition-field
+    tests/scenarios/invalid-runtime-partition-field.json
+    "scenario network.runtime_partitions entry has unsupported field: bidirectional"
+  )
   add_test(NAME bbp-valid-profile-switch-events
     COMMAND bbp
       --scenario-json

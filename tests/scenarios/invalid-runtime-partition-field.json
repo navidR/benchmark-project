@@ -1,0 +1,13 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "network": {
+    "runtime_partitions": [
+      {
+        "group_a": [1],
+        "group_b": [2],
+        "bidirectional": true
+      }
+    ]
+  },
+  "nodes": 2
+}

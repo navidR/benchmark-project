@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "network": {
+    "isolate": true
+  },
+  "nodes": 1
+}

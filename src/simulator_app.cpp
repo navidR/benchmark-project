@@ -1795,6 +1795,11 @@ std::vector<IoLimit> ParseIoLimits(const boost::json::value& value,
                                " entries must be JSON objects");
     }
     const boost::json::object& object = entry.as_object();
+    RejectUnsupportedFields(
+        object,
+        {"device", "read_bytes_per_sec", "write_bytes_per_sec",
+         "read_operations_per_sec", "write_operations_per_sec"},
+        std::string(field) + " entry");
     IoLimit limit;
     limit.device = ParseBlockDeviceId(JsonStringField(object, "device"));
     if (!devices.insert(limit.device).second) {
@@ -1978,6 +1983,12 @@ void ApplyCpuMaxAlias(const boost::json::value& value, std::string_view field,
 ResourceLimits ParseResourceProfile(const boost::json::object& object,
                                     const ResourceLimits& defaults,
                                     std::string_view profile_name) {
+  RejectUnsupportedFields(
+      object,
+      {"memory_high", "memory_max", "cpu_quota", "cpu_max", "memory_high_bytes",
+       "memory_max_bytes", "cpu_quota_us", "cpu_period_us", "cpu_weight",
+       "io_weight", "io_max", "pids_max"},
+      "scenario resource profile " + std::string(profile_name));
   boost::json::object canonical = object;
   const bool memory_high_alias = object.if_contains("memory_high") != nullptr;
   const bool memory_max_alias = object.if_contains("memory_max") != nullptr;
@@ -2069,6 +2080,12 @@ void ParseNetworkProfiles(const boost::json::object& scenario,
       throw std::runtime_error("scenario network profile " + name +
                                " must be an object");
     }
+    RejectUnsupportedFields(
+        profile_value.as_object(),
+        {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
+         "reorder_basis_points", "limit_packets"},
+        "scenario network profile " + name);
     const NetworkCondition condition =
         ParseNetworkConditionObject(profile_value.as_object());
     ValidateNetworkCondition(condition);
@@ -2098,6 +2115,8 @@ void ParseScenarioChains(const boost::json::object& scenario,
                                " definition must be an object");
     }
     const boost::json::object& definition = definition_value.as_object();
+    RejectUnsupportedFields(definition, {"driver", "default_binary"},
+                            "scenario chain " + name + " definition");
     const ChainKind driver =
         ParseChainKind(JsonStringField(definition, "driver"));
     if (driver != chain) {
@@ -2426,6 +2445,12 @@ void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
                                " entries must be JSON objects");
     }
     const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(
+        object,
+        {"node", "bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
+         "reorder_basis_points", "limit_packets"},
+        std::string(source) + " entry");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(std::string(source) + " node must be in 1.." +
@@ -2443,7 +2468,12 @@ void ApplyNetworkBlockRules(const boost::json::array& rules, uint32_t nodes,
       throw std::runtime_error(std::string(source) +
                                " entries must be JSON objects");
     }
-    NetworkBlockRule rule = ParseNetworkBlockRuleObject(value.as_object());
+    const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(object,
+                            {"node", "src_address", "src_port", "dst_address",
+                             "dst_port", "handle"},
+                            std::string(source) + " entry");
+    NetworkBlockRule rule = ParseNetworkBlockRuleObject(object);
     if (rule.node_index >= nodes) {
       throw std::runtime_error(std::string(source) + " node must be in 1.." +
                                std::to_string(nodes));
@@ -2460,8 +2490,10 @@ void ApplyNetworkPartitionRules(const boost::json::array& rules, uint32_t nodes,
       throw std::runtime_error(std::string(source) +
                                " entries must be JSON objects");
     }
-    NetworkPartitionRule rule =
-        ParseNetworkPartitionRuleObject(value.as_object());
+    const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(object, {"group_a", "group_b"},
+                            std::string(source) + " entry");
+    NetworkPartitionRule rule = ParseNetworkPartitionRuleObject(object);
     ValidateNetworkPartitionRule(rule, nodes, source);
     output.push_back(std::move(rule));
   }
@@ -2476,6 +2508,11 @@ void ApplyResourceLimitPatches(const boost::json::array& updates,
                                " entries must be JSON objects");
     }
     const boost::json::object& object = value.as_object();
+    RejectUnsupportedFields(
+        object,
+        {"node", "memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
+         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max"},
+        std::string(source) + " entry");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(std::string(source) + " node must be in 1.." +
@@ -3379,6 +3416,10 @@ void ApplyScenarioJson(const boost::json::object& scenario,
           "scenario block_production must be a JSON object");
     }
     const boost::json::object& object = block_production->as_object();
+    RejectUnsupportedFields(object,
+                            {"enabled", "native_mining", "period_ms",
+                             "probability", "seed", "difficulty"},
+                            "scenario block_production");
     if (!OptionProvided(vm, "no-mining")) {
       options.block_production.enabled = JsonOptionalBoolField(
           object, "enabled", options.block_production.enabled);
@@ -3470,6 +3511,12 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       throw std::runtime_error("scenario resources must be a JSON object");
     }
     const boost::json::object& object = resources->as_object();
+    RejectUnsupportedFields(
+        object,
+        {"memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
+         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max",
+         "runtime_node_limits"},
+        "scenario resources");
     if (!OptionProvided(vm, "memory-high-bytes")) {
       options.memory_high_bytes = JsonOptionalUint64Field(
           object, "memory_high_bytes", options.memory_high_bytes);
@@ -3549,6 +3596,12 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       throw std::runtime_error("scenario network must be a JSON object");
     }
     const boost::json::object& object = network->as_object();
+    RejectUnsupportedFields(object,
+                            {"isolated", "default_condition", "node_conditions",
+                             "runtime_node_conditions", "runtime_node_blocks",
+                             "runtime_node_unblocks", "runtime_partitions",
+                             "runtime_partition_heals"},
+                            "scenario network");
     if (!OptionProvided(vm, "isolate-network")) {
       options.isolate_network =
           JsonOptionalBoolField(object, "isolated", options.isolate_network);
@@ -3560,6 +3613,12 @@ void ApplyScenarioJson(const boost::json::object& scenario,
         throw std::runtime_error(
             "scenario network.default_condition must be a JSON object");
       }
+      RejectUnsupportedFields(
+          default_condition->as_object(),
+          {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+           "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
+           "reorder_basis_points", "limit_packets"},
+          "scenario network.default_condition");
       const NetworkCondition scenario_condition =
           ParseNetworkConditionObject(default_condition->as_object());
       if (!OptionProvided(vm, "network-bandwidth-mbps")) {

@@ -1,0 +1,10 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "resource_profiles": {
+    "small": {
+      "memory_max": "1GiB",
+      "memory_limit": "512MiB"
+    }
+  },
+  "nodes": 1
+}

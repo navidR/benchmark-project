@@ -1,0 +1,14 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "network": {
+    "runtime_node_blocks": [
+      {
+        "node": 1,
+        "dst_address": "127.0.0.1",
+        "dst_port": 18168,
+        "protocol": "tcp"
+      }
+    ]
+  },
+  "nodes": 1
+}

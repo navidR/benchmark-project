@@ -1,0 +1,9 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "network": {
+    "default_condition": {
+      "latency_ms": 25
+    }
+  },
+  "nodes": 1
+}
