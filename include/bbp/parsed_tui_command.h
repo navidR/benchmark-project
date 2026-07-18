@@ -14,6 +14,11 @@
 
 namespace bbp {
 
+enum class TuiPartitionTargetKind {
+  kNodePair,
+  kSelectedTopologyGroup,
+};
+
 struct ParsedTuiCommand {
   SimulationCommandKind kind = SimulationCommandKind::kStopMining;
   std::optional<BlockProductionPolicy> block_production_policy;
@@ -25,6 +30,7 @@ struct ParsedTuiCommand {
   std::optional<ResourceLimitPatch> resource_limit_patch;
   std::optional<NetworkCondition> network_condition;
   std::optional<SimulationNetworkFlow> network_flow;
+  std::optional<TuiPartitionTargetKind> partition_target_kind;
   std::optional<PerfCounterTargetKind> perf_counter_target_kind;
   std::optional<std::string> perf_counter_target_id;
   std::vector<PerfCounterKind> perf_counter_kinds;

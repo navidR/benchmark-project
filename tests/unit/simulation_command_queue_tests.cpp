@@ -358,34 +358,50 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_network_flows) {
 
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_partitions) {
   bbp::SimulationCommandQueue queue;
+  const bbp::SimulationPartition node_pair{
+      .scope = bbp::SimulationPartitionScope::kNodePair,
+      .group_a = {.group_ids = {"firo-1"}, .node_ids = {"firo-1"}},
+      .group_b = {.group_ids = {"firo-2"}, .node_ids = {"firo-2"}},
+  };
+  const bbp::SimulationPartition groups{
+      .scope = bbp::SimulationPartitionScope::kRole,
+      .group_a = {.group_ids = {"role-wallet"},
+                  .node_ids = {"firo-1", "firo-2"}},
+      .group_b = {.group_ids = {"role-miner"}, .node_ids = {"firo-3"}},
+  };
   queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
-                             "firo-1", "firo-2", true);
+                             node_pair, true);
   queue.PushPartitionCommand(bbp::SimulationCommandKind::kHealPartition,
-                             "firo-1", "firo-2");
+                             groups);
 
   const std::optional<bbp::SimulationCommand> partition = queue.TryPop();
   const std::optional<bbp::SimulationCommand> heal = queue.TryPop();
   BOOST_REQUIRE(partition);
-  BOOST_REQUIRE(partition->peer_node_id);
-  BOOST_TEST(*partition->peer_node_id == "firo-2");
+  BOOST_TEST(partition->node_id == "firo-1");
+  BOOST_REQUIRE(partition->partition);
+  BOOST_CHECK(*partition->partition == node_pair);
   BOOST_TEST(partition->confirmed);
   BOOST_REQUIRE(heal);
   BOOST_CHECK(heal->kind == bbp::SimulationCommandKind::kHealPartition);
-  BOOST_REQUIRE(heal->peer_node_id);
-  BOOST_TEST(*heal->peer_node_id == "firo-2");
+  BOOST_TEST(heal->node_id == "sim");
+  BOOST_REQUIRE(heal->partition);
+  BOOST_CHECK(*heal->partition == groups);
 
+  bbp::SimulationPartition empty = node_pair;
+  empty.group_b.node_ids.clear();
   BOOST_CHECK_THROW(
       queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
-                                 "firo-1", "", true),
+                                 empty, true),
       std::runtime_error);
+  bbp::SimulationPartition overlap = groups;
+  overlap.group_b.node_ids = {"firo-2"};
   BOOST_CHECK_THROW(
       queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
-                                 "firo-1", "firo-1", true),
+                                 overlap, true),
       std::runtime_error);
-  BOOST_CHECK_THROW(
-      queue.PushPartitionCommand(bbp::SimulationCommandKind::kKillNode,
-                                 "firo-1", "firo-2", true),
-      std::runtime_error);
+  BOOST_CHECK_THROW(queue.PushPartitionCommand(
+                        bbp::SimulationCommandKind::kKillNode, node_pair, true),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -405,8 +421,13 @@ BOOST_AUTO_TEST_CASE(
           bbp::SimulationCommandKind::kBlockNetworkFlow, "firo-1", flow),
       std::runtime_error);
   BOOST_CHECK_THROW(
-      queue.PushPartitionCommand(bbp::SimulationCommandKind::kPartitionNodes,
-                                 "firo-1", "firo-2"),
+      queue.PushPartitionCommand(
+          bbp::SimulationCommandKind::kPartitionNodes,
+          bbp::SimulationPartition{
+              .scope = bbp::SimulationPartitionScope::kNodePair,
+              .group_a = {.group_ids = {"firo-1"}, .node_ids = {"firo-1"}},
+              .group_b = {.group_ids = {"firo-2"}, .node_ids = {"firo-2"}},
+          }),
       std::runtime_error);
   BOOST_TEST(!queue.TryPop());
 }

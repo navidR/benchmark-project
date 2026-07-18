@@ -37,6 +37,7 @@
 #include "bbp/run_report.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulator/workload_kind.h"
+#include "bbp/topology_partition_resolver.h"
 #include "bbp/tui_command_parser.h"
 #include "bbp/tui_view.h"
 #include "bbp/util.h"
@@ -56,6 +57,7 @@ constexpr std::size_t kMaximumReportRecordsPerLiveRefresh = 256U;
 struct PendingConfirmation {
   ParsedTuiCommand command;
   std::string target_node_id;
+  std::optional<SimulationPartition> partition;
 };
 
 struct TuiState {
@@ -1274,7 +1276,7 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   AddText(top + 15, left + 2, popup_cols - 4,
           "block|unblock <dst-ip> <port> [src-ip]  clear-rule <handle>");
   AddText(top + 16, left + 2, popup_cols - 4,
-          "partition <node-id>  heal <node-id>");
+          "partition|heal [node-id]  (no id: selected topology group)");
   AddText(top + 17, left + 2, popup_cols - 4,
           "perf-counters [node|wallet|group|cgroup [id]] <name[,name...]>");
   AddText(top + 18, left + 2, popup_cols - 4, "> " + std::string(input) + "_",
@@ -2272,11 +2274,11 @@ std::uint64_t BlockProductionSeed(const boost::json::object& report) {
   return JsonUnsignedMetric(value->as_object(), "seed").value_or(0U);
 }
 
-bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
-                            const boost::json::object& report,
-                            SimulationCommandQueue* command_queue,
-                            TuiState* state, bool confirmed = false,
-                            std::string confirmed_target = {}) {
+bool QueueParsedNodeCommand(
+    const ParsedTuiCommand& parsed, const boost::json::object& report,
+    SimulationCommandQueue* command_queue, TuiState* state,
+    bool confirmed = false, std::string confirmed_target = {},
+    std::optional<SimulationPartition> confirmed_partition = std::nullopt) {
   if (command_queue == nullptr) {
     state->command_input_error =
         "Live commands are unavailable in report mode.";
@@ -2289,6 +2291,11 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
     std::string target = "the simulation";
     std::string node_id;
     std::optional<PerfCounterTarget> perf_target;
+    std::optional<SimulationPartition> partition =
+        std::move(confirmed_partition);
+    const bool partition_command =
+        parsed.kind == SimulationCommandKind::kPartitionNodes ||
+        parsed.kind == SimulationCommandKind::kHealPartition;
     if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
       if (!parsed.block_production_policy) {
         throw std::runtime_error("block production policy is missing");
@@ -2303,6 +2310,41 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
           parsed.perf_counter_target_kind, parsed.perf_counter_target_id);
       target = std::string(PerfCounterTargetKindName(perf_target->kind)) + ":" +
                perf_target->id;
+    } else if (partition_command) {
+      if (!parsed.partition_target_kind) {
+        throw std::runtime_error("partition target kind is missing");
+      }
+      if (!partition) {
+        if (*parsed.partition_target_kind ==
+            TuiPartitionTargetKind::kSelectedTopologyGroup) {
+          if (state->view != TuiView::kTopology) {
+            throw std::runtime_error(
+                "selected-group partition requires the topology view");
+          }
+          partition = ResolveSelectedTopologyPartition(
+              report, state->selected_topology_group);
+        } else {
+          if (!parsed.peer_node_id) {
+            throw std::runtime_error("partition peer node is missing");
+          }
+          const boost::json::array* nodes = NodeSummaries(report);
+          const std::optional<std::size_t> selected_node =
+              SelectedNodeIndex(report, *state);
+          const boost::json::object* node =
+              nodes == nullptr || !selected_node
+                  ? nullptr
+                  : NodeAt(*nodes, *selected_node);
+          if (node == nullptr) {
+            throw std::runtime_error("no backing node is selected");
+          }
+          partition = MakeNodePairPartition(JsonString(*node, "node_id"),
+                                            *parsed.peer_node_id);
+        }
+      }
+      target = SimulationPartitionTargetText(*partition);
+      node_id = partition->scope == SimulationPartitionScope::kNodePair
+                    ? partition->group_a.node_ids.front()
+                    : "sim";
     } else {
       node_id = std::move(confirmed_target);
       if (node_id.empty()) {
@@ -2326,6 +2368,7 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
       state->pending_confirmation = PendingConfirmation{
           .command = parsed,
           .target_node_id = target,
+          .partition = partition,
       };
       state->command_palette_open = false;
       state->command_input.clear();
@@ -2400,11 +2443,11 @@ bool QueueParsedNodeCommand(const ParsedTuiCommand& parsed,
             parsed.kind, node_id, *parsed.network_flow, confirmed);
       } else if (parsed.kind == SimulationCommandKind::kPartitionNodes ||
                  parsed.kind == SimulationCommandKind::kHealPartition) {
-        if (!parsed.peer_node_id) {
-          throw std::runtime_error("partition peer node is missing");
+        if (!partition) {
+          throw std::runtime_error("typed partition target is missing");
         }
         sequence = command_queue->PushPartitionCommand(
-            parsed.kind, node_id, *parsed.peer_node_id, confirmed);
+            parsed.kind, std::move(*partition), confirmed);
       } else {
         sequence = command_queue->Push(parsed.kind, node_id, confirmed);
       }
@@ -2489,9 +2532,9 @@ bool HandleCommandConfirmationInput(int ch, const boost::json::object& report,
   if (ch == 'y' || ch == 'Y') {
     PendingConfirmation pending = std::move(*state->pending_confirmation);
     state->pending_confirmation.reset();
-    static_cast<void>(
-        QueueParsedNodeCommand(pending.command, report, command_queue, state,
-                               true, std::move(pending.target_node_id)));
+    static_cast<void>(QueueParsedNodeCommand(
+        pending.command, report, command_queue, state, true,
+        std::move(pending.target_node_id), std::move(pending.partition)));
     return true;
   }
   return ch != ERR;

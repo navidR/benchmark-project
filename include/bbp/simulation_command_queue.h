@@ -39,8 +39,7 @@ class SimulationCommandQueue {
                                        SimulationNetworkFlow flow,
                                        bool confirmed = false);
   std::uint64_t PushPartitionCommand(SimulationCommandKind kind,
-                                     std::string node_id,
-                                     std::string peer_node_id,
+                                     SimulationPartition partition,
                                      bool confirmed = false);
   std::uint64_t PushPerfCounters(PerfCounterTarget target,
                                  std::vector<PerfCounterKind> kinds);

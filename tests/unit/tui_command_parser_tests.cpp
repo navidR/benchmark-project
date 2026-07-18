@@ -275,10 +275,20 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_network_commands) {
   const bbp::ParsedTuiCommand partition =
       bbp::TuiCommandParser::Parse("partition firo-2", 0U);
   BOOST_CHECK(partition.kind == bbp::SimulationCommandKind::kPartitionNodes);
+  BOOST_REQUIRE(partition.partition_target_kind);
+  BOOST_CHECK(*partition.partition_target_kind ==
+              bbp::TuiPartitionTargetKind::kNodePair);
   BOOST_REQUIRE(partition.peer_node_id);
   BOOST_TEST(*partition.peer_node_id == "firo-2");
-  BOOST_CHECK(bbp::TuiCommandParser::Parse("heal firo-2", 0U).kind ==
-              bbp::SimulationCommandKind::kHealPartition);
+  const bbp::ParsedTuiCommand selected =
+      bbp::TuiCommandParser::Parse("heal", 0U);
+  BOOST_CHECK(selected.kind == bbp::SimulationCommandKind::kHealPartition);
+  BOOST_REQUIRE(selected.partition_target_kind);
+  BOOST_CHECK(*selected.partition_target_kind ==
+              bbp::TuiPartitionTargetKind::kSelectedTopologyGroup);
+  BOOST_TEST(!selected.peer_node_id);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("partition firo-2 extra", 0U),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_network_commands) {
@@ -314,6 +324,6 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_network_commands) {
       std::runtime_error);
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("clear-rule 0", 0U),
                     std::runtime_error);
-  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("partition", 0U),
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("heal firo-2 extra", 0U),
                     std::runtime_error);
 }

@@ -2,9 +2,72 @@
 
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace bbp {
+namespace {
+
+std::set<std::string> ValidatePartitionGroup(
+    const SimulationPartitionGroup& group, std::string_view name) {
+  if (group.group_ids.empty()) {
+    throw std::runtime_error("partition " + std::string(name) +
+                             " requires a group id");
+  }
+  if (group.node_ids.empty()) {
+    throw std::runtime_error("partition " + std::string(name) +
+                             " requires a node id");
+  }
+  std::set<std::string> group_ids;
+  for (const std::string& group_id : group.group_ids) {
+    if (group_id.empty()) {
+      throw std::runtime_error("partition " + std::string(name) +
+                               " contains an empty group id");
+    }
+    if (!group_ids.insert(group_id).second) {
+      throw std::runtime_error("partition " + std::string(name) +
+                               " contains duplicate group ids");
+    }
+  }
+  std::set<std::string> node_ids;
+  for (const std::string& node_id : group.node_ids) {
+    if (node_id.empty()) {
+      throw std::runtime_error("partition " + std::string(name) +
+                               " contains an empty node id");
+    }
+    if (!node_ids.insert(node_id).second) {
+      throw std::runtime_error("partition " + std::string(name) +
+                               " contains duplicate node ids");
+    }
+  }
+  return node_ids;
+}
+
+void ValidatePartition(const SimulationPartition& partition) {
+  const std::set<std::string> group_a_nodes =
+      ValidatePartitionGroup(partition.group_a, "group A");
+  const std::set<std::string> group_b_nodes =
+      ValidatePartitionGroup(partition.group_b, "group B");
+  for (const std::string& node_id : group_a_nodes) {
+    if (group_b_nodes.contains(node_id)) {
+      throw std::runtime_error("partition groups overlap at node " + node_id);
+    }
+  }
+  if (partition.scope == SimulationPartitionScope::kNodePair) {
+    if (partition.group_a.group_ids.size() != 1U ||
+        partition.group_a.node_ids.size() != 1U ||
+        partition.group_b.group_ids.size() != 1U ||
+        partition.group_b.node_ids.size() != 1U) {
+      throw std::runtime_error(
+          "node-pair partition requires one node in each group");
+    }
+  } else if (partition.group_a.group_ids.size() != 1U) {
+    throw std::runtime_error(
+        "selected topology partition requires exactly one selected group");
+  }
+}
+
+}  // namespace
 
 std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
                                            std::string node_id,
@@ -53,6 +116,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -74,6 +138,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = false,
@@ -95,6 +160,7 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = false,
@@ -127,6 +193,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -148,6 +215,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -172,6 +240,7 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = false,
@@ -201,6 +270,7 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -227,6 +297,7 @@ std::uint64_t SimulationCommandQueue::PushResourceLimits(
       .resource_limit_patch = std::move(patch),
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -249,6 +320,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkCondition(
       .resource_limit_patch = std::nullopt,
       .network_condition = condition,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -292,6 +364,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::move(flow),
+      .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -299,32 +372,31 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
 }
 
 std::uint64_t SimulationCommandQueue::PushPartitionCommand(
-    SimulationCommandKind kind, std::string node_id, std::string peer_node_id,
-    bool confirmed) {
+    SimulationCommandKind kind, SimulationPartition partition, bool confirmed) {
   if (kind != SimulationCommandKind::kPartitionNodes &&
       kind != SimulationCommandKind::kHealPartition) {
     throw std::runtime_error(
         "partition command requires a partition or heal kind");
   }
-  if (peer_node_id.empty()) {
-    throw std::runtime_error("partition command requires a peer node id");
-  }
-  if (node_id == peer_node_id) {
-    throw std::runtime_error("partition command nodes must differ");
-  }
+  ValidatePartition(partition);
+  const std::string event_node_id =
+      partition.scope == SimulationPartitionScope::kNodePair
+          ? partition.group_a.node_ids.front()
+          : "sim";
   return PushCommand(SimulationCommand{
       .sequence = 0U,
       .kind = kind,
-      .node_id = std::move(node_id),
+      .node_id = event_node_id,
       .block_production_policy = std::nullopt,
       .mining_difficulty = std::nullopt,
-      .peer_node_id = std::move(peer_node_id),
+      .peer_node_id = std::nullopt,
       .peer_count_policy = std::nullopt,
       .block_count = std::nullopt,
       .profile = std::nullopt,
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::move(partition),
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .confirmed = confirmed,
@@ -376,6 +448,7 @@ std::uint64_t SimulationCommandQueue::PushPerfCounters(
       .resource_limit_patch = std::nullopt,
       .network_condition = std::nullopt,
       .network_flow = std::nullopt,
+      .partition = std::nullopt,
       .perf_counter_target = std::move(target),
       .perf_counter_kinds = std::move(kinds),
       .confirmed = false,

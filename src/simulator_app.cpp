@@ -10216,6 +10216,41 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
   }
 }
 
+std::uint32_t PartitionNodeIndex(const std::vector<NodeRuntime>& nodes,
+                                 std::string_view node_id) {
+  const auto node = std::find_if(nodes.begin(), nodes.end(),
+                                 [&](const NodeRuntime& candidate) {
+                                   return candidate.config.id == node_id;
+                                 });
+  if (node == nodes.end()) {
+    throw std::runtime_error("partition command references unknown node: " +
+                             std::string(node_id));
+  }
+  const std::size_t index =
+      static_cast<std::size_t>(std::distance(nodes.begin(), node));
+  if (index > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error("partition command node index exceeds uint32");
+  }
+  return static_cast<std::uint32_t>(index);
+}
+
+NetworkPartitionRule RuntimePartitionRule(
+    const SimulationPartition& partition,
+    const std::vector<NodeRuntime>& nodes) {
+  NetworkPartitionRule rule;
+  rule.group_a.reserve(partition.group_a.node_ids.size());
+  rule.group_b.reserve(partition.group_b.node_ids.size());
+  for (const std::string& node_id : partition.group_a.node_ids) {
+    rule.group_a.push_back(PartitionNodeIndex(nodes, node_id));
+  }
+  for (const std::string& node_id : partition.group_b.node_ids) {
+    rule.group_b.push_back(PartitionNodeIndex(nodes, node_id));
+  }
+  ValidateNetworkPartitionRule(rule, static_cast<std::uint32_t>(nodes.size()),
+                               "operator partition command");
+  return rule;
+}
+
 NetworkBlockRule MakeP2pBlockRule(uint32_t src_node_index,
                                   uint32_t dst_node_index,
                                   const std::vector<NodeRuntime>& nodes) {
@@ -11367,6 +11402,30 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
     }
     detail["network_flow"] = std::move(flow);
   }
+  if (command.partition) {
+    const auto group_json = [](const SimulationPartitionGroup& group) {
+      boost::json::object object;
+      boost::json::array group_ids;
+      group_ids.reserve(group.group_ids.size());
+      for (const std::string& group_id : group.group_ids) {
+        group_ids.emplace_back(group_id);
+      }
+      boost::json::array node_ids;
+      node_ids.reserve(group.node_ids.size());
+      for (const std::string& node_id : group.node_ids) {
+        node_ids.emplace_back(node_id);
+      }
+      object["group_ids"] = std::move(group_ids);
+      object["node_ids"] = std::move(node_ids);
+      return object;
+    };
+    boost::json::object partition;
+    partition["scope"] =
+        std::string(SimulationPartitionScopeName(command.partition->scope));
+    partition["group_a"] = group_json(command.partition->group_a);
+    partition["group_b"] = group_json(command.partition->group_b);
+    detail["partition"] = std::move(partition);
+  }
   if (command.perf_counter_target) {
     boost::json::object target;
     target["kind"] =
@@ -12133,37 +12192,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                          command.sequence));
             } else if (command.kind == SimulationCommandKind::kPartitionNodes ||
                        command.kind == SimulationCommandKind::kHealPartition) {
-              if (!command.peer_node_id) {
+              if (!command.partition) {
                 throw std::runtime_error(
-                    "partition command requires a peer node id");
+                    "partition command requires a typed partition target");
               }
-              const auto node_iter =
-                  std::find_if(nodes.begin(), nodes.end(),
-                               [&](const NodeRuntime& candidate) {
-                                 return candidate.config.id == command.node_id;
-                               });
-              const auto peer_iter = std::find_if(
-                  nodes.begin(), nodes.end(),
-                  [&](const NodeRuntime& candidate) {
-                    return candidate.config.id == *command.peer_node_id;
-                  });
-              if (node_iter == nodes.end() || peer_iter == nodes.end()) {
-                throw std::runtime_error(
-                    "partition command references an unknown node");
-              }
-              const std::size_t node_index = static_cast<std::size_t>(
-                  std::distance(nodes.begin(), node_iter));
-              const std::size_t peer_index = static_cast<std::size_t>(
-                  std::distance(nodes.begin(), peer_iter));
-              if (node_index > std::numeric_limits<std::uint32_t>::max() ||
-                  peer_index > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::runtime_error(
-                    "partition command node index exceeds uint32");
-              }
-              const NetworkPartitionRule partition{
-                  .group_a = {static_cast<std::uint32_t>(node_index)},
-                  .group_b = {static_cast<std::uint32_t>(peer_index)},
-              };
+              const NetworkPartitionRule partition =
+                  RuntimePartitionRule(*command.partition, nodes);
               ApplyRuntimeNetworkPartition(
                   options, events_path, nodes, partition,
                   command.kind == SimulationCommandKind::kHealPartition, 0U, 0U,

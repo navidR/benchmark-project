@@ -10,6 +10,7 @@
 #include "bbp/network.h"
 #include "bbp/peer_count_policy.h"
 #include "bbp/perf_counter.h"
+#include "bbp/simulation_partition.h"
 #include "bbp/simulator/resource_limit_patch.h"
 
 namespace bbp {
@@ -63,6 +64,7 @@ struct SimulationCommand {
   std::optional<ResourceLimitPatch> resource_limit_patch;
   std::optional<NetworkCondition> network_condition;
   std::optional<SimulationNetworkFlow> network_flow;
+  std::optional<SimulationPartition> partition;
   std::optional<PerfCounterTarget> perf_counter_target;
   std::vector<PerfCounterKind> perf_counter_kinds;
   bool confirmed = false;
