@@ -1,0 +1,12 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 5,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 5,
+    "type": "scale_free_graph",
+    "seed": 7,
+    "average_degree": 2,
+    "attachment_count": 1
+  }
+}

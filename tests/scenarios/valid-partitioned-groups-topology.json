@@ -1,0 +1,10 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 4,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 4,
+    "type": "partitioned_groups",
+    "groups": [[1, 2], [3, 4]]
+  }
+}

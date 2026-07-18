@@ -75,7 +75,6 @@ struct WalletInitialization {
   WalletInitializationStrategy strategy =
       WalletInitializationStrategy::kDriverRpc;
   WalletPrivacyMode mode = WalletPrivacyMode::kPublic;
-  std::string seed;
 };
 
 struct WalletIdentity {

@@ -529,6 +529,46 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-directional-edge-condition.json"
       --probe-capabilities
   )
+  foreach(topology_kind
+      ring
+      star
+      random-graph
+      scale-free
+      latency-matrix
+      partitioned-groups
+      region-graph)
+    add_test(NAME bbp-valid-${topology_kind}-topology
+      COMMAND bbp
+        --scenario-json
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-${topology_kind}-topology.json"
+        --probe-capabilities
+    )
+  endforeach()
+  add_cli_failure_test(
+    bbp-invalid-topology-kind-field
+    tests/scenarios/invalid-topology-kind-field.json
+    "scenario topology full_mesh has unsupported field: average_degree"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-wallet-initialization-field
+    tests/scenarios/invalid-topology-wallet-initialization-field.json
+    "scenario topology.wallet_initialization has unsupported field: seed"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-peer-connectivity-field
+    tests/scenarios/invalid-topology-peer-connectivity-field.json
+    "scenario topology.peer_connectivity entry has unsupported field: weight"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-edge-field
+    tests/scenarios/invalid-topology-edge-field.json
+    "scenario topology.edges entry has unsupported field: label"
+  )
+  add_cli_failure_test(
+    bbp-invalid-topology-region-edge-field
+    tests/scenarios/invalid-topology-region-edge-field.json
+    "scenario topology.region_edges entry has unsupported field: weight"
+  )
   add_cli_failure_test(
     bbp-invalid-directional-edge-condition-without-isolation
     tests/scenarios/invalid-directional-edge-condition-without-isolation.json

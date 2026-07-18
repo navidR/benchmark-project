@@ -1146,6 +1146,9 @@ ChainWalletMode ToChainWalletMode(const WalletInitialization& initialization) {
 
 PeerConnectivityPolicy ParsePeerConnectivityPolicyObject(
     const boost::json::object& object, uint32_t node_count) {
+  RejectUnsupportedFields(
+      object, {"node", "all_peers", "min_peer_count", "max_peer_count"},
+      "scenario topology.peer_connectivity entry");
   const uint32_t node = JsonUint32Field(object, "node");
   if (node == 0U || node > node_count) {
     throw std::runtime_error(
@@ -1263,6 +1266,13 @@ uint32_t ParseTopologyNode(const boost::json::object& object, const char* field,
 
 PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
                                        uint32_t node_count) {
+  RejectUnsupportedFields(
+      object,
+      {"from", "to", "bidirectional", "active", "latency_ms", "bandwidth_mbps",
+       "delay_ms", "jitter_ms", "loss_basis_points", "loss_percent",
+       "duplicate_basis_points", "corrupt_basis_points", "reorder_basis_points",
+       "limit_packets"},
+      "scenario topology.edges entry");
   PeerTopologyEdge edge;
   edge.from = ParseTopologyNode(object, "from", node_count);
   edge.to = ParseTopologyNode(object, "to", node_count);
@@ -1278,6 +1288,7 @@ PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
       "delay_ms",
       "jitter_ms",
       "loss_basis_points",
+      "loss_percent",
       "duplicate_basis_points",
       "corrupt_basis_points",
       "reorder_basis_points",
@@ -1310,6 +1321,7 @@ constexpr std::string_view kTopologyEdgeConditionFields[] = {
     "delay_ms",
     "jitter_ms",
     "loss_basis_points",
+    "loss_percent",
     "duplicate_basis_points",
     "corrupt_basis_points",
     "reorder_basis_points",
@@ -1413,6 +1425,9 @@ std::vector<PeerTopologyRegionEdge> ParsePeerTopologyRegionEdges(
           "scenario topology.region_edges entries must be JSON objects");
     }
     const boost::json::object& edge_object = edge_value.as_object();
+    RejectUnsupportedFields(
+        edge_object, {"from_region", "to_region", "bidirectional", "active"},
+        "scenario topology.region_edges entry");
     const uint32_t from = JsonUint32Field(edge_object, "from_region");
     const uint32_t to = JsonUint32Field(edge_object, "to_region");
     if (from == 0U || from > region_count || to == 0U || to > region_count) {
@@ -1436,6 +1451,52 @@ PeerTopologyConfig ParsePeerTopologyConfig(const boost::json::object& object,
   PeerTopologyConfig topology;
   topology.kind = ParsePeerTopologyKind(
       JsonOptionalStringField(object, "type", "full_mesh"));
+  const auto is_common_field = [](std::string_view field) {
+    constexpr std::string_view kCommonFields[] = {
+        "type",
+        "node_count",
+        "wallet_node_count",
+        "miner_node_count",
+        "wallet_nodes",
+        "miner_nodes",
+        "allow_miner_wallet_overlap",
+        "wallet_initialization",
+        "peer_connectivity",
+    };
+    return std::find(std::begin(kCommonFields), std::end(kCommonFields),
+                     field) != std::end(kCommonFields);
+  };
+  const auto is_kind_field = [kind = topology.kind](std::string_view field) {
+    switch (kind) {
+      case PeerTopologyKind::kFullMesh:
+      case PeerTopologyKind::kRing:
+        return false;
+      case PeerTopologyKind::kStar:
+        return field == "center_node";
+      case PeerTopologyKind::kRandomGraph:
+        return field == "seed" || field == "average_degree";
+      case PeerTopologyKind::kScaleFreeGraph:
+        return field == "seed" || field == "average_degree" ||
+               field == "attachment_count";
+      case PeerTopologyKind::kLatencyMatrix:
+        return field == "latency_matrix_ms";
+      case PeerTopologyKind::kCustomEdgeList:
+        return field == "edges";
+      case PeerTopologyKind::kPartitionedGroups:
+        return field == "groups";
+      case PeerTopologyKind::kInternetLikeRegionGraph:
+        return field == "regions" || field == "region_edges";
+    }
+    return false;
+  };
+  for (const auto& member : object) {
+    if (!is_common_field(member.key()) && !is_kind_field(member.key())) {
+      throw std::runtime_error(
+          "scenario topology " +
+          std::string(PeerTopologyKindName(topology.kind)) +
+          " has unsupported field: " + std::string(member.key()));
+    }
+  }
   topology.seed = JsonOptionalUint64Field(object, "seed", default_seed);
   switch (topology.kind) {
     case PeerTopologyKind::kFullMesh:
@@ -1601,14 +1662,14 @@ WalletInitialization ParseWalletInitializationObject(
         "scenario topology.wallet_initialization must be a JSON object");
   }
   const boost::json::object& object = value->as_object();
+  RejectUnsupportedFields(object, {"strategy", "mode"},
+                          "scenario topology.wallet_initialization");
   initialization.strategy =
       ParseWalletInitializationStrategy(JsonOptionalStringField(
           object, "strategy",
           WalletInitializationStrategyName(initialization.strategy)));
   initialization.mode = ParseWalletPrivacyMode(JsonOptionalStringField(
       object, "mode", WalletPrivacyModeName(initialization.mode)));
-  initialization.seed =
-      JsonOptionalStringField(object, "seed", initialization.seed);
   return initialization;
 }
 
@@ -4928,9 +4989,6 @@ boost::json::object WalletInitializationJson(
   object["strategy"] =
       std::string(WalletInitializationStrategyName(initialization.strategy));
   object["mode"] = std::string(WalletPrivacyModeName(initialization.mode));
-  if (!initialization.seed.empty()) {
-    object["seed"] = initialization.seed;
-  }
   return object;
 }
 

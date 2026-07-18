@@ -1,0 +1,18 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 4,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 4,
+    "type": "internet_like_region_graph",
+    "regions": [[1, 2], [3, 4]],
+    "region_edges": [
+      {
+        "from_region": 1,
+        "to_region": 2,
+        "bidirectional": true,
+        "active": true
+      }
+    ]
+  }
+}

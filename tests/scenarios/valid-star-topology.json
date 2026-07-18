@@ -1,0 +1,10 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 3,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 3,
+    "type": "star",
+    "center_node": 2
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 3,
+  "block_production": {"enabled": false},
+  "network": {"isolated": true},
+  "topology": {
+    "node_count": 3,
+    "type": "latency_matrix",
+    "latency_matrix_ms": [
+      [0, 10, null],
+      [10, 0, 20],
+      [null, 20, 0]
+    ]
+  }
+}
