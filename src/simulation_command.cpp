@@ -58,6 +58,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "export_node_report";
     case SimulationCommandKind::kSetPerfCounters:
       return "set_perf_counters";
+    case SimulationCommandKind::kSendWalletTransaction:
+      return "send_wallet_transaction";
   }
   throw std::runtime_error("unknown simulation command kind");
 }
@@ -142,6 +144,9 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "set_perf_counters") {
     return SimulationCommandKind::kSetPerfCounters;
   }
+  if (name == "send_wallet_transaction") {
+    return SimulationCommandKind::kSendWalletTransaction;
+  }
   return std::nullopt;
 }
 
@@ -161,6 +166,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kSetNetworkCondition:
     case SimulationCommandKind::kBlockNetworkFlow:
     case SimulationCommandKind::kPartitionNodes:
+    case SimulationCommandKind::kSendWalletTransaction:
       return true;
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:

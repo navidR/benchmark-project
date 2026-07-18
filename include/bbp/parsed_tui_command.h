@@ -34,6 +34,7 @@ struct ParsedTuiCommand {
   std::optional<PerfCounterTargetKind> perf_counter_target_kind;
   std::optional<std::string> perf_counter_target_id;
   std::vector<PerfCounterKind> perf_counter_kinds;
+  std::optional<SimulationWalletSend> wallet_send;
 };
 
 }  // namespace bbp

@@ -268,6 +268,7 @@ add_executable(bbp
   src/tui_command_parser.cpp
   src/util.cpp
   src/wallet_funding_strategy.cpp
+  src/wallet_send_resolver.cpp
   src/wallet_transaction_plan.cpp
   src/yaml_helpers.cpp
 )
@@ -360,6 +361,7 @@ if(BUILD_TESTING)
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/util_tests.cpp
     tests/unit/wallet_funding_strategy_tests.cpp
+    tests/unit/wallet_send_resolver_tests.cpp
     tests/unit/wallet_transaction_plan_tests.cpp
     tests/unit/wallet_transfer_strategy_tests.cpp
     tests/unit/workload_kind_tests.cpp
@@ -416,6 +418,7 @@ if(BUILD_TESTING)
     src/tui_command_parser.cpp
     src/util.cpp
     src/wallet_funding_strategy.cpp
+    src/wallet_send_resolver.cpp
     src/wallet_transaction_plan.cpp
   )
   add_dependencies(bbp-unit-tests bbp-process-tree-helper)

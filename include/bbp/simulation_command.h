@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "bbp/block_production_policy.h"
 #include "bbp/mining_difficulty.h"
@@ -11,6 +12,7 @@
 #include "bbp/peer_count_policy.h"
 #include "bbp/perf_counter.h"
 #include "bbp/simulation_partition.h"
+#include "bbp/simulation_wallet_send.h"
 #include "bbp/simulator/resource_limit_patch.h"
 
 namespace bbp {
@@ -42,6 +44,7 @@ enum class SimulationCommandKind {
   kHealPartition,
   kExportNodeReport,
   kSetPerfCounters,
+  kSendWalletTransaction,
 };
 
 struct SimulationNetworkFlow {
@@ -68,6 +71,7 @@ struct SimulationCommand {
   std::optional<SimulationPartition> partition;
   std::optional<PerfCounterTarget> perf_counter_target;
   std::vector<PerfCounterKind> perf_counter_kinds;
+  std::optional<SimulationWalletSend> wallet_send;
   bool confirmed = false;
 };
 

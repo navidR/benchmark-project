@@ -121,6 +121,7 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
     case SimulationCommandKind::kHealPartition:
     case SimulationCommandKind::kExportNodeReport:
     case SimulationCommandKind::kSetPerfCounters:
+    case SimulationCommandKind::kSendWalletTransaction:
       throw std::runtime_error(
           "command must be handled by the simulator resource owner");
   }

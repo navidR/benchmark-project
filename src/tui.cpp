@@ -41,6 +41,7 @@
 #include "bbp/tui_command_parser.h"
 #include "bbp/tui_view.h"
 #include "bbp/util.h"
+#include "bbp/wallet_send_resolver.h"
 
 namespace bbp {
 namespace {
@@ -57,7 +58,9 @@ constexpr std::size_t kMaximumReportRecordsPerLiveRefresh = 256U;
 struct PendingConfirmation {
   ParsedTuiCommand command;
   std::string target_node_id;
+  std::string target_text;
   std::optional<SimulationPartition> partition;
+  std::optional<SimulationWalletSend> wallet_send;
 };
 
 struct TuiState {
@@ -1233,8 +1236,7 @@ void DrawCommandConfirmationPopup(int rows, int cols,
           A_BOLD | COLOR_PAIR(kColorWarning));
   AddText(top + 3, left + 2, popup_cols - 4,
           std::string(SimulationCommandKindName(pending.command.kind)));
-  AddText(top + 4, left + 2, popup_cols - 4,
-          "Target: " + pending.target_node_id);
+  AddText(top + 4, left + 2, popup_cols - 4, "Target: " + pending.target_text);
   AddText(top + 6, left + 2, popup_cols - 4,
           "Press y to confirm; n or Esc cancels.", COLOR_PAIR(kColorMuted));
 }
@@ -1261,8 +1263,10 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
   AddText(top + 1, left + 2, popup_cols - 4, "Live command", A_BOLD);
   AddText(top + 2, left + 2, popup_cols - 4,
-          "block-production <probability> <period-ms>");
-  AddText(top + 3, left + 2, popup_cols - 4, "mining-difficulty <value>");
+          "block-production <probability> <period-ms>  mining-difficulty "
+          "<value>");
+  AddText(top + 3, left + 2, popup_cols - 4,
+          "wallet-send <receiver-wallet> <amount> <fee> [timeout-sec]");
   AddText(top + 4, left + 2, popup_cols - 4,
           "stop-mining  disconnect  reconnect  log-more  log-less");
   AddText(top + 5, left + 2, popup_cols - 4,
@@ -2289,7 +2293,8 @@ bool QueueParsedNodeCommand(
     const ParsedTuiCommand& parsed, const boost::json::object& report,
     SimulationCommandQueue* command_queue, TuiState* state,
     bool confirmed = false, std::string confirmed_target = {},
-    std::optional<SimulationPartition> confirmed_partition = std::nullopt) {
+    std::optional<SimulationPartition> confirmed_partition = std::nullopt,
+    std::optional<SimulationWalletSend> confirmed_wallet_send = std::nullopt) {
   if (command_queue == nullptr) {
     state->command_input_error =
         "Live commands are unavailable in report mode.";
@@ -2304,6 +2309,8 @@ bool QueueParsedNodeCommand(
     std::optional<PerfCounterTarget> perf_target;
     std::optional<SimulationPartition> partition =
         std::move(confirmed_partition);
+    std::optional<SimulationWalletSend> wallet_send =
+        std::move(confirmed_wallet_send);
     const bool partition_command =
         parsed.kind == SimulationCommandKind::kPartitionNodes ||
         parsed.kind == SimulationCommandKind::kHealPartition;
@@ -2321,6 +2328,30 @@ bool QueueParsedNodeCommand(
           parsed.perf_counter_target_kind, parsed.perf_counter_target_id);
       target = std::string(PerfCounterTargetKindName(perf_target->kind)) + ":" +
                perf_target->id;
+    } else if (parsed.kind == SimulationCommandKind::kSendWalletTransaction) {
+      if (!wallet_send) {
+        if (state->view != TuiView::kWallets) {
+          throw std::runtime_error(
+              "wallet-send requires a selected wallet in the wallet view");
+        }
+        if (!parsed.wallet_send) {
+          throw std::runtime_error("wallet send payload is missing");
+        }
+        ResolvedWalletSend resolved = ResolveSelectedWalletSend(
+            report, state->selected_wallet, *parsed.wallet_send);
+        wallet_send = resolved.send;
+        node_id = std::move(resolved.sender_node_id);
+        target = std::move(resolved.target_text);
+      } else {
+        if (confirmed_target.empty()) {
+          throw std::runtime_error(
+              "confirmed wallet send has no retained backing node");
+        }
+        node_id = confirmed_target;
+        target = "wallet-" + std::to_string(wallet_send->sender_wallet_index) +
+                 " -> wallet-" +
+                 std::to_string(wallet_send->receiver_wallet_index);
+      }
     } else if (partition_command) {
       if (!parsed.partition_target_kind) {
         throw std::runtime_error("partition target kind is missing");
@@ -2378,8 +2409,10 @@ bool QueueParsedNodeCommand(
     if (SimulationCommandRequiresConfirmation(parsed.kind) && !confirmed) {
       state->pending_confirmation = PendingConfirmation{
           .command = parsed,
-          .target_node_id = target,
+          .target_node_id = node_id,
+          .target_text = target,
           .partition = partition,
+          .wallet_send = wallet_send,
       };
       state->command_palette_open = false;
       state->command_input.clear();
@@ -2400,6 +2433,12 @@ bool QueueParsedNodeCommand(
       }
       sequence = command_queue->PushPerfCounters(std::move(*perf_target),
                                                  parsed.perf_counter_kinds);
+    } else if (parsed.kind == SimulationCommandKind::kSendWalletTransaction) {
+      if (!wallet_send) {
+        throw std::runtime_error("wallet send payload is missing");
+      }
+      sequence =
+          command_queue->PushWalletSend(node_id, *wallet_send, confirmed);
     } else {
       if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
         if (!parsed.mining_difficulty) {
@@ -2545,7 +2584,8 @@ bool HandleCommandConfirmationInput(int ch, const boost::json::object& report,
     state->pending_confirmation.reset();
     static_cast<void>(QueueParsedNodeCommand(
         pending.command, report, command_queue, state, true,
-        std::move(pending.target_node_id), std::move(pending.partition)));
+        std::move(pending.target_node_id), std::move(pending.partition),
+        std::move(pending.wallet_send)));
     return true;
   }
   return ch != ERR;

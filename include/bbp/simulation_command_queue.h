@@ -43,6 +43,9 @@ class SimulationCommandQueue {
                                      bool confirmed = false);
   std::uint64_t PushPerfCounters(PerfCounterTarget target,
                                  std::vector<PerfCounterKind> kinds);
+  std::uint64_t PushWalletSend(std::string sender_node_id,
+                               SimulationWalletSend send,
+                               bool confirmed = false);
   std::optional<SimulationCommand> TryPop();
   std::optional<SimulationCommand> WaitPop();
   void Close();

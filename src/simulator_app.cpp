@@ -6562,6 +6562,40 @@ std::string WalletTransactionDetail(
   return boost::json::serialize(detail);
 }
 
+std::string OperatorWalletTransactionDetail(
+    const SimulationWalletSend& send, const WalletIdentity& sender,
+    const WalletIdentity& receiver,
+    const WalletInitialization& wallet_initialization,
+    const ChainWalletTransactionResult& transaction,
+    std::uint64_t operator_command_sequence) {
+  boost::json::object detail;
+  detail["workload_index"] = 0U;
+  detail["workload_count"] = 0U;
+  detail["transaction_index"] = operator_command_sequence;
+  detail["transaction_count"] = nullptr;
+  detail["transaction_rate"] = nullptr;
+  detail["submission_kind"] = "operator_wallet_send";
+  detail["operator_command_sequence"] = operator_command_sequence;
+  detail["mode"] =
+      std::string(WalletPrivacyModeName(wallet_initialization.mode));
+  detail["sender_wallet_index"] = sender.wallet_index;
+  detail["receiver_wallet_index"] = receiver.wallet_index;
+  detail["sender_node"] = sender.node;
+  detail["receiver_node"] = receiver.node;
+  detail["sender_address"] = sender.address;
+  detail["receiver_address"] = receiver.address;
+  detail["amount"] = FormatFixed8Amount(send.amount_satoshis);
+  detail["amount_satoshis"] = send.amount_satoshis;
+  detail["fee"] = FormatFixed8Amount(send.fee_satoshis);
+  detail["fee_satoshis"] = send.fee_satoshis;
+  detail["requested_fee_rate"] = transaction.requested_fee_rate;
+  detail["requested_fee_rate_satoshis"] = send.fee_satoshis;
+  detail["txids"] = TxIdsJson(transaction.txids);
+  detail["mempool_size"] = transaction.mempool_size;
+  detail["timeout_sec"] = send.timeout_sec;
+  return boost::json::serialize(detail);
+}
+
 struct TrackedTransaction {
   std::string txid;
   std::string submission_kind;
@@ -6621,6 +6655,7 @@ class TransactionObservationTracker {
     if (transaction.txid.empty()) {
       throw std::runtime_error("cannot track an empty transaction id");
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!tracked_txids_.insert(transaction.txid).second) {
       throw std::runtime_error("duplicate submitted transaction id: " +
                                transaction.txid);
@@ -6635,8 +6670,8 @@ class TransactionObservationTracker {
                                  TrackedTransaction transaction,
                                  std::chrono::seconds timeout,
                                  std::stop_token stop_token) {
+    const TrackedTransaction tracked = transaction;
     Track(std::move(transaction));
-    const TrackedTransaction& tracked = transactions_.back();
     for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
       const NodeRuntime& node = nodes[node_index];
       if (!node.AllowsChainMetrics()) {
@@ -6655,7 +6690,12 @@ class TransactionObservationTracker {
                   const ChainDriver& driver,
                   const std::vector<NodeRuntime>& nodes,
                   std::stop_token stop_token) {
-    for (const TrackedTransaction& transaction : transactions_) {
+    std::vector<TrackedTransaction> transactions;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      transactions = transactions_;
+    }
+    for (const TrackedTransaction& transaction : transactions) {
       for (std::size_t node_index = 0; node_index < nodes.size();
            ++node_index) {
         const NodeRuntime& node = nodes[node_index];
@@ -6681,25 +6721,35 @@ class TransactionObservationTracker {
     if (observation.state == ChainTransactionState::kUnknown) {
       return;
     }
+    if (observation.state == ChainTransactionState::kConfirmed &&
+        (!observation.confirmation_height || observation.block_hash.empty() ||
+         observation.confirmations == 0U)) {
+      throw std::runtime_error(
+          "confirmed transaction observation is missing block metadata");
+    }
     const std::pair<std::string, std::string> key{transaction.txid, node_id};
     const std::string detail =
         TransactionObservationDetail(transaction, node, node_id, observation);
-    if (visible_.insert(key).second) {
+    bool record_visible = false;
+    bool record_confirmed = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      record_visible = visible_.insert(key).second;
+      if (observation.state == ChainTransactionState::kConfirmed) {
+        record_confirmed = confirmed_.insert(key).second;
+      }
+    }
+    if (record_visible) {
       WriteEvent(events_path, options.run_id, node_id,
                  SimulationEventKind::kTransactionVisible, detail);
     }
-    if (observation.state == ChainTransactionState::kConfirmed &&
-        confirmed_.insert(key).second) {
-      if (!observation.confirmation_height || observation.block_hash.empty() ||
-          observation.confirmations == 0U) {
-        throw std::runtime_error(
-            "confirmed transaction observation is missing block metadata");
-      }
+    if (record_confirmed) {
       WriteEvent(events_path, options.run_id, node_id,
                  SimulationEventKind::kTransactionConfirmed, detail);
     }
   }
 
+  std::mutex mutex_;
   std::vector<TrackedTransaction> transactions_;
   std::set<std::string> tracked_txids_;
   std::set<std::pair<std::string, std::string>> visible_;
@@ -11471,6 +11521,17 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
   if (!command.perf_counter_kinds.empty()) {
     detail["perf_counters"] = PerfCounterNamesJson(command.perf_counter_kinds);
   }
+  if (command.wallet_send) {
+    boost::json::object send;
+    send["sender_wallet_index"] = command.wallet_send->sender_wallet_index;
+    send["receiver_wallet_index"] = command.wallet_send->receiver_wallet_index;
+    send["amount"] = FormatFixed8Amount(command.wallet_send->amount_satoshis);
+    send["amount_satoshis"] = command.wallet_send->amount_satoshis;
+    send["fee"] = FormatFixed8Amount(command.wallet_send->fee_satoshis);
+    send["fee_satoshis"] = command.wallet_send->fee_satoshis;
+    send["timeout_sec"] = command.wallet_send->timeout_sec;
+    detail["wallet_send"] = std::move(send);
+  }
   if (command.kind == SimulationCommandKind::kExportNodeReport) {
     detail["output_path"] = NodeReportRelativePath(command).generic_string();
   }
@@ -11550,6 +11611,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::stop_source block_production_rpc_stop_source;
   std::stop_source metrics_rpc_stop_source;
   std::atomic<bool> wallets_initialized = false;
+  TransactionObservationTracker transaction_tracker;
   std::mutex lifecycle_failure_mutex;
   std::exception_ptr lifecycle_failure;
   std::stop_callback cancel_command_rpc(stop_token, [&command_rpc_stop_source] {
@@ -11953,6 +12015,106 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                        SimulationCommandKind::kSetPerfCounters) {
               std::lock_guard<std::mutex> lock(node_process_mutex);
               ApplyPerfCounterCommand(command, nodes);
+            } else if (command.kind ==
+                       SimulationCommandKind::kSendWalletTransaction) {
+              if (!command.wallet_send) {
+                throw std::runtime_error("wallet send payload is missing");
+              }
+              if (!wallets_initialized.load(std::memory_order_acquire)) {
+                throw std::runtime_error(
+                    "wallet registry is not initialized for live sends");
+              }
+              const SimulationWalletSend& send = *command.wallet_send;
+              if (send.sender_wallet_index == 0U ||
+                  send.receiver_wallet_index == 0U ||
+                  send.sender_wallet_index == send.receiver_wallet_index ||
+                  send.amount_satoshis == 0U || send.timeout_sec == 0U ||
+                  send.amount_satoshis >
+                      std::numeric_limits<std::uint64_t>::max() -
+                          send.fee_satoshis) {
+                throw std::runtime_error("wallet send payload is invalid");
+              }
+              const WalletIdentity& sender = simulation_registry.WalletByIndex(
+                  static_cast<std::size_t>(send.sender_wallet_index - 1U));
+              const WalletIdentity& receiver =
+                  simulation_registry.WalletByIndex(static_cast<std::size_t>(
+                      send.receiver_wallet_index - 1U));
+              if (sender.wallet_index != send.sender_wallet_index ||
+                  receiver.wallet_index != send.receiver_wallet_index) {
+                throw std::runtime_error(
+                    "wallet registry index does not match live send payload");
+              }
+              if (sender.node == 0U || sender.node > nodes.size() ||
+                  receiver.node == 0U || receiver.node > nodes.size()) {
+                throw std::runtime_error(
+                    "wallet send references an invalid backing node");
+              }
+              if (sender.address.empty() || receiver.address.empty()) {
+                throw std::runtime_error(
+                    "wallet send requires initialized wallet addresses");
+              }
+              NodeRuntime& sender_node = nodes[sender.node - 1U];
+              if (sender_node.config.id != command.node_id) {
+                throw std::runtime_error(
+                    "wallet send backing node does not match sender wallet");
+              }
+              ChainWalletTransactionResult transaction;
+              {
+                std::lock_guard<std::mutex> lock(node_process_mutex);
+                RequireNodeRunning(sender_node, "operator wallet send");
+                if (!sender_node.config.wallet_enabled) {
+                  throw std::runtime_error(
+                      "operator wallet send requires wallet support on " +
+                      sender_node.config.id);
+                }
+                transaction = driver.SendWalletTransaction(
+                    sender_node.config,
+                    ToChainWalletMode(
+                        simulation_registry.wallet_initialization()),
+                    receiver.address, send.amount_satoshis, send.fee_satoshis,
+                    std::chrono::seconds(send.timeout_sec),
+                    command_rpc_stop_source.get_token());
+              }
+              if (transaction.txids.empty()) {
+                throw std::runtime_error(
+                    "operator wallet send returned no transaction id");
+              }
+              for (const std::string& txid : transaction.txids) {
+                if (txid.empty()) {
+                  throw std::runtime_error(
+                      "operator wallet send returned an empty transaction id");
+                }
+              }
+              WriteEvent(events_path, options.run_id, sender_node.config.id,
+                         SimulationEventKind::kWalletTransactionSubmitted,
+                         OperatorWalletTransactionDetail(
+                             send, sender, receiver,
+                             simulation_registry.wallet_initialization(),
+                             transaction, command.sequence));
+              if (transaction.txids.size() >
+                  std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    "operator wallet send txid count exceeds uint32");
+              }
+              for (std::size_t txid_index = 0U;
+                   txid_index < transaction.txids.size(); ++txid_index) {
+                transaction_tracker.TrackAndWaitForVisibility(
+                    options, events_path, driver, nodes,
+                    TrackedTransaction{
+                        .txid = transaction.txids[txid_index],
+                        .submission_kind = "operator_wallet_send",
+                        .workload_index = 0U,
+                        .workload_count = 0U,
+                        .transaction_index = command.sequence,
+                        .transaction_count = std::nullopt,
+                        .transaction_rate = std::nullopt,
+                        .txid_index =
+                            static_cast<std::uint32_t>(txid_index + 1U),
+                        .submission_node = sender.node,
+                    },
+                    std::chrono::seconds(send.timeout_sec),
+                    command_rpc_stop_source.get_token());
+              }
             } else if (command.kind ==
                        SimulationCommandKind::kSetResourceLimits) {
               if (!command.resource_limit_patch) {
@@ -12640,7 +12802,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         OrderScheduledScenarioEvents(options.scheduled_events);
     runtime_actions.insert(runtime_actions.end(), scheduled_events.begin(),
                            scheduled_events.end());
-    TransactionObservationTracker transaction_tracker;
     for (size_t workload_index = 0; workload_index < runtime_actions.size();
          ++workload_index) {
       ThrowIfStopRequested(stop_token);

@@ -6,16 +6,19 @@
 #include <boost/tokenizer.hpp>
 #include <charconv>
 #include <chrono>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "bbp/util.h"
+
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 27> kCommandNames = {
+constexpr std::array<std::string_view, 28> kCommandNames = {
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -43,6 +46,7 @@ constexpr std::array<std::string_view, 27> kCommandNames = {
     "heal",
     "export-node-report",
     "perf-counters",
+    "wallet-send",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -227,6 +231,61 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = target_kind,
           .perf_counter_target_id = std::move(target_id),
           .perf_counter_kinds = ParsePerfCounterKinds(tokens.back()),
+          .wallet_send = std::nullopt,
+      };
+    }
+    if (tokens[0] == "wallet-send") {
+      if (tokens.size() != 4U && tokens.size() != 5U) {
+        throw std::runtime_error(
+            "usage: wallet-send <receiver-wallet-index> <amount> <fee> "
+            "[timeout-sec]");
+      }
+      const std::uint64_t receiver =
+          ParsePositiveToken(tokens[1], "receiver wallet index");
+      if (receiver > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("receiver wallet index exceeds uint32");
+      }
+      const std::uint64_t amount =
+          ParseFixed8Amount(tokens[2], "wallet amount");
+      const std::uint64_t fee = ParseFixed8Amount(tokens[3], "wallet fee");
+      if (amount == 0U) {
+        throw std::runtime_error(
+            "wallet send amount must be greater than zero");
+      }
+      if (amount > std::numeric_limits<std::uint64_t>::max() - fee) {
+        throw std::runtime_error(
+            "wallet send amount plus fee overflows uint64");
+      }
+      std::uint64_t timeout = 30U;
+      if (tokens.size() == 5U) {
+        timeout = ParsePositiveToken(tokens[4], "wallet send timeout");
+        if (timeout > std::numeric_limits<std::uint32_t>::max()) {
+          throw std::runtime_error("wallet send timeout exceeds uint32");
+        }
+      }
+      return ParsedTuiCommand{
+          .kind = SimulationCommandKind::kSendWalletTransaction,
+          .block_production_policy = std::nullopt,
+          .mining_difficulty = std::nullopt,
+          .peer_node_id = std::nullopt,
+          .peer_count_policy = std::nullopt,
+          .block_count = std::nullopt,
+          .profile = std::nullopt,
+          .resource_limit_patch = std::nullopt,
+          .network_condition = std::nullopt,
+          .network_flow = std::nullopt,
+          .partition_target_kind = std::nullopt,
+          .perf_counter_target_kind = std::nullopt,
+          .perf_counter_target_id = std::nullopt,
+          .perf_counter_kinds = {},
+          .wallet_send =
+              SimulationWalletSend{
+                  .sender_wallet_index = 0U,
+                  .receiver_wallet_index = static_cast<std::uint32_t>(receiver),
+                  .amount_satoshis = amount,
+                  .fee_satoshis = fee,
+                  .timeout_sec = static_cast<std::uint32_t>(timeout),
+              },
       };
     }
     if (tokens[0] == "block-production") {
@@ -252,6 +311,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "mining-difficulty") {
@@ -272,6 +332,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "connect-peer" || tokens[0] == "disconnect-peer") {
@@ -293,6 +354,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "peer-policy") {
@@ -314,6 +376,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "generate-blocks") {
@@ -338,6 +401,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "resource-profile" || tokens[0] == "network-profile") {
@@ -359,6 +423,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "network-condition") {
@@ -399,6 +464,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "block" || tokens[0] == "unblock") {
@@ -448,6 +514,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "clear-rule") {
@@ -479,6 +546,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
     if (tokens[0] == "partition" || tokens[0] == "heal") {
@@ -508,6 +576,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .perf_counter_target_kind = std::nullopt,
           .perf_counter_target_id = std::nullopt,
           .perf_counter_kinds = {},
+          .wallet_send = std::nullopt,
       };
     }
 
@@ -553,6 +622,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         .perf_counter_target_kind = std::nullopt,
         .perf_counter_target_id = std::nullopt,
         .perf_counter_kinds = {},
+        .wallet_send = std::nullopt,
     };
   } catch (const boost::bad_lexical_cast&) {
     throw std::runtime_error("command contains an invalid numeric argument");

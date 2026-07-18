@@ -1,5 +1,6 @@
 #include "bbp/simulation_command_queue.h"
 
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -100,6 +101,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kPartitionNodes:
     case SimulationCommandKind::kHealPartition:
     case SimulationCommandKind::kSetPerfCounters:
+    case SimulationCommandKind::kSendWalletTransaction:
       throw std::runtime_error(
           "simulation command kind requires a typed payload method");
   }
@@ -119,6 +121,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -141,6 +144,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = false,
   });
 }
@@ -163,6 +167,7 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = false,
   });
 }
@@ -196,6 +201,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -218,6 +224,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -243,6 +250,7 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = false,
   });
 }
@@ -273,6 +281,7 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -300,6 +309,7 @@ std::uint64_t SimulationCommandQueue::PushResourceLimits(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -323,6 +333,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkCondition(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -367,6 +378,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
       .partition = std::nullopt,
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -399,6 +411,7 @@ std::uint64_t SimulationCommandQueue::PushPartitionCommand(
       .partition = std::move(partition),
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
       .confirmed = confirmed,
   });
 }
@@ -451,7 +464,51 @@ std::uint64_t SimulationCommandQueue::PushPerfCounters(
       .partition = std::nullopt,
       .perf_counter_target = std::move(target),
       .perf_counter_kinds = std::move(kinds),
+      .wallet_send = std::nullopt,
       .confirmed = false,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushWalletSend(std::string sender_node_id,
+                                                     SimulationWalletSend send,
+                                                     bool confirmed) {
+  if (send.sender_wallet_index == 0U) {
+    throw std::runtime_error("wallet send requires a sender wallet");
+  }
+  if (send.receiver_wallet_index == 0U) {
+    throw std::runtime_error("wallet send requires a receiver wallet");
+  }
+  if (send.sender_wallet_index == send.receiver_wallet_index) {
+    throw std::runtime_error("wallet send source and receiver must differ");
+  }
+  if (send.amount_satoshis == 0U) {
+    throw std::runtime_error("wallet send amount must be greater than zero");
+  }
+  if (send.amount_satoshis >
+      std::numeric_limits<std::uint64_t>::max() - send.fee_satoshis) {
+    throw std::runtime_error("wallet send amount plus fee overflows uint64");
+  }
+  if (send.timeout_sec == 0U) {
+    throw std::runtime_error("wallet send timeout must be greater than zero");
+  }
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kSendWalletTransaction,
+      .node_id = std::move(sender_node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
+      .partition = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
+      .wallet_send = send,
+      .confirmed = confirmed,
   });
 }
 

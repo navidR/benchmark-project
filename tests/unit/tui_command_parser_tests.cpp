@@ -66,6 +66,45 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
               bbp::SimulationCommandKind::kExportNodeReport);
 }
 
+BOOST_AUTO_TEST_CASE(tui_command_parser_builds_wallet_send_commands) {
+  const bbp::ParsedTuiCommand command = bbp::TuiCommandParser::Parse(
+      "wallet-send 2 0.10000000 0.00001000 45", 0U);
+  BOOST_CHECK(command.kind ==
+              bbp::SimulationCommandKind::kSendWalletTransaction);
+  BOOST_REQUIRE(command.wallet_send);
+  BOOST_TEST(command.wallet_send->sender_wallet_index == 0U);
+  BOOST_TEST(command.wallet_send->receiver_wallet_index == 2U);
+  BOOST_TEST(command.wallet_send->amount_satoshis == 10000000U);
+  BOOST_TEST(command.wallet_send->fee_satoshis == 1000U);
+  BOOST_TEST(command.wallet_send->timeout_sec == 45U);
+
+  const bbp::ParsedTuiCommand default_timeout =
+      bbp::TuiCommandParser::Parse("wallet-send 7 1 0", 0U);
+  BOOST_REQUIRE(default_timeout.wallet_send);
+  BOOST_TEST(default_timeout.wallet_send->amount_satoshis == 100000000U);
+  BOOST_TEST(default_timeout.wallet_send->fee_satoshis == 0U);
+  BOOST_TEST(default_timeout.wallet_send->timeout_sec == 30U);
+
+  constexpr std::string_view kInvalid[] = {
+      "wallet-send",
+      "wallet-send 0 1 0",
+      "wallet-send -1 1 0",
+      "wallet-send 4294967296 1 0",
+      "wallet-send 2 0 0",
+      "wallet-send 2 -1 0",
+      "wallet-send 2 0.000000001 0",
+      "wallet-send 2 1 0.000000001",
+      "wallet-send 2 184467440737.09551615 0.00000001",
+      "wallet-send 2 1 0 0",
+      "wallet-send 2 1 0 4294967296",
+      "wallet-send 2 1 0 30 extra",
+  };
+  for (const std::string_view input : kInvalid) {
+    BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse(input, 0U),
+                      std::runtime_error);
+  }
+}
+
 BOOST_AUTO_TEST_CASE(tui_command_parser_builds_perf_counter_commands) {
   const bbp::ParsedTuiCommand selected = bbp::TuiCommandParser::Parse(
       "perf-counters cycles,instructions,task-clock", 0U);

@@ -30,6 +30,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kHealPartition,
       bbp::SimulationCommandKind::kExportNodeReport,
       bbp::SimulationCommandKind::kSetPerfCounters,
+      bbp::SimulationCommandKind::kSendWalletTransaction,
   };
 
   for (bbp::SimulationCommandKind kind : kKinds) {
@@ -57,6 +58,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kBlockNetworkFlow));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kPartitionNodes));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kSendWalletTransaction));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kGenerateBlocks));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(

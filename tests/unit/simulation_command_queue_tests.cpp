@@ -1,6 +1,7 @@
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -138,6 +139,57 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_perf_counter_target) {
                                  .id = "firo-1",
                                  .node_ids = {"firo-1"}},
           {bbp::PerfCounterKind::kCycles, bbp::PerfCounterKind::kCycles}),
+      std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_wallet_send_identity) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationWalletSend send{
+      .sender_wallet_index = 1U,
+      .receiver_wallet_index = 2U,
+      .amount_satoshis = 10000000U,
+      .fee_satoshis = 1000U,
+      .timeout_sec = 45U,
+  };
+  const std::uint64_t sequence =
+      queue.PushWalletSend("firo-wallet-a", send, true);
+
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->sequence == sequence);
+  BOOST_CHECK(command->kind ==
+              bbp::SimulationCommandKind::kSendWalletTransaction);
+  BOOST_TEST(command->node_id == "firo-wallet-a");
+  BOOST_REQUIRE(command->wallet_send);
+  BOOST_CHECK(*command->wallet_send == send);
+  BOOST_TEST(command->confirmed);
+
+  BOOST_CHECK_THROW(queue.PushWalletSend("firo-wallet-a", send),
+                    std::runtime_error);
+  bbp::SimulationWalletSend invalid = send;
+  invalid.sender_wallet_index = 0U;
+  BOOST_CHECK_THROW(queue.PushWalletSend("firo-wallet-a", invalid, true),
+                    std::runtime_error);
+  invalid = send;
+  invalid.receiver_wallet_index = invalid.sender_wallet_index;
+  BOOST_CHECK_THROW(queue.PushWalletSend("firo-wallet-a", invalid, true),
+                    std::runtime_error);
+  invalid = send;
+  invalid.amount_satoshis = 0U;
+  BOOST_CHECK_THROW(queue.PushWalletSend("firo-wallet-a", invalid, true),
+                    std::runtime_error);
+  invalid = send;
+  invalid.amount_satoshis = std::numeric_limits<std::uint64_t>::max();
+  invalid.fee_satoshis = 1U;
+  BOOST_CHECK_THROW(queue.PushWalletSend("firo-wallet-a", invalid, true),
+                    std::runtime_error);
+  invalid = send;
+  invalid.timeout_sec = 0U;
+  BOOST_CHECK_THROW(queue.PushWalletSend("firo-wallet-a", invalid, true),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      queue.Push(bbp::SimulationCommandKind::kSendWalletTransaction,
+                 "firo-wallet-a", true),
       std::runtime_error);
 }
 

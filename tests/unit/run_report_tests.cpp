@@ -1697,6 +1697,125 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    run_report_aggregates_operator_wallet_send_identity_and_amounts) {
+  const std::filesystem::path dir =
+      MakeTestDir("run-report-operator-wallet-send");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"r1","chain":"firo","nodes":2,"node_configs":[{"index":1,"id":"firo-wallet-a","chain":"firo","role":"wallet"},{"index":2,"id":"firo-wallet-b","chain":"firo","role":"wallet"}]})"
+      "\n");
+  const auto append_event = [&](std::string_view node_id,
+                                std::string_view event_name,
+                                const boost::json::object& detail) {
+    boost::json::object event;
+    event["run_id"] = "r1";
+    event["node_id"] = node_id;
+    event["event"] = event_name;
+    event["detail"] = boost::json::serialize(detail);
+    bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+  };
+
+  bbp::AppendLine(dir / "events.jsonl",
+                  R"({"run_id":"r1","node_id":"sim","event":"run_started"})");
+  append_event("firo-wallet-a", "wallet_address_created",
+               {{"wallet_index", 1U},
+                {"node", 1U},
+                {"strategy", "driver_rpc"},
+                {"mode", "public"},
+                {"address", "addr1"}});
+  append_event("firo-wallet-b", "wallet_address_created",
+               {{"wallet_index", 2U},
+                {"node", 2U},
+                {"strategy", "driver_rpc"},
+                {"mode", "public"},
+                {"address", "addr2"}});
+
+  boost::json::object wallet_send;
+  wallet_send["sender_wallet_index"] = 1U;
+  wallet_send["receiver_wallet_index"] = 2U;
+  wallet_send["amount"] = "0.10000000";
+  wallet_send["amount_satoshis"] = 10000000U;
+  wallet_send["fee"] = "0.00001000";
+  wallet_send["fee_satoshis"] = 1000U;
+  wallet_send["timeout_sec"] = 45U;
+  boost::json::object command_detail;
+  command_detail["sequence"] = 1U;
+  command_detail["kind"] = "send_wallet_transaction";
+  command_detail["wallet_send"] = wallet_send;
+  command_detail["confirmed"] = true;
+  append_event("firo-wallet-a", "operator_command_started", command_detail);
+
+  boost::json::object transaction_detail;
+  transaction_detail["submission_kind"] = "operator_wallet_send";
+  transaction_detail["operator_command_sequence"] = 1U;
+  transaction_detail["sender_wallet_index"] = 1U;
+  transaction_detail["receiver_wallet_index"] = 2U;
+  transaction_detail["sender_node"] = 1U;
+  transaction_detail["receiver_node"] = 2U;
+  transaction_detail["sender_address"] = "addr1";
+  transaction_detail["receiver_address"] = "addr2";
+  transaction_detail["amount"] = "0.10000000";
+  transaction_detail["amount_satoshis"] = 10000000U;
+  transaction_detail["fee"] = "0.00001000";
+  transaction_detail["fee_satoshis"] = 1000U;
+  transaction_detail["timeout_sec"] = 45U;
+  transaction_detail["txids"] = boost::json::array{"operator-txid"};
+  append_event("firo-wallet-a", "wallet_transaction_submitted",
+               transaction_detail);
+  append_event("firo-wallet-a", "operator_command_completed", command_detail);
+  bbp::AppendLine(dir / "events.jsonl",
+                  R"({"run_id":"r1","node_id":"sim","event":"run_finished"})");
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  BOOST_TEST(report.at("ok").as_bool());
+  const boost::json::array& wallets = report.at("wallets_summary").as_array();
+  BOOST_REQUIRE_EQUAL(wallets.size(), 2U);
+  BOOST_TEST(JsonInteger(wallets[0].as_object(), "wallet_index") == 1U);
+  BOOST_TEST(JsonInteger(wallets[0].as_object(), "transactions_sent") == 1U);
+  BOOST_TEST(JsonInteger(wallets[0].as_object(),
+                         "simulated_amount_sent_satoshis") == 10000000U);
+  BOOST_TEST(JsonInteger(wallets[1].as_object(), "wallet_index") == 2U);
+  BOOST_TEST(JsonInteger(wallets[1].as_object(), "transactions_received") ==
+             1U);
+  BOOST_TEST(JsonInteger(wallets[1].as_object(),
+                         "simulated_amount_received_satoshis") == 10000000U);
+
+  const boost::json::array& transactions =
+      report.at("wallet_transactions").as_array();
+  BOOST_REQUIRE_EQUAL(transactions.size(), 1U);
+  const boost::json::object& submitted =
+      transactions.front().as_object().at("detail").as_object();
+  BOOST_TEST(submitted.at("submission_kind").as_string() ==
+             "operator_wallet_send");
+  BOOST_TEST(JsonInteger(submitted, "operator_command_sequence") == 1U);
+  BOOST_TEST(JsonInteger(submitted, "sender_wallet_index") == 1U);
+  BOOST_TEST(JsonInteger(submitted, "receiver_wallet_index") == 2U);
+  BOOST_TEST(JsonInteger(submitted, "amount_satoshis") == 10000000U);
+  BOOST_TEST(submitted.at("txids").as_array().front().as_string() ==
+             "operator-txid");
+
+  const boost::json::array& commands =
+      report.at("operator_commands").as_array();
+  BOOST_REQUIRE_EQUAL(commands.size(), 1U);
+  const boost::json::object& command = commands.front().as_object();
+  BOOST_TEST(command.at("status").as_string() == "completed");
+  const boost::json::object& stored_detail = command.at("detail").as_object();
+  BOOST_TEST(stored_detail.at("kind").as_string() == "send_wallet_transaction");
+  BOOST_TEST(JsonInteger(stored_detail, "sequence") == 1U);
+  const boost::json::object& stored_send =
+      stored_detail.at("wallet_send").as_object();
+  BOOST_TEST(JsonInteger(stored_send, "sender_wallet_index") == 1U);
+  BOOST_TEST(JsonInteger(stored_send, "receiver_wallet_index") == 2U);
+  BOOST_TEST(JsonInteger(stored_send, "amount_satoshis") == 10000000U);
+  BOOST_TEST(JsonInteger(stored_send, "fee_satoshis") == 1000U);
+  BOOST_TEST(JsonInteger(stored_send, "timeout_sec") == 45U);
+  BOOST_TEST(stored_detail.at("confirmed").as_bool());
+
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
     incremental_run_report_bounds_refresh_work_and_matches_full_report) {
   const std::filesystem::path dir = MakeTestDir("run-report-incremental");
   bbp::WriteText(

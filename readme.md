@@ -928,6 +928,24 @@ transactional: if any member cannot be attached, every member retains its
 previous live session and configuration. The selected configuration is
 preserved and reopened across node restarts.
 
+From the wallet view, the selected wallet can submit a distinct live wallet
+transaction without exposing an address or private wallet material in the
+command:
+
+```text
+wallet-send <receiver-wallet-index> <amount> <fee> [timeout-sec]
+wallet-send 2 0.10000000 0.00001000 45
+```
+
+The selected wallet remains the typed sender through the destructive-action
+confirmation; the receiver is a different positive one-based wallet index.
+Amounts and fees use exact fixed-eight coin units, the amount must be positive,
+and the optional timeout defaults to 30 seconds. The simulator resolves both
+wallet identities through the run registry, calls only the active chain
+driver, records the operator command plus wallet submission and per-node
+visibility events, and never accepts signing keys or raw recipient addresses
+from this surface.
+
 Per-node cgroup limits can also be changed live through typed, confirmed
 commands:
 
