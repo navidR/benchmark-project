@@ -1,11 +1,12 @@
 {
   "firod": "/tmp/not-used-by-probe",
+  "metrics_sample_count": 1,
   "nodes": [
     {
       "id": "firo-1",
       "chain": "firo",
       "role": "base",
-      "untyped_option": "always"
+      "start_time": "100ms"
     }
   ]
 }

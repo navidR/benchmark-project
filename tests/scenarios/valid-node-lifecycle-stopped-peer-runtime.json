@@ -1,0 +1,34 @@
+{
+  "simulation": {
+    "duration": "3s",
+    "metrics_interval": "50ms"
+  },
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "block_production": {
+    "enabled": false
+  },
+  "nodes": [
+    {
+      "id": "firo-restarting",
+      "chain": "firo",
+      "role": "base",
+      "restart_policy": "always"
+    },
+    {
+      "id": "firo-stopped-peer",
+      "chain": "firo",
+      "role": "base",
+      "stop_time": "1s"
+    },
+    {
+      "id": "firo-running-peer",
+      "chain": "firo",
+      "role": "base"
+    }
+  ]
+}

@@ -49,6 +49,7 @@ struct NodeReport {
   std::string chain;
   std::string role;
   std::string last_error;
+  std::optional<SimulationEventKind> last_error_kind;
   std::uint64_t metric_samples = 0;
   std::optional<NodeRuntimeLifecycle> final_state;
   std::string unknown_final_state;
@@ -162,6 +163,12 @@ bool IsNodeErrorEvent(SimulationEventKind kind) {
     default:
       return false;
   }
+}
+
+bool IsRpcRecoveryErrorEvent(SimulationEventKind kind) {
+  return kind == SimulationEventKind::kProcessExitedBeforeRpcReady ||
+         kind == SimulationEventKind::kMetricsNodeUnavailable ||
+         kind == SimulationEventKind::kWalletMetricsUnavailable;
 }
 
 std::string NodeErrorText(const boost::json::object& event) {
@@ -2022,6 +2029,7 @@ struct IncrementalRunReport::Impl {
     }
     if (!node_id.empty() && node_id != "sim" && IsNodeErrorEvent(*event_kind)) {
       nodes[node_id].last_error = NodeErrorText(event);
+      nodes[node_id].last_error_kind = *event_kind;
     }
     switch (*event_kind) {
       case SimulationEventKind::kRunStarted:
@@ -2055,6 +2063,13 @@ struct IncrementalRunReport::Impl {
                             &nodes[node_id]);
         }
         break;
+      case SimulationEventKind::kRpcReady:
+        if (!node_id.empty() && nodes[node_id].last_error_kind &&
+            IsRpcRecoveryErrorEvent(*nodes[node_id].last_error_kind)) {
+          nodes[node_id].last_error.clear();
+          nodes[node_id].last_error_kind.reset();
+        }
+        break;
       case SimulationEventKind::kStdoutTail:
       case SimulationEventKind::kStderrTail:
       case SimulationEventKind::kDaemonLogTail:
@@ -2067,6 +2082,21 @@ struct IncrementalRunReport::Impl {
         break;
       case SimulationEventKind::kGeneratedBlocks:
         AppendEventSummary(event, &Array("generated_blocks"));
+        break;
+      case SimulationEventKind::kNodeStartDeadlineReached:
+        AppendEventSummary(event, &Array("node_start_deadlines"));
+        break;
+      case SimulationEventKind::kNodeStopDeadlineReached:
+        AppendEventSummary(event, &Array("node_stop_deadlines"));
+        break;
+      case SimulationEventKind::kProcessExited:
+        AppendEventSummary(event, &Array("process_exits"));
+        break;
+      case SimulationEventKind::kProcessExitedBeforeRpcReady:
+        AppendEventSummary(event, &Array("process_exits"));
+        break;
+      case SimulationEventKind::kRestartPolicyApplied:
+        AppendEventSummary(event, &Array("restart_policy_actions"));
         break;
       case SimulationEventKind::kScheduledBlockProduced:
         ++scheduled_block_count;

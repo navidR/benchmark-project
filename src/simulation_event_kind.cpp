@@ -20,8 +20,14 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "directional_network_policies_verified";
     case SimulationEventKind::kNetworkReady:
       return "network_ready";
+    case SimulationEventKind::kNodeStartDeadlineReached:
+      return "node_start_deadline_reached";
+    case SimulationEventKind::kNodeStopDeadlineReached:
+      return "node_stop_deadline_reached";
     case SimulationEventKind::kProcessStarted:
       return "process_started";
+    case SimulationEventKind::kProcessExited:
+      return "process_exited";
     case SimulationEventKind::kProcessExitedBeforeRpcReady:
       return "process_exited_before_rpc_ready";
     case SimulationEventKind::kRpcReady:
@@ -76,6 +82,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "topology_edge_update_rollback_failed";
     case SimulationEventKind::kRestartRequested:
       return "restart_requested";
+    case SimulationEventKind::kRestartPolicyApplied:
+      return "restart_policy_applied";
     case SimulationEventKind::kSigterm:
       return "sigterm";
     case SimulationEventKind::kProcessRestarted:
@@ -165,7 +173,12 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
   if (name == "directional_network_policies_verified")
     return SimulationEventKind::kDirectionalNetworkPoliciesVerified;
   if (name == "network_ready") return SimulationEventKind::kNetworkReady;
+  if (name == "node_start_deadline_reached")
+    return SimulationEventKind::kNodeStartDeadlineReached;
+  if (name == "node_stop_deadline_reached")
+    return SimulationEventKind::kNodeStopDeadlineReached;
   if (name == "process_started") return SimulationEventKind::kProcessStarted;
+  if (name == "process_exited") return SimulationEventKind::kProcessExited;
   if (name == "process_exited_before_rpc_ready")
     return SimulationEventKind::kProcessExitedBeforeRpcReady;
   if (name == "rpc_ready") return SimulationEventKind::kRpcReady;
@@ -217,6 +230,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
     return SimulationEventKind::kTopologyEdgeUpdateRollbackFailed;
   if (name == "restart_requested")
     return SimulationEventKind::kRestartRequested;
+  if (name == "restart_policy_applied")
+    return SimulationEventKind::kRestartPolicyApplied;
   if (name == "sigterm") return SimulationEventKind::kSigterm;
   if (name == "process_restarted")
     return SimulationEventKind::kProcessRestarted;

@@ -5,7 +5,8 @@
       "id": "firo-1",
       "chain": "firo",
       "role": "base",
-      "untyped_option": "always"
+      "start_time": "2s",
+      "stop_time": "1s"
     }
   ]
 }

@@ -5,7 +5,7 @@
       "id": "firo-1",
       "chain": "firo",
       "role": "base",
-      "untyped_option": "always"
+      "restart_policy": "sometimes"
     }
   ]
 }

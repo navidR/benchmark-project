@@ -1,0 +1,34 @@
+{
+  "simulation": {
+    "duration": "1s",
+    "metrics_interval": "25ms"
+  },
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "block_production": {
+    "enabled": false
+  },
+  "resource_profiles": {
+    "startup_throttled": {
+      "cpu_quota_us": 1000,
+      "cpu_period_us": 100000
+    }
+  },
+  "nodes": [
+    {
+      "id": "firo-starting",
+      "chain": "firo",
+      "role": "base",
+      "start_time": "100ms",
+      "stop_time": "110ms",
+      "resources": {
+        "profile": "startup_throttled"
+      },
+      "restart_policy": "always"
+    }
+  ]
+}

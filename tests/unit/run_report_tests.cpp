@@ -1482,6 +1482,52 @@ BOOST_AUTO_TEST_CASE(run_report_orders_nodes_and_derives_resource_rates) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    run_report_retains_process_exit_history_and_clears_recovered_errors) {
+  const std::filesystem::path dir =
+      MakeTestDir("run-report-lifecycle-exit-recovery");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"r1","chain":"firo","nodes":2,"node_configs":[{"index":1,"id":"firo-recovered","chain":"firo","role":"base"},{"index":2,"id":"firo-failed","chain":"firo","role":"base"}]})"
+      "\n");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-recovered","event":"process_exited","detail":"{\"running\":false,\"pid\":101,\"raw_status\":9,\"kind\":\"signal\",\"signal\":9}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-recovered","event":"process_exited_before_rpc_ready","detail":"{\"running\":false,\"pid\":102,\"raw_status\":768,\"kind\":\"exit\",\"exit_code\":3}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-recovered","event":"rpc_ready"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"firo-failed","event":"process_exited_before_rpc_ready","detail":"{\"running\":false,\"pid\":201,\"raw_status\":1024,\"kind\":\"exit\",\"exit_code\":4}"})");
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  const boost::json::array& exits = report.at("process_exits").as_array();
+  BOOST_REQUIRE_EQUAL(exits.size(), 3U);
+  BOOST_TEST(JsonInteger(exits[0].as_object().at("detail").as_object(),
+                         "raw_status") == 9U);
+  BOOST_TEST(JsonInteger(exits[1].as_object().at("detail").as_object(),
+                         "raw_status") == 768U);
+  BOOST_TEST(JsonInteger(exits[2].as_object().at("detail").as_object(),
+                         "raw_status") == 1024U);
+
+  const boost::json::array& nodes = report.at("nodes_summary").as_array();
+  BOOST_REQUIRE_EQUAL(nodes.size(), 2U);
+  BOOST_TEST(nodes[0].as_object().at("node_id").as_string() ==
+             "firo-recovered");
+  BOOST_TEST(nodes[0].as_object().at("last_error").is_null());
+  BOOST_TEST(nodes[1].as_object().at("node_id").as_string() == "firo-failed");
+  BOOST_TEST(nodes[1].as_object().at("last_error").as_string() ==
+             "process_exited_before_rpc_ready: "
+             "{\"running\":false,\"pid\":201,\"raw_status\":1024,"
+             "\"kind\":\"exit\",\"exit_code\":4}");
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_builds_topology_groups_and_node_exports) {
   const std::filesystem::path dir = MakeTestDir("run-report-topology-groups");
   bbp::WriteText(

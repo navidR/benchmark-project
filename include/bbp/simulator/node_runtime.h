@@ -11,6 +11,7 @@
 #include "bbp/cgroup.h"
 #include "bbp/drivers/chain_driver.h"
 #include "bbp/network.h"
+#include "bbp/node_lifecycle_policy.h"
 #include "bbp/perf_counter.h"
 #include "bbp/process.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
@@ -25,6 +26,7 @@ struct NodeRuntime {
   std::optional<NodeVethConfig> network;
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
+  NodeLifecyclePolicy lifecycle_policy;
   std::optional<std::chrono::steady_clock::time_point> process_started_at;
   std::vector<PerfCounterKind> perf_counter_kinds = DefaultPerfCounterKinds();
   PerfCounterTargetKind perf_counter_target_kind = PerfCounterTargetKind::kNode;
@@ -100,6 +102,16 @@ struct NodeRuntime {
     return Lifecycle() == NodeRuntimeLifecycle::kRunning;
   }
 
+  bool DeclarativeStopApplied() const {
+    return std::atomic_ref<bool>(declarative_stop_applied_)
+        .load(std::memory_order_acquire);
+  }
+
+  void MarkDeclarativeStopApplied() {
+    std::atomic_ref<bool>(declarative_stop_applied_)
+        .store(true, std::memory_order_release);
+  }
+
  private:
   alignas(std::atomic_ref<std::uint64_t>::required_alignment) std::uint64_t
       generated_block_count_ = 0;
@@ -114,6 +126,9 @@ struct NodeRuntime {
   alignas(std::atomic_ref<NodeRuntimeLifecycle>::
               required_alignment) mutable NodeRuntimeLifecycle lifecycle_ =
       NodeRuntimeLifecycle::kDefined;
+  alignas(std::atomic_ref<
+          bool>::required_alignment) mutable bool declarative_stop_applied_ =
+      false;
 };
 
 }  // namespace bbp

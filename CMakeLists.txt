@@ -233,6 +233,7 @@ add_executable(bbp
   src/network.cpp
   src/network_rule_pane.cpp
   src/network_allocation_lock.cpp
+  src/node_lifecycle_policy.cpp
   src/node_artifact_inventory.cpp
   src/node_file_pane.cpp
   src/node_log_collector.cpp
@@ -329,6 +330,7 @@ if(BUILD_TESTING)
     tests/unit/node_file_pane_tests.cpp
     tests/unit/simulation_network_address_plan_tests.cpp
     tests/unit/node_log_pane_tests.cpp
+    tests/unit/node_lifecycle_policy_tests.cpp
     tests/unit/node_runtime_tests.cpp
     tests/unit/operator_command_status_tests.cpp
     tests/unit/peer_connectivity_controller_tests.cpp
@@ -382,6 +384,7 @@ if(BUILD_TESTING)
     src/network.cpp
     src/network_rule_pane.cpp
     src/network_allocation_lock.cpp
+    src/node_lifecycle_policy.cpp
     src/node_artifact_inventory.cpp
     src/node_file_pane.cpp
     src/node_log_pane.cpp
@@ -699,6 +702,36 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-chain-config.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-node-lifecycle-policy-json
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-lifecycle-policy.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-node-lifecycle-policy-yaml
+    COMMAND bbp
+      --scenario-yaml
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-node-lifecycle-policy.yaml"
+      --probe-capabilities
+  )
+  foreach(lifecycle_runtime_scenario IN ITEMS
+      valid-node-restart-always-runtime
+      valid-node-restart-on-failure-runtime
+      valid-node-restart-never-runtime
+      valid-node-restart-legacy-timing-runtime
+      valid-node-lifecycle-retry-stop-runtime
+      valid-node-lifecycle-retry-duration-runtime
+      valid-node-lifecycle-never-started-runtime
+      valid-node-lifecycle-stopped-peer-runtime
+      valid-node-lifecycle-concurrent-start-runtime
+      valid-node-lifecycle-stop-during-readiness)
+    add_test(NAME bbp-${lifecycle_runtime_scenario}
+      COMMAND bbp
+        --scenario
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/${lifecycle_runtime_scenario}.json"
+        --probe-capabilities
+    )
+  endforeach()
   add_test(NAME bbp-valid-bitcoin-driver
     COMMAND bbp
       --scenario
@@ -811,7 +844,67 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     bbp-invalid-node-field
     tests/scenarios/invalid-node-field.json
-    "scenario node firo-1 has unsupported field: restart_policy"
+    "scenario node firo-1 has unsupported field: untyped_option"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-start-time-shape
+    tests/scenarios/invalid-node-start-time-shape.json
+    "scenario node firo-1 start_time must be a duration string"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-start-time-unit
+    tests/scenarios/invalid-node-start-time-unit.json
+    "duration must contain a positive integer and explicit unit"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-start-time-negative
+    tests/scenarios/invalid-node-start-time-negative.json
+    "duration must contain a positive integer and explicit unit"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-stop-time-shape
+    tests/scenarios/invalid-node-stop-time-shape.json
+    "scenario node firo-1 stop_time must be a duration string"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-stop-time-unit
+    tests/scenarios/invalid-node-stop-time-unit.json
+    "duration must contain a positive integer and explicit unit"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-stop-time-negative
+    tests/scenarios/invalid-node-stop-time-negative.json
+    "duration must contain a positive integer and explicit unit"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-start-at-duration
+    tests/scenarios/invalid-node-start-at-duration.json
+    "node start_time must be before simulation duration"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-stop-before-start
+    tests/scenarios/invalid-node-stop-before-start.json
+    "node stop_time must be after start_time"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-stop-at-duration
+    tests/scenarios/invalid-node-stop-at-duration.json
+    "node stop_time must be before simulation duration"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-restart-policy
+    tests/scenarios/invalid-node-restart-policy.json
+    "restart_policy must be never, on_failure, or always"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-restart-policy-shape
+    tests/scenarios/invalid-node-restart-policy-shape.json
+    "scenario node firo-1 restart_policy must be a string"
+  )
+  add_cli_failure_test(
+    bbp-invalid-node-timed-sample-count
+    tests/scenarios/invalid-node-timed-sample-count.json
+    "timed node lifecycle and metrics_sample_count must not be combined"
   )
   add_cli_failure_test(
     bbp-invalid-node-rpc-field

@@ -1,0 +1,31 @@
+{
+  "simulation": {
+    "duration": "3s",
+    "time_scale": 2.0
+  },
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "block_production": {
+    "enabled": false
+  },
+  "nodes": [
+    {
+      "id": "firo-delayed",
+      "chain": "firo",
+      "role": "base",
+      "start_time": "500ms",
+      "stop_time": "2s",
+      "restart_policy": "on_failure"
+    },
+    {
+      "id": "firo-immediate",
+      "chain": "firo",
+      "role": "base",
+      "restart_policy": "always"
+    }
+  ]
+}

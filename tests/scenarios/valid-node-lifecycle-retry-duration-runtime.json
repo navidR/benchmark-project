@@ -1,0 +1,24 @@
+{
+  "simulation": {
+    "duration": "500ms",
+    "metrics_interval": "25ms"
+  },
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "block_production": {
+    "enabled": false
+  },
+  "nodes": [
+    {
+      "id": "firo-retry-duration",
+      "chain": "firo",
+      "role": "base",
+      "start_time": "100ms",
+      "restart_policy": "always"
+    }
+  ]
+}
