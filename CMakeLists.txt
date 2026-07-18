@@ -1694,6 +1694,11 @@ if(BUILD_TESTING)
     "network block rule dst_port must be 1..65535"
   )
   add_cli_failure_test(
+    bbp-invalid-network-flow-source-port
+    tests/scenarios/invalid-network-flow-source-port.json
+    "network block rule src_port must be 1..65535"
+  )
+  add_cli_failure_test(
     bbp-invalid-network-flow-address
     tests/scenarios/invalid-network-flow-address.json
     "invalid IPv4 network block destination: invalid"

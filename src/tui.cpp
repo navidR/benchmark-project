@@ -463,6 +463,15 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
         text += " n";
         text += JsonMetricText(workload, "node");
         text += " ";
+        text += JsonString(workload, "src_address", "*");
+        text += ":";
+        if (const std::optional<std::uint64_t> source_port =
+                JsonUnsignedMetric(workload, "src_port")) {
+          text += std::to_string(*source_port);
+        } else {
+          text += "*";
+        }
+        text += " -> ";
         text += JsonString(workload, "dst_address", "-");
         text += ":";
         text += JsonMetricText(workload, "dst_port");
@@ -1123,9 +1132,11 @@ void DrawNetworkRulePane(int content_bottom, int cols,
       const NetworkRuleSummary& rule = rule_pane.Rules()[index];
       const std::string source =
           rule.source_address.empty() ? "*" : rule.source_address;
+      const std::string source_port =
+          rule.source_port == 0U ? "*" : std::to_string(rule.source_port);
       AddText(y, 0, cols,
-              std::to_string(rule.handle) + "  " + source + " -> " +
-                  rule.destination_address + ":" +
+              std::to_string(rule.handle) + "  " + source + ":" + source_port +
+                  " -> " + rule.destination_address + ":" +
                   std::to_string(rule.destination_port) + "  match " +
                   std::to_string(rule.match_packets) + " / drop " +
                   std::to_string(rule.drop_packets));
@@ -1274,9 +1285,9 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
           "network-condition <mbps> <delay> <jitter> <loss> <dup> <corrupt> "
           "<reorder> [limit]");
   AddText(top + 15, left + 2, popup_cols - 4,
-          "block|unblock <dst-ip> <port> [src-ip]  clear-rule <handle>");
+          "block|unblock <dst-ip> <port> [src-ip|*] [src-port]");
   AddText(top + 16, left + 2, popup_cols - 4,
-          "partition|heal [node-id]  (no id: selected topology group)");
+          "clear-rule <handle>  partition|heal [node-id/group selection]");
   AddText(top + 17, left + 2, popup_cols - 4,
           "perf-counters [node|wallet|group|cgroup [id]] <name[,name...]>");
   AddText(top + 18, left + 2, popup_cols - 4, "> " + std::string(input) + "_",

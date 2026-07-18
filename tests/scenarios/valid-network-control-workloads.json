@@ -20,6 +20,7 @@
       "type": "block_network_flow",
       "node": 1,
       "src_address": "10.210.1.2",
+      "src_port": 43120,
       "dst_address": "10.210.1.6",
       "dst_port": 18168,
       "handle": 77
@@ -28,6 +29,7 @@
       "type": "unblock_network_flow",
       "node": 1,
       "src_address": "10.210.1.2",
+      "src_port": 43120,
       "dst_address": "10.210.1.6",
       "dst_port": 18168,
       "handle": 77

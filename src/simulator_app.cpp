@@ -815,6 +815,10 @@ uint32_t StableRuleHandle(const NetworkBlockRule& rule) {
   for (const unsigned char c : rule.src_address) {
     mix_byte(c);
   }
+  if (rule.src_port != 0U) {
+    mix_byte(0xFFU);
+    mix_uint32(rule.src_port);
+  }
   for (const unsigned char c : rule.dst_address) {
     mix_byte(c);
   }
@@ -845,11 +849,17 @@ NetworkBlockRule ParseNetworkBlockRuleObject(
     }
     rule.src_address = std::string(src_address->as_string());
   }
+  const bool src_port_present = object.if_contains("src_port") != nullptr;
+  const uint32_t src_port = JsonOptionalUint32Field(object, "src_port", 0U);
+  if (src_port_present && (src_port == 0U || src_port > 65535U)) {
+    throw std::runtime_error("network block rule src_port must be 1..65535");
+  }
   rule.dst_address = JsonStringField(object, "dst_address");
   ValidateIpv4Address(rule.dst_address, "network block destination");
   if (!rule.src_address.empty()) {
     ValidateIpv4Address(rule.src_address, "network block source");
   }
+  rule.src_port = static_cast<uint16_t>(src_port);
   rule.dst_port = static_cast<uint16_t>(dst_port);
   rule.handle = JsonOptionalUint32Field(object, "handle", 0U);
   if (rule.handle == 0U) {
@@ -4053,14 +4063,15 @@ Options ParseOptions(int argc, char** argv) {
       "runtime-node-block-json",
       po::value<std::vector<std::string>>(&legacy_inputs.runtime_node_blocks)
           ->composing(),
-      "repeatable JSON object with node, optional src_address, dst_address, "
-      "dst_port, and optional handle for one live host-side TCP drop filter")(
+      "repeatable JSON object with node, optional src_address and src_port, "
+      "dst_address, dst_port, and optional handle for one live host-side TCP "
+      "drop filter")(
       "runtime-node-unblock-json",
       po::value<std::vector<std::string>>(&legacy_inputs.runtime_node_unblocks)
           ->composing(),
-      "repeatable JSON object with node, optional src_address, dst_address, "
-      "dst_port, and optional handle for one live host-side TCP drop filter "
-      "removal")(
+      "repeatable JSON object with node, optional src_address and src_port, "
+      "dst_address, dst_port, and optional handle for one live host-side TCP "
+      "drop filter removal")(
       "runtime-partition-json",
       po::value<std::vector<std::string>>(&legacy_inputs.runtime_partitions)
           ->composing(),
@@ -4722,6 +4733,10 @@ boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
     filter_json["ipv4_dst"] = filter.ipv4_dst;
     filter_json["has_ipv4_dst_mask"] = filter.has_ipv4_dst_mask;
     filter_json["ipv4_dst_mask"] = filter.ipv4_dst_mask;
+    filter_json["has_tcp_src"] = filter.has_tcp_src;
+    filter_json["tcp_src"] = filter.tcp_src;
+    filter_json["has_tcp_src_mask"] = filter.has_tcp_src_mask;
+    filter_json["tcp_src_mask"] = filter.tcp_src_mask;
     filter_json["has_tcp_dst"] = filter.has_tcp_dst;
     filter_json["tcp_dst"] = filter.tcp_dst;
     filter_json["has_tcp_dst_mask"] = filter.has_tcp_dst_mask;
@@ -4774,6 +4789,9 @@ boost::json::object NetworkBlockRuleJson(const NetworkBlockRule& rule) {
   object["node"] = rule.node_index + 1U;
   if (!rule.src_address.empty()) {
     object["src_address"] = rule.src_address;
+  }
+  if (rule.src_port != 0U) {
+    object["src_port"] = rule.src_port;
   }
   object["dst_address"] = rule.dst_address;
   object["dst_port"] = rule.dst_port;
@@ -5604,6 +5622,7 @@ std::string DropFilterProbeJson() {
   result["host_name"] = probe.host_name;
   result["peer_name"] = probe.peer_name;
   result["dst_address"] = probe.dst_address;
+  result["src_port"] = probe.src_port;
   result["dst_port"] = probe.dst_port;
   result["handle"] = probe.handle;
   result["parent_filters_before"] = TcFiltersJson(probe.parent_filters_before);
@@ -5691,6 +5710,11 @@ boost::json::object NetworkPolicyCounterJson(const TcFilterInfo& filter) {
     object["src_address"] = filter.ipv4_src;
   } else {
     object["src_address"] = nullptr;
+  }
+  if (filter.has_tcp_src) {
+    object["src_port"] = filter.tcp_src;
+  } else {
+    object["src_port"] = nullptr;
   }
   object["dst_address"] = filter.ipv4_dst;
   object["dst_port"] = filter.tcp_dst;
@@ -10009,9 +10033,9 @@ bool NetworkBlockRulePresent(const NodeRuntime& node,
   const std::vector<TcFilterInfo> filters =
       ListTcFiltersForInterface(node.network->host_name);
   for (const TcFilterInfo& filter : filters) {
-    if (TcFilterMatchesEgressIpv4TcpDrop(filter, node.network->host_name,
-                                         rule.src_address, rule.dst_address,
-                                         rule.dst_port, rule.handle)) {
+    if (TcFilterMatchesEgressIpv4TcpDrop(
+            filter, node.network->host_name, rule.src_address, rule.src_port,
+            rule.dst_address, rule.dst_port, rule.handle)) {
       return true;
     }
   }
@@ -10032,6 +10056,7 @@ std::optional<NetworkBlockRule> NetworkBlockRuleForHandle(
     }
     NetworkBlockRule rule;
     rule.src_address = filter.has_ipv4_src ? filter.ipv4_src : "";
+    rule.src_port = filter.has_tcp_src ? filter.tcp_src : 0U;
     rule.dst_address = filter.ipv4_dst;
     rule.dst_port = filter.tcp_dst;
     rule.handle = filter.handle;
@@ -10051,9 +10076,9 @@ void RequireNetworkBlockHandleAvailable(const NodeRuntime& node,
     if (filter.handle != rule.handle) {
       continue;
     }
-    if (!TcFilterMatchesEgressIpv4TcpDrop(filter, node.network->host_name,
-                                          rule.src_address, rule.dst_address,
-                                          rule.dst_port, rule.handle)) {
+    if (!TcFilterMatchesEgressIpv4TcpDrop(
+            filter, node.network->host_name, rule.src_address, rule.src_port,
+            rule.dst_address, rule.dst_port, rule.handle)) {
       throw std::runtime_error(
           "network block rule handle is already used by different filter: " +
           std::to_string(rule.handle));
@@ -10105,8 +10130,8 @@ void RestoreNetworkBlockRule(const NodeRuntime& node,
   const bool present = NetworkBlockRulePresent(node, rule);
   if (should_be_present && !present) {
     ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
-                                   rule.dst_address, rule.dst_port,
-                                   rule.handle);
+                                   rule.src_port, rule.dst_address,
+                                   rule.dst_port, rule.handle);
   } else if (!should_be_present && present) {
     DeleteEgressIpv4TcpDropFilter(node.network->host_name, rule.handle);
   }
@@ -10130,8 +10155,8 @@ NetworkBlockMutationResult MutateNetworkBlockRuleTransactional(
       }
     } else {
       ReplaceEgressIpv4TcpDropFilter(node.network->host_name, rule.src_address,
-                                     rule.dst_address, rule.dst_port,
-                                     rule.handle);
+                                     rule.src_port, rule.dst_address,
+                                     rule.dst_port, rule.handle);
     }
     ThrowIfStopRequested(stop_token);
     const bool present_after = NetworkBlockRulePresent(node, rule);
@@ -10371,7 +10396,8 @@ void ApplyRuntimeNetworkPartition(
         } else {
           ReplaceEgressIpv4TcpDropFilter(
               node.network->host_name, state.rule.src_address,
-              state.rule.dst_address, state.rule.dst_port, state.rule.handle);
+              state.rule.src_port, state.rule.dst_address, state.rule.dst_port,
+              state.rule.handle);
         }
         ThrowIfStopRequested(stop_token);
         state.present_after = NetworkBlockRulePresent(node, state.rule);
@@ -11391,6 +11417,9 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
     if (!command.network_flow->src_address.empty()) {
       flow["src_address"] = command.network_flow->src_address;
     }
+    if (command.network_flow->src_port != 0U) {
+      flow["src_port"] = command.network_flow->src_port;
+    }
     if (!command.network_flow->dst_address.empty()) {
       flow["dst_address"] = command.network_flow->dst_address;
     }
@@ -12169,6 +12198,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                   rule = *existing;
                 } else {
                   rule.src_address = command.network_flow->src_address;
+                  rule.src_port = command.network_flow->src_port;
                   rule.dst_address = command.network_flow->dst_address;
                   rule.dst_port = command.network_flow->dst_port;
                   rule.handle = command.network_flow->handle;

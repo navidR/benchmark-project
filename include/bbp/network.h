@@ -119,6 +119,10 @@ struct TcFilterInfo {
   std::string ipv4_dst;
   bool has_ipv4_dst_mask = false;
   std::string ipv4_dst_mask;
+  bool has_tcp_src = false;
+  std::uint16_t tcp_src = 0;
+  bool has_tcp_src_mask = false;
+  std::uint16_t tcp_src_mask = 0;
   bool has_tcp_dst = false;
   std::uint16_t tcp_dst = 0;
   bool has_tcp_dst_mask = false;
@@ -365,6 +369,7 @@ struct DropFilterProbe {
   std::string host_name;
   std::string peer_name;
   std::string dst_address;
+  std::uint16_t src_port = 0;
   std::uint16_t dst_port = 0;
   std::uint32_t handle = 0;
   std::vector<TcFilterInfo> parent_filters_before;
@@ -428,6 +433,7 @@ DirectionalNetworkPolicyStats ReadDirectionalNetworkPolicyStatsInNamespace(
 bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& if_name,
                                       const std::string& src_address,
+                                      std::uint16_t src_port,
                                       const std::string& dst_address,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle);
@@ -459,6 +465,7 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
                                     std::uint32_t handle);
 void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
                                     const std::string& src_address,
+                                    std::uint16_t src_port,
                                     const std::string& dst_address,
                                     std::uint16_t dst_port,
                                     std::uint32_t handle);

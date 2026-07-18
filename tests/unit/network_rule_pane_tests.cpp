@@ -14,8 +14,10 @@ boost::json::object MakeReport(std::uint32_t rule_count) {
     rule["handle"] = index + 1U;
     if (index == 0U) {
       rule["src_address"] = nullptr;
+      rule["src_port"] = nullptr;
     } else {
       rule["src_address"] = "10.0.0.1";
+      rule["src_port"] = 43120U;
     }
     rule["dst_address"] = "10.0.0.2";
     rule["dst_port"] = 18168U;
@@ -46,7 +48,9 @@ BOOST_AUTO_TEST_CASE(network_rule_pane_loads_typed_active_rules) {
   BOOST_REQUIRE_EQUAL(pane.Rules().size(), 2U);
   BOOST_TEST(pane.Rules()[0].handle == 1U);
   BOOST_TEST(pane.Rules()[0].source_address.empty());
+  BOOST_TEST(pane.Rules()[0].source_port == 0U);
   BOOST_TEST(pane.Rules()[1].source_address == "10.0.0.1");
+  BOOST_TEST(pane.Rules()[1].source_port == 43120U);
   BOOST_TEST(pane.Rules()[1].destination_address == "10.0.0.2");
   BOOST_TEST(pane.Rules()[1].destination_port == 18168U);
   BOOST_TEST(pane.Rules()[1].drop_packets == 4U);

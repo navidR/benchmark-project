@@ -303,6 +303,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_network_flows) {
   bbp::SimulationCommandQueue queue;
   const bbp::SimulationNetworkFlow flow{
       .src_address = "10.210.1.2",
+      .src_port = 43120U,
       .dst_address = "10.210.1.6",
       .dst_port = 18168U,
       .handle = 77U,
@@ -315,6 +316,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_network_flows) {
                                "firo-1",
                                bbp::SimulationNetworkFlow{
                                    .src_address = {},
+                                   .src_port = 0U,
                                    .dst_address = {},
                                    .dst_port = 0U,
                                    .handle = 77U,
@@ -326,6 +328,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_network_flows) {
   BOOST_REQUIRE(block);
   BOOST_REQUIRE(block->network_flow);
   BOOST_TEST(block->network_flow->src_address == "10.210.1.2");
+  BOOST_TEST(block->network_flow->src_port == 43120U);
   BOOST_TEST(block->network_flow->dst_address == "10.210.1.6");
   BOOST_TEST(block->network_flow->dst_port == 18168U);
   BOOST_TEST(block->network_flow->handle == 77U);
@@ -333,6 +336,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_network_flows) {
   BOOST_CHECK(unblock->kind == bbp::SimulationCommandKind::kUnblockNetworkFlow);
   BOOST_REQUIRE(clear);
   BOOST_REQUIRE(clear->network_flow);
+  BOOST_TEST(clear->network_flow->src_port == 0U);
   BOOST_TEST(clear->network_flow->dst_address.empty());
   BOOST_TEST(clear->network_flow->handle == 77U);
 

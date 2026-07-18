@@ -402,9 +402,10 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       };
     }
     if (tokens[0] == "block" || tokens[0] == "unblock") {
-      if (tokens.size() != 3U && tokens.size() != 4U) {
+      if (tokens.size() < 3U || tokens.size() > 5U) {
         throw std::runtime_error("usage: " + tokens[0] +
-                                 " <dst-ipv4> <dst-port> [src-ipv4]");
+                                 " <dst-ipv4> <dst-port> [src-ipv4|*] "
+                                 "[src-port]");
       }
       const std::uint32_t dst_port =
           boost::lexical_cast<std::uint32_t>(tokens[2]);
@@ -412,8 +413,15 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
         throw std::runtime_error("network flow port must be 1..65535");
       }
       ValidateIpv4Address(tokens[1], "network flow destination");
-      if (tokens.size() == 4U) {
+      if (tokens.size() >= 4U && tokens[3] != "*") {
         ValidateIpv4Address(tokens[3], "network flow source");
+      }
+      std::uint32_t src_port = 0U;
+      if (tokens.size() == 5U) {
+        src_port = boost::lexical_cast<std::uint32_t>(tokens[4]);
+        if (src_port == 0U || src_port > 65535U) {
+          throw std::runtime_error("network flow source port must be 1..65535");
+        }
       }
       return ParsedTuiCommand{
           .kind = tokens[0] == "block"
@@ -429,7 +437,9 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .network_condition = std::nullopt,
           .network_flow =
               SimulationNetworkFlow{
-                  .src_address = tokens.size() == 4U ? tokens[3] : "",
+                  .src_address =
+                      tokens.size() >= 4U && tokens[3] != "*" ? tokens[3] : "",
+                  .src_port = static_cast<std::uint16_t>(src_port),
                   .dst_address = tokens[1],
                   .dst_port = static_cast<std::uint16_t>(dst_port),
                   .handle = 0U,
@@ -460,6 +470,7 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
           .network_flow =
               SimulationNetworkFlow{
                   .src_address = {},
+                  .src_port = 0U,
                   .dst_address = {},
                   .dst_port = 0U,
                   .handle = handle,

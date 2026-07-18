@@ -136,15 +136,18 @@ void NetworkRulePane::Load(const boost::json::object& report,
     }
     const boost::json::object& object = value.as_object();
     const std::uint64_t handle = JsonUnsigned(object, "handle");
+    const std::uint64_t source_port = JsonUnsigned(object, "src_port");
     const std::uint64_t port = JsonUnsigned(object, "dst_port");
     if (handle == 0U || handle > std::numeric_limits<std::uint32_t>::max() ||
-        port == 0U || port > std::numeric_limits<std::uint16_t>::max() ||
+        source_port > std::numeric_limits<std::uint16_t>::max() || port == 0U ||
+        port > std::numeric_limits<std::uint16_t>::max() ||
         JsonString(object, "dst_address").empty()) {
       continue;
     }
     rules_.push_back(NetworkRuleSummary{
         .handle = static_cast<std::uint32_t>(handle),
         .source_address = JsonString(object, "src_address"),
+        .source_port = static_cast<std::uint16_t>(source_port),
         .destination_address = JsonString(object, "dst_address"),
         .destination_port = static_cast<std::uint16_t>(port),
         .match_packets = JsonUnsigned(object, "match_packets"),

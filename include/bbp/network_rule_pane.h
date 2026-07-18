@@ -12,6 +12,7 @@ namespace bbp {
 struct NetworkRuleSummary {
   std::uint32_t handle = 0;
   std::string source_address;
+  std::uint16_t source_port = 0;
   std::string destination_address;
   std::uint16_t destination_port = 0;
   std::uint64_t match_packets = 0;

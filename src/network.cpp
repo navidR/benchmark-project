@@ -461,6 +461,7 @@ std::string DescribeTcFilters(const std::vector<TcFilterInfo>& filters) {
            << (filter.has_ipv4_src ? filter.ipv4_src : std::string(""))
            << " ipv4_dst="
            << (filter.has_ipv4_dst ? filter.ipv4_dst : std::string(""))
+           << " tcp_src=" << (filter.has_tcp_src ? filter.tcp_src : 0U)
            << " tcp_dst=" << (filter.has_tcp_dst ? filter.tcp_dst : 0U)
            << " drop=" << (filter.has_drop_action ? "true" : "false") << "]";
   }
@@ -665,13 +666,14 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& dst_address,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle) {
-  return TcFilterMatchesEgressIpv4TcpDrop(filter, if_name, "", dst_address,
+  return TcFilterMatchesEgressIpv4TcpDrop(filter, if_name, "", 0U, dst_address,
                                           dst_port, handle);
 }
 
 bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& if_name,
                                       const std::string& src_address,
+                                      std::uint16_t src_port,
                                       const std::string& dst_address,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle) {
@@ -679,10 +681,13 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
       src_address.empty()
           ? !filter.has_ipv4_src
           : (filter.has_ipv4_src && filter.ipv4_src == src_address);
+  const bool source_port_matches =
+      src_port == 0U ? !filter.has_tcp_src
+                     : (filter.has_tcp_src && filter.tcp_src == src_port);
   return TcFilterIsEgressIpv4TcpDropPolicy(filter, if_name) &&
-         filter.handle == handle && source_matches && filter.has_ipv4_dst &&
-         filter.ipv4_dst == dst_address && filter.has_tcp_dst &&
-         filter.tcp_dst == dst_port;
+         filter.handle == handle && source_matches && source_port_matches &&
+         filter.has_ipv4_dst && filter.ipv4_dst == dst_address &&
+         filter.has_tcp_dst && filter.tcp_dst == dst_port;
 }
 
 bool TcFilterIsEgressIpv4TcpDropPolicy(const TcFilterInfo& filter,
@@ -690,12 +695,17 @@ bool TcFilterIsEgressIpv4TcpDropPolicy(const TcFilterInfo& filter,
   const bool source_mask_is_exact =
       !filter.has_ipv4_src ||
       (filter.has_ipv4_src_mask && filter.ipv4_src_mask == "255.255.255.255");
+  const bool source_port_mask_is_exact =
+      filter.has_tcp_src == filter.has_tcp_src_mask &&
+      (!filter.has_tcp_src ||
+       (filter.tcp_src != 0U && filter.tcp_src_mask == 0xFFFFU));
   return filter.if_name == if_name && filter.kind == TcFilterKind::kFlower &&
          filter.handle != 0U && filter.parent == kClsactEgressParent &&
          filter.egress && filter.protocol == ETH_P_IP && filter.has_eth_type &&
          filter.eth_type == ETH_P_IP && filter.has_ip_proto &&
          filter.ip_proto == IPPROTO_TCP && source_mask_is_exact &&
-         filter.has_ipv4_dst && filter.has_ipv4_dst_mask &&
+         source_port_mask_is_exact && filter.has_ipv4_dst &&
+         filter.has_ipv4_dst_mask &&
          filter.ipv4_dst_mask == "255.255.255.255" && filter.has_tcp_dst &&
          filter.has_tcp_dst_mask && filter.tcp_dst_mask == 0xFFFFU &&
          filter.has_drop_action;
@@ -1988,6 +1998,20 @@ int ParseFlowerAttr(const nlattr* attr, void* data) {
         return MNL_CB_ERROR;
       }
       return MNL_CB_OK;
+    case TCA_FLOWER_KEY_TCP_SRC:
+      if (mnl_attr_validate(attr, MNL_TYPE_U16) < 0) {
+        return MNL_CB_ERROR;
+      }
+      filter->has_tcp_src = true;
+      filter->tcp_src = ntohs(mnl_attr_get_u16(attr));
+      return MNL_CB_OK;
+    case TCA_FLOWER_KEY_TCP_SRC_MASK:
+      if (mnl_attr_validate(attr, MNL_TYPE_U16) < 0) {
+        return MNL_CB_ERROR;
+      }
+      filter->has_tcp_src_mask = true;
+      filter->tcp_src_mask = ntohs(mnl_attr_get_u16(attr));
+      return MNL_CB_OK;
     case TCA_FLOWER_KEY_TCP_DST:
       if (mnl_attr_validate(attr, MNL_TYPE_U16) < 0) {
         return MNL_CB_ERROR;
@@ -3116,11 +3140,13 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
                                     const std::string& dst_address,
                                     std::uint16_t dst_port,
                                     std::uint32_t handle) {
-  ReplaceEgressIpv4TcpDropFilter(if_name, "", dst_address, dst_port, handle);
+  ReplaceEgressIpv4TcpDropFilter(if_name, "", 0U, dst_address, dst_port,
+                                 handle);
 }
 
 void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
                                     const std::string& src_address,
+                                    std::uint16_t src_port,
                                     const std::string& dst_address,
                                     std::uint16_t dst_port,
                                     std::uint32_t handle) {
@@ -3172,6 +3198,11 @@ void ReplaceEgressIpv4TcpDropFilter(const std::string& if_name,
   }
   mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST, ipv4_address.s_addr);
   mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST_MASK, ipv4_mask);
+  if (src_port != 0U) {
+    mnl_attr_put_u16(nlh, TCA_FLOWER_KEY_TCP_SRC, htons(src_port));
+    mnl_attr_put_u16(nlh, TCA_FLOWER_KEY_TCP_SRC_MASK,
+                     htons(static_cast<std::uint16_t>(0xFFFFU)));
+  }
   mnl_attr_put_u16(nlh, TCA_FLOWER_KEY_TCP_DST, htons(dst_port));
   mnl_attr_put_u16(nlh, TCA_FLOWER_KEY_TCP_DST_MASK,
                    htons(static_cast<std::uint16_t>(0xFFFFU)));
@@ -3639,6 +3670,7 @@ DropFilterProbe ProbeDropFilter() {
   probe.host_name = ProbeName('h');
   probe.peer_name = ProbeName('p');
   probe.dst_address = "198.51.100.7";
+  probe.src_port = 24567;
   probe.dst_port = 18168;
   probe.handle = 1001;
 
@@ -3651,16 +3683,17 @@ DropFilterProbe ProbeDropFilter() {
     SetLinkUp(probe.peer_name, true);
 
     probe.parent_filters_before = ListTcFiltersForInterface(probe.host_name);
-    ReplaceEgressIpv4TcpDropFilter(probe.host_name, probe.dst_address,
-                                   probe.dst_port, probe.handle);
+    ReplaceEgressIpv4TcpDropFilter(probe.host_name, "", probe.src_port,
+                                   probe.dst_address, probe.dst_port,
+                                   probe.handle);
     probe.parent_filters_after_apply =
         ListTcFiltersForInterface(probe.host_name);
 
     bool found = false;
     for (const TcFilterInfo& filter : probe.parent_filters_after_apply) {
-      if (TcFilterMatchesEgressIpv4TcpDrop(filter, probe.host_name,
-                                           probe.dst_address, probe.dst_port,
-                                           probe.handle)) {
+      if (TcFilterMatchesEgressIpv4TcpDrop(filter, probe.host_name, "",
+                                           probe.src_port, probe.dst_address,
+                                           probe.dst_port, probe.handle)) {
         if (!filter.has_stats) {
           throw std::runtime_error(
               "flower gact drop filter did not expose kernel statistics");
@@ -3679,9 +3712,9 @@ DropFilterProbe ProbeDropFilter() {
     probe.parent_filters_after_delete =
         ListTcFiltersForInterface(probe.host_name);
     for (const TcFilterInfo& filter : probe.parent_filters_after_delete) {
-      if (TcFilterMatchesEgressIpv4TcpDrop(filter, probe.host_name,
-                                           probe.dst_address, probe.dst_port,
-                                           probe.handle)) {
+      if (TcFilterMatchesEgressIpv4TcpDrop(filter, probe.host_name, "",
+                                           probe.src_port, probe.dst_address,
+                                           probe.dst_port, probe.handle)) {
         throw std::runtime_error(
             "flower gact drop filter remained after delete");
       }

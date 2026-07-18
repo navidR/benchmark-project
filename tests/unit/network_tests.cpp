@@ -510,9 +510,58 @@ BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_source_aware_tcp_drop) {
   filter.has_drop_action = true;
 
   BOOST_TEST(bbp::TcFilterMatchesEgressIpv4TcpDrop(
-      filter, "veth0", "198.51.100.11", "198.51.100.7", 18168, 1001));
+      filter, "veth0", "198.51.100.11", 0U, "198.51.100.7", 18168, 1001));
   BOOST_TEST(!bbp::TcFilterMatchesEgressIpv4TcpDrop(
-      filter, "veth0", "198.51.100.12", "198.51.100.7", 18168, 1001));
+      filter, "veth0", "198.51.100.12", 0U, "198.51.100.7", 18168, 1001));
+}
+
+BOOST_AUTO_TEST_CASE(tc_filter_summary_matches_source_port_aware_tcp_drop) {
+  bbp::TcFilterInfo filter;
+  filter.if_name = "veth0";
+  filter.kind = bbp::TcFilterKind::kFlower;
+  filter.kernel_kind = "flower";
+  filter.handle = 1001;
+  filter.parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS);
+  filter.protocol = ETH_P_IP;
+  filter.egress = true;
+  filter.has_eth_type = true;
+  filter.eth_type = ETH_P_IP;
+  filter.has_ip_proto = true;
+  filter.ip_proto = IPPROTO_TCP;
+  filter.has_tcp_src = true;
+  filter.tcp_src = 43120;
+  filter.has_tcp_src_mask = true;
+  filter.tcp_src_mask = 0xFFFFU;
+  filter.has_ipv4_dst = true;
+  filter.ipv4_dst = "198.51.100.7";
+  filter.has_ipv4_dst_mask = true;
+  filter.ipv4_dst_mask = "255.255.255.255";
+  filter.has_tcp_dst = true;
+  filter.tcp_dst = 18168;
+  filter.has_tcp_dst_mask = true;
+  filter.tcp_dst_mask = 0xFFFFU;
+  filter.has_drop_action = true;
+
+  BOOST_TEST(bbp::TcFilterMatchesEgressIpv4TcpDrop(
+      filter, "veth0", "", 43120U, "198.51.100.7", 18168, 1001));
+  BOOST_TEST(!bbp::TcFilterMatchesEgressIpv4TcpDrop(
+      filter, "veth0", "", 43121U, "198.51.100.7", 18168, 1001));
+  BOOST_TEST(!bbp::TcFilterMatchesEgressIpv4TcpDrop(
+      filter, "veth0", "", 0U, "198.51.100.7", 18168, 1001));
+  BOOST_TEST(!bbp::TcFilterMatchesEgressIpv4TcpDrop(
+      filter, "veth0", "198.51.100.7", 18168, 1001));
+
+  filter.tcp_src_mask = 0xFFF0U;
+  BOOST_TEST(!bbp::TcFilterIsEgressIpv4TcpDropPolicy(filter, "veth0"));
+  filter.tcp_src_mask = 0xFFFFU;
+  filter.has_tcp_src_mask = false;
+  BOOST_TEST(!bbp::TcFilterIsEgressIpv4TcpDropPolicy(filter, "veth0"));
+  filter.has_tcp_src = false;
+  filter.has_tcp_src_mask = true;
+  BOOST_TEST(!bbp::TcFilterIsEgressIpv4TcpDropPolicy(filter, "veth0"));
+  filter.has_tcp_src = true;
+  filter.tcp_src = 0U;
+  BOOST_TEST(!bbp::TcFilterIsEgressIpv4TcpDropPolicy(filter, "veth0"));
 }
 
 BOOST_AUTO_TEST_CASE(tc_filter_summary_rejects_source_filter_for_dst_only) {
