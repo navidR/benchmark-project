@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "simulation": {
+    "benchmark_root": "/tmp/inert"
+  },
+  "nodes": 1
+}

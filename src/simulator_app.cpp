@@ -19,6 +19,7 @@
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -361,6 +362,22 @@ std::string JsonOptionalStringField(const boost::json::object& object,
                              std::string(field));
   }
   return std::string(value->as_string());
+}
+
+void RejectUnsupportedFields(
+    const boost::json::object& object,
+    std::initializer_list<std::string_view> allowed_fields,
+    std::string_view context,
+    std::string_view additional_allowed_field = std::string_view()) {
+  for (const auto& member : object) {
+    if (member.key() != additional_allowed_field &&
+        std::find(allowed_fields.begin(), allowed_fields.end(), member.key()) ==
+            allowed_fields.end()) {
+      throw std::runtime_error(
+          std::string(context) +
+          " has unsupported field: " + std::string(member.key()));
+    }
+  }
 }
 
 uint64_t JsonAmountField(const boost::json::object& object, const char* field) {
@@ -3089,6 +3106,12 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       throw std::runtime_error("scenario simulation must be a JSON object");
     }
     simulation = &simulation_value->as_object();
+    RejectUnsupportedFields(
+        *simulation,
+        {"name", "seed", "duration", "time_scale", "cleanup_policy",
+         "privilege_mode", "log_retention_policy", "metrics_interval",
+         "tick_interval", "output_dir", "tui_refresh_interval"},
+        "scenario simulation");
     if (simulation->if_contains("name") != nullptr) {
       options.simulation_name = JsonStringField(*simulation, "name");
       RequireSafeScenarioIdentifier(options.simulation_name, "simulation name");
@@ -3223,6 +3246,32 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                              active_chain_name);
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
+  RejectUnsupportedFields(scenario,
+                          {"simulation",
+                           "chains",
+                           "chain",
+                           "chain_daemon",
+                           "output_dir",
+                           "run_id",
+                           "topology",
+                           "nodes",
+                           "node_count",
+                           "block_production",
+                           "generate_node",
+                           "ready_timeout_sec",
+                           "sync_timeout_sec",
+                           "metrics_sample_count",
+                           "metrics_interval_ms",
+                           "isolated_network",
+                           "workloads",
+                           "events",
+                           "resources",
+                           "resource_profiles",
+                           "process",
+                           "network",
+                           "network_profiles",
+                           "generate_blocks"},
+                          "scenario", chain_spec.daemon_scenario_field);
   const bool chain_daemon_provided =
       OptionProvided(vm, "node-binary") || OptionProvided(vm, "chain-daemon") ||
       OptionProvided(vm, chain_spec.daemon_option_name.c_str());

@@ -1,0 +1,5 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "metrics_interval": "25ms",
+  "nodes": 1
+}

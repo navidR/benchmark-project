@@ -1097,6 +1097,16 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-simulation-time-scale.json
     "simulation time_scale supports at most six decimal places"
   )
+  add_cli_failure_test(
+    bbp-invalid-simulation-field
+    tests/scenarios/invalid-simulation-field.json
+    "scenario simulation has unsupported field: benchmark_root"
+  )
+  add_cli_failure_test(
+    bbp-invalid-top-level-field
+    tests/scenarios/invalid-top-level-field.json
+    "scenario has unsupported field: metrics_interval"
+  )
   add_test(NAME bbp-valid-profile-switch-events
     COMMAND bbp
       --scenario-json
