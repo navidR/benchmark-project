@@ -47,6 +47,7 @@ class SimulationCommandQueue {
   std::uint64_t PushWalletSend(std::string sender_node_id,
                                SimulationWalletSend send,
                                bool confirmed = false);
+  std::uint64_t PushScenarioCommand(SimulationCommand command);
   std::optional<SimulationCommand> TryPop();
   std::optional<SimulationCommand> WaitPop();
   void Close();

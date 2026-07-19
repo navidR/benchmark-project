@@ -73,6 +73,7 @@ struct SimulationCommand {
   std::vector<PerfCounterKind> perf_counter_kinds;
   std::optional<SimulationWalletSend> wallet_send;
   bool confirmed = false;
+  std::optional<std::uint32_t> scheduled_event_sequence;
 };
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind);

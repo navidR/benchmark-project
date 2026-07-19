@@ -1,0 +1,15 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "events": [
+    {
+      "at": "1ms",
+      "action": "partition_nodes",
+      "partition": {
+        "scope": "node_pair",
+        "group_a": {"group_ids": ["a"], "node_ids": [1, 1]},
+        "group_b": {"group_ids": ["b"], "node_ids": [2]}
+      }
+    }
+  ]
+}

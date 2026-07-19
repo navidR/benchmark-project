@@ -9,6 +9,31 @@
 namespace bbp {
 namespace {
 
+std::size_t SimulationCommandPayloadCount(const SimulationCommand& command) {
+  return static_cast<std::size_t>(command.block_production_policy.has_value()) +
+         static_cast<std::size_t>(command.mining_difficulty.has_value()) +
+         static_cast<std::size_t>(command.peer_node_id.has_value()) +
+         static_cast<std::size_t>(command.peer_count_policy.has_value()) +
+         static_cast<std::size_t>(command.block_count.has_value()) +
+         static_cast<std::size_t>(command.profile.has_value()) +
+         static_cast<std::size_t>(command.resource_limit_patch.has_value()) +
+         static_cast<std::size_t>(command.network_condition.has_value()) +
+         static_cast<std::size_t>(command.network_flow.has_value()) +
+         static_cast<std::size_t>(command.partition.has_value()) +
+         static_cast<std::size_t>(command.perf_counter_target.has_value()) +
+         static_cast<std::size_t>(!command.perf_counter_kinds.empty()) +
+         static_cast<std::size_t>(command.wallet_send.has_value());
+}
+
+void RequirePayload(const SimulationCommand& command, bool expected_present,
+                    std::size_t expected_count) {
+  if (!expected_present ||
+      SimulationCommandPayloadCount(command) != expected_count) {
+    throw std::runtime_error(
+        "simulation command has missing or unexpected typed payload fields");
+  }
+}
+
 std::set<std::string> ValidatePartitionGroup(
     const SimulationPartitionGroup& group, std::string_view name) {
   if (group.group_ids.empty()) {
@@ -68,6 +93,188 @@ void ValidatePartition(const SimulationPartition& partition) {
   }
 }
 
+void ValidateNetworkFlowCommand(const SimulationCommand& command) {
+  RequirePayload(command, command.network_flow.has_value(), 1U);
+  const SimulationNetworkFlow& flow = *command.network_flow;
+  const bool complete_match = !flow.dst_address.empty() && flow.dst_port != 0U;
+  if (command.kind == SimulationCommandKind::kBlockNetworkFlow &&
+      !complete_match) {
+    throw std::runtime_error(
+        "block network flow requires a destination address and port");
+  }
+  if (command.kind == SimulationCommandKind::kUnblockNetworkFlow &&
+      flow.handle == 0U && !complete_match) {
+    throw std::runtime_error(
+        "unblock network flow requires a handle or complete match");
+  }
+  if (complete_match) {
+    ValidateIpv4Address(flow.dst_address, "network flow destination");
+  }
+  if (!flow.src_address.empty()) {
+    ValidateIpv4Address(flow.src_address, "network flow source");
+  }
+}
+
+void ValidatePerfCounterCommand(const SimulationCommand& command) {
+  RequirePayload(command,
+                 command.perf_counter_target.has_value() &&
+                     !command.perf_counter_kinds.empty(),
+                 2U);
+  const PerfCounterTarget& target = *command.perf_counter_target;
+  if (target.id.empty()) {
+    throw std::runtime_error("perf counter target id must not be empty");
+  }
+  if (target.node_ids.empty()) {
+    throw std::runtime_error("perf counter target must resolve to a node");
+  }
+  std::set<std::string> unique_nodes;
+  for (const std::string& node_id : target.node_ids) {
+    if (node_id.empty()) {
+      throw std::runtime_error("perf counter target node id must not be empty");
+    }
+    if (!unique_nodes.insert(node_id).second) {
+      throw std::runtime_error("perf counter target contains duplicate nodes");
+    }
+  }
+  if (target.kind != PerfCounterTargetKind::kGroup &&
+      target.node_ids.size() != 1U) {
+    throw std::runtime_error(
+        "non-group perf counter target must resolve to one node");
+  }
+  const std::set<PerfCounterKind> unique_kinds(
+      command.perf_counter_kinds.begin(), command.perf_counter_kinds.end());
+  if (unique_kinds.size() != command.perf_counter_kinds.size()) {
+    throw std::runtime_error("perf counter selection contains duplicates");
+  }
+  const std::string expected_node_id =
+      target.kind == PerfCounterTargetKind::kGroup ? "sim"
+                                                   : target.node_ids.front();
+  if (command.node_id != expected_node_id) {
+    throw std::runtime_error(
+        "perf counter command node does not match its target");
+  }
+}
+
+void ValidateWalletSendCommand(const SimulationCommand& command) {
+  RequirePayload(command, command.wallet_send.has_value(), 1U);
+  const SimulationWalletSend& send = *command.wallet_send;
+  if (send.sender_wallet_index == 0U) {
+    throw std::runtime_error("wallet send requires a sender wallet");
+  }
+  if (send.receiver_wallet_index == 0U) {
+    throw std::runtime_error("wallet send requires a receiver wallet");
+  }
+  if (send.sender_wallet_index == send.receiver_wallet_index) {
+    throw std::runtime_error("wallet send source and receiver must differ");
+  }
+  if (send.amount_satoshis == 0U) {
+    throw std::runtime_error("wallet send amount must be greater than zero");
+  }
+  if (send.amount_satoshis >
+      std::numeric_limits<std::uint64_t>::max() - send.fee_satoshis) {
+    throw std::runtime_error("wallet send amount plus fee overflows uint64");
+  }
+  if (send.timeout_sec == 0U) {
+    throw std::runtime_error("wallet send timeout must be greater than zero");
+  }
+}
+
+void ValidateSimulationCommand(const SimulationCommand& command) {
+  if (command.sequence != 0U) {
+    throw std::runtime_error(
+        "simulation command sequence must be assigned by the queue");
+  }
+  if (command.node_id.empty() &&
+      command.kind != SimulationCommandKind::kSetBlockProductionPolicy) {
+    throw std::runtime_error("simulation command requires a node id");
+  }
+  if (SimulationCommandRequiresConfirmation(command.kind) &&
+      !command.confirmed) {
+    throw std::runtime_error("destructive simulation command is unconfirmed");
+  }
+
+  switch (command.kind) {
+    case SimulationCommandKind::kIncreaseLogVerbosity:
+    case SimulationCommandKind::kDecreaseLogVerbosity:
+    case SimulationCommandKind::kStopMining:
+    case SimulationCommandKind::kDisconnectNode:
+    case SimulationCommandKind::kReconnectNode:
+    case SimulationCommandKind::kKillNode:
+    case SimulationCommandKind::kFreezeNode:
+    case SimulationCommandKind::kThawNode:
+    case SimulationCommandKind::kStopNode:
+    case SimulationCommandKind::kRestartNode:
+    case SimulationCommandKind::kExportNodeReport:
+      RequirePayload(command, true, 0U);
+      break;
+    case SimulationCommandKind::kSetBlockProductionPolicy:
+      RequirePayload(command, command.block_production_policy.has_value(), 1U);
+      if (command.node_id != "sim") {
+        throw std::runtime_error(
+            "block production policy command must target sim");
+      }
+      break;
+    case SimulationCommandKind::kSetMiningDifficulty:
+      RequirePayload(command, command.mining_difficulty.has_value(), 1U);
+      break;
+    case SimulationCommandKind::kConnectPeer:
+    case SimulationCommandKind::kDisconnectPeer:
+      RequirePayload(command, command.peer_node_id.has_value(), 1U);
+      if (command.peer_node_id->empty()) {
+        throw std::runtime_error("peer command requires a target peer node id");
+      }
+      if (command.node_id == command.peer_node_id) {
+        throw std::runtime_error("peer command source and target must differ");
+      }
+      break;
+    case SimulationCommandKind::kSetPeerCountPolicy:
+      RequirePayload(command, command.peer_count_policy.has_value(), 1U);
+      break;
+    case SimulationCommandKind::kGenerateBlocks:
+      RequirePayload(command, command.block_count.has_value(), 1U);
+      if (*command.block_count == 0U) {
+        throw std::runtime_error("generate-blocks count must be positive");
+      }
+      break;
+    case SimulationCommandKind::kSetResourceProfile:
+    case SimulationCommandKind::kSetNetworkProfile:
+      RequirePayload(command, command.profile.has_value(), 1U);
+      if (command.profile->empty()) {
+        throw std::runtime_error("profile command requires a profile name");
+      }
+      break;
+    case SimulationCommandKind::kSetResourceLimits:
+      RequirePayload(command, command.resource_limit_patch.has_value(), 1U);
+      ValidateResourceLimitPatch(*command.resource_limit_patch,
+                                 "operator resource update");
+      if (command.resource_limit_patch->io_limits_present &&
+          command.resource_limit_patch->io_limits.size() != 1U) {
+        throw std::runtime_error(
+            "operator io resource update requires exactly one block device");
+      }
+      break;
+    case SimulationCommandKind::kSetNetworkCondition:
+      RequirePayload(command, command.network_condition.has_value(), 1U);
+      ValidateNetworkCondition(*command.network_condition);
+      break;
+    case SimulationCommandKind::kBlockNetworkFlow:
+    case SimulationCommandKind::kUnblockNetworkFlow:
+      ValidateNetworkFlowCommand(command);
+      break;
+    case SimulationCommandKind::kPartitionNodes:
+    case SimulationCommandKind::kHealPartition:
+      RequirePayload(command, command.partition.has_value(), 1U);
+      ValidatePartition(*command.partition);
+      break;
+    case SimulationCommandKind::kSetPerfCounters:
+      ValidatePerfCounterCommand(command);
+      break;
+    case SimulationCommandKind::kSendWalletTransaction:
+      ValidateWalletSendCommand(command);
+      break;
+  }
+}
+
 }  // namespace
 
 std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
@@ -123,6 +330,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -146,6 +354,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = false,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -169,6 +378,7 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = false,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -203,6 +413,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -226,6 +437,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -252,7 +464,21 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
+}
+
+std::uint64_t SimulationCommandQueue::PushScenarioCommand(
+    SimulationCommand command) {
+  if (!command.scheduled_event_sequence ||
+      *command.scheduled_event_sequence == 0U) {
+    throw std::runtime_error(
+        "scenario command requires a scheduled event sequence");
+  }
+  if (!command.confirmed) {
+    throw std::runtime_error("scenario command must be explicitly authorized");
+  }
+  return PushCommand(std::move(command));
 }
 
 std::uint64_t SimulationCommandQueue::PushProfileCommand(
@@ -283,6 +509,7 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -311,6 +538,7 @@ std::uint64_t SimulationCommandQueue::PushResourceLimits(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -335,6 +563,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkCondition(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -380,6 +609,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -413,6 +643,7 @@ std::uint64_t SimulationCommandQueue::PushPartitionCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -466,6 +697,7 @@ std::uint64_t SimulationCommandQueue::PushPerfCounters(
       .perf_counter_kinds = std::move(kinds),
       .wallet_send = std::nullopt,
       .confirmed = false,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
@@ -509,19 +741,12 @@ std::uint64_t SimulationCommandQueue::PushWalletSend(std::string sender_node_id,
       .perf_counter_kinds = {},
       .wallet_send = send,
       .confirmed = confirmed,
+      .scheduled_event_sequence = std::nullopt,
   });
 }
 
 std::uint64_t SimulationCommandQueue::PushCommand(SimulationCommand command) {
-  const std::string& node_id = command.node_id;
-  if (node_id.empty() &&
-      command.kind != SimulationCommandKind::kSetBlockProductionPolicy) {
-    throw std::runtime_error("simulation command requires a node id");
-  }
-  if (SimulationCommandRequiresConfirmation(command.kind) &&
-      !command.confirmed) {
-    throw std::runtime_error("destructive simulation command is unconfirmed");
-  }
+  ValidateSimulationCommand(command);
 
   std::lock_guard<std::mutex> lock(mutex_);
   if (closed_) {

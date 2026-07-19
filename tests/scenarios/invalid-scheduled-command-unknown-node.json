@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "events": [
+    {"at": "1ms", "action": "stop_node", "node": "missing-node"}
+  ]
+}

@@ -1,5 +1,6 @@
 #include <boost/test/unit_test.hpp>
 #include <future>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -103,4 +104,61 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(command.resource_limit_patch);
   BOOST_CHECK(*command.resource_limit_patch == patch);
   BOOST_TEST(command.confirmed);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_reports_ordered_command_outcomes) {
+  bbp::SimulationCommandQueue queue;
+  std::vector<std::uint64_t> handled;
+  std::vector<std::pair<std::uint64_t, std::optional<std::string>>> outcomes;
+  std::promise<void> all_outcomes;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&handled](const bbp::SimulationCommand& command) {
+        handled.push_back(command.sequence);
+        if (command.sequence == 2U) {
+          throw std::runtime_error("scheduled failure");
+        }
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&outcomes, &all_outcomes](const bbp::SimulationCommand& command,
+                                 std::optional<std::string_view> error) {
+        outcomes.emplace_back(
+            command.sequence,
+            error ? std::optional<std::string>(*error) : std::nullopt);
+        if (outcomes.size() == 3U) {
+          all_outcomes.set_value();
+        }
+      });
+
+  queue.Push(bbp::SimulationCommandKind::kIncreaseLogVerbosity, "firo-1");
+  bbp::SimulationCommand failing;
+  failing.kind = bbp::SimulationCommandKind::kRestartNode;
+  failing.node_id = "firo-1";
+  failing.confirmed = true;
+  failing.scheduled_event_sequence = 1U;
+  queue.PushScenarioCommand(std::move(failing));
+  bbp::SimulationCommand succeeding;
+  succeeding.kind = bbp::SimulationCommandKind::kExportNodeReport;
+  succeeding.node_id = "firo-1";
+  succeeding.confirmed = true;
+  succeeding.scheduled_event_sequence = 2U;
+  queue.PushScenarioCommand(std::move(succeeding));
+
+  processor.Start();
+  all_outcomes.get_future().wait();
+  processor.Stop();
+
+  BOOST_REQUIRE_EQUAL(handled.size(), 3U);
+  BOOST_TEST(handled[0] == 1U);
+  BOOST_TEST(handled[1] == 2U);
+  BOOST_TEST(handled[2] == 3U);
+  BOOST_REQUIRE_EQUAL(outcomes.size(), 3U);
+  BOOST_TEST(outcomes[0].first == 1U);
+  BOOST_TEST(!outcomes[0].second);
+  BOOST_TEST(outcomes[1].first == 2U);
+  BOOST_REQUIRE(outcomes[1].second);
+  BOOST_TEST(*outcomes[1].second == "scheduled failure");
+  BOOST_TEST(outcomes[2].first == 3U);
+  BOOST_TEST(!outcomes[2].second);
 }

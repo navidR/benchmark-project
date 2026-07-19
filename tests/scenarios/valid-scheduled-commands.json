@@ -1,0 +1,163 @@
+{
+  "chains": {
+    "firo": {
+      "driver": "firo",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "resource_profiles": {
+    "small": {"memory_max": "1GiB", "pids_max": 256},
+    "large": {"memory_max": "2GiB", "pids_max": 512}
+  },
+  "network_profiles": {
+    "normal": {"bandwidth_mbps": 50, "delay_ms": 10},
+    "degraded": {"bandwidth_mbps": 5, "delay_ms": 100}
+  },
+  "isolated_network": true,
+  "block_production": {"enabled": false},
+  "nodes": [
+    {
+      "id": "firo-a",
+      "chain": "firo",
+      "role": "wallet_miner",
+      "resources": {"profile": "small"},
+      "network": {"profile": "normal"},
+      "wallet": {
+        "enabled": true,
+        "initialization": {"strategy": "driver_rpc", "mode": "public"}
+      }
+    },
+    {
+      "id": "firo-b",
+      "chain": "firo",
+      "role": "wallet_miner",
+      "resources": {"profile": "small"},
+      "network": {"profile": "normal"},
+      "wallet": {
+        "enabled": true,
+        "initialization": {"strategy": "driver_rpc", "mode": "public"}
+      }
+    }
+  ],
+  "topology": {
+    "node_count": 2,
+    "wallet_nodes": [1, 2],
+    "miner_nodes": [1, 2],
+    "allow_miner_wallet_overlap": true,
+    "wallet_initialization": {"strategy": "driver_rpc", "mode": "public"},
+    "type": "full_mesh"
+  },
+  "events": [
+    {"at": "1ms", "action": "increase_log_verbosity", "node": "firo-a"},
+    {"at": "2ms", "action": "decrease_log_verbosity", "node": 1},
+    {"at": "3ms", "action": "stop_mining", "node": "firo-a"},
+    {"at": "4ms", "action": "disconnect_node", "node": "firo-a"},
+    {"at": "5ms", "action": "reconnect_node", "node": "firo-a"},
+    {
+      "at": "6ms",
+      "action": "set_block_production_policy",
+      "period_ms": 1000,
+      "probability": 0.25,
+      "seed": 7
+    },
+    {"at": "7ms", "action": "set_mining_difficulty", "node": "firo-a", "difficulty": 1.0},
+    {"at": "8ms", "action": "kill_node", "node": "firo-a"},
+    {
+      "at": "9ms",
+      "action": "connect_peer",
+      "node": "firo-a",
+      "peer_node_id": 2
+    },
+    {
+      "at": "10ms",
+      "action": "disconnect_peer",
+      "node": "firo-a",
+      "peer_node_id": "firo-b"
+    },
+    {
+      "at": "11ms",
+      "action": "set_peer_count_policy",
+      "node": "firo-a",
+      "minimum_peer_count": 0,
+      "maximum_peer_count": 1
+    },
+    {"at": "12ms", "action": "freeze_node", "node": "firo-a"},
+    {"at": "13ms", "action": "thaw_node", "node": "firo-a"},
+    {"at": "14ms", "action": "stop_node", "node": "firo-a"},
+    {"at": "15ms", "action": "restart_node", "node": "firo-a"},
+    {"at": "16ms", "action": "generate_blocks", "node": 1, "block_count": 2},
+    {
+      "at": "17ms",
+      "action": "set_resource_profile",
+      "node": "firo-a",
+      "profile": "large"
+    },
+    {
+      "at": "18ms",
+      "action": "set_resource_limits",
+      "node": 1,
+      "resource_limits": {"memory_high_bytes": 1073741824}
+    },
+    {
+      "at": "19ms",
+      "action": "set_network_profile",
+      "node": "firo-a",
+      "profile": "degraded"
+    },
+    {
+      "at": "20ms",
+      "action": "set_network_condition",
+      "node": 1,
+      "network_condition": {"delay_ms": 25, "limit_packets": 1000}
+    },
+    {
+      "at": "21ms",
+      "action": "block_network_flow",
+      "node": 1,
+      "network_flow": {"dst_address": "10.0.0.2", "dst_port": 8168}
+    },
+    {
+      "at": "22ms",
+      "action": "unblock_network_flow",
+      "node": "firo-a",
+      "network_flow": {"handle": 7}
+    },
+    {
+      "at": "23ms",
+      "action": "partition_nodes",
+      "partition": {
+        "scope": "node_pair",
+        "group_a": {"group_ids": ["firo-a"], "node_ids": [1]},
+        "group_b": {"group_ids": ["firo-b"], "node_ids": ["firo-b"]}
+      }
+    },
+    {
+      "at": "24ms",
+      "action": "heal_partition",
+      "partition": {
+        "scope": "node_pair",
+        "group_a": {"group_ids": ["firo-a"], "node_ids": ["firo-a"]},
+        "group_b": {"group_ids": ["firo-b"], "node_ids": [2]}
+      }
+    },
+    {"at": "25ms", "action": "export_node_report", "node": "firo-a"},
+    {
+      "at": "26ms",
+      "action": "set_perf_counters",
+      "perf_target": {"kind": "node", "id": "firo-a", "node_ids": [1]},
+      "perf_counters": ["cycles", "instructions"]
+    },
+    {
+      "at": "27ms",
+      "action": "send_wallet_transaction",
+      "node": "firo-a",
+      "wallet_send": {
+        "sender_wallet_index": 1,
+        "receiver_wallet_index": 2,
+        "amount": "1.00000000",
+        "fee": "0.00010000",
+        "timeout_sec": 30
+      }
+    }
+  ]
+}

@@ -146,7 +146,12 @@ boost::json::object ScheduledEventLifecycleDetail(
   const std::uint64_t started_at_ms = ElapsedMilliseconds(epoch, started);
   boost::json::object detail;
   detail["sequence"] = event.sequence;
-  detail["action"] = std::string(WorkloadKindName(event.action.kind));
+  if (const auto* workload = std::get_if<ScenarioWorkload>(&event.action)) {
+    detail["action"] = std::string(WorkloadKindName(workload->kind));
+  } else {
+    detail["action"] = std::string(SimulationCommandKindName(
+        std::get<SimulationCommand>(event.action).kind));
+  }
   detail["scheduled_at_ms"] = scheduled_at_ms;
   detail["scheduled_wall_at_ms"] = scheduled_wall_at_ms;
   detail["started_at_ms"] = started_at_ms;
@@ -2520,7 +2525,26 @@ void ValidateProfileSwitchReferences(Options* options) {
     validate(workload);
   }
   for (const ScheduledScenarioEvent& event : options->scheduled_events) {
-    validate(event.action);
+    if (const auto* workload = std::get_if<ScenarioWorkload>(&event.action)) {
+      validate(*workload);
+      continue;
+    }
+    const SimulationCommand& command =
+        std::get<SimulationCommand>(event.action);
+    if (command.kind == SimulationCommandKind::kSetResourceProfile &&
+        (!command.profile ||
+         !options->resource_profiles.contains(*command.profile))) {
+      throw std::runtime_error(
+          "scenario scheduled command references unknown resource profile: " +
+          (command.profile ? *command.profile : std::string("<missing>")));
+    }
+    if (command.kind == SimulationCommandKind::kSetNetworkProfile &&
+        (!command.profile ||
+         !options->network_profiles.contains(*command.profile))) {
+      throw std::runtime_error(
+          "scenario scheduled command references unknown network profile: " +
+          (command.profile ? *command.profile : std::string("<missing>")));
+    }
   }
 }
 
@@ -2892,6 +2916,500 @@ void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
           " has unsupported field: " + std::string(member.key()));
     }
   }
+}
+
+bool IsScenarioCommandPayloadField(SimulationCommandKind kind,
+                                   std::string_view field) {
+  if (field == "node") {
+    return kind != SimulationCommandKind::kSetBlockProductionPolicy &&
+           kind != SimulationCommandKind::kPartitionNodes &&
+           kind != SimulationCommandKind::kHealPartition &&
+           kind != SimulationCommandKind::kSetPerfCounters;
+  }
+  switch (kind) {
+    case SimulationCommandKind::kIncreaseLogVerbosity:
+    case SimulationCommandKind::kDecreaseLogVerbosity:
+    case SimulationCommandKind::kStopMining:
+    case SimulationCommandKind::kDisconnectNode:
+    case SimulationCommandKind::kReconnectNode:
+    case SimulationCommandKind::kKillNode:
+    case SimulationCommandKind::kFreezeNode:
+    case SimulationCommandKind::kThawNode:
+    case SimulationCommandKind::kStopNode:
+    case SimulationCommandKind::kRestartNode:
+    case SimulationCommandKind::kExportNodeReport:
+      return false;
+    case SimulationCommandKind::kSetBlockProductionPolicy:
+      return IsOneOf(field, {"period_ms", "probability", "seed"});
+    case SimulationCommandKind::kSetMiningDifficulty:
+      return field == "difficulty";
+    case SimulationCommandKind::kConnectPeer:
+    case SimulationCommandKind::kDisconnectPeer:
+      return field == "peer_node_id";
+    case SimulationCommandKind::kSetPeerCountPolicy:
+      return IsOneOf(field, {"minimum_peer_count", "maximum_peer_count"});
+    case SimulationCommandKind::kGenerateBlocks:
+      return field == "block_count";
+    case SimulationCommandKind::kSetResourceProfile:
+    case SimulationCommandKind::kSetNetworkProfile:
+      return field == "profile";
+    case SimulationCommandKind::kSetResourceLimits:
+      return field == "resource_limits";
+    case SimulationCommandKind::kSetNetworkCondition:
+      return field == "network_condition";
+    case SimulationCommandKind::kBlockNetworkFlow:
+    case SimulationCommandKind::kUnblockNetworkFlow:
+      return field == "network_flow";
+    case SimulationCommandKind::kPartitionNodes:
+    case SimulationCommandKind::kHealPartition:
+      return field == "partition";
+    case SimulationCommandKind::kSetPerfCounters:
+      return IsOneOf(field, {"perf_target", "perf_counters"});
+    case SimulationCommandKind::kSendWalletTransaction:
+      return field == "wallet_send";
+  }
+  return false;
+}
+
+void RejectUnsupportedScenarioCommandFields(const boost::json::object& object,
+                                            SimulationCommandKind kind) {
+  for (const auto& member : object) {
+    if (member.key() != "at" && member.key() != "action" &&
+        !IsScenarioCommandPayloadField(kind, member.key())) {
+      throw std::runtime_error(
+          "scenario scheduled command " +
+          std::string(SimulationCommandKindName(kind)) +
+          " has unsupported field: " + std::string(member.key()));
+    }
+  }
+}
+
+std::string ScenarioCommandNodeId(const boost::json::object& object,
+                                  const char* field, const Options& options) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("scenario scheduled command requires " +
+                             std::string(field));
+  }
+  if (value->is_string()) {
+    const std::string node_id(value->as_string());
+    for (std::uint32_t node_index = 0U; node_index < options.nodes;
+         ++node_index) {
+      if (ScenarioNodeId(options, node_index) == node_id) {
+        return node_id;
+      }
+    }
+    throw std::runtime_error(
+        "scenario scheduled command references unknown node ID: " + node_id);
+  }
+  const std::uint32_t node = JsonUint32Value(*value, field);
+  if (node == 0U || node > options.nodes) {
+    throw std::runtime_error("scenario scheduled command " +
+                             std::string(field) + " must be in 1.." +
+                             std::to_string(options.nodes));
+  }
+  return ScenarioNodeId(options, node - 1U);
+}
+
+std::vector<std::string> ScenarioCommandNodeIds(
+    const boost::json::object& object, const char* field,
+    const Options& options) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr || !value->is_array() || value->as_array().empty()) {
+    throw std::runtime_error("scenario scheduled command " +
+                             std::string(field) + " must be a non-empty array");
+  }
+  std::vector<std::string> node_ids;
+  std::set<std::string> unique;
+  node_ids.reserve(value->as_array().size());
+  for (const boost::json::value& node : value->as_array()) {
+    boost::json::object wrapper;
+    wrapper["node"] = node;
+    std::string node_id = ScenarioCommandNodeId(wrapper, "node", options);
+    if (!unique.insert(node_id).second) {
+      throw std::runtime_error("scenario scheduled command " +
+                               std::string(field) +
+                               " contains duplicate node ID: " + node_id);
+    }
+    node_ids.push_back(std::move(node_id));
+  }
+  return node_ids;
+}
+
+SimulationPartitionScope ParseSimulationPartitionScope(std::string_view value) {
+  if (value ==
+      SimulationPartitionScopeName(SimulationPartitionScope::kNodePair)) {
+    return SimulationPartitionScope::kNodePair;
+  }
+  if (value ==
+      SimulationPartitionScopeName(SimulationPartitionScope::kPartitionGroup)) {
+    return SimulationPartitionScope::kPartitionGroup;
+  }
+  if (value ==
+      SimulationPartitionScopeName(SimulationPartitionScope::kRegion)) {
+    return SimulationPartitionScope::kRegion;
+  }
+  if (value == SimulationPartitionScopeName(SimulationPartitionScope::kRole)) {
+    return SimulationPartitionScope::kRole;
+  }
+  throw std::runtime_error("unsupported simulation partition scope: " +
+                           std::string(value));
+}
+
+SimulationPartitionGroup ParseSimulationPartitionGroup(
+    const boost::json::object& object, const Options& options,
+    std::string_view context) {
+  RejectUnsupportedFields(object, {"group_ids", "node_ids"}, context);
+  const boost::json::value* groups = object.if_contains("group_ids");
+  if (groups == nullptr || !groups->is_array() || groups->as_array().empty()) {
+    throw std::runtime_error(std::string(context) +
+                             " group_ids must be a non-empty array");
+  }
+  SimulationPartitionGroup group;
+  std::set<std::string> unique_groups;
+  for (const boost::json::value& value : groups->as_array()) {
+    if (!value.is_string() || value.as_string().empty()) {
+      throw std::runtime_error(std::string(context) +
+                               " group_ids entries must be non-empty strings");
+    }
+    std::string group_id(value.as_string());
+    if (!unique_groups.insert(group_id).second) {
+      throw std::runtime_error(std::string(context) +
+                               " contains duplicate group ID: " + group_id);
+    }
+    group.group_ids.push_back(std::move(group_id));
+  }
+  group.node_ids = ScenarioCommandNodeIds(object, "node_ids", options);
+  return group;
+}
+
+SimulationPartition ParseSimulationPartition(const boost::json::object& object,
+                                             const Options& options) {
+  RejectUnsupportedFields(object, {"scope", "group_a", "group_b"},
+                          "scenario scheduled command partition");
+  SimulationPartition partition;
+  partition.scope =
+      ParseSimulationPartitionScope(JsonStringField(object, "scope"));
+  const boost::json::value* group_a = object.if_contains("group_a");
+  const boost::json::value* group_b = object.if_contains("group_b");
+  if (group_a == nullptr || !group_a->is_object() || group_b == nullptr ||
+      !group_b->is_object()) {
+    throw std::runtime_error(
+        "scenario scheduled command partition groups must be objects");
+  }
+  partition.group_a = ParseSimulationPartitionGroup(
+      group_a->as_object(), options, "scenario scheduled command group_a");
+  partition.group_b = ParseSimulationPartitionGroup(
+      group_b->as_object(), options, "scenario scheduled command group_b");
+  std::set<std::string> group_a_nodes(partition.group_a.node_ids.begin(),
+                                      partition.group_a.node_ids.end());
+  for (const std::string& node_id : partition.group_b.node_ids) {
+    if (group_a_nodes.contains(node_id)) {
+      throw std::runtime_error(
+          "scenario scheduled command partition groups overlap at node " +
+          node_id);
+    }
+  }
+  if (partition.scope == SimulationPartitionScope::kNodePair &&
+      (partition.group_a.group_ids.size() != 1U ||
+       partition.group_a.node_ids.size() != 1U ||
+       partition.group_b.group_ids.size() != 1U ||
+       partition.group_b.node_ids.size() != 1U)) {
+    throw std::runtime_error(
+        "scenario scheduled node-pair partition requires one node per group");
+  }
+  return partition;
+}
+
+PerfCounterTarget ParseScenarioPerfTarget(const boost::json::object& object,
+                                          const Options& options) {
+  RejectUnsupportedFields(object, {"kind", "id", "node_ids"},
+                          "scenario scheduled command perf_target");
+  const std::string kind_name = JsonStringField(object, "kind");
+  const std::optional<PerfCounterTargetKind> kind =
+      PerfCounterTargetKindFromName(kind_name);
+  if (!kind) {
+    throw std::runtime_error("unsupported perf counter target kind: " +
+                             kind_name);
+  }
+  PerfCounterTarget target;
+  target.kind = *kind;
+  target.id = JsonStringField(object, "id");
+  if (target.id.empty()) {
+    throw std::runtime_error(
+        "scenario scheduled command perf target id must not be empty");
+  }
+  target.node_ids = ScenarioCommandNodeIds(object, "node_ids", options);
+  return target;
+}
+
+std::vector<PerfCounterKind> ParseScenarioPerfCounters(
+    const boost::json::object& object) {
+  const boost::json::value* value = object.if_contains("perf_counters");
+  if (value == nullptr || !value->is_array() || value->as_array().empty()) {
+    throw std::runtime_error(
+        "scenario scheduled command perf_counters must be a non-empty array");
+  }
+  std::vector<PerfCounterKind> counters;
+  std::set<PerfCounterKind> unique;
+  for (const boost::json::value& counter : value->as_array()) {
+    if (!counter.is_string()) {
+      throw std::runtime_error(
+          "scenario scheduled command perf_counters entries must be strings");
+    }
+    const std::string name(counter.as_string());
+    const std::optional<PerfCounterKind> kind = PerfCounterKindFromName(name);
+    if (!kind) {
+      throw std::runtime_error("unsupported perf counter: " + name);
+    }
+    if (!unique.insert(*kind).second) {
+      throw std::runtime_error(
+          "scenario scheduled command perf_counters contains duplicate: " +
+          name);
+    }
+    counters.push_back(*kind);
+  }
+  return counters;
+}
+
+bool UsesScenarioCommandSchema(
+    const boost::json::object& event,
+    const std::optional<WorkloadKind>& workload_kind,
+    const std::optional<SimulationCommandKind>& command_kind) {
+  if (!command_kind) {
+    return false;
+  }
+  if (!workload_kind) {
+    return true;
+  }
+  const boost::json::value* node = event.if_contains("node");
+  if (node != nullptr && node->is_string()) {
+    return true;
+  }
+  constexpr std::string_view kTypedCommandFields[] = {
+      "resource_limits",    "network_condition", "network_flow",
+      "partition",          "perf_target",       "perf_counters",
+      "wallet_send",        "peer_node_id",      "block_count",
+      "minimum_peer_count", "maximum_peer_count"};
+  return std::any_of(std::begin(kTypedCommandFields),
+                     std::end(kTypedCommandFields),
+                     [&](std::string_view field) {
+                       return event.if_contains(field) != nullptr;
+                     });
+}
+
+SimulationCommand ParseScheduledSimulationCommand(
+    const boost::json::object& object, SimulationCommandKind kind,
+    const Options& options) {
+  RejectUnsupportedScenarioCommandFields(object, kind);
+  SimulationCommand command;
+  command.kind = kind;
+  command.confirmed = true;
+  if (kind == SimulationCommandKind::kSetBlockProductionPolicy ||
+      kind == SimulationCommandKind::kPartitionNodes ||
+      kind == SimulationCommandKind::kHealPartition ||
+      kind == SimulationCommandKind::kSetPerfCounters) {
+    command.node_id = "sim";
+  } else {
+    command.node_id = ScenarioCommandNodeId(object, "node", options);
+  }
+
+  if (kind == SimulationCommandKind::kSetBlockProductionPolicy) {
+    const std::uint64_t period_ms = JsonUint64Field(object, "period_ms");
+    if (period_ms == 0U ||
+        period_ms > static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max())) {
+      throw std::runtime_error(
+          "scenario scheduled command period_ms is out of range");
+    }
+    if (object.if_contains("probability") == nullptr) {
+      throw std::runtime_error(
+          "scenario scheduled command requires probability");
+    }
+    command.block_production_policy = BlockProductionPolicy(
+        std::chrono::milliseconds(static_cast<std::int64_t>(period_ms)),
+        JsonOptionalDoubleField(object, "probability", 0.0),
+        JsonUint64Field(object, "seed"));
+  } else if (kind == SimulationCommandKind::kSetMiningDifficulty) {
+    if (object.if_contains("difficulty") == nullptr) {
+      throw std::runtime_error(
+          "scenario scheduled command requires difficulty");
+    }
+    command.mining_difficulty =
+        MiningDifficulty(JsonOptionalDoubleField(object, "difficulty", 0.0));
+  } else if (kind == SimulationCommandKind::kConnectPeer ||
+             kind == SimulationCommandKind::kDisconnectPeer) {
+    command.peer_node_id =
+        ScenarioCommandNodeId(object, "peer_node_id", options);
+    if (command.node_id == command.peer_node_id) {
+      throw std::runtime_error(
+          "scenario scheduled peer command source and target must differ");
+    }
+  } else if (kind == SimulationCommandKind::kSetPeerCountPolicy) {
+    command.peer_count_policy =
+        PeerCountPolicy(JsonUint32Field(object, "minimum_peer_count"),
+                        JsonUint32Field(object, "maximum_peer_count"));
+  } else if (kind == SimulationCommandKind::kGenerateBlocks) {
+    const std::uint32_t block_count = JsonUint32Field(object, "block_count");
+    if (block_count == 0U) {
+      throw std::runtime_error(
+          "scenario scheduled generate_blocks count must be positive");
+    }
+    command.block_count = block_count;
+  } else if (kind == SimulationCommandKind::kSetResourceProfile ||
+             kind == SimulationCommandKind::kSetNetworkProfile) {
+    command.profile = JsonStringField(object, "profile");
+    RequireSafeScenarioIdentifier(*command.profile,
+                                  "scenario scheduled profile name");
+  } else if (kind == SimulationCommandKind::kSetResourceLimits) {
+    const boost::json::value* limits = object.if_contains("resource_limits");
+    if (limits == nullptr || !limits->is_object()) {
+      throw std::runtime_error(
+          "scenario scheduled command resource_limits must be an object");
+    }
+    RejectUnsupportedFields(
+        limits->as_object(),
+        {"memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
+         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max"},
+        "scenario scheduled command resource_limits");
+    command.resource_limit_patch =
+        ParseResourceLimitPatchObject(limits->as_object());
+  } else if (kind == SimulationCommandKind::kSetNetworkCondition) {
+    const boost::json::value* condition =
+        object.if_contains("network_condition");
+    if (condition == nullptr || !condition->is_object()) {
+      throw std::runtime_error(
+          "scenario scheduled command network_condition must be an object");
+    }
+    RejectUnsupportedFields(
+        condition->as_object(),
+        {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
+         "reorder_basis_points", "limit_packets"},
+        "scenario scheduled command network_condition");
+    command.network_condition =
+        ParseNetworkConditionObject(condition->as_object());
+  } else if (kind == SimulationCommandKind::kBlockNetworkFlow ||
+             kind == SimulationCommandKind::kUnblockNetworkFlow) {
+    const boost::json::value* flow = object.if_contains("network_flow");
+    if (flow == nullptr || !flow->is_object()) {
+      throw std::runtime_error(
+          "scenario scheduled command network_flow must be an object");
+    }
+    const boost::json::object& flow_object = flow->as_object();
+    RejectUnsupportedFields(
+        flow_object,
+        {"src_address", "src_port", "dst_address", "dst_port", "handle"},
+        "scenario scheduled command network_flow");
+    SimulationNetworkFlow parsed;
+    parsed.src_address =
+        JsonOptionalStringField(flow_object, "src_address", "");
+    parsed.dst_address =
+        JsonOptionalStringField(flow_object, "dst_address", "");
+    const std::uint32_t src_port =
+        JsonOptionalUint32Field(flow_object, "src_port", 0U);
+    const std::uint32_t dst_port =
+        JsonOptionalUint32Field(flow_object, "dst_port", 0U);
+    if (src_port > 65535U || dst_port > 65535U) {
+      throw std::runtime_error(
+          "scenario scheduled command network flow port exceeds 65535");
+    }
+    parsed.src_port = static_cast<std::uint16_t>(src_port);
+    parsed.dst_port = static_cast<std::uint16_t>(dst_port);
+    parsed.handle = JsonOptionalUint32Field(flow_object, "handle", 0U);
+    if (!parsed.src_address.empty()) {
+      ValidateIpv4Address(parsed.src_address,
+                          "scenario scheduled network flow source");
+    }
+    if (!parsed.dst_address.empty()) {
+      ValidateIpv4Address(parsed.dst_address,
+                          "scenario scheduled network flow destination");
+    }
+    if (parsed.dst_address.empty()) {
+      if (kind != SimulationCommandKind::kUnblockNetworkFlow ||
+          parsed.handle == 0U || parsed.dst_port != 0U) {
+        throw std::runtime_error(
+            "scenario scheduled handle-only network flow must be unblock");
+      }
+    } else if (parsed.dst_port == 0U) {
+      throw std::runtime_error(
+          "scenario scheduled network flow destination port must be positive");
+    }
+    command.network_flow = std::move(parsed);
+  } else if (kind == SimulationCommandKind::kPartitionNodes ||
+             kind == SimulationCommandKind::kHealPartition) {
+    const boost::json::value* partition = object.if_contains("partition");
+    if (partition == nullptr || !partition->is_object()) {
+      throw std::runtime_error(
+          "scenario scheduled command partition must be an object");
+    }
+    command.partition =
+        ParseSimulationPartition(partition->as_object(), options);
+    if (command.partition->scope == SimulationPartitionScope::kNodePair) {
+      command.node_id = command.partition->group_a.node_ids.front();
+    }
+  } else if (kind == SimulationCommandKind::kSetPerfCounters) {
+    const boost::json::value* target = object.if_contains("perf_target");
+    if (target == nullptr || !target->is_object()) {
+      throw std::runtime_error(
+          "scenario scheduled command perf_target must be an object");
+    }
+    command.perf_counter_target =
+        ParseScenarioPerfTarget(target->as_object(), options);
+    command.perf_counter_kinds = ParseScenarioPerfCounters(object);
+    if (command.perf_counter_target->kind != PerfCounterTargetKind::kGroup &&
+        command.perf_counter_target->node_ids.size() != 1U) {
+      throw std::runtime_error(
+          "scenario scheduled non-group perf target must contain one node");
+    }
+    if (command.perf_counter_target->kind != PerfCounterTargetKind::kGroup) {
+      command.node_id = command.perf_counter_target->node_ids.front();
+    }
+  } else if (kind == SimulationCommandKind::kSendWalletTransaction) {
+    const boost::json::value* send = object.if_contains("wallet_send");
+    if (send == nullptr || !send->is_object()) {
+      throw std::runtime_error(
+          "scenario scheduled command wallet_send must be an object");
+    }
+    const boost::json::object& send_object = send->as_object();
+    RejectUnsupportedFields(send_object,
+                            {"sender_wallet_index", "receiver_wallet_index",
+                             "amount", "fee", "timeout_sec"},
+                            "scenario scheduled command wallet_send");
+    SimulationWalletSend parsed;
+    parsed.sender_wallet_index =
+        JsonUint32Field(send_object, "sender_wallet_index");
+    parsed.receiver_wallet_index =
+        JsonUint32Field(send_object, "receiver_wallet_index");
+    parsed.amount_satoshis = JsonAmountField(send_object, "amount");
+    parsed.fee_satoshis = JsonAmountField(send_object, "fee");
+    parsed.timeout_sec = JsonUint32Field(send_object, "timeout_sec");
+    const std::size_t wallet_count = options.topology.wallet_nodes.size();
+    if (parsed.sender_wallet_index == 0U ||
+        parsed.receiver_wallet_index == 0U ||
+        parsed.sender_wallet_index > wallet_count ||
+        parsed.receiver_wallet_index > wallet_count ||
+        parsed.sender_wallet_index == parsed.receiver_wallet_index ||
+        parsed.amount_satoshis == 0U || parsed.timeout_sec == 0U ||
+        parsed.amount_satoshis >
+            std::numeric_limits<std::uint64_t>::max() - parsed.fee_satoshis) {
+      throw std::runtime_error(
+          "scenario scheduled command wallet_send payload is invalid");
+    }
+    const std::uint32_t sender_node =
+        options.topology.wallet_nodes[parsed.sender_wallet_index - 1U];
+    const std::string sender_node_id = ScenarioNodeId(options, sender_node);
+    if (command.node_id != sender_node_id) {
+      throw std::runtime_error(
+          "scenario scheduled command wallet sender does not match node");
+    }
+    command.wallet_send = parsed;
+  }
+  command.scheduled_event_sequence = 1U;
+  SimulationCommandQueue validation_queue;
+  validation_queue.PushScenarioCommand(command);
+  command.scheduled_event_sequence.reset();
+  return command;
 }
 
 void ApplyScenarioWorkloads(const boost::json::array& workloads,
@@ -3283,16 +3801,47 @@ void ApplyScheduledScenarioEvents(
     const boost::json::object& event = value.as_object();
     const std::string at_text = JsonStringField(event, "at");
     const std::string action_name = JsonStringField(event, "action");
-    const std::optional<WorkloadKind> kind = ParseWorkloadKind(action_name);
-    if (!kind) {
+    const std::optional<WorkloadKind> workload_kind =
+        ParseWorkloadKind(action_name);
+    const std::optional<SimulationCommandKind> command_kind =
+        SimulationCommandKindFromName(action_name);
+    if (!workload_kind && !command_kind) {
       throw std::runtime_error("unsupported scheduled event action: " +
                                action_name);
     }
     if (event.if_contains("type") != nullptr) {
       throw std::runtime_error("scenario events entries use action, not type");
     }
-    RejectUnsupportedScenarioActionFields(event, *kind, true);
+    const std::chrono::milliseconds scheduled_at =
+        PositiveDuration::Parse(at_text).value();
+    const std::chrono::milliseconds scheduled_wall_at =
+        options.time_scale.WallDuration(scheduled_at);
+    const auto maximum_monotonic_delay =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::duration::max());
+    if (scheduled_wall_at > maximum_monotonic_delay) {
+      throw std::runtime_error(
+          "scheduled event time exceeds monotonic clock range");
+    }
+    if (options.simulation_duration &&
+        scheduled_at >= *options.simulation_duration) {
+      throw std::runtime_error(
+          "scheduled event time must be less than simulation duration");
+    }
+    const std::uint32_t sequence = static_cast<std::uint32_t>(index + 1U);
+    if (UsesScenarioCommandSchema(event, workload_kind, command_kind)) {
+      SimulationCommand command =
+          ParseScheduledSimulationCommand(event, *command_kind, options);
+      command.scheduled_event_sequence = sequence;
+      if (command.kind == SimulationCommandKind::kSendWalletTransaction) {
+        options.wallet_backed_workload_requested = true;
+      }
+      options.scheduled_events.emplace_back(scheduled_at, sequence,
+                                            std::move(command));
+      continue;
+    }
 
+    RejectUnsupportedScenarioActionFields(event, *workload_kind, true);
     boost::json::object action_object = event;
     action_object.erase("at");
     action_object.erase("action");
@@ -3304,27 +3853,10 @@ void ApplyScheduledScenarioEvents(
     if (options.workloads.size() != workload_count + 1U) {
       throw std::runtime_error("scheduled event did not produce one action");
     }
-
-    ScheduledScenarioEvent scheduled;
-    scheduled.at = PositiveDuration::Parse(at_text).value();
-    const std::chrono::milliseconds scheduled_wall_at =
-        options.time_scale.WallDuration(scheduled.at);
-    const auto maximum_monotonic_delay =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::duration::max());
-    if (scheduled_wall_at > maximum_monotonic_delay) {
-      throw std::runtime_error(
-          "scheduled event time exceeds monotonic clock range");
-    }
-    if (options.simulation_duration &&
-        scheduled.at >= *options.simulation_duration) {
-      throw std::runtime_error(
-          "scheduled event time must be less than simulation duration");
-    }
-    scheduled.sequence = static_cast<std::uint32_t>(index + 1U);
-    scheduled.action = std::move(options.workloads.back());
+    ScenarioWorkload workload = std::move(options.workloads.back());
     options.workloads.pop_back();
-    options.scheduled_events.push_back(std::move(scheduled));
+    options.scheduled_events.emplace_back(scheduled_at, sequence,
+                                          std::move(workload));
   }
 }
 
@@ -3938,12 +4470,25 @@ bool WorkloadsRequireIsolatedNetwork(const Options& options) {
     }
   }
   for (const ScheduledScenarioEvent& event : options.scheduled_events) {
-    if (event.action.kind == WorkloadKind::kPartitionNodes ||
-        event.action.kind == WorkloadKind::kHealPartition ||
-        event.action.kind == WorkloadKind::kSetNetworkCondition ||
-        event.action.kind == WorkloadKind::kBlockNetworkFlow ||
-        event.action.kind == WorkloadKind::kUnblockNetworkFlow ||
-        event.action.kind == WorkloadKind::kSetNetworkProfile) {
+    if (const auto* workload = std::get_if<ScenarioWorkload>(&event.action)) {
+      if (workload->kind == WorkloadKind::kPartitionNodes ||
+          workload->kind == WorkloadKind::kHealPartition ||
+          workload->kind == WorkloadKind::kSetNetworkCondition ||
+          workload->kind == WorkloadKind::kBlockNetworkFlow ||
+          workload->kind == WorkloadKind::kUnblockNetworkFlow ||
+          workload->kind == WorkloadKind::kSetNetworkProfile) {
+        return true;
+      }
+      continue;
+    }
+    const SimulationCommandKind command_kind =
+        std::get<SimulationCommand>(event.action).kind;
+    if (command_kind == SimulationCommandKind::kPartitionNodes ||
+        command_kind == SimulationCommandKind::kHealPartition ||
+        command_kind == SimulationCommandKind::kSetNetworkCondition ||
+        command_kind == SimulationCommandKind::kBlockNetworkFlow ||
+        command_kind == SimulationCommandKind::kUnblockNetworkFlow ||
+        command_kind == SimulationCommandKind::kSetNetworkProfile) {
       return true;
     }
   }
@@ -3958,7 +4503,9 @@ std::vector<const ScenarioWorkload*> ConfiguredScenarioActions(
     actions.push_back(&workload);
   }
   for (const ScheduledScenarioEvent& event : options.scheduled_events) {
-    actions.push_back(&event.action);
+    if (const auto* workload = std::get_if<ScenarioWorkload>(&event.action)) {
+      actions.push_back(workload);
+    }
   }
   return actions;
 }
@@ -3975,7 +4522,9 @@ std::vector<ScenarioWorkload> OrderedConfiguredScenarioActions(
   std::vector<ScenarioWorkload> actions = options.workloads;
   for (const ScheduledScenarioEvent& event :
        OrderScheduledScenarioEvents(options.scheduled_events)) {
-    actions.push_back(event.action);
+    if (const auto* workload = std::get_if<ScenarioWorkload>(&event.action)) {
+      actions.push_back(*workload);
+    }
   }
   return actions;
 }
@@ -7963,12 +8512,125 @@ boost::json::object WorkloadJson(const ScenarioWorkload& workload) {
   throw std::runtime_error("unknown scenario workload kind");
 }
 
+boost::json::object SimulationCommandScenarioJson(
+    const SimulationCommand& command) {
+  boost::json::object object;
+  object["action"] = std::string(SimulationCommandKindName(command.kind));
+  if (command.kind != SimulationCommandKind::kSetBlockProductionPolicy &&
+      command.kind != SimulationCommandKind::kPartitionNodes &&
+      command.kind != SimulationCommandKind::kHealPartition &&
+      command.kind != SimulationCommandKind::kSetPerfCounters) {
+    object["node"] = command.node_id;
+  }
+  if (command.block_production_policy) {
+    object["period_ms"] = command.block_production_policy->period().count();
+    object["probability"] = command.block_production_policy->probability();
+    object["seed"] = command.block_production_policy->seed();
+  }
+  if (command.mining_difficulty) {
+    object["difficulty"] = command.mining_difficulty->value();
+  }
+  if (command.peer_node_id) {
+    object["peer_node_id"] = *command.peer_node_id;
+  }
+  if (command.peer_count_policy) {
+    object["minimum_peer_count"] = command.peer_count_policy->minimum();
+    object["maximum_peer_count"] = command.peer_count_policy->maximum();
+  }
+  if (command.block_count) {
+    object["block_count"] = *command.block_count;
+  }
+  if (command.profile) {
+    object["profile"] = *command.profile;
+  }
+  if (command.resource_limit_patch) {
+    object["resource_limits"] =
+        ResourceLimitPatchJson(*command.resource_limit_patch);
+  }
+  if (command.network_condition) {
+    object["network_condition"] =
+        NetworkConditionJson(*command.network_condition);
+  }
+  if (command.network_flow) {
+    boost::json::object flow;
+    if (!command.network_flow->src_address.empty()) {
+      flow["src_address"] = command.network_flow->src_address;
+    }
+    if (command.network_flow->src_port != 0U) {
+      flow["src_port"] = command.network_flow->src_port;
+    }
+    if (!command.network_flow->dst_address.empty()) {
+      flow["dst_address"] = command.network_flow->dst_address;
+    }
+    if (command.network_flow->dst_port != 0U) {
+      flow["dst_port"] = command.network_flow->dst_port;
+    }
+    if (command.network_flow->handle != 0U) {
+      flow["handle"] = command.network_flow->handle;
+    }
+    object["network_flow"] = std::move(flow);
+  }
+  if (command.partition) {
+    const auto group_json = [](const SimulationPartitionGroup& group) {
+      boost::json::object group_object;
+      boost::json::array group_ids;
+      for (const std::string& group_id : group.group_ids) {
+        group_ids.emplace_back(group_id);
+      }
+      boost::json::array node_ids;
+      for (const std::string& node_id : group.node_ids) {
+        node_ids.emplace_back(node_id);
+      }
+      group_object["group_ids"] = std::move(group_ids);
+      group_object["node_ids"] = std::move(node_ids);
+      return group_object;
+    };
+    boost::json::object partition;
+    partition["scope"] =
+        std::string(SimulationPartitionScopeName(command.partition->scope));
+    partition["group_a"] = group_json(command.partition->group_a);
+    partition["group_b"] = group_json(command.partition->group_b);
+    object["partition"] = std::move(partition);
+  }
+  if (command.perf_counter_target) {
+    boost::json::object target;
+    target["kind"] =
+        PerfCounterTargetKindName(command.perf_counter_target->kind);
+    target["id"] = command.perf_counter_target->id;
+    boost::json::array node_ids;
+    for (const std::string& node_id : command.perf_counter_target->node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    target["node_ids"] = std::move(node_ids);
+    object["perf_target"] = std::move(target);
+  }
+  if (!command.perf_counter_kinds.empty()) {
+    object["perf_counters"] = PerfCounterNamesJson(command.perf_counter_kinds);
+  }
+  if (command.wallet_send) {
+    boost::json::object send;
+    send["sender_wallet_index"] = command.wallet_send->sender_wallet_index;
+    send["receiver_wallet_index"] = command.wallet_send->receiver_wallet_index;
+    send["amount"] = FormatFixed8Amount(command.wallet_send->amount_satoshis);
+    send["fee"] = FormatFixed8Amount(command.wallet_send->fee_satoshis);
+    send["timeout_sec"] = command.wallet_send->timeout_sec;
+    object["wallet_send"] = std::move(send);
+  }
+  return object;
+}
+
 boost::json::object ScheduledScenarioEventJson(
     const ScheduledScenarioEvent& event,
     const SimulationTimeScale& time_scale) {
-  boost::json::object object = WorkloadJson(event.action);
-  object.erase("type");
-  object["action"] = std::string(WorkloadKindName(event.action.kind));
+  boost::json::object object;
+  if (const auto* workload = std::get_if<ScenarioWorkload>(&event.action)) {
+    object = WorkloadJson(*workload);
+    object.erase("type");
+    object["action"] = std::string(WorkloadKindName(workload->kind));
+  } else {
+    object = SimulationCommandScenarioJson(
+        std::get<SimulationCommand>(event.action));
+  }
   object["sequence"] = event.sequence;
   object["at"] = std::to_string(event.at.count()) + "ms";
   object["at_ms"] = event.at.count();
@@ -11869,6 +12531,9 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
     detail["output_path"] = NodeReportRelativePath(command).generic_string();
   }
   detail["confirmed"] = command.confirmed;
+  if (command.scheduled_event_sequence) {
+    detail["scheduled_event_sequence"] = *command.scheduled_event_sequence;
+  }
   if (!error.empty()) {
     detail["error"] = error;
   }
@@ -11882,6 +12547,51 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       external_stop_token,
       [&simulation_stop_source] { simulation_stop_source.request_stop(); });
   const std::stop_token stop_token = simulation_stop_source.get_token();
+  const bool has_scheduled_commands = std::any_of(
+      options.scheduled_events.begin(), options.scheduled_events.end(),
+      [](const auto& event) {
+        return std::holds_alternative<SimulationCommand>(event.action);
+      });
+  SimulationCommandQueue scenario_command_queue;
+  SimulationCommandQueue* active_command_queue =
+      command_queue != nullptr
+          ? command_queue
+          : (has_scheduled_commands ? &scenario_command_queue : nullptr);
+  std::mutex scheduled_command_outcome_mutex;
+  std::condition_variable_any scheduled_command_outcome_ready;
+  std::map<std::uint32_t, std::optional<std::string>>
+      scheduled_command_outcomes;
+  const auto record_scheduled_command_outcome =
+      [&](const SimulationCommand& command,
+          std::optional<std::string_view> error) {
+        if (!command.scheduled_event_sequence) {
+          return;
+        }
+        std::lock_guard<std::mutex> lock(scheduled_command_outcome_mutex);
+        auto [outcome, inserted] = scheduled_command_outcomes.emplace(
+            *command.scheduled_event_sequence,
+            error ? std::optional<std::string>(*error) : std::nullopt);
+        if (!inserted) {
+          outcome->second = "scheduled command produced more than one outcome";
+        }
+        scheduled_command_outcome_ready.notify_all();
+      };
+  const auto wait_for_scheduled_command =
+      [&](std::uint32_t scheduled_event_sequence) {
+        std::unique_lock<std::mutex> lock(scheduled_command_outcome_mutex);
+        const bool ready =
+            scheduled_command_outcome_ready.wait(lock, stop_token, [&] {
+              return scheduled_command_outcomes.contains(
+                  scheduled_event_sequence);
+            });
+        if (!ready) {
+          throw SimulationCancelled();
+        }
+        std::optional<std::string> outcome =
+            std::move(scheduled_command_outcomes.at(scheduled_event_sequence));
+        scheduled_command_outcomes.erase(scheduled_event_sequence);
+        return outcome;
+      };
   const auto run_root = BenchmarkRunRoot(options);
   if (std::filesystem::exists(run_root)) {
     if (!options.replace_run) {
@@ -11979,8 +12689,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     command_rpc_stop_source.request_stop();
     if (command_processor) {
       command_processor->Stop();
-    } else if (command_queue != nullptr) {
-      command_queue->Cancel();
+    } else if (active_command_queue != nullptr) {
+      active_command_queue->Cancel();
     }
   };
   const auto stop_peer_connectivity = [&]() {
@@ -12266,7 +12976,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           BBP_LOG(warning) << "peer policy enforcement failed for " << node_id
                            << ": " << error;
         });
-    if (command_queue != nullptr) {
+    if (active_command_queue != nullptr) {
       chain_command_executor = std::make_unique<ChainCommandExecutor>(
           driver, log_nodes,
           [&](const ChainNodeConfig& config,
@@ -12324,7 +13034,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             peer_connectivity_controller->SetPolicy(config.id, policy);
           });
       command_processor = std::make_unique<SimulationCommandProcessor>(
-          *command_queue,
+          *active_command_queue,
           [&](const SimulationCommand& command) {
             WriteEvent(events_path, options.run_id, command.node_id,
                        SimulationEventKind::kOperatorCommandStarted,
@@ -12788,7 +13498,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 << "command #" << command.sequence << " "
                 << SimulationCommandKindName(command.kind) << " for "
                 << command.node_id << " failed: " << error;
-          });
+          },
+          record_scheduled_command_outcome);
     }
     const std::set<std::string> configured_miners(miner_node_ids.begin(),
                                                   miner_node_ids.end());
@@ -13126,10 +13837,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     runtime_actions.reserve(options.workloads.size() +
                             options.scheduled_events.size());
     for (const ScenarioWorkload& workload : EffectiveWorkloads(options)) {
-      runtime_actions.push_back(
-          ScheduledScenarioEvent{.at = std::chrono::milliseconds(0),
-                                 .sequence = 0U,
-                                 .action = workload});
+      runtime_actions.emplace_back(std::chrono::milliseconds(0), 0U, workload);
     }
     std::vector<ScheduledScenarioEvent> scheduled_events =
         OrderScheduledScenarioEvents(options.scheduled_events);
@@ -13160,231 +13868,255 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                        runtime_action, scheduled_wall_at, event_engine_epoch,
                        action_started, std::nullopt)));
       }
-      const ScenarioWorkload& scenario_workload = runtime_action.action;
       try {
-        if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
-          const BlockGenerationWorkload& workload =
-              scenario_workload.block_generation;
-          if (workload.count == 0U) {
-            if (is_scheduled) {
-              const auto action_finished = std::chrono::steady_clock::now();
-              WriteEvent(
-                  events_path, options.run_id, "sim",
-                  SimulationEventKind::kScheduledEventCompleted,
-                  boost::json::serialize(ScheduledEventLifecycleDetail(
-                      runtime_action, scheduled_wall_at, event_engine_epoch,
-                      action_started, action_finished)));
-            }
-            continue;
+        if (const auto* scheduled_command =
+                std::get_if<SimulationCommand>(&runtime_action.action)) {
+          if (!is_scheduled || active_command_queue == nullptr) {
+            throw std::runtime_error(
+                "scheduled command processor is not available");
           }
-          NodeRuntime& generator = nodes[workload.node - 1U];
-          uint64_t start_height = 0U;
-          std::vector<std::string> hashes;
-          {
-            std::lock_guard<std::mutex> lock(node_process_mutex);
-            RequireNodeRunning(generator, "block generation workload");
-            start_height =
-                driver.ReadMetrics(generator.config, stop_token).height;
-            hashes = driver.GenerateBlocks(generator.config, workload.count,
-                                           chain_spec.default_reward_address,
-                                           stop_token);
-            RecordGeneratedBlocks(driver, generator, hashes, stop_token);
+          const std::uint64_t operator_sequence =
+              active_command_queue->PushScenarioCommand(*scheduled_command);
+          const std::optional<std::string> outcome =
+              wait_for_scheduled_command(runtime_action.sequence);
+          if (outcome) {
+            throw std::runtime_error("scheduled command operator sequence " +
+                                     std::to_string(operator_sequence) +
+                                     " failed: " + *outcome);
           }
-          const uint64_t target_height =
-              start_height + static_cast<uint64_t>(hashes.size());
-          WriteEvent(
-              events_path, options.run_id, generator.config.id,
-              SimulationEventKind::kGeneratedBlocks,
-              GeneratedBlocksDetail(action_index, action_count, workload.node,
-                                    start_height, target_height, hashes,
-                                    chain_spec.default_reward_address));
-          for (auto& node : nodes) {
-            if (!node.AllowsChainMetrics()) {
+        } else {
+          const ScenarioWorkload& scenario_workload =
+              std::get<ScenarioWorkload>(runtime_action.action);
+          if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
+            const BlockGenerationWorkload& workload =
+                scenario_workload.block_generation;
+            if (workload.count == 0U) {
+              if (is_scheduled) {
+                const auto action_finished = std::chrono::steady_clock::now();
+                WriteEvent(
+                    events_path, options.run_id, "sim",
+                    SimulationEventKind::kScheduledEventCompleted,
+                    boost::json::serialize(ScheduledEventLifecycleDetail(
+                        runtime_action, scheduled_wall_at, event_engine_epoch,
+                        action_started, action_finished)));
+              }
               continue;
             }
-            driver.WaitForHeight(
-                node.config, target_height,
-                std::chrono::seconds(workload.sync_timeout_sec), stop_token);
-            WriteEvent(events_path, options.run_id, node.config.id,
-                       SimulationEventKind::kHeightReached,
-                       std::to_string(target_height));
-          }
-          transaction_tracker.ObserveAll(options, events_path, driver, nodes,
-                                         stop_token);
-        } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
-          const WaitUntilHeightWorkload& workload =
-              scenario_workload.wait_until_height;
-          NodeRuntime& node = nodes[workload.node - 1U];
-          RequireNodeRunning(node, "wait_until_height workload");
-          driver.WaitForHeight(node.config, workload.height,
-                               std::chrono::seconds(workload.timeout_sec),
-                               stop_token);
-          const uint64_t observed_height =
-              driver.ReadMetrics(node.config, stop_token).height;
-          WriteEvent(events_path, options.run_id, node.config.id,
-                     SimulationEventKind::kHeightWaitReached,
-                     HeightWaitDetail(action_index, action_count, workload.node,
-                                      workload.height, observed_height));
-        } else if (scenario_workload.kind == WorkloadKind::kWaitForPeers) {
-          const WaitForPeersWorkload& workload =
-              scenario_workload.wait_for_peers;
-          NodeRuntime& node = nodes[workload.node - 1U];
-          RequireNodeRunning(node, "wait_for_peers workload");
-          driver.WaitForPeerCount(node.config, workload.peer_count,
-                                  std::chrono::seconds(workload.timeout_sec),
-                                  stop_token);
-          const uint64_t observed_peer_count =
-              driver.ReadMetrics(node.config, stop_token).peer_count;
-          WriteEvent(
-              events_path, options.run_id, node.config.id,
-              SimulationEventKind::kPeerCountReached,
-              PeerCountWaitDetail(action_index, action_count, workload.node,
-                                  workload.peer_count, observed_peer_count));
-        } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
-          ApplyConnectPeerWorkload(options, events_path, driver,
-                                   *peer_connectivity_controller, nodes,
-                                   scenario_workload.connect_peer, action_index,
-                                   action_count, stop_token);
-        } else if (scenario_workload.kind == WorkloadKind::kDisconnectPeer) {
-          ApplyDisconnectPeerWorkload(options, events_path, driver,
-                                      *peer_connectivity_controller, nodes,
-                                      scenario_workload.disconnect_peer,
-                                      action_index, action_count, stop_token);
-        } else if (scenario_workload.kind ==
-                   WorkloadKind::kSendRawTransaction) {
-          ApplySendRawTransactionWorkload(
-              options, events_path, driver, nodes, transaction_tracker,
-              scenario_workload.send_raw_transaction, action_index,
-              action_count, stop_token);
-        } else if (scenario_workload.kind ==
-                   WorkloadKind::kWalletTransactions) {
-          ApplyWalletTransactionsWorkload(
-              options, events_path, driver, nodes, simulation_registry,
-              transaction_tracker, scenario_workload.wallet_transactions,
-              action_index, action_count, stop_token);
-        } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
-          const RestartNodeWorkload& workload = scenario_workload.restart_node;
-          NodeRuntime& node = nodes[workload.node - 1U];
-          {
-            std::lock_guard<std::mutex> lock(node_process_mutex);
-            if (!RestartNode(options, events_path, driver, node,
-                             lifecycle_epoch, stop_token)) {
-              throw std::runtime_error(
-                  "restart_node workload reached node stop_time before "
-                  "completion: " +
-                  node.config.id);
+            NodeRuntime& generator = nodes[workload.node - 1U];
+            uint64_t start_height = 0U;
+            std::vector<std::string> hashes;
+            {
+              std::lock_guard<std::mutex> lock(node_process_mutex);
+              RequireNodeRunning(generator, "block generation workload");
+              start_height =
+                  driver.ReadMetrics(generator.config, stop_token).height;
+              hashes = driver.GenerateBlocks(generator.config, workload.count,
+                                             chain_spec.default_reward_address,
+                                             stop_token);
+              RecordGeneratedBlocks(driver, generator, hashes, stop_token);
             }
-          }
-          WriteEvent(
-              events_path, options.run_id, node.config.id,
-              SimulationEventKind::kNodeRestarted,
-              RestartNodeWorkloadDetail(action_index, action_count,
-                                        workload.node, node.RestartCount()));
-        } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
-          const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
-          NodeRuntime& node = nodes[workload.node - 1U];
-          RequireNodeRunning(node, "freeze_node workload");
-          FreezeNodeForDuration(options, events_path, node,
-                                workload.duration_ms, stop_token);
-          WriteEvent(
-              events_path, options.run_id, node.config.id,
-              SimulationEventKind::kNodeFreezeCompleted,
-              FreezeNodeWorkloadDetail(action_index, action_count,
-                                       workload.node, workload.duration_ms));
-        } else if (scenario_workload.kind ==
-                   WorkloadKind::kUpdateResourceLimits) {
-          const ResourceLimitUpdateWorkload& workload =
-              scenario_workload.update_resource_limits;
-          NodeRuntime& node = nodes[workload.node - 1U];
-          ApplyResourceLimitUpdate(options, events_path, node, workload.patch,
-                                   action_index, action_count, workload.node);
-        } else if (scenario_workload.kind ==
-                   WorkloadKind::kSetResourceProfile) {
-          ApplyResourceProfileSwitch(options, events_path, nodes,
-                                     scenario_workload.profile_switch,
+            const uint64_t target_height =
+                start_height + static_cast<uint64_t>(hashes.size());
+            WriteEvent(
+                events_path, options.run_id, generator.config.id,
+                SimulationEventKind::kGeneratedBlocks,
+                GeneratedBlocksDetail(action_index, action_count, workload.node,
+                                      start_height, target_height, hashes,
+                                      chain_spec.default_reward_address));
+            for (auto& node : nodes) {
+              if (!node.AllowsChainMetrics()) {
+                continue;
+              }
+              driver.WaitForHeight(
+                  node.config, target_height,
+                  std::chrono::seconds(workload.sync_timeout_sec), stop_token);
+              WriteEvent(events_path, options.run_id, node.config.id,
+                         SimulationEventKind::kHeightReached,
+                         std::to_string(target_height));
+            }
+            transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+                                           stop_token);
+          } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
+            const WaitUntilHeightWorkload& workload =
+                scenario_workload.wait_until_height;
+            NodeRuntime& node = nodes[workload.node - 1U];
+            RequireNodeRunning(node, "wait_until_height workload");
+            driver.WaitForHeight(node.config, workload.height,
+                                 std::chrono::seconds(workload.timeout_sec),
+                                 stop_token);
+            const uint64_t observed_height =
+                driver.ReadMetrics(node.config, stop_token).height;
+            WriteEvent(
+                events_path, options.run_id, node.config.id,
+                SimulationEventKind::kHeightWaitReached,
+                HeightWaitDetail(action_index, action_count, workload.node,
+                                 workload.height, observed_height));
+          } else if (scenario_workload.kind == WorkloadKind::kWaitForPeers) {
+            const WaitForPeersWorkload& workload =
+                scenario_workload.wait_for_peers;
+            NodeRuntime& node = nodes[workload.node - 1U];
+            RequireNodeRunning(node, "wait_for_peers workload");
+            driver.WaitForPeerCount(node.config, workload.peer_count,
+                                    std::chrono::seconds(workload.timeout_sec),
+                                    stop_token);
+            const uint64_t observed_peer_count =
+                driver.ReadMetrics(node.config, stop_token).peer_count;
+            WriteEvent(
+                events_path, options.run_id, node.config.id,
+                SimulationEventKind::kPeerCountReached,
+                PeerCountWaitDetail(action_index, action_count, workload.node,
+                                    workload.peer_count, observed_peer_count));
+          } else if (scenario_workload.kind == WorkloadKind::kConnectPeer) {
+            ApplyConnectPeerWorkload(options, events_path, driver,
+                                     *peer_connectivity_controller, nodes,
+                                     scenario_workload.connect_peer,
                                      action_index, action_count, stop_token);
-        } else if (scenario_workload.kind == WorkloadKind::kSetNetworkProfile) {
-          ApplyNetworkProfileSwitch(options, events_path, nodes,
-                                    scenario_workload.profile_switch,
-                                    action_index, action_count, stop_token);
-        } else if (scenario_workload.kind == WorkloadKind::kResourcePressure) {
-          ApplyResourcePressureWorkload(options, events_path, metrics_path,
-                                        driver, nodes, node_process_mutex,
-                                        scenario_workload.resource_pressure,
+          } else if (scenario_workload.kind == WorkloadKind::kDisconnectPeer) {
+            ApplyDisconnectPeerWorkload(options, events_path, driver,
+                                        *peer_connectivity_controller, nodes,
+                                        scenario_workload.disconnect_peer,
                                         action_index, action_count, stop_token);
-        } else if (scenario_workload.kind ==
-                   WorkloadKind::kSetNetworkCondition) {
-          const NetworkConditionWorkload& workload =
-              scenario_workload.network_condition;
-          NodeRuntime& node = nodes[workload.node - 1U];
-          QdiscInfo qdisc;
-          NodeVethConfig updated_network;
-          {
-            std::lock_guard<std::mutex> lock(node_network_state_mutex);
-            qdisc = ReplaceNodeNetworkConditionTransactional(
-                &node, workload.condition, stop_token);
-            updated_network = *node.network;
+          } else if (scenario_workload.kind ==
+                     WorkloadKind::kSendRawTransaction) {
+            ApplySendRawTransactionWorkload(
+                options, events_path, driver, nodes, transaction_tracker,
+                scenario_workload.send_raw_transaction, action_index,
+                action_count, stop_token);
+          } else if (scenario_workload.kind ==
+                     WorkloadKind::kWalletTransactions) {
+            ApplyWalletTransactionsWorkload(
+                options, events_path, driver, nodes, simulation_registry,
+                transaction_tracker, scenario_workload.wallet_transactions,
+                action_index, action_count, stop_token);
+          } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
+            const RestartNodeWorkload& workload =
+                scenario_workload.restart_node;
+            NodeRuntime& node = nodes[workload.node - 1U];
+            {
+              std::lock_guard<std::mutex> lock(node_process_mutex);
+              if (!RestartNode(options, events_path, driver, node,
+                               lifecycle_epoch, stop_token)) {
+                throw std::runtime_error(
+                    "restart_node workload reached node stop_time before "
+                    "completion: " +
+                    node.config.id);
+              }
+            }
+            WriteEvent(
+                events_path, options.run_id, node.config.id,
+                SimulationEventKind::kNodeRestarted,
+                RestartNodeWorkloadDetail(action_index, action_count,
+                                          workload.node, node.RestartCount()));
+          } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
+            const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
+            NodeRuntime& node = nodes[workload.node - 1U];
+            RequireNodeRunning(node, "freeze_node workload");
+            FreezeNodeForDuration(options, events_path, node,
+                                  workload.duration_ms, stop_token);
+            WriteEvent(
+                events_path, options.run_id, node.config.id,
+                SimulationEventKind::kNodeFreezeCompleted,
+                FreezeNodeWorkloadDetail(action_index, action_count,
+                                         workload.node, workload.duration_ms));
+          } else if (scenario_workload.kind ==
+                     WorkloadKind::kUpdateResourceLimits) {
+            const ResourceLimitUpdateWorkload& workload =
+                scenario_workload.update_resource_limits;
+            NodeRuntime& node = nodes[workload.node - 1U];
+            ApplyResourceLimitUpdate(options, events_path, node, workload.patch,
+                                     action_index, action_count, workload.node);
+          } else if (scenario_workload.kind ==
+                     WorkloadKind::kSetResourceProfile) {
+            ApplyResourceProfileSwitch(options, events_path, nodes,
+                                       scenario_workload.profile_switch,
+                                       action_index, action_count, stop_token);
+          } else if (scenario_workload.kind ==
+                     WorkloadKind::kSetNetworkProfile) {
+            ApplyNetworkProfileSwitch(options, events_path, nodes,
+                                      scenario_workload.profile_switch,
+                                      action_index, action_count, stop_token);
+          } else if (scenario_workload.kind ==
+                     WorkloadKind::kResourcePressure) {
+            ApplyResourcePressureWorkload(
+                options, events_path, metrics_path, driver, nodes,
+                node_process_mutex, scenario_workload.resource_pressure,
+                action_index, action_count, stop_token);
+          } else if (scenario_workload.kind ==
+                     WorkloadKind::kSetNetworkCondition) {
+            const NetworkConditionWorkload& workload =
+                scenario_workload.network_condition;
+            NodeRuntime& node = nodes[workload.node - 1U];
+            QdiscInfo qdisc;
+            NodeVethConfig updated_network;
+            {
+              std::lock_guard<std::mutex> lock(node_network_state_mutex);
+              qdisc = ReplaceNodeNetworkConditionTransactional(
+                  &node, workload.condition, stop_token);
+              updated_network = *node.network;
+            }
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kNetworkConditionUpdated,
+                       NetworkConditionVerificationDetail(
+                           updated_network, qdisc, action_index, action_count));
+          } else if (scenario_workload.kind ==
+                         WorkloadKind::kBlockNetworkFlow ||
+                     scenario_workload.kind ==
+                         WorkloadKind::kUnblockNetworkFlow) {
+            const NetworkBlockRule& rule = scenario_workload.network_block.rule;
+            NodeRuntime& node = nodes[rule.node_index];
+            NetworkBlockMutationResult result;
+            {
+              std::lock_guard<std::mutex> lock(node_network_state_mutex);
+              result = MutateNetworkBlockRuleTransactional(
+                  node, rule,
+                  scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow,
+                  stop_token);
+            }
+            WriteEvent(
+                events_path, options.run_id, node.config.id,
+                scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow
+                    ? SimulationEventKind::kNetworkBlockRemoved
+                    : SimulationEventKind::kNetworkBlockApplied,
+                NetworkBlockRuleDetail(node, rule, result.existed_before,
+                                       result.present_after, action_index,
+                                       action_count));
+          } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
+            ApplyRuntimeNetworkPartition(
+                options, events_path, nodes,
+                scenario_workload.network_partition.partition, false,
+                action_index, action_count, stop_token);
+          } else if (scenario_workload.kind == WorkloadKind::kHealPartition) {
+            ApplyRuntimeNetworkPartition(
+                options, events_path, nodes,
+                scenario_workload.network_partition.partition, true,
+                action_index, action_count, stop_token);
+          } else if (scenario_workload.kind == WorkloadKind::kCheckpoint) {
+            const CheckpointWorkload& workload = scenario_workload.checkpoint;
+            const std::string name =
+                workload.name.empty()
+                    ? "checkpoint-" + std::to_string(action_index)
+                    : workload.name;
+            transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+                                           stop_token);
+            const std::uint32_t node_metric_samples =
+                WriteMetricsSnapshot(metrics_path, options, driver, nodes,
+                                     node_process_mutex, {}, {}, stop_token);
+            const std::uint32_t wallet_metric_samples =
+                WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver,
+                                           nodes, {}, stop_token);
+            WriteEvent(events_path, options.run_id, "sim",
+                       SimulationEventKind::kCheckpointRecorded,
+                       CheckpointWorkloadDetail(action_index, action_count,
+                                                name, node_metric_samples,
+                                                wallet_metric_samples));
+          } else if (IsTopologyEdgeAction(scenario_workload.kind)) {
+            std::lock_guard<std::mutex> lock(node_process_mutex);
+            ApplyTopologyEdgeWorkload(
+                options, events_path, chain_spec, driver,
+                *peer_connectivity_controller, runtime_topology, nodes,
+                scenario_workload.topology_edge, scenario_workload.kind,
+                action_index, action_count, stop_token);
           }
-          WriteEvent(events_path, options.run_id, node.config.id,
-                     SimulationEventKind::kNetworkConditionUpdated,
-                     NetworkConditionVerificationDetail(
-                         updated_network, qdisc, action_index, action_count));
-        } else if (scenario_workload.kind == WorkloadKind::kBlockNetworkFlow ||
-                   scenario_workload.kind ==
-                       WorkloadKind::kUnblockNetworkFlow) {
-          const NetworkBlockRule& rule = scenario_workload.network_block.rule;
-          NodeRuntime& node = nodes[rule.node_index];
-          NetworkBlockMutationResult result;
-          {
-            std::lock_guard<std::mutex> lock(node_network_state_mutex);
-            result = MutateNetworkBlockRuleTransactional(
-                node, rule,
-                scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow,
-                stop_token);
-          }
-          WriteEvent(events_path, options.run_id, node.config.id,
-                     scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow
-                         ? SimulationEventKind::kNetworkBlockRemoved
-                         : SimulationEventKind::kNetworkBlockApplied,
-                     NetworkBlockRuleDetail(node, rule, result.existed_before,
-                                            result.present_after, action_index,
-                                            action_count));
-        } else if (scenario_workload.kind == WorkloadKind::kPartitionNodes) {
-          ApplyRuntimeNetworkPartition(
-              options, events_path, nodes,
-              scenario_workload.network_partition.partition, false,
-              action_index, action_count, stop_token);
-        } else if (scenario_workload.kind == WorkloadKind::kHealPartition) {
-          ApplyRuntimeNetworkPartition(
-              options, events_path, nodes,
-              scenario_workload.network_partition.partition, true, action_index,
-              action_count, stop_token);
-        } else if (scenario_workload.kind == WorkloadKind::kCheckpoint) {
-          const CheckpointWorkload& workload = scenario_workload.checkpoint;
-          const std::string name =
-              workload.name.empty()
-                  ? "checkpoint-" + std::to_string(action_index)
-                  : workload.name;
-          transaction_tracker.ObserveAll(options, events_path, driver, nodes,
-                                         stop_token);
-          const std::uint32_t node_metric_samples =
-              WriteMetricsSnapshot(metrics_path, options, driver, nodes,
-                                   node_process_mutex, {}, {}, stop_token);
-          const std::uint32_t wallet_metric_samples =
-              WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver,
-                                         nodes, {}, stop_token);
-          WriteEvent(events_path, options.run_id, "sim",
-                     SimulationEventKind::kCheckpointRecorded,
-                     CheckpointWorkloadDetail(action_index, action_count, name,
-                                              node_metric_samples,
-                                              wallet_metric_samples));
-        } else if (IsTopologyEdgeAction(scenario_workload.kind)) {
-          std::lock_guard<std::mutex> lock(node_process_mutex);
-          ApplyTopologyEdgeWorkload(
-              options, events_path, chain_spec, driver,
-              *peer_connectivity_controller, runtime_topology, nodes,
-              scenario_workload.topology_edge, scenario_workload.kind,
-              action_index, action_count, stop_token);
         }
       } catch (const std::exception& e) {
         if (is_scheduled) {

@@ -795,6 +795,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-scheduled-events-scenario.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-scheduled-commands
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-scheduled-commands.json"
+      --probe-capabilities
+  )
   add_test(NAME bbp-valid-canonical-simulation
     COMMAND bbp
       --scenario-json
@@ -1429,6 +1435,41 @@ if(BUILD_TESTING)
     bbp-invalid-scheduled-event-clock-overflow
     tests/scenarios/invalid-scheduled-event-clock-overflow.json
     "scheduled event time exceeds monotonic clock range"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-command-field
+    tests/scenarios/invalid-scheduled-command-field.json
+    "scenario scheduled command increase_log_verbosity has unsupported field: unexpected"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-command-missing-payload
+    tests/scenarios/invalid-scheduled-command-missing-payload.json
+    "missing or invalid uint32 JSON field: block_count"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-command-payload-shape
+    tests/scenarios/invalid-scheduled-command-payload-shape.json
+    "scenario scheduled command resource_limits must be an object"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-command-unknown-node
+    tests/scenarios/invalid-scheduled-command-unknown-node.json
+    "scenario scheduled command references unknown node ID: missing-node"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-command-duplicate-node
+    tests/scenarios/invalid-scheduled-command-duplicate-node.json
+    "scenario scheduled command node_ids contains duplicate node ID: firo-1"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-command-peer-self
+    tests/scenarios/invalid-scheduled-command-peer-self.json
+    "scenario scheduled peer command source and target must differ"
+  )
+  add_cli_failure_test(
+    bbp-invalid-scheduled-command-perf-duplicate
+    tests/scenarios/invalid-scheduled-command-perf-duplicate.json
+    "scenario scheduled command perf_counters contains duplicate: cycles"
   )
   add_cli_failure_test(
     bbp-invalid-checkpoint-name

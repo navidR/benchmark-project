@@ -1,0 +1,7 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "events": [
+    {"at": "1ms", "action": "generate_blocks", "node": "firo-1"}
+  ]
+}

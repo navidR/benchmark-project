@@ -2,16 +2,28 @@
 
 #include <chrono>
 #include <cstdint>
+#include <variant>
 #include <vector>
 
+#include "bbp/simulation_command.h"
 #include "bbp/simulator/scenario_workload.h"
 
 namespace bbp {
 
+using ScheduledScenarioAction =
+    std::variant<ScenarioWorkload, SimulationCommand>;
+
 struct ScheduledScenarioEvent {
-  std::chrono::milliseconds at{0};
-  std::uint32_t sequence = 0;
-  ScenarioWorkload action;
+  ScheduledScenarioEvent(std::chrono::milliseconds scheduled_at,
+                         std::uint32_t source_sequence,
+                         ScenarioWorkload workload);
+  ScheduledScenarioEvent(std::chrono::milliseconds scheduled_at,
+                         std::uint32_t source_sequence,
+                         SimulationCommand command);
+
+  std::chrono::milliseconds at;
+  std::uint32_t sequence;
+  ScheduledScenarioAction action;
 };
 
 std::vector<ScheduledScenarioEvent> OrderScheduledScenarioEvents(

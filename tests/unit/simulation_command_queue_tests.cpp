@@ -504,3 +504,64 @@ BOOST_AUTO_TEST_CASE(
       std::runtime_error);
   BOOST_TEST(!queue.TryPop());
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_validates_and_sequences_scenario_commands) {
+  bbp::SimulationCommandQueue queue;
+
+  bbp::SimulationCommand unconfirmed;
+  unconfirmed.kind = bbp::SimulationCommandKind::kGenerateBlocks;
+  unconfirmed.node_id = "firo-1";
+  unconfirmed.block_count = 1U;
+  unconfirmed.scheduled_event_sequence = 1U;
+  BOOST_CHECK_THROW(queue.PushScenarioCommand(unconfirmed), std::runtime_error);
+
+  bbp::SimulationCommand unexpected_payload;
+  unexpected_payload.kind = bbp::SimulationCommandKind::kRestartNode;
+  unexpected_payload.node_id = "firo-1";
+  unexpected_payload.block_count = 1U;
+  unexpected_payload.confirmed = true;
+  unexpected_payload.scheduled_event_sequence = 2U;
+  BOOST_CHECK_THROW(queue.PushScenarioCommand(unexpected_payload),
+                    std::runtime_error);
+
+  bbp::SimulationCommand missing_source;
+  missing_source.kind = bbp::SimulationCommandKind::kIncreaseLogVerbosity;
+  missing_source.node_id = "firo-1";
+  missing_source.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushScenarioCommand(missing_source),
+                    std::runtime_error);
+  BOOST_TEST(!queue.TryPop());
+
+  const std::uint64_t operator_sequence =
+      queue.Push(bbp::SimulationCommandKind::kIncreaseLogVerbosity, "firo-1");
+  bbp::SimulationCommand scenario;
+  scenario.kind = bbp::SimulationCommandKind::kRestartNode;
+  scenario.node_id = "firo-2";
+  scenario.confirmed = true;
+  scenario.scheduled_event_sequence = 9U;
+  const std::uint64_t scenario_sequence =
+      queue.PushScenarioCommand(std::move(scenario));
+
+  BOOST_TEST(operator_sequence == 1U);
+  BOOST_TEST(scenario_sequence == 2U);
+  const std::optional<bbp::SimulationCommand> first = queue.TryPop();
+  const std::optional<bbp::SimulationCommand> second = queue.TryPop();
+  BOOST_REQUIRE(first);
+  BOOST_REQUIRE(second);
+  BOOST_TEST(first->sequence == 1U);
+  BOOST_TEST(!first->scheduled_event_sequence);
+  BOOST_TEST(second->sequence == 2U);
+  BOOST_REQUIRE(second->scheduled_event_sequence);
+  BOOST_TEST(*second->scheduled_event_sequence == 9U);
+  BOOST_TEST(second->confirmed);
+
+  queue.Close();
+  bbp::SimulationCommand after_close;
+  after_close.kind = bbp::SimulationCommandKind::kExportNodeReport;
+  after_close.node_id = "firo-1";
+  after_close.confirmed = true;
+  after_close.scheduled_event_sequence = 10U;
+  BOOST_CHECK_THROW(queue.PushScenarioCommand(std::move(after_close)),
+                    std::runtime_error);
+}

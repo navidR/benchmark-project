@@ -1,0 +1,12 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "events": [
+    {
+      "at": "1ms",
+      "action": "connect_peer",
+      "node": "firo-1",
+      "peer_node_id": 1
+    }
+  ]
+}

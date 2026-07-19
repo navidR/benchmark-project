@@ -1,0 +1,12 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "events": [
+    {
+      "at": "1ms",
+      "action": "set_resource_limits",
+      "node": "firo-1",
+      "resource_limits": []
+    }
+  ]
+}

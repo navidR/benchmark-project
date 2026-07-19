@@ -1,0 +1,12 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "events": [
+    {
+      "at": "1ms",
+      "action": "increase_log_verbosity",
+      "node": "firo-1",
+      "unexpected": true
+    }
+  ]
+}

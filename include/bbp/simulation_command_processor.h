@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string_view>
 #include <thread>
 
@@ -14,10 +15,13 @@ class SimulationCommandProcessor {
   using CommandHandler = std::function<void(const SimulationCommand&)>;
   using FailureHandler =
       std::function<void(const SimulationCommand&, std::string_view)>;
+  using OutcomeHandler = std::function<void(const SimulationCommand&,
+                                            std::optional<std::string_view>)>;
 
   SimulationCommandProcessor(SimulationCommandQueue& queue,
                              CommandHandler command_handler,
-                             FailureHandler failure_handler);
+                             FailureHandler failure_handler,
+                             OutcomeHandler outcome_handler = {});
   SimulationCommandProcessor(const SimulationCommandProcessor&) = delete;
   SimulationCommandProcessor& operator=(const SimulationCommandProcessor&) =
       delete;
@@ -30,10 +34,13 @@ class SimulationCommandProcessor {
   void Run();
   void ReportFailure(const SimulationCommand& command,
                      std::string_view detail) const;
+  void ReportOutcome(const SimulationCommand& command,
+                     std::optional<std::string_view> error) const;
 
   SimulationCommandQueue& queue_;
   CommandHandler command_handler_;
   FailureHandler failure_handler_;
+  OutcomeHandler outcome_handler_;
   std::thread thread_;
   bool started_ = false;
 };

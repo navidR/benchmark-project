@@ -1,0 +1,12 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "events": [
+    {
+      "at": "1ms",
+      "action": "set_perf_counters",
+      "perf_target": {"kind": "node", "id": "firo-1", "node_ids": [1]},
+      "perf_counters": ["cycles", "cycles"]
+    }
+  ]
+}
