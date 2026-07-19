@@ -87,6 +87,7 @@ struct WalletReport {
 enum class RunReportStatus {
   kFinished,
   kFailed,
+  kCancelled,
   kIncomplete,
 };
 
@@ -96,6 +97,8 @@ std::string_view RunReportStatusName(RunReportStatus status) {
       return "finished";
     case RunReportStatus::kFailed:
       return "failed";
+    case RunReportStatus::kCancelled:
+      return "cancelled";
     case RunReportStatus::kIncomplete:
       return "incomplete";
   }
@@ -1858,6 +1861,7 @@ struct IncrementalRunReport::Impl {
     run_started = false;
     run_finished = false;
     run_failed = false;
+    run_cancelled = false;
     simulation_duration_reached = false;
     event_counts.clear();
     nodes.clear();
@@ -2049,6 +2053,10 @@ struct IncrementalRunReport::Impl {
         }
         break;
       }
+      case SimulationEventKind::kRunCancelled:
+        run_cancelled = true;
+        report["cancelled_at"] = OptionalStringField(event, "timestamp");
+        break;
       case SimulationEventKind::kSimulationDurationReached: {
         simulation_duration_reached = true;
         boost::json::value detail = ParseEventDetail(event);
@@ -2261,11 +2269,13 @@ struct IncrementalRunReport::Impl {
   }
 
   void UpdateReport() {
-    const bool ok = run_started && run_finished && !run_failed;
+    const bool ok =
+        run_started && run_finished && !run_failed && !run_cancelled;
     const RunReportStatus status =
-        ok ? RunReportStatus::kFinished
-           : (run_failed ? RunReportStatus::kFailed
-                         : RunReportStatus::kIncomplete);
+        run_failed ? RunReportStatus::kFailed
+                   : (run_cancelled ? RunReportStatus::kCancelled
+                                    : (ok ? RunReportStatus::kFinished
+                                          : RunReportStatus::kIncomplete));
     SeedConfiguredNodes(report, &nodes);
     report["ok"] = ok;
     report["status"] = RunReportStatusName(status);
@@ -2322,6 +2332,7 @@ struct IncrementalRunReport::Impl {
   bool run_started = false;
   bool run_finished = false;
   bool run_failed = false;
+  bool run_cancelled = false;
   bool simulation_duration_reached = false;
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;

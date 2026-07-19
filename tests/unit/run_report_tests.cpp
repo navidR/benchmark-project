@@ -1231,6 +1231,36 @@ BOOST_AUTO_TEST_CASE(run_report_exposes_failed_run_detail) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(run_report_preserves_cancelled_run_status) {
+  const std::filesystem::path dir = MakeTestDir("run-report-cancelled");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-19T12:00:00Z","event":"run_started"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-19T12:00:01Z","event":"run_cancelled"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-19T12:00:02Z","event":"run_finished"})");
+
+  boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  BOOST_TEST(!report.at("ok").as_bool());
+  BOOST_TEST(report.at("status").as_string() == "cancelled");
+  BOOST_TEST(report.at("cancelled_at").as_string() == "2026-07-19T12:00:01Z");
+  BOOST_TEST(report.at("finished_at").as_string() == "2026-07-19T12:00:02Z");
+
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-19T12:00:03Z","event":"run_failed","detail":"cleanup failed"})");
+  report = boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  BOOST_TEST(!report.at("ok").as_bool());
+  BOOST_TEST(report.at("status").as_string() == "failed");
+  BOOST_TEST(report.at("failure").as_string() == "cleanup failed");
+
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(
     run_report_bounds_scheduled_blocks_and_applies_runtime_policy) {
   const std::filesystem::path dir = MakeTestDir("run-report-scheduled-blocks");
