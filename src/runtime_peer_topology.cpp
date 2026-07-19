@@ -70,6 +70,23 @@ std::map<EdgeKey, InitialEdgeState> InitialEdges(
                                     .latency_ms = edge.latency_ms,
                                     .condition = edge.condition});
   }
+  if (topology.kind == PeerTopologyKind::kInternetLikeRegionGraph &&
+      !topology.region_edges.empty()) {
+    for (const PeerTopologyRegionEdge& edge : topology.region_edges) {
+      if (edge.active) {
+        continue;
+      }
+      const InitialEdgeState state{.active = false,
+                                   .latency_ms = edge.latency_ms,
+                                   .condition = edge.condition};
+      const std::uint32_t from = topology.regions[edge.from_region].front();
+      const std::uint32_t to = topology.regions[edge.to_region].front();
+      AddInitialEdge(&edges, from, to, node_count, state);
+      if (edge.bidirectional) {
+        AddInitialEdge(&edges, to, from, node_count, state);
+      }
+    }
+  }
   return edges;
 }
 

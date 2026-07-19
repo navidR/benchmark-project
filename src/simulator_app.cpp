@@ -1426,7 +1426,11 @@ std::vector<PeerTopologyRegionEdge> ParsePeerTopologyRegionEdges(
     }
     const boost::json::object& edge_object = edge_value.as_object();
     RejectUnsupportedFields(
-        edge_object, {"from_region", "to_region", "bidirectional", "active"},
+        edge_object,
+        {"from_region", "to_region", "bidirectional", "active", "latency_ms",
+         "bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
+         "reorder_basis_points", "limit_packets"},
         "scenario topology.region_edges entry");
     const uint32_t from = JsonUint32Field(edge_object, "from_region");
     const uint32_t to = JsonUint32Field(edge_object, "to_region");
@@ -1440,6 +1444,29 @@ std::vector<PeerTopologyRegionEdge> ParsePeerTopologyRegionEdges(
     edge.bidirectional =
         JsonOptionalBoolField(edge_object, "bidirectional", edge.bidirectional);
     edge.active = JsonOptionalBoolField(edge_object, "active", edge.active);
+    const boost::json::value* latency = edge_object.if_contains("latency_ms");
+    if (latency != nullptr) {
+      edge.latency_ms = JsonUint32Value(*latency, "latency_ms");
+    }
+    bool condition_present = edge.latency_ms.has_value();
+    for (std::string_view field : kTopologyEdgeConditionFields) {
+      condition_present =
+          condition_present || edge_object.if_contains(field) != nullptr;
+    }
+    if (condition_present) {
+      NetworkCondition condition = ParseNetworkConditionObject(edge_object);
+      if (edge.latency_ms) {
+        const boost::json::value* delay = edge_object.if_contains("delay_ms");
+        if (delay != nullptr && condition.delay_ms != *edge.latency_ms) {
+          throw std::runtime_error(
+              "scenario topology region edge latency_ms and delay_ms must "
+              "match");
+        }
+        condition.delay_ms = *edge.latency_ms;
+      }
+      ValidateNetworkCondition(condition);
+      edge.condition = condition;
+    }
     edges.push_back(edge);
   }
   return edges;
@@ -5201,6 +5228,12 @@ boost::json::array PeerTopologyRegionEdgesJson(
     object["to_region"] = edge.to_region + 1U;
     object["bidirectional"] = edge.bidirectional;
     object["active"] = edge.active;
+    if (edge.latency_ms) {
+      object["latency_ms"] = *edge.latency_ms;
+    }
+    if (edge.condition) {
+      AddNetworkConditionJsonFields(*edge.condition, &object);
+    }
     array.push_back(std::move(object));
   }
   return array;

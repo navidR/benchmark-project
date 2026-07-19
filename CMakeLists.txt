@@ -645,6 +645,21 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-directional-edge-condition-latency-alias.json
     "scenario topology edge latency_ms and delay_ms must match"
   )
+  add_cli_failure_test(
+    bbp-invalid-directional-region-edge-condition-without-isolation
+    tests/scenarios/invalid-directional-region-edge-condition-without-isolation.json
+    "network runtime options require --isolate-network"
+  )
+  add_cli_failure_test(
+    bbp-invalid-directional-region-edge-condition-loss
+    tests/scenarios/invalid-directional-region-edge-condition-loss.json
+    "netem loss basis points must be 0..10000"
+  )
+  add_cli_failure_test(
+    bbp-invalid-directional-region-edge-condition-latency-alias
+    tests/scenarios/invalid-directional-region-edge-condition-latency-alias.json
+    "scenario topology region edge latency_ms and delay_ms must match"
+  )
   add_test(NAME bbp-valid-wallet-transactions-scenario
     COMMAND bbp
       --scenario-json

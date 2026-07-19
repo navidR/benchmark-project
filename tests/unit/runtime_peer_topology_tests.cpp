@@ -71,3 +71,36 @@ BOOST_AUTO_TEST_CASE(runtime_peer_topology_validates_inventory_and_updates) {
   BOOST_CHECK_THROW(topology.SetActive(1U, 0U, false), std::runtime_error);
   BOOST_CHECK_THROW(topology.ActivePeerIndexes(2U), std::out_of_range);
 }
+
+BOOST_AUTO_TEST_CASE(
+    runtime_peer_topology_preserves_inactive_conditioned_region_edges) {
+  bbp::NetworkCondition condition;
+  condition.bandwidth_mbps = 9U;
+  condition.delay_ms = 45U;
+
+  bbp::PeerTopologyConfig config;
+  config.kind = bbp::PeerTopologyKind::kInternetLikeRegionGraph;
+  config.regions = {{0U, 1U}, {2U, 3U}};
+  config.region_edges = {{.from_region = 0U,
+                          .to_region = 1U,
+                          .bidirectional = false,
+                          .active = false,
+                          .latency_ms = 45U,
+                          .condition = condition}};
+
+  bbp::RuntimePeerTopology topology(config, 4U);
+  BOOST_TEST(!topology.Edge(0U, 2U).active);
+  BOOST_REQUIRE(topology.Edge(0U, 2U).condition.has_value());
+  BOOST_CHECK(*topology.Edge(0U, 2U).condition == condition);
+
+  topology.SetActive(0U, 2U, true);
+  const bbp::SimulationNetworkAddressPlan plan =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.210.9.0/26", 4U);
+  const auto policies = topology.DirectionalPolicies(plan, 0U);
+  BOOST_REQUIRE_EQUAL(policies.size(), 1U);
+  BOOST_TEST(policies.front().destination_address == plan.NodeAddress(2U));
+  BOOST_CHECK(policies.front().condition == condition);
+
+  topology.RestoreBaseline(0U, 2U);
+  BOOST_TEST(!topology.Edge(0U, 2U).active);
+}

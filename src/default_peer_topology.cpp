@@ -383,10 +383,12 @@ std::vector<ResolvedPeerTopologyEdge> ResolvePeerTopologyEdges(
             continue;
           }
           edges.Add(topology.regions[edge.from_region].front(),
-                    topology.regions[edge.to_region].front());
+                    topology.regions[edge.to_region].front(), edge.latency_ms,
+                    edge.condition);
           if (edge.bidirectional) {
             edges.Add(topology.regions[edge.to_region].front(),
-                      topology.regions[edge.from_region].front());
+                      topology.regions[edge.from_region].front(),
+                      edge.latency_ms, edge.condition);
           }
         }
       }

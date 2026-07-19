@@ -256,6 +256,15 @@ BOOST_AUTO_TEST_CASE(peer_topology_partitioned_groups_isolate_groups) {
 }
 
 BOOST_AUTO_TEST_CASE(peer_topology_region_graph_uses_region_gateways) {
+  bbp::NetworkCondition regional;
+  regional.bandwidth_mbps = 12U;
+  regional.delay_ms = 40U;
+  regional.jitter_ms = 3U;
+  regional.loss_basis_points = 5U;
+
+  bbp::NetworkCondition one_way;
+  one_way.delay_ms = 75U;
+
   bbp::PeerTopologyConfig topology;
   topology.kind = bbp::PeerTopologyKind::kInternetLikeRegionGraph;
   topology.regions = {{0U, 1U}, {2U, 3U}, {4U}};
@@ -263,11 +272,15 @@ BOOST_AUTO_TEST_CASE(peer_topology_region_graph_uses_region_gateways) {
       {.from_region = 0U,
        .to_region = 1U,
        .bidirectional = true,
-       .active = true},
+       .active = true,
+       .latency_ms = 40U,
+       .condition = regional},
       {.from_region = 1U,
        .to_region = 2U,
        .bidirectional = false,
-       .active = true},
+       .active = true,
+       .latency_ms = 75U,
+       .condition = one_way},
   };
   const auto edges = bbp::ResolvePeerTopologyEdges(topology, 5U);
   BOOST_TEST(HasEdge(edges, 0U, 1U));
@@ -276,4 +289,24 @@ BOOST_AUTO_TEST_CASE(peer_topology_region_graph_uses_region_gateways) {
   BOOST_TEST(HasEdge(edges, 2U, 4U));
   BOOST_TEST(!HasEdge(edges, 4U, 2U));
   BOOST_TEST(!HasEdge(edges, 1U, 3U));
+  const auto regional_gateway = std::find_if(
+      edges.begin(), edges.end(),
+      [](const auto& edge) { return edge.from == 0U && edge.to == 2U; });
+  BOOST_REQUIRE(regional_gateway != edges.end());
+  BOOST_REQUIRE(regional_gateway->condition.has_value());
+  BOOST_CHECK(*regional_gateway->condition == regional);
+  BOOST_REQUIRE(regional_gateway->latency_ms.has_value());
+  BOOST_TEST(*regional_gateway->latency_ms == 40U);
+  const auto reverse_gateway = std::find_if(
+      edges.begin(), edges.end(),
+      [](const auto& edge) { return edge.from == 2U && edge.to == 0U; });
+  BOOST_REQUIRE(reverse_gateway != edges.end());
+  BOOST_REQUIRE(reverse_gateway->condition.has_value());
+  BOOST_CHECK(*reverse_gateway->condition == regional);
+  const auto one_way_gateway = std::find_if(
+      edges.begin(), edges.end(),
+      [](const auto& edge) { return edge.from == 2U && edge.to == 4U; });
+  BOOST_REQUIRE(one_way_gateway != edges.end());
+  BOOST_REQUIRE(one_way_gateway->condition.has_value());
+  BOOST_CHECK(*one_way_gateway->condition == one_way);
 }

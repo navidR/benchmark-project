@@ -1,0 +1,17 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "nodes": 2,
+  "network": {"isolated": true},
+  "topology": {
+    "type": "internet_like_region_graph",
+    "regions": [[1], [2]],
+    "region_edges": [
+      {
+        "from_region": 1,
+        "to_region": 2,
+        "latency_ms": 10,
+        "delay_ms": 11
+      }
+    ]
+  }
+}

@@ -91,6 +91,8 @@ struct PeerTopologyRegionEdge {
   std::uint32_t to_region = 0;
   bool bidirectional = true;
   bool active = true;
+  std::optional<std::uint32_t> latency_ms = std::nullopt;
+  std::optional<NetworkCondition> condition = std::nullopt;
 };
 
 struct PeerTopologyConfig {

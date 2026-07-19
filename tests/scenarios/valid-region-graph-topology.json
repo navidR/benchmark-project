@@ -2,6 +2,7 @@
   "firod": "/tmp/not-used-by-probe",
   "nodes": 4,
   "block_production": {"enabled": false},
+  "network": {"isolated": true},
   "topology": {
     "node_count": 4,
     "type": "internet_like_region_graph",
@@ -10,9 +11,31 @@
       {
         "from_region": 1,
         "to_region": 2,
-        "bidirectional": true,
-        "active": true
+        "bidirectional": false,
+        "active": false,
+        "latency_ms": 45,
+        "delay_ms": 45,
+        "bandwidth_mbps": 9,
+        "jitter_ms": 2,
+        "loss_basis_points": 3,
+        "duplicate_basis_points": 4,
+        "corrupt_basis_points": 5,
+        "reorder_basis_points": 6,
+        "limit_packets": 700
       }
     ]
-  }
+  },
+  "events": [
+    {"at": "1s", "action": "activate_edge", "from": 1, "to": 3},
+    {
+      "at": "2s",
+      "action": "set_edge_condition",
+      "from": 1,
+      "to": 3,
+      "delay_ms": 50,
+      "loss_basis_points": 7
+    },
+    {"at": "3s", "action": "deactivate_edge", "from": 1, "to": 3},
+    {"at": "4s", "action": "restore_edge", "from": 1, "to": 3}
+  ]
 }
