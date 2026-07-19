@@ -9,10 +9,14 @@
 #include <chrono>
 #include <filesystem>
 #include <future>
+#include <optional>
+#include <stop_token>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "bbp/http_client.h"
+#include "bbp/simulation_cancelled.h"
 
 namespace {
 
@@ -69,6 +73,76 @@ bbp::RpcEndpoint DigestEndpoint(std::uint16_t port) {
       .password = "digest-secret",
       .cookie_file = {},
   };
+}
+
+struct DigestReply {
+  boost::beast::http::status status;
+  std::vector<std::string> challenges;
+  std::string body;
+};
+
+struct DigestConversation {
+  std::vector<std::string> authorizations;
+  std::optional<bbp::HttpResponse> response;
+  std::optional<std::string> error;
+};
+
+std::vector<std::string> ServeDigestReplies(
+    boost::asio::ip::tcp::acceptor& acceptor,
+    const std::vector<DigestReply>& replies) {
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+
+  boost::asio::ip::tcp::socket socket(acceptor.get_executor());
+  acceptor.accept(socket);
+  beast::flat_buffer buffer;
+  std::vector<std::string> authorizations;
+  authorizations.reserve(replies.size());
+  for (const DigestReply& reply : replies) {
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    const auto authorization = request.find(http::field::authorization);
+    authorizations.push_back(authorization == request.end()
+                                 ? ""
+                                 : std::string(authorization->value()));
+
+    http::response<http::string_body> response{reply.status, 11};
+    for (const std::string& challenge : reply.challenges) {
+      response.insert(http::field::www_authenticate, challenge);
+    }
+    response.keep_alive(true);
+    response.body() = reply.body;
+    response.prepare_payload();
+    http::write(socket, response);
+  }
+  return authorizations;
+}
+
+DigestConversation RunDigestConversation(
+    const std::vector<DigestReply>& replies, std::string user = "bbp-user",
+    std::string password = "digest-secret") {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context context;
+  tcp::acceptor acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeDigestReplies(acceptor, replies); });
+  bbp::RpcEndpoint endpoint = DigestEndpoint(acceptor.local_endpoint().port());
+  endpoint.user = std::move(user);
+  endpoint.password = std::move(password);
+
+  DigestConversation result;
+  try {
+    result.response = bbp::HttpClient(std::chrono::seconds(1))
+                          .PostJson(endpoint, "/json_rpc", "{}");
+  } catch (const std::exception& error) {
+    result.error = error.what();
+  }
+  result.authorizations = served.get();
+  return result;
 }
 
 }  // namespace
@@ -209,11 +283,11 @@ BOOST_AUTO_TEST_CASE(http_client_completes_monero_digest_authentication) {
   tcp::acceptor acceptor(
       context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
   std::future<std::string> authorization = std::async(std::launch::async, [&] {
+    tcp::socket socket(acceptor.get_executor());
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
     for (std::uint32_t request_index = 0U; request_index < 2U;
          ++request_index) {
-      tcp::socket socket(acceptor.get_executor());
-      acceptor.accept(socket);
-      beast::flat_buffer buffer;
       http::request<http::string_body> request;
       http::read(socket, buffer, request);
       if (request_index == 0U) {
@@ -228,6 +302,7 @@ BOOST_AUTO_TEST_CASE(http_client_completes_monero_digest_authentication) {
             http::field::www_authenticate,
             "Digest qop=\"auth\",algorithm=MD5,realm=\"monero-rpc\","
             "nonce=\"fixed-nonce\",stale=false");
+        response.keep_alive(true);
         response.body() = "unauthorized";
         response.prepare_payload();
         http::write(socket, response);
@@ -292,5 +367,193 @@ BOOST_AUTO_TEST_CASE(http_client_rejects_malformed_digest_challenges) {
     BOOST_TEST(std::string(error.what()).find("digest-secret") ==
                std::string::npos);
   }
+  server.get();
+}
+
+BOOST_AUTO_TEST_CASE(http_client_rejects_unsafe_digest_credentials) {
+  const bbp::HttpClient client(std::chrono::milliseconds(20));
+  const auto expect_unsafe = [&](std::string user, std::string password) {
+    bbp::RpcEndpoint endpoint = DigestEndpoint(1U);
+    endpoint.user = std::move(user);
+    endpoint.password = std::move(password);
+    try {
+      static_cast<void>(client.PostJson(endpoint, "/json_rpc", "{}"));
+      BOOST_FAIL("unsafe Digest credentials were accepted");
+    } catch (const std::exception& error) {
+      const std::string message = error.what();
+      BOOST_TEST(message.find(endpoint.user) == std::string::npos);
+      BOOST_TEST(message.find(endpoint.password) == std::string::npos);
+    }
+  };
+
+  expect_unsafe("unsafe:user", "safe-password");
+  expect_unsafe("safe-user", "unsafe:password");
+  expect_unsafe("unsafe\nuser", "safe-password");
+  expect_unsafe("safe-user", "unsafe\rpassword");
+  expect_unsafe(std::string(257U, 'u'), "safe-password");
+  expect_unsafe("safe-user", std::string(257U, 'p'));
+}
+
+BOOST_AUTO_TEST_CASE(http_client_rejects_multiple_supported_digest_challenges) {
+  const DigestConversation result = RunDigestConversation({
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges = {"Digest qop=auth,algorithm=MD5,realm=first,nonce=one",
+                      "Digest qop=auth,algorithm=MD5,realm=second,nonce=two"},
+       .body = "unauthorized"},
+  });
+
+  BOOST_REQUIRE(result.error.has_value());
+  BOOST_TEST(result.error->find("multiple supported") != std::string::npos);
+  BOOST_REQUIRE_EQUAL(result.authorizations.size(), 1U);
+  BOOST_TEST(result.authorizations.front().empty());
+}
+
+BOOST_AUTO_TEST_CASE(http_client_rejects_invalid_digest_stale_state) {
+  const DigestConversation result = RunDigestConversation({
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges =
+           {"Digest qop=auth,algorithm=MD5,realm=test,nonce=one,stale=maybe"},
+       .body = "unauthorized"},
+  });
+
+  BOOST_REQUIRE(result.error.has_value());
+  BOOST_TEST(result.error->find("invalid stale state") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(
+    http_client_rejects_authenticated_digest_401_without_stale_refresh) {
+  const DigestConversation result = RunDigestConversation({
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges =
+           {"Digest qop=auth,algorithm=MD5,realm=test,nonce=one,stale=false"},
+       .body = "unauthorized"},
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges =
+           {"Digest qop=auth,algorithm=MD5,realm=test,nonce=two,stale=false"},
+       .body = "rejected"},
+  });
+
+  BOOST_REQUIRE(result.error.has_value());
+  BOOST_TEST(result.error->find("without a stale challenge") !=
+             std::string::npos);
+  BOOST_REQUIRE_EQUAL(result.authorizations.size(), 2U);
+  BOOST_TEST(result.authorizations.front().empty());
+  BOOST_TEST(result.authorizations.back().find("nonce=\"one\"") !=
+             std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(http_client_rejects_digest_stale_nonce_reuse) {
+  const DigestConversation result = RunDigestConversation({
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges = {"Digest qop=auth,algorithm=MD5,realm=test,nonce=one"},
+       .body = "unauthorized"},
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges =
+           {"Digest qop=auth,algorithm=MD5,realm=test,nonce=one,stale=true"},
+       .body = "stale"},
+  });
+
+  BOOST_REQUIRE(result.error.has_value());
+  BOOST_TEST(result.error->find("reused its nonce") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(http_client_rejects_digest_stale_realm_change) {
+  const DigestConversation result = RunDigestConversation({
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges = {"Digest qop=auth,algorithm=MD5,realm=first,nonce=one"},
+       .body = "unauthorized"},
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges =
+           {"Digest qop=auth,algorithm=MD5,realm=second,nonce=two,stale=true"},
+       .body = "stale"},
+  });
+
+  BOOST_REQUIRE(result.error.has_value());
+  BOOST_TEST(result.error->find("changed realm") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(http_client_retries_one_valid_digest_stale_nonce) {
+  const DigestConversation result = RunDigestConversation({
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges = {"Digest qop=auth,algorithm=MD5,realm=test,nonce=one"},
+       .body = "unauthorized"},
+      {.status = boost::beast::http::status::unauthorized,
+       .challenges =
+           {"Digest qop=auth,algorithm=MD5,realm=test,nonce=two,stale=true"},
+       .body = "stale"},
+      {.status = boost::beast::http::status::ok,
+       .challenges = {},
+       .body = "{\"ok\":true}"},
+  });
+
+  BOOST_REQUIRE(!result.error.has_value());
+  BOOST_REQUIRE(result.response.has_value());
+  BOOST_TEST(result.response->status == 200);
+  BOOST_TEST(result.response->body == "{\"ok\":true}");
+  BOOST_REQUIRE_EQUAL(result.authorizations.size(), 3U);
+  BOOST_TEST(result.authorizations[0].empty());
+  BOOST_TEST(result.authorizations[1].find("nonce=\"one\"") !=
+             std::string::npos);
+  BOOST_TEST(result.authorizations[2].find("nonce=\"two\"") !=
+             std::string::npos);
+  BOOST_TEST(result.authorizations[1].find("digest-secret") ==
+             std::string::npos);
+  BOOST_TEST(result.authorizations[2].find("digest-secret") ==
+             std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(http_client_digest_errors_do_not_expose_credentials) {
+  const std::string user = "diagnostic-user-secret";
+  const std::string password = "diagnostic-password-secret";
+  const DigestConversation result = RunDigestConversation(
+      {{.status = boost::beast::http::status::unauthorized,
+        .challenges = {"Digest qop=auth,algorithm=MD5,realm=test"},
+        .body = "unauthorized"}},
+      user, password);
+
+  BOOST_REQUIRE(result.error.has_value());
+  BOOST_TEST(result.error->find(user) == std::string::npos);
+  BOOST_TEST(result.error->find(password) == std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(
+    http_client_digest_wait_honors_stop_while_server_is_silent) {
+  namespace asio = boost::asio;
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context context;
+  tcp::acceptor acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::promise<void> request_received;
+  std::future<void> request_seen = request_received.get_future();
+  std::future<void> server = std::async(std::launch::async, [&] {
+    tcp::socket socket(acceptor.get_executor());
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    request_received.set_value();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  });
+
+  std::stop_source stop;
+  const bbp::HttpClient client(std::chrono::seconds(5));
+  std::future<void> rpc = std::async(std::launch::async, [&] {
+    static_cast<void>(
+        client.PostJson(DigestEndpoint(acceptor.local_endpoint().port()),
+                        "/json_rpc", "{}", stop.get_token()));
+  });
+  BOOST_REQUIRE(request_seen.wait_for(std::chrono::seconds(1)) ==
+                std::future_status::ready);
+
+  const auto cancellation_started = std::chrono::steady_clock::now();
+  stop.request_stop();
+  BOOST_REQUIRE(rpc.wait_for(std::chrono::milliseconds(250)) ==
+                std::future_status::ready);
+  BOOST_CHECK_THROW(rpc.get(), bbp::SimulationCancelled);
+  const auto elapsed = std::chrono::steady_clock::now() - cancellation_started;
+  BOOST_TEST(elapsed < std::chrono::milliseconds(250));
   server.get();
 }

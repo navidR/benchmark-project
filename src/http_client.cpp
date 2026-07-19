@@ -71,6 +71,7 @@ struct HttpExchange {
 struct DigestChallenge {
   std::string realm;
   std::string nonce;
+  bool stale = false;
 };
 
 std::runtime_error CredentialFileError(const std::filesystem::path& path,
@@ -163,6 +164,20 @@ RpcCredentials ResolveCredentials(const RpcEndpoint& endpoint) {
       if (endpoint.user.empty() || endpoint.password.empty()) {
         throw std::runtime_error(
             "RPC digest authentication requires a user and password");
+      }
+      if (endpoint.user.size() > 256U || endpoint.password.size() > 256U ||
+          endpoint.user.find(':') != std::string::npos ||
+          endpoint.password.find(':') != std::string::npos ||
+          std::any_of(endpoint.user.begin(), endpoint.user.end(),
+                      [](unsigned char character) {
+                        return character < 0x20U || character == 0x7fU;
+                      }) ||
+          std::any_of(endpoint.password.begin(), endpoint.password.end(),
+                      [](unsigned char character) {
+                        return character < 0x20U || character == 0x7fU;
+                      })) {
+        throw std::runtime_error(
+            "RPC digest authentication credentials are unsafe");
       }
       if (!endpoint.cookie_file.empty()) {
         throw std::runtime_error(
@@ -316,24 +331,47 @@ std::optional<DigestChallenge> ParseDigestChallenge(std::string_view input) {
   const auto nonce = parameters.find("nonce");
   const auto algorithm = parameters.find("algorithm");
   const auto qop = parameters.find("qop");
+  const auto stale = parameters.find("stale");
   if (realm == parameters.end() || realm->second.empty() ||
-      nonce == parameters.end() || nonce->second.empty() ||
+      realm->second.size() > 1024U || nonce == parameters.end() ||
+      nonce->second.empty() || nonce->second.size() > 1024U ||
       (algorithm != parameters.end() &&
        !AsciiCaseEqual(algorithm->second, "MD5")) ||
       qop == parameters.end() || !AsciiCaseEqual(qop->second, "auth")) {
     return std::nullopt;
   }
-  return DigestChallenge{.realm = realm->second, .nonce = nonce->second};
+  bool is_stale = false;
+  if (stale != parameters.end()) {
+    if (AsciiCaseEqual(stale->second, "true")) {
+      is_stale = true;
+    } else if (!AsciiCaseEqual(stale->second, "false")) {
+      throw std::runtime_error(
+          "RPC digest authentication challenge has invalid stale state");
+    }
+  }
+  return DigestChallenge{
+      .realm = realm->second,
+      .nonce = nonce->second,
+      .stale = is_stale,
+  };
 }
 
 DigestChallenge SelectDigestChallenge(
     const std::vector<std::string>& challenges) {
+  std::optional<DigestChallenge> selected;
   for (const std::string& challenge : challenges) {
     const std::optional<DigestChallenge> parsed =
         ParseDigestChallenge(challenge);
     if (parsed) {
-      return *parsed;
+      if (selected) {
+        throw std::runtime_error(
+            "RPC server returned multiple supported digest challenges");
+      }
+      selected = *parsed;
     }
+  }
+  if (selected) {
+    return *selected;
   }
   throw std::runtime_error(
       "RPC server returned no supported MD5 qop=auth digest challenge");
@@ -381,98 +419,136 @@ std::string DigestAuthorization(const RpcCredentials& credentials,
          ",qop=auth,nc=" + std::string(kNonceCount);
 }
 
+class JsonConnection {
+ public:
+  JsonConnection(const RpcEndpoint& endpoint, std::chrono::milliseconds timeout)
+      : endpoint_(endpoint),
+        timeout_(timeout),
+        resolver_(ioc_),
+        stream_(ioc_) {}
+
+  JsonConnection(const JsonConnection&) = delete;
+  JsonConnection& operator=(const JsonConnection&) = delete;
+
+  ~JsonConnection() {
+    beast::error_code shutdown_error;
+    stream_.socket().shutdown(tcp::socket::shutdown_both, shutdown_error);
+  }
+
+  void Connect(std::stop_token stop_token) {
+    ThrowIfStopped(stop_token);
+    beast::error_code operation_error;
+    bool completed = false;
+    ioc_.restart();
+    resolver_.async_resolve(
+        endpoint_.host, std::to_string(endpoint_.port),
+        [&](beast::error_code resolve_error,
+            tcp::resolver::results_type resolved_endpoints) {
+          if (resolve_error) {
+            operation_error = resolve_error;
+            completed = true;
+            return;
+          }
+          endpoints_ = std::move(resolved_endpoints);
+          stream_.expires_after(timeout_);
+          stream_.async_connect(endpoints_, [&](beast::error_code connect_error,
+                                                const tcp::endpoint&) {
+            operation_error = connect_error;
+            completed = true;
+          });
+        });
+    Run(stop_token, completed, operation_error, "HTTP JSON connect");
+  }
+
+  HttpExchange Send(std::string_view path, std::string_view body,
+                    const std::optional<std::string>& authorization,
+                    std::stop_token stop_token) {
+    ThrowIfStopped(stop_token);
+    http::request<http::string_body> request{http::verb::post,
+                                             std::string(path), 11};
+    request.set(http::field::host,
+                endpoint_.host + ":" + std::to_string(endpoint_.port));
+    request.set(http::field::content_type, "text/plain");
+    request.keep_alive(true);
+    if (authorization) {
+      request.set(http::field::authorization, *authorization);
+    }
+    request.body() = std::string(body);
+    request.prepare_payload();
+
+    http::response<http::string_body> response;
+    beast::error_code operation_error;
+    bool completed = false;
+    ioc_.restart();
+    stream_.expires_after(timeout_);
+    http::async_write(
+        stream_, request, [&](beast::error_code write_error, std::size_t) {
+          if (write_error) {
+            operation_error = write_error;
+            completed = true;
+            return;
+          }
+          stream_.expires_after(timeout_);
+          http::async_read(stream_, buffer_, response,
+                           [&](beast::error_code read_error, std::size_t) {
+                             operation_error = read_error;
+                             completed = true;
+                           });
+        });
+    Run(stop_token, completed, operation_error, "HTTP JSON POST");
+
+    HttpExchange exchange;
+    exchange.response.status = static_cast<int>(response.result_int());
+    exchange.response.body = std::move(response.body());
+    const auto challenge_range =
+        response.base().equal_range(http::field::www_authenticate);
+    for (auto field = challenge_range.first; field != challenge_range.second;
+         ++field) {
+      exchange.authentication_challenges.emplace_back(field->value());
+    }
+    return exchange;
+  }
+
+ private:
+  static void ThrowIfStopped(std::stop_token stop_token) {
+    if (stop_token.stop_requested()) {
+      throw SimulationCancelled();
+    }
+  }
+
+  void Run(std::stop_token stop_token, bool& completed,
+           const beast::error_code& operation_error,
+           std::string_view operation) {
+    std::stop_callback cancellation(stop_token, [this] { ioc_.stop(); });
+    ioc_.run();
+    ThrowIfStopped(stop_token);
+    if (!completed) {
+      throw std::runtime_error(std::string(operation) +
+                               " stopped before completion");
+    }
+    if (operation_error) {
+      throw boost::system::system_error(operation_error,
+                                        std::string(operation));
+    }
+  }
+
+  RpcEndpoint endpoint_;
+  std::chrono::milliseconds timeout_;
+  asio::io_context ioc_;
+  tcp::resolver resolver_;
+  beast::tcp_stream stream_;
+  tcp::resolver::results_type endpoints_;
+  beast::flat_buffer buffer_;
+};
+
 HttpExchange SendJson(const RpcEndpoint& endpoint, std::string_view path,
                       std::string_view body,
                       const std::optional<std::string>& authorization,
                       std::chrono::milliseconds timeout,
                       std::stop_token stop_token) {
-  if (stop_token.stop_requested()) {
-    throw SimulationCancelled();
-  }
-
-  asio::io_context ioc;
-  tcp::resolver resolver(ioc);
-  beast::tcp_stream stream(ioc);
-  tcp::resolver::results_type endpoints;
-
-  http::request<http::string_body> request{http::verb::post, std::string(path),
-                                           11};
-  request.set(http::field::host,
-              endpoint.host + ":" + std::to_string(endpoint.port));
-  request.set(http::field::content_type, "text/plain");
-  if (authorization) {
-    request.set(http::field::authorization, *authorization);
-  }
-  request.body() = std::string(body);
-  request.prepare_payload();
-
-  beast::flat_buffer buffer;
-  http::response<http::string_body> response;
-  beast::error_code operation_error;
-  bool completed = false;
-
-  resolver.async_resolve(
-      endpoint.host, std::to_string(endpoint.port),
-      [&](beast::error_code resolve_error,
-          tcp::resolver::results_type resolved_endpoints) {
-        if (resolve_error) {
-          operation_error = resolve_error;
-          completed = true;
-          return;
-        }
-        endpoints = std::move(resolved_endpoints);
-        stream.expires_after(timeout);
-        stream.async_connect(endpoints, [&](beast::error_code connect_error,
-                                            const tcp::endpoint&) {
-          if (connect_error) {
-            operation_error = connect_error;
-            completed = true;
-            return;
-          }
-          stream.expires_after(timeout);
-          http::async_write(
-              stream, request, [&](beast::error_code write_error, std::size_t) {
-                if (write_error) {
-                  operation_error = write_error;
-                  completed = true;
-                  return;
-                }
-                stream.expires_after(timeout);
-                http::async_read(
-                    stream, buffer, response,
-                    [&](beast::error_code read_error, std::size_t) {
-                      operation_error = read_error;
-                      completed = true;
-                    });
-              });
-        });
-      });
-
-  std::stop_callback cancellation(stop_token, [&ioc] { ioc.stop(); });
-  ioc.run();
-  if (stop_token.stop_requested()) {
-    throw SimulationCancelled();
-  }
-  if (!completed) {
-    throw std::runtime_error("HTTP JSON POST stopped before completion");
-  }
-  if (operation_error) {
-    throw boost::system::system_error(operation_error, "HTTP JSON POST");
-  }
-
-  beast::error_code shutdown_error;
-  stream.socket().shutdown(tcp::socket::shutdown_both, shutdown_error);
-
-  HttpExchange exchange;
-  exchange.response.status = static_cast<int>(response.result_int());
-  exchange.response.body = std::move(response.body());
-  const auto challenge_range =
-      response.base().equal_range(http::field::www_authenticate);
-  for (auto field = challenge_range.first; field != challenge_range.second;
-       ++field) {
-    exchange.authentication_challenges.emplace_back(field->value());
-  }
-  return exchange;
+  JsonConnection connection(endpoint, timeout);
+  connection.Connect(stop_token);
+  return connection.Send(path, body, authorization, stop_token);
 }
 
 }  // namespace
@@ -489,8 +565,10 @@ HttpResponse HttpClient::PostJson(const RpcEndpoint& endpoint,
   }
 
   std::lock_guard lock(digest_mutex_);
+  JsonConnection connection(endpoint, timeout_);
+  connection.Connect(stop_token);
   HttpExchange challenge_response =
-      SendJson(endpoint, path, body, std::nullopt, timeout_, stop_token);
+      connection.Send(path, body, std::nullopt, stop_token);
   if (challenge_response.response.status != 401) {
     throw std::runtime_error(
         "RPC digest endpoint accepted a request without authentication");
@@ -499,15 +577,29 @@ HttpResponse HttpClient::PostJson(const RpcEndpoint& endpoint,
   DigestChallenge challenge =
       SelectDigestChallenge(challenge_response.authentication_challenges);
   for (std::uint32_t attempt = 0U; attempt < 2U; ++attempt) {
-    HttpExchange authenticated = SendJson(
-        endpoint, path, body, DigestAuthorization(credentials, challenge, path),
-        timeout_, stop_token);
+    HttpExchange authenticated = connection.Send(
+        path, body, DigestAuthorization(credentials, challenge, path),
+        stop_token);
     if (authenticated.response.status != 401) {
       return authenticated.response;
     }
     if (attempt == 0U) {
-      challenge =
+      DigestChallenge refreshed =
           SelectDigestChallenge(authenticated.authentication_challenges);
+      if (!refreshed.stale) {
+        throw std::runtime_error(
+            "RPC digest authentication was rejected without a stale "
+            "challenge");
+      }
+      if (refreshed.realm != challenge.realm) {
+        throw std::runtime_error(
+            "RPC digest authentication stale challenge changed realm");
+      }
+      if (refreshed.nonce == challenge.nonce) {
+        throw std::runtime_error(
+            "RPC digest authentication stale challenge reused its nonce");
+      }
+      challenge = std::move(refreshed);
     }
   }
   throw std::runtime_error("RPC digest authentication was rejected");
