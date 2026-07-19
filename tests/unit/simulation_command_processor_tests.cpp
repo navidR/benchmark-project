@@ -3,6 +3,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -161,4 +162,62 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(*outcomes[1].second == "scheduled failure");
   BOOST_TEST(outcomes[2].first == 3U);
   BOOST_TEST(!outcomes[2].second);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_fails_pending_commands_in_fifo_order) {
+  bbp::SimulationCommandQueue queue;
+  std::promise<void> first_started;
+  std::promise<void> release_first;
+  const std::shared_future<void> release = release_first.get_future().share();
+  std::vector<std::uint64_t> handled;
+  std::vector<std::pair<std::uint64_t, std::string>> failures;
+  std::vector<std::pair<std::uint64_t, std::optional<std::string>>> outcomes;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&](const bbp::SimulationCommand& command) {
+        handled.push_back(command.sequence);
+        first_started.set_value();
+        release.wait();
+      },
+      [&](const bbp::SimulationCommand& command, std::string_view error) {
+        failures.emplace_back(command.sequence, error);
+      },
+      [&](const bbp::SimulationCommand& command,
+          std::optional<std::string_view> error) {
+        outcomes.emplace_back(
+            command.sequence,
+            error ? std::optional<std::string>(*error) : std::nullopt);
+      });
+
+  queue.Push(bbp::SimulationCommandKind::kIncreaseLogVerbosity, "firo-1");
+  queue.Push(bbp::SimulationCommandKind::kExportNodeReport, "firo-2");
+  queue.Push(bbp::SimulationCommandKind::kThawNode, "firo-3");
+  processor.Start();
+  first_started.get_future().wait();
+  std::future<void> stopped =
+      std::async(std::launch::async, [&] { processor.Stop(); });
+  while (!queue.IsClosed()) {
+    std::this_thread::yield();
+  }
+  release_first.set_value();
+  stopped.get();
+
+  BOOST_REQUIRE_EQUAL(handled.size(), 1U);
+  BOOST_TEST(handled[0] == 1U);
+  BOOST_REQUIRE_EQUAL(failures.size(), 2U);
+  BOOST_TEST(failures[0].first == 2U);
+  BOOST_TEST(failures[1].first == 3U);
+  BOOST_TEST(failures[0].second ==
+             "simulation command processor stopped before execution");
+  BOOST_TEST(failures[1].second == failures[0].second);
+  BOOST_REQUIRE_EQUAL(outcomes.size(), 3U);
+  BOOST_TEST(outcomes[0].first == 1U);
+  BOOST_TEST(!outcomes[0].second);
+  BOOST_TEST(outcomes[1].first == 2U);
+  BOOST_REQUIRE(outcomes[1].second);
+  BOOST_TEST(*outcomes[1].second == failures[0].second);
+  BOOST_TEST(outcomes[2].first == 3U);
+  BOOST_REQUIRE(outcomes[2].second);
+  BOOST_TEST(*outcomes[2].second == failures[1].second);
 }

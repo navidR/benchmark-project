@@ -12690,7 +12690,14 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     if (command_processor) {
       command_processor->Stop();
     } else if (active_command_queue != nullptr) {
-      active_command_queue->Cancel();
+      for (const SimulationCommand& command : active_command_queue->Cancel()) {
+        constexpr std::string_view kError =
+            "simulation stopped before command processor startup";
+        WriteEvent(events_path, options.run_id, command.node_id,
+                   SimulationEventKind::kOperatorCommandFailed,
+                   SimulationCommandDetail(command, kError));
+        record_scheduled_command_outcome(command, kError);
+      }
     }
   };
   const auto stop_peer_connectivity = [&]() {
@@ -13488,9 +13495,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                           << command.node_id << " completed";
           },
           [&](const SimulationCommand& command, std::string_view error) {
-            if (command_rpc_stop_source.stop_requested()) {
-              return;
-            }
             WriteEvent(events_path, options.run_id, command.node_id,
                        SimulationEventKind::kOperatorCommandFailed,
                        SimulationCommandDetail(command, error));

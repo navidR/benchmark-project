@@ -66,13 +66,24 @@ BOOST_AUTO_TEST_CASE(
     simulation_command_queue_cancel_discards_pending_commands) {
   bbp::SimulationCommandQueue queue;
   queue.Push(bbp::SimulationCommandKind::kDisconnectNode, "firo-1", true);
-  queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-2", true);
+  queue.PushGenerateBlocks("firo-2", 7U, true);
 
-  queue.Cancel();
+  const std::vector<bbp::SimulationCommand> cancelled = queue.Cancel();
 
   BOOST_TEST(queue.IsClosed());
   BOOST_TEST(!queue.TryPop());
   BOOST_TEST(!queue.WaitPop());
+  BOOST_REQUIRE_EQUAL(cancelled.size(), 2U);
+  BOOST_TEST(cancelled[0].sequence == 1U);
+  BOOST_CHECK(cancelled[0].kind == bbp::SimulationCommandKind::kDisconnectNode);
+  BOOST_TEST(cancelled[0].node_id == "firo-1");
+  BOOST_TEST(cancelled[0].confirmed);
+  BOOST_TEST(cancelled[1].sequence == 2U);
+  BOOST_CHECK(cancelled[1].kind == bbp::SimulationCommandKind::kGenerateBlocks);
+  BOOST_TEST(cancelled[1].node_id == "firo-2");
+  BOOST_REQUIRE(cancelled[1].block_count);
+  BOOST_TEST(*cancelled[1].block_count == 7U);
+  BOOST_TEST(cancelled[1].confirmed);
   BOOST_CHECK_THROW(
       queue.Push(bbp::SimulationCommandKind::kKillNode, "firo-3", true),
       std::runtime_error);

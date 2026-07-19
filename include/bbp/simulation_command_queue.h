@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "bbp/simulation_command.h"
 
@@ -51,7 +52,7 @@ class SimulationCommandQueue {
   std::optional<SimulationCommand> TryPop();
   std::optional<SimulationCommand> WaitPop();
   void Close();
-  void Cancel();
+  std::vector<SimulationCommand> Cancel();
   [[nodiscard]] bool IsClosed() const;
 
  private:

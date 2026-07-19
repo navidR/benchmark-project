@@ -788,13 +788,19 @@ void SimulationCommandQueue::Close() {
   ready_.notify_all();
 }
 
-void SimulationCommandQueue::Cancel() {
+std::vector<SimulationCommand> SimulationCommandQueue::Cancel() {
+  std::vector<SimulationCommand> cancelled;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     closed_ = true;
-    commands_.clear();
+    cancelled.reserve(commands_.size());
+    while (!commands_.empty()) {
+      cancelled.push_back(std::move(commands_.front()));
+      commands_.pop_front();
+    }
   }
   ready_.notify_all();
+  return cancelled;
 }
 
 bool SimulationCommandQueue::IsClosed() const {

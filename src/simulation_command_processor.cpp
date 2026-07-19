@@ -6,6 +6,12 @@
 #include "bbp/logging.h"
 
 namespace bbp {
+namespace {
+
+constexpr std::string_view kCancelledBeforeExecution =
+    "simulation command processor stopped before execution";
+
+}  // namespace
 
 SimulationCommandProcessor::SimulationCommandProcessor(
     SimulationCommandQueue& queue, CommandHandler command_handler,
@@ -37,9 +43,13 @@ void SimulationCommandProcessor::Stop() {
   if (!started_) {
     return;
   }
-  queue_.Cancel();
+  std::vector<SimulationCommand> cancelled = queue_.Cancel();
   if (thread_.joinable()) {
     thread_.join();
+  }
+  for (const SimulationCommand& command : cancelled) {
+    ReportFailure(command, kCancelledBeforeExecution);
+    ReportOutcome(command, kCancelledBeforeExecution);
   }
   started_ = false;
 }
