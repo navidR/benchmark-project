@@ -1,12 +1,18 @@
 #include "bbp/drivers/chain_driver_registry.h"
 
+#include <sys/random.h>
+
+#include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
 #include "bbp/drivers/bitcoin_driver.h"
 #include "bbp/drivers/firo_driver.h"
+#include "bbp/drivers/monero_driver.h"
 
 namespace bbp {
 namespace {
@@ -28,7 +34,46 @@ constexpr const char* kBitcoinDefaultRewardAddress =
 constexpr std::uint32_t kBitcoinMaxNodes = 16;
 constexpr std::uint32_t kBitcoinCoinbaseSpendableConfirmations = 101;
 constexpr std::uint16_t kBitcoinP2pPortBase = 18444;
-constexpr std::uint16_t kBitcoinRpcPortBase = 18443;
+constexpr std::uint16_t kBitcoinRpcPortBase = 19443;
+constexpr const char* kMoneroChainName = "monero";
+constexpr const char* kMoneroDaemonOptionName = "monerod";
+constexpr const char* kMoneroNodeIdPrefix = "monero";
+constexpr const char* kMoneroDefaultRewardAddress =
+    "42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9"
+    "UxqeoyFQMYbqSWYTfJJQAWDm";
+constexpr std::uint32_t kMoneroMaxNodes = 16;
+constexpr std::uint32_t kMoneroCoinbaseSpendableConfirmations = 60;
+constexpr std::uint16_t kMoneroP2pPortBase = 18080;
+constexpr std::uint16_t kMoneroRpcPortBase = 19081;
+
+std::string RandomCredentialHex() {
+  std::array<unsigned char, 32U> bytes{};
+  std::size_t offset = 0U;
+  while (offset < bytes.size()) {
+    const ssize_t count =
+        getrandom(bytes.data() + offset, bytes.size() - offset, 0U);
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::runtime_error("getrandom for RPC credentials failed: " +
+                               std::string(std::strerror(errno)));
+    }
+    if (count == 0) {
+      throw std::runtime_error(
+          "getrandom for RPC credentials made no progress");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string output;
+  output.reserve(bytes.size() * 2U);
+  for (const unsigned char byte : bytes) {
+    output.push_back(kHex[byte >> 4U]);
+    output.push_back(kHex[byte & 0x0fU]);
+  }
+  return output;
+}
 
 std::uint16_t AddPortOffset(std::uint16_t base, std::uint32_t offset) {
   const std::uint32_t port = static_cast<std::uint32_t>(base) + offset;
@@ -99,6 +144,7 @@ const ChainDriverSpec& DefaultChainDriverSpec() {
       .coinbase_spendable_confirmations = kFiroCoinbaseSpendableConfirmations,
       .p2p_port_base = kFiroP2pPortBase,
       .rpc_port_base = kFiroRpcPortBase,
+      .rpc_authentication = RpcAuthenticationMode::kCookieFile,
   };
   return spec;
 }
@@ -115,6 +161,23 @@ const ChainDriverSpec& BitcoinChainDriverSpec() {
           kBitcoinCoinbaseSpendableConfirmations,
       .p2p_port_base = kBitcoinP2pPortBase,
       .rpc_port_base = kBitcoinRpcPortBase,
+      .rpc_authentication = RpcAuthenticationMode::kCookieFile,
+  };
+  return spec;
+}
+
+const ChainDriverSpec& MoneroChainDriverSpec() {
+  static const ChainDriverSpec spec{
+      .name = kMoneroChainName,
+      .daemon_option_name = kMoneroDaemonOptionName,
+      .daemon_scenario_field = kMoneroDaemonOptionName,
+      .node_id_prefix = kMoneroNodeIdPrefix,
+      .default_reward_address = kMoneroDefaultRewardAddress,
+      .max_nodes = kMoneroMaxNodes,
+      .coinbase_spendable_confirmations = kMoneroCoinbaseSpendableConfirmations,
+      .p2p_port_base = kMoneroP2pPortBase,
+      .rpc_port_base = kMoneroRpcPortBase,
+      .rpc_authentication = RpcAuthenticationMode::kDigest,
   };
   return spec;
 }
@@ -126,7 +189,7 @@ const ChainDriverSpec& ChainDriverSpecFor(ChainKind chain) {
     case ChainKind::kBitcoin:
       return BitcoinChainDriverSpec();
     case ChainKind::kMonero:
-      break;
+      return MoneroChainDriverSpec();
   }
   throw std::runtime_error("chain driver is not implemented: " +
                            std::string(ChainKindName(chain)));
@@ -143,7 +206,7 @@ std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain) {
     case ChainKind::kBitcoin:
       return std::make_unique<BitcoinDriver>(std::chrono::seconds(5));
     case ChainKind::kMonero:
-      break;
+      return std::make_unique<MoneroDriver>(std::chrono::seconds(5));
   }
   throw std::runtime_error("chain driver is not implemented: " +
                            std::string(ChainKindName(chain)));
@@ -166,8 +229,19 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
   config.log_dir = node_root;
   config.p2p_port = AddPortOffset(spec.p2p_port_base, request.node_index);
   config.rpc_port = AddPortOffset(spec.rpc_port_base, request.node_index);
-  config.rpc_authentication = RpcAuthenticationMode::kCookieFile;
-  config.rpc_cookie_file = node_root / ".bbp-rpc-cookie";
+  config.rpc_authentication = spec.rpc_authentication;
+  switch (spec.rpc_authentication) {
+    case RpcAuthenticationMode::kCookieFile:
+      config.rpc_cookie_file = node_root / ".bbp-rpc-cookie";
+      break;
+    case RpcAuthenticationMode::kDigest:
+      config.rpc_user = "bbp-" + node_id;
+      config.rpc_password = RandomCredentialHex();
+      break;
+    case RpcAuthenticationMode::kBasic:
+      throw std::runtime_error(
+          "registered chain driver cannot generate Basic RPC credentials");
+  }
   config.listen = true;
   config.wallet_enabled = request.wallet_enabled;
   config.connect_peers = request.connect_peers;

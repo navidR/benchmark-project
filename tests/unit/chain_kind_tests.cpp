@@ -1,9 +1,12 @@
+#include <array>
 #include <boost/test/unit_test.hpp>
+#include <map>
 #include <stdexcept>
 
 #include "bbp/chain_kind.h"
 #include "bbp/drivers/bitcoin_driver.h"
 #include "bbp/drivers/chain_driver_registry.h"
+#include "bbp/drivers/monero_driver.h"
 
 BOOST_AUTO_TEST_CASE(chain_kind_parses_supported_names) {
   BOOST_TEST(static_cast<int>(bbp::ParseChainKind("firo")) ==
@@ -24,20 +27,32 @@ BOOST_AUTO_TEST_CASE(chain_kind_has_canonical_names) {
   BOOST_TEST(bbp::ChainKindName(bbp::ChainKind::kMonero) == "monero");
 }
 
-BOOST_AUTO_TEST_CASE(bitcoin_driver_is_registered_and_monero_is_rejected) {
+BOOST_AUTO_TEST_CASE(later_chain_drivers_are_registered) {
   const bbp::ChainDriverSpec& bitcoin =
       bbp::ChainDriverSpecFor(bbp::ChainKind::kBitcoin);
   BOOST_TEST(bitcoin.name == "bitcoin");
   BOOST_TEST(bitcoin.daemon_option_name == "bitcoind");
   BOOST_TEST(bitcoin.max_nodes == 16U);
   BOOST_TEST(bitcoin.p2p_port_base == 18444U);
-  BOOST_TEST(bitcoin.rpc_port_base == 18443U);
+  BOOST_TEST(bitcoin.rpc_port_base == 19443U);
   const std::unique_ptr<bbp::ChainDriver> driver =
       bbp::CreateChainDriver(bbp::ChainKind::kBitcoin);
   BOOST_REQUIRE(driver != nullptr);
   BOOST_CHECK(dynamic_cast<bbp::BitcoinDriver*>(driver.get()) != nullptr);
-  BOOST_CHECK_THROW(bbp::CreateChainDriver(bbp::ChainKind::kMonero),
-                    std::runtime_error);
+
+  const bbp::ChainDriverSpec& monero =
+      bbp::ChainDriverSpecFor(bbp::ChainKind::kMonero);
+  BOOST_TEST(monero.name == "monero");
+  BOOST_TEST(monero.daemon_option_name == "monerod");
+  BOOST_TEST(monero.max_nodes == 16U);
+  BOOST_TEST(monero.coinbase_spendable_confirmations == 60U);
+  BOOST_TEST(monero.p2p_port_base == 18080U);
+  BOOST_TEST(monero.rpc_port_base == 19081U);
+  BOOST_CHECK(monero.rpc_authentication == bbp::RpcAuthenticationMode::kDigest);
+  const std::unique_ptr<bbp::ChainDriver> monero_driver =
+      bbp::CreateChainDriver(bbp::ChainKind::kMonero);
+  BOOST_REQUIRE(monero_driver != nullptr);
+  BOOST_CHECK(dynamic_cast<bbp::MoneroDriver*>(monero_driver.get()) != nullptr);
 }
 
 BOOST_AUTO_TEST_CASE(bitcoin_node_config_uses_chain_ports_and_prefix) {
@@ -52,10 +67,69 @@ BOOST_AUTO_TEST_CASE(bitcoin_node_config_uses_chain_ports_and_prefix) {
 
   BOOST_TEST(config.id == "bitcoin-3");
   BOOST_TEST(config.p2p_port == 18446U);
-  BOOST_TEST(config.rpc_port == 18445U);
+  BOOST_TEST(config.rpc_port == 19445U);
   BOOST_TEST(config.rpc_cookie_file ==
              std::filesystem::path(
                  "/tmp/bitcoin-test/nodes/bitcoin-3/.bbp-rpc-cookie"));
+}
+
+BOOST_AUTO_TEST_CASE(monero_node_config_uses_unique_digest_credentials) {
+  bbp::ChainNodeConfigRequest request;
+  request.run_id = "monero-test";
+  request.run_root = "/tmp/monero-test";
+  request.daemon_binary = "/tmp/monerod";
+  request.node_index = 0U;
+
+  const bbp::ChainNodeConfig first = bbp::MakeChainNodeConfig(
+      bbp::ChainDriverSpecFor(bbp::ChainKind::kMonero), request);
+  request.node_index = 1U;
+  const bbp::ChainNodeConfig second = bbp::MakeChainNodeConfig(
+      bbp::ChainDriverSpecFor(bbp::ChainKind::kMonero), request);
+
+  BOOST_TEST(first.id == "monero-1");
+  BOOST_TEST(first.p2p_port == 18080U);
+  BOOST_TEST(first.rpc_port == 19081U);
+  BOOST_CHECK(first.rpc_authentication == bbp::RpcAuthenticationMode::kDigest);
+  BOOST_TEST(first.rpc_user == "bbp-monero-1");
+  BOOST_TEST(first.rpc_password.size() == 64U);
+  BOOST_TEST(first.rpc_cookie_file.empty());
+  BOOST_TEST(second.rpc_user == "bbp-monero-2");
+  BOOST_TEST(second.rpc_password.size() == 64U);
+  BOOST_TEST(first.rpc_password != second.rpc_password);
+  BOOST_TEST(second.rpc_cookie_file.empty());
+}
+
+BOOST_AUTO_TEST_CASE(chain_node_port_ranges_are_disjoint_through_max_nodes) {
+  const std::array<const bbp::ChainDriverSpec*, 3U> specs = {
+      &bbp::DefaultChainDriverSpec(),
+      &bbp::ChainDriverSpecFor(bbp::ChainKind::kBitcoin),
+      &bbp::ChainDriverSpecFor(bbp::ChainKind::kMonero),
+  };
+  std::map<std::uint16_t, std::string> allocated_ports;
+  std::size_t expected_port_count = 0U;
+  for (const bbp::ChainDriverSpec* spec : specs) {
+    for (std::uint32_t node_index = 0U; node_index < spec->max_nodes;
+         ++node_index) {
+      bbp::ChainNodeConfigRequest request;
+      request.run_id = "port-plan-test";
+      request.run_root = "/tmp/port-plan-test";
+      request.daemon_binary = "/tmp/daemon";
+      request.node_index = node_index;
+      const bbp::ChainNodeConfig config =
+          bbp::MakeChainNodeConfig(*spec, request);
+      const auto allocate = [&](std::uint16_t port, std::string protocol) {
+        const std::string owner = spec->name + " " + std::move(protocol) +
+                                  " node " + std::to_string(node_index + 1U);
+        const auto [position, inserted] = allocated_ports.emplace(port, owner);
+        BOOST_CHECK_MESSAGE(inserted, owner + " port " + std::to_string(port) +
+                                          " overlaps " + position->second);
+      };
+      allocate(config.p2p_port, "P2P");
+      allocate(config.rpc_port, "RPC");
+    }
+    expected_port_count += static_cast<std::size_t>(spec->max_nodes) * 2U;
+  }
+  BOOST_TEST(allocated_ports.size() == expected_port_count);
 }
 
 BOOST_AUTO_TEST_CASE(chain_node_config_uses_explicit_safe_scenario_id) {

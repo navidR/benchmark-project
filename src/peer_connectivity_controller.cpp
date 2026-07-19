@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <exception>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -13,6 +14,24 @@ namespace {
 
 std::string PeerEndpoint(const ChainNodeConfig& config) {
   return config.p2p_host + ":" + std::to_string(config.p2p_port);
+}
+
+std::string ExceptionMessage(const std::exception_ptr& error) {
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::exception& exception) {
+    return exception.what();
+  } catch (...) {
+    return "unknown exception";
+  }
+}
+
+[[noreturn]] void RethrowPeerMutationFailure(
+    const std::exception_ptr& original_error, std::string_view operation,
+    const std::exception_ptr& rollback_error) {
+  throw std::runtime_error(
+      ExceptionMessage(original_error) + "; peer " + std::string(operation) +
+      " rollback failed: " + ExceptionMessage(rollback_error));
 }
 
 }  // namespace
@@ -132,8 +151,7 @@ void PeerConnectivityController::ConnectPeer(std::string_view node_id,
   }
   RequireUnambiguousPeerIdentity(node, stop_token);
   const std::string endpoint = PeerEndpoint(peer);
-  driver_.ConnectPeer(node, endpoint, stop_token);
-  driver_.WaitForPeerAddress(node, endpoint, timeout, stop_token);
+  SetPeerConnectionState(node, endpoint, true, timeout, stop_token);
 }
 
 void PeerConnectivityController::DisconnectPeer(std::string_view node_id,
@@ -151,8 +169,40 @@ void PeerConnectivityController::DisconnectPeer(std::string_view node_id,
   }
   RequireUnambiguousPeerIdentity(node, stop_token);
   const std::string endpoint = PeerEndpoint(peer);
-  driver_.DisconnectPeer(node, endpoint, stop_token);
-  driver_.WaitForPeerAddressAbsent(node, endpoint, timeout, stop_token);
+  SetPeerConnectionState(node, endpoint, false, timeout, stop_token);
+}
+
+void PeerConnectivityController::SetPeerConnectionState(
+    const ChainNodeConfig& node, const std::string& endpoint, bool connected,
+    std::chrono::seconds timeout, std::stop_token stop_token) const {
+  const bool connected_before =
+      !driver_.ConnectedPeerAddresses(node, {endpoint}, stop_token).empty();
+  try {
+    if (connected) {
+      driver_.ConnectPeer(node, endpoint, stop_token);
+      driver_.WaitForPeerAddress(node, endpoint, timeout, stop_token);
+    } else {
+      driver_.DisconnectPeer(node, endpoint, stop_token);
+      driver_.WaitForPeerAddressAbsent(node, endpoint, timeout, stop_token);
+    }
+  } catch (...) {
+    const std::exception_ptr original_error = std::current_exception();
+    try {
+      if (connected_before) {
+        driver_.ConnectPeer(node, endpoint, std::stop_token{});
+        driver_.WaitForPeerAddress(node, endpoint, timeout, std::stop_token{});
+      } else {
+        driver_.DisconnectPeer(node, endpoint, std::stop_token{});
+        driver_.WaitForPeerAddressAbsent(node, endpoint, timeout,
+                                         std::stop_token{});
+      }
+    } catch (...) {
+      RethrowPeerMutationFailure(original_error,
+                                 connected ? "connection" : "disconnection",
+                                 std::current_exception());
+    }
+    std::rethrow_exception(original_error);
+  }
 }
 
 const ChainNodeConfig& PeerConnectivityController::FindNode(
@@ -304,9 +354,8 @@ void PeerConnectivityController::EnforcePolicy(const ChainNodeConfig& node,
          !disconnected_indexes.empty()) {
     const std::size_t index = disconnected_indexes.front();
     disconnected_indexes.erase(disconnected_indexes.begin());
-    driver_.ConnectPeer(node, candidate_endpoints[index], stop_token);
-    driver_.WaitForPeerAddress(node, candidate_endpoints[index],
-                               std::chrono::seconds(10), stop_token);
+    SetPeerConnectionState(node, candidate_endpoints[index], true,
+                           std::chrono::seconds(10), stop_token);
     connected_indexes.push_back(index);
     action_handler_(node.id, candidates[index]->id,
                     PeerConnectivityAction::kConnected, policy);
@@ -315,9 +364,8 @@ void PeerConnectivityController::EnforcePolicy(const ChainNodeConfig& node,
   while (connected_indexes.size() > policy.maximum()) {
     const std::size_t index = connected_indexes.back();
     connected_indexes.pop_back();
-    driver_.DisconnectPeer(node, candidate_endpoints[index], stop_token);
-    driver_.WaitForPeerAddressAbsent(node, candidate_endpoints[index],
-                                     std::chrono::seconds(10), stop_token);
+    SetPeerConnectionState(node, candidate_endpoints[index], false,
+                           std::chrono::seconds(10), stop_token);
     action_handler_(node.id, candidates[index]->id,
                     PeerConnectivityAction::kDisconnected, policy);
   }

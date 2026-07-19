@@ -24,6 +24,7 @@ struct ChainDriverSpec {
   std::uint32_t coinbase_spendable_confirmations = 0;
   std::uint16_t p2p_port_base = 0;
   std::uint16_t rpc_port_base = 0;
+  RpcAuthenticationMode rpc_authentication = RpcAuthenticationMode::kCookieFile;
 };
 
 struct ChainNodeConfigRequest {

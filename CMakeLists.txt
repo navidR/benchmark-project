@@ -222,6 +222,7 @@ add_executable(bbp
   src/drivers/chain_driver_registry.cpp
   src/drivers/bitcoin_driver.cpp
   src/drivers/firo_driver.cpp
+  src/drivers/monero_driver.cpp
   src/http_client.cpp
   src/log_tail.cpp
   src/log_level.cpp
@@ -322,6 +323,7 @@ if(BUILD_TESTING)
     tests/unit/bitcoin_driver_tests.cpp
     tests/unit/firo_driver_tests.cpp
     tests/unit/http_client_tests.cpp
+    tests/unit/monero_driver_tests.cpp
     tests/unit/log_tail_tests.cpp
     tests/unit/log_level_tests.cpp
     tests/unit/logging_tests.cpp
@@ -378,6 +380,7 @@ if(BUILD_TESTING)
     src/drivers/chain_driver_registry.cpp
     src/drivers/bitcoin_driver.cpp
     src/drivers/firo_driver.cpp
+    src/drivers/monero_driver.cpp
     src/http_client.cpp
     src/log_tail.cpp
     src/log_level.cpp
@@ -859,6 +862,12 @@ if(BUILD_TESTING)
     COMMAND bbp
       --scenario
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-bitcoin-driver.json"
+      --probe-capabilities
+  )
+  add_test(NAME bbp-valid-monero-driver
+    COMMAND bbp
+      --scenario
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-monero-driver.json"
       --probe-capabilities
   )
   add_test(NAME bbp-valid-node-chain-config-yaml

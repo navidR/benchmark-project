@@ -1,0 +1,26 @@
+{
+  "chains": {
+    "monero": {
+      "driver": "monero",
+      "default_binary": "/tmp/not-used-by-probe"
+    }
+  },
+  "chain": "monero",
+  "simulation": {
+    "name": "monero-fakechain-driver"
+  },
+  "block_production": {
+    "enabled": false
+  },
+  "nodes": [
+    {
+      "id": "monero-1",
+      "chain": "monero",
+      "role": "base",
+      "chain_config": {
+        "network": "regtest",
+        "extra_args": ["--db-sync-mode=fast"]
+      }
+    }
+  ]
+}

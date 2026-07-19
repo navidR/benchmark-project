@@ -8772,9 +8772,21 @@ void WriteScenarioFiles(const Options& options,
     chain_config["extra_args"] = std::move(extra_args);
     node["chain_config"] = std::move(chain_config);
     boost::json::object rpc;
-    rpc["authentication"] = "cookie";
+    switch (chain_spec.rpc_authentication) {
+      case RpcAuthenticationMode::kCookieFile:
+        rpc["authentication"] = "cookie";
+        rpc["credential_file_lifecycle"] = "ephemeral";
+        break;
+      case RpcAuthenticationMode::kDigest:
+        rpc["authentication"] = "digest";
+        rpc["credential_file_lifecycle"] = nullptr;
+        break;
+      case RpcAuthenticationMode::kBasic:
+        rpc["authentication"] = "basic";
+        rpc["credential_file_lifecycle"] = nullptr;
+        break;
+    }
     rpc["credentials"] = "<generated-redacted>";
-    rpc["credential_file_lifecycle"] = "ephemeral";
     rpc["binding_scope"] =
         options.isolate_network ? "node_veth_only" : "loopback_only";
     node["rpc"] = std::move(rpc);

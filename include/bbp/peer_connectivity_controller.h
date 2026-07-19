@@ -69,6 +69,10 @@ class PeerConnectivityController {
       const std::vector<std::string>& peer_node_ids) const;
   void RequireUnambiguousPeerIdentity(const ChainNodeConfig& node,
                                       std::stop_token stop_token) const;
+  void SetPeerConnectionState(const ChainNodeConfig& node,
+                              const std::string& endpoint, bool connected,
+                              std::chrono::seconds timeout,
+                              std::stop_token stop_token) const;
   void ValidatePolicy(std::string_view node_id,
                       const PeerCountPolicy& policy) const;
   void Run(std::stop_token stop_token);

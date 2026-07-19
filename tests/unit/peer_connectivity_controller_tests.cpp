@@ -2,7 +2,9 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,12 +33,35 @@ class TestChainDriver final : public bbp::ChainDriver {
                      std::chrono::seconds, std::stop_token) const override {}
   void WaitForPeerCount(const bbp::ChainNodeConfig&, std::uint64_t,
                         std::chrono::seconds, std::stop_token) const override {}
-  void WaitForPeerAddress(const bbp::ChainNodeConfig&, const std::string&,
-                          std::chrono::seconds,
-                          std::stop_token) const override {}
-  void WaitForPeerAddressAbsent(const bbp::ChainNodeConfig&, const std::string&,
+  void WaitForPeerAddress(const bbp::ChainNodeConfig& config,
+                          const std::string& address, std::chrono::seconds,
+                          std::stop_token) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (connected_wait_failure_) {
+      const std::string message = std::move(*connected_wait_failure_);
+      connected_wait_failure_.reset();
+      throw std::runtime_error(message);
+    }
+    const auto found = connections_.find(config.id);
+    if (found == connections_.end() || !found->second.contains(address)) {
+      throw std::runtime_error("peer did not reach connected state");
+    }
+  }
+  void WaitForPeerAddressAbsent(const bbp::ChainNodeConfig& config,
+                                const std::string& address,
                                 std::chrono::seconds,
-                                std::stop_token) const override {}
+                                std::stop_token) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (disconnected_wait_failure_) {
+      const std::string message = std::move(*disconnected_wait_failure_);
+      disconnected_wait_failure_.reset();
+      throw std::runtime_error(message);
+    }
+    const auto found = connections_.find(config.id);
+    if (found != connections_.end() && found->second.contains(address)) {
+      throw std::runtime_error("peer did not reach disconnected state");
+    }
+  }
   bbp::ChainMetrics ReadMetrics(const bbp::ChainNodeConfig&,
                                 std::stop_token) const override {
     return {};
@@ -132,12 +157,21 @@ class TestChainDriver final : public bbp::ChainDriver {
   void ConnectPeer(const bbp::ChainNodeConfig& config,
                    const std::string& address, std::stop_token) const override {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (ignore_next_connect_) {
+      ignore_next_connect_ = false;
+      return;
+    }
     connections_[config.id].insert(address);
   }
   void DisconnectPeer(const bbp::ChainNodeConfig& config,
                       const std::string& address,
                       std::stop_token) const override {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (disconnect_failure_) {
+      const std::string message = std::move(*disconnect_failure_);
+      disconnect_failure_.reset();
+      throw std::runtime_error(message);
+    }
     connections_[config.id].erase(address);
   }
   void ChangeLogVerbosity(const bbp::ChainNodeConfig&,
@@ -166,9 +200,33 @@ class TestChainDriver final : public bbp::ChainDriver {
     return found != connections_.end() && found->second.contains(address);
   }
 
+  void IgnoreNextConnect() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ignore_next_connect_ = true;
+  }
+
+  void FailNextConnectedWait(std::string message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    connected_wait_failure_ = std::move(message);
+  }
+
+  void FailNextDisconnectedWait(std::string message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    disconnected_wait_failure_ = std::move(message);
+  }
+
+  void FailNextDisconnect(std::string message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    disconnect_failure_ = std::move(message);
+  }
+
  private:
   mutable std::mutex mutex_;
   mutable std::map<std::string, std::set<std::string>> connections_;
+  mutable bool ignore_next_connect_ = false;
+  mutable std::optional<std::string> disconnect_failure_;
+  mutable std::optional<std::string> connected_wait_failure_;
+  mutable std::optional<std::string> disconnected_wait_failure_;
 };
 
 std::vector<bbp::ChainNodeConfig> TestNodes() {
@@ -312,4 +370,91 @@ BOOST_AUTO_TEST_CASE(peer_connectivity_controller_validates_allowed_peer_sets) {
   BOOST_TEST(controller.AllowedPeersFor("node-1") ==
                  std::vector<std::string>({"node-2", "node-3"}),
              boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_rejects_contradictory_peer_state) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  driver.IgnoreNextConnect();
+  BOOST_CHECK_EXCEPTION(
+      controller.ConnectPeer("node-1", "node-2", std::chrono::seconds(1)),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()).find("did not reach connected") !=
+               std::string::npos;
+      });
+  BOOST_TEST(!driver.IsConnected("node-1", "10.0.0.2:18001"));
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_restores_disconnected_state_after_failure) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  driver.FailNextConnectedWait("original connection postcondition failure");
+  BOOST_CHECK_EXCEPTION(
+      controller.ConnectPeer("node-1", "node-2", std::chrono::seconds(1)),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "original connection postcondition failure";
+      });
+  BOOST_TEST(!driver.IsConnected("node-1", "10.0.0.2:18001"));
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_restores_connected_state_after_failure) {
+  TestChainDriver driver;
+  const std::vector<bbp::ChainNodeConfig> nodes = TestNodes();
+  driver.ConnectPeer(nodes[0], "10.0.0.2:18001", {});
+  bbp::PeerConnectivityController controller(
+      driver, nodes, {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  driver.FailNextDisconnectedWait(
+      "original disconnection postcondition failure");
+  BOOST_CHECK_EXCEPTION(
+      controller.DisconnectPeer("node-1", "node-2", std::chrono::seconds(1)),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "original disconnection postcondition failure";
+      });
+  BOOST_TEST(driver.IsConnected("node-1", "10.0.0.2:18001"));
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_reports_original_and_rollback_failures) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  driver.FailNextConnectedWait("original connection failure");
+  driver.FailNextDisconnect("rollback disconnect failure");
+  BOOST_CHECK_EXCEPTION(
+      controller.ConnectPeer("node-1", "node-2", std::chrono::seconds(1)),
+      std::runtime_error, [](const std::runtime_error& error) {
+        const std::string message = error.what();
+        return message.find("original connection failure") !=
+                   std::string::npos &&
+               message.find("peer connection rollback failed") !=
+                   std::string::npos &&
+               message.find("rollback disconnect failure") != std::string::npos;
+      });
 }
