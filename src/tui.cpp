@@ -2463,8 +2463,8 @@ bool QueueParsedNodeCommand(
         if (!parsed.block_count) {
           throw std::runtime_error("generated block count is missing");
         }
-        sequence =
-            command_queue->PushGenerateBlocks(node_id, *parsed.block_count);
+        sequence = command_queue->PushGenerateBlocks(
+            node_id, *parsed.block_count, confirmed);
       } else if (parsed.kind == SimulationCommandKind::kSetResourceLimits) {
         if (!parsed.resource_limit_patch) {
           throw std::runtime_error("resource limit patch is missing");

@@ -24,7 +24,8 @@ class SimulationCommandQueue {
   std::uint64_t PushPeerCountPolicy(std::string node_id, PeerCountPolicy policy,
                                     bool confirmed = false);
   std::uint64_t PushGenerateBlocks(std::string node_id,
-                                   std::uint32_t block_count);
+                                   std::uint32_t block_count,
+                                   bool confirmed = false);
   std::uint64_t PushProfileCommand(SimulationCommandKind kind,
                                    std::string node_id, std::string profile,
                                    bool confirmed = false);

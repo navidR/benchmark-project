@@ -230,7 +230,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
 }
 
 std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
-    std::string node_id, std::uint32_t block_count) {
+    std::string node_id, std::uint32_t block_count, bool confirmed) {
   if (block_count == 0U) {
     throw std::runtime_error("generate-blocks count must be positive");
   }
@@ -251,7 +251,7 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .perf_counter_target = std::nullopt,
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
-      .confirmed = false,
+      .confirmed = confirmed,
   });
 }
 

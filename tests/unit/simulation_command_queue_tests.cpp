@@ -262,9 +262,26 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(command->confirmed);
 }
 
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_requires_generate_blocks_confirmation) {
+  bbp::SimulationCommandQueue queue;
+
+  BOOST_CHECK_THROW(queue.PushGenerateBlocks("firo-1", 1U), std::runtime_error);
+  BOOST_TEST(!queue.TryPop());
+
+  const std::uint64_t sequence = queue.PushGenerateBlocks("firo-1", 1U, true);
+  BOOST_TEST(sequence == 1U);
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kGenerateBlocks);
+  BOOST_REQUIRE(command->block_count);
+  BOOST_TEST(*command->block_count == 1U);
+  BOOST_TEST(command->confirmed);
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_operator_payloads) {
   bbp::SimulationCommandQueue queue;
-  queue.PushGenerateBlocks("firo-1", 7U);
+  queue.PushGenerateBlocks("firo-1", 7U, true);
   queue.PushProfileCommand(bbp::SimulationCommandKind::kSetResourceProfile,
                            "firo-2", "constrained", true);
 

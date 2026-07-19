@@ -60,7 +60,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kPartitionNodes));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kSendWalletTransaction));
-  BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kGenerateBlocks));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kThawNode));

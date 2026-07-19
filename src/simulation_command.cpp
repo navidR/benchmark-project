@@ -166,6 +166,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kSetNetworkCondition:
     case SimulationCommandKind::kBlockNetworkFlow:
     case SimulationCommandKind::kPartitionNodes:
+    case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kSendWalletTransaction:
       return true;
     case SimulationCommandKind::kIncreaseLogVerbosity:
@@ -175,7 +176,6 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kSetMiningDifficulty:
     case SimulationCommandKind::kConnectPeer:
     case SimulationCommandKind::kThawNode:
-    case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kUnblockNetworkFlow:
     case SimulationCommandKind::kHealPartition:
     case SimulationCommandKind::kExportNodeReport:
