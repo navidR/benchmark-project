@@ -1,11 +1,10 @@
-#include "bbp/util.h"
-
+#include <boost/test/unit_test.hpp>
 #include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <boost/test/unit_test.hpp>
+#include "bbp/util.h"
 
 namespace {
 
@@ -17,10 +16,9 @@ bool IsSourceFile(const std::filesystem::path& path) {
 
 void CheckDirectoryForForbiddenTokens(const std::filesystem::path& directory) {
   const std::vector<std::string_view> forbidden = {
-      "system(",       "system (",       "popen(",
-      "popen (",       "execvp(",        "execvp (",
-      "execlp(",       "execlp (",       "posix_spawnp(",
-      "posix_spawnp (", "/bin/sh",        "bash -c",
+      "system(",       "system (",       "popen(",  "popen (",
+      "execvp(",       "execvp (",       "execlp(", "execlp (",
+      "posix_spawnp(", "posix_spawnp (", "/bin/sh", "bash -c",
   };
 
   for (const auto& entry :
@@ -32,7 +30,7 @@ void CheckDirectoryForForbiddenTokens(const std::filesystem::path& directory) {
     for (std::string_view token : forbidden) {
       if (text.find(token) != std::string::npos) {
         BOOST_FAIL("forbidden shell-out token '" << token << "' in "
-                                                << entry.path().string());
+                                                 << entry.path().string());
       }
     }
   }

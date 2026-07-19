@@ -114,9 +114,9 @@ void NodeLogCollector::PollOnce() {
       } catch (const std::exception& error) {
         const std::string message = error.what();
         if (message != last_errors_[node_index][source_index]) {
-          BBP_LOG(warning)
-              << "cannot read " << ChainLogSourceName(source) << " for "
-              << nodes_[node_index].id << ": " << message;
+          BBP_LOG(warning) << "cannot read " << ChainLogSourceName(source)
+                           << " for " << nodes_[node_index].id << ": "
+                           << message;
           last_errors_[node_index][source_index] = message;
         }
         continue;

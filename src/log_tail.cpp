@@ -81,7 +81,7 @@ std::optional<LogTailChunk> TailLogFile(const std::filesystem::path& path,
 
   bool descriptor_open = true;
   try {
-    struct stat status{};
+    struct stat status {};
     if (fstat(fd, &status) != 0) {
       throw LogIoError(path, "inspect log file");
     }
