@@ -358,6 +358,51 @@ BOOST_AUTO_TEST_CASE(child_process_resolves_relative_binary_before_chdir) {
   std::filesystem::remove_all(run_dir);
 }
 
+BOOST_AUTO_TEST_CASE(child_process_applies_validated_environment_overrides) {
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-environment-" + std::to_string(getpid()));
+  std::filesystem::remove_all(run_dir);
+
+  bbp::ProcessSpec spec;
+  spec.binary = "/usr/bin/env";
+  spec.cwd = run_dir;
+  spec.stdout_path = run_dir / "stdout.log";
+  spec.stderr_path = run_dir / "stderr.log";
+  spec.environment = {{"BBP_PROCESS_TEST_VALUE", "exact inherited value"}};
+
+  bbp::ChildProcess child = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  BOOST_REQUIRE(child.WaitForExit(std::chrono::seconds(1)));
+  BOOST_REQUIRE(child.exit_status().has_value());
+  BOOST_TEST(*child.exit_status() == 0);
+  BOOST_TEST(bbp::ReadText(spec.stdout_path)
+                 .find("BBP_PROCESS_TEST_VALUE=exact inherited value\n") !=
+             std::string::npos);
+
+  spec.environment = {{"DUPLICATE", "first"}, {"DUPLICATE", "second"}};
+  BOOST_CHECK_THROW(bbp::ChildProcess::Spawn(spec, std::nullopt),
+                    std::runtime_error);
+  spec.environment = {{"INVALID=NAME", "value"}};
+  BOOST_CHECK_THROW(bbp::ChildProcess::Spawn(spec, std::nullopt),
+                    std::runtime_error);
+
+  const std::filesystem::path invalid_run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-invalid-environment-" + std::to_string(getpid()));
+  std::filesystem::remove_all(invalid_run_dir);
+  spec.cwd = invalid_run_dir;
+  spec.stdout_path = invalid_run_dir / "stdout.log";
+  spec.stderr_path = invalid_run_dir / "stderr.log";
+  spec.environment = {
+      {std::string("INVALID\0NAME", 12), "value"},
+  };
+  BOOST_CHECK_THROW(bbp::ChildProcess::Spawn(spec, std::nullopt),
+                    std::runtime_error);
+  BOOST_TEST(!std::filesystem::exists(invalid_run_dir));
+
+  std::filesystem::remove_all(run_dir);
+}
+
 BOOST_AUTO_TEST_CASE(child_process_termination_signals_complete_process_group) {
   const std::filesystem::path run_dir =
       std::filesystem::temp_directory_path() /

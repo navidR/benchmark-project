@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
@@ -141,12 +142,28 @@ void AttachPidToCgroup(const std::filesystem::path& cgroup, pid_t pid) {
   WriteText(cgroup / "cgroup.procs", std::to_string(pid));
 }
 
+void ValidateEnvironment(
+    const std::vector<std::pair<std::string, std::string>>& environment) {
+  std::set<std::string_view> names;
+  for (const auto& [name, value] : environment) {
+    if (name.empty() || name.find('=') != std::string::npos ||
+        name.find('\0') != std::string::npos ||
+        value.find('\0') != std::string::npos) {
+      throw std::runtime_error("process environment entry is malformed");
+    }
+    if (!names.insert(name).second) {
+      throw std::runtime_error("process environment contains a duplicate name");
+    }
+  }
+}
+
 }  // namespace
 
 ChildProcess ChildProcess::Spawn(
     const ProcessSpec& spec,
     const std::optional<std::filesystem::path>& cgroup) {
   RequireExecutable(spec.binary);
+  ValidateEnvironment(spec.environment);
   const std::filesystem::path executable =
       std::filesystem::absolute(spec.binary);
   EnsureDirectory(spec.stdout_path.parent_path());
@@ -185,6 +202,11 @@ ChildProcess ChildProcess::Spawn(
     sigemptyset(&empty_signal_mask);
     if (sigprocmask(SIG_SETMASK, &empty_signal_mask, nullptr) != 0) {
       ChildSetupFail("reset signal mask", setup_status[1]);
+    }
+    for (const auto& [name, value] : spec.environment) {
+      if (setenv(name.c_str(), value.c_str(), 1) != 0) {
+        ChildSetupFail("set process environment", setup_status[1]);
+      }
     }
     if (spec.network_namespace_fd &&
         setns(*spec.network_namespace_fd, CLONE_NEWNET) != 0) {

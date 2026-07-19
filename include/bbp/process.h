@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bbp {
@@ -16,6 +17,7 @@ struct ProcessSpec {
   std::filesystem::path cwd;
   std::filesystem::path stdout_path;
   std::filesystem::path stderr_path;
+  std::vector<std::pair<std::string, std::string>> environment;
   std::optional<int> network_namespace_fd;
 };
 
