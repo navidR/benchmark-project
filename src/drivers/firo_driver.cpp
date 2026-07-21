@@ -518,6 +518,83 @@ FiroDriver::FiroDriver(std::chrono::milliseconds rpc_timeout,
   }
 }
 
+std::optional<OperatorConnectionCommand>
+FiroDriver::BuildOperatorConnectionCommand(
+    const FiroNodeConfig& config, const std::filesystem::path& run_root) const {
+  if (config.network != ChainNetwork::kRegtest) {
+    throw std::runtime_error("Firo driver supports only regtest network");
+  }
+  if (config.p2p_port == 0U) {
+    throw std::runtime_error(
+        "Firo operator connection requires a nonzero P2P port");
+  }
+  boost::system::error_code address_error;
+  const boost::asio::ip::address peer_address =
+      boost::asio::ip::make_address(config.p2p_host, address_error);
+  if (address_error || !peer_address.is_v4() || peer_address.is_unspecified() ||
+      peer_address.is_multicast()) {
+    throw std::runtime_error(
+        "Firo operator connection requires a reachable IPv4 peer address");
+  }
+  if (!std::filesystem::is_directory(run_root)) {
+    throw std::runtime_error("Firo operator connection run root is missing: " +
+                             run_root.string());
+  }
+
+  RequireExecutable(config.binary);
+  const std::filesystem::path daemon =
+      std::filesystem::canonical(config.binary);
+  std::filesystem::path executable = daemon.parent_path() / "firo-qt";
+  RequireExecutable(executable);
+  executable = std::filesystem::canonical(executable);
+
+  const std::filesystem::path canonical_run_root =
+      std::filesystem::canonical(run_root);
+  const std::filesystem::path data_dir =
+      canonical_run_root / "operator" / "firo-qt";
+  EnsureDirectory(data_dir);
+  std::error_code permission_error;
+  std::filesystem::permissions(data_dir, std::filesystem::perms::owner_all,
+                               std::filesystem::perm_options::replace,
+                               permission_error);
+  if (permission_error) {
+    throw std::runtime_error(
+        "set Firo operator data directory permissions failed: " +
+        permission_error.message());
+  }
+  const std::filesystem::path canonical_data_dir =
+      std::filesystem::canonical(data_dir);
+  const auto path_mismatch =
+      std::mismatch(canonical_run_root.begin(), canonical_run_root.end(),
+                    canonical_data_dir.begin(), canonical_data_dir.end());
+  if (path_mismatch.first != canonical_run_root.end() ||
+      canonical_data_dir == std::filesystem::canonical(config.data_dir)) {
+    throw std::runtime_error(
+        "Firo operator data directory is not isolated below the run root");
+  }
+
+  OperatorConnectionCommand command;
+  command.executable = std::move(executable);
+  command.data_dir = canonical_data_dir;
+  command.peer_address = config.p2p_host;
+  command.peer_port = config.p2p_port;
+  command.arguments = {
+      "-regtest",
+      Arg("-datadir", canonical_data_dir.string()),
+      Arg("-connect", config.p2p_host + ":" + std::to_string(config.p2p_port)),
+      "-dns=0",
+      "-dnsseed=0",
+      "-forcednsseed=0",
+      "-maxconnections=1",
+      "-listen=0",
+      "-discover=0",
+      "-listenonion=0",
+      "-torsetup=0",
+      "-upnp=0",
+  };
+  return command;
+}
+
 ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
   if (config.network != ChainNetwork::kRegtest) {
     throw std::runtime_error("Firo driver supports only regtest network");

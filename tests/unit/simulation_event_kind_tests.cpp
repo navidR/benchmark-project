@@ -17,6 +17,7 @@ BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
       bbp::SimulationEventKind::kProcessExited,
       bbp::SimulationEventKind::kProcessExitedBeforeRpcReady,
       bbp::SimulationEventKind::kRpcReady,
+      bbp::SimulationEventKind::kOperatorConnectionCommand,
       bbp::SimulationEventKind::kStartupPeerConnected,
       bbp::SimulationEventKind::kWalletAddressRequested,
       bbp::SimulationEventKind::kWalletAddressCreated,

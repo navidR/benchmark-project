@@ -1850,6 +1850,7 @@ struct IncrementalRunReport::Impl {
     for (const std::string_view field : kArrayFields) {
       report[field] = boost::json::array{};
     }
+    report["operator_connection_command"] = nullptr;
 
     event_count = 0;
     metric_count = 0;
@@ -2078,6 +2079,16 @@ struct IncrementalRunReport::Impl {
           nodes[node_id].last_error_kind.reset();
         }
         break;
+      case SimulationEventKind::kOperatorConnectionCommand: {
+        boost::json::value detail = ParseEventDetail(event);
+        if (detail.is_object()) {
+          boost::json::object connection = detail.as_object();
+          connection["node_id"] = node_id;
+          connection["timestamp"] = OptionalStringField(event, "timestamp");
+          report["operator_connection_command"] = std::move(connection);
+        }
+        break;
+      }
       case SimulationEventKind::kStdoutTail:
       case SimulationEventKind::kStderrTail:
       case SimulationEventKind::kDaemonLogTail:

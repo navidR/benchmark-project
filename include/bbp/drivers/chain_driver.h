@@ -16,6 +16,7 @@
 #include "bbp/http_client.h"
 #include "bbp/log_tail.h"
 #include "bbp/mining_difficulty.h"
+#include "bbp/operator_connection.h"
 #include "bbp/process.h"
 
 namespace bbp {
@@ -154,6 +155,9 @@ class ChainDriver {
   virtual ~ChainDriver() = default;
 
   virtual ProcessSpec RenderProcess(const ChainNodeConfig& config) const = 0;
+  virtual std::optional<OperatorConnectionCommand>
+  BuildOperatorConnectionCommand(const ChainNodeConfig& config,
+                                 const std::filesystem::path& run_root) const;
   virtual std::optional<LogTailChunk> ReadLogTail(
       const ChainNodeConfig& config, ChainLogSource source,
       const LogTailCursor& cursor, std::uint64_t max_bytes) const = 0;

@@ -19,6 +19,7 @@ enum class SimulationEventKind {
   kProcessExited,
   kProcessExitedBeforeRpcReady,
   kRpcReady,
+  kOperatorConnectionCommand,
   kStartupPeerConnected,
   kWalletAddressRequested,
   kWalletAddressCreated,

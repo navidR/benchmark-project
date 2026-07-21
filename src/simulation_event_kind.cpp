@@ -32,6 +32,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "process_exited_before_rpc_ready";
     case SimulationEventKind::kRpcReady:
       return "rpc_ready";
+    case SimulationEventKind::kOperatorConnectionCommand:
+      return "operator_connection_command";
     case SimulationEventKind::kStartupPeerConnected:
       return "startup_peer_connected";
     case SimulationEventKind::kWalletAddressRequested:
@@ -182,6 +184,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
   if (name == "process_exited_before_rpc_ready")
     return SimulationEventKind::kProcessExitedBeforeRpcReady;
   if (name == "rpc_ready") return SimulationEventKind::kRpcReady;
+  if (name == "operator_connection_command")
+    return SimulationEventKind::kOperatorConnectionCommand;
   if (name == "startup_peer_connected")
     return SimulationEventKind::kStartupPeerConnected;
   if (name == "wallet_address_requested")

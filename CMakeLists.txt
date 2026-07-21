@@ -239,6 +239,7 @@ add_executable(bbp
   src/node_file_pane.cpp
   src/node_log_collector.cpp
   src/node_log_pane.cpp
+  src/operator_connection.cpp
   src/operator_command_status.cpp
   src/peer_count_policy.cpp
   src/peer_connectivity_controller.cpp
@@ -336,6 +337,7 @@ if(BUILD_TESTING)
     tests/unit/node_log_pane_tests.cpp
     tests/unit/node_lifecycle_policy_tests.cpp
     tests/unit/node_runtime_tests.cpp
+    tests/unit/operator_connection_tests.cpp
     tests/unit/operator_command_status_tests.cpp
     tests/unit/peer_connectivity_controller_tests.cpp
     tests/unit/peer_list_pane_tests.cpp
@@ -395,6 +397,7 @@ if(BUILD_TESTING)
     src/node_artifact_inventory.cpp
     src/node_file_pane.cpp
     src/node_log_pane.cpp
+    src/operator_connection.cpp
     src/operator_command_status.cpp
     src/peer_count_policy.cpp
     src/peer_connectivity_controller.cpp
@@ -1566,6 +1569,10 @@ if(BUILD_TESTING)
       $<TARGET_FILE:bbp>
       --run "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
       --once
+  )
+  set_tests_properties(bbp-integrated-tui-once
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION "manual GUI command available"
   )
   add_test(NAME bbp-report-run-id-under-benchmark-root
     COMMAND bbp

@@ -50,6 +50,60 @@ std::uint64_t JsonIntegerValue(const boost::json::value& value) {
 
 }  // namespace
 
+BOOST_AUTO_TEST_CASE(run_report_preserves_manual_operator_connection_command) {
+  const std::filesystem::path dir =
+      MakeTestDir("run-report-operator-connection");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"r1","chain":"firo","nodes":1})");
+  boost::json::object detail;
+  detail["kind"] = "manual_firo_gui";
+  detail["manual_launch"] = true;
+  detail["discovery_disabled"] = true;
+  detail["wallet_enabled"] = true;
+  detail["network"] = "regtest";
+  detail["executable"] = "/opt/firo/bin/firo-qt";
+  detail["arguments"] =
+      boost::json::array{"-regtest", "-datadir=/tmp/run/operator/firo-qt",
+                         "-connect=10.77.0.2:19168", "-dnsseed=0", "-listen=0"};
+  detail["argv"] = boost::json::array{"/opt/firo/bin/firo-qt",
+                                      "-regtest",
+                                      "-datadir=/tmp/run/operator/firo-qt",
+                                      "-connect=10.77.0.2:19168",
+                                      "-dnsseed=0",
+                                      "-listen=0"};
+  detail["command"] =
+      "'/opt/firo/bin/firo-qt' '-regtest' "
+      "'-datadir=/tmp/run/operator/firo-qt' "
+      "'-connect=10.77.0.2:19168' '-dnsseed=0' '-listen=0'";
+  detail["data_dir"] = "/tmp/run/operator/firo-qt";
+  detail["peer_address"] = "10.77.0.2";
+  detail["peer_port"] = 19168U;
+  detail["peer_endpoint"] = "10.77.0.2:19168";
+  boost::json::object event;
+  event["timestamp"] = "2026-07-21T00:00:00Z";
+  event["run_id"] = "r1";
+  event["node_id"] = "firo-1";
+  event["event"] = "operator_connection_command";
+  event["detail"] = boost::json::serialize(detail);
+  bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+
+  const boost::json::object report =
+      boost::json::parse(bbp::BuildRunReportJson(dir)).as_object();
+  const boost::json::object& connection =
+      report.at("operator_connection_command").as_object();
+  BOOST_TEST(connection.at("node_id").as_string() == "firo-1");
+  BOOST_TEST(connection.at("timestamp").as_string() == "2026-07-21T00:00:00Z");
+  BOOST_TEST(connection.at("command") == detail.at("command"));
+  BOOST_TEST(connection.at("arguments") == detail.at("arguments"));
+  BOOST_TEST(connection.at("argv") == detail.at("argv"));
+  BOOST_TEST(connection.at("data_dir") == detail.at("data_dir"));
+  BOOST_TEST(connection.at("peer_endpoint") == detail.at("peer_endpoint"));
+  BOOST_TEST(connection.at("manual_launch").as_bool());
+  BOOST_TEST(connection.at("discovery_disabled").as_bool());
+  BOOST_TEST(connection.at("wallet_enabled").as_bool());
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(run_report_normalizes_process_control_schema) {
   const std::filesystem::path canonical =
       MakeTestDir("run-report-process-canonical");

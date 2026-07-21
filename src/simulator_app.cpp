@@ -7137,6 +7137,60 @@ void RequireNodeRunning(const NodeRuntime& node, std::string_view action) {
   }
 }
 
+void PublishOperatorConnectionCommand(const Options& options,
+                                      const std::filesystem::path& run_root,
+                                      const std::filesystem::path& events_path,
+                                      const ChainDriver& driver,
+                                      const std::vector<NodeRuntime>& nodes,
+                                      bool* resolved) {
+  if (*resolved) {
+    return;
+  }
+  for (const NodeRuntime& node : nodes) {
+    if (!node.AllowsChainMetrics() || !node.process.running()) {
+      continue;
+    }
+    const std::optional<OperatorConnectionCommand> connection =
+        driver.BuildOperatorConnectionCommand(node.config, run_root);
+    *resolved = true;
+    if (!connection) {
+      return;
+    }
+
+    boost::json::array arguments;
+    arguments.reserve(connection->arguments.size());
+    for (const std::string& argument : connection->arguments) {
+      arguments.emplace_back(argument);
+    }
+    boost::json::array argv;
+    argv.reserve(connection->arguments.size() + 1U);
+    argv.emplace_back(connection->executable.string());
+    for (const std::string& argument : connection->arguments) {
+      argv.emplace_back(argument);
+    }
+    boost::json::object detail;
+    detail["kind"] = "manual_firo_gui";
+    detail["manual_launch"] = true;
+    detail["discovery_disabled"] = true;
+    detail["wallet_enabled"] = true;
+    detail["network"] = ChainNetworkName(node.config.network);
+    detail["executable"] = connection->executable.string();
+    detail["arguments"] = std::move(arguments);
+    detail["argv"] = std::move(argv);
+    detail["command"] = connection->ShellCommand();
+    detail["data_dir"] = connection->data_dir.string();
+    detail["peer_address"] = connection->peer_address;
+    detail["peer_port"] = connection->peer_port;
+    detail["peer_endpoint"] =
+        connection->peer_address + ":" + std::to_string(connection->peer_port);
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kOperatorConnectionCommand,
+               boost::json::serialize(detail));
+    BBP_LOG(info) << "manual Firo GUI command: " << connection->ShellCommand();
+    return;
+  }
+}
+
 std::string GeneratedBlocksDetail(
     uint32_t workload_index, uint32_t workload_count, uint32_t generator_node,
     uint64_t start_height, uint64_t target_height,
@@ -12869,6 +12923,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   };
   const bool timed_node_lifecycle = HasTimedNodeLifecycle(options);
   std::chrono::steady_clock::time_point lifecycle_epoch;
+  bool operator_connection_resolved = false;
   std::chrono::steady_clock::time_point event_engine_epoch;
   const auto start_duration_timer =
       [&](std::chrono::steady_clock::time_point epoch) {
@@ -12911,6 +12966,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     StartNodes(options, run_root, events_path, chain_spec, driver,
                runtime_topology, nodes, lifecycle_epoch, stop_token);
     network_allocation_lock.reset();
+    PublishOperatorConnectionCommand(options, run_root, events_path, driver,
+                                     nodes, &operator_connection_resolved);
     const std::vector<std::uint32_t> miner_indexes =
         ConfiguredMinerIndexes(options);
     if (options.block_production.enabled && miner_indexes.empty()) {
@@ -13612,6 +13669,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                         node.config, *options.block_production.difficulty,
                         operation_stop_token);
                   }
+                  PublishOperatorConnectionCommand(
+                      options, run_root, events_path, driver, nodes,
+                      &operator_connection_resolved);
                 }
               }
             }

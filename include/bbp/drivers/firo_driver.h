@@ -23,6 +23,9 @@ class FiroDriver final : public ChainDriver {
                       std::string driver_name = "Firo");
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const override;
+  std::optional<OperatorConnectionCommand> BuildOperatorConnectionCommand(
+      const FiroNodeConfig& config,
+      const std::filesystem::path& run_root) const override;
   std::optional<LogTailChunk> ReadLogTail(
       const FiroNodeConfig& config, ChainLogSource source,
       const LogTailCursor& cursor, std::uint64_t max_bytes) const override;

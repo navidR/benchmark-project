@@ -20,6 +20,7 @@
 
 #include "bbp/drivers/firo_driver.h"
 #include "bbp/simulation_cancelled.h"
+#include "bbp/util.h"
 
 namespace {
 
@@ -59,6 +60,102 @@ std::vector<std::string> ServeRpcResponses(
 }
 
 }  // namespace
+
+BOOST_AUTO_TEST_CASE(firo_builds_isolated_manual_gui_command) {
+  const std::filesystem::path test_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-firo-gui-command-" + std::to_string(getpid()));
+  std::filesystem::remove_all(test_dir);
+  const std::filesystem::path bin_dir = test_dir / "Firo bin";
+  const std::filesystem::path run_root = test_dir / "run root";
+  const std::filesystem::path node_data = run_root / "nodes" / "firo-1";
+  std::filesystem::create_directories(bin_dir);
+  std::filesystem::create_directories(node_data);
+  const std::filesystem::path qt_binary = bin_dir / "firo-qt";
+  const std::filesystem::path daemon_binary = bin_dir / "firod";
+  bbp::WriteText(qt_binary, "test fixture\n");
+  bbp::WriteText(daemon_binary, "test fixture\n");
+  std::filesystem::permissions(qt_binary,
+                               std::filesystem::perms::owner_read |
+                                   std::filesystem::perms::owner_write |
+                                   std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::replace);
+  std::filesystem::permissions(daemon_binary,
+                               std::filesystem::perms::owner_read |
+                                   std::filesystem::perms::owner_write |
+                                   std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::replace);
+
+  bbp::FiroNodeConfig config;
+  config.id = "firo-1";
+  config.binary = daemon_binary;
+  config.data_dir = node_data;
+  config.p2p_host = "10.77.0.2";
+  config.p2p_port = 19168U;
+
+  const bbp::FiroDriver driver(std::chrono::milliseconds(100));
+  const std::optional<bbp::OperatorConnectionCommand> connection =
+      driver.BuildOperatorConnectionCommand(config, run_root);
+  BOOST_REQUIRE(connection);
+  BOOST_TEST(connection->executable == std::filesystem::canonical(qt_binary));
+  BOOST_TEST(connection->data_dir ==
+             std::filesystem::canonical(run_root / "operator" / "firo-qt"));
+  BOOST_TEST(connection->data_dir != std::filesystem::canonical(node_data));
+  BOOST_TEST(connection->peer_address == "10.77.0.2");
+  BOOST_TEST(connection->peer_port == 19168U);
+  const std::vector<std::string> expected_arguments = {
+      "-regtest",
+      "-datadir=" + connection->data_dir.string(),
+      "-connect=10.77.0.2:19168",
+      "-dns=0",
+      "-dnsseed=0",
+      "-forcednsseed=0",
+      "-maxconnections=1",
+      "-listen=0",
+      "-discover=0",
+      "-listenonion=0",
+      "-torsetup=0",
+      "-upnp=0",
+  };
+  BOOST_TEST(connection->arguments == expected_arguments,
+             boost::test_tools::per_element());
+  BOOST_CHECK(std::ranges::find(connection->arguments, "-disablewallet") ==
+              connection->arguments.end());
+  BOOST_TEST(connection->ShellCommand().starts_with(
+      "'" + std::filesystem::canonical(qt_binary).string() + "' '-regtest'"));
+  const std::filesystem::perms permissions =
+      std::filesystem::status(connection->data_dir).permissions();
+  BOOST_CHECK((permissions & std::filesystem::perms::owner_all) ==
+              std::filesystem::perms::owner_all);
+  BOOST_CHECK((permissions & std::filesystem::perms::group_all) ==
+              std::filesystem::perms::none);
+  BOOST_CHECK((permissions & std::filesystem::perms::others_all) ==
+              std::filesystem::perms::none);
+
+  config.p2p_port = 0U;
+  BOOST_CHECK_THROW(driver.BuildOperatorConnectionCommand(config, run_root),
+                    std::runtime_error);
+  config.p2p_port = 19168U;
+  config.p2p_host = "0.0.0.0";
+  BOOST_CHECK_THROW(driver.BuildOperatorConnectionCommand(config, run_root),
+                    std::runtime_error);
+  config.p2p_host = "ff02::1";
+  BOOST_CHECK_THROW(driver.BuildOperatorConnectionCommand(config, run_root),
+                    std::runtime_error);
+  config.p2p_host = "not-an-address";
+  BOOST_CHECK_THROW(driver.BuildOperatorConnectionCommand(config, run_root),
+                    std::runtime_error);
+  config.p2p_host = "10.77.0.2";
+  BOOST_CHECK_THROW(
+      driver.BuildOperatorConnectionCommand(config, test_dir / "missing"),
+      std::runtime_error);
+
+  std::filesystem::permissions(qt_binary, std::filesystem::perms::owner_read,
+                               std::filesystem::perm_options::replace);
+  BOOST_CHECK_THROW(driver.BuildOperatorConnectionCommand(config, run_root),
+                    std::runtime_error);
+  std::filesystem::remove_all(test_dir);
+}
 
 BOOST_AUTO_TEST_CASE(firo_reads_normalized_chain_metrics) {
   namespace asio = boost::asio;

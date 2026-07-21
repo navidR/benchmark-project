@@ -32,6 +32,7 @@
 #include "bbp/node_file_pane.h"
 #include "bbp/node_log_pane.h"
 #include "bbp/operator_command_status.h"
+#include "bbp/operator_connection.h"
 #include "bbp/peer_list_pane.h"
 #include "bbp/perf_counter_target_resolver.h"
 #include "bbp/run_report.h"
@@ -364,14 +365,18 @@ std::string NetworkLossText(const boost::json::object& metrics) {
 }
 
 std::string WorkloadsSummaryText(const boost::json::object& report) {
+  const std::string operator_suffix =
+      OperatorConnectionCommandFromReport(report).empty()
+          ? std::string{}
+          : "; manual GUI command available";
   const boost::json::value* workloads_value = report.if_contains("workloads");
   if (workloads_value == nullptr || !workloads_value->is_array()) {
-    return "workloads: -";
+    return "workloads: -" + operator_suffix;
   }
 
   const boost::json::array& workloads = workloads_value->as_array();
   if (workloads.empty()) {
-    return "workloads: 0";
+    return "workloads: 0" + operator_suffix;
   }
   std::string text = "workloads: " + std::to_string(workloads.size());
   std::size_t index = 0;
@@ -513,7 +518,7 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
         break;
     }
   }
-  return text;
+  return text + operator_suffix;
 }
 
 std::string LifecycleSummaryText(const boost::json::object& report) {
@@ -1390,6 +1395,16 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   const int left_width = std::max(0, cols / 2);
   const int right_width = std::max(0, cols - left_width);
   int y = top + 2;
+  const std::string operator_command =
+      OperatorConnectionCommandFromReport(report);
+  if (!operator_command.empty()) {
+    AddText(y, 0, cols, "manual GUI command: " + operator_command,
+            COLOR_PAIR(kColorTitle) | A_BOLD);
+    ++y;
+    if (y >= bottom) {
+      return;
+    }
+  }
   AddDetailPair(y, 0, left_width, "id", JsonString(*node, "node_id", "-"));
   AddDetailPair(y, left_width, right_width, "state",
                 JsonString(*node, "final_state", "-"));
