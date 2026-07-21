@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -262,6 +263,23 @@ class ScopedNetlinkFailurePlan {
   bool installed_ = false;
 };
 
+enum class RtnetlinkDumpFailure {
+  kTimeout,
+  kIncomplete,
+};
+
+class ScopedRtnetlinkDumpFailure {
+ public:
+  explicit ScopedRtnetlinkDumpFailure(RtnetlinkDumpFailure failure);
+  ScopedRtnetlinkDumpFailure(const ScopedRtnetlinkDumpFailure&) = delete;
+  ScopedRtnetlinkDumpFailure& operator=(const ScopedRtnetlinkDumpFailure&) =
+      delete;
+  ~ScopedRtnetlinkDumpFailure();
+
+ private:
+  bool installed_ = false;
+};
+
 void ValidateNetlinkAcknowledgementForTest(
     const std::vector<std::uint8_t>& reply, std::uint32_t sequence,
     std::uint32_t port_id);
@@ -395,18 +413,24 @@ struct DirectionalNetworkPolicyProbe {
   std::vector<LinkInfo> parent_after_delete;
 };
 
-std::vector<LinkInfo> ListNetworkLinks();
-std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd);
-std::vector<AddressInfo> ListIpv4Addresses();
-std::vector<AddressInfo> ListIpv4AddressesInNamespace(int netns_fd);
-std::vector<RouteInfo> ListIpv4Routes();
-std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd);
-std::vector<QdiscInfo> ListQdiscs();
-std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd);
-std::vector<TcFilterInfo> ListTcFilters();
-std::vector<TcFilterInfo> ListTcFiltersForInterface(const std::string& if_name);
+std::vector<LinkInfo> ListNetworkLinks(std::stop_token stop_token = {});
+std::vector<LinkInfo> ListNetworkLinksInNamespace(
+    int netns_fd, std::stop_token stop_token = {});
+std::vector<AddressInfo> ListIpv4Addresses(std::stop_token stop_token = {});
+std::vector<AddressInfo> ListIpv4AddressesInNamespace(
+    int netns_fd, std::stop_token stop_token = {});
+std::vector<RouteInfo> ListIpv4Routes(std::stop_token stop_token = {});
+std::vector<RouteInfo> ListIpv4RoutesInNamespace(
+    int netns_fd, std::stop_token stop_token = {});
+std::vector<QdiscInfo> ListQdiscs(std::stop_token stop_token = {});
+std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd,
+                                             std::stop_token stop_token = {});
+std::vector<TcFilterInfo> ListTcFilters(std::stop_token stop_token = {});
+std::vector<TcFilterInfo> ListTcFiltersForInterface(
+    const std::string& if_name, std::stop_token stop_token = {});
 std::vector<TcFilterInfo> ListTcFiltersForInterfaceParentInNamespace(
-    int netns_fd, const std::string& if_name, std::uint32_t parent);
+    int netns_fd, const std::string& if_name, std::uint32_t parent,
+    std::stop_token stop_token = {});
 bool QdiscMatchesNetworkCondition(const QdiscInfo& qdisc,
                                   const NetworkCondition& condition);
 bool QdiscsMatchNetworkCondition(const std::vector<QdiscInfo>& qdiscs,
@@ -432,7 +456,8 @@ DirectionalNetworkPolicyStats SummarizeDirectionalNetworkPolicyStats(
     const std::vector<DirectionalNetworkPolicy>& policies);
 DirectionalNetworkPolicyStats ReadDirectionalNetworkPolicyStatsInNamespace(
     int netns_fd, const std::string& if_name,
-    const std::vector<DirectionalNetworkPolicy>& policies);
+    const std::vector<DirectionalNetworkPolicy>& policies,
+    std::stop_token stop_token = {});
 bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       const std::string& if_name,
                                       const std::string& src_address,
@@ -479,9 +504,12 @@ void DeleteEgressIpv4TcpDropFilter(const std::string& if_name,
 void UpdateDirectionalNetworkPoliciesInNamespace(
     int netns_fd, const std::string& if_name,
     const std::vector<DirectionalNetworkPolicy>& previous,
-    const std::vector<DirectionalNetworkPolicy>& desired);
-void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config);
-void DeleteNodeVethNetwork(const NodeVethConfig& config);
+    const std::vector<DirectionalNetworkPolicy>& desired,
+    std::stop_token stop_token = {});
+void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
+                          std::stop_token stop_token = {});
+void DeleteNodeVethNetwork(const NodeVethConfig& config,
+                           std::stop_token stop_token = {});
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();
 RouteProbe ProbeIpv4RouteAssignment();

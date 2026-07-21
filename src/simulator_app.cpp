@@ -6524,8 +6524,9 @@ const RunOwnership& RequireRunOwnership(const Options& options) {
   return *options.run_ownership;
 }
 
-void RequireRunNetworkInterfacesAvailable(const Options& options) {
-  const std::vector<LinkInfo> links = ListNetworkLinks();
+void RequireRunNetworkInterfacesAvailable(const Options& options,
+                                          std::stop_token stop_token) {
+  const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
   for (std::uint32_t node_index = 0; node_index < options.nodes; ++node_index) {
     for (const char suffix : {'h', 'p'}) {
       const std::string name =
@@ -6659,8 +6660,9 @@ const QdiscInfo* FindQdiscByInterfaceName(const std::vector<QdiscInfo>& qdiscs,
   return nullptr;
 }
 
-QdiscInfo VerifyNodeNetworkCondition(const NodeVethConfig& config) {
-  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+QdiscInfo VerifyNodeNetworkCondition(const NodeVethConfig& config,
+                                     std::stop_token stop_token = {}) {
+  const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
   QdiscInfo summary;
   if (!QdiscsMatchNetworkCondition(qdiscs, config.host_name, config.condition,
                                    &summary)) {
@@ -8474,7 +8476,7 @@ std::uint32_t WriteMetricsSnapshot(
     std::optional<NodeVethConfig> network;
     std::string profile;
   };
-  const std::vector<LinkInfo> links = ListNetworkLinks();
+  const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
   std::vector<QdiscInfo> qdiscs;
   std::vector<NetworkMetricsState> network_states(nodes.size());
   {
@@ -8483,7 +8485,7 @@ std::uint32_t WriteMetricsSnapshot(
         nodes.begin(), nodes.end(),
         [](const NodeRuntime& node) { return node.network.has_value(); });
     if (has_isolated_node) {
-      qdiscs = ListQdiscs();
+      qdiscs = ListQdiscs(stop_token);
     }
     for (std::size_t index = 0; index < nodes.size(); ++index) {
       network_states[index].network = nodes[index].network;
@@ -8603,7 +8605,7 @@ std::uint32_t WriteMetricsSnapshot(
       runtime.prefix_length = network->prefix_len;
       if (node.network_namespace) {
         runtime.routes =
-            ListIpv4RoutesInNamespace(node.network_namespace->fd());
+            ListIpv4RoutesInNamespace(node.network_namespace->fd(), stop_token);
       }
     }
     std::optional<DirectionalNetworkPolicyStats> directional_stats;
@@ -8611,7 +8613,7 @@ std::uint32_t WriteMetricsSnapshot(
       std::lock_guard<std::mutex> lock(node_network_state_mutex);
       directional_stats = ReadDirectionalNetworkPolicyStatsInNamespace(
           node.network_namespace->fd(), network->peer_name,
-          node.directional_network_policies);
+          node.directional_network_policies, stop_token);
     }
     const LinkInfo* link =
         network ? FindLinkByName(links, network->host_name) : nullptr;
@@ -8639,7 +8641,7 @@ std::uint32_t WriteMetricsSnapshot(
       }
       if (link != nullptr) {
         std::lock_guard<std::mutex> lock(node_network_state_mutex);
-        filters = ListTcFiltersForInterface(network->host_name);
+        filters = ListTcFiltersForInterface(network->host_name, stop_token);
         filter_metrics = &filters;
       }
     }
@@ -10462,9 +10464,11 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         runtime.network_namespace =
             NetworkNamespace::Create(runtime.cgroup->path());
         runtime.network = MakeNodeVethConfig(options, i);
-        SetupNodeVethNetwork(runtime.network_namespace->fd(), *runtime.network);
+        SetupNodeVethNetwork(runtime.network_namespace->fd(), *runtime.network,
+                             stop_token);
         if (runtime.network->apply_condition) {
-          const QdiscInfo qdisc = VerifyNodeNetworkCondition(*runtime.network);
+          const QdiscInfo qdisc =
+              VerifyNodeNetworkCondition(*runtime.network, stop_token);
           WriteEvent(
               events_path, options.run_id, node_id,
               SimulationEventKind::kNetworkConditionVerified,
@@ -10475,7 +10479,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         if (!runtime.directional_network_policies.empty()) {
           UpdateDirectionalNetworkPoliciesInNamespace(
               runtime.network_namespace->fd(), runtime.network->peer_name, {},
-              runtime.directional_network_policies);
+              runtime.directional_network_policies, stop_token);
           boost::json::object detail;
           detail["source_node"] = i + 1U;
           detail["peer_if"] = runtime.network->peer_name;
@@ -10503,6 +10507,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                           NodeRuntimeLifecycle::kCgroupReady);
       nodes.push_back(std::move(runtime));
     } catch (...) {
+      const std::exception_ptr original_error = std::current_exception();
       TransitionNodeState(events_path, options.run_id, runtime,
                           NodeRuntimeLifecycle::kFailed);
       static_cast<void>(RequestNodeKill(runtime));
@@ -10520,9 +10525,22 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
         }
       }
       if (runtime.network) {
-        DeleteNodeVethNetwork(*runtime.network);
+        try {
+          DeleteNodeVethNetwork(*runtime.network);
+        } catch (const std::exception& cleanup_error) {
+          std::string original_message = "unknown startup failure";
+          try {
+            std::rethrow_exception(original_error);
+          } catch (const std::exception& original_exception) {
+            original_message = original_exception.what();
+          } catch (...) {
+          }
+          throw std::runtime_error(
+              original_message +
+              "; node network rollback failed: " + cleanup_error.what());
+        }
       }
-      throw;
+      std::rethrow_exception(original_error);
     }
   }
 
@@ -11250,7 +11268,7 @@ void ApplyTopologyEdgeWorkload(
       std::lock_guard<std::mutex> lock(node_network_state_mutex);
       UpdateDirectionalNetworkPoliciesInNamespace(
           source.network_namespace->fd(), source.network->peer_name,
-          previous_policies, desired_policies);
+          previous_policies, desired_policies, stop_token);
       source.directional_network_policies.swap(rollback_policy_state);
       kernel_updated = true;
     } else if (previous_policies != desired_policies) {
@@ -12025,7 +12043,7 @@ QdiscInfo ReplaceNodeNetworkConditionTransactional(
     ThrowIfStopRequested(stop_token);
     ReplaceNetworkConditionQdisc(updated.host_name, updated.condition);
     ThrowIfStopRequested(stop_token);
-    const QdiscInfo qdisc = VerifyNodeNetworkCondition(updated);
+    const QdiscInfo qdisc = VerifyNodeNetworkCondition(updated, stop_token);
     node->network = updated;
     node->network_profile.clear();
     return qdisc;
@@ -12151,7 +12169,8 @@ void ApplyNetworkProfileSwitch(const Options& options,
         desired_network.condition = desired;
         ReplaceNetworkConditionQdisc(desired_network.host_name, desired);
         ThrowIfStopRequested(stop_token);
-        previous.applied_qdisc = VerifyNodeNetworkCondition(desired_network);
+        previous.applied_qdisc =
+            VerifyNodeNetworkCondition(desired_network, stop_token);
         previous.current_network = std::move(desired_network);
       }
     } catch (...) {
@@ -13132,10 +13151,11 @@ void ApplyRuntimeNodeFreezes(const Options& options,
 }
 
 template <typename Action>
-void RunNodeCleanupStep(bool best_effort, std::string_view description,
+bool RunNodeCleanupStep(bool best_effort, std::string_view description,
                         Action&& action) {
   try {
     action();
+    return true;
   } catch (const std::exception& error) {
     if (!best_effort) {
       throw;
@@ -13148,6 +13168,7 @@ void RunNodeCleanupStep(bool best_effort, std::string_view description,
     }
     BBP_LOG(error) << description << " failed during node cleanup";
   }
+  return false;
 }
 
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
@@ -13347,22 +13368,30 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
     } catch (...) {
       record_failure("RPC credential removal", std::current_exception());
     }
+    bool network_cleanup_verified = true;
     if (node.network) {
-      RunNodeCleanupStep(best_effort, "node network removal",
-                         [&] { DeleteNodeVethNetwork(*node.network); });
-      RunNodeCleanupStep(best_effort, "network removal event", [&] {
-        WriteEvent(events_path, options.run_id, node.config.id,
-                   SimulationEventKind::kNetworkRemoved);
-      });
+      network_cleanup_verified =
+          RunNodeCleanupStep(best_effort, "verified node network removal", [&] {
+            DeleteNodeVethNetwork(*node.network);
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kNetworkRemoved);
+          });
     }
     if (node.network_namespace) {
       RunNodeCleanupStep(best_effort, "network namespace stop",
                          [&] { node.network_namespace->Stop(); });
     }
-    RunNodeCleanupStep(best_effort, "cleaned state event", [&] {
-      TransitionNodeState(events_path, options.run_id, node,
-                          NodeRuntimeLifecycle::kCleaned);
-    });
+    if (network_cleanup_verified) {
+      RunNodeCleanupStep(best_effort, "cleaned state event", [&] {
+        TransitionNodeState(events_path, options.run_id, node,
+                            NodeRuntimeLifecycle::kCleaned);
+      });
+    } else {
+      RunNodeCleanupStep(best_effort, "cleanup failure state event", [&] {
+        TransitionNodeState(events_path, options.run_id, node,
+                            NodeRuntimeLifecycle::kFailed);
+      });
+    }
   }
   if (options.cleanup_policy != CleanupPolicy::kRetainCgroups) {
     if (best_effort) {
@@ -13884,9 +13913,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
   if (options.isolate_network) {
     network_allocation_lock = std::make_unique<NetworkAllocationLock>();
-    RequireRunNetworkInterfacesAvailable(options);
+    RequireRunNetworkInterfacesAvailable(options, stop_token);
     options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
-        options.run_id, options.nodes, ListIpv4Routes());
+        options.run_id, options.nodes, ListIpv4Routes(stop_token));
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   RuntimePeerTopology runtime_topology(options.topology.peer_topology,

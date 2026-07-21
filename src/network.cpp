@@ -13,6 +13,7 @@
 #include <linux/veth.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -187,25 +188,6 @@ class MnlSocket {
 
   unsigned int PortId() const { return mnl_socket_get_portid(socket_); }
 
-  void SetReceiveTimeout(std::chrono::milliseconds timeout) {
-    const auto whole_seconds = timeout.count() / 1000;
-    if (timeout.count() <= 0 ||
-        whole_seconds >
-            static_cast<decltype(timeout.count())>(
-                std::numeric_limits<decltype(timeval::tv_sec)>::max())) {
-      throw std::runtime_error("invalid netlink receive timeout");
-    }
-    timeval value{};
-    value.tv_sec = static_cast<decltype(value.tv_sec)>(timeout.count() / 1000);
-    value.tv_usec =
-        static_cast<decltype(value.tv_usec)>((timeout.count() % 1000) * 1000);
-    if (setsockopt(mnl_socket_get_fd(socket_), SOL_SOCKET, SO_RCVTIMEO, &value,
-                   sizeof(value)) != 0) {
-      throw std::runtime_error(std::string("setsockopt(SO_RCVTIMEO) failed: ") +
-                               std::strerror(errno));
-    }
-  }
-
   void Send(const void* data, size_t size) const {
     const ssize_t sent = mnl_socket_sendto(socket_, data, size);
     if (sent < 0) {
@@ -218,13 +200,48 @@ class MnlSocket {
     }
   }
 
-  ssize_t Receive(void* data, size_t size) const {
-    const ssize_t received = mnl_socket_recvfrom(socket_, data, size);
-    if (received < 0) {
-      throw std::runtime_error(std::string("mnl_socket_recvfrom failed: ") +
-                               std::strerror(errno));
+  ssize_t ReceiveUntil(void* data, size_t size,
+                       std::chrono::steady_clock::time_point deadline,
+                       std::stop_token stop_token) const {
+    constexpr auto kCancellationPollInterval = std::chrono::milliseconds(25);
+    while (true) {
+      if (stop_token.stop_requested()) {
+        throw std::runtime_error("netlink receive cancelled");
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        throw std::runtime_error("netlink receive deadline exceeded");
+      }
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+      const auto wait = std::min(kCancellationPollInterval,
+                                 remaining > std::chrono::milliseconds::zero()
+                                     ? remaining
+                                     : std::chrono::milliseconds(1));
+      pollfd descriptor{};
+      descriptor.fd = mnl_socket_get_fd(socket_);
+      descriptor.events = POLLIN;
+      const int ready = poll(&descriptor, 1, static_cast<int>(wait.count()));
+      if (ready == 0) {
+        continue;
+      }
+      if (ready < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw std::runtime_error(std::string("poll(netlink) failed: ") +
+                                 std::strerror(errno));
+      }
+      const ssize_t received = mnl_socket_recvfrom(socket_, data, size);
+      if (received < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        throw std::runtime_error(std::string("mnl_socket_recvfrom failed: ") +
+                                 std::strerror(errno));
+      }
+      return received;
     }
-    return received;
   }
 
  private:
@@ -976,12 +993,18 @@ DirectionalNetworkPolicyStats SummarizeDirectionalNetworkPolicyStats(
 namespace {
 
 constexpr std::chrono::milliseconds kNetlinkAcknowledgementTimeout{5000};
+constexpr std::chrono::milliseconds kRtnetlinkDumpTimeout{5000};
 
 #ifdef BBP_ENABLE_TEST_HOOKS
 struct NetlinkFailurePlanState {
   bool installed = false;
   std::uint64_t request_count = 0;
   std::vector<NetlinkFailurePoint> points;
+};
+
+struct RtnetlinkDumpFailureState {
+  bool installed = false;
+  RtnetlinkDumpFailure failure = RtnetlinkDumpFailure::kTimeout;
 };
 
 std::mutex& NetlinkFailurePlanMutex() {
@@ -992,6 +1015,20 @@ std::mutex& NetlinkFailurePlanMutex() {
 NetlinkFailurePlanState& MutableNetlinkFailurePlan() {
   static NetlinkFailurePlanState state;
   return state;
+}
+
+RtnetlinkDumpFailureState& MutableRtnetlinkDumpFailure() {
+  static RtnetlinkDumpFailureState state;
+  return state;
+}
+
+std::optional<RtnetlinkDumpFailure> CurrentRtnetlinkDumpFailureForTest() {
+  std::lock_guard lock(NetlinkFailurePlanMutex());
+  const RtnetlinkDumpFailureState& state = MutableRtnetlinkDumpFailure();
+  if (!state.installed) {
+    return std::nullopt;
+  }
+  return state.failure;
 }
 
 std::uint64_t BeginNetlinkRequestForTest() {
@@ -1101,24 +1138,98 @@ auto ExecuteInNetworkNamespace(int netns_fd,
   return result.get();
 }
 
-void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence) {
+void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence,
+                        bool* acknowledged = nullptr) {
+  if (acknowledged != nullptr) {
+    *acknowledged = false;
+  }
 #ifdef BBP_ENABLE_TEST_HOOKS
   const std::uint64_t request_number = BeginNetlinkRequestForTest();
   MaybeInjectNetlinkFailure(request_number, NetlinkFailurePhase::kBeforeSend);
 #endif
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
-  socket.SetReceiveTimeout(kNetlinkAcknowledgementTimeout);
   const unsigned int port_id = socket.PortId();
   socket.Send(nlh, nlh->nlmsg_len);
 #ifdef BBP_ENABLE_TEST_HOOKS
-  MaybeInjectNetlinkFailure(request_number, NetlinkFailurePhase::kAfterSend);
+  std::exception_ptr injected_after_send;
+  try {
+    MaybeInjectNetlinkFailure(request_number, NetlinkFailurePhase::kAfterSend);
+  } catch (...) {
+    injected_after_send = std::current_exception();
+  }
 #endif
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
-  const ssize_t received = socket.Receive(buffer.data(), buffer.size());
+  const ssize_t received = socket.ReceiveUntil(
+      buffer.data(), buffer.size(),
+      std::chrono::steady_clock::now() + kNetlinkAcknowledgementTimeout, {});
   ValidateNetlinkAcknowledgement(buffer.data(), static_cast<size_t>(received),
                                  sequence, port_id);
+  if (acknowledged != nullptr) {
+    *acknowledged = true;
+  }
+#ifdef BBP_ENABLE_TEST_HOOKS
+  if (injected_after_send) {
+    std::rethrow_exception(injected_after_send);
+  }
+#endif
+}
+
+template <typename ParseCallback, typename Output>
+void ReceiveRtnetlinkDump(MnlSocket& socket, std::uint32_t sequence,
+                          ParseCallback parse_callback, Output* output,
+                          std::stop_token stop_token) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + kRtnetlinkDumpTimeout;
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  bool received_partial_dump = false;
+  while (true) {
+#ifdef BBP_ENABLE_TEST_HOOKS
+    const std::optional<RtnetlinkDumpFailure> injected =
+        CurrentRtnetlinkDumpFailureForTest();
+    if (injected == RtnetlinkDumpFailure::kTimeout) {
+      throw std::runtime_error("rtnetlink dump receive deadline exceeded");
+    }
+#endif
+    ssize_t received = 0;
+    try {
+      received = socket.ReceiveUntil(buffer.data(), buffer.size(), deadline,
+                                     stop_token);
+    } catch (const std::runtime_error& error) {
+      if (received_partial_dump) {
+        throw std::runtime_error(
+            "rtnetlink dump incomplete before matching NLMSG_DONE: " +
+            std::string(error.what()));
+      }
+      throw std::runtime_error("rtnetlink dump receive failed: " +
+                               std::string(error.what()));
+    }
+    if (received == 0) {
+      throw std::runtime_error(
+          "rtnetlink dump incomplete before matching NLMSG_DONE");
+    }
+    const int status =
+        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
+                   socket.PortId(), parse_callback, output);
+    if (status == MNL_CB_ERROR) {
+      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
+                               std::strerror(errno));
+    }
+    if (status == MNL_CB_STOP) {
+#ifdef BBP_ENABLE_TEST_HOOKS
+      if (injected == RtnetlinkDumpFailure::kIncomplete) {
+        throw std::runtime_error(
+            "rtnetlink dump incomplete before matching NLMSG_DONE");
+      }
+#endif
+      return;
+    }
+    if (status != MNL_CB_OK) {
+      throw std::runtime_error("rtnetlink dump returned an invalid status");
+    }
+    received_partial_dump = true;
+  }
 }
 
 void PutRawPayload(nlmsghdr* nlh, const void* data, size_t size) {
@@ -1139,6 +1250,68 @@ void TryDeleteLink(const std::string& name) {
   try {
     DeleteLink(name);
   } catch (const std::exception&) {
+  }
+}
+
+std::string ExceptionMessage(const std::exception_ptr& error) {
+  if (!error) {
+    return "unknown failure";
+  }
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::exception& exception) {
+    return exception.what();
+  } catch (...) {
+    return "unknown failure";
+  }
+}
+
+void DeleteLinkAndVerifyAbsent(const std::string& name,
+                               std::stop_token stop_token) {
+  DeleteLink(name);
+  const std::vector<LinkInfo> remaining = ListNetworkLinks(stop_token);
+  if (HasLinkNamed(remaining, name)) {
+    throw std::runtime_error(
+        "deleted network interface remained after kernel read-back: " + name);
+  }
+}
+
+void SetLinkOwnershipAlias(const std::string& name,
+                           const std::string& ownership_alias);
+
+void RollBackCreatedVethPair(const std::string& host_name,
+                             const std::string& peer_name,
+                             const std::string& host_ownership_alias,
+                             const std::string& peer_ownership_alias) {
+  if (host_ownership_alias.empty() || peer_ownership_alias.empty()) {
+    throw std::runtime_error(
+        "cannot verify ownership of an ambiguously created veth pair");
+  }
+
+  SetLinkOwnershipAlias(host_name, host_ownership_alias);
+  const std::vector<LinkInfo> links = ListNetworkLinks();
+  const auto find_link = [&](const std::string& name) {
+    return std::find_if(
+        links.begin(), links.end(),
+        [&](const LinkInfo& candidate) { return candidate.name == name; });
+  };
+  const auto host = find_link(host_name);
+  const auto peer = find_link(peer_name);
+  if (host == links.end() || host->ownership_alias != host_ownership_alias) {
+    throw std::runtime_error(
+        "acknowledged veth owner alias was not visible before rollback");
+  }
+  if (peer == links.end()) {
+    throw std::runtime_error(
+        "acknowledged veth peer was not visible before rollback");
+  }
+
+  DeleteLink(host_name);
+  const std::vector<LinkInfo> remaining = ListNetworkLinks();
+  if (HasLinkNamed(remaining, host_name) ||
+      HasLinkNamed(remaining, peer_name)) {
+    throw std::runtime_error(
+        "ambiguously created veth pair remained after rollback read-back");
   }
 }
 
@@ -2213,6 +2386,27 @@ ScopedNetlinkFailurePlan::~ScopedNetlinkFailurePlan() {
   state.points.clear();
 }
 
+ScopedRtnetlinkDumpFailure::ScopedRtnetlinkDumpFailure(
+    RtnetlinkDumpFailure failure) {
+  std::lock_guard lock(NetlinkFailurePlanMutex());
+  RtnetlinkDumpFailureState& state = MutableRtnetlinkDumpFailure();
+  if (state.installed) {
+    throw std::logic_error("an rtnetlink dump failure is already installed");
+  }
+  state.installed = true;
+  state.failure = failure;
+  installed_ = true;
+}
+
+ScopedRtnetlinkDumpFailure::~ScopedRtnetlinkDumpFailure() {
+  if (!installed_) {
+    return;
+  }
+  std::lock_guard lock(NetlinkFailurePlanMutex());
+  RtnetlinkDumpFailureState& state = MutableRtnetlinkDumpFailure();
+  state.installed = false;
+}
+
 void ValidateNetlinkAcknowledgementForTest(
     const std::vector<std::uint8_t>& reply, std::uint32_t sequence,
     std::uint32_t port_id) {
@@ -2266,7 +2460,7 @@ void NetworkNamespace::Stop() {
   }
 }
 
-std::vector<LinkInfo> ListNetworkLinks() {
+std::vector<LinkInfo> ListNetworkLinks(std::stop_token stop_token) {
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
 
@@ -2284,24 +2478,12 @@ std::vector<LinkInfo> ListNetworkLinks() {
   socket.Send(nlh, nlh->nlmsg_len);
 
   std::vector<LinkInfo> links;
-  while (true) {
-    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-    const int status =
-        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
-                   socket.PortId(), ParseLinkMessage, &links);
-    if (status == MNL_CB_ERROR) {
-      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
-                               std::strerror(errno));
-    }
-    if (status == MNL_CB_STOP) {
-      break;
-    }
-  }
+  ReceiveRtnetlinkDump(socket, sequence, ParseLinkMessage, &links, stop_token);
 
   return links;
 }
 
-std::vector<AddressInfo> ListIpv4Addresses() {
+std::vector<AddressInfo> ListIpv4Addresses(std::stop_token stop_token) {
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
 
@@ -2319,24 +2501,13 @@ std::vector<AddressInfo> ListIpv4Addresses() {
   socket.Send(nlh, nlh->nlmsg_len);
 
   std::vector<AddressInfo> addresses;
-  while (true) {
-    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-    const int status =
-        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
-                   socket.PortId(), ParseAddressMessage, &addresses);
-    if (status == MNL_CB_ERROR) {
-      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
-                               std::strerror(errno));
-    }
-    if (status == MNL_CB_STOP) {
-      break;
-    }
-  }
+  ReceiveRtnetlinkDump(socket, sequence, ParseAddressMessage, &addresses,
+                       stop_token);
 
   return addresses;
 }
 
-std::vector<RouteInfo> ListIpv4Routes() {
+std::vector<RouteInfo> ListIpv4Routes(std::stop_token stop_token) {
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
 
@@ -2354,24 +2525,13 @@ std::vector<RouteInfo> ListIpv4Routes() {
   socket.Send(nlh, nlh->nlmsg_len);
 
   std::vector<RouteInfo> routes;
-  while (true) {
-    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-    const int status =
-        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
-                   socket.PortId(), ParseRouteMessage, &routes);
-    if (status == MNL_CB_ERROR) {
-      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
-                               std::strerror(errno));
-    }
-    if (status == MNL_CB_STOP) {
-      break;
-    }
-  }
+  ReceiveRtnetlinkDump(socket, sequence, ParseRouteMessage, &routes,
+                       stop_token);
 
   return routes;
 }
 
-std::vector<QdiscInfo> ListQdiscs() {
+std::vector<QdiscInfo> ListQdiscs(std::stop_token stop_token) {
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
 
@@ -2389,19 +2549,8 @@ std::vector<QdiscInfo> ListQdiscs() {
   socket.Send(nlh, nlh->nlmsg_len);
 
   std::vector<QdiscInfo> qdiscs;
-  while (true) {
-    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-    const int status =
-        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
-                   socket.PortId(), ParseQdiscMessage, &qdiscs);
-    if (status == MNL_CB_ERROR) {
-      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
-                               std::strerror(errno));
-    }
-    if (status == MNL_CB_STOP) {
-      break;
-    }
-  }
+  ReceiveRtnetlinkDump(socket, sequence, ParseQdiscMessage, &qdiscs,
+                       stop_token);
 
   return qdiscs;
 }
@@ -2409,7 +2558,8 @@ std::vector<QdiscInfo> ListQdiscs() {
 namespace {
 
 void AppendTcFiltersForLinkParent(const LinkInfo& link, std::uint32_t parent,
-                                  std::vector<TcFilterInfo>* filters) {
+                                  std::vector<TcFilterInfo>* filters,
+                                  std::stop_token stop_token) {
   if (link.index <= 0) {
     return;
   }
@@ -2430,24 +2580,14 @@ void AppendTcFiltersForLinkParent(const LinkInfo& link, std::uint32_t parent,
   message->tcm_parent = parent;
 
   socket.Send(nlh, nlh->nlmsg_len);
-  while (true) {
-    const ssize_t received = socket.Receive(buffer.data(), buffer.size());
-    const int status =
-        mnl_cb_run(buffer.data(), static_cast<size_t>(received), sequence,
-                   socket.PortId(), ParseFilterMessage, filters);
-    if (status == MNL_CB_ERROR) {
-      throw std::runtime_error(std::string("mnl_cb_run failed: ") +
-                               std::strerror(errno));
-    }
-    if (status == MNL_CB_STOP) {
-      break;
-    }
-  }
+  ReceiveRtnetlinkDump(socket, sequence, ParseFilterMessage, filters,
+                       stop_token);
 }
 
 void AppendTcFiltersForLink(const LinkInfo& link,
                             const std::vector<QdiscInfo>& qdiscs,
-                            std::vector<TcFilterInfo>* filters) {
+                            std::vector<TcFilterInfo>* filters,
+                            std::stop_token stop_token) {
   const std::array<std::uint32_t, 2> clsact_parents = {kClsactIngressParent,
                                                        kClsactEgressParent};
   if (link.index <= 0 ||
@@ -2455,25 +2595,25 @@ void AppendTcFiltersForLink(const LinkInfo& link,
     return;
   }
   for (const std::uint32_t parent : clsact_parents) {
-    AppendTcFiltersForLinkParent(link, parent, filters);
+    AppendTcFiltersForLinkParent(link, parent, filters, stop_token);
   }
 }
 
 }  // namespace
 
-std::vector<TcFilterInfo> ListTcFilters() {
+std::vector<TcFilterInfo> ListTcFilters(std::stop_token stop_token) {
   std::vector<TcFilterInfo> filters;
-  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-  for (const LinkInfo& link : ListNetworkLinks()) {
-    AppendTcFiltersForLink(link, qdiscs, &filters);
+  const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
+  for (const LinkInfo& link : ListNetworkLinks(stop_token)) {
+    AppendTcFiltersForLink(link, qdiscs, &filters, stop_token);
   }
   return filters;
 }
 
 std::vector<TcFilterInfo> ListTcFiltersForInterface(
-    const std::string& if_name) {
+    const std::string& if_name, std::stop_token stop_token) {
   RequireInterfaceName(if_name);
-  const std::vector<LinkInfo> links = ListNetworkLinks();
+  const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
   const auto link = std::find_if(
       links.begin(), links.end(),
       [&](const LinkInfo& candidate) { return candidate.name == if_name; });
@@ -2481,18 +2621,19 @@ std::vector<TcFilterInfo> ListTcFiltersForInterface(
     throw std::runtime_error("network interface not found: " + if_name);
   }
   std::vector<TcFilterInfo> filters;
-  AppendTcFiltersForLink(*link, ListQdiscs(), &filters);
+  AppendTcFiltersForLink(*link, ListQdiscs(stop_token), &filters, stop_token);
   return filters;
 }
 
 std::vector<TcFilterInfo> ListTcFiltersForInterfaceParentInNamespace(
-    int netns_fd, const std::string& if_name, std::uint32_t parent) {
+    int netns_fd, const std::string& if_name, std::uint32_t parent,
+    std::stop_token stop_token) {
   if (netns_fd < 0) {
     throw std::runtime_error("invalid network namespace fd");
   }
   return ExecuteInNetworkNamespace(netns_fd, [&]() {
     RequireInterfaceName(if_name);
-    const std::vector<LinkInfo> links = ListNetworkLinks();
+    const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
     const auto link = std::find_if(
         links.begin(), links.end(),
         [&](const LinkInfo& candidate) { return candidate.name == if_name; });
@@ -2500,7 +2641,7 @@ std::vector<TcFilterInfo> ListTcFiltersForInterfaceParentInNamespace(
       throw std::runtime_error("network interface not found: " + if_name);
     }
     std::vector<TcFilterInfo> filters;
-    AppendTcFiltersForLinkParent(*link, parent, &filters);
+    AppendTcFiltersForLinkParent(*link, parent, &filters, stop_token);
     return filters;
   });
 }
@@ -2547,7 +2688,24 @@ void CreateVethPair(const std::string& host_name, const std::string& peer_name,
   mnl_attr_nest_end(nlh, info_data);
   mnl_attr_nest_end(nlh, link_info);
 
-  SendNetlinkRequest(nlh, sequence);
+  bool creation_acknowledged = false;
+  try {
+    SendNetlinkRequest(nlh, sequence, &creation_acknowledged);
+  } catch (...) {
+    const std::exception_ptr original = std::current_exception();
+    if (creation_acknowledged && !host_ownership_alias.empty() &&
+        !peer_ownership_alias.empty()) {
+      try {
+        RollBackCreatedVethPair(host_name, peer_name, host_ownership_alias,
+                                peer_ownership_alias);
+      } catch (...) {
+        throw std::runtime_error(ExceptionMessage(original) +
+                                 "; veth creation rollback failed: " +
+                                 ExceptionMessage(std::current_exception()));
+      }
+    }
+    std::rethrow_exception(original);
+  }
   try {
     if (!host_ownership_alias.empty()) {
       SetLinkOwnershipAlias(host_name, host_ownership_alias);
@@ -2556,8 +2714,15 @@ void CreateVethPair(const std::string& host_name, const std::string& peer_name,
       SetLinkOwnershipAlias(peer_name, peer_ownership_alias);
     }
   } catch (...) {
-    TryDeleteLink(host_name);
-    throw;
+    const std::exception_ptr original = std::current_exception();
+    try {
+      DeleteLinkAndVerifyAbsent(host_name, {});
+    } catch (...) {
+      throw std::runtime_error(
+          ExceptionMessage(original) +
+          "; rollback failed: " + ExceptionMessage(std::current_exception()));
+    }
+    std::rethrow_exception(original);
   }
 }
 
@@ -3045,8 +3210,9 @@ void ReplaceDirectionalFlowerFilter(const std::string& if_name,
   SendNetlinkRequest(nlh, sequence);
 }
 
-std::vector<TcFilterInfo> ListDirectionalFilters(const std::string& if_name) {
-  const std::vector<LinkInfo> links = ListNetworkLinks();
+std::vector<TcFilterInfo> ListDirectionalFilters(
+    const std::string& if_name, std::stop_token stop_token = {}) {
+  const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
   const auto link = std::find_if(
       links.begin(), links.end(),
       [&](const LinkInfo& candidate) { return candidate.name == if_name; });
@@ -3054,7 +3220,8 @@ std::vector<TcFilterInfo> ListDirectionalFilters(const std::string& if_name) {
     throw std::runtime_error("network interface not found: " + if_name);
   }
   std::vector<TcFilterInfo> filters;
-  AppendTcFiltersForLinkParent(*link, kDirectionalRootHandle, &filters);
+  AppendTcFiltersForLinkParent(*link, kDirectionalRootHandle, &filters,
+                               stop_token);
   return filters;
 }
 
@@ -3079,9 +3246,11 @@ bool HasOwnedDirectionalRoot(const std::vector<QdiscInfo>& qdiscs,
 
 void ApplyDirectionalNetworkPolicies(
     const std::string& if_name,
-    const std::vector<DirectionalNetworkPolicy>& policies) {
+    const std::vector<DirectionalNetworkPolicy>& policies,
+    std::stop_token stop_token) {
   ValidateDirectionalNetworkPolicies(policies);
-  const bool had_owned_root = HasOwnedDirectionalRoot(ListQdiscs(), if_name);
+  const bool had_owned_root =
+      HasOwnedDirectionalRoot(ListQdiscs(stop_token), if_name);
   if (had_owned_root) {
     DeleteRootQdisc(if_name);
   }
@@ -3107,8 +3276,9 @@ void ApplyDirectionalNetworkPolicies(
     ReplaceDirectionalFlowerFilter(if_name, policy);
   }
 
-  const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-  const std::vector<TcFilterInfo> filters = ListDirectionalFilters(if_name);
+  const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
+  const std::vector<TcFilterInfo> filters =
+      ListDirectionalFilters(if_name, stop_token);
   if (!DirectionalNetworkPoliciesMatch(qdiscs, filters, if_name, policies)) {
     std::ostringstream detail;
     detail << "directional network policy kernel read-back mismatch on "
@@ -3127,7 +3297,8 @@ void ApplyDirectionalNetworkPolicies(
 void UpdateDirectionalNetworkPoliciesInNamespace(
     int netns_fd, const std::string& if_name,
     const std::vector<DirectionalNetworkPolicy>& previous,
-    const std::vector<DirectionalNetworkPolicy>& desired) {
+    const std::vector<DirectionalNetworkPolicy>& desired,
+    std::stop_token stop_token) {
   if (netns_fd < 0) {
     throw std::runtime_error("invalid network namespace fd");
   }
@@ -3135,9 +3306,10 @@ void UpdateDirectionalNetworkPoliciesInNamespace(
   ValidateDirectionalNetworkPolicies(previous);
   ValidateDirectionalNetworkPolicies(desired);
   ExecuteInNetworkNamespace(netns_fd, [&]() {
-    const std::vector<QdiscInfo> qdiscs = ListQdiscs();
+    const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
     static_cast<void>(HasOwnedDirectionalRoot(qdiscs, if_name));
-    const std::vector<TcFilterInfo> filters = ListDirectionalFilters(if_name);
+    const std::vector<TcFilterInfo> filters =
+        ListDirectionalFilters(if_name, stop_token);
     if (!DirectionalNetworkPoliciesMatch(qdiscs, filters, if_name, previous)) {
       throw std::runtime_error(
           "directional network policy state does not match expected prior "
@@ -3145,11 +3317,11 @@ void UpdateDirectionalNetworkPoliciesInNamespace(
           if_name);
     }
     try {
-      ApplyDirectionalNetworkPolicies(if_name, desired);
+      ApplyDirectionalNetworkPolicies(if_name, desired, stop_token);
     } catch (const std::exception& apply_error) {
       const std::string apply_message = apply_error.what();
       try {
-        ApplyDirectionalNetworkPolicies(if_name, previous);
+        ApplyDirectionalNetworkPolicies(if_name, previous, {});
       } catch (const std::exception& rollback_error) {
         throw std::runtime_error(apply_message +
                                  "; rollback failed: " + rollback_error.what());
@@ -3333,7 +3505,8 @@ void ReplaceNetworkConditionQdisc(const std::string& if_name,
   ReplaceRootNetemQdisc(if_name, condition);
 }
 
-void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
+void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
+                          std::stop_token stop_token) {
   if (netns_fd < 0) {
     throw std::runtime_error("invalid network namespace fd");
   }
@@ -3346,7 +3519,7 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
     throw std::runtime_error("node veth endpoint names must be distinct");
   }
 
-  const std::vector<LinkInfo> existing_links = ListNetworkLinks();
+  const std::vector<LinkInfo> existing_links = ListNetworkLinks(stop_token);
   if (HasLinkNamed(existing_links, config.host_name) ||
       HasLinkNamed(existing_links, config.peer_name)) {
     throw std::runtime_error(
@@ -3360,7 +3533,7 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
     pair_created = true;
     if (!config.host_ownership_alias.empty() ||
         !config.peer_ownership_alias.empty()) {
-      const std::vector<LinkInfo> created_links = ListNetworkLinks();
+      const std::vector<LinkInfo> created_links = ListNetworkLinks(stop_token);
       const auto require_created_alias = [&](const std::string& name,
                                              const std::string& alias) {
         if (alias.empty()) {
@@ -3393,22 +3566,27 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
       AddIpv4Route(config.peer_name, "0.0.0.0", 0, config.host_address);
     });
   } catch (...) {
+    const std::exception_ptr original = std::current_exception();
     if (pair_created) {
-      TryDeleteLink(config.host_name);
+      try {
+        DeleteNodeVethNetwork(config, {});
+      } catch (...) {
+        throw std::runtime_error(ExceptionMessage(original) +
+                                 "; veth rollback failed: " +
+                                 ExceptionMessage(std::current_exception()));
+      }
     }
-    throw;
+    std::rethrow_exception(original);
   }
 }
 
-void DeleteNodeVethNetwork(const NodeVethConfig& config) {
-  const auto delete_owned_link = [](const std::string& name,
-                                    const std::string& expected_alias) {
-    if (expected_alias.empty()) {
-      TryDeleteLink(name);
-      return;
-    }
-    RequireOwnershipAlias(expected_alias);
-    const std::vector<LinkInfo> links = ListNetworkLinks();
+void DeleteNodeVethNetwork(const NodeVethConfig& config,
+                           std::stop_token stop_token) {
+  RequireOwnershipAlias(config.host_ownership_alias);
+  RequireOwnershipAlias(config.peer_ownership_alias);
+  const auto delete_owned_link = [&](const std::string& name,
+                                     const std::string& expected_alias) {
+    const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
     const auto link = std::find_if(
         links.begin(), links.end(),
         [&](const LinkInfo& candidate) { return candidate.name == name; });
@@ -3420,41 +3598,49 @@ void DeleteNodeVethNetwork(const NodeVethConfig& config) {
           "refusing to delete veth endpoint with foreign ownership alias: " +
           name);
     }
-    TryDeleteLink(name);
+    DeleteLinkAndVerifyAbsent(name, stop_token);
   };
   delete_owned_link(config.host_name, config.host_ownership_alias);
   delete_owned_link(config.peer_name, config.peer_ownership_alias);
 }
 
-std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd,
-                                   []() { return ListNetworkLinks(); });
+std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd,
+                                                  std::stop_token stop_token) {
+  return ExecuteInNetworkNamespace(
+      netns_fd, [stop_token]() { return ListNetworkLinks(stop_token); });
 }
 
-std::vector<AddressInfo> ListIpv4AddressesInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd,
-                                   []() { return ListIpv4Addresses(); });
+std::vector<AddressInfo> ListIpv4AddressesInNamespace(
+    int netns_fd, std::stop_token stop_token) {
+  return ExecuteInNetworkNamespace(
+      netns_fd, [stop_token]() { return ListIpv4Addresses(stop_token); });
 }
 
-std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd, []() { return ListIpv4Routes(); });
+std::vector<RouteInfo> ListIpv4RoutesInNamespace(int netns_fd,
+                                                 std::stop_token stop_token) {
+  return ExecuteInNetworkNamespace(
+      netns_fd, [stop_token]() { return ListIpv4Routes(stop_token); });
 }
 
-std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd) {
-  return ExecuteInNetworkNamespace(netns_fd, []() { return ListQdiscs(); });
+std::vector<QdiscInfo> ListQdiscsInNamespace(int netns_fd,
+                                             std::stop_token stop_token) {
+  return ExecuteInNetworkNamespace(
+      netns_fd, [stop_token]() { return ListQdiscs(stop_token); });
 }
 
 DirectionalNetworkPolicyStats ReadDirectionalNetworkPolicyStatsInNamespace(
     int netns_fd, const std::string& if_name,
-    const std::vector<DirectionalNetworkPolicy>& policies) {
+    const std::vector<DirectionalNetworkPolicy>& policies,
+    std::stop_token stop_token) {
   if (netns_fd < 0) {
     throw std::runtime_error("invalid network namespace fd");
   }
   RequireInterfaceName(if_name);
   ValidateDirectionalNetworkPolicies(policies);
   return ExecuteInNetworkNamespace(netns_fd, [&]() {
-    const std::vector<QdiscInfo> qdiscs = ListQdiscs();
-    const std::vector<TcFilterInfo> filters = ListDirectionalFilters(if_name);
+    const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
+    const std::vector<TcFilterInfo> filters =
+        ListDirectionalFilters(if_name, stop_token);
     return SummarizeDirectionalNetworkPolicyStats(qdiscs, filters, if_name,
                                                   policies);
   });

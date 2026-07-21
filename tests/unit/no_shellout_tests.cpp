@@ -43,3 +43,37 @@ BOOST_AUTO_TEST_CASE(simulator_source_does_not_shell_out) {
   CheckDirectoryForForbiddenTokens(source_root / "include");
   CheckDirectoryForForbiddenTokens(source_root / "src");
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulator_cleanup_gates_network_removed_on_verified_deletion) {
+  const std::filesystem::path simulator =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::string source = bbp::ReadText(simulator);
+  const std::string verified_step =
+      "RunNodeCleanupStep(best_effort, \"verified node network removal\", [&] "
+      "{";
+  const std::size_t step = source.find(verified_step);
+  BOOST_REQUIRE(step != std::string::npos);
+  const std::size_t deletion =
+      source.find("DeleteNodeVethNetwork(*node.network);", step);
+  BOOST_REQUIRE(deletion != std::string::npos);
+  const std::size_t event =
+      source.find("SimulationEventKind::kNetworkRemoved", deletion);
+  BOOST_REQUIRE(event != std::string::npos);
+  const std::size_t verified_step_end = source.find("      });", event);
+  BOOST_REQUIRE(verified_step_end != std::string::npos);
+  const std::size_t cleaned_gate =
+      source.find("if (network_cleanup_verified)", verified_step_end);
+  BOOST_REQUIRE(cleaned_gate != std::string::npos);
+  const std::size_t cleaned =
+      source.find("NodeRuntimeLifecycle::kCleaned", cleaned_gate);
+  BOOST_REQUIRE(cleaned != std::string::npos);
+  const std::size_t failed =
+      source.find("NodeRuntimeLifecycle::kFailed", cleaned);
+  BOOST_REQUIRE(failed != std::string::npos);
+  BOOST_TEST(deletion < event);
+  BOOST_TEST(event < verified_step_end);
+  BOOST_TEST(verified_step_end < cleaned_gate);
+  BOOST_TEST(cleaned_gate < cleaned);
+  BOOST_TEST(cleaned < failed);
+}

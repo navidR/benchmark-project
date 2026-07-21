@@ -11,6 +11,7 @@
 #include <atomic>
 #include <boost/test/unit_test.hpp>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -209,6 +210,211 @@ BOOST_AUTO_TEST_CASE(
         return std::string(error.what()).find(std::strerror(EPERM)) !=
                std::string::npos;
       });
+}
+
+BOOST_AUTO_TEST_CASE(rtnetlink_dump_cancellation_has_bounded_latency) {
+  std::stop_source stop_source;
+  stop_source.request_stop();
+  const auto started = std::chrono::steady_clock::now();
+  BOOST_CHECK_EXCEPTION(
+      bbp::ListNetworkLinks(stop_source.get_token()), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()).find("cancelled") != std::string::npos;
+      });
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  BOOST_TEST(
+      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() <
+      250);
+}
+
+BOOST_AUTO_TEST_CASE(rtnetlink_dump_timeout_has_bounded_latency) {
+  const auto started = std::chrono::steady_clock::now();
+  {
+    bbp::ScopedRtnetlinkDumpFailure failure(
+        bbp::RtnetlinkDumpFailure::kTimeout);
+    BOOST_CHECK_EXCEPTION(
+        bbp::ListNetworkLinks(), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what()).find("deadline exceeded") !=
+                 std::string::npos;
+        });
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  BOOST_TEST(
+      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() <
+      250);
+}
+
+BOOST_AUTO_TEST_CASE(rtnetlink_incomplete_dump_is_never_returned) {
+  bbp::ScopedRtnetlinkDumpFailure failure(
+      bbp::RtnetlinkDumpFailure::kIncomplete);
+  BOOST_CHECK_EXCEPTION(
+      bbp::ListNetworkLinks(), std::runtime_error,
+      [](const std::runtime_error& error) {
+        const std::string message = error.what();
+        return message.find("incomplete") != std::string::npos &&
+               message.find("NLMSG_DONE") != std::string::npos;
+      });
+}
+
+BOOST_AUTO_TEST_CASE(
+    veth_cleanup_surfaces_deletion_failure_and_preserves_link) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  try {
+    ScopedParentVeth pair(config);
+    {
+      bbp::ScopedNetlinkFailurePlan plan(
+          {{1U, bbp::NetlinkFailurePhase::kBeforeSend}});
+      BOOST_CHECK_EXCEPTION(
+          bbp::DeleteNodeVethNetwork(config), std::runtime_error,
+          [](const std::runtime_error& error) {
+            return std::string(error.what())
+                       .find(
+                           "injected netlink failure before send at request "
+                           "1") != std::string::npos;
+          });
+    }
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    BOOST_TEST(
+        std::any_of(links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.name == config.host_name &&
+                 link.ownership_alias == config.host_ownership_alias;
+        }));
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged deletion-error test: " << error.what());
+      return;
+    }
+    throw;
+  }
+}
+
+BOOST_AUTO_TEST_CASE(veth_cleanup_returns_only_after_kernel_absence_readback) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  try {
+    bbp::CreateVethPair(config.host_name, config.peer_name,
+                        config.host_ownership_alias,
+                        config.peer_ownership_alias);
+    bbp::DeleteNodeVethNetwork(config);
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    BOOST_TEST(std::none_of(
+        links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.name == config.host_name || link.name == config.peer_name;
+        }));
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged deletion-readback test: " << error.what());
+      return;
+    }
+    throw;
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    veth_creation_post_send_failure_rolls_back_verified_owned_pair) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  try {
+    {
+      bbp::ScopedNetlinkFailurePlan plan(
+          {{1U, bbp::NetlinkFailurePhase::kAfterSend}});
+      BOOST_CHECK_EXCEPTION(
+          bbp::CreateVethPair(config.host_name, config.peer_name,
+                              config.host_ownership_alias,
+                              config.peer_ownership_alias),
+          std::runtime_error, [](const std::runtime_error& error) {
+            const std::string message = error.what();
+            return message.find(
+                       "injected netlink failure after send at request 1") !=
+                       std::string::npos &&
+                   message.find("rollback failed") == std::string::npos;
+          });
+    }
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    BOOST_TEST(std::none_of(
+        links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.name == config.host_name || link.name == config.peer_name;
+        }));
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged creation-rollback test: " << error.what());
+      return;
+    }
+    throw;
+  }
+}
+
+BOOST_AUTO_TEST_CASE(veth_setup_reports_original_and_rollback_failures) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  try {
+    bbp::NetworkNamespace network_namespace = bbp::NetworkNamespace::Create();
+    std::string failure;
+    {
+      bbp::ScopedNetlinkFailurePlan plan(
+          {{4U, bbp::NetlinkFailurePhase::kBeforeSend},
+           {5U, bbp::NetlinkFailurePhase::kBeforeSend}});
+      try {
+        bbp::SetupNodeVethNetwork(network_namespace.fd(), config);
+        BOOST_FAIL("injected setup and rollback failures did not fail setup");
+      } catch (const std::runtime_error& error) {
+        failure = error.what();
+      }
+    }
+    BOOST_TEST(
+        failure.find("injected netlink failure before send at request 4") !=
+        std::string::npos);
+    BOOST_TEST(failure.find("veth rollback failed") != std::string::npos);
+    BOOST_TEST(
+        failure.find("injected netlink failure before send at request 5") !=
+        std::string::npos);
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    BOOST_TEST(
+        std::any_of(links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.name == config.host_name;
+        }));
+    bbp::DeleteNodeVethNetwork(config);
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged setup-rollback test: " << error.what());
+      return;
+    }
+    throw;
+  }
+}
+
+BOOST_AUTO_TEST_CASE(veth_setup_failure_completes_verified_rollback) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  try {
+    bbp::NetworkNamespace network_namespace = bbp::NetworkNamespace::Create();
+    {
+      bbp::ScopedNetlinkFailurePlan plan(
+          {{4U, bbp::NetlinkFailurePhase::kBeforeSend}});
+      BOOST_CHECK_EXCEPTION(
+          bbp::SetupNodeVethNetwork(network_namespace.fd(), config),
+          std::runtime_error, [](const std::runtime_error& error) {
+            const std::string message = error.what();
+            return message.find(
+                       "injected netlink failure before send at request 4") !=
+                       std::string::npos &&
+                   message.find("rollback failed") == std::string::npos;
+          });
+    }
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    BOOST_TEST(std::none_of(
+        links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.name == config.host_name || link.name == config.peer_name;
+        }));
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged setup-rollback test: " << error.what());
+      return;
+    }
+    throw;
+  }
 }
 
 BOOST_AUTO_TEST_CASE(directional_netlink_failure_rolls_back_applied_mutations) {
