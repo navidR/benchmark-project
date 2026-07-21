@@ -1255,9 +1255,10 @@ BOOST_AUTO_TEST_CASE(firo_counts_non_reward_transactions_in_generated_block) {
       tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
   const std::vector<std::string> responses = {
       R"({"result":{"hash":"block-hash","tx":["reward","tx-1","tx-2"]},"error":null,"id":"bbp"})"};
-  std::future<std::vector<std::string>> served =
-      std::async(std::launch::async,
-                 [&] { return ServeRpcResponses(acceptor, responses); });
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
 
   bbp::FiroNodeConfig config;
   config.id = "block-transaction-count-test";
@@ -1272,4 +1273,59 @@ BOOST_AUTO_TEST_CASE(firo_counts_non_reward_transactions_in_generated_block) {
   const std::vector<std::string> methods = served.get();
   BOOST_REQUIRE_EQUAL(methods.size(), 1U);
   BOOST_TEST(methods[0] == "getblock");
+  BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+  const boost::json::array& parameters =
+      requests[0].as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(parameters.size(), 2U);
+  BOOST_REQUIRE(parameters[0].is_string());
+  BOOST_TEST(parameters[0].as_string() == "block-hash");
+  BOOST_REQUIRE(parameters[1].is_bool());
+  BOOST_TEST(parameters[1].as_bool());
+  BOOST_CHECK(!parameters[1].is_int64());
+  BOOST_CHECK(!parameters[1].is_uint64());
+}
+
+BOOST_AUTO_TEST_CASE(firo_finds_spendable_output_with_boolean_getblock_mode) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"hash":"funding-block","tx":["funding-tx"]},"error":null,"id":"bbp"})",
+      R"({"result":{"value":40.00000000,"confirmations":101,"scriptPubKey":{"hex":"51","addresses":["funding-address"]}},"error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "spendable-output-getblock-mode-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const bbp::FiroUtxo output = driver.FindSpendableOutput(
+      config, {"funding-block"}, "funding-address", 3999000000ULL, 101U);
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_TEST(output.txid == "funding-tx");
+  BOOST_TEST(output.vout == 0U);
+  BOOST_TEST(output.amount_satoshis == 4000000000ULL);
+  BOOST_REQUIRE_EQUAL(methods.size(), 2U);
+  BOOST_TEST(methods[0] == "getblock");
+  BOOST_TEST(methods[1] == "gettxout");
+  BOOST_REQUIRE_EQUAL(requests.size(), 2U);
+  const boost::json::array& parameters =
+      requests[0].as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(parameters.size(), 2U);
+  BOOST_TEST(parameters[0].as_string() == "funding-block");
+  BOOST_REQUIRE(parameters[1].is_bool());
+  BOOST_TEST(parameters[1].as_bool());
+  BOOST_CHECK(!parameters[1].is_int64());
+  BOOST_CHECK(!parameters[1].is_uint64());
 }

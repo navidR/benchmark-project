@@ -935,7 +935,7 @@ std::uint64_t FiroDriver::ReadBlockNonRewardTransactionCount(
     std::stop_token stop_token) const {
   boost::json::array params;
   params.emplace_back(block_hash);
-  params.emplace_back(1);
+  params.emplace_back(true);
   const boost::json::value block =
       RpcCall(config, "getblock", params, stop_token);
   if (!block.is_object()) {
@@ -1163,7 +1163,7 @@ FiroUtxo FiroDriver::FindSpendableOutput(
     ThrowIfStopRequested(stop_token);
     boost::json::array block_params;
     block_params.emplace_back(block_hash);
-    block_params.push_back(1);
+    block_params.push_back(true);
     const boost::json::value block =
         RpcCall(config, "getblock", block_params, stop_token);
     const boost::json::value* transactions =
