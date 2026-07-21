@@ -14,6 +14,7 @@
 #include "bbp/node_lifecycle_policy.h"
 #include "bbp/perf_counter.h"
 #include "bbp/process.h"
+#include "bbp/run_process_state.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/simulator/resource_limits.h"
 
@@ -26,6 +27,7 @@ struct NodeRuntime {
   std::optional<NodeVethConfig> network;
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
+  RunProcessState* run_process_state = nullptr;
   NodeLifecyclePolicy lifecycle_policy;
   std::optional<std::chrono::steady_clock::time_point> process_started_at;
   std::vector<PerfCounterKind> perf_counter_kinds = DefaultPerfCounterKinds();

@@ -348,21 +348,35 @@ bool ChildProcess::WaitForExit(std::chrono::milliseconds timeout) {
 }
 
 void ChildProcess::Terminate(std::chrono::milliseconds graceful_timeout) {
-  if (!running()) {
+  if (!RequestTerminate()) {
     return;
   }
-  SignalProcessGroupAndLeader(pid_, pidfd_, SIGTERM);
   if (WaitForExit(graceful_timeout)) {
     return;
   }
   Kill();
 }
 
-void ChildProcess::Kill() {
+bool ChildProcess::RequestTerminate() {
   if (!running()) {
-    return;
+    return false;
+  }
+  SignalProcessGroupAndLeader(pid_, pidfd_, SIGTERM);
+  return true;
+}
+
+bool ChildProcess::RequestKill() {
+  if (!running()) {
+    return false;
   }
   SignalProcessGroupAndLeader(pid_, pidfd_, SIGKILL);
+  return true;
+}
+
+void ChildProcess::Kill() {
+  if (!RequestKill()) {
+    return;
+  }
   WaitForExit(std::chrono::seconds(5));
 }
 

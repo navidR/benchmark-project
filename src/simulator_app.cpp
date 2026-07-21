@@ -54,6 +54,7 @@
 #include "bbp/probabilistic_block_scheduler.h"
 #include "bbp/process.h"
 #include "bbp/run_ownership.h"
+#include "bbp/run_process_state.h"
 #include "bbp/run_report.h"
 #include "bbp/runtime_peer_topology.h"
 #include "bbp/signal_stop_monitor.h"
@@ -6939,7 +6940,7 @@ boost::json::object DirectionalNetworkPolicyCounterJson(
   return object;
 }
 
-void ResetNodePerfCounters(NodeRuntime& node) {
+void ResetNodePerfCounters(NodeRuntime& node, const RunProcessState::Guard&) {
   node.process_perf_counters.reset();
   node.cgroup_perf_counters.reset();
   node.perf_counter_target_pid = -1;
@@ -6950,7 +6951,8 @@ void ResetNodePerfCounters(NodeRuntime& node) {
   node.perf_counter_error.clear();
 }
 
-void SetNodePerfCounterError(NodeRuntime& node, PerfCounterErrorKind kind,
+void SetNodePerfCounterError(NodeRuntime& node, const RunProcessState::Guard&,
+                             PerfCounterErrorKind kind,
                              std::string_view error) {
   node.process_perf_counters.reset();
   node.cgroup_perf_counters.reset();
@@ -6961,11 +6963,13 @@ void SetNodePerfCounterError(NodeRuntime& node, PerfCounterErrorKind kind,
   node.perf_counter_error = error;
 }
 
-void AttachNodePerfCounters(NodeRuntime& node) {
-  ResetNodePerfCounters(node);
+void AttachNodePerfCounters(NodeRuntime& node,
+                            const RunProcessState::Guard& guard) {
+  ResetNodePerfCounters(node, guard);
   node.perf_counter_process_generation = node.RestartCount();
   if (node.process.pid() <= 0 || !node.process.running()) {
-    SetNodePerfCounterError(node, PerfCounterErrorKind::kProcessUnavailable,
+    SetNodePerfCounterError(node, guard,
+                            PerfCounterErrorKind::kProcessUnavailable,
                             "node process is not running");
     return;
   }
@@ -6979,7 +6983,7 @@ void AttachNodePerfCounters(NodeRuntime& node) {
           ProcessPerfCounters::Open(target_pid, node.perf_counter_kinds);
       if (node.process.pid() != target_pid || !node.process.running()) {
         SetNodePerfCounterError(
-            node, PerfCounterErrorKind::kProcessUnavailable,
+            node, guard, PerfCounterErrorKind::kProcessUnavailable,
             "node process exited or changed while perf counters were opening");
         return;
       }
@@ -6989,7 +6993,8 @@ void AttachNodePerfCounters(NodeRuntime& node) {
     }
 
     if (!node.cgroup) {
-      SetNodePerfCounterError(node, PerfCounterErrorKind::kProcessUnavailable,
+      SetNodePerfCounterError(node, guard,
+                              PerfCounterErrorKind::kProcessUnavailable,
                               "node cgroup is unavailable");
       return;
     }
@@ -6998,7 +7003,7 @@ void AttachNodePerfCounters(NodeRuntime& node) {
     if (!node.process.running() || !node.cgroup ||
         counters.cgroup_path() != node.cgroup->path()) {
       SetNodePerfCounterError(
-          node, PerfCounterErrorKind::kProcessUnavailable,
+          node, guard, PerfCounterErrorKind::kProcessUnavailable,
           "node process or cgroup changed while perf counters were opening");
       return;
     }
@@ -7006,7 +7011,7 @@ void AttachNodePerfCounters(NodeRuntime& node) {
     node.perf_counter_cpus = counters.cpus();
     node.cgroup_perf_counters.emplace(std::move(counters));
   } catch (const PerfCounterError& error) {
-    SetNodePerfCounterError(node, error.kind(), error.what());
+    SetNodePerfCounterError(node, guard, error.kind(), error.what());
     BBP_LOG(warning) << "perf counters unavailable for " << node.config.id
                      << " target="
                      << PerfCounterTargetKindName(node.perf_counter_target_kind)
@@ -7435,18 +7440,136 @@ void WriteEvent(const std::filesystem::path& events_path,
 void TransitionNodeState(const std::filesystem::path& events_path,
                          const std::string& run_id, NodeRuntime& node,
                          NodeRuntimeLifecycle state) {
-  node.SetLifecycle(state);
+  if (node.run_process_state != nullptr) {
+    auto process_guard = node.run_process_state->Lock();
+    node.SetLifecycle(state);
+  } else {
+    node.SetLifecycle(state);
+  }
   WriteEvent(events_path, run_id, node.config.id, SimulationEventKind::kState,
              NodeRuntimeLifecycleName(state));
 }
 
-void RequireNodeRunning(const NodeRuntime& node, std::string_view action) {
+RunProcessState::Guard LockNodeProcessState(const NodeRuntime& node) {
+  if (node.run_process_state == nullptr) {
+    throw std::logic_error("node has no run process synchronization state: " +
+                           node.config.id);
+  }
+  return node.run_process_state->Lock();
+}
+
+void RequireNodeRunning(const NodeRuntime& node, const RunProcessState::Guard&,
+                        std::string_view action) {
   if (!node.AllowsChainMetrics() || !node.process.running()) {
     throw std::runtime_error(
         std::string(action) + " requires a Running node: " + node.config.id +
         " (state=" + std::string(NodeRuntimeLifecycleName(node.Lifecycle())) +
         ")");
   }
+}
+
+void RequireNodeRunning(const NodeRuntime& node, std::string_view action) {
+  auto process_guard = LockNodeProcessState(node);
+  RequireNodeRunning(node, process_guard, action);
+}
+
+bool NodeProcessRunning(const NodeRuntime& node) {
+  auto process_guard = LockNodeProcessState(node);
+  return node.process.running();
+}
+
+void WriteNodeStateEvent(const std::filesystem::path& events_path,
+                         const std::string& run_id, const NodeRuntime& node,
+                         NodeRuntimeLifecycle state) {
+  WriteEvent(events_path, run_id, node.config.id, SimulationEventKind::kState,
+             NodeRuntimeLifecycleName(state));
+}
+
+bool RequestNodeTerminate(NodeRuntime& node) {
+  auto process_guard = LockNodeProcessState(node);
+  return node.process.RequestTerminate();
+}
+
+bool RequestNodeKill(NodeRuntime& node) {
+  auto process_guard = LockNodeProcessState(node);
+  return node.process.RequestKill();
+}
+
+bool WaitForNodeProcessExitUntil(NodeRuntime& node,
+                                 std::chrono::steady_clock::time_point deadline,
+                                 std::stop_token stop_token = {}) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!NodeProcessRunning(node)) {
+      return true;
+    }
+    WaitForDuration(std::chrono::milliseconds(20), stop_token);
+  }
+  return !NodeProcessRunning(node);
+}
+
+struct NodeProcessGeneration {
+  pid_t pid = -1;
+  std::uint64_t restart_count = 0U;
+};
+
+NodeProcessGeneration RunningNodeProcessGeneration(
+    NodeRuntime& node, const RunProcessState::Guard& process_guard,
+    std::string_view action) {
+  RequireNodeRunning(node, process_guard, action);
+  return {.pid = node.process.pid(), .restart_count = node.RestartCount()};
+}
+
+bool IsCurrentRunningNodeProcess(NodeRuntime& node,
+                                 const RunProcessState::Guard&,
+                                 const NodeProcessGeneration& generation) {
+  return node.Lifecycle() == NodeRuntimeLifecycle::kRunning &&
+         node.process.pid() == generation.pid &&
+         node.RestartCount() == generation.restart_count &&
+         node.process.running();
+}
+
+bool StartNativeMiningForCurrentProcess(const ChainDriver& driver,
+                                        NodeRuntime& node,
+                                        RunProcessState& run_process_state,
+                                        std::string_view reward_address,
+                                        std::stop_token stop_token,
+                                        std::string_view action) {
+  auto mining_rpc_guard = run_process_state.LockNativeMiningRpc();
+  NodeProcessGeneration generation;
+  {
+    auto process_guard = run_process_state.Lock();
+    generation = RunningNodeProcessGeneration(node, process_guard, action);
+  }
+
+  driver.StartMining(node.config, std::string(reward_address), stop_token);
+
+  bool current_process_running = false;
+  {
+    auto process_guard = run_process_state.Lock();
+    if (IsCurrentRunningNodeProcess(node, process_guard, generation)) {
+      run_process_state.AddActiveNativeMiner(process_guard, node.config.id);
+      return true;
+    }
+    current_process_running =
+        node.AllowsChainMetrics() && node.process.running();
+  }
+
+  // The successful RPC no longer belongs to the process generation that
+  // authorized it. If a replacement is live, undo any request that may have
+  // reached that replacement before allowing its own serialized mining RPC.
+  if (current_process_running) {
+    driver.StopMining(node.config, stop_token);
+  }
+  return false;
+}
+
+void StopNativeMining(const ChainDriver& driver, NodeRuntime& node,
+                      RunProcessState& run_process_state,
+                      std::stop_token stop_token = {}) {
+  auto mining_rpc_guard = run_process_state.LockNativeMiningRpc();
+  driver.StopMining(node.config, stop_token);
+  auto process_guard = run_process_state.Lock();
+  run_process_state.RemoveActiveNativeMiner(process_guard, node.config.id);
 }
 
 void PublishOperatorConnectionCommand(const Options& options,
@@ -7459,8 +7582,11 @@ void PublishOperatorConnectionCommand(const Options& options,
     return;
   }
   for (const NodeRuntime& node : nodes) {
-    if (!node.AllowsChainMetrics() || !node.process.running()) {
-      continue;
+    {
+      auto process_guard = LockNodeProcessState(node);
+      if (!node.AllowsChainMetrics() || !node.process.running()) {
+        continue;
+      }
     }
     const std::optional<OperatorConnectionCommand> connection =
         driver.BuildOperatorConnectionCommand(node.config, run_root);
@@ -8270,7 +8396,8 @@ std::string WalletAddressDetail(const WalletIdentity& wallet,
   return boost::json::serialize(detail);
 }
 
-std::string ProcessExitDetail(const ChildProcess& process) {
+std::string ProcessExitDetail(const ChildProcess& process,
+                              const RunProcessState::Guard&) {
   const bool running = process.running();
   boost::json::object detail;
   detail["running"] = running;
@@ -8338,7 +8465,7 @@ using MetricsStopRequested = std::function<bool()>;
 std::uint32_t WriteMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
-    std::mutex& node_process_mutex,
+    RunProcessState& run_process_state,
     const NodeMetricsFailureHandler& node_failure_handler = {},
     const MetricsStopRequested& stop_requested = {},
     std::stop_token stop_token = {}) {
@@ -8399,7 +8526,7 @@ std::uint32_t WriteMetricsSnapshot(
     runtime.rpc_host = rpc_endpoint.host;
     runtime.rpc_port = rpc_endpoint.port;
     {
-      std::lock_guard<std::mutex> lock(node_process_mutex);
+      auto process_guard = run_process_state.Lock();
       runtime.pid = node.process.pid();
       runtime.pidfd_available = node.process.pidfd() >= 0;
       runtime.process_running = node.process.running();
@@ -9718,7 +9845,7 @@ std::string NodeLifecycleDeadlineDetail(
 std::string ProcessStartedDetail(
     const NodeRuntime& node, std::string_view reason,
     std::chrono::steady_clock::time_point simulation_epoch,
-    const SimulationTimeScale& time_scale) {
+    const SimulationTimeScale& time_scale, const RunProcessState::Guard&) {
   boost::json::object detail;
   detail["pid"] = node.process.pid();
   detail["reason"] = reason;
@@ -9741,13 +9868,19 @@ std::string ProcessStartedDetail(
 [[noreturn]] void RecordNodeExitBeforeRpcReady(
     const Options& options, const std::filesystem::path& events_path,
     NodeRuntime& node) {
-  ResetNodePerfCounters(node);
+  std::string exit_detail;
+  std::optional<int> wait_status;
+  {
+    auto process_guard = LockNodeProcessState(node);
+    ResetNodePerfCounters(node, process_guard);
+    exit_detail = ProcessExitDetail(node.process, process_guard);
+    wait_status = node.process.exit_status();
+    node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
+  }
   WriteEvent(events_path, options.run_id, node.config.id,
-             SimulationEventKind::kProcessExitedBeforeRpcReady,
-             ProcessExitDetail(node.process));
-  TransitionNodeState(events_path, options.run_id, node,
+             SimulationEventKind::kProcessExitedBeforeRpcReady, exit_detail);
+  WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kFailed);
-  const std::optional<int> wait_status = node.process.exit_status();
   if (!wait_status) {
     throw std::runtime_error(
         "node exited before RPC readiness without a wait status: " +
@@ -9761,28 +9894,54 @@ void StartNodeProcessAttempt(
     const ChainDriver& driver, NodeRuntime& node, std::string_view reason,
     std::chrono::steady_clock::time_point lifecycle_epoch, bool restart_attempt,
     bool transition_to_running, std::stop_token stop_token) {
-  ProcessSpec process = driver.RenderProcess(node.config);
+  ProcessSpec process;
+  {
+    std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+    process = driver.RenderProcess(node.config);
+  }
   if (node.network_namespace) {
     process.network_namespace_fd = node.network_namespace->fd();
   }
-  TransitionNodeState(events_path, options.run_id, node,
+  {
+    auto process_guard = LockNodeProcessState(node);
+    const NodeRuntimeLifecycle expected =
+        restart_attempt ? NodeRuntimeLifecycle::kRestarting
+                        : NodeRuntimeLifecycle::kCgroupReady;
+    if (node.Lifecycle() != expected) {
+      throw std::runtime_error(
+          "node start conflicts with an active lifecycle operation: " +
+          node.config.id + " (state=" +
+          std::string(NodeRuntimeLifecycleName(node.Lifecycle())) + ")");
+    }
+    node.SetLifecycle(NodeRuntimeLifecycle::kStarting);
+  }
+  WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kStarting);
-  node.process = ChildProcess::Spawn(process, node.cgroup->path());
-  node.process_started_at = std::chrono::steady_clock::now();
+  ChildProcess spawned = ChildProcess::Spawn(process, node.cgroup->path());
   const std::uint64_t restart_count =
       restart_attempt ? node.IncrementRestartCount() : node.RestartCount();
-  AttachNodePerfCounters(node);
-  BBP_LOG(info) << "started " << node.config.id << " pid=" << node.process.pid()
+  pid_t process_pid = -1;
+  std::string process_detail;
+  {
+    auto process_guard = LockNodeProcessState(node);
+    node.process = std::move(spawned);
+    node.process_started_at = std::chrono::steady_clock::now();
+    AttachNodePerfCounters(node, process_guard);
+    process_pid = node.process.pid();
+    process_detail =
+        restart_attempt
+            ? RestartDetail(process_pid, restart_count, reason)
+            : ProcessStartedDetail(node, reason, lifecycle_epoch,
+                                   options.time_scale, process_guard);
+  }
+  BBP_LOG(info) << "started " << node.config.id << " pid=" << process_pid
                 << " reason=" << reason;
   if (restart_attempt) {
     WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kProcessRestarted,
-               RestartDetail(node.process.pid(), restart_count, reason));
+               SimulationEventKind::kProcessRestarted, process_detail);
   } else {
     WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kProcessStarted,
-               ProcessStartedDetail(node, reason, lifecycle_epoch,
-                                    options.time_scale));
+               SimulationEventKind::kProcessStarted, process_detail);
   }
   std::stop_source readiness_stop_source;
   std::stop_callback stop_readiness_on_request(
@@ -9791,7 +9950,7 @@ void StartNodeProcessAttempt(
   std::jthread exit_monitor([&](std::stop_token monitor_stop_token) {
     try {
       while (!monitor_stop_token.stop_requested()) {
-        if (!node.process.running()) {
+        if (!NodeProcessRunning(node)) {
           readiness_stop_source.request_stop();
           return;
         }
@@ -9812,27 +9971,35 @@ void StartNodeProcessAttempt(
                      readiness_stop_source.get_token());
   } catch (const SimulationCancelled&) {
     stop_exit_monitor();
-    if (!node.process.running()) {
+    if (!NodeProcessRunning(node)) {
       RecordNodeExitBeforeRpcReady(options, events_path, node);
     }
     throw;
   } catch (...) {
     stop_exit_monitor();
-    if (!node.process.running()) {
+    if (!NodeProcessRunning(node)) {
       RecordNodeExitBeforeRpcReady(options, events_path, node);
     }
-    TransitionNodeState(events_path, options.run_id, node,
+    {
+      auto process_guard = LockNodeProcessState(node);
+      node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
+    }
+    WriteNodeStateEvent(events_path, options.run_id, node,
                         NodeRuntimeLifecycle::kFailed);
     throw;
   }
   stop_exit_monitor();
-  if (!node.process.running()) {
+  if (!NodeProcessRunning(node)) {
     RecordNodeExitBeforeRpcReady(options, events_path, node);
   }
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRpcReady);
   if (transition_to_running) {
-    TransitionNodeState(events_path, options.run_id, node,
+    {
+      auto process_guard = LockNodeProcessState(node);
+      node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+    }
+    WriteNodeStateEvent(events_path, options.run_id, node,
                         NodeRuntimeLifecycle::kRunning);
   }
 }
@@ -9855,11 +10022,15 @@ void ApplyDeclarativeStopDuringStart(
              NodeLifecycleDeadlineDetail(
                  node, options.time_scale, lifecycle_epoch,
                  *node.lifecycle_policy.stop_time, "declarative_stop"));
-  if (node.process.running()) {
+  if (NodeProcessRunning(node)) {
     StopNodeProcess(options, events_path, driver, node, stop_token, true);
   } else {
-    ResetNodePerfCounters(node);
-    TransitionNodeState(events_path, options.run_id, node,
+    {
+      auto process_guard = LockNodeProcessState(node);
+      ResetNodePerfCounters(node, process_guard);
+      node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+    }
+    WriteNodeStateEvent(events_path, options.run_id, node,
                         NodeRuntimeLifecycle::kStopped);
   }
 }
@@ -9986,7 +10157,17 @@ bool StartNodeProcessWithPolicy(
               "suppressed before recovery: " +
               node.config.id);
         }
-        TransitionNodeState(events_path, options.run_id, node,
+        {
+          auto process_guard = LockNodeProcessState(node);
+          if (node.Lifecycle() != NodeRuntimeLifecycle::kFailed) {
+            throw std::runtime_error(
+                "startup restart conflicts with an active lifecycle "
+                "operation: " +
+                node.config.id);
+          }
+          node.SetLifecycle(NodeRuntimeLifecycle::kRestarting);
+        }
+        WriteNodeStateEvent(events_path, options.run_id, node,
                             NodeRuntimeLifecycle::kRestarting);
         WriteEvent(events_path, options.run_id, node.config.id,
                    SimulationEventKind::kRestartRequested,
@@ -10048,7 +10229,7 @@ bool StartPreparedNode(const Options& options,
     throw std::runtime_error("node start is forbidden after stop_time: " +
                              node.config.id);
   }
-  if (node.process.running()) {
+  if (NodeProcessRunning(node)) {
     throw std::runtime_error("node process is already running: " +
                              node.config.id);
   }
@@ -10137,17 +10318,22 @@ void ConnectAvailableStartupPeers(
       std::map<std::string, std::size_t> running_endpoints;
       for (std::size_t index = 0; index < nodes.size(); ++index) {
         if (nodes[index].AllowsChainMetrics() &&
-            nodes[index].process.running()) {
+            NodeProcessRunning(nodes[index])) {
           running_endpoints.emplace(NodePeerEndpoint(nodes[index]), index);
         }
       }
       for (std::size_t source_index = 0; source_index < nodes.size();
            ++source_index) {
         NodeRuntime& source = nodes[source_index];
-        if (!source.AllowsChainMetrics() || !source.process.running()) {
+        if (!source.AllowsChainMetrics() || !NodeProcessRunning(source)) {
           continue;
         }
-        for (const std::string& peer : source.config.connect_peers) {
+        std::vector<std::string> connect_peers;
+        {
+          std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+          connect_peers = source.config.connect_peers;
+        }
+        for (const std::string& peer : connect_peers) {
           if (completed_connections.contains({source_index, peer})) {
             continue;
           }
@@ -10205,6 +10391,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                 const ChainDriverSpec& chain_spec, const ChainDriver& driver,
                 const RuntimePeerTopology& runtime_topology,
                 std::vector<NodeRuntime>& nodes,
+                RunProcessState& run_process_state,
                 std::chrono::steady_clock::time_point simulation_epoch,
                 std::stop_token stop_token) {
   if (options.isolate_network) {
@@ -10241,6 +10428,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     NodeRuntime runtime;
     try {
       runtime.config = config;
+      runtime.run_process_state = &run_process_state;
       runtime.lifecycle_policy = EffectiveNodeLifecyclePolicy(options, i);
       runtime.perf_counter_target_kind = PerfCounterTargetKind::kNode;
       runtime.perf_counter_target_id = node_id;
@@ -10317,7 +10505,9 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     } catch (...) {
       TransitionNodeState(events_path, options.run_id, runtime,
                           NodeRuntimeLifecycle::kFailed);
-      runtime.process.Kill();
+      static_cast<void>(RequestNodeKill(runtime));
+      static_cast<void>(WaitForNodeProcessExitUntil(
+          runtime, std::chrono::steady_clock::now() + std::chrono::seconds(5)));
       try {
         driver.CleanupRpcCredentials(runtime.config);
       } catch (const std::exception&) {
@@ -10739,7 +10929,7 @@ std::string ResourcePressureDetail(const ResourcePressureWorkload& workload,
 void ApplyResourcePressureWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const std::filesystem::path& metrics_path, const ChainDriver& driver,
-    std::vector<NodeRuntime>& nodes, std::mutex& node_process_mutex,
+    std::vector<NodeRuntime>& nodes, RunProcessState& run_process_state,
     const ResourcePressureWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
@@ -10786,7 +10976,7 @@ void ApplyResourcePressureWorkload(
     WaitForDuration(std::chrono::milliseconds(workload.duration_ms),
                     stop_token);
     WriteMetricsSnapshot(metrics_path, options, driver, nodes,
-                         node_process_mutex, {}, {}, stop_token);
+                         run_process_state, {}, {}, stop_token);
   } catch (...) {
     const std::exception_ptr original_error = std::current_exception();
     try {
@@ -10975,9 +11165,11 @@ void ApplyTopologyEdgeWorkload(
   const std::vector<DirectionalNetworkPolicy> expected_previous_policies =
       runtime_topology.DirectionalPolicies(NetworkAddressPlan(options), from);
   std::vector<DirectionalNetworkPolicy> previous_policies;
+  std::vector<std::string> previous_restart_peers;
   {
     std::lock_guard<std::mutex> lock(node_network_state_mutex);
     previous_policies = source.directional_network_policies;
+    previous_restart_peers = source.config.connect_peers;
   }
   if (previous_policies != expected_previous_policies) {
     throw std::runtime_error(
@@ -10993,8 +11185,6 @@ void ApplyTopologyEdgeWorkload(
   }
   const std::vector<std::string> expected_previous_restart_peers =
       StartupPeerAddresses(options, runtime_topology, chain_spec, from);
-  const std::vector<std::string> previous_restart_peers =
-      source.config.connect_peers;
   if (previous_restart_peers != expected_previous_restart_peers) {
     throw std::runtime_error(
         "runtime restart-peer state does not match topology model");
@@ -11090,7 +11280,10 @@ void ApplyTopologyEdgeWorkload(
       connected_after = attempted.active;
     }
 
-    source.config.connect_peers = desired_restart_peers;
+    {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
+      source.config.connect_peers = desired_restart_peers;
+    }
     config_updated = true;
 
     if (active_transition) {
@@ -11171,6 +11364,7 @@ void ApplyTopologyEdgeWorkload(
       });
     }
     if (config_updated || model_mutated) {
+      std::lock_guard<std::mutex> lock(node_network_state_mutex);
       source.config.connect_peers = previous_restart_peers;
     }
     if (model_mutated) {
@@ -12538,24 +12732,46 @@ bool RestartNode(
                              node.config.id);
   }
 
-  TransitionNodeState(events_path, options.run_id, node,
+  {
+    auto process_guard = LockNodeProcessState(node);
+    const NodeRuntimeLifecycle lifecycle = node.Lifecycle();
+    if (lifecycle != NodeRuntimeLifecycle::kRunning &&
+        lifecycle != NodeRuntimeLifecycle::kFailed &&
+        lifecycle != NodeRuntimeLifecycle::kStopped &&
+        lifecycle != NodeRuntimeLifecycle::kKilled) {
+      throw std::runtime_error(
+          "node restart conflicts with an active lifecycle operation: " +
+          node.config.id +
+          " (state=" + std::string(NodeRuntimeLifecycleName(lifecycle)) + ")");
+    }
+    node.SetLifecycle(NodeRuntimeLifecycle::kRestarting);
+    ResetNodePerfCounters(node, process_guard);
+  }
+  WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kRestarting);
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRestartRequested,
              RestartRequestedDetail(node, reason));
-  ResetNodePerfCounters(node);
   if (node.cgroup->Frozen()) {
     SetNodeFrozen(options, events_path, node, false, stop_token);
   }
-  if (node.process.running()) {
+  if (NodeProcessRunning(node)) {
     WriteEvent(events_path, options.run_id, node.config.id,
                SimulationEventKind::kRpcStop);
     try {
       driver.Stop(node.config, stop_token);
     } catch (...) {
-      if (node.process.running()) {
-        AttachNodePerfCounters(node);
-        TransitionNodeState(events_path, options.run_id, node,
+      bool restored_running = false;
+      {
+        auto process_guard = LockNodeProcessState(node);
+        if (node.process.running()) {
+          AttachNodePerfCounters(node, process_guard);
+          node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+          restored_running = true;
+        }
+      }
+      if (restored_running) {
+        WriteNodeStateEvent(events_path, options.run_id, node,
                             NodeRuntimeLifecycle::kRunning);
       }
       throw;
@@ -12566,14 +12782,30 @@ bool RestartNode(
   }
   const auto exit_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(15);
-  while (node.process.running() &&
+  while (NodeProcessRunning(node) &&
          std::chrono::steady_clock::now() < exit_deadline) {
     WaitForDuration(std::chrono::milliseconds(50), stop_token);
   }
-  if (node.process.running()) {
+  if (NodeProcessRunning(node)) {
     WriteEvent(events_path, options.run_id, node.config.id,
                SimulationEventKind::kSigterm);
-    node.process.Terminate(std::chrono::seconds(5));
+    static_cast<void>(RequestNodeTerminate(node));
+    const auto terminate_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    try {
+      if (!WaitForNodeProcessExitUntil(node, terminate_deadline, stop_token)) {
+        static_cast<void>(RequestNodeKill(node));
+        const auto kill_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        if (!WaitForNodeProcessExitUntil(node, kill_deadline, stop_token)) {
+          throw std::runtime_error("node process survived SIGKILL: " +
+                                   node.config.id);
+        }
+      }
+    } catch (...) {
+      static_cast<void>(RequestNodeKill(node));
+      throw;
+    }
   }
   ThrowIfStopRequested(stop_token);
   if (!StartNodeProcessWithPolicy(options, events_path, driver, node, reason,
@@ -12616,8 +12848,13 @@ bool RestartNode(
       node_stop_timer.reset();
     }
   };
+  std::vector<std::string> restart_peers;
+  {
+    std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+    restart_peers = node.config.connect_peers;
+  }
   try {
-    for (const std::string& peer : node.config.connect_peers) {
+    for (const std::string& peer : restart_peers) {
       if (available_peer_addresses != nullptr &&
           !available_peer_addresses->contains(peer)) {
         continue;
@@ -12645,7 +12882,11 @@ bool RestartNode(
     throw;
   } catch (...) {
     stop_node_timer();
-    TransitionNodeState(events_path, options.run_id, node,
+    {
+      auto process_guard = LockNodeProcessState(node);
+      node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
+    }
+    WriteNodeStateEvent(events_path, options.run_id, node,
                         NodeRuntimeLifecycle::kFailed);
     throw;
   }
@@ -12656,7 +12897,11 @@ bool RestartNode(
                                     lifecycle_epoch, stop_token);
     return false;
   }
-  TransitionNodeState(events_path, options.run_id, node,
+  {
+    auto process_guard = LockNodeProcessState(node);
+    node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+  }
+  WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kRunning);
   return true;
 }
@@ -12727,18 +12972,33 @@ void StopNodeProcess(const Options& options,
                      const ChainDriver& driver, NodeRuntime& node,
                      std::stop_token stop_token, bool allow_rpc_unavailable) {
   ThrowIfStopRequested(stop_token);
-  if (!node.process.running()) {
-    throw std::runtime_error("node process is not running: " + node.config.id);
+  bool rpc_stop_requested = false;
+  {
+    auto process_guard = LockNodeProcessState(node);
+    if (!node.process.running()) {
+      throw std::runtime_error("node process is not running: " +
+                               node.config.id);
+    }
+    const NodeRuntimeLifecycle lifecycle = node.Lifecycle();
+    if (lifecycle != NodeRuntimeLifecycle::kRunning &&
+        !(allow_rpc_unavailable &&
+          lifecycle == NodeRuntimeLifecycle::kStarting)) {
+      throw std::runtime_error(
+          "node stop conflicts with an active lifecycle operation: " +
+          node.config.id +
+          " (state=" + std::string(NodeRuntimeLifecycleName(lifecycle)) + ")");
+    }
+    rpc_stop_requested =
+        !allow_rpc_unavailable || lifecycle == NodeRuntimeLifecycle::kRunning;
+    ResetNodePerfCounters(node, process_guard);
+    node.SetLifecycle(NodeRuntimeLifecycle::kStopping);
   }
-  if (node.cgroup && node.cgroup->Frozen()) {
-    SetNodeFrozen(options, events_path, node, false, stop_token);
-  }
-  bool rpc_stop_requested = !allow_rpc_unavailable ||
-                            node.Lifecycle() == NodeRuntimeLifecycle::kRunning;
-  ResetNodePerfCounters(node);
-  TransitionNodeState(events_path, options.run_id, node,
+  WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kStopping);
   try {
+    if (node.cgroup && node.cgroup->Frozen()) {
+      SetNodeFrozen(options, events_path, node, false, stop_token);
+    }
     if (rpc_stop_requested) {
       WriteEvent(events_path, options.run_id, node.config.id,
                  SimulationEventKind::kRpcStop);
@@ -12765,29 +13025,52 @@ void StopNodeProcess(const Options& options,
     if (rpc_stop_requested) {
       const auto exit_deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(15);
-      while (node.process.running() &&
+      while (NodeProcessRunning(node) &&
              std::chrono::steady_clock::now() < exit_deadline) {
         WaitForDuration(std::chrono::milliseconds(50), stop_token);
       }
     }
-    if (node.process.running()) {
+    if (NodeProcessRunning(node)) {
       WriteEvent(events_path, options.run_id, node.config.id,
                  SimulationEventKind::kSigterm);
-      node.process.Terminate(std::chrono::seconds(5));
+      static_cast<void>(RequestNodeTerminate(node));
+      const auto terminate_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      if (!WaitForNodeProcessExitUntil(node, terminate_deadline, stop_token)) {
+        static_cast<void>(RequestNodeKill(node));
+        const auto kill_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        if (!WaitForNodeProcessExitUntil(node, kill_deadline, stop_token)) {
+          throw std::runtime_error("node process survived SIGKILL: " +
+                                   node.config.id);
+        }
+      }
     }
-    if (node.process.running()) {
+    if (NodeProcessRunning(node)) {
       throw std::runtime_error("node process survived graceful stop: " +
                                node.config.id);
     }
   } catch (...) {
-    if (!allow_rpc_unavailable && node.process.running()) {
-      AttachNodePerfCounters(node);
-      TransitionNodeState(events_path, options.run_id, node,
+    bool restored_running = false;
+    if (!allow_rpc_unavailable) {
+      auto process_guard = LockNodeProcessState(node);
+      if (node.process.running()) {
+        AttachNodePerfCounters(node, process_guard);
+        node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+        restored_running = true;
+      }
+    }
+    if (restored_running) {
+      WriteNodeStateEvent(events_path, options.run_id, node,
                           NodeRuntimeLifecycle::kRunning);
     }
     throw;
   }
-  TransitionNodeState(events_path, options.run_id, node,
+  {
+    auto process_guard = LockNodeProcessState(node);
+    node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+  }
+  WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kStopped);
 }
 
@@ -12890,8 +13173,13 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
   };
 
   for (auto& node : nodes) {
-    ResetNodePerfCounters(node);
-    if (node.process.running()) {
+    bool running = false;
+    {
+      auto process_guard = LockNodeProcessState(node);
+      ResetNodePerfCounters(node, process_guard);
+      running = node.process.running();
+    }
+    if (running) {
       RunNodeCleanupStep(best_effort, "stopping state event", [&] {
         TransitionNodeState(events_path, options.run_id, node,
                             NodeRuntimeLifecycle::kStopping);
@@ -12904,7 +13192,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
   std::vector<std::size_t> running_processes;
   running_processes.reserve(nodes.size());
   for (std::size_t index = 0; index < nodes.size(); ++index) {
-    if (nodes[index].process.running()) {
+    if (NodeProcessRunning(nodes[index])) {
       running_processes.push_back(index);
       RunNodeCleanupStep(best_effort, "RPC stop event", [&] {
         WriteEvent(events_path, options.run_id, nodes[index].config.id,
@@ -12947,7 +13235,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
          std::chrono::steady_clock::now() < shutdown_deadline) {
     process_running = false;
     for (auto& node : nodes) {
-      process_running = node.process.running() || process_running;
+      process_running = NodeProcessRunning(node) || process_running;
     }
     if (process_running) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -12956,7 +13244,7 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
 
   running_processes.clear();
   for (std::size_t index = 0; index < nodes.size(); ++index) {
-    if (!nodes[index].process.running()) {
+    if (!NodeProcessRunning(nodes[index])) {
       continue;
     }
     running_processes.push_back(index);
@@ -12966,18 +13254,62 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
     });
   }
   std::vector<std::exception_ptr> termination_failures(nodes.size());
-  std::vector<std::jthread> termination_workers;
-  termination_workers.reserve(running_processes.size());
   for (const std::size_t index : running_processes) {
-    termination_workers.emplace_back([&, index] {
-      try {
-        nodes[index].process.Terminate(std::chrono::seconds(1));
-      } catch (...) {
+    try {
+      static_cast<void>(RequestNodeTerminate(nodes[index]));
+    } catch (...) {
+      termination_failures[index] = std::current_exception();
+    }
+  }
+  const auto terminate_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  bool terminating_processes = true;
+  while (terminating_processes &&
+         std::chrono::steady_clock::now() < terminate_deadline) {
+    terminating_processes = false;
+    for (const std::size_t index : running_processes) {
+      terminating_processes =
+          NodeProcessRunning(nodes[index]) || terminating_processes;
+    }
+    if (terminating_processes) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+  std::vector<std::size_t> kill_processes;
+  kill_processes.reserve(running_processes.size());
+  for (const std::size_t index : running_processes) {
+    if (!NodeProcessRunning(nodes[index])) {
+      continue;
+    }
+    kill_processes.push_back(index);
+    try {
+      static_cast<void>(RequestNodeKill(nodes[index]));
+    } catch (...) {
+      if (!termination_failures[index]) {
         termination_failures[index] = std::current_exception();
       }
-    });
+    }
   }
-  termination_workers.clear();
+  const auto kill_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  bool killed_processes_running = true;
+  while (killed_processes_running &&
+         std::chrono::steady_clock::now() < kill_deadline) {
+    killed_processes_running = false;
+    for (const std::size_t index : kill_processes) {
+      killed_processes_running =
+          NodeProcessRunning(nodes[index]) || killed_processes_running;
+    }
+    if (killed_processes_running) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+  for (const std::size_t index : kill_processes) {
+    if (NodeProcessRunning(nodes[index]) && !termination_failures[index]) {
+      termination_failures[index] = std::make_exception_ptr(std::runtime_error(
+          "node process survived SIGKILL: " + nodes[index].config.id));
+    }
+  }
   for (const std::exception_ptr& failure : termination_failures) {
     record_failure("node process termination", failure);
   }
@@ -13114,7 +13446,8 @@ struct NodePerfCounterSnapshot {
 };
 
 void BeginNodePerfCounterReplacement(NodePerfCounterSnapshot& snapshot,
-                                     PerfCounterTargetKind target_kind) {
+                                     PerfCounterTargetKind target_kind,
+                                     const RunProcessState::Guard&) {
   NodeRuntime& node = *snapshot.node;
   snapshot.configuration_kind = node.perf_counter_target_kind;
   node.perf_counter_kinds.swap(snapshot.configuration_kinds);
@@ -13138,7 +13471,8 @@ void BeginNodePerfCounterReplacement(NodePerfCounterSnapshot& snapshot,
   snapshot.replacement_started = true;
 }
 
-void RestoreNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot) {
+void RestoreNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot,
+                                    const RunProcessState::Guard&) {
   if (!snapshot.replacement_started) {
     return;
   }
@@ -13159,7 +13493,8 @@ void RestoreNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot) {
   node.perf_counter_error = std::move(snapshot.error);
 }
 
-void RequireNodePerfCounterAttachment(const NodeRuntime& node) {
+void RequireNodePerfCounterAttachment(const NodeRuntime& node,
+                                      const RunProcessState::Guard&) {
   if (node.perf_counter_error_kind || !node.perf_counter_error.empty()) {
     throw std::runtime_error(
         "perf counter attachment failed for " + node.config.id + ": " +
@@ -13189,7 +13524,8 @@ void RequireNodePerfCounterAttachment(const NodeRuntime& node) {
 }
 
 void ApplyPerfCounterCommand(const SimulationCommand& command,
-                             std::vector<NodeRuntime>& nodes) {
+                             std::vector<NodeRuntime>& nodes,
+                             const RunProcessState::Guard& process_guard) {
   if (!command.perf_counter_target) {
     throw std::runtime_error("perf counter command requires a typed target");
   }
@@ -13268,13 +13604,13 @@ void ApplyPerfCounterCommand(const SimulationCommand& command,
 
   try {
     for (NodePerfCounterSnapshot& snapshot : snapshots) {
-      BeginNodePerfCounterReplacement(snapshot, target.kind);
-      AttachNodePerfCounters(*snapshot.node);
-      RequireNodePerfCounterAttachment(*snapshot.node);
+      BeginNodePerfCounterReplacement(snapshot, target.kind, process_guard);
+      AttachNodePerfCounters(*snapshot.node, process_guard);
+      RequireNodePerfCounterAttachment(*snapshot.node, process_guard);
     }
   } catch (...) {
     for (NodePerfCounterSnapshot& snapshot : snapshots) {
-      RestoreNodePerfCounterSnapshot(snapshot);
+      RestoreNodePerfCounterSnapshot(snapshot, process_guard);
     }
     throw;
   }
@@ -13579,9 +13915,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::optional<std::chrono::steady_clock::time_point> simulation_epoch;
   std::atomic<bool> simulation_duration_reached = false;
   std::atomic<std::uint64_t> duration_stop_requested_at_ms = 0U;
-  std::vector<std::string> active_native_miner_ids;
-  std::set<std::string> paused_scheduled_miners;
-  std::mutex node_process_mutex;
+  RunProcessState run_process_state;
   std::stop_source command_rpc_stop_source;
   std::stop_source block_production_rpc_stop_source;
   std::stop_source metrics_rpc_stop_source;
@@ -13643,16 +13977,22 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       block_scheduler->Stop();
     }
     std::exception_ptr first_failure;
-    for (const std::string& node_id : active_native_miner_ids) {
+    std::vector<std::string> active_native_miners;
+    {
+      auto process_guard = run_process_state.Lock();
+      active_native_miners =
+          run_process_state.ActiveNativeMiners(process_guard);
+    }
+    for (const std::string& node_id : active_native_miners) {
       try {
-        driver.StopMining(FindNodeRuntimeById(nodes, node_id).config);
+        StopNativeMining(driver, FindNodeRuntimeById(nodes, node_id),
+                         run_process_state);
       } catch (...) {
         if (!first_failure) {
           first_failure = std::current_exception();
         }
       }
     }
-    active_native_miner_ids.clear();
     if (first_failure) {
       std::rethrow_exception(first_failure);
     }
@@ -13697,9 +14037,16 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     cleanup_step("node shutdown",
                  [&] { StopNodes(options, events_path, driver, nodes, true); });
     for (auto& node : nodes) {
+      cleanup_step("node process fallback signal",
+                   [&] { static_cast<void>(RequestNodeKill(node)); });
+    }
+    const auto fallback_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (auto& node : nodes) {
       cleanup_step("node process fallback shutdown", [&] {
-        if (node.process.running()) {
-          node.process.Terminate(std::chrono::seconds(1));
+        if (!WaitForNodeProcessExitUntil(node, fallback_deadline)) {
+          throw std::runtime_error("node process survived fallback SIGKILL: " +
+                                   node.config.id);
         }
       });
     }
@@ -13830,7 +14177,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   }
   try {
     StartNodes(options, run_root, events_path, chain_spec, driver,
-               runtime_topology, nodes, lifecycle_epoch, stop_token);
+               runtime_topology, nodes, run_process_state, lifecycle_epoch,
+               stop_token);
     network_allocation_lock.reset();
     PublishOperatorConnectionCommand(options, run_root, events_path, driver,
                                      nodes, &operator_connection_resolved);
@@ -13863,9 +14211,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       block_scheduler = std::make_unique<ProbabilisticBlockScheduler>(
           miner_node_ids, options.block_production.policy,
           [&](const std::string& node_id) {
-            std::lock_guard<std::mutex> process_lock(node_process_mutex);
             NodeRuntime& miner = FindNodeRuntimeById(nodes, node_id);
-            RequireNodeRunning(miner, "scheduled block production");
+            {
+              auto process_guard = run_process_state.Lock();
+              RequireNodeRunning(miner, process_guard,
+                                 "scheduled block production");
+            }
             const std::vector<std::string> hashes = driver.GenerateBlocks(
                 miner.config, 1U, chain_spec.default_reward_address,
                 block_production_rpc_stop_source.get_token());
@@ -13936,11 +14287,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               }
               block_scheduler->StopMiner(config.id);
             } else {
-              driver.StopMining(config, command_stop_token);
-              active_native_miner_ids.erase(
-                  std::remove(active_native_miner_ids.begin(),
-                              active_native_miner_ids.end(), config.id),
-                  active_native_miner_ids.end());
+              StopNativeMining(driver, FindNodeRuntimeById(nodes, config.id),
+                               run_process_state, command_stop_token);
             }
           },
           [&](BlockProductionPolicy policy) {
@@ -13998,8 +14346,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               ExportNodeReport(run_root, command);
             } else if (command.kind ==
                        SimulationCommandKind::kSetPerfCounters) {
-              std::lock_guard<std::mutex> lock(node_process_mutex);
-              ApplyPerfCounterCommand(command, nodes);
+              auto process_guard = run_process_state.Lock();
+              ApplyPerfCounterCommand(command, nodes, process_guard);
             } else if (command.kind ==
                        SimulationCommandKind::kSendWalletTransaction) {
               if (!command.wallet_send) {
@@ -14045,21 +14393,22 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               }
               ChainWalletTransactionResult transaction;
               {
-                std::lock_guard<std::mutex> lock(node_process_mutex);
-                RequireNodeRunning(sender_node, "operator wallet send");
+                auto process_guard = run_process_state.Lock();
+                RequireNodeRunning(sender_node, process_guard,
+                                   "operator wallet send");
                 if (!sender_node.config.wallet_enabled) {
                   throw std::runtime_error(
                       "operator wallet send requires wallet support on " +
                       sender_node.config.id);
                 }
-                transaction = driver.SendWalletTransaction(
-                    sender_node.config,
-                    ToChainWalletMode(
-                        simulation_registry.wallet_initialization()),
-                    receiver.address, send.amount_satoshis, send.fee_satoshis,
-                    std::chrono::seconds(send.timeout_sec),
-                    command_rpc_stop_source.get_token());
               }
+              transaction = driver.SendWalletTransaction(
+                  sender_node.config,
+                  ToChainWalletMode(
+                      simulation_registry.wallet_initialization()),
+                  receiver.address, send.amount_satoshis, send.fee_satoshis,
+                  std::chrono::seconds(send.timeout_sec),
+                  command_rpc_stop_source.get_token());
               if (transaction.txids.empty()) {
                 throw std::runtime_error(
                     "operator wallet send returned no transaction id");
@@ -14110,34 +14459,66 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                        std::nullopt, std::nullopt, std::nullopt,
                                        command.sequence, true);
             } else if (command.kind == SimulationCommandKind::kKillNode) {
+              bool was_paused = false;
+              {
+                auto process_guard = run_process_state.Lock();
+                was_paused = run_process_state.IsPausedScheduledMiner(
+                    process_guard, command.node_id);
+              }
               const bool resume_on_failure =
-                  stop_scheduled_miner() ||
-                  paused_scheduled_miners.contains(command.node_id);
+                  stop_scheduled_miner() || was_paused;
               try {
-                std::lock_guard<std::mutex> lock(node_process_mutex);
-                if (!node.process.running()) {
-                  throw std::runtime_error("node process is not running: " +
-                                           command.node_id);
+                pid_t pid = -1;
+                {
+                  auto process_guard = run_process_state.Lock();
+                  if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning) {
+                    throw std::runtime_error(
+                        "node kill conflicts with an active lifecycle "
+                        "operation: " +
+                        command.node_id + " (state=" +
+                        std::string(
+                            NodeRuntimeLifecycleName(node.Lifecycle())) +
+                        ")");
+                  }
+                  if (!node.process.running()) {
+                    throw std::runtime_error("node process is not running: " +
+                                             command.node_id);
+                  }
+                  pid = node.process.pid();
+                  ResetNodePerfCounters(node, process_guard);
+                  node.SetLifecycle(NodeRuntimeLifecycle::kKilling);
                 }
+                WriteNodeStateEvent(events_path, options.run_id, node,
+                                    NodeRuntimeLifecycle::kKilling);
                 if (node.cgroup && node.cgroup->Frozen()) {
                   SetNodeFrozen(options, events_path, node, false,
                                 command_rpc_stop_source.get_token());
                 }
-                const pid_t pid = node.process.pid();
-                TransitionNodeState(events_path, options.run_id, node,
-                                    NodeRuntimeLifecycle::kKilling);
                 WriteEvent(events_path, options.run_id, command.node_id,
                            SimulationEventKind::kProcessKillRequested,
                            "pid=" + std::to_string(pid));
                 try {
-                  node.process.Kill();
-                  if (node.process.running()) {
+                  static_cast<void>(RequestNodeKill(node));
+                  const auto kill_deadline = std::chrono::steady_clock::now() +
+                                             std::chrono::seconds(5);
+                  if (!WaitForNodeProcessExitUntil(
+                          node, kill_deadline,
+                          command_rpc_stop_source.get_token())) {
                     throw std::runtime_error("node process survived SIGKILL: " +
                                              command.node_id);
                   }
                 } catch (...) {
-                  if (node.process.running()) {
-                    TransitionNodeState(events_path, options.run_id, node,
+                  bool restored_running = false;
+                  {
+                    auto process_guard = run_process_state.Lock();
+                    if (node.process.running()) {
+                      AttachNodePerfCounters(node, process_guard);
+                      node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+                      restored_running = true;
+                    }
+                  }
+                  if (restored_running) {
+                    WriteNodeStateEvent(events_path, options.run_id, node,
                                         NodeRuntimeLifecycle::kRunning);
                   }
                   throw;
@@ -14145,53 +14526,88 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 WriteEvent(events_path, options.run_id, command.node_id,
                            SimulationEventKind::kProcessKilled,
                            "pid=" + std::to_string(pid));
-                TransitionNodeState(events_path, options.run_id, node,
+                {
+                  auto process_guard = run_process_state.Lock();
+                  node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
+                }
+                WriteNodeStateEvent(events_path, options.run_id, node,
                                     NodeRuntimeLifecycle::kKilled);
               } catch (...) {
-                if (resume_on_failure && node.process.running()) {
+                bool restored_running = false;
+                {
+                  auto process_guard = run_process_state.Lock();
+                  if (node.Lifecycle() == NodeRuntimeLifecycle::kKilling &&
+                      node.process.running()) {
+                    AttachNodePerfCounters(node, process_guard);
+                    node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
+                    restored_running = true;
+                  }
+                }
+                if (restored_running) {
+                  WriteNodeStateEvent(events_path, options.run_id, node,
+                                      NodeRuntimeLifecycle::kRunning);
+                }
+                if (resume_on_failure && NodeProcessRunning(node)) {
                   block_scheduler->StartMiner(command.node_id);
-                  paused_scheduled_miners.erase(command.node_id);
+                  auto process_guard = run_process_state.Lock();
+                  static_cast<void>(run_process_state.ResumeScheduledMiner(
+                      process_guard, command.node_id));
                 }
                 throw;
               }
-              paused_scheduled_miners.erase(command.node_id);
-              active_native_miner_ids.erase(
-                  std::remove(active_native_miner_ids.begin(),
-                              active_native_miner_ids.end(), command.node_id),
-                  active_native_miner_ids.end());
+              {
+                auto process_guard = run_process_state.Lock();
+                static_cast<void>(run_process_state.ResumeScheduledMiner(
+                    process_guard, command.node_id));
+                run_process_state.RemoveActiveNativeMiner(process_guard,
+                                                          command.node_id);
+              }
             } else if (command.kind == SimulationCommandKind::kStopNode) {
+              bool was_paused = false;
+              {
+                auto process_guard = run_process_state.Lock();
+                was_paused = run_process_state.IsPausedScheduledMiner(
+                    process_guard, command.node_id);
+              }
               const bool resume_on_failure =
-                  stop_scheduled_miner() ||
-                  paused_scheduled_miners.contains(command.node_id);
+                  stop_scheduled_miner() || was_paused;
               try {
-                std::lock_guard<std::mutex> lock(node_process_mutex);
                 StopNodeProcess(options, events_path, driver, node,
                                 command_rpc_stop_source.get_token());
               } catch (...) {
-                if (resume_on_failure && node.process.running()) {
+                if (resume_on_failure && NodeProcessRunning(node)) {
                   block_scheduler->StartMiner(command.node_id);
-                  paused_scheduled_miners.erase(command.node_id);
+                  auto process_guard = run_process_state.Lock();
+                  static_cast<void>(run_process_state.ResumeScheduledMiner(
+                      process_guard, command.node_id));
                 }
                 throw;
               }
-              paused_scheduled_miners.erase(command.node_id);
-              active_native_miner_ids.erase(
-                  std::remove(active_native_miner_ids.begin(),
-                              active_native_miner_ids.end(), command.node_id),
-                  active_native_miner_ids.end());
-            } else if (command.kind == SimulationCommandKind::kRestartNode) {
-              const bool resume_scheduled_miner =
-                  stop_scheduled_miner() ||
-                  paused_scheduled_miners.contains(command.node_id);
-              if (resume_scheduled_miner) {
-                paused_scheduled_miners.insert(command.node_id);
+              {
+                auto process_guard = run_process_state.Lock();
+                static_cast<void>(run_process_state.ResumeScheduledMiner(
+                    process_guard, command.node_id));
+                run_process_state.RemoveActiveNativeMiner(process_guard,
+                                                          command.node_id);
               }
-              const bool resume_native_miner =
-                  std::find(active_native_miner_ids.begin(),
-                            active_native_miner_ids.end(),
-                            command.node_id) != active_native_miner_ids.end();
+            } else if (command.kind == SimulationCommandKind::kRestartNode) {
+              bool was_paused = false;
+              bool resume_native_miner = false;
+              {
+                auto process_guard = run_process_state.Lock();
+                was_paused = run_process_state.IsPausedScheduledMiner(
+                    process_guard, command.node_id);
+                resume_native_miner = run_process_state.IsActiveNativeMiner(
+                    process_guard, command.node_id);
+              }
+              const bool resume_scheduled_miner =
+                  stop_scheduled_miner() || was_paused;
+              if (resume_scheduled_miner) {
+                auto process_guard = run_process_state.Lock();
+                run_process_state.PauseScheduledMiner(process_guard,
+                                                      command.node_id);
+              }
               try {
-                std::lock_guard<std::mutex> lock(node_process_mutex);
                 if (!RestartNode(options, events_path, driver, node,
                                  lifecycle_epoch,
                                  command_rpc_stop_source.get_token())) {
@@ -14201,25 +14617,34 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                       node.config.id);
                 }
                 if (resume_native_miner) {
-                  driver.StartMining(node.config,
-                                     chain_spec.default_reward_address,
-                                     command_rpc_stop_source.get_token());
+                  if (!StartNativeMiningForCurrentProcess(
+                          driver, node, run_process_state,
+                          chain_spec.default_reward_address,
+                          command_rpc_stop_source.get_token(),
+                          "operator native mining restart")) {
+                    throw std::runtime_error(
+                        "node process changed during native mining restart: " +
+                        node.config.id);
+                  }
                 }
               } catch (...) {
-                if (resume_scheduled_miner && node.process.running()) {
+                if (resume_scheduled_miner && NodeProcessRunning(node)) {
                   block_scheduler->StartMiner(command.node_id);
-                  paused_scheduled_miners.erase(command.node_id);
+                  auto process_guard = run_process_state.Lock();
+                  static_cast<void>(run_process_state.ResumeScheduledMiner(
+                      process_guard, command.node_id));
                 }
                 throw;
               }
               if (resume_scheduled_miner) {
                 block_scheduler->StartMiner(command.node_id);
-                paused_scheduled_miners.erase(command.node_id);
+                auto process_guard = run_process_state.Lock();
+                static_cast<void>(run_process_state.ResumeScheduledMiner(
+                    process_guard, command.node_id));
               }
             } else if (command.kind == SimulationCommandKind::kFreezeNode) {
               const bool resume_on_thaw = stop_scheduled_miner();
               try {
-                std::lock_guard<std::mutex> lock(node_process_mutex);
                 RequireNodeRunning(node, "operator freeze");
                 SetNodeFrozen(options, events_path, node, true,
                               command_rpc_stop_source.get_token());
@@ -14230,15 +14655,20 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 throw;
               }
               if (resume_on_thaw) {
-                paused_scheduled_miners.insert(command.node_id);
+                auto process_guard = run_process_state.Lock();
+                run_process_state.PauseScheduledMiner(process_guard,
+                                                      command.node_id);
               }
             } else if (command.kind == SimulationCommandKind::kThawNode) {
+              SetNodeFrozen(options, events_path, node, false,
+                            command_rpc_stop_source.get_token());
+              bool resume_scheduled_miner = false;
               {
-                std::lock_guard<std::mutex> lock(node_process_mutex);
-                SetNodeFrozen(options, events_path, node, false,
-                              command_rpc_stop_source.get_token());
+                auto process_guard = run_process_state.Lock();
+                resume_scheduled_miner = run_process_state.ResumeScheduledMiner(
+                    process_guard, command.node_id);
               }
-              if (paused_scheduled_miners.erase(command.node_id) != 0U) {
+              if (resume_scheduled_miner) {
                 block_scheduler->StartMiner(command.node_id);
               }
             } else if (command.kind == SimulationCommandKind::kGenerateBlocks) {
@@ -14246,7 +14676,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 throw std::runtime_error(
                     "generate-blocks command requires a positive count");
               }
-              std::lock_guard<std::mutex> lock(node_process_mutex);
               RequireNodeRunning(node, "operator block generation");
               const std::uint64_t start_height =
                   driver
@@ -14480,7 +14909,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                   configured_miners.contains(node.config.id)) {
                 block_scheduler->StopMiner(node.config.id);
               }
-              std::lock_guard<std::mutex> process_lock(node_process_mutex);
               if (node.DeclarativeStopApplied()) {
                 continue;
               }
@@ -14491,18 +14919,23 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                   NodeLifecycleDeadlineDetail(
                       node, options.time_scale, lifecycle_epoch,
                       *node.lifecycle_policy.stop_time, "declarative_stop"));
-              if (node.process.running()) {
+              if (NodeProcessRunning(node)) {
                 StopNodeProcess(options, events_path, driver, node,
                                 operation_stop_token);
               } else {
-                ResetNodePerfCounters(node);
-                TransitionNodeState(events_path, options.run_id, node,
+                {
+                  auto process_guard = run_process_state.Lock();
+                  ResetNodePerfCounters(node, process_guard);
+                  node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+                }
+                WriteNodeStateEvent(events_path, options.run_id, node,
                                     NodeRuntimeLifecycle::kStopped);
               }
-              active_native_miner_ids.erase(
-                  std::remove(active_native_miner_ids.begin(),
-                              active_native_miner_ids.end(), node.config.id),
-                  active_native_miner_ids.end());
+              {
+                auto process_guard = run_process_state.Lock();
+                run_process_state.RemoveActiveNativeMiner(process_guard,
+                                                          node.config.id);
+              }
               continue;
             }
 
@@ -14512,33 +14945,30 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 now >= SteadyDeadline(lifecycle_epoch,
                                       options.time_scale.WallDuration(
                                           *node.lifecycle_policy.start_time))) {
-              {
-                std::lock_guard<std::mutex> process_lock(node_process_mutex);
-                WriteEvent(events_path, options.run_id, node.config.id,
-                           SimulationEventKind::kNodeStartDeadlineReached,
-                           NodeLifecycleDeadlineDetail(
-                               node, options.time_scale, lifecycle_epoch,
-                               *node.lifecycle_policy.start_time,
-                               "declarative_start"));
-                node_started = StartPreparedNode(
-                    options, events_path, driver, node, "declarative_start",
-                    lifecycle_epoch, operation_stop_token);
-                if (node_started) {
-                  ConnectAvailableStartupPeers(options, events_path, driver,
-                                               nodes, index, lifecycle_epoch,
-                                               operation_stop_token);
-                  if (configured_miners.contains(node.config.id) &&
-                      options.block_production.enabled &&
-                      options.block_production.difficulty) {
-                    RequireNodeRunning(node, "declarative mining difficulty");
-                    driver.SetMiningDifficulty(
-                        node.config, *options.block_production.difficulty,
-                        operation_stop_token);
-                  }
-                  PublishOperatorConnectionCommand(
-                      options, run_root, events_path, driver, nodes,
-                      &operator_connection_resolved);
+              WriteEvent(
+                  events_path, options.run_id, node.config.id,
+                  SimulationEventKind::kNodeStartDeadlineReached,
+                  NodeLifecycleDeadlineDetail(
+                      node, options.time_scale, lifecycle_epoch,
+                      *node.lifecycle_policy.start_time, "declarative_start"));
+              node_started = StartPreparedNode(
+                  options, events_path, driver, node, "declarative_start",
+                  lifecycle_epoch, operation_stop_token);
+              if (node_started) {
+                ConnectAvailableStartupPeers(options, events_path, driver,
+                                             nodes, index, lifecycle_epoch,
+                                             operation_stop_token);
+                if (configured_miners.contains(node.config.id) &&
+                    options.block_production.enabled &&
+                    options.block_production.difficulty) {
+                  RequireNodeRunning(node, "declarative mining difficulty");
+                  driver.SetMiningDifficulty(
+                      node.config, *options.block_production.difficulty,
+                      operation_stop_token);
                 }
+                PublishOperatorConnectionCommand(options, run_root, events_path,
+                                                 driver, nodes,
+                                                 &operator_connection_resolved);
               }
             }
             if (node_started && block_scheduler &&
@@ -14548,66 +14978,71 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                        options.block_production.mode ==
                            MiningMode::kNativeMining &&
                        configured_miners.contains(node.config.id)) {
-              std::lock_guard<std::mutex> process_lock(node_process_mutex);
-              RequireNodeRunning(node, "declarative native mining start");
-              driver.StartMining(node.config, chain_spec.default_reward_address,
-                                 operation_stop_token);
-              active_native_miner_ids.push_back(node.config.id);
+              static_cast<void>(StartNativeMiningForCurrentProcess(
+                  driver, node, run_process_state,
+                  chain_spec.default_reward_address, operation_stop_token,
+                  "declarative native mining start"));
             }
 
             bool node_restarted = false;
+            std::optional<int> exited_wait_status;
+            std::string process_exit_detail;
             {
-              std::lock_guard<std::mutex> process_lock(node_process_mutex);
+              auto process_guard = run_process_state.Lock();
               if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning ||
                   node.process.running()) {
                 continue;
               }
-              const std::optional<int> wait_status = node.process.exit_status();
-              if (!wait_status) {
+              exited_wait_status = node.process.exit_status();
+              if (!exited_wait_status) {
                 throw std::runtime_error("node exited without a wait status: " +
                                          node.config.id);
               }
-              ResetNodePerfCounters(node);
-              WriteEvent(events_path, options.run_id, node.config.id,
-                         SimulationEventKind::kProcessExited,
-                         ProcessExitDetail(node.process));
-              TransitionNodeState(events_path, options.run_id, node,
-                                  NodeRuntimeLifecycle::kFailed);
-              const bool restart = NodeRestartPolicyAllowsRestart(
-                  node.lifecycle_policy.restart_policy, *wait_status);
-              WriteEvent(
-                  events_path, options.run_id, node.config.id,
-                  SimulationEventKind::kRestartPolicyApplied,
-                  RestartPolicyAppliedDetail(node, *wait_status, restart));
-              if (!restart) {
-                throw std::runtime_error(
-                    "node process exited and restart policy did not "
-                    "restart it: " +
-                    node.config.id);
+              ResetNodePerfCounters(node, process_guard);
+              process_exit_detail =
+                  ProcessExitDetail(node.process, process_guard);
+              node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
+            }
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kProcessExited,
+                       process_exit_detail);
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kState,
+                       NodeRuntimeLifecycleName(NodeRuntimeLifecycle::kFailed));
+            const bool restart = NodeRestartPolicyAllowsRestart(
+                node.lifecycle_policy.restart_policy, *exited_wait_status);
+            WriteEvent(
+                events_path, options.run_id, node.config.id,
+                SimulationEventKind::kRestartPolicyApplied,
+                RestartPolicyAppliedDetail(node, *exited_wait_status, restart));
+            if (!restart) {
+              throw std::runtime_error(
+                  "node process exited and restart policy did not restart "
+                  "it: " +
+                  node.config.id);
+            }
+            std::set<std::string> available_peer_addresses;
+            for (const NodeRuntime& candidate : nodes) {
+              if (candidate.config.id != node.config.id &&
+                  candidate.AllowsChainMetrics()) {
+                available_peer_addresses.insert(NodePeerEndpoint(candidate));
               }
-              std::set<std::string> available_peer_addresses;
-              for (const NodeRuntime& candidate : nodes) {
-                if (candidate.config.id != node.config.id &&
-                    candidate.AllowsChainMetrics()) {
-                  available_peer_addresses.insert(NodePeerEndpoint(candidate));
-                }
-              }
-              node_restarted =
-                  RestartNode(options, events_path, driver, node,
-                              lifecycle_epoch, operation_stop_token,
-                              "restart_policy", &available_peer_addresses);
-              if (node_restarted) {
-                ConnectAvailableStartupPeers(options, events_path, driver,
-                                             nodes, index, lifecycle_epoch,
-                                             operation_stop_token);
-                if (configured_miners.contains(node.config.id) &&
-                    options.block_production.enabled &&
-                    options.block_production.difficulty) {
-                  RequireNodeRunning(node, "restart mining difficulty restore");
-                  driver.SetMiningDifficulty(
-                      node.config, *options.block_production.difficulty,
-                      operation_stop_token);
-                }
+            }
+            node_restarted =
+                RestartNode(options, events_path, driver, node, lifecycle_epoch,
+                            operation_stop_token, "restart_policy",
+                            &available_peer_addresses);
+            if (node_restarted) {
+              ConnectAvailableStartupPeers(options, events_path, driver, nodes,
+                                           index, lifecycle_epoch,
+                                           operation_stop_token);
+              if (configured_miners.contains(node.config.id) &&
+                  options.block_production.enabled &&
+                  options.block_production.difficulty) {
+                RequireNodeRunning(node, "restart mining difficulty restore");
+                driver.SetMiningDifficulty(node.config,
+                                           *options.block_production.difficulty,
+                                           operation_stop_token);
               }
             }
             if (node_restarted && block_scheduler &&
@@ -14617,10 +15052,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                        options.block_production.mode ==
                            MiningMode::kNativeMining &&
                        configured_miners.contains(node.config.id)) {
-              std::lock_guard<std::mutex> process_lock(node_process_mutex);
-              driver.StartMining(node.config, chain_spec.default_reward_address,
-                                 operation_stop_token);
-              active_native_miner_ids.push_back(node.config.id);
+              static_cast<void>(StartNativeMiningForCurrentProcess(
+                  driver, node, run_process_state,
+                  chain_spec.default_reward_address, operation_stop_token,
+                  "restart-policy native mining restore"));
             }
           }
           std::unique_lock<std::mutex> wait_lock(wakeup_mutex);
@@ -14654,7 +15089,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         options.metrics_sample_count, options.metrics_interval,
         [&](std::uint32_t sample) {
           WriteMetricsSnapshot(
-              metrics_path, options, driver, nodes, node_process_mutex,
+              metrics_path, options, driver, nodes, run_process_state,
               [&](const NodeRuntime& node, std::string_view error) {
                 boost::json::object detail;
                 detail["sample"] = sample;
@@ -14713,9 +15148,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           if (!nodes[miner_index].AllowsChainMetrics()) {
             continue;
           }
-          driver.StartMining(nodes[miner_index].config,
-                             chain_spec.default_reward_address, stop_token);
-          active_native_miner_ids.push_back(nodes[miner_index].config.id);
+          static_cast<void>(StartNativeMiningForCurrentProcess(
+              driver, nodes[miner_index], run_process_state,
+              chain_spec.default_reward_address, stop_token,
+              "initial native mining start"));
         }
       } else if (block_scheduler) {
         block_scheduler->Start();
@@ -14727,7 +15163,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
 
     ThrowIfStopRequested(stop_token);
     WriteMetricsSnapshot(
-        metrics_path, options, driver, nodes, node_process_mutex,
+        metrics_path, options, driver, nodes, run_process_state,
         [&](const NodeRuntime& node, std::string_view error) {
           boost::json::object detail;
           detail["sample"] = 0;
@@ -14765,11 +15201,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     ApplyRuntimeNetworkPartitions(options, events_path, nodes, stop_token);
     ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes, stop_token);
     ApplyRuntimeNetworkUnblockRules(options, events_path, nodes, stop_token);
-    {
-      std::lock_guard<std::mutex> lock(node_process_mutex);
-      ApplyRuntimeNodeRestarts(options, events_path, driver, nodes,
-                               lifecycle_epoch, stop_token);
-    }
+    ApplyRuntimeNodeRestarts(options, events_path, driver, nodes,
+                             lifecycle_epoch, stop_token);
     ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
     if (!timed_node_lifecycle) {
       event_engine_epoch = std::chrono::steady_clock::now();
@@ -14847,16 +15280,13 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             NodeRuntime& generator = nodes[workload.node - 1U];
             uint64_t start_height = 0U;
             std::vector<std::string> hashes;
-            {
-              std::lock_guard<std::mutex> lock(node_process_mutex);
-              RequireNodeRunning(generator, "block generation workload");
-              start_height =
-                  driver.ReadMetrics(generator.config, stop_token).height;
-              hashes = driver.GenerateBlocks(generator.config, workload.count,
-                                             chain_spec.default_reward_address,
-                                             stop_token);
-              RecordGeneratedBlocks(driver, generator, hashes, stop_token);
-            }
+            RequireNodeRunning(generator, "block generation workload");
+            start_height =
+                driver.ReadMetrics(generator.config, stop_token).height;
+            hashes = driver.GenerateBlocks(generator.config, workload.count,
+                                           chain_spec.default_reward_address,
+                                           stop_token);
+            RecordGeneratedBlocks(driver, generator, hashes, stop_token);
             const uint64_t target_height =
                 start_height + static_cast<uint64_t>(hashes.size());
             WriteEvent(
@@ -14934,15 +15364,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             const RestartNodeWorkload& workload =
                 scenario_workload.restart_node;
             NodeRuntime& node = nodes[workload.node - 1U];
-            {
-              std::lock_guard<std::mutex> lock(node_process_mutex);
-              if (!RestartNode(options, events_path, driver, node,
-                               lifecycle_epoch, stop_token)) {
-                throw std::runtime_error(
-                    "restart_node workload reached node stop_time before "
-                    "completion: " +
-                    node.config.id);
-              }
+            if (!RestartNode(options, events_path, driver, node,
+                             lifecycle_epoch, stop_token)) {
+              throw std::runtime_error(
+                  "restart_node workload reached node stop_time before "
+                  "completion: " +
+                  node.config.id);
             }
             WriteEvent(
                 events_path, options.run_id, node.config.id,
@@ -14981,7 +15408,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                      WorkloadKind::kResourcePressure) {
             ApplyResourcePressureWorkload(
                 options, events_path, metrics_path, driver, nodes,
-                node_process_mutex, scenario_workload.resource_pressure,
+                run_process_state, scenario_workload.resource_pressure,
                 action_index, action_count, stop_token);
           } else if (scenario_workload.kind ==
                      WorkloadKind::kSetNetworkCondition) {
@@ -15042,7 +15469,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                            stop_token);
             const std::uint32_t node_metric_samples =
                 WriteMetricsSnapshot(metrics_path, options, driver, nodes,
-                                     node_process_mutex, {}, {}, stop_token);
+                                     run_process_state, {}, {}, stop_token);
             const std::uint32_t wallet_metric_samples =
                 WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver,
                                            nodes, {}, stop_token);
@@ -15052,7 +15479,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                                 name, node_metric_samples,
                                                 wallet_metric_samples));
           } else if (IsTopologyEdgeAction(scenario_workload.kind)) {
-            std::lock_guard<std::mutex> lock(node_process_mutex);
             ApplyTopologyEdgeWorkload(
                 options, events_path, chain_spec, driver,
                 *peer_connectivity_controller, runtime_topology, nodes,
@@ -15102,7 +15528,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     transaction_tracker.ObserveAll(options, events_path, driver, nodes,
                                    stop_token);
     WriteMetricsSnapshot(metrics_path, options, driver, nodes,
-                         node_process_mutex, {}, {}, stop_token);
+                         run_process_state, {}, {}, stop_token);
     WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},
                                stop_token);
 

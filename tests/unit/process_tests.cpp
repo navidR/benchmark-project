@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "bbp/process.h"
 #include "bbp/util.h"
@@ -474,6 +475,70 @@ BOOST_AUTO_TEST_CASE(child_process_move_assignment_refuses_live_owner_loss) {
   BOOST_TEST(second.running());
   first.Kill();
   second.Kill();
+  std::filesystem::remove_all(run_dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    child_process_nonblocking_signal_requests_share_one_shutdown_deadline) {
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-process-common-deadline-" + std::to_string(getpid()));
+  std::filesystem::remove_all(run_dir);
+  std::filesystem::create_directories(run_dir);
+
+  constexpr std::size_t kProcessCount = 6U;
+  std::vector<bbp::ChildProcess> children;
+  children.reserve(kProcessCount);
+  for (std::size_t index = 0; index < kProcessCount; ++index) {
+    bbp::ProcessSpec spec;
+    spec.binary = "/bin/sleep";
+    spec.argv = {"10"};
+    spec.cwd = run_dir;
+    spec.stdout_path = run_dir / (std::to_string(index) + ".out");
+    spec.stderr_path = run_dir / (std::to_string(index) + ".err");
+    children.push_back(bbp::ChildProcess::Spawn(spec, std::nullopt));
+  }
+
+  const auto request_started = std::chrono::steady_clock::now();
+  for (bbp::ChildProcess& child : children) {
+    BOOST_REQUIRE(child.RequestTerminate());
+  }
+  const auto request_elapsed =
+      std::chrono::steady_clock::now() - request_started;
+  BOOST_TEST(
+      std::chrono::duration_cast<std::chrono::milliseconds>(request_elapsed)
+          .count() < 2000);
+
+  const auto common_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  for (bbp::ChildProcess& child : children) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < common_deadline) {
+      static_cast<void>(child.WaitForExit(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              common_deadline - now)));
+    }
+  }
+  for (bbp::ChildProcess& child : children) {
+    if (child.running()) {
+      static_cast<void>(child.RequestKill());
+    }
+  }
+  const auto kill_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  for (bbp::ChildProcess& child : children) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < kill_deadline) {
+      static_cast<void>(child.WaitForExit(
+          std::chrono::duration_cast<std::chrono::milliseconds>(kill_deadline -
+                                                                now)));
+    }
+    BOOST_TEST(!child.running());
+  }
+  const auto total_elapsed = std::chrono::steady_clock::now() - request_started;
+  BOOST_TEST(
+      std::chrono::duration_cast<std::chrono::milliseconds>(total_elapsed)
+          .count() < 5000);
   std::filesystem::remove_all(run_dir);
 }
 

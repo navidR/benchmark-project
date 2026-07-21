@@ -37,6 +37,8 @@ class ChildProcess {
   int pidfd() const { return pidfd_; }
   bool running() const;
   bool WaitForExit(std::chrono::milliseconds timeout);
+  bool RequestTerminate();
+  bool RequestKill();
   void Terminate(std::chrono::milliseconds graceful_timeout);
   void Kill();
   std::optional<int> exit_status() const { return exit_status_; }
