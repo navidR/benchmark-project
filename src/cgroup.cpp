@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "bbp/run_ownership.h"
 #include "bbp/util.h"
 
 namespace bbp {
@@ -29,8 +30,6 @@ namespace {
 
 constexpr std::string_view kCgroupRoot = "/sys/fs/cgroup";
 constexpr std::string_view kSimulatorRootName = "bbp";
-constexpr std::string_view kRunOwnershipMarker = ".bbp-run";
-constexpr std::string_view kRunOwnershipMarkerContents = "bbp run\n";
 
 std::mutex prepared_runs_mutex;
 std::set<std::string> prepared_runs;
@@ -552,35 +551,6 @@ void RemoveRunCgroup(const std::string& run_id) {
   RemoveCgroupDirectory(run_root, "run");
 }
 
-void RequireStaleRunOwnership(
-    const std::string& run_id,
-    const std::filesystem::path& owned_run_directory) {
-  if (owned_run_directory.filename() != run_id) {
-    throw std::runtime_error(
-        "run directory does not match stale cgroup run id: " +
-        owned_run_directory.string());
-  }
-  std::error_code ec;
-  const std::filesystem::file_status run_status =
-      std::filesystem::symlink_status(owned_run_directory, ec);
-  if (ec || !std::filesystem::is_directory(run_status)) {
-    throw std::runtime_error(
-        "stale cgroup cleanup requires an owned run "
-        "directory: " +
-        owned_run_directory.string());
-  }
-  const std::filesystem::path marker =
-      owned_run_directory / std::string(kRunOwnershipMarker);
-  const std::filesystem::file_status marker_status =
-      std::filesystem::symlink_status(marker, ec);
-  if (ec || !std::filesystem::is_regular_file(marker_status) ||
-      ReadText(marker) != kRunOwnershipMarkerContents) {
-    throw std::runtime_error(
-        "stale cgroup cleanup requires an exact simulator ownership marker: " +
-        marker.string());
-  }
-}
-
 }  // namespace
 
 BlockDeviceId ParseBlockDeviceId(std::string_view text) {
@@ -671,12 +641,14 @@ void Cgroup::RemoveRun(const std::string& run_id) {
   ForgetPreparedRun(run_id);
 }
 
-void Cgroup::RemoveStaleRun(const std::string& run_id,
-                            const std::filesystem::path& owned_run_directory) {
-  RequireSafeRunId(run_id);
-  RequireStaleRunOwnership(run_id, owned_run_directory);
-  RemoveRunCgroup(run_id);
-  ForgetPreparedRun(run_id);
+void Cgroup::RemoveStaleRun(const RunOwnership& ownership) {
+  const RunOwnership loaded =
+      LoadRunOwnership(ownership.run_id, ownership.run_root);
+  if (loaded != ownership) {
+    throw std::runtime_error("stale cgroup ownership fields do not match");
+  }
+  RemoveRunCgroup(ownership.cgroup_name);
+  ForgetPreparedRun(ownership.cgroup_name);
 }
 
 CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {

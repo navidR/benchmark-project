@@ -284,6 +284,15 @@ void RequireInterfaceName(const std::string& name) {
   }
 }
 
+void RequireOwnershipAlias(const std::string& alias) {
+  constexpr std::size_t kMaximumInterfaceAliasLength = 255U;
+  if (alias.empty() || alias.size() > kMaximumInterfaceAliasLength ||
+      alias.find('\0') != std::string::npos) {
+    throw std::runtime_error(
+        "interface ownership alias must be 1..255 bytes without NUL");
+  }
+}
+
 bool HasLinkNamed(const std::vector<LinkInfo>& links, const std::string& name) {
   for (const LinkInfo& link : links) {
     if (link.name == name) {
@@ -1133,6 +1142,27 @@ void TryDeleteLink(const std::string& name) {
   }
 }
 
+void SetLinkOwnershipAlias(const std::string& name,
+                           const std::string& ownership_alias) {
+  RequireInterfaceName(name);
+  RequireOwnershipAlias(ownership_alias);
+
+  std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
+  nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
+  nlh->nlmsg_type = RTM_NEWLINK;
+  nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  const uint32_t sequence = NextSequence();
+  nlh->nlmsg_seq = sequence;
+
+  auto* message = static_cast<ifinfomsg*>(
+      mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
+  message->ifi_family = AF_UNSPEC;
+  mnl_attr_put_str(nlh, IFLA_IFNAME, name.c_str());
+  mnl_attr_put_strz(nlh, IFLA_IFALIAS, ownership_alias.c_str());
+
+  SendNetlinkRequest(nlh, sequence);
+}
+
 std::string ProbeName(char suffix) {
   return "bbp" + std::to_string(static_cast<long long>(getpid() % 100000)) +
          suffix;
@@ -1299,6 +1329,12 @@ int ParseLinkAttr(const nlattr* attr, void* data) {
       return MNL_CB_ERROR;
     }
     link->name = mnl_attr_get_str(attr);
+  }
+  if (type == IFLA_IFALIAS) {
+    if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
+      return MNL_CB_ERROR;
+    }
+    link->ownership_alias = mnl_attr_get_str(attr);
   }
   if (type == IFLA_STATS64) {
     if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
@@ -2469,10 +2505,17 @@ std::vector<TcFilterInfo> ListTcFiltersForInterfaceParentInNamespace(
   });
 }
 
-void CreateVethPair(const std::string& host_name,
-                    const std::string& peer_name) {
+void CreateVethPair(const std::string& host_name, const std::string& peer_name,
+                    const std::string& host_ownership_alias,
+                    const std::string& peer_ownership_alias) {
   RequireInterfaceName(host_name);
   RequireInterfaceName(peer_name);
+  if (!host_ownership_alias.empty()) {
+    RequireOwnershipAlias(host_ownership_alias);
+  }
+  if (!peer_ownership_alias.empty()) {
+    RequireOwnershipAlias(peer_ownership_alias);
+  }
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
   nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
@@ -2486,6 +2529,9 @@ void CreateVethPair(const std::string& host_name,
   message->ifi_family = AF_UNSPEC;
 
   mnl_attr_put_str(nlh, IFLA_IFNAME, host_name.c_str());
+  if (!host_ownership_alias.empty()) {
+    mnl_attr_put_strz(nlh, IFLA_IFALIAS, host_ownership_alias.c_str());
+  }
   nlattr* link_info = mnl_attr_nest_start(nlh, IFLA_LINKINFO);
   mnl_attr_put_strz(nlh, IFLA_INFO_KIND, "veth");
   nlattr* info_data = mnl_attr_nest_start(nlh, IFLA_INFO_DATA);
@@ -2494,11 +2540,25 @@ void CreateVethPair(const std::string& host_name,
       mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
   peer_message->ifi_family = AF_UNSPEC;
   mnl_attr_put_str(nlh, IFLA_IFNAME, peer_name.c_str());
+  if (!peer_ownership_alias.empty()) {
+    mnl_attr_put_strz(nlh, IFLA_IFALIAS, peer_ownership_alias.c_str());
+  }
   mnl_attr_nest_end(nlh, peer);
   mnl_attr_nest_end(nlh, info_data);
   mnl_attr_nest_end(nlh, link_info);
 
   SendNetlinkRequest(nlh, sequence);
+  try {
+    if (!host_ownership_alias.empty()) {
+      SetLinkOwnershipAlias(host_name, host_ownership_alias);
+    }
+    if (!peer_ownership_alias.empty()) {
+      SetLinkOwnershipAlias(peer_name, peer_ownership_alias);
+    }
+  } catch (...) {
+    TryDeleteLink(host_name);
+    throw;
+  }
 }
 
 void DeleteLink(const std::string& name) {
@@ -3295,8 +3355,30 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
 
   bool pair_created = false;
   try {
-    CreateVethPair(config.host_name, config.peer_name);
+    CreateVethPair(config.host_name, config.peer_name,
+                   config.host_ownership_alias, config.peer_ownership_alias);
     pair_created = true;
+    if (!config.host_ownership_alias.empty() ||
+        !config.peer_ownership_alias.empty()) {
+      const std::vector<LinkInfo> created_links = ListNetworkLinks();
+      const auto require_created_alias = [&](const std::string& name,
+                                             const std::string& alias) {
+        if (alias.empty()) {
+          return;
+        }
+        const auto created = std::find_if(
+            created_links.begin(), created_links.end(),
+            [&](const LinkInfo& link) { return link.name == name; });
+        if (created == created_links.end() ||
+            created->ownership_alias != alias) {
+          throw std::runtime_error(
+              "created veth endpoint ownership alias read-back failed: " +
+              name);
+        }
+      };
+      require_created_alias(config.host_name, config.host_ownership_alias);
+      require_created_alias(config.peer_name, config.peer_ownership_alias);
+    }
     AddIpv4Address(config.host_name, config.host_address, config.prefix_len);
     SetLinkUp(config.host_name, true);
     if (config.apply_condition) {
@@ -3319,8 +3401,29 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config) {
 }
 
 void DeleteNodeVethNetwork(const NodeVethConfig& config) {
-  TryDeleteLink(config.host_name);
-  TryDeleteLink(config.peer_name);
+  const auto delete_owned_link = [](const std::string& name,
+                                    const std::string& expected_alias) {
+    if (expected_alias.empty()) {
+      TryDeleteLink(name);
+      return;
+    }
+    RequireOwnershipAlias(expected_alias);
+    const std::vector<LinkInfo> links = ListNetworkLinks();
+    const auto link = std::find_if(
+        links.begin(), links.end(),
+        [&](const LinkInfo& candidate) { return candidate.name == name; });
+    if (link == links.end()) {
+      return;
+    }
+    if (link->ownership_alias != expected_alias) {
+      throw std::runtime_error(
+          "refusing to delete veth endpoint with foreign ownership alias: " +
+          name);
+    }
+    TryDeleteLink(name);
+  };
+  delete_owned_link(config.host_name, config.host_ownership_alias);
+  delete_owned_link(config.peer_name, config.peer_ownership_alias);
 }
 
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd) {

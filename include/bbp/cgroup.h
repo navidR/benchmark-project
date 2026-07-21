@@ -11,6 +11,8 @@
 #include <string_view>
 #include <vector>
 
+#include "bbp/run_ownership.h"
+
 namespace bbp {
 
 struct BlockDeviceId {
@@ -82,8 +84,7 @@ class Cgroup {
   static void PrepareRun(const std::string& run_id);
   static Cgroup Create(const std::string& run_id, const std::string& node_id);
   static void RemoveRun(const std::string& run_id);
-  static void RemoveStaleRun(const std::string& run_id,
-                             const std::filesystem::path& owned_run_directory);
+  static void RemoveStaleRun(const RunOwnership& ownership);
   static CgroupFreezeProbe ProbeFreezeThaw();
 
   explicit Cgroup(std::filesystem::path path) : path_(std::move(path)) {}

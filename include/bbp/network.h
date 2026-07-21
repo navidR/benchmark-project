@@ -32,6 +32,7 @@ std::string_view TcFilterKindName(TcFilterKind kind);
 struct LinkInfo {
   int index = 0;
   std::string name;
+  std::string ownership_alias;
   bool up = false;
   bool has_stats = false;
   std::uint64_t rx_bytes = 0;
@@ -229,6 +230,8 @@ class NetworkNamespace {
 struct NodeVethConfig {
   std::string host_name;
   std::string peer_name;
+  std::string host_ownership_alias;
+  std::string peer_ownership_alias;
   std::string host_address;
   std::string node_address;
   std::uint8_t prefix_len = 30;
@@ -438,7 +441,9 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle);
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace();
-void CreateVethPair(const std::string& host_name, const std::string& peer_name);
+void CreateVethPair(const std::string& host_name, const std::string& peer_name,
+                    const std::string& host_ownership_alias = {},
+                    const std::string& peer_ownership_alias = {});
 void DeleteLink(const std::string& name);
 void MoveLinkToNamespace(const std::string& name, int netns_fd);
 void SetLinkUp(const std::string& name, bool up);

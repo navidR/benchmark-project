@@ -53,6 +53,7 @@
 #include "bbp/positive_duration.h"
 #include "bbp/probabilistic_block_scheduler.h"
 #include "bbp/process.h"
+#include "bbp/run_ownership.h"
 #include "bbp/run_report.h"
 #include "bbp/runtime_peer_topology.h"
 #include "bbp/signal_stop_monitor.h"
@@ -5850,6 +5851,7 @@ boost::json::array LinksJson(const std::vector<LinkInfo>& links) {
     boost::json::object link_json;
     link_json["index"] = link.index;
     link_json["name"] = link.name;
+    link_json["ownership_alias"] = link.ownership_alias;
     link_json["up"] = link.up;
     link_json["has_stats"] = link.has_stats;
     link_json["rx_bytes"] = link.rx_bytes;
@@ -6514,30 +6516,11 @@ const SimulationNetworkAddressPlan& NetworkAddressPlan(const Options& options) {
   return *options.network_address_plan;
 }
 
-uint32_t StableRunHash(std::string_view run_id) {
-  uint32_t hash = 2166136261U;
-  for (const unsigned char c : run_id) {
-    hash ^= c;
-    hash *= 16777619U;
+const RunOwnership& RequireRunOwnership(const Options& options) {
+  if (!options.run_ownership) {
+    throw std::logic_error("run ownership is not initialized");
   }
-  return hash;
-}
-
-std::string RunInterfaceToken(std::string_view run_id) {
-  constexpr char kHex[] = "0123456789abcdef";
-  uint32_t value = StableRunHash(run_id) & 0x00FFFFFFU;
-  std::string token(6, '0');
-  for (int i = 5; i >= 0; --i) {
-    token[static_cast<size_t>(i)] = kHex[value & 0x0FU];
-    value >>= 4U;
-  }
-  return token;
-}
-
-std::string NodeInterfaceName(std::string_view run_id, uint32_t node_index,
-                              char suffix) {
-  return "bbp" + RunInterfaceToken(run_id) + "n" +
-         std::to_string(node_index + 1U) + suffix;
+  return *options.run_ownership;
 }
 
 void RequireRunNetworkInterfacesAvailable(const Options& options) {
@@ -6545,7 +6528,7 @@ void RequireRunNetworkInterfacesAvailable(const Options& options) {
   for (std::uint32_t node_index = 0; node_index < options.nodes; ++node_index) {
     for (const char suffix : {'h', 'p'}) {
       const std::string name =
-          NodeInterfaceName(options.run_id, node_index, suffix);
+          RunInterfaceName(RequireRunOwnership(options), node_index, suffix);
       const auto collision =
           std::find_if(links.begin(), links.end(),
                        [&](const LinkInfo& link) { return link.name == name; });
@@ -6559,8 +6542,11 @@ void RequireRunNetworkInterfacesAvailable(const Options& options) {
 
 NodeVethConfig MakeNodeVethConfig(const Options& options, uint32_t node_index) {
   NodeVethConfig config;
-  config.host_name = NodeInterfaceName(options.run_id, node_index, 'h');
-  config.peer_name = NodeInterfaceName(options.run_id, node_index, 'p');
+  const RunOwnership& ownership = RequireRunOwnership(options);
+  config.host_name = RunInterfaceName(ownership, node_index, 'h');
+  config.peer_name = RunInterfaceName(ownership, node_index, 'p');
+  config.host_ownership_alias = RunInterfaceAlias(ownership, node_index, 'h');
+  config.peer_ownership_alias = RunInterfaceAlias(ownership, node_index, 'p');
   config.host_address = NetworkAddressPlan(options).HostAddress(node_index);
   config.node_address = NetworkAddressPlan(options).NodeAddress(node_index);
   config.prefix_len = NetworkAddressPlan(options).NodePrefixLength();
@@ -6649,32 +6635,6 @@ void RequireSafeOutputDirectory(const std::filesystem::path& output_dir) {
   const std::filesystem::path absolute = std::filesystem::absolute(output_dir);
   if (absolute == absolute.root_path()) {
     throw std::runtime_error("output directory must not be filesystem root");
-  }
-}
-
-bool IsOwnedRunDirectory(const std::filesystem::path& run_root) {
-  std::error_code ec;
-  const std::filesystem::file_status run_status =
-      std::filesystem::symlink_status(run_root, ec);
-  if (ec || !std::filesystem::is_directory(run_status)) {
-    return false;
-  }
-  const std::filesystem::path marker = run_root / kRunMarkerFile;
-  const std::filesystem::file_status marker_status =
-      std::filesystem::symlink_status(marker, ec);
-  return !ec && std::filesystem::is_regular_file(marker_status) &&
-         ReadText(marker) == "bbp run\n";
-}
-
-void RequireOwnedRunDirectory(const std::filesystem::path& run_root) {
-  if (!std::filesystem::is_directory(run_root)) {
-    throw std::runtime_error("run path exists but is not a directory: " +
-                             run_root.string());
-  }
-  if (!IsOwnedRunDirectory(run_root)) {
-    throw std::runtime_error(
-        "refusing to remove directory without simulator marker: " +
-        run_root.string());
   }
 }
 
@@ -9671,7 +9631,7 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
 void CleanupRun(Options options) {
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
-  RequireOwnedRunDirectory(run_root);
+  options.run_ownership = LoadRunOwnership(options.run_id, run_root);
   LoadCleanupMetadata(run_root, &options);
   RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
 
@@ -9680,11 +9640,14 @@ void CleanupRun(Options options) {
     network_allocation_lock = std::make_unique<NetworkAllocationLock>();
   }
 
-  Cgroup::RemoveStaleRun(options.run_id, run_root);
+  Cgroup::RemoveStaleRun(RequireRunOwnership(options));
   for (uint32_t i = 0; i < options.nodes; ++i) {
     NodeVethConfig config;
-    config.host_name = NodeInterfaceName(options.run_id, i, 'h');
-    config.peer_name = NodeInterfaceName(options.run_id, i, 'p');
+    const RunOwnership& ownership = RequireRunOwnership(options);
+    config.host_name = RunInterfaceName(ownership, i, 'h');
+    config.peer_name = RunInterfaceName(ownership, i, 'p');
+    config.host_ownership_alias = RunInterfaceAlias(ownership, i, 'h');
+    config.peer_ownership_alias = RunInterfaceAlias(ownership, i, 'p');
     DeleteNodeVethNetwork(config);
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
@@ -10293,7 +10256,8 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
                           NodeRuntimeLifecycle::kDefined);
       TransitionNodeState(events_path, options.run_id, runtime,
                           NodeRuntimeLifecycle::kPreparing);
-      runtime.cgroup = Cgroup::Create(options.run_id, node_id);
+      runtime.cgroup =
+          Cgroup::Create(RequireRunOwnership(options).cgroup_name, node_id);
       runtime.resources = InitialResourceLimits(options, i);
       runtime.cgroup->SetMemoryHigh(runtime.resources.memory_high_bytes);
       runtime.cgroup->SetMemoryMax(runtime.resources.memory_max_bytes);
@@ -13070,11 +13034,12 @@ void StopNodes(const Options& options, const std::filesystem::path& events_path,
   }
   if (options.cleanup_policy != CleanupPolicy::kRetainCgroups) {
     if (best_effort) {
-      RunNodeCleanupStep(true, "run cgroup removal",
-                         [&] { Cgroup::RemoveRun(options.run_id); });
+      RunNodeCleanupStep(true, "run cgroup removal", [&] {
+        Cgroup::RemoveRun(RequireRunOwnership(options).cgroup_name);
+      });
     } else {
       try {
-        Cgroup::RemoveRun(options.run_id);
+        Cgroup::RemoveRun(RequireRunOwnership(options).cgroup_name);
       } catch (const std::exception& error) {
         WriteEvent(events_path, options.run_id, "sim",
                    SimulationEventKind::kRunCgroupRemoveFailed, error.what());
@@ -13564,8 +13529,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
           "run directory already exists: " + run_root.string() +
           " (use --replace-run to remove it)");
     }
-    RequireOwnedRunDirectory(run_root);
-    Cgroup::RemoveStaleRun(options.run_id, run_root);
+    const RunOwnership previous_ownership =
+        LoadRunOwnership(options.run_id, run_root);
+    Cgroup::RemoveStaleRun(previous_ownership);
     std::error_code ec;
     std::filesystem::remove_all(run_root, ec);
     if (ec) {
@@ -13574,9 +13540,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
   }
   EnsureDirectory(run_root);
+  options.run_ownership = CreateRunOwnership(options.run_id, run_root);
+  WriteRunOwnershipMarker(RequireRunOwnership(options));
   AttachRunLogFile(run_root);
   BBP_LOG(info) << "starting run " << options.run_id;
-  WriteText(run_root / kRunMarkerFile, "bbp run\n");
   EnsureDirectory(run_root / "nodes");
   std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
   if (options.isolate_network) {
@@ -13850,7 +13817,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         });
       };
   try {
-    Cgroup::PrepareRun(options.run_id);
+    Cgroup::PrepareRun(RequireRunOwnership(options).cgroup_name);
   } catch (const std::exception& error) {
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRunFailed, error.what());

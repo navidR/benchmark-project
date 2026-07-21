@@ -57,6 +57,8 @@ bbp::NodeVethConfig UniqueVethConfig() {
   bbp::NodeVethConfig config;
   config.host_name = "bbpt" + token + "h";
   config.peer_name = "bbpt" + token + "p";
+  config.host_ownership_alias = "bbp:test:" + token + ":h";
+  config.peer_ownership_alias = "bbp:test:" + token + ":p";
   const unsigned int subnet = 32U + (ordinal % 192U);
   config.host_address = "198.18." + std::to_string(subnet) + ".1";
   config.node_address = "198.18." + std::to_string(subnet) + ".2";
@@ -101,7 +103,9 @@ class ScopedParentVeth {
  public:
   explicit ScopedParentVeth(bbp::NodeVethConfig config)
       : config_(std::move(config)) {
-    bbp::CreateVethPair(config_.host_name, config_.peer_name);
+    bbp::CreateVethPair(config_.host_name, config_.peer_name,
+                        config_.host_ownership_alias,
+                        config_.peer_ownership_alias);
     created_ = true;
   }
 
@@ -333,6 +337,42 @@ BOOST_AUTO_TEST_CASE(veth_setup_refuses_and_preserves_name_collisions) {
     if (ExplicitPrivilegeFailure(error)) {
       BOOST_TEST_MESSAGE(
           "skipping privileged ownership test: " << error.what());
+      return;
+    }
+    throw;
+  }
+}
+
+BOOST_AUTO_TEST_CASE(veth_cleanup_preserves_a_colliding_foreign_owner) {
+  const bbp::NodeVethConfig foreign = UniqueVethConfig();
+  bbp::NodeVethConfig colliding = foreign;
+  colliding.host_ownership_alias += ":different";
+  colliding.peer_ownership_alias += ":different";
+  try {
+    ScopedParentVeth pair(foreign);
+    BOOST_CHECK_EXCEPTION(
+        bbp::DeleteNodeVethNetwork(colliding), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what()).find("foreign ownership alias") !=
+                 std::string::npos;
+        });
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    const auto host = std::find_if(links.begin(), links.end(),
+                                   [&](const bbp::LinkInfo& link) {
+                                     return link.name == foreign.host_name;
+                                   });
+    const auto peer = std::find_if(links.begin(), links.end(),
+                                   [&](const bbp::LinkInfo& link) {
+                                     return link.name == foreign.peer_name;
+                                   });
+    BOOST_REQUIRE(host != links.end());
+    BOOST_REQUIRE(peer != links.end());
+    BOOST_TEST(host->ownership_alias == foreign.host_ownership_alias);
+    BOOST_TEST(peer->ownership_alias == foreign.peer_ownership_alias);
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged ownership collision test: " << error.what());
       return;
     }
     throw;

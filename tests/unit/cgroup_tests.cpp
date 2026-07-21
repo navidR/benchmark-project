@@ -14,6 +14,7 @@
 
 #include "bbp/cgroup.h"
 #include "bbp/network.h"
+#include "bbp/run_ownership.h"
 #include "bbp/util.h"
 
 namespace {
@@ -311,16 +312,85 @@ BOOST_AUTO_TEST_CASE(stale_cgroup_cleanup_requires_exact_run_marker) {
   const std::filesystem::path run_directory = parent / run_id;
   std::filesystem::remove_all(parent);
   std::filesystem::create_directories(run_directory);
+  const bbp::RunOwnership ownership =
+      bbp::CreateRunOwnership(run_id, run_directory);
   bbp::WriteText(run_directory / ".bbp-run", "not a simulator marker\n");
 
   BOOST_CHECK_EXCEPTION(
-      bbp::Cgroup::RemoveStaleRun(run_id, run_directory), std::runtime_error,
+      bbp::Cgroup::RemoveStaleRun(ownership), std::runtime_error,
       [](const std::runtime_error& error) {
-        return std::string(error.what())
-                   .find("exact simulator ownership marker") !=
+        return std::string(error.what()).find("invalid run ownership marker") !=
                std::string::npos;
       });
 
+  std::filesystem::remove_all(parent);
+}
+
+BOOST_AUTO_TEST_CASE(stale_cleanup_is_scoped_to_one_same_id_run_instance) {
+  const std::string run_id = UniqueRunId("same-id");
+  const std::filesystem::path parent = TestDirectory("same-id-roots");
+  const std::filesystem::path first_root = parent / "first" / run_id;
+  const std::filesystem::path second_root = parent / "second" / run_id;
+  std::filesystem::remove_all(parent);
+  std::filesystem::create_directories(first_root);
+  std::filesystem::create_directories(second_root);
+  const bbp::RunOwnership first = bbp::CreateRunOwnership(run_id, first_root);
+  const bbp::RunOwnership second = bbp::CreateRunOwnership(run_id, second_root);
+  bbp::WriteRunOwnershipMarker(first);
+  bbp::WriteRunOwnershipMarker(second);
+
+  try {
+    bbp::Cgroup::PrepareRun(first.cgroup_name);
+    bbp::Cgroup::PrepareRun(second.cgroup_name);
+  } catch (const std::exception& error) {
+    BOOST_TEST_MESSAGE(
+        "skipping privileged same-id ownership test: " << error.what());
+    try {
+      bbp::Cgroup::RemoveRun(second.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    try {
+      bbp::Cgroup::RemoveRun(first.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    std::filesystem::remove_all(parent);
+    return;
+  }
+
+  try {
+    const bbp::Cgroup first_node =
+        bbp::Cgroup::Create(first.cgroup_name, "node-1");
+    const pid_t pid = fork();
+    BOOST_REQUIRE(pid >= 0);
+    if (pid == 0) {
+      for (;;) {
+        pause();
+      }
+    }
+    ChildGuard child(pid);
+    first_node.AttachPid(pid);
+
+    bbp::Cgroup::RemoveStaleRun(second);
+    BOOST_TEST(std::filesystem::is_directory(RunCgroupPath(first.cgroup_name)));
+    BOOST_TEST(!std::filesystem::exists(RunCgroupPath(second.cgroup_name)));
+    BOOST_TEST(kill(pid, 0) == 0);
+
+    bbp::Cgroup::RemoveRun(first.cgroup_name);
+    const int status = child.Wait();
+    BOOST_REQUIRE(WIFSIGNALED(status));
+    BOOST_TEST(WTERMSIG(status) == SIGKILL);
+  } catch (...) {
+    try {
+      bbp::Cgroup::RemoveRun(second.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    try {
+      bbp::Cgroup::RemoveRun(first.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    std::filesystem::remove_all(parent);
+    throw;
+  }
   std::filesystem::remove_all(parent);
 }
 
