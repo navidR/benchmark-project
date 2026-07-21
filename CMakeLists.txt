@@ -693,6 +693,12 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-distribution-strategies.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-wallet-transaction-load-strategies
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transaction-load-strategies.json"
+      --probe-capabilities
+  )
   add_test(NAME bbp-valid-resource-pressure-scenario
     COMMAND bbp
       --scenario-json
@@ -1736,7 +1742,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     bbp-invalid-wallet-transfer-strategy
     tests/scenarios/invalid-wallet-transfer-strategy.json
-    "scenario wallet_transactions strategy must be round_robin, random, fanout, or hotspot"
+    "scenario wallet_transactions strategy must be round_robin, random, fanout, hotspot, random_bruteforce, or equal_fanout"
   )
   add_cli_failure_test(
     bbp-invalid-wallet-transaction-count-and-rate
@@ -1862,6 +1868,76 @@ if(BUILD_TESTING)
     bbp-invalid-wallet-distribution-overflow
     tests/scenarios/invalid-wallet-distribution-overflow.json
     "scenario wallet_transactions amount plus fee overflows uint64"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-count-and-duration
+    tests/scenarios/invalid-wallet-load-count-and-duration.json
+    "scenario transaction load transaction_count and duration are mutually exclusive"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-duration-without-rate
+    tests/scenarios/invalid-wallet-load-duration-without-rate.json
+    "scenario transaction load duration requires transaction_rate"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-missing-bound
+    tests/scenarios/invalid-wallet-load-missing-bound.json
+    "scenario transaction load must specify exactly one of transaction_count or duration"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-zero-concurrency
+    tests/scenarios/invalid-wallet-load-zero-concurrency.json
+    "scenario transaction load concurrency must be in 1..64"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-zero-queue
+    tests/scenarios/invalid-wallet-load-zero-queue.json
+    "scenario transaction load queue_capacity must be in 1..65536"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-mode-mismatch
+    tests/scenarios/invalid-wallet-load-mode-mismatch.json
+    "scenario transaction load mode must match topology.wallet_initialization.mode"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-overlap
+    tests/scenarios/invalid-wallet-load-overlap.json
+    "scenario transaction load sender_wallets and receiver_wallets must be disjoint"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-equal-fanout-partial-count
+    tests/scenarios/invalid-wallet-equal-fanout-partial-count.json
+    "scenario equal_fanout attempt limit must contain complete receiver batches"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-equal-fanout-small-queue
+    tests/scenarios/invalid-wallet-equal-fanout-small-queue.json
+    "scenario equal_fanout queue_capacity must fit one complete receiver batch"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-fee-policy
+    tests/scenarios/invalid-wallet-load-fee-policy.json
+    "scenario wallet_transactions fee_policy must be fixed"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-duration-overflow
+    tests/scenarios/invalid-wallet-load-duration-overflow.json
+    "transaction load duration and rate attempt count overflows uint64"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-legacy-load-control
+    tests/scenarios/invalid-wallet-legacy-load-control.json
+    "scenario wallet_transactions load controls require random_bruteforce or equal_fanout strategy"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-missing-sender
+    tests/scenarios/invalid-wallet-load-missing-sender.json
+    "scenario transaction load requires nonempty sender_wallets and receiver_wallets"
+  )
+  add_cli_failure_test(
+    bbp-invalid-wallet-load-unsupported-driver
+    tests/scenarios/invalid-wallet-load-unsupported-driver.json
+    "selected chain driver does not support the requested transaction load mode"
   )
   add_cli_failure_test(
     bbp-invalid-restart-node-node

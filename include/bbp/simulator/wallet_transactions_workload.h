@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "bbp/simulation_registry.h"
 #include "bbp/simulator/constants.h"
 #include "bbp/simulator/wallet_funding_strategy.h"
 #include "bbp/simulator/wallet_transfer_strategy.h"
@@ -16,6 +17,30 @@ enum class ValueDistributionKind {
   kFixed,
   kUniform,
 };
+
+enum class WalletTransactionFeePolicy {
+  kFixed,
+};
+
+constexpr std::uint32_t kMaximumWalletTransactionLoadConcurrency = 64U;
+constexpr std::uint32_t kMaximumWalletTransactionLoadQueueCapacity = 65'536U;
+
+constexpr std::string_view WalletTransactionFeePolicyName(
+    WalletTransactionFeePolicy policy) {
+  switch (policy) {
+    case WalletTransactionFeePolicy::kFixed:
+      return "fixed";
+  }
+  return "unknown";
+}
+
+constexpr std::optional<WalletTransactionFeePolicy>
+WalletTransactionFeePolicyFromName(std::string_view name) {
+  if (name == "fixed") {
+    return WalletTransactionFeePolicy::kFixed;
+  }
+  return std::nullopt;
+}
 
 constexpr std::string_view ValueDistributionKindName(
     ValueDistributionKind kind) {
@@ -65,8 +90,13 @@ struct WalletTransactionsWorkload {
   std::uint64_t funding_threshold_satoshis = 0;
   std::uint32_t transaction_count = 0;
   std::optional<WalletTransactionRate> transaction_rate;
+  std::optional<std::chrono::milliseconds> duration;
+  std::uint32_t concurrency = 1;
+  std::uint32_t queue_capacity = 64;
+  WalletPrivacyMode mode = WalletPrivacyMode::kPublic;
   AmountDistribution amount;
   IntervalDistribution interval;
+  WalletTransactionFeePolicy fee_policy = WalletTransactionFeePolicy::kFixed;
   std::uint64_t fee_satoshis = 0;
   std::uint64_t random_seed = 0;
   std::vector<std::uint32_t> sender_wallets;

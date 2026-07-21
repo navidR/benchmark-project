@@ -10,6 +10,8 @@ enum class WalletTransferStrategy {
   kRandom,
   kFanout,
   kHotspot,
+  kRandomBruteforce,
+  kEqualFanout,
 };
 
 constexpr std::string_view WalletTransferStrategyName(
@@ -23,6 +25,10 @@ constexpr std::string_view WalletTransferStrategyName(
       return "fanout";
     case WalletTransferStrategy::kHotspot:
       return "hotspot";
+    case WalletTransferStrategy::kRandomBruteforce:
+      return "random_bruteforce";
+    case WalletTransferStrategy::kEqualFanout:
+      return "equal_fanout";
   }
   return "unknown";
 }
@@ -41,7 +47,18 @@ constexpr std::optional<WalletTransferStrategy> WalletTransferStrategyFromName(
   if (name == "hotspot") {
     return WalletTransferStrategy::kHotspot;
   }
+  if (name == "random_bruteforce") {
+    return WalletTransferStrategy::kRandomBruteforce;
+  }
+  if (name == "equal_fanout") {
+    return WalletTransferStrategy::kEqualFanout;
+  }
   return std::nullopt;
+}
+
+constexpr bool IsTransactionLoadStrategy(WalletTransferStrategy strategy) {
+  return strategy == WalletTransferStrategy::kRandomBruteforce ||
+         strategy == WalletTransferStrategy::kEqualFanout;
 }
 
 }  // namespace bbp

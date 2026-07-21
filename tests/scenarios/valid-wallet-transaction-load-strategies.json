@@ -1,0 +1,57 @@
+{
+  "firod": "/tmp/not-used-by-probe",
+  "output_dir": "runs",
+  "run_id": "wallet-load-strategies",
+  "nodes": 5,
+  "block_production": {"enabled": false},
+  "topology": {
+    "node_count": 5,
+    "wallet_node_count": 4,
+    "miner_node_count": 1,
+    "wallet_nodes": [1, 2, 3, 4],
+    "miner_nodes": [5],
+    "wallet_initialization": {"strategy": "driver_rpc", "mode": "public"}
+  },
+  "workloads": [
+    {
+      "type": "wallet_transactions",
+      "strategy": "random_bruteforce",
+      "sender_wallets": [1, 2],
+      "receiver_wallets": [3, 4],
+      "transaction_count": 8,
+      "transaction_rate": 20,
+      "concurrency": 2,
+      "queue_capacity": 4,
+      "mode": "public",
+      "amount": {
+        "distribution": "uniform",
+        "min": "0.01000000",
+        "max": "0.10000000"
+      },
+      "fee_policy": "fixed",
+      "fee": "0.00001000",
+      "funding_threshold": "0.10001000",
+      "seed": 19
+    },
+    {
+      "type": "wallet_transactions",
+      "strategy": "equal_fanout",
+      "sender_wallets": [1, 2],
+      "receiver_wallets": [3, 4],
+      "duration": "2s",
+      "transaction_rate": 2,
+      "concurrency": 2,
+      "queue_capacity": 2,
+      "mode": "public",
+      "amount": {
+        "distribution": "uniform",
+        "min": "0.01000000",
+        "max": "1.00000000"
+      },
+      "fee_policy": "fixed",
+      "fee": "0.00001000",
+      "funding_threshold": "1.00001000",
+      "seed": 23
+    }
+  ]
+}

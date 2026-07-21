@@ -1126,7 +1126,28 @@ WalletTransferStrategy ParseWalletTransferStrategy(std::string_view value) {
   }
   throw std::runtime_error(
       "scenario wallet_transactions strategy must be round_robin, random, "
-      "fanout, or hotspot");
+      "fanout, hotspot, random_bruteforce, or equal_fanout");
+}
+
+WalletPrivacyMode ParseWalletTransactionMode(std::string_view value) {
+  const std::optional<WalletPrivacyMode> mode =
+      WalletPrivacyModeFromName(value);
+  if (mode) {
+    return *mode;
+  }
+  throw std::runtime_error(
+      "scenario wallet_transactions mode must be public or private");
+}
+
+WalletTransactionFeePolicy ParseWalletTransactionFeePolicy(
+    std::string_view value) {
+  const std::optional<WalletTransactionFeePolicy> policy =
+      WalletTransactionFeePolicyFromName(value);
+  if (policy) {
+    return *policy;
+  }
+  throw std::runtime_error(
+      "scenario wallet_transactions fee_policy must be fixed");
 }
 
 std::string_view PeerConnectivityModeName(PeerConnectivityMode mode) {
@@ -1724,7 +1745,19 @@ void ValidateWalletTransactionsWorkload(
   }
   const bool has_transaction_count = workload.transaction_count != 0U;
   const bool has_transaction_rate = workload.transaction_rate.has_value();
-  if (has_transaction_count == has_transaction_rate) {
+  const bool has_duration = workload.duration.has_value();
+  const bool load_strategy = IsTransactionLoadStrategy(workload.strategy);
+  if (load_strategy) {
+    if (has_transaction_count == has_duration) {
+      throw std::runtime_error(
+          "scenario transaction load must specify exactly one of "
+          "transaction_count or duration");
+    }
+    if (has_duration && !has_transaction_rate) {
+      throw std::runtime_error(
+          "scenario transaction load duration requires transaction_rate");
+    }
+  } else if (has_transaction_count == has_transaction_rate) {
     throw std::runtime_error(
         "scenario wallet_transactions must specify exactly one of "
         "transaction_count or transaction_rate");
@@ -1795,6 +1828,43 @@ void ValidateWalletTransactionsWorkload(
         "scenario wallet_transactions timeout_sec must be greater than zero");
   }
 
+  if (load_strategy) {
+    if (workload.concurrency == 0U ||
+        workload.concurrency > kMaximumWalletTransactionLoadConcurrency) {
+      throw std::runtime_error(
+          "scenario transaction load concurrency must be in 1.." +
+          std::to_string(kMaximumWalletTransactionLoadConcurrency));
+    }
+    if (workload.queue_capacity == 0U ||
+        workload.queue_capacity > kMaximumWalletTransactionLoadQueueCapacity) {
+      throw std::runtime_error(
+          "scenario transaction load queue_capacity must be in 1.." +
+          std::to_string(kMaximumWalletTransactionLoadQueueCapacity));
+    }
+    if (workload.interval.minimum != std::chrono::milliseconds(0) ||
+        workload.interval.maximum != std::chrono::milliseconds(0)) {
+      throw std::runtime_error(
+          "scenario transaction load does not accept interval");
+    }
+    if (workload.mode != options.wallet_initialization.mode) {
+      throw std::runtime_error(
+          "scenario transaction load mode must match "
+          "topology.wallet_initialization.mode");
+    }
+    const std::unique_ptr<ChainDriver> driver =
+        CreateChainDriver(options.chain);
+    if (!driver->SupportsWalletTransactionMode(
+            ToChainWalletMode(options.wallet_initialization))) {
+      throw std::runtime_error(
+          "selected chain driver does not support the requested transaction "
+          "load mode");
+    }
+    if (has_duration) {
+      static_cast<void>(WalletTransactionDurationAttemptLimit(
+          *workload.duration, *workload.transaction_rate));
+    }
+  }
+
   switch (workload.strategy) {
     case WalletTransferStrategy::kRoundRobin:
     case WalletTransferStrategy::kRandom:
@@ -1837,9 +1907,61 @@ void ValidateWalletTransactionsWorkload(
             "leave at least one sender");
       }
       break;
+    case WalletTransferStrategy::kRandomBruteforce:
+    case WalletTransferStrategy::kEqualFanout: {
+      if (workload.sender_wallets.empty() ||
+          workload.receiver_wallets.empty()) {
+        throw std::runtime_error(
+            "scenario transaction load requires nonempty sender_wallets and "
+            "receiver_wallets");
+      }
+      for (const std::uint32_t sender : workload.sender_wallets) {
+        if (std::find(workload.receiver_wallets.begin(),
+                      workload.receiver_wallets.end(),
+                      sender) != workload.receiver_wallets.end()) {
+          throw std::runtime_error(
+              "scenario transaction load sender_wallets and receiver_wallets "
+              "must be disjoint");
+        }
+      }
+      if (workload.strategy == WalletTransferStrategy::kEqualFanout) {
+        const std::uint64_t receiver_count =
+            static_cast<std::uint64_t>(workload.receiver_wallets.size());
+        if (workload.fee_satoshis >
+            std::numeric_limits<std::uint64_t>::max() / receiver_count) {
+          throw std::runtime_error(
+              "scenario equal_fanout fee total overflows uint64");
+        }
+        if (workload.amount.minimum_satoshis >
+            (std::numeric_limits<std::uint64_t>::max() -
+             workload.fee_satoshis * receiver_count) /
+                receiver_count) {
+          throw std::runtime_error(
+              "scenario equal_fanout minimum amount total overflows uint64");
+        }
+        if (workload.queue_capacity < workload.receiver_wallets.size()) {
+          throw std::runtime_error(
+              "scenario equal_fanout queue_capacity must fit one complete "
+              "receiver batch");
+        }
+        const std::uint64_t attempt_limit =
+            has_transaction_count
+                ? static_cast<std::uint64_t>(workload.transaction_count)
+                : WalletTransactionDurationAttemptLimit(
+                      *workload.duration, *workload.transaction_rate);
+        if (attempt_limit % receiver_count != 0U) {
+          throw std::runtime_error(
+              "scenario equal_fanout attempt limit must contain complete "
+              "receiver batches");
+        }
+      }
+      break;
+    }
   }
 
-  if (has_transaction_count) {
+  if (load_strategy) {
+    static_cast<void>(WalletTransactionLoadPlanner(wallet_count, workload));
+  } else if (has_transaction_count) {
     static_cast<void>(BuildWalletTransactionPlan(wallet_count, workload));
   } else {
     static_cast<void>(WalletTransactionPlanner(wallet_count, workload));
@@ -2882,8 +3004,13 @@ bool IsScenarioActionPayloadField(WorkloadKind kind, std::string_view field) {
                              "readiness_confirmations",
                              "transaction_count",
                              "transaction_rate",
+                             "duration",
+                             "concurrency",
+                             "queue_capacity",
+                             "mode",
                              "amount",
                              "interval",
+                             "fee_policy",
                              "fee",
                              "funding_threshold",
                              "seed",
@@ -3692,6 +3819,8 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
           ParseWalletTransferStrategy(JsonOptionalStringField(
               workload, "strategy",
               WalletTransferStrategyName(transactions.strategy)));
+      const bool load_strategy =
+          IsTransactionLoadStrategy(transactions.strategy);
       transactions.funding_blocks_per_wallet =
           JsonOptionalUint32Field(workload, "funding_blocks_per_wallet",
                                   transactions.funding_blocks_per_wallet);
@@ -3702,7 +3831,54 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
           workload.if_contains("transaction_count") != nullptr;
       const bool transaction_rate_present =
           workload.if_contains("transaction_rate") != nullptr;
-      if (transaction_count_present && transaction_rate_present) {
+      const bool duration_present = workload.if_contains("duration") != nullptr;
+      const bool load_control_present =
+          duration_present || workload.if_contains("concurrency") != nullptr ||
+          workload.if_contains("queue_capacity") != nullptr ||
+          workload.if_contains("mode") != nullptr ||
+          workload.if_contains("fee_policy") != nullptr;
+      if (!load_strategy && load_control_present) {
+        throw std::runtime_error(
+            "scenario wallet_transactions load controls require "
+            "random_bruteforce or equal_fanout strategy");
+      }
+      if (load_strategy) {
+        if (transaction_count_present && duration_present) {
+          throw std::runtime_error(
+              "scenario transaction load transaction_count and duration are "
+              "mutually exclusive");
+        }
+        if (transaction_count_present) {
+          transactions.transaction_count =
+              JsonOptionalUint32Field(workload, "transaction_count", 0U);
+        }
+        if (duration_present) {
+          const boost::json::value& duration = workload.at("duration");
+          if (!duration.is_string()) {
+            throw std::runtime_error(
+                "scenario transaction load duration must be a duration "
+                "string");
+          }
+          transactions.duration =
+              PositiveDuration::Parse(std::string_view(duration.as_string()))
+                  .value();
+        }
+        transactions.concurrency = JsonOptionalUint32Field(
+            workload, "concurrency", transactions.concurrency);
+        transactions.queue_capacity = JsonOptionalUint32Field(
+            workload, "queue_capacity", transactions.queue_capacity);
+        transactions.mode = ParseWalletTransactionMode(JsonOptionalStringField(
+            workload, "mode",
+            WalletPrivacyModeName(options.wallet_initialization.mode)));
+        transactions.fee_policy =
+            ParseWalletTransactionFeePolicy(JsonOptionalStringField(
+                workload, "fee_policy",
+                WalletTransactionFeePolicyName(transactions.fee_policy)));
+        if (workload.if_contains("interval") != nullptr) {
+          throw std::runtime_error(
+              "scenario transaction load does not accept interval");
+        }
+      } else if (transaction_count_present && transaction_rate_present) {
         throw std::runtime_error(
             "scenario wallet_transactions transaction_count and "
             "transaction_rate are mutually exclusive");
@@ -3710,12 +3886,12 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       if (transaction_rate_present) {
         transactions.transaction_rate = WalletTransactionRate::FromDouble(
             JsonOptionalDoubleField(workload, "transaction_rate", 0.0));
-        if (workload.if_contains("interval") != nullptr) {
+        if (!load_strategy && workload.if_contains("interval") != nullptr) {
           throw std::runtime_error(
               "scenario wallet_transactions transaction_rate does not accept "
               "interval");
         }
-      } else {
+      } else if (!load_strategy) {
         transactions.transaction_count = JsonOptionalUint32Field(
             workload, "transaction_count",
             options.topology.configured
@@ -3723,7 +3899,9 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
                 : 0U);
       }
       transactions.amount = ParseAmountDistribution(workload, "amount");
-      transactions.interval = ParseIntervalDistribution(workload, "interval");
+      if (!load_strategy) {
+        transactions.interval = ParseIntervalDistribution(workload, "interval");
+      }
       transactions.fee_satoshis = JsonAmountField(workload, "fee");
       const std::uint64_t default_funding_threshold =
           transactions.amount.maximum_satoshis <=
@@ -8476,6 +8654,18 @@ boost::json::object WalletTransactionsWorkloadJson(
   } else {
     object["transaction_rate"] = nullptr;
     object["transaction_rate_millionths"] = nullptr;
+  }
+  if (IsTransactionLoadStrategy(workload.strategy)) {
+    if (workload.duration) {
+      object["duration"] = std::to_string(workload.duration->count()) + "ms";
+    } else {
+      object["duration"] = nullptr;
+    }
+    object["concurrency"] = workload.concurrency;
+    object["queue_capacity"] = workload.queue_capacity;
+    object["mode"] = std::string(WalletPrivacyModeName(workload.mode));
+    object["fee_policy"] =
+        std::string(WalletTransactionFeePolicyName(workload.fee_policy));
   }
   object["amount"] = AmountDistributionConfigurationJson(workload.amount);
   if (workload.interval.kind != ValueDistributionKind::kFixed ||
