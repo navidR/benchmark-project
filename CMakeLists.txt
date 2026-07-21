@@ -491,6 +491,16 @@ if(BUILD_TESTING)
     )
   endfunction()
 
+  function(add_argument_failure_test name arguments regex)
+    add_test(NAME "${name}"
+      COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+        "-DARGS=${arguments}"
+        "-DREGEX=${regex}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/expect_arguments_failure.cmake"
+    )
+  endfunction()
+
   add_test(NAME bbp-valid-yaml-scenario
     COMMAND bbp
       --scenario-yaml
@@ -698,6 +708,77 @@ if(BUILD_TESTING)
       --scenario-json
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transaction-load-strategies.json"
       --probe-capabilities
+  )
+  add_test(NAME bbp-direct-random-bruteforce-load-options
+    COMMAND bbp
+      --nodes 4
+      --wallet-node-count 3
+      --transaction-load-strategy random_bruteforce
+      --probe-capabilities
+  )
+  add_test(NAME bbp-direct-equal-fanout-load-options
+    COMMAND bbp
+      --nodes 5
+      --wallet-node-count 4
+      --transaction-load-strategy equal_fanout
+      --probe-capabilities
+  )
+  add_test(NAME bbp-direct-transaction-load-help
+    COMMAND bbp --help
+  )
+  set_tests_properties(bbp-direct-transaction-load-help
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION "transaction-load-strategy"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-missing-strategy
+    "--wallet-node-count|2|--nodes|3|--probe-capabilities"
+    "--wallet-node-count requires --transaction-load-strategy"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-missing-wallet-count
+    "--transaction-load-strategy|random_bruteforce|--nodes|3|--probe-capabilities"
+    "--transaction-load-strategy requires --wallet-node-count"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-missing-node-count
+    "--transaction-load-strategy|random_bruteforce|--wallet-node-count|2|--probe-capabilities"
+    "--transaction-load-strategy requires an explicit --nodes value"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-too-few-wallets
+    "--transaction-load-strategy|random_bruteforce|--wallet-node-count|1|--nodes|3|--probe-capabilities"
+    "--wallet-node-count must be at least 2 for transaction load"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-missing-miner
+    "--transaction-load-strategy|equal_fanout|--wallet-node-count|3|--nodes|3|--probe-capabilities"
+    "--wallet-node-count must leave at least one non-wallet miner node"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-unsupported-strategy
+    "--transaction-load-strategy|round_robin|--wallet-node-count|2|--nodes|3|--probe-capabilities"
+    "--transaction-load-strategy must be random_bruteforce or equal_fanout"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-unsupported-driver
+    "--chain|bitcoin|--transaction-load-strategy|random_bruteforce|--wallet-node-count|2|--nodes|3|--probe-capabilities"
+    "selected chain driver does not support the requested transaction load mode"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-scenario-conflict
+    "--scenario|${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-transaction-load-strategies.json|--transaction-load-strategy|random_bruteforce|--wallet-node-count|2|--nodes|5|--probe-capabilities"
+    "direct transaction load options must not be combined with a scenario"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-custom-miner-conflict
+    "--transaction-load-strategy|random_bruteforce|--wallet-node-count|2|--nodes|4|--generate-node|4|--probe-capabilities"
+    "direct transaction load selects the first non-wallet node as its miner"
+  )
+  add_argument_failure_test(
+    bbp-direct-load-node-limit-preflight
+    "--transaction-load-strategy|random_bruteforce|--wallet-node-count|2|--nodes|4294967295|--probe-capabilities"
+    "--nodes currently supports 1..16 for chain smoke runs"
   )
   add_test(NAME bbp-valid-resource-pressure-scenario
     COMMAND bbp
@@ -1581,7 +1662,7 @@ if(BUILD_TESTING)
   )
   set_tests_properties(bbp-integrated-tui-once
     PROPERTIES
-      PASS_REGULAR_EXPRESSION "manual GUI command available"
+      PASS_REGULAR_EXPRESSION "load a=6 s=2 bp=3; manual GUI command available"
   )
   add_test(NAME bbp-report-run-id-under-benchmark-root
     COMMAND bbp

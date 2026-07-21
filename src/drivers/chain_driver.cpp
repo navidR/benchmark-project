@@ -82,6 +82,11 @@ bool ChainDriver::SupportsWalletTransactionMode(ChainWalletMode) const {
   return false;
 }
 
+std::uint64_t ChainDriver::WalletTransactionFeeReserveSatoshis(
+    ChainWalletMode, std::uint64_t requested_fee_rate_satoshis) const {
+  return requested_fee_rate_satoshis;
+}
+
 ChainWalletTransactionResult ChainDriver::SubmitWalletTransaction(
     const ChainNodeConfig& config, ChainWalletMode wallet_mode,
     const std::string& destination_address, std::uint64_t amount_satoshis,

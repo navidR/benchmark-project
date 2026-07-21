@@ -166,6 +166,8 @@ class ChainDriver {
 
   virtual ProcessSpec RenderProcess(const ChainNodeConfig& config) const = 0;
   virtual bool SupportsWalletTransactionMode(ChainWalletMode mode) const;
+  virtual std::uint64_t WalletTransactionFeeReserveSatoshis(
+      ChainWalletMode mode, std::uint64_t requested_fee_rate_satoshis) const;
   virtual std::optional<OperatorConnectionCommand>
   BuildOperatorConnectionCommand(const ChainNodeConfig& config,
                                  const std::filesystem::path& run_root) const;

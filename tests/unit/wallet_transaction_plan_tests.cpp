@@ -293,6 +293,7 @@ BOOST_AUTO_TEST_CASE(
       .maximum_satoshis = 1000U,
   };
   workload.fee_satoshis = 10U;
+  workload.fee_reserve_satoshis = 50U;
 
   bbp::WalletTransactionLoadPlanner first(4U, workload);
   bbp::WalletTransactionLoadPlanner second(4U, workload);
@@ -318,7 +319,7 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(entry.amount_satoshis <= 1000U);
     BOOST_TEST(entry.amount_satoshis <= before[entry.sender_index] / 5U);
     BOOST_TEST(first_balances[entry.sender_index] ==
-               before[entry.sender_index] - entry.amount_satoshis - 10U);
+               before[entry.sender_index] - entry.amount_satoshis - 50U);
     ++generated;
     BOOST_REQUIRE(generated < 100U);
   }
@@ -336,9 +337,10 @@ BOOST_AUTO_TEST_CASE(
   workload.amount = bbp::AmountDistribution{
       .kind = bbp::ValueDistributionKind::kUniform,
       .minimum_satoshis = 100U,
-      .maximum_satoshis = 10'000U,
+      .maximum_satoshis = 1'000U,
   };
   workload.fee_satoshis = 10U;
+  workload.fee_reserve_satoshis = 100U;
 
   bbp::WalletTransactionLoadPlanner first(5U, workload);
   bbp::WalletTransactionLoadPlanner second(5U, workload);
@@ -354,7 +356,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE_EQUAL(first_batch->size(), 3U);
   const std::size_t sender = first_batch->front().sender_index;
   BOOST_TEST(sender < 2U);
-  const std::uint64_t expected_share = (before[sender] - 30U) / 3U;
+  const std::uint64_t expected_share = (before[sender] - 300U) / 3U;
   for (std::size_t index = 0U; index < first_batch->size(); ++index) {
     const bbp::WalletTransactionPlanEntry& entry = first_batch->at(index);
     BOOST_TEST(entry.sender_index == sender);
@@ -362,7 +364,7 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(entry.amount_satoshis == expected_share);
   }
   BOOST_TEST(first_balances[sender] ==
-             before[sender] - 3U * (expected_share + 10U));
+             before[sender] - 3U * expected_share - 300U);
   BOOST_TEST(first.batch_size() == 3U);
 }
 

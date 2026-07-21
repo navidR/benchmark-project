@@ -77,6 +77,26 @@ BOOST_AUTO_TEST_CASE(transaction_load_queue_close_drains_pending_work) {
   BOOST_TEST(!queue.Pop());
 }
 
+BOOST_AUTO_TEST_CASE(transaction_load_queue_admits_batches_atomically) {
+  bbp::BoundedWalletTransactionQueue queue(3U);
+  BOOST_TEST(queue.TryPushBatch({Task(1U), Task(2U)}));
+  BOOST_TEST(queue.size() == 2U);
+  BOOST_TEST(queue.maximum_size() == 2U);
+
+  BOOST_TEST(!queue.TryPushBatch({Task(3U), Task(4U)}));
+  BOOST_TEST(queue.size() == 2U);
+  const auto first = queue.Pop();
+  const auto second = queue.Pop();
+  BOOST_REQUIRE(first);
+  BOOST_REQUIRE(second);
+  BOOST_TEST(first->transaction_index == 1U);
+  BOOST_TEST(second->transaction_index == 2U);
+
+  BOOST_TEST(!queue.TryPushBatch({Task(5U), Task(6U), Task(7U), Task(8U)}));
+  BOOST_TEST(queue.size() == 0U);
+  BOOST_TEST(queue.maximum_size() == 2U);
+}
+
 BOOST_AUTO_TEST_CASE(transaction_load_queue_stop_wakes_waiting_consumer) {
   bbp::BoundedWalletTransactionQueue queue(1U);
   std::stop_source stop;
@@ -140,10 +160,23 @@ BOOST_AUTO_TEST_CASE(transaction_load_accounting_rejects_invalid_updates) {
   accounting.RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 0us);
   accounting.RecordPropagated(true);
   BOOST_CHECK_THROW(accounting.RecordPropagated(false), std::runtime_error);
+  BOOST_CHECK_THROW(accounting.RecordConfirmed(), std::runtime_error);
   const bbp::TransactionLoadSnapshot snapshot = accounting.Snapshot(0us);
   BOOST_TEST(snapshot.attempted_per_second == 0.0);
   BOOST_TEST(snapshot.submitted_per_second == 0.0);
   BOOST_TEST(snapshot.propagated_per_second == 0.0);
   BOOST_TEST(snapshot.confirmed_per_second == 0.0);
+  BOOST_TEST(snapshot.InvariantsHold());
+}
+
+BOOST_AUTO_TEST_CASE(transaction_load_confirmation_can_follow_propagation) {
+  bbp::TransactionLoadAccounting accounting;
+  accounting.RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 1us);
+  accounting.RecordPropagated(false);
+  accounting.RecordConfirmed();
+
+  const bbp::TransactionLoadSnapshot snapshot = accounting.Snapshot(1s);
+  BOOST_TEST(snapshot.propagated == 1U);
+  BOOST_TEST(snapshot.confirmed == 1U);
   BOOST_TEST(snapshot.InvariantsHold());
 }

@@ -528,6 +528,19 @@ bool FiroDriver::SupportsWalletTransactionMode(WalletMode mode) const {
   return false;
 }
 
+std::uint64_t FiroDriver::WalletTransactionFeeReserveSatoshis(
+    WalletMode mode, std::uint64_t requested_fee_rate_satoshis) const {
+  if (!SupportsWalletTransactionMode(mode)) {
+    throw std::runtime_error("unknown Firo wallet mode");
+  }
+  constexpr std::uint64_t kMaximumStandardTransactionKilobytes = 100U;
+  if (requested_fee_rate_satoshis > std::numeric_limits<std::uint64_t>::max() /
+                                        kMaximumStandardTransactionKilobytes) {
+    throw std::runtime_error("Firo wallet transaction fee reserve overflow");
+  }
+  return requested_fee_rate_satoshis * kMaximumStandardTransactionKilobytes;
+}
+
 std::optional<OperatorConnectionCommand>
 FiroDriver::BuildOperatorConnectionCommand(
     const FiroNodeConfig& config, const std::filesystem::path& run_root) const {

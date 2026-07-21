@@ -31,6 +31,8 @@ BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
       bbp::SimulationEventKind::kPeerDisconnected,
       bbp::SimulationEventKind::kRawTransactionSubmitted,
       bbp::SimulationEventKind::kWalletTransactionSubmitted,
+      bbp::SimulationEventKind::kTransactionLoadAttempt,
+      bbp::SimulationEventKind::kTransactionLoadCompleted,
       bbp::SimulationEventKind::kTransactionVisible,
       bbp::SimulationEventKind::kTransactionConfirmed,
       bbp::SimulationEventKind::kScheduledEventStarted,

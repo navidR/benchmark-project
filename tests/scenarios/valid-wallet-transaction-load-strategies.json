@@ -30,7 +30,7 @@
       },
       "fee_policy": "fixed",
       "fee": "0.00001000",
-      "funding_threshold": "0.10001000",
+      "funding_threshold": "0.10100000",
       "seed": 19
     },
     {
@@ -50,7 +50,7 @@
       },
       "fee_policy": "fixed",
       "fee": "0.00001000",
-      "funding_threshold": "1.00001000",
+      "funding_threshold": "1.00100000",
       "seed": 23
     }
   ]

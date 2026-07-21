@@ -98,10 +98,17 @@ struct WalletTransactionsWorkload {
   IntervalDistribution interval;
   WalletTransactionFeePolicy fee_policy = WalletTransactionFeePolicy::kFixed;
   std::uint64_t fee_satoshis = 0;
+  std::uint64_t fee_reserve_satoshis = 0;
   std::uint64_t random_seed = 0;
   std::vector<std::uint32_t> sender_wallets;
   std::vector<std::uint32_t> receiver_wallets;
   std::uint32_t timeout_sec = 30;
 };
+
+constexpr std::uint64_t EffectiveWalletTransactionFeeReserveSatoshis(
+    const WalletTransactionsWorkload& workload) {
+  return workload.fee_reserve_satoshis == 0U ? workload.fee_satoshis
+                                             : workload.fee_reserve_satoshis;
+}
 
 }  // namespace bbp

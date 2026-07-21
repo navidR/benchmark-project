@@ -59,15 +59,25 @@ BoundedWalletTransactionQueue::BoundedWalletTransactionQueue(
 }
 
 bool BoundedWalletTransactionQueue::TryPush(WalletTransactionLoadTask task) {
+  std::vector<WalletTransactionLoadTask> tasks;
+  tasks.push_back(std::move(task));
+  return TryPushBatch(std::move(tasks));
+}
+
+bool BoundedWalletTransactionQueue::TryPushBatch(
+    std::vector<WalletTransactionLoadTask> tasks) {
   std::lock_guard lock(mutex_);
   if (closed_) {
     throw std::runtime_error("transaction load queue is closed");
   }
-  if (tasks_.size() == capacity_) {
+  if (tasks.size() > capacity_ || tasks_.size() > capacity_ - tasks.size()) {
     return false;
   }
-  tasks_.push_back(std::move(task));
-  ready_.notify_one();
+  for (WalletTransactionLoadTask& task : tasks) {
+    tasks_.push_back(std::move(task));
+  }
+  maximum_size_ = std::max(maximum_size_, tasks_.size());
+  ready_.notify_all();
   return true;
 }
 
@@ -99,6 +109,11 @@ std::size_t BoundedWalletTransactionQueue::capacity() const {
 std::size_t BoundedWalletTransactionQueue::size() const {
   std::lock_guard lock(mutex_);
   return tasks_.size();
+}
+
+std::size_t BoundedWalletTransactionQueue::maximum_size() const {
+  std::lock_guard lock(mutex_);
+  return maximum_size_;
 }
 
 bool BoundedWalletTransactionQueue::closed() const {
@@ -200,6 +215,15 @@ void TransactionLoadAccounting::RecordPropagated(bool confirmed) {
   if (confirmed) {
     Increment(&counters_.confirmed, "confirmed");
   }
+}
+
+void TransactionLoadAccounting::RecordConfirmed() {
+  std::lock_guard lock(mutex_);
+  if (counters_.confirmed == counters_.propagated) {
+    throw std::runtime_error(
+        "transaction load confirmed count exceeds propagated count");
+  }
+  Increment(&counters_.confirmed, "confirmed");
 }
 
 void TransactionLoadAccounting::RecordObservationError() {

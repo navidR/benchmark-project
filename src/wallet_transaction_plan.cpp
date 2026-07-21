@@ -366,18 +366,20 @@ WalletTransactionLoadPlanner::NextBatch(
           "transaction load balance ledger does not cover every sender");
     }
   }
+  const std::uint64_t fee_reserve_satoshis =
+      EffectiveWalletTransactionFeeReserveSatoshis(workload_);
 
   if (workload_.strategy == WalletTransferStrategy::kRandomBruteforce) {
     std::vector<std::size_t> eligible_senders;
     eligible_senders.reserve(senders_.size());
     for (const std::size_t sender : senders_) {
       const std::uint64_t balance = available_balances->at(sender);
-      if (balance <= workload_.fee_satoshis) {
+      if (balance <= fee_reserve_satoshis) {
         continue;
       }
       const std::uint64_t maximum =
           std::min({workload_.amount.maximum_satoshis, balance / 5U,
-                    balance - workload_.fee_satoshis});
+                    balance - fee_reserve_satoshis});
       if (maximum >= workload_.amount.minimum_satoshis) {
         eligible_senders.push_back(sender);
       }
@@ -392,10 +394,10 @@ WalletTransactionLoadPlanner::NextBatch(
     const std::uint64_t balance = available_balances->at(sender);
     const std::uint64_t maximum =
         std::min({workload_.amount.maximum_satoshis, balance / 5U,
-                  balance - workload_.fee_satoshis});
+                  balance - fee_reserve_satoshis});
     const std::uint64_t amount =
         SampleInclusive(&rng_, workload_.amount.minimum_satoshis, maximum);
-    available_balances->at(sender) = balance - amount - workload_.fee_satoshis;
+    available_balances->at(sender) = balance - amount - fee_reserve_satoshis;
     return std::vector<WalletTransactionPlanEntry>{WalletTransactionPlanEntry{
         .sender_index = sender,
         .receiver_index = receiver,
@@ -408,11 +410,11 @@ WalletTransactionLoadPlanner::NextBatch(
   }
   const std::uint64_t receiver_count =
       static_cast<std::uint64_t>(receivers_.size());
-  if (workload_.fee_satoshis >
+  if (fee_reserve_satoshis >
       std::numeric_limits<std::uint64_t>::max() / receiver_count) {
     throw std::runtime_error("equal fan-out fee total overflows uint64");
   }
-  const std::uint64_t total_fees = workload_.fee_satoshis * receiver_count;
+  const std::uint64_t total_fees = fee_reserve_satoshis * receiver_count;
   for (std::size_t offset = 0U; offset < equal_sender_order_.size(); ++offset) {
     const std::size_t position =
         (equal_sender_cursor_ + offset) % equal_sender_order_.size();
@@ -422,8 +424,7 @@ WalletTransactionLoadPlanner::NextBatch(
       continue;
     }
     const std::uint64_t fee_safe_budget = balance - total_fees;
-    const std::uint64_t amount = std::min(workload_.amount.maximum_satoshis,
-                                          fee_safe_budget / receiver_count);
+    const std::uint64_t amount = fee_safe_budget / receiver_count;
     if (amount < workload_.amount.minimum_satoshis) {
       continue;
     }

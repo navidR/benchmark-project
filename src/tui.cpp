@@ -365,18 +365,34 @@ std::string NetworkLossText(const boost::json::object& metrics) {
 }
 
 std::string WorkloadsSummaryText(const boost::json::object& report) {
+  std::string load_suffix;
+  const boost::json::value* load_summaries =
+      report.if_contains("transaction_load_summaries");
+  if (load_summaries != nullptr && load_summaries->is_array() &&
+      !load_summaries->as_array().empty()) {
+    const boost::json::value& latest = load_summaries->as_array().back();
+    if (latest.is_object()) {
+      const boost::json::object* detail =
+          JsonObject(latest.as_object(), "detail");
+      if (detail != nullptr) {
+        load_suffix = "; load a=" + JsonMetricText(*detail, "attempted") +
+                      " s=" + JsonMetricText(*detail, "submitted") +
+                      " bp=" + JsonMetricText(*detail, "backpressured");
+      }
+    }
+  }
   const std::string operator_suffix =
       OperatorConnectionCommandFromReport(report).empty()
           ? std::string{}
           : "; manual GUI command available";
   const boost::json::value* workloads_value = report.if_contains("workloads");
   if (workloads_value == nullptr || !workloads_value->is_array()) {
-    return "workloads: -" + operator_suffix;
+    return "workloads: -" + load_suffix + operator_suffix;
   }
 
   const boost::json::array& workloads = workloads_value->as_array();
   if (workloads.empty()) {
-    return "workloads: 0" + operator_suffix;
+    return "workloads: 0" + load_suffix + operator_suffix;
   }
   std::string text = "workloads: " + std::to_string(workloads.size());
   std::size_t index = 0;
@@ -518,7 +534,7 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
         break;
     }
   }
-  return text + operator_suffix;
+  return text + load_suffix + operator_suffix;
 }
 
 std::string LifecycleSummaryText(const boost::json::object& report) {

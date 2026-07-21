@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <stop_token>
 #include <thread>
@@ -1229,6 +1230,18 @@ BOOST_AUTO_TEST_CASE(firo_load_submission_classifies_rpc_rejection) {
   BOOST_REQUIRE_EQUAL(methods.size(), 2U);
   BOOST_TEST(methods[0] == "settxfee");
   BOOST_TEST(methods[1] == "sendtoaddress");
+}
+
+BOOST_AUTO_TEST_CASE(firo_reserves_the_maximum_standard_transaction_fee) {
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  BOOST_TEST(driver.WalletTransactionFeeReserveSatoshis(
+                 bbp::WalletMode::kPublic, 1000U) == 100000U);
+  BOOST_TEST(driver.WalletTransactionFeeReserveSatoshis(
+                 bbp::WalletMode::kPrivate, 1000U) == 100000U);
+  BOOST_CHECK_THROW(
+      driver.WalletTransactionFeeReserveSatoshis(
+          bbp::WalletMode::kPublic, std::numeric_limits<std::uint64_t>::max()),
+      std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {

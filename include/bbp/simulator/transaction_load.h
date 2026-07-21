@@ -9,6 +9,7 @@
 #include <optional>
 #include <stop_token>
 #include <string_view>
+#include <vector>
 
 #include "bbp/simulator/wallet_transaction_plan.h"
 
@@ -37,11 +38,13 @@ class BoundedWalletTransactionQueue {
   explicit BoundedWalletTransactionQueue(std::size_t capacity);
 
   bool TryPush(WalletTransactionLoadTask task);
+  bool TryPushBatch(std::vector<WalletTransactionLoadTask> tasks);
   std::optional<WalletTransactionLoadTask> Pop(std::stop_token stop_token = {});
   void Close();
 
   [[nodiscard]] std::size_t capacity() const;
   [[nodiscard]] std::size_t size() const;
+  [[nodiscard]] std::size_t maximum_size() const;
   [[nodiscard]] bool closed() const;
 
  private:
@@ -49,6 +52,7 @@ class BoundedWalletTransactionQueue {
   mutable std::mutex mutex_;
   std::condition_variable_any ready_;
   std::deque<WalletTransactionLoadTask> tasks_;
+  std::size_t maximum_size_ = 0U;
   bool closed_ = false;
 };
 
@@ -81,6 +85,7 @@ class TransactionLoadAccounting {
   void RecordOutcome(TransactionLoadOutcome outcome,
                      std::chrono::microseconds latency);
   void RecordPropagated(bool confirmed);
+  void RecordConfirmed();
   void RecordObservationError();
 
   [[nodiscard]] TransactionLoadSnapshot Snapshot(

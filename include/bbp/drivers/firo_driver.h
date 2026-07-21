@@ -24,6 +24,9 @@ class FiroDriver final : public ChainDriver {
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const override;
   bool SupportsWalletTransactionMode(WalletMode mode) const override;
+  std::uint64_t WalletTransactionFeeReserveSatoshis(
+      WalletMode mode,
+      std::uint64_t requested_fee_rate_satoshis) const override;
   std::optional<OperatorConnectionCommand> BuildOperatorConnectionCommand(
       const FiroNodeConfig& config,
       const std::filesystem::path& run_root) const override;

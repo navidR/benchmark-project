@@ -43,6 +43,9 @@ constexpr std::size_t kMaximumCheckpointSummaries = 256U;
 constexpr std::size_t kMaximumDirectionalPolicyVerifications = 256U;
 constexpr std::size_t kMaximumTopologyEdgeSummaries = 256U;
 constexpr std::size_t kMaximumProfileUpdateSummaries = 256U;
+constexpr std::size_t kMaximumWalletTransactionSummaries = 256U;
+constexpr std::size_t kMaximumTransactionLoadAttemptSummaries = 256U;
+constexpr std::size_t kMaximumTransactionLoadCompletionSummaries = 256U;
 
 struct NodeReport {
   std::optional<std::uint64_t> index;
@@ -1551,6 +1554,15 @@ void AppendEventSummary(const boost::json::object& event,
   summaries->push_back(std::move(summary));
 }
 
+void AppendBoundedEventSummary(const boost::json::object& event,
+                               std::size_t maximum_size,
+                               boost::json::array* summaries) {
+  AppendEventSummary(event, summaries);
+  if (summaries->size() > maximum_size) {
+    summaries->erase(summaries->begin());
+  }
+}
+
 std::optional<std::vector<std::uint64_t>> PartitionGroup(
     const boost::json::object& detail, std::string_view field) {
   const boost::json::value* value = detail.if_contains(field);
@@ -1845,6 +1857,8 @@ struct IncrementalRunReport::Impl {
         "topology_edge_rollback_failures",
         "wallet_funding",
         "wallet_transactions",
+        "transaction_load_attempts",
+        "transaction_load_summaries",
         "operator_commands",
     };
     for (const std::string_view field : kArrayFields) {
@@ -1859,6 +1873,9 @@ struct IncrementalRunReport::Impl {
     scheduled_event_completed_count = 0;
     scheduled_event_failed_count = 0;
     checkpoint_count = 0;
+    wallet_transaction_count = 0;
+    transaction_load_attempt_count = 0;
+    transaction_load_completed_count = 0;
     run_started = false;
     run_finished = false;
     run_failed = false;
@@ -2162,6 +2179,18 @@ struct IncrementalRunReport::Impl {
       case SimulationEventKind::kTransactionConfirmed:
         AppendEventSummary(event, &Array("transaction_confirmations"));
         break;
+      case SimulationEventKind::kTransactionLoadAttempt:
+        ++transaction_load_attempt_count;
+        AppendBoundedEventSummary(event,
+                                  kMaximumTransactionLoadAttemptSummaries,
+                                  &Array("transaction_load_attempts"));
+        break;
+      case SimulationEventKind::kTransactionLoadCompleted:
+        ++transaction_load_completed_count;
+        AppendBoundedEventSummary(event,
+                                  kMaximumTransactionLoadCompletionSummaries,
+                                  &Array("transaction_load_summaries"));
+        break;
       case SimulationEventKind::kNodeRestarted:
         AppendEventSummary(event, &Array("node_restarts"));
         break;
@@ -2223,9 +2252,11 @@ struct IncrementalRunReport::Impl {
         break;
       }
       case SimulationEventKind::kWalletTransactionSubmitted: {
+        ++wallet_transaction_count;
         boost::json::value detail = ParseEventDetail(event);
         RememberWalletTransactionEvent(detail, &wallets);
-        AppendEventSummary(event, &Array("wallet_transactions"));
+        AppendBoundedEventSummary(event, kMaximumWalletTransactionSummaries,
+                                  &Array("wallet_transactions"));
         break;
       }
       case SimulationEventKind::kOperatorCommandCompleted:
@@ -2299,6 +2330,10 @@ struct IncrementalRunReport::Impl {
     report["scheduled_event_completed_count"] = scheduled_event_completed_count;
     report["scheduled_event_failed_count"] = scheduled_event_failed_count;
     report["checkpoint_count"] = checkpoint_count;
+    report["wallet_transaction_count"] = wallet_transaction_count;
+    report["transaction_load_attempt_count"] = transaction_load_attempt_count;
+    report["transaction_load_completed_count"] =
+        transaction_load_completed_count;
     report["active_network_partitions"] =
         ActivePartitionsJson(active_network_partitions);
     report["wallets_summary"] = WalletsJson(wallets);
@@ -2340,6 +2375,9 @@ struct IncrementalRunReport::Impl {
   std::uint64_t scheduled_event_completed_count = 0;
   std::uint64_t scheduled_event_failed_count = 0;
   std::uint64_t checkpoint_count = 0;
+  std::uint64_t wallet_transaction_count = 0;
+  std::uint64_t transaction_load_attempt_count = 0;
+  std::uint64_t transaction_load_completed_count = 0;
   bool run_started = false;
   bool run_finished = false;
   bool run_failed = false;

@@ -66,6 +66,7 @@
 #include "bbp/simulator/node_runtime.h"
 #include "bbp/simulator/options.h"
 #include "bbp/simulator/process_control_config.h"
+#include "bbp/simulator/transaction_load.h"
 #include "bbp/simulator/wallet_transaction_plan.h"
 #include "bbp/simulator/yaml_helpers.h"
 #include "bbp/tui.h"
@@ -1160,14 +1161,18 @@ std::string_view PeerConnectivityModeName(PeerConnectivityMode mode) {
   throw std::runtime_error("unknown peer connectivity mode");
 }
 
-ChainWalletMode ToChainWalletMode(const WalletInitialization& initialization) {
-  switch (initialization.mode) {
+ChainWalletMode ToChainWalletMode(WalletPrivacyMode mode) {
+  switch (mode) {
     case WalletPrivacyMode::kPublic:
       return ChainWalletMode::kPublic;
     case WalletPrivacyMode::kPrivate:
       return ChainWalletMode::kPrivate;
   }
   throw std::runtime_error("unknown wallet privacy mode");
+}
+
+ChainWalletMode ToChainWalletMode(const WalletInitialization& initialization) {
+  return ToChainWalletMode(initialization.mode);
 }
 
 PeerConnectivityPolicy ParsePeerConnectivityPolicyObject(
@@ -1811,13 +1816,20 @@ void ValidateWalletTransactionsWorkload(
     throw std::runtime_error(
         "scenario wallet_transactions fee must be greater than zero");
   }
+  const std::uint64_t fee_reserve_satoshis =
+      EffectiveWalletTransactionFeeReserveSatoshis(workload);
+  if (fee_reserve_satoshis < workload.fee_satoshis) {
+    throw std::runtime_error(
+        "scenario transaction load fee reserve must cover the requested "
+        "fee rate");
+  }
   if (workload.amount.maximum_satoshis >
-      std::numeric_limits<uint64_t>::max() - workload.fee_satoshis) {
+      std::numeric_limits<uint64_t>::max() - fee_reserve_satoshis) {
     throw std::runtime_error(
         "scenario wallet_transactions amount plus fee overflows uint64");
   }
   const std::uint64_t minimum_funding_threshold =
-      workload.amount.maximum_satoshis + workload.fee_satoshis;
+      workload.amount.maximum_satoshis + fee_reserve_satoshis;
   if (workload.funding_threshold_satoshis < minimum_funding_threshold) {
     throw std::runtime_error(
         "scenario wallet_transactions funding_threshold must cover amount "
@@ -1927,14 +1939,14 @@ void ValidateWalletTransactionsWorkload(
       if (workload.strategy == WalletTransferStrategy::kEqualFanout) {
         const std::uint64_t receiver_count =
             static_cast<std::uint64_t>(workload.receiver_wallets.size());
-        if (workload.fee_satoshis >
+        if (fee_reserve_satoshis >
             std::numeric_limits<std::uint64_t>::max() / receiver_count) {
           throw std::runtime_error(
               "scenario equal_fanout fee total overflows uint64");
         }
         if (workload.amount.minimum_satoshis >
             (std::numeric_limits<std::uint64_t>::max() -
-             workload.fee_satoshis * receiver_count) /
+             fee_reserve_satoshis * receiver_count) /
                 receiver_count) {
           throw std::runtime_error(
               "scenario equal_fanout minimum amount total overflows uint64");
@@ -3903,11 +3915,21 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
         transactions.interval = ParseIntervalDistribution(workload, "interval");
       }
       transactions.fee_satoshis = JsonAmountField(workload, "fee");
+      if (load_strategy) {
+        const std::unique_ptr<ChainDriver> load_driver =
+            CreateChainDriver(options.chain);
+        transactions.fee_reserve_satoshis =
+            load_driver->WalletTransactionFeeReserveSatoshis(
+                ToChainWalletMode(transactions.mode),
+                transactions.fee_satoshis);
+      }
+      const std::uint64_t fee_reserve_satoshis =
+          EffectiveWalletTransactionFeeReserveSatoshis(transactions);
       const std::uint64_t default_funding_threshold =
           transactions.amount.maximum_satoshis <=
                   std::numeric_limits<std::uint64_t>::max() -
-                      transactions.fee_satoshis
-              ? transactions.amount.maximum_satoshis + transactions.fee_satoshis
+                      fee_reserve_satoshis
+              ? transactions.amount.maximum_satoshis + fee_reserve_satoshis
               : 0U;
       transactions.funding_threshold_satoshis = JsonOptionalAmountField(
           workload, "funding_threshold", default_funding_threshold);
@@ -4939,6 +4961,135 @@ void ParseLegacyCliInputs(const LegacyCliInputs& inputs, Options& options) {
 
 bool TopologyHasDirectionalNetworkConditions(const Options& options);
 
+void ApplyDirectTransactionLoadOptions(
+    const boost::program_options::variables_map& vm,
+    std::string_view strategy_name, std::uint32_t wallet_node_count,
+    Options* options) {
+  const bool strategy_provided =
+      OptionProvided(vm, "transaction-load-strategy");
+  const bool wallet_count_provided = OptionProvided(vm, "wallet-node-count");
+  if (!strategy_provided && !wallet_count_provided) {
+    return;
+  }
+  if (!strategy_provided) {
+    throw std::runtime_error(
+        "--wallet-node-count requires --transaction-load-strategy");
+  }
+  if (!wallet_count_provided) {
+    throw std::runtime_error(
+        "--transaction-load-strategy requires --wallet-node-count");
+  }
+  if (!OptionProvided(vm, "nodes")) {
+    throw std::runtime_error(
+        "--transaction-load-strategy requires an explicit --nodes value");
+  }
+  if (OptionProvided(vm, "scenario") || OptionProvided(vm, "scenario-json") ||
+      OptionProvided(vm, "scenario-yaml")) {
+    throw std::runtime_error(
+        "direct transaction load options must not be combined with a "
+        "scenario; use the scenario workload for advanced overrides");
+  }
+  if (OptionProvided(vm, "run") || OptionProvided(vm, "report-run") ||
+      OptionProvided(vm, "cleanup-run")) {
+    throw std::runtime_error(
+        "direct transaction load options require a new simulation run");
+  }
+  if (OptionProvided(vm, "generate-node")) {
+    throw std::runtime_error(
+        "direct transaction load selects the first non-wallet node as its "
+        "miner; use a scenario for a custom miner");
+  }
+  const std::uint32_t maximum_nodes =
+      ChainDriverSpecFor(options->chain).max_nodes;
+  if (options->nodes < 1U || options->nodes > maximum_nodes) {
+    throw std::runtime_error("--nodes currently supports 1.." +
+                             std::to_string(maximum_nodes) +
+                             " for chain smoke runs");
+  }
+  if (wallet_node_count < 2U) {
+    throw std::runtime_error(
+        "--wallet-node-count must be at least 2 for transaction load");
+  }
+  if (wallet_node_count >= options->nodes) {
+    throw std::runtime_error(
+        "--wallet-node-count must leave at least one non-wallet miner node");
+  }
+
+  const WalletTransferStrategy strategy =
+      ParseWalletTransferStrategy(strategy_name);
+  if (!IsTransactionLoadStrategy(strategy)) {
+    throw std::runtime_error(
+        "--transaction-load-strategy must be random_bruteforce or "
+        "equal_fanout");
+  }
+
+  options->topology.configured = true;
+  options->isolate_network = true;
+  if (!OptionProvided(vm, "metrics-sample-count")) {
+    options->metrics_sample_count = 1U;
+  }
+  options->topology.node_count = options->nodes;
+  options->topology.wallet_node_count = wallet_node_count;
+  options->topology.miner_node_count = 1U;
+  options->topology.allow_miner_wallet_overlap = false;
+  options->topology.wallet_nodes =
+      ConsecutiveNodeIndexes(0U, wallet_node_count);
+  options->topology.miner_nodes = {wallet_node_count};
+  options->topology.peer_topology.kind = PeerTopologyKind::kFullMesh;
+  options->wallet_initialization =
+      WalletInitialization{.strategy = WalletInitializationStrategy::kDriverRpc,
+                           .mode = WalletPrivacyMode::kPublic};
+  options->generate_node = wallet_node_count + 1U;
+
+  WalletTransactionsWorkload load;
+  load.funding_strategy = WalletFundingStrategy::kRoundRobin;
+  load.strategy = strategy;
+  const std::uint32_t coinbase_confirmations =
+      ChainDriverSpecFor(options->chain).coinbase_spendable_confirmations;
+  load.funding_blocks_per_wallet = coinbase_confirmations;
+  load.readiness_confirmations = coinbase_confirmations;
+  load.transaction_rate = WalletTransactionRate::FromDouble(2.0);
+  load.concurrency = 2U;
+  load.queue_capacity = 8U;
+  load.mode = WalletPrivacyMode::kPublic;
+  load.amount = AmountDistribution{
+      .kind = ValueDistributionKind::kUniform,
+      .minimum_satoshis = 1'000'000U,
+      .maximum_satoshis = 10'000'000U,
+  };
+  load.fee_policy = WalletTransactionFeePolicy::kFixed;
+  load.fee_satoshis = 1'000U;
+  load.fee_reserve_satoshis =
+      CreateChainDriver(options->chain)
+          ->WalletTransactionFeeReserveSatoshis(ToChainWalletMode(load.mode),
+                                                load.fee_satoshis);
+  load.funding_threshold_satoshis =
+      load.amount.maximum_satoshis + load.fee_reserve_satoshis;
+  load.random_seed = options->simulation_seed;
+  load.timeout_sec = options->sync_timeout_sec;
+
+  const std::uint32_t sender_count = wallet_node_count / 2U;
+  for (std::uint32_t wallet = 1U; wallet <= sender_count; ++wallet) {
+    load.sender_wallets.push_back(wallet);
+  }
+  for (std::uint32_t wallet = sender_count + 1U; wallet <= wallet_node_count;
+       ++wallet) {
+    load.receiver_wallets.push_back(wallet);
+  }
+  const std::uint32_t receiver_count =
+      static_cast<std::uint32_t>(load.receiver_wallets.size());
+  load.transaction_count = strategy == WalletTransferStrategy::kEqualFanout
+                               ? receiver_count
+                               : receiver_count * 2U;
+
+  ScenarioWorkload workload;
+  workload.kind = WorkloadKind::kWalletTransactions;
+  workload.wallet_transactions = std::move(load);
+  options->workloads.push_back(std::move(workload));
+  options->workloads_configured = true;
+  options->wallet_backed_workload_requested = true;
+}
+
 Options ParseOptions(int argc, char** argv) {
   namespace po = boost::program_options;
   Options options;
@@ -4956,6 +5107,8 @@ Options ParseOptions(int argc, char** argv) {
   bool native_mining = false;
   bool keep_cgroups = false;
   std::string cleanup_run_id;
+  std::uint32_t wallet_node_count = 0U;
+  std::string transaction_load_strategy;
 
   const std::string nodes_help =
       "chain regtest nodes, 1.." + std::to_string(default_chain_spec.max_nodes);
@@ -4982,6 +5135,18 @@ Options ParseOptions(int argc, char** argv) {
       "trace, debug, info, warning, error, or fatal")(
       "metrics-interval", po::value<std::string>(),
       "metrics interval with an explicit unit, such as 250ms or 1s")(
+      "nodes", po::value<std::uint32_t>(),
+      "total nodes for a direct transaction-load run")(
+      "wallet-node-count", po::value<std::uint32_t>(),
+      "wallet nodes for a direct transaction-load run (minimum 2)")(
+      "transaction-load-strategy", po::value<std::string>(),
+      "direct random_bruteforce or equal_fanout load; defaults: full mesh, "
+      "isolated namespaces, one miner, public driver wallets, two receiver "
+      "batches for random or one complete equal fan-out at 2 tx/s, "
+      "concurrency 2, queue 8, uniform 0.01..0.10 coin random amounts, "
+      "fixed 0.00001000 coin fee, simulation seed, and one final metric "
+      "sample")("isolate-network",
+                "confine every node to its own benchmark network namespace")(
       "keep-artifacts", "preserve run artifacts")(
       "once", "render one frame when viewing a previous run");
   po::options_description desc("Allowed options");
@@ -5022,6 +5187,13 @@ Options ParseOptions(int argc, char** argv) {
       "refresh-ms", po::value<std::uint32_t>(&options.tui_refresh_ms),
       "milliseconds between integrated TUI report refreshes")(
       "nodes", po::value<uint32_t>(&options.nodes), nodes_help.c_str())(
+      "wallet-node-count", po::value<std::uint32_t>(&wallet_node_count),
+      "wallet nodes for direct transaction load; assigns wallets first and "
+      "one miner next")(
+      "transaction-load-strategy",
+      po::value<std::string>(&transaction_load_strategy),
+      "direct random_bruteforce or equal_fanout transaction load using "
+      "bounded isolated defaults")(
       "generate-node", po::value<uint32_t>(&options.generate_node),
       "default 1-based miner node when no topology is configured")(
       "no-mining", po::bool_switch(&no_mining),
@@ -5307,6 +5479,8 @@ Options ParseOptions(int argc, char** argv) {
   if (options.tui_refresh_ms == 0U) {
     throw std::runtime_error("--refresh-ms must be greater than zero");
   }
+  ApplyDirectTransactionLoadOptions(vm, transaction_load_strategy,
+                                    wallet_node_count, &options);
   if (!options.scenario_json.empty()) {
     const boost::json::value scenario =
         boost::json::parse(ReadText(options.scenario_json));
@@ -7676,6 +7850,119 @@ std::string WalletTransactionDetail(
   return boost::json::serialize(detail);
 }
 
+std::string TransactionLoadAttemptDetail(
+    uint32_t workload_index, uint32_t workload_count,
+    const WalletTransactionsWorkload& workload, std::uint64_t attempt_limit,
+    const WalletTransactionLoadTask& task, const WalletIdentity& sender,
+    const WalletIdentity& receiver, TransactionLoadOutcome outcome,
+    std::chrono::microseconds latency,
+    const ChainWalletTransactionResult* transaction,
+    std::string_view error_message) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["transaction_index"] = task.transaction_index;
+  detail["attempt_limit"] = attempt_limit;
+  detail["strategy"] =
+      std::string(WalletTransferStrategyName(workload.strategy));
+  detail["mode"] = std::string(WalletPrivacyModeName(workload.mode));
+  detail["seed"] = workload.random_seed;
+  detail["sender_wallet_index"] = sender.wallet_index;
+  detail["receiver_wallet_index"] = receiver.wallet_index;
+  detail["sender_node"] = sender.node;
+  detail["receiver_node"] = receiver.node;
+  detail["amount"] = FormatFixed8Amount(task.plan.amount_satoshis);
+  detail["amount_satoshis"] = task.plan.amount_satoshis;
+  detail["fee_policy"] =
+      std::string(WalletTransactionFeePolicyName(workload.fee_policy));
+  detail["fee"] = FormatFixed8Amount(workload.fee_satoshis);
+  detail["fee_satoshis"] = workload.fee_satoshis;
+  detail["fee_reserve_satoshis"] =
+      EffectiveWalletTransactionFeeReserveSatoshis(workload);
+  if (task.scheduled_simulation_elapsed) {
+    detail["scheduled_simulation_elapsed_ms"] =
+        task.scheduled_simulation_elapsed->count();
+  } else {
+    detail["scheduled_simulation_elapsed_ms"] = nullptr;
+  }
+  if (task.scheduled_wall_elapsed) {
+    detail["scheduled_wall_elapsed_ms"] = task.scheduled_wall_elapsed->count();
+  } else {
+    detail["scheduled_wall_elapsed_ms"] = nullptr;
+  }
+  detail["outcome"] = std::string(TransactionLoadOutcomeName(outcome));
+  detail["backpressured"] = outcome == TransactionLoadOutcome::kBackpressured;
+  detail["dropped"] = outcome == TransactionLoadOutcome::kBackpressured;
+  detail["latency_us"] = static_cast<std::uint64_t>(latency.count());
+  detail["latency_ms"] = static_cast<double>(latency.count()) / 1000.0;
+  if (transaction != nullptr) {
+    detail["txids"] = TxIdsJson(transaction->txids);
+    detail["mempool_size"] = transaction->mempool_size;
+    detail["requested_fee_rate"] = transaction->requested_fee_rate;
+  } else {
+    detail["txids"] = boost::json::array{};
+    detail["mempool_size"] = nullptr;
+    detail["requested_fee_rate"] = nullptr;
+  }
+  if (error_message.empty()) {
+    detail["error"] = nullptr;
+  } else {
+    detail["error"] = error_message;
+  }
+  return boost::json::serialize(detail);
+}
+
+std::string TransactionLoadCompletedDetail(
+    uint32_t workload_index, uint32_t workload_count,
+    const WalletTransactionsWorkload& workload, std::uint64_t attempt_limit,
+    std::size_t queue_maximum_size, const TransactionLoadSnapshot& snapshot) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  detail["strategy"] =
+      std::string(WalletTransferStrategyName(workload.strategy));
+  detail["mode"] = std::string(WalletPrivacyModeName(workload.mode));
+  detail["seed"] = workload.random_seed;
+  detail["configured_attempt_limit"] = attempt_limit;
+  if (workload.transaction_rate) {
+    detail["configured_rate"] = workload.transaction_rate->value();
+  } else {
+    detail["configured_rate"] = nullptr;
+  }
+  if (workload.duration) {
+    detail["configured_duration_ms"] = workload.duration->count();
+  } else {
+    detail["configured_duration_ms"] = nullptr;
+  }
+  detail["configured_concurrency"] = workload.concurrency;
+  detail["queue_capacity"] = workload.queue_capacity;
+  detail["queue_maximum_depth"] = queue_maximum_size;
+  detail["fee_reserve_satoshis"] =
+      EffectiveWalletTransactionFeeReserveSatoshis(workload);
+  detail["attempted"] = snapshot.attempted;
+  detail["submitted"] = snapshot.submitted;
+  detail["rejected"] = snapshot.rejected;
+  detail["timed_out"] = snapshot.timed_out;
+  detail["backpressured"] = snapshot.backpressured;
+  detail["dropped"] = snapshot.backpressured;
+  detail["propagated"] = snapshot.propagated;
+  detail["confirmed"] = snapshot.confirmed;
+  detail["failed"] = snapshot.failed;
+  detail["observation_errors"] = snapshot.observation_errors;
+  detail["latency_sample_count"] = snapshot.latency_sample_count;
+  detail["latency_total_us"] = snapshot.latency_total_us;
+  detail["latency_min_us"] = snapshot.latency_min_us;
+  detail["latency_max_us"] = snapshot.latency_max_us;
+  detail["average_latency_ms"] = snapshot.average_latency_ms;
+  detail["elapsed_us"] = snapshot.elapsed_us;
+  detail["attempted_per_second"] = snapshot.attempted_per_second;
+  detail["submitted_per_second"] = snapshot.submitted_per_second;
+  detail["propagated_per_second"] = snapshot.propagated_per_second;
+  detail["confirmed_per_second"] = snapshot.confirmed_per_second;
+  detail["accounting_invariants_hold"] = snapshot.InvariantsHold();
+  return boost::json::serialize(detail);
+}
+
 std::string OperatorWalletTransactionDetail(
     const SimulationWalletSend& send, const WalletIdentity& sender,
     const WalletIdentity& receiver,
@@ -7720,6 +8007,12 @@ struct TrackedTransaction {
   std::optional<double> transaction_rate;
   std::uint32_t txid_index = 0;
   std::uint32_t submission_node = 0;
+};
+
+struct TransactionSetObservation {
+  bool propagated = false;
+  bool confirmed = false;
+  bool observation_error = false;
 };
 
 std::string TransactionObservationDetail(
@@ -7823,6 +8116,108 @@ class TransactionObservationTracker {
                           static_cast<std::uint32_t>(node_index + 1U),
                           node.config.id, observation);
       }
+    }
+  }
+
+  std::vector<TransactionSetObservation> ObserveSetsUntilVisible(
+      const Options& options, const std::filesystem::path& events_path,
+      const ChainDriver& driver, const std::vector<NodeRuntime>& nodes,
+      const std::vector<std::vector<TrackedTransaction>>& transaction_sets,
+      std::chrono::seconds timeout, std::stop_token stop_token) {
+    std::vector<TransactionSetObservation> results(transaction_sets.size());
+    if (transaction_sets.empty()) {
+      return results;
+    }
+    std::size_t observable_node_count = 0U;
+    for (const NodeRuntime& node : nodes) {
+      if (node.AllowsChainMetrics()) {
+        ++observable_node_count;
+      }
+    }
+    if (observable_node_count == 0U) {
+      throw std::runtime_error(
+          "transaction load observation requires an observable node");
+    }
+
+    const auto forget_observations = [this, &transaction_sets, &nodes] {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const std::vector<TrackedTransaction>& transaction_set :
+           transaction_sets) {
+        for (const TrackedTransaction& transaction : transaction_set) {
+          for (const NodeRuntime& node : nodes) {
+            visible_.erase({transaction.txid, node.config.id});
+            confirmed_.erase({transaction.txid, node.config.id});
+          }
+        }
+      }
+    };
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    try {
+      while (true) {
+        ThrowIfStopRequested(stop_token);
+        bool all_propagated = true;
+        for (std::size_t set_index = 0U; set_index < transaction_sets.size();
+             ++set_index) {
+          TransactionSetObservation& result = results[set_index];
+          if (result.propagated) {
+            continue;
+          }
+          const std::vector<TrackedTransaction>& transaction_set =
+              transaction_sets[set_index];
+          if (transaction_set.empty()) {
+            result.observation_error = true;
+            all_propagated = false;
+            continue;
+          }
+          bool set_visible = true;
+          bool set_confirmed = true;
+          for (const TrackedTransaction& transaction : transaction_set) {
+            for (std::size_t node_index = 0U; node_index < nodes.size();
+                 ++node_index) {
+              const NodeRuntime& node = nodes[node_index];
+              if (!node.AllowsChainMetrics()) {
+                continue;
+              }
+              try {
+                const ChainTransactionObservation observation =
+                    driver.ObserveTransaction(node.config, transaction.txid,
+                                              stop_token);
+                RecordObservation(options, events_path, transaction,
+                                  static_cast<std::uint32_t>(node_index + 1U),
+                                  node.config.id, observation);
+                if (observation.state == ChainTransactionState::kUnknown) {
+                  set_visible = false;
+                  set_confirmed = false;
+                } else if (observation.state !=
+                           ChainTransactionState::kConfirmed) {
+                  set_confirmed = false;
+                }
+              } catch (const SimulationCancelled&) {
+                throw;
+              } catch (const std::exception& error) {
+                result.observation_error = true;
+                set_visible = false;
+                set_confirmed = false;
+                BBP_LOG(warning) << "transaction load observation failed for "
+                                 << transaction.txid << " on " << node.config.id
+                                 << ": " << error.what();
+              }
+            }
+          }
+          result.propagated = set_visible;
+          result.confirmed = set_visible && set_confirmed;
+          all_propagated = all_propagated && result.propagated;
+        }
+        if (all_propagated || std::chrono::steady_clock::now() >= deadline) {
+          forget_observations();
+          return results;
+        }
+        WaitForDuration(std::chrono::milliseconds(50), stop_token);
+      }
+    } catch (...) {
+      forget_observations();
+      throw;
     }
   }
 
@@ -8666,6 +9061,10 @@ boost::json::object WalletTransactionsWorkloadJson(
     object["mode"] = std::string(WalletPrivacyModeName(workload.mode));
     object["fee_policy"] =
         std::string(WalletTransactionFeePolicyName(workload.fee_policy));
+    object["fee_reserve"] = FormatFixed8Amount(
+        EffectiveWalletTransactionFeeReserveSatoshis(workload));
+    object["fee_reserve_satoshis"] =
+        EffectiveWalletTransactionFeeReserveSatoshis(workload);
   }
   object["amount"] = AmountDistributionConfigurationJson(workload.amount);
   if (workload.interval.kind != ValueDistributionKind::kFixed ||
@@ -11029,6 +11428,316 @@ void ApplyWalletTransactionsWorkload(
                    static_cast<uint64_t>(state.preparation_hashes.size()),
                    state.ready_balance_satoshis));
     funding.push_back(std::move(state));
+  }
+
+  if (IsTransactionLoadStrategy(workload.strategy)) {
+    std::vector<std::uint64_t> available_balances(wallets.size(), 0U);
+    for (std::size_t wallet_index = 0U; wallet_index < wallets.size();
+         ++wallet_index) {
+      ThrowIfStopRequested(stop_token);
+      const WalletIdentity& wallet = wallets[wallet_index];
+      const NodeRuntime& wallet_node = nodes[wallet.node - 1U];
+      available_balances[wallet_index] =
+          driver
+              .ReadWalletSnapshot(
+                  wallet_node.config,
+                  ToChainWalletMode(registry.wallet_initialization()), 1U,
+                  stop_token)
+              .available_balance_satoshis;
+    }
+
+    const std::uint64_t attempt_limit =
+        workload.transaction_count != 0U
+            ? static_cast<std::uint64_t>(workload.transaction_count)
+            : WalletTransactionDurationAttemptLimit(*workload.duration,
+                                                    *workload.transaction_rate);
+    WalletTransactionLoadPlanner planner(wallets.size(), workload);
+    BoundedWalletTransactionQueue queue(workload.queue_capacity);
+    TransactionLoadAccounting accounting;
+    std::vector<std::mutex> sender_submission_mutexes(wallets.size());
+    const auto load_started_at = std::chrono::steady_clock::now();
+    std::mutex infrastructure_error_mutex;
+    std::exception_ptr infrastructure_error;
+    std::atomic<bool> worker_cancelled = false;
+
+    const auto record_infrastructure_error =
+        [&infrastructure_error_mutex,
+         &infrastructure_error](std::exception_ptr error) {
+          std::lock_guard<std::mutex> lock(infrastructure_error_mutex);
+          if (!infrastructure_error) {
+            infrastructure_error = std::move(error);
+          }
+        };
+    const auto terminal_latency = [](const WalletTransactionLoadTask& task) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now <= task.scheduled_at) {
+        return std::chrono::microseconds(0);
+      }
+      return std::chrono::duration_cast<std::chrono::microseconds>(
+          now - task.scheduled_at);
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(workload.concurrency);
+    try {
+      for (std::uint32_t worker_index = 0U; worker_index < workload.concurrency;
+           ++worker_index) {
+        static_cast<void>(worker_index);
+        workers.emplace_back([&] {
+          try {
+            while (const std::optional<WalletTransactionLoadTask> next =
+                       queue.Pop()) {
+              const WalletTransactionLoadTask& task = *next;
+              const WalletIdentity& sender = wallets.at(task.plan.sender_index);
+              const WalletIdentity& receiver =
+                  wallets.at(task.plan.receiver_index);
+              const FundingState& sender_funding =
+                  funding.at(task.plan.sender_index);
+              NodeRuntime& sender_node = nodes.at(sender.node - 1U);
+              TransactionLoadOutcome outcome = TransactionLoadOutcome::kFailed;
+              ChainWalletTransactionResult transaction;
+              std::string error_message;
+              bool submitted = false;
+              try {
+                std::unique_lock<std::mutex> sender_submission_lock(
+                    sender_submission_mutexes.at(task.plan.sender_index));
+                RequireNodeRunning(sender_node, "transaction load submission");
+                transaction = driver.SubmitWalletTransaction(
+                    sender_node.config,
+                    ToChainWalletMode(registry.wallet_initialization()),
+                    receiver.address, task.plan.amount_satoshis,
+                    workload.fee_satoshis,
+                    std::chrono::seconds(workload.timeout_sec), stop_token);
+                if (transaction.txids.empty()) {
+                  throw std::runtime_error(
+                      "transaction load submission returned no transaction id");
+                }
+                if (transaction.txids.size() >
+                    std::numeric_limits<std::uint32_t>::max()) {
+                  throw std::runtime_error(
+                      "transaction load txid count exceeds uint32");
+                }
+                std::set<std::string> unique_txids;
+                for (const std::string& txid : transaction.txids) {
+                  if (txid.empty()) {
+                    throw std::runtime_error(
+                        "transaction load submission returned an empty "
+                        "transaction id");
+                  }
+                  if (!unique_txids.insert(txid).second) {
+                    throw std::runtime_error(
+                        "transaction load submission returned duplicate "
+                        "transaction ids");
+                  }
+                }
+                outcome = TransactionLoadOutcome::kSubmitted;
+                submitted = true;
+              } catch (const ChainTransactionRejected& error) {
+                outcome = TransactionLoadOutcome::kRejected;
+                error_message = error.what();
+              } catch (const ChainTransactionTimedOut& error) {
+                outcome = TransactionLoadOutcome::kTimedOut;
+                error_message = error.what();
+              } catch (const SimulationCancelled& error) {
+                outcome = TransactionLoadOutcome::kFailed;
+                error_message = error.what();
+                worker_cancelled.store(true);
+              } catch (const std::exception& error) {
+                outcome = TransactionLoadOutcome::kFailed;
+                error_message = error.what();
+              } catch (...) {
+                outcome = TransactionLoadOutcome::kFailed;
+                error_message = "unknown transaction submission error";
+              }
+
+              const std::chrono::microseconds latency = terminal_latency(task);
+              accounting.RecordOutcome(outcome, latency);
+              try {
+                if (submitted) {
+                  WriteEvent(
+                      events_path, options.run_id, sender_node.config.id,
+                      SimulationEventKind::kWalletTransactionSubmitted,
+                      WalletTransactionDetail(
+                          workload_index, workload_count, workload,
+                          task.transaction_index, sender, receiver,
+                          sender_funding.miner_node,
+                          sender_funding.start_height,
+                          sender_funding.target_height,
+                          static_cast<std::uint64_t>(
+                              sender_funding.hashes.size()),
+                          sender_funding.ready_height,
+                          sender_funding.preparation,
+                          static_cast<std::uint64_t>(
+                              sender_funding.preparation_hashes.size()),
+                          sender_funding.ready_balance_satoshis,
+                          task.plan.amount_satoshis, task.plan.interval_before,
+                          task.scheduled_simulation_elapsed,
+                          task.scheduled_wall_elapsed, transaction));
+                }
+                WriteEvent(
+                    events_path, options.run_id, sender_node.config.id,
+                    SimulationEventKind::kTransactionLoadAttempt,
+                    TransactionLoadAttemptDetail(
+                        workload_index, workload_count, workload, attempt_limit,
+                        task, sender, receiver, outcome, latency,
+                        submitted ? &transaction : nullptr, error_message));
+              } catch (...) {
+                record_infrastructure_error(std::current_exception());
+              }
+
+              if (!submitted) {
+                continue;
+              }
+              std::vector<TrackedTransaction> tracked;
+              tracked.reserve(transaction.txids.size());
+              for (std::size_t txid_index = 0U;
+                   txid_index < transaction.txids.size(); ++txid_index) {
+                tracked.push_back(TrackedTransaction{
+                    .txid = transaction.txids[txid_index],
+                    .submission_kind = "wallet_transaction_submitted",
+                    .workload_index = workload_index,
+                    .workload_count = workload_count,
+                    .transaction_index = task.transaction_index,
+                    .transaction_count = workload.transaction_count == 0U
+                                             ? std::nullopt
+                                             : std::optional<std::uint32_t>(
+                                                   workload.transaction_count),
+                    .transaction_rate =
+                        workload.transaction_rate
+                            ? std::optional<double>(
+                                  workload.transaction_rate->value())
+                            : std::nullopt,
+                    .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
+                    .submission_node = sender.node,
+                });
+              }
+              try {
+                const std::vector<TransactionSetObservation> observations =
+                    transaction_tracker.ObserveSetsUntilVisible(
+                        options, events_path, driver, nodes, {tracked},
+                        std::chrono::seconds(workload.timeout_sec), stop_token);
+                if (observations.front().observation_error) {
+                  accounting.RecordObservationError();
+                }
+                if (observations.front().propagated) {
+                  accounting.RecordPropagated(observations.front().confirmed);
+                }
+              } catch (const SimulationCancelled&) {
+                accounting.RecordObservationError();
+                worker_cancelled.store(true);
+              } catch (...) {
+                accounting.RecordObservationError();
+                record_infrastructure_error(std::current_exception());
+              }
+            }
+          } catch (...) {
+            record_infrastructure_error(std::current_exception());
+          }
+        });
+      }
+    } catch (...) {
+      const std::exception_ptr creation_error = std::current_exception();
+      queue.Close();
+      for (std::thread& worker : workers) {
+        worker.join();
+      }
+      std::rethrow_exception(creation_error);
+    }
+
+    std::exception_ptr producer_error;
+    const auto rate_epoch = std::chrono::steady_clock::now();
+    std::uint64_t transaction_index = 0U;
+    try {
+      while (transaction_index < attempt_limit) {
+        ThrowIfStopRequested(stop_token);
+        std::optional<std::chrono::milliseconds> scheduled_simulation_elapsed;
+        std::optional<std::chrono::milliseconds> scheduled_wall_elapsed;
+        std::chrono::steady_clock::time_point scheduled_at =
+            std::chrono::steady_clock::now();
+        if (workload.transaction_rate) {
+          scheduled_simulation_elapsed =
+              workload.transaction_rate->SimulationElapsedBefore(
+                  transaction_index);
+          scheduled_wall_elapsed =
+              options.time_scale.WallDuration(*scheduled_simulation_elapsed);
+          scheduled_at = SteadyDeadline(rate_epoch, *scheduled_wall_elapsed);
+          WaitUntil(scheduled_at, stop_token);
+        }
+
+        std::vector<std::uint64_t> planned_balances = available_balances;
+        const auto batch = planner.NextBatch(&planned_balances);
+        if (!batch) {
+          break;
+        }
+        if (batch->empty() ||
+            batch->size() > attempt_limit - transaction_index) {
+          throw std::runtime_error(
+              "transaction load planner returned an invalid batch size");
+        }
+        std::vector<WalletTransactionLoadTask> tasks;
+        tasks.reserve(batch->size());
+        for (std::size_t offset = 0U; offset < batch->size(); ++offset) {
+          tasks.push_back(WalletTransactionLoadTask{
+              .transaction_index = transaction_index + offset + 1U,
+              .plan = batch->at(offset),
+              .scheduled_simulation_elapsed = scheduled_simulation_elapsed,
+              .scheduled_wall_elapsed = scheduled_wall_elapsed,
+              .scheduled_at = scheduled_at,
+          });
+        }
+
+        const bool admitted = queue.TryPushBatch(tasks);
+        if (admitted) {
+          available_balances = std::move(planned_balances);
+        } else {
+          for (const WalletTransactionLoadTask& task : tasks) {
+            const WalletIdentity& sender = wallets.at(task.plan.sender_index);
+            const WalletIdentity& receiver =
+                wallets.at(task.plan.receiver_index);
+            const std::chrono::microseconds latency = terminal_latency(task);
+            accounting.RecordOutcome(TransactionLoadOutcome::kBackpressured,
+                                     latency);
+            WriteEvent(events_path, options.run_id,
+                       nodes.at(sender.node - 1U).config.id,
+                       SimulationEventKind::kTransactionLoadAttempt,
+                       TransactionLoadAttemptDetail(
+                           workload_index, workload_count, workload,
+                           attempt_limit, task, sender, receiver,
+                           TransactionLoadOutcome::kBackpressured, latency,
+                           nullptr, "bounded transaction load queue is full"));
+          }
+        }
+        transaction_index += static_cast<std::uint64_t>(batch->size());
+      }
+    } catch (...) {
+      producer_error = std::current_exception();
+    }
+
+    queue.Close();
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+    if (producer_error) {
+      std::rethrow_exception(producer_error);
+    }
+    {
+      std::lock_guard<std::mutex> lock(infrastructure_error_mutex);
+      if (infrastructure_error) {
+        std::rethrow_exception(infrastructure_error);
+      }
+    }
+    if (worker_cancelled.load() || stop_token.stop_requested()) {
+      throw SimulationCancelled();
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - load_started_at);
+    const TransactionLoadSnapshot snapshot = accounting.Snapshot(elapsed);
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kTransactionLoadCompleted,
+               TransactionLoadCompletedDetail(workload_index, workload_count,
+                                              workload, attempt_limit,
+                                              queue.maximum_size(), snapshot));
+    return;
   }
 
   WalletTransactionPlanner transaction_planner(wallets.size(), workload);

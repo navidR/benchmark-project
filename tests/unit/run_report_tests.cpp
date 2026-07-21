@@ -1967,6 +1967,83 @@ BOOST_AUTO_TEST_CASE(
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    run_report_bounds_transaction_load_details_and_preserves_totals) {
+  const std::filesystem::path dir = MakeTestDir("run-report-transaction-load");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"load","chain":"firo","nodes":2})");
+
+  for (std::uint64_t index = 1U; index <= 300U; ++index) {
+    boost::json::object attempt_detail;
+    attempt_detail["transaction_index"] = index;
+    attempt_detail["outcome"] = "backpressured";
+    attempt_detail["dropped"] = true;
+    boost::json::object attempt_event;
+    attempt_event["run_id"] = "load";
+    attempt_event["node_id"] = "firo-1";
+    attempt_event["event"] = "transaction_load_attempt";
+    attempt_event["detail"] = boost::json::serialize(attempt_detail);
+    bbp::AppendLine(dir / "events.jsonl",
+                    boost::json::serialize(attempt_event));
+
+    boost::json::object transaction_detail;
+    transaction_detail["transaction_index"] = index;
+    transaction_detail["sender_wallet_index"] = 1U;
+    transaction_detail["receiver_wallet_index"] = 2U;
+    transaction_detail["amount_satoshis"] = 1U;
+    boost::json::object transaction_event;
+    transaction_event["run_id"] = "load";
+    transaction_event["node_id"] = "firo-1";
+    transaction_event["event"] = "wallet_transaction_submitted";
+    transaction_event["detail"] = boost::json::serialize(transaction_detail);
+    bbp::AppendLine(dir / "events.jsonl",
+                    boost::json::serialize(transaction_event));
+  }
+
+  boost::json::object summary_detail;
+  summary_detail["attempted"] = 300U;
+  summary_detail["submitted"] = 0U;
+  summary_detail["rejected"] = 0U;
+  summary_detail["timed_out"] = 0U;
+  summary_detail["backpressured"] = 300U;
+  summary_detail["dropped"] = 300U;
+  summary_detail["propagated"] = 0U;
+  summary_detail["confirmed"] = 0U;
+  summary_detail["failed"] = 0U;
+  summary_detail["accounting_invariants_hold"] = true;
+  boost::json::object summary_event;
+  summary_event["run_id"] = "load";
+  summary_event["node_id"] = "sim";
+  summary_event["event"] = "transaction_load_completed";
+  summary_event["detail"] = boost::json::serialize(summary_detail);
+  bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(summary_event));
+
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  BOOST_TEST(JsonInteger(report, "transaction_load_attempt_count") == 300U);
+  BOOST_TEST(JsonInteger(report, "wallet_transaction_count") == 300U);
+  BOOST_TEST(JsonInteger(report, "transaction_load_completed_count") == 1U);
+  const boost::json::array& attempts =
+      report.at("transaction_load_attempts").as_array();
+  const boost::json::array& transactions =
+      report.at("wallet_transactions").as_array();
+  BOOST_REQUIRE_EQUAL(attempts.size(), 256U);
+  BOOST_REQUIRE_EQUAL(transactions.size(), 256U);
+  BOOST_TEST(JsonInteger(attempts.front().as_object().at("detail").as_object(),
+                         "transaction_index") == 45U);
+  BOOST_TEST(
+      JsonInteger(transactions.front().as_object().at("detail").as_object(),
+                  "transaction_index") == 45U);
+  const boost::json::array& summaries =
+      report.at("transaction_load_summaries").as_array();
+  BOOST_REQUIRE_EQUAL(summaries.size(), 1U);
+  const boost::json::object& stored_summary =
+      summaries.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(stored_summary, "attempted") == 300U);
+  BOOST_TEST(JsonInteger(stored_summary, "backpressured") == 300U);
+  BOOST_TEST(stored_summary.at("accounting_invariants_hold").as_bool());
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(incremental_run_report_waits_for_complete_jsonl_lines) {
   const std::filesystem::path dir = MakeTestDir("run-report-partial-line");
   bbp::WriteText(dir / "resolved-scenario.json",
