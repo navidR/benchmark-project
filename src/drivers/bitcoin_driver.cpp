@@ -26,8 +26,9 @@ std::string Arg(std::string key, const std::string& value) {
 }  // namespace
 
 BitcoinDriver::BitcoinDriver(std::chrono::milliseconds rpc_timeout)
-    : bitcoin_family_rpc_(
-          std::make_unique<FiroDriver>(rpc_timeout, "Bitcoin Core")) {}
+    : bitcoin_family_rpc_(std::make_unique<FiroDriver>(
+          rpc_timeout, "Bitcoin Core",
+          BitcoinFamilyGetBlockVerbosityEncoding::kInteger)) {}
 
 ProcessSpec BitcoinDriver::RenderProcess(const ChainNodeConfig& config) const {
   if (config.network != ChainNetwork::kRegtest) {

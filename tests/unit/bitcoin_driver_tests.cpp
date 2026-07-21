@@ -1,6 +1,13 @@
+#include <unistd.h>
+
 #include <algorithm>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/json/parse.hpp>
 #include <boost/test/unit_test.hpp>
 #include <filesystem>
+#include <future>
 #include <string>
 
 #include "bbp/drivers/bitcoin_driver.h"
@@ -34,6 +41,26 @@ bbp::ChainNodeConfig TestConfig() {
   config.p2p_bind = "10.210.1.2";
   config.wallet_enabled = false;
   return config;
+}
+
+boost::json::value ServeRpcResponse(boost::asio::ip::tcp::acceptor& acceptor,
+                                    const std::string& response_body) {
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+
+  boost::asio::ip::tcp::socket socket(acceptor.get_executor());
+  acceptor.accept(socket);
+  beast::flat_buffer buffer;
+  http::request<http::string_body> request;
+  http::read(socket, buffer, request);
+  const boost::json::value request_json = boost::json::parse(request.body());
+
+  http::response<http::string_body> response{http::status::ok, 11};
+  response.set(http::field::content_type, "application/json");
+  response.body() = response_body;
+  response.prepare_payload();
+  http::write(socket, response);
+  return request_json;
 }
 
 }  // namespace
@@ -95,4 +122,40 @@ BOOST_AUTO_TEST_CASE(bitcoin_driver_reports_unsupported_wallet_boundary) {
         return std::string(error.what()).find("Bitcoin Core") !=
                std::string::npos;
       });
+}
+
+BOOST_AUTO_TEST_CASE(
+    bitcoin_driver_uses_integer_getblock_verbosity_for_transaction_count) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::future<boost::json::value> served = std::async(std::launch::async, [&] {
+    return ServeRpcResponse(
+        acceptor,
+        R"({"result":{"hash":"block-hash","tx":["reward","tx-1","tx-2"]},"error":null,"id":"bbp"})");
+  });
+
+  bbp::ChainNodeConfig config;
+  config.id = "bitcoin-block-transaction-count-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::BitcoinDriver driver(std::chrono::seconds(1));
+
+  BOOST_TEST(driver.ReadBlockNonRewardTransactionCount(config, "block-hash") ==
+             2U);
+  const boost::json::value request = served.get();
+  BOOST_TEST(request.as_object().at("method").as_string() == "getblock");
+  const boost::json::array& parameters =
+      request.as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(parameters.size(), 2U);
+  BOOST_TEST(parameters[0].as_string() == "block-hash");
+  BOOST_REQUIRE(parameters[1].is_int64());
+  BOOST_TEST(parameters[1].as_int64() == 1);
+  BOOST_CHECK(!parameters[1].is_bool());
 }

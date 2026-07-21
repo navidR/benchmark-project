@@ -501,6 +501,19 @@ bool TxOutPaysAddress(const boost::json::object& txout,
          JsonStringArrayContains(*addresses, source_address);
 }
 
+void AppendGetBlockVerbosity(boost::json::array& params,
+                             BitcoinFamilyGetBlockVerbosityEncoding encoding) {
+  switch (encoding) {
+    case BitcoinFamilyGetBlockVerbosityEncoding::kBoolean:
+      params.emplace_back(true);
+      return;
+    case BitcoinFamilyGetBlockVerbosityEncoding::kInteger:
+      params.emplace_back(std::int64_t{1});
+      return;
+  }
+  throw std::runtime_error("unknown getblock verbosity encoding");
+}
+
 std::string TxOutScriptPubKeyHex(const boost::json::object& txout) {
   const boost::json::value* script = txout.if_contains("scriptPubKey");
   if (script == nullptr || !script->is_object()) {
@@ -511,9 +524,12 @@ std::string TxOutScriptPubKeyHex(const boost::json::object& txout) {
 
 }  // namespace
 
-FiroDriver::FiroDriver(std::chrono::milliseconds rpc_timeout,
-                       std::string driver_name)
-    : driver_name_(std::move(driver_name)), http_(rpc_timeout) {
+FiroDriver::FiroDriver(
+    std::chrono::milliseconds rpc_timeout, std::string driver_name,
+    BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding)
+    : driver_name_(std::move(driver_name)),
+      getblock_verbosity_encoding_(getblock_verbosity_encoding),
+      http_(rpc_timeout) {
   if (driver_name_.empty()) {
     throw std::invalid_argument("chain driver display name must not be empty");
   }
@@ -958,7 +974,7 @@ std::uint64_t FiroDriver::ReadBlockNonRewardTransactionCount(
     std::stop_token stop_token) const {
   boost::json::array params;
   params.emplace_back(block_hash);
-  params.emplace_back(true);
+  AppendGetBlockVerbosity(params, getblock_verbosity_encoding_);
   const boost::json::value block =
       RpcCall(config, "getblock", params, stop_token);
   if (!block.is_object()) {
@@ -1186,7 +1202,7 @@ FiroUtxo FiroDriver::FindSpendableOutput(
     ThrowIfStopRequested(stop_token);
     boost::json::array block_params;
     block_params.emplace_back(block_hash);
-    block_params.push_back(true);
+    AppendGetBlockVerbosity(block_params, getblock_verbosity_encoding_);
     const boost::json::value block =
         RpcCall(config, "getblock", block_params, stop_token);
     const boost::json::value* transactions =

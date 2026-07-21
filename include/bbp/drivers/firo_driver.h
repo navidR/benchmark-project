@@ -17,10 +17,17 @@ using FiroRawTransactionResult = ChainRawTransactionResult;
 using FiroWalletTransactionResult = ChainWalletTransactionResult;
 using WalletMode = ChainWalletMode;
 
+enum class BitcoinFamilyGetBlockVerbosityEncoding {
+  kBoolean,
+  kInteger,
+};
+
 class FiroDriver final : public ChainDriver {
  public:
-  explicit FiroDriver(std::chrono::milliseconds rpc_timeout,
-                      std::string driver_name = "Firo");
+  explicit FiroDriver(
+      std::chrono::milliseconds rpc_timeout, std::string driver_name = "Firo",
+      BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding =
+          BitcoinFamilyGetBlockVerbosityEncoding::kBoolean);
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const override;
   bool SupportsWalletTransactionMode(WalletMode mode) const override;
@@ -150,6 +157,7 @@ class FiroDriver final : public ChainDriver {
                              std::stop_token stop_token = {}) const;
 
   std::string driver_name_;
+  BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding_;
   HttpClient http_;
 };
 
