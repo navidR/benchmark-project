@@ -119,6 +119,16 @@ class UnsupportedChainOperation : public std::runtime_error {
   UnsupportedChainOperation(std::string_view chain, std::string_view operation);
 };
 
+class ChainTransactionRejected : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class ChainTransactionTimedOut : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 struct ChainWalletTransactionResult {
   std::vector<std::string> txids;
   std::string destination_amount;
@@ -155,6 +165,7 @@ class ChainDriver {
   virtual ~ChainDriver() = default;
 
   virtual ProcessSpec RenderProcess(const ChainNodeConfig& config) const = 0;
+  virtual bool SupportsWalletTransactionMode(ChainWalletMode mode) const;
   virtual std::optional<OperatorConnectionCommand>
   BuildOperatorConnectionCommand(const ChainNodeConfig& config,
                                  const std::filesystem::path& run_root) const;
@@ -229,6 +240,11 @@ class ChainDriver {
       const std::string& destination_address, uint64_t amount_satoshis,
       uint64_t fee_satoshis, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const = 0;
+  virtual ChainWalletTransactionResult SubmitWalletTransaction(
+      const ChainNodeConfig& config, ChainWalletMode wallet_mode,
+      const std::string& destination_address, uint64_t amount_satoshis,
+      uint64_t fee_satoshis, std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const;
   virtual ChainTransactionObservation ObserveTransaction(
       const ChainNodeConfig& config, const std::string& txid,
       std::stop_token stop_token = {}) const = 0;

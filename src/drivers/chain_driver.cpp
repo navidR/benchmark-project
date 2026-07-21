@@ -78,6 +78,20 @@ ChainDriver::BuildOperatorConnectionCommand(
   return std::nullopt;
 }
 
+bool ChainDriver::SupportsWalletTransactionMode(ChainWalletMode) const {
+  return false;
+}
+
+ChainWalletTransactionResult ChainDriver::SubmitWalletTransaction(
+    const ChainNodeConfig& config, ChainWalletMode wallet_mode,
+    const std::string& destination_address, std::uint64_t amount_satoshis,
+    std::uint64_t fee_satoshis, std::chrono::seconds timeout,
+    std::stop_token stop_token) const {
+  return SendWalletTransaction(config, wallet_mode, destination_address,
+                               amount_satoshis, fee_satoshis, timeout,
+                               stop_token);
+}
+
 std::string ChainDriver::CreateWalletFundingAddress(
     const ChainNodeConfig&, ChainWalletMode, const std::string& wallet_address,
     std::stop_token) const {

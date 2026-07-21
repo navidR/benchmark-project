@@ -268,6 +268,7 @@ add_executable(bbp
   src/simulator_app.cpp
   src/tui.cpp
   src/tui_command_parser.cpp
+  src/transaction_load.cpp
   src/util.cpp
   src/wallet_funding_strategy.cpp
   src/wallet_send_resolver.cpp
@@ -363,6 +364,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_time_scale_tests.cpp
     tests/unit/signal_stop_monitor_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
+    tests/unit/transaction_load_tests.cpp
     tests/unit/util_tests.cpp
     tests/unit/wallet_funding_strategy_tests.cpp
     tests/unit/wallet_send_resolver_tests.cpp
@@ -422,6 +424,7 @@ if(BUILD_TESTING)
     src/simulation_time_scale.cpp
     src/signal_stop_monitor.cpp
     src/tui_command_parser.cpp
+    src/transaction_load.cpp
     src/util.cpp
     src/wallet_funding_strategy.cpp
     src/wallet_send_resolver.cpp

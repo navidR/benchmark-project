@@ -1153,6 +1153,84 @@ BOOST_AUTO_TEST_CASE(firo_submits_public_transfer_with_exact_rpc_payload) {
   BOOST_TEST(!send_params[4].as_bool());
 }
 
+BOOST_AUTO_TEST_CASE(firo_load_submission_returns_before_observation) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":"load-transfer-tx","error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "load-transfer-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  BOOST_TEST(driver.SupportsWalletTransactionMode(bbp::WalletMode::kPublic));
+  BOOST_TEST(driver.SupportsWalletTransactionMode(bbp::WalletMode::kPrivate));
+  const bbp::FiroWalletTransactionResult result =
+      driver.SubmitWalletTransaction(config, bbp::WalletMode::kPublic,
+                                     "load-destination", 25000000ULL, 1000ULL,
+                                     std::chrono::seconds(1));
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_REQUIRE_EQUAL(result.txids.size(), 1U);
+  BOOST_TEST(result.txids[0] == "load-transfer-tx");
+  BOOST_TEST(result.destination_amount == "0.25000000");
+  BOOST_TEST(result.requested_fee_rate == "0.00001000");
+  BOOST_TEST(result.mempool_size == 0U);
+  BOOST_REQUIRE_EQUAL(methods.size(), 2U);
+  BOOST_TEST(methods[0] == "settxfee");
+  BOOST_TEST(methods[1] == "sendtoaddress");
+  BOOST_REQUIRE_EQUAL(requests.size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(firo_load_submission_classifies_rpc_rejection) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":null,"error":{"code":-6,"message":"Insufficient funds"},"id":"bbp"})"};
+  const std::vector<unsigned> statuses = {200U, 500U};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr, &statuses);
+      });
+
+  bbp::FiroNodeConfig config;
+  config.id = "load-rejection-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  BOOST_CHECK_THROW(driver.SubmitWalletTransaction(
+                        config, bbp::WalletMode::kPublic, "load-destination",
+                        25000000ULL, 1000ULL, std::chrono::seconds(1)),
+                    bbp::ChainTransactionRejected);
+  const std::vector<std::string> methods = served.get();
+  BOOST_REQUIRE_EQUAL(methods.size(), 2U);
+  BOOST_TEST(methods[0] == "settxfee");
+  BOOST_TEST(methods[1] == "sendtoaddress");
+}
+
 BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {
   namespace asio = boost::asio;
   using tcp = asio::ip::tcp;

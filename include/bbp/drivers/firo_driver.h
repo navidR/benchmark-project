@@ -23,6 +23,7 @@ class FiroDriver final : public ChainDriver {
                       std::string driver_name = "Firo");
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const override;
+  bool SupportsWalletTransactionMode(WalletMode mode) const override;
   std::optional<OperatorConnectionCommand> BuildOperatorConnectionCommand(
       const FiroNodeConfig& config,
       const std::filesystem::path& run_root) const override;
@@ -96,6 +97,11 @@ class FiroDriver final : public ChainDriver {
       uint64_t fee_satoshis, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const override;
   FiroWalletTransactionResult SendWalletTransaction(
+      const FiroNodeConfig& config, WalletMode wallet_mode,
+      const std::string& destination_address, uint64_t amount_satoshis,
+      uint64_t fee_satoshis, std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const override;
+  FiroWalletTransactionResult SubmitWalletTransaction(
       const FiroNodeConfig& config, WalletMode wallet_mode,
       const std::string& destination_address, uint64_t amount_satoshis,
       uint64_t fee_satoshis, std::chrono::seconds timeout,
