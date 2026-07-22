@@ -29,6 +29,7 @@ enum class WorkloadKind {
   kSendRawTransaction,
   kWalletTransactions,
   kCheckpoint,
+  kCount,
 };
 
 constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
@@ -79,6 +80,8 @@ constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
       return "wallet_transactions";
     case WorkloadKind::kCheckpoint:
       return "checkpoint";
+    case WorkloadKind::kCount:
+      break;
   }
   return "unknown";
 }

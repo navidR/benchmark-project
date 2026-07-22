@@ -229,6 +229,7 @@ add_executable(bbp
   src/log_level.cpp
   src/log_view.cpp
   src/logging.cpp
+  src/mcp_registry.cpp
   src/main.cpp
   src/metric_sparkline.cpp
   src/mining_difficulty.cpp
@@ -359,6 +360,7 @@ if(BUILD_TESTING)
     tests/unit/log_tail_tests.cpp
     tests/unit/log_level_tests.cpp
     tests/unit/logging_tests.cpp
+    tests/unit/mcp_registry_tests.cpp
     tests/unit/metric_sparkline_tests.cpp
     tests/unit/network_tests.cpp
     tests/unit/network_rule_pane_tests.cpp
@@ -425,6 +427,7 @@ if(BUILD_TESTING)
     src/log_level.cpp
     src/log_view.cpp
     src/logging.cpp
+    src/mcp_registry.cpp
     src/metric_sparkline.cpp
     src/mining_difficulty.cpp
     src/network.cpp

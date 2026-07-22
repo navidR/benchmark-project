@@ -26,6 +26,8 @@ std::string_view ChainKindName(ChainKind chain) {
       return "bitcoin";
     case ChainKind::kMonero:
       return "monero";
+    case ChainKind::kCount:
+      break;
   }
   throw std::logic_error("unknown chain kind");
 }

@@ -190,6 +190,8 @@ const ChainDriverSpec& ChainDriverSpecFor(ChainKind chain) {
       return BitcoinChainDriverSpec();
     case ChainKind::kMonero:
       return MoneroChainDriverSpec();
+    case ChainKind::kCount:
+      break;
   }
   throw std::runtime_error("chain driver is not implemented: " +
                            std::string(ChainKindName(chain)));
@@ -207,6 +209,8 @@ std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain) {
       return std::make_unique<BitcoinDriver>(std::chrono::seconds(5));
     case ChainKind::kMonero:
       return std::make_unique<MoneroDriver>(std::chrono::seconds(5));
+    case ChainKind::kCount:
+      break;
   }
   throw std::runtime_error("chain driver is not implemented: " +
                            std::string(ChainKindName(chain)));

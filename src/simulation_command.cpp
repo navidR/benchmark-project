@@ -60,6 +60,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "set_perf_counters";
     case SimulationCommandKind::kSendWalletTransaction:
       return "send_wallet_transaction";
+    case SimulationCommandKind::kCount:
+      break;
   }
   throw std::runtime_error("unknown simulation command kind");
 }
@@ -181,6 +183,8 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kExportNodeReport:
     case SimulationCommandKind::kSetPerfCounters:
       return false;
+    case SimulationCommandKind::kCount:
+      break;
   }
   throw std::runtime_error("unknown simulation command kind");
 }

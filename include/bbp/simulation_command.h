@@ -45,6 +45,7 @@ enum class SimulationCommandKind {
   kExportNodeReport,
   kSetPerfCounters,
   kSendWalletTransaction,
+  kCount,
 };
 
 struct SimulationNetworkFlow {

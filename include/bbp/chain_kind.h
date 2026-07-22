@@ -8,6 +8,7 @@ enum class ChainKind {
   kFiro,
   kBitcoin,
   kMonero,
+  kCount,
 };
 
 ChainKind ParseChainKind(std::string_view value);

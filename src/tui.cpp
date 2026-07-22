@@ -571,6 +571,9 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
         text += "checkpoint ";
         text += JsonString(workload, "name", "-");
         break;
+      case WorkloadKind::kCount:
+        text += type_name;
+        break;
     }
   }
   return text + load_suffix + operator_suffix;

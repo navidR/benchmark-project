@@ -273,6 +273,8 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
     case SimulationCommandKind::kSendWalletTransaction:
       ValidateWalletSendCommand(command);
       break;
+    case SimulationCommandKind::kCount:
+      throw std::runtime_error("unknown simulation command kind");
   }
 }
 
@@ -318,6 +320,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kHealPartition:
     case SimulationCommandKind::kSetPerfCounters:
     case SimulationCommandKind::kSendWalletTransaction:
+    case SimulationCommandKind::kCount:
       throw std::runtime_error(
           "simulation command kind requires a typed payload method");
   }

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "bbp/block_production_policy.h"
@@ -21,7 +22,18 @@ enum class TuiPartitionTargetKind {
 
 enum class TuiLocalAction {
   kCreateFiroQtLauncher,
+  kCount,
 };
+
+constexpr std::string_view TuiLocalActionName(TuiLocalAction action) {
+  switch (action) {
+    case TuiLocalAction::kCreateFiroQtLauncher:
+      return "create_firo_qt_launcher";
+    case TuiLocalAction::kCount:
+      break;
+  }
+  return "unknown";
+}
 
 struct ParsedTuiCommand {
   SimulationCommandKind kind = SimulationCommandKind::kStopMining;

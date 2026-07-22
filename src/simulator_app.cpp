@@ -3040,6 +3040,8 @@ bool IsScenarioActionPayloadField(WorkloadKind kind, std::string_view field) {
                              "destination_address"});
     case WorkloadKind::kCheckpoint:
       return field == "name";
+    case WorkloadKind::kCount:
+      return false;
   }
   return false;
 }
@@ -3109,6 +3111,8 @@ bool IsScenarioCommandPayloadField(SimulationCommandKind kind,
       return IsOneOf(field, {"perf_target", "perf_counters"});
     case SimulationCommandKind::kSendWalletTransaction:
       return field == "wallet_send";
+    case SimulationCommandKind::kCount:
+      return false;
   }
   return false;
 }
