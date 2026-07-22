@@ -1,0 +1,896 @@
+#include "bbp/mcp_protocol.h"
+
+#include <sys/random.h>
+
+#include <algorithm>
+#include <array>
+#include <boost/beast/http/field.hpp>
+#include <boost/beast/http/status.hpp>
+#include <boost/beast/http/verb.hpp>
+#include <boost/json/array.hpp>
+#include <boost/json/object.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cstring>
+#include <deque>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "bbp/mcp_registry.h"
+
+namespace bbp {
+namespace {
+
+namespace http = boost::beast::http;
+
+constexpr std::string_view kJsonContentType = "application/json";
+constexpr std::string_view kSseContentType = "text/event-stream";
+constexpr std::string_view kSessionHeader = "Mcp-Session-Id";
+constexpr std::string_view kProtocolHeader = "MCP-Protocol-Version";
+
+struct McpNotification {
+  std::uint64_t sequence = 0U;
+  std::string json;
+};
+
+struct McpSession {
+  bool initialized = false;
+  std::string client_name;
+  std::deque<McpNotification> notifications;
+  std::uint64_t next_notification_sequence = 1U;
+};
+
+struct JsonRpcRequest {
+  boost::json::value id;
+  bool has_id = false;
+  std::string method;
+  boost::json::object params;
+};
+
+std::string HeaderValue(const http::request<http::string_body>& request,
+                        std::string_view name) {
+  const auto field = request.find(name);
+  if (field == request.end()) {
+    return {};
+  }
+  return std::string(field->value());
+}
+
+std::string LowerAscii(std::string_view value) {
+  std::string lower(value);
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](char character) {
+    if (character >= 'A' && character <= 'Z') {
+      return static_cast<char>(character - 'A' + 'a');
+    }
+    return character;
+  });
+  return lower;
+}
+
+bool ContainsMediaType(std::string_view value, std::string_view media_type) {
+  const std::string expected = LowerAscii(media_type);
+  while (!value.empty()) {
+    const std::size_t comma = value.find(',');
+    std::string_view entry = value.substr(0U, comma);
+    if (comma == std::string_view::npos) {
+      value = {};
+    } else {
+      value.remove_prefix(comma + 1U);
+    }
+    const std::size_t semicolon = entry.find(';');
+    entry = entry.substr(0U, semicolon);
+    while (!entry.empty() && (entry.front() == ' ' || entry.front() == '\t')) {
+      entry.remove_prefix(1U);
+    }
+    while (!entry.empty() && (entry.back() == ' ' || entry.back() == '\t')) {
+      entry.remove_suffix(1U);
+    }
+    if (LowerAscii(entry) == expected) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ConstantTimeEqual(std::string_view left, std::string_view right) {
+  const std::size_t length = std::max(left.size(), right.size());
+  std::size_t difference = left.size() ^ right.size();
+  for (std::size_t index = 0U; index < length; ++index) {
+    const unsigned char left_byte =
+        index < left.size() ? static_cast<unsigned char>(left[index]) : 0U;
+    const unsigned char right_byte =
+        index < right.size() ? static_cast<unsigned char>(right[index]) : 0U;
+    difference |= static_cast<std::size_t>(left_byte ^ right_byte);
+  }
+  return difference == 0U;
+}
+
+std::string RandomHex(std::size_t byte_count) {
+  std::vector<unsigned char> bytes(byte_count);
+  std::size_t offset = 0U;
+  while (offset < bytes.size()) {
+    const ssize_t received =
+        getrandom(bytes.data() + offset, bytes.size() - offset, 0U);
+    if (received < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::runtime_error("getrandom for MCP session failed: " +
+                               std::string(std::strerror(errno)));
+    }
+    if (received == 0) {
+      throw std::runtime_error("getrandom for MCP session made no progress");
+    }
+    offset += static_cast<std::size_t>(received);
+  }
+  constexpr std::array<char, 16> kHex = {'0', '1', '2', '3', '4', '5',
+                                         '6', '7', '8', '9', 'a', 'b',
+                                         'c', 'd', 'e', 'f'};
+  std::string result;
+  result.reserve(bytes.size() * 2U);
+  for (const unsigned char byte : bytes) {
+    result.push_back(kHex[byte >> 4U]);
+    result.push_back(kHex[byte & 0x0fU]);
+  }
+  return result;
+}
+
+std::string LoopbackOrigin(std::string_view host, std::uint16_t port) {
+  std::string origin = "http://" + std::string(host);
+  if (port != 80U) {
+    origin += ":" + std::to_string(port);
+  }
+  return origin;
+}
+
+bool IsAllowedOrigin(std::string_view origin, std::uint16_t port) {
+  if (origin.empty()) {
+    return true;
+  }
+  if (port != 0U) {
+    return origin == LoopbackOrigin("127.0.0.1", port) ||
+           origin == LoopbackOrigin("localhost", port) ||
+           origin == LoopbackOrigin("[::1]", port);
+  }
+  constexpr std::array<std::string_view, 3> kPrefixes = {
+      "http://127.0.0.1:", "http://localhost:", "http://[::1]:"};
+  return std::any_of(kPrefixes.begin(), kPrefixes.end(), [origin](auto prefix) {
+    if (!origin.starts_with(prefix)) {
+      return false;
+    }
+    const std::string_view port_text = origin.substr(prefix.size());
+    std::uint16_t parsed = 0U;
+    const auto [end, error] = std::from_chars(
+        port_text.data(), port_text.data() + port_text.size(), parsed, 10);
+    return error == std::errc{} && end == port_text.data() + port_text.size() &&
+           parsed != 0U;
+  });
+}
+
+http::response<http::string_body> TextResponse(
+    const http::request<http::string_body>& request, http::status status,
+    std::string body, std::string_view content_type = "text/plain") {
+  http::response<http::string_body> response{status, request.version()};
+  response.set(http::field::server, "bbp");
+  response.set(http::field::content_type, content_type);
+  response.keep_alive(false);
+  response.body() = std::move(body);
+  response.prepare_payload();
+  return response;
+}
+
+boost::json::object JsonRpcError(boost::json::value id, int code,
+                                 std::string message,
+                                 boost::json::value data = nullptr) {
+  boost::json::object error{{"code", code}, {"message", std::move(message)}};
+  if (!data.is_null()) {
+    error["data"] = std::move(data);
+  }
+  return boost::json::object{
+      {"jsonrpc", "2.0"}, {"id", std::move(id)}, {"error", std::move(error)}};
+}
+
+boost::json::object JsonRpcResult(boost::json::value id,
+                                  boost::json::value result) {
+  return boost::json::object{
+      {"jsonrpc", "2.0"}, {"id", std::move(id)}, {"result", std::move(result)}};
+}
+
+http::response<http::string_body> JsonResponse(
+    const http::request<http::string_body>& request, boost::json::value body,
+    http::status status = http::status::ok) {
+  return TextResponse(request, status, boost::json::serialize(body),
+                      kJsonContentType);
+}
+
+JsonRpcRequest ParseJsonRpcRequest(const boost::json::value& value) {
+  if (!value.is_object()) {
+    throw std::invalid_argument("JSON-RPC request must be an object");
+  }
+  const boost::json::object& object = value.as_object();
+  const boost::json::value* version = object.if_contains("jsonrpc");
+  const boost::json::value* method = object.if_contains("method");
+  if (version == nullptr || !version->is_string() ||
+      version->as_string() != "2.0" || method == nullptr ||
+      !method->is_string() || method->as_string().empty()) {
+    throw std::invalid_argument("invalid JSON-RPC 2.0 request");
+  }
+  JsonRpcRequest request;
+  request.method = std::string(method->as_string());
+  if (const boost::json::value* id = object.if_contains("id")) {
+    if (!id->is_string() && !id->is_int64() && !id->is_uint64()) {
+      throw std::invalid_argument("JSON-RPC id must be a string or integer");
+    }
+    request.id = *id;
+    request.has_id = true;
+  }
+  if (const boost::json::value* params = object.if_contains("params")) {
+    if (!params->is_object()) {
+      throw std::invalid_argument("JSON-RPC params must be an object");
+    }
+    request.params = params->as_object();
+  }
+  return request;
+}
+
+std::optional<std::size_t> ParseCursor(const boost::json::object& params) {
+  const boost::json::value* cursor = params.if_contains("cursor");
+  if (cursor == nullptr) {
+    return std::nullopt;
+  }
+  if (!cursor->is_string() || cursor->as_string().empty()) {
+    throw std::invalid_argument("cursor must be a non-empty decimal string");
+  }
+  const std::string_view text(cursor->as_string().data(),
+                              cursor->as_string().size());
+  std::size_t value = 0U;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value, 10);
+  if (error != std::errc{} || end != text.data() + text.size()) {
+    throw std::invalid_argument("cursor must be a decimal list offset");
+  }
+  return value;
+}
+
+boost::json::object ToolPage(const boost::json::object& params) {
+  const boost::json::array all = BuildMcpToolRegistry();
+  const std::size_t begin = ParseCursor(params).value_or(0U);
+  if (begin > all.size()) {
+    throw std::invalid_argument("tool cursor is out of range");
+  }
+  const std::size_t end = std::min(all.size(), begin + kMcpListPageSize);
+  boost::json::array page;
+  page.reserve(end - begin);
+  for (std::size_t index = begin; index < end; ++index) {
+    page.push_back(all[index]);
+  }
+  boost::json::object result{{"tools", std::move(page)}};
+  if (end < all.size()) {
+    result["nextCursor"] = std::to_string(end);
+  }
+  return result;
+}
+
+boost::json::object ResourcePage(const boost::json::object& params) {
+  const boost::json::array all = BuildMcpResourceRegistry();
+  const std::size_t begin = ParseCursor(params).value_or(0U);
+  if (begin > all.size()) {
+    throw std::invalid_argument("resource cursor is out of range");
+  }
+  const std::size_t end = std::min(all.size(), begin + kMcpListPageSize);
+  boost::json::array page;
+  page.reserve(end - begin);
+  for (std::size_t index = begin; index < end; ++index) {
+    page.push_back(all[index]);
+  }
+  boost::json::object result{{"resources", std::move(page)}};
+  if (end < all.size()) {
+    result["nextCursor"] = std::to_string(end);
+  }
+  return result;
+}
+
+bool RegisteredTool(std::string_view name) {
+  return std::any_of(McpOperationRegistry().begin(),
+                     McpOperationRegistry().end(),
+                     [name](const McpNamedCapability& operation) {
+                       return operation.name == name;
+                     });
+}
+
+bool RegisteredResource(std::string_view uri) {
+  constexpr std::string_view kPrefix = "bbp:///";
+  if (!uri.starts_with(kPrefix)) {
+    return false;
+  }
+  const std::string_view name = uri.substr(kPrefix.size());
+  return std::any_of(
+      McpInformationFamilyRegistry().begin(),
+      McpInformationFamilyRegistry().end(),
+      [name](const McpNamedCapability& family) { return family.name == name; });
+}
+
+std::string RequiredString(const boost::json::object& params,
+                           std::string_view field) {
+  const boost::json::value* value = params.if_contains(field);
+  if (value == nullptr || !value->is_string() || value->as_string().empty()) {
+    throw std::invalid_argument(std::string(field) +
+                                " must be a non-empty string");
+  }
+  return std::string(value->as_string());
+}
+
+std::string RequiredClientName(const boost::json::object& params) {
+  const boost::json::value* capabilities = params.if_contains("capabilities");
+  if (capabilities == nullptr || !capabilities->is_object()) {
+    throw std::invalid_argument("capabilities must be an object");
+  }
+  const boost::json::value* client = params.if_contains("clientInfo");
+  if (client == nullptr || !client->is_object()) {
+    throw std::invalid_argument("clientInfo must be an object");
+  }
+  const std::string name = RequiredString(client->as_object(), "name");
+  const std::string version = RequiredString(client->as_object(), "version");
+  if (name.size() > kMcpMaximumClientNameBytes ||
+      version.size() > kMcpMaximumClientNameBytes) {
+    throw std::invalid_argument("clientInfo name or version is too long");
+  }
+  return name;
+}
+
+}  // namespace
+
+struct McpProtocol::Impl {
+  Impl(McpProtocolConfig config_value, McpToolHandler tool_handler_value,
+       McpResourceHandler resource_handler_value)
+      : config(std::move(config_value)),
+        tool_handler(std::move(tool_handler_value)),
+        resource_handler(std::move(resource_handler_value)) {
+    if (config.bearer_token.size() < 32U || config.bearer_token.size() > 512U) {
+      throw std::runtime_error("MCP bearer token must contain 32..512 bytes");
+    }
+    if (config.endpoint_path.empty() || config.endpoint_path.front() != '/' ||
+        config.endpoint_path.find('?') != std::string::npos ||
+        config.endpoint_path.find('#') != std::string::npos) {
+      throw std::runtime_error("MCP endpoint path must be an absolute path");
+    }
+  }
+
+  bool Authenticate(const http::request<http::string_body>& request) {
+    const std::string authorization = HeaderValue(request, "Authorization");
+    const std::string expected = "Bearer " + config.bearer_token;
+    if (!ConstantTimeEqual(authorization, expected)) {
+      std::lock_guard<std::mutex> lock(mutex);
+      ++stats.authentication_failures;
+      return false;
+    }
+    return true;
+  }
+
+  bool ValidateOrigin(const http::request<http::string_body>& request) {
+    std::uint16_t endpoint_port = 0U;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      endpoint_port = config.endpoint_port;
+    }
+    if (!IsAllowedOrigin(HeaderValue(request, "Origin"), endpoint_port)) {
+      std::lock_guard<std::mutex> lock(mutex);
+      ++stats.origin_failures;
+      return false;
+    }
+    return true;
+  }
+
+  http::response<http::string_body> RejectAuthentication(
+      const http::request<http::string_body>& request) {
+    auto response = TextResponse(request, http::status::unauthorized,
+                                 "MCP bearer authentication required");
+    response.set(http::field::www_authenticate, "Bearer");
+    return response;
+  }
+
+  std::optional<http::response<http::string_body>> ValidateHttpRequest(
+      const http::request<http::string_body>& request) {
+    if (request.target() != config.endpoint_path) {
+      return TextResponse(request, http::status::not_found,
+                          "MCP endpoint not found");
+    }
+    if (!ValidateOrigin(request)) {
+      return TextResponse(
+          request, http::status::forbidden,
+          "MCP request Origin is not the bound loopback endpoint");
+    }
+    if (!Authenticate(request)) {
+      return RejectAuthentication(request);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> RequireSession(
+      const http::request<http::string_body>& request,
+      bool require_initialized) {
+    const std::string session_id = HeaderValue(request, kSessionHeader);
+    if (session_id.empty()) {
+      return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto session = sessions.find(session_id);
+    if (session == sessions.end() ||
+        (require_initialized && !session->second.initialized)) {
+      return std::nullopt;
+    }
+    return session_id;
+  }
+
+  bool ValidProtocolVersion(
+      const http::request<http::string_body>& request) const {
+    return HeaderValue(request, kProtocolHeader) == kMcpProtocolVersion;
+  }
+
+  std::optional<std::string> CreateSession(std::string client_name) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (sessions.size() >= kMcpMaximumSessions) {
+      ++stats.rejected_sessions;
+      return std::nullopt;
+    }
+    std::string id;
+    do {
+      id = RandomHex(24U);
+    } while (sessions.contains(id));
+    sessions.emplace(id, McpSession{.initialized = false,
+                                    .client_name = std::move(client_name),
+                                    .notifications = {},
+                                    .next_notification_sequence = 1U});
+    stats.maximum_sessions = std::max(stats.maximum_sessions, sessions.size());
+    return id;
+  }
+
+  void MarkInitialized(std::string_view session_id) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto session = sessions.find(session_id);
+    if (session == sessions.end()) {
+      throw std::runtime_error("MCP session ended during initialization");
+    }
+    if (!session->second.initialized) {
+      session->second.initialized = true;
+      ++stats.initialized_sessions;
+    }
+  }
+
+  boost::json::object InitializeResult() const {
+    boost::json::object capabilities;
+    capabilities["logging"] = boost::json::object{};
+    capabilities["prompts"] = boost::json::object{{"listChanged", false}};
+    capabilities["resources"] =
+        boost::json::object{{"subscribe", true}, {"listChanged", false}};
+    capabilities["tools"] = boost::json::object{{"listChanged", false}};
+    capabilities["completions"] = boost::json::object{};
+    capabilities["experimental"] =
+        boost::json::object{{"bbp", BuildMcpCapabilityDocument()}};
+    return boost::json::object{
+        {"protocolVersion", kMcpProtocolVersion},
+        {"capabilities", std::move(capabilities)},
+        {"serverInfo", boost::json::object{{"name", "bbp"}, {"version", "1"}}},
+        {"instructions",
+         "Use typed BBP tools and resources; direct host or daemon access is "
+         "outside this endpoint."}};
+  }
+
+  boost::json::value ReadResource(std::string_view uri,
+                                  std::string_view session_id,
+                                  std::stop_token stop_token) {
+    if (uri == "bbp:///capabilities") {
+      return BuildMcpCapabilityDocument();
+    }
+    if (uri == "bbp:///schemas") {
+      const boost::json::object capabilities = BuildMcpCapabilityDocument();
+      return boost::json::object{
+          {"scenario", BuildMcpScenarioSchema()},
+          {"tools", BuildMcpToolRegistry()},
+          {"results", capabilities.at("result_families")}};
+    }
+    if (!resource_handler) {
+      throw std::runtime_error("resource is not available in the current run");
+    }
+    return resource_handler(uri, session_id, stop_token);
+  }
+
+  boost::json::value Dispatch(const JsonRpcRequest& request,
+                              std::string_view session_id,
+                              std::stop_token stop_token) {
+    if (request.method == "ping") {
+      return boost::json::object{};
+    }
+    if (request.method == "tools/list") {
+      return ToolPage(request.params);
+    }
+    if (request.method == "resources/list") {
+      return ResourcePage(request.params);
+    }
+    if (request.method == "prompts/list") {
+      return boost::json::object{{"prompts", boost::json::array{}}};
+    }
+    if (request.method == "completion/complete") {
+      return boost::json::object{
+          {"completion", boost::json::object{{"values", boost::json::array{}},
+                                             {"total", 0U},
+                                             {"hasMore", false}}}};
+    }
+    if (request.method == "logging/setLevel") {
+      static_cast<void>(RequiredString(request.params, "level"));
+      return boost::json::object{};
+    }
+    if (request.method == "resources/read") {
+      const std::string uri = RequiredString(request.params, "uri");
+      if (!RegisteredResource(uri)) {
+        throw std::invalid_argument("unknown BBP resource URI");
+      }
+      boost::json::value value = ReadResource(uri, session_id, stop_token);
+      return boost::json::object{
+          {"contents", boost::json::array{boost::json::object{
+                           {"uri", uri},
+                           {"mimeType", "application/json"},
+                           {"text", boost::json::serialize(value)}}}}};
+    }
+    if (request.method == "tools/call") {
+      const std::string name = RequiredString(request.params, "name");
+      if (!RegisteredTool(name)) {
+        throw std::invalid_argument("unknown BBP tool");
+      }
+      boost::json::object arguments;
+      if (const boost::json::value* value =
+              request.params.if_contains("arguments")) {
+        if (!value->is_object()) {
+          throw std::invalid_argument("tool arguments must be an object");
+        }
+        arguments = value->as_object();
+      }
+      boost::json::value result;
+      try {
+        if (!tool_handler) {
+          throw std::runtime_error("tool is not available in the current run");
+        }
+        result = tool_handler(name, arguments, session_id, stop_token);
+      } catch (const std::exception& error) {
+        boost::json::object structured_error{{"kind", "tool_error"},
+                                             {"message", error.what()}};
+        return boost::json::object{
+            {"content",
+             boost::json::array{boost::json::object{
+                 {"type", "text"},
+                 {"text", boost::json::serialize(structured_error)}}}},
+            {"structuredContent", std::move(structured_error)},
+            {"isError", true}};
+      }
+      return boost::json::object{
+          {"content",
+           boost::json::array{boost::json::object{
+               {"type", "text"}, {"text", boost::json::serialize(result)}}}},
+          {"structuredContent", std::move(result)},
+          {"isError", false}};
+    }
+    throw std::out_of_range("method not found");
+  }
+
+  http::response<http::string_body> HandleInitialize(
+      const http::request<http::string_body>& http_request,
+      const JsonRpcRequest& request) {
+    if (!request.has_id) {
+      return JsonResponse(
+          http_request, JsonRpcError(nullptr, -32600,
+                                     "initialize must be a JSON-RPC request"));
+    }
+    if (!HeaderValue(http_request, kSessionHeader).empty()) {
+      return JsonResponse(http_request,
+                          JsonRpcError(request.id, -32600,
+                                       "initialize must not reuse a session"));
+    }
+    const std::string requested_version =
+        RequiredString(request.params, "protocolVersion");
+    if (requested_version != kMcpProtocolVersion) {
+      return JsonResponse(
+          http_request,
+          JsonRpcError(request.id, -32602, "unsupported MCP protocol version",
+                       boost::json::object{{"supported", kMcpProtocolVersion},
+                                           {"requested", requested_version}}));
+    }
+    const std::string client_name = RequiredClientName(request.params);
+    const std::optional<std::string> session_id = CreateSession(client_name);
+    if (!session_id) {
+      return JsonResponse(
+          http_request,
+          JsonRpcError(request.id, -32001, "MCP session capacity reached"),
+          http::status::service_unavailable);
+    }
+    auto response = JsonResponse(http_request,
+                                 JsonRpcResult(request.id, InitializeResult()));
+    response.set(kSessionHeader, *session_id);
+    response.set(kProtocolHeader, kMcpProtocolVersion);
+    return response;
+  }
+
+  http::response<http::string_body> HandlePost(
+      const http::request<http::string_body>& http_request,
+      std::stop_token stop_token) {
+    if (!ContainsMediaType(HeaderValue(http_request, "Content-Type"),
+                           kJsonContentType)) {
+      return TextResponse(http_request, http::status::unsupported_media_type,
+                          "MCP POST requires application/json");
+    }
+    const std::string accept = HeaderValue(http_request, "Accept");
+    if (!ContainsMediaType(accept, kJsonContentType) ||
+        !ContainsMediaType(accept, kSseContentType)) {
+      return TextResponse(http_request, http::status::not_acceptable,
+                          "MCP POST Accept must include application/json and "
+                          "text/event-stream");
+    }
+    boost::json::value parsed;
+    try {
+      parsed = boost::json::parse(http_request.body());
+    } catch (const std::exception&) {
+      std::lock_guard<std::mutex> lock(mutex);
+      ++stats.malformed_requests;
+      return JsonResponse(http_request,
+                          JsonRpcError(nullptr, -32700, "parse error"));
+    }
+    JsonRpcRequest request;
+    try {
+      request = ParseJsonRpcRequest(parsed);
+    } catch (const std::exception& error) {
+      std::lock_guard<std::mutex> lock(mutex);
+      ++stats.malformed_requests;
+      return JsonResponse(
+          http_request,
+          JsonRpcError(nullptr, -32600, "invalid request", error.what()));
+    }
+    if (request.method == "initialize") {
+      try {
+        return HandleInitialize(http_request, request);
+      } catch (const std::invalid_argument& error) {
+        return JsonResponse(
+            http_request,
+            JsonRpcError(request.id, -32602, "invalid params", error.what()));
+      }
+    }
+    if (!ValidProtocolVersion(http_request)) {
+      return TextResponse(http_request, http::status::bad_request,
+                          "missing or unsupported MCP-Protocol-Version");
+    }
+    const std::optional<std::string> session_id =
+        RequireSession(http_request, false);
+    if (!session_id) {
+      return TextResponse(http_request, http::status::not_found,
+                          "unknown MCP session");
+    }
+    if (request.method == "notifications/initialized") {
+      if (request.has_id) {
+        return JsonResponse(
+            http_request,
+            JsonRpcError(request.id, -32600,
+                         "notifications/initialized must not have an id"));
+      }
+      try {
+        MarkInitialized(*session_id);
+      } catch (const std::invalid_argument&) {
+        return TextResponse(http_request, http::status::bad_request,
+                            "invalid initialized notification");
+      }
+      return TextResponse(http_request, http::status::accepted, "");
+    }
+    if (!RequireSession(http_request, true)) {
+      if (!request.has_id) {
+        return TextResponse(http_request, http::status::accepted, "");
+      }
+      return JsonResponse(
+          http_request,
+          JsonRpcError(
+              request.id, -32002,
+              "MCP session has not received notifications/initialized"));
+    }
+    if (!request.has_id) {
+      return TextResponse(http_request, http::status::accepted, "");
+    }
+    try {
+      return JsonResponse(
+          http_request, JsonRpcResult(request.id, Dispatch(request, *session_id,
+                                                           stop_token)));
+    } catch (const std::invalid_argument& error) {
+      return JsonResponse(
+          http_request,
+          JsonRpcError(request.id, -32602, "invalid params", error.what()));
+    } catch (const std::out_of_range&) {
+      return JsonResponse(http_request,
+                          JsonRpcError(request.id, -32601, "method not found"));
+    } catch (const std::exception& error) {
+      return JsonResponse(
+          http_request,
+          JsonRpcError(request.id, -32603, "internal error", error.what()));
+    }
+  }
+
+  http::response<http::string_body> HandleGet(
+      const http::request<http::string_body>& request) {
+    if (!ContainsMediaType(HeaderValue(request, "Accept"), kSseContentType)) {
+      return TextResponse(request, http::status::not_acceptable,
+                          "MCP GET requires Accept: text/event-stream");
+    }
+    if (!ValidProtocolVersion(request)) {
+      return TextResponse(request, http::status::bad_request,
+                          "missing or unsupported MCP-Protocol-Version");
+    }
+    const std::optional<std::string> session_id = RequireSession(request, true);
+    if (!session_id) {
+      return TextResponse(request, http::status::not_found,
+                          "unknown or uninitialized MCP session");
+    }
+    std::uint64_t after = 0U;
+    const std::string last_event = HeaderValue(request, "Last-Event-ID");
+    if (!last_event.empty()) {
+      const auto [end, error] = std::from_chars(
+          last_event.data(), last_event.data() + last_event.size(), after, 10);
+      if (error != std::errc{} ||
+          end != last_event.data() + last_event.size()) {
+        return TextResponse(request, http::status::bad_request,
+                            "Last-Event-ID must be a decimal sequence");
+      }
+    }
+    std::string body;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto session = sessions.find(*session_id);
+      if (session == sessions.end()) {
+        return TextResponse(request, http::status::not_found,
+                            "unknown MCP session");
+      }
+      for (const McpNotification& notification :
+           session->second.notifications) {
+        if (notification.sequence <= after) {
+          continue;
+        }
+        body += "id: " + std::to_string(notification.sequence) + "\n";
+        body += "event: message\n";
+        body += "data: " + notification.json + "\n\n";
+      }
+    }
+    if (body.empty()) {
+      body = ": bbp keepalive\n\n";
+    }
+    auto response = TextResponse(request, http::status::ok, std::move(body),
+                                 kSseContentType);
+    response.set(http::field::cache_control, "no-cache");
+    return response;
+  }
+
+  http::response<http::string_body> HandleDelete(
+      const http::request<http::string_body>& request) {
+    if (!ValidProtocolVersion(request)) {
+      return TextResponse(request, http::status::bad_request,
+                          "missing or unsupported MCP-Protocol-Version");
+    }
+    const std::string session_id = HeaderValue(request, kSessionHeader);
+    if (session_id.empty()) {
+      return TextResponse(request, http::status::not_found,
+                          "unknown MCP session");
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (sessions.erase(session_id) == 0U) {
+      return TextResponse(request, http::status::not_found,
+                          "unknown MCP session");
+    }
+    ++stats.terminated_sessions;
+    return TextResponse(request, http::status::ok, "MCP session terminated");
+  }
+
+  McpProtocolConfig config;
+  McpToolHandler tool_handler;
+  McpResourceHandler resource_handler;
+  mutable std::mutex mutex;
+  std::map<std::string, McpSession, std::less<>> sessions;
+  McpProtocolStats stats;
+};
+
+McpProtocol::McpProtocol(McpProtocolConfig config, McpToolHandler tool_handler,
+                         McpResourceHandler resource_handler)
+    : impl_(std::make_unique<Impl>(std::move(config), std::move(tool_handler),
+                                   std::move(resource_handler))) {}
+
+McpProtocol::~McpProtocol() = default;
+
+http::response<http::string_body> McpProtocol::Handle(
+    const http::request<http::string_body>& request,
+    std::stop_token stop_token) {
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    ++impl_->stats.requests;
+  }
+  std::optional<http::response<http::string_body>> rejection =
+      impl_->ValidateHttpRequest(request);
+  if (rejection) {
+    return std::move(*rejection);
+  }
+  switch (request.method()) {
+    case http::verb::post:
+      return impl_->HandlePost(request, stop_token);
+    case http::verb::get:
+      return impl_->HandleGet(request);
+    case http::verb::delete_:
+      return impl_->HandleDelete(request);
+    default:
+      return TextResponse(request, http::status::method_not_allowed,
+                          "MCP endpoint supports POST, GET, and DELETE");
+  }
+}
+
+void McpProtocol::EnqueueNotification(std::string_view session_id,
+                                      std::string_view method,
+                                      boost::json::value params) {
+  if (method.empty()) {
+    throw std::runtime_error("MCP notification method must not be empty");
+  }
+  boost::json::object notification{
+      {"jsonrpc", "2.0"}, {"method", method}, {"params", std::move(params)}};
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  const auto session = impl_->sessions.find(session_id);
+  if (session == impl_->sessions.end()) {
+    throw std::runtime_error("unknown MCP notification session");
+  }
+  McpSession& target = session->second;
+  if (target.notifications.size() == kMcpMaximumNotificationsPerSession) {
+    target.notifications.pop_front();
+    ++impl_->stats.notifications_dropped;
+  }
+  target.notifications.push_back(
+      McpNotification{.sequence = target.next_notification_sequence++,
+                      .json = boost::json::serialize(notification)});
+  ++impl_->stats.notifications_enqueued;
+}
+
+void McpProtocol::BroadcastNotification(std::string_view method,
+                                        const boost::json::value& params) {
+  if (method.empty()) {
+    throw std::runtime_error("MCP notification method must not be empty");
+  }
+  boost::json::object notification{
+      {"jsonrpc", "2.0"}, {"method", method}, {"params", params}};
+  const std::string json = boost::json::serialize(notification);
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  for (auto& [id, session] : impl_->sessions) {
+    static_cast<void>(id);
+    if (!session.initialized) {
+      continue;
+    }
+    if (session.notifications.size() == kMcpMaximumNotificationsPerSession) {
+      session.notifications.pop_front();
+      ++impl_->stats.notifications_dropped;
+    }
+    session.notifications.push_back(McpNotification{
+        .sequence = session.next_notification_sequence++, .json = json});
+    ++impl_->stats.notifications_enqueued;
+  }
+}
+
+void McpProtocol::SetEndpointPort(std::uint16_t endpoint_port) {
+  if (endpoint_port == 0U) {
+    throw std::runtime_error("MCP endpoint port must be nonzero");
+  }
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->config.endpoint_port = endpoint_port;
+}
+
+McpProtocolStats McpProtocol::Stats() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  McpProtocolStats result = impl_->stats;
+  result.sessions = impl_->sessions.size();
+  return result;
+}
+
+}  // namespace bbp
