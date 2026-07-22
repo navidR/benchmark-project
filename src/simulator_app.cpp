@@ -57,6 +57,7 @@
 #include "bbp/run_process_state.h"
 #include "bbp/run_report.h"
 #include "bbp/runtime_peer_topology.h"
+#include "bbp/scenario_service.h"
 #include "bbp/signal_stop_monitor.h"
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
@@ -5111,8 +5112,13 @@ void ApplyDirectTransactionLoadOptions(
   options->wallet_backed_workload_requested = true;
 }
 
-Options ParseOptions(int argc, char** argv) {
+Options ParseOptions(int argc, char** argv,
+                     const boost::json::object* in_memory_scenario = nullptr) {
   namespace po = boost::program_options;
+  if (in_memory_scenario != nullptr && (argc != 0 || argv != nullptr)) {
+    throw std::logic_error(
+        "in-memory scenario parsing must not receive command-line arguments");
+  }
   Options options;
   LegacyCliInputs legacy_inputs;
   const ChainDriverSpec& default_chain_spec = DefaultChainDriverSpec();
@@ -5403,8 +5409,10 @@ Options ParseOptions(int argc, char** argv) {
       "list links through rtnetlink/libmnl and exit");
 
   po::variables_map vm;
-  po::store(po::parse_command_line(argc, argv, desc), vm);
-  po::notify(vm);
+  if (in_memory_scenario == nullptr) {
+    po::store(po::parse_command_line(argc, argv, desc), vm);
+    po::notify(vm);
+  }
 
   options.chain = ParseChainKind(chain_name);
   options.log_level = ParseLogLevel(log_level_name);
@@ -5508,6 +5516,9 @@ Options ParseOptions(int argc, char** argv) {
   }
   ApplyDirectTransactionLoadOptions(vm, transaction_load_strategy,
                                     wallet_node_count, &options);
+  if (in_memory_scenario != nullptr) {
+    ApplyScenarioJson(*in_memory_scenario, vm, options);
+  }
   if (!options.scenario_json.empty()) {
     const boost::json::value scenario =
         boost::json::parse(ReadText(options.scenario_json));
@@ -9514,9 +9525,8 @@ boost::json::object ScheduledScenarioEventJson(
   return object;
 }
 
-void WriteScenarioFiles(const Options& options,
-                        const std::filesystem::path& run_root,
-                        const ChainDriverSpec& chain_spec) {
+boost::json::object BuildResolvedScenarioDocument(
+    const Options& options, const ChainDriverSpec& chain_spec) {
   const std::vector<ScenarioWorkload> workloads = EffectiveWorkloads(options);
   boost::json::object resolved;
   resolved["run_id"] = options.run_id;
@@ -9838,6 +9848,14 @@ void WriteScenarioFiles(const Options& options,
         .freezes = options.runtime_node_freezes,
     });
   }
+  return resolved;
+}
+
+void WriteScenarioFiles(const Options& options,
+                        const std::filesystem::path& run_root,
+                        const ChainDriverSpec& chain_spec) {
+  const boost::json::object resolved =
+      BuildResolvedScenarioDocument(options, chain_spec);
   WriteText(run_root / "resolved-scenario.json",
             boost::json::serialize(resolved) + "\n");
   WriteText(run_root / "scenario.yaml", YamlFromJson(resolved));
@@ -15993,6 +16011,42 @@ std::filesystem::path ResolveRunReference(
 }
 
 }  // namespace
+
+Options ParseAndValidateScenario(const boost::json::object& scenario) {
+  return ParseOptions(0, nullptr, &scenario);
+}
+
+boost::json::object ResolveScenario(const boost::json::object& scenario) {
+  const Options options = ParseAndValidateScenario(scenario);
+  return BuildResolvedScenarioDocument(options,
+                                       ChainDriverSpecFor(options.chain));
+}
+
+SimulationCommand ParseAndValidateSimulationCommand(
+    const boost::json::object& command, const Options& options) {
+  const boost::json::value* kind_value = command.if_contains("kind");
+  if (kind_value == nullptr || !kind_value->is_string()) {
+    throw std::runtime_error(
+        "runtime simulation command requires a string kind");
+  }
+  const std::string kind_name(kind_value->as_string());
+  const std::optional<SimulationCommandKind> kind =
+      SimulationCommandKindFromName(kind_name);
+  if (!kind) {
+    throw std::runtime_error("unsupported runtime simulation command: " +
+                             kind_name);
+  }
+  if (command.if_contains("at") != nullptr ||
+      command.if_contains("action") != nullptr) {
+    throw std::runtime_error(
+        "runtime simulation command must use kind, not at or action");
+  }
+  boost::json::object scheduled = command;
+  scheduled.erase("kind");
+  scheduled["at"] = "0ms";
+  scheduled["action"] = kind_name;
+  return ParseScheduledSimulationCommand(scheduled, *kind, options);
+}
 
 int SimulatorApp::Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);

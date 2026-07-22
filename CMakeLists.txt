@@ -392,6 +392,7 @@ if(BUILD_TESTING)
     tests/unit/resource_limit_patch_tests.cpp
     tests/unit/run_ownership_tests.cpp
     tests/unit/run_process_state_tests.cpp
+    tests/unit/scenario_service_tests.cpp
     tests/unit/scheduled_scenario_event_tests.cpp
     tests/unit/simulation_command_processor_tests.cpp
     tests/unit/simulation_command_queue_tests.cpp
@@ -422,6 +423,7 @@ if(BUILD_TESTING)
     src/simulation_command.cpp
     src/simulation_event_kind.cpp
     src/drivers/chain_driver.cpp
+    src/drivers/chain_command_executor.cpp
     src/drivers/chain_driver_registry.cpp
     src/drivers/bitcoin_driver.cpp
     src/drivers/firo_driver.cpp
@@ -442,6 +444,7 @@ if(BUILD_TESTING)
     src/node_lifecycle_policy.cpp
     src/node_artifact_inventory.cpp
     src/node_file_pane.cpp
+    src/node_log_collector.cpp
     src/node_log_pane.cpp
     src/operator_connection.cpp
     src/operator_command_status.cpp
@@ -461,6 +464,7 @@ if(BUILD_TESTING)
     src/run_process_state.cpp
     src/run_report.cpp
     src/runtime_peer_topology.cpp
+    src/simulator_app.cpp
     src/scheduled_scenario_event.cpp
     src/simulation_command_processor.cpp
     src/simulation_command_queue.cpp
@@ -474,10 +478,12 @@ if(BUILD_TESTING)
     src/tui_exit_confirmation.cpp
     src/transaction_load.cpp
     src/transaction_observation_store.cpp
+    src/tui.cpp
     src/util.cpp
     src/wallet_funding_strategy.cpp
     src/wallet_send_resolver.cpp
     src/wallet_transaction_plan.cpp
+    src/yaml_helpers.cpp
   )
   add_dependencies(bbp-unit-tests bbp-process-tree-helper)
   target_include_directories(bbp-unit-tests PRIVATE include)
@@ -493,12 +499,15 @@ if(BUILD_TESTING)
     Boost::log
     Boost::log_setup
     Boost::multiprecision
+    Boost::program_options
     Boost::random
     Boost::unit_test_framework
     Boost::system
     Boost::url
     libperf::libperf
     libmnl::libmnl
+    ncurses::ncursesw
+    yaml::yaml
   )
   target_compile_options(bbp-unit-tests PRIVATE
     -Wall
