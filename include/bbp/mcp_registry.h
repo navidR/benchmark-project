@@ -17,6 +17,10 @@ inline constexpr std::size_t kMcpMaximumTasksPerSession = 64U;
 inline constexpr std::size_t kMcpMaximumSubscriptionsPerSession = 64U;
 inline constexpr std::size_t kMcpMaximumNotificationsPerSession = 256U;
 inline constexpr std::size_t kMcpMaximumRetainedOperations = 256U;
+inline constexpr std::size_t kMcpMaximumRetainedResultBytes =
+    4U * 1024U * 1024U;
+inline constexpr std::size_t kMcpMaximumEvidenceTextBytes = 1024U * 1024U;
+inline constexpr std::size_t kMcpMaximumSelectionItems = 10000U;
 
 enum class McpOperationKind {
   kValidateScenario,

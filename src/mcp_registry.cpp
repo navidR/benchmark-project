@@ -240,7 +240,10 @@ boost::json::object BuildMcpCapabilityDocument() {
       {"tasks_per_session", kMcpMaximumTasksPerSession},
       {"subscriptions_per_session", kMcpMaximumSubscriptionsPerSession},
       {"notifications_per_session", kMcpMaximumNotificationsPerSession},
-      {"retained_operations", kMcpMaximumRetainedOperations}};
+      {"retained_operations", kMcpMaximumRetainedOperations},
+      {"retained_result_bytes", kMcpMaximumRetainedResultBytes},
+      {"evidence_text_bytes", kMcpMaximumEvidenceTextBytes},
+      {"selection_items", kMcpMaximumSelectionItems}};
   boost::json::object document;
   document["protocol_version"] = kMcpProtocolVersion;
   document["transport"] = "streamable_http";

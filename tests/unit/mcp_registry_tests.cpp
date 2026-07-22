@@ -228,8 +228,18 @@ BOOST_AUTO_TEST_CASE(mcp_registry_exposes_every_information_family_and_bound) {
              kMcpMaximumSessions);
   BOOST_TEST(limits->as_object().at("tasks_per_session").as_uint64() ==
              kMcpMaximumTasksPerSession);
+  BOOST_TEST(limits->as_object().at("subscriptions_per_session").as_uint64() ==
+             kMcpMaximumSubscriptionsPerSession);
   BOOST_TEST(limits->as_object().at("notifications_per_session").as_uint64() ==
              kMcpMaximumNotificationsPerSession);
+  BOOST_TEST(limits->as_object().at("retained_operations").as_uint64() ==
+             kMcpMaximumRetainedOperations);
+  BOOST_TEST(limits->as_object().at("retained_result_bytes").as_uint64() ==
+             kMcpMaximumRetainedResultBytes);
+  BOOST_TEST(limits->as_object().at("evidence_text_bytes").as_uint64() ==
+             kMcpMaximumEvidenceTextBytes);
+  BOOST_TEST(limits->as_object().at("selection_items").as_uint64() ==
+             kMcpMaximumSelectionItems);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_scenario_schema_has_unique_authoritative_members) {
@@ -503,6 +513,14 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
                    .as_string() == McpResultFamilyName(family));
     RequireClosedSchemaTree(schema);
   }
+  const boost::json::object operation_schema =
+      BuildMcpResultSchema(McpResultFamily::kOperation);
+  BOOST_TEST(operation_schema.at("properties")
+                 .as_object()
+                 .contains("terminal_result"));
+  BOOST_TEST(
+      operation_schema.at("properties").as_object().contains("terminal_error"));
+  BOOST_TEST(operation_schema.at("allOf").as_array().size() == 3U);
 }
 
 }  // namespace bbp

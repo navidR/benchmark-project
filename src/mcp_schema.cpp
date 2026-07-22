@@ -1365,6 +1365,7 @@ boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation) {
 
 boost::json::object BuildMcpResultSchema(McpResultFamily family) {
   boost::json::object properties;
+  boost::json::array constraints;
   properties["result_family"] = ConstStringSchema(McpResultFamilyName(family));
   boost::json::array required = Required({"result_family"});
   const auto require = [&](std::initializer_list<std::string_view> fields) {
@@ -1468,6 +1469,67 @@ boost::json::object BuildMcpResultSchema(McpResultFamily family) {
       properties["terminal_result_family"] = ResultFamilyNameSchema();
       require({"operation_id", "operation", "state", "progress_completed",
                "progress_total", "cancel_requested", "terminal_result_family"});
+      {
+        boost::json::array terminal_results;
+        for (std::size_t index = 0U;
+             index < static_cast<std::size_t>(McpResultFamily::kCount);
+             ++index) {
+          const auto result_family = static_cast<McpResultFamily>(index);
+          if (result_family == McpResultFamily::kError) {
+            continue;
+          }
+          if (result_family == McpResultFamily::kOperation) {
+            terminal_results.emplace_back(
+                AddDraft(ClosedObject(properties, required)));
+          } else {
+            terminal_results.emplace_back(BuildMcpResultSchema(result_family));
+          }
+        }
+        properties["terminal_result"] =
+            boost::json::object{{"oneOf", std::move(terminal_results)}};
+        properties["terminal_error"] =
+            BuildMcpResultSchema(McpResultFamily::kError);
+        constraints.emplace_back(boost::json::object{
+            {"if", boost::json::object{{"properties",
+                                        boost::json::object{
+                                            {"state", ConstStringSchema(
+                                                          "succeeded")}}}}},
+            {"then",
+             boost::json::object{
+                 {"required", Required({"terminal_result"})},
+                 {"not", boost::json::object{
+                             {"required", Required({"terminal_error"})}}}}}});
+        constraints.emplace_back(boost::json::object{
+            {"if",
+             boost::json::object{
+                 {"properties",
+                  boost::json::object{
+                      {"state", StringEnumSchema(boost::json::array{
+                                    "failed", "cancelled"})}}}}},
+            {"then",
+             boost::json::object{
+                 {"required", Required({"terminal_error"})},
+                 {"not", boost::json::object{
+                             {"required", Required({"terminal_result"})}}}}}});
+        constraints.emplace_back(boost::json::object{
+            {"if",
+             boost::json::object{
+                 {"properties",
+                  boost::json::object{
+                      {"state", StringEnumSchema(boost::json::array{
+                                    "queued", "running", "cancelling"})}}}}},
+            {"then",
+             boost::json::object{
+                 {"not",
+                  boost::json::object{
+                      {"anyOf",
+                       boost::json::array{
+                           boost::json::object{
+                               {"required", Required({"terminal_result"})}},
+                           boost::json::object{
+                               {"required",
+                                Required({"terminal_error"})}}}}}}}}});
+      }
       break;
     case McpResultFamily::kSubscription:
       properties["subscription_id"] = IdentifierSchema();
@@ -1502,7 +1564,12 @@ boost::json::object BuildMcpResultSchema(McpResultFamily family) {
     case McpResultFamily::kCount:
       throw std::logic_error("unknown MCP result family");
   }
-  return AddDraft(ClosedObject(std::move(properties), std::move(required)));
+  boost::json::object schema =
+      ClosedObject(std::move(properties), std::move(required));
+  if (!constraints.empty()) {
+    schema["allOf"] = std::move(constraints);
+  }
+  return AddDraft(std::move(schema));
 }
 
 boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation) {
