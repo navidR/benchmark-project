@@ -41,6 +41,7 @@
 #include "bbp/topology_partition_resolver.h"
 #include "bbp/tui_command_admission.h"
 #include "bbp/tui_command_parser.h"
+#include "bbp/tui_exit_confirmation.h"
 #include "bbp/tui_view.h"
 #include "bbp/util.h"
 #include "bbp/wallet_send_resolver.h"
@@ -82,6 +83,7 @@ struct TuiState {
   std::string command_input;
   std::string command_input_error;
   std::optional<PendingConfirmation> pending_confirmation;
+  TuiExitConfirmation exit_confirmation;
 };
 
 class CursesSession {
@@ -1288,6 +1290,35 @@ void DrawCommandConfirmationPopup(int rows, int cols,
           "Press y to confirm; n or Esc cancels.", COLOR_PAIR(kColorMuted));
 }
 
+void DrawExitConfirmationPopup(int rows, int cols) {
+  constexpr int kPopupRows = 8;
+  if (rows < kPopupRows + 2 || cols < 40) {
+    return;
+  }
+  const int popup_cols = std::min(cols - 4, 68);
+  const int top = (rows - kPopupRows) / 2;
+  const int left = (cols - popup_cols) / 2;
+  for (int row = 0; row < kPopupRows; ++row) {
+    mvhline(top + row, left, ' ', popup_cols);
+  }
+  mvhline(top, left + 1, ACS_HLINE, popup_cols - 2);
+  mvhline(top + kPopupRows - 1, left + 1, ACS_HLINE, popup_cols - 2);
+  mvvline(top + 1, left, ACS_VLINE, kPopupRows - 2);
+  mvvline(top + 1, left + popup_cols - 1, ACS_VLINE, kPopupRows - 2);
+  mvaddch(top, left, ACS_ULCORNER);
+  mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
+  mvaddch(top + kPopupRows - 1, left, ACS_LLCORNER);
+  mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
+  AddText(top + 1, left + 2, popup_cols - 4, "Confirm exit",
+          A_BOLD | COLOR_PAIR(kColorWarning));
+  AddText(top + 3, left + 2, popup_cols - 4,
+          "Do you want to exit the benchmark TUI?");
+  AddText(top + 4, left + 2, popup_cols - 4,
+          "An active benchmark will stop only after confirmation.");
+  AddText(top + 6, left + 2, popup_cols - 4,
+          "Press y to exit; n or Esc cancels.", COLOR_PAIR(kColorMuted));
+}
+
 void DrawCommandPalette(int rows, int cols, std::string_view input,
                         std::string_view error) {
   constexpr int kPopupRows = 22;
@@ -1923,18 +1954,21 @@ void DrawSelectedTopologyDetail(int top, int bottom, int cols,
                 PerfCounterSummaryText(*group));
 }
 
-void DrawSummary(
-    const std::filesystem::path& run_root, const boost::json::object& report,
-    std::string_view error, const std::vector<std::string>& log_lines,
-    TuiView view, std::size_t selected_node, std::size_t selected_wallet,
-    std::size_t selected_topology_group, const NodeLogPane& node_log_pane,
-    const PeerListPane& peer_list_pane,
-    const NetworkRulePane& network_rule_pane,
-    const NodeFilePane& node_file_pane, std::string_view command_status,
-    bool command_error_open, std::string_view command_error,
-    bool command_palette_open, std::string_view command_input,
-    std::string_view command_input_error,
-    const std::optional<PendingConfirmation>& pending_confirmation) {
+void DrawSummary(const std::filesystem::path& run_root,
+                 const boost::json::object& report, std::string_view error,
+                 const std::vector<std::string>& log_lines, TuiView view,
+                 std::size_t selected_node, std::size_t selected_wallet,
+                 std::size_t selected_topology_group,
+                 const NodeLogPane& node_log_pane,
+                 const PeerListPane& peer_list_pane,
+                 const NetworkRulePane& network_rule_pane,
+                 const NodeFilePane& node_file_pane,
+                 std::string_view command_status, bool command_error_open,
+                 std::string_view command_error, bool command_palette_open,
+                 std::string_view command_input,
+                 std::string_view command_input_error,
+                 const std::optional<PendingConfirmation>& pending_confirmation,
+                 const TuiExitConfirmation& exit_confirmation) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -1957,8 +1991,12 @@ void DrawSummary(
       DrawLogPane(log_top, rows, cols, log_lines);
     }
     DrawHorizontalLine(rows - 2);
-    AddText(rows - 1, 0, cols, "Arrows select. l node log. q or Esc exits.",
+    AddText(rows - 1, 0, cols,
+            "Arrows select. l node log. Esc asks to exit; q exits.",
             COLOR_PAIR(kColorMuted));
+    if (exit_confirmation.is_open()) {
+      DrawExitConfirmationPopup(rows, cols);
+    }
     refresh();
     return;
   }
@@ -2085,8 +2123,12 @@ void DrawSummary(
       DrawLogPane(log_top, rows, cols, log_lines);
     }
     DrawHorizontalLine(rows - 2);
-    AddText(rows - 1, 0, cols, "Arrows select. l node log. q or Esc exits.",
+    AddText(rows - 1, 0, cols,
+            "Arrows select. l node log. Esc asks to exit; q exits.",
             COLOR_PAIR(kColorMuted));
+    if (exit_confirmation.is_open()) {
+      DrawExitConfirmationPopup(rows, cols);
+    }
     refresh();
     return;
   }
@@ -2301,8 +2343,8 @@ void DrawSummary(
     footer +=
         "Tab/n/w/g/h view. Arrows select. b files. p peers. a rules. c "
         "command. e export. "
-        "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. q "
-        "exits.";
+        "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. Esc "
+        "asks; q exits.";
   }
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
   if (command_error_open) {
@@ -2314,10 +2356,13 @@ void DrawSummary(
   if (pending_confirmation) {
     DrawCommandConfirmationPopup(rows, cols, *pending_confirmation);
   }
+  if (exit_confirmation.is_open()) {
+    DrawExitConfirmationPopup(rows, cols);
+  }
   refresh();
 }
 
-bool ShouldExit(int ch) { return ch == 'q' || ch == 'Q' || ch == 27; }
+bool ShouldExit(int ch) { return ch == 'q' || ch == 'Q'; }
 
 std::size_t CurrentNodeLogVisibleRows() {
   int rows = 0;
@@ -2659,6 +2704,10 @@ bool HandleCommandConfirmationInput(int ch, const boost::json::object& report,
 bool HandleInput(int ch, const std::filesystem::path& run_root,
                  const boost::json::object& report,
                  SimulationCommandQueue* command_queue, TuiState* state) {
+  if (state->exit_confirmation.is_open()) {
+    return state->exit_confirmation.HandleInput(ch) !=
+           TuiExitConfirmationResult::kIgnored;
+  }
   if (state->pending_confirmation) {
     return HandleCommandConfirmationInput(ch, report, command_queue, state);
   }
@@ -2672,6 +2721,11 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
       return true;
     }
     return ch != ERR && ch != 'q' && ch != 'Q';
+  }
+
+  if (state->exit_confirmation.HandleInput(ch) !=
+      TuiExitConfirmationResult::kIgnored) {
+    return true;
   }
 
   const boost::json::array* nodes = NodeSummaries(report);
@@ -3008,7 +3062,8 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         state.node_log_pane, state.peer_list_pane, state.network_rule_pane,
         state.node_file_pane, state.command_status, state.command_error_open,
         state.command_error, state.command_palette_open, state.command_input,
-        state.command_input_error, state.pending_confirmation);
+        state.command_input_error, state.pending_confirmation,
+        state.exit_confirmation);
     if (once) {
       return error.empty() ? 0 : 1;
     }
@@ -3023,6 +3078,9 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       const int ch = getch();
       const bool palette_was_open = state.command_palette_open;
       if (HandleInput(ch, run_root, *report, command_queue, &state)) {
+        if (state.exit_confirmation.exit_requested()) {
+          return 0;
+        }
         if (state.command_palette_open) {
           int rows = 0;
           int cols = 0;

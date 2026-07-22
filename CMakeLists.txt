@@ -271,6 +271,7 @@ add_executable(bbp
   src/tui.cpp
   src/tui_command_admission.cpp
   src/tui_command_parser.cpp
+  src/tui_exit_confirmation.cpp
   src/transaction_load.cpp
   src/transaction_observation_store.cpp
   src/util.cpp
@@ -382,6 +383,7 @@ if(BUILD_TESTING)
     tests/unit/signal_stop_monitor_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
     tests/unit/tui_command_admission_tests.cpp
+    tests/unit/tui_exit_confirmation_tests.cpp
     tests/unit/transaction_load_tests.cpp
     tests/unit/transaction_observation_store_tests.cpp
     tests/unit/util_tests.cpp
@@ -446,6 +448,7 @@ if(BUILD_TESTING)
     src/signal_stop_monitor.cpp
     src/tui_command_parser.cpp
     src/tui_command_admission.cpp
+    src/tui_exit_confirmation.cpp
     src/transaction_load.cpp
     src/transaction_observation_store.cpp
     src/util.cpp
@@ -1716,6 +1719,13 @@ if(BUILD_TESTING)
   set_tests_properties(bbp-integrated-tui-live-transaction-load
     PROPERTIES
       PASS_REGULAR_EXPRESSION "load a=8 s=2 r=1 to=1 bp=1 d=1 p=2 c=1 f=1 cn=1"
+  )
+  add_test(NAME bbp-integrated-tui-exit-confirmation
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+      "-DRUN_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-live-load"
+      "-DTEST_INPUT=${CMAKE_CURRENT_BINARY_DIR}/tui-exit-input"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/tui_exit_confirmation.cmake"
   )
   add_test(NAME bbp-report-run-id-under-benchmark-root
     COMMAND bbp
