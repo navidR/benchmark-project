@@ -25,6 +25,25 @@ bbp::WalletTransactionLoadTask Task(std::uint64_t transaction_index) {
   };
 }
 
+bbp::WalletTransactionsWorkload LoadWorkload(
+    bbp::WalletTransferStrategy strategy,
+    std::vector<std::uint32_t> receivers) {
+  bbp::WalletTransactionsWorkload workload;
+  workload.strategy = strategy;
+  workload.transaction_count = static_cast<std::uint32_t>(receivers.size());
+  workload.amount = bbp::AmountDistribution{
+      .kind = bbp::ValueDistributionKind::kFixed,
+      .minimum_satoshis = 100U,
+      .maximum_satoshis = 2'000U,
+  };
+  workload.fee_satoshis = 10U;
+  workload.fee_reserve_satoshis = 10U;
+  workload.random_seed = 17U;
+  workload.sender_wallets = {1U};
+  workload.receiver_wallets = std::move(receivers);
+  return workload;
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(transaction_load_outcome_names_are_stable) {
@@ -111,6 +130,145 @@ BOOST_AUTO_TEST_CASE(transaction_load_queue_stop_wakes_waiting_consumer) {
   BOOST_CHECK(pending.wait_for(1s) == std::future_status::ready);
   BOOST_TEST(!pending.get());
   BOOST_TEST(!queue.closed());
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_failed_reservation_reconciles_and_retries) {
+  bbp::WalletTransactionsWorkload workload =
+      LoadWorkload(bbp::WalletTransferStrategy::kRandomBruteforce, {2U});
+  workload.amount.maximum_satoshis = 100U;
+  bbp::WalletTransactionLoadPlanner planner(2U, workload);
+  bbp::TransactionLoadBalanceReservations reservations({550U, 0U}, 10U, 2U);
+
+  const auto admitted = reservations.PlanAndReserve(
+      &planner, 1U, 2U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_REQUIRE(admitted.has_plan());
+  BOOST_TEST(admitted.admitted);
+  BOOST_REQUIRE_EQUAL(admitted.plans.size(), 1U);
+  BOOST_TEST(admitted.plans.front().amount_satoshis == 100U);
+  BOOST_TEST(reservations.available_balances().front() == 440U);
+  BOOST_TEST(reservations.outstanding_size() == 1U);
+
+  const auto exhausted = reservations.PlanAndReserve(
+      &planner, 2U, 1U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_TEST(!exhausted.has_plan());
+  std::future<bool> waiting =
+      std::async(std::launch::async,
+                 [&reservations, revision = exhausted.balance_revision] {
+                   return reservations.WaitForResolution(revision);
+                 });
+  BOOST_CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+
+  reservations.Settle(1U, 550U, false);
+  BOOST_CHECK(waiting.wait_for(1s) == std::future_status::ready);
+  BOOST_TEST(waiting.get());
+  BOOST_TEST(reservations.available_balances().front() == 550U);
+  BOOST_TEST(reservations.outstanding_size() == 0U);
+
+  const auto retry = reservations.PlanAndReserve(
+      &planner, 2U, 1U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_REQUIRE(retry.has_plan());
+  BOOST_TEST(retry.admitted);
+  BOOST_TEST(retry.plans.front().amount_satoshis == 100U);
+  reservations.Settle(2U, std::nullopt, true);
+  BOOST_TEST(reservations.available_balances().front() == 550U);
+  BOOST_TEST(reservations.outstanding_size() == 0U);
+  BOOST_TEST(reservations.maximum_size() == 1U);
+  BOOST_CHECK_THROW(reservations.Settle(2U, 550U, false), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_partial_equal_fanout_uses_actual_sender_balance) {
+  bbp::WalletTransactionsWorkload workload =
+      LoadWorkload(bbp::WalletTransferStrategy::kEqualFanout, {2U, 3U, 4U});
+  workload.fee_reserve_satoshis = 100U;
+  bbp::WalletTransactionLoadPlanner planner(4U, workload);
+  bbp::TransactionLoadBalanceReservations reservations({3'500U, 0U, 0U, 0U},
+                                                       100U, 6U);
+
+  const auto first = reservations.PlanAndReserve(
+      &planner, 1U, 6U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_REQUIRE(first.has_plan());
+  BOOST_TEST(first.admitted);
+  BOOST_REQUIRE_EQUAL(first.plans.size(), 3U);
+  for (const bbp::WalletTransactionPlanEntry& plan : first.plans) {
+    BOOST_TEST(plan.amount_satoshis == 1'066U);
+  }
+  BOOST_TEST(reservations.available_balances().front() == 2U);
+  BOOST_TEST(reservations.outstanding_size() == 3U);
+
+  const auto exhausted = reservations.PlanAndReserve(
+      &planner, 4U, 3U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_TEST(!exhausted.has_plan());
+  std::future<bool> waiting =
+      std::async(std::launch::async,
+                 [&reservations, revision = exhausted.balance_revision] {
+                   return reservations.WaitForResolution(revision);
+                 });
+  BOOST_CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+
+  reservations.Settle(1U, std::nullopt, false);
+  BOOST_CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+  reservations.Settle(2U, 2'334U, false);
+  BOOST_TEST(reservations.available_balances().front() == 1'168U);
+  BOOST_TEST(reservations.outstanding_size() == 1U);
+  BOOST_CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+  reservations.Settle(3U, std::nullopt, false);
+  BOOST_CHECK(waiting.wait_for(1s) == std::future_status::ready);
+  BOOST_TEST(waiting.get());
+
+  const auto second = reservations.PlanAndReserve(
+      &planner, 4U, 3U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_REQUIRE(second.has_plan());
+  BOOST_TEST(second.admitted);
+  BOOST_REQUIRE_EQUAL(second.plans.size(), 3U);
+  for (const bbp::WalletTransactionPlanEntry& plan : second.plans) {
+    BOOST_TEST(plan.amount_satoshis == 289U);
+  }
+  BOOST_TEST(reservations.available_balances().front() == 1U);
+  BOOST_TEST(reservations.maximum_size() == 3U);
+  reservations.Settle(4U, std::nullopt, false);
+  reservations.Settle(5U, std::nullopt, false);
+  reservations.Settle(6U, std::nullopt, false);
+  BOOST_TEST(reservations.outstanding_size() == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_reservation_settlement_is_concurrency_safe) {
+  bbp::WalletTransactionsWorkload workload =
+      LoadWorkload(bbp::WalletTransferStrategy::kRandomBruteforce, {2U});
+  workload.amount.maximum_satoshis = 100U;
+  bbp::WalletTransactionLoadPlanner planner(2U, workload);
+  bbp::TransactionLoadBalanceReservations reservations({2'000U, 0U}, 10U, 4U);
+  for (std::uint64_t index = 1U; index <= 4U; ++index) {
+    const auto admitted = reservations.PlanAndReserve(
+        &planner, index, 5U - index,
+        [](const std::vector<bbp::WalletTransactionPlanEntry>&) {
+          return true;
+        });
+    BOOST_REQUIRE(admitted.admitted);
+  }
+  BOOST_TEST(reservations.outstanding_size() == 4U);
+
+  std::vector<std::future<void>> settlements;
+  for (std::uint64_t index = 1U; index <= 4U; ++index) {
+    settlements.push_back(
+        std::async(std::launch::async, [&reservations, index] {
+          reservations.Settle(index, std::nullopt, true);
+        }));
+  }
+  for (std::future<void>& settlement : settlements) {
+    settlement.get();
+  }
+  BOOST_TEST(reservations.outstanding_size() == 0U);
+  BOOST_TEST(reservations.available_balances().front() == 2'000U);
+  BOOST_TEST(reservations.maximum_size() == 4U);
 }
 
 BOOST_AUTO_TEST_CASE(transaction_load_accounting_preserves_partition_totals) {

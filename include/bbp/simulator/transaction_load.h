@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -58,6 +60,57 @@ class BoundedWalletTransactionQueue {
   std::deque<WalletTransactionLoadTask> tasks_;
   std::size_t maximum_size_ = 0U;
   bool closed_ = false;
+};
+
+struct TransactionLoadBatchAdmission {
+  std::vector<WalletTransactionPlanEntry> plans;
+  bool admitted = false;
+  std::uint64_t balance_revision = 0U;
+
+  [[nodiscard]] bool has_plan() const { return !plans.empty(); }
+};
+
+class TransactionLoadBalanceReservations {
+ public:
+  using AdmissionCallback =
+      std::function<bool(const std::vector<WalletTransactionPlanEntry>&)>;
+
+  TransactionLoadBalanceReservations(
+      std::vector<std::uint64_t> available_balances,
+      std::uint64_t fee_reserve_satoshis, std::size_t maximum_reservations);
+
+  TransactionLoadBatchAdmission PlanAndReserve(
+      WalletTransactionLoadPlanner* planner,
+      std::uint64_t first_transaction_index, std::uint64_t remaining_attempts,
+      const AdmissionCallback& admit_batch);
+  void Settle(std::uint64_t transaction_index,
+              std::optional<std::uint64_t> actual_available_balance,
+              bool release_if_balance_unavailable);
+  bool WaitForResolution(std::uint64_t observed_revision,
+                         std::stop_token stop_token = {});
+
+  [[nodiscard]] std::vector<std::uint64_t> available_balances() const;
+  [[nodiscard]] std::size_t outstanding_size() const;
+  [[nodiscard]] std::size_t maximum_size() const;
+
+ private:
+  struct Reservation {
+    std::size_t sender_index = 0U;
+    std::uint64_t amount_satoshis = 0U;
+  };
+
+  void RollBackReservations(
+      const std::vector<std::uint64_t>& transaction_indexes);
+
+  const std::uint64_t fee_reserve_satoshis_;
+  const std::size_t maximum_reservations_;
+  mutable std::mutex mutex_;
+  std::condition_variable_any resolved_;
+  std::vector<std::uint64_t> available_balances_;
+  std::vector<std::uint64_t> reserved_by_sender_;
+  std::map<std::uint64_t, Reservation> reservations_;
+  std::size_t maximum_size_ = 0U;
+  std::uint64_t balance_revision_ = 0U;
 };
 
 struct TransactionLoadSnapshot {

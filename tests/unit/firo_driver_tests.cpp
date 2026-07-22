@@ -1369,6 +1369,108 @@ BOOST_AUTO_TEST_CASE(firo_load_submission_classifies_rpc_rejection) {
   BOOST_TEST(methods[1] == "sendtoaddress");
 }
 
+BOOST_AUTO_TEST_CASE(
+    firo_partial_fanout_failure_reconciles_actual_balance_before_retry) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"balance":0.00003500,"unconfirmed_balance":0.0,"immature_balance":0.0,"txcount":0},"error":null,"id":"bbp"})",
+      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":"fanout-one","error":null,"id":"bbp"})",
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":null,"error":{"code":-6,"message":"Insufficient funds"},"id":"bbp"})",
+      R"({"result":{"balance":0.00002334,"unconfirmed_balance":0.0,"immature_balance":0.0,"txcount":1},"error":null,"id":"bbp"})",
+      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":"fanout-three","error":null,"id":"bbp"})"};
+  const std::vector<unsigned> statuses = {200U, 200U, 200U, 200U, 200U,
+                                          500U, 200U, 200U, 200U, 200U};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr, &statuses);
+      });
+
+  bbp::FiroNodeConfig config;
+  config.id = "load-reconciliation-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  bbp::WalletTransactionsWorkload workload;
+  workload.strategy = bbp::WalletTransferStrategy::kEqualFanout;
+  workload.transaction_count = 6U;
+  workload.amount = bbp::AmountDistribution{
+      .kind = bbp::ValueDistributionKind::kFixed,
+      .minimum_satoshis = 100U,
+      .maximum_satoshis = 2'000U,
+  };
+  workload.fee_satoshis = 10U;
+  workload.fee_reserve_satoshis = 100U;
+  workload.sender_wallets = {1U};
+  workload.receiver_wallets = {2U, 3U, 4U};
+  bbp::WalletTransactionLoadPlanner planner(4U, workload);
+  const bbp::ChainWalletSnapshot initial =
+      driver.ReadWalletSnapshot(config, bbp::WalletMode::kPublic, 1U);
+  BOOST_REQUIRE_EQUAL(initial.available_balance_satoshis, 3'500U);
+  bbp::TransactionLoadBalanceReservations reservations(
+      {initial.available_balance_satoshis, 0U, 0U, 0U}, 100U, 6U);
+  const auto first = reservations.PlanAndReserve(
+      &planner, 1U, 6U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_REQUIRE(first.admitted);
+  BOOST_REQUIRE_EQUAL(first.plans.size(), 3U);
+
+  const bbp::ChainWalletTransactionResult submitted_first =
+      driver.SubmitWalletTransaction(
+          config, bbp::WalletMode::kPublic, "load-destination-1",
+          first.plans.at(0).amount_satoshis, 10U, std::chrono::seconds(1));
+  BOOST_REQUIRE_EQUAL(submitted_first.txids.size(), 1U);
+  reservations.Settle(1U, std::nullopt, false);
+  BOOST_CHECK_THROW(
+      driver.SubmitWalletTransaction(
+          config, bbp::WalletMode::kPublic, "load-destination-2",
+          first.plans.at(1).amount_satoshis, 10U, std::chrono::seconds(1)),
+      bbp::ChainTransactionRejected);
+  const bbp::ChainWalletSnapshot actual =
+      driver.ReadWalletSnapshot(config, bbp::WalletMode::kPublic, 1U);
+  BOOST_TEST(actual.available_balance_satoshis == 2'334U);
+  reservations.Settle(2U, actual.available_balance_satoshis, false);
+  BOOST_TEST(reservations.available_balances().front() == 1'168U);
+  BOOST_TEST(reservations.outstanding_size() == 1U);
+  const bbp::ChainWalletTransactionResult submitted_third =
+      driver.SubmitWalletTransaction(
+          config, bbp::WalletMode::kPublic, "load-destination-3",
+          first.plans.at(2).amount_satoshis, 10U, std::chrono::seconds(1));
+  BOOST_REQUIRE_EQUAL(submitted_third.txids.size(), 1U);
+  reservations.Settle(3U, std::nullopt, false);
+
+  const auto retry = reservations.PlanAndReserve(
+      &planner, 4U, 3U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) {
+        return false;
+      });
+  BOOST_REQUIRE(retry.has_plan());
+  BOOST_TEST(!retry.admitted);
+  BOOST_REQUIRE_EQUAL(retry.plans.size(), 3U);
+  BOOST_TEST(retry.plans.front().amount_satoshis == 289U);
+  BOOST_TEST(reservations.available_balances().front() == 1'168U);
+  BOOST_TEST(reservations.outstanding_size() == 0U);
+
+  const std::vector<std::string> methods = served.get();
+  const std::vector<std::string> expected_methods = {
+      "getwalletinfo", "listtransactions", "settxfee",      "sendtoaddress",
+      "settxfee",      "sendtoaddress",    "getwalletinfo", "listtransactions",
+      "settxfee",      "sendtoaddress"};
+  BOOST_TEST(methods == expected_methods, boost::test_tools::per_element());
+}
+
 BOOST_AUTO_TEST_CASE(firo_reserves_the_maximum_standard_transaction_fee) {
   const bbp::FiroDriver driver(std::chrono::seconds(1));
   BOOST_TEST(driver.WalletTransactionFeeReserveSatoshis(

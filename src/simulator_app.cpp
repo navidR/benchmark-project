@@ -11678,13 +11678,13 @@ void ApplyWalletTransactionsWorkload(
   }
 
   if (IsTransactionLoadStrategy(workload.strategy)) {
-    std::vector<std::uint64_t> available_balances(wallets.size(), 0U);
+    std::vector<std::uint64_t> initial_available_balances(wallets.size(), 0U);
     for (std::size_t wallet_index = 0U; wallet_index < wallets.size();
          ++wallet_index) {
       ThrowIfStopRequested(stop_token);
       const WalletIdentity& wallet = wallets[wallet_index];
       const NodeRuntime& wallet_node = nodes[wallet.node - 1U];
-      available_balances[wallet_index] =
+      initial_available_balances[wallet_index] =
           driver
               .ReadWalletSnapshot(
                   wallet_node.config,
@@ -11700,6 +11700,17 @@ void ApplyWalletTransactionsWorkload(
                                                     *workload.transaction_rate);
     WalletTransactionLoadPlanner planner(wallets.size(), workload);
     BoundedWalletTransactionQueue queue(workload.queue_capacity);
+    if (workload.queue_capacity >
+            std::numeric_limits<std::size_t>::max() - workload.concurrency ||
+        workload.queue_capacity + workload.concurrency >
+            std::numeric_limits<std::size_t>::max() - planner.batch_size()) {
+      throw std::runtime_error(
+          "transaction load reservation bound overflows size_t");
+    }
+    TransactionLoadBalanceReservations balance_reservations(
+        std::move(initial_available_balances),
+        EffectiveWalletTransactionFeeReserveSatoshis(workload),
+        workload.queue_capacity + workload.concurrency + planner.batch_size());
     auto accounting = std::make_shared<TransactionLoadAccounting>();
     std::vector<std::mutex> sender_submission_mutexes(wallets.size());
     const auto load_started_at = std::chrono::steady_clock::now();
@@ -11745,56 +11756,100 @@ void ApplyWalletTransactionsWorkload(
               ChainWalletTransactionResult transaction;
               std::string error_message;
               bool submitted = false;
-              try {
+              bool submission_started = false;
+              bool release_if_balance_unavailable = true;
+              std::optional<std::uint64_t> actual_available_balance;
+              {
                 std::unique_lock<std::mutex> sender_submission_lock(
                     sender_submission_mutexes.at(task.plan.sender_index));
-                RequireNodeRunning(sender_node, "transaction load submission");
-                transaction = driver.SubmitWalletTransaction(
-                    sender_node.config,
-                    ToChainWalletMode(registry.wallet_initialization()),
-                    receiver.address, task.plan.amount_satoshis,
-                    workload.fee_satoshis,
-                    std::chrono::seconds(workload.timeout_sec), stop_token);
-                if (transaction.txids.empty()) {
-                  throw std::runtime_error(
-                      "transaction load submission returned no transaction id");
-                }
-                if (transaction.txids.size() >
-                    std::numeric_limits<std::uint32_t>::max()) {
-                  throw std::runtime_error(
-                      "transaction load txid count exceeds uint32");
-                }
-                std::set<std::string> unique_txids;
-                for (const std::string& txid : transaction.txids) {
-                  if (txid.empty()) {
+                try {
+                  RequireNodeRunning(sender_node,
+                                     "transaction load submission");
+                  submission_started = true;
+                  release_if_balance_unavailable = false;
+                  transaction = driver.SubmitWalletTransaction(
+                      sender_node.config,
+                      ToChainWalletMode(registry.wallet_initialization()),
+                      receiver.address, task.plan.amount_satoshis,
+                      workload.fee_satoshis,
+                      std::chrono::seconds(workload.timeout_sec), stop_token);
+                  if (transaction.txids.empty()) {
                     throw std::runtime_error(
-                        "transaction load submission returned an empty "
-                        "transaction id");
+                        "transaction load submission returned no transaction "
+                        "id");
                   }
-                  if (!unique_txids.insert(txid).second) {
+                  if (transaction.txids.size() >
+                      std::numeric_limits<std::uint32_t>::max()) {
                     throw std::runtime_error(
-                        "transaction load submission returned duplicate "
-                        "transaction ids");
+                        "transaction load txid count exceeds uint32");
+                  }
+                  std::set<std::string> unique_txids;
+                  for (const std::string& txid : transaction.txids) {
+                    if (txid.empty()) {
+                      throw std::runtime_error(
+                          "transaction load submission returned an empty "
+                          "transaction id");
+                    }
+                    if (!unique_txids.insert(txid).second) {
+                      throw std::runtime_error(
+                          "transaction load submission returned duplicate "
+                          "transaction ids");
+                    }
+                  }
+                  outcome = TransactionLoadOutcome::kSubmitted;
+                  submitted = true;
+                } catch (const ChainTransactionRejected& error) {
+                  outcome = TransactionLoadOutcome::kRejected;
+                  error_message = error.what();
+                  release_if_balance_unavailable = true;
+                } catch (const ChainTransactionTimedOut& error) {
+                  outcome = TransactionLoadOutcome::kTimedOut;
+                  error_message = error.what();
+                } catch (const SimulationCancelled& error) {
+                  outcome = TransactionLoadOutcome::kFailed;
+                  error_message = error.what();
+                  worker_cancelled.store(true);
+                } catch (const std::exception& error) {
+                  outcome = TransactionLoadOutcome::kFailed;
+                  error_message = error.what();
+                  release_if_balance_unavailable = !submission_started;
+                } catch (...) {
+                  outcome = TransactionLoadOutcome::kFailed;
+                  error_message = "unknown transaction submission error";
+                  release_if_balance_unavailable = !submission_started;
+                }
+
+                if (!submitted) {
+                  try {
+                    actual_available_balance =
+                        driver
+                            .ReadWalletSnapshot(
+                                sender_node.config,
+                                ToChainWalletMode(
+                                    registry.wallet_initialization()),
+                                1U, stop_token)
+                            .available_balance_satoshis;
+                  } catch (const SimulationCancelled&) {
+                    worker_cancelled.store(true);
+                  } catch (const std::exception& error) {
+                    BBP_LOG(warning)
+                        << "transaction load balance reconciliation failed "
+                           "for "
+                        << sender_node.config.id << ": " << error.what();
+                  } catch (...) {
+                    BBP_LOG(warning)
+                        << "transaction load balance reconciliation failed "
+                           "for "
+                        << sender_node.config.id << ": unknown exception";
                   }
                 }
-                outcome = TransactionLoadOutcome::kSubmitted;
-                submitted = true;
-              } catch (const ChainTransactionRejected& error) {
-                outcome = TransactionLoadOutcome::kRejected;
-                error_message = error.what();
-              } catch (const ChainTransactionTimedOut& error) {
-                outcome = TransactionLoadOutcome::kTimedOut;
-                error_message = error.what();
-              } catch (const SimulationCancelled& error) {
-                outcome = TransactionLoadOutcome::kFailed;
-                error_message = error.what();
-                worker_cancelled.store(true);
-              } catch (const std::exception& error) {
-                outcome = TransactionLoadOutcome::kFailed;
-                error_message = error.what();
-              } catch (...) {
-                outcome = TransactionLoadOutcome::kFailed;
-                error_message = "unknown transaction submission error";
+                try {
+                  balance_reservations.Settle(
+                      task.transaction_index, actual_available_balance,
+                      !submitted && release_if_balance_unavailable);
+                } catch (...) {
+                  record_infrastructure_error(std::current_exception());
+                }
               }
 
               const std::chrono::microseconds latency = terminal_latency(task);
@@ -11917,32 +11972,35 @@ void ApplyWalletTransactionsWorkload(
           WaitUntil(scheduled_at, stop_token);
         }
 
-        std::vector<std::uint64_t> planned_balances = available_balances;
-        const auto batch = planner.NextBatch(&planned_balances);
-        if (!batch) {
+        std::vector<WalletTransactionLoadTask> tasks;
+        const TransactionLoadBatchAdmission admission =
+            balance_reservations.PlanAndReserve(
+                &planner, transaction_index + 1U,
+                attempt_limit - transaction_index,
+                [&](const std::vector<WalletTransactionPlanEntry>& plans) {
+                  tasks.reserve(plans.size());
+                  for (std::size_t offset = 0U; offset < plans.size();
+                       ++offset) {
+                    tasks.push_back(WalletTransactionLoadTask{
+                        .transaction_index = transaction_index + offset + 1U,
+                        .plan = plans.at(offset),
+                        .scheduled_simulation_elapsed =
+                            scheduled_simulation_elapsed,
+                        .scheduled_wall_elapsed = scheduled_wall_elapsed,
+                        .scheduled_at = scheduled_at,
+                    });
+                  }
+                  return queue.TryPushBatch(tasks);
+                });
+        if (!admission.has_plan()) {
+          if (balance_reservations.WaitForResolution(admission.balance_revision,
+                                                     stop_token)) {
+            continue;
+          }
+          ThrowIfStopRequested(stop_token);
           break;
         }
-        if (batch->empty() ||
-            batch->size() > attempt_limit - transaction_index) {
-          throw std::runtime_error(
-              "transaction load planner returned an invalid batch size");
-        }
-        std::vector<WalletTransactionLoadTask> tasks;
-        tasks.reserve(batch->size());
-        for (std::size_t offset = 0U; offset < batch->size(); ++offset) {
-          tasks.push_back(WalletTransactionLoadTask{
-              .transaction_index = transaction_index + offset + 1U,
-              .plan = batch->at(offset),
-              .scheduled_simulation_elapsed = scheduled_simulation_elapsed,
-              .scheduled_wall_elapsed = scheduled_wall_elapsed,
-              .scheduled_at = scheduled_at,
-          });
-        }
-
-        const bool admitted = queue.TryPushBatch(tasks);
-        if (admitted) {
-          available_balances = std::move(planned_balances);
-        } else {
+        if (!admission.admitted) {
           for (const WalletTransactionLoadTask& task : tasks) {
             const WalletIdentity& sender = wallets.at(task.plan.sender_index);
             const WalletIdentity& receiver =
@@ -11960,7 +12018,7 @@ void ApplyWalletTransactionsWorkload(
                            nullptr, "bounded transaction load queue is full"));
           }
         }
-        transaction_index += static_cast<std::uint64_t>(batch->size());
+        transaction_index += static_cast<std::uint64_t>(admission.plans.size());
       }
     } catch (...) {
       producer_error = std::current_exception();

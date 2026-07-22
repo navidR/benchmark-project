@@ -103,3 +103,31 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(propagated < final_observation);
   BOOST_TEST(final_observation < final_completion);
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulator_transaction_load_reconciles_failed_balance_reservations) {
+  const std::filesystem::path simulator =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::string source = bbp::ReadText(simulator);
+  const std::size_t ledger =
+      source.find("TransactionLoadBalanceReservations balance_reservations");
+  BOOST_REQUIRE(ledger != std::string::npos);
+  const std::size_t failed = source.find("if (!submitted)", ledger);
+  BOOST_REQUIRE(failed != std::string::npos);
+  const std::size_t actual = source.find(".ReadWalletSnapshot(", failed);
+  BOOST_REQUIRE(actual != std::string::npos);
+  const std::size_t settlement =
+      source.find("balance_reservations.Settle", actual);
+  BOOST_REQUIRE(settlement != std::string::npos);
+  const std::size_t plan =
+      source.find("balance_reservations.PlanAndReserve", settlement);
+  BOOST_REQUIRE(plan != std::string::npos);
+  const std::size_t wait =
+      source.find("balance_reservations.WaitForResolution", plan);
+  BOOST_REQUIRE(wait != std::string::npos);
+  BOOST_TEST(ledger < failed);
+  BOOST_TEST(failed < actual);
+  BOOST_TEST(actual < settlement);
+  BOOST_TEST(settlement < plan);
+  BOOST_TEST(plan < wait);
+}
