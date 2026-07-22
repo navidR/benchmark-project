@@ -119,6 +119,10 @@ class FiroDriver final : public ChainDriver {
   ChainTransactionObservation ObserveTransaction(
       const FiroNodeConfig& config, const std::string& txid,
       std::stop_token stop_token = {}) const override;
+  ChainTransactionObservation ObserveTransactionUntil(
+      const FiroNodeConfig& config, const std::string& txid,
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {}) const override;
   ChainTransactionObservation WaitForTransaction(
       const FiroNodeConfig& config, const std::string& txid,
       std::chrono::seconds timeout,
@@ -155,6 +159,15 @@ class FiroDriver final : public ChainDriver {
                              std::string_view method,
                              const boost::json::array& params,
                              std::stop_token stop_token = {}) const;
+  boost::json::value RpcCallUntil(
+      const FiroNodeConfig& config, std::string_view method,
+      const boost::json::array& params,
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {}) const;
+  ChainTransactionObservation ObserveTransactionImpl(
+      const FiroNodeConfig& config, const std::string& txid,
+      const std::optional<std::chrono::steady_clock::time_point>& deadline,
+      std::stop_token stop_token) const;
 
   std::string driver_name_;
   BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding_;

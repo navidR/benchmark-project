@@ -7945,7 +7945,7 @@ std::string TransactionLoadAttemptDetail(
     const WalletIdentity& receiver, TransactionLoadOutcome outcome,
     std::chrono::microseconds latency,
     const ChainWalletTransactionResult* transaction,
-    std::string_view error_message) {
+    std::string_view error_class, std::string_view error_message) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
@@ -7996,6 +7996,11 @@ std::string TransactionLoadAttemptDetail(
     detail["error"] = nullptr;
   } else {
     detail["error"] = error_message;
+  }
+  if (error_class.empty()) {
+    detail["error_class"] = nullptr;
+  } else {
+    detail["error_class"] = error_class;
   }
   return boost::json::serialize(detail);
 }
@@ -8274,8 +8279,8 @@ class TransactionObservationTracker {
               }
               try {
                 const ChainTransactionObservation observation =
-                    driver.ObserveTransaction(node.config, transaction.txid,
-                                              stop_token);
+                    driver.ObserveTransactionUntil(
+                        node.config, transaction.txid, deadline, stop_token);
                 RecordObservation(options, events_path, transaction,
                                   static_cast<std::uint32_t>(node_index + 1U),
                                   node.config.id, observation);
@@ -11754,6 +11759,7 @@ void ApplyWalletTransactionsWorkload(
               NodeRuntime& sender_node = nodes.at(sender.node - 1U);
               TransactionLoadOutcome outcome = TransactionLoadOutcome::kFailed;
               ChainWalletTransactionResult transaction;
+              std::string error_class;
               std::string error_message;
               bool submitted = false;
               bool submission_started = false;
@@ -11800,21 +11806,42 @@ void ApplyWalletTransactionsWorkload(
                   submitted = true;
                 } catch (const ChainTransactionRejected& error) {
                   outcome = TransactionLoadOutcome::kRejected;
+                  error_class = "policy_rejection";
                   error_message = error.what();
                   release_if_balance_unavailable = true;
                 } catch (const ChainTransactionTimedOut& error) {
                   outcome = TransactionLoadOutcome::kTimedOut;
+                  error_class = "timeout";
+                  error_message = error.what();
+                } catch (const ChainTransactionRpcWarmup& error) {
+                  outcome = TransactionLoadOutcome::kFailed;
+                  error_class = "warmup";
+                  error_message = error.what();
+                } catch (const ChainTransactionRpcMethodUnavailable& error) {
+                  outcome = TransactionLoadOutcome::kFailed;
+                  error_class = "method_unavailable";
+                  error_message = error.what();
+                } catch (const ChainTransactionTransportFailure& error) {
+                  outcome = TransactionLoadOutcome::kFailed;
+                  error_class = "transport";
+                  error_message = error.what();
+                } catch (const ChainTransactionInternalRpcFailure& error) {
+                  outcome = TransactionLoadOutcome::kFailed;
+                  error_class = "internal_rpc";
                   error_message = error.what();
                 } catch (const SimulationCancelled& error) {
                   outcome = TransactionLoadOutcome::kFailed;
+                  error_class = "cancellation";
                   error_message = error.what();
                   worker_cancelled.store(true);
                 } catch (const std::exception& error) {
                   outcome = TransactionLoadOutcome::kFailed;
+                  error_class = "internal";
                   error_message = error.what();
                   release_if_balance_unavailable = !submission_started;
                 } catch (...) {
                   outcome = TransactionLoadOutcome::kFailed;
+                  error_class = "unknown";
                   error_message = "unknown transaction submission error";
                   release_if_balance_unavailable = !submission_started;
                 }
@@ -11876,13 +11903,13 @@ void ApplyWalletTransactionsWorkload(
                           task.scheduled_simulation_elapsed,
                           task.scheduled_wall_elapsed, transaction));
                 }
-                WriteEvent(
-                    events_path, options.run_id, sender_node.config.id,
-                    SimulationEventKind::kTransactionLoadAttempt,
-                    TransactionLoadAttemptDetail(
-                        workload_index, workload_count, workload, attempt_limit,
-                        task, sender, receiver, outcome, latency,
-                        submitted ? &transaction : nullptr, error_message));
+                WriteEvent(events_path, options.run_id, sender_node.config.id,
+                           SimulationEventKind::kTransactionLoadAttempt,
+                           TransactionLoadAttemptDetail(
+                               workload_index, workload_count, workload,
+                               attempt_limit, task, sender, receiver, outcome,
+                               latency, submitted ? &transaction : nullptr,
+                               error_class, error_message));
               } catch (...) {
                 record_infrastructure_error(std::current_exception());
               }
@@ -12008,14 +12035,15 @@ void ApplyWalletTransactionsWorkload(
             const std::chrono::microseconds latency = terminal_latency(task);
             accounting->RecordOutcome(TransactionLoadOutcome::kBackpressured,
                                       latency);
-            WriteEvent(events_path, options.run_id,
-                       nodes.at(sender.node - 1U).config.id,
-                       SimulationEventKind::kTransactionLoadAttempt,
-                       TransactionLoadAttemptDetail(
-                           workload_index, workload_count, workload,
-                           attempt_limit, task, sender, receiver,
-                           TransactionLoadOutcome::kBackpressured, latency,
-                           nullptr, "bounded transaction load queue is full"));
+            WriteEvent(
+                events_path, options.run_id,
+                nodes.at(sender.node - 1U).config.id,
+                SimulationEventKind::kTransactionLoadAttempt,
+                TransactionLoadAttemptDetail(
+                    workload_index, workload_count, workload, attempt_limit,
+                    task, sender, receiver,
+                    TransactionLoadOutcome::kBackpressured, latency, nullptr,
+                    "backpressure", "bounded transaction load queue is full"));
           }
         }
         transaction_index += static_cast<std::uint64_t>(admission.plans.size());

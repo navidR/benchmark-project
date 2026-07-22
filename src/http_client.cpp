@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/core/detail/base64.hpp>
 #include <boost/beast/http.hpp>
@@ -421,11 +422,13 @@ std::string DigestAuthorization(const RpcCredentials& credentials,
 
 class JsonConnection {
  public:
-  JsonConnection(const RpcEndpoint& endpoint, std::chrono::milliseconds timeout)
+  JsonConnection(const RpcEndpoint& endpoint,
+                 std::chrono::steady_clock::time_point deadline)
       : endpoint_(endpoint),
-        timeout_(timeout),
+        deadline_(deadline),
         resolver_(ioc_),
-        stream_(ioc_) {}
+        stream_(ioc_),
+        deadline_timer_(ioc_) {}
 
   JsonConnection(const JsonConnection&) = delete;
   JsonConnection& operator=(const JsonConnection&) = delete;
@@ -440,6 +443,7 @@ class JsonConnection {
     beast::error_code operation_error;
     bool completed = false;
     ioc_.restart();
+    StartDeadline("HTTP JSON connect");
     resolver_.async_resolve(
         endpoint_.host, std::to_string(endpoint_.port),
         [&](beast::error_code resolve_error,
@@ -447,14 +451,16 @@ class JsonConnection {
           if (resolve_error) {
             operation_error = resolve_error;
             completed = true;
+            CancelDeadline();
             return;
           }
           endpoints_ = std::move(resolved_endpoints);
-          stream_.expires_after(timeout_);
+          stream_.expires_at(deadline_);
           stream_.async_connect(endpoints_, [&](beast::error_code connect_error,
                                                 const tcp::endpoint&) {
             operation_error = connect_error;
             completed = true;
+            CancelDeadline();
           });
         });
     Run(stop_token, completed, operation_error, "HTTP JSON connect");
@@ -480,19 +486,22 @@ class JsonConnection {
     beast::error_code operation_error;
     bool completed = false;
     ioc_.restart();
-    stream_.expires_after(timeout_);
+    StartDeadline("HTTP JSON POST");
+    stream_.expires_at(deadline_);
     http::async_write(
         stream_, request, [&](beast::error_code write_error, std::size_t) {
           if (write_error) {
             operation_error = write_error;
             completed = true;
+            CancelDeadline();
             return;
           }
-          stream_.expires_after(timeout_);
+          stream_.expires_at(deadline_);
           http::async_read(stream_, buffer_, response,
                            [&](beast::error_code read_error, std::size_t) {
                              operation_error = read_error;
                              completed = true;
+                             CancelDeadline();
                            });
         });
     Run(stop_token, completed, operation_error, "HTTP JSON POST");
@@ -516,12 +525,36 @@ class JsonConnection {
     }
   }
 
+  void StartDeadline(std::string_view operation) {
+    if (std::chrono::steady_clock::now() >= deadline_) {
+      throw boost::system::system_error(
+          beast::error::timeout, std::string(operation) + " deadline expired");
+    }
+    deadline_expired_ = false;
+    deadline_timer_.expires_at(deadline_);
+    deadline_timer_.async_wait([this](const beast::error_code& error) {
+      if (error) {
+        return;
+      }
+      deadline_expired_ = true;
+      resolver_.cancel();
+      beast::error_code cancel_error;
+      stream_.socket().cancel(cancel_error);
+    });
+  }
+
+  void CancelDeadline() { static_cast<void>(deadline_timer_.cancel()); }
+
   void Run(std::stop_token stop_token, bool& completed,
            const beast::error_code& operation_error,
            std::string_view operation) {
     std::stop_callback cancellation(stop_token, [this] { ioc_.stop(); });
     ioc_.run();
     ThrowIfStopped(stop_token);
+    if (deadline_expired_) {
+      throw boost::system::system_error(
+          beast::error::timeout, std::string(operation) + " deadline expired");
+    }
     if (!completed) {
       throw std::runtime_error(std::string(operation) +
                                " stopped before completion");
@@ -533,22 +566,35 @@ class JsonConnection {
   }
 
   RpcEndpoint endpoint_;
-  std::chrono::milliseconds timeout_;
+  std::chrono::steady_clock::time_point deadline_;
   asio::io_context ioc_;
   tcp::resolver resolver_;
   beast::tcp_stream stream_;
+  asio::steady_timer deadline_timer_;
   tcp::resolver::results_type endpoints_;
   beast::flat_buffer buffer_;
+  bool deadline_expired_ = false;
 };
 
 HttpExchange SendJson(const RpcEndpoint& endpoint, std::string_view path,
                       std::string_view body,
                       const std::optional<std::string>& authorization,
-                      std::chrono::milliseconds timeout,
+                      std::chrono::steady_clock::time_point deadline,
                       std::stop_token stop_token) {
-  JsonConnection connection(endpoint, timeout);
+  JsonConnection connection(endpoint, deadline);
   connection.Connect(stop_token);
   return connection.Send(path, body, authorization, stop_token);
+}
+
+std::chrono::steady_clock::time_point DeadlineAfter(
+    std::chrono::milliseconds timeout) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto converted =
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
+  if (converted >= std::chrono::steady_clock::time_point::max() - now) {
+    return std::chrono::steady_clock::time_point::max();
+  }
+  return now + converted;
 }
 
 }  // namespace
@@ -556,16 +602,33 @@ HttpExchange SendJson(const RpcEndpoint& endpoint, std::string_view path,
 HttpResponse HttpClient::PostJson(const RpcEndpoint& endpoint,
                                   std::string_view path, std::string_view body,
                                   std::stop_token stop_token) const {
+  return PostJsonWithDeadline(endpoint, path, body, DeadlineAfter(timeout_),
+                              stop_token);
+}
+
+HttpResponse HttpClient::PostJsonUntil(
+    const RpcEndpoint& endpoint, std::string_view path, std::string_view body,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) const {
+  return PostJsonWithDeadline(endpoint, path, body,
+                              std::min(deadline, DeadlineAfter(timeout_)),
+                              stop_token);
+}
+
+HttpResponse HttpClient::PostJsonWithDeadline(
+    const RpcEndpoint& endpoint, std::string_view path, std::string_view body,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) const {
   const RpcCredentials credentials = ResolveCredentials(endpoint);
   if (endpoint.authentication != RpcAuthenticationMode::kDigest) {
     const std::string authorization =
         "Basic " + Base64Encode(credentials.user + ":" + credentials.password);
-    return SendJson(endpoint, path, body, authorization, timeout_, stop_token)
+    return SendJson(endpoint, path, body, authorization, deadline, stop_token)
         .response;
   }
 
   std::lock_guard lock(digest_mutex_);
-  JsonConnection connection(endpoint, timeout_);
+  JsonConnection connection(endpoint, deadline);
   connection.Connect(stop_token);
   HttpExchange challenge_response =
       connection.Send(path, body, std::nullopt, stop_token);

@@ -97,6 +97,21 @@ ChainWalletTransactionResult ChainDriver::SubmitWalletTransaction(
                                stop_token);
 }
 
+ChainTransactionObservation ChainDriver::ObserveTransactionUntil(
+    const ChainNodeConfig& config, const std::string& txid,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) const {
+  if (std::chrono::steady_clock::now() >= deadline) {
+    throw ChainTransactionTimedOut("transaction observation timed out");
+  }
+  ChainTransactionObservation observation =
+      ObserveTransaction(config, txid, stop_token);
+  if (std::chrono::steady_clock::now() >= deadline) {
+    throw ChainTransactionTimedOut("transaction observation timed out");
+  }
+  return observation;
+}
+
 std::string ChainDriver::CreateWalletFundingAddress(
     const ChainNodeConfig&, ChainWalletMode, const std::string& wallet_address,
     std::stop_token) const {

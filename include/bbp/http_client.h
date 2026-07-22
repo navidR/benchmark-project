@@ -37,8 +37,17 @@ class HttpClient {
   HttpResponse PostJson(const RpcEndpoint& endpoint, std::string_view path,
                         std::string_view body,
                         std::stop_token stop_token = {}) const;
+  HttpResponse PostJsonUntil(const RpcEndpoint& endpoint, std::string_view path,
+                             std::string_view body,
+                             std::chrono::steady_clock::time_point deadline,
+                             std::stop_token stop_token = {}) const;
 
  private:
+  HttpResponse PostJsonWithDeadline(
+      const RpcEndpoint& endpoint, std::string_view path, std::string_view body,
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token) const;
+
   std::chrono::milliseconds timeout_;
   mutable std::mutex digest_mutex_;
 };

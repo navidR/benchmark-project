@@ -131,3 +131,100 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(settlement < plan);
   BOOST_TEST(plan < wait);
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulator_transaction_load_preserves_deadline_and_failure_classes) {
+  const std::filesystem::path simulator =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::string source = bbp::ReadText(simulator);
+  const std::size_t submit =
+      source.find("transaction = driver.SubmitWalletTransaction(");
+  BOOST_REQUIRE(submit != std::string::npos);
+  const std::size_t configured_deadline = source.find(
+      "std::chrono::seconds(workload.timeout_sec), stop_token", submit);
+  BOOST_REQUIRE(configured_deadline != std::string::npos);
+  const std::size_t rejected =
+      source.find("catch (const ChainTransactionRejected& error)", submit);
+  const std::size_t timeout =
+      source.find("catch (const ChainTransactionTimedOut& error)", rejected);
+  const std::size_t warmup =
+      source.find("catch (const ChainTransactionRpcWarmup& error)", timeout);
+  const std::size_t unavailable = source.find(
+      "catch (const ChainTransactionRpcMethodUnavailable& error)", warmup);
+  const std::size_t transport = source.find(
+      "catch (const ChainTransactionTransportFailure& error)", unavailable);
+  const std::size_t internal = source.find(
+      "catch (const ChainTransactionInternalRpcFailure& error)", transport);
+  const std::size_t cancellation =
+      source.find("catch (const SimulationCancelled& error)", internal);
+  BOOST_REQUIRE(rejected != std::string::npos);
+  BOOST_REQUIRE(timeout != std::string::npos);
+  BOOST_REQUIRE(warmup != std::string::npos);
+  BOOST_REQUIRE(unavailable != std::string::npos);
+  BOOST_REQUIRE(transport != std::string::npos);
+  BOOST_REQUIRE(internal != std::string::npos);
+  BOOST_REQUIRE(cancellation != std::string::npos);
+  const auto require_mapping = [&](std::size_t begin, std::size_t end,
+                                   std::string_view outcome,
+                                   std::string_view error_class_name) {
+    const std::size_t mapped_outcome = source.find(outcome, begin);
+    const std::size_t mapped_class = source.find(error_class_name, begin);
+    BOOST_REQUIRE(mapped_outcome != std::string::npos);
+    BOOST_REQUIRE(mapped_class != std::string::npos);
+    BOOST_TEST(mapped_outcome < end);
+    BOOST_TEST(mapped_class < end);
+  };
+  require_mapping(rejected, timeout,
+                  "outcome = TransactionLoadOutcome::kRejected;",
+                  "error_class = \"policy_rejection\";");
+  require_mapping(timeout, warmup,
+                  "outcome = TransactionLoadOutcome::kTimedOut;",
+                  "error_class = \"timeout\";");
+  require_mapping(warmup, unavailable,
+                  "outcome = TransactionLoadOutcome::kFailed;",
+                  "error_class = \"warmup\";");
+  require_mapping(unavailable, transport,
+                  "outcome = TransactionLoadOutcome::kFailed;",
+                  "error_class = \"method_unavailable\";");
+  require_mapping(transport, internal,
+                  "outcome = TransactionLoadOutcome::kFailed;",
+                  "error_class = \"transport\";");
+  require_mapping(internal, cancellation,
+                  "outcome = TransactionLoadOutcome::kFailed;",
+                  "error_class = \"internal_rpc\";");
+  const std::size_t ordinary_failure =
+      source.find("catch (const std::exception& error)", cancellation);
+  BOOST_REQUIRE(ordinary_failure != std::string::npos);
+  require_mapping(cancellation, ordinary_failure,
+                  "outcome = TransactionLoadOutcome::kFailed;",
+                  "error_class = \"cancellation\";");
+  const std::size_t error_class =
+      source.find("detail[\"error_class\"] = error_class");
+  BOOST_REQUIRE(error_class != std::string::npos);
+
+  const std::size_t observe_sets = source.find("ObserveSetsUntilVisible(");
+  BOOST_REQUIRE(observe_sets != std::string::npos);
+  const std::size_t shared_deadline = source.find(
+      "const auto deadline = std::chrono::steady_clock::now() + "
+      "timeout",
+      observe_sets);
+  BOOST_REQUIRE(shared_deadline != std::string::npos);
+  const std::size_t bounded_observation =
+      source.find("driver.ObserveTransactionUntil(", shared_deadline);
+  BOOST_REQUIRE(bounded_observation != std::string::npos);
+  const std::size_t deadline_argument =
+      source.find("node.config, transaction.txid, deadline, stop_token",
+                  bounded_observation);
+  BOOST_REQUIRE(deadline_argument != std::string::npos);
+
+  BOOST_TEST(submit < configured_deadline);
+  BOOST_TEST(configured_deadline < rejected);
+  BOOST_TEST(rejected < timeout);
+  BOOST_TEST(timeout < warmup);
+  BOOST_TEST(warmup < unavailable);
+  BOOST_TEST(unavailable < transport);
+  BOOST_TEST(transport < internal);
+  BOOST_TEST(internal < cancellation);
+  BOOST_TEST(shared_deadline < bounded_observation);
+  BOOST_TEST(bounded_observation < deadline_argument);
+}

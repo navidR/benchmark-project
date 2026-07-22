@@ -129,6 +129,26 @@ class ChainTransactionTimedOut : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+class ChainTransactionRpcWarmup : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class ChainTransactionRpcMethodUnavailable : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class ChainTransactionTransportFailure : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class ChainTransactionInternalRpcFailure : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 struct ChainWalletTransactionResult {
   std::vector<std::string> txids;
   std::string destination_amount;
@@ -250,6 +270,10 @@ class ChainDriver {
   virtual ChainTransactionObservation ObserveTransaction(
       const ChainNodeConfig& config, const std::string& txid,
       std::stop_token stop_token = {}) const = 0;
+  virtual ChainTransactionObservation ObserveTransactionUntil(
+      const ChainNodeConfig& config, const std::string& txid,
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {}) const;
   virtual ChainTransactionObservation WaitForTransaction(
       const ChainNodeConfig& config, const std::string& txid,
       std::chrono::seconds timeout, std::stop_token stop_token = {}) const = 0;

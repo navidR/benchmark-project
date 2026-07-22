@@ -45,6 +45,57 @@ class FiroRpcError final : public std::runtime_error {
   std::int64_t code_;
 };
 
+std::chrono::steady_clock::time_point DeadlineAfter(
+    std::chrono::seconds timeout) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto converted =
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
+  if (converted >= std::chrono::steady_clock::time_point::max() - now) {
+    return std::chrono::steady_clock::time_point::max();
+  }
+  return now + converted;
+}
+
+void ThrowIfDeadlineExpired(std::chrono::steady_clock::time_point deadline,
+                            std::string_view operation) {
+  if (std::chrono::steady_clock::now() >= deadline) {
+    throw ChainTransactionTimedOut(std::string(operation) + " timed out");
+  }
+}
+
+[[noreturn]] void ThrowClassifiedRpcError(const FiroRpcError& error,
+                                          std::string_view driver_name,
+                                          std::string_view operation) {
+  const std::string message = std::string(driver_name) + " " +
+                              std::string(operation) + ": " + error.what();
+  switch (error.code()) {
+    case -28:
+      throw ChainTransactionRpcWarmup(message);
+    case -32601:
+      throw ChainTransactionRpcMethodUnavailable(message);
+    case -6:
+    case -25:
+    case -26:
+    case -27:
+      throw ChainTransactionRejected(message);
+    case -32603:
+    default:
+      throw ChainTransactionInternalRpcFailure(message);
+  }
+}
+
+[[noreturn]] void ThrowTransportFailure(
+    const boost::system::system_error& error, std::string_view driver_name,
+    std::string_view operation) {
+  if (error.code() == boost::beast::error::timeout) {
+    throw ChainTransactionTimedOut(std::string(driver_name) + " " +
+                                   std::string(operation) + " timed out");
+  }
+  throw ChainTransactionTransportFailure(
+      std::string(driver_name) + " " + std::string(operation) +
+      " transport failed: " + error.code().message());
+}
+
 std::string PeerHost(const std::string& endpoint,
                      std::string_view driver_name) {
   const std::string uri = "tcp://" + endpoint;
@@ -1363,13 +1414,15 @@ FiroWalletTransactionResult FiroDriver::SubmitWalletTransaction(
     const std::string& destination_address, uint64_t amount_satoshis,
     uint64_t fee_satoshis, std::chrono::seconds timeout,
     std::stop_token stop_token) const {
-  static_cast<void>(timeout);
   ThrowIfStopRequested(stop_token);
+  const auto deadline = DeadlineAfter(timeout);
+  ThrowIfDeadlineExpired(deadline,
+                         driver_name_ + " wallet transaction submission");
   try {
     boost::json::array fee_params;
     fee_params.emplace_back(FormatFixed8Amount(fee_satoshis));
     const boost::json::value fee_result =
-        RpcCall(config, "settxfee", fee_params, stop_token);
+        RpcCallUntil(config, "settxfee", fee_params, deadline, stop_token);
     if (!fee_result.is_bool() || !fee_result.as_bool()) {
       throw ChainTransactionRejected("Firo settxfee did not return true");
     }
@@ -1382,9 +1435,9 @@ FiroWalletTransactionResult FiroDriver::SubmitWalletTransaction(
       send_params.emplace_back("");
       send_params.emplace_back("");
       send_params.emplace_back(false);
-      txids = ParseTxIdResult(
-          RpcCall(config, "sendtoaddress", send_params, stop_token),
-          "sendtoaddress");
+      txids = ParseTxIdResult(RpcCallUntil(config, "sendtoaddress", send_params,
+                                           deadline, stop_token),
+                              "sendtoaddress");
     } else if (wallet_mode == WalletMode::kPrivate) {
       boost::json::object recipient;
       recipient["amount"] = FormatFixed8Amount(amount_satoshis);
@@ -1395,7 +1448,8 @@ FiroWalletTransactionResult FiroDriver::SubmitWalletTransaction(
       boost::json::array send_params;
       send_params.emplace_back(std::move(recipients));
       txids = ParseTxIdResult(
-          RpcCall(config, "spendspark", send_params, stop_token), "spendspark");
+          RpcCallUntil(config, "spendspark", send_params, deadline, stop_token),
+          "spendspark");
     } else {
       throw std::runtime_error("unknown Firo wallet mode");
     }
@@ -1404,20 +1458,30 @@ FiroWalletTransactionResult FiroDriver::SubmitWalletTransaction(
     result.txids = std::move(txids);
     result.destination_amount = FormatFixed8Amount(amount_satoshis);
     result.requested_fee_rate = FormatFixed8Amount(fee_satoshis);
+    ThrowIfDeadlineExpired(deadline,
+                           driver_name_ + " wallet transaction submission");
     return result;
   } catch (const SimulationCancelled&) {
     throw;
   } catch (const ChainTransactionRejected&) {
     throw;
-  } catch (const FiroRpcError& error) {
-    throw ChainTransactionRejected(
-        driver_name_ + " wallet transaction rejected: " + error.what());
-  } catch (const boost::system::system_error& error) {
-    if (error.code() == boost::beast::error::timeout) {
-      throw ChainTransactionTimedOut(
-          driver_name_ + " wallet transaction submission timed out");
-    }
+  } catch (const ChainTransactionTimedOut&) {
     throw;
+  } catch (const ChainTransactionRpcWarmup&) {
+    throw;
+  } catch (const ChainTransactionRpcMethodUnavailable&) {
+    throw;
+  } catch (const ChainTransactionTransportFailure&) {
+    throw;
+  } catch (const ChainTransactionInternalRpcFailure&) {
+    throw;
+  } catch (const FiroRpcError& error) {
+    ThrowClassifiedRpcError(error, driver_name_,
+                            "wallet transaction submission failed");
+  } catch (const std::runtime_error& error) {
+    throw ChainTransactionInternalRpcFailure(
+        driver_name_ +
+        " wallet transaction submission failed internally: " + error.what());
   }
 }
 
@@ -1430,14 +1494,62 @@ uint64_t FiroDriver::WaitForMempoolTransaction(
 ChainTransactionObservation FiroDriver::ObserveTransaction(
     const FiroNodeConfig& config, const std::string& txid,
     std::stop_token stop_token) const {
+  return ObserveTransactionImpl(config, txid, std::nullopt, stop_token);
+}
+
+ChainTransactionObservation FiroDriver::ObserveTransactionUntil(
+    const FiroNodeConfig& config, const std::string& txid,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  ThrowIfDeadlineExpired(deadline, driver_name_ + " transaction observation");
+  try {
+    ChainTransactionObservation observation =
+        ObserveTransactionImpl(config, txid, deadline, stop_token);
+    ThrowIfDeadlineExpired(deadline, driver_name_ + " transaction observation");
+    return observation;
+  } catch (const SimulationCancelled&) {
+    throw;
+  } catch (const ChainTransactionTimedOut&) {
+    throw;
+  } catch (const ChainTransactionRpcWarmup&) {
+    throw;
+  } catch (const ChainTransactionRpcMethodUnavailable&) {
+    throw;
+  } catch (const ChainTransactionTransportFailure&) {
+    throw;
+  } catch (const ChainTransactionInternalRpcFailure&) {
+    throw;
+  } catch (const FiroRpcError& error) {
+    ThrowClassifiedRpcError(error, driver_name_,
+                            "transaction observation failed");
+  } catch (const std::runtime_error& error) {
+    throw ChainTransactionInternalRpcFailure(
+        driver_name_ +
+        " transaction observation failed internally: " + error.what());
+  }
+}
+
+ChainTransactionObservation FiroDriver::ObserveTransactionImpl(
+    const FiroNodeConfig& config, const std::string& txid,
+    const std::optional<std::chrono::steady_clock::time_point>& deadline,
+    std::stop_token stop_token) const {
   ThrowIfStopRequested(stop_token);
   if (txid.empty()) {
     throw std::runtime_error("cannot observe an empty " + driver_name_ +
                              " transaction id");
   }
 
+  const auto rpc_call = [&](std::string_view method,
+                            const boost::json::array& params) {
+    if (deadline) {
+      return RpcCallUntil(config, method, params, *deadline, stop_token);
+    }
+    return RpcCall(config, method, params, stop_token);
+  };
+
   const boost::json::value height_value =
-      RpcCall(config, "getblockcount", boost::json::array{}, stop_token);
+      rpc_call("getblockcount", boost::json::array{});
   std::uint64_t observed_height = 0;
   if (height_value.is_uint64()) {
     observed_height = height_value.as_uint64();
@@ -1449,7 +1561,7 @@ ChainTransactionObservation FiroDriver::ObserveTransaction(
   }
 
   const boost::json::value mempool =
-      RpcCall(config, "getrawmempool", boost::json::array{}, stop_token);
+      rpc_call("getrawmempool", boost::json::array{});
   if (!mempool.is_array()) {
     throw std::runtime_error(driver_name_ +
                              " getrawmempool returned a non-array");
@@ -1465,7 +1577,7 @@ ChainTransactionObservation FiroDriver::ObserveTransaction(
   params.emplace_back(true);
   boost::json::value transaction;
   try {
-    transaction = RpcCall(config, "getrawtransaction", params, stop_token);
+    transaction = rpc_call("getrawtransaction", params);
   } catch (const FiroRpcError& error) {
     if (error.code() == -5) {
       return observation;
@@ -1529,7 +1641,8 @@ ChainTransactionObservation FiroDriver::WaitForTransaction(
   ChainTransactionObservation last_observation;
   while (std::chrono::steady_clock::now() < deadline) {
     ThrowIfStopRequested(stop_token);
-    last_observation = ObserveTransaction(config, txid, stop_token);
+    last_observation =
+        ObserveTransactionUntil(config, txid, deadline, stop_token);
     if (last_observation.state != ChainTransactionState::kUnknown) {
       return last_observation;
     }
@@ -1684,6 +1797,59 @@ boost::json::value FiroDriver::RpcCall(const FiroNodeConfig& config,
                              std::string(method) + ": " + response.body);
   }
   return ParseRpcResponse(response.body, method, driver_name_);
+}
+
+boost::json::value FiroDriver::RpcCallUntil(
+    const FiroNodeConfig& config, std::string_view method,
+    const boost::json::array& params,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  ThrowIfDeadlineExpired(deadline,
+                         driver_name_ + " RPC " + std::string(method));
+  boost::json::object request;
+  request["jsonrpc"] = "1.0";
+  request["id"] = "bbp";
+  request["method"] = method;
+  request["params"] = params;
+  const std::string body = boost::json::serialize(request);
+  HttpResponse response;
+  try {
+    response =
+        http_.PostJsonUntil(Endpoint(config), "/", body, deadline, stop_token);
+  } catch (const SimulationCancelled&) {
+    throw;
+  } catch (const boost::system::system_error& error) {
+    ThrowTransportFailure(error, driver_name_, "RPC " + std::string(method));
+  }
+  ThrowIfDeadlineExpired(deadline,
+                         driver_name_ + " RPC " + std::string(method));
+  if (response.status != 200) {
+    try {
+      static_cast<void>(ParseRpcResponse(response.body, method, driver_name_));
+    } catch (const FiroRpcError&) {
+      throw;
+    } catch (const std::exception&) {
+    }
+    throw ChainTransactionTransportFailure(driver_name_ + " RPC HTTP status " +
+                                           std::to_string(response.status) +
+                                           " for " + std::string(method));
+  }
+  try {
+    boost::json::value result =
+        ParseRpcResponse(response.body, method, driver_name_);
+    ThrowIfDeadlineExpired(deadline,
+                           driver_name_ + " RPC " + std::string(method));
+    return result;
+  } catch (const FiroRpcError&) {
+    throw;
+  } catch (const ChainTransactionTimedOut&) {
+    throw;
+  } catch (const std::exception& error) {
+    throw ChainTransactionInternalRpcFailure(
+        driver_name_ + " RPC " + std::string(method) +
+        " returned an invalid response: " + error.what());
+  }
 }
 
 }  // namespace bbp

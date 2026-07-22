@@ -64,6 +64,42 @@ std::vector<std::string> ServeRpcResponses(
   return methods;
 }
 
+std::vector<std::string> ServeDelayedRpcResponses(
+    boost::asio::ip::tcp::acceptor& acceptor,
+    const std::vector<std::string>& responses,
+    const std::vector<std::chrono::milliseconds>& response_delays,
+    const std::vector<unsigned>* response_statuses = nullptr) {
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  if (responses.size() != response_delays.size()) {
+    throw std::runtime_error("delayed RPC response fixture size mismatch");
+  }
+  std::vector<std::string> methods;
+  for (std::size_t response_index = 0U; response_index < responses.size();
+       ++response_index) {
+    boost::asio::ip::tcp::socket socket(acceptor.get_executor());
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    const boost::json::value request_json = boost::json::parse(request.body());
+    methods.emplace_back(request_json.as_object().at("method").as_string());
+    std::this_thread::sleep_for(response_delays.at(response_index));
+
+    const http::status status =
+        response_statuses == nullptr
+            ? http::status::ok
+            : static_cast<http::status>(response_statuses->at(response_index));
+    http::response<http::string_body> response{status, 11};
+    response.set(http::field::content_type, "application/json");
+    response.body() = responses.at(response_index);
+    response.prepare_payload();
+    beast::error_code write_error;
+    http::write(socket, response, write_error);
+  }
+  return methods;
+}
+
 std::uint64_t JsonNonNegativeInteger(const boost::json::value& value) {
   if (value.is_uint64()) {
     return value.as_uint64();
@@ -1367,6 +1403,259 @@ BOOST_AUTO_TEST_CASE(firo_load_submission_classifies_rpc_rejection) {
   BOOST_REQUIRE_EQUAL(methods.size(), 2U);
   BOOST_TEST(methods[0] == "settxfee");
   BOOST_TEST(methods[1] == "sendtoaddress");
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_load_submission_shares_one_wall_clock_deadline_across_rpcs) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":"late-success","error":null,"id":"bbp"})"};
+  const std::vector<std::chrono::milliseconds> delays = {
+      std::chrono::milliseconds(650), std::chrono::milliseconds(650)};
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeDelayedRpcResponses(acceptor, responses, delays); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "load-deadline-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(5));
+
+  const auto started = std::chrono::steady_clock::now();
+  bool timed_out = false;
+  bool accepted_late_success = false;
+  try {
+    static_cast<void>(driver.SubmitWalletTransaction(
+        config, bbp::WalletMode::kPublic, "load-destination", 25000000ULL,
+        1000ULL, std::chrono::seconds(1)));
+    accepted_late_success = true;
+  } catch (const bbp::ChainTransactionTimedOut&) {
+    timed_out = true;
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_TEST(timed_out);
+  BOOST_TEST(!accepted_late_success);
+  BOOST_TEST(elapsed.count() >= 850);
+  BOOST_TEST(elapsed.count() < 1250);
+  const std::vector<std::string> expected_methods = {"settxfee",
+                                                     "sendtoaddress"};
+  BOOST_TEST(methods == expected_methods, boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(firo_load_submission_preserves_exact_rpc_error_classes) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  const auto classify = [](std::int64_t code) {
+    asio::io_context server_context;
+    tcp::acceptor acceptor(
+        server_context,
+        tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+    const std::vector<std::string> responses = {
+        R"({"result":true,"error":null,"id":"bbp"})",
+        std::string(R"({"result":null,"error":{"code":)") +
+            std::to_string(code) +
+            R"(,"message":"classified failure"},"id":"bbp"})"};
+    const std::vector<unsigned> statuses = {200U, 500U};
+    std::future<std::vector<std::string>> served =
+        std::async(std::launch::async, [&] {
+          return ServeRpcResponses(acceptor, responses, nullptr, &statuses);
+        });
+
+    bbp::FiroNodeConfig config;
+    config.id = "load-error-class-test";
+    config.rpc_host = "127.0.0.1";
+    config.rpc_port = acceptor.local_endpoint().port();
+    config.rpc_user = "user";
+    config.rpc_password = "password";
+    const bbp::FiroDriver driver(std::chrono::seconds(2));
+    std::string classification = "success";
+    try {
+      static_cast<void>(driver.SubmitWalletTransaction(
+          config, bbp::WalletMode::kPublic, "load-destination", 25000000ULL,
+          1000ULL, std::chrono::seconds(1)));
+    } catch (const bbp::ChainTransactionRejected&) {
+      classification = "policy_rejection";
+    } catch (const bbp::ChainTransactionRpcWarmup&) {
+      classification = "warmup";
+    } catch (const bbp::ChainTransactionRpcMethodUnavailable&) {
+      classification = "method_unavailable";
+    } catch (const bbp::ChainTransactionInternalRpcFailure&) {
+      classification = "internal_rpc";
+    }
+    const std::vector<std::string> methods = served.get();
+    const std::vector<std::string> expected_methods = {"settxfee",
+                                                       "sendtoaddress"};
+    BOOST_TEST(methods == expected_methods, boost::test_tools::per_element());
+    return classification;
+  };
+
+  BOOST_TEST(classify(-6) == "policy_rejection");
+  BOOST_TEST(classify(-28) == "warmup");
+  BOOST_TEST(classify(-32601) == "method_unavailable");
+  BOOST_TEST(classify(-32603) == "internal_rpc");
+  BOOST_TEST(classify(-1) == "internal_rpc");
+}
+
+BOOST_AUTO_TEST_CASE(firo_load_submission_classifies_transport_failure) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::uint16_t refused_port = acceptor.local_endpoint().port();
+  boost::system::error_code close_error;
+  acceptor.close(close_error);
+  BOOST_REQUIRE(!close_error);
+
+  bbp::FiroNodeConfig config;
+  config.id = "load-transport-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = refused_port;
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(2));
+  BOOST_CHECK_THROW(driver.SubmitWalletTransaction(
+                        config, bbp::WalletMode::kPublic, "load-destination",
+                        25000000ULL, 1000ULL, std::chrono::seconds(1)),
+                    bbp::ChainTransactionTransportFailure);
+}
+
+BOOST_AUTO_TEST_CASE(firo_load_submission_preserves_cancellation_class) {
+  namespace asio = boost::asio;
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::promise<void> request_received;
+  std::future<void> request_received_future = request_received.get_future();
+  std::mutex server_mutex;
+  std::condition_variable_any server_wakeup;
+  std::jthread server([&](std::stop_token stop_token) {
+    tcp::socket socket(server_context);
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    request_received.set_value();
+    std::unique_lock<std::mutex> lock(server_mutex);
+    server_wakeup.wait(lock, stop_token, [] { return false; });
+  });
+
+  bbp::FiroNodeConfig config;
+  config.id = "load-cancellation-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(30));
+  std::stop_source stop_source;
+  std::atomic<bool> cancelled = false;
+  std::exception_ptr failure;
+  std::thread submitter([&] {
+    try {
+      static_cast<void>(driver.SubmitWalletTransaction(
+          config, bbp::WalletMode::kPublic, "load-destination", 25000000ULL,
+          1000ULL, std::chrono::seconds(20), stop_source.get_token()));
+    } catch (const bbp::SimulationCancelled&) {
+      cancelled = true;
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  });
+
+  BOOST_REQUIRE(request_received_future.wait_for(std::chrono::seconds(1)) ==
+                std::future_status::ready);
+  const auto stop_started = std::chrono::steady_clock::now();
+  stop_source.request_stop();
+  submitter.join();
+  const auto stop_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - stop_started);
+  server.request_stop();
+  server_wakeup.notify_all();
+  server.join();
+
+  BOOST_TEST(cancelled.load());
+  BOOST_TEST(!static_cast<bool>(failure));
+  BOOST_TEST(stop_elapsed.count() < 500);
+}
+
+BOOST_AUTO_TEST_CASE(firo_many_node_observation_shares_one_deadline) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::vector<std::string> responses;
+  std::vector<std::chrono::milliseconds> delays;
+  for (std::size_t node = 0U; node < 3U; ++node) {
+    static_cast<void>(node);
+    responses.push_back(R"({"result":1,"error":null,"id":"bbp"})");
+    responses.push_back(R"({"result":[],"error":null,"id":"bbp"})");
+    responses.push_back(
+        R"({"result":null,"error":{"code":-5,"message":"not found"},"id":"bbp"})");
+    delays.push_back(std::chrono::milliseconds(400));
+    delays.push_back(std::chrono::milliseconds(0));
+    delays.push_back(std::chrono::milliseconds(0));
+  }
+  responses.push_back(R"({"result":1,"error":null,"id":"bbp"})");
+  delays.push_back(std::chrono::milliseconds(400));
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeDelayedRpcResponses(acceptor, responses, delays); });
+
+  bbp::FiroNodeConfig config;
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(5));
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = started + std::chrono::milliseconds(1500);
+  std::size_t completed = 0U;
+  std::size_t timed_out = 0U;
+  for (std::size_t node = 0U; node < 6U; ++node) {
+    config.id = "deadline-node-" + std::to_string(node + 1U);
+    try {
+      static_cast<void>(
+          driver.ObserveTransactionUntil(config, "load-txid", deadline));
+      ++completed;
+    } catch (const bbp::ChainTransactionTimedOut&) {
+      ++timed_out;
+    }
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  const std::vector<std::string> methods = served.get();
+
+  BOOST_TEST(completed == 3U);
+  BOOST_TEST(timed_out == 3U);
+  BOOST_TEST(elapsed.count() >= 1350);
+  BOOST_TEST(elapsed.count() < 1800);
+  BOOST_TEST(methods.size() == 10U);
+  BOOST_TEST(methods.back() == "getblockcount");
 }
 
 BOOST_AUTO_TEST_CASE(

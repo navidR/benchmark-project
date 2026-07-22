@@ -254,6 +254,48 @@ BOOST_AUTO_TEST_CASE(http_client_transport_errors_do_not_expose_credentials) {
   std::filesystem::remove_all(directory);
 }
 
+BOOST_AUTO_TEST_CASE(http_client_per_call_deadline_bounds_a_silent_server) {
+  namespace asio = boost::asio;
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context context;
+  tcp::acceptor acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::future<void> server = std::async(std::launch::async, [&] {
+    tcp::socket socket(acceptor.get_executor());
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  });
+
+  bbp::RpcEndpoint endpoint;
+  endpoint.host = "127.0.0.1";
+  endpoint.port = acceptor.local_endpoint().port();
+  endpoint.authentication = bbp::RpcAuthenticationMode::kBasic;
+  endpoint.user = "user";
+  endpoint.password = "password";
+  const bbp::HttpClient client(std::chrono::seconds(5));
+  const auto started = std::chrono::steady_clock::now();
+  bool timed_out = false;
+  try {
+    static_cast<void>(client.PostJsonUntil(
+        endpoint, "/", "{}", started + std::chrono::milliseconds(100)));
+  } catch (const boost::system::system_error& error) {
+    timed_out = error.code() == boost::beast::error::timeout;
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  server.get();
+
+  BOOST_TEST(timed_out);
+  BOOST_TEST(elapsed.count() >= 50);
+  BOOST_TEST(elapsed.count() < 250);
+}
+
 BOOST_AUTO_TEST_CASE(http_client_rejects_conflicting_authentication_sources) {
   const bbp::HttpClient client(std::chrono::milliseconds(20));
   bbp::RpcEndpoint endpoint;
