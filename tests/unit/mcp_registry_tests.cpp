@@ -2,12 +2,17 @@
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
 #include <cstddef>
+#include <limits>
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "bbp/chain_kind.h"
+#include "bbp/default_peer_topology.h"
+#include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/mcp_registry.h"
+#include "bbp/scenario_fields.h"
 #include "bbp/simulation_command.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulator/workload_kind.h"
@@ -43,6 +48,83 @@ std::set<std::string> NamedSet(const boost::json::array& array) {
     BOOST_REQUIRE(result.emplace(name->as_string()).second);
   }
   return result;
+}
+
+std::set<std::string> PropertySet(const boost::json::object& schema) {
+  const boost::json::value* properties = schema.if_contains("properties");
+  BOOST_REQUIRE(properties != nullptr);
+  BOOST_REQUIRE(properties->is_object());
+  std::set<std::string> result;
+  for (const auto& member : properties->as_object()) {
+    BOOST_REQUIRE(result.emplace(member.key()).second);
+  }
+  return result;
+}
+
+std::set<std::string> FieldSet(
+    std::span<const std::string_view> fields,
+    std::initializer_list<std::string_view> additional = {}) {
+  std::set<std::string> result;
+  for (const std::string_view field : fields) {
+    BOOST_REQUIRE(result.emplace(field).second);
+  }
+  for (const std::string_view field : additional) {
+    BOOST_REQUIRE(result.emplace(field).second);
+  }
+  return result;
+}
+
+void RequireClosedSchemaTree(const boost::json::value& value) {
+  if (value.is_array()) {
+    for (const boost::json::value& child : value.as_array()) {
+      RequireClosedSchemaTree(child);
+    }
+    return;
+  }
+  if (!value.is_object()) {
+    return;
+  }
+  const boost::json::object& object = value.as_object();
+  const boost::json::value* type = object.if_contains("type");
+  if (type != nullptr && type->is_string() && type->as_string() == "object") {
+    const boost::json::value* additional =
+        object.if_contains("additionalProperties");
+    BOOST_REQUIRE(additional != nullptr);
+    BOOST_REQUIRE(additional->is_bool());
+    BOOST_TEST(additional->as_bool() == false);
+  }
+  for (const std::string_view keyword :
+       {"properties", "patternProperties", "items", "oneOf", "anyOf", "allOf",
+        "not", "if", "then", "else"}) {
+    const boost::json::value* child = object.if_contains(keyword);
+    if (child != nullptr) {
+      RequireClosedSchemaTree(*child);
+    }
+  }
+}
+
+const boost::json::object& VariantWithConst(const boost::json::array& variants,
+                                            std::string_view discriminator,
+                                            std::string_view name) {
+  for (const boost::json::value& variant : variants) {
+    BOOST_REQUIRE(variant.is_object());
+    const boost::json::object& object = variant.as_object();
+    const boost::json::value* properties = object.if_contains("properties");
+    BOOST_REQUIRE(properties != nullptr);
+    BOOST_REQUIRE(properties->is_object());
+    const boost::json::value* field =
+        properties->as_object().if_contains(discriminator);
+    if (field != nullptr && field->is_object()) {
+      const boost::json::value* constant =
+          field->as_object().if_contains("const");
+      if (constant != nullptr && constant->is_string() &&
+          constant->as_string() == name) {
+        return object;
+      }
+    }
+  }
+  BOOST_FAIL("missing schema variant " << name);
+  return variants.front().as_object();
 }
 
 }  // namespace
@@ -165,6 +247,262 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_schema_has_unique_authoritative_members) {
   BOOST_TEST(schema.at("x-bbp-members").as_array().size() == members.size());
   BOOST_TEST(schema.at("x-bbp-workload-kinds").as_array().size() ==
              static_cast<std::size_t>(WorkloadKind::kCount));
+}
+
+BOOST_AUTO_TEST_CASE(mcp_scenario_object_schemas_match_every_descriptor) {
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(ScenarioObjectKind::kCount); ++index) {
+    const auto kind = static_cast<ScenarioObjectKind>(index);
+    const boost::json::object schema = BuildMcpScenarioObjectSchema(kind);
+    BOOST_TEST(schema.at("additionalProperties").as_bool() == false);
+    BOOST_TEST(PropertySet(schema) == FieldSet(ScenarioObjectFields(kind)));
+  }
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  std::set<std::string> expected =
+      FieldSet(ScenarioObjectFields(ScenarioObjectKind::kRoot));
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(ChainKind::kCount); ++index) {
+    expected.emplace(ChainDriverSpecFor(static_cast<ChainKind>(index))
+                         .daemon_scenario_field);
+  }
+  BOOST_TEST(PropertySet(scenario) == expected);
+  BOOST_REQUIRE(scenario.contains("allOf"));
+  BOOST_TEST(scenario.at("allOf").as_array().size() ==
+             static_cast<std::size_t>(ChainKind::kCount) * 2U + 2U);
+  RequireClosedSchemaTree(scenario);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_topology_workload_and_command_schemas_are_exhaustive) {
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::object& scenario_properties =
+      scenario.at("properties").as_object();
+  const boost::json::array& topologies =
+      scenario_properties.at("topology").as_object().at("oneOf").as_array();
+  BOOST_REQUIRE(topologies.size() ==
+                static_cast<std::size_t>(PeerTopologyKind::kCount));
+  for (std::size_t index = 0U; index < topologies.size(); ++index) {
+    const auto kind = static_cast<PeerTopologyKind>(index);
+    const boost::json::object& variant = topologies[index].as_object();
+    std::set<std::string> expected = FieldSet(ScenarioTopologyCommonFields());
+    for (const std::string_view field : ScenarioTopologyKindFields(kind)) {
+      expected.emplace(field);
+    }
+    BOOST_TEST(PropertySet(variant) == expected);
+    BOOST_TEST(variant.at("properties")
+                   .as_object()
+                   .at("type")
+                   .as_object()
+                   .at("const")
+                   .as_string() == PeerTopologyKindName(kind));
+    BOOST_TEST(variant.at("additionalProperties").as_bool() == false);
+    const boost::json::value* required = variant.if_contains("required");
+    if (kind == PeerTopologyKind::kFullMesh) {
+      BOOST_TEST(required == nullptr);
+    } else {
+      BOOST_REQUIRE(required != nullptr);
+      BOOST_TEST(StringSet(required->as_array()).contains("type"));
+    }
+  }
+
+  const boost::json::object workload_schema = BuildMcpWorkloadSchema();
+  const boost::json::array& workloads = workload_schema.at("oneOf").as_array();
+  BOOST_REQUIRE(workloads.size() ==
+                static_cast<std::size_t>(WorkloadKind::kCount));
+  for (std::size_t index = 0U; index < workloads.size(); ++index) {
+    const auto kind = static_cast<WorkloadKind>(index);
+    const boost::json::object& variant = workloads[index].as_object();
+    BOOST_TEST(PropertySet(variant) ==
+               FieldSet(ScenarioWorkloadFields(kind), {"type"}));
+    BOOST_TEST(variant.at("properties")
+                   .as_object()
+                   .at("type")
+                   .as_object()
+                   .at("const")
+                   .as_string() == WorkloadKindName(kind));
+    BOOST_TEST(variant.at("additionalProperties").as_bool() == false);
+  }
+
+  const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
+  const boost::json::array& commands = command_schema.at("oneOf").as_array();
+  BOOST_REQUIRE(commands.size() ==
+                static_cast<std::size_t>(SimulationCommandKind::kCount));
+  for (std::size_t index = 0U; index < commands.size(); ++index) {
+    const auto kind = static_cast<SimulationCommandKind>(index);
+    std::set<std::string> expected =
+        FieldSet(ScenarioCommandFields(kind), {"kind"});
+    if (ScenarioCommandFieldAllowed(kind, "node")) {
+      expected.emplace("node");
+    }
+    const boost::json::object& variant = commands[index].as_object();
+    BOOST_TEST(PropertySet(variant) == expected);
+    BOOST_TEST(variant.at("properties")
+                   .as_object()
+                   .at("kind")
+                   .as_object()
+                   .at("const")
+                   .as_string() == SimulationCommandKindName(kind));
+    BOOST_TEST(variant.at("additionalProperties").as_bool() == false);
+  }
+  RequireClosedSchemaTree(BuildMcpWorkloadSchema());
+  RequireClosedSchemaTree(BuildMcpSimulationCommandSchema());
+}
+
+BOOST_AUTO_TEST_CASE(mcp_schema_builders_reject_enum_sentinels) {
+  BOOST_CHECK_THROW(BuildMcpScenarioObjectSchema(ScenarioObjectKind::kCount),
+                    std::logic_error);
+  BOOST_CHECK_THROW(BuildMcpOperationInputSchema(McpOperationKind::kCount),
+                    std::logic_error);
+  BOOST_CHECK_THROW(McpOperationResultFamily(McpOperationKind::kCount),
+                    std::logic_error);
+  BOOST_CHECK_THROW(BuildMcpOperationOutputSchema(McpOperationKind::kCount),
+                    std::logic_error);
+  BOOST_CHECK_THROW(BuildMcpResultSchema(McpResultFamily::kCount),
+                    std::logic_error);
+
+  const boost::json::object node_profile =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNodeProfile);
+  BOOST_TEST(StringSet(node_profile.at("required").as_array()) ==
+             std::set<std::string>{"profile"});
+}
+
+BOOST_AUTO_TEST_CASE(mcp_scheduled_events_cover_every_registered_action) {
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::array& variants = scenario.at("properties")
+                                           .as_object()
+                                           .at("events")
+                                           .as_object()
+                                           .at("items")
+                                           .as_object()
+                                           .at("oneOf")
+                                           .as_array();
+  BOOST_REQUIRE(variants.size() ==
+                static_cast<std::size_t>(WorkloadKind::kCount) +
+                    static_cast<std::size_t>(SimulationCommandKind::kCount));
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(WorkloadKind::kCount); ++index) {
+    const auto kind = static_cast<WorkloadKind>(index);
+    BOOST_TEST(PropertySet(variants[index].as_object()) ==
+               FieldSet(ScenarioWorkloadFields(kind), {"at", "action"}));
+  }
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(SimulationCommandKind::kCount);
+       ++index) {
+    const auto kind = static_cast<SimulationCommandKind>(index);
+    std::set<std::string> expected =
+        FieldSet(ScenarioCommandFields(kind), {"at", "action"});
+    if (ScenarioCommandFieldAllowed(kind, "node")) {
+      expected.emplace("node");
+    }
+    BOOST_TEST(
+        PropertySet(
+            variants[static_cast<std::size_t>(WorkloadKind::kCount) + index]
+                .as_object()) == expected);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(mcp_wallet_and_perf_schemas_preserve_production_types) {
+  const boost::json::object wallet_send =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kWalletSend);
+  const boost::json::array& amount_choices = wallet_send.at("properties")
+                                                 .as_object()
+                                                 .at("amount")
+                                                 .as_object()
+                                                 .at("oneOf")
+                                                 .as_array();
+  BOOST_TEST(amount_choices.front().as_object().at("maximum").as_uint64() ==
+             std::numeric_limits<std::uint64_t>::max());
+
+  const boost::json::object workload_schema = BuildMcpWorkloadSchema();
+  const boost::json::array& workloads = workload_schema.at("oneOf").as_array();
+  const boost::json::object& wallet_transactions = VariantWithConst(
+      workloads, "type", WorkloadKindName(WorkloadKind::kWalletTransactions));
+  const boost::json::object& wallet_properties =
+      wallet_transactions.at("properties").as_object();
+  BOOST_TEST(wallet_properties.at("interval")
+                 .as_object()
+                 .at("oneOf")
+                 .as_array()
+                 .size() == 2U);
+  BOOST_TEST(wallet_properties.at("sender_wallets")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("minimum")
+                 .as_uint64() == 1U);
+  BOOST_TEST(wallet_properties.at("funding_strategy")
+                 .as_object()
+                 .at("enum")
+                 .as_array()
+                 .size() == 2U);
+  BOOST_TEST(wallet_properties.at("strategy")
+                 .as_object()
+                 .at("enum")
+                 .as_array()
+                 .size() == 6U);
+
+  const boost::json::object perf_target =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kPerfTarget);
+  BOOST_TEST(perf_target.at("properties")
+                 .as_object()
+                 .at("kind")
+                 .as_object()
+                 .at("enum")
+                 .as_array()
+                 .size() == 4U);
+  const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
+  const boost::json::object perf_command = VariantWithConst(
+      command_schema.at("oneOf").as_array(), "kind",
+      SimulationCommandKindName(SimulationCommandKind::kSetPerfCounters));
+  BOOST_TEST(perf_command.at("properties")
+                 .as_object()
+                 .at("perf_counters")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("enum")
+                 .as_array()
+                 .size() == 9U);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
+  const boost::json::array tools = BuildMcpToolRegistry();
+  BOOST_REQUIRE(tools.size() ==
+                static_cast<std::size_t>(McpOperationKind::kCount));
+  for (std::size_t index = 0U; index < tools.size(); ++index) {
+    const auto operation = static_cast<McpOperationKind>(index);
+    const boost::json::object& tool = tools[index].as_object();
+    BOOST_TEST(tool.at("name").as_string() == McpOperationKindName(operation));
+    const boost::json::object& input = tool.at("inputSchema").as_object();
+    BOOST_TEST(input.at("additionalProperties").as_bool() == false);
+    RequireClosedSchemaTree(input);
+    const boost::json::object& output = tool.at("outputSchema").as_object();
+    BOOST_REQUIRE(output.at("oneOf").as_array().size() == 2U);
+    const boost::json::object& success =
+        output.at("oneOf").as_array().front().as_object();
+    BOOST_TEST(success.at("properties")
+                   .as_object()
+                   .at("result_family")
+                   .as_object()
+                   .at("const")
+                   .as_string() ==
+               McpResultFamilyName(McpOperationResultFamily(operation)));
+    RequireClosedSchemaTree(output);
+  }
+
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(McpResultFamily::kCount); ++index) {
+    const auto family = static_cast<McpResultFamily>(index);
+    const boost::json::object schema = BuildMcpResultSchema(family);
+    BOOST_TEST(schema.at("additionalProperties").as_bool() == false);
+    BOOST_TEST(schema.at("properties")
+                   .as_object()
+                   .at("result_family")
+                   .as_object()
+                   .at("const")
+                   .as_string() == McpResultFamilyName(family));
+    RequireClosedSchemaTree(schema);
+  }
 }
 
 }  // namespace bbp

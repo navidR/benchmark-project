@@ -178,10 +178,6 @@ boost::json::array EnumNames(Enum count, Name name) {
   return values;
 }
 
-boost::json::object StringEnumSchema(boost::json::array values) {
-  return boost::json::object{{"type", "string"}, {"enum", std::move(values)}};
-}
-
 }  // namespace
 
 std::string_view McpOperationKindName(McpOperationKind kind) {
@@ -222,62 +218,6 @@ std::span<const McpNamedCapability> McpResultFamilyRegistry() {
 
 std::span<const std::string_view> McpScenarioMemberRegistry() {
   return kScenarioMemberViews;
-}
-
-boost::json::object BuildMcpScenarioSchema() {
-  boost::json::object properties;
-  properties["chain"] = StringEnumSchema(EnumNames(
-      ChainKind::kCount, [](ChainKind kind) { return ChainKindName(kind); }));
-  properties["simulation"] = boost::json::object{{"type", "object"}};
-  properties["chains"] = boost::json::object{{"type", "object"}};
-  properties["topology"] = boost::json::object{{"type", "object"}};
-  properties["nodes"] = boost::json::object{{"type", "array"}};
-  properties["workloads"] = boost::json::object{{"type", "array"}};
-  properties["events"] = boost::json::object{{"type", "array"}};
-  properties["resources"] = boost::json::object{{"type", "object"}};
-  properties["network"] = boost::json::object{{"type", "object"}};
-  boost::json::object schema{
-      {"$schema", "https://json-schema.org/draft/2020-12/schema"},
-      {"type", "object"},
-      {"properties", std::move(properties)},
-      {"additionalProperties", false}};
-  schema["x-bbp-members"] = StringArray(kScenarioMemberViews);
-  schema["x-bbp-workload-kinds"] =
-      EnumNames(WorkloadKind::kCount,
-                [](WorkloadKind kind) { return WorkloadKindName(kind); });
-  return schema;
-}
-
-boost::json::array BuildMcpToolRegistry() {
-  boost::json::array tools;
-  tools.reserve(kOperations.size());
-  for (const McpNamedCapability& operation : kOperations) {
-    boost::json::object input_schema{
-        {"$schema", "https://json-schema.org/draft/2020-12/schema"},
-        {"type", "object"}};
-    if (operation.name == "simulation.command") {
-      boost::json::object properties;
-      properties["kind"] = StringEnumSchema(EnumNames(
-          SimulationCommandKind::kCount, [](SimulationCommandKind kind) {
-            return SimulationCommandKindName(kind);
-          }));
-      input_schema["properties"] = std::move(properties);
-      input_schema["required"] = boost::json::array{"kind"};
-    } else if (operation.name == "scenario.validate" ||
-               operation.name == "scenario.resolve" ||
-               operation.name == "run.launch") {
-      input_schema["properties"] =
-          boost::json::object{{"scenario", BuildMcpScenarioSchema()}};
-      input_schema["required"] = boost::json::array{"scenario"};
-    }
-    input_schema["additionalProperties"] = true;
-    tools.emplace_back(boost::json::object{
-        {"name", operation.name},
-        {"description", operation.description},
-        {"inputSchema", std::move(input_schema)},
-        {"execution", boost::json::object{{"taskSupport", "optional"}}}});
-  }
-  return tools;
 }
 
 boost::json::array BuildMcpResourceRegistry() {

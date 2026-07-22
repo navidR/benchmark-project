@@ -6,6 +6,8 @@
 #include <span>
 #include <string_view>
 
+#include "bbp/scenario_fields.h"
+
 namespace bbp {
 
 inline constexpr std::string_view kMcpProtocolVersion = "2025-11-25";
@@ -133,6 +135,7 @@ struct McpNamedCapability {
 std::string_view McpOperationKindName(McpOperationKind kind);
 std::string_view McpInformationFamilyName(McpInformationFamily family);
 std::string_view McpResultFamilyName(McpResultFamily family);
+McpResultFamily McpOperationResultFamily(McpOperationKind operation);
 
 std::span<const McpNamedCapability> McpOperationRegistry();
 std::span<const McpNamedCapability> McpInformationFamilyRegistry();
@@ -140,7 +143,13 @@ std::span<const McpNamedCapability> McpResultFamilyRegistry();
 std::span<const std::string_view> McpScenarioMemberRegistry();
 
 boost::json::object BuildMcpCapabilityDocument();
+boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind);
 boost::json::object BuildMcpScenarioSchema();
+boost::json::object BuildMcpWorkloadSchema();
+boost::json::object BuildMcpSimulationCommandSchema();
+boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation);
+boost::json::object BuildMcpResultSchema(McpResultFamily family);
+boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation);
 boost::json::array BuildMcpToolRegistry();
 boost::json::array BuildMcpResourceRegistry();
 
