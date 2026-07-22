@@ -1,6 +1,7 @@
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -179,4 +180,49 @@ BOOST_AUTO_TEST_CASE(transaction_load_confirmation_can_follow_propagation) {
   BOOST_TEST(snapshot.propagated == 1U);
   BOOST_TEST(snapshot.confirmed == 1U);
   BOOST_TEST(snapshot.InvariantsHold());
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_confirmation_counts_all_nodes_exactly_once) {
+  auto accounting = std::make_shared<bbp::TransactionLoadAccounting>();
+  accounting->RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 1us);
+  bbp::TransactionLoadConfirmation confirmation(
+      accounting, {{"tx-a", "node-a"}, {"tx-a", "node-b"}});
+
+  confirmation.RecordObservation("tx-a", "node-a", false);
+  confirmation.RecordPropagated(false);
+  confirmation.RecordObservation("tx-a", "node-a", true);
+  BOOST_TEST(accounting->Snapshot(1s).confirmed == 0U);
+  confirmation.RecordObservation("tx-a", "node-b", true);
+  confirmation.RecordObservation("tx-a", "node-a", true);
+  confirmation.RecordObservation("tx-a", "node-b", true);
+
+  const bbp::TransactionLoadSnapshot snapshot = accounting->Snapshot(1s);
+  BOOST_TEST(snapshot.propagated == 1U);
+  BOOST_TEST(snapshot.confirmed == 1U);
+  BOOST_TEST(snapshot.confirmed_per_second == 1.0);
+  BOOST_TEST(snapshot.InvariantsHold());
+  BOOST_TEST(confirmation.propagation_recorded());
+  BOOST_TEST(confirmation.confirmation_recorded());
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_confirmation_reconciles_confirmation_before_propagation) {
+  auto accounting = std::make_shared<bbp::TransactionLoadAccounting>();
+  accounting->RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 1us);
+  bbp::TransactionLoadConfirmation confirmation(
+      accounting, {{"tx-a", "node-a"}, {"tx-b", "node-a"}});
+
+  confirmation.RecordObservation("tx-a", "node-a", true);
+  confirmation.RecordObservation("tx-b", "node-a", true);
+  confirmation.RecordPropagated(false);
+
+  const bbp::TransactionLoadSnapshot snapshot = accounting->Snapshot(2s);
+  BOOST_TEST(snapshot.propagated == 1U);
+  BOOST_TEST(snapshot.confirmed == 1U);
+  BOOST_TEST(snapshot.confirmed_per_second == 0.5);
+  BOOST_TEST(snapshot.InvariantsHold());
+  BOOST_CHECK_THROW(confirmation.RecordPropagated(true), std::runtime_error);
+  BOOST_CHECK_THROW(confirmation.RecordObservation("other", "node-a", true),
+                    std::runtime_error);
 }

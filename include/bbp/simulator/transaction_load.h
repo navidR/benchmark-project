@@ -5,10 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stop_token>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bbp/simulator/wallet_transaction_plan.h"
@@ -94,6 +98,30 @@ class TransactionLoadAccounting {
  private:
   mutable std::mutex mutex_;
   TransactionLoadSnapshot counters_;
+};
+
+class TransactionLoadConfirmation {
+ public:
+  using ObservationKey = std::pair<std::string, std::string>;
+
+  TransactionLoadConfirmation(
+      std::shared_ptr<TransactionLoadAccounting> accounting,
+      std::vector<ObservationKey> expected_observations);
+
+  void RecordObservation(std::string_view txid, std::string_view node_id,
+                         bool confirmed);
+  void RecordPropagated(bool confirmed);
+
+  [[nodiscard]] bool propagation_recorded() const;
+  [[nodiscard]] bool confirmation_recorded() const;
+
+ private:
+  const std::shared_ptr<TransactionLoadAccounting> accounting_;
+  const std::set<ObservationKey> expected_observations_;
+  mutable std::mutex mutex_;
+  std::set<ObservationKey> confirmed_observations_;
+  bool propagation_recorded_ = false;
+  bool confirmation_recorded_ = false;
 };
 
 }  // namespace bbp

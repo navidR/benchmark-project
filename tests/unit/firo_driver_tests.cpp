@@ -6,6 +6,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <condition_variable>
@@ -14,13 +15,16 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stop_token>
 #include <thread>
 #include <vector>
 
 #include "bbp/drivers/firo_driver.h"
+#include "bbp/run_report.h"
 #include "bbp/simulation_cancelled.h"
+#include "bbp/simulator/transaction_load.h"
 #include "bbp/util.h"
 
 namespace {
@@ -58,6 +62,16 @@ std::vector<std::string> ServeRpcResponses(
     ++response_index;
   }
   return methods;
+}
+
+std::uint64_t JsonNonNegativeInteger(const boost::json::value& value) {
+  if (value.is_uint64()) {
+    return value.as_uint64();
+  }
+  if (value.is_int64() && value.as_int64() >= 0) {
+    return static_cast<std::uint64_t>(value.as_int64());
+  }
+  throw std::runtime_error("expected a non-negative JSON integer");
 }
 
 }  // namespace
@@ -1195,6 +1209,129 @@ BOOST_AUTO_TEST_CASE(firo_load_submission_returns_before_observation) {
   BOOST_TEST(methods[0] == "settxfee");
   BOOST_TEST(methods[1] == "sendtoaddress");
   BOOST_REQUIRE_EQUAL(requests.size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_load_submit_propagate_mine_confirm_reaches_report_once) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  using namespace std::chrono_literals;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":"late-confirmation-tx","error":null,"id":"bbp"})",
+      R"({"result":200,"error":null,"id":"bbp"})",
+      R"({"result":["late-confirmation-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"late-confirmation-tx"},"error":null,"id":"bbp"})",
+      R"({"result":["block-201"],"error":null,"id":"bbp"})",
+      R"({"result":201,"error":null,"id":"bbp"})",
+      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"late-confirmation-tx","blockhash":"block-201","height":201,"confirmations":1},"error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "load-confirmation-node";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(1s);
+
+  auto accounting = std::make_shared<bbp::TransactionLoadAccounting>();
+  const bbp::ChainWalletTransactionResult submitted =
+      driver.SubmitWalletTransaction(config, bbp::WalletMode::kPublic,
+                                     "load-destination", 25'000'000U, 1'000U,
+                                     1s);
+  BOOST_REQUIRE_EQUAL(submitted.txids.size(), 1U);
+  accounting->RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 10us);
+  bbp::TransactionLoadConfirmation confirmation(
+      accounting, {{submitted.txids.front(), config.id}});
+
+  const bbp::ChainTransactionObservation propagated =
+      driver.ObserveTransaction(config, submitted.txids.front());
+  BOOST_CHECK(propagated.state == bbp::ChainTransactionState::kMempool);
+  confirmation.RecordObservation(
+      submitted.txids.front(), config.id,
+      propagated.state == bbp::ChainTransactionState::kConfirmed);
+  confirmation.RecordPropagated(false);
+  BOOST_TEST(accounting->Snapshot(1s).confirmed == 0U);
+
+  const std::vector<std::string> blocks =
+      driver.GenerateBlocks(config, 1U, "mining-address");
+  BOOST_REQUIRE_EQUAL(blocks.size(), 1U);
+  BOOST_TEST(blocks.front() == "block-201");
+  const bbp::ChainTransactionObservation confirmed =
+      driver.ObserveTransaction(config, submitted.txids.front());
+  BOOST_CHECK(confirmed.state == bbp::ChainTransactionState::kConfirmed);
+  confirmation.RecordObservation(submitted.txids.front(), config.id, true);
+  confirmation.RecordObservation(submitted.txids.front(), config.id, true);
+
+  const bbp::TransactionLoadSnapshot snapshot = accounting->Snapshot(1s);
+  BOOST_TEST(snapshot.attempted == 1U);
+  BOOST_TEST(snapshot.submitted == 1U);
+  BOOST_TEST(snapshot.propagated == 1U);
+  BOOST_TEST(snapshot.confirmed == 1U);
+  BOOST_TEST(snapshot.confirmed_per_second == 1.0);
+  BOOST_TEST(snapshot.InvariantsHold());
+
+  const std::filesystem::path report_root =
+      std::filesystem::temp_directory_path() /
+      ("bbp-load-late-confirmation-report-" + std::to_string(getpid()));
+  std::filesystem::remove_all(report_root);
+  std::filesystem::create_directories(report_root);
+  bbp::WriteText(report_root / "resolved-scenario.json",
+                 R"({"run_id":"late-confirmation","chain":"firo","nodes":1})");
+  bbp::AppendLine(
+      report_root / "events.jsonl",
+      R"({"run_id":"late-confirmation","node_id":"sim","event":"run_started"})");
+  boost::json::object detail;
+  detail["attempted"] = snapshot.attempted;
+  detail["submitted"] = snapshot.submitted;
+  detail["rejected"] = snapshot.rejected;
+  detail["timed_out"] = snapshot.timed_out;
+  detail["backpressured"] = snapshot.backpressured;
+  detail["dropped"] = snapshot.backpressured;
+  detail["propagated"] = snapshot.propagated;
+  detail["confirmed"] = snapshot.confirmed;
+  detail["failed"] = snapshot.failed;
+  detail["confirmed_per_second"] = snapshot.confirmed_per_second;
+  detail["accounting_invariants_hold"] = snapshot.InvariantsHold();
+  boost::json::object event;
+  event["run_id"] = "late-confirmation";
+  event["node_id"] = "sim";
+  event["event"] = "transaction_load_completed";
+  event["detail"] = boost::json::serialize(detail);
+  bbp::AppendLine(report_root / "events.jsonl", boost::json::serialize(event));
+  bbp::AppendLine(
+      report_root / "events.jsonl",
+      R"({"run_id":"late-confirmation","node_id":"sim","event":"run_finished"})");
+
+  const boost::json::object report = bbp::BuildRunReport(report_root);
+  BOOST_TEST(JsonNonNegativeInteger(
+                 report.at("transaction_load_completed_count")) == 1U);
+  const boost::json::array& summaries =
+      report.at("transaction_load_summaries").as_array();
+  BOOST_REQUIRE_EQUAL(summaries.size(), 1U);
+  const boost::json::object& stored =
+      summaries.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonNonNegativeInteger(stored.at("confirmed")) == 1U);
+  BOOST_TEST(stored.at("confirmed_per_second").as_double() == 1.0);
+  BOOST_TEST(stored.at("accounting_invariants_hold").as_bool());
+  std::filesystem::remove_all(report_root);
+
+  const std::vector<std::string> methods = served.get();
+  const std::vector<std::string> expected_methods = {
+      "settxfee",      "sendtoaddress",     "getblockcount",
+      "getrawmempool", "getrawtransaction", "generatetoaddress",
+      "getblockcount", "getrawmempool",     "getrawtransaction"};
+  BOOST_TEST(methods == expected_methods, boost::test_tools::per_element());
 }
 
 BOOST_AUTO_TEST_CASE(firo_load_submission_classifies_rpc_rejection) {

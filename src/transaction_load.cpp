@@ -259,4 +259,73 @@ TransactionLoadSnapshot TransactionLoadAccounting::Snapshot(
   return snapshot;
 }
 
+TransactionLoadConfirmation::TransactionLoadConfirmation(
+    std::shared_ptr<TransactionLoadAccounting> accounting,
+    std::vector<ObservationKey> expected_observations)
+    : accounting_(std::move(accounting)),
+      expected_observations_(expected_observations.begin(),
+                             expected_observations.end()) {
+  if (!accounting_) {
+    throw std::runtime_error(
+        "transaction load confirmation accounting is missing");
+  }
+  if (expected_observations.empty()) {
+    throw std::runtime_error(
+        "transaction load confirmation requires an expected observation");
+  }
+  if (expected_observations_.size() != expected_observations.size()) {
+    throw std::runtime_error(
+        "transaction load confirmation has duplicate expected observations");
+  }
+  for (const ObservationKey& observation : expected_observations_) {
+    if (observation.first.empty() || observation.second.empty()) {
+      throw std::runtime_error(
+          "transaction load confirmation observation key is empty");
+    }
+  }
+}
+
+void TransactionLoadConfirmation::RecordObservation(std::string_view txid,
+                                                    std::string_view node_id,
+                                                    bool confirmed) {
+  if (!confirmed) {
+    return;
+  }
+  const ObservationKey key{std::string(txid), std::string(node_id)};
+  std::lock_guard lock(mutex_);
+  if (!expected_observations_.contains(key)) {
+    throw std::runtime_error(
+        "transaction load confirmation received an unexpected observation");
+  }
+  confirmed_observations_.insert(key);
+  if (propagation_recorded_ && !confirmation_recorded_ &&
+      confirmed_observations_.size() == expected_observations_.size()) {
+    accounting_->RecordConfirmed();
+    confirmation_recorded_ = true;
+  }
+}
+
+void TransactionLoadConfirmation::RecordPropagated(bool confirmed) {
+  std::lock_guard lock(mutex_);
+  if (propagation_recorded_) {
+    throw std::runtime_error(
+        "transaction load propagation was recorded more than once");
+  }
+  const bool all_confirmed =
+      confirmed_observations_.size() == expected_observations_.size();
+  accounting_->RecordPropagated(confirmed || all_confirmed);
+  propagation_recorded_ = true;
+  confirmation_recorded_ = confirmed || all_confirmed;
+}
+
+bool TransactionLoadConfirmation::propagation_recorded() const {
+  std::lock_guard lock(mutex_);
+  return propagation_recorded_;
+}
+
+bool TransactionLoadConfirmation::confirmation_recorded() const {
+  std::lock_guard lock(mutex_);
+  return confirmation_recorded_;
+}
+
 }  // namespace bbp

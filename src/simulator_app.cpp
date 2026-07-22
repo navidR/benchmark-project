@@ -8095,6 +8095,7 @@ struct TrackedTransaction {
   std::optional<double> transaction_rate;
   std::uint32_t txid_index = 0;
   std::uint32_t submission_node = 0;
+  std::shared_ptr<TransactionLoadConfirmation> load_confirmation;
 };
 
 struct TransactionSetObservation {
@@ -8147,15 +8148,28 @@ std::string TransactionObservationDetail(
 class TransactionObservationTracker {
  public:
   void Track(TrackedTransaction transaction) {
-    if (transaction.txid.empty()) {
-      throw std::runtime_error("cannot track an empty transaction id");
-    }
+    std::vector<TrackedTransaction> transactions;
+    transactions.push_back(std::move(transaction));
+    TrackSet(std::move(transactions));
+  }
+
+  void TrackSet(std::vector<TrackedTransaction> transactions) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!tracked_txids_.insert(transaction.txid).second) {
-      throw std::runtime_error("duplicate submitted transaction id: " +
-                               transaction.txid);
+    std::set<std::string> new_txids;
+    for (const TrackedTransaction& transaction : transactions) {
+      if (transaction.txid.empty()) {
+        throw std::runtime_error("cannot track an empty transaction id");
+      }
+      if (!new_txids.insert(transaction.txid).second ||
+          tracked_txids_.contains(transaction.txid)) {
+        throw std::runtime_error("duplicate submitted transaction id: " +
+                                 transaction.txid);
+      }
     }
-    transactions_.push_back(std::move(transaction));
+    for (TrackedTransaction& transaction : transactions) {
+      tracked_txids_.insert(transaction.txid);
+      transactions_.push_back(std::move(transaction));
+    }
   }
 
   void TrackAndWaitForVisibility(const Options& options,
@@ -8226,19 +8240,10 @@ class TransactionObservationTracker {
       throw std::runtime_error(
           "transaction load observation requires an observable node");
     }
-
-    const auto forget_observations = [this, &transaction_sets, &nodes] {
-      std::lock_guard<std::mutex> lock(mutex_);
-      for (const std::vector<TrackedTransaction>& transaction_set :
-           transaction_sets) {
-        for (const TrackedTransaction& transaction : transaction_set) {
-          for (const NodeRuntime& node : nodes) {
-            visible_.erase({transaction.txid, node.config.id});
-            confirmed_.erase({transaction.txid, node.config.id});
-          }
-        }
-      }
-    };
+    for (const std::vector<TrackedTransaction>& transaction_set :
+         transaction_sets) {
+      TrackSet(transaction_set);
+    }
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     try {
@@ -8298,13 +8303,11 @@ class TransactionObservationTracker {
           all_propagated = all_propagated && result.propagated;
         }
         if (all_propagated || std::chrono::steady_clock::now() >= deadline) {
-          forget_observations();
           return results;
         }
         WaitForDuration(std::chrono::milliseconds(50), stop_token);
       }
     } catch (...) {
-      forget_observations();
       throw;
     }
   }
@@ -8344,6 +8347,11 @@ class TransactionObservationTracker {
       WriteEvent(events_path, options.run_id, node_id,
                  SimulationEventKind::kTransactionConfirmed, detail);
     }
+    if (transaction.load_confirmation) {
+      transaction.load_confirmation->RecordObservation(
+          transaction.txid, node_id,
+          observation.state == ChainTransactionState::kConfirmed);
+    }
   }
 
   std::mutex mutex_;
@@ -8352,6 +8360,65 @@ class TransactionObservationTracker {
   std::set<std::pair<std::string, std::string>> visible_;
   std::set<std::pair<std::string, std::string>> confirmed_;
 };
+
+std::vector<TransactionLoadConfirmation::ObservationKey>
+ExpectedTransactionLoadObservations(const std::vector<std::string>& txids,
+                                    const std::vector<NodeRuntime>& nodes) {
+  std::size_t observable_node_count = 0U;
+  for (const NodeRuntime& node : nodes) {
+    if (node.AllowsChainMetrics()) {
+      ++observable_node_count;
+    }
+  }
+  if (observable_node_count == 0U) {
+    throw std::runtime_error(
+        "transaction load confirmation requires an observable node");
+  }
+  if (txids.size() >
+      std::numeric_limits<std::size_t>::max() / observable_node_count) {
+    throw std::runtime_error(
+        "transaction load confirmation observation count overflows size_t");
+  }
+  std::vector<TransactionLoadConfirmation::ObservationKey> expected;
+  expected.reserve(txids.size() * observable_node_count);
+  for (const std::string& txid : txids) {
+    for (const NodeRuntime& node : nodes) {
+      if (node.AllowsChainMetrics()) {
+        expected.emplace_back(txid, node.config.id);
+      }
+    }
+  }
+  return expected;
+}
+
+struct PendingTransactionLoadCompletion {
+  std::uint32_t workload_index = 0U;
+  std::uint32_t workload_count = 0U;
+  WalletTransactionsWorkload workload;
+  std::uint64_t attempt_limit = 0U;
+  std::size_t queue_maximum_size = 0U;
+  std::shared_ptr<TransactionLoadAccounting> accounting;
+  std::chrono::microseconds elapsed{0};
+};
+
+void WriteTransactionLoadCompletions(
+    const Options& options, const std::filesystem::path& events_path,
+    const std::vector<PendingTransactionLoadCompletion>& completions) {
+  for (const PendingTransactionLoadCompletion& completion : completions) {
+    if (!completion.accounting) {
+      throw std::runtime_error(
+          "pending transaction load completion has no accounting");
+    }
+    const TransactionLoadSnapshot snapshot =
+        completion.accounting->Snapshot(completion.elapsed);
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kTransactionLoadCompleted,
+               TransactionLoadCompletedDetail(
+                   completion.workload_index, completion.workload_count,
+                   completion.workload, completion.attempt_limit,
+                   completion.queue_maximum_size, snapshot));
+  }
+}
 
 void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
                            const std::vector<std::string>& block_hashes,
@@ -11468,6 +11535,7 @@ void ApplySendRawTransactionWorkload(
           .transaction_rate = std::nullopt,
           .txid_index = 1U,
           .submission_node = workload.submit_node,
+          .load_confirmation = nullptr,
       },
       std::chrono::seconds(workload.timeout_sec), stop_token);
 }
@@ -11477,6 +11545,7 @@ void ApplyWalletTransactionsWorkload(
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
     const SimulationRegistry& registry,
     TransactionObservationTracker& transaction_tracker,
+    std::vector<PendingTransactionLoadCompletion>* pending_load_completions,
     const WalletTransactionsWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
   struct FundingState {
@@ -11631,7 +11700,7 @@ void ApplyWalletTransactionsWorkload(
                                                     *workload.transaction_rate);
     WalletTransactionLoadPlanner planner(wallets.size(), workload);
     BoundedWalletTransactionQueue queue(workload.queue_capacity);
-    TransactionLoadAccounting accounting;
+    auto accounting = std::make_shared<TransactionLoadAccounting>();
     std::vector<std::mutex> sender_submission_mutexes(wallets.size());
     const auto load_started_at = std::chrono::steady_clock::now();
     std::mutex infrastructure_error_mutex;
@@ -11729,7 +11798,7 @@ void ApplyWalletTransactionsWorkload(
               }
 
               const std::chrono::microseconds latency = terminal_latency(task);
-              accounting.RecordOutcome(outcome, latency);
+              accounting->RecordOutcome(outcome, latency);
               try {
                 if (submitted) {
                   WriteEvent(
@@ -11768,6 +11837,10 @@ void ApplyWalletTransactionsWorkload(
               }
               std::vector<TrackedTransaction> tracked;
               tracked.reserve(transaction.txids.size());
+              const auto confirmation =
+                  std::make_shared<TransactionLoadConfirmation>(
+                      accounting, ExpectedTransactionLoadObservations(
+                                      transaction.txids, nodes));
               for (std::size_t txid_index = 0U;
                    txid_index < transaction.txids.size(); ++txid_index) {
                 tracked.push_back(TrackedTransaction{
@@ -11787,6 +11860,7 @@ void ApplyWalletTransactionsWorkload(
                             : std::nullopt,
                     .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
                     .submission_node = sender.node,
+                    .load_confirmation = confirmation,
                 });
               }
               try {
@@ -11795,16 +11869,17 @@ void ApplyWalletTransactionsWorkload(
                         options, events_path, driver, nodes, {tracked},
                         std::chrono::seconds(workload.timeout_sec), stop_token);
                 if (observations.front().observation_error) {
-                  accounting.RecordObservationError();
+                  accounting->RecordObservationError();
                 }
                 if (observations.front().propagated) {
-                  accounting.RecordPropagated(observations.front().confirmed);
+                  confirmation->RecordPropagated(
+                      observations.front().confirmed);
                 }
               } catch (const SimulationCancelled&) {
-                accounting.RecordObservationError();
+                accounting->RecordObservationError();
                 worker_cancelled.store(true);
               } catch (...) {
-                accounting.RecordObservationError();
+                accounting->RecordObservationError();
                 record_infrastructure_error(std::current_exception());
               }
             }
@@ -11873,8 +11948,8 @@ void ApplyWalletTransactionsWorkload(
             const WalletIdentity& receiver =
                 wallets.at(task.plan.receiver_index);
             const std::chrono::microseconds latency = terminal_latency(task);
-            accounting.RecordOutcome(TransactionLoadOutcome::kBackpressured,
-                                     latency);
+            accounting->RecordOutcome(TransactionLoadOutcome::kBackpressured,
+                                      latency);
             WriteEvent(events_path, options.run_id,
                        nodes.at(sender.node - 1U).config.id,
                        SimulationEventKind::kTransactionLoadAttempt,
@@ -11909,12 +11984,19 @@ void ApplyWalletTransactionsWorkload(
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - load_started_at);
-    const TransactionLoadSnapshot snapshot = accounting.Snapshot(elapsed);
-    WriteEvent(events_path, options.run_id, "sim",
-               SimulationEventKind::kTransactionLoadCompleted,
-               TransactionLoadCompletedDetail(workload_index, workload_count,
-                                              workload, attempt_limit,
-                                              queue.maximum_size(), snapshot));
+    if (pending_load_completions == nullptr) {
+      throw std::runtime_error(
+          "transaction load completion destination is missing");
+    }
+    pending_load_completions->push_back(PendingTransactionLoadCompletion{
+        .workload_index = workload_index,
+        .workload_count = workload_count,
+        .workload = workload,
+        .attempt_limit = attempt_limit,
+        .queue_maximum_size = queue.maximum_size(),
+        .accounting = std::move(accounting),
+        .elapsed = elapsed,
+    });
     return;
   }
 
@@ -11985,6 +12067,7 @@ void ApplyWalletTransactionsWorkload(
                   : std::nullopt,
           .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
           .submission_node = sender.node,
+          .load_confirmation = nullptr,
       };
       if (workload.transaction_rate) {
         transaction_tracker.Track(std::move(tracked));
@@ -13952,6 +14035,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   std::stop_source metrics_rpc_stop_source;
   std::atomic<bool> wallets_initialized = false;
   TransactionObservationTracker transaction_tracker;
+  std::vector<PendingTransactionLoadCompletion>
+      pending_transaction_load_completions;
   std::mutex lifecycle_failure_mutex;
   std::exception_ptr lifecycle_failure;
   std::stop_callback cancel_command_rpc(stop_token, [&command_rpc_stop_source] {
@@ -14476,6 +14561,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                         .txid_index =
                             static_cast<std::uint32_t>(txid_index + 1U),
                         .submission_node = sender.node,
+                        .load_confirmation = nullptr,
                     },
                     std::chrono::seconds(send.timeout_sec),
                     command_rpc_stop_source.get_token());
@@ -15389,8 +15475,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                      WorkloadKind::kWalletTransactions) {
             ApplyWalletTransactionsWorkload(
                 options, events_path, driver, nodes, simulation_registry,
-                transaction_tracker, scenario_workload.wallet_transactions,
-                action_index, action_count, stop_token);
+                transaction_tracker, &pending_transaction_load_completions,
+                scenario_workload.wallet_transactions, action_index,
+                action_count, stop_token);
           } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
             const RestartNodeWorkload& workload =
                 scenario_workload.restart_node;
@@ -15558,6 +15645,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     stop_block_production();
     transaction_tracker.ObserveAll(options, events_path, driver, nodes,
                                    stop_token);
+    WriteTransactionLoadCompletions(options, events_path,
+                                    pending_transaction_load_completions);
     WriteMetricsSnapshot(metrics_path, options, driver, nodes,
                          run_process_state, {}, {}, stop_token);
     WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},
