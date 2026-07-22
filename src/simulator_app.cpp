@@ -7981,7 +7981,9 @@ std::string TransactionLoadAttemptDetail(
   }
   detail["outcome"] = std::string(TransactionLoadOutcomeName(outcome));
   detail["backpressured"] = outcome == TransactionLoadOutcome::kBackpressured;
-  detail["dropped"] = outcome == TransactionLoadOutcome::kBackpressured;
+  detail["dropped"] = outcome == TransactionLoadOutcome::kBackpressured ||
+                      outcome == TransactionLoadOutcome::kDropped;
+  detail["cancelled"] = outcome == TransactionLoadOutcome::kCancelled;
   detail["latency_us"] = static_cast<std::uint64_t>(latency.count());
   detail["latency_ms"] = static_cast<double>(latency.count()) / 1000.0;
   if (transaction != nullptr) {
@@ -8038,7 +8040,8 @@ std::string TransactionLoadCompletedDetail(
   detail["rejected"] = snapshot.rejected;
   detail["timed_out"] = snapshot.timed_out;
   detail["backpressured"] = snapshot.backpressured;
-  detail["dropped"] = snapshot.backpressured;
+  detail["dropped"] = snapshot.dropped;
+  detail["cancelled"] = snapshot.cancelled;
   detail["propagated"] = snapshot.propagated;
   detail["confirmed"] = snapshot.confirmed;
   detail["failed"] = snapshot.failed;
@@ -11723,6 +11726,11 @@ void ApplyWalletTransactionsWorkload(
     std::mutex infrastructure_error_mutex;
     std::exception_ptr infrastructure_error;
     std::atomic<bool> worker_cancelled = false;
+    std::stop_source load_stop_source;
+    std::stop_callback propagate_stop(stop_token, [&load_stop_source] {
+      static_cast<void>(load_stop_source.request_stop());
+    });
+    const std::stop_token load_stop_token = load_stop_source.get_token();
 
     const auto record_infrastructure_error =
         [&infrastructure_error_mutex,
@@ -11740,6 +11748,23 @@ void ApplyWalletTransactionsWorkload(
       return std::chrono::duration_cast<std::chrono::microseconds>(
           now - task.scheduled_at);
     };
+    const auto record_dropped_tasks =
+        [&](std::vector<WalletTransactionLoadTask> dropped_tasks) {
+          for (const WalletTransactionLoadTask& task : dropped_tasks) {
+            try {
+              balance_reservations.Settle(task.transaction_index, std::nullopt,
+                                          true);
+            } catch (...) {
+              record_infrastructure_error(std::current_exception());
+            }
+            try {
+              accounting->RecordOutcome(TransactionLoadOutcome::kDropped,
+                                        terminal_latency(task));
+            } catch (...) {
+              record_infrastructure_error(std::current_exception());
+            }
+          }
+        };
 
     std::vector<std::thread> workers;
     workers.reserve(workload.concurrency);
@@ -11750,11 +11775,8 @@ void ApplyWalletTransactionsWorkload(
         workers.emplace_back([&] {
           try {
             while (const std::optional<WalletTransactionLoadTask> next =
-                       queue.Pop()) {
+                       queue.Pop(load_stop_token)) {
               const WalletTransactionLoadTask& task = *next;
-              if (!WaitForTransactionLoadSchedule(task, stop_token)) {
-                throw SimulationCancelled();
-              }
               const WalletIdentity& sender = wallets.at(task.plan.sender_index);
               const WalletIdentity& receiver =
                   wallets.at(task.plan.receiver_index);
@@ -11768,11 +11790,22 @@ void ApplyWalletTransactionsWorkload(
               bool submitted = false;
               bool submission_started = false;
               bool release_if_balance_unavailable = true;
+              bool cancel_queue_after_settlement = false;
               std::optional<std::uint64_t> actual_available_balance;
               {
                 std::unique_lock<std::mutex> sender_submission_lock(
-                    sender_submission_mutexes.at(task.plan.sender_index));
+                    sender_submission_mutexes.at(task.plan.sender_index),
+                    std::defer_lock);
                 try {
+                  if (queue.cancelled() ||
+                      !WaitForTransactionLoadSchedule(task, load_stop_token)) {
+                    throw SimulationCancelled();
+                  }
+                  sender_submission_lock.lock();
+                  if (queue.cancelled()) {
+                    throw SimulationCancelled();
+                  }
+                  ThrowIfStopRequested(load_stop_token);
                   RequireNodeRunning(sender_node,
                                      "transaction load submission");
                   submission_started = true;
@@ -11782,7 +11815,8 @@ void ApplyWalletTransactionsWorkload(
                       ToChainWalletMode(registry.wallet_initialization()),
                       receiver.address, task.plan.amount_satoshis,
                       workload.fee_satoshis,
-                      std::chrono::seconds(workload.timeout_sec), stop_token);
+                      std::chrono::seconds(workload.timeout_sec),
+                      load_stop_token);
                   if (transaction.txids.empty()) {
                     throw std::runtime_error(
                         "transaction load submission returned no transaction "
@@ -11834,10 +11868,13 @@ void ApplyWalletTransactionsWorkload(
                   error_class = "internal_rpc";
                   error_message = error.what();
                 } catch (const SimulationCancelled& error) {
-                  outcome = TransactionLoadOutcome::kFailed;
+                  outcome = TransactionLoadOutcome::kCancelled;
                   error_class = "cancellation";
                   error_message = error.what();
+                  release_if_balance_unavailable = !submission_started;
                   worker_cancelled.store(true);
+                  static_cast<void>(load_stop_source.request_stop());
+                  cancel_queue_after_settlement = true;
                 } catch (const std::exception& error) {
                   outcome = TransactionLoadOutcome::kFailed;
                   error_class = "internal";
@@ -11850,7 +11887,8 @@ void ApplyWalletTransactionsWorkload(
                   release_if_balance_unavailable = !submission_started;
                 }
 
-                if (!submitted) {
+                if (!submitted &&
+                    outcome != TransactionLoadOutcome::kCancelled) {
                   try {
                     actual_available_balance =
                         driver
@@ -11858,10 +11896,12 @@ void ApplyWalletTransactionsWorkload(
                                 sender_node.config,
                                 ToChainWalletMode(
                                     registry.wallet_initialization()),
-                                1U, stop_token)
+                                1U, load_stop_token)
                             .available_balance_satoshis;
                   } catch (const SimulationCancelled&) {
                     worker_cancelled.store(true);
+                    static_cast<void>(load_stop_source.request_stop());
+                    cancel_queue_after_settlement = true;
                   } catch (const std::exception& error) {
                     BBP_LOG(warning)
                         << "transaction load balance reconciliation failed "
@@ -11874,6 +11914,9 @@ void ApplyWalletTransactionsWorkload(
                         << sender_node.config.id << ": unknown exception";
                   }
                 }
+                if (!sender_submission_lock.owns_lock()) {
+                  sender_submission_lock.lock();
+                }
                 try {
                   balance_reservations.Settle(
                       task.transaction_index, actual_available_balance,
@@ -11881,6 +11924,9 @@ void ApplyWalletTransactionsWorkload(
                 } catch (...) {
                   record_infrastructure_error(std::current_exception());
                 }
+              }
+              if (cancel_queue_after_settlement) {
+                record_dropped_tasks(queue.Cancel());
               }
 
               const std::chrono::microseconds latency = terminal_latency(task);
@@ -11953,7 +11999,8 @@ void ApplyWalletTransactionsWorkload(
                 const std::vector<TransactionSetObservation> observations =
                     transaction_tracker.ObserveSetsUntilVisible(
                         options, events_path, driver, nodes, {tracked},
-                        std::chrono::seconds(workload.timeout_sec), stop_token);
+                        std::chrono::seconds(workload.timeout_sec),
+                        load_stop_token);
                 if (observations.front().observation_error) {
                   accounting->RecordObservationError();
                 }
@@ -11964,6 +12011,8 @@ void ApplyWalletTransactionsWorkload(
               } catch (const SimulationCancelled&) {
                 accounting->RecordObservationError();
                 worker_cancelled.store(true);
+                static_cast<void>(load_stop_source.request_stop());
+                record_dropped_tasks(queue.Cancel());
               } catch (...) {
                 accounting->RecordObservationError();
                 record_infrastructure_error(std::current_exception());
@@ -11976,7 +12025,7 @@ void ApplyWalletTransactionsWorkload(
       }
     } catch (...) {
       const std::exception_ptr creation_error = std::current_exception();
-      queue.Close();
+      record_dropped_tasks(queue.Cancel());
       for (std::thread& worker : workers) {
         worker.join();
       }
@@ -11988,7 +12037,7 @@ void ApplyWalletTransactionsWorkload(
     std::uint64_t transaction_index = 0U;
     try {
       while (transaction_index < attempt_limit) {
-        ThrowIfStopRequested(stop_token);
+        ThrowIfStopRequested(load_stop_token);
         const std::chrono::steady_clock::time_point batch_admission_at =
             std::chrono::steady_clock::now();
         if (workload.transaction_rate) {
@@ -12002,7 +12051,7 @@ void ApplyWalletTransactionsWorkload(
           ApplyTransactionLoadRateSchedule(
               &first_task, *workload.transaction_rate, options.time_scale,
               rate_epoch, transaction_index);
-          WaitUntil(first_task.scheduled_at, stop_token);
+          WaitUntil(first_task.scheduled_at, load_stop_token);
         }
 
         std::vector<WalletTransactionLoadTask> tasks;
@@ -12032,10 +12081,10 @@ void ApplyWalletTransactionsWorkload(
                 });
         if (!admission.has_plan()) {
           if (balance_reservations.WaitForResolution(admission.balance_revision,
-                                                     stop_token)) {
+                                                     load_stop_token)) {
             continue;
           }
-          ThrowIfStopRequested(stop_token);
+          ThrowIfStopRequested(load_stop_token);
           break;
         }
         if (!admission.admitted) {
@@ -12063,9 +12112,31 @@ void ApplyWalletTransactionsWorkload(
       producer_error = std::current_exception();
     }
 
-    queue.Close();
+    if (producer_error || load_stop_token.stop_requested() ||
+        worker_cancelled.load()) {
+      static_cast<void>(load_stop_source.request_stop());
+      record_dropped_tasks(queue.Cancel());
+    } else {
+      queue.Close();
+    }
     for (std::thread& worker : workers) {
       worker.join();
+    }
+    if (load_stop_token.stop_requested() || worker_cancelled.load()) {
+      record_dropped_tasks(queue.Cancel());
+    }
+    const bool cancelled = queue.cancelled() || worker_cancelled.load() ||
+                           load_stop_token.stop_requested();
+    if (cancelled) {
+      const auto elapsed =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - load_started_at);
+      const TransactionLoadSnapshot snapshot = accounting->Snapshot(elapsed);
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kTransactionLoadCompleted,
+                 TransactionLoadCompletedDetail(
+                     workload_index, workload_count, workload, attempt_limit,
+                     queue.maximum_size(), snapshot));
     }
     if (producer_error) {
       std::rethrow_exception(producer_error);
@@ -12076,7 +12147,7 @@ void ApplyWalletTransactionsWorkload(
         std::rethrow_exception(infrastructure_error);
       }
     }
-    if (worker_cancelled.load() || stop_token.stop_requested()) {
+    if (cancelled) {
       throw SimulationCancelled();
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(

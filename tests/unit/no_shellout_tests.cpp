@@ -112,7 +112,7 @@ BOOST_AUTO_TEST_CASE(
   const std::size_t ledger =
       source.find("TransactionLoadBalanceReservations balance_reservations");
   BOOST_REQUIRE(ledger != std::string::npos);
-  const std::size_t failed = source.find("if (!submitted)", ledger);
+  const std::size_t failed = source.find("if (!submitted &&", ledger);
   BOOST_REQUIRE(failed != std::string::npos);
   const std::size_t actual = source.find(".ReadWalletSnapshot(", failed);
   BOOST_REQUIRE(actual != std::string::npos);
@@ -140,9 +140,12 @@ BOOST_AUTO_TEST_CASE(
   const std::size_t submit =
       source.find("transaction = driver.SubmitWalletTransaction(");
   BOOST_REQUIRE(submit != std::string::npos);
-  const std::size_t configured_deadline = source.find(
-      "std::chrono::seconds(workload.timeout_sec), stop_token", submit);
+  const std::size_t configured_deadline =
+      source.find("std::chrono::seconds(workload.timeout_sec),", submit);
   BOOST_REQUIRE(configured_deadline != std::string::npos);
+  const std::size_t load_stop_argument =
+      source.find("load_stop_token);", configured_deadline);
+  BOOST_REQUIRE(load_stop_argument != std::string::npos);
   const std::size_t rejected =
       source.find("catch (const ChainTransactionRejected& error)", submit);
   const std::size_t timeout =
@@ -196,7 +199,7 @@ BOOST_AUTO_TEST_CASE(
       source.find("catch (const std::exception& error)", cancellation);
   BOOST_REQUIRE(ordinary_failure != std::string::npos);
   require_mapping(cancellation, ordinary_failure,
-                  "outcome = TransactionLoadOutcome::kFailed;",
+                  "outcome = TransactionLoadOutcome::kCancelled;",
                   "error_class = \"cancellation\";");
   const std::size_t error_class =
       source.find("detail[\"error_class\"] = error_class");
@@ -218,7 +221,8 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(deadline_argument != std::string::npos);
 
   BOOST_TEST(submit < configured_deadline);
-  BOOST_TEST(configured_deadline < rejected);
+  BOOST_TEST(configured_deadline < load_stop_argument);
+  BOOST_TEST(load_stop_argument < rejected);
   BOOST_TEST(rejected < timeout);
   BOOST_TEST(timeout < warmup);
   BOOST_TEST(warmup < unavailable);
@@ -230,6 +234,33 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    simulator_transaction_load_cancels_pending_queue_without_rpc_drain) {
+  const std::filesystem::path simulator =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::string source = bbp::ReadText(simulator);
+  const std::size_t stopped_pop = source.find("queue.Pop(load_stop_token)");
+  const std::size_t cancelled_outcome =
+      source.find("outcome = TransactionLoadOutcome::kCancelled;", stopped_pop);
+  const std::size_t local_stop =
+      source.find("load_stop_source.request_stop()", cancelled_outcome);
+  const std::size_t cancel_queue =
+      source.find("record_dropped_tasks(queue.Cancel())", cancelled_outcome);
+  const std::size_t post_join_cancel =
+      source.find("record_dropped_tasks(queue.Cancel())", cancel_queue + 1U);
+  const std::size_t dropped_outcome =
+      source.find("accounting->RecordOutcome(TransactionLoadOutcome::kDropped");
+  BOOST_REQUIRE(stopped_pop != std::string::npos);
+  BOOST_REQUIRE(cancelled_outcome != std::string::npos);
+  BOOST_REQUIRE(local_stop != std::string::npos);
+  BOOST_REQUIRE(cancel_queue != std::string::npos);
+  BOOST_REQUIRE(post_join_cancel != std::string::npos);
+  BOOST_REQUIRE(dropped_outcome != std::string::npos);
+  BOOST_TEST(stopped_pop < cancelled_outcome);
+  BOOST_TEST(cancelled_outcome < local_stop);
+  BOOST_TEST(local_stop < cancel_queue);
+}
+
+BOOST_AUTO_TEST_CASE(
     simulator_equal_fanout_paces_every_transaction_before_rpc_mutation) {
   const std::filesystem::path simulator =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
@@ -238,7 +269,7 @@ BOOST_AUTO_TEST_CASE(
       "ApplyTransactionLoadRateSchedule(\n"
       "                          &task");
   const std::size_t worker_wait =
-      source.find("WaitForTransactionLoadSchedule(task, stop_token)");
+      source.find("WaitForTransactionLoadSchedule(task, load_stop_token)");
   const std::size_t rpc_mutation =
       source.find("driver.SubmitWalletTransaction(", worker_wait);
   BOOST_REQUIRE(task_schedule != std::string::npos);

@@ -1333,7 +1333,8 @@ BOOST_AUTO_TEST_CASE(
   detail["rejected"] = snapshot.rejected;
   detail["timed_out"] = snapshot.timed_out;
   detail["backpressured"] = snapshot.backpressured;
-  detail["dropped"] = snapshot.backpressured;
+  detail["dropped"] = snapshot.dropped;
+  detail["cancelled"] = snapshot.cancelled;
   detail["propagated"] = snapshot.propagated;
   detail["confirmed"] = snapshot.confirmed;
   detail["failed"] = snapshot.failed;

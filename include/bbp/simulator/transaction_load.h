@@ -27,6 +27,8 @@ enum class TransactionLoadOutcome {
   kRejected,
   kTimedOut,
   kBackpressured,
+  kDropped,
+  kCancelled,
   kFailed,
 };
 
@@ -57,11 +59,13 @@ class BoundedWalletTransactionQueue {
   bool TryPushBatch(std::vector<WalletTransactionLoadTask> tasks);
   std::optional<WalletTransactionLoadTask> Pop(std::stop_token stop_token = {});
   void Close();
+  std::vector<WalletTransactionLoadTask> Cancel();
 
   [[nodiscard]] std::size_t capacity() const;
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] std::size_t maximum_size() const;
   [[nodiscard]] bool closed() const;
+  [[nodiscard]] bool cancelled() const;
 
  private:
   const std::size_t capacity_;
@@ -70,6 +74,7 @@ class BoundedWalletTransactionQueue {
   std::deque<WalletTransactionLoadTask> tasks_;
   std::size_t maximum_size_ = 0U;
   bool closed_ = false;
+  bool cancelled_ = false;
 };
 
 struct TransactionLoadBatchAdmission {
@@ -129,6 +134,8 @@ struct TransactionLoadSnapshot {
   std::uint64_t rejected = 0;
   std::uint64_t timed_out = 0;
   std::uint64_t backpressured = 0;
+  std::uint64_t dropped = 0;
+  std::uint64_t cancelled = 0;
   std::uint64_t failed = 0;
   std::uint64_t propagated = 0;
   std::uint64_t confirmed = 0;

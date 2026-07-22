@@ -1295,6 +1295,9 @@ BOOST_AUTO_TEST_CASE(run_report_preserves_cancelled_run_status) {
       R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-19T12:00:01Z","event":"run_cancelled"})");
   bbp::AppendLine(
       dir / "events.jsonl",
+      R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-19T12:00:01Z","event":"transaction_load_completed","detail":"{\"attempted\":7,\"submitted\":1,\"rejected\":0,\"timed_out\":0,\"backpressured\":0,\"dropped\":5,\"cancelled\":1,\"failed\":0,\"propagated\":1,\"confirmed\":0,\"accounting_invariants_hold\":true}"})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
       R"({"run_id":"r1","node_id":"sim","timestamp":"2026-07-19T12:00:02Z","event":"run_finished"})");
 
   boost::json::object report =
@@ -1303,6 +1306,13 @@ BOOST_AUTO_TEST_CASE(run_report_preserves_cancelled_run_status) {
   BOOST_TEST(report.at("status").as_string() == "cancelled");
   BOOST_TEST(report.at("cancelled_at").as_string() == "2026-07-19T12:00:01Z");
   BOOST_TEST(report.at("finished_at").as_string() == "2026-07-19T12:00:02Z");
+  const boost::json::array& load_summaries =
+      report.at("transaction_load_summaries").as_array();
+  BOOST_REQUIRE_EQUAL(load_summaries.size(), 1U);
+  const boost::json::object& load_summary =
+      load_summaries.front().as_object().at("detail").as_object();
+  BOOST_TEST(JsonInteger(load_summary, "dropped") == 5U);
+  BOOST_TEST(JsonInteger(load_summary, "cancelled") == 1U);
 
   bbp::AppendLine(
       dir / "events.jsonl",
@@ -2007,6 +2017,7 @@ BOOST_AUTO_TEST_CASE(
   summary_detail["timed_out"] = 0U;
   summary_detail["backpressured"] = 300U;
   summary_detail["dropped"] = 300U;
+  summary_detail["cancelled"] = 0U;
   summary_detail["propagated"] = 0U;
   summary_detail["confirmed"] = 0U;
   summary_detail["failed"] = 0U;

@@ -43,6 +43,10 @@ std::string_view TransactionLoadOutcomeName(TransactionLoadOutcome outcome) {
       return "timed_out";
     case TransactionLoadOutcome::kBackpressured:
       return "backpressured";
+    case TransactionLoadOutcome::kDropped:
+      return "dropped";
+    case TransactionLoadOutcome::kCancelled:
+      return "cancelled";
     case TransactionLoadOutcome::kFailed:
       return "failed";
   }
@@ -124,11 +128,15 @@ bool BoundedWalletTransactionQueue::TryPushBatch(
 std::optional<WalletTransactionLoadTask> BoundedWalletTransactionQueue::Pop(
     std::stop_token stop_token) {
   std::unique_lock lock(mutex_);
-  if (!ready_.wait(lock, stop_token,
-                   [this] { return closed_ || !tasks_.empty(); })) {
+  if (stop_token.stop_requested() || cancelled_) {
     return std::nullopt;
   }
-  if (tasks_.empty()) {
+  if (!ready_.wait(lock, stop_token, [this] {
+        return closed_ || cancelled_ || !tasks_.empty();
+      })) {
+    return std::nullopt;
+  }
+  if (stop_token.stop_requested() || cancelled_ || tasks_.empty()) {
     return std::nullopt;
   }
   WalletTransactionLoadTask task = std::move(tasks_.front());
@@ -140,6 +148,22 @@ void BoundedWalletTransactionQueue::Close() {
   std::lock_guard lock(mutex_);
   closed_ = true;
   ready_.notify_all();
+}
+
+std::vector<WalletTransactionLoadTask> BoundedWalletTransactionQueue::Cancel() {
+  std::vector<WalletTransactionLoadTask> dropped;
+  {
+    std::lock_guard lock(mutex_);
+    dropped.reserve(tasks_.size());
+    closed_ = true;
+    cancelled_ = true;
+    while (!tasks_.empty()) {
+      dropped.push_back(std::move(tasks_.front()));
+      tasks_.pop_front();
+    }
+  }
+  ready_.notify_all();
+  return dropped;
 }
 
 std::size_t BoundedWalletTransactionQueue::capacity() const {
@@ -159,6 +183,11 @@ std::size_t BoundedWalletTransactionQueue::maximum_size() const {
 bool BoundedWalletTransactionQueue::closed() const {
   std::lock_guard lock(mutex_);
   return closed_;
+}
+
+bool BoundedWalletTransactionQueue::cancelled() const {
+  std::lock_guard lock(mutex_);
+  return cancelled_;
 }
 
 TransactionLoadBalanceReservations::TransactionLoadBalanceReservations(
@@ -406,27 +435,17 @@ void TransactionLoadBalanceReservations::RollBackReservations(
 }
 
 bool TransactionLoadSnapshot::InvariantsHold() const {
-  if (submitted > std::numeric_limits<std::uint64_t>::max() - rejected) {
-    return false;
+  std::uint64_t terminal_total = 0U;
+  for (const std::uint64_t count :
+       {submitted, rejected, timed_out, backpressured, dropped, cancelled,
+        failed}) {
+    if (terminal_total > std::numeric_limits<std::uint64_t>::max() - count) {
+      return false;
+    }
+    terminal_total += count;
   }
-  const std::uint64_t submitted_and_rejected = submitted + rejected;
-  if (submitted_and_rejected >
-      std::numeric_limits<std::uint64_t>::max() - timed_out) {
-    return false;
-  }
-  const std::uint64_t through_timeout = submitted_and_rejected + timed_out;
-  if (through_timeout >
-      std::numeric_limits<std::uint64_t>::max() - backpressured) {
-    return false;
-  }
-  const std::uint64_t through_backpressure = through_timeout + backpressured;
-  if (through_backpressure >
-      std::numeric_limits<std::uint64_t>::max() - failed) {
-    return false;
-  }
-  return attempted == through_backpressure + failed &&
-         confirmed <= propagated && propagated <= submitted &&
-         latency_sample_count == attempted;
+  return attempted == terminal_total && confirmed <= propagated &&
+         propagated <= submitted && latency_sample_count == attempted;
 }
 
 void TransactionLoadAccounting::RecordOutcome(
@@ -455,6 +474,12 @@ void TransactionLoadAccounting::RecordOutcome(
     case TransactionLoadOutcome::kBackpressured:
       RequireIncrementable(counters_.backpressured, "backpressured");
       break;
+    case TransactionLoadOutcome::kDropped:
+      RequireIncrementable(counters_.dropped, "dropped");
+      break;
+    case TransactionLoadOutcome::kCancelled:
+      RequireIncrementable(counters_.cancelled, "cancelled");
+      break;
     case TransactionLoadOutcome::kFailed:
       RequireIncrementable(counters_.failed, "failed");
       break;
@@ -473,6 +498,12 @@ void TransactionLoadAccounting::RecordOutcome(
       break;
     case TransactionLoadOutcome::kBackpressured:
       Increment(&counters_.backpressured, "backpressured");
+      break;
+    case TransactionLoadOutcome::kDropped:
+      Increment(&counters_.dropped, "dropped");
+      break;
+    case TransactionLoadOutcome::kCancelled:
+      Increment(&counters_.cancelled, "cancelled");
       break;
     case TransactionLoadOutcome::kFailed:
       Increment(&counters_.failed, "failed");

@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <array>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <future>
@@ -57,6 +59,10 @@ BOOST_AUTO_TEST_CASE(transaction_load_outcome_names_are_stable) {
                  bbp::TransactionLoadOutcome::kBackpressured) ==
              "backpressured");
   BOOST_TEST(bbp::TransactionLoadOutcomeName(
+                 bbp::TransactionLoadOutcome::kDropped) == "dropped");
+  BOOST_TEST(bbp::TransactionLoadOutcomeName(
+                 bbp::TransactionLoadOutcome::kCancelled) == "cancelled");
+  BOOST_TEST(bbp::TransactionLoadOutcomeName(
                  bbp::TransactionLoadOutcome::kFailed) == "failed");
 }
 
@@ -97,6 +103,56 @@ BOOST_AUTO_TEST_CASE(transaction_load_queue_close_drains_pending_work) {
   BOOST_TEST(!queue.Pop());
 }
 
+BOOST_AUTO_TEST_CASE(transaction_load_queue_cancel_drops_pending_work) {
+  bbp::BoundedWalletTransactionQueue queue(3U);
+  BOOST_REQUIRE(queue.TryPushBatch({Task(7U), Task(8U), Task(9U)}));
+
+  const std::vector<bbp::WalletTransactionLoadTask> dropped = queue.Cancel();
+  BOOST_TEST(queue.closed());
+  BOOST_TEST(queue.cancelled());
+  BOOST_TEST(queue.size() == 0U);
+  BOOST_REQUIRE_EQUAL(dropped.size(), 3U);
+  BOOST_TEST(dropped[0].transaction_index == 7U);
+  BOOST_TEST(dropped[1].transaction_index == 8U);
+  BOOST_TEST(dropped[2].transaction_index == 9U);
+  BOOST_TEST(!queue.Pop());
+  BOOST_TEST(queue.Cancel().empty());
+  BOOST_CHECK_THROW(queue.TryPush(Task(10U)), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_queue_cancel_returns_pending_work_exactly_once) {
+  constexpr std::size_t kTaskCount = 128U;
+  bbp::BoundedWalletTransactionQueue queue(kTaskCount);
+  std::vector<bbp::WalletTransactionLoadTask> tasks;
+  tasks.reserve(kTaskCount);
+  for (std::size_t index = 0U; index < kTaskCount; ++index) {
+    tasks.push_back(Task(index + 1U));
+  }
+  BOOST_REQUIRE(queue.TryPushBatch(std::move(tasks)));
+
+  std::array<std::future<std::vector<bbp::WalletTransactionLoadTask>>, 4U>
+      cancellations;
+  for (auto& cancellation : cancellations) {
+    cancellation =
+        std::async(std::launch::async, [&queue] { return queue.Cancel(); });
+  }
+
+  std::vector<std::uint64_t> dropped_indexes;
+  for (auto& cancellation : cancellations) {
+    for (const auto& task : cancellation.get()) {
+      dropped_indexes.push_back(task.transaction_index);
+    }
+  }
+  std::sort(dropped_indexes.begin(), dropped_indexes.end());
+  BOOST_REQUIRE_EQUAL(dropped_indexes.size(), kTaskCount);
+  for (std::size_t index = 0U; index < kTaskCount; ++index) {
+    BOOST_TEST(dropped_indexes[index] == index + 1U);
+  }
+  BOOST_TEST(queue.cancelled());
+  BOOST_TEST(queue.size() == 0U);
+}
+
 BOOST_AUTO_TEST_CASE(transaction_load_queue_admits_batches_atomically) {
   bbp::BoundedWalletTransactionQueue queue(3U);
   BOOST_TEST(queue.TryPushBatch({Task(1U), Task(2U)}));
@@ -130,6 +186,72 @@ BOOST_AUTO_TEST_CASE(transaction_load_queue_stop_wakes_waiting_consumer) {
   BOOST_CHECK(pending.wait_for(1s) == std::future_status::ready);
   BOOST_TEST(!pending.get());
   BOOST_TEST(!queue.closed());
+
+  BOOST_REQUIRE(queue.TryPush(Task(1U)));
+  BOOST_TEST(!queue.Pop(stop.get_token()));
+  BOOST_TEST(queue.size() == 1U);
+  const auto dropped = queue.Cancel();
+  BOOST_REQUIRE_EQUAL(dropped.size(), 1U);
+  BOOST_TEST(dropped.front().transaction_index == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_full_queue_cancellation_has_bounded_latency) {
+  constexpr std::size_t kCapacity =
+      bbp::kMaximumWalletTransactionLoadQueueCapacity;
+  bbp::BoundedWalletTransactionQueue queue(kCapacity);
+  bbp::WalletTransactionLoadTask active = Task(1U);
+  active.scheduled_at = std::chrono::steady_clock::now() + 30s;
+  BOOST_REQUIRE(queue.TryPush(std::move(active)));
+
+  std::stop_source stop;
+  std::promise<void> popped;
+  std::future<void> popped_future = popped.get_future();
+  std::future<std::uint64_t> worker =
+      std::async(std::launch::async,
+                 [&queue, &popped, token = stop.get_token()]() mutable {
+                   std::uint64_t popped_count = 0U;
+                   while (const auto task = queue.Pop(token)) {
+                     ++popped_count;
+                     popped.set_value();
+                     if (!bbp::WaitForTransactionLoadSchedule(*task, token)) {
+                       break;
+                     }
+                   }
+                   return popped_count;
+                 });
+  BOOST_REQUIRE(popped_future.wait_for(1s) == std::future_status::ready);
+
+  std::vector<bbp::WalletTransactionLoadTask> queued;
+  queued.reserve(kCapacity);
+  for (std::size_t index = 0U; index < kCapacity; ++index) {
+    queued.push_back(Task(index + 2U));
+  }
+  BOOST_REQUIRE(queue.TryPushBatch(std::move(queued)));
+  BOOST_TEST(queue.size() == kCapacity);
+
+  const auto cancel_started = std::chrono::steady_clock::now();
+  stop.request_stop();
+  const std::vector<bbp::WalletTransactionLoadTask> dropped = queue.Cancel();
+  bbp::TransactionLoadAccounting accounting;
+  accounting.RecordOutcome(bbp::TransactionLoadOutcome::kCancelled, 0us);
+  for (std::size_t index = 0U; index < dropped.size(); ++index) {
+    accounting.RecordOutcome(bbp::TransactionLoadOutcome::kDropped, 0us);
+  }
+  BOOST_REQUIRE(worker.wait_for(1s) == std::future_status::ready);
+  const auto cancel_elapsed = std::chrono::steady_clock::now() - cancel_started;
+
+  BOOST_TEST(worker.get() == 1U);
+  BOOST_TEST(dropped.size() == kCapacity);
+  BOOST_TEST(queue.size() == 0U);
+  BOOST_TEST(cancel_elapsed < 2s);
+  const bbp::TransactionLoadSnapshot snapshot = accounting.Snapshot(
+      std::chrono::duration_cast<std::chrono::microseconds>(cancel_elapsed));
+  BOOST_TEST(snapshot.attempted == kCapacity + 1U);
+  BOOST_TEST(snapshot.cancelled == 1U);
+  BOOST_TEST(snapshot.dropped == kCapacity);
+  BOOST_TEST(snapshot.failed == 0U);
+  BOOST_TEST(snapshot.InvariantsHold());
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -329,29 +451,33 @@ BOOST_AUTO_TEST_CASE(transaction_load_accounting_preserves_partition_totals) {
   accounting.RecordOutcome(bbp::TransactionLoadOutcome::kRejected, 300us);
   accounting.RecordOutcome(bbp::TransactionLoadOutcome::kTimedOut, 400us);
   accounting.RecordOutcome(bbp::TransactionLoadOutcome::kBackpressured, 500us);
-  accounting.RecordOutcome(bbp::TransactionLoadOutcome::kFailed, 600us);
+  accounting.RecordOutcome(bbp::TransactionLoadOutcome::kDropped, 600us);
+  accounting.RecordOutcome(bbp::TransactionLoadOutcome::kCancelled, 700us);
+  accounting.RecordOutcome(bbp::TransactionLoadOutcome::kFailed, 800us);
   accounting.RecordPropagated(false);
   accounting.RecordPropagated(true);
   accounting.RecordObservationError();
 
   const bbp::TransactionLoadSnapshot snapshot = accounting.Snapshot(2s);
-  BOOST_TEST(snapshot.attempted == 6U);
+  BOOST_TEST(snapshot.attempted == 8U);
   BOOST_TEST(snapshot.submitted == 2U);
   BOOST_TEST(snapshot.rejected == 1U);
   BOOST_TEST(snapshot.timed_out == 1U);
   BOOST_TEST(snapshot.backpressured == 1U);
+  BOOST_TEST(snapshot.dropped == 1U);
+  BOOST_TEST(snapshot.cancelled == 1U);
   BOOST_TEST(snapshot.failed == 1U);
   BOOST_TEST(snapshot.propagated == 2U);
   BOOST_TEST(snapshot.confirmed == 1U);
   BOOST_TEST(snapshot.observation_errors == 1U);
-  BOOST_TEST(snapshot.latency_sample_count == 6U);
-  BOOST_TEST(snapshot.latency_total_us == 2100U);
+  BOOST_TEST(snapshot.latency_sample_count == 8U);
+  BOOST_TEST(snapshot.latency_total_us == 3600U);
   BOOST_TEST(snapshot.latency_min_us == 100U);
-  BOOST_TEST(snapshot.latency_max_us == 600U);
-  BOOST_TEST(snapshot.average_latency_ms == 0.35,
+  BOOST_TEST(snapshot.latency_max_us == 800U);
+  BOOST_TEST(snapshot.average_latency_ms == 0.45,
              boost::test_tools::tolerance(0.000001));
   BOOST_TEST(snapshot.elapsed_us == 2'000'000U);
-  BOOST_TEST(snapshot.attempted_per_second == 3.0);
+  BOOST_TEST(snapshot.attempted_per_second == 4.0);
   BOOST_TEST(snapshot.submitted_per_second == 1.0);
   BOOST_TEST(snapshot.propagated_per_second == 1.0);
   BOOST_TEST(snapshot.confirmed_per_second == 0.5);
