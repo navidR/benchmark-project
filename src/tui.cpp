@@ -1401,6 +1401,26 @@ void DrawCommandPaletteInput(int rows, int cols, std::string_view input,
   }
 }
 
+void DrawModalEpilogue(
+    int rows, int cols, bool command_error_open, std::string_view command_error,
+    bool command_palette_open, std::string_view command_input,
+    std::string_view command_input_error,
+    const std::optional<PendingConfirmation>& pending_confirmation,
+    const TuiExitConfirmation& exit_confirmation) {
+  if (command_error_open) {
+    DrawCommandErrorPopup(rows, cols, command_error);
+  }
+  if (command_palette_open) {
+    DrawCommandPalette(rows, cols, command_input, command_input_error);
+  }
+  if (pending_confirmation) {
+    DrawCommandConfirmationPopup(rows, cols, *pending_confirmation);
+  }
+  if (exit_confirmation.is_open()) {
+    DrawExitConfirmationPopup(rows, cols);
+  }
+}
+
 void AddDetailPair(int y, int x, int width, std::string_view label,
                    std::string_view value) {
   if (width <= 0) {
@@ -1954,21 +1974,16 @@ void DrawSelectedTopologyDetail(int top, int bottom, int cols,
                 PerfCounterSummaryText(*group));
 }
 
-void DrawSummary(const std::filesystem::path& run_root,
-                 const boost::json::object& report, std::string_view error,
-                 const std::vector<std::string>& log_lines, TuiView view,
-                 std::size_t selected_node, std::size_t selected_wallet,
-                 std::size_t selected_topology_group,
-                 const NodeLogPane& node_log_pane,
-                 const PeerListPane& peer_list_pane,
-                 const NetworkRulePane& network_rule_pane,
-                 const NodeFilePane& node_file_pane,
-                 std::string_view command_status, bool command_error_open,
-                 std::string_view command_error, bool command_palette_open,
-                 std::string_view command_input,
-                 std::string_view command_input_error,
-                 const std::optional<PendingConfirmation>& pending_confirmation,
-                 const TuiExitConfirmation& exit_confirmation) {
+void DrawFrameBody(const std::filesystem::path& run_root,
+                   const boost::json::object& report, std::string_view error,
+                   const std::vector<std::string>& log_lines, TuiView view,
+                   std::size_t selected_node, std::size_t selected_wallet,
+                   std::size_t selected_topology_group,
+                   const NodeLogPane& node_log_pane,
+                   const PeerListPane& peer_list_pane,
+                   const NetworkRulePane& network_rule_pane,
+                   const NodeFilePane& node_file_pane,
+                   std::string_view command_status) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -1994,10 +2009,6 @@ void DrawSummary(const std::filesystem::path& run_root,
     AddText(rows - 1, 0, cols,
             "Arrows select. l node log. Esc asks to exit; q exits.",
             COLOR_PAIR(kColorMuted));
-    if (exit_confirmation.is_open()) {
-      DrawExitConfirmationPopup(rows, cols);
-    }
-    refresh();
     return;
   }
 
@@ -2126,10 +2137,6 @@ void DrawSummary(const std::filesystem::path& run_root,
     AddText(rows - 1, 0, cols,
             "Arrows select. l node log. Esc asks to exit; q exits.",
             COLOR_PAIR(kColorMuted));
-    if (exit_confirmation.is_open()) {
-      DrawExitConfirmationPopup(rows, cols);
-    }
-    refresh();
     return;
   }
 
@@ -2347,18 +2354,33 @@ void DrawSummary(const std::filesystem::path& run_root,
         "asks; q exits.";
   }
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
-  if (command_error_open) {
-    DrawCommandErrorPopup(rows, cols, command_error);
-  }
-  if (command_palette_open) {
-    DrawCommandPalette(rows, cols, command_input, command_input_error);
-  }
-  if (pending_confirmation) {
-    DrawCommandConfirmationPopup(rows, cols, *pending_confirmation);
-  }
-  if (exit_confirmation.is_open()) {
-    DrawExitConfirmationPopup(rows, cols);
-  }
+}
+
+void DrawSummary(const std::filesystem::path& run_root,
+                 const boost::json::object& report, std::string_view error,
+                 const std::vector<std::string>& log_lines, TuiView view,
+                 std::size_t selected_node, std::size_t selected_wallet,
+                 std::size_t selected_topology_group,
+                 const NodeLogPane& node_log_pane,
+                 const PeerListPane& peer_list_pane,
+                 const NetworkRulePane& network_rule_pane,
+                 const NodeFilePane& node_file_pane,
+                 std::string_view command_status, bool command_error_open,
+                 std::string_view command_error, bool command_palette_open,
+                 std::string_view command_input,
+                 std::string_view command_input_error,
+                 const std::optional<PendingConfirmation>& pending_confirmation,
+                 const TuiExitConfirmation& exit_confirmation) {
+  DrawFrameBody(run_root, report, error, log_lines, view, selected_node,
+                selected_wallet, selected_topology_group, node_log_pane,
+                peer_list_pane, network_rule_pane, node_file_pane,
+                command_status);
+  int rows = 0;
+  int cols = 0;
+  getmaxyx(stdscr, rows, cols);
+  DrawModalEpilogue(rows, cols, command_error_open, command_error,
+                    command_palette_open, command_input, command_input_error,
+                    pending_confirmation, exit_confirmation);
   refresh();
 }
 

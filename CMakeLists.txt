@@ -329,6 +329,18 @@ if(BUILD_TESTING)
     -Werror
   )
 
+  add_executable(bbp-tui-pty-helper
+    tests/helpers/tui_pty_helper.cpp
+  )
+  target_link_libraries(bbp-tui-pty-helper PRIVATE util)
+  target_compile_options(bbp-tui-pty-helper PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion
+    -Werror
+  )
+
   add_executable(bbp-unit-tests
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
@@ -1726,6 +1738,17 @@ if(BUILD_TESTING)
       "-DRUN_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-live-load"
       "-DTEST_INPUT=${CMAKE_CURRENT_BINARY_DIR}/tui-exit-input"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/tui_exit_confirmation.cmake"
+  )
+  add_test(NAME bbp-integrated-tui-exit-confirmation-pty
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      $<TARGET_FILE:bbp>
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-live-load"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+  )
+  add_test(NAME bbp-tui-shared-modal-epilogue
+    COMMAND "${CMAKE_COMMAND}"
+      "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/tui.cpp"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/tui_shared_modal_epilogue.cmake"
   )
   add_test(NAME bbp-report-run-id-under-benchmark-root
     COMMAND bbp
