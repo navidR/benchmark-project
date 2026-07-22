@@ -357,14 +357,17 @@ BOOST_AUTO_TEST_CASE(
   const std::size_t sender = first_batch->front().sender_index;
   BOOST_TEST(sender < 2U);
   const std::uint64_t expected_share = (before[sender] - 300U) / 3U;
+  const std::uint64_t expected_capped_share = 1'000U;
+  BOOST_TEST(expected_share > workload.amount.maximum_satoshis);
   for (std::size_t index = 0U; index < first_batch->size(); ++index) {
     const bbp::WalletTransactionPlanEntry& entry = first_batch->at(index);
     BOOST_TEST(entry.sender_index == sender);
     BOOST_TEST(entry.receiver_index == index + 2U);
-    BOOST_TEST(entry.amount_satoshis == expected_share);
+    BOOST_TEST(entry.amount_satoshis == expected_capped_share);
+    BOOST_TEST(entry.amount_satoshis <= workload.amount.maximum_satoshis);
   }
   BOOST_TEST(first_balances[sender] ==
-             before[sender] - 3U * expected_share - 300U);
+             before[sender] - 3U * expected_capped_share - 300U);
   BOOST_TEST(first.batch_size() == 3U);
 }
 

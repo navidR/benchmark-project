@@ -2044,6 +2044,44 @@ BOOST_AUTO_TEST_CASE(
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    run_report_preserves_equal_fanout_caps_and_per_transfer_rate_slots) {
+  const std::filesystem::path dir = MakeTestDir("run-report-fanout-rate");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"fanout-rate","chain":"firo","nodes":4})");
+
+  for (std::uint64_t index = 0U; index < 3U; ++index) {
+    boost::json::object detail;
+    detail["transaction_index"] = index + 1U;
+    detail["strategy"] = "equal_fanout";
+    detail["amount_satoshis"] = 1'000U;
+    detail["scheduled_simulation_elapsed_ms"] = index * 500U;
+    detail["scheduled_wall_elapsed_ms"] = index * 500U;
+    detail["outcome"] = "submitted";
+    boost::json::object event;
+    event["run_id"] = "fanout-rate";
+    event["node_id"] = "firo-1";
+    event["event"] = "transaction_load_attempt";
+    event["detail"] = boost::json::serialize(detail);
+    bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+  }
+
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  const boost::json::array& attempts =
+      report.at("transaction_load_attempts").as_array();
+  BOOST_REQUIRE_EQUAL(attempts.size(), 3U);
+  for (std::size_t index = 0U; index < attempts.size(); ++index) {
+    const boost::json::object& detail =
+        attempts[index].as_object().at("detail").as_object();
+    BOOST_TEST(JsonInteger(detail, "amount_satoshis") == 1'000U);
+    BOOST_TEST(JsonInteger(detail, "scheduled_simulation_elapsed_ms") ==
+               index * 500U);
+    BOOST_TEST(JsonInteger(detail, "scheduled_wall_elapsed_ms") ==
+               index * 500U);
+  }
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(incremental_run_report_waits_for_complete_jsonl_lines) {
   const std::filesystem::path dir = MakeTestDir("run-report-partial-line");
   bbp::WriteText(dir / "resolved-scenario.json",

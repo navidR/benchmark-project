@@ -133,6 +133,57 @@ BOOST_AUTO_TEST_CASE(transaction_load_queue_stop_wakes_waiting_consumer) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    transaction_load_equal_fanout_tasks_use_distinct_global_rate_slots) {
+  const auto epoch = std::chrono::steady_clock::now();
+  const bbp::WalletTransactionRate rate =
+      bbp::WalletTransactionRate::FromDouble(2.0);
+  const bbp::SimulationTimeScale time_scale =
+      bbp::SimulationTimeScale::FromDouble(1.0);
+  std::vector<bbp::WalletTransactionLoadTask> tasks = {Task(1U), Task(2U),
+                                                       Task(3U)};
+
+  for (std::size_t index = 0U; index < tasks.size(); ++index) {
+    bbp::ApplyTransactionLoadRateSchedule(&tasks[index], rate, time_scale,
+                                          epoch, index);
+  }
+
+  BOOST_TEST(tasks[0].scheduled_simulation_elapsed->count() == 0);
+  BOOST_TEST(tasks[1].scheduled_simulation_elapsed->count() == 500);
+  BOOST_TEST(tasks[2].scheduled_simulation_elapsed->count() == 1000);
+  BOOST_TEST(tasks[0].scheduled_wall_elapsed->count() == 0);
+  BOOST_TEST(tasks[1].scheduled_wall_elapsed->count() == 500);
+  BOOST_TEST(tasks[2].scheduled_wall_elapsed->count() == 1000);
+  BOOST_CHECK(tasks[0].scheduled_at == epoch);
+  BOOST_CHECK(tasks[1].scheduled_at == epoch + 500ms);
+  BOOST_CHECK(tasks[2].scheduled_at == epoch + 1s);
+  BOOST_CHECK_THROW(bbp::ApplyTransactionLoadRateSchedule(
+                        nullptr, rate, time_scale, epoch, 0U),
+                    std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_runtime_waits_for_each_task_rate_slot_cancellably) {
+  bbp::WalletTransactionLoadTask ready = Task(1U);
+  ready.scheduled_at = std::chrono::steady_clock::now() + 40ms;
+  const auto wait_started = std::chrono::steady_clock::now();
+  BOOST_TEST(bbp::WaitForTransactionLoadSchedule(ready));
+  const auto elapsed = std::chrono::steady_clock::now() - wait_started;
+  BOOST_TEST(elapsed >= 30ms);
+
+  bbp::WalletTransactionLoadTask cancelled = Task(2U);
+  cancelled.scheduled_at = std::chrono::steady_clock::now() + 5s;
+  std::stop_source stop;
+  std::future<bool> pending =
+      std::async(std::launch::async, [&cancelled, token = stop.get_token()] {
+        return bbp::WaitForTransactionLoadSchedule(cancelled, token);
+      });
+  BOOST_CHECK(pending.wait_for(20ms) == std::future_status::timeout);
+  stop.request_stop();
+  BOOST_CHECK(pending.wait_for(1s) == std::future_status::ready);
+  BOOST_TEST(!pending.get());
+}
+
+BOOST_AUTO_TEST_CASE(
     transaction_load_failed_reservation_reconciles_and_retries) {
   bbp::WalletTransactionsWorkload workload =
       LoadWorkload(bbp::WalletTransferStrategy::kRandomBruteforce, {2U});

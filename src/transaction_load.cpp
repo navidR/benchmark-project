@@ -49,6 +49,46 @@ std::string_view TransactionLoadOutcomeName(TransactionLoadOutcome outcome) {
   throw std::runtime_error("unknown transaction load outcome");
 }
 
+void ApplyTransactionLoadRateSchedule(
+    WalletTransactionLoadTask* task, const WalletTransactionRate& rate,
+    const SimulationTimeScale& time_scale,
+    std::chrono::steady_clock::time_point rate_epoch,
+    std::uint64_t zero_based_transaction_index) {
+  if (task == nullptr) {
+    throw std::runtime_error("transaction load schedule task is missing");
+  }
+  const std::chrono::milliseconds simulation_elapsed =
+      rate.SimulationElapsedBefore(zero_based_transaction_index);
+  const std::chrono::milliseconds wall_elapsed =
+      time_scale.WallDuration(simulation_elapsed);
+  const auto maximum_wall_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::time_point::max() - rate_epoch);
+  if (wall_elapsed > maximum_wall_elapsed) {
+    throw std::runtime_error(
+        "transaction load rate schedule exceeds monotonic clock range");
+  }
+  task->scheduled_simulation_elapsed = simulation_elapsed;
+  task->scheduled_wall_elapsed = wall_elapsed;
+  task->scheduled_at = rate_epoch + wall_elapsed;
+}
+
+bool WaitForTransactionLoadSchedule(const WalletTransactionLoadTask& task,
+                                    std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    return false;
+  }
+  if (std::chrono::steady_clock::now() >= task.scheduled_at) {
+    return true;
+  }
+  std::condition_variable_any condition;
+  std::mutex mutex;
+  std::unique_lock lock(mutex);
+  condition.wait_until(lock, stop_token, task.scheduled_at,
+                       [] { return false; });
+  return !stop_token.stop_requested();
+}
+
 BoundedWalletTransactionQueue::BoundedWalletTransactionQueue(
     std::size_t capacity)
     : capacity_(capacity) {

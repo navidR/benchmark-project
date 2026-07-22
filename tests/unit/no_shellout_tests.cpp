@@ -228,3 +228,21 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(shared_deadline < bounded_observation);
   BOOST_TEST(bounded_observation < deadline_argument);
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulator_equal_fanout_paces_every_transaction_before_rpc_mutation) {
+  const std::filesystem::path simulator =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::string source = bbp::ReadText(simulator);
+  const std::size_t task_schedule = source.find(
+      "ApplyTransactionLoadRateSchedule(\n"
+      "                          &task");
+  const std::size_t worker_wait =
+      source.find("WaitForTransactionLoadSchedule(task, stop_token)");
+  const std::size_t rpc_mutation =
+      source.find("driver.SubmitWalletTransaction(", worker_wait);
+  BOOST_REQUIRE(task_schedule != std::string::npos);
+  BOOST_REQUIRE(worker_wait != std::string::npos);
+  BOOST_REQUIRE(rpc_mutation != std::string::npos);
+  BOOST_TEST(worker_wait < rpc_mutation);
+}

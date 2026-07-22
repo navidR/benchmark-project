@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/simulation_time_scale.h"
 #include "bbp/simulator/wallet_transaction_plan.h"
 
 namespace bbp {
@@ -38,6 +39,15 @@ struct WalletTransactionLoadTask {
   std::optional<std::chrono::milliseconds> scheduled_wall_elapsed;
   std::chrono::steady_clock::time_point scheduled_at;
 };
+
+void ApplyTransactionLoadRateSchedule(
+    WalletTransactionLoadTask* task, const WalletTransactionRate& rate,
+    const SimulationTimeScale& time_scale,
+    std::chrono::steady_clock::time_point rate_epoch,
+    std::uint64_t zero_based_transaction_index);
+
+bool WaitForTransactionLoadSchedule(const WalletTransactionLoadTask& task,
+                                    std::stop_token stop_token = {});
 
 class BoundedWalletTransactionQueue {
  public:

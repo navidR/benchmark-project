@@ -424,7 +424,8 @@ WalletTransactionLoadPlanner::NextBatch(
       continue;
     }
     const std::uint64_t fee_safe_budget = balance - total_fees;
-    const std::uint64_t amount = fee_safe_budget / receiver_count;
+    const std::uint64_t amount = std::min(workload_.amount.maximum_satoshis,
+                                          fee_safe_budget / receiver_count);
     if (amount < workload_.amount.minimum_satoshis) {
       continue;
     }

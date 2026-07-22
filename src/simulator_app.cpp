@@ -7967,6 +7967,7 @@ std::string TransactionLoadAttemptDetail(
   detail["fee_satoshis"] = workload.fee_satoshis;
   detail["fee_reserve_satoshis"] =
       EffectiveWalletTransactionFeeReserveSatoshis(workload);
+  detail["amount_distribution"] = AmountDistributionDetail(workload.amount);
   if (task.scheduled_simulation_elapsed) {
     detail["scheduled_simulation_elapsed_ms"] =
         task.scheduled_simulation_elapsed->count();
@@ -11751,6 +11752,9 @@ void ApplyWalletTransactionsWorkload(
             while (const std::optional<WalletTransactionLoadTask> next =
                        queue.Pop()) {
               const WalletTransactionLoadTask& task = *next;
+              if (!WaitForTransactionLoadSchedule(task, stop_token)) {
+                throw SimulationCancelled();
+              }
               const WalletIdentity& sender = wallets.at(task.plan.sender_index);
               const WalletIdentity& receiver =
                   wallets.at(task.plan.receiver_index);
@@ -11985,18 +11989,20 @@ void ApplyWalletTransactionsWorkload(
     try {
       while (transaction_index < attempt_limit) {
         ThrowIfStopRequested(stop_token);
-        std::optional<std::chrono::milliseconds> scheduled_simulation_elapsed;
-        std::optional<std::chrono::milliseconds> scheduled_wall_elapsed;
-        std::chrono::steady_clock::time_point scheduled_at =
+        const std::chrono::steady_clock::time_point batch_admission_at =
             std::chrono::steady_clock::now();
         if (workload.transaction_rate) {
-          scheduled_simulation_elapsed =
-              workload.transaction_rate->SimulationElapsedBefore(
-                  transaction_index);
-          scheduled_wall_elapsed =
-              options.time_scale.WallDuration(*scheduled_simulation_elapsed);
-          scheduled_at = SteadyDeadline(rate_epoch, *scheduled_wall_elapsed);
-          WaitUntil(scheduled_at, stop_token);
+          WalletTransactionLoadTask first_task{
+              .transaction_index = transaction_index + 1U,
+              .plan = {},
+              .scheduled_simulation_elapsed = std::nullopt,
+              .scheduled_wall_elapsed = std::nullopt,
+              .scheduled_at = batch_admission_at,
+          };
+          ApplyTransactionLoadRateSchedule(
+              &first_task, *workload.transaction_rate, options.time_scale,
+              rate_epoch, transaction_index);
+          WaitUntil(first_task.scheduled_at, stop_token);
         }
 
         std::vector<WalletTransactionLoadTask> tasks;
@@ -12008,14 +12014,19 @@ void ApplyWalletTransactionsWorkload(
                   tasks.reserve(plans.size());
                   for (std::size_t offset = 0U; offset < plans.size();
                        ++offset) {
-                    tasks.push_back(WalletTransactionLoadTask{
+                    WalletTransactionLoadTask task{
                         .transaction_index = transaction_index + offset + 1U,
                         .plan = plans.at(offset),
-                        .scheduled_simulation_elapsed =
-                            scheduled_simulation_elapsed,
-                        .scheduled_wall_elapsed = scheduled_wall_elapsed,
-                        .scheduled_at = scheduled_at,
-                    });
+                        .scheduled_simulation_elapsed = std::nullopt,
+                        .scheduled_wall_elapsed = std::nullopt,
+                        .scheduled_at = batch_admission_at,
+                    };
+                    if (workload.transaction_rate) {
+                      ApplyTransactionLoadRateSchedule(
+                          &task, *workload.transaction_rate, options.time_scale,
+                          rate_epoch, transaction_index + offset);
+                    }
+                    tasks.push_back(std::move(task));
                   }
                   return queue.TryPushBatch(tasks);
                 });
