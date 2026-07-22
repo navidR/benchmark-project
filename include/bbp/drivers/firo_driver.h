@@ -22,12 +22,20 @@ enum class BitcoinFamilyGetBlockVerbosityEncoding {
   kInteger,
 };
 
+enum class BitcoinFamilyTransactionConfirmationHeightSource {
+  kTransaction,
+  kBlockHeader,
+};
+
 class FiroDriver final : public ChainDriver {
  public:
   explicit FiroDriver(
       std::chrono::milliseconds rpc_timeout, std::string driver_name = "Firo",
       BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding =
-          BitcoinFamilyGetBlockVerbosityEncoding::kBoolean);
+          BitcoinFamilyGetBlockVerbosityEncoding::kBoolean,
+      BitcoinFamilyTransactionConfirmationHeightSource
+          transaction_confirmation_height_source =
+              BitcoinFamilyTransactionConfirmationHeightSource::kTransaction);
 
   ProcessSpec RenderProcess(const FiroNodeConfig& config) const override;
   bool SupportsWalletTransactionMode(WalletMode mode) const override;
@@ -171,6 +179,8 @@ class FiroDriver final : public ChainDriver {
 
   std::string driver_name_;
   BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding_;
+  BitcoinFamilyTransactionConfirmationHeightSource
+      transaction_confirmation_height_source_;
   HttpClient http_;
 };
 

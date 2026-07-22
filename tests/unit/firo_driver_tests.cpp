@@ -949,6 +949,8 @@ BOOST_AUTO_TEST_CASE(firo_rejects_invalid_transaction_confirmation_numbers) {
   BOOST_TEST(rejects(
       R"({"result":{"txid":"invalid-tx","blockhash":"block","height":1,"confirmations":-1},"error":null,"id":"bbp"})"));
   BOOST_TEST(rejects(
+      R"({"result":{"txid":"invalid-tx","blockhash":"block","confirmations":1},"error":null,"id":"bbp"})"));
+  BOOST_TEST(rejects(
       R"({"result":{"txid":"invalid-tx","blockhash":"block","height":18446744073709551615,"confirmations":2},"error":null,"id":"bbp"})"));
 }
 

@@ -587,9 +587,13 @@ std::string TxOutScriptPubKeyHex(const boost::json::object& txout) {
 
 FiroDriver::FiroDriver(
     std::chrono::milliseconds rpc_timeout, std::string driver_name,
-    BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding)
+    BitcoinFamilyGetBlockVerbosityEncoding getblock_verbosity_encoding,
+    BitcoinFamilyTransactionConfirmationHeightSource
+        transaction_confirmation_height_source)
     : driver_name_(std::move(driver_name)),
       getblock_verbosity_encoding_(getblock_verbosity_encoding),
+      transaction_confirmation_height_source_(
+          transaction_confirmation_height_source),
       http_(rpc_timeout) {
   if (driver_name_.empty()) {
     throw std::invalid_argument("chain driver display name must not be empty");
@@ -1621,14 +1625,39 @@ ChainTransactionObservation FiroDriver::ObserveTransactionImpl(
                              " getrawtransaction returned an invalid block "
                              "hash");
   }
-  const std::uint64_t confirmation_height =
-      JsonUint64Member(object, "height", driver_name_);
   const std::uint64_t confirmation_count =
       JsonUint64Member(object, "confirmations", driver_name_);
   if (confirmation_count == 0U) {
     throw std::runtime_error(driver_name_ +
                              " getrawtransaction returned zero "
                              "confirmations for a block");
+  }
+  std::uint64_t confirmation_height = 0U;
+  switch (transaction_confirmation_height_source_) {
+    case BitcoinFamilyTransactionConfirmationHeightSource::kTransaction:
+      confirmation_height = JsonUint64Member(object, "height", driver_name_);
+      break;
+    case BitcoinFamilyTransactionConfirmationHeightSource::kBlockHeader: {
+      boost::json::array header_params;
+      header_params.emplace_back(block_hash->as_string());
+      header_params.emplace_back(true);
+      const boost::json::value header =
+          rpc_call("getblockheader", header_params);
+      if (!header.is_object()) {
+        throw std::runtime_error(driver_name_ +
+                                 " getblockheader returned a non-object");
+      }
+      const boost::json::object& header_object = header.as_object();
+      if (JsonStringMember(header_object, "hash", driver_name_) !=
+          block_hash->as_string()) {
+        throw std::runtime_error(driver_name_ +
+                                 " getblockheader returned a different block "
+                                 "hash");
+      }
+      confirmation_height =
+          JsonUint64Member(header_object, "height", driver_name_);
+      break;
+    }
   }
   if (confirmation_height >
       std::numeric_limits<std::uint64_t>::max() - (confirmation_count - 1U)) {
