@@ -1,5 +1,6 @@
 #include <poll.h>
 #include <pty.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -300,6 +302,47 @@ void RequireExitZero(PtyProcess* process, std::string_view context) {
     throw std::runtime_error(std::string(context) + " exited " +
                              std::to_string(result));
   }
+}
+
+std::filesystem::path LauncherPathFromOutput(std::string_view output) {
+  constexpr std::string_view prefix = "/tmp/bbp-firo-qt-";
+  constexpr std::size_t random_length = 6U;
+  constexpr std::string_view suffix = ".sh";
+  const std::size_t begin = output.find(prefix);
+  if (begin == std::string_view::npos) {
+    return {};
+  }
+  const std::size_t length = prefix.size() + random_length + suffix.size();
+  if (begin + length > output.size() ||
+      output.substr(begin + prefix.size() + random_length, suffix.size()) !=
+          suffix) {
+    return {};
+  }
+  return std::string(output.substr(begin, length));
+}
+
+std::pair<std::string, std::filesystem::path> ReadLauncherDialog(
+    const PtyProcess& process, std::string_view context) {
+  std::string output =
+      process.ReadUntil("Native Firo-Qt launcher", 3s, context);
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  std::filesystem::path path = LauncherPathFromOutput(output);
+  while (path.empty() && std::chrono::steady_clock::now() < deadline) {
+    output += process.ReadFor(100ms);
+    path = LauncherPathFromOutput(output);
+  }
+  if (path.empty()) {
+    throw std::runtime_error(std::string(context) +
+                             " did not show its complete script path");
+  }
+  RequireContains(output, "Script path:", context);
+  RequireContains(output, "Complete command:", context);
+  RequireContains(output, "'-regtest'", context);
+  RequireContains(output, "'-connect=", context);
+  RequireContains(output, "'-maxconnections=1'", context);
+  RequireContains(output, "'-upnp=0'", context);
+  RequireContains(output, "BBP has not launched Firo-Qt", context);
+  return {std::move(output), std::move(path)};
 }
 
 void CheckCanonicalExitModal(const std::filesystem::path& command,
@@ -672,6 +715,56 @@ void WriteActiveScenario(const std::filesystem::path& path) {
   }
 }
 
+std::string AppendActiveOperatorConnectionEvent(
+    const std::filesystem::path& events_path,
+    const std::filesystem::path& run_root,
+    const std::filesystem::path& qt_binary) {
+  const std::filesystem::path data_dir = run_root / "operator" / "firo-qt";
+  const std::string command =
+      "'" + std::filesystem::canonical(qt_binary).string() +
+      "' '-regtest' '-datadir=" + data_dir.string() +
+      "' '-connect=127.0.0.1:18168' '-dns=0' '-dnsseed=0' "
+      "'-forcednsseed=0' '-maxconnections=1' '-listen=0' '-discover=0' "
+      "'-listenonion=0' '-torsetup=0' '-upnp=0'";
+  std::ofstream stream(events_path, std::ios::app);
+  if (!stream) {
+    throw std::runtime_error(
+        "could not append active-run operator connection event");
+  }
+  stream << "{\"run_id\":\"tui-active\",\"node_id\":\"firo-active\","
+            "\"timestamp\":\"2026-07-22T00:00:00Z\","
+            "\"event\":\"operator_connection_command\","
+            "\"detail\":\"{\\\"kind\\\":\\\"manual_firo_gui\\\","
+            "\\\"manual_launch\\\":true,\\\"wallet_enabled\\\":true,"
+            "\\\"discovery_disabled\\\":true,\\\"command\\\":\\\""
+         << command << "\\\",\\\"data_dir\\\":\\\"" << data_dir.string()
+         << "\\\",\\\"peer_endpoint\\\":\\\"127.0.0.1:18168\\\"}\"}\n";
+  if (!stream) {
+    throw std::runtime_error(
+        "could not flush active-run operator connection event");
+  }
+  return command;
+}
+
+std::filesystem::path CopyActiveDaemonFixtures(
+    const std::filesystem::path& helper_binary,
+    const std::filesystem::path& directory) {
+  const std::filesystem::path bin = directory / "bin";
+  std::filesystem::create_directory(bin);
+  const std::filesystem::path daemon = bin / "firod";
+  const std::filesystem::path qt = bin / "firo-qt";
+  std::filesystem::copy_file(helper_binary, daemon);
+  std::filesystem::copy_file(helper_binary, qt);
+  constexpr std::filesystem::perms kOwnerExecutable =
+      std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+      std::filesystem::perms::owner_exec;
+  std::filesystem::permissions(daemon, kOwnerExecutable,
+                               std::filesystem::perm_options::replace);
+  std::filesystem::permissions(qt, kOwnerExecutable,
+                               std::filesystem::perm_options::replace);
+  return daemon;
+}
+
 void AppendMalformedEvent(const std::filesystem::path& events_path) {
   std::ofstream stream(events_path, std::ios::app);
   if (!stream) {
@@ -684,14 +777,24 @@ void AppendMalformedEvent(const std::filesystem::path& events_path) {
 }
 
 void CheckActiveRunLifecycle(const std::filesystem::path& command,
-                             const std::filesystem::path& daemon) {
+                             const std::filesystem::path& helper_binary) {
   OwnedTemporaryDirectory directory("active");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
   const std::filesystem::path scenario = directory.root() / "scenario.json";
   const std::filesystem::path benchmark_root = directory.root() / "runs";
   const std::string run_id = "tui-active-" + std::to_string(getpid());
   const std::filesystem::path run_root = benchmark_root / run_id;
   const std::filesystem::path events_path = run_root / "events.jsonl";
+  const std::filesystem::path qt_execution_marker =
+      directory.root() / "firo-qt-was-executed";
   WriteActiveScenario(scenario);
+
+  if (setenv("BBP_TUI_FIRO_QT_EXECUTION_MARKER", qt_execution_marker.c_str(),
+             1) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "set Firo-Qt execution marker");
+  }
 
   PtyProcess process(
       command,
@@ -699,6 +802,10 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
        "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
        "--refresh-ms", "50"},
       30, 100);
+  if (unsetenv("BBP_TUI_FIRO_QT_EXECUTION_MARKER") != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "clear Firo-Qt execution marker");
+  }
   static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
                                       "active benchmark"));
   const std::string startup_events =
@@ -706,6 +813,59 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   const pid_t daemon_pid = ProcessStartedPid(startup_events);
   if (!process.Running() || !ProcessExists(daemon_pid)) {
     throw std::runtime_error("active benchmark was not running before Esc");
+  }
+
+  const std::string expected_qt_command = AppendActiveOperatorConnectionEvent(
+      events_path, run_root, daemon.parent_path() / "firo-qt");
+  process.Write("c");
+  static_cast<void>(
+      process.ReadUntil("Live command", 3s, "active Firo-Qt palette"));
+  process.Write("firo-qt\n");
+  auto [first_dialog, first_launcher] =
+      ReadLauncherDialog(process, "active Firo-Qt launcher dialog");
+  static_cast<void>(first_dialog);
+  if (ReadFile(first_launcher) !=
+      "#!/bin/bash\nexec " + expected_qt_command + "\n") {
+    throw std::runtime_error(
+        "active Firo-Qt launcher did not preserve the complete command");
+  }
+  if (!process.Running() || !ProcessExists(daemon_pid) ||
+      std::filesystem::exists(qt_execution_marker)) {
+    throw std::runtime_error(
+        "creating the Firo-Qt launcher executed it or changed the active run");
+  }
+
+  process.Write("\n");
+  static_cast<void>(process.ReadFor(200ms));
+  if (!std::filesystem::exists(first_launcher) || !process.Running() ||
+      !ProcessExists(daemon_pid)) {
+    throw std::runtime_error(
+        "dismissing the Firo-Qt dialog changed the active run or launcher");
+  }
+  process.Write("c");
+  static_cast<void>(
+      process.ReadUntil("Live command", 3s, "repeated Firo-Qt palette"));
+  process.Write("firo-qt\n");
+  auto [second_dialog, second_launcher] =
+      ReadLauncherDialog(process, "repeated Firo-Qt launcher dialog");
+  static_cast<void>(second_dialog);
+  if (first_launcher == second_launcher ||
+      std::filesystem::exists(first_launcher) ||
+      !std::filesystem::exists(second_launcher)) {
+    throw std::runtime_error(
+        "repeated Firo-Qt command did not retain exactly one launcher");
+  }
+  process.Write("\n");
+  static_cast<void>(process.ReadFor(200ms));
+  const std::string after_launcher = ReadFile(events_path);
+  RequireNotContains(after_launcher, "\"event\":\"run_cancelled\"",
+                     "active Firo-Qt dialog dismissal");
+  RequireNotContains(after_launcher, "\"event\":\"run_finished\"",
+                     "active Firo-Qt dialog dismissal");
+  if (!process.Running() || !ProcessExists(daemon_pid) ||
+      std::filesystem::exists(qt_execution_marker)) {
+    throw std::runtime_error(
+        "Firo-Qt dialog dismissal stopped the active worker or ran Firo-Qt");
   }
 
   std::this_thread::sleep_for(200ms);
@@ -750,6 +910,16 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   RequireContains(finished_events, "\"event\":\"run_cancelled\"",
                   "active-run confirmed exit");
   WaitForProcessExit(daemon_pid, 3s);
+  struct stat launcher_status {};
+  errno = 0;
+  if (lstat(second_launcher.c_str(), &launcher_status) == 0 ||
+      errno != ENOENT) {
+    throw std::runtime_error(
+        "owned Firo-Qt launcher survived confirmed active-run cleanup");
+  }
+  if (std::filesystem::exists(qt_execution_marker)) {
+    throw std::runtime_error("BBP executed the generated Firo-Qt launcher");
+  }
 }
 
 int RunIdleDaemon() {
@@ -761,6 +931,14 @@ int RunIdleDaemon() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (std::filesystem::path(argv[0]).filename() == "firo-qt") {
+    const char* marker = std::getenv("BBP_TUI_FIRO_QT_EXECUTION_MARKER");
+    if (marker != nullptr) {
+      std::ofstream stream(marker);
+      stream << "executed\n";
+    }
+    return 0;
+  }
   if (argc == 5 && std::string_view(argv[1]) == "--direct-load-lifecycle") {
     try {
       CheckDirectLoadLifecycle(argv[2], argv[3], argv[4]);

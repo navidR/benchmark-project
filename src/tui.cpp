@@ -82,9 +82,20 @@ struct TuiState {
   bool command_palette_open = false;
   std::string command_input;
   std::string command_input_error;
+  std::optional<OwnedFiroQtLauncher> firo_qt_launcher;
+  bool firo_qt_launcher_dialog_open = false;
+  std::string firo_qt_launcher_command;
   std::optional<PendingConfirmation> pending_confirmation;
   TuiExitConfirmation exit_confirmation;
 };
+
+int FinishTui(TuiState* state, int result) {
+  if (state->firo_qt_launcher) {
+    static_cast<void>(state->firo_qt_launcher->Cleanup());
+    state->firo_qt_launcher.reset();
+  }
+  return result;
+}
 
 class CursesSession {
  public:
@@ -1346,7 +1357,7 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   AddText(top + 3, left + 2, popup_cols - 4,
           "wallet-send <receiver-wallet> <amount> <fee> [timeout-sec]");
   AddText(top + 4, left + 2, popup_cols - 4,
-          "stop-mining  disconnect  reconnect  log-more  log-less");
+          "stop-mining  disconnect  reconnect  log-more  log-less  firo-qt");
   AddText(top + 5, left + 2, popup_cols - 4,
           "connect-peer <node-id>  disconnect-peer <node-id>");
   AddText(top + 6, left + 2, popup_cols - 4, "peer-policy <minimum> <maximum>");
@@ -1401,10 +1412,76 @@ void DrawCommandPaletteInput(int rows, int cols, std::string_view input,
   }
 }
 
+std::size_t WrappedLineCount(std::string_view text, int width) {
+  const std::size_t unsigned_width = static_cast<std::size_t>(width);
+  return std::max<std::size_t>(
+      1U, (text.size() + unsigned_width - 1U) / unsigned_width);
+}
+
+void DrawWrappedText(int* y, int left, int width, std::string_view text,
+                     int attributes = 0) {
+  if (text.empty()) {
+    AddText(*y, left, width, "", attributes);
+    ++*y;
+    return;
+  }
+  std::size_t offset = 0U;
+  while (offset < text.size()) {
+    const std::size_t count =
+        std::min(static_cast<std::size_t>(width), text.size() - offset);
+    AddText(*y, left, width, text.substr(offset, count), attributes);
+    ++*y;
+    offset += count;
+  }
+}
+
+void DrawFiroQtLauncherDialog(int rows, int cols,
+                              const std::filesystem::path& launcher_path,
+                              std::string_view command) {
+  if (rows < 12 || cols < 48 || launcher_path.empty() || command.empty()) {
+    return;
+  }
+  const int popup_cols = std::min(cols - 4, 100);
+  const int content_width = popup_cols - 4;
+  const std::string path = launcher_path.string();
+  const std::size_t desired_rows = 7U + WrappedLineCount(path, content_width) +
+                                   WrappedLineCount(command, content_width);
+  if (desired_rows > static_cast<std::size_t>(rows - 2)) {
+    return;
+  }
+  const int popup_rows = static_cast<int>(desired_rows);
+  const int top = (rows - popup_rows) / 2;
+  const int left = (cols - popup_cols) / 2;
+  for (int row = 0; row < popup_rows; ++row) {
+    mvhline(top + row, left, ' ', popup_cols);
+  }
+  mvhline(top, left + 1, ACS_HLINE, popup_cols - 2);
+  mvhline(top + popup_rows - 1, left + 1, ACS_HLINE, popup_cols - 2);
+  mvvline(top + 1, left, ACS_VLINE, popup_rows - 2);
+  mvvline(top + 1, left + popup_cols - 1, ACS_VLINE, popup_rows - 2);
+  mvaddch(top, left, ACS_ULCORNER);
+  mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
+  mvaddch(top + popup_rows - 1, left, ACS_LLCORNER);
+  mvaddch(top + popup_rows - 1, left + popup_cols - 1, ACS_LRCORNER);
+
+  int y = top + 1;
+  AddText(y++, left + 2, content_width, "Native Firo-Qt launcher",
+          A_BOLD | COLOR_PAIR(kColorTitle));
+  AddText(y++, left + 2, content_width, "Script path:", A_BOLD);
+  DrawWrappedText(&y, left + 2, content_width, path);
+  AddText(y++, left + 2, content_width, "Complete command:", A_BOLD);
+  DrawWrappedText(&y, left + 2, content_width, command);
+  AddText(y, left + 2, content_width,
+          "Enter or Esc dismisses; BBP has not launched Firo-Qt.",
+          COLOR_PAIR(kColorMuted));
+}
+
 void DrawModalEpilogue(
     int rows, int cols, bool command_error_open, std::string_view command_error,
     bool command_palette_open, std::string_view command_input,
-    std::string_view command_input_error,
+    std::string_view command_input_error, bool firo_qt_launcher_dialog_open,
+    const std::filesystem::path& firo_qt_launcher_path,
+    std::string_view firo_qt_launcher_command,
     const std::optional<PendingConfirmation>& pending_confirmation,
     const TuiExitConfirmation& exit_confirmation) {
   if (command_error_open) {
@@ -1415,6 +1492,10 @@ void DrawModalEpilogue(
   }
   if (pending_confirmation) {
     DrawCommandConfirmationPopup(rows, cols, *pending_confirmation);
+  }
+  if (firo_qt_launcher_dialog_open) {
+    DrawFiroQtLauncherDialog(rows, cols, firo_qt_launcher_path,
+                             firo_qt_launcher_command);
   }
   if (exit_confirmation.is_open()) {
     DrawExitConfirmationPopup(rows, cols);
@@ -2356,21 +2437,21 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
 }
 
-void DrawSummary(const std::filesystem::path& run_root,
-                 const boost::json::object& report, std::string_view error,
-                 const std::vector<std::string>& log_lines, TuiView view,
-                 std::size_t selected_node, std::size_t selected_wallet,
-                 std::size_t selected_topology_group,
-                 const NodeLogPane& node_log_pane,
-                 const PeerListPane& peer_list_pane,
-                 const NetworkRulePane& network_rule_pane,
-                 const NodeFilePane& node_file_pane,
-                 std::string_view command_status, bool command_error_open,
-                 std::string_view command_error, bool command_palette_open,
-                 std::string_view command_input,
-                 std::string_view command_input_error,
-                 const std::optional<PendingConfirmation>& pending_confirmation,
-                 const TuiExitConfirmation& exit_confirmation) {
+void DrawSummary(
+    const std::filesystem::path& run_root, const boost::json::object& report,
+    std::string_view error, const std::vector<std::string>& log_lines,
+    TuiView view, std::size_t selected_node, std::size_t selected_wallet,
+    std::size_t selected_topology_group, const NodeLogPane& node_log_pane,
+    const PeerListPane& peer_list_pane,
+    const NetworkRulePane& network_rule_pane,
+    const NodeFilePane& node_file_pane, std::string_view command_status,
+    bool command_error_open, std::string_view command_error,
+    bool command_palette_open, std::string_view command_input,
+    std::string_view command_input_error, bool firo_qt_launcher_dialog_open,
+    const std::filesystem::path& firo_qt_launcher_path,
+    std::string_view firo_qt_launcher_command,
+    const std::optional<PendingConfirmation>& pending_confirmation,
+    const TuiExitConfirmation& exit_confirmation) {
   DrawFrameBody(run_root, report, error, log_lines, view, selected_node,
                 selected_wallet, selected_topology_group, node_log_pane,
                 peer_list_pane, network_rule_pane, node_file_pane,
@@ -2380,7 +2461,9 @@ void DrawSummary(const std::filesystem::path& run_root,
   getmaxyx(stdscr, rows, cols);
   DrawModalEpilogue(rows, cols, command_error_open, command_error,
                     command_palette_open, command_input, command_input_error,
-                    pending_confirmation, exit_confirmation);
+                    firo_qt_launcher_dialog_open, firo_qt_launcher_path,
+                    firo_qt_launcher_command, pending_confirmation,
+                    exit_confirmation);
   refresh();
 }
 
@@ -2419,6 +2502,39 @@ bool QueueParsedNodeCommand(
     bool confirmed = false, std::string confirmed_target = {},
     std::optional<SimulationPartition> confirmed_partition = std::nullopt,
     std::optional<SimulationWalletSend> confirmed_wallet_send = std::nullopt) {
+  if (parsed.local_action) {
+    if (command_queue == nullptr) {
+      state->command_input_error =
+          "The Firo-Qt launcher is available only for a running benchmark.";
+      state->command_status = state->command_input_error;
+      return false;
+    }
+    try {
+      if (*parsed.local_action != TuiLocalAction::kCreateFiroQtLauncher) {
+        throw std::runtime_error("unknown local TUI action");
+      }
+      const std::string command = OperatorConnectionCommandFromReport(report);
+      if (command.empty()) {
+        throw std::runtime_error(
+            "the running benchmark has no Firo-Qt connection command");
+      }
+      if (state->firo_qt_launcher) {
+        static_cast<void>(state->firo_qt_launcher->Cleanup());
+        state->firo_qt_launcher.reset();
+      }
+      state->firo_qt_launcher.emplace(OwnedFiroQtLauncher::Create(command));
+      state->firo_qt_launcher_command = command;
+      state->firo_qt_launcher_dialog_open = true;
+      state->command_input_error.clear();
+      state->command_status = "Created native Firo-Qt launcher " +
+                              state->firo_qt_launcher->path().string() + ".";
+      return true;
+    } catch (const std::exception& error) {
+      state->command_input_error = TuiCommandRejectionMessage(error.what());
+      state->command_status = state->command_input_error;
+      return false;
+    }
+  }
   if (command_queue == nullptr) {
     state->command_input_error =
         "Live commands are unavailable in report mode.";
@@ -2723,12 +2839,25 @@ bool HandleCommandConfirmationInput(int ch, const boost::json::object& report,
   return ch != ERR;
 }
 
+bool HandleFiroQtLauncherDialogInput(int ch, TuiState* state) {
+  if (ch == '\n' || ch == KEY_ENTER || ch == 27) {
+    state->firo_qt_launcher_dialog_open = false;
+    state->command_status =
+        "Firo-Qt launcher remains available until benchmark cleanup.";
+    return true;
+  }
+  return ch != ERR;
+}
+
 bool HandleInput(int ch, const std::filesystem::path& run_root,
                  const boost::json::object& report,
                  SimulationCommandQueue* command_queue, TuiState* state) {
   if (state->exit_confirmation.is_open()) {
     return state->exit_confirmation.HandleInput(ch) !=
            TuiExitConfirmationResult::kIgnored;
+  }
+  if (state->firo_qt_launcher_dialog_open) {
+    return HandleFiroQtLauncherDialogInput(ch, state);
   }
   if (state->pending_confirmation) {
     return HandleCommandConfirmationInput(ch, report, command_queue, state);
@@ -3044,7 +3173,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
 
   while (true) {
     if (stop_token.stop_requested()) {
-      return 0;
+      return FinishTui(&state, 0);
     }
     std::string error;
     const boost::json::object* report = &empty_report;
@@ -3084,10 +3213,13 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         state.node_log_pane, state.peer_list_pane, state.network_rule_pane,
         state.node_file_pane, state.command_status, state.command_error_open,
         state.command_error, state.command_palette_open, state.command_input,
-        state.command_input_error, state.pending_confirmation,
+        state.command_input_error, state.firo_qt_launcher_dialog_open,
+        state.firo_qt_launcher ? state.firo_qt_launcher->path()
+                               : std::filesystem::path{},
+        state.firo_qt_launcher_command, state.pending_confirmation,
         state.exit_confirmation);
     if (once) {
-      return error.empty() ? 0 : 1;
+      return FinishTui(&state, error.empty() ? 0 : 1);
     }
 
     const std::uint32_t refresh_wait_ms =
@@ -3095,13 +3227,13 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
     std::uint32_t slept_ms = 0;
     while (slept_ms < refresh_wait_ms) {
       if (stop_token.stop_requested()) {
-        return 0;
+        return FinishTui(&state, 0);
       }
       const int ch = getch();
       const bool palette_was_open = state.command_palette_open;
       if (HandleInput(ch, run_root, *report, command_queue, &state)) {
         if (state.exit_confirmation.exit_requested()) {
-          return 0;
+          return FinishTui(&state, 0);
         }
         if (state.command_palette_open) {
           int rows = 0;
@@ -3120,7 +3252,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         break;
       }
       if (ShouldExit(ch)) {
-        return 0;
+        return FinishTui(&state, 0);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(sleep_step_ms));
       slept_ms += sleep_step_ms;

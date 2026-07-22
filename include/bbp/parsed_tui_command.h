@@ -19,6 +19,10 @@ enum class TuiPartitionTargetKind {
   kSelectedTopologyGroup,
 };
 
+enum class TuiLocalAction {
+  kCreateFiroQtLauncher,
+};
+
 struct ParsedTuiCommand {
   SimulationCommandKind kind = SimulationCommandKind::kStopMining;
   std::optional<BlockProductionPolicy> block_production_policy;
@@ -35,6 +39,7 @@ struct ParsedTuiCommand {
   std::optional<std::string> perf_counter_target_id;
   std::vector<PerfCounterKind> perf_counter_kinds;
   std::optional<SimulationWalletSend> wallet_send;
+  std::optional<TuiLocalAction> local_action = std::nullopt;
 };
 
 }  // namespace bbp

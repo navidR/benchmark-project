@@ -9,6 +9,40 @@
 
 namespace bbp {
 
+enum class FiroQtLauncherCleanupResult {
+  kRemoved,
+  kAlreadyAbsent,
+  kOwnershipChanged,
+};
+
+class OwnedFiroQtLauncher {
+ public:
+  OwnedFiroQtLauncher() = default;
+  OwnedFiroQtLauncher(const OwnedFiroQtLauncher&) = delete;
+  OwnedFiroQtLauncher& operator=(const OwnedFiroQtLauncher&) = delete;
+  OwnedFiroQtLauncher(OwnedFiroQtLauncher&& other) noexcept;
+  OwnedFiroQtLauncher& operator=(OwnedFiroQtLauncher&& other);
+  ~OwnedFiroQtLauncher();
+
+  static OwnedFiroQtLauncher Create(std::string_view shell_command);
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+  [[nodiscard]] bool active() const { return active_; }
+  [[nodiscard]] FiroQtLauncherCleanupResult Cleanup();
+
+ private:
+  OwnedFiroQtLauncher(std::filesystem::path path, std::uintmax_t device,
+                      std::uintmax_t inode, int descriptor);
+  void CleanupNoThrow() noexcept;
+  void ResetOwnership() noexcept;
+
+  std::filesystem::path path_;
+  std::uintmax_t device_ = 0U;
+  std::uintmax_t inode_ = 0U;
+  int descriptor_ = -1;
+  bool active_ = false;
+};
+
 struct OperatorConnectionCommand {
   std::filesystem::path executable;
   std::vector<std::string> arguments;

@@ -255,6 +255,7 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_resource_limits) {
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
   BOOST_TEST(bbp::TuiCommandParser::Complete("reco") == "reconnect ");
+  BOOST_TEST(bbp::TuiCommandParser::Complete("firo-q") == "firo-qt ");
   BOOST_TEST(bbp::TuiCommandParser::Complete("log-") == "log-");
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("unknown", 0U),
                     std::runtime_error);
@@ -268,6 +269,16 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("generate-blocks 0", 0U),
                     std::runtime_error);
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("resource-profile", 0U),
+                    std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(tui_command_parser_builds_local_firo_qt_action) {
+  const bbp::ParsedTuiCommand command =
+      bbp::TuiCommandParser::Parse("  firo-qt  ", 0U);
+  BOOST_REQUIRE(command.local_action);
+  BOOST_CHECK(*command.local_action ==
+              bbp::TuiLocalAction::kCreateFiroQtLauncher);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("firo-qt now", 0U),
                     std::runtime_error);
 }
 

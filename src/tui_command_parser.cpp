@@ -18,7 +18,7 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 28> kCommandNames = {
+constexpr std::array<std::string_view, 29> kCommandNames = {
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -47,6 +47,7 @@ constexpr std::array<std::string_view, 28> kCommandNames = {
     "export-node-report",
     "perf-counters",
     "wallet-send",
+    "firo-qt",
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -136,6 +137,12 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
   }
 
   try {
+    if (tokens[0] == "firo-qt") {
+      RequireArgumentCount(tokens, 1U, "firo-qt");
+      ParsedTuiCommand parsed;
+      parsed.local_action = TuiLocalAction::kCreateFiroQtLauncher;
+      return parsed;
+    }
     if (tokens[0] == "resource-limit") {
       ResourceLimitPatch patch;
       if (tokens.size() < 3U) {
