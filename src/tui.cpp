@@ -39,6 +39,7 @@
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulator/workload_kind.h"
 #include "bbp/topology_partition_resolver.h"
+#include "bbp/tui_command_admission.h"
 #include "bbp/tui_command_parser.h"
 #include "bbp/tui_view.h"
 #include "bbp/util.h"
@@ -2455,84 +2456,93 @@ bool QueueParsedNodeCommand(
       return true;
     }
 
-    if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
-      sequence = command_queue->PushBlockProductionPolicy(
-          *parsed.block_production_policy);
-    } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
-      if (!perf_target) {
-        throw std::runtime_error("perf counter target is missing");
-      }
-      sequence = command_queue->PushPerfCounters(std::move(*perf_target),
-                                                 parsed.perf_counter_kinds);
-    } else if (parsed.kind == SimulationCommandKind::kSendWalletTransaction) {
-      if (!wallet_send) {
-        throw std::runtime_error("wallet send payload is missing");
-      }
-      sequence =
-          command_queue->PushWalletSend(node_id, *wallet_send, confirmed);
-    } else {
-      if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
-        if (!parsed.mining_difficulty) {
-          throw std::runtime_error("mining difficulty is missing");
+    const TuiCommandAdmissionResult admission = AdmitTuiCommand([&] {
+      if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
+        sequence = command_queue->PushBlockProductionPolicy(
+            *parsed.block_production_policy);
+      } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
+        if (!perf_target) {
+          throw std::runtime_error("perf counter target is missing");
         }
-        sequence = command_queue->PushMiningDifficulty(
-            node_id, *parsed.mining_difficulty);
-      } else if (parsed.kind == SimulationCommandKind::kSetPeerCountPolicy) {
-        if (!parsed.peer_count_policy) {
-          throw std::runtime_error("peer count policy is missing");
+        sequence = command_queue->PushPerfCounters(std::move(*perf_target),
+                                                   parsed.perf_counter_kinds);
+      } else if (parsed.kind == SimulationCommandKind::kSendWalletTransaction) {
+        if (!wallet_send) {
+          throw std::runtime_error("wallet send payload is missing");
         }
-        sequence = command_queue->PushPeerCountPolicy(
-            node_id, *parsed.peer_count_policy, confirmed);
-      } else if (parsed.kind == SimulationCommandKind::kConnectPeer ||
-                 parsed.kind == SimulationCommandKind::kDisconnectPeer) {
-        if (!parsed.peer_node_id) {
-          throw std::runtime_error("peer target node is missing");
-        }
-        sequence = command_queue->PushPeerCommand(
-            parsed.kind, node_id, *parsed.peer_node_id, confirmed);
-      } else if (parsed.kind == SimulationCommandKind::kGenerateBlocks) {
-        if (!parsed.block_count) {
-          throw std::runtime_error("generated block count is missing");
-        }
-        sequence = command_queue->PushGenerateBlocks(
-            node_id, *parsed.block_count, confirmed);
-      } else if (parsed.kind == SimulationCommandKind::kSetResourceLimits) {
-        if (!parsed.resource_limit_patch) {
-          throw std::runtime_error("resource limit patch is missing");
-        }
-        sequence = command_queue->PushResourceLimits(
-            node_id, *parsed.resource_limit_patch, confirmed);
-      } else if (parsed.kind == SimulationCommandKind::kSetResourceProfile ||
-                 parsed.kind == SimulationCommandKind::kSetNetworkProfile) {
-        if (!parsed.profile) {
-          throw std::runtime_error("profile name is missing");
-        }
-        sequence = command_queue->PushProfileCommand(
-            parsed.kind, node_id, *parsed.profile, confirmed);
-      } else if (parsed.kind == SimulationCommandKind::kSetNetworkCondition) {
-        if (!parsed.network_condition) {
-          throw std::runtime_error("network condition is missing");
-        }
-        sequence = command_queue->PushNetworkCondition(
-            node_id, *parsed.network_condition, confirmed);
-      } else if (parsed.kind == SimulationCommandKind::kBlockNetworkFlow ||
-                 parsed.kind == SimulationCommandKind::kUnblockNetworkFlow) {
-        if (!parsed.network_flow) {
-          throw std::runtime_error("network flow is missing");
-        }
-        sequence = command_queue->PushNetworkFlowCommand(
-            parsed.kind, node_id, *parsed.network_flow, confirmed);
-      } else if (parsed.kind == SimulationCommandKind::kPartitionNodes ||
-                 parsed.kind == SimulationCommandKind::kHealPartition) {
-        if (!partition) {
-          throw std::runtime_error("typed partition target is missing");
-        }
-        sequence = command_queue->PushPartitionCommand(
-            parsed.kind, std::move(*partition), confirmed);
+        sequence =
+            command_queue->PushWalletSend(node_id, *wallet_send, confirmed);
       } else {
-        sequence = command_queue->Push(parsed.kind, node_id, confirmed);
+        if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
+          if (!parsed.mining_difficulty) {
+            throw std::runtime_error("mining difficulty is missing");
+          }
+          sequence = command_queue->PushMiningDifficulty(
+              node_id, *parsed.mining_difficulty);
+        } else if (parsed.kind == SimulationCommandKind::kSetPeerCountPolicy) {
+          if (!parsed.peer_count_policy) {
+            throw std::runtime_error("peer count policy is missing");
+          }
+          sequence = command_queue->PushPeerCountPolicy(
+              node_id, *parsed.peer_count_policy, confirmed);
+        } else if (parsed.kind == SimulationCommandKind::kConnectPeer ||
+                   parsed.kind == SimulationCommandKind::kDisconnectPeer) {
+          if (!parsed.peer_node_id) {
+            throw std::runtime_error("peer target node is missing");
+          }
+          sequence = command_queue->PushPeerCommand(
+              parsed.kind, node_id, *parsed.peer_node_id, confirmed);
+        } else if (parsed.kind == SimulationCommandKind::kGenerateBlocks) {
+          if (!parsed.block_count) {
+            throw std::runtime_error("generated block count is missing");
+          }
+          sequence = command_queue->PushGenerateBlocks(
+              node_id, *parsed.block_count, confirmed);
+        } else if (parsed.kind == SimulationCommandKind::kSetResourceLimits) {
+          if (!parsed.resource_limit_patch) {
+            throw std::runtime_error("resource limit patch is missing");
+          }
+          sequence = command_queue->PushResourceLimits(
+              node_id, *parsed.resource_limit_patch, confirmed);
+        } else if (parsed.kind == SimulationCommandKind::kSetResourceProfile ||
+                   parsed.kind == SimulationCommandKind::kSetNetworkProfile) {
+          if (!parsed.profile) {
+            throw std::runtime_error("profile name is missing");
+          }
+          sequence = command_queue->PushProfileCommand(
+              parsed.kind, node_id, *parsed.profile, confirmed);
+        } else if (parsed.kind == SimulationCommandKind::kSetNetworkCondition) {
+          if (!parsed.network_condition) {
+            throw std::runtime_error("network condition is missing");
+          }
+          sequence = command_queue->PushNetworkCondition(
+              node_id, *parsed.network_condition, confirmed);
+        } else if (parsed.kind == SimulationCommandKind::kBlockNetworkFlow ||
+                   parsed.kind == SimulationCommandKind::kUnblockNetworkFlow) {
+          if (!parsed.network_flow) {
+            throw std::runtime_error("network flow is missing");
+          }
+          sequence = command_queue->PushNetworkFlowCommand(
+              parsed.kind, node_id, *parsed.network_flow, confirmed);
+        } else if (parsed.kind == SimulationCommandKind::kPartitionNodes ||
+                   parsed.kind == SimulationCommandKind::kHealPartition) {
+          if (!partition) {
+            throw std::runtime_error("typed partition target is missing");
+          }
+          sequence = command_queue->PushPartitionCommand(
+              parsed.kind, std::move(*partition), confirmed);
+        } else {
+          sequence = command_queue->Push(parsed.kind, node_id, confirmed);
+        }
       }
+      return sequence;
+    });
+    if (!admission.accepted) {
+      state->command_input_error = admission.feedback;
+      state->command_status = state->command_input_error;
+      return false;
     }
+    sequence = admission.sequence;
     state->command_status =
         "Queued #" + std::to_string(sequence) + " " +
         std::string(SimulationCommandKindName(parsed.kind)) + " for " + target +
@@ -2540,8 +2550,7 @@ bool QueueParsedNodeCommand(
     state->command_input_error.clear();
     return true;
   } catch (const std::exception& error) {
-    state->command_input_error =
-        "Command rejected: " + std::string(error.what());
+    state->command_input_error = TuiCommandRejectionMessage(error.what());
     state->command_status = state->command_input_error;
     return false;
   }

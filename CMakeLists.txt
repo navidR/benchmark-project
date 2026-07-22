@@ -269,8 +269,10 @@ add_executable(bbp
   src/signal_stop_monitor.cpp
   src/simulator_app.cpp
   src/tui.cpp
+  src/tui_command_admission.cpp
   src/tui_command_parser.cpp
   src/transaction_load.cpp
+  src/transaction_observation_store.cpp
   src/util.cpp
   src/wallet_funding_strategy.cpp
   src/wallet_send_resolver.cpp
@@ -379,7 +381,9 @@ if(BUILD_TESTING)
     tests/unit/simulation_time_scale_tests.cpp
     tests/unit/signal_stop_monitor_tests.cpp
     tests/unit/tui_command_parser_tests.cpp
+    tests/unit/tui_command_admission_tests.cpp
     tests/unit/transaction_load_tests.cpp
+    tests/unit/transaction_observation_store_tests.cpp
     tests/unit/util_tests.cpp
     tests/unit/wallet_funding_strategy_tests.cpp
     tests/unit/wallet_send_resolver_tests.cpp
@@ -441,7 +445,9 @@ if(BUILD_TESTING)
     src/simulation_time_scale.cpp
     src/signal_stop_monitor.cpp
     src/tui_command_parser.cpp
+    src/tui_command_admission.cpp
     src/transaction_load.cpp
+    src/transaction_observation_store.cpp
     src/util.cpp
     src/wallet_funding_strategy.cpp
     src/wallet_send_resolver.cpp
@@ -523,6 +529,12 @@ if(BUILD_TESTING)
       --scenario-yaml
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-yaml-scenario.yaml"
       --probe-capabilities
+  )
+  add_test(NAME bbp-scenario-action-count-is-bounded
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+      "-DSCENARIO=${CMAKE_CURRENT_BINARY_DIR}/item10-scenario-action-bound.json"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/scenario_action_bound.cmake"
   )
   add_test(NAME bbp-canonical-json-scenario
     COMMAND bbp

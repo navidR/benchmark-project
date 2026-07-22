@@ -1247,6 +1247,39 @@ BOOST_AUTO_TEST_CASE(firo_load_submission_returns_before_observation) {
   BOOST_REQUIRE_EQUAL(requests.size(), 2U);
 }
 
+BOOST_AUTO_TEST_CASE(firo_wallet_submission_rejects_multiple_transaction_ids) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":["unexpected-1","unexpected-2"],"error":null,"id":"bbp"})"};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async,
+                 [&] { return ServeRpcResponses(acceptor, responses); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "multiple-transfer-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  BOOST_CHECK_THROW(driver.SubmitWalletTransaction(
+                        config, bbp::WalletMode::kPublic, "destination",
+                        25000000ULL, 1000ULL, std::chrono::seconds(1)),
+                    std::runtime_error);
+  const std::vector<std::string> methods = served.get();
+  BOOST_REQUIRE_EQUAL(methods.size(), 2U);
+  BOOST_TEST(methods[0] == "settxfee");
+  BOOST_TEST(methods[1] == "sendtoaddress");
+}
+
 BOOST_AUTO_TEST_CASE(
     firo_load_submit_propagate_mine_confirm_reaches_report_once) {
   namespace asio = boost::asio;

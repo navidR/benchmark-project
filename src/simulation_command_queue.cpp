@@ -1,5 +1,6 @@
 #include "bbp/simulation_command_queue.h"
 
+#include <algorithm>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -276,6 +277,14 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
 }
 
 }  // namespace
+
+SimulationCommandQueue::SimulationCommandQueue(std::size_t capacity)
+    : capacity_(capacity) {
+  if (capacity_ == 0U) {
+    throw std::runtime_error(
+        "simulation command queue capacity must be greater than zero");
+  }
+}
 
 std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
                                            std::string node_id,
@@ -752,9 +761,22 @@ std::uint64_t SimulationCommandQueue::PushCommand(SimulationCommand command) {
   if (closed_) {
     throw std::runtime_error("simulation command queue is closed");
   }
+  if (commands_.size() >= capacity_) {
+    if (rejected_ == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::runtime_error(
+          "simulation command queue rejection count exceeds uint64");
+    }
+    ++rejected_;
+    throw std::runtime_error("simulation command queue is full (capacity " +
+                             std::to_string(capacity_) + ")");
+  }
+  if (next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::runtime_error("simulation command sequence exceeds uint64");
+  }
   const std::uint64_t sequence = next_sequence_++;
   command.sequence = sequence;
   commands_.push_back(std::move(command));
+  maximum_size_ = std::max(maximum_size_, commands_.size());
   ready_.notify_one();
   return sequence;
 }
@@ -806,6 +828,16 @@ std::vector<SimulationCommand> SimulationCommandQueue::Cancel() {
 bool SimulationCommandQueue::IsClosed() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return closed_;
+}
+
+SimulationCommandQueueStats SimulationCommandQueue::Stats() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return SimulationCommandQueueStats{
+      .size = commands_.size(),
+      .capacity = capacity_,
+      .maximum_size = maximum_size_,
+      .rejected = rejected_,
+  };
 }
 
 }  // namespace bbp

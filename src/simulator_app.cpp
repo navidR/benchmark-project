@@ -69,6 +69,7 @@
 #include "bbp/simulator/options.h"
 #include "bbp/simulator/process_control_config.h"
 #include "bbp/simulator/transaction_load.h"
+#include "bbp/simulator/transaction_observation_store.h"
 #include "bbp/simulator/wallet_transaction_plan.h"
 #include "bbp/simulator/yaml_helpers.h"
 #include "bbp/tui.h"
@@ -3556,6 +3557,15 @@ SimulationCommand ParseScheduledSimulationCommand(
 void ApplyScenarioWorkloads(const boost::json::array& workloads,
                             const boost::program_options::variables_map& vm,
                             Options& options) {
+  if (options.workloads.size() > kMaximumScenarioActionCount ||
+      options.scheduled_events.size() >
+          kMaximumScenarioActionCount - options.workloads.size() ||
+      workloads.size() > kMaximumScenarioActionCount -
+                             options.workloads.size() -
+                             options.scheduled_events.size()) {
+    throw std::runtime_error("scenario action count exceeds retained limit " +
+                             std::to_string(kMaximumScenarioActionCount));
+  }
   for (const boost::json::value& value : workloads) {
     if (!value.is_object()) {
       throw std::runtime_error(
@@ -3992,8 +4002,13 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
 void ApplyScheduledScenarioEvents(
     const boost::json::array& events,
     const boost::program_options::variables_map& vm, Options& options) {
-  if (events.size() > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::runtime_error("scenario events exceeds uint32 sequence range");
+  if (options.workloads.size() > kMaximumScenarioActionCount ||
+      options.scheduled_events.size() >
+          kMaximumScenarioActionCount - options.workloads.size() ||
+      events.size() > kMaximumScenarioActionCount - options.workloads.size() -
+                          options.scheduled_events.size()) {
+    throw std::runtime_error("scenario action count exceeds retained limit " +
+                             std::to_string(kMaximumScenarioActionCount));
   }
   for (std::size_t index = 0; index < events.size(); ++index) {
     const boost::json::value& value = events[index];
@@ -5581,9 +5596,11 @@ Options ParseOptions(int argc, char** argv) {
   if (options.generate_node == 0U || options.generate_node > options.nodes) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
   }
-  if (options.workloads.size() > std::numeric_limits<std::uint32_t>::max() -
-                                     options.scheduled_events.size()) {
-    throw std::runtime_error("scenario action count exceeds uint32 range");
+  if (options.workloads.size() > kMaximumScenarioActionCount ||
+      options.scheduled_events.size() >
+          kMaximumScenarioActionCount - options.workloads.size()) {
+    throw std::runtime_error("scenario action count exceeds retained limit " +
+                             std::to_string(kMaximumScenarioActionCount));
   }
   for (const ScenarioWorkload* configured_workload :
        ConfiguredScenarioActions(options)) {
@@ -8094,19 +8111,6 @@ std::string OperatorWalletTransactionDetail(
   return boost::json::serialize(detail);
 }
 
-struct TrackedTransaction {
-  std::string txid;
-  std::string submission_kind;
-  std::uint32_t workload_index = 0;
-  std::uint32_t workload_count = 0;
-  std::uint64_t transaction_index = 0;
-  std::optional<std::uint32_t> transaction_count;
-  std::optional<double> transaction_rate;
-  std::uint32_t txid_index = 0;
-  std::uint32_t submission_node = 0;
-  std::shared_ptr<TransactionLoadConfirmation> load_confirmation;
-};
-
 struct TransactionSetObservation {
   bool propagated = false;
   bool confirmed = false;
@@ -8156,40 +8160,53 @@ std::string TransactionObservationDetail(
 
 class TransactionObservationTracker {
  public:
-  void Track(TrackedTransaction transaction) {
+  struct Reservation {
+    TransactionObservationStore::Reservation observation;
+    std::vector<std::string> required_node_ids;
+  };
+
+  [[nodiscard]] std::optional<Reservation> TryReserve(
+      const std::vector<NodeRuntime>& nodes) {
+    std::vector<std::string> required_node_ids = ObservableNodeIds(nodes);
+    std::optional<TransactionObservationStore::Reservation> observation =
+        observations_.TryReserve();
+    if (!observation) {
+      return std::nullopt;
+    }
+    return Reservation{
+        .observation = std::move(*observation),
+        .required_node_ids = std::move(required_node_ids),
+    };
+  }
+
+  [[nodiscard]] Reservation Reserve(const std::vector<NodeRuntime>& nodes) {
+    std::vector<std::string> required_node_ids = ObservableNodeIds(nodes);
+    return Reservation{
+        .observation = observations_.Reserve(),
+        .required_node_ids = std::move(required_node_ids),
+    };
+  }
+
+  void Track(Reservation reservation, TrackedTransaction transaction) {
     std::vector<TrackedTransaction> transactions;
     transactions.push_back(std::move(transaction));
-    TrackSet(std::move(transactions));
+    reservation.observation.Commit(std::move(transactions),
+                                   reservation.required_node_ids);
   }
 
-  void TrackSet(std::vector<TrackedTransaction> transactions) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::set<std::string> new_txids;
-    for (const TrackedTransaction& transaction : transactions) {
-      if (transaction.txid.empty()) {
-        throw std::runtime_error("cannot track an empty transaction id");
-      }
-      if (!new_txids.insert(transaction.txid).second ||
-          tracked_txids_.contains(transaction.txid)) {
-        throw std::runtime_error("duplicate submitted transaction id: " +
-                                 transaction.txid);
-      }
-    }
-    for (TrackedTransaction& transaction : transactions) {
-      tracked_txids_.insert(transaction.txid);
-      transactions_.push_back(std::move(transaction));
-    }
+  void TrackSet(Reservation reservation,
+                std::vector<TrackedTransaction> transactions) {
+    reservation.observation.Commit(std::move(transactions),
+                                   reservation.required_node_ids);
   }
 
-  void TrackAndWaitForVisibility(const Options& options,
-                                 const std::filesystem::path& events_path,
-                                 const ChainDriver& driver,
-                                 const std::vector<NodeRuntime>& nodes,
-                                 TrackedTransaction transaction,
-                                 std::chrono::seconds timeout,
-                                 std::stop_token stop_token) {
+  void TrackAndWaitForVisibility(
+      Reservation reservation, const Options& options,
+      const std::filesystem::path& events_path, const ChainDriver& driver,
+      const std::vector<NodeRuntime>& nodes, TrackedTransaction transaction,
+      std::chrono::seconds timeout, std::stop_token stop_token) {
     const TrackedTransaction tracked = transaction;
-    Track(std::move(transaction));
+    Track(std::move(reservation), std::move(transaction));
     for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
       const NodeRuntime& node = nodes[node_index];
       if (!node.AllowsChainMetrics()) {
@@ -8208,11 +8225,8 @@ class TransactionObservationTracker {
                   const ChainDriver& driver,
                   const std::vector<NodeRuntime>& nodes,
                   std::stop_token stop_token) {
-    std::vector<TrackedTransaction> transactions;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      transactions = transactions_;
-    }
+    const std::vector<TrackedTransaction> transactions =
+        observations_.PendingTransactions();
     for (const TrackedTransaction& transaction : transactions) {
       for (std::size_t node_index = 0; node_index < nodes.size();
            ++node_index) {
@@ -8230,7 +8244,7 @@ class TransactionObservationTracker {
     }
   }
 
-  std::vector<TransactionSetObservation> ObserveSetsUntilVisible(
+  std::vector<TransactionSetObservation> ObserveTrackedSetsUntilVisible(
       const Options& options, const std::filesystem::path& events_path,
       const ChainDriver& driver, const std::vector<NodeRuntime>& nodes,
       const std::vector<std::vector<TrackedTransaction>>& transaction_sets,
@@ -8249,11 +8263,6 @@ class TransactionObservationTracker {
       throw std::runtime_error(
           "transaction load observation requires an observable node");
     }
-    for (const std::vector<TrackedTransaction>& transaction_set :
-         transaction_sets) {
-      TrackSet(transaction_set);
-    }
-
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     try {
       while (true) {
@@ -8322,6 +8331,22 @@ class TransactionObservationTracker {
   }
 
  private:
+  static std::vector<std::string> ObservableNodeIds(
+      const std::vector<NodeRuntime>& nodes) {
+    std::vector<std::string> node_ids;
+    node_ids.reserve(nodes.size());
+    for (const NodeRuntime& node : nodes) {
+      if (node.AllowsChainMetrics()) {
+        node_ids.push_back(node.config.id);
+      }
+    }
+    if (node_ids.empty()) {
+      throw std::runtime_error(
+          "transaction observation requires an observable node");
+    }
+    return node_ids;
+  }
+
   void RecordObservation(const Options& options,
                          const std::filesystem::path& events_path,
                          const TrackedTransaction& transaction,
@@ -8336,39 +8361,35 @@ class TransactionObservationTracker {
       throw std::runtime_error(
           "confirmed transaction observation is missing block metadata");
     }
-    const std::pair<std::string, std::string> key{transaction.txid, node_id};
     const std::string detail =
         TransactionObservationDetail(transaction, node, node_id, observation);
-    bool record_visible = false;
-    bool record_confirmed = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      record_visible = visible_.insert(key).second;
-      if (observation.state == ChainTransactionState::kConfirmed) {
-        record_confirmed = confirmed_.insert(key).second;
-      }
+    const TransactionObservationTransition transition = observations_.Record(
+        transaction.txid, node_id, true,
+        observation.state == ChainTransactionState::kConfirmed);
+    if (!transition.tracked) {
+      return;
     }
-    if (record_visible) {
+    if (transition.first_visible) {
       WriteEvent(events_path, options.run_id, node_id,
                  SimulationEventKind::kTransactionVisible, detail);
     }
-    if (record_confirmed) {
+    if (transition.first_confirmed) {
       WriteEvent(events_path, options.run_id, node_id,
                  SimulationEventKind::kTransactionConfirmed, detail);
     }
-    if (transaction.load_confirmation) {
-      transaction.load_confirmation->RecordObservation(
-          transaction.txid, node_id,
-          observation.state == ChainTransactionState::kConfirmed);
-    }
   }
 
-  std::mutex mutex_;
-  std::vector<TrackedTransaction> transactions_;
-  std::set<std::string> tracked_txids_;
-  std::set<std::pair<std::string, std::string>> visible_;
-  std::set<std::pair<std::string, std::string>> confirmed_;
+  TransactionObservationStore observations_;
 };
+
+const std::string& RequireSingleWalletTransactionId(
+    const ChainWalletTransactionResult& transaction, std::string_view source) {
+  if (transaction.txids.size() != 1U || transaction.txids.front().empty()) {
+    throw std::runtime_error(std::string(source) +
+                             " must return exactly one transaction id");
+  }
+  return transaction.txids.front();
+}
 
 std::vector<TransactionLoadConfirmation::ObservationKey>
 ExpectedTransactionLoadObservations(const std::vector<std::string>& txids,
@@ -11522,18 +11543,24 @@ void ApplySendRawTransactionWorkload(
       funder.config, funding_hashes, workload.source_address, minimum_amount,
       ChainDriverSpecFor(options.chain).coinbase_spendable_confirmations,
       stop_token);
+  TransactionObservationTracker::Reservation observation_reservation =
+      transaction_tracker.Reserve(nodes);
   const ChainRawTransactionResult transaction = driver.SendRawTransaction(
       submitter.config, utxo, workload.source_address,
       workload.source_private_key, workload.destination_address,
       workload.amount_satoshis, workload.fee_satoshis,
       std::chrono::seconds(workload.timeout_sec), stop_token);
+  if (transaction.txid.empty()) {
+    throw std::runtime_error(
+        "raw transaction submission returned an empty transaction id");
+  }
   WriteEvent(events_path, options.run_id, submitter.config.id,
              SimulationEventKind::kRawTransactionSubmitted,
              RawTransactionDetail(workload_index, workload_count, workload,
                                   start_height, target_height, funding_hashes,
                                   transaction));
   transaction_tracker.TrackAndWaitForVisibility(
-      options, events_path, driver, nodes,
+      std::move(observation_reservation), options, events_path, driver, nodes,
       TrackedTransaction{
           .txid = transaction.txid,
           .submission_kind = "raw_transaction_submitted",
@@ -11785,6 +11812,10 @@ void ApplyWalletTransactionsWorkload(
               NodeRuntime& sender_node = nodes.at(sender.node - 1U);
               TransactionLoadOutcome outcome = TransactionLoadOutcome::kFailed;
               ChainWalletTransactionResult transaction;
+              std::vector<TrackedTransaction> tracked;
+              std::shared_ptr<TransactionLoadConfirmation> confirmation;
+              std::optional<TransactionObservationTracker::Reservation>
+                  observation_reservation;
               std::string error_class;
               std::string error_message;
               bool submitted = false;
@@ -11808,40 +11839,54 @@ void ApplyWalletTransactionsWorkload(
                   ThrowIfStopRequested(load_stop_token);
                   RequireNodeRunning(sender_node,
                                      "transaction load submission");
-                  submission_started = true;
-                  release_if_balance_unavailable = false;
-                  transaction = driver.SubmitWalletTransaction(
-                      sender_node.config,
-                      ToChainWalletMode(registry.wallet_initialization()),
-                      receiver.address, task.plan.amount_satoshis,
-                      workload.fee_satoshis,
-                      std::chrono::seconds(workload.timeout_sec),
-                      load_stop_token);
-                  if (transaction.txids.empty()) {
-                    throw std::runtime_error(
-                        "transaction load submission returned no transaction "
-                        "id");
+                  observation_reservation =
+                      transaction_tracker.TryReserve(nodes);
+                  if (!observation_reservation) {
+                    outcome = TransactionLoadOutcome::kBackpressured;
+                    error_class = "backpressure";
+                    error_message =
+                        "bounded transaction observation capacity is full";
+                  } else {
+                    submission_started = true;
+                    release_if_balance_unavailable = false;
+                    transaction = driver.SubmitWalletTransaction(
+                        sender_node.config,
+                        ToChainWalletMode(registry.wallet_initialization()),
+                        receiver.address, task.plan.amount_satoshis,
+                        workload.fee_satoshis,
+                        std::chrono::seconds(workload.timeout_sec),
+                        load_stop_token);
+                    const std::string& txid = RequireSingleWalletTransactionId(
+                        transaction, "transaction load submission");
+                    confirmation =
+                        std::make_shared<TransactionLoadConfirmation>(
+                            accounting, ExpectedTransactionLoadObservations(
+                                            transaction.txids, nodes));
+                    tracked.push_back(TrackedTransaction{
+                        .txid = txid,
+                        .submission_kind = "wallet_transaction_submitted",
+                        .workload_index = workload_index,
+                        .workload_count = workload_count,
+                        .transaction_index = task.transaction_index,
+                        .transaction_count =
+                            workload.transaction_count == 0U
+                                ? std::nullopt
+                                : std::optional<std::uint32_t>(
+                                      workload.transaction_count),
+                        .transaction_rate =
+                            workload.transaction_rate
+                                ? std::optional<double>(
+                                      workload.transaction_rate->value())
+                                : std::nullopt,
+                        .txid_index = 1U,
+                        .submission_node = sender.node,
+                        .load_confirmation = confirmation,
+                    });
+                    transaction_tracker.TrackSet(
+                        std::move(*observation_reservation), tracked);
+                    outcome = TransactionLoadOutcome::kSubmitted;
+                    submitted = true;
                   }
-                  if (transaction.txids.size() >
-                      std::numeric_limits<std::uint32_t>::max()) {
-                    throw std::runtime_error(
-                        "transaction load txid count exceeds uint32");
-                  }
-                  std::set<std::string> unique_txids;
-                  for (const std::string& txid : transaction.txids) {
-                    if (txid.empty()) {
-                      throw std::runtime_error(
-                          "transaction load submission returned an empty "
-                          "transaction id");
-                    }
-                    if (!unique_txids.insert(txid).second) {
-                      throw std::runtime_error(
-                          "transaction load submission returned duplicate "
-                          "transaction ids");
-                    }
-                  }
-                  outcome = TransactionLoadOutcome::kSubmitted;
-                  submitted = true;
                 } catch (const ChainTransactionRejected& error) {
                   outcome = TransactionLoadOutcome::kRejected;
                   error_class = "policy_rejection";
@@ -11887,7 +11932,7 @@ void ApplyWalletTransactionsWorkload(
                   release_if_balance_unavailable = !submission_started;
                 }
 
-                if (!submitted &&
+                if (submission_started && !submitted &&
                     outcome != TransactionLoadOutcome::kCancelled) {
                   try {
                     actual_available_balance =
@@ -11967,37 +12012,9 @@ void ApplyWalletTransactionsWorkload(
               if (!submitted) {
                 continue;
               }
-              std::vector<TrackedTransaction> tracked;
-              tracked.reserve(transaction.txids.size());
-              const auto confirmation =
-                  std::make_shared<TransactionLoadConfirmation>(
-                      accounting, ExpectedTransactionLoadObservations(
-                                      transaction.txids, nodes));
-              for (std::size_t txid_index = 0U;
-                   txid_index < transaction.txids.size(); ++txid_index) {
-                tracked.push_back(TrackedTransaction{
-                    .txid = transaction.txids[txid_index],
-                    .submission_kind = "wallet_transaction_submitted",
-                    .workload_index = workload_index,
-                    .workload_count = workload_count,
-                    .transaction_index = task.transaction_index,
-                    .transaction_count = workload.transaction_count == 0U
-                                             ? std::nullopt
-                                             : std::optional<std::uint32_t>(
-                                                   workload.transaction_count),
-                    .transaction_rate =
-                        workload.transaction_rate
-                            ? std::optional<double>(
-                                  workload.transaction_rate->value())
-                            : std::nullopt,
-                    .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
-                    .submission_node = sender.node,
-                    .load_confirmation = confirmation,
-                });
-              }
               try {
                 const std::vector<TransactionSetObservation> observations =
-                    transaction_tracker.ObserveSetsUntilVisible(
+                    transaction_tracker.ObserveTrackedSetsUntilVisible(
                         options, events_path, driver, nodes, {tracked},
                         std::chrono::seconds(workload.timeout_sec),
                         load_stop_token);
@@ -12156,6 +12173,11 @@ void ApplyWalletTransactionsWorkload(
       throw std::runtime_error(
           "transaction load completion destination is missing");
     }
+    if (pending_load_completions->size() >= kMaximumScenarioActionCount) {
+      throw std::runtime_error(
+          "pending transaction load completion count exceeds retained limit " +
+          std::to_string(kMaximumScenarioActionCount));
+    }
     pending_load_completions->push_back(PendingTransactionLoadCompletion{
         .workload_index = workload_index,
         .workload_count = workload_count,
@@ -12195,12 +12217,16 @@ void ApplyWalletTransactionsWorkload(
     NodeRuntime& sender_node = nodes[sender.node - 1U];
     RequireNodeRunning(sender_node, "wallet transaction submission");
 
+    TransactionObservationTracker::Reservation observation_reservation =
+        transaction_tracker.Reserve(nodes);
     const ChainWalletTransactionResult transaction =
         driver.SendWalletTransaction(
             sender_node.config,
             ToChainWalletMode(registry.wallet_initialization()),
             receiver.address, plan_entry.amount_satoshis, workload.fee_satoshis,
             std::chrono::seconds(workload.timeout_sec), stop_token);
+    const std::string& txid = RequireSingleWalletTransactionId(
+        transaction, "wallet transaction submission");
     WriteEvent(
         events_path, options.run_id, sender_node.config.id,
         SimulationEventKind::kWalletTransactionSubmitted,
@@ -12214,36 +12240,32 @@ void ApplyWalletTransactionsWorkload(
             sender_funding.ready_balance_satoshis, plan_entry.amount_satoshis,
             plan_entry.interval_before, scheduled_simulation_elapsed,
             scheduled_wall_elapsed, transaction));
-    if (transaction.txids.size() > std::numeric_limits<std::uint32_t>::max()) {
-      throw std::runtime_error("wallet transaction txid count exceeds uint32");
-    }
-    for (std::size_t txid_index = 0; txid_index < transaction.txids.size();
-         ++txid_index) {
-      TrackedTransaction tracked{
-          .txid = transaction.txids[txid_index],
-          .submission_kind = "wallet_transaction_submitted",
-          .workload_index = workload_index,
-          .workload_count = workload_count,
-          .transaction_index = transaction_index + 1U,
-          .transaction_count =
-              workload.transaction_count == 0U
-                  ? std::nullopt
-                  : std::optional<std::uint32_t>(workload.transaction_count),
-          .transaction_rate =
-              workload.transaction_rate
-                  ? std::optional<double>(workload.transaction_rate->value())
-                  : std::nullopt,
-          .txid_index = static_cast<std::uint32_t>(txid_index + 1U),
-          .submission_node = sender.node,
-          .load_confirmation = nullptr,
-      };
-      if (workload.transaction_rate) {
-        transaction_tracker.Track(std::move(tracked));
-      } else {
-        transaction_tracker.TrackAndWaitForVisibility(
-            options, events_path, driver, nodes, std::move(tracked),
-            std::chrono::seconds(workload.timeout_sec), stop_token);
-      }
+    TrackedTransaction tracked{
+        .txid = txid,
+        .submission_kind = "wallet_transaction_submitted",
+        .workload_index = workload_index,
+        .workload_count = workload_count,
+        .transaction_index = transaction_index + 1U,
+        .transaction_count =
+            workload.transaction_count == 0U
+                ? std::nullopt
+                : std::optional<std::uint32_t>(workload.transaction_count),
+        .transaction_rate =
+            workload.transaction_rate
+                ? std::optional<double>(workload.transaction_rate->value())
+                : std::nullopt,
+        .txid_index = 1U,
+        .submission_node = sender.node,
+        .load_confirmation = nullptr,
+    };
+    if (workload.transaction_rate) {
+      transaction_tracker.Track(std::move(observation_reservation),
+                                std::move(tracked));
+    } else {
+      transaction_tracker.TrackAndWaitForVisibility(
+          std::move(observation_reservation), options, events_path, driver,
+          nodes, std::move(tracked), std::chrono::seconds(workload.timeout_sec),
+          stop_token);
     }
     if (workload.transaction_rate) {
       transaction_tracker.ObserveAll(options, events_path, driver, nodes,
@@ -14686,6 +14708,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                       sender_node.config.id);
                 }
               }
+              TransactionObservationTracker::Reservation
+                  observation_reservation = transaction_tracker.Reserve(nodes);
               transaction = driver.SendWalletTransaction(
                   sender_node.config,
                   ToChainWalletMode(
@@ -14693,47 +14717,31 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                   receiver.address, send.amount_satoshis, send.fee_satoshis,
                   std::chrono::seconds(send.timeout_sec),
                   command_rpc_stop_source.get_token());
-              if (transaction.txids.empty()) {
-                throw std::runtime_error(
-                    "operator wallet send returned no transaction id");
-              }
-              for (const std::string& txid : transaction.txids) {
-                if (txid.empty()) {
-                  throw std::runtime_error(
-                      "operator wallet send returned an empty transaction id");
-                }
-              }
+              const std::string& txid = RequireSingleWalletTransactionId(
+                  transaction, "operator wallet send");
               WriteEvent(events_path, options.run_id, sender_node.config.id,
                          SimulationEventKind::kWalletTransactionSubmitted,
                          OperatorWalletTransactionDetail(
                              send, sender, receiver,
                              simulation_registry.wallet_initialization(),
                              transaction, command.sequence));
-              if (transaction.txids.size() >
-                  std::numeric_limits<std::uint32_t>::max()) {
-                throw std::runtime_error(
-                    "operator wallet send txid count exceeds uint32");
-              }
-              for (std::size_t txid_index = 0U;
-                   txid_index < transaction.txids.size(); ++txid_index) {
-                transaction_tracker.TrackAndWaitForVisibility(
-                    options, events_path, driver, nodes,
-                    TrackedTransaction{
-                        .txid = transaction.txids[txid_index],
-                        .submission_kind = "operator_wallet_send",
-                        .workload_index = 0U,
-                        .workload_count = 0U,
-                        .transaction_index = command.sequence,
-                        .transaction_count = std::nullopt,
-                        .transaction_rate = std::nullopt,
-                        .txid_index =
-                            static_cast<std::uint32_t>(txid_index + 1U),
-                        .submission_node = sender.node,
-                        .load_confirmation = nullptr,
-                    },
-                    std::chrono::seconds(send.timeout_sec),
-                    command_rpc_stop_source.get_token());
-              }
+              transaction_tracker.TrackAndWaitForVisibility(
+                  std::move(observation_reservation), options, events_path,
+                  driver, nodes,
+                  TrackedTransaction{
+                      .txid = txid,
+                      .submission_kind = "operator_wallet_send",
+                      .workload_index = 0U,
+                      .workload_count = 0U,
+                      .transaction_index = command.sequence,
+                      .transaction_count = std::nullopt,
+                      .transaction_rate = std::nullopt,
+                      .txid_index = 1U,
+                      .submission_node = sender.node,
+                      .load_confirmation = nullptr,
+                  },
+                  std::chrono::seconds(send.timeout_sec),
+                  command_rpc_stop_source.get_token());
             } else if (command.kind ==
                        SimulationCommandKind::kSetResourceLimits) {
               if (!command.resource_limit_patch) {

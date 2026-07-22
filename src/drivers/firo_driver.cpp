@@ -295,6 +295,16 @@ std::vector<std::string> ParseTxIdResult(const boost::json::value& value,
                            " returned non-string txid result");
 }
 
+std::vector<std::string> ParseSingleTxIdResult(const boost::json::value& value,
+                                               std::string_view method) {
+  std::vector<std::string> txids = ParseTxIdResult(value, method);
+  if (txids.size() != 1U) {
+    throw std::runtime_error("Firo RPC " + std::string(method) +
+                             " must return exactly one txid");
+  }
+  return txids;
+}
+
 std::string ParseWalletAddressResult(const boost::json::value& value,
                                      std::string_view method) {
   if (value.is_string() && !value.as_string().empty()) {
@@ -1435,9 +1445,10 @@ FiroWalletTransactionResult FiroDriver::SubmitWalletTransaction(
       send_params.emplace_back("");
       send_params.emplace_back("");
       send_params.emplace_back(false);
-      txids = ParseTxIdResult(RpcCallUntil(config, "sendtoaddress", send_params,
-                                           deadline, stop_token),
-                              "sendtoaddress");
+      txids =
+          ParseSingleTxIdResult(RpcCallUntil(config, "sendtoaddress",
+                                             send_params, deadline, stop_token),
+                                "sendtoaddress");
     } else if (wallet_mode == WalletMode::kPrivate) {
       boost::json::object recipient;
       recipient["amount"] = FormatFixed8Amount(amount_satoshis);
@@ -1447,7 +1458,7 @@ FiroWalletTransactionResult FiroDriver::SubmitWalletTransaction(
       recipients[destination_address] = std::move(recipient);
       boost::json::array send_params;
       send_params.emplace_back(std::move(recipients));
-      txids = ParseTxIdResult(
+      txids = ParseSingleTxIdResult(
           RpcCallUntil(config, "spendspark", send_params, deadline, stop_token),
           "spendspark");
     } else {

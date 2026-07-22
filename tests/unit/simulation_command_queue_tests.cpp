@@ -1,9 +1,12 @@
+#include <atomic>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <future>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
+#include <vector>
 
 #include "bbp/simulation_command_queue.h"
 
@@ -33,6 +36,101 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_fifo_order) {
   BOOST_CHECK(second->kind == bbp::SimulationCommandKind::kKillNode);
   BOOST_TEST(second->node_id == "firo-2");
   BOOST_TEST(!queue.TryPop());
+}
+
+BOOST_AUTO_TEST_CASE(item10_prefixed_command_queue_retention_reproducer) {
+  constexpr std::size_t kCapacity = 256U;
+  bbp::SimulationCommandQueue queue(kCapacity);
+  constexpr std::uint64_t kProduced = 10'000U;
+  std::uint64_t rejected = 0U;
+  for (std::uint64_t index = 0U; index < kProduced; ++index) {
+    try {
+      queue.Push(bbp::SimulationCommandKind::kExportNodeReport, "firo-1");
+    } catch (const std::runtime_error& error) {
+      if (rejected == 0U || index + 1U == kProduced) {
+        BOOST_TEST(std::string(error.what()) ==
+                   "simulation command queue is full (capacity 256)");
+      }
+      ++rejected;
+    }
+  }
+
+  const bbp::SimulationCommandQueueStats before_cancel = queue.Stats();
+  BOOST_TEST(before_cancel.size == kCapacity);
+  BOOST_TEST(before_cancel.capacity == kCapacity);
+  BOOST_TEST(before_cancel.maximum_size == kCapacity);
+  BOOST_TEST(before_cancel.rejected == kProduced - kCapacity);
+  BOOST_TEST(rejected == kProduced - kCapacity);
+  const std::vector<bbp::SimulationCommand> cancelled = queue.Cancel();
+  BOOST_TEST(cancelled.size() == kCapacity);
+  BOOST_TEST(queue.Stats().size == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_full_rejection_does_not_consume_sequence) {
+  bbp::SimulationCommandQueue queue(2U);
+  BOOST_TEST(queue.Push(bbp::SimulationCommandKind::kExportNodeReport,
+                        "firo-1") == 1U);
+  BOOST_TEST(queue.Push(bbp::SimulationCommandKind::kExportNodeReport,
+                        "firo-1") == 2U);
+  const auto started = std::chrono::steady_clock::now();
+  BOOST_CHECK_THROW(
+      queue.Push(bbp::SimulationCommandKind::kExportNodeReport, "firo-1"),
+      std::runtime_error);
+  const auto rejection_latency =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - started);
+  BOOST_TEST(rejection_latency.count() < 100'000);
+  BOOST_REQUIRE(queue.TryPop());
+  BOOST_TEST(queue.Push(bbp::SimulationCommandKind::kExportNodeReport,
+                        "firo-1") == 3U);
+  const bbp::SimulationCommandQueueStats stats = queue.Stats();
+  BOOST_TEST(stats.size == 2U);
+  BOOST_TEST(stats.maximum_size == 2U);
+  BOOST_TEST(stats.rejected == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_concurrent_producers_never_exceed_capacity) {
+  constexpr std::size_t kCapacity = 64U;
+  constexpr std::size_t kProducerCount = 8U;
+  constexpr std::size_t kCommandsPerProducer = 1'000U;
+  bbp::SimulationCommandQueue queue(kCapacity);
+  std::vector<std::future<std::size_t>> producers;
+  for (std::size_t producer = 0U; producer < kProducerCount; ++producer) {
+    producers.push_back(std::async(std::launch::async, [&queue] {
+      std::size_t rejected = 0U;
+      for (std::size_t command = 0U; command < kCommandsPerProducer;
+           ++command) {
+        try {
+          static_cast<void>(queue.Push(
+              bbp::SimulationCommandKind::kExportNodeReport, "firo-1"));
+        } catch (const std::runtime_error&) {
+          ++rejected;
+        }
+      }
+      return rejected;
+    }));
+  }
+  std::size_t rejected = 0U;
+  for (std::future<std::size_t>& producer : producers) {
+    rejected += producer.get();
+  }
+
+  const bbp::SimulationCommandQueueStats stats = queue.Stats();
+  BOOST_TEST(stats.size == kCapacity);
+  BOOST_TEST(stats.maximum_size == kCapacity);
+  BOOST_TEST(stats.rejected == rejected);
+  BOOST_TEST(rejected == kProducerCount * kCommandsPerProducer - kCapacity);
+  const std::vector<bbp::SimulationCommand> commands = queue.Cancel();
+  BOOST_REQUIRE_EQUAL(commands.size(), kCapacity);
+  std::set<std::uint64_t> sequences;
+  for (const bbp::SimulationCommand& command : commands) {
+    sequences.insert(command.sequence);
+  }
+  BOOST_TEST(sequences.size() == kCapacity);
+  BOOST_TEST(*sequences.begin() == 1U);
+  BOOST_TEST(*sequences.rbegin() == kCapacity);
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_queue_wakes_waiting_consumer) {

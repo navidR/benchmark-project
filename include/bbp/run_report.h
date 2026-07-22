@@ -11,6 +11,8 @@
 
 namespace bbp {
 
+constexpr std::size_t kMaximumRunReportSummaryRecords = 256U;
+
 struct RunReportRefreshStats {
   std::uint64_t event_records = 0;
   std::uint64_t metric_records = 0;

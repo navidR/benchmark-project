@@ -5,6 +5,7 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/test/unit_test.hpp>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -13,6 +14,7 @@
 #include <string_view>
 
 #include "bbp/run_report.h"
+#include "bbp/simulation_event_kind.h"
 #include "bbp/util.h"
 
 namespace {
@@ -49,6 +51,147 @@ std::uint64_t JsonIntegerValue(const boost::json::value& value) {
 }
 
 }  // namespace
+
+BOOST_AUTO_TEST_CASE(item10_prefixed_report_retention_reproducer) {
+  const std::filesystem::path dir = MakeTestDir("item10-prefixed-report");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"item10","chain":"firo","nodes":1})");
+  constexpr std::uint64_t kProduced = 10'000U;
+  for (std::uint64_t index = 0U; index < kProduced; ++index) {
+    boost::json::object event;
+    event["run_id"] = "item10";
+    event["node_id"] = "firo-1";
+    event["event"] = "generated_blocks";
+    event["detail"] = std::to_string(index);
+    bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+  }
+
+  const auto refresh_started = std::chrono::steady_clock::now();
+  bbp::IncrementalRunReport incremental(dir);
+  const boost::json::object& report = incremental.Refresh();
+  const auto refresh_elapsed =
+      std::chrono::steady_clock::now() - refresh_started;
+  BOOST_TEST(refresh_elapsed < std::chrono::seconds(5));
+  const auto idle_refresh_started = std::chrono::steady_clock::now();
+  static_cast<void>(incremental.Refresh(256U));
+  const auto idle_refresh_elapsed =
+      std::chrono::steady_clock::now() - idle_refresh_started;
+  BOOST_TEST(idle_refresh_elapsed < std::chrono::seconds(1));
+  BOOST_TEST(incremental.last_refresh_stats().event_records == 0U);
+  BOOST_TEST(report.at("generated_blocks").as_array().size() <= 256U);
+  BOOST_TEST(JsonInteger(report, "event_count") == kProduced);
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_report_bounds_every_historical_summary_and_preserves_exact_totals) {
+  const std::filesystem::path dir = MakeTestDir("bounded-all-summaries");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"bounded","chain":"firo","nodes":1})");
+  const std::vector<std::pair<bbp::SimulationEventKind, std::string_view>>
+      histories = {
+          {bbp::SimulationEventKind::kGeneratedBlocks, "generated_blocks"},
+          {bbp::SimulationEventKind::kNodeStartDeadlineReached,
+           "node_start_deadlines"},
+          {bbp::SimulationEventKind::kNodeStopDeadlineReached,
+           "node_stop_deadlines"},
+          {bbp::SimulationEventKind::kProcessExited, "process_exits"},
+          {bbp::SimulationEventKind::kRestartPolicyApplied,
+           "restart_policy_actions"},
+          {bbp::SimulationEventKind::kScheduledBlockProduced,
+           "scheduled_blocks"},
+          {bbp::SimulationEventKind::kScheduledEventStarted,
+           "scheduled_events_started"},
+          {bbp::SimulationEventKind::kScheduledEventCompleted,
+           "scheduled_events_completed"},
+          {bbp::SimulationEventKind::kScheduledEventFailed,
+           "scheduled_events_failed"},
+          {bbp::SimulationEventKind::kCheckpointRecorded, "checkpoints"},
+          {bbp::SimulationEventKind::kHeightReached, "height_reached"},
+          {bbp::SimulationEventKind::kHeightWaitReached, "height_waits"},
+          {bbp::SimulationEventKind::kPeerCountReached, "peer_waits"},
+          {bbp::SimulationEventKind::kPeerConnected, "peer_connects"},
+          {bbp::SimulationEventKind::kPeerDisconnected, "peer_disconnects"},
+          {bbp::SimulationEventKind::kRawTransactionSubmitted,
+           "raw_transactions"},
+          {bbp::SimulationEventKind::kTransactionVisible,
+           "transaction_visibility"},
+          {bbp::SimulationEventKind::kTransactionConfirmed,
+           "transaction_confirmations"},
+          {bbp::SimulationEventKind::kTransactionLoadAttempt,
+           "transaction_load_attempts"},
+          {bbp::SimulationEventKind::kTransactionLoadCompleted,
+           "transaction_load_summaries"},
+          {bbp::SimulationEventKind::kNodeRestarted, "node_restarts"},
+          {bbp::SimulationEventKind::kNodeFreezeCompleted, "node_freezes"},
+          {bbp::SimulationEventKind::kResourceLimitsUpdated,
+           "resource_updates"},
+          {bbp::SimulationEventKind::kResourceProfileUpdated,
+           "resource_profile_updates"},
+          {bbp::SimulationEventKind::kNetworkProfileUpdated,
+           "network_profile_updates"},
+          {bbp::SimulationEventKind::kProfileUpdateRollbackFailed,
+           "profile_update_rollback_failures"},
+          {bbp::SimulationEventKind::kNetworkConditionUpdated,
+           "network_condition_updates"},
+          {bbp::SimulationEventKind::kNetworkBlockApplied, "network_blocks"},
+          {bbp::SimulationEventKind::kNetworkBlockRemoved, "network_unblocks"},
+          {bbp::SimulationEventKind::kNetworkPartitionApplied,
+           "network_partitions"},
+          {bbp::SimulationEventKind::kNetworkPartitionHealed,
+           "network_partition_heals"},
+          {bbp::SimulationEventKind::kDirectionalNetworkPoliciesVerified,
+           "directional_network_policy_verifications"},
+          {bbp::SimulationEventKind::kTopologyEdgeUpdated,
+           "topology_edge_updates"},
+          {bbp::SimulationEventKind::kTopologyEdgeUpdateRollbackFailed,
+           "topology_edge_rollback_failures"},
+          {bbp::SimulationEventKind::kWalletFunded, "wallet_funding"},
+          {bbp::SimulationEventKind::kWalletTransactionSubmitted,
+           "wallet_transactions"},
+          {bbp::SimulationEventKind::kOperatorCommandCompleted,
+           "operator_commands"},
+      };
+  constexpr std::uint64_t kEventsPerKind = 300U;
+  for (const auto& [kind, field] : histories) {
+    static_cast<void>(field);
+    for (std::uint64_t index = 0U; index < kEventsPerKind; ++index) {
+      boost::json::object detail;
+      detail["index"] = index;
+      boost::json::object event;
+      event["run_id"] = "bounded";
+      event["node_id"] = "firo-1";
+      event["event"] = bbp::SimulationEventKindName(kind);
+      event["detail"] = boost::json::serialize(detail);
+      bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+    }
+  }
+
+  const auto all_histories_started = std::chrono::steady_clock::now();
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  const auto all_histories_elapsed =
+      std::chrono::steady_clock::now() - all_histories_started;
+  BOOST_TEST(all_histories_elapsed < std::chrono::seconds(5));
+  BOOST_TEST(JsonInteger(report, "summary_retention_limit") ==
+             bbp::kMaximumRunReportSummaryRecords);
+  BOOST_TEST(JsonInteger(report, "event_count") ==
+             histories.size() * kEventsPerKind);
+  const boost::json::object& event_counts =
+      report.at("event_counts").as_object();
+  for (const auto& [kind, field] : histories) {
+    const boost::json::array& retained = report.at(field).as_array();
+    BOOST_TEST(retained.size() == bbp::kMaximumRunReportSummaryRecords);
+    BOOST_TEST(JsonInteger(event_counts, bbp::SimulationEventKindName(kind)) ==
+               kEventsPerKind);
+    const boost::json::object& first = retained.front().as_object();
+    BOOST_TEST(JsonInteger(first.at("detail").as_object(), "index") ==
+               kEventsPerKind - bbp::kMaximumRunReportSummaryRecords);
+    const boost::json::object& last = retained.back().as_object();
+    BOOST_TEST(JsonInteger(last.at("detail").as_object(), "index") ==
+               kEventsPerKind - 1U);
+  }
+  std::filesystem::remove_all(dir);
+}
 
 BOOST_AUTO_TEST_CASE(run_report_preserves_manual_operator_connection_command) {
   const std::filesystem::path dir =

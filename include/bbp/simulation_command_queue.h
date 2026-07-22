@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -12,8 +13,20 @@
 
 namespace bbp {
 
+constexpr std::size_t kDefaultSimulationCommandQueueCapacity = 256U;
+
+struct SimulationCommandQueueStats {
+  std::size_t size = 0U;
+  std::size_t capacity = 0U;
+  std::size_t maximum_size = 0U;
+  std::uint64_t rejected = 0U;
+};
+
 class SimulationCommandQueue {
  public:
+  explicit SimulationCommandQueue(
+      std::size_t capacity = kDefaultSimulationCommandQueueCapacity);
+
   std::uint64_t Push(SimulationCommandKind kind, std::string node_id,
                      bool confirmed = false);
   std::uint64_t PushBlockProductionPolicy(BlockProductionPolicy policy);
@@ -54,6 +67,7 @@ class SimulationCommandQueue {
   void Close();
   std::vector<SimulationCommand> Cancel();
   [[nodiscard]] bool IsClosed() const;
+  [[nodiscard]] SimulationCommandQueueStats Stats() const;
 
  private:
   std::uint64_t PushCommand(SimulationCommand command);
@@ -61,6 +75,9 @@ class SimulationCommandQueue {
   mutable std::mutex mutex_;
   std::condition_variable ready_;
   std::deque<SimulationCommand> commands_;
+  const std::size_t capacity_;
+  std::size_t maximum_size_ = 0U;
+  std::uint64_t rejected_ = 0U;
   std::uint64_t next_sequence_ = 1;
   bool closed_ = false;
 };

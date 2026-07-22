@@ -30,6 +30,8 @@
 
 namespace bbp {
 
+constexpr std::size_t kMaximumScenarioActionCount = 256U;
+
 struct Options {
   ChainKind chain = ChainKind::kFiro;
   LogLevel log_level = LogLevel::kInfo;

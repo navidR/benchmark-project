@@ -36,16 +36,26 @@ namespace {
 
 constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
 constexpr std::size_t kMaximumNodeMetricHistorySamples = 120U;
-constexpr std::size_t kMaximumOperatorCommandSummaries = 256U;
-constexpr std::size_t kMaximumScheduledBlockSummaries = 256U;
-constexpr std::size_t kMaximumScheduledEventSummaries = 256U;
-constexpr std::size_t kMaximumCheckpointSummaries = 256U;
-constexpr std::size_t kMaximumDirectionalPolicyVerifications = 256U;
-constexpr std::size_t kMaximumTopologyEdgeSummaries = 256U;
-constexpr std::size_t kMaximumProfileUpdateSummaries = 256U;
-constexpr std::size_t kMaximumWalletTransactionSummaries = 256U;
-constexpr std::size_t kMaximumTransactionLoadAttemptSummaries = 256U;
-constexpr std::size_t kMaximumTransactionLoadCompletionSummaries = 256U;
+constexpr std::size_t kMaximumOperatorCommandSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumScheduledBlockSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumScheduledEventSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumCheckpointSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumDirectionalPolicyVerifications =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumTopologyEdgeSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumProfileUpdateSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumWalletTransactionSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumTransactionLoadAttemptSummaries =
+    kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumTransactionLoadCompletionSummaries =
+    kMaximumRunReportSummaryRecords;
 
 struct NodeReport {
   std::optional<std::uint64_t> index;
@@ -1552,6 +1562,9 @@ void AppendEventSummary(const boost::json::object& event,
     summary["detail"] = std::move(detail);
   }
   summaries->push_back(std::move(summary));
+  if (summaries->size() > kMaximumRunReportSummaryRecords) {
+    summaries->erase(summaries->begin());
+  }
 }
 
 void AppendBoundedEventSummary(const boost::json::object& event,
@@ -2323,6 +2336,7 @@ struct IncrementalRunReport::Impl {
     report["status"] = RunReportStatusName(status);
     report["simulation_duration_reached"] = simulation_duration_reached;
     report["event_count"] = event_count;
+    report["summary_retention_limit"] = kMaximumRunReportSummaryRecords;
     report["metric_count"] = metric_count;
     report["event_counts"] = EventCountsJson(event_counts);
     report["scheduled_block_count"] = scheduled_block_count;
