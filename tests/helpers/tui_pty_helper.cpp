@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -249,6 +250,33 @@ std::string WaitForFileText(const std::filesystem::path& path,
                            " to contain " + std::string(expected));
 }
 
+std::size_t CountOccurrences(std::string_view text, std::string_view expected) {
+  std::size_t count = 0U;
+  std::size_t offset = 0U;
+  while ((offset = text.find(expected, offset)) != std::string_view::npos) {
+    ++count;
+    offset += expected.size();
+  }
+  return count;
+}
+
+std::string WaitForFileOccurrences(const std::filesystem::path& path,
+                                   std::string_view expected,
+                                   std::size_t minimum_count,
+                                   std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::string contents;
+  while (std::chrono::steady_clock::now() < deadline) {
+    contents = ReadFile(path);
+    if (CountOccurrences(contents, expected) >= minimum_count) {
+      return contents;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  throw std::runtime_error("timed out waiting for " + path.string() +
+                           " occurrence count for " + std::string(expected));
+}
+
 void RequireContains(std::string_view text, std::string_view expected,
                      std::string_view context) {
   if (text.find(expected) == std::string_view::npos) {
@@ -362,6 +390,51 @@ pid_t ProcessStartedPid(std::string_view events) {
 
 bool ProcessExists(pid_t pid) { return kill(pid, 0) == 0 || errno == EPERM; }
 
+std::vector<pid_t> EventProcessPids(std::string_view events) {
+  constexpr std::string_view event_marker = "\"event\":\"process_started\"";
+  constexpr std::string_view pid_marker = "\\\"pid\\\":";
+  std::vector<pid_t> pids;
+  std::size_t offset = 0U;
+  while ((offset = events.find(event_marker, offset)) !=
+         std::string_view::npos) {
+    const std::size_t line_end = events.find('\n', offset);
+    const std::size_t pid_field = events.find(pid_marker, offset);
+    if (pid_field == std::string_view::npos ||
+        (line_end != std::string_view::npos && pid_field >= line_end)) {
+      throw std::runtime_error("process_started event did not contain a pid");
+    }
+    const std::size_t begin = pid_field + pid_marker.size();
+    const std::size_t end = events.find_first_not_of("0123456789", begin);
+    const long parsed =
+        std::stol(std::string(events.substr(begin, end - begin)));
+    if (parsed <= 0) {
+      throw std::runtime_error("process_started pid was not positive");
+    }
+    pids.push_back(static_cast<pid_t>(parsed));
+    offset = line_end == std::string_view::npos ? events.size() : line_end + 1U;
+  }
+  return pids;
+}
+
+std::vector<pid_t> MetricNamespacePids(std::string_view metrics) {
+  constexpr std::string_view marker = "\"network_namespace_helper_pid\":";
+  std::set<pid_t> unique_pids;
+  std::size_t offset = 0U;
+  while ((offset = metrics.find(marker, offset)) != std::string_view::npos) {
+    const std::size_t begin = offset + marker.size();
+    if (metrics.substr(begin, 4U) != "null") {
+      const std::size_t end = metrics.find_first_not_of("0123456789", begin);
+      const long parsed =
+          std::stol(std::string(metrics.substr(begin, end - begin)));
+      if (parsed > 0) {
+        unique_pids.insert(static_cast<pid_t>(parsed));
+      }
+    }
+    offset = begin;
+  }
+  return {unique_pids.begin(), unique_pids.end()};
+}
+
 void WaitForProcessExit(pid_t pid, std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -371,6 +444,205 @@ void WaitForProcessExit(pid_t pid, std::chrono::milliseconds timeout) {
     std::this_thread::sleep_for(20ms);
   }
   throw std::runtime_error("active-run daemon survived confirmed TUI exit");
+}
+
+std::string MarkerResourceId(const std::filesystem::path& run_root) {
+  const std::string marker = ReadFile(run_root / ".bbp-run");
+  constexpr std::string_view field = "\"resource_id\":\"";
+  const std::size_t begin_field = marker.find(field);
+  if (begin_field == std::string::npos) {
+    throw std::runtime_error("run ownership marker has no resource id");
+  }
+  const std::size_t begin = begin_field + field.size();
+  const std::size_t end = marker.find('"', begin);
+  if (end == std::string::npos || end - begin != 32U) {
+    throw std::runtime_error("run ownership marker resource id is invalid");
+  }
+  return marker.substr(begin, end - begin);
+}
+
+void RequireNoRpcCredentials(const std::filesystem::path& run_root) {
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(run_root)) {
+    if (entry.path().filename() == ".bbp-rpc-cookie") {
+      throw std::runtime_error("RPC credential survived run cleanup: " +
+                               entry.path().string());
+    }
+  }
+}
+
+void RequireOwnedResourcesRemoved(const std::filesystem::path& run_root,
+                                  std::uint32_t node_count,
+                                  const std::vector<pid_t>& daemon_pids,
+                                  const std::vector<pid_t>& namespace_pids) {
+  for (const pid_t pid : daemon_pids) {
+    WaitForProcessExit(pid, 5s);
+  }
+  for (const pid_t pid : namespace_pids) {
+    WaitForProcessExit(pid, 5s);
+  }
+  const std::string resource_id = MarkerResourceId(run_root);
+  const std::filesystem::path cgroup =
+      std::filesystem::path("/sys/fs/cgroup/bbp") / resource_id;
+  if (std::filesystem::exists(cgroup)) {
+    throw std::runtime_error("owned run cgroup survived cleanup: " +
+                             cgroup.string());
+  }
+  const std::string interface_token = resource_id.substr(0U, 8U);
+  for (std::uint32_t node = 1U; node <= node_count; ++node) {
+    for (const char suffix : {'h', 'p'}) {
+      const std::filesystem::path interface =
+          std::filesystem::path("/sys/class/net") /
+          ("bbp" + interface_token + "n" + std::to_string(node) + suffix);
+      if (std::filesystem::exists(interface)) {
+        throw std::runtime_error("owned run interface survived cleanup: " +
+                                 interface.string());
+      }
+    }
+  }
+  RequireNoRpcCredentials(run_root);
+}
+
+void CheckFiniteDirectLoadOption(const std::filesystem::path& command,
+                                 const std::filesystem::path& daemon,
+                                 const std::filesystem::path& benchmark_root) {
+  const std::string run_id = "direct-load-finite-" + std::to_string(getpid());
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  PtyProcess process(command,
+                     {"--firod",
+                      daemon.string(),
+                      "--benchmark-root",
+                      benchmark_root.string(),
+                      "--run-id",
+                      run_id,
+                      "--nodes",
+                      "2",
+                      "--wallet-node-count",
+                      "2",
+                      "--transaction-load-strategy",
+                      "random_bruteforce",
+                      "--metrics-sample-count",
+                      "1",
+                      "--no-tui",
+                      "--metrics-interval",
+                      "100ms",
+                      "--block-production-period-ms",
+                      "100",
+                      "--block-production-probability",
+                      "1",
+                      "--keep-artifacts"},
+                     24, 80);
+  const int result = process.Wait(60s);
+  if (result != 0) {
+    throw std::runtime_error("explicit finite direct load exited " +
+                             std::to_string(result));
+  }
+  const std::string resolved = ReadFile(run_root / "resolved-scenario.json");
+  RequireContains(resolved, "\"metrics_sample_count\":1",
+                  "explicit finite direct load options");
+  const std::string events = ReadFile(run_root / "events.jsonl");
+  RequireContains(events, "\"event\":\"run_finished\"",
+                  "explicit finite direct load");
+  RequireNotContains(events, "\"event\":\"run_cancelled\"",
+                     "explicit finite direct load");
+  const std::vector<pid_t> daemon_pids = EventProcessPids(events);
+  if (daemon_pids.size() != 2U) {
+    throw std::runtime_error("finite direct load did not start two daemons");
+  }
+  RequireOwnedResourcesRemoved(
+      run_root, 2U, daemon_pids,
+      MetricNamespacePids(ReadFile(run_root / "metrics.jsonl")));
+}
+
+void CheckIndefiniteDirectLoadLifecycle(
+    const std::filesystem::path& command, const std::filesystem::path& daemon,
+    const std::filesystem::path& benchmark_root) {
+  const std::string run_id =
+      "direct-load-indefinite-" + std::to_string(getpid());
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  PtyProcess process(command,
+                     {"--firod",
+                      daemon.string(),
+                      "--benchmark-root",
+                      benchmark_root.string(),
+                      "--run-id",
+                      run_id,
+                      "--nodes",
+                      "2",
+                      "--wallet-node-count",
+                      "2",
+                      "--transaction-load-strategy",
+                      "random_bruteforce",
+                      "--metrics-interval",
+                      "100ms",
+                      "--refresh-ms",
+                      "50",
+                      "--block-production-period-ms",
+                      "100",
+                      "--block-production-probability",
+                      "1",
+                      "--keep-artifacts"},
+                     30, 100);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 10s,
+                                      "indefinite direct load"));
+  const std::string resolved = WaitForFileText(
+      run_root / "resolved-scenario.json", "\"metrics_sample_count\":0", 10s);
+  RequireContains(resolved, "\"transaction_count\":2",
+                  "indefinite direct load options");
+  std::string after_workload =
+      WaitForFileText(events_path, "\\\"transaction_index\\\":2", 30s);
+  const std::size_t metrics_before =
+      CountOccurrences(after_workload, "\"event\":\"metrics_sample\"");
+  const std::size_t blocks_before = CountOccurrences(
+      after_workload, "\"event\":\"scheduled_block_produced\"");
+  after_workload = WaitForFileOccurrences(
+      events_path, "\"event\":\"metrics_sample\"", metrics_before + 2U, 20s);
+  after_workload = WaitForFileOccurrences(
+      events_path, "\"event\":\"scheduled_block_produced\"", blocks_before + 2U,
+      20s);
+  RequireNotContains(after_workload, "\"event\":\"run_cancelled\"",
+                     "indefinite direct load after workload");
+  RequireNotContains(after_workload, "\"event\":\"run_finished\"",
+                     "indefinite direct load after workload");
+  const std::vector<pid_t> daemon_pids = EventProcessPids(after_workload);
+  if (!process.Running() || daemon_pids.size() != 2U) {
+    throw std::runtime_error(
+        "default direct load was not running after workload completion");
+  }
+  for (const pid_t pid : daemon_pids) {
+    if (!ProcessExists(pid)) {
+      throw std::runtime_error(
+          "direct-load daemon stopped after workload completion");
+    }
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(
+      process.ReadUntil("Confirm exit", 3s, "direct-load exit modal"));
+  process.Write("y");
+  const int result = process.Wait(30s);
+  if (result != 0) {
+    throw std::runtime_error("explicit direct-load exit returned " +
+                             std::to_string(result));
+  }
+  const std::string finished =
+      WaitForFileText(events_path, "\"event\":\"run_finished\"", 5s);
+  RequireContains(finished, "\"event\":\"run_cancelled\"",
+                  "explicit direct-load exit");
+  RequireContains(finished, "\"event\":\"transaction_load_completed\"",
+                  "explicit direct-load exit");
+  RequireOwnedResourcesRemoved(
+      run_root, 2U, daemon_pids,
+      MetricNamespacePids(ReadFile(run_root / "metrics.jsonl")));
+}
+
+void CheckDirectLoadLifecycle(const std::filesystem::path& command,
+                              const std::filesystem::path& daemon,
+                              const std::filesystem::path& benchmark_root) {
+  std::filesystem::create_directories(benchmark_root);
+  CheckFiniteDirectLoadOption(command, daemon, benchmark_root);
+  CheckIndefiniteDirectLoadLifecycle(command, daemon, benchmark_root);
 }
 
 void WriteActiveScenario(const std::filesystem::path& path) {
@@ -489,6 +761,18 @@ int RunIdleDaemon() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 5 && std::string_view(argv[1]) == "--direct-load-lifecycle") {
+    try {
+      CheckDirectLoadLifecycle(argv[2], argv[3], argv[4]);
+      std::cout << "direct no-JSON finite option and indefinite active-run "
+                   "lifecycle checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "direct-load lifecycle regression failed: " << error.what()
+                << '\n';
+      return 1;
+    }
+  }
   if (argc > 1 && argv[1][0] == '-') {
     return RunIdleDaemon();
   }

@@ -5041,9 +5041,6 @@ void ApplyDirectTransactionLoadOptions(
 
   options->topology.configured = true;
   options->isolate_network = true;
-  if (!OptionProvided(vm, "metrics-sample-count")) {
-    options->metrics_sample_count = 1U;
-  }
   options->topology.node_count = options->nodes;
   options->topology.wallet_node_count = wallet_node_count;
   options->topology.miner_node_count = 1U;
@@ -5165,9 +5162,13 @@ Options ParseOptions(int argc, char** argv) {
       "wallets), public driver wallets, two receiver batches for random or "
       "one complete equal fan-out at 2 tx/s, "
       "concurrency 2, queue 8, uniform 0.01..0.10 coin random amounts, "
-      "fixed 0.00001000 coin fee, simulation seed, and one final metric "
-      "sample")("isolate-network",
-                "confine every node to its own benchmark network namespace")(
+      "fixed 0.00001000 coin fee, simulation seed, and continuous metrics "
+      "until explicit stop")(
+      "isolate-network",
+      "confine every node to its own benchmark network namespace")(
+      "metrics-sample-count", po::value<std::uint32_t>(),
+      "periodic metric sample limit; zero keeps the run active until explicit "
+      "stop, while a positive count makes the run finite")(
       "keep-artifacts", "preserve run artifacts")(
       "once", "render one frame when viewing a previous run");
   po::options_description desc("Allowed options");
@@ -5239,8 +5240,8 @@ Options ParseOptions(int argc, char** argv) {
                              "block propagation timeout")(
       "metrics-sample-count",
       po::value<uint32_t>(&options.metrics_sample_count),
-      "periodic metric samples collected concurrently with workloads and "
-      "block production")(
+      "periodic metric sample limit; zero keeps the run active until explicit "
+      "stop, while a positive count makes the run finite")(
       "metrics-interval", po::value<std::string>(&metrics_interval_text),
       "typed interval between metric and node-log samples, such as 250ms or "
       "1s")("metrics-interval-ms",

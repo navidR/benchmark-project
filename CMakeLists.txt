@@ -786,8 +786,21 @@ if(BUILD_TESTING)
   )
   set_tests_properties(bbp-direct-transaction-load-help
     PROPERTIES
-      PASS_REGULAR_EXPRESSION "transaction-load-strategy"
+      PASS_REGULAR_EXPRESSION "zero keeps the"
   )
+
+  set(BBP_FIROD_INTEGRATION_BINARY "" CACHE FILEPATH
+    "optional firod used by the real direct-load lifecycle regression"
+  )
+  if(BBP_FIROD_INTEGRATION_BINARY)
+    add_test(NAME bbp-direct-transaction-load-lifecycle
+      COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+        --direct-load-lifecycle
+        $<TARGET_FILE:bbp>
+        "${BBP_FIROD_INTEGRATION_BINARY}"
+        "${CMAKE_CURRENT_BINARY_DIR}/direct-load-lifecycle-artifacts"
+    )
+  endif()
   add_argument_failure_test(
     bbp-direct-load-missing-strategy
     "--wallet-node-count|2|--nodes|3|--probe-capabilities"
