@@ -110,4 +110,18 @@ class Cgroup {
   std::filesystem::path path_;
 };
 
+#ifdef BBP_ENABLE_TEST_HOOKS
+struct CgroupScopeTestConfig {
+  std::filesystem::path root;
+  std::string simulator_name;
+  std::filesystem::path state_file;
+  bool allow_root_process_move = true;
+};
+
+void PrepareCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                 const std::string& run_id);
+void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                const std::string& run_id);
+#endif
+
 }  // namespace bbp

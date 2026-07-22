@@ -9762,22 +9762,24 @@ void CleanupRun(Options options) {
       std::filesystem::absolute(options.output_dir) / options.run_id;
   options.run_ownership = LoadRunOwnership(options.run_id, run_root);
   LoadCleanupMetadata(run_root, &options);
-  RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
 
   std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
   if (options.isolate_network) {
+    RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
     network_allocation_lock = std::make_unique<NetworkAllocationLock>();
   }
 
   Cgroup::RemoveStaleRun(RequireRunOwnership(options));
-  for (uint32_t i = 0; i < options.nodes; ++i) {
-    NodeVethConfig config;
-    const RunOwnership& ownership = RequireRunOwnership(options);
-    config.host_name = RunInterfaceName(ownership, i, 'h');
-    config.peer_name = RunInterfaceName(ownership, i, 'p');
-    config.host_ownership_alias = RunInterfaceAlias(ownership, i, 'h');
-    config.peer_ownership_alias = RunInterfaceAlias(ownership, i, 'p');
-    DeleteNodeVethNetwork(config);
+  if (options.isolate_network) {
+    for (uint32_t i = 0; i < options.nodes; ++i) {
+      NodeVethConfig config;
+      const RunOwnership& ownership = RequireRunOwnership(options);
+      config.host_name = RunInterfaceName(ownership, i, 'h');
+      config.peer_name = RunInterfaceName(ownership, i, 'p');
+      config.host_ownership_alias = RunInterfaceAlias(ownership, i, 'h');
+      config.peer_ownership_alias = RunInterfaceAlias(ownership, i, 'p');
+      DeleteNodeVethNetwork(config);
+    }
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   const std::unique_ptr<ChainDriver> driver = CreateChainDriver(options.chain);

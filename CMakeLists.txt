@@ -315,6 +315,17 @@ if(BUILD_TESTING)
     -Werror
   )
 
+  add_executable(bbp-no-cap-net-admin-exec
+    tests/helpers/no_cap_net_admin_exec.cpp
+  )
+  target_compile_options(bbp-no-cap-net-admin-exec PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion
+    -Werror
+  )
+
   add_executable(bbp-unit-tests
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
@@ -1706,6 +1717,13 @@ if(BUILD_TESTING)
       "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
       "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/copied-run-marker-test"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/copied_run_marker_cleanup.cmake"
+  )
+  add_test(NAME bbp-non-isolated-cleanup-without-network-capability
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+      "-DCAPABILITY_HELPER=$<TARGET_FILE:bbp-no-cap-net-admin-exec>"
+      "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/non-isolated-cleanup-test"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/non_isolated_cleanup.cmake"
   )
   add_cli_failure_test(
     bbp-invalid-role-topology-miners

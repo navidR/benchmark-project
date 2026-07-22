@@ -457,3 +457,206 @@ BOOST_AUTO_TEST_CASE(network_namespace_helper_is_owned_by_node_cgroup) {
   network_namespace.Stop();
   BOOST_TEST(!std::filesystem::exists(RunCgroupPath(run->run_id())));
 }
+
+BOOST_AUTO_TEST_CASE(
+    cgroup_scope_restores_processes_and_controller_state_once) {
+  const std::string suffix = UniqueRunId("scope");
+  const std::filesystem::path scope_root =
+      std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
+  const std::filesystem::path state_file = TestDirectory("scope-state");
+  std::error_code error;
+  std::filesystem::remove(state_file, error);
+  error.clear();
+  if (!std::filesystem::create_directory(scope_root, error)) {
+    BOOST_TEST_MESSAGE("skipping real cgroup scope test: " << error.message());
+    return;
+  }
+
+  const pid_t pid = fork();
+  BOOST_REQUIRE(pid >= 0);
+  if (pid == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+  ChildGuard child(pid);
+  try {
+    bbp::WriteText(scope_root / "cgroup.procs", std::to_string(pid));
+    const std::string process_cgroup_before =
+        bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup");
+    const std::string root_controllers_before =
+        bbp::ReadText(scope_root / "cgroup.subtree_control");
+    const bbp::CgroupScopeTestConfig config{
+        .root = scope_root,
+        .simulator_name = "bbp",
+        .state_file = state_file,
+    };
+    const std::string first = "scope-first";
+    const std::string second = "scope-second";
+
+    int gate[2] = {-1, -1};
+    BOOST_REQUIRE(pipe(gate) == 0);
+    const auto fork_preparer = [&](const std::string& run_id) {
+      const pid_t preparer = fork();
+      if (preparer == 0) {
+        close(gate[1]);
+        char signal = 0;
+        ssize_t received = -1;
+        do {
+          received = read(gate[0], &signal, 1U);
+        } while (received < 0 && errno == EINTR);
+        if (received != 1) {
+          _exit(20);
+        }
+        try {
+          bbp::PrepareCgroupRunInTestScope(config, run_id);
+          _exit(0);
+        } catch (const std::exception&) {
+          _exit(21);
+        }
+      }
+      return preparer;
+    };
+    const pid_t first_preparer = fork_preparer(first);
+    BOOST_REQUIRE(first_preparer > 0);
+    const pid_t second_preparer = fork_preparer(second);
+    BOOST_REQUIRE(second_preparer > 0);
+    close(gate[0]);
+    BOOST_REQUIRE(write(gate[1], "xx", 2U) == 2);
+    close(gate[1]);
+    int first_status = 0;
+    int second_status = 0;
+    BOOST_REQUIRE(waitpid(first_preparer, &first_status, 0) == first_preparer);
+    BOOST_REQUIRE(waitpid(second_preparer, &second_status, 0) ==
+                  second_preparer);
+    BOOST_REQUIRE(WIFEXITED(first_status));
+    BOOST_REQUIRE(WIFEXITED(second_status));
+    BOOST_TEST(WEXITSTATUS(first_status) == 0);
+    BOOST_TEST(WEXITSTATUS(second_status) == 0);
+
+    BOOST_TEST(std::filesystem::exists(state_file));
+    BOOST_TEST(bbp::SplitWhitespace(bbp::ReadText(scope_root / "cgroup.procs"))
+                   .empty());
+    BOOST_TEST(bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup")
+                   .find(".bbp-controller-v1-") != std::string::npos);
+    bbp::RemoveCgroupRunInTestScope(config, first);
+    BOOST_TEST(std::filesystem::exists(state_file));
+    BOOST_TEST(std::filesystem::exists(scope_root / "bbp" / second));
+    BOOST_TEST(bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup")
+                   .find(".bbp-controller-v1-") != std::string::npos);
+
+    bbp::RemoveCgroupRunInTestScope(config, second);
+    BOOST_TEST(!std::filesystem::exists(state_file));
+    BOOST_TEST(!std::filesystem::exists(scope_root / "bbp"));
+    BOOST_TEST(bbp::ReadText(scope_root / "cgroup.subtree_control") ==
+               root_controllers_before);
+    BOOST_TEST(bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup") ==
+               process_cgroup_before);
+    const std::vector<std::string> restored =
+        bbp::SplitWhitespace(bbp::ReadText(scope_root / "cgroup.procs"));
+    BOOST_CHECK(std::find(restored.begin(), restored.end(),
+                          std::to_string(pid)) != restored.end());
+
+    kill(pid, SIGKILL);
+    const int status = child.Wait();
+    BOOST_REQUIRE(WIFSIGNALED(status));
+    BOOST_TEST(WTERMSIG(status) == SIGKILL);
+    BOOST_REQUIRE(std::filesystem::remove(scope_root, error));
+    BOOST_REQUIRE(!error);
+  } catch (...) {
+    try {
+      bbp::RemoveCgroupRunInTestScope(
+          bbp::CgroupScopeTestConfig{
+              .root = scope_root,
+              .simulator_name = "bbp",
+              .state_file = state_file,
+          },
+          "scope-first");
+    } catch (const std::exception&) {
+    }
+    try {
+      bbp::RemoveCgroupRunInTestScope(
+          bbp::CgroupScopeTestConfig{
+              .root = scope_root,
+              .simulator_name = "bbp",
+              .state_file = state_file,
+          },
+          "scope-second");
+    } catch (const std::exception&) {
+    }
+    throw;
+  }
+}
+
+BOOST_AUTO_TEST_CASE(cgroup_scope_prepare_failure_restores_partial_mutations) {
+  const std::string suffix = UniqueRunId("scope-rollback");
+  const std::filesystem::path scope_root =
+      std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
+  const std::filesystem::path simulator = scope_root / "bbp";
+  const std::string run_id = "preexisting-run";
+  const std::filesystem::path state_file = TestDirectory("rollback-state");
+  std::error_code error;
+  std::filesystem::remove(state_file, error);
+  error.clear();
+  if (!std::filesystem::create_directory(scope_root, error)) {
+    BOOST_TEST_MESSAGE(
+        "skipping real cgroup rollback test: " << error.message());
+    return;
+  }
+  std::filesystem::create_directory(simulator);
+  std::filesystem::create_directory(simulator / run_id);
+
+  const pid_t pid = fork();
+  BOOST_REQUIRE(pid >= 0);
+  if (pid == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+  ChildGuard child(pid);
+  try {
+    bbp::WriteText(scope_root / "cgroup.procs", std::to_string(pid));
+    const std::string process_cgroup_before =
+        bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup");
+    const std::string root_controllers_before =
+        bbp::ReadText(scope_root / "cgroup.subtree_control");
+    const std::string simulator_controllers_before =
+        bbp::ReadText(simulator / "cgroup.subtree_control");
+    const bbp::CgroupScopeTestConfig config{
+        .root = scope_root,
+        .simulator_name = "bbp",
+        .state_file = state_file,
+    };
+
+    BOOST_CHECK_EXCEPTION(
+        bbp::PrepareCgroupRunInTestScope(config, run_id), std::runtime_error,
+        [](const std::runtime_error& failure) {
+          return std::string(failure.what())
+                     .find("refusing to adopt pre-existing run cgroup") !=
+                 std::string::npos;
+        });
+    BOOST_TEST(!std::filesystem::exists(state_file));
+    BOOST_TEST(std::filesystem::exists(simulator / run_id));
+    BOOST_TEST(bbp::ReadText(scope_root / "cgroup.subtree_control") ==
+               root_controllers_before);
+    BOOST_TEST(bbp::ReadText(simulator / "cgroup.subtree_control") ==
+               simulator_controllers_before);
+    BOOST_TEST(bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup") ==
+               process_cgroup_before);
+
+    kill(pid, SIGKILL);
+    const int status = child.Wait();
+    BOOST_REQUIRE(WIFSIGNALED(status));
+    BOOST_TEST(WTERMSIG(status) == SIGKILL);
+    BOOST_REQUIRE(std::filesystem::remove(simulator / run_id, error));
+    BOOST_REQUIRE(!error);
+    error.clear();
+    BOOST_REQUIRE(std::filesystem::remove(simulator, error));
+    BOOST_REQUIRE(!error);
+    error.clear();
+    BOOST_REQUIRE(std::filesystem::remove(scope_root, error));
+    BOOST_REQUIRE(!error);
+  } catch (...) {
+    throw;
+  }
+}
