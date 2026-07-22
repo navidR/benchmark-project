@@ -43,6 +43,7 @@
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/log_tail.h"
 #include "bbp/logging.h"
+#include "bbp/mcp_endpoint.h"
 #include "bbp/network.h"
 #include "bbp/network_allocation_lock.h"
 #include "bbp/node_log_collector.h"
@@ -14022,6 +14023,22 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   WriteEvent(events_path, options.run_id, "sim",
              SimulationEventKind::kRunStarted);
 
+  McpEndpoint mcp_endpoint(McpEndpointConfig{.run_root = run_root,
+                                             .run_id = options.run_id,
+                                             .server = {},
+                                             .dispatcher = {}});
+  try {
+    mcp_endpoint.Start();
+    const McpEndpointPublication publication = mcp_endpoint.publication();
+    BBP_LOG(info) << "MCP endpoint listening at " << publication.endpoint
+                  << "; client_config="
+                  << publication.client_config_file.string();
+  } catch (const std::exception& error) {
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kRunFailed, error.what());
+    throw;
+  }
+
   std::unique_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
   ChainDriver& driver = *driver_owner;
   std::vector<NodeRuntime> nodes;
@@ -14181,6 +14198,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         WriteNodeLogTails(events_path, options, driver, nodes);
       });
     }
+    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
   };
   const auto handle_run_cancellation = [&]() {
     stop_duration_timer();
@@ -14211,6 +14229,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRunFinished);
     });
+    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
     BBP_LOG(info) << "cancelled run " << options.run_id;
   };
   const auto handle_simulation_duration = [&]() {
@@ -14255,6 +14274,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRunFinished);
     });
+    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
     BBP_LOG(info) << "simulation duration reached for run " << options.run_id;
   };
   const bool timed_node_lifecycle = HasTimedNodeLifecycle(options);
@@ -14291,6 +14311,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   } catch (const std::exception& error) {
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRunFailed, error.what());
+    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
     throw;
   }
   lifecycle_epoch = std::chrono::steady_clock::now();
@@ -15649,6 +15670,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     log_collector->Stop();
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRunFinished);
+    mcp_endpoint.Stop();
     BBP_LOG(info) << "finished run " << options.run_id;
   } catch (const SimulationCancelled&) {
     stop_lifecycle_supervisor();
