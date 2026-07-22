@@ -19,7 +19,6 @@
 #include <exception>
 #include <filesystem>
 #include <functional>
-#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -57,6 +56,7 @@
 #include "bbp/run_process_state.h"
 #include "bbp/run_report.h"
 #include "bbp/runtime_peer_topology.h"
+#include "bbp/scenario_fields.h"
 #include "bbp/scenario_service.h"
 #include "bbp/signal_stop_monitor.h"
 #include "bbp/simulation_cancelled.h"
@@ -376,8 +376,7 @@ std::string JsonOptionalStringField(const boost::json::object& object,
 
 void RejectUnsupportedFields(
     const boost::json::object& object,
-    std::initializer_list<std::string_view> allowed_fields,
-    std::string_view context,
+    std::span<const std::string_view> allowed_fields, std::string_view context,
     std::string_view additional_allowed_field = std::string_view()) {
   for (const auto& member : object) {
     if (member.key() != additional_allowed_field &&
@@ -424,7 +423,7 @@ void ValidateDistributionObjectFields(const boost::json::object& object,
                                       std::string_view field) {
   for (const auto& [name, unused] : object) {
     static_cast<void>(unused);
-    if (name != "distribution" && name != "min" && name != "max") {
+    if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kDistribution, name)) {
       throw std::runtime_error(
           std::string(field) +
           " distribution contains unsupported field: " + std::string(name));
@@ -1027,7 +1026,8 @@ std::optional<ScenarioNodeWalletConfig> ParseScenarioNodeWalletConfig(
   }
   const boost::json::object& object = value->as_object();
   for (const auto& member : object) {
-    if (member.key() != "enabled" && member.key() != "initialization") {
+    if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kNodeWallet,
+                                    member.key())) {
       throw std::runtime_error(
           "scenario node " + std::string(node_id) +
           " has unsupported wallet field: " + std::string(member.key()));
@@ -1061,7 +1061,8 @@ std::optional<ScenarioNodeWalletConfig> ParseScenarioNodeWalletConfig(
   const boost::json::object& initialization_object =
       initialization->as_object();
   for (const auto& member : initialization_object) {
-    if (member.key() != "strategy" && member.key() != "mode") {
+    if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kWalletInitialization,
+                                    member.key())) {
       throw std::runtime_error(
           "scenario node " + std::string(node_id) +
           " has unsupported wallet.initialization field: " +
@@ -1182,7 +1183,7 @@ ChainWalletMode ToChainWalletMode(const WalletInitialization& initialization) {
 PeerConnectivityPolicy ParsePeerConnectivityPolicyObject(
     const boost::json::object& object, uint32_t node_count) {
   RejectUnsupportedFields(
-      object, {"node", "all_peers", "min_peer_count", "max_peer_count"},
+      object, ScenarioObjectFields(ScenarioObjectKind::kPeerConnectivity),
       "scenario topology.peer_connectivity entry");
   const uint32_t node = JsonUint32Field(object, "node");
   if (node == 0U || node > node_count) {
@@ -1302,11 +1303,7 @@ uint32_t ParseTopologyNode(const boost::json::object& object, const char* field,
 PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
                                        uint32_t node_count) {
   RejectUnsupportedFields(
-      object,
-      {"from", "to", "bidirectional", "active", "latency_ms", "bandwidth_mbps",
-       "delay_ms", "jitter_ms", "loss_basis_points", "loss_percent",
-       "duplicate_basis_points", "corrupt_basis_points", "reorder_basis_points",
-       "limit_packets"},
+      object, ScenarioObjectFields(ScenarioObjectKind::kTopologyEdge),
       "scenario topology.edges entry");
   PeerTopologyEdge edge;
   edge.from = ParseTopologyNode(object, "from", node_count);
@@ -1318,19 +1315,9 @@ PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
   if (latency != nullptr) {
     edge.latency_ms = JsonUint32Value(*latency, "latency_ms");
   }
-  constexpr std::string_view kConditionFields[] = {
-      "bandwidth_mbps",
-      "delay_ms",
-      "jitter_ms",
-      "loss_basis_points",
-      "loss_percent",
-      "duplicate_basis_points",
-      "corrupt_basis_points",
-      "reorder_basis_points",
-      "limit_packets",
-  };
   bool condition_present = edge.latency_ms.has_value();
-  for (std::string_view field : kConditionFields) {
+  for (const std::string_view field :
+       ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition)) {
     condition_present =
         condition_present || object.if_contains(field) != nullptr;
   }
@@ -1350,25 +1337,15 @@ PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
   return edge;
 }
 
-constexpr std::string_view kTopologyEdgeConditionFields[] = {
-    "latency_ms",
-    "bandwidth_mbps",
-    "delay_ms",
-    "jitter_ms",
-    "loss_basis_points",
-    "loss_percent",
-    "duplicate_basis_points",
-    "corrupt_basis_points",
-    "reorder_basis_points",
-    "limit_packets",
-};
-
 bool HasTopologyEdgeConditionField(const boost::json::object& object) {
-  return std::any_of(std::begin(kTopologyEdgeConditionFields),
-                     std::end(kTopologyEdgeConditionFields),
-                     [&](std::string_view field) {
-                       return object.if_contains(field) != nullptr;
-                     });
+  return object.if_contains("latency_ms") != nullptr ||
+         std::any_of(
+             ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition)
+                 .begin(),
+             ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition).end(),
+             [&](std::string_view field) {
+               return object.if_contains(field) != nullptr;
+             });
 }
 
 NetworkCondition ParseTopologyEdgeWorkloadCondition(
@@ -1462,10 +1439,7 @@ std::vector<PeerTopologyRegionEdge> ParsePeerTopologyRegionEdges(
     const boost::json::object& edge_object = edge_value.as_object();
     RejectUnsupportedFields(
         edge_object,
-        {"from_region", "to_region", "bidirectional", "active", "latency_ms",
-         "bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
-         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
-         "reorder_basis_points", "limit_packets"},
+        ScenarioObjectFields(ScenarioObjectKind::kTopologyRegionEdge),
         "scenario topology.region_edges entry");
     const uint32_t from = JsonUint32Field(edge_object, "from_region");
     const uint32_t to = JsonUint32Field(edge_object, "to_region");
@@ -1484,7 +1458,8 @@ std::vector<PeerTopologyRegionEdge> ParsePeerTopologyRegionEdges(
       edge.latency_ms = JsonUint32Value(*latency, "latency_ms");
     }
     bool condition_present = edge.latency_ms.has_value();
-    for (std::string_view field : kTopologyEdgeConditionFields) {
+    for (const std::string_view field :
+         ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition)) {
       condition_present =
           condition_present || edge_object.if_contains(field) != nullptr;
     }
@@ -1513,46 +1488,8 @@ PeerTopologyConfig ParsePeerTopologyConfig(const boost::json::object& object,
   PeerTopologyConfig topology;
   topology.kind = ParsePeerTopologyKind(
       JsonOptionalStringField(object, "type", "full_mesh"));
-  const auto is_common_field = [](std::string_view field) {
-    constexpr std::string_view kCommonFields[] = {
-        "type",
-        "node_count",
-        "wallet_node_count",
-        "miner_node_count",
-        "wallet_nodes",
-        "miner_nodes",
-        "allow_miner_wallet_overlap",
-        "wallet_initialization",
-        "peer_connectivity",
-    };
-    return std::find(std::begin(kCommonFields), std::end(kCommonFields),
-                     field) != std::end(kCommonFields);
-  };
-  const auto is_kind_field = [kind = topology.kind](std::string_view field) {
-    switch (kind) {
-      case PeerTopologyKind::kFullMesh:
-      case PeerTopologyKind::kRing:
-        return false;
-      case PeerTopologyKind::kStar:
-        return field == "center_node";
-      case PeerTopologyKind::kRandomGraph:
-        return field == "seed" || field == "average_degree";
-      case PeerTopologyKind::kScaleFreeGraph:
-        return field == "seed" || field == "average_degree" ||
-               field == "attachment_count";
-      case PeerTopologyKind::kLatencyMatrix:
-        return field == "latency_matrix_ms";
-      case PeerTopologyKind::kCustomEdgeList:
-        return field == "edges";
-      case PeerTopologyKind::kPartitionedGroups:
-        return field == "groups";
-      case PeerTopologyKind::kInternetLikeRegionGraph:
-        return field == "regions" || field == "region_edges";
-    }
-    return false;
-  };
   for (const auto& member : object) {
-    if (!is_common_field(member.key()) && !is_kind_field(member.key())) {
+    if (!ScenarioTopologyFieldAllowed(topology.kind, member.key())) {
       throw std::runtime_error(
           "scenario topology " +
           std::string(PeerTopologyKindName(topology.kind)) +
@@ -1600,6 +1537,8 @@ PeerTopologyConfig ParsePeerTopologyConfig(const boost::json::object& object,
       topology.region_edges = ParsePeerTopologyRegionEdges(
           object, static_cast<uint32_t>(topology.regions.size()));
       break;
+    case PeerTopologyKind::kCount:
+      throw std::logic_error("unknown scenario topology kind");
   }
   ResolvePeerTopologyEdges(topology, node_count);
   return topology;
@@ -1724,8 +1663,9 @@ WalletInitialization ParseWalletInitializationObject(
         "scenario topology.wallet_initialization must be a JSON object");
   }
   const boost::json::object& object = value->as_object();
-  RejectUnsupportedFields(object, {"strategy", "mode"},
-                          "scenario topology.wallet_initialization");
+  RejectUnsupportedFields(
+      object, ScenarioObjectFields(ScenarioObjectKind::kWalletInitialization),
+      "scenario topology.wallet_initialization");
   initialization.strategy =
       ParseWalletInitializationStrategy(JsonOptionalStringField(
           object, "strategy",
@@ -2026,11 +1966,9 @@ std::vector<IoLimit> ParseIoLimits(const boost::json::value& value,
                                " entries must be JSON objects");
     }
     const boost::json::object& object = entry.as_object();
-    RejectUnsupportedFields(
-        object,
-        {"device", "read_bytes_per_sec", "write_bytes_per_sec",
-         "read_operations_per_sec", "write_operations_per_sec"},
-        std::string(field) + " entry");
+    RejectUnsupportedFields(object,
+                            ScenarioObjectFields(ScenarioObjectKind::kIoLimit),
+                            std::string(field) + " entry");
     IoLimit limit;
     limit.device = ParseBlockDeviceId(JsonStringField(object, "device"));
     if (!devices.insert(limit.device).second) {
@@ -2215,10 +2153,7 @@ ResourceLimits ParseResourceProfile(const boost::json::object& object,
                                     const ResourceLimits& defaults,
                                     std::string_view profile_name) {
   RejectUnsupportedFields(
-      object,
-      {"memory_high", "memory_max", "cpu_quota", "cpu_max", "memory_high_bytes",
-       "memory_max_bytes", "cpu_quota_us", "cpu_period_us", "cpu_weight",
-       "io_weight", "io_max", "pids_max"},
+      object, ScenarioObjectFields(ScenarioObjectKind::kResourceProfile),
       "scenario resource profile " + std::string(profile_name));
   boost::json::object canonical = object;
   const bool memory_high_alias = object.if_contains("memory_high") != nullptr;
@@ -2313,9 +2248,7 @@ void ParseNetworkProfiles(const boost::json::object& scenario,
     }
     RejectUnsupportedFields(
         profile_value.as_object(),
-        {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
-         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
-         "reorder_basis_points", "limit_packets"},
+        ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition),
         "scenario network profile " + name);
     const NetworkCondition condition =
         ParseNetworkConditionObject(profile_value.as_object());
@@ -2346,8 +2279,9 @@ void ParseScenarioChains(const boost::json::object& scenario,
                                " definition must be an object");
     }
     const boost::json::object& definition = definition_value.as_object();
-    RejectUnsupportedFields(definition, {"driver", "default_binary"},
-                            "scenario chain " + name + " definition");
+    RejectUnsupportedFields(
+        definition, ScenarioObjectFields(ScenarioObjectKind::kChainDefinition),
+        "scenario chain " + name + " definition");
     const ChainKind driver =
         ParseChainKind(JsonStringField(definition, "driver"));
     if (driver != chain) {
@@ -2438,12 +2372,8 @@ ScenarioNodeRoles ParseScenarioNodes(
       throw std::runtime_error("scenario nodes contains duplicate id: " + id);
     }
     for (const auto& member : node) {
-      if (member.key() != "id" && member.key() != "chain" &&
-          member.key() != "role" && member.key() != "binary" &&
-          member.key() != "data_dir" && member.key() != "resources" &&
-          member.key() != "network" && member.key() != "chain_config" &&
-          member.key() != "wallet" && member.key() != "start_time" &&
-          member.key() != "stop_time" && member.key() != "restart_policy") {
+      if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kNode,
+                                      member.key())) {
         throw std::runtime_error(
             "scenario node " + id +
             " has unsupported field: " + std::string(member.key()));
@@ -2537,7 +2467,8 @@ ScenarioNodeRoles ParseScenarioNodes(
       }
       const boost::json::object& chain_config = chain_config_value->as_object();
       for (const auto& member : chain_config) {
-        if (member.key() != "network" && member.key() != "extra_args") {
+        if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kNodeChainConfig,
+                                        member.key())) {
           throw std::runtime_error("scenario node " + id +
                                    " has unsupported chain_config field: " +
                                    std::string(member.key()));
@@ -2583,7 +2514,8 @@ ScenarioNodeRoles ParseScenarioNodes(
                                  " must be an object");
       }
       for (const auto& member : section_value->as_object()) {
-        if (member.key() != "profile") {
+        if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kNodeProfile,
+                                        member.key())) {
           throw std::runtime_error("scenario node " + id + " has unsupported " +
                                    section +
                                    " field: " + std::string(member.key()));
@@ -2696,10 +2628,7 @@ void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
     }
     const boost::json::object& object = value.as_object();
     RejectUnsupportedFields(
-        object,
-        {"node", "bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
-         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
-         "reorder_basis_points", "limit_packets"},
+        object, ScenarioObjectFields(ScenarioObjectKind::kNodeNetworkCondition),
         std::string(source) + " entry");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
@@ -2719,10 +2648,9 @@ void ApplyNetworkBlockRules(const boost::json::array& rules, uint32_t nodes,
                                " entries must be JSON objects");
     }
     const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(object,
-                            {"node", "src_address", "src_port", "dst_address",
-                             "dst_port", "handle"},
-                            std::string(source) + " entry");
+    RejectUnsupportedFields(
+        object, ScenarioObjectFields(ScenarioObjectKind::kNetworkBlockRule),
+        std::string(source) + " entry");
     NetworkBlockRule rule = ParseNetworkBlockRuleObject(object);
     if (rule.node_index >= nodes) {
       throw std::runtime_error(std::string(source) + " node must be in 1.." +
@@ -2741,8 +2669,9 @@ void ApplyNetworkPartitionRules(const boost::json::array& rules, uint32_t nodes,
                                " entries must be JSON objects");
     }
     const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(object, {"group_a", "group_b"},
-                            std::string(source) + " entry");
+    RejectUnsupportedFields(
+        object, ScenarioObjectFields(ScenarioObjectKind::kNetworkPartition),
+        std::string(source) + " entry");
     NetworkPartitionRule rule = ParseNetworkPartitionRuleObject(object);
     ValidateNetworkPartitionRule(rule, nodes, source);
     output.push_back(std::move(rule));
@@ -2760,8 +2689,7 @@ void ApplyResourceLimitPatches(const boost::json::array& updates,
     const boost::json::object& object = value.as_object();
     RejectUnsupportedFields(
         object,
-        {"node", "memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
-         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max"},
+        ScenarioObjectFields(ScenarioObjectKind::kRuntimeResourceLimits),
         std::string(source) + " entry");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
@@ -2946,114 +2874,13 @@ ProfileSwitchWorkload ParseProfileSwitchWorkload(
   return workload;
 }
 
-bool IsOneOf(std::string_view field,
-             std::initializer_list<std::string_view> fields) {
-  return std::find(fields.begin(), fields.end(), field) != fields.end();
-}
-
-bool IsResourceLimitPatchField(std::string_view field) {
-  return IsOneOf(field, {"memory_high_bytes", "memory_max_bytes",
-                         "cpu_quota_us", "cpu_period_us", "cpu_weight",
-                         "io_weight", "io_max", "pids_max"});
-}
-
-bool IsNetworkConditionField(std::string_view field) {
-  return IsOneOf(
-      field, {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
-              "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
-              "reorder_basis_points", "limit_packets"});
-}
-
-bool IsTopologyEdgeConditionField(std::string_view field) {
-  return field == "latency_ms" || IsNetworkConditionField(field);
-}
-
-bool IsScenarioActionPayloadField(WorkloadKind kind, std::string_view field) {
-  switch (kind) {
-    case WorkloadKind::kBlockGeneration:
-      return IsOneOf(field, {"node", "nodes", "count", "sync_timeout_sec"});
-    case WorkloadKind::kWaitUntilHeight:
-      return IsOneOf(field, {"node", "nodes", "height", "timeout_sec"});
-    case WorkloadKind::kWaitForPeers:
-      return IsOneOf(field, {"node", "nodes", "peer_count", "timeout_sec"});
-    case WorkloadKind::kConnectPeer:
-    case WorkloadKind::kDisconnectPeer:
-      return IsOneOf(field, {"node", "nodes", "peer", "timeout_sec"});
-    case WorkloadKind::kRestartNode:
-      return IsOneOf(field, {"node", "nodes"});
-    case WorkloadKind::kFreezeNode:
-      return IsOneOf(field, {"node", "nodes", "duration_ms"});
-    case WorkloadKind::kUpdateResourceLimits:
-      return IsOneOf(field, {"node", "nodes"}) ||
-             IsResourceLimitPatchField(field);
-    case WorkloadKind::kSetResourceProfile:
-    case WorkloadKind::kSetNetworkProfile:
-      return IsOneOf(field, {"nodes", "profile"});
-    case WorkloadKind::kResourcePressure:
-      return IsOneOf(field, {"node", "nodes", "duration_ms"}) ||
-             IsResourceLimitPatchField(field);
-    case WorkloadKind::kSetNetworkCondition:
-      return IsOneOf(field, {"node", "nodes"}) ||
-             IsNetworkConditionField(field);
-    case WorkloadKind::kBlockNetworkFlow:
-    case WorkloadKind::kUnblockNetworkFlow:
-      return IsOneOf(field, {"node", "nodes", "src_address", "src_port",
-                             "dst_address", "dst_port", "handle"});
-    case WorkloadKind::kPartitionNodes:
-    case WorkloadKind::kHealPartition:
-      return IsOneOf(field, {"group_a", "group_b"});
-    case WorkloadKind::kSetEdgeCondition:
-    case WorkloadKind::kActivateEdge:
-    case WorkloadKind::kDeactivateEdge:
-    case WorkloadKind::kRestoreEdge:
-      return IsOneOf(field, {"from", "to", "timeout_sec"}) ||
-             IsTopologyEdgeConditionField(field);
-    case WorkloadKind::kSendRawTransaction:
-      return IsOneOf(
-          field, {"nodes", "funding_node", "submit_node", "source_address",
-                  "source_private_key", "destination_address", "funding_blocks",
-                  "amount", "fee", "timeout_sec"});
-    case WorkloadKind::kWalletTransactions:
-      return IsOneOf(field, {"funding_strategy",
-                             "strategy",
-                             "funding_blocks_per_wallet",
-                             "readiness_confirmations",
-                             "transaction_count",
-                             "transaction_rate",
-                             "duration",
-                             "concurrency",
-                             "queue_capacity",
-                             "mode",
-                             "amount",
-                             "interval",
-                             "fee_policy",
-                             "fee",
-                             "funding_threshold",
-                             "seed",
-                             "sender_wallets",
-                             "receiver_wallets",
-                             "timeout_sec",
-                             "wallets",
-                             "private_key",
-                             "source_private_key",
-                             "address",
-                             "source_address",
-                             "destination_address"});
-    case WorkloadKind::kCheckpoint:
-      return field == "name";
-    case WorkloadKind::kCount:
-      return false;
-  }
-  return false;
-}
-
 void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
                                            WorkloadKind kind, bool scheduled) {
   for (const auto& member : object) {
     const bool structural =
         scheduled ? member.key() == "at" || member.key() == "action"
                   : member.key() == "type";
-    if (!structural && !IsScenarioActionPayloadField(kind, member.key())) {
+    if (!structural && !ScenarioWorkloadFieldAllowed(kind, member.key())) {
       throw std::runtime_error(
           std::string(scheduled ? "scenario scheduled action "
                                 : "scenario workload ") +
@@ -3063,66 +2890,11 @@ void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
   }
 }
 
-bool IsScenarioCommandPayloadField(SimulationCommandKind kind,
-                                   std::string_view field) {
-  if (field == "node") {
-    return kind != SimulationCommandKind::kSetBlockProductionPolicy &&
-           kind != SimulationCommandKind::kPartitionNodes &&
-           kind != SimulationCommandKind::kHealPartition &&
-           kind != SimulationCommandKind::kSetPerfCounters;
-  }
-  switch (kind) {
-    case SimulationCommandKind::kIncreaseLogVerbosity:
-    case SimulationCommandKind::kDecreaseLogVerbosity:
-    case SimulationCommandKind::kStopMining:
-    case SimulationCommandKind::kDisconnectNode:
-    case SimulationCommandKind::kReconnectNode:
-    case SimulationCommandKind::kKillNode:
-    case SimulationCommandKind::kFreezeNode:
-    case SimulationCommandKind::kThawNode:
-    case SimulationCommandKind::kStopNode:
-    case SimulationCommandKind::kRestartNode:
-    case SimulationCommandKind::kExportNodeReport:
-      return false;
-    case SimulationCommandKind::kSetBlockProductionPolicy:
-      return IsOneOf(field, {"period_ms", "probability", "seed"});
-    case SimulationCommandKind::kSetMiningDifficulty:
-      return field == "difficulty";
-    case SimulationCommandKind::kConnectPeer:
-    case SimulationCommandKind::kDisconnectPeer:
-      return field == "peer_node_id";
-    case SimulationCommandKind::kSetPeerCountPolicy:
-      return IsOneOf(field, {"minimum_peer_count", "maximum_peer_count"});
-    case SimulationCommandKind::kGenerateBlocks:
-      return field == "block_count";
-    case SimulationCommandKind::kSetResourceProfile:
-    case SimulationCommandKind::kSetNetworkProfile:
-      return field == "profile";
-    case SimulationCommandKind::kSetResourceLimits:
-      return field == "resource_limits";
-    case SimulationCommandKind::kSetNetworkCondition:
-      return field == "network_condition";
-    case SimulationCommandKind::kBlockNetworkFlow:
-    case SimulationCommandKind::kUnblockNetworkFlow:
-      return field == "network_flow";
-    case SimulationCommandKind::kPartitionNodes:
-    case SimulationCommandKind::kHealPartition:
-      return field == "partition";
-    case SimulationCommandKind::kSetPerfCounters:
-      return IsOneOf(field, {"perf_target", "perf_counters"});
-    case SimulationCommandKind::kSendWalletTransaction:
-      return field == "wallet_send";
-    case SimulationCommandKind::kCount:
-      return false;
-  }
-  return false;
-}
-
 void RejectUnsupportedScenarioCommandFields(const boost::json::object& object,
                                             SimulationCommandKind kind) {
   for (const auto& member : object) {
     if (member.key() != "at" && member.key() != "action" &&
-        !IsScenarioCommandPayloadField(kind, member.key())) {
+        !ScenarioCommandFieldAllowed(kind, member.key())) {
       throw std::runtime_error(
           "scenario scheduled command " +
           std::string(SimulationCommandKindName(kind)) +
@@ -3206,7 +2978,10 @@ SimulationPartitionScope ParseSimulationPartitionScope(std::string_view value) {
 SimulationPartitionGroup ParseSimulationPartitionGroup(
     const boost::json::object& object, const Options& options,
     std::string_view context) {
-  RejectUnsupportedFields(object, {"group_ids", "node_ids"}, context);
+  RejectUnsupportedFields(
+      object,
+      ScenarioObjectFields(ScenarioObjectKind::kSimulationPartitionGroup),
+      context);
   const boost::json::value* groups = object.if_contains("group_ids");
   if (groups == nullptr || !groups->is_array() || groups->as_array().empty()) {
     throw std::runtime_error(std::string(context) +
@@ -3232,8 +3007,9 @@ SimulationPartitionGroup ParseSimulationPartitionGroup(
 
 SimulationPartition ParseSimulationPartition(const boost::json::object& object,
                                              const Options& options) {
-  RejectUnsupportedFields(object, {"scope", "group_a", "group_b"},
-                          "scenario scheduled command partition");
+  RejectUnsupportedFields(
+      object, ScenarioObjectFields(ScenarioObjectKind::kSimulationPartition),
+      "scenario scheduled command partition");
   SimulationPartition partition;
   partition.scope =
       ParseSimulationPartitionScope(JsonStringField(object, "scope"));
@@ -3270,7 +3046,8 @@ SimulationPartition ParseSimulationPartition(const boost::json::object& object,
 
 PerfCounterTarget ParseScenarioPerfTarget(const boost::json::object& object,
                                           const Options& options) {
-  RejectUnsupportedFields(object, {"kind", "id", "node_ids"},
+  RejectUnsupportedFields(object,
+                          ScenarioObjectFields(ScenarioObjectKind::kPerfTarget),
                           "scenario scheduled command perf_target");
   const std::string kind_name = JsonStringField(object, "kind");
   const std::optional<PerfCounterTargetKind> kind =
@@ -3333,16 +3110,11 @@ bool UsesScenarioCommandSchema(
   if (node != nullptr && node->is_string()) {
     return true;
   }
-  constexpr std::string_view kTypedCommandFields[] = {
-      "resource_limits",    "network_condition", "network_flow",
-      "partition",          "perf_target",       "perf_counters",
-      "wallet_send",        "peer_node_id",      "block_count",
-      "minimum_peer_count", "maximum_peer_count"};
-  return std::any_of(std::begin(kTypedCommandFields),
-                     std::end(kTypedCommandFields),
-                     [&](std::string_view field) {
-                       return event.if_contains(field) != nullptr;
-                     });
+  return std::any_of(event.begin(), event.end(), [&](const auto& member) {
+    return member.key() != "at" && member.key() != "action" &&
+           ScenarioCommandFieldAllowed(*command_kind, member.key()) &&
+           !ScenarioWorkloadFieldAllowed(*workload_kind, member.key());
+  });
 }
 
 SimulationCommand ParseScheduledSimulationCommand(
@@ -3416,8 +3188,7 @@ SimulationCommand ParseScheduledSimulationCommand(
     }
     RejectUnsupportedFields(
         limits->as_object(),
-        {"memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
-         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max"},
+        ScenarioObjectFields(ScenarioObjectKind::kResourceLimits),
         "scenario scheduled command resource_limits");
     command.resource_limit_patch =
         ParseResourceLimitPatchObject(limits->as_object());
@@ -3430,9 +3201,7 @@ SimulationCommand ParseScheduledSimulationCommand(
     }
     RejectUnsupportedFields(
         condition->as_object(),
-        {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
-         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
-         "reorder_basis_points", "limit_packets"},
+        ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition),
         "scenario scheduled command network_condition");
     command.network_condition =
         ParseNetworkConditionObject(condition->as_object());
@@ -3445,8 +3214,7 @@ SimulationCommand ParseScheduledSimulationCommand(
     }
     const boost::json::object& flow_object = flow->as_object();
     RejectUnsupportedFields(
-        flow_object,
-        {"src_address", "src_port", "dst_address", "dst_port", "handle"},
+        flow_object, ScenarioObjectFields(ScenarioObjectKind::kNetworkFlow),
         "scenario scheduled command network_flow");
     SimulationNetworkFlow parsed;
     parsed.src_address =
@@ -3519,10 +3287,9 @@ SimulationCommand ParseScheduledSimulationCommand(
           "scenario scheduled command wallet_send must be an object");
     }
     const boost::json::object& send_object = send->as_object();
-    RejectUnsupportedFields(send_object,
-                            {"sender_wallet_index", "receiver_wallet_index",
-                             "amount", "fee", "timeout_sec"},
-                            "scenario scheduled command wallet_send");
+    RejectUnsupportedFields(
+        send_object, ScenarioObjectFields(ScenarioObjectKind::kWalletSend),
+        "scenario scheduled command wallet_send");
     SimulationWalletSend parsed;
     parsed.sender_wallet_index =
         JsonUint32Field(send_object, "sender_wallet_index");
@@ -4099,10 +3866,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     simulation = &simulation_value->as_object();
     RejectUnsupportedFields(
-        *simulation,
-        {"name", "seed", "duration", "time_scale", "cleanup_policy",
-         "privilege_mode", "log_retention_policy", "metrics_interval",
-         "tick_interval", "output_dir", "tui_refresh_interval"},
+        *simulation, ScenarioObjectFields(ScenarioObjectKind::kSimulation),
         "scenario simulation");
     if (simulation->if_contains("name") != nullptr) {
       options.simulation_name = JsonStringField(*simulation, "name");
@@ -4239,30 +4003,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   RejectUnsupportedFields(scenario,
-                          {"simulation",
-                           "chains",
-                           "chain",
-                           "chain_daemon",
-                           "output_dir",
-                           "run_id",
-                           "topology",
-                           "nodes",
-                           "node_count",
-                           "block_production",
-                           "generate_node",
-                           "ready_timeout_sec",
-                           "sync_timeout_sec",
-                           "metrics_sample_count",
-                           "metrics_interval_ms",
-                           "isolated_network",
-                           "workloads",
-                           "events",
-                           "resources",
-                           "resource_profiles",
-                           "process",
-                           "network",
-                           "network_profiles",
-                           "generate_blocks"},
+                          ScenarioObjectFields(ScenarioObjectKind::kRoot),
                           "scenario", chain_spec.daemon_scenario_field);
   const bool chain_daemon_provided =
       OptionProvided(vm, "node-binary") || OptionProvided(vm, "chain-daemon") ||
@@ -4371,10 +4112,9 @@ void ApplyScenarioJson(const boost::json::object& scenario,
           "scenario block_production must be a JSON object");
     }
     const boost::json::object& object = block_production->as_object();
-    RejectUnsupportedFields(object,
-                            {"enabled", "native_mining", "period_ms",
-                             "probability", "seed", "difficulty"},
-                            "scenario block_production");
+    RejectUnsupportedFields(
+        object, ScenarioObjectFields(ScenarioObjectKind::kBlockProduction),
+        "scenario block_production");
     if (!OptionProvided(vm, "no-mining")) {
       options.block_production.enabled = JsonOptionalBoolField(
           object, "enabled", options.block_production.enabled);
@@ -4467,10 +4207,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     const boost::json::object& object = resources->as_object();
     RejectUnsupportedFields(
-        object,
-        {"memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
-         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max",
-         "runtime_node_limits"},
+        object, ScenarioObjectFields(ScenarioObjectKind::kResources),
         "scenario resources");
     if (!OptionProvided(vm, "memory-high-bytes")) {
       options.memory_high_bytes = JsonOptionalUint64Field(
@@ -4552,10 +4289,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     }
     const boost::json::object& object = network->as_object();
     RejectUnsupportedFields(object,
-                            {"isolated", "default_condition", "node_conditions",
-                             "runtime_node_conditions", "runtime_node_blocks",
-                             "runtime_node_unblocks", "runtime_partitions",
-                             "runtime_partition_heals"},
+                            ScenarioObjectFields(ScenarioObjectKind::kNetwork),
                             "scenario network");
     if (!OptionProvided(vm, "isolate-network")) {
       options.isolate_network =
@@ -4570,9 +4304,7 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       }
       RejectUnsupportedFields(
           default_condition->as_object(),
-          {"bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
-           "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
-           "reorder_basis_points", "limit_packets"},
+          ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition),
           "scenario network.default_condition");
       const NetworkCondition scenario_condition =
           ParseNetworkConditionObject(default_condition->as_object());
@@ -4817,10 +4549,7 @@ void ParseNodeNetworkConditionTexts(
     }
     const boost::json::object& object = value.as_object();
     RejectUnsupportedFields(
-        object,
-        {"node", "bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
-         "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
-         "reorder_basis_points", "limit_packets"},
+        object, ScenarioObjectFields(ScenarioObjectKind::kNodeNetworkCondition),
         option_name);
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
@@ -4843,8 +4572,7 @@ void ParseRuntimeNodeResourceTexts(
     const boost::json::object& object = value.as_object();
     RejectUnsupportedFields(
         object,
-        {"node", "memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
-         "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max"},
+        ScenarioObjectFields(ScenarioObjectKind::kRuntimeResourceLimits),
         "--runtime-node-resource-json");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
@@ -4865,10 +4593,9 @@ void ParseRuntimeNodeBlockTexts(const std::vector<std::string>& texts,
                                " must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(object,
-                            {"node", "src_address", "src_port", "dst_address",
-                             "dst_port", "handle"},
-                            option_name);
+    RejectUnsupportedFields(
+        object, ScenarioObjectFields(ScenarioObjectKind::kNetworkBlockRule),
+        option_name);
     NetworkBlockRule rule = ParseNetworkBlockRuleObject(object);
     if (rule.node_index >= nodes) {
       throw std::runtime_error(std::string(option_name) +
@@ -4888,7 +4615,9 @@ void ParseRuntimePartitionTexts(const std::vector<std::string>& texts,
                                " must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(object, {"group_a", "group_b"}, option_name);
+    RejectUnsupportedFields(
+        object, ScenarioObjectFields(ScenarioObjectKind::kNetworkPartition),
+        option_name);
     NetworkPartitionRule rule = ParseNetworkPartitionRuleObject(object);
     for (uint32_t node_index : rule.group_a) {
       if (node_index >= nodes) {
@@ -4916,7 +4645,9 @@ void ParseRuntimeNodeRestartTexts(const std::vector<std::string>& texts,
           "--runtime-node-restart-json must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(object, {"node"}, "--runtime-node-restart-json");
+    RejectUnsupportedFields(
+        object, ScenarioObjectFields(ScenarioObjectKind::kProcessRestart),
+        "--runtime-node-restart-json");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(
@@ -4936,8 +4667,9 @@ void ParseRuntimeNodeFreezeTexts(const std::vector<std::string>& texts,
           "--runtime-node-freeze-json must be a JSON object");
     }
     const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(object, {"node", "duration_ms"},
-                            "--runtime-node-freeze-json");
+    RejectUnsupportedFields(
+        object, ScenarioObjectFields(ScenarioObjectKind::kProcessFreeze),
+        "--runtime-node-freeze-json");
     const uint32_t node = JsonUint32Field(object, "node");
     if (node == 0 || node > nodes) {
       throw std::runtime_error(
@@ -6277,6 +6009,8 @@ void AddPeerTopologyJson(const PeerTopologyConfig& topology,
             PeerTopologyRegionEdgesJson(topology.region_edges);
       }
       break;
+    case PeerTopologyKind::kCount:
+      throw std::logic_error("unknown peer topology kind");
   }
   (*object)["resolved_edges"] =
       ResolvedPeerTopologyEdgesJson(topology, node_count);

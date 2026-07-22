@@ -19,6 +19,7 @@ enum class PeerTopologyKind {
   kCustomEdgeList,
   kPartitionedGroups,
   kInternetLikeRegionGraph,
+  kCount,
 };
 
 constexpr std::string_view PeerTopologyKindName(PeerTopologyKind kind) {
@@ -41,6 +42,8 @@ constexpr std::string_view PeerTopologyKindName(PeerTopologyKind kind) {
       return "partitioned_groups";
     case PeerTopologyKind::kInternetLikeRegionGraph:
       return "internet_like_region_graph";
+    case PeerTopologyKind::kCount:
+      break;
   }
   return "unknown";
 }

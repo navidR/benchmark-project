@@ -393,6 +393,8 @@ std::vector<ResolvedPeerTopologyEdge> ResolvePeerTopologyEdges(
         }
       }
       break;
+    case PeerTopologyKind::kCount:
+      throw std::logic_error("unknown peer topology kind");
   }
   return edges.Resolve();
 }

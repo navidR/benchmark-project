@@ -1,3 +1,4 @@
+#include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
 #include <filesystem>
@@ -29,6 +30,57 @@ BOOST_AUTO_TEST_CASE(scenario_service_uses_production_nested_field_validation) {
       [](const std::runtime_error& error) {
         return std::string(error.what()) ==
                "scenario simulation has unsupported field: unexpected";
+      });
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_service_uses_descriptor_validation_for_nested_contexts) {
+  boost::json::object topology = MinimalScenario();
+  topology["topology"] = boost::json::object{
+      {"node_count", 1U}, {"type", "ring"}, {"center_node", 1U}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(topology), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scenario topology ring has unsupported field: center_node";
+      });
+
+  boost::json::object node = MinimalScenario();
+  node["nodes"] = boost::json::array{boost::json::object{
+      {"id", "firo-1"},
+      {"chain", "firo"},
+      {"role", "base"},
+      {"wallet",
+       boost::json::object{{"enabled", false}, {"unexpected", true}}}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(node), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scenario node firo-1 has unsupported wallet field: "
+               "unexpected";
+      });
+
+  boost::json::object process = MinimalScenario();
+  process["process"] = boost::json::object{
+      {"runtime_node_restarts", boost::json::array{boost::json::object{
+                                    {"node", 1U}, {"unexpected", true}}}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(process), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scenario process.runtime_node_restarts entry has unsupported "
+               "field: unexpected";
+      });
+
+  boost::json::object workload = MinimalScenario();
+  workload["workloads"] = boost::json::array{boost::json::object{
+      {"type", "checkpoint"}, {"name", "before"}, {"unexpected", true}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(workload), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scenario workload checkpoint has unsupported field: "
+               "unexpected";
       });
 }
 
@@ -76,6 +128,17 @@ BOOST_AUTO_TEST_CASE(
         return std::string(error.what()) ==
                "scenario scheduled command set_resource_limits has "
                "unsupported field: unexpected";
+      });
+
+  boost::json::object invalid_nested = input;
+  invalid_nested["resource_limits"] =
+      boost::json::object{{"cpu_weight", 200U}, {"unexpected", true}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateSimulationCommand(invalid_nested, options),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scenario scheduled command resource_limits has unsupported "
+               "field: unexpected";
       });
 }
 

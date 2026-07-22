@@ -8,6 +8,8 @@
 #include <string>
 #include <utility>
 
+#include "bbp/scenario_fields.h"
+
 namespace bbp {
 namespace {
 
@@ -83,8 +85,8 @@ ProcessControlConfig ParseProcessControlConfig(
   }
 
   for (const auto& member : object) {
-    if (member.key() != "runtime_node_restarts" &&
-        member.key() != "runtime_node_freezes") {
+    if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kProcess,
+                                    member.key())) {
       throw std::runtime_error(
           std::string(context) +
           " has unsupported field: " + std::string(member.key()));
@@ -99,7 +101,8 @@ ProcessControlConfig ParseProcessControlConfig(
       const boost::json::object& restart =
           RequireEntryObject(value, "runtime_node_restarts", context);
       for (const auto& member : restart) {
-        if (member.key() != "node") {
+        if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kProcessRestart,
+                                        member.key())) {
           throw std::runtime_error(
               std::string(context) +
               ".runtime_node_restarts entry has unsupported field: " +
@@ -118,7 +121,8 @@ ProcessControlConfig ParseProcessControlConfig(
       const boost::json::object& freeze =
           RequireEntryObject(value, "runtime_node_freezes", context);
       for (const auto& member : freeze) {
-        if (member.key() != "node" && member.key() != "duration_ms") {
+        if (!ScenarioObjectFieldAllowed(ScenarioObjectKind::kProcessFreeze,
+                                        member.key())) {
           throw std::runtime_error(
               std::string(context) +
               ".runtime_node_freezes entry has unsupported field: " +

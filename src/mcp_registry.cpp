@@ -5,8 +5,10 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "bbp/chain_kind.h"
+#include "bbp/scenario_fields.h"
 #include "bbp/simulation_command.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulator/workload_kind.h"
@@ -131,145 +133,15 @@ constexpr std::array<McpNamedCapability, EnumCount(McpResultFamily::kCount)>
          {"cleanup", "Ownership-verified cleanup and kernel read-back"},
          {"error", "Typed structured failure with retained evidence"}}};
 
-constexpr auto kScenarioMembers = std::to_array<std::string_view>(
-    {"simulation",
-     "simulation.name",
-     "simulation.seed",
-     "simulation.duration",
-     "simulation.time_scale",
-     "simulation.cleanup_policy",
-     "simulation.privilege_mode",
-     "simulation.log_retention_policy",
-     "simulation.metrics_interval",
-     "simulation.tick_interval",
-     "simulation.output_dir",
-     "simulation.tui_refresh_interval",
-     "chains",
-     "chains.*.driver",
-     "chains.*.default_binary",
-     "chain",
-     "chain_daemon",
-     "firod",
-     "bitcoind",
-     "monerod",
-     "output_dir",
-     "run_id",
-     "topology",
-     "topology.node_count",
-     "topology.wallet_nodes",
-     "topology.miner_nodes",
-     "topology.allow_miner_wallet_overlap",
-     "topology.wallet_initialization",
-     "topology.wallet_initialization.strategy",
-     "topology.wallet_initialization.mode",
-     "topology.peer_topology",
-     "topology.peer_topology.kind",
-     "topology.peer_topology.seed",
-     "topology.peer_topology.edge_probability",
-     "topology.peer_topology.attachment_edges",
-     "topology.peer_topology.groups",
-     "topology.peer_topology.regions",
-     "topology.peer_topology.latency_matrix_ms",
-     "topology.edges",
-     "topology.edges[].from",
-     "topology.edges[].to",
-     "topology.edges[].bidirectional",
-     "topology.edges[].active",
-     "topology.edges[].latency_ms",
-     "topology.edges[].bandwidth_mbps",
-     "topology.edges[].delay_ms",
-     "topology.edges[].jitter_ms",
-     "topology.edges[].loss_basis_points",
-     "topology.edges[].loss_percent",
-     "topology.edges[].duplicate_basis_points",
-     "topology.edges[].corrupt_basis_points",
-     "topology.edges[].reorder_basis_points",
-     "topology.edges[].limit_packets",
-     "topology.peer_connectivity",
-     "topology.peer_connectivity[].node",
-     "topology.peer_connectivity[].all_peers",
-     "topology.peer_connectivity[].min_peer_count",
-     "topology.peer_connectivity[].max_peer_count",
-     "nodes",
-     "node_count",
-     "nodes[].id",
-     "nodes[].chain",
-     "nodes[].binary",
-     "nodes[].data_dir",
-     "nodes[].chain_config",
-     "nodes[].chain_config.network",
-     "nodes[].chain_config.extra_args",
-     "nodes[].wallet",
-     "nodes[].wallet.enabled",
-     "nodes[].wallet.mode",
-     "nodes[].wallet.initialization_strategy",
-     "nodes[].start_time",
-     "nodes[].stop_time",
-     "nodes[].restart_policy",
-     "nodes[].role",
-     "nodes[].resources",
-     "nodes[].network",
-     "block_production",
-     "block_production.enabled",
-     "block_production.native_mining",
-     "block_production.period_ms",
-     "block_production.probability",
-     "block_production.seed",
-     "block_production.difficulty",
-     "generate_node",
-     "ready_timeout_sec",
-     "sync_timeout_sec",
-     "metrics_sample_count",
-     "metrics_interval_ms",
-     "isolated_network",
-     "workloads",
-     "workloads[].type",
-     "events",
-     "events[].at",
-     "events[].action",
-     "resources",
-     "resources.memory_high_bytes",
-     "resources.memory_max_bytes",
-     "resources.cpu_quota_us",
-     "resources.cpu_period_us",
-     "resources.cpu_weight",
-     "resources.io_weight",
-     "resources.io_max",
-     "resources.pids_max",
-     "resources.runtime_node_limits",
-     "resource_profiles",
-     "process",
-     "process.runtime_node_restarts",
-     "process.runtime_node_freezes",
-     "network",
-     "network.isolated",
-     "network.default_condition",
-     "network.node_conditions",
-     "network.runtime_node_conditions",
-     "network.runtime_node_blocks",
-     "network.runtime_node_unblocks",
-     "network.runtime_partitions",
-     "network.runtime_partition_heals",
-     "network_profiles",
-     "generate_blocks",
-     "network_condition.bandwidth_mbps",
-     "network_condition.delay_ms",
-     "network_condition.jitter_ms",
-     "network_condition.loss_basis_points",
-     "network_condition.loss_percent",
-     "network_condition.duplicate_basis_points",
-     "network_condition.corrupt_basis_points",
-     "network_condition.reorder_basis_points",
-     "network_condition.limit_packets",
-     "distribution.kind",
-     "distribution.value",
-     "distribution.minimum",
-     "distribution.maximum",
-     "io_max[].device",
-     "io_max[].read_bytes_per_sec",
-     "io_max[].write_bytes_per_sec",
-     "io_max[].read_operations_per_sec",
-     "io_max[].write_operations_per_sec"});
+const std::vector<std::string> kScenarioMembers = BuildScenarioMemberRegistry();
+const std::vector<std::string_view> kScenarioMemberViews = [] {
+  std::vector<std::string_view> views;
+  views.reserve(kScenarioMembers.size());
+  for (const std::string& member : kScenarioMembers) {
+    views.push_back(member);
+  }
+  return views;
+}();
 
 static_assert(kOperations.size() == EnumCount(McpOperationKind::kCount));
 static_assert(kInformationFamilies.size() ==
@@ -349,7 +221,7 @@ std::span<const McpNamedCapability> McpResultFamilyRegistry() {
 }
 
 std::span<const std::string_view> McpScenarioMemberRegistry() {
-  return kScenarioMembers;
+  return kScenarioMemberViews;
 }
 
 boost::json::object BuildMcpScenarioSchema() {
@@ -369,7 +241,7 @@ boost::json::object BuildMcpScenarioSchema() {
       {"type", "object"},
       {"properties", std::move(properties)},
       {"additionalProperties", false}};
-  schema["x-bbp-members"] = StringArray(kScenarioMembers);
+  schema["x-bbp-members"] = StringArray(kScenarioMemberViews);
   schema["x-bbp-workload-kinds"] =
       EnumNames(WorkloadKind::kCount,
                 [](WorkloadKind kind) { return WorkloadKindName(kind); });
