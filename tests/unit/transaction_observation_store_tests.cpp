@@ -178,11 +178,15 @@ BOOST_AUTO_TEST_CASE(
   transition = store.Record("tx-1", "node-1", true, true);
   BOOST_TEST(transition.first_confirmed);
   BOOST_TEST(!transition.retired);
+  BOOST_TEST(!transition.load_progress);
   BOOST_TEST(store.Stats().active == 1U);
   transition = store.Record("tx-1", "node-2", true, true);
   BOOST_TEST(transition.first_visible);
   BOOST_TEST(transition.first_confirmed);
   BOOST_TEST(transition.retired);
+  BOOST_REQUIRE(transition.load_progress);
+  BOOST_TEST(transition.load_progress->revision == 3U);
+  BOOST_TEST(transition.load_progress->confirmed == 1U);
   BOOST_TEST(store.Stats().active == 0U);
   BOOST_TEST(accounting->Snapshot(std::chrono::microseconds(1)).confirmed ==
              1U);

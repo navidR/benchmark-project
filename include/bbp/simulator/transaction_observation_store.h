@@ -36,6 +36,7 @@ struct TransactionObservationTransition {
   bool first_visible = false;
   bool first_confirmed = false;
   bool retired = false;
+  std::optional<TransactionLoadSnapshot> load_progress;
 };
 
 struct TransactionObservationStoreStats {

@@ -302,14 +302,22 @@ BOOST_AUTO_TEST_CASE(
       source.find("record_dropped_tasks(queue.Cancel())", cancelled_outcome);
   const std::size_t post_join_cancel =
       source.find("record_dropped_tasks(queue.Cancel())", cancel_queue + 1U);
+  const std::size_t record_dropped_tasks =
+      source.find("const auto record_dropped_tasks");
   const std::size_t dropped_outcome =
-      source.find("accounting->RecordOutcome(TransactionLoadOutcome::kDropped");
+      source.find("TransactionLoadOutcome::kDropped", record_dropped_tasks);
+  const std::size_t dropped_accounting =
+      source.rfind("accounting->RecordOutcome", dropped_outcome);
   BOOST_REQUIRE(stopped_pop != std::string::npos);
   BOOST_REQUIRE(cancelled_outcome != std::string::npos);
   BOOST_REQUIRE(local_stop != std::string::npos);
   BOOST_REQUIRE(cancel_queue != std::string::npos);
   BOOST_REQUIRE(post_join_cancel != std::string::npos);
+  BOOST_REQUIRE(record_dropped_tasks != std::string::npos);
   BOOST_REQUIRE(dropped_outcome != std::string::npos);
+  BOOST_REQUIRE(dropped_accounting != std::string::npos);
+  BOOST_TEST(record_dropped_tasks < dropped_accounting);
+  BOOST_TEST(dropped_accounting < dropped_outcome);
   BOOST_TEST(stopped_pop < cancelled_outcome);
   BOOST_TEST(cancelled_outcome < local_stop);
   BOOST_TEST(local_stop < cancel_queue);

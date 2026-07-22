@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -48,6 +49,43 @@ std::uint64_t JsonIntegerValue(const boost::json::value& value) {
     return static_cast<std::uint64_t>(value.as_int64());
   }
   throw std::runtime_error("expected non-negative JSON integer");
+}
+
+void AppendDetailEvent(const std::filesystem::path& dir,
+                       std::string_view event_name,
+                       const boost::json::object& detail,
+                       std::string_view node_id = "sim") {
+  boost::json::object event;
+  event["run_id"] = "load";
+  event["node_id"] = node_id;
+  event["event"] = event_name;
+  event["detail"] = boost::json::serialize(detail);
+  bbp::AppendLine(dir / "events.jsonl", boost::json::serialize(event));
+}
+
+boost::json::object TransactionLoadProgressDetail(
+    std::uint64_t workload_index, std::uint64_t revision,
+    std::uint64_t attempted, std::uint64_t submitted,
+    std::uint64_t rejected = 0U, std::uint64_t timed_out = 0U,
+    std::uint64_t backpressured = 0U, std::uint64_t dropped = 0U,
+    std::uint64_t propagated = 0U, std::uint64_t confirmed = 0U,
+    std::uint64_t failed = 0U, std::uint64_t cancelled = 0U) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = 2U;
+  detail["revision"] = revision;
+  detail["attempted"] = attempted;
+  detail["submitted"] = submitted;
+  detail["rejected"] = rejected;
+  detail["timed_out"] = timed_out;
+  detail["backpressured"] = backpressured;
+  detail["dropped"] = dropped;
+  detail["propagated"] = propagated;
+  detail["confirmed"] = confirmed;
+  detail["failed"] = failed;
+  detail["cancelled"] = cancelled;
+  detail["accounting_invariants_hold"] = true;
+  return detail;
 }
 
 }  // namespace
@@ -2195,6 +2233,197 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(JsonInteger(stored_summary, "attempted") == 300U);
   BOOST_TEST(JsonInteger(stored_summary, "backpressured") == 300U);
   BOOST_TEST(stored_summary.at("accounting_invariants_hold").as_bool());
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_report_exposes_exact_active_one_node_load_without_completion) {
+  const std::filesystem::path dir = MakeTestDir("run-report-live-load");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"load","chain":"firo","nodes":1})");
+
+  boost::json::object unrelated_visibility;
+  unrelated_visibility["workload_index"] = 2U;
+  unrelated_visibility["submission_kind"] = "raw_transaction_submitted";
+  unrelated_visibility["txid"] = "not-a-load";
+  AppendDetailEvent(dir, "transaction_visible", unrelated_visibility, "firo-1");
+
+  constexpr std::string_view kOutcomes[] = {
+      "submitted",     "submitted", "rejected", "timed_out",
+      "backpressured", "dropped",   "failed",   "cancelled",
+  };
+  for (std::uint64_t index = 0U; index < std::size(kOutcomes); ++index) {
+    boost::json::object detail;
+    detail["workload_index"] = 1U;
+    detail["workload_count"] = 1U;
+    detail["transaction_index"] = index + 1U;
+    detail["outcome"] = kOutcomes[index];
+    AppendDetailEvent(dir, "transaction_load_attempt", detail, "firo-1");
+  }
+  for (std::uint64_t index = 1U; index <= 2U; ++index) {
+    boost::json::object detail;
+    detail["workload_index"] = 1U;
+    detail["workload_count"] = 1U;
+    detail["transaction_index"] = index;
+    detail["txid"] = "tx-" + std::to_string(index);
+    AppendDetailEvent(dir, "transaction_visible", detail, "firo-1");
+  }
+  boost::json::object confirmed_detail;
+  confirmed_detail["workload_index"] = 1U;
+  confirmed_detail["workload_count"] = 1U;
+  confirmed_detail["transaction_index"] = 1U;
+  confirmed_detail["txid"] = "tx-1";
+  AppendDetailEvent(dir, "transaction_confirmed", confirmed_detail, "firo-1");
+
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  const boost::json::array& loads =
+      report.at("transaction_load_live").as_array();
+  BOOST_REQUIRE_EQUAL(loads.size(), 1U);
+  const boost::json::object& load = loads.front().as_object();
+  BOOST_TEST(JsonInteger(load, "workload_index") == 1U);
+  BOOST_TEST(JsonInteger(load, "attempted") == 8U);
+  BOOST_TEST(JsonInteger(load, "submitted") == 2U);
+  BOOST_TEST(JsonInteger(load, "rejected") == 1U);
+  BOOST_TEST(JsonInteger(load, "timed_out") == 1U);
+  BOOST_TEST(JsonInteger(load, "backpressured") == 1U);
+  BOOST_TEST(JsonInteger(load, "dropped") == 1U);
+  BOOST_TEST(JsonInteger(load, "propagated") == 2U);
+  BOOST_TEST(JsonInteger(load, "confirmed") == 1U);
+  BOOST_TEST(JsonInteger(load, "failed") == 1U);
+  BOOST_TEST(JsonInteger(load, "cancelled") == 1U);
+  BOOST_TEST(!load.at("authoritative").as_bool());
+  BOOST_TEST(!load.at("completed").as_bool());
+  BOOST_TEST(report.at("transaction_load_summaries").as_array().empty());
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_report_keeps_exact_revisioned_load_after_attempt_detail_rollover) {
+  const std::filesystem::path dir = MakeTestDir("run-report-load-rollover");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"load","chain":"firo","nodes":2})");
+  constexpr std::uint64_t kAttempts = 300U;
+  for (std::uint64_t index = 1U; index <= kAttempts; ++index) {
+    AppendDetailEvent(
+        dir, "transaction_load_progress",
+        TransactionLoadProgressDetail(1U, index, index, 0U, 0U, 0U, index));
+    boost::json::object attempt;
+    attempt["workload_index"] = 1U;
+    attempt["workload_count"] = 1U;
+    attempt["transaction_index"] = index;
+    attempt["outcome"] = "backpressured";
+    AppendDetailEvent(dir, "transaction_load_attempt", attempt, "firo-1");
+  }
+
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  BOOST_TEST(report.at("transaction_load_attempts").as_array().size() ==
+             bbp::kMaximumRunReportSummaryRecords);
+  const boost::json::array& loads =
+      report.at("transaction_load_live").as_array();
+  BOOST_REQUIRE_EQUAL(loads.size(), 1U);
+  const boost::json::object& load = loads.front().as_object();
+  BOOST_TEST(JsonInteger(load, "revision") == kAttempts);
+  BOOST_TEST(JsonInteger(load, "attempted") == kAttempts);
+  BOOST_TEST(JsonInteger(load, "backpressured") == kAttempts);
+  BOOST_TEST(load.at("authoritative").as_bool());
+  BOOST_TEST(!load.at("completed").as_bool());
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_report_attributes_loads_rejects_stale_progress_and_reconciles_completion) {
+  const std::filesystem::path dir = MakeTestDir("run-report-load-attribution");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"load","chain":"firo","nodes":2})");
+  AppendDetailEvent(dir, "transaction_load_progress",
+                    TransactionLoadProgressDetail(1U, 2U, 2U, 1U, 1U));
+  AppendDetailEvent(dir, "transaction_load_progress",
+                    TransactionLoadProgressDetail(2U, 1U, 1U, 0U, 0U, 0U, 0U,
+                                                  0U, 0U, 0U, 1U));
+  AppendDetailEvent(dir, "transaction_load_progress",
+                    TransactionLoadProgressDetail(1U, 1U, 1U, 1U));
+  AppendDetailEvent(dir, "transaction_load_completed",
+                    TransactionLoadProgressDetail(1U, 2U, 2U, 1U, 1U));
+
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  const boost::json::array& loads =
+      report.at("transaction_load_live").as_array();
+  BOOST_REQUIRE_EQUAL(loads.size(), 2U);
+  const boost::json::object& workload_two = loads.front().as_object();
+  const boost::json::object& workload_one = loads.back().as_object();
+  BOOST_TEST(JsonInteger(workload_two, "workload_index") == 2U);
+  BOOST_TEST(JsonInteger(workload_two, "failed") == 1U);
+  BOOST_TEST(!workload_two.at("completed").as_bool());
+  BOOST_TEST(JsonInteger(workload_one, "workload_index") == 1U);
+  BOOST_TEST(JsonInteger(workload_one, "revision") == 2U);
+  BOOST_TEST(JsonInteger(workload_one, "attempted") == 2U);
+  BOOST_TEST(JsonInteger(workload_one, "submitted") == 1U);
+  BOOST_TEST(JsonInteger(workload_one, "rejected") == 1U);
+  BOOST_TEST(workload_one.at("completed").as_bool());
+  BOOST_TEST(JsonInteger(report, "transaction_load_completed_count") == 1U);
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    incremental_load_progress_is_bounded_responsive_and_matches_full_report) {
+  const std::filesystem::path dir = MakeTestDir("run-report-load-backlog");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"load","chain":"firo","nodes":2})");
+  constexpr std::uint64_t kProgressEvents = 1024U;
+  for (std::uint64_t revision = 1U; revision <= kProgressEvents; ++revision) {
+    AppendDetailEvent(dir, "transaction_load_progress",
+                      TransactionLoadProgressDetail(1U, revision, revision, 0U,
+                                                    0U, 0U, revision));
+  }
+
+  bbp::IncrementalRunReport incremental(dir);
+  const auto started = std::chrono::steady_clock::now();
+  const boost::json::object* incremental_report = nullptr;
+  std::uint64_t refreshes = 0U;
+  do {
+    const auto refresh_started = std::chrono::steady_clock::now();
+    incremental_report = &incremental.Refresh(256U);
+    const auto refresh_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - refresh_started);
+    BOOST_TEST(refresh_us.count() < 1'000'000);
+    BOOST_TEST(incremental.last_refresh_stats().event_records <= 256U);
+    ++refreshes;
+  } while (incremental.last_refresh_stats().has_backlog);
+  const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  BOOST_TEST(total_ms.count() < 5'000);
+  BOOST_TEST(refreshes == 4U);
+  BOOST_REQUIRE(incremental_report != nullptr);
+  const boost::json::object exhaustive = bbp::BuildRunReport(dir);
+  BOOST_TEST(*incremental_report == exhaustive);
+  const boost::json::object& load =
+      incremental_report->at("transaction_load_live")
+          .as_array()
+          .front()
+          .as_object();
+  BOOST_TEST(JsonInteger(load, "revision") == kProgressEvents);
+  BOOST_TEST(JsonInteger(load, "attempted") == kProgressEvents);
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(run_report_bounds_live_transaction_load_workloads) {
+  const std::filesystem::path dir = MakeTestDir("run-report-load-bound");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"load","chain":"firo","nodes":1})");
+  constexpr std::uint64_t kWorkloads = 300U;
+  for (std::uint64_t workload = 1U; workload <= kWorkloads; ++workload) {
+    AppendDetailEvent(dir, "transaction_load_progress",
+                      TransactionLoadProgressDetail(workload, 1U, 1U, 0U, 0U,
+                                                    0U, 0U, 0U, 0U, 0U, 1U));
+  }
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  const boost::json::array& loads =
+      report.at("transaction_load_live").as_array();
+  BOOST_REQUIRE_EQUAL(loads.size(), bbp::kMaximumRunReportSummaryRecords);
+  BOOST_TEST(JsonInteger(loads.front().as_object(), "workload_index") == 45U);
+  BOOST_TEST(JsonInteger(loads.back().as_object(), "workload_index") ==
+             kWorkloads);
   std::filesystem::remove_all(dir);
 }
 

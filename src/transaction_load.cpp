@@ -448,13 +448,14 @@ bool TransactionLoadSnapshot::InvariantsHold() const {
          propagated <= submitted && latency_sample_count == attempted;
 }
 
-void TransactionLoadAccounting::RecordOutcome(
+TransactionLoadSnapshot TransactionLoadAccounting::RecordOutcome(
     TransactionLoadOutcome outcome, std::chrono::microseconds latency) {
   if (latency.count() < 0) {
     throw std::runtime_error("transaction load latency must not be negative");
   }
   const auto latency_us = static_cast<std::uint64_t>(latency.count());
   std::lock_guard lock(mutex_);
+  RequireIncrementable(counters_.revision, "revision");
   RequireIncrementable(counters_.attempted, "attempted");
   RequireIncrementable(counters_.latency_sample_count, "latency sample");
   if (counters_.latency_total_us >
@@ -518,10 +519,14 @@ void TransactionLoadAccounting::RecordOutcome(
     counters_.latency_min_us = std::min(counters_.latency_min_us, latency_us);
     counters_.latency_max_us = std::max(counters_.latency_max_us, latency_us);
   }
+  Increment(&counters_.revision, "revision");
+  return counters_;
 }
 
-void TransactionLoadAccounting::RecordPropagated(bool confirmed) {
+TransactionLoadSnapshot TransactionLoadAccounting::RecordPropagated(
+    bool confirmed) {
   std::lock_guard lock(mutex_);
+  RequireIncrementable(counters_.revision, "revision");
   if (counters_.propagated == counters_.submitted) {
     throw std::runtime_error(
         "transaction load propagated count exceeds submitted count");
@@ -530,20 +535,28 @@ void TransactionLoadAccounting::RecordPropagated(bool confirmed) {
   if (confirmed) {
     Increment(&counters_.confirmed, "confirmed");
   }
+  Increment(&counters_.revision, "revision");
+  return counters_;
 }
 
-void TransactionLoadAccounting::RecordConfirmed() {
+TransactionLoadSnapshot TransactionLoadAccounting::RecordConfirmed() {
   std::lock_guard lock(mutex_);
+  RequireIncrementable(counters_.revision, "revision");
   if (counters_.confirmed == counters_.propagated) {
     throw std::runtime_error(
         "transaction load confirmed count exceeds propagated count");
   }
   Increment(&counters_.confirmed, "confirmed");
+  Increment(&counters_.revision, "revision");
+  return counters_;
 }
 
-void TransactionLoadAccounting::RecordObservationError() {
+TransactionLoadSnapshot TransactionLoadAccounting::RecordObservationError() {
   std::lock_guard lock(mutex_);
+  RequireIncrementable(counters_.revision, "revision");
   Increment(&counters_.observation_errors, "observation error");
+  Increment(&counters_.revision, "revision");
+  return counters_;
 }
 
 TransactionLoadSnapshot TransactionLoadAccounting::Snapshot(
@@ -600,11 +613,12 @@ TransactionLoadConfirmation::TransactionLoadConfirmation(
   }
 }
 
-void TransactionLoadConfirmation::RecordObservation(std::string_view txid,
-                                                    std::string_view node_id,
-                                                    bool confirmed) {
+std::optional<TransactionLoadSnapshot>
+TransactionLoadConfirmation::RecordObservation(std::string_view txid,
+                                               std::string_view node_id,
+                                               bool confirmed) {
   if (!confirmed) {
-    return;
+    return std::nullopt;
   }
   const ObservationKey key{std::string(txid), std::string(node_id)};
   std::lock_guard lock(mutex_);
@@ -615,12 +629,15 @@ void TransactionLoadConfirmation::RecordObservation(std::string_view txid,
   confirmed_observations_.insert(key);
   if (propagation_recorded_ && !confirmation_recorded_ &&
       confirmed_observations_.size() == expected_observations_.size()) {
-    accounting_->RecordConfirmed();
+    TransactionLoadSnapshot progress = accounting_->RecordConfirmed();
     confirmation_recorded_ = true;
+    return progress;
   }
+  return std::nullopt;
 }
 
-void TransactionLoadConfirmation::RecordPropagated(bool confirmed) {
+TransactionLoadSnapshot TransactionLoadConfirmation::RecordPropagated(
+    bool confirmed) {
   std::lock_guard lock(mutex_);
   if (propagation_recorded_) {
     throw std::runtime_error(
@@ -628,9 +645,11 @@ void TransactionLoadConfirmation::RecordPropagated(bool confirmed) {
   }
   const bool all_confirmed =
       confirmed_observations_.size() == expected_observations_.size();
-  accounting_->RecordPropagated(confirmed || all_confirmed);
+  TransactionLoadSnapshot progress =
+      accounting_->RecordPropagated(confirmed || all_confirmed);
   propagation_recorded_ = true;
   confirmation_recorded_ = confirmed || all_confirmed;
+  return progress;
 }
 
 bool TransactionLoadConfirmation::propagation_recorded() const {

@@ -1321,17 +1321,19 @@ BOOST_AUTO_TEST_CASE(
                                      "load-destination", 25'000'000U, 1'000U,
                                      1s);
   BOOST_REQUIRE_EQUAL(submitted.txids.size(), 1U);
-  accounting->RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 10us);
+  const bbp::TransactionLoadSnapshot submitted_progress =
+      accounting->RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 10us);
   bbp::TransactionLoadConfirmation confirmation(
       accounting, {{submitted.txids.front(), config.id}});
 
   const bbp::ChainTransactionObservation propagated =
       driver.ObserveTransaction(config, submitted.txids.front());
   BOOST_CHECK(propagated.state == bbp::ChainTransactionState::kMempool);
-  confirmation.RecordObservation(
+  BOOST_TEST(!confirmation.RecordObservation(
       submitted.txids.front(), config.id,
-      propagated.state == bbp::ChainTransactionState::kConfirmed);
-  confirmation.RecordPropagated(false);
+      propagated.state == bbp::ChainTransactionState::kConfirmed));
+  const bbp::TransactionLoadSnapshot propagated_progress =
+      confirmation.RecordPropagated(false);
   BOOST_TEST(accounting->Snapshot(1s).confirmed == 0U);
 
   const std::vector<std::string> blocks =
@@ -1341,8 +1343,11 @@ BOOST_AUTO_TEST_CASE(
   const bbp::ChainTransactionObservation confirmed =
       driver.ObserveTransaction(config, submitted.txids.front());
   BOOST_CHECK(confirmed.state == bbp::ChainTransactionState::kConfirmed);
-  confirmation.RecordObservation(submitted.txids.front(), config.id, true);
-  confirmation.RecordObservation(submitted.txids.front(), config.id, true);
+  const std::optional<bbp::TransactionLoadSnapshot> confirmed_progress =
+      confirmation.RecordObservation(submitted.txids.front(), config.id, true);
+  BOOST_REQUIRE(confirmed_progress);
+  BOOST_TEST(!confirmation.RecordObservation(submitted.txids.front(), config.id,
+                                             true));
 
   const bbp::TransactionLoadSnapshot snapshot = accounting->Snapshot(1s);
   BOOST_TEST(snapshot.attempted == 1U);
@@ -1362,7 +1367,36 @@ BOOST_AUTO_TEST_CASE(
   bbp::AppendLine(
       report_root / "events.jsonl",
       R"({"run_id":"late-confirmation","node_id":"sim","event":"run_started"})");
+  const auto append_progress = [&](const bbp::TransactionLoadSnapshot& value) {
+    boost::json::object progress_detail;
+    progress_detail["workload_index"] = 1U;
+    progress_detail["workload_count"] = 1U;
+    progress_detail["revision"] = value.revision;
+    progress_detail["attempted"] = value.attempted;
+    progress_detail["submitted"] = value.submitted;
+    progress_detail["rejected"] = value.rejected;
+    progress_detail["timed_out"] = value.timed_out;
+    progress_detail["backpressured"] = value.backpressured;
+    progress_detail["dropped"] = value.dropped;
+    progress_detail["cancelled"] = value.cancelled;
+    progress_detail["propagated"] = value.propagated;
+    progress_detail["confirmed"] = value.confirmed;
+    progress_detail["failed"] = value.failed;
+    boost::json::object progress_event;
+    progress_event["run_id"] = "late-confirmation";
+    progress_event["node_id"] = "sim";
+    progress_event["event"] = "transaction_load_progress";
+    progress_event["detail"] = boost::json::serialize(progress_detail);
+    bbp::AppendLine(report_root / "events.jsonl",
+                    boost::json::serialize(progress_event));
+  };
+  append_progress(submitted_progress);
+  append_progress(propagated_progress);
+  append_progress(*confirmed_progress);
   boost::json::object detail;
+  detail["workload_index"] = 1U;
+  detail["workload_count"] = 1U;
+  detail["revision"] = snapshot.revision;
   detail["attempted"] = snapshot.attempted;
   detail["submitted"] = snapshot.submitted;
   detail["rejected"] = snapshot.rejected;
@@ -1388,6 +1422,14 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object report = bbp::BuildRunReport(report_root);
   BOOST_TEST(JsonNonNegativeInteger(
                  report.at("transaction_load_completed_count")) == 1U);
+  const boost::json::array& live =
+      report.at("transaction_load_live").as_array();
+  BOOST_REQUIRE_EQUAL(live.size(), 1U);
+  const boost::json::object& live_load = live.front().as_object();
+  BOOST_TEST(JsonNonNegativeInteger(live_load.at("workload_index")) == 1U);
+  BOOST_TEST(JsonNonNegativeInteger(live_load.at("revision")) == 3U);
+  BOOST_TEST(JsonNonNegativeInteger(live_load.at("confirmed")) == 1U);
+  BOOST_TEST(live_load.at("completed").as_bool());
   const boost::json::array& summaries =
       report.at("transaction_load_summaries").as_array();
   BOOST_REQUIRE_EQUAL(summaries.size(), 1U);

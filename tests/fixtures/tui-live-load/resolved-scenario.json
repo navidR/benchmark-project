@@ -1,0 +1,7 @@
+{
+  "run_id": "tui-live-load",
+  "chain": "firo",
+  "nodes": 1,
+  "isolated_network": false,
+  "workloads": []
+}

@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -1808,6 +1809,14 @@ struct IncrementalRunReport::Impl {
     bool observed_exists = false;
   };
 
+  struct TransactionLoadLiveReport {
+    boost::json::object detail;
+    std::uint64_t revision = 0U;
+    std::uint64_t last_update_event_count = 0U;
+    bool authoritative = false;
+    bool completed = false;
+  };
+
   explicit Impl(std::filesystem::path root) : run_root(std::move(root)) {
     if (!std::filesystem::is_directory(run_root)) {
       throw std::runtime_error("run root is not a directory: " +
@@ -1823,6 +1832,168 @@ struct IncrementalRunReport::Impl {
       value = report.if_contains(field);
     }
     return value->as_array();
+  }
+
+  TransactionLoadLiveReport& LiveTransactionLoad(std::uint64_t workload_index) {
+    const auto existing = transaction_load_live.find(workload_index);
+    if (existing != transaction_load_live.end()) {
+      return existing->second;
+    }
+    if (transaction_load_live.size() >= kMaximumRunReportSummaryRecords) {
+      auto oldest = transaction_load_live.begin();
+      for (auto current = std::next(oldest);
+           current != transaction_load_live.end(); ++current) {
+        if (current->second.last_update_event_count <
+            oldest->second.last_update_event_count) {
+          oldest = current;
+        }
+      }
+      transaction_load_live.erase(oldest);
+    }
+    TransactionLoadLiveReport live;
+    live.detail["workload_index"] = workload_index;
+    for (const std::string_view field :
+         {"attempted", "submitted", "rejected", "timed_out", "backpressured",
+          "dropped", "propagated", "confirmed", "failed", "cancelled"}) {
+      live.detail[field] = 0U;
+    }
+    return transaction_load_live.emplace(workload_index, std::move(live))
+        .first->second;
+  }
+
+  static void IncrementLiveTransactionLoadCounter(boost::json::object* detail,
+                                                  std::string_view field) {
+    const std::uint64_t current =
+        OptionalUint64Field(*detail, field).value_or(0U);
+    if (current == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::runtime_error("transaction load live " + std::string(field) +
+                               " counter overflow");
+    }
+    (*detail)[field] = current + 1U;
+  }
+
+  void RememberFallbackTransactionLoadAttempt(
+      const boost::json::object& event) {
+    boost::json::value parsed = ParseEventDetail(event);
+    if (!parsed.is_object()) {
+      return;
+    }
+    const boost::json::object& detail = parsed.as_object();
+    const std::optional<std::uint64_t> workload_index =
+        OptionalUint64Field(detail, "workload_index");
+    if (!workload_index || *workload_index == 0U) {
+      return;
+    }
+    TransactionLoadLiveReport& live = LiveTransactionLoad(*workload_index);
+    if (live.authoritative) {
+      return;
+    }
+    const std::optional<std::uint64_t> workload_count =
+        OptionalUint64Field(detail, "workload_count");
+    if (workload_count) {
+      live.detail["workload_count"] = *workload_count;
+    }
+    IncrementLiveTransactionLoadCounter(&live.detail, "attempted");
+    const std::string outcome = OptionalStringField(detail, "outcome");
+    if (outcome == "submitted") {
+      IncrementLiveTransactionLoadCounter(&live.detail, "submitted");
+    } else if (outcome == "rejected") {
+      IncrementLiveTransactionLoadCounter(&live.detail, "rejected");
+    } else if (outcome == "timed_out") {
+      IncrementLiveTransactionLoadCounter(&live.detail, "timed_out");
+    } else if (outcome == "backpressured") {
+      IncrementLiveTransactionLoadCounter(&live.detail, "backpressured");
+    } else if (outcome == "dropped") {
+      IncrementLiveTransactionLoadCounter(&live.detail, "dropped");
+    } else if (outcome == "failed") {
+      IncrementLiveTransactionLoadCounter(&live.detail, "failed");
+    } else if (outcome == "cancelled") {
+      IncrementLiveTransactionLoadCounter(&live.detail, "cancelled");
+    }
+    live.last_update_event_count = event_count;
+  }
+
+  void RememberFallbackTransactionLoadObservation(
+      const boost::json::object& event, std::string_view counter) {
+    if (OptionalUint64Field(report, "nodes") != 1U) {
+      return;
+    }
+    boost::json::value parsed = ParseEventDetail(event);
+    if (!parsed.is_object()) {
+      return;
+    }
+    const boost::json::object& detail = parsed.as_object();
+    const std::optional<std::uint64_t> workload_index =
+        OptionalUint64Field(detail, "workload_index");
+    if (!workload_index || *workload_index == 0U) {
+      return;
+    }
+    const auto existing = transaction_load_live.find(*workload_index);
+    if (existing == transaction_load_live.end()) {
+      return;
+    }
+    TransactionLoadLiveReport& live = existing->second;
+    if (live.authoritative) {
+      return;
+    }
+    IncrementLiveTransactionLoadCounter(&live.detail, counter);
+    live.last_update_event_count = event_count;
+  }
+
+  void RememberTransactionLoadSnapshot(const boost::json::object& event,
+                                       bool completed) {
+    boost::json::value parsed = ParseEventDetail(event);
+    if (!parsed.is_object()) {
+      return;
+    }
+    boost::json::object detail = std::move(parsed).as_object();
+    const std::optional<std::uint64_t> workload_index =
+        OptionalUint64Field(detail, "workload_index");
+    if (!workload_index || *workload_index == 0U) {
+      return;
+    }
+    TransactionLoadLiveReport& live = LiveTransactionLoad(*workload_index);
+    const std::optional<std::uint64_t> revision =
+        OptionalUint64Field(detail, "revision");
+    if (revision && live.authoritative && *revision < live.revision) {
+      if (completed) {
+        live.completed = true;
+      }
+      return;
+    }
+    if (!revision && live.authoritative && !completed) {
+      return;
+    }
+    live.detail = std::move(detail);
+    live.revision = revision.value_or(live.revision);
+    live.authoritative = true;
+    live.completed = live.completed || completed;
+    live.last_update_event_count = event_count;
+  }
+
+  boost::json::array TransactionLoadLiveJson() const {
+    std::vector<const TransactionLoadLiveReport*> ordered;
+    ordered.reserve(transaction_load_live.size());
+    for (const auto& [workload_index, live] : transaction_load_live) {
+      static_cast<void>(workload_index);
+      ordered.push_back(&live);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto* left, const auto* right) {
+                return left->last_update_event_count <
+                       right->last_update_event_count;
+              });
+    boost::json::array result;
+    result.reserve(ordered.size());
+    for (const TransactionLoadLiveReport* live : ordered) {
+      boost::json::object value = live->detail;
+      value["revision"] = live->revision;
+      value["authoritative"] = live->authoritative;
+      value["completed"] = live->completed;
+      value["last_update_event_count"] = live->last_update_event_count;
+      result.push_back(std::move(value));
+    }
+    return result;
   }
 
   void Reset() {
@@ -1898,6 +2069,7 @@ struct IncrementalRunReport::Impl {
     nodes.clear();
     wallets.clear();
     active_network_partitions.clear();
+    transaction_load_live.clear();
     event_cursor = {};
     metric_cursor = {};
     wallet_metric_cursor = {};
@@ -2187,19 +2359,26 @@ struct IncrementalRunReport::Impl {
         AppendEventSummary(event, &Array("raw_transactions"));
         break;
       case SimulationEventKind::kTransactionVisible:
+        RememberFallbackTransactionLoadObservation(event, "propagated");
         AppendEventSummary(event, &Array("transaction_visibility"));
         break;
       case SimulationEventKind::kTransactionConfirmed:
+        RememberFallbackTransactionLoadObservation(event, "confirmed");
         AppendEventSummary(event, &Array("transaction_confirmations"));
         break;
       case SimulationEventKind::kTransactionLoadAttempt:
         ++transaction_load_attempt_count;
+        RememberFallbackTransactionLoadAttempt(event);
         AppendBoundedEventSummary(event,
                                   kMaximumTransactionLoadAttemptSummaries,
                                   &Array("transaction_load_attempts"));
         break;
+      case SimulationEventKind::kTransactionLoadProgress:
+        RememberTransactionLoadSnapshot(event, false);
+        break;
       case SimulationEventKind::kTransactionLoadCompleted:
         ++transaction_load_completed_count;
+        RememberTransactionLoadSnapshot(event, true);
         AppendBoundedEventSummary(event,
                                   kMaximumTransactionLoadCompletionSummaries,
                                   &Array("transaction_load_summaries"));
@@ -2348,6 +2527,7 @@ struct IncrementalRunReport::Impl {
     report["transaction_load_attempt_count"] = transaction_load_attempt_count;
     report["transaction_load_completed_count"] =
         transaction_load_completed_count;
+    report["transaction_load_live"] = TransactionLoadLiveJson();
     report["active_network_partitions"] =
         ActivePartitionsJson(active_network_partitions);
     report["wallets_summary"] = WalletsJson(wallets);
@@ -2401,6 +2581,7 @@ struct IncrementalRunReport::Impl {
   std::map<std::string, NodeReport> nodes;
   std::map<std::uint64_t, WalletReport> wallets;
   std::map<std::string, boost::json::object> active_network_partitions;
+  std::map<std::uint64_t, TransactionLoadLiveReport> transaction_load_live;
   InputCursor event_cursor;
   InputCursor metric_cursor;
   InputCursor wallet_metric_cursor;

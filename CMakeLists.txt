@@ -1698,14 +1698,24 @@ if(BUILD_TESTING)
       WILL_FAIL TRUE
   )
   add_test(NAME bbp-integrated-tui-once
-    COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm
+    COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm COLUMNS=160 LINES=40
       $<TARGET_FILE:bbp>
       --run "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
       --once
   )
   set_tests_properties(bbp-integrated-tui-once
     PROPERTIES
-      PASS_REGULAR_EXPRESSION "load a=6 s=2 bp=3; manual GUI command available"
+      PASS_REGULAR_EXPRESSION "load a=6 s=2 r=0 to=0 bp=3 d=3 p=2 c=0 f=1 cn=0; manual GUI command available"
+  )
+  add_test(NAME bbp-integrated-tui-live-transaction-load
+    COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm COLUMNS=160 LINES=40
+      $<TARGET_FILE:bbp>
+      --run "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-live-load"
+      --once
+  )
+  set_tests_properties(bbp-integrated-tui-live-transaction-load
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION "load a=8 s=2 r=1 to=1 bp=1 d=1 p=2 c=1 f=1 cn=1"
   )
   add_test(NAME bbp-report-run-id-under-benchmark-root
     COMMAND bbp

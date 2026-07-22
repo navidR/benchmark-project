@@ -367,20 +367,45 @@ std::string NetworkLossText(const boost::json::object& metrics) {
 
 std::string WorkloadsSummaryText(const boost::json::object& report) {
   std::string load_suffix;
-  const boost::json::value* load_summaries =
-      report.if_contains("transaction_load_summaries");
-  if (load_summaries != nullptr && load_summaries->is_array() &&
-      !load_summaries->as_array().empty()) {
-    const boost::json::value& latest = load_summaries->as_array().back();
-    if (latest.is_object()) {
-      const boost::json::object* detail =
-          JsonObject(latest.as_object(), "detail");
-      if (detail != nullptr) {
-        load_suffix = "; load a=" + JsonMetricText(*detail, "attempted") +
-                      " s=" + JsonMetricText(*detail, "submitted") +
-                      " bp=" + JsonMetricText(*detail, "backpressured");
+  const boost::json::object* load_detail = nullptr;
+  const boost::json::value* live_loads =
+      report.if_contains("transaction_load_live");
+  if (live_loads != nullptr && live_loads->is_array()) {
+    const boost::json::array& loads = live_loads->as_array();
+    for (std::size_t offset = 0U; offset < loads.size(); ++offset) {
+      const boost::json::value& candidate = loads[loads.size() - offset - 1U];
+      if (candidate.is_object() &&
+          !JsonBool(candidate.as_object(), "completed").value_or(false)) {
+        load_detail = &candidate.as_object();
+        break;
       }
     }
+    if (load_detail == nullptr && !loads.empty() && loads.back().is_object()) {
+      load_detail = &loads.back().as_object();
+    }
+  }
+  if (load_detail == nullptr) {
+    const boost::json::value* load_summaries =
+        report.if_contains("transaction_load_summaries");
+    if (load_summaries != nullptr && load_summaries->is_array() &&
+        !load_summaries->as_array().empty()) {
+      const boost::json::value& latest = load_summaries->as_array().back();
+      if (latest.is_object()) {
+        load_detail = JsonObject(latest.as_object(), "detail");
+      }
+    }
+  }
+  if (load_detail != nullptr) {
+    load_suffix = "; load a=" + JsonMetricText(*load_detail, "attempted") +
+                  " s=" + JsonMetricText(*load_detail, "submitted") +
+                  " r=" + JsonMetricText(*load_detail, "rejected") +
+                  " to=" + JsonMetricText(*load_detail, "timed_out") +
+                  " bp=" + JsonMetricText(*load_detail, "backpressured") +
+                  " d=" + JsonMetricText(*load_detail, "dropped") +
+                  " p=" + JsonMetricText(*load_detail, "propagated") +
+                  " c=" + JsonMetricText(*load_detail, "confirmed") +
+                  " f=" + JsonMetricText(*load_detail, "failed") +
+                  " cn=" + JsonMetricText(*load_detail, "cancelled");
   }
   const std::string operator_suffix =
       OperatorConnectionCommandFromReport(report).empty()

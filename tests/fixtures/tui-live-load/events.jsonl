@@ -1,0 +1,12 @@
+{"timestamp":"2026-07-22T00:00:00Z","run_id":"tui-live-load","node_id":"sim","event":"run_started"}
+{"timestamp":"2026-07-22T00:00:01Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":1,\"outcome\":\"submitted\"}"}
+{"timestamp":"2026-07-22T00:00:02Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":2,\"outcome\":\"submitted\"}"}
+{"timestamp":"2026-07-22T00:00:03Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":3,\"outcome\":\"rejected\"}"}
+{"timestamp":"2026-07-22T00:00:04Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":4,\"outcome\":\"timed_out\"}"}
+{"timestamp":"2026-07-22T00:00:05Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":5,\"outcome\":\"backpressured\"}"}
+{"timestamp":"2026-07-22T00:00:06Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":6,\"outcome\":\"dropped\"}"}
+{"timestamp":"2026-07-22T00:00:07Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":7,\"outcome\":\"failed\"}"}
+{"timestamp":"2026-07-22T00:00:08Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_load_attempt","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":8,\"outcome\":\"cancelled\"}"}
+{"timestamp":"2026-07-22T00:00:09Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_visible","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":1,\"txid\":\"live-a\",\"state\":\"mempool\"}"}
+{"timestamp":"2026-07-22T00:00:10Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_visible","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":2,\"txid\":\"live-b\",\"state\":\"mempool\"}"}
+{"timestamp":"2026-07-22T00:00:11Z","run_id":"tui-live-load","node_id":"firo-1","event":"transaction_confirmed","detail":"{\"workload_index\":1,\"workload_count\":1,\"transaction_index\":1,\"txid\":\"live-a\",\"state\":\"confirmed\"}"}

@@ -129,6 +129,7 @@ class TransactionLoadBalanceReservations {
 };
 
 struct TransactionLoadSnapshot {
+  std::uint64_t revision = 0;
   std::uint64_t attempted = 0;
   std::uint64_t submitted = 0;
   std::uint64_t rejected = 0;
@@ -156,11 +157,11 @@ struct TransactionLoadSnapshot {
 
 class TransactionLoadAccounting {
  public:
-  void RecordOutcome(TransactionLoadOutcome outcome,
-                     std::chrono::microseconds latency);
-  void RecordPropagated(bool confirmed);
-  void RecordConfirmed();
-  void RecordObservationError();
+  TransactionLoadSnapshot RecordOutcome(TransactionLoadOutcome outcome,
+                                        std::chrono::microseconds latency);
+  TransactionLoadSnapshot RecordPropagated(bool confirmed);
+  TransactionLoadSnapshot RecordConfirmed();
+  TransactionLoadSnapshot RecordObservationError();
 
   [[nodiscard]] TransactionLoadSnapshot Snapshot(
       std::chrono::microseconds elapsed) const;
@@ -178,9 +179,9 @@ class TransactionLoadConfirmation {
       std::shared_ptr<TransactionLoadAccounting> accounting,
       std::vector<ObservationKey> expected_observations);
 
-  void RecordObservation(std::string_view txid, std::string_view node_id,
-                         bool confirmed);
-  void RecordPropagated(bool confirmed);
+  std::optional<TransactionLoadSnapshot> RecordObservation(
+      std::string_view txid, std::string_view node_id, bool confirmed);
+  TransactionLoadSnapshot RecordPropagated(bool confirmed);
 
   [[nodiscard]] bool propagation_recorded() const;
   [[nodiscard]] bool confirmation_recorded() const;

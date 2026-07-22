@@ -446,7 +446,8 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(transaction_load_accounting_preserves_partition_totals) {
   bbp::TransactionLoadAccounting accounting;
-  accounting.RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 100us);
+  const bbp::TransactionLoadSnapshot first_progress =
+      accounting.RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 100us);
   accounting.RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted, 200us);
   accounting.RecordOutcome(bbp::TransactionLoadOutcome::kRejected, 300us);
   accounting.RecordOutcome(bbp::TransactionLoadOutcome::kTimedOut, 400us);
@@ -459,6 +460,10 @@ BOOST_AUTO_TEST_CASE(transaction_load_accounting_preserves_partition_totals) {
   accounting.RecordObservationError();
 
   const bbp::TransactionLoadSnapshot snapshot = accounting.Snapshot(2s);
+  BOOST_TEST(first_progress.revision == 1U);
+  BOOST_TEST(first_progress.attempted == 1U);
+  BOOST_TEST(first_progress.submitted == 1U);
+  BOOST_TEST(snapshot.revision == 11U);
   BOOST_TEST(snapshot.attempted == 8U);
   BOOST_TEST(snapshot.submitted == 2U);
   BOOST_TEST(snapshot.rejected == 1U);
@@ -525,12 +530,20 @@ BOOST_AUTO_TEST_CASE(
       accounting, {{"tx-a", "node-a"}, {"tx-a", "node-b"}});
 
   confirmation.RecordObservation("tx-a", "node-a", false);
-  confirmation.RecordPropagated(false);
-  confirmation.RecordObservation("tx-a", "node-a", true);
+  const bbp::TransactionLoadSnapshot propagation =
+      confirmation.RecordPropagated(false);
+  const std::optional<bbp::TransactionLoadSnapshot> partial_confirmation =
+      confirmation.RecordObservation("tx-a", "node-a", true);
+  BOOST_TEST(propagation.revision == 2U);
+  BOOST_TEST(!partial_confirmation);
   BOOST_TEST(accounting->Snapshot(1s).confirmed == 0U);
-  confirmation.RecordObservation("tx-a", "node-b", true);
-  confirmation.RecordObservation("tx-a", "node-a", true);
-  confirmation.RecordObservation("tx-a", "node-b", true);
+  const std::optional<bbp::TransactionLoadSnapshot> late_confirmation =
+      confirmation.RecordObservation("tx-a", "node-b", true);
+  BOOST_REQUIRE(late_confirmation);
+  BOOST_TEST(late_confirmation->revision == 3U);
+  BOOST_TEST(late_confirmation->confirmed == 1U);
+  BOOST_TEST(!confirmation.RecordObservation("tx-a", "node-a", true));
+  BOOST_TEST(!confirmation.RecordObservation("tx-a", "node-b", true));
 
   const bbp::TransactionLoadSnapshot snapshot = accounting->Snapshot(1s);
   BOOST_TEST(snapshot.propagated == 1U);

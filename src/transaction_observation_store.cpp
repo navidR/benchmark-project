@@ -262,7 +262,8 @@ TransactionObservationTransition TransactionObservationStore::Record(
     }
   }
   if (load_confirmation) {
-    load_confirmation->RecordObservation(txid, node_id, confirmed);
+    transition.load_progress =
+        load_confirmation->RecordObservation(txid, node_id, confirmed);
   }
   return transition;
 }

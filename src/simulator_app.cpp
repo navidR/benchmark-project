@@ -8030,6 +8030,59 @@ std::string TransactionLoadAttemptDetail(
   return boost::json::serialize(detail);
 }
 
+void AddTransactionLoadCounterFields(const TransactionLoadSnapshot& snapshot,
+                                     boost::json::object* detail) {
+  (*detail)["revision"] = snapshot.revision;
+  (*detail)["attempted"] = snapshot.attempted;
+  (*detail)["submitted"] = snapshot.submitted;
+  (*detail)["rejected"] = snapshot.rejected;
+  (*detail)["timed_out"] = snapshot.timed_out;
+  (*detail)["backpressured"] = snapshot.backpressured;
+  (*detail)["dropped"] = snapshot.dropped;
+  (*detail)["cancelled"] = snapshot.cancelled;
+  (*detail)["propagated"] = snapshot.propagated;
+  (*detail)["confirmed"] = snapshot.confirmed;
+  (*detail)["failed"] = snapshot.failed;
+  (*detail)["observation_errors"] = snapshot.observation_errors;
+  (*detail)["latency_sample_count"] = snapshot.latency_sample_count;
+  (*detail)["latency_total_us"] = snapshot.latency_total_us;
+  (*detail)["latency_min_us"] = snapshot.latency_min_us;
+  (*detail)["latency_max_us"] = snapshot.latency_max_us;
+  (*detail)["accounting_invariants_hold"] = snapshot.InvariantsHold();
+}
+
+void AddTransactionLoadSnapshotFields(const TransactionLoadSnapshot& snapshot,
+                                      boost::json::object* detail) {
+  AddTransactionLoadCounterFields(snapshot, detail);
+  (*detail)["average_latency_ms"] = snapshot.average_latency_ms;
+  (*detail)["elapsed_us"] = snapshot.elapsed_us;
+  (*detail)["attempted_per_second"] = snapshot.attempted_per_second;
+  (*detail)["submitted_per_second"] = snapshot.submitted_per_second;
+  (*detail)["propagated_per_second"] = snapshot.propagated_per_second;
+  (*detail)["confirmed_per_second"] = snapshot.confirmed_per_second;
+}
+
+std::string TransactionLoadProgressDetail(
+    std::uint32_t workload_index, std::uint32_t workload_count,
+    const TransactionLoadSnapshot& snapshot) {
+  boost::json::object detail;
+  detail["workload_index"] = workload_index;
+  detail["workload_count"] = workload_count;
+  AddTransactionLoadCounterFields(snapshot, &detail);
+  return boost::json::serialize(detail);
+}
+
+void WriteTransactionLoadProgress(const Options& options,
+                                  const std::filesystem::path& events_path,
+                                  std::uint32_t workload_index,
+                                  std::uint32_t workload_count,
+                                  const TransactionLoadSnapshot& snapshot) {
+  WriteEvent(
+      events_path, options.run_id, "sim",
+      SimulationEventKind::kTransactionLoadProgress,
+      TransactionLoadProgressDetail(workload_index, workload_count, snapshot));
+}
+
 std::string TransactionLoadCompletedDetail(
     uint32_t workload_index, uint32_t workload_count,
     const WalletTransactionsWorkload& workload, std::uint64_t attempt_limit,
@@ -8057,28 +8110,7 @@ std::string TransactionLoadCompletedDetail(
   detail["queue_maximum_depth"] = queue_maximum_size;
   detail["fee_reserve_satoshis"] =
       EffectiveWalletTransactionFeeReserveSatoshis(workload);
-  detail["attempted"] = snapshot.attempted;
-  detail["submitted"] = snapshot.submitted;
-  detail["rejected"] = snapshot.rejected;
-  detail["timed_out"] = snapshot.timed_out;
-  detail["backpressured"] = snapshot.backpressured;
-  detail["dropped"] = snapshot.dropped;
-  detail["cancelled"] = snapshot.cancelled;
-  detail["propagated"] = snapshot.propagated;
-  detail["confirmed"] = snapshot.confirmed;
-  detail["failed"] = snapshot.failed;
-  detail["observation_errors"] = snapshot.observation_errors;
-  detail["latency_sample_count"] = snapshot.latency_sample_count;
-  detail["latency_total_us"] = snapshot.latency_total_us;
-  detail["latency_min_us"] = snapshot.latency_min_us;
-  detail["latency_max_us"] = snapshot.latency_max_us;
-  detail["average_latency_ms"] = snapshot.average_latency_ms;
-  detail["elapsed_us"] = snapshot.elapsed_us;
-  detail["attempted_per_second"] = snapshot.attempted_per_second;
-  detail["submitted_per_second"] = snapshot.submitted_per_second;
-  detail["propagated_per_second"] = snapshot.propagated_per_second;
-  detail["confirmed_per_second"] = snapshot.confirmed_per_second;
-  detail["accounting_invariants_hold"] = snapshot.InvariantsHold();
+  AddTransactionLoadSnapshotFields(snapshot, &detail);
   return boost::json::serialize(detail);
 }
 
@@ -8381,6 +8413,11 @@ class TransactionObservationTracker {
     if (transition.first_confirmed) {
       WriteEvent(events_path, options.run_id, node_id,
                  SimulationEventKind::kTransactionConfirmed, detail);
+    }
+    if (transition.load_progress) {
+      WriteTransactionLoadProgress(
+          options, events_path, transaction.workload_index,
+          transaction.workload_count, *transition.load_progress);
     }
   }
 
@@ -11772,6 +11809,11 @@ void ApplyWalletTransactionsWorkload(
             infrastructure_error = std::move(error);
           }
         };
+    const auto record_load_progress =
+        [&](const TransactionLoadSnapshot& value) {
+          WriteTransactionLoadProgress(options, events_path, workload_index,
+                                       workload_count, value);
+        };
     const auto terminal_latency = [](const WalletTransactionLoadTask& task) {
       const auto now = std::chrono::steady_clock::now();
       if (now <= task.scheduled_at) {
@@ -11790,8 +11832,10 @@ void ApplyWalletTransactionsWorkload(
               record_infrastructure_error(std::current_exception());
             }
             try {
-              accounting->RecordOutcome(TransactionLoadOutcome::kDropped,
-                                        terminal_latency(task));
+              const TransactionLoadSnapshot progress =
+                  accounting->RecordOutcome(TransactionLoadOutcome::kDropped,
+                                            terminal_latency(task));
+              record_load_progress(progress);
             } catch (...) {
               record_infrastructure_error(std::current_exception());
             }
@@ -11980,8 +12024,10 @@ void ApplyWalletTransactionsWorkload(
               }
 
               const std::chrono::microseconds latency = terminal_latency(task);
-              accounting->RecordOutcome(outcome, latency);
+              const TransactionLoadSnapshot outcome_progress =
+                  accounting->RecordOutcome(outcome, latency);
               try {
+                record_load_progress(outcome_progress);
                 if (submitted) {
                   WriteEvent(
                       events_path, options.run_id, sender_node.config.id,
@@ -12024,19 +12070,27 @@ void ApplyWalletTransactionsWorkload(
                         std::chrono::seconds(workload.timeout_sec),
                         load_stop_token);
                 if (observations.front().observation_error) {
-                  accounting->RecordObservationError();
+                  record_load_progress(accounting->RecordObservationError());
                 }
                 if (observations.front().propagated) {
-                  confirmation->RecordPropagated(
-                      observations.front().confirmed);
+                  record_load_progress(confirmation->RecordPropagated(
+                      observations.front().confirmed));
                 }
               } catch (const SimulationCancelled&) {
-                accounting->RecordObservationError();
+                try {
+                  record_load_progress(accounting->RecordObservationError());
+                } catch (...) {
+                  record_infrastructure_error(std::current_exception());
+                }
                 worker_cancelled.store(true);
                 static_cast<void>(load_stop_source.request_stop());
                 record_dropped_tasks(queue.Cancel());
               } catch (...) {
-                accounting->RecordObservationError();
+                try {
+                  record_load_progress(accounting->RecordObservationError());
+                } catch (...) {
+                  record_infrastructure_error(std::current_exception());
+                }
                 record_infrastructure_error(std::current_exception());
               }
             }
@@ -12115,8 +12169,9 @@ void ApplyWalletTransactionsWorkload(
             const WalletIdentity& receiver =
                 wallets.at(task.plan.receiver_index);
             const std::chrono::microseconds latency = terminal_latency(task);
-            accounting->RecordOutcome(TransactionLoadOutcome::kBackpressured,
-                                      latency);
+            const TransactionLoadSnapshot progress = accounting->RecordOutcome(
+                TransactionLoadOutcome::kBackpressured, latency);
+            record_load_progress(progress);
             WriteEvent(
                 events_path, options.run_id,
                 nodes.at(sender.node - 1U).config.id,
