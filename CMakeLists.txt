@@ -15,6 +15,7 @@ set(BOOST_INCLUDE_LIBRARIES
   hash2
   json
   log
+  multiprecision
   program_options
   random
   system
@@ -289,6 +290,7 @@ target_link_libraries(bbp PRIVATE
   Boost::json
   Boost::log
   Boost::log_setup
+  Boost::multiprecision
   Boost::program_options
   Boost::random
   Boost::system
@@ -481,6 +483,7 @@ if(BUILD_TESTING)
     Boost::json
     Boost::log
     Boost::log_setup
+    Boost::multiprecision
     Boost::random
     Boost::unit_test_framework
     Boost::system
@@ -496,6 +499,12 @@ if(BUILD_TESTING)
     -Werror
   )
   add_test(NAME bbp-unit-tests COMMAND bbp-unit-tests)
+  add_test(NAME bbp-vendored-boost-multiprecision
+    COMMAND "${CMAKE_COMMAND}"
+      "-DCOMPILE_COMMANDS=${CMAKE_BINARY_DIR}/compile_commands.json"
+      "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/vendored_boost_multiprecision.cmake"
+  )
 
   function(add_cli_failure_test name scenario regex)
     add_test(NAME "${name}"
