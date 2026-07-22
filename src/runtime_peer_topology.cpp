@@ -93,10 +93,20 @@ std::map<EdgeKey, InitialEdgeState> InitialEdges(
 }  // namespace
 
 RuntimePeerTopology::RuntimePeerTopology(const PeerTopologyConfig& topology,
-                                         std::uint32_t node_count)
+                                         std::uint32_t node_count,
+                                         bool allow_empty)
     : node_count_(node_count) {
   if (node_count_ == 0U) {
-    throw std::runtime_error("runtime topology requires at least one node");
+    const bool default_empty_topology =
+        topology.kind == PeerTopologyKind::kFullMesh && topology.seed == 0U &&
+        topology.star_center == 0U && topology.average_degree == 0U &&
+        topology.attachment_count == 0U && topology.edges.empty() &&
+        topology.groups.empty() && topology.latency_matrix_ms.empty() &&
+        topology.regions.empty() && topology.region_edges.empty();
+    if (!allow_empty || !default_empty_topology) {
+      throw std::runtime_error("runtime topology requires at least one node");
+    }
+    return;
   }
   std::vector<std::uint32_t> next_band(node_count_, 0U);
   for (const auto& [nodes, state] : InitialEdges(topology, node_count_)) {

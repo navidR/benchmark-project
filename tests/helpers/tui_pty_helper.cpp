@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -546,6 +547,103 @@ void RequireOwnedResourcesRemoved(const std::filesystem::path& run_root,
   RequireNoRpcCredentials(run_root);
 }
 
+void RequirePrivateMcpPath(const std::filesystem::path& path, mode_t type,
+                           mode_t permissions) {
+  struct stat status {};
+  if (lstat(path.c_str(), &status) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "inspect MCP publication");
+  }
+  if ((status.st_mode & S_IFMT) != type ||
+      (status.st_mode & 0777) != permissions || status.st_uid != geteuid()) {
+    throw std::runtime_error("MCP publication type, mode, or owner mismatch: " +
+                             path.string());
+  }
+}
+
+void CheckEmptyControlPlane(const std::filesystem::path& command) {
+  OwnedTemporaryDirectory directory("empty-control-plane");
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::string run_id =
+      "empty-control-plane-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  const std::filesystem::path mcp_path = run_root / "mcp";
+  const std::filesystem::path token_path = mcp_path / "token";
+  const std::filesystem::path client_path = mcp_path / "client.json";
+
+  PtyProcess process(
+      command,
+      {"--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--refresh-ms", "50", "--metrics-interval", "50ms"},
+      30, 120);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "empty control plane"));
+  const std::string resolved =
+      WaitForFileText(run_root / "resolved-scenario.json", "\"nodes\":0", 5s);
+  RequireContains(resolved, "\"node_configs\":[]",
+                  "empty control-plane resolved scenario");
+  RequireContains(resolved, "\"enabled\":false",
+                  "empty control-plane block production");
+  const std::string client =
+      WaitForFileText(client_path, "\"codex_config_toml\"", 5s);
+  const std::string token = ReadFile(token_path);
+  if (token.size() != 65U || token.back() != '\n' ||
+      !std::all_of(token.begin(), token.end() - 1, [](unsigned char character) {
+        return std::isxdigit(character) != 0;
+      })) {
+    throw std::runtime_error("empty control-plane MCP token is invalid");
+  }
+  RequirePrivateMcpPath(mcp_path, S_IFDIR, 0700);
+  RequirePrivateMcpPath(token_path, S_IFREG, 0600);
+  RequirePrivateMcpPath(client_path, S_IFREG, 0600);
+  RequireContains(client,
+                  "http://127.0.0.1:", "empty control-plane MCP endpoint");
+  RequireContains(client, "Bearer ", "empty control-plane MCP authentication");
+  RequireContains(client, "[mcp_servers.bbp]",
+                  "empty control-plane Codex configuration");
+  RequireContains(client, "\"opencode_config\"",
+                  "empty control-plane OpenCode configuration");
+
+  std::string events = WaitForFileOccurrences(
+      events_path, "\"event\":\"metrics_sample\"", 2U, 5s);
+  RequireNotContains(events, "\"event\":\"process_started\"",
+                     "empty control plane");
+  if (!process.Running()) {
+    throw std::runtime_error("empty control plane exited without a request");
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(
+      process.ReadUntil("Confirm exit", 3s, "empty control-plane exit modal"));
+  process.Write("n");
+  const std::size_t samples_before =
+      CountOccurrences(events, "\"event\":\"metrics_sample\"");
+  events = WaitForFileOccurrences(events_path, "\"event\":\"metrics_sample\"",
+                                  samples_before + 2U, 5s);
+  if (!process.Running() || !std::filesystem::exists(client_path)) {
+    throw std::runtime_error(
+        "Esc,n stopped the empty control plane or its MCP endpoint");
+  }
+  RequireNotContains(events, "\"event\":\"run_cancelled\"",
+                     "empty control-plane cancel path");
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s, "empty control-plane confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "empty RunBenchmarkWithTui exit");
+  const std::string finished =
+      WaitForFileText(events_path, "\"event\":\"run_finished\"", 3s);
+  RequireContains(finished, "\"event\":\"run_cancelled\"",
+                  "empty control-plane confirmed exit");
+  if (std::filesystem::exists(mcp_path)) {
+    throw std::runtime_error(
+        "MCP publication survived empty control-plane cleanup");
+  }
+  RequireOwnedResourcesRemoved(run_root, 0U, {}, {});
+}
+
 void CheckFiniteDirectLoadOption(const std::filesystem::path& command,
                                  const std::filesystem::path& daemon,
                                  const std::filesystem::path& benchmark_root) {
@@ -947,6 +1045,17 @@ int main(int argc, char** argv) {
       return 0;
     } catch (const std::exception& error) {
       std::cerr << "direct-load lifecycle regression failed: " << error.what()
+                << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--empty-control-plane") {
+    try {
+      CheckEmptyControlPlane(argv[2]);
+      std::cout << "empty zero-node TUI and MCP lifecycle checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "empty control-plane regression failed: " << error.what()
                 << '\n';
       return 1;
     }

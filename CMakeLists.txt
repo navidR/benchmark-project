@@ -1799,6 +1799,11 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-live-load"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
   )
+  add_test(NAME bbp-empty-control-plane-lifecycle
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --empty-control-plane
+      $<TARGET_FILE:bbp>
+  )
   add_test(NAME bbp-tui-shared-modal-epilogue
     COMMAND "${CMAKE_COMMAND}"
       "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/tui.cpp"

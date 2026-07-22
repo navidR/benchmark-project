@@ -72,6 +72,19 @@ BOOST_AUTO_TEST_CASE(runtime_peer_topology_validates_inventory_and_updates) {
   BOOST_CHECK_THROW(topology.ActivePeerIndexes(2U), std::out_of_range);
 }
 
+BOOST_AUTO_TEST_CASE(runtime_peer_topology_allows_only_explicit_default_empty) {
+  bbp::PeerTopologyConfig config;
+  BOOST_CHECK_THROW(bbp::RuntimePeerTopology(config, 0U), std::runtime_error);
+
+  const bbp::RuntimePeerTopology empty(config, 0U, true);
+  BOOST_TEST(empty.edges().empty());
+  BOOST_CHECK_THROW(empty.ActivePeerIndexes(0U), std::out_of_range);
+
+  config.kind = bbp::PeerTopologyKind::kCustomEdgeList;
+  BOOST_CHECK_THROW(bbp::RuntimePeerTopology(config, 0U, true),
+                    std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(
     runtime_peer_topology_preserves_inactive_conditioned_region_edges) {
   bbp::NetworkCondition condition;

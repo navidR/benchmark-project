@@ -22,7 +22,7 @@ struct RuntimePeerTopologyEdge {
 class RuntimePeerTopology {
  public:
   RuntimePeerTopology(const PeerTopologyConfig& topology,
-                      std::uint32_t node_count);
+                      std::uint32_t node_count, bool allow_empty = false);
 
   const std::vector<RuntimePeerTopologyEdge>& edges() const;
   const RuntimePeerTopologyEdge& Edge(std::uint32_t from,

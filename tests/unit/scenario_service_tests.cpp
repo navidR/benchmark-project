@@ -104,6 +104,12 @@ BOOST_AUTO_TEST_CASE(scenario_service_returns_production_resolved_document) {
                  .as_string() == "firo-1");
 }
 
+BOOST_AUTO_TEST_CASE(scenario_service_preserves_explicit_node_minimum) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 0U;
+  BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(
     scenario_service_parses_live_commands_with_scheduled_rules) {
   const Options options = ParseAndValidateScenario(MinimalScenario());

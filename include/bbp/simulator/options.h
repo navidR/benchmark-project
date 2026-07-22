@@ -53,6 +53,7 @@ struct Options {
   CleanupPolicy cleanup_policy = CleanupPolicy::kAutomatic;
   PrivilegeMode privilege_mode = PrivilegeMode::kDirect;
   LogRetentionPolicy log_retention_policy = LogRetentionPolicy::kPreserve;
+  bool empty_control_plane = false;
   std::uint32_t nodes = 1;
   std::vector<std::string> node_ids;
   std::vector<std::string> node_roles;

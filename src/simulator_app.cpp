@@ -5268,6 +5268,16 @@ Options ParseOptions(int argc, char** argv,
     }
     ApplyScenarioJson(scenario.as_object(), vm, options);
   }
+  const bool initial_inventory_requested =
+      in_memory_scenario != nullptr || !options.scenario_json.empty() ||
+      !options.scenario_yaml.empty() || OptionProvided(vm, "nodes") ||
+      OptionProvided(vm, "generate-node") || node_binary_option_count != 0U;
+  if (stored_run_operation_count == 0U && !initial_inventory_requested) {
+    options.empty_control_plane = true;
+    options.nodes = 0U;
+    options.generate_node = 0U;
+    options.block_production.enabled = false;
+  }
   if (options.simulation_name.empty()) {
     options.simulation_name = options.run_id;
   }
@@ -5340,14 +5350,23 @@ Options ParseOptions(int argc, char** argv,
     throw std::runtime_error(
         "network runtime options require --isolate-network");
   }
-  if (options.nodes < 1 || options.nodes > chain_spec.max_nodes) {
+  if (options.empty_control_plane) {
+    if (options.nodes != 0U || options.generate_node != 0U ||
+        options.topology.configured || !options.node_ids.empty() ||
+        !options.node_roles.empty() || !options.scenario_node_configs.empty()) {
+      throw std::runtime_error(
+          "empty control-plane runs must not define an initial node inventory");
+    }
+  } else if (options.nodes < 1 || options.nodes > chain_spec.max_nodes) {
     throw std::runtime_error("--nodes currently supports 1.." +
                              std::to_string(chain_spec.max_nodes) +
                              " for chain smoke runs");
   }
   RuntimePeerTopology validated_runtime_topology(options.topology.peer_topology,
-                                                 options.nodes);
-  if (options.generate_node == 0U || options.generate_node > options.nodes) {
+                                                 options.nodes,
+                                                 options.empty_control_plane);
+  if (!options.empty_control_plane &&
+      (options.generate_node == 0U || options.generate_node > options.nodes)) {
     throw std::runtime_error("--generate-node must be in 1..--nodes");
   }
   if (options.workloads.size() > kMaximumScenarioActionCount ||
@@ -5585,10 +5604,10 @@ Options ParseOptions(int argc, char** argv,
   }
   RequireSafeRunId(options.run_id);
   const bool needs_chain_daemon =
-      !options.probe_network && options.report_run.empty() &&
-      options.tui_run.empty() && !options.probe_bandwidth_limit &&
-      !options.probe_capabilities && !options.probe_cgroup_freeze &&
-      !options.probe_drop_filter &&
+      !options.empty_control_plane && !options.probe_network &&
+      options.report_run.empty() && options.tui_run.empty() &&
+      !options.probe_bandwidth_limit && !options.probe_capabilities &&
+      !options.probe_cgroup_freeze && !options.probe_drop_filter &&
       !options.probe_directional_network_condition && !options.probe_netns &&
       !options.probe_veth && !options.probe_address && !options.probe_route &&
       !options.probe_qdisc && !options.probe_qdisc_mutation &&
@@ -6371,6 +6390,9 @@ std::vector<uint32_t> ConfiguredStartupPeerIndexes(
 }
 
 bool TopologyHasDirectionalNetworkConditions(const Options& options) {
+  if (options.empty_control_plane) {
+    return false;
+  }
   const std::vector<ResolvedPeerTopologyEdge> edges =
       ResolvePeerTopologyEdges(options.topology.peer_topology, options.nodes);
   return std::any_of(edges.begin(), edges.end(), [](const auto& edge) {
@@ -9356,7 +9378,8 @@ boost::json::object BuildResolvedScenarioDocument(
         NodeRoleTopologyJson(options.topology, options.wallet_initialization);
   }
   resolved["topology_initial_edges"] = RuntimePeerTopologyEdgesJson(
-      RuntimePeerTopology(options.topology.peer_topology, options.nodes));
+      RuntimePeerTopology(options.topology.peer_topology, options.nodes,
+                          options.empty_control_plane));
   if (!options.resource_profiles.empty()) {
     boost::json::object profiles;
     for (const auto& [name, limits] : options.resource_profiles) {
@@ -13510,6 +13533,9 @@ std::filesystem::path BenchmarkRunRoot(const Options& options) {
 }
 
 std::vector<std::uint32_t> ConfiguredMinerIndexes(const Options& options) {
+  if (options.empty_control_plane) {
+    return {};
+  }
   if (options.topology.configured) {
     return options.topology.miner_nodes;
   }
@@ -14004,7 +14030,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   BBP_LOG(info) << "starting run " << options.run_id;
   EnsureDirectory(run_root / "nodes");
   std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
-  if (options.isolate_network) {
+  if (options.isolate_network && !options.empty_control_plane) {
     network_allocation_lock = std::make_unique<NetworkAllocationLock>();
     RequireRunNetworkInterfacesAvailable(options, stop_token);
     options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
@@ -14012,7 +14038,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   }
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   RuntimePeerTopology runtime_topology(options.topology.peer_topology,
-                                       options.nodes);
+                                       options.nodes,
+                                       options.empty_control_plane);
   SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
       options.topology, options.wallet_initialization);
   WriteScenarioFiles(options, run_root, chain_spec);
@@ -14385,35 +14412,41 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     for (const NodeRuntime& node : nodes) {
       log_nodes.push_back(node.config);
     }
-    peer_connectivity_controller = std::make_unique<PeerConnectivityController>(
-        driver, log_nodes, InitialPeerCountPolicies(options, nodes),
-        InitialAllowedPeers(runtime_topology, nodes), options.metrics_interval,
-        [&](std::string_view node_id) {
-          return FindNodeRuntimeById(nodes, std::string(node_id))
-              .AllowsChainMetrics();
-        },
-        [&](std::string_view node_id, std::string_view peer_node_id,
-            PeerConnectivityAction action, const PeerCountPolicy& policy) {
-          boost::json::object detail;
-          detail["peer_node_id"] = peer_node_id;
-          detail["minimum_peer_count"] = policy.minimum();
-          detail["maximum_peer_count"] = policy.maximum();
-          const SimulationEventKind event_kind =
-              action == PeerConnectivityAction::kConnected
-                  ? SimulationEventKind::kPeerPolicyConnected
-                  : SimulationEventKind::kPeerPolicyDisconnected;
-          WriteEvent(events_path, options.run_id, std::string(node_id),
-                     event_kind, boost::json::serialize(detail));
-          BBP_LOG(info) << SimulationEventKindName(event_kind) << " " << node_id
-                        << " -> " << peer_node_id;
-        },
-        [&](std::string_view node_id, std::string_view error) {
-          WriteEvent(events_path, options.run_id, std::string(node_id),
-                     SimulationEventKind::kPeerPolicyEnforcementFailed, error);
-          BBP_LOG(warning) << "peer policy enforcement failed for " << node_id
-                           << ": " << error;
-        });
-    if (active_command_queue != nullptr) {
+    if (!nodes.empty()) {
+      peer_connectivity_controller =
+          std::make_unique<PeerConnectivityController>(
+              driver, log_nodes, InitialPeerCountPolicies(options, nodes),
+              InitialAllowedPeers(runtime_topology, nodes),
+              options.metrics_interval,
+              [&](std::string_view node_id) {
+                return FindNodeRuntimeById(nodes, std::string(node_id))
+                    .AllowsChainMetrics();
+              },
+              [&](std::string_view node_id, std::string_view peer_node_id,
+                  PeerConnectivityAction action,
+                  const PeerCountPolicy& policy) {
+                boost::json::object detail;
+                detail["peer_node_id"] = peer_node_id;
+                detail["minimum_peer_count"] = policy.minimum();
+                detail["maximum_peer_count"] = policy.maximum();
+                const SimulationEventKind event_kind =
+                    action == PeerConnectivityAction::kConnected
+                        ? SimulationEventKind::kPeerPolicyConnected
+                        : SimulationEventKind::kPeerPolicyDisconnected;
+                WriteEvent(events_path, options.run_id, std::string(node_id),
+                           event_kind, boost::json::serialize(detail));
+                BBP_LOG(info) << SimulationEventKindName(event_kind) << " "
+                              << node_id << " -> " << peer_node_id;
+              },
+              [&](std::string_view node_id, std::string_view error) {
+                WriteEvent(events_path, options.run_id, std::string(node_id),
+                           SimulationEventKind::kPeerPolicyEnforcementFailed,
+                           error);
+                BBP_LOG(warning) << "peer policy enforcement failed for "
+                                 << node_id << ": " << error;
+              });
+    }
+    if (active_command_queue != nullptr && !nodes.empty()) {
       chain_command_executor = std::make_unique<ChainCommandExecutor>(
           driver, log_nodes,
           [&](const ChainNodeConfig& config,
@@ -15272,7 +15305,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     wallets_initialized.store(true, std::memory_order_release);
 
     ThrowIfStopRequested(stop_token);
-    peer_connectivity_controller->Start();
+    if (peer_connectivity_controller) {
+      peer_connectivity_controller->Start();
+    }
     if (options.block_production.enabled) {
       if (options.block_production.mode == MiningMode::kNativeMining) {
         for (const std::uint32_t miner_index : miner_indexes) {
