@@ -715,6 +715,7 @@ boost::json::object EvidenceRecordSchema() {
   properties["kind"] = IdentifierSchema();
   properties["message"] = StringSchema();
   properties["artifact_id"] = IdentifierSchema();
+  properties["data"] = boost::json::object{};
   return ClosedObject(std::move(properties),
                       Required({"family", "sequence", "timestamp_ms"}));
 }

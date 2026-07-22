@@ -493,6 +493,18 @@ std::uint64_t SimulationCommandQueue::PushScenarioCommand(
   return PushCommand(std::move(command));
 }
 
+std::uint64_t SimulationCommandQueue::PushRuntimeCommand(
+    SimulationCommand command) {
+  if (command.scheduled_event_sequence) {
+    throw std::runtime_error(
+        "runtime command must not contain a scheduled event sequence");
+  }
+  if (!command.confirmed) {
+    throw std::runtime_error("runtime command must be explicitly authorized");
+  }
+  return PushCommand(std::move(command));
+}
+
 std::uint64_t SimulationCommandQueue::PushProfileCommand(
     SimulationCommandKind kind, std::string node_id, std::string profile,
     bool confirmed) {

@@ -114,6 +114,7 @@ struct McpEvidenceRecord {
   std::optional<std::string> kind;
   std::optional<std::string> message;
   std::optional<std::string> artifact_id;
+  std::optional<boost::json::value> data;
 };
 
 struct McpSubscriptionRequest {

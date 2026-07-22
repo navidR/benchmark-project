@@ -162,14 +162,16 @@ BOOST_AUTO_TEST_CASE(
                                        .node_id = "node-1",
                                        .kind = "ignored",
                                        .message = std::nullopt,
-                                       .artifact_id = std::nullopt});
+                                       .artifact_id = std::nullopt,
+                                       .data = std::nullopt});
   dispatcher.Publish(McpEvidenceRecord{.family = McpInformationFamily::kMetrics,
                                        .sequence = 0U,
                                        .timestamp_ms = 2U,
                                        .node_id = "node-1",
                                        .kind = "sample",
                                        .message = "ready",
-                                       .artifact_id = std::nullopt});
+                                       .artifact_id = std::nullopt,
+                                       .data = std::nullopt});
   const boost::json::object page =
       Invoke(&dispatcher, "subscription.poll",
              boost::json::object{

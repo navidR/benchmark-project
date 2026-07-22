@@ -44,6 +44,7 @@
 #include "bbp/log_tail.h"
 #include "bbp/logging.h"
 #include "bbp/mcp_endpoint.h"
+#include "bbp/mcp_live_application.h"
 #include "bbp/network.h"
 #include "bbp/network_allocation_lock.h"
 #include "bbp/node_log_collector.h"
@@ -13961,16 +13962,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       external_stop_token,
       [&simulation_stop_source] { simulation_stop_source.request_stop(); });
   const std::stop_token stop_token = simulation_stop_source.get_token();
-  const bool has_scheduled_commands = std::any_of(
-      options.scheduled_events.begin(), options.scheduled_events.end(),
-      [](const auto& event) {
-        return std::holds_alternative<SimulationCommand>(event.action);
-      });
   SimulationCommandQueue scenario_command_queue;
   SimulationCommandQueue* active_command_queue =
-      command_queue != nullptr
-          ? command_queue
-          : (has_scheduled_commands ? &scenario_command_queue : nullptr);
+      command_queue != nullptr ? command_queue : &scenario_command_queue;
   std::mutex scheduled_command_outcome_mutex;
   std::condition_variable_any scheduled_command_outcome_ready;
   std::map<std::uint32_t, std::optional<std::string>>
@@ -14050,10 +14044,20 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   WriteEvent(events_path, options.run_id, "sim",
              SimulationEventKind::kRunStarted);
 
+  McpLiveApplication mcp_application(
+      McpLiveApplication::Config{.run_id = options.run_id,
+                                 .run_root = run_root,
+                                 .options = &options,
+                                 .command_queue = active_command_queue,
+                                 .request_run_stop = [&simulation_stop_source] {
+                                   simulation_stop_source.request_stop();
+                                 }});
   McpEndpoint mcp_endpoint(McpEndpointConfig{.run_root = run_root,
                                              .run_id = options.run_id,
                                              .server = {},
-                                             .dispatcher = {}});
+                                             .dispatcher = {}},
+                           mcp_application.OperationFactory(),
+                           mcp_application.ResourceReader());
   try {
     mcp_endpoint.Start();
     const McpEndpointPublication publication = mcp_endpoint.publication();
@@ -15031,7 +15035,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                 << SimulationCommandKindName(command.kind) << " for "
                 << command.node_id << " failed: " << error;
           },
-          record_scheduled_command_outcome);
+          [&](const SimulationCommand& command,
+              std::optional<std::string_view> error) {
+            record_scheduled_command_outcome(command, error);
+            mcp_application.RecordCommandOutcome(command, error);
+          });
     }
     const std::set<std::string> configured_miners(miner_node_ids.begin(),
                                                   miner_node_ids.end());

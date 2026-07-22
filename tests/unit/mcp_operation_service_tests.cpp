@@ -87,7 +87,8 @@ McpEvidenceRecord Evidence(McpInformationFamily family, std::string node_id,
                            .node_id = std::move(node_id),
                            .kind = "sample",
                            .message = std::move(message),
-                           .artifact_id = std::nullopt};
+                           .artifact_id = std::nullopt,
+                           .data = std::nullopt};
 }
 
 }  // namespace

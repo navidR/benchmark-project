@@ -212,6 +212,10 @@ void ValidateEvidenceRecord(const McpEvidenceRecord& record) {
   if (record.message && record.message->size() > kMcpMaximumEvidenceTextBytes) {
     throw std::invalid_argument("evidence message exceeds retained byte limit");
   }
+  if (record.data && boost::json::serialize(*record.data).size() >
+                         kMcpMaximumRetainedResultBytes) {
+    throw std::invalid_argument("evidence data exceeds retained byte limit");
+  }
 }
 
 McpServiceNotification OperationNotification(
@@ -1237,6 +1241,9 @@ boost::json::object McpEvidenceRecordJson(const McpEvidenceRecord& record) {
   }
   if (record.artifact_id) {
     result["artifact_id"] = *record.artifact_id;
+  }
+  if (record.data) {
+    result["data"] = *record.data;
   }
   return result;
 }
