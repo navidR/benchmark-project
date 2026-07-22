@@ -110,7 +110,8 @@ BOOST_AUTO_TEST_CASE(operator_connection_renders_every_argv_element) {
              "'-datadir=/tmp/a'\"'\"'b' '$(touch /tmp/x)'");
 
   connection.executable.clear();
-  BOOST_CHECK_THROW(connection.ShellCommand(), std::invalid_argument);
+  BOOST_CHECK_THROW(static_cast<void>(connection.ShellCommand()),
+                    std::invalid_argument);
 }
 
 BOOST_AUTO_TEST_CASE(operator_connection_is_recovered_from_run_report) {
