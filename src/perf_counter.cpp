@@ -14,7 +14,9 @@ extern "C" {
 #include <algorithm>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -282,6 +284,65 @@ std::uint64_t SaturatingUint64(const boost::multiprecision::uint128_t& value,
   return static_cast<std::uint64_t>(value);
 }
 
+std::vector<pid_t> ReadProcessThreadIds(pid_t pid) {
+  std::vector<pid_t> tids;
+  const std::filesystem::path task_path =
+      std::filesystem::path("/proc") / std::to_string(pid) / "task";
+  try {
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(task_path)) {
+      const std::string name = entry.path().filename().string();
+      long long parsed = 0;
+      const auto [end, error] =
+          std::from_chars(name.data(), name.data() + name.size(), parsed);
+      if (error != std::errc{} || end != name.data() + name.size() ||
+          parsed <= 0 ||
+          parsed > static_cast<long long>(std::numeric_limits<pid_t>::max())) {
+        throw PerfCounterError(
+            PerfCounterErrorKind::kInternal, EIO,
+            "invalid thread id in process task directory: " + name);
+      }
+      tids.push_back(static_cast<pid_t>(parsed));
+    }
+  } catch (const PerfCounterError&) {
+    throw;
+  } catch (const std::filesystem::filesystem_error& error) {
+    int error_number = error.code().value();
+    if (error_number <= 0) {
+      error_number = EIO;
+    }
+    const PerfCounterErrorKind kind =
+        error_number == ENOENT || error_number == ESRCH
+            ? PerfCounterErrorKind::kProcessUnavailable
+            : ClassifyPerfError(error_number);
+    throw PerfCounterError(kind, error_number,
+                           "enumerate process threads for perf failed: " +
+                               std::string(std::strerror(error_number)));
+  }
+
+  std::sort(tids.begin(), tids.end());
+  if (tids.empty() || !std::binary_search(tids.begin(), tids.end(), pid)) {
+    throw PerfCounterError(PerfCounterErrorKind::kProcessUnavailable, ESRCH,
+                           "process has no live leader thread for perf");
+  }
+  if (tids.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw PerfCounterError(PerfCounterErrorKind::kResourceExhausted, EOVERFLOW,
+                           "process thread count exceeds libperf limit");
+  }
+  return tids;
+}
+
+void CheckedAggregate(std::uint64_t amount, std::string_view field,
+                      PerfCounterKind kind, std::uint64_t* total) {
+  if (*total > std::numeric_limits<std::uint64_t>::max() - amount) {
+    throw PerfCounterError(PerfCounterErrorKind::kInternal, EOVERFLOW,
+                           "aggregate process " +
+                               std::string(PerfCounterKindName(kind)) + " " +
+                               std::string(field) + " exceeds uint64");
+  }
+  *total += amount;
+}
+
 }  // namespace
 
 std::string_view PerfCounterKindName(PerfCounterKind kind) {
@@ -432,51 +493,72 @@ ProcessPerfCounters ProcessPerfCounters::Open(
   ValidateCounterSelection(kinds);
 
   InitializeLibperf();
-  ThreadMapPtr threads(perf_thread_map__new_dummy());
-  if (!threads) {
-    throw PerfCounterError(PerfCounterErrorKind::kResourceExhausted, ENOMEM,
-                           "create libperf thread map failed: out of memory");
-  }
-  perf_thread_map__set_pid(threads.get(), 0, pid);
-
-  auto impl = std::make_unique<Impl>(pid, kinds, std::move(threads));
-  impl->events.reserve(kinds.size());
-  for (const PerfCounterKind kind : kinds) {
-    const PerfEventEncoding encoding = CounterEncoding(kind);
-    perf_event_attr attributes{};
-    attributes.size = sizeof(attributes);
-    attributes.type = encoding.type;
-    attributes.config = encoding.config;
-    attributes.read_format =
-        PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
-    attributes.disabled = 1;
-    attributes.inherit = 1;
-    attributes.inherit_stat = 1;
-
-    EvselPtr event(perf_evsel__new(&attributes));
-    if (!event) {
-      throw PerfCounterError(PerfCounterErrorKind::kResourceExhausted, ENOMEM,
-                             "create libperf event selector for " +
-                                 std::string(PerfCounterKindName(kind)) +
-                                 " failed: out of memory");
+  constexpr std::size_t kMaximumAttachmentAttempts = 8U;
+  for (std::size_t attempt = 0U; attempt < kMaximumAttachmentAttempts;
+       ++attempt) {
+    std::vector<pid_t> tids = ReadProcessThreadIds(pid);
+    ThreadMapPtr threads(
+        perf_thread_map__new_array(static_cast<int>(tids.size()), tids.data()));
+    if (!threads) {
+      throw PerfCounterError(
+          PerfCounterErrorKind::kResourceExhausted, ENOMEM,
+          "create libperf process thread map failed: out of memory");
     }
-    errno = 0;
-    const int opened =
-        perf_evsel__open(event.get(), nullptr, impl->threads.get());
-    if (opened != 0) {
-      ThrowPerfOperationError("open libperf event", kind, opened);
-    }
-    impl->events.push_back(std::move(event));
-  }
 
-  for (std::size_t index = 0; index < impl->events.size(); ++index) {
-    errno = 0;
-    const int enabled = perf_evsel__enable(impl->events[index].get());
-    if (enabled != 0) {
-      ThrowPerfOperationError("enable libperf event", kinds[index], enabled);
+    auto impl = std::make_unique<Impl>(pid, kinds, std::move(threads));
+    impl->events.reserve(kinds.size());
+    bool retry = false;
+    for (const PerfCounterKind kind : kinds) {
+      const PerfEventEncoding encoding = CounterEncoding(kind);
+      perf_event_attr attributes{};
+      attributes.size = sizeof(attributes);
+      attributes.type = encoding.type;
+      attributes.config = encoding.config;
+      attributes.read_format =
+          PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+      attributes.disabled = 1;
+      attributes.inherit = 1;
+      attributes.inherit_stat = 1;
+      attributes.inherit_thread = 1;
+
+      EvselPtr event(perf_evsel__new(&attributes));
+      if (!event) {
+        throw PerfCounterError(PerfCounterErrorKind::kResourceExhausted, ENOMEM,
+                               "create libperf event selector for " +
+                                   std::string(PerfCounterKindName(kind)) +
+                                   " failed: out of memory");
+      }
+      errno = 0;
+      const int opened =
+          perf_evsel__open(event.get(), nullptr, impl->threads.get());
+      if (opened != 0) {
+        const int error_number = opened < -1 ? -opened : errno;
+        if (error_number == ESRCH) {
+          retry = true;
+          break;
+        }
+        ThrowPerfOperationError("open libperf event", kind, opened);
+      }
+      impl->events.push_back(std::move(event));
+    }
+    if (retry) {
+      continue;
+    }
+
+    for (std::size_t index = 0; index < impl->events.size(); ++index) {
+      errno = 0;
+      const int enabled = perf_evsel__enable(impl->events[index].get());
+      if (enabled != 0) {
+        ThrowPerfOperationError("enable libperf event", kinds[index], enabled);
+      }
+    }
+    if (ReadProcessThreadIds(pid) == tids) {
+      return ProcessPerfCounters(std::move(impl));
     }
   }
-  return ProcessPerfCounters(std::move(impl));
+  throw PerfCounterError(
+      PerfCounterErrorKind::kResourceExhausted, EAGAIN,
+      "process thread map did not stabilize during libperf attachment");
 }
 
 ProcessPerfCounters::ProcessPerfCounters(std::unique_ptr<Impl> impl)
@@ -498,25 +580,56 @@ std::vector<PerfCounterValue> ProcessPerfCounters::Read() const {
   std::vector<PerfCounterValue> values;
   values.reserve(impl_->events.size());
   for (std::size_t index = 0; index < impl_->events.size(); ++index) {
-    perf_counts_values counts{};
-    errno = 0;
-    const int result =
-        perf_evsel__read(impl_->events[index].get(), 0, 0, &counts);
-    if (result != 0) {
-      ThrowPerfOperationError("read libperf event", impl_->kinds[index],
-                              result);
+    std::uint64_t raw_value = 0U;
+    std::uint64_t time_enabled = 0U;
+    std::uint64_t time_running = 0U;
+    boost::multiprecision::uint128_t scaled_total = 0U;
+    bool scaled_available = true;
+    bool multiplexed = false;
+    bool scaled = false;
+    bool scaled_overflow = false;
+    const int thread_count = perf_thread_map__nr(impl_->threads.get());
+    for (int thread = 0; thread < thread_count; ++thread) {
+      perf_counts_values counts{};
+      errno = 0;
+      const int result =
+          perf_evsel__read(impl_->events[index].get(), 0, thread, &counts);
+      if (result != 0) {
+        ThrowPerfOperationError("read libperf event", impl_->kinds[index],
+                                result);
+      }
+      CheckedAggregate(counts.val, "raw value", impl_->kinds[index],
+                       &raw_value);
+      CheckedAggregate(counts.ena, "enabled time", impl_->kinds[index],
+                       &time_enabled);
+      CheckedAggregate(counts.run, "running time", impl_->kinds[index],
+                       &time_running);
+      multiplexed = multiplexed || counts.run < counts.ena;
+      const ScaledPerfCounterValue thread_scaled =
+          ScalePerfCounterValue(counts.val, counts.ena, counts.run);
+      if (thread_scaled.value) {
+        scaled_total += *thread_scaled.value;
+        scaled = scaled || thread_scaled.scaled;
+        scaled_overflow = scaled_overflow || thread_scaled.overflow;
+      } else if (counts.val != 0U || counts.ena != 0U) {
+        scaled_available = false;
+      }
     }
-    const ScaledPerfCounterValue scaled =
-        ScalePerfCounterValue(counts.val, counts.ena, counts.run);
+    std::optional<std::uint64_t> scaled_value;
+    if (scaled_available) {
+      bool aggregate_overflow = false;
+      scaled_value = SaturatingUint64(scaled_total, &aggregate_overflow);
+      scaled_overflow = scaled_overflow || aggregate_overflow;
+    }
     values.push_back({
         .kind = impl_->kinds[index],
-        .raw_value = counts.val,
-        .scaled_value = scaled.value,
-        .time_enabled_ns = counts.ena,
-        .time_running_ns = counts.run,
-        .multiplexed = counts.run < counts.ena,
-        .scaled = scaled.scaled,
-        .scaled_overflow = scaled.overflow,
+        .raw_value = raw_value,
+        .scaled_value = scaled_value,
+        .time_enabled_ns = time_enabled,
+        .time_running_ns = time_running,
+        .multiplexed = multiplexed,
+        .scaled = scaled,
+        .scaled_overflow = scaled_overflow,
     });
   }
   return values;

@@ -1,18 +1,105 @@
+#include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <boost/test/unit_test.hpp>
+#include <cerrno>
+#include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "bbp/perf_counter.h"
 #include "bbp/util.h"
 
 namespace {
+
+class ChildGuard {
+ public:
+  explicit ChildGuard(pid_t pid) : pid_(pid) {}
+  ChildGuard(const ChildGuard&) = delete;
+  ChildGuard& operator=(const ChildGuard&) = delete;
+
+  ~ChildGuard() {
+    if (pid_ <= 0) {
+      return;
+    }
+    (void)kill(pid_, SIGKILL);
+    int status = 0;
+    while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+
+  int Wait() {
+    int status = 0;
+    pid_t waited = -1;
+    do {
+      waited = waitpid(pid_, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited == pid_) {
+      pid_ = -1;
+    }
+    return status;
+  }
+
+ private:
+  pid_t pid_;
+};
+
+bool WriteByte(int fd) {
+  const char value = 'x';
+  ssize_t written = -1;
+  do {
+    written = write(fd, &value, 1U);
+  } while (written < 0 && errno == EINTR);
+  return written == 1;
+}
+
+bool ReadByte(int fd) {
+  char value = 0;
+  ssize_t read_count = -1;
+  do {
+    read_count = read(fd, &value, 1U);
+  } while (read_count < 0 && errno == EINTR);
+  return read_count == 1;
+}
+
+void ClosePipe(int pipe_fds[2]) {
+  (void)close(pipe_fds[0]);
+  (void)close(pipe_fds[1]);
+}
+
+bool BurnThreadCpu(std::int64_t target_ns) {
+  timespec cpu_started{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_started) != 0) {
+    return false;
+  }
+  volatile std::uint64_t accumulator = 0U;
+  while (true) {
+    for (std::uint64_t index = 0U; index < 100'000U; ++index) {
+      accumulator = accumulator + index;
+    }
+    timespec cpu_now{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_now) != 0) {
+      return false;
+    }
+    const std::int64_t elapsed_ns =
+        static_cast<std::int64_t>(cpu_now.tv_sec - cpu_started.tv_sec) *
+            1'000'000'000LL +
+        static_cast<std::int64_t>(cpu_now.tv_nsec - cpu_started.tv_nsec);
+    if (elapsed_ns >= target_ns) {
+      break;
+    }
+  }
+  (void)accumulator;
+  return true;
+}
 
 std::filesystem::path CurrentCgroupV2Path() {
   std::string membership = bbp::ReadText("/proc/self/cgroup");
@@ -174,6 +261,143 @@ BOOST_AUTO_TEST_CASE(perf_counter_collects_task_clock_for_owned_process) {
     }
     throw;
   }
+}
+
+BOOST_AUTO_TEST_CASE(
+    item11_prefixed_process_perf_counts_preexisting_worker_thread) {
+  constexpr std::size_t kWorkerCount = 2U;
+  int ready[2] = {-1, -1};
+  int start[2] = {-1, -1};
+  int done[2] = {-1, -1};
+  int release[2] = {-1, -1};
+  BOOST_REQUIRE(pipe2(ready, O_CLOEXEC) == 0);
+  BOOST_REQUIRE(pipe2(start, O_CLOEXEC) == 0);
+  BOOST_REQUIRE(pipe2(done, O_CLOEXEC) == 0);
+  BOOST_REQUIRE(pipe2(release, O_CLOEXEC) == 0);
+
+  const pid_t child_pid = fork();
+  BOOST_REQUIRE(child_pid >= 0);
+  if (child_pid == 0) {
+    (void)close(ready[0]);
+    (void)close(start[1]);
+    (void)close(done[0]);
+    (void)close(release[1]);
+    std::vector<std::thread> workers;
+    for (std::size_t worker_index = 0U; worker_index < kWorkerCount;
+         ++worker_index) {
+      workers.emplace_back([&] {
+        if (!WriteByte(ready[1]) || !ReadByte(start[0])) {
+          _exit(120);
+        }
+        if (!BurnThreadCpu(200'000'000LL)) {
+          _exit(121);
+        }
+        if (!WriteByte(done[1])) {
+          _exit(122);
+        }
+      });
+    }
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+    if (!ReadByte(release[0])) {
+      _exit(123);
+    }
+    _exit(0);
+  }
+
+  ChildGuard child(child_pid);
+  (void)close(ready[1]);
+  (void)close(start[0]);
+  (void)close(done[1]);
+  (void)close(release[0]);
+  for (std::size_t worker = 0U; worker < kWorkerCount; ++worker) {
+    BOOST_REQUIRE(ReadByte(ready[0]));
+  }
+  bbp::ProcessPerfCounters counters = bbp::ProcessPerfCounters::Open(
+      child_pid, {bbp::PerfCounterKind::kTaskClock});
+  for (std::size_t worker = 0U; worker < kWorkerCount; ++worker) {
+    BOOST_REQUIRE(WriteByte(start[1]));
+  }
+  for (std::size_t worker = 0U; worker < kWorkerCount; ++worker) {
+    BOOST_REQUIRE(ReadByte(done[0]));
+  }
+
+  const std::vector<bbp::PerfCounterValue> values = counters.Read();
+  BOOST_REQUIRE_EQUAL(values.size(), 1U);
+  BOOST_TEST_MESSAGE(
+      "two pre-existing workers task-clock ns: " << values.front().raw_value);
+  BOOST_TEST(values.front().raw_value >= 300'000'000U);
+  BOOST_TEST(values.front().raw_value <= 650'000'000U);
+
+  BOOST_REQUIRE(WriteByte(release[1]));
+  const int status = child.Wait();
+  BOOST_REQUIRE(WIFEXITED(status));
+  BOOST_TEST(WEXITSTATUS(status) == 0);
+  ClosePipe(ready);
+  ClosePipe(start);
+  ClosePipe(done);
+  ClosePipe(release);
+}
+
+BOOST_AUTO_TEST_CASE(process_perf_counts_future_worker_thread_once) {
+  int ready[2] = {-1, -1};
+  int start[2] = {-1, -1};
+  int done[2] = {-1, -1};
+  int release[2] = {-1, -1};
+  BOOST_REQUIRE(pipe2(ready, O_CLOEXEC) == 0);
+  BOOST_REQUIRE(pipe2(start, O_CLOEXEC) == 0);
+  BOOST_REQUIRE(pipe2(done, O_CLOEXEC) == 0);
+  BOOST_REQUIRE(pipe2(release, O_CLOEXEC) == 0);
+
+  const pid_t child_pid = fork();
+  BOOST_REQUIRE(child_pid >= 0);
+  if (child_pid == 0) {
+    (void)close(ready[0]);
+    (void)close(start[1]);
+    (void)close(done[0]);
+    (void)close(release[1]);
+    if (!WriteByte(ready[1]) || !ReadByte(start[0])) {
+      _exit(130);
+    }
+    std::thread worker([] {
+      if (!BurnThreadCpu(250'000'000LL)) {
+        _exit(131);
+      }
+    });
+    worker.join();
+    if (!WriteByte(done[1]) || !ReadByte(release[0])) {
+      _exit(132);
+    }
+    _exit(0);
+  }
+
+  ChildGuard child(child_pid);
+  (void)close(ready[1]);
+  (void)close(start[0]);
+  (void)close(done[1]);
+  (void)close(release[0]);
+  BOOST_REQUIRE(ReadByte(ready[0]));
+  bbp::ProcessPerfCounters counters = bbp::ProcessPerfCounters::Open(
+      child_pid, {bbp::PerfCounterKind::kTaskClock});
+  BOOST_REQUIRE(WriteByte(start[1]));
+  BOOST_REQUIRE(ReadByte(done[0]));
+
+  const std::vector<bbp::PerfCounterValue> values = counters.Read();
+  BOOST_REQUIRE_EQUAL(values.size(), 1U);
+  BOOST_TEST_MESSAGE(
+      "future worker task-clock ns: " << values.front().raw_value);
+  BOOST_TEST(values.front().raw_value >= 150'000'000U);
+  BOOST_TEST(values.front().raw_value <= 400'000'000U);
+
+  BOOST_REQUIRE(WriteByte(release[1]));
+  const int status = child.Wait();
+  BOOST_REQUIRE(WIFEXITED(status));
+  BOOST_TEST(WEXITSTATUS(status) == 0);
+  ClosePipe(ready);
+  ClosePipe(start);
+  ClosePipe(done);
+  ClosePipe(release);
 }
 
 BOOST_AUTO_TEST_CASE(perf_counter_collects_task_clock_for_cgroup) {
