@@ -5027,9 +5027,8 @@ void ApplyDirectTransactionLoadOptions(
     throw std::runtime_error(
         "--wallet-node-count must be at least 2 for transaction load");
   }
-  if (wallet_node_count >= options->nodes) {
-    throw std::runtime_error(
-        "--wallet-node-count must leave at least one non-wallet miner node");
+  if (wallet_node_count > options->nodes) {
+    throw std::runtime_error("--wallet-node-count must not exceed --nodes");
   }
 
   const WalletTransferStrategy strategy =
@@ -5048,15 +5047,19 @@ void ApplyDirectTransactionLoadOptions(
   options->topology.node_count = options->nodes;
   options->topology.wallet_node_count = wallet_node_count;
   options->topology.miner_node_count = 1U;
-  options->topology.allow_miner_wallet_overlap = false;
+  options->topology.allow_miner_wallet_overlap =
+      wallet_node_count == options->nodes;
   options->topology.wallet_nodes =
       ConsecutiveNodeIndexes(0U, wallet_node_count);
-  options->topology.miner_nodes = {wallet_node_count};
+  const std::uint32_t miner_node = options->topology.allow_miner_wallet_overlap
+                                       ? wallet_node_count - 1U
+                                       : wallet_node_count;
+  options->topology.miner_nodes = {miner_node};
   options->topology.peer_topology.kind = PeerTopologyKind::kFullMesh;
   options->wallet_initialization =
       WalletInitialization{.strategy = WalletInitializationStrategy::kDriverRpc,
                            .mode = WalletPrivacyMode::kPublic};
-  options->generate_node = wallet_node_count + 1U;
+  options->generate_node = miner_node + 1U;
 
   WalletTransactionsWorkload load;
   load.funding_strategy = WalletFundingStrategy::kRoundRobin;
@@ -5158,8 +5161,9 @@ Options ParseOptions(int argc, char** argv) {
       "wallet nodes for a direct transaction-load run (minimum 2)")(
       "transaction-load-strategy", po::value<std::string>(),
       "direct random_bruteforce or equal_fanout load; defaults: full mesh, "
-      "isolated namespaces, one miner, public driver wallets, two receiver "
-      "batches for random or one complete equal fan-out at 2 tx/s, "
+      "isolated namespaces, one miner (the final wallet when all nodes are "
+      "wallets), public driver wallets, two receiver batches for random or "
+      "one complete equal fan-out at 2 tx/s, "
       "concurrency 2, queue 8, uniform 0.01..0.10 coin random amounts, "
       "fixed 0.00001000 coin fee, simulation seed, and one final metric "
       "sample")("isolate-network",
@@ -5206,7 +5210,8 @@ Options ParseOptions(int argc, char** argv) {
       "nodes", po::value<uint32_t>(&options.nodes), nodes_help.c_str())(
       "wallet-node-count", po::value<std::uint32_t>(&wallet_node_count),
       "wallet nodes for direct transaction load; assigns wallets first and "
-      "one miner next")(
+      "one miner next, or overlaps the final wallet when all nodes are "
+      "wallets")(
       "transaction-load-strategy",
       po::value<std::string>(&transaction_load_strategy),
       "direct random_bruteforce or equal_fanout transaction load using "

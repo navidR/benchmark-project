@@ -752,6 +752,20 @@ if(BUILD_TESTING)
       --transaction-load-strategy equal_fanout
       --probe-capabilities
   )
+  add_test(NAME bbp-direct-six-wallet-random-bruteforce-load-options
+    COMMAND bbp
+      --nodes 6
+      --wallet-node-count 6
+      --transaction-load-strategy random_bruteforce
+      --probe-capabilities
+  )
+  add_test(NAME bbp-direct-six-wallet-equal-fanout-load-options
+    COMMAND bbp
+      --nodes 6
+      --wallet-node-count 6
+      --transaction-load-strategy equal_fanout
+      --probe-capabilities
+  )
   add_test(NAME bbp-direct-transaction-load-help
     COMMAND bbp --help
   )
@@ -780,9 +794,9 @@ if(BUILD_TESTING)
     "--wallet-node-count must be at least 2 for transaction load"
   )
   add_argument_failure_test(
-    bbp-direct-load-missing-miner
-    "--transaction-load-strategy|equal_fanout|--wallet-node-count|3|--nodes|3|--probe-capabilities"
-    "--wallet-node-count must leave at least one non-wallet miner node"
+    bbp-direct-load-too-many-wallets
+    "--transaction-load-strategy|equal_fanout|--wallet-node-count|4|--nodes|3|--probe-capabilities"
+    "--wallet-node-count must not exceed --nodes"
   )
   add_argument_failure_test(
     bbp-direct-load-unsupported-strategy
