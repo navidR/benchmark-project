@@ -150,11 +150,12 @@ bool WriteResponse(beast::tcp_stream* stream,
 
 struct McpServer::Impl {
   Impl(McpServerConfig server_config, McpProtocolConfig protocol_config,
-       McpToolHandler tool_handler, McpResourceHandler resource_handler)
+       McpToolHandler tool_handler, McpResourceHandler resource_handler,
+       McpSessionHandler session_handler)
       : config(std::move(server_config)),
         protocol_config_(std::move(protocol_config)),
         protocol(protocol_config_, std::move(tool_handler),
-                 std::move(resource_handler)),
+                 std::move(resource_handler), std::move(session_handler)),
         acceptor(io_context) {
     if (config.worker_count == 0U || config.worker_count > 64U) {
       throw std::runtime_error("MCP worker count must be in 1..64");
@@ -451,10 +452,12 @@ struct McpServer::Impl {
 
 McpServer::McpServer(McpServerConfig config, McpProtocolConfig protocol_config,
                      McpToolHandler tool_handler,
-                     McpResourceHandler resource_handler)
+                     McpResourceHandler resource_handler,
+                     McpSessionHandler session_handler)
     : impl_(std::make_unique<Impl>(
           std::move(config), std::move(protocol_config),
-          std::move(tool_handler), std::move(resource_handler))) {}
+          std::move(tool_handler), std::move(resource_handler),
+          std::move(session_handler))) {}
 
 McpServer::~McpServer() = default;
 

@@ -44,6 +44,7 @@ struct McpNotification {
 
 struct McpSession {
   bool initialized = false;
+  bool closing = false;
   std::string client_name;
   std::deque<McpNotification> notifications;
   std::uint64_t next_notification_sequence = 1U;
@@ -351,10 +352,12 @@ std::string RequiredClientName(const boost::json::object& params) {
 
 struct McpProtocol::Impl {
   Impl(McpProtocolConfig config_value, McpToolHandler tool_handler_value,
-       McpResourceHandler resource_handler_value)
+       McpResourceHandler resource_handler_value,
+       McpSessionHandler session_handler_value)
       : config(std::move(config_value)),
         tool_handler(std::move(tool_handler_value)),
-        resource_handler(std::move(resource_handler_value)) {
+        resource_handler(std::move(resource_handler_value)),
+        session_handler(std::move(session_handler_value)) {
     if (config.bearer_token.size() < 32U || config.bearer_token.size() > 512U) {
       throw std::runtime_error("MCP bearer token must contain 32..512 bytes");
     }
@@ -362,6 +365,28 @@ struct McpProtocol::Impl {
         config.endpoint_path.find('?') != std::string::npos ||
         config.endpoint_path.find('#') != std::string::npos) {
       throw std::runtime_error("MCP endpoint path must be an absolute path");
+    }
+  }
+
+  ~Impl() {
+    std::vector<std::string> session_ids;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      session_ids.reserve(sessions.size());
+      for (const auto& [session_id, session] : sessions) {
+        static_cast<void>(session);
+        session_ids.push_back(session_id);
+      }
+      sessions.clear();
+    }
+    if (!session_handler) {
+      return;
+    }
+    for (const std::string& session_id : session_ids) {
+      try {
+        session_handler(session_id, false);
+      } catch (const std::exception&) {
+      }
     }
   }
 
@@ -424,7 +449,7 @@ struct McpProtocol::Impl {
     }
     std::lock_guard<std::mutex> lock(mutex);
     const auto session = sessions.find(session_id);
-    if (session == sessions.end() ||
+    if (session == sessions.end() || session->second.closing ||
         (require_initialized && !session->second.initialized)) {
       return std::nullopt;
     }
@@ -447,6 +472,7 @@ struct McpProtocol::Impl {
       id = RandomHex(24U);
     } while (sessions.contains(id));
     sessions.emplace(id, McpSession{.initialized = false,
+                                    .closing = false,
                                     .client_name = std::move(client_name),
                                     .notifications = {},
                                     .next_notification_sequence = 1U});
@@ -610,6 +636,22 @@ struct McpProtocol::Impl {
           http_request,
           JsonRpcError(request.id, -32001, "MCP session capacity reached"),
           http::status::service_unavailable);
+    }
+    if (session_handler) {
+      try {
+        session_handler(*session_id, true);
+      } catch (const std::exception& error) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          sessions.erase(*session_id);
+        }
+        return JsonResponse(
+            http_request,
+            JsonRpcError(request.id, -32001,
+                         "MCP application session capacity reached",
+                         error.what()),
+            http::status::service_unavailable);
+      }
     }
     auto response = JsonResponse(http_request,
                                  JsonRpcResult(request.id, InitializeResult()));
@@ -781,27 +823,57 @@ struct McpProtocol::Impl {
       return TextResponse(request, http::status::not_found,
                           "unknown MCP session");
     }
-    std::lock_guard<std::mutex> lock(mutex);
-    if (sessions.erase(session_id) == 0U) {
-      return TextResponse(request, http::status::not_found,
-                          "unknown MCP session");
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto session = sessions.find(session_id);
+      if (session == sessions.end() || session->second.closing) {
+        return TextResponse(request, http::status::not_found,
+                            "unknown MCP session");
+      }
+      session->second.closing = true;
     }
-    ++stats.terminated_sessions;
+    if (session_handler) {
+      try {
+        session_handler(session_id, false);
+      } catch (const std::exception& error) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          const auto session = sessions.find(session_id);
+          if (session != sessions.end()) {
+            session->second.closing = false;
+          }
+        }
+        return TextResponse(
+            request, http::status::service_unavailable,
+            std::string("MCP session cleanup incomplete: ") + error.what());
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (sessions.erase(session_id) == 0U) {
+        return TextResponse(request, http::status::not_found,
+                            "unknown MCP session");
+      }
+      ++stats.terminated_sessions;
+    }
     return TextResponse(request, http::status::ok, "MCP session terminated");
   }
 
   McpProtocolConfig config;
   McpToolHandler tool_handler;
   McpResourceHandler resource_handler;
+  McpSessionHandler session_handler;
   mutable std::mutex mutex;
   std::map<std::string, McpSession, std::less<>> sessions;
   McpProtocolStats stats;
 };
 
 McpProtocol::McpProtocol(McpProtocolConfig config, McpToolHandler tool_handler,
-                         McpResourceHandler resource_handler)
+                         McpResourceHandler resource_handler,
+                         McpSessionHandler session_handler)
     : impl_(std::make_unique<Impl>(std::move(config), std::move(tool_handler),
-                                   std::move(resource_handler))) {}
+                                   std::move(resource_handler),
+                                   std::move(session_handler))) {}
 
 McpProtocol::~McpProtocol() = default;
 

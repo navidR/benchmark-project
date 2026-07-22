@@ -43,11 +43,14 @@ using McpToolHandler = std::function<boost::json::value(
     std::stop_token)>;
 using McpResourceHandler = std::function<boost::json::value(
     std::string_view, std::string_view, std::stop_token)>;
+using McpSessionHandler =
+    std::function<void(std::string_view, bool /* opened */)>;
 
 class McpProtocol {
  public:
   McpProtocol(McpProtocolConfig config, McpToolHandler tool_handler,
-              McpResourceHandler resource_handler);
+              McpResourceHandler resource_handler,
+              McpSessionHandler session_handler = {});
   ~McpProtocol();
 
   McpProtocol(const McpProtocol&) = delete;

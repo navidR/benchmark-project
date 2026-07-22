@@ -487,7 +487,11 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
     BOOST_TEST(input.at("additionalProperties").as_bool() == false);
     RequireClosedSchemaTree(input);
     const boost::json::object& output = tool.at("outputSchema").as_object();
-    BOOST_REQUIRE(output.at("oneOf").as_array().size() == 2U);
+    const std::size_t expected_output_choices =
+        McpOperationResultFamily(operation) == McpResultFamily::kOperation ? 2U
+                                                                           : 3U;
+    BOOST_REQUIRE(output.at("oneOf").as_array().size() ==
+                  expected_output_choices);
     const boost::json::object& success =
         output.at("oneOf").as_array().front().as_object();
     BOOST_TEST(success.at("properties")

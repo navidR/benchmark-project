@@ -34,7 +34,8 @@ struct McpServerStats {
 class McpServer {
  public:
   McpServer(McpServerConfig config, McpProtocolConfig protocol_config,
-            McpToolHandler tool_handler, McpResourceHandler resource_handler);
+            McpToolHandler tool_handler, McpResourceHandler resource_handler,
+            McpSessionHandler session_handler = {});
   ~McpServer();
 
   McpServer(const McpServer&) = delete;

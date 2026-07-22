@@ -1,9 +1,11 @@
+#include <atomic>
 #include <boost/beast/http.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/test/unit_test.hpp>
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 
 #include "bbp/mcp_protocol.h"
@@ -220,6 +222,45 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_dispatches_registered_tools_and_resources) {
   BOOST_TEST(
       boost::json::parse(text).as_object().at("protocol_version").as_string() ==
       kMcpProtocolVersion);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_protocol_session_lifecycle_is_transactional_and_cleanup_gated) {
+  std::atomic<std::size_t> opened = 0U;
+  std::atomic<std::size_t> closed = 0U;
+  bool reject_close = false;
+  McpProtocol protocol(
+      McpProtocolConfig{.bearer_token = std::string(kTestToken),
+                        .endpoint_path = "/mcp",
+                        .endpoint_port = 43123U},
+      {}, {}, [&](std::string_view, bool is_opened) {
+        if (is_opened) {
+          opened.fetch_add(1U, std::memory_order_relaxed);
+          return;
+        }
+        if (reject_close) {
+          throw std::runtime_error("owned work is still active");
+        }
+        closed.fetch_add(1U, std::memory_order_relaxed);
+      });
+  const std::string session = Initialize(&protocol);
+  MarkInitialized(&protocol, session);
+  BOOST_TEST(opened.load(std::memory_order_relaxed) == 1U);
+
+  reject_close = true;
+  const auto rejected =
+      protocol.Handle(ProtocolRequest(http::verb::delete_, {}, session));
+  BOOST_TEST(rejected.result() == http::status::service_unavailable);
+  BOOST_TEST(protocol.Stats().sessions == 1U);
+  BOOST_TEST(closed.load(std::memory_order_relaxed) == 0U);
+
+  reject_close = false;
+  const auto removed =
+      protocol.Handle(ProtocolRequest(http::verb::delete_, {}, session));
+  BOOST_TEST(removed.result() == http::status::ok);
+  BOOST_TEST(protocol.Stats().sessions == 0U);
+  BOOST_TEST(protocol.Stats().terminated_sessions == 1U);
+  BOOST_TEST(closed.load(std::memory_order_relaxed) == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_protocol_bounds_sessions_and_retained_notifications) {

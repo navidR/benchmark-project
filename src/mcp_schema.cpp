@@ -1574,9 +1574,15 @@ boost::json::object BuildMcpResultSchema(McpResultFamily family) {
 
 boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation) {
   boost::json::array choices;
-  choices.emplace_back(
-      BuildMcpResultSchema(McpOperationResultFamily(operation)));
-  if (McpOperationResultFamily(operation) != McpResultFamily::kError) {
+  const McpResultFamily result_family = McpOperationResultFamily(operation);
+  choices.emplace_back(BuildMcpResultSchema(result_family));
+  if (result_family != McpResultFamily::kOperation) {
+    // Long actions return their stable operation immediately; callers then
+    // use operation.get/subscriptions for progress and the typed terminal
+    // result. Fast application services may still return the direct family.
+    choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kOperation));
+  }
+  if (result_family != McpResultFamily::kError) {
     choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kError));
   }
   return AddDraft(boost::json::object{{"oneOf", std::move(choices)}});
