@@ -317,6 +317,32 @@ BOOST_AUTO_TEST_CASE(mcp_operation_rejects_wrong_typed_terminal_result) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_operation_contains_non_standard_executor_and_callback_exceptions) {
+  std::atomic<std::size_t> callback_invocations = 0U;
+  McpOperationService service(TestConfig(), [&](const McpServiceNotification&) {
+    callback_invocations.fetch_add(1U, std::memory_order_relaxed);
+    throw 7;
+  });
+  service.RegisterSession("session-a");
+  const McpOperationSnapshot submitted =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) -> McpTypedResult { throw 11; });
+
+  const McpOperationSnapshot terminal =
+      WaitForTerminal(&service, "session-a", submitted.operation_id);
+  BOOST_CHECK(terminal.state == McpOperationState::kFailed);
+  BOOST_REQUIRE(static_cast<bool>(terminal.error));
+  BOOST_TEST(terminal.error->code == "operation_failed");
+  BOOST_TEST(terminal.error->message ==
+             "operation failed with a non-standard exception");
+
+  service.Shutdown();
+  const McpOperationServiceStats stats = service.Stats();
+  BOOST_TEST(callback_invocations.load(std::memory_order_relaxed) == 2U);
+  BOOST_TEST(stats.notification_handler_failures == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_operation_rejects_oversized_results_and_subscription_selection) {
   McpOperationService service;
   service.RegisterSession("session-a");
@@ -387,6 +413,108 @@ BOOST_AUTO_TEST_CASE(mcp_operation_session_removal_cancels_owned_state) {
                     std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_operation_terminal_callback_removes_session_after_waiters_drain) {
+  McpOperationService* service_pointer = nullptr;
+  std::atomic<bool> finish = false;
+  std::atomic<bool> removal_started = false;
+  std::atomic<bool> removal_completed = false;
+  std::atomic<bool> removal_succeeded = false;
+  std::atomic<std::size_t> waiter_failures = 0U;
+  McpOperationService service(
+      TestConfig(), [&](const McpServiceNotification& notification) {
+        if (notification.method != "notifications/progress" ||
+            notification.params.as_object().at("message").as_string() !=
+                "succeeded" ||
+            removal_started.exchange(true, std::memory_order_acq_rel)) {
+          return;
+        }
+        try {
+          removal_succeeded.store(
+              service_pointer->RemoveSession("session-a", 1s),
+              std::memory_order_release);
+        } catch (...) {
+          waiter_failures.fetch_add(1U, std::memory_order_relaxed);
+        }
+        removal_completed.store(true, std::memory_order_release);
+      });
+  service_pointer = &service;
+  service.RegisterSession("session-a");
+  const McpSubscriptionSnapshot subscription = service.CreateSubscription(
+      "session-a",
+      McpSubscriptionRequest{.families = {McpInformationFamily::kMetrics},
+                             .node_ids = {},
+                             .cursor = 0U});
+  const McpOperationSnapshot submitted =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [&](McpOperationContext&) {
+                       while (!finish.load(std::memory_order_acquire)) {
+                         std::this_thread::yield();
+                       }
+                       return ValidationResult();
+                     });
+  WaitUntilState(&service, "session-a", submitted.operation_id,
+                 McpOperationState::kRunning);
+
+  constexpr std::size_t kOperationWaiters = 4U;
+  std::atomic<std::size_t> waiters_started = 0U;
+  std::vector<std::optional<McpOperationSnapshot>> waited(kOperationWaiters);
+  std::vector<std::jthread> waiters;
+  for (std::size_t index = 0U; index < kOperationWaiters; ++index) {
+    waiters.emplace_back([&, index] {
+      waiters_started.fetch_add(1U, std::memory_order_release);
+      try {
+        waited[index] =
+            service.WaitForOperation("session-a", submitted.operation_id, 1s);
+      } catch (...) {
+        waiter_failures.fetch_add(1U, std::memory_order_relaxed);
+      }
+    });
+  }
+  std::optional<McpSubscriptionSnapshot> polled;
+  std::jthread poller([&] {
+    waiters_started.fetch_add(1U, std::memory_order_release);
+    try {
+      polled = service.PollSubscription(
+          "session-a", subscription.subscription_id, 0U, 1U, 1s);
+    } catch (...) {
+      waiter_failures.fetch_add(1U, std::memory_order_relaxed);
+    }
+  });
+
+  const auto waiter_deadline = std::chrono::steady_clock::now() + 2s;
+  while (waiters_started.load(std::memory_order_acquire) !=
+             kOperationWaiters + 1U &&
+         std::chrono::steady_clock::now() < waiter_deadline) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(20ms);
+  finish.store(true, std::memory_order_release);
+  for (std::jthread& waiter : waiters) {
+    waiter.join();
+  }
+  poller.join();
+
+  const auto removal_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!removal_completed.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < removal_deadline) {
+    std::this_thread::yield();
+  }
+  service.Shutdown();
+
+  BOOST_TEST(waiters_started.load(std::memory_order_acquire) ==
+             kOperationWaiters + 1U);
+  BOOST_TEST(removal_completed.load(std::memory_order_acquire));
+  BOOST_TEST(removal_succeeded.load(std::memory_order_acquire));
+  BOOST_TEST(waiter_failures.load(std::memory_order_relaxed) == 0U);
+  for (const auto& result : waited) {
+    BOOST_REQUIRE(static_cast<bool>(result));
+    BOOST_CHECK(result->state == McpOperationState::kSucceeded);
+  }
+  BOOST_REQUIRE(static_cast<bool>(polled));
+  BOOST_TEST(!polled->active);
+}
+
 BOOST_AUTO_TEST_CASE(mcp_operation_shutdown_requests_stop_and_joins_workers) {
   McpOperationService service(TestConfig(2U, 8U));
   service.RegisterSession("session-a");
@@ -411,6 +539,105 @@ BOOST_AUTO_TEST_CASE(mcp_operation_shutdown_requests_stop_and_joins_workers) {
   BOOST_TEST(stats.active_subscriptions == 0U);
   BOOST_CHECK_THROW(service.RegisterSession("session-b"), std::runtime_error);
   service.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(mcp_operation_terminal_callback_can_shutdown_reentrantly) {
+  McpOperationService* service_pointer = nullptr;
+  std::atomic<bool> shutdown_started = false;
+  std::atomic<bool> shutdown_returned = false;
+  McpOperationService service(
+      TestConfig(), [&](const McpServiceNotification& notification) {
+        if (notification.method != "notifications/progress" ||
+            notification.params.as_object().at("message").as_string() !=
+                "succeeded" ||
+            shutdown_started.exchange(true, std::memory_order_acq_rel)) {
+          return;
+        }
+        service_pointer->Shutdown();
+        shutdown_returned.store(true, std::memory_order_release);
+      });
+  service_pointer = &service;
+  service.RegisterSession("session-a");
+  static_cast<void>(
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) { return ValidationResult(); }));
+
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!shutdown_returned.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  service.Shutdown();
+
+  BOOST_TEST(shutdown_started.load(std::memory_order_acquire));
+  BOOST_TEST(shutdown_returned.load(std::memory_order_acquire));
+  const McpOperationServiceStats stats = service.Stats();
+  BOOST_TEST(!stats.accepting);
+  BOOST_TEST(stats.sessions == 0U);
+  BOOST_TEST(stats.active_workers == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_operation_concurrent_shutdown_waits_for_worker_owner) {
+  std::atomic<bool> stop_seen = false;
+  std::atomic<bool> release_worker = false;
+  std::atomic<bool> first_returned = false;
+  std::atomic<bool> second_entered = false;
+  std::atomic<bool> second_returned = false;
+  McpOperationService service;
+  service.RegisterSession("session-a");
+  const McpOperationSnapshot submitted =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [&](McpOperationContext& context) {
+                       while (!context.stop_requested()) {
+                         std::this_thread::yield();
+                       }
+                       stop_seen.store(true, std::memory_order_release);
+                       while (!release_worker.load(std::memory_order_acquire)) {
+                         std::this_thread::yield();
+                       }
+                       context.ThrowIfCancelled();
+                       return ValidationResult();
+                     });
+  WaitUntilState(&service, "session-a", submitted.operation_id,
+                 McpOperationState::kRunning);
+
+  std::jthread first_shutdown([&] {
+    service.Shutdown();
+    first_returned.store(true, std::memory_order_release);
+  });
+  const auto stop_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!stop_seen.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < stop_deadline) {
+    std::this_thread::yield();
+  }
+  std::jthread second_shutdown([&] {
+    second_entered.store(true, std::memory_order_release);
+    service.Shutdown();
+    second_returned.store(true, std::memory_order_release);
+  });
+  const auto second_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!second_entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < second_deadline) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(20ms);
+  const bool second_returned_while_worker_active =
+      second_returned.load(std::memory_order_acquire);
+  const std::size_t sessions_while_worker_active = service.Stats().sessions;
+
+  release_worker.store(true, std::memory_order_release);
+  first_shutdown.join();
+  second_shutdown.join();
+
+  BOOST_TEST(stop_seen.load(std::memory_order_acquire));
+  BOOST_TEST(!second_returned_while_worker_active);
+  BOOST_TEST(sessions_while_worker_active == 1U);
+  BOOST_TEST(first_returned.load(std::memory_order_acquire));
+  BOOST_TEST(second_returned.load(std::memory_order_acquire));
+  const McpOperationServiceStats stats = service.Stats();
+  BOOST_TEST(stats.sessions == 0U);
+  BOOST_TEST(stats.active_operations == 0U);
+  BOOST_TEST(stats.active_workers == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_operation_callbacks_never_run_under_service_lock) {

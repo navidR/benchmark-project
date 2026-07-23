@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -22,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -36,18 +38,34 @@ constexpr std::string_view kJsonContentType = "application/json";
 constexpr std::string_view kSseContentType = "text/event-stream";
 constexpr std::string_view kSessionHeader = "Mcp-Session-Id";
 constexpr std::string_view kProtocolHeader = "MCP-Protocol-Version";
+constexpr std::size_t kMaximumPendingSessionCleanups = 2U * kMcpMaximumSessions;
 
 struct McpNotification {
   std::uint64_t sequence = 0U;
   std::string json;
 };
 
+enum class McpSessionState {
+  kOpening,
+  kAwaitingInitialization,
+  kInitialized,
+  kClosing,
+};
+
 struct McpSession {
-  bool initialized = false;
-  bool closing = false;
+  McpSessionState state = McpSessionState::kOpening;
+  std::chrono::steady_clock::time_point initialization_deadline =
+      std::chrono::steady_clock::time_point::max();
   std::string client_name;
   std::deque<McpNotification> notifications;
   std::uint64_t next_notification_sequence = 1U;
+};
+
+struct McpPendingSessionCleanup {
+  std::string session_id;
+  std::chrono::steady_clock::time_point retry_at;
+  std::size_t failed_attempts = 0U;
+  bool in_progress = false;
 };
 
 struct JsonRpcRequest {
@@ -366,18 +384,44 @@ struct McpProtocol::Impl {
         config.endpoint_path.find('#') != std::string::npos) {
       throw std::runtime_error("MCP endpoint path must be an absolute path");
     }
+    if (config.uninitialized_session_timeout <=
+        std::chrono::milliseconds::zero()) {
+      throw std::runtime_error(
+          "MCP uninitialized session timeout must be positive");
+    }
+    deadline_worker = std::jthread(
+        [this](std::stop_token stop_token) { ExpirationLoop(stop_token); });
+    cleanup_worker = std::jthread(
+        [this](std::stop_token stop_token) { CleanupLoop(stop_token); });
   }
 
   ~Impl() {
+    deadline_worker.request_stop();
+    cleanup_worker.request_stop();
+    state_changed.notify_all();
+    if (deadline_worker.joinable()) {
+      deadline_worker.join();
+    }
+    if (cleanup_worker.joinable()) {
+      cleanup_worker.join();
+    }
+
     std::vector<std::string> session_ids;
     {
       std::lock_guard<std::mutex> lock(mutex);
-      session_ids.reserve(sessions.size());
+      session_ids.reserve(sessions.size() + pending_cleanup.size());
       for (const auto& [session_id, session] : sessions) {
         static_cast<void>(session);
         session_ids.push_back(session_id);
       }
+      for (const McpPendingSessionCleanup& cleanup : pending_cleanup) {
+        session_ids.push_back(cleanup.session_id);
+      }
+      session_ids.insert(session_ids.end(), failed_cleanup.begin(),
+                         failed_cleanup.end());
       sessions.clear();
+      pending_cleanup.clear();
+      failed_cleanup.clear();
     }
     if (!session_handler) {
       return;
@@ -385,8 +429,204 @@ struct McpProtocol::Impl {
     for (const std::string& session_id : session_ids) {
       try {
         session_handler(session_id, false);
-      } catch (const std::exception&) {
+      } catch (...) {
       }
+    }
+  }
+
+  bool InvokeSessionClose(std::string_view session_id,
+                          std::string* error_message = nullptr) {
+    try {
+      if (session_handler) {
+        session_handler(session_id, false);
+      }
+    } catch (const std::exception& error) {
+      if (error_message != nullptr) {
+        *error_message = error.what();
+      }
+      return false;
+    } catch (...) {
+      if (error_message != nullptr) {
+        *error_message = "non-standard exception";
+      }
+      return false;
+    }
+    return true;
+  }
+
+  bool FinishExplicitSessionClose(std::string_view session_id,
+                                  McpSessionState previous_state,
+                                  std::string* error_message) {
+    if (!InvokeSessionClose(session_id, error_message)) {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto session = sessions.find(session_id);
+      if (session != sessions.end() &&
+          session->second.state == McpSessionState::kClosing) {
+        session->second.state = previous_state;
+      }
+      state_changed.notify_all();
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto session = sessions.find(session_id);
+    if (session == sessions.end()) {
+      return false;
+    }
+    sessions.erase(session);
+    ++stats.terminated_sessions;
+    state_changed.notify_all();
+    return true;
+  }
+
+  void ExpireSessionLocked(
+      std::map<std::string, McpSession, std::less<>>::iterator session,
+      std::chrono::steady_clock::time_point now) {
+    if (session_handler) {
+      if (pending_cleanup.size() < kMaximumPendingSessionCleanups) {
+        pending_cleanup.push_back(
+            McpPendingSessionCleanup{.session_id = session->first,
+                                     .retry_at = now,
+                                     .failed_attempts = 0U,
+                                     .in_progress = false});
+      } else {
+        ++stats.failed_session_cleanups;
+        if (failed_cleanup.size() == kMcpMaximumSessions) {
+          failed_cleanup.pop_front();
+        }
+        failed_cleanup.push_back(session->first);
+      }
+    }
+    sessions.erase(session);
+    ++stats.terminated_sessions;
+    ++stats.expired_sessions;
+  }
+
+  void ExpirationLoop(std::stop_token stop_token) {
+    std::unique_lock<std::mutex> lock(mutex);
+    while (!stop_token.stop_requested()) {
+      const auto now = std::chrono::steady_clock::now();
+      auto next_deadline = std::chrono::steady_clock::time_point::max();
+      bool expired = false;
+      for (auto session = sessions.begin(); session != sessions.end();) {
+        if (session->second.state != McpSessionState::kAwaitingInitialization) {
+          ++session;
+          continue;
+        }
+        if (session->second.initialization_deadline > now) {
+          next_deadline =
+              std::min(next_deadline, session->second.initialization_deadline);
+          ++session;
+          continue;
+        }
+        auto current = session++;
+        ExpireSessionLocked(current, now);
+        expired = true;
+      }
+      if (expired) {
+        state_changed.notify_all();
+        continue;
+      }
+      if (next_deadline == std::chrono::steady_clock::time_point::max()) {
+        static_cast<void>(state_changed.wait(lock, stop_token, [this] {
+          return std::any_of(sessions.begin(), sessions.end(),
+                             [](const auto& entry) {
+                               return entry.second.state ==
+                                      McpSessionState::kAwaitingInitialization;
+                             });
+        }));
+      } else {
+        const auto wake_at = next_deadline;
+        static_cast<void>(state_changed.wait_until(
+            lock, stop_token, wake_at, [this, wake_at] {
+              return std::any_of(
+                  sessions.begin(), sessions.end(),
+                  [wake_at](const auto& entry) {
+                    return entry.second.state ==
+                               McpSessionState::kAwaitingInitialization &&
+                           entry.second.initialization_deadline < wake_at;
+                  });
+            }));
+      }
+    }
+  }
+
+  void CleanupLoop(std::stop_token stop_token) {
+    constexpr std::size_t kMaximumRuntimeAttempts = 2U;
+    constexpr std::chrono::seconds kRetryInterval{1};
+    std::unique_lock<std::mutex> lock(mutex);
+    while (!stop_token.stop_requested()) {
+      if (pending_cleanup.empty()) {
+        static_cast<void>(state_changed.wait(
+            lock, stop_token, [this] { return !pending_cleanup.empty(); }));
+        continue;
+      }
+      const auto next =
+          std::min_element(pending_cleanup.begin(), pending_cleanup.end(),
+                           [](const McpPendingSessionCleanup& left,
+                              const McpPendingSessionCleanup& right) {
+                             if (left.in_progress != right.in_progress) {
+                               return !left.in_progress;
+                             }
+                             return left.retry_at < right.retry_at;
+                           });
+      if (next == pending_cleanup.end() || next->in_progress) {
+        static_cast<void>(state_changed.wait(lock, stop_token, [this] {
+          return std::any_of(pending_cleanup.begin(), pending_cleanup.end(),
+                             [](const McpPendingSessionCleanup& cleanup) {
+                               return !cleanup.in_progress;
+                             });
+        }));
+        continue;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (next->retry_at > now) {
+        const auto wake_at = next->retry_at;
+        static_cast<void>(state_changed.wait_until(
+            lock, stop_token, wake_at, [this, wake_at] {
+              return std::any_of(
+                  pending_cleanup.begin(), pending_cleanup.end(),
+                  [wake_at](const McpPendingSessionCleanup& cleanup) {
+                    return !cleanup.in_progress && cleanup.retry_at < wake_at;
+                  });
+            }));
+        continue;
+      }
+      next->in_progress = true;
+      const std::string session_id = next->session_id;
+      lock.unlock();
+      const bool removed = InvokeSessionClose(session_id);
+      lock.lock();
+      const auto cleanup =
+          std::find_if(pending_cleanup.begin(), pending_cleanup.end(),
+                       [&](const McpPendingSessionCleanup& entry) {
+                         return entry.session_id == session_id;
+                       });
+      if (cleanup == pending_cleanup.end()) {
+        continue;
+      }
+      if (removed) {
+        pending_cleanup.erase(cleanup);
+        continue;
+      }
+      ++cleanup->failed_attempts;
+      cleanup->in_progress = false;
+      if (stop_token.stop_requested()) {
+        continue;
+      }
+      if (cleanup->failed_attempts < kMaximumRuntimeAttempts) {
+        cleanup->retry_at = std::chrono::steady_clock::now() + kRetryInterval;
+        continue;
+      }
+      ++stats.failed_session_cleanups;
+      if (failed_cleanup.size() == kMcpMaximumSessions) {
+        const std::string final_attempt = std::move(failed_cleanup.front());
+        failed_cleanup.pop_front();
+        lock.unlock();
+        static_cast<void>(InvokeSessionClose(final_attempt));
+        lock.lock();
+      }
+      failed_cleanup.push_back(session_id);
+      pending_cleanup.erase(cleanup);
     }
   }
 
@@ -447,10 +687,23 @@ struct McpProtocol::Impl {
     if (session_id.empty()) {
       return std::nullopt;
     }
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     const auto session = sessions.find(session_id);
-    if (session == sessions.end() || session->second.closing ||
-        (require_initialized && !session->second.initialized)) {
+    if (session == sessions.end() ||
+        session->second.state == McpSessionState::kOpening ||
+        session->second.state == McpSessionState::kClosing) {
+      return std::nullopt;
+    }
+    if (session->second.state == McpSessionState::kAwaitingInitialization &&
+        std::chrono::steady_clock::now() >=
+            session->second.initialization_deadline) {
+      ExpireSessionLocked(session, std::chrono::steady_clock::now());
+      lock.unlock();
+      state_changed.notify_all();
+      return std::nullopt;
+    }
+    if (require_initialized &&
+        session->second.state != McpSessionState::kInitialized) {
       return std::nullopt;
     }
     return session_id;
@@ -463,33 +716,69 @@ struct McpProtocol::Impl {
 
   std::optional<std::string> CreateSession(std::string client_name) {
     std::lock_guard<std::mutex> lock(mutex);
-    if (sessions.size() >= kMcpMaximumSessions) {
+    if (sessions.size() >= kMcpMaximumSessions ||
+        pending_cleanup.size() > kMcpMaximumSessions) {
       ++stats.rejected_sessions;
       return std::nullopt;
     }
     std::string id;
     do {
       id = RandomHex(24U);
-    } while (sessions.contains(id));
-    sessions.emplace(id, McpSession{.initialized = false,
-                                    .closing = false,
-                                    .client_name = std::move(client_name),
-                                    .notifications = {},
-                                    .next_notification_sequence = 1U});
+    } while (sessions.contains(id) ||
+             std::any_of(pending_cleanup.begin(), pending_cleanup.end(),
+                         [&](const McpPendingSessionCleanup& cleanup) {
+                           return cleanup.session_id == id;
+                         }) ||
+             std::find(failed_cleanup.begin(), failed_cleanup.end(), id) !=
+                 failed_cleanup.end());
+    sessions.emplace(
+        id, McpSession{.state = McpSessionState::kOpening,
+                       .initialization_deadline =
+                           std::chrono::steady_clock::time_point::max(),
+                       .client_name = std::move(client_name),
+                       .notifications = {},
+                       .next_notification_sequence = 1U});
     stats.maximum_sessions = std::max(stats.maximum_sessions, sessions.size());
     return id;
   }
 
-  void MarkInitialized(std::string_view session_id) {
+  void ArmInitializationDeadline(std::string_view session_id) {
     std::lock_guard<std::mutex> lock(mutex);
-    auto session = sessions.find(session_id);
+    const auto session = sessions.find(session_id);
+    if (session == sessions.end() ||
+        session->second.state != McpSessionState::kOpening) {
+      throw std::logic_error("MCP session ended while opening");
+    }
+    session->second.state = McpSessionState::kAwaitingInitialization;
+    session->second.initialization_deadline =
+        std::chrono::steady_clock::now() + config.uninitialized_session_timeout;
+    state_changed.notify_all();
+  }
+
+  bool MarkInitialized(std::string_view session_id) {
+    std::unique_lock<std::mutex> lock(mutex);
+    const auto session = sessions.find(session_id);
     if (session == sessions.end()) {
-      throw std::runtime_error("MCP session ended during initialization");
+      return false;
     }
-    if (!session->second.initialized) {
-      session->second.initialized = true;
-      ++stats.initialized_sessions;
+    if (session->second.state == McpSessionState::kInitialized) {
+      return true;
     }
+    if (session->second.state != McpSessionState::kAwaitingInitialization) {
+      return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= session->second.initialization_deadline) {
+      ExpireSessionLocked(session, now);
+      lock.unlock();
+      state_changed.notify_all();
+      return false;
+    }
+    session->second.state = McpSessionState::kInitialized;
+    ++stats.initialized_sessions;
+    lock.unlock();
+    state_changed.notify_all();
+    return true;
   }
 
   boost::json::object InitializeResult() const {
@@ -651,8 +940,20 @@ struct McpProtocol::Impl {
                          "MCP application session capacity reached",
                          error.what()),
             http::status::service_unavailable);
+      } catch (...) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          sessions.erase(*session_id);
+        }
+        return JsonResponse(
+            http_request,
+            JsonRpcError(request.id, -32001,
+                         "MCP application session capacity reached",
+                         "non-standard exception"),
+            http::status::service_unavailable);
       }
     }
+    ArmInitializationDeadline(*session_id);
     auto response = JsonResponse(http_request,
                                  JsonRpcResult(request.id, InitializeResult()));
     response.set(kSessionHeader, *session_id);
@@ -720,15 +1021,17 @@ struct McpProtocol::Impl {
             JsonRpcError(request.id, -32600,
                          "notifications/initialized must not have an id"));
       }
-      try {
-        MarkInitialized(*session_id);
-      } catch (const std::invalid_argument&) {
-        return TextResponse(http_request, http::status::bad_request,
-                            "invalid initialized notification");
+      if (!MarkInitialized(*session_id)) {
+        return TextResponse(http_request, http::status::not_found,
+                            "unknown MCP session");
       }
       return TextResponse(http_request, http::status::accepted, "");
     }
     if (!RequireSession(http_request, true)) {
+      if (!RequireSession(http_request, false)) {
+        return TextResponse(http_request, http::status::not_found,
+                            "unknown MCP session");
+      }
       if (!request.has_id) {
         return TextResponse(http_request, http::status::accepted, "");
       }
@@ -823,38 +1126,37 @@ struct McpProtocol::Impl {
       return TextResponse(request, http::status::not_found,
                           "unknown MCP session");
     }
+    McpSessionState previous_state = McpSessionState::kOpening;
     {
-      std::lock_guard<std::mutex> lock(mutex);
+      std::unique_lock<std::mutex> lock(mutex);
       const auto session = sessions.find(session_id);
-      if (session == sessions.end() || session->second.closing) {
+      if (session == sessions.end() ||
+          session->second.state == McpSessionState::kOpening ||
+          session->second.state == McpSessionState::kClosing) {
         return TextResponse(request, http::status::not_found,
                             "unknown MCP session");
       }
-      session->second.closing = true;
-    }
-    if (session_handler) {
-      try {
-        session_handler(session_id, false);
-      } catch (const std::exception& error) {
-        {
-          std::lock_guard<std::mutex> lock(mutex);
-          const auto session = sessions.find(session_id);
-          if (session != sessions.end()) {
-            session->second.closing = false;
-          }
-        }
-        return TextResponse(
-            request, http::status::service_unavailable,
-            std::string("MCP session cleanup incomplete: ") + error.what());
-      }
-    }
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (sessions.erase(session_id) == 0U) {
+      if (session->second.state == McpSessionState::kAwaitingInitialization &&
+          std::chrono::steady_clock::now() >=
+              session->second.initialization_deadline) {
+        ExpireSessionLocked(session, std::chrono::steady_clock::now());
+        lock.unlock();
+        state_changed.notify_all();
         return TextResponse(request, http::status::not_found,
                             "unknown MCP session");
       }
-      ++stats.terminated_sessions;
+      previous_state = session->second.state;
+      session->second.state = McpSessionState::kClosing;
+    }
+    std::string cleanup_error;
+    if (!FinishExplicitSessionClose(session_id, previous_state,
+                                    &cleanup_error)) {
+      if (!cleanup_error.empty()) {
+        return TextResponse(request, http::status::service_unavailable,
+                            "MCP session cleanup incomplete: " + cleanup_error);
+      }
+      return TextResponse(request, http::status::not_found,
+                          "unknown MCP session");
     }
     return TextResponse(request, http::status::ok, "MCP session terminated");
   }
@@ -864,8 +1166,13 @@ struct McpProtocol::Impl {
   McpResourceHandler resource_handler;
   McpSessionHandler session_handler;
   mutable std::mutex mutex;
+  std::condition_variable_any state_changed;
   std::map<std::string, McpSession, std::less<>> sessions;
+  std::vector<McpPendingSessionCleanup> pending_cleanup;
+  std::deque<std::string> failed_cleanup;
   McpProtocolStats stats;
+  std::jthread deadline_worker;
+  std::jthread cleanup_worker;
 };
 
 McpProtocol::McpProtocol(McpProtocolConfig config, McpToolHandler tool_handler,
@@ -937,7 +1244,7 @@ void McpProtocol::BroadcastNotification(std::string_view method,
   std::lock_guard<std::mutex> lock(impl_->mutex);
   for (auto& [id, session] : impl_->sessions) {
     static_cast<void>(id);
-    if (!session.initialized) {
+    if (session.state != McpSessionState::kInitialized) {
       continue;
     }
     if (session.notifications.size() == kMcpMaximumNotificationsPerSession) {

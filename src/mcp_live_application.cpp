@@ -1,5 +1,6 @@
 #include "bbp/mcp_live_application.h"
 
+#include <algorithm>
 #include <boost/json/array.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
@@ -7,12 +8,17 @@
 #include <cstdint>
 #include <filesystem>
 #include <initializer_list>
+#include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "bbp/chain_kind.h"
 #include "bbp/mcp_registry.h"
+#include "bbp/mcp_run_evidence.h"
 #include "bbp/run_report.h"
 #include "bbp/scenario_service.h"
 #include "bbp/simulation_command_queue.h"
@@ -51,6 +57,111 @@ std::string RequireString(const boost::json::object& object,
                                 " must be a non-empty string");
   }
   return std::string(value.as_string());
+}
+
+std::uint64_t OptionalUnsigned(const boost::json::object& object,
+                               std::string_view name, std::uint64_t fallback) {
+  const boost::json::value* value = object.if_contains(name);
+  if (value == nullptr) {
+    return fallback;
+  }
+  if (value->is_uint64()) {
+    return value->as_uint64();
+  }
+  if (value->is_int64() && value->as_int64() >= 0) {
+    return static_cast<std::uint64_t>(value->as_int64());
+  }
+  throw std::invalid_argument("MCP application argument " + std::string(name) +
+                              " must be an unsigned integer");
+}
+
+bool OptionalBoolean(const boost::json::object& object, std::string_view name,
+                     bool fallback) {
+  const boost::json::value* value = object.if_contains(name);
+  if (value == nullptr) {
+    return fallback;
+  }
+  if (!value->is_bool()) {
+    throw std::invalid_argument("MCP application argument " +
+                                std::string(name) + " must be a boolean");
+  }
+  return value->as_bool();
+}
+
+std::string OptionalCursor(const boost::json::object& object,
+                           std::string_view name) {
+  const boost::json::value* value = object.if_contains(name);
+  if (value == nullptr) {
+    return {};
+  }
+  if (!value->is_string() || value->as_string().empty()) {
+    throw std::invalid_argument("MCP application argument " +
+                                std::string(name) +
+                                " must be a non-empty cursor string");
+  }
+  if (value->as_string().size() > 256U) {
+    throw std::invalid_argument("MCP application argument " +
+                                std::string(name) +
+                                " exceeds the cursor byte bound");
+  }
+  return std::string(value->as_string());
+}
+
+std::vector<std::string> OptionalStringArray(const boost::json::object& object,
+                                             std::string_view name,
+                                             bool required = false) {
+  const boost::json::value* value = object.if_contains(name);
+  if (value == nullptr) {
+    if (required) {
+      throw std::invalid_argument("missing MCP application argument: " +
+                                  std::string(name));
+    }
+    return {};
+  }
+  if (!value->is_array() || (required && value->as_array().empty())) {
+    throw std::invalid_argument("MCP application argument " +
+                                std::string(name) +
+                                " must be a non-empty array");
+  }
+  std::vector<std::string> result;
+  result.reserve(value->as_array().size());
+  std::set<std::string, std::less<>> unique;
+  for (const boost::json::value& item : value->as_array()) {
+    if (!item.is_string() || item.as_string().empty()) {
+      throw std::invalid_argument("MCP application argument " +
+                                  std::string(name) +
+                                  " must contain non-empty strings");
+    }
+    std::string text(item.as_string());
+    if (!unique.insert(text).second) {
+      throw std::invalid_argument("MCP application argument " +
+                                  std::string(name) +
+                                  " must contain unique strings");
+    }
+    result.push_back(std::move(text));
+  }
+  return result;
+}
+
+std::vector<McpInformationFamily> RequireFamilies(
+    const boost::json::object& object) {
+  const std::vector<std::string> names =
+      OptionalStringArray(object, "families", true);
+  std::vector<McpInformationFamily> families;
+  families.reserve(names.size());
+  const std::span<const McpNamedCapability> registry =
+      McpInformationFamilyRegistry();
+  for (const std::string& name : names) {
+    const auto found = std::find_if(
+        registry.begin(), registry.end(),
+        [&](const McpNamedCapability& entry) { return entry.name == name; });
+    if (found == registry.end()) {
+      throw std::invalid_argument("unknown MCP evidence family: " + name);
+    }
+    families.push_back(static_cast<McpInformationFamily>(
+        static_cast<std::size_t>(found - registry.begin())));
+  }
+  return families;
 }
 
 std::uint64_t EpochMilliseconds() {
@@ -126,6 +237,36 @@ boost::json::object EvidencePage(std::string_view run_id,
                              {"truncated", false}};
 }
 
+McpRunEvidenceQuery ParseEvidenceQuery(const boost::json::object& arguments,
+                                       bool logs_only) {
+  McpRunEvidenceQuery query;
+  query.families =
+      logs_only
+          ? std::vector<McpInformationFamily>{McpInformationFamily::kLogHistory}
+          : RequireFamilies(arguments);
+  query.node_ids = OptionalStringArray(arguments, "node_ids", logs_only);
+  const std::uint64_t start = OptionalUnsigned(arguments, "start_sequence", 0U);
+  query.cursor = OptionalCursor(arguments, "cursor");
+  if (query.cursor.empty()) {
+    query.start_sequence = start;
+  }
+  const std::uint64_t limit =
+      OptionalUnsigned(arguments, "limit", kMcpListPageSize);
+  if (limit == 0U || limit > kMcpListPageSize ||
+      limit > std::numeric_limits<std::size_t>::max()) {
+    throw std::invalid_argument("MCP evidence limit is out of range");
+  }
+  query.limit = static_cast<std::size_t>(limit);
+  if (arguments.if_contains("end_sequence") != nullptr) {
+    query.end_sequence = OptionalUnsigned(arguments, "end_sequence", 0U);
+    if (*query.end_sequence < start) {
+      throw std::invalid_argument(
+          "MCP log end_sequence precedes start_sequence");
+    }
+  }
+  return query;
+}
+
 }  // namespace
 
 McpLiveApplication::McpLiveApplication(Config config)
@@ -171,7 +312,11 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   static_cast<void>(session_id);
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
-      kind != McpOperationKind::kInvokeRuntimeCommand) {
+      kind != McpOperationKind::kInvokeRuntimeCommand &&
+      kind != McpOperationKind::kQueryEvidence &&
+      kind != McpOperationKind::kQueryLogs &&
+      kind != McpOperationKind::kFollowLogs &&
+      kind != McpOperationKind::kReadArtifact) {
     return {};
   }
   RequireRun(arguments);
@@ -206,15 +351,93 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   }
 
   if (kind == McpOperationKind::kReportRun) {
+    const std::vector<std::string> node_ids =
+        OptionalStringArray(arguments, "node_ids");
+    const bool include_artifacts =
+        OptionalBoolean(arguments, "include_artifacts", false);
     return McpOperationPlan{
-        .progress_total = 1U, .executor = [this](McpOperationContext& context) {
+        .progress_total = 1U,
+        .executor = [this, node_ids,
+                     include_artifacts](McpOperationContext& context) {
           context.ThrowIfCancelled();
-          boost::json::object report = ReportSnapshot(context.stop_token());
+          boost::json::value report;
+          if (node_ids.empty()) {
+            report = ReportSnapshot(context.stop_token());
+          } else {
+            boost::json::array node_reports;
+            node_reports.reserve(node_ids.size());
+            for (const std::string& node_id : node_ids) {
+              context.ThrowIfCancelled();
+              const boost::json::value node_report = boost::json::parse(
+                  BuildNodeReportJson(config_.run_root, node_id, 0U));
+              node_reports.push_back(node_report);
+            }
+            report =
+                boost::json::object{{"run_id", config_.run_id},
+                                    {"node_reports", std::move(node_reports)}};
+          }
+          if (include_artifacts) {
+            report.as_object()["artifacts"] = BuildMcpRunArtifactInventory(
+                config_.run_id, config_.run_root, context.stop_token());
+          }
           return McpTypedResult{
               .family = McpResultFamily::kEvidencePage,
               .value =
                   EvidencePage(config_.run_id, McpInformationFamily::kReports,
                                std::move(report))};
+        }};
+  }
+
+  if (kind == McpOperationKind::kQueryEvidence ||
+      kind == McpOperationKind::kQueryLogs ||
+      kind == McpOperationKind::kFollowLogs) {
+    McpRunEvidenceQuery query = ParseEvidenceQuery(
+        arguments, kind == McpOperationKind::kQueryLogs ||
+                       kind == McpOperationKind::kFollowLogs);
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, query = std::move(query),
+                     follow = kind == McpOperationKind::kFollowLogs](
+                        McpOperationContext& context) mutable {
+          constexpr auto kFollowWait = std::chrono::seconds(1);
+          constexpr auto kFollowPoll = std::chrono::milliseconds(25);
+          const auto deadline = std::chrono::steady_clock::now() + kFollowWait;
+          while (true) {
+            context.ThrowIfCancelled();
+            boost::json::object page = QueryMcpRunEvidence(
+                config_.run_id, config_.run_root, query, context.stop_token());
+            if (!follow || !page.at("items").as_array().empty() ||
+                std::chrono::steady_clock::now() >= deadline) {
+              return McpTypedResult{.family = McpResultFamily::kEvidencePage,
+                                    .value = std::move(page)};
+            }
+            query.cursor = std::string(page.at("next_cursor").as_string());
+            query.start_sequence = 0U;
+            std::this_thread::sleep_for(kFollowPoll);
+          }
+        }};
+  }
+
+  if (kind == McpOperationKind::kReadArtifact) {
+    const std::string artifact_id = RequireString(arguments, "artifact_id");
+    const std::uint64_t offset = OptionalUnsigned(arguments, "offset", 0U);
+    const std::uint64_t limit =
+        OptionalUnsigned(arguments, "limit", 64U * 1024U);
+    if (limit == 0U || limit > (1U << 20U) ||
+        limit > std::numeric_limits<std::size_t>::max()) {
+      throw std::invalid_argument("MCP artifact limit is out of range");
+    }
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, artifact_id, offset,
+                     limit = static_cast<std::size_t>(limit)](
+                        McpOperationContext& context) {
+          context.ThrowIfCancelled();
+          return McpTypedResult{
+              .family = McpResultFamily::kArtifactContent,
+              .value = ReadMcpRunArtifact(config_.run_id, config_.run_root,
+                                          artifact_id, offset, limit,
+                                          context.stop_token())};
         }};
   }
 
@@ -255,7 +478,7 @@ boost::json::value McpLiveApplication::ReadResource(
     std::stop_token stop_token) {
   static_cast<void>(session_id);
   if (stop_token.stop_requested()) {
-    throw std::runtime_error("MCP resource read was cancelled");
+    throw McpOperationCancelled();
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -405,8 +628,8 @@ boost::json::value McpLiveApplication::ReadResource(
       data = SelectReportFields(report, {"operator_connection_command"});
       break;
     case McpInformationFamily::kArtifacts:
-      data = boost::json::object{{"run_root", config_.run_root.string()},
-                                 {"safe_contents_require_artifact_read", true}};
+      data = BuildMcpRunArtifactInventory(config_.run_id, config_.run_root,
+                                          stop_token);
       break;
     case McpInformationFamily::kArtifactContents:
       data = boost::json::object{{"available_through", "artifact.read"}};
@@ -426,7 +649,7 @@ boost::json::value McpLiveApplication::ReadResource(
       throw std::logic_error("invalid MCP live resource dispatch");
   }
   if (stop_token.stop_requested()) {
-    throw std::runtime_error("MCP resource read was cancelled");
+    throw McpOperationCancelled();
   }
   return ResourceEnvelope(family, config_.run_id, std::move(data));
 }

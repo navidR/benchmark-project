@@ -4,9 +4,15 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <boost/test/unit_test.hpp>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <exception>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "bbp/mcp_protocol.h"
 #include "bbp/mcp_registry.h"
@@ -15,6 +21,7 @@ namespace bbp {
 namespace {
 
 namespace http = boost::beast::http;
+using namespace std::chrono_literals;
 
 constexpr std::string_view kTestToken =
     "0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -86,6 +93,19 @@ const boost::json::object& ParsedBody(const std::string& body,
   *storage = boost::json::parse(body);
   BOOST_REQUIRE(storage->is_object());
   return storage->as_object();
+}
+
+template <typename Predicate>
+bool WaitFor(Predicate predicate,
+             std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  return predicate();
 }
 
 McpProtocol MakeProtocol(std::size_t* tool_calls = nullptr) {
@@ -304,6 +324,162 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_bounds_sessions_and_retained_notifications) {
       protocol.Handle(ProtocolRequest(http::verb::delete_, {}, first_session));
   BOOST_TEST(deleted.result() == http::status::ok);
   BOOST_TEST(protocol.Handle(get).result() == http::status::not_found);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_protocol_expires_only_sessions_without_initialized_notification) {
+  std::atomic<std::size_t> opened = 0U;
+  std::atomic<std::size_t> closed = 0U;
+  McpProtocol* protocol_pointer = nullptr;
+  McpProtocol protocol(
+      McpProtocolConfig{.bearer_token = std::string(kTestToken),
+                        .endpoint_path = "/mcp",
+                        .endpoint_port = 43123U,
+                        .uninitialized_session_timeout = 100ms},
+      {}, {}, [&](std::string_view, bool is_opened) {
+        if (is_opened) {
+          opened.fetch_add(1U, std::memory_order_relaxed);
+          return;
+        }
+        static_cast<void>(protocol_pointer->Stats());
+        closed.fetch_add(1U, std::memory_order_relaxed);
+      });
+  protocol_pointer = &protocol;
+
+  const std::string initialized = Initialize(&protocol);
+  MarkInitialized(&protocol, initialized);
+  const std::string abandoned = Initialize(&protocol);
+  BOOST_TEST(protocol.Stats().sessions == 2U);
+
+  BOOST_REQUIRE(
+      WaitFor([&] { return protocol.Stats().expired_sessions == 1U; }, 500ms));
+  const std::string replacement = Initialize(&protocol);
+  BOOST_TEST(!replacement.empty());
+  MarkInitialized(&protocol, replacement);
+
+  const McpProtocolStats stats = protocol.Stats();
+  BOOST_TEST(stats.sessions == 2U);
+  BOOST_TEST(stats.initialized_sessions == 2U);
+  BOOST_TEST(stats.terminated_sessions == 1U);
+  BOOST_TEST(stats.expired_sessions == 1U);
+  BOOST_TEST(opened.load(std::memory_order_relaxed) == 3U);
+  BOOST_REQUIRE(WaitFor(
+      [&] { return closed.load(std::memory_order_relaxed) == 1U; }, 500ms));
+  BOOST_TEST(closed.load(std::memory_order_relaxed) == 1U);
+
+  const auto initialized_ping = protocol.Handle(
+      ProtocolRequest(http::verb::post, RequestBody(9U, "ping"), initialized));
+  BOOST_TEST(initialized_ping.result() == http::status::ok);
+  const auto abandoned_ping = protocol.Handle(
+      ProtocolRequest(http::verb::post, InitializedBody(), abandoned));
+  BOOST_TEST(abandoned_ping.result() == http::status::not_found);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_protocol_starts_initialization_deadline_after_open_callback) {
+  std::mutex callback_mutex;
+  std::condition_variable callback_changed;
+  bool callback_entered = false;
+  bool release_open = false;
+  std::atomic<bool> opening = false;
+  std::atomic<std::size_t> overlapping_closes = 0U;
+  std::atomic<std::size_t> closed = 0U;
+  McpProtocol protocol(
+      McpProtocolConfig{.bearer_token = std::string(kTestToken),
+                        .endpoint_path = "/mcp",
+                        .endpoint_port = 43123U,
+                        .uninitialized_session_timeout = 5ms},
+      {}, {}, [&](std::string_view, bool is_opened) {
+        if (is_opened) {
+          opening.store(true, std::memory_order_release);
+          std::unique_lock<std::mutex> lock(callback_mutex);
+          callback_entered = true;
+          callback_changed.notify_all();
+          callback_changed.wait(lock, [&] { return release_open; });
+          opening.store(false, std::memory_order_release);
+          return;
+        }
+        if (opening.load(std::memory_order_acquire)) {
+          overlapping_closes.fetch_add(1U, std::memory_order_relaxed);
+        }
+        closed.fetch_add(1U, std::memory_order_relaxed);
+      });
+
+  std::optional<http::response<http::string_body>> response;
+  std::exception_ptr failure;
+  std::jthread initializer([&] {
+    try {
+      response = protocol.Handle(
+          ProtocolRequest(http::verb::post, InitializeBody(1U)));
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  });
+
+  bool entered = false;
+  {
+    std::unique_lock<std::mutex> lock(callback_mutex);
+    entered = callback_changed.wait_for(lock, 500ms,
+                                        [&] { return callback_entered; });
+  }
+  std::this_thread::sleep_for(20ms);
+  BOOST_TEST(closed.load(std::memory_order_relaxed) == 0U);
+  {
+    std::lock_guard<std::mutex> lock(callback_mutex);
+    release_open = true;
+  }
+  callback_changed.notify_all();
+  initializer.join();
+
+  BOOST_REQUIRE(entered);
+  BOOST_REQUIRE(failure == nullptr);
+  BOOST_REQUIRE(response.has_value());
+  BOOST_TEST(response->result() == http::status::ok);
+  BOOST_REQUIRE(
+      WaitFor([&] { return protocol.Stats().expired_sessions == 1U; }, 500ms));
+  BOOST_TEST(overlapping_closes.load(std::memory_order_relaxed) == 0U);
+  BOOST_REQUIRE(WaitFor(
+      [&] { return closed.load(std::memory_order_relaxed) == 1U; }, 500ms));
+  BOOST_TEST(closed.load(std::memory_order_relaxed) == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_protocol_expiry_reclaims_capacity_when_cleanup_throws) {
+  std::atomic<std::size_t> close_attempts = 0U;
+  McpProtocol protocol(
+      McpProtocolConfig{.bearer_token = std::string(kTestToken),
+                        .endpoint_path = "/mcp",
+                        .endpoint_port = 43123U,
+                        .uninitialized_session_timeout = 100ms},
+      {}, {}, [&](std::string_view, bool is_opened) {
+        if (!is_opened) {
+          close_attempts.fetch_add(1U, std::memory_order_relaxed);
+          throw std::runtime_error("cleanup still busy");
+        }
+      });
+
+  for (std::size_t index = 0U; index < kMcpMaximumSessions; ++index) {
+    static_cast<void>(Initialize(&protocol));
+  }
+  const auto full = protocol.Handle(ProtocolRequest(
+      http::verb::post, InitializeBody(kMcpMaximumSessions + 1U)));
+  BOOST_TEST(full.result() == http::status::service_unavailable);
+
+  BOOST_REQUIRE(WaitFor([&] {
+    const McpProtocolStats stats = protocol.Stats();
+    return stats.sessions == 0U &&
+           stats.expired_sessions == kMcpMaximumSessions;
+  }));
+  const std::string replacement = Initialize(&protocol);
+  MarkInitialized(&protocol, replacement);
+  BOOST_TEST(protocol.Stats().sessions == 1U);
+  BOOST_REQUIRE(WaitFor(
+      [&] {
+        return protocol.Stats().failed_session_cleanups == kMcpMaximumSessions;
+      },
+      3s));
+  BOOST_TEST(close_attempts.load(std::memory_order_relaxed) ==
+             2U * kMcpMaximumSessions);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_protocol_reconnect_resumes_after_event_cursor) {

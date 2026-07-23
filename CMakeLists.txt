@@ -235,6 +235,7 @@ add_executable(bbp
   src/mcp_operation_service.cpp
   src/mcp_protocol.cpp
   src/mcp_registry.cpp
+  src/mcp_run_evidence.cpp
   src/mcp_schema.cpp
   src/mcp_server.cpp
   src/main.cpp
@@ -450,6 +451,7 @@ if(BUILD_TESTING)
     src/mcp_operation_service.cpp
     src/mcp_protocol.cpp
     src/mcp_registry.cpp
+    src/mcp_run_evidence.cpp
     src/mcp_schema.cpp
     src/mcp_server.cpp
     src/metric_sparkline.cpp

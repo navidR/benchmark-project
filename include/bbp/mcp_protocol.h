@@ -3,6 +3,7 @@
 #include <boost/beast/http/message.hpp>
 #include <boost/beast/http/string_body.hpp>
 #include <boost/json/value.hpp>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -23,6 +24,8 @@ struct McpProtocolStats {
   std::size_t maximum_sessions = 0U;
   std::uint64_t initialized_sessions = 0U;
   std::uint64_t terminated_sessions = 0U;
+  std::uint64_t expired_sessions = 0U;
+  std::uint64_t failed_session_cleanups = 0U;
   std::uint64_t rejected_sessions = 0U;
   std::uint64_t requests = 0U;
   std::uint64_t malformed_requests = 0U;
@@ -36,6 +39,8 @@ struct McpProtocolConfig {
   std::string bearer_token;
   std::string endpoint_path = "/mcp";
   std::uint16_t endpoint_port = 0U;
+  std::chrono::milliseconds uninitialized_session_timeout =
+      std::chrono::seconds(30);
 };
 
 using McpToolHandler = std::function<boost::json::value(
@@ -43,6 +48,7 @@ using McpToolHandler = std::function<boost::json::value(
     std::stop_token)>;
 using McpResourceHandler = std::function<boost::json::value(
     std::string_view, std::string_view, std::stop_token)>;
+// Automatic expiry may retry opened=false; close handling must be idempotent.
 using McpSessionHandler =
     std::function<void(std::string_view, bool /* opened */)>;
 

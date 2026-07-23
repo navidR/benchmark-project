@@ -21,6 +21,7 @@ namespace bbp {
 namespace {
 
 constexpr std::size_t kMaximumIdentifierBytes = 128U;
+thread_local const void* g_mcp_operation_worker = nullptr;
 
 std::string RandomId(std::string_view prefix) {
   std::array<unsigned char, 16U> bytes{};
@@ -298,10 +299,18 @@ void McpOperationContext::ReportProgress(std::uint64_t completed) const {
 }
 
 struct McpOperationService::Impl {
+  enum class ShutdownPhase {
+    kRunning,
+    kStopping,
+    kComplete,
+  };
+
   struct OperationRecord {
     McpOperationSnapshot snapshot;
     std::uint64_t admission_sequence = 0U;
     std::optional<std::jthread> worker;
+    std::size_t waiters = 0U;
+    bool worker_exited = false;
   };
 
   struct SubscriptionRecord {
@@ -313,11 +322,37 @@ struct McpOperationService::Impl {
     std::uint64_t dropped = 0U;
     bool active = true;
     std::uint64_t admission_sequence = 0U;
+    std::size_t waiters = 0U;
   };
 
   struct SessionRecord {
     std::size_t active_operations = 0U;
+    std::size_t waiters = 0U;
     std::map<std::string, SubscriptionRecord, std::less<>> subscriptions;
+  };
+
+  struct WaiterPin {
+    WaiterPin(Impl* implementation, SessionRecord* session_record,
+              std::size_t* target_waiters)
+        : implementation(implementation),
+          session_record(session_record),
+          target_waiters(target_waiters) {
+      ++session_record->waiters;
+      ++*target_waiters;
+    }
+
+    ~WaiterPin() {
+      --*target_waiters;
+      --session_record->waiters;
+      implementation->state_changed.notify_all();
+    }
+
+    WaiterPin(const WaiterPin&) = delete;
+    WaiterPin& operator=(const WaiterPin&) = delete;
+
+    Impl* implementation;
+    SessionRecord* session_record;
+    std::size_t* target_waiters;
   };
 
   explicit Impl(McpOperationServiceConfig config_value,
@@ -445,13 +480,41 @@ struct McpOperationService::Impl {
     snapshot->sequence = next_state_sequence++;
   }
 
+  bool CurrentThreadIsWorker() const { return g_mcp_operation_worker == this; }
+
+  void CollectDeferredWorkersLocked(std::vector<std::jthread>* workers) {
+    const std::thread::id current_thread = std::this_thread::get_id();
+    for (auto worker = deferred_workers.begin();
+         worker != deferred_workers.end();) {
+      if (worker->get_id() == current_thread) {
+        ++worker;
+        continue;
+      }
+      workers->push_back(std::move(*worker));
+      worker = deferred_workers.erase(worker);
+    }
+  }
+
+  void TakeWorkerLocked(std::optional<std::jthread>* worker,
+                        std::vector<std::jthread>* workers) {
+    if (!*worker) {
+      return;
+    }
+    if ((*worker)->get_id() == std::this_thread::get_id()) {
+      deferred_workers.push_back(std::move(**worker));
+    } else {
+      workers->push_back(std::move(**worker));
+    }
+    worker->reset();
+  }
+
   void CollectFinishedWorkersLocked(std::vector<std::jthread>* workers) {
+    CollectDeferredWorkersLocked(workers);
     for (auto& [id, operation] : operations) {
       static_cast<void>(id);
       if (IsTerminalMcpOperationState(operation.snapshot.state) &&
-          operation.worker) {
-        workers->push_back(std::move(*operation.worker));
-        operation.worker.reset();
+          operation.worker_exited) {
+        TakeWorkerLocked(&operation.worker, workers);
       }
     }
   }
@@ -460,7 +523,8 @@ struct McpOperationService::Impl {
     auto oldest = operations.end();
     for (auto operation = operations.begin(); operation != operations.end();
          ++operation) {
-      if (!IsTerminalMcpOperationState(operation->second.snapshot.state)) {
+      if (!IsTerminalMcpOperationState(operation->second.snapshot.state) ||
+          operation->second.waiters != 0U) {
         continue;
       }
       if (oldest == operations.end() || operation->second.admission_sequence <
@@ -472,9 +536,7 @@ struct McpOperationService::Impl {
       throw std::runtime_error(
           "MCP retained operation capacity contains only active work");
     }
-    if (oldest->second.worker) {
-      workers->push_back(std::move(*oldest->second.worker));
-    }
+    TakeWorkerLocked(&oldest->second.worker, workers);
     operations.erase(oldest);
     ++stats.evicted_operations;
   }
@@ -486,7 +548,7 @@ struct McpOperationService::Impl {
     for (const McpServiceNotification& notification : notifications) {
       try {
         notification_handler(notification);
-      } catch (const std::exception&) {
+      } catch (...) {
         std::lock_guard<std::mutex> lock(mutex);
         ++stats.notification_handler_failures;
       }
@@ -630,6 +692,13 @@ struct McpOperationService::Impl {
                                 .retryable = false,
                                 .diagnostics = {}};
       terminal_state = McpOperationState::kFailed;
+    } catch (...) {
+      error = McpOperationError{
+          .code = "operation_failed",
+          .message = "operation failed with a non-standard exception",
+          .retryable = false,
+          .diagnostics = {}};
+      terminal_state = McpOperationState::kFailed;
     }
     if (error) {
       ValidateError(&*error);
@@ -652,6 +721,83 @@ struct McpOperationService::Impl {
     }
     state_changed.notify_all();
     NotifyOperation(snapshot);
+  }
+
+  bool SessionWaitersDrainedLocked() const {
+    return std::all_of(
+        sessions.begin(), sessions.end(),
+        [](const auto& session) { return session.second.waiters == 0U; });
+  }
+
+  void FinalizeShutdownLocked() {
+    for (auto& [session_id, session] : sessions) {
+      static_cast<void>(session_id);
+      session.subscriptions.clear();
+    }
+    sessions.clear();
+    stats.sessions = 0U;
+    shutdown_phase = ShutdownPhase::kComplete;
+  }
+
+  void FailUnexpectedOperation(std::string_view operation_id) noexcept {
+    try {
+      McpOperationSnapshot snapshot;
+      bool notify = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = operations.find(operation_id);
+        if (found != operations.end() &&
+            !IsTerminalMcpOperationState(found->second.snapshot.state)) {
+          McpOperationError error{
+              .code = "operation_failed",
+              .message = "operation worker failed at its thread boundary",
+              .retryable = false,
+              .diagnostics = {}};
+          CompleteLocked(&found->second, McpOperationState::kFailed,
+                         std::nullopt, std::move(error));
+          snapshot = found->second.snapshot;
+          notify = true;
+        }
+      }
+      state_changed.notify_all();
+      if (notify) {
+        NotifyOperation(snapshot);
+      }
+    } catch (...) {
+    }
+  }
+
+  void WorkerExited(std::string_view operation_id) noexcept {
+    try {
+      std::unique_lock<std::mutex> lock(mutex);
+      const auto found = operations.find(operation_id);
+      if (found != operations.end()) {
+        found->second.worker_exited = true;
+      }
+      if (shutdown_phase == ShutdownPhase::kStopping &&
+          shutdown_owner == std::this_thread::get_id() &&
+          shutdown_workers_joined) {
+        state_changed.wait(lock,
+                           [this] { return SessionWaitersDrainedLocked(); });
+        FinalizeShutdownLocked();
+      }
+      lock.unlock();
+      state_changed.notify_all();
+    } catch (...) {
+    }
+  }
+
+  void WorkerMain(std::string operation_id, McpOperationExecutor executor,
+                  std::stop_token stop_token) noexcept {
+    const void* previous_worker = g_mcp_operation_worker;
+    g_mcp_operation_worker = this;
+    try {
+      RunOperation(operation_id, std::move(executor), stop_token);
+    } catch (...) {
+      FailUnexpectedOperation(operation_id);
+    }
+    WorkerExited(operation_id);
+    g_mcp_operation_worker = previous_worker;
   }
 
   McpSubscriptionSnapshot SubscriptionSnapshotLocked(
@@ -680,12 +826,41 @@ struct McpOperationService::Impl {
   void Shutdown() {
     std::vector<std::jthread> workers;
     std::vector<McpServiceNotification> notifications;
+    const auto join_workers = [](std::vector<std::jthread>* joinable_workers) {
+      for (std::jthread& worker : *joinable_workers) {
+        worker.request_stop();
+        if (worker.joinable()) {
+          worker.join();
+        }
+      }
+    };
     {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (shutdown_complete) {
+      std::unique_lock<std::mutex> lock(mutex);
+      if (shutdown_phase == ShutdownPhase::kComplete) {
+        CollectFinishedWorkersLocked(&workers);
+        lock.unlock();
+        join_workers(&workers);
         return;
       }
+      if (shutdown_phase == ShutdownPhase::kStopping) {
+        if (shutdown_owner == std::this_thread::get_id() ||
+            CurrentThreadIsWorker()) {
+          return;
+        }
+        state_changed.wait(lock, [this] {
+          return shutdown_phase == ShutdownPhase::kComplete;
+        });
+        CollectFinishedWorkersLocked(&workers);
+        lock.unlock();
+        join_workers(&workers);
+        return;
+      }
+
+      shutdown_phase = ShutdownPhase::kStopping;
+      shutdown_owner = std::this_thread::get_id();
+      shutdown_owner_is_worker = CurrentThreadIsWorker();
       stats.accepting = false;
+      CollectDeferredWorkersLocked(&workers);
       for (auto& [id, operation] : operations) {
         static_cast<void>(id);
         if (!IsTerminalMcpOperationState(operation.snapshot.state)) {
@@ -699,9 +874,9 @@ struct McpOperationService::Impl {
             operation.worker->request_stop();
           }
         }
-        if (operation.worker) {
-          workers.push_back(std::move(*operation.worker));
-          operation.worker.reset();
+        if (!operation.worker ||
+            operation.worker->get_id() != std::this_thread::get_id()) {
+          TakeWorkerLocked(&operation.worker, &workers);
         }
       }
       for (auto& [session_id, session] : sessions) {
@@ -714,22 +889,22 @@ struct McpOperationService::Impl {
     }
     state_changed.notify_all();
     Deliver(std::move(notifications));
-    for (std::jthread& worker : workers) {
-      worker.request_stop();
-      if (worker.joinable()) {
-        worker.join();
-      }
-    }
+    join_workers(&workers);
+
+    bool completed = false;
     {
-      std::lock_guard<std::mutex> lock(mutex);
-      for (auto& [session_id, session] : sessions) {
-        static_cast<void>(session_id);
-        session.subscriptions.clear();
+      std::unique_lock<std::mutex> lock(mutex);
+      shutdown_workers_joined = true;
+      if (!shutdown_owner_is_worker) {
+        state_changed.wait(lock,
+                           [this] { return SessionWaitersDrainedLocked(); });
+        FinalizeShutdownLocked();
+        completed = true;
       }
-      sessions.clear();
-      shutdown_complete = true;
     }
-    state_changed.notify_all();
+    if (completed) {
+      state_changed.notify_all();
+    }
   }
 
   McpOperationServiceConfig config;
@@ -738,10 +913,14 @@ struct McpOperationService::Impl {
   mutable std::condition_variable_any state_changed;
   std::map<std::string, SessionRecord, std::less<>> sessions;
   std::map<std::string, OperationRecord, std::less<>> operations;
+  std::vector<std::jthread> deferred_workers;
   McpOperationServiceStats stats;
   std::uint64_t next_state_sequence = 1U;
   std::uint64_t next_admission_sequence = 1U;
-  bool shutdown_complete = false;
+  ShutdownPhase shutdown_phase = ShutdownPhase::kRunning;
+  std::thread::id shutdown_owner;
+  bool shutdown_owner_is_worker = false;
+  bool shutdown_workers_joined = false;
 };
 
 McpOperationService::McpOperationService(
@@ -806,7 +985,8 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
   const bool stopped = impl_->state_changed.wait_until(lock, deadline, [&] {
     const auto found = impl_->sessions.find(session_id);
     return found == impl_->sessions.end() ||
-           found->second.active_operations == 0U;
+           (found->second.active_operations == 0U &&
+            found->second.waiters == 0U);
   });
   if (!stopped) {
     return false;
@@ -814,13 +994,13 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
   for (auto& [id, operation] : impl_->operations) {
     static_cast<void>(id);
     if (operation.snapshot.session_id == session_id && operation.worker) {
-      workers.push_back(std::move(*operation.worker));
-      operation.worker.reset();
+      impl_->TakeWorkerLocked(&operation.worker, &workers);
     }
   }
   impl_->sessions.erase(std::string(session_id));
   impl_->stats.sessions = impl_->sessions.size();
   lock.unlock();
+  impl_->state_changed.notify_all();
   for (std::jthread& worker : workers) {
     if (worker.joinable()) {
       worker.join();
@@ -889,8 +1069,8 @@ McpOperationSnapshot McpOperationService::Submit(
       operation->second.worker.emplace(
           [implementation = impl_.get(), operation_id,
            executor = std::move(executor)](std::stop_token stop_token) mutable {
-            implementation->RunOperation(operation_id, std::move(executor),
-                                         stop_token);
+            implementation->WorkerMain(operation_id, std::move(executor),
+                                       stop_token);
           });
     } catch (...) {
       --session.active_operations;
@@ -951,7 +1131,10 @@ std::optional<McpOperationSnapshot> McpOperationService::WaitForOperation(
         "MCP operation wait timeout cannot be negative");
   }
   std::unique_lock<std::mutex> lock(impl_->mutex);
-  static_cast<void>(impl_->RequireOperationLocked(session_id, operation_id));
+  Impl::SessionRecord& session = impl_->RequireSessionLocked(session_id);
+  Impl::OperationRecord& operation =
+      impl_->RequireOperationLocked(session_id, operation_id);
+  Impl::WaiterPin waiter(impl_.get(), &session, &operation.waiters);
   const auto terminal = [&] {
     return IsTerminalMcpOperationState(
         impl_->RequireOperationLocked(session_id, operation_id).snapshot.state);
@@ -1016,7 +1199,7 @@ McpSubscriptionSnapshot McpOperationService::CreateSubscription(
     auto oldest = session.subscriptions.end();
     for (auto subscription = session.subscriptions.begin();
          subscription != session.subscriptions.end(); ++subscription) {
-      if (subscription->second.active) {
+      if (subscription->second.active || subscription->second.waiters != 0U) {
         continue;
       }
       if (oldest == session.subscriptions.end() ||
@@ -1039,7 +1222,8 @@ McpSubscriptionSnapshot McpOperationService::CreateSubscription(
       .next_sequence = request.cursor + 1U,
       .dropped = 0U,
       .active = true,
-      .admission_sequence = impl_->next_admission_sequence++};
+      .admission_sequence = impl_->next_admission_sequence++,
+      .waiters = 0U};
   auto [inserted, was_inserted] =
       session.subscriptions.emplace(subscription_id, std::move(subscription));
   if (!was_inserted) {
@@ -1063,8 +1247,10 @@ McpSubscriptionSnapshot McpOperationService::PollSubscription(
     throw std::invalid_argument("MCP subscription poll timeout is negative");
   }
   std::unique_lock<std::mutex> lock(impl_->mutex);
-  static_cast<void>(
-      impl_->RequireSubscriptionLocked(session_id, subscription_id));
+  Impl::SessionRecord& session = impl_->RequireSessionLocked(session_id);
+  Impl::SubscriptionRecord& subscription =
+      impl_->RequireSubscriptionLocked(session_id, subscription_id);
+  Impl::WaiterPin waiter(impl_.get(), &session, &subscription.waiters);
   const auto ready = [&] {
     const Impl::SubscriptionRecord& subscription =
         impl_->RequireSubscriptionLocked(session_id, subscription_id);
