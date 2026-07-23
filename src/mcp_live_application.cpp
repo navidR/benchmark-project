@@ -449,7 +449,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                       McpOperationContext& context) mutable {
         context.ThrowIfCancelled();
         const std::uint64_t sequence = SubmitCommand(std::move(command));
-        const std::optional<std::string> error = WaitForCommand(sequence);
+        const std::optional<std::string> error =
+            WaitForCommand(sequence, context.stop_token());
         if (error) {
           throw McpOperationFailure(
               "simulation_command_failed",
@@ -684,16 +685,22 @@ std::uint64_t McpLiveApplication::SubmitCommand(SimulationCommand command) {
 }
 
 std::optional<std::string> McpLiveApplication::WaitForCommand(
-    std::uint64_t sequence) {
+    std::uint64_t sequence, std::stop_token stop_token) {
+  std::stop_callback wake_on_cancellation(
+      stop_token, [this] { command_outcome_ready_.notify_all(); });
   std::unique_lock<std::mutex> lock(mutex_);
   command_outcome_ready_.wait(lock, [&] {
     const auto pending = pending_commands_.find(sequence);
-    return shutdown_ || pending == pending_commands_.end() ||
-           pending->second.completed;
+    return stop_token.stop_requested() || shutdown_ ||
+           pending == pending_commands_.end() || pending->second.completed;
   });
   const auto pending = pending_commands_.find(sequence);
   if (pending == pending_commands_.end()) {
     throw std::logic_error("MCP simulation command outcome was lost");
+  }
+  if (stop_token.stop_requested()) {
+    pending_commands_.erase(pending);
+    throw McpOperationCancelled();
   }
   if (!pending->second.completed) {
     pending_commands_.erase(pending);

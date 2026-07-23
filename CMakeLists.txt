@@ -211,6 +211,7 @@ endforeach()
 mark_target_interface_includes_system(yaml)
 
 add_executable(bbp
+  src/application_instance_lock.cpp
   src/block_production_policy.cpp
   src/capability.cpp
   src/cgroup.cpp
@@ -354,6 +355,7 @@ if(BUILD_TESTING)
   )
 
   add_executable(bbp-unit-tests
+    tests/unit/application_instance_lock_tests.cpp
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
@@ -425,6 +427,7 @@ if(BUILD_TESTING)
     tests/unit/wallet_transaction_plan_tests.cpp
     tests/unit/wallet_transfer_strategy_tests.cpp
     tests/unit/workload_kind_tests.cpp
+    src/application_instance_lock.cpp
     src/capability.cpp
     src/cgroup.cpp
     src/chain_extra_args.cpp

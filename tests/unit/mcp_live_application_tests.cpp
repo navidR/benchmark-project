@@ -167,6 +167,21 @@ BOOST_AUTO_TEST_CASE(
                  .as_string() ==
              "simulation command #2 failed: production command failure");
 
+  const boost::json::object cancellable_submitted =
+      Invoke(&dispatcher, "simulation.command", command_arguments);
+  const SimulationCommand cancellable = WaitForQueuedCommand(&queue);
+  const auto cancellation_started = std::chrono::steady_clock::now();
+  const boost::json::object cancellation =
+      Invoke(&dispatcher, "operation.cancel",
+             boost::json::object{
+                 {"operation_id", cancellable_submitted.at("operation_id")}});
+  BOOST_TEST(cancellation.at("cancel_requested").as_bool());
+  const boost::json::object cancelled_terminal =
+      WaitForTerminal(&dispatcher, cancellable_submitted);
+  BOOST_TEST(cancelled_terminal.at("state").as_string() == "cancelled");
+  BOOST_CHECK(std::chrono::steady_clock::now() - cancellation_started < 500ms);
+  application.RecordCommandOutcome(cancellable, std::nullopt);
+
   const boost::json::object stop_submitted =
       Invoke(&dispatcher, "run.stop",
              boost::json::object{{"run_id", "live-application"}});

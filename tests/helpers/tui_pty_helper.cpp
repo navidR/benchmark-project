@@ -30,8 +30,9 @@ class PtyProcess {
  public:
   PtyProcess(const std::filesystem::path& command,
              std::vector<std::string> arguments, unsigned short rows,
-             unsigned short cols) {
-    struct winsize size {};
+             unsigned short cols,
+             const std::filesystem::path& home_directory = {}) {
+    struct winsize size{};
     size.ws_row = rows;
     size.ws_col = cols;
     pid_ = forkpty(&master_fd_, nullptr, nullptr, &size);
@@ -41,6 +42,9 @@ class PtyProcess {
     if (pid_ == 0) {
       static_cast<void>(setenv("TERM", "xterm", 1));
       static_cast<void>(setenv("ESCDELAY", "25", 1));
+      if (!home_directory.empty()) {
+        static_cast<void>(setenv("HOME", home_directory.c_str(), 1));
+      }
       std::vector<char*> argv;
       argv.reserve(arguments.size() + 2U);
       argv.push_back(const_cast<char*>(command.c_str()));
@@ -549,7 +553,7 @@ void RequireOwnedResourcesRemoved(const std::filesystem::path& run_root,
 
 void RequirePrivateMcpPath(const std::filesystem::path& path, mode_t type,
                            mode_t permissions) {
-  struct stat status {};
+  struct stat status{};
   if (lstat(path.c_str(), &status) != 0) {
     throw std::system_error(errno, std::generic_category(),
                             "inspect MCP publication");
@@ -564,11 +568,13 @@ void RequirePrivateMcpPath(const std::filesystem::path& path, mode_t type,
 void CheckEmptyControlPlane(const std::filesystem::path& command) {
   OwnedTemporaryDirectory directory("empty-control-plane");
   const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
   const std::string run_id =
       "empty-control-plane-" + std::to_string(static_cast<long long>(getpid()));
   const std::filesystem::path run_root = benchmark_root / run_id;
   const std::filesystem::path events_path = run_root / "events.jsonl";
-  const std::filesystem::path mcp_path = run_root / "mcp";
+  const std::filesystem::path mcp_path = home_directory / ".bbp" / "mcp";
   const std::filesystem::path token_path = mcp_path / "token";
   const std::filesystem::path client_path = mcp_path / "client.json";
 
@@ -576,7 +582,7 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       command,
       {"--benchmark-root", benchmark_root.string(), "--run-id", run_id,
        "--refresh-ms", "50", "--metrics-interval", "50ms"},
-      30, 120);
+      30, 120, home_directory);
   static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
                                       "empty control plane"));
   const std::string resolved =
@@ -637,10 +643,12 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       WaitForFileText(events_path, "\"event\":\"run_finished\"", 3s);
   RequireContains(finished, "\"event\":\"run_cancelled\"",
                   "empty control-plane confirmed exit");
-  if (std::filesystem::exists(mcp_path)) {
+  if (std::filesystem::exists(token_path) ||
+      std::filesystem::exists(client_path)) {
     throw std::runtime_error(
-        "MCP publication survived empty control-plane cleanup");
+        "MCP credentials survived empty control-plane cleanup");
   }
+  RequirePrivateMcpPath(mcp_path, S_IFDIR, 0700);
   RequireOwnedResourcesRemoved(run_root, 0U, {}, {});
 }
 
@@ -1008,7 +1016,7 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   RequireContains(finished_events, "\"event\":\"run_cancelled\"",
                   "active-run confirmed exit");
   WaitForProcessExit(daemon_pid, 3s);
-  struct stat launcher_status {};
+  struct stat launcher_status{};
   errno = 0;
   if (lstat(second_launcher.c_str(), &launcher_status) == 0 ||
       errno != ENOENT) {

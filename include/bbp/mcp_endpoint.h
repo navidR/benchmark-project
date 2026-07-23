@@ -16,7 +16,7 @@ inline constexpr std::string_view kMcpTokenFile = "token";
 inline constexpr std::string_view kMcpClientConfigFile = "client.json";
 
 struct McpEndpointConfig {
-  std::filesystem::path run_root;
+  std::filesystem::path state_directory;
   std::string run_id;
   McpServerConfig server;
   McpDispatcherConfig dispatcher;
@@ -31,7 +31,7 @@ struct McpEndpointPublication {
 
 // Owns the authenticated loopback listener and its short-lived credential
 // publication. Stop removes and verifies every published credential before it
-// returns; retained run artifacts therefore never retain a live MCP secret.
+// returns; the private publication directory remains for the next BBP process.
 class McpEndpoint {
  public:
   explicit McpEndpoint(McpEndpointConfig config,

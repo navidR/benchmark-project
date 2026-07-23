@@ -85,9 +85,8 @@ http::response<http::string_body> Initialize(std::uint16_t port,
 BOOST_AUTO_TEST_CASE(
     mcp_endpoint_publishes_usable_client_configuration_and_cleans_credentials) {
   EndpointTestDirectory temporary;
-  const std::filesystem::path run_root = temporary.path() / "run";
-  std::filesystem::create_directory(run_root);
-  McpEndpoint endpoint(McpEndpointConfig{.run_root = run_root,
+  const std::filesystem::path state_directory = temporary.path();
+  McpEndpoint endpoint(McpEndpointConfig{.state_directory = state_directory,
                                          .run_id = "endpoint-test",
                                          .server = {},
                                          .dispatcher = {}});
@@ -135,36 +134,70 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!endpoint.running());
   BOOST_TEST(!std::filesystem::exists(publication.token_file));
   BOOST_TEST(!std::filesystem::exists(publication.client_config_file));
-  BOOST_TEST(!std::filesystem::exists(run_root / kMcpEndpointDirectory));
+  BOOST_TEST(
+      std::filesystem::is_directory(state_directory / kMcpEndpointDirectory));
   BOOST_TEST(endpoint.DispatcherStats().active_workers == 0U);
 }
 
-BOOST_AUTO_TEST_CASE(mcp_endpoint_never_removes_a_preexisting_directory) {
+BOOST_AUTO_TEST_CASE(mcp_endpoint_replaces_stale_publication_files) {
   EndpointTestDirectory temporary;
-  const std::filesystem::path run_root = temporary.path() / "run";
+  const std::filesystem::path state_directory = temporary.path();
   const std::filesystem::path publication_directory =
-      run_root / kMcpEndpointDirectory;
+      state_directory / kMcpEndpointDirectory;
   std::filesystem::create_directories(publication_directory);
+  WriteText(publication_directory / kMcpTokenFile, "stale-token\n");
+  WriteText(publication_directory / kMcpClientConfigFile, "stale-client\n");
 
-  {
-    McpEndpoint endpoint(McpEndpointConfig{.run_root = run_root,
-                                           .run_id = "endpoint-collision-test",
-                                           .server = {},
-                                           .dispatcher = {}});
-    BOOST_CHECK_THROW(endpoint.Start(), std::runtime_error);
-  }
+  McpEndpoint endpoint(McpEndpointConfig{.state_directory = state_directory,
+                                         .run_id = "endpoint-replacement-test",
+                                         .server = {},
+                                         .dispatcher = {}});
+  endpoint.Start();
+  const McpEndpointPublication publication = endpoint.publication();
+  BOOST_TEST(ReadText(publication.token_file) != "stale-token\n");
+  BOOST_TEST(ReadText(publication.client_config_file) != "stale-client\n");
+  endpoint.Stop();
 
   BOOST_TEST(std::filesystem::is_directory(publication_directory));
+  BOOST_TEST(!std::filesystem::exists(publication.token_file));
+  BOOST_TEST(!std::filesystem::exists(publication.client_config_file));
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_endpoint_removes_stale_publications_before_listener_failure) {
+  EndpointTestDirectory temporary;
+  const std::filesystem::path state_directory = temporary.path();
+  const std::filesystem::path publication_directory =
+      state_directory / kMcpEndpointDirectory;
+  std::filesystem::create_directories(publication_directory);
+  WriteText(publication_directory / kMcpTokenFile, "stale-token\n");
+  WriteText(publication_directory / kMcpClientConfigFile, "stale-client\n");
+  WriteText(publication_directory / ".token.tmp", "stale-temp-token\n");
+  WriteText(publication_directory / ".client.json.tmp", "stale-temp-client\n");
+
+  McpEndpoint endpoint(McpEndpointConfig{
+      .state_directory = state_directory,
+      .run_id = "endpoint-failure-test",
+      .server = McpServerConfig{.bind_address = "invalid-address"},
+      .dispatcher = {}});
+  BOOST_CHECK_THROW(endpoint.Start(), std::runtime_error);
+
+  BOOST_TEST(!std::filesystem::exists(publication_directory / kMcpTokenFile));
+  BOOST_TEST(
+      !std::filesystem::exists(publication_directory / kMcpClientConfigFile));
+  BOOST_TEST(!std::filesystem::exists(publication_directory / ".token.tmp"));
+  BOOST_TEST(
+      !std::filesystem::exists(publication_directory / ".client.json.tmp"));
 }
 
 BOOST_AUTO_TEST_CASE(mcp_endpoint_refuses_a_replaced_cleanup_path) {
   EndpointTestDirectory temporary;
-  const std::filesystem::path run_root = temporary.path() / "run";
+  const std::filesystem::path state_directory = temporary.path();
   const std::filesystem::path publication_directory =
-      run_root / kMcpEndpointDirectory;
-  const std::filesystem::path displaced_directory = run_root / "mcp-displaced";
-  std::filesystem::create_directory(run_root);
-  McpEndpoint endpoint(McpEndpointConfig{.run_root = run_root,
+      state_directory / kMcpEndpointDirectory;
+  const std::filesystem::path displaced_directory =
+      state_directory / "mcp-displaced";
+  McpEndpoint endpoint(McpEndpointConfig{.state_directory = state_directory,
                                          .run_id = "endpoint-replaced-test",
                                          .server = {},
                                          .dispatcher = {}});
@@ -178,7 +211,7 @@ BOOST_AUTO_TEST_CASE(mcp_endpoint_refuses_a_replaced_cleanup_path) {
   BOOST_REQUIRE(std::filesystem::remove(publication_directory));
   std::filesystem::rename(displaced_directory, publication_directory);
   endpoint.Stop();
-  BOOST_TEST(!std::filesystem::exists(publication_directory));
+  BOOST_TEST(std::filesystem::is_directory(publication_directory));
 }
 
 }  // namespace bbp

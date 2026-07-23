@@ -36,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/application_instance_lock.h"
 #include "bbp/capability.h"
 #include "bbp/cgroup.h"
 #include "bbp/default_peer_topology.h"
@@ -8493,7 +8494,7 @@ std::uint32_t WriteMetricsSnapshot(
       runtime.cgroup_path = node.cgroup->path().string();
     }
     if (node.network_namespace) {
-      struct stat namespace_stat {};
+      struct stat namespace_stat{};
       if (fstat(node.network_namespace->fd(), &namespace_stat) != 0) {
         throw std::runtime_error("fstat node network namespace failed");
       }
@@ -13956,6 +13957,7 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
 }
 
 int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
+                         const std::filesystem::path& state_directory,
                          std::stop_token external_stop_token = {}) {
   std::stop_source simulation_stop_source;
   std::stop_callback stop_simulation_on_external_request(
@@ -14052,7 +14054,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
                                  .request_run_stop = [&simulation_stop_source] {
                                    simulation_stop_source.request_stop();
                                  }});
-  McpEndpoint mcp_endpoint(McpEndpointConfig{.run_root = run_root,
+  McpEndpoint mcp_endpoint(McpEndpointConfig{.state_directory = state_directory,
                                              .run_id = options.run_id,
                                              .server = {},
                                              .dispatcher = {}},
@@ -15749,7 +15751,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   return 0;
 }
 
-int RunBenchmarkWithTui(Options options, std::stop_token signal_stop_token) {
+int RunBenchmarkWithTui(Options options,
+                        const std::filesystem::path& state_directory,
+                        std::stop_token signal_stop_token) {
   SetConsoleLoggingEnabled(false);
   try {
     const auto run_root = BenchmarkRunRoot(options);
@@ -15765,10 +15769,10 @@ int RunBenchmarkWithTui(Options options, std::stop_token signal_stop_token) {
 
     std::thread simulation_thread([&options, &simulation_failure,
                                    &simulation_result, &command_queue,
-                                   &stop_source]() {
+                                   &state_directory, &stop_source]() {
       try {
-        simulation_result = RunBenchmarkHeadless(options, &command_queue,
-                                                 stop_source.get_token());
+        simulation_result = RunBenchmarkHeadless(
+            options, &command_queue, state_directory, stop_source.get_token());
       } catch (...) {
         simulation_failure = std::current_exception();
       }
@@ -15851,6 +15855,7 @@ int SimulatorApp::Run(int argc, char** argv) {
   Options options = ParseOptions(argc, argv);
   SetMinimumLogLevel(options.log_level);
   RequireSafeOutputDirectory(options.output_dir);
+  ApplicationInstanceLock instance_lock;
   if (options.probe_network) {
     BBP_LOG(info) << NetworkProbeJson();
     return 0;
@@ -15940,7 +15945,8 @@ int SimulatorApp::Run(int argc, char** argv) {
   if (options.no_tui) {
     SignalStopMonitor signal_monitor;
     const int result =
-        RunBenchmarkHeadless(options, nullptr, signal_monitor.GetToken());
+        RunBenchmarkHeadless(options, nullptr, instance_lock.state_directory(),
+                             signal_monitor.GetToken());
     if (signal_monitor.ReceivedSignal() != 0) {
       BBP_LOG(info) << "graceful shutdown completed after signal "
                     << signal_monitor.ReceivedSignal();
@@ -15948,7 +15954,8 @@ int SimulatorApp::Run(int argc, char** argv) {
     return result;
   }
   SignalStopMonitor signal_monitor;
-  const int result = RunBenchmarkWithTui(options, signal_monitor.GetToken());
+  const int result = RunBenchmarkWithTui(
+      options, instance_lock.state_directory(), signal_monitor.GetToken());
   if (signal_monitor.ReceivedSignal() != 0) {
     BBP_LOG(info) << "graceful shutdown completed after signal "
                   << signal_monitor.ReceivedSignal();

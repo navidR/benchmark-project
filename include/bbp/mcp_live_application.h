@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 
@@ -61,7 +62,8 @@ class McpLiveApplication {
                                   std::stop_token stop_token);
   void RequireRun(const boost::json::object& arguments) const;
   std::uint64_t SubmitCommand(SimulationCommand command);
-  std::optional<std::string> WaitForCommand(std::uint64_t sequence);
+  std::optional<std::string> WaitForCommand(std::uint64_t sequence,
+                                            std::stop_token stop_token);
   boost::json::object ReportSnapshot(std::stop_token stop_token);
   std::string RunState() const;
 

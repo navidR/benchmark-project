@@ -78,7 +78,7 @@ bool SameIdentity(const struct stat& status, const FileIdentity& identity) {
 
 FileIdentity RequireOwnedDirectory(const std::filesystem::path& path,
                                    mode_t forbidden_permissions) {
-  struct stat status {};
+  struct stat status{};
   if (lstat(path.c_str(), &status) != 0) {
     throw SystemError("inspect MCP directory", path);
   }
@@ -100,6 +100,12 @@ FileIdentity WriteCredentialFile(int directory_descriptor,
                                  std::string_view name,
                                  std::string_view contents) {
   const std::string temporary_name = "." + std::string(name) + ".tmp";
+  if (unlinkat(directory_descriptor, temporary_name.c_str(), 0) != 0 &&
+      errno != ENOENT) {
+    throw std::runtime_error("remove stale temporary MCP credential " +
+                             temporary_name +
+                             " failed: " + std::strerror(errno));
+  }
   const int descriptor = openat(
       directory_descriptor, temporary_name.c_str(),
       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
@@ -129,7 +135,7 @@ FileIdentity WriteCredentialFile(int directory_descriptor,
   if (failure == 0 && fsync(descriptor) != 0) {
     failure = errno;
   }
-  struct stat status {};
+  struct stat status{};
   if (failure == 0 && fstat(descriptor, &status) != 0) {
     failure = errno;
   }
@@ -144,20 +150,20 @@ FileIdentity WriteCredentialFile(int directory_descriptor,
   }
   bool published = false;
   if (failure == 0 &&
-      linkat(directory_descriptor, temporary_name.c_str(), directory_descriptor,
-             std::string(name).c_str(), 0) != 0) {
+      renameat(directory_descriptor, temporary_name.c_str(),
+               directory_descriptor, std::string(name).c_str()) != 0) {
     failure = errno;
   } else if (failure == 0) {
     published = true;
   }
-  if (unlinkat(directory_descriptor, temporary_name.c_str(), 0) != 0 &&
-      failure == 0) {
-    failure = errno;
+  if (!published) {
+    static_cast<void>(
+        unlinkat(directory_descriptor, temporary_name.c_str(), 0));
   }
   if (failure == 0 && fsync(directory_descriptor) != 0) {
     failure = errno;
   }
-  struct stat published_status {};
+  struct stat published_status{};
   if (failure == 0 && fstatat(directory_descriptor, std::string(name).c_str(),
                               &published_status, AT_SYMLINK_NOFOLLOW) != 0) {
     failure = errno;
@@ -169,8 +175,6 @@ FileIdentity WriteCredentialFile(int directory_descriptor,
     failure = EPERM;
   }
   if (failure != 0) {
-    static_cast<void>(
-        unlinkat(directory_descriptor, temporary_name.c_str(), 0));
     if (published) {
       static_cast<void>(
           unlinkat(directory_descriptor, std::string(name).c_str(), 0));
@@ -183,7 +187,7 @@ FileIdentity WriteCredentialFile(int directory_descriptor,
 
 void RemoveAndVerifyFile(int directory_descriptor, std::string_view name,
                          const std::optional<FileIdentity>& identity) {
-  struct stat status {};
+  struct stat status{};
   if (fstatat(directory_descriptor, std::string(name).c_str(), &status,
               AT_SYMLINK_NOFOLLOW) != 0) {
     if (errno == ENOENT) {
@@ -209,6 +213,44 @@ void RemoveAndVerifyFile(int directory_descriptor, std::string_view name,
       errno != ENOENT) {
     throw std::runtime_error("MCP credential survived cleanup: " +
                              std::string(name));
+  }
+}
+
+void RemoveStalePublicationFile(int directory_descriptor,
+                                std::string_view name) {
+  struct stat status{};
+  if (fstatat(directory_descriptor, std::string(name).c_str(), &status,
+              AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) {
+      return;
+    }
+    throw std::runtime_error("inspect stale MCP publication " +
+                             std::string(name) +
+                             " failed: " + std::strerror(errno));
+  }
+  if (status.st_uid != geteuid() ||
+      (!S_ISREG(status.st_mode) && !S_ISLNK(status.st_mode))) {
+    throw std::runtime_error(
+        "refusing to remove foreign or unsafe stale MCP publication: " +
+        std::string(name));
+  }
+  if (unlinkat(directory_descriptor, std::string(name).c_str(), 0) != 0) {
+    throw std::runtime_error("remove stale MCP publication " +
+                             std::string(name) +
+                             " failed: " + std::strerror(errno));
+  }
+}
+
+void RemoveStalePublications(int directory_descriptor,
+                             const std::filesystem::path& directory) {
+  RemoveStalePublicationFile(directory_descriptor, kMcpClientConfigFile);
+  RemoveStalePublicationFile(directory_descriptor, kMcpTokenFile);
+  RemoveStalePublicationFile(directory_descriptor,
+                             "." + std::string(kMcpClientConfigFile) + ".tmp");
+  RemoveStalePublicationFile(directory_descriptor,
+                             "." + std::string(kMcpTokenFile) + ".tmp");
+  if (fsync(directory_descriptor) != 0) {
+    throw SystemError("sync stale MCP publication cleanup", directory);
   }
 }
 
@@ -262,8 +304,8 @@ struct McpEndpoint::Impl {
       : config(std::move(config_value)),
         dispatcher(config.dispatcher, std::move(operation_factory),
                    std::move(resource_reader)) {
-    if (config.run_root.empty()) {
-      throw std::runtime_error("MCP endpoint requires a run root");
+    if (config.state_directory.empty()) {
+      throw std::runtime_error("MCP endpoint requires a state directory");
     }
     if (config.run_id.empty()) {
       throw std::runtime_error("MCP endpoint requires a run id");
@@ -277,23 +319,47 @@ struct McpEndpoint::Impl {
     if (started || stopped) {
       throw std::runtime_error("MCP endpoint cannot be started in this state");
     }
-    static_cast<void>(RequireOwnedDirectory(config.run_root, 0U));
-    publication_directory = config.run_root / kMcpEndpointDirectory;
-    if (mkdir(publication_directory.c_str(), S_IRWXU) != 0) {
+    static_cast<void>(
+        RequireOwnedDirectory(config.state_directory, S_IRWXG | S_IRWXO));
+    publication_directory = config.state_directory / kMcpEndpointDirectory;
+    if (mkdir(publication_directory.c_str(), S_IRWXU) != 0 && errno != EEXIST) {
       throw SystemError("create MCP publication directory",
                         publication_directory);
     }
-    publication_directory_created = true;
     try {
-      publication_directory_identity =
-          RequireOwnedDirectory(publication_directory, S_IRWXG | S_IRWXO);
-      publication_directory_descriptor =
+      static_cast<void>(RequireOwnedDirectory(publication_directory, 0U));
+      const int descriptor =
           open(publication_directory.c_str(),
                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-      if (publication_directory_descriptor < 0) {
+      if (descriptor < 0) {
         throw SystemError("open MCP publication directory",
                           publication_directory);
       }
+      if (fchmod(descriptor, S_IRWXU) != 0) {
+        const int error = errno;
+        close(descriptor);
+        throw SystemError("secure MCP publication directory",
+                          publication_directory, error);
+      }
+      struct stat directory_status{};
+      if (fstat(descriptor, &directory_status) != 0) {
+        const int error = errno;
+        close(descriptor);
+        throw SystemError("inspect MCP publication directory",
+                          publication_directory, error);
+      }
+      if (!S_ISDIR(directory_status.st_mode) ||
+          directory_status.st_uid != geteuid() ||
+          (directory_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        close(descriptor);
+        throw SystemError("verify MCP publication directory",
+                          publication_directory, EPERM);
+      }
+      publication_directory_descriptor = descriptor;
+      publication_directory_identity = Identity(directory_status);
+      publication_directory_opened = true;
+      RemoveStalePublications(publication_directory_descriptor,
+                              publication_directory);
       token = RandomToken();
       McpProtocolConfig protocol_config{
           .bearer_token = token, .endpoint_path = "/mcp", .endpoint_port = 0U};
@@ -378,7 +444,7 @@ struct McpEndpoint::Impl {
   }
 
   void RemovePublicationsUnlocked() {
-    if (!publication_directory_created) {
+    if (!publication_directory_opened) {
       return;
     }
     std::exception_ptr failure;
@@ -424,21 +490,10 @@ struct McpEndpoint::Impl {
             visible_identity.device != publication_directory_identity->device ||
             visible_identity.inode != publication_directory_identity->inode) {
           throw std::runtime_error(
-              "refusing to remove a replaced MCP publication directory: " +
+              "MCP publication directory changed during cleanup: " +
               publication_directory.string());
         }
-        if (rmdir(publication_directory.c_str()) != 0) {
-          throw SystemError("remove MCP publication directory",
-                            publication_directory);
-        }
-        struct stat status {};
-        if (lstat(publication_directory.c_str(), &status) == 0 ||
-            errno != ENOENT) {
-          throw std::runtime_error(
-              "MCP publication directory survived cleanup: " +
-              publication_directory.string());
-        }
-        publication_directory_created = false;
+        publication_directory_opened = false;
       });
     }
     if (failure) {
@@ -462,7 +517,7 @@ struct McpEndpoint::Impl {
       BBP_LOG(error) << "MCP credential cleanup failed";
     }
     started = false;
-    stopped = !publication_directory_created;
+    stopped = !publication_directory_opened;
     std::fill(token.begin(), token.end(), '\0');
     token.clear();
   }
@@ -486,7 +541,7 @@ struct McpEndpoint::Impl {
   std::optional<FileIdentity> client_config_identity;
   McpEndpointPublication current_publication;
   std::string token;
-  bool publication_directory_created = false;
+  bool publication_directory_opened = false;
   bool started = false;
   bool stopped = false;
 };
