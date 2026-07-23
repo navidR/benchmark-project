@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -37,9 +38,15 @@ class McpLiveApplication {
     std::string run_id;
     std::filesystem::path run_root;
     std::optional<RetainedRun> retained_run;
-    const Options* options = nullptr;
-    SimulationCommandQueue* command_queue = nullptr;
+    std::shared_ptr<const Options> options;
+    std::shared_ptr<SimulationCommandQueue> command_queue;
     std::function<void()> request_run_stop;
+    std::function<void()> run_started;
+    std::function<void()> run_stopping;
+    std::function<void()> run_stopped;
+#ifdef BBP_ENABLE_TEST_HOOKS
+    std::function<void()> request_admitted_test_hook = {};
+#endif
   };
 
   explicit McpLiveApplication(Config config);
@@ -65,11 +72,25 @@ class McpLiveApplication {
   void Shutdown();
 
  private:
+  class ActiveRequest {
+   public:
+    explicit ActiveRequest(McpLiveApplication* application);
+    ~ActiveRequest();
+
+    ActiveRequest(const ActiveRequest&) = delete;
+    ActiveRequest& operator=(const ActiveRequest&) = delete;
+
+   private:
+    McpLiveApplication* application_;
+  };
+
   struct PendingCommand {
     bool completed = false;
     std::optional<std::string> error;
   };
 
+  void BeginRequest();
+  void EndRequest();
   McpOperationPlan BuildOperation(McpOperationKind kind,
                                   const boost::json::object& arguments,
                                   std::string_view session_id);
@@ -88,7 +109,10 @@ class McpLiveApplication {
   Config config_;
   mutable std::mutex mutex_;
   std::condition_variable command_outcome_ready_;
+  std::condition_variable requests_drained_;
   std::map<std::uint64_t, PendingCommand> pending_commands_;
+  std::stop_source request_stop_source_;
+  std::size_t active_requests_ = 0U;
   bool run_started_ = false;
   bool stop_requested_ = false;
   bool run_stopped_ = false;

@@ -583,14 +583,12 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       {"--benchmark-root", benchmark_root.string(), "--run-id", run_id,
        "--refresh-ms", "50", "--metrics-interval", "50ms"},
       30, 120, home_directory);
-  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
-                                      "empty control plane"));
-  const std::string resolved =
-      WaitForFileText(run_root / "resolved-scenario.json", "\"nodes\":0", 5s);
-  RequireContains(resolved, "\"node_configs\":[]",
-                  "empty control-plane resolved scenario");
-  RequireContains(resolved, "\"enabled\":false",
-                  "empty control-plane block production");
+  std::string initial = process.ReadUntil("Blockchain Benchmark Project TUI",
+                                          5s, "empty control plane");
+  if (initial.find("No active run.") == std::string::npos) {
+    initial +=
+        process.ReadUntil("No active run.", 3s, "empty control-plane state");
+  }
   const std::string client =
       WaitForFileText(client_path, "\"codex_config_toml\"", 5s);
   const std::string token = ReadFile(token_path);
@@ -611,10 +609,11 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   RequireContains(client, "\"opencode_config\"",
                   "empty control-plane OpenCode configuration");
 
-  std::string events = WaitForFileOccurrences(
-      events_path, "\"event\":\"metrics_sample\"", 2U, 5s);
-  RequireNotContains(events, "\"event\":\"process_started\"",
-                     "empty control plane");
+  if (std::filesystem::exists(run_root) ||
+      std::filesystem::exists(events_path)) {
+    throw std::runtime_error(
+        "empty control plane created a synthetic benchmark run");
+  }
   if (!process.Running()) {
     throw std::runtime_error("empty control plane exited without a request");
   }
@@ -623,33 +622,30 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   static_cast<void>(
       process.ReadUntil("Confirm exit", 3s, "empty control-plane exit modal"));
   process.Write("n");
-  const std::size_t samples_before =
-      CountOccurrences(events, "\"event\":\"metrics_sample\"");
-  events = WaitForFileOccurrences(events_path, "\"event\":\"metrics_sample\"",
-                                  samples_before + 2U, 5s);
+  static_cast<void>(process.ReadFor(250ms));
   if (!process.Running() || !std::filesystem::exists(client_path)) {
     throw std::runtime_error(
         "Esc,n stopped the empty control plane or its MCP endpoint");
   }
-  RequireNotContains(events, "\"event\":\"run_cancelled\"",
-                     "empty control-plane cancel path");
+  if (std::filesystem::exists(run_root)) {
+    throw std::runtime_error(
+        "empty control-plane cancel path created a benchmark run");
+  }
 
   process.Write("\x1b");
   static_cast<void>(process.ReadUntil(
       "Confirm exit", 3s, "empty control-plane confirmed exit modal"));
   process.Write("y");
-  RequireExitZero(&process, "empty RunBenchmarkWithTui exit");
-  const std::string finished =
-      WaitForFileText(events_path, "\"event\":\"run_finished\"", 3s);
-  RequireContains(finished, "\"event\":\"run_cancelled\"",
-                  "empty control-plane confirmed exit");
+  RequireExitZero(&process, "empty editor TUI exit");
   if (std::filesystem::exists(token_path) ||
       std::filesystem::exists(client_path)) {
     throw std::runtime_error(
         "MCP credentials survived empty control-plane cleanup");
   }
   RequirePrivateMcpPath(mcp_path, S_IFDIR, 0700);
-  RequireOwnedResourcesRemoved(run_root, 0U, {}, {});
+  if (std::filesystem::exists(run_root)) {
+    throw std::runtime_error("empty editor TUI left a synthetic benchmark run");
+  }
 }
 
 void CheckRetainedMcpLifecycle(const std::filesystem::path& command,

@@ -89,6 +89,27 @@ struct TuiState {
   TuiExitConfirmation exit_confirmation;
 };
 
+void ResetRunUiState(TuiState* state) {
+  state->selected_node = 0U;
+  state->selected_wallet = 0U;
+  state->selected_topology_group = 0U;
+  state->node_file_pane.Close();
+  state->node_log_pane.Close();
+  state->peer_list_pane.Close();
+  state->network_rule_pane.Close();
+  state->command_status.clear();
+  state->last_command_result_sequence = 0U;
+  state->command_error_open = false;
+  state->command_error.clear();
+  state->command_palette_open = false;
+  state->command_input.clear();
+  state->command_input_error.clear();
+  state->firo_qt_launcher.reset();
+  state->firo_qt_launcher_dialog_open = false;
+  state->firo_qt_launcher_command.clear();
+  state->pending_confirmation.reset();
+}
+
 int FinishTui(TuiState* state, int result) {
   if (state->firo_qt_launcher) {
     static_cast<void>(state->firo_qt_launcher->Cleanup());
@@ -2470,6 +2491,25 @@ void DrawSummary(
   refresh();
 }
 
+void DrawEmptySummary(const TuiExitConfirmation& exit_confirmation) {
+  int rows = 0;
+  int cols = 0;
+  getmaxyx(stdscr, rows, cols);
+  erase();
+  AddText(0, 0, cols, "Blockchain Benchmark Project TUI",
+          COLOR_PAIR(kColorTitle) | A_BOLD);
+  DrawHorizontalLine(1);
+  AddText(3, 0, cols, "No active run.", A_BOLD);
+  AddText(5, 0, cols, "Waiting for a benchmark run.", COLOR_PAIR(kColorMuted));
+  DrawHorizontalLine(rows - 2);
+  AddText(rows - 1, 0, cols, "Esc asks to exit; q exits.",
+          COLOR_PAIR(kColorMuted));
+  DrawModalEpilogue(rows, cols, false, "", false, "", "", false,
+                    std::filesystem::path{}, "", std::nullopt,
+                    exit_confirmation);
+  refresh();
+}
+
 bool ShouldExit(int ch) { return ch == 'q' || ch == 'Q'; }
 
 std::size_t CurrentNodeLogVisibleRows() {
@@ -3168,33 +3208,72 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
                  std::uint32_t refresh_ms,
                  SimulationCommandQueue* command_queue,
                  std::stop_token stop_token) {
+  std::shared_ptr<SimulationCommandQueue> shared_command_queue;
+  if (command_queue != nullptr) {
+    // Preserve the fixed-root API's caller-owned queue lifetime contract.
+    shared_command_queue = std::shared_ptr<SimulationCommandQueue>(
+        command_queue, [](SimulationCommandQueue*) {});
+  }
+  const TuiRunSnapshot snapshot{
+      .generation = 0U,
+      .run_root = run_root,
+      .command_queue = std::move(shared_command_queue),
+  };
+  return RunTuiReport([snapshot]() { return snapshot; }, once, refresh_ms,
+                      stop_token);
+}
+
+int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
+                 std::uint32_t refresh_ms, std::stop_token stop_token) {
+  if (!snapshot_provider) {
+    throw std::invalid_argument("TUI run snapshot provider is empty");
+  }
+
   CursesSession curses;
   const std::uint32_t sleep_step_ms = 50;
   TuiState state;
   std::optional<IncrementalRunReport> live_report;
+  std::optional<TuiRunSnapshot> snapshot;
   const boost::json::object empty_report;
+
+  const auto update_snapshot = [&](TuiRunSnapshot next_snapshot) {
+    const bool run_changed = !snapshot ||
+                             snapshot->generation != next_snapshot.generation ||
+                             snapshot->run_root != next_snapshot.run_root;
+    if (run_changed) {
+      live_report.reset();
+      ResetRunUiState(&state);
+    }
+    snapshot = std::move(next_snapshot);
+    return run_changed;
+  };
 
   while (true) {
     if (stop_token.stop_requested()) {
       return FinishTui(&state, 0);
     }
+    static_cast<void>(update_snapshot(snapshot_provider()));
+
     std::string error;
     const boost::json::object* report = &empty_report;
     bool report_has_backlog = false;
-    try {
-      if (!live_report) {
-        live_report.emplace(run_root, stop_token);
+    const bool has_active_run = !snapshot->run_root.empty();
+    if (has_active_run) {
+      try {
+        if (!live_report) {
+          live_report.emplace(snapshot->run_root, stop_token);
+        }
+        report =
+            &live_report->Refresh(once ? std::numeric_limits<std::size_t>::max()
+                                       : kMaximumReportRecordsPerLiveRefresh,
+                                  stop_token);
+        report_has_backlog = live_report->last_refresh_stats().has_backlog;
+      } catch (const std::exception& e) {
+        if (stop_token.stop_requested()) {
+          return FinishTui(&state, 0);
+        }
+        error = e.what();
       }
-      report = &live_report->Refresh(
-          once ? std::numeric_limits<std::size_t>::max()
-               : kMaximumReportRecordsPerLiveRefresh,
-          stop_token);
-      report_has_backlog = live_report->last_refresh_stats().has_backlog;
-    } catch (const std::exception& e) {
-      if (stop_token.stop_requested()) {
-        return FinishTui(&state, 0);
-      }
-      error = e.what();
     }
     state.selected_node = ClampNodeSelection(*report, state.selected_node);
     state.selected_wallet =
@@ -3208,23 +3287,29 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
         state.node_log_pane.Refresh(*report, *selected_node);
         state.peer_list_pane.Refresh(*report, *selected_node);
         state.network_rule_pane.Refresh(*report, *selected_node);
-        state.node_file_pane.Refresh(run_root, *report, *selected_node);
+        state.node_file_pane.Refresh(snapshot->run_root, *report,
+                                     *selected_node);
       }
       RefreshCommandResults(*report, &state);
     }
-    const std::vector<std::string> log_lines =
-        ReadRecentLogLines(RunLogPath(run_root), 256U);
-    DrawSummary(
-        run_root, *report, error, log_lines, state.view, state.selected_node,
-        state.selected_wallet, state.selected_topology_group,
-        state.node_log_pane, state.peer_list_pane, state.network_rule_pane,
-        state.node_file_pane, state.command_status, state.command_error_open,
-        state.command_error, state.command_palette_open, state.command_input,
-        state.command_input_error, state.firo_qt_launcher_dialog_open,
-        state.firo_qt_launcher ? state.firo_qt_launcher->path()
-                               : std::filesystem::path{},
-        state.firo_qt_launcher_command, state.pending_confirmation,
-        state.exit_confirmation);
+    if (has_active_run) {
+      const std::vector<std::string> log_lines =
+          ReadRecentLogLines(RunLogPath(snapshot->run_root), 256U);
+      DrawSummary(snapshot->run_root, *report, error, log_lines, state.view,
+                  state.selected_node, state.selected_wallet,
+                  state.selected_topology_group, state.node_log_pane,
+                  state.peer_list_pane, state.network_rule_pane,
+                  state.node_file_pane, state.command_status,
+                  state.command_error_open, state.command_error,
+                  state.command_palette_open, state.command_input,
+                  state.command_input_error, state.firo_qt_launcher_dialog_open,
+                  state.firo_qt_launcher ? state.firo_qt_launcher->path()
+                                         : std::filesystem::path{},
+                  state.firo_qt_launcher_command, state.pending_confirmation,
+                  state.exit_confirmation);
+    } else {
+      DrawEmptySummary(state.exit_confirmation);
+    }
     if (once) {
       return FinishTui(&state, error.empty() ? 0 : 1);
     }
@@ -3236,9 +3321,14 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       if (stop_token.stop_requested()) {
         return FinishTui(&state, 0);
       }
+      if (update_snapshot(snapshot_provider())) {
+        break;
+      }
       const int ch = getch();
       const bool palette_was_open = state.command_palette_open;
-      if (HandleInput(ch, run_root, *report, command_queue, &state)) {
+      SimulationCommandQueue* const command_queue =
+          snapshot->run_root.empty() ? nullptr : snapshot->command_queue.get();
+      if (HandleInput(ch, snapshot->run_root, *report, command_queue, &state)) {
         if (state.exit_confirmation.exit_requested()) {
           return FinishTui(&state, 0);
         }

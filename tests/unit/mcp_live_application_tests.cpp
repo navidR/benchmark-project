@@ -7,6 +7,8 @@
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -87,28 +89,40 @@ SimulationCommand WaitForQueuedCommand(SimulationCommandQueue* queue) {
   throw std::runtime_error("MCP live command was not queued");
 }
 
+McpOperationSnapshot WaitForTerminal(McpOperationService* service,
+                                     std::string_view operation_id) {
+  const std::optional<McpOperationSnapshot> terminal =
+      service->WaitForOperation("live-session", operation_id, 2s);
+  BOOST_REQUIRE(static_cast<bool>(terminal));
+  return *terminal;
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_application_reads_real_report_and_waits_for_real_command_outcome) {
   LiveApplicationDirectory temporary;
   const boost::json::object scenario = LiveScenario();
-  const Options options = ParseAndValidateScenario(scenario);
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
   WriteText(temporary.path() / "resolved-scenario.json",
             boost::json::serialize(ResolveScenario(scenario)) + "\n");
   AppendLine(
       temporary.path() / "events.jsonl",
       R"({"run_id":"live-application","node_id":"sim","event":"run_started"})");
 
-  SimulationCommandQueue queue;
+  auto queue = std::make_shared<SimulationCommandQueue>();
   std::atomic<bool> stop_requested = false;
   McpLiveApplication application(McpLiveApplication::Config{
       .run_id = "live-application",
       .run_root = temporary.path(),
       .retained_run = std::nullopt,
-      .options = &options,
-      .command_queue = &queue,
-      .request_run_stop = [&] { stop_requested.store(true); }});
+      .options = options,
+      .command_queue = queue,
+      .request_run_stop = [&] { stop_requested.store(true); },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
   const boost::json::value starting_registry = application.ResourceReader()(
       McpInformationFamily::kRunRegistry, "live-session", std::stop_token{});
   BOOST_TEST(starting_registry.as_object()
@@ -157,7 +171,7 @@ BOOST_AUTO_TEST_CASE(
                                       {"node", "firo-1"}}}};
   const boost::json::object command_submitted =
       Invoke(&dispatcher, "simulation.command", command_arguments);
-  const SimulationCommand command = WaitForQueuedCommand(&queue);
+  const SimulationCommand command = WaitForQueuedCommand(queue.get());
   application.RecordCommandOutcome(command, std::nullopt);
   const boost::json::object command_terminal =
       WaitForTerminal(&dispatcher, command_submitted);
@@ -169,7 +183,7 @@ BOOST_AUTO_TEST_CASE(
 
   const boost::json::object failed_submitted =
       Invoke(&dispatcher, "simulation.command", command_arguments);
-  const SimulationCommand failed = WaitForQueuedCommand(&queue);
+  const SimulationCommand failed = WaitForQueuedCommand(queue.get());
   application.RecordCommandOutcome(failed, "production command failure");
   const boost::json::object failed_terminal =
       WaitForTerminal(&dispatcher, failed_submitted);
@@ -182,7 +196,7 @@ BOOST_AUTO_TEST_CASE(
 
   const boost::json::object cancellable_submitted =
       Invoke(&dispatcher, "simulation.command", command_arguments);
-  const SimulationCommand cancellable = WaitForQueuedCommand(&queue);
+  const SimulationCommand cancellable = WaitForQueuedCommand(queue.get());
   const auto cancellation_started = std::chrono::steady_clock::now();
   const boost::json::object cancellation =
       Invoke(&dispatcher, "operation.cancel",
@@ -236,6 +250,125 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_prebuilt_command_is_rejected_after_run_stopping_is_published) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(
+      McpLiveApplication::Config{.run_id = "live-application",
+                                 .run_root = temporary.path(),
+                                 .retained_run = std::nullopt,
+                                 .options = options,
+                                 .command_queue = queue,
+                                 .request_run_stop = [] {},
+                                 .run_started = {},
+                                 .run_stopping = {},
+                                 .run_stopped = {}});
+  application.MarkRunStarted();
+
+  McpOperationPlan stale_plan = application.OperationFactory()(
+      McpOperationKind::kInvokeRuntimeCommand,
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"command", boost::json::object{{"kind", "increase_log_verbosity"},
+                                          {"node", "firo-1"}}}},
+      "live-session");
+  application.MarkRunStopping();
+
+  McpOperationService service;
+  service.RegisterSession("live-session");
+  const McpOperationSnapshot submitted =
+      service.Submit("live-session", McpOperationKind::kInvokeRuntimeCommand,
+                     stale_plan.progress_total, std::move(stale_plan.executor));
+  const McpOperationSnapshot terminal =
+      WaitForTerminal(&service, submitted.operation_id);
+  BOOST_CHECK(terminal.state == McpOperationState::kFailed);
+  BOOST_REQUIRE(terminal.error.has_value());
+  BOOST_TEST(terminal.error->code == "run_not_active");
+  const SimulationCommandQueueStats stats = queue->Stats();
+  BOOST_TEST(stats.size == 0U);
+  BOOST_TEST(stats.maximum_size == 0U);
+  BOOST_TEST(!queue->TryPop().has_value());
+
+  service.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_shutdown_cancels_and_drains_an_admitted_old_run_request) {
+  LiveApplicationDirectory temporary;
+  const boost::json::object scenario = LiveScenario();
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
+  const RunOwnership ownership =
+      CreateRunOwnership("live-application", temporary.path());
+  WriteRunOwnershipMarker(ownership);
+  WriteText(temporary.path() / "resolved-scenario.json",
+            boost::json::serialize(ResolveScenario(scenario)) + "\n");
+  AppendLine(
+      temporary.path() / "events.jsonl",
+      R"({"run_id":"live-application","node_id":"firo-1","event":"run_started"})");
+
+  std::promise<void> request_admitted_promise;
+  std::future<void> request_admitted = request_admitted_promise.get_future();
+  std::promise<void> release_request_promise;
+  const std::shared_future<void> release_request =
+      release_request_promise.get_future().share();
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(
+      McpLiveApplication::Config{.run_id = "live-application",
+                                 .run_root = temporary.path(),
+                                 .retained_run = std::nullopt,
+                                 .options = options,
+                                 .command_queue = queue,
+                                 .request_run_stop = [] {},
+                                 .run_started = {},
+                                 .run_stopping = {},
+                                 .run_stopped = {},
+                                 .request_admitted_test_hook =
+                                     [&] {
+                                       request_admitted_promise.set_value();
+                                       release_request.wait();
+                                     }});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object submitted =
+      Invoke(&dispatcher, "log.follow",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_ids", boost::json::array{"firo-1"}}});
+  if (request_admitted.wait_for(2s) != std::future_status::ready) {
+    release_request_promise.set_value();
+    dispatcher.Shutdown();
+    application.Shutdown();
+    BOOST_FAIL("old-run request was not admitted");
+  }
+
+  std::future<void> shutdown =
+      std::async(std::launch::async, [&] { application.Shutdown(); });
+  BOOST_CHECK(shutdown.wait_for(20ms) == std::future_status::timeout);
+  release_request_promise.set_value();
+  BOOST_REQUIRE(shutdown.wait_for(500ms) == std::future_status::ready);
+  shutdown.get();
+
+  const boost::json::object terminal = WaitForTerminal(&dispatcher, submitted);
+  BOOST_TEST(terminal.at("state").as_string() == "cancelled");
+  BOOST_TEST(terminal.if_contains("terminal_result") == nullptr);
+
+  std::filesystem::remove_all(temporary.path());
+  std::filesystem::create_directories(temporary.path());
+  AppendLine(
+      temporary.path() / "events.jsonl",
+      R"({"run_id":"live-application","node_id":"replacement","event":"replacement_run_sentinel"})");
+  BOOST_TEST(terminal.if_contains("terminal_result") == nullptr);
+
+  dispatcher.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_retained_application_is_truthful_read_only_and_uses_persisted_status) {
   LiveApplicationDirectory temporary;
   const boost::json::object scenario = LiveScenario();
@@ -254,7 +387,12 @@ BOOST_AUTO_TEST_CASE(
       .retained_run =
           McpLiveApplication::RetainedRun{
               .chain = "firo", .node_count = 1U, .state = "failed"},
-      .request_run_stop = {}});
+      .options = {},
+      .command_queue = {},
+      .request_run_stop = {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
   BOOST_TEST(application.read_only());
   const std::vector<McpOperationKind> supported =
       application.SupportedOperations();
@@ -309,8 +447,7 @@ BOOST_AUTO_TEST_CASE(
           .as_object()
           .at("data")
           .as_object();
-  BOOST_TEST(notifications.at("transport").as_string() ==
-             "MCP SSE GET stream");
+  BOOST_TEST(notifications.at("transport").as_string() == "MCP SSE GET stream");
   BOOST_TEST(notifications.if_contains("available_through") == nullptr);
 
   try {
@@ -359,7 +496,8 @@ BOOST_AUTO_TEST_CASE(
     mcp_live_application_pages_owned_evidence_logs_and_safe_artifacts) {
   LiveApplicationDirectory temporary;
   const boost::json::object scenario = LiveScenario();
-  const Options options = ParseAndValidateScenario(scenario);
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
   const RunOwnership ownership =
       CreateRunOwnership("live-application", temporary.path());
   WriteRunOwnershipMarker(ownership);
@@ -387,14 +525,17 @@ BOOST_AUTO_TEST_CASE(
   std::filesystem::create_symlink(
       "/etc/passwd", temporary.path() / "nodes" / "firo-1" / "escape.log");
 
-  SimulationCommandQueue queue;
+  auto queue = std::make_shared<SimulationCommandQueue>();
   McpLiveApplication application(
       McpLiveApplication::Config{.run_id = "live-application",
                                  .run_root = temporary.path(),
                                  .retained_run = std::nullopt,
-                                 .options = &options,
-                                 .command_queue = &queue,
-                                 .request_run_stop = [] {}});
+                                 .options = options,
+                                 .command_queue = queue,
+                                 .request_run_stop = [] {},
+                                 .run_started = {},
+                                 .run_stopping = {},
+                                 .run_stopped = {}});
   application.MarkRunStarted();
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
@@ -543,17 +684,16 @@ BOOST_AUTO_TEST_CASE(mcp_evidence_rejects_records_from_a_different_run) {
   const RunOwnership ownership =
       CreateRunOwnership("live-application", temporary.path());
   WriteRunOwnershipMarker(ownership);
-  AppendLine(
-      temporary.path() / "events.jsonl",
-      R"({"run_id":"other","node_id":"sim","event":"run_failed"})");
+  AppendLine(temporary.path() / "events.jsonl",
+             R"({"run_id":"other","node_id":"sim","event":"run_failed"})");
   McpRunEvidenceQuery query;
   query.families = {McpInformationFamily::kEvents};
 
   BOOST_CHECK_EXCEPTION(
       QueryMcpRunEvidence("live-application", temporary.path(), query),
       std::runtime_error, [](const std::runtime_error& error) {
-        return std::string(error.what()).find(
-                   "record run_id does not match the selected run") !=
+        return std::string(error.what())
+                   .find("record run_id does not match the selected run") !=
                std::string::npos;
       });
 }

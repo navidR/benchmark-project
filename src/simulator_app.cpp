@@ -45,6 +45,7 @@
 #include "bbp/log_tail.h"
 #include "bbp/logging.h"
 #include "bbp/mcp_endpoint.h"
+#include "bbp/mcp_host_application.h"
 #include "bbp/mcp_live_application.h"
 #include "bbp/network.h"
 #include "bbp/network_allocation_lock.h"
@@ -14063,7 +14064,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
   const auto wallet_metrics_path = run_root / "wallet-metrics.jsonl";
   WriteEvent(events_path, options.run_id, "sim",
              SimulationEventKind::kRunStarted);
-  mcp_application.MarkRunStarted();
 
   std::unique_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
   ChainDriver& driver = *driver_owner;
@@ -15338,6 +15338,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     }
 
     ThrowIfStopRequested(stop_token);
+    mcp_application.MarkRunStarted();
     WriteMetricsSnapshot(
         metrics_path, options, driver, nodes, run_process_state,
         [&](const NodeRuntime& node, std::string_view error) {
@@ -15752,58 +15753,599 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
   return 0;
 }
 
-int RunBenchmarkWithTui(Options options, SimulationCommandQueue& command_queue,
-                        McpLiveApplication& mcp_application,
-                        std::stop_source& simulation_stop_source,
-                        std::stop_source& application_stop_source) {
-  SetConsoleLoggingEnabled(false);
-  try {
-    const auto run_root = BenchmarkRunRoot(options);
-    std::exception_ptr simulation_failure;
-    std::exception_ptr tui_failure;
-    int simulation_result = 1;
+enum class EditorRunState {
+  kStarting,
+  kActive,
+  kStopping,
+  kStopped,
+  kFailed,
+};
 
-    std::thread simulation_thread([&options, &simulation_failure,
-                                   &simulation_result, &command_queue,
-                                   &mcp_application, &simulation_stop_source,
-                                   &application_stop_source]() {
+bool IsTerminalEditorRunState(EditorRunState state) {
+  return state == EditorRunState::kStopped || state == EditorRunState::kFailed;
+}
+
+[[maybe_unused]] std::string_view EditorRunStateName(EditorRunState state) {
+  switch (state) {
+    case EditorRunState::kStarting:
+      return "starting";
+    case EditorRunState::kActive:
+      return "active";
+    case EditorRunState::kStopping:
+      return "stopping";
+    case EditorRunState::kStopped:
+      return "stopped";
+    case EditorRunState::kFailed:
+      return "failed";
+  }
+  throw std::logic_error("unknown editor run state");
+}
+
+struct EditorRunContext {
+  std::uint64_t generation = 0U;
+  std::shared_ptr<Options> options;
+  std::optional<boost::json::object> source_scenario;
+  std::shared_ptr<SimulationCommandQueue> command_queue;
+  std::stop_source simulation_stop_source;
+  std::shared_ptr<McpLiveApplication> mcp_application;
+  std::jthread worker;
+  mutable std::mutex mutex;
+  std::condition_variable_any state_changed;
+  EditorRunState state = EditorRunState::kStarting;
+  bool reached_active = false;
+  bool host_stop_requested = false;
+  std::exception_ptr failure;
+  int result = 1;
+};
+
+struct EditorRunSnapshot {
+  std::uint64_t generation = 0U;
+  std::string run_id;
+  std::filesystem::path run_root;
+  std::string chain;
+  std::uint32_t node_count = 0U;
+  EditorRunState state = EditorRunState::kStarting;
+  std::shared_ptr<SimulationCommandQueue> command_queue;
+  std::shared_ptr<McpLiveApplication> mcp_application;
+};
+
+int RunPreparedBenchmark(const std::shared_ptr<EditorRunContext>& context) {
+  Options& options = *context->options;
+  const std::filesystem::path run_root = BenchmarkRunRoot(options);
+  const std::stop_token setup_stop_token =
+      context->simulation_stop_source.get_token();
+  std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
+  bool run_prepared = false;
+  try {
+    ThrowIfStopRequested(setup_stop_token);
+    PrepareManagedRunRoot(&options);
+    run_prepared = true;
+    if (options.isolate_network) {
+      network_allocation_lock =
+          std::make_unique<NetworkAllocationLock>(setup_stop_token);
+      RequireRunNetworkInterfacesAvailable(options, setup_stop_token);
+      options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
+          options.run_id, options.nodes, ListIpv4Routes(setup_stop_token));
+    }
+    ThrowIfStopRequested(setup_stop_token);
+    WriteScenarioFiles(options, run_root, ChainDriverSpecFor(options.chain));
+    if (context->source_scenario) {
+      boost::json::object source = *context->source_scenario;
+      source["run_id"] = options.run_id;
+      WriteText(run_root / "source-scenario.json",
+                boost::json::serialize(source) + "\n");
+    }
+    ThrowIfStopRequested(setup_stop_token);
+  } catch (...) {
+    const std::exception_ptr setup_failure = std::current_exception();
+    if (run_prepared) {
       try {
-        simulation_result = RunBenchmarkHeadless(
-            options, command_queue, mcp_application, simulation_stop_source,
-            application_stop_source.get_token());
+        RemovePreparedRunRoot(options);
       } catch (...) {
-        mcp_application.MarkRunStopping();
-        application_stop_source.request_stop();
-        command_queue.Close();
-        mcp_application.MarkRunStopped();
-        simulation_failure = std::current_exception();
+        throw std::runtime_error(
+            "run setup failed: " + ExceptionMessage(setup_failure) +
+            "; setup cleanup also failed: " +
+            ExceptionMessage(std::current_exception()));
+      }
+    }
+    if (setup_stop_token.stop_requested()) {
+      throw SimulationCancelled();
+    }
+    std::rethrow_exception(setup_failure);
+  }
+
+  return RunBenchmarkHeadless(options, *context->command_queue,
+                              *context->mcp_application,
+                              context->simulation_stop_source);
+}
+
+class EditorRunController {
+ public:
+  EditorRunController() = default;
+
+  ~EditorRunController() {
+    try {
+      Shutdown();
+    } catch (...) {
+    }
+  }
+
+  EditorRunController(const EditorRunController&) = delete;
+  EditorRunController& operator=(const EditorRunController&) = delete;
+
+  std::shared_ptr<EditorRunContext> LaunchScenario(
+      const boost::json::object& scenario) {
+    return Launch(ParseAndValidateScenario(scenario), scenario);
+  }
+
+  std::shared_ptr<EditorRunContext> LaunchOptions(Options options) {
+    return Launch(std::move(options), std::nullopt);
+  }
+
+  EditorRunSnapshot WaitUntilActive(
+      const std::shared_ptr<EditorRunContext>& context,
+      std::stop_token stop_token) const {
+    std::unique_lock<std::mutex> lock(context->mutex);
+    const bool ready = context->state_changed.wait(lock, stop_token, [&] {
+      return context->reached_active ||
+             IsTerminalEditorRunState(context->state);
+    });
+    if (!ready) {
+      throw McpOperationCancelled();
+    }
+    if (context->reached_active) {
+      return SnapshotLocked(*context);
+    }
+    if (context->failure) {
+      throw McpOperationFailure(
+          "run_launch_failed",
+          "managed run startup failed: " + ExceptionMessage(context->failure),
+          false);
+    }
+    throw McpOperationFailure("run_launch_cancelled",
+                              "managed run stopped before startup completed",
+                              false);
+  }
+
+  EditorRunSnapshot StopRun(std::string_view run_id,
+                            std::chrono::seconds timeout,
+                            std::stop_token stop_token) {
+    std::shared_ptr<EditorRunContext> context;
+    {
+      std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        context = active_;
+      }
+      if (!context) {
+        throw McpOperationFailure("run_not_active",
+                                  "there is no active managed run", false);
+      }
+      {
+        std::lock_guard<std::mutex> lock(context->mutex);
+        if (context->options->run_id != run_id) {
+          throw McpOperationFailure(
+              "run_id_mismatch",
+              "requested run does not match the active managed run", false);
+        }
+        if (context->state == EditorRunState::kStopping ||
+            IsTerminalEditorRunState(context->state)) {
+          throw McpOperationFailure(
+              "run_not_active", "the managed run is no longer active", false);
+        }
+        context->host_stop_requested = true;
+      }
+      context->mcp_application->MarkRunStopping();
+      RequestStop(context);
+    }
+
+    std::unique_lock<std::mutex> lock(context->mutex);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const bool stopped = context->state_changed.wait_until(
+        lock, stop_token, deadline,
+        [&] { return IsTerminalEditorRunState(context->state); });
+    if (!stopped) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      throw McpOperationFailure(
+          "run_stop_timeout",
+          "managed run cleanup did not finish before the timeout", true);
+    }
+    return SnapshotLocked(*context);
+  }
+
+  std::optional<EditorRunSnapshot> CurrentRun(bool include_terminal) const {
+    std::shared_ptr<EditorRunContext> context;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      context = active_;
+    }
+    if (!context) {
+      return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(context->mutex);
+    if (!include_terminal && IsTerminalEditorRunState(context->state)) {
+      return std::nullopt;
+    }
+    return SnapshotLocked(*context);
+  }
+
+  void RequestActiveRunStop() {
+    std::shared_ptr<EditorRunContext> context;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      context = active_;
+    }
+    if (!context) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(context->mutex);
+      context->host_stop_requested = true;
+    }
+    context->mcp_application->MarkRunStopping();
+    RequestStop(context);
+  }
+
+  int WaitForInitialRun(const std::shared_ptr<EditorRunContext>& context,
+                        std::stop_token application_stop_token) const {
+    std::unique_lock<std::mutex> lock(context->mutex);
+    const bool completed = context->state_changed.wait(
+        lock, application_stop_token,
+        [&] { return IsTerminalEditorRunState(context->state); });
+    if (!completed) {
+      return 0;
+    }
+    if (context->host_stop_requested) {
+      lock.unlock();
+      WaitForApplicationStop(application_stop_token);
+      return 0;
+    }
+    if (context->failure) {
+      std::rethrow_exception(context->failure);
+    }
+    return context->result;
+  }
+
+  void Shutdown() {
+    std::shared_ptr<EditorRunContext> context;
+    {
+      std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_) {
+          return;
+        }
+        shutdown_ = true;
+        context = std::move(active_);
+      }
+      if (context) {
+        RequestStop(context);
+      }
+    }
+    JoinAndShutdown(context);
+  }
+
+ private:
+  static EditorRunSnapshot SnapshotLocked(const EditorRunContext& context) {
+    return EditorRunSnapshot{
+        .generation = context.generation,
+        .run_id = context.options->run_id,
+        .run_root = BenchmarkRunRoot(*context.options),
+        .chain = std::string(ChainKindName(context.options->chain)),
+        .node_count = context.options->nodes,
+        .state = context.state,
+        .command_queue = context.command_queue,
+        .mcp_application = context.mcp_application};
+  }
+
+  static void RequestStop(const std::shared_ptr<EditorRunContext>& context) {
+    context->simulation_stop_source.request_stop();
+    context->command_queue->Close();
+  }
+
+  static void RequestHostedStop(
+      const std::shared_ptr<EditorRunContext>& context) {
+    {
+      std::lock_guard<std::mutex> lock(context->mutex);
+      context->host_stop_requested = true;
+      if (!IsTerminalEditorRunState(context->state)) {
+        context->state = EditorRunState::kStopping;
+        context->state_changed.notify_all();
+      }
+    }
+    RequestStop(context);
+  }
+
+  static void WaitForApplicationStop(std::stop_token stop_token) {
+    std::condition_variable_any stopped;
+    std::mutex mutex;
+    std::unique_lock<std::mutex> lock(mutex);
+    static_cast<void>(stopped.wait(lock, stop_token, [] { return false; }));
+  }
+
+  static void JoinAndShutdown(
+      const std::shared_ptr<EditorRunContext>& context) {
+    if (!context) {
+      return;
+    }
+    if (context->worker.joinable()) {
+      context->worker.join();
+    }
+    context->mcp_application->Shutdown();
+  }
+
+  void ReapTerminalRun() {
+    std::shared_ptr<EditorRunContext> context;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!active_) {
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> run_lock(active_->mutex);
+        if (!IsTerminalEditorRunState(active_->state)) {
+          return;
+        }
+      }
+      context = std::move(active_);
+    }
+    JoinAndShutdown(context);
+  }
+
+  std::shared_ptr<EditorRunContext> Launch(
+      Options options, std::optional<boost::json::object> source_scenario) {
+    RequireSafeOutputDirectory(options.output_dir);
+    std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+    ReapTerminalRun();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) {
+        throw McpOperationFailure(
+            "application_stopping",
+            "BBP is shutting down and cannot launch another run", false);
+      }
+      if (active_) {
+        throw McpOperationFailure(
+            "run_already_active",
+            "a managed run is already starting, active, or stopping", true);
+      }
+    }
+
+    auto context = std::make_shared<EditorRunContext>();
+    context->generation = next_generation_++;
+    context->options = std::make_shared<Options>(std::move(options));
+    context->source_scenario = std::move(source_scenario);
+    context->command_queue = std::make_shared<SimulationCommandQueue>();
+    const std::weak_ptr<EditorRunContext> weak_context(context);
+    context->mcp_application =
+        std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
+            .run_id = context->options->run_id,
+            .run_root = BenchmarkRunRoot(*context->options),
+            .retained_run = std::nullopt,
+            .options = context->options,
+            .command_queue = context->command_queue,
+            .request_run_stop =
+                [weak_context] {
+                  if (const std::shared_ptr<EditorRunContext> run =
+                          weak_context.lock()) {
+                    RequestHostedStop(run);
+                  }
+                },
+            .run_started =
+                [weak_context] {
+                  if (const std::shared_ptr<EditorRunContext> run =
+                          weak_context.lock()) {
+                    std::lock_guard<std::mutex> lock(run->mutex);
+                    if (run->state == EditorRunState::kStarting) {
+                      run->reached_active = true;
+                      run->state = EditorRunState::kActive;
+                      run->state_changed.notify_all();
+                    }
+                  }
+                },
+            .run_stopping =
+                [weak_context] {
+                  if (const std::shared_ptr<EditorRunContext> run =
+                          weak_context.lock()) {
+                    std::lock_guard<std::mutex> lock(run->mutex);
+                    if (!IsTerminalEditorRunState(run->state)) {
+                      run->state = EditorRunState::kStopping;
+                      run->state_changed.notify_all();
+                    }
+                  }
+                },
+            .run_stopped = {}});
+    context->worker = std::jthread([context] {
+      try {
+        context->result = RunPreparedBenchmark(context);
+        std::lock_guard<std::mutex> lock(context->mutex);
+        if (!IsTerminalEditorRunState(context->state)) {
+          context->state = EditorRunState::kStopped;
+        }
+        context->state_changed.notify_all();
+      } catch (const SimulationCancelled&) {
+        context->mcp_application->MarkRunStopping();
+        context->mcp_application->MarkRunStopped();
+        std::lock_guard<std::mutex> lock(context->mutex);
+        context->result = 0;
+        context->state = EditorRunState::kStopped;
+        context->state_changed.notify_all();
+      } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        context->mcp_application->MarkRunStopping();
+        context->mcp_application->MarkRunStopped();
+        std::lock_guard<std::mutex> lock(context->mutex);
+        context->failure = failure;
+        context->state = EditorRunState::kFailed;
+        context->state_changed.notify_all();
       }
     });
-
-    int tui_result = 1;
-    try {
-      tui_result =
-          RunTuiReport(run_root, false, options.tui_refresh_ms, &command_queue,
-                       application_stop_source.get_token());
-    } catch (...) {
-      tui_failure = std::current_exception();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      active_ = context;
     }
+    return context;
+  }
+
+  mutable std::mutex transition_mutex_;
+  mutable std::mutex mutex_;
+  std::shared_ptr<EditorRunContext> active_;
+  std::uint64_t next_generation_ = 1U;
+  bool shutdown_ = false;
+};
+
+std::optional<McpHostedRunSnapshot> McpSnapshot(
+    const EditorRunController& controller) {
+  const std::optional<EditorRunSnapshot> snapshot =
+      controller.CurrentRun(false);
+  if (!snapshot) {
+    return std::nullopt;
+  }
+  return McpHostedRunSnapshot{
+      .generation = snapshot->generation,
+      .run_id = snapshot->run_id,
+      .state = std::string(EditorRunStateName(snapshot->state)),
+      .chain = snapshot->chain,
+      .node_count = snapshot->node_count,
+      .application = snapshot->mcp_application,
+  };
+}
+
+TuiRunSnapshot TuiSnapshot(const EditorRunController& controller) {
+  const std::optional<EditorRunSnapshot> snapshot =
+      controller.CurrentRun(false);
+  if (!snapshot || snapshot->state == EditorRunState::kStarting) {
+    return {};
+  }
+  return TuiRunSnapshot{
+      .generation = snapshot->generation,
+      .run_root = snapshot->run_root,
+      .command_queue = snapshot->command_queue,
+  };
+}
+
+void WaitForApplicationStop(std::stop_token stop_token) {
+  std::condition_variable_any stopped;
+  std::mutex mutex;
+  std::unique_lock<std::mutex> lock(mutex);
+  static_cast<void>(stopped.wait(lock, stop_token, [] { return false; }));
+}
+
+int RunEditorApplication(Options options,
+                         const std::filesystem::path& state_directory) {
+  SignalStopMonitor signal_monitor;
+  std::stop_source application_stop_source;
+  EditorRunController run_controller;
+  McpHostApplication host_application(McpHostApplication::Config{
+      .host_id = options.run_id,
+      .snapshot_run = [&] { return McpSnapshot(run_controller); },
+      .launch_run =
+          [&](const boost::json::object& scenario, std::stop_token stop_token) {
+            const std::shared_ptr<EditorRunContext> run =
+                run_controller.LaunchScenario(scenario);
+            const EditorRunSnapshot snapshot =
+                run_controller.WaitUntilActive(run, stop_token);
+            return McpRunLifecycleResult{
+                .run_id = snapshot.run_id,
+                .state = std::string(EditorRunStateName(snapshot.state)),
+                .node_count = snapshot.node_count,
+            };
+          },
+      .stop_run =
+          [&](std::string_view run_id, std::chrono::seconds timeout,
+              std::stop_token stop_token) {
+            const EditorRunSnapshot snapshot =
+                run_controller.StopRun(run_id, timeout, stop_token);
+            return McpRunLifecycleResult{
+                .run_id = snapshot.run_id,
+                .state = std::string(EditorRunStateName(snapshot.state)),
+                .node_count = snapshot.node_count,
+            };
+          },
+  });
+  McpEndpoint mcp_endpoint(
+      McpEndpointConfig{
+          .state_directory = state_directory,
+          .run_id = options.run_id,
+          .server = {},
+          .dispatcher = {},
+          .allowed_operations = host_application.SupportedOperations(),
+          .allowed_information_families =
+              host_application.SupportedInformationFamilies(),
+          .read_only = false,
+      },
+      host_application.OperationFactory(), host_application.ResourceReader());
+  std::stop_callback stop_on_signal(signal_monitor.GetToken(), [&] {
     application_stop_source.request_stop();
-    command_queue.Close();
-    simulation_thread.join();
+  });
 
-    if (simulation_failure) {
-      std::rethrow_exception(simulation_failure);
+  int result = 1;
+  std::exception_ptr application_failure;
+  try {
+    mcp_endpoint.Start();
+    const McpEndpointPublication publication = mcp_endpoint.publication();
+    BBP_LOG(info) << "MCP endpoint listening at " << publication.endpoint
+                  << "; client_config="
+                  << publication.client_config_file.string();
+
+    std::shared_ptr<EditorRunContext> initial_run;
+    if (!options.empty_control_plane) {
+      initial_run = run_controller.LaunchOptions(options);
     }
-    if (tui_failure) {
-      std::rethrow_exception(tui_failure);
+    if (options.no_tui) {
+      if (initial_run) {
+        result = run_controller.WaitForInitialRun(
+            initial_run, application_stop_source.get_token());
+      } else {
+        WaitForApplicationStop(application_stop_source.get_token());
+        result = 0;
+      }
+    } else {
+      SetConsoleLoggingEnabled(false);
+      result = RunTuiReport([&] { return TuiSnapshot(run_controller); }, false,
+                            options.tui_refresh_ms,
+                            application_stop_source.get_token());
+      SetConsoleLoggingEnabled(true);
     }
-    SetConsoleLoggingEnabled(true);
-    return simulation_result == 0 ? tui_result : simulation_result;
   } catch (...) {
     SetConsoleLoggingEnabled(true);
-    throw;
+    application_failure = std::current_exception();
   }
+
+  std::exception_ptr cleanup_failure;
+  const auto capture_cleanup_failure = [&](auto&& action) {
+    try {
+      action();
+    } catch (...) {
+      if (!cleanup_failure) {
+        cleanup_failure = std::current_exception();
+      }
+    }
+  };
+  bool endpoint_drained = false;
+  capture_cleanup_failure([&] {
+    mcp_endpoint.StopAdmissionAndDrain();
+    endpoint_drained = true;
+  });
+  if (endpoint_drained) {
+    capture_cleanup_failure([&] { host_application.Shutdown(); });
+    capture_cleanup_failure([&] { run_controller.Shutdown(); });
+    capture_cleanup_failure([&] { mcp_endpoint.Stop(); });
+  }
+
+  if (application_failure) {
+    std::rethrow_exception(application_failure);
+  }
+  if (cleanup_failure) {
+    std::rethrow_exception(cleanup_failure);
+  }
+  if (signal_monitor.ReceivedSignal() != 0) {
+    BBP_LOG(info) << "graceful shutdown completed after signal "
+                  << signal_monitor.ReceivedSignal();
+  }
+  return result;
 }
 
 std::filesystem::path ResolveRunReference(
@@ -15858,7 +16400,12 @@ int RunRetainedTuiWithMcp(const Options& cli_options,
       McpLiveApplication::Config{.run_id = retained.run_id,
                                  .run_root = run_root,
                                  .retained_run = retained.metadata,
-                                 .request_run_stop = {}});
+                                 .options = {},
+                                 .command_queue = {},
+                                 .request_run_stop = {},
+                                 .run_started = {},
+                                 .run_stopping = {},
+                                 .run_stopped = {}});
   McpEndpoint mcp_endpoint(
       McpEndpointConfig{
           .state_directory = state_directory,
@@ -16046,146 +16593,8 @@ int SimulatorApp::Run(int argc, char** argv) {
     CleanupRun(options);
     return 0;
   }
-
-  SignalStopMonitor signal_monitor;
-  SimulationCommandQueue command_queue;
-  std::stop_source simulation_stop_source;
-  std::stop_source application_stop_source;
-  const std::filesystem::path run_root = BenchmarkRunRoot(options);
-  McpLiveApplication mcp_application(
-      McpLiveApplication::Config{.run_id = options.run_id,
-                                 .run_root = run_root,
-                                 .retained_run = std::nullopt,
-                                 .options = &options,
-                                 .command_queue = &command_queue,
-                                 .request_run_stop = [&] {
-                                   simulation_stop_source.request_stop();
-                                   command_queue.Close();
-                                 }});
-  std::stop_callback cancel_on_signal(signal_monitor.GetToken(), [&] {
-    mcp_application.MarkRunStopping();
-    application_stop_source.request_stop();
-    simulation_stop_source.request_stop();
-    command_queue.Close();
-  });
-  McpEndpoint mcp_endpoint(
-      McpEndpointConfig{
-          .state_directory = instance_lock.state_directory(),
-          .run_id = options.run_id,
-          .server = {},
-          .dispatcher = {},
-          .allowed_operations = mcp_application.SupportedOperations(),
-          .allowed_information_families =
-              mcp_application.SupportedInformationFamilies(),
-          .read_only = false},
-      mcp_application.OperationFactory(), mcp_application.ResourceReader());
-
-  std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
-  bool run_prepared = false;
-  try {
-    if (simulation_stop_source.stop_requested()) {
-      return 0;
-    }
-    PrepareManagedRunRoot(&options);
-    run_prepared = true;
-    const std::stop_token setup_stop_token =
-        simulation_stop_source.get_token();
-    if (options.isolate_network && !options.empty_control_plane) {
-      network_allocation_lock = std::make_unique<NetworkAllocationLock>();
-      RequireRunNetworkInterfacesAvailable(options, setup_stop_token);
-      options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
-          options.run_id, options.nodes, ListIpv4Routes(setup_stop_token));
-    }
-    ThrowIfStopRequested(setup_stop_token);
-    WriteScenarioFiles(options, run_root, ChainDriverSpecFor(options.chain));
-    ThrowIfStopRequested(setup_stop_token);
-    mcp_endpoint.Start();
-  } catch (...) {
-    const std::exception_ptr setup_failure = std::current_exception();
-    std::exception_ptr setup_cleanup_failure;
-    const auto capture_setup_cleanup_failure = [&](auto&& action) {
-      try {
-        action();
-      } catch (...) {
-        if (!setup_cleanup_failure) {
-          setup_cleanup_failure = std::current_exception();
-        }
-      }
-    };
-    bool endpoint_drained = false;
-    capture_setup_cleanup_failure([&] {
-      mcp_endpoint.StopAdmissionAndDrain();
-      endpoint_drained = true;
-    });
-    if (endpoint_drained) {
-      capture_setup_cleanup_failure([&] { mcp_application.Shutdown(); });
-      if (run_prepared) {
-        capture_setup_cleanup_failure(
-            [&] { RemovePreparedRunRoot(options); });
-      }
-      capture_setup_cleanup_failure([&] { mcp_endpoint.Stop(); });
-    }
-    if (setup_cleanup_failure) {
-      throw std::runtime_error(
-          "run setup failed: " + ExceptionMessage(setup_failure) +
-          "; setup cleanup also failed: " +
-          ExceptionMessage(setup_cleanup_failure));
-    }
-    std::rethrow_exception(setup_failure);
-  }
-  const McpEndpointPublication publication = mcp_endpoint.publication();
-  BBP_LOG(info) << "MCP endpoint listening at " << publication.endpoint
-                << "; client_config="
-                << publication.client_config_file.string();
-
-  int result = 1;
-  std::exception_ptr application_failure;
-  try {
-    if (options.no_tui) {
-      result = RunBenchmarkHeadless(options, command_queue, mcp_application,
-                                    simulation_stop_source,
-                                    application_stop_source.get_token());
-    } else {
-      result =
-          RunBenchmarkWithTui(options, command_queue, mcp_application,
-                              simulation_stop_source, application_stop_source);
-    }
-  } catch (...) {
-    application_failure = std::current_exception();
-  }
-
-  std::exception_ptr cleanup_failure;
-  const auto capture_cleanup_failure = [&](auto&& action) {
-    try {
-      action();
-    } catch (...) {
-      if (!cleanup_failure) {
-        cleanup_failure = std::current_exception();
-      }
-    }
-  };
-  bool endpoint_drained = false;
-  capture_cleanup_failure([&] {
-    mcp_endpoint.StopAdmissionAndDrain();
-    endpoint_drained = true;
-  });
-  if (endpoint_drained) {
-    capture_cleanup_failure([&] { mcp_application.MarkRunStopped(); });
-    capture_cleanup_failure([&] { mcp_application.Shutdown(); });
-    capture_cleanup_failure([&] { mcp_endpoint.Stop(); });
-  }
-
-  if (application_failure) {
-    std::rethrow_exception(application_failure);
-  }
-  if (cleanup_failure) {
-    std::rethrow_exception(cleanup_failure);
-  }
-  if (signal_monitor.ReceivedSignal() != 0) {
-    BBP_LOG(info) << "graceful shutdown completed after signal "
-                  << signal_monitor.ReceivedSignal();
-  }
-  return result;
+  return RunEditorApplication(std::move(options),
+                              instance_lock.state_directory());
 }
 
 }  // namespace bbp

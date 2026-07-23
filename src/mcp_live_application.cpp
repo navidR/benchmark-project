@@ -7,6 +7,7 @@
 #include <boost/json/serialize.hpp>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <initializer_list>
 #include <limits>
@@ -53,6 +54,32 @@ constexpr std::array kRetainedOperations = {
 constexpr std::array kOwnedRunOperations = {
     McpOperationKind::kQueryEvidence, McpOperationKind::kQueryLogs,
     McpOperationKind::kFollowLogs, McpOperationKind::kReadArtifact};
+
+class CombinedStopToken {
+  struct ForwardStop {
+    std::stop_source* source;
+
+    void operator()() const noexcept { source->request_stop(); }
+  };
+
+ public:
+  CombinedStopToken(std::stop_token operation, std::stop_token application)
+      : operation_callback_(operation, ForwardStop{&source_}),
+        application_callback_(application, ForwardStop{&source_}) {}
+
+  std::stop_token token() const { return source_.get_token(); }
+
+ private:
+  std::stop_source source_;
+  std::stop_callback<ForwardStop> operation_callback_;
+  std::stop_callback<ForwardStop> application_callback_;
+};
+
+void ThrowIfCancelled(std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw McpOperationCancelled();
+  }
+}
 
 const boost::json::value& RequireMember(const boost::json::object& object,
                                         std::string_view name) {
@@ -248,8 +275,7 @@ boost::json::object BuildSchemaDocument(
     operation_schemas[operations[index].name] = boost::json::object{
         {"input",
          BuildMcpOperationInputSchema(kind, selected_information_families)},
-        {"output",
-         BuildMcpOperationOutputSchema(kind, selected_operations)},
+        {"output", BuildMcpOperationOutputSchema(kind, selected_operations)},
     };
   }
   return boost::json::object{
@@ -357,7 +383,8 @@ McpLiveApplication::McpLiveApplication(Config config)
           "MCP retained application requires persisted run metadata");
     }
     if (config_.options != nullptr || config_.command_queue != nullptr ||
-        config_.request_run_stop) {
+        config_.request_run_stop || config_.run_started ||
+        config_.run_stopping || config_.run_stopped) {
       throw std::invalid_argument(
           "MCP retained application cannot own live run controls");
     }
@@ -378,18 +405,79 @@ McpLiveApplication::McpLiveApplication(Config config)
 
 McpLiveApplication::~McpLiveApplication() { Shutdown(); }
 
+McpLiveApplication::ActiveRequest::ActiveRequest(
+    McpLiveApplication* application)
+    : application_(application) {
+  application_->BeginRequest();
+}
+
+McpLiveApplication::ActiveRequest::~ActiveRequest() {
+  application_->EndRequest();
+}
+
 McpApplicationOperationFactory McpLiveApplication::OperationFactory() {
   return [this](McpOperationKind kind, const boost::json::object& arguments,
                 std::string_view session_id) {
-    return BuildOperation(kind, arguments, session_id);
+    McpOperationPlan plan = BuildOperation(kind, arguments, session_id);
+    if (plan.executor) {
+      McpOperationExecutor executor = std::move(plan.executor);
+      plan.executor = [this, executor = std::move(executor)](
+                          McpOperationContext& context) mutable {
+        ActiveRequest request(this);
+        McpTypedResult result = executor(context);
+        ThrowIfCancelled(request_stop_source_.get_token());
+        return result;
+      };
+    }
+    return plan;
   };
 }
 
 McpApplicationResourceReader McpLiveApplication::ResourceReader() {
   return [this](McpInformationFamily family, std::string_view session_id,
                 std::stop_token stop_token) {
-    return ReadResource(family, session_id, stop_token);
+    ActiveRequest request(this);
+    CombinedStopToken cancellation(stop_token,
+                                   request_stop_source_.get_token());
+    return ReadResource(family, session_id, cancellation.token());
   };
+}
+
+void McpLiveApplication::BeginRequest() {
+#ifdef BBP_ENABLE_TEST_HOOKS
+  std::function<void()> request_admitted_test_hook;
+#endif
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_) {
+      throw McpOperationCancelled();
+    }
+    ++active_requests_;
+#ifdef BBP_ENABLE_TEST_HOOKS
+    request_admitted_test_hook = config_.request_admitted_test_hook;
+#endif
+  }
+#ifdef BBP_ENABLE_TEST_HOOKS
+  try {
+    if (request_admitted_test_hook) {
+      request_admitted_test_hook();
+    }
+  } catch (...) {
+    EndRequest();
+    throw;
+  }
+#endif
+}
+
+void McpLiveApplication::EndRequest() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (active_requests_ == 0U) {
+    std::terminate();
+  }
+  --active_requests_;
+  if (active_requests_ == 0U) {
+    requests_drained_.notify_all();
+  }
 }
 
 std::vector<McpOperationKind> McpLiveApplication::SupportedOperations() const {
@@ -502,21 +590,24 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         .progress_total = 1U,
         .executor = [this, node_ids,
                      include_artifacts](McpOperationContext& context) {
-          context.ThrowIfCancelled();
+          CombinedStopToken cancellation(context.stop_token(),
+                                         request_stop_source_.get_token());
+          const std::stop_token stop_token = cancellation.token();
+          ThrowIfCancelled(stop_token);
           boost::json::value report;
           if (node_ids.empty()) {
-            report = ReportSnapshot(context.stop_token());
+            report = ReportSnapshot(stop_token);
           } else {
             boost::json::array node_reports;
             node_reports.reserve(node_ids.size());
             for (const std::string& node_id : node_ids) {
-              context.ThrowIfCancelled();
+              ThrowIfCancelled(stop_token);
               boost::json::value node_report;
               try {
                 node_report = boost::json::parse(BuildNodeReportJson(
-                    config_.run_root, node_id, 0U, context.stop_token()));
+                    config_.run_root, node_id, 0U, stop_token));
               } catch (...) {
-                context.ThrowIfCancelled();
+                ThrowIfCancelled(stop_token);
                 throw;
               }
               if (!node_report.is_object()) {
@@ -533,8 +624,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           }
           if (include_artifacts) {
             report.as_object()["artifacts"] = BuildMcpRunArtifactInventory(
-                config_.run_id, config_.run_root, context.stop_token());
+                config_.run_id, config_.run_root, stop_token);
           }
+          ThrowIfCancelled(stop_token);
           return McpTypedResult{
               .family = McpResultFamily::kEvidencePage,
               .value =
@@ -554,13 +646,17 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         .executor = [this, query = std::move(query),
                      follow = kind == McpOperationKind::kFollowLogs](
                         McpOperationContext& context) mutable {
+          CombinedStopToken cancellation(context.stop_token(),
+                                         request_stop_source_.get_token());
+          const std::stop_token stop_token = cancellation.token();
           constexpr auto kFollowWait = std::chrono::seconds(1);
           constexpr auto kFollowPoll = std::chrono::milliseconds(25);
           const auto deadline = std::chrono::steady_clock::now() + kFollowWait;
           while (true) {
-            context.ThrowIfCancelled();
+            ThrowIfCancelled(stop_token);
             boost::json::object page = QueryMcpRunEvidence(
-                config_.run_id, config_.run_root, query, context.stop_token());
+                config_.run_id, config_.run_root, query, stop_token);
+            ThrowIfCancelled(stop_token);
             if (!follow || !page.at("items").as_array().empty() ||
                 std::chrono::steady_clock::now() >= deadline) {
               return McpTypedResult{.family = McpResultFamily::kEvidencePage,
@@ -587,12 +683,14 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         .executor = [this, artifact_id, offset,
                      limit = static_cast<std::size_t>(limit)](
                         McpOperationContext& context) {
-          context.ThrowIfCancelled();
-          return McpTypedResult{
-              .family = McpResultFamily::kArtifactContent,
-              .value = ReadMcpRunArtifact(config_.run_id, config_.run_root,
-                                          artifact_id, offset, limit,
-                                          context.stop_token())};
+          CombinedStopToken cancellation(context.stop_token(),
+                                         request_stop_source_.get_token());
+          const std::stop_token stop_token = cancellation.token();
+          ThrowIfCancelled(stop_token);
+          return McpTypedResult{.family = McpResultFamily::kArtifactContent,
+                                .value = ReadMcpRunArtifact(
+                                    config_.run_id, config_.run_root,
+                                    artifact_id, offset, limit, stop_token)};
         }};
   }
 
@@ -602,10 +700,13 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       .progress_total = 1U,
       .executor = [this, command = std::move(command)](
                       McpOperationContext& context) mutable {
-        context.ThrowIfCancelled();
+        CombinedStopToken cancellation(context.stop_token(),
+                                       request_stop_source_.get_token());
+        const std::stop_token stop_token = cancellation.token();
+        ThrowIfCancelled(stop_token);
         const std::uint64_t sequence = SubmitCommand(std::move(command));
         const std::optional<std::string> error =
-            WaitForCommand(sequence, context.stop_token());
+            WaitForCommand(sequence, stop_token);
         if (error) {
           throw McpOperationFailure(
               "simulation_command_failed",
@@ -1004,45 +1105,69 @@ std::uint32_t McpLiveApplication::NodeCount() const {
 }
 
 void McpLiveApplication::MarkRunStarted() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (config_.retained_run) {
-    return;
+  bool notify = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (config_.retained_run || stop_requested_ || run_stopped_ || shutdown_) {
+      return;
+    }
+    if (!run_started_) {
+      run_started_ = true;
+      notify = true;
+    }
   }
-  if (stop_requested_ || run_stopped_ || shutdown_) {
-    return;
+  if (notify && config_.run_started) {
+    config_.run_started();
   }
-  run_started_ = true;
 }
 
 void McpLiveApplication::MarkRunStopping() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (config_.retained_run) {
-    return;
+  bool notify = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (config_.retained_run || run_stopped_ || shutdown_) {
+      return;
+    }
+    if (!stop_requested_) {
+      stop_requested_ = true;
+      notify = true;
+    }
+    command_outcome_ready_.notify_all();
   }
-  if (run_stopped_ || shutdown_) {
-    return;
+  if (notify && config_.run_stopping) {
+    config_.run_stopping();
   }
-  stop_requested_ = true;
-  command_outcome_ready_.notify_all();
 }
 
 void McpLiveApplication::MarkRunStopped() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (config_.retained_run) {
-    return;
+  bool notify = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (config_.retained_run) {
+      return;
+    }
+    stop_requested_ = true;
+    if (!run_stopped_) {
+      run_stopped_ = true;
+      notify = true;
+    }
+    command_outcome_ready_.notify_all();
   }
-  stop_requested_ = true;
-  run_stopped_ = true;
-  command_outcome_ready_.notify_all();
+  if (notify && config_.run_stopped) {
+    config_.run_stopped();
+  }
 }
 
 void McpLiveApplication::Shutdown() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (shutdown_) {
-    return;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    shutdown_ = true;
+    stop_requested_ = true;
+    command_outcome_ready_.notify_all();
   }
-  shutdown_ = true;
-  command_outcome_ready_.notify_all();
+  request_stop_source_.request_stop();
+  std::unique_lock<std::mutex> lock(mutex_);
+  requests_drained_.wait(lock, [this] { return active_requests_ == 0U; });
 }
 
 }  // namespace bbp

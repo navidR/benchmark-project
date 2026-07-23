@@ -232,6 +232,7 @@ add_executable(bbp
   src/logging.cpp
   src/mcp_dispatcher.cpp
   src/mcp_endpoint.cpp
+  src/mcp_host_application.cpp
   src/mcp_live_application.cpp
   src/mcp_operation_service.cpp
   src/mcp_protocol.cpp
@@ -373,6 +374,7 @@ if(BUILD_TESTING)
     tests/unit/logging_tests.cpp
     tests/unit/mcp_dispatcher_tests.cpp
     tests/unit/mcp_endpoint_tests.cpp
+    tests/unit/mcp_host_application_tests.cpp
     tests/unit/mcp_live_application_tests.cpp
     tests/unit/mcp_operation_service_tests.cpp
     tests/unit/mcp_protocol_tests.cpp
@@ -450,6 +452,7 @@ if(BUILD_TESTING)
     src/logging.cpp
     src/mcp_dispatcher.cpp
     src/mcp_endpoint.cpp
+    src/mcp_host_application.cpp
     src/mcp_live_application.cpp
     src/mcp_operation_service.cpp
     src/mcp_protocol.cpp
