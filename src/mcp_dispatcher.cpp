@@ -254,8 +254,9 @@ McpResourceHandler McpDispatcher::ResourceHandler() {
 }
 
 McpSessionHandler McpDispatcher::SessionHandler() {
-  return [this](std::string_view session_id, bool opened) {
-    ChangeSession(session_id, opened);
+  return [this](std::string_view session_id, bool opened,
+                std::stop_token stop_token) {
+    ChangeSession(session_id, opened, stop_token);
   };
 }
 
@@ -361,12 +362,19 @@ boost::json::value McpDispatcher::ReadResource(std::string_view uri,
   return resource_reader_(family, session_id, stop_token);
 }
 
-void McpDispatcher::ChangeSession(std::string_view session_id, bool opened) {
+void McpDispatcher::ChangeSession(std::string_view session_id, bool opened,
+                                  std::stop_token stop_token) {
   if (opened) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
     operations_.RegisterSession(std::string(session_id));
     return;
   }
-  if (!operations_.RemoveSession(session_id, config_.session_removal_timeout)) {
+  const std::chrono::milliseconds timeout =
+      stop_token.stop_requested() ? std::chrono::milliseconds::zero()
+                                  : config_.session_removal_timeout;
+  if (!operations_.RemoveSession(session_id, timeout)) {
     throw std::runtime_error(
         "MCP session still owns an operation after its removal deadline");
   }

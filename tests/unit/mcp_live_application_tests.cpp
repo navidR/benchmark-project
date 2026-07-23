@@ -108,7 +108,7 @@ BOOST_AUTO_TEST_CASE(
       .request_run_stop = [&] { stop_requested.store(true); }});
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
-  dispatcher.SessionHandler()("live-session", true);
+  dispatcher.SessionHandler()("live-session", true, {});
 
   const boost::json::value reports = application.ResourceReader()(
       McpInformationFamily::kReports, "live-session", std::stop_token{});
@@ -220,7 +220,7 @@ BOOST_AUTO_TEST_CASE(
                                  .request_run_stop = [] {}});
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
-  dispatcher.SessionHandler()("live-session", true);
+  dispatcher.SessionHandler()("live-session", true, {});
 
   const boost::json::object evidence_terminal = WaitForTerminal(
       &dispatcher,

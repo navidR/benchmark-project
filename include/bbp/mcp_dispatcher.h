@@ -58,7 +58,8 @@ class McpDispatcher {
   boost::json::value ReadResource(std::string_view uri,
                                   std::string_view session_id,
                                   std::stop_token stop_token);
-  void ChangeSession(std::string_view session_id, bool opened);
+  void ChangeSession(std::string_view session_id, bool opened,
+                     std::stop_token stop_token);
   void DeliverNotification(const McpServiceNotification& notification);
 
   McpDispatcherConfig config_;

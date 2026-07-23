@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -248,17 +249,17 @@ BOOST_AUTO_TEST_CASE(
     mcp_protocol_session_lifecycle_is_transactional_and_cleanup_gated) {
   std::atomic<std::size_t> opened = 0U;
   std::atomic<std::size_t> closed = 0U;
-  bool reject_close = false;
+  std::atomic<bool> reject_close = false;
   McpProtocol protocol(
       McpProtocolConfig{.bearer_token = std::string(kTestToken),
                         .endpoint_path = "/mcp",
                         .endpoint_port = 43123U},
-      {}, {}, [&](std::string_view, bool is_opened) {
+      {}, {}, [&](std::string_view, bool is_opened, std::stop_token) {
         if (is_opened) {
           opened.fetch_add(1U, std::memory_order_relaxed);
           return;
         }
-        if (reject_close) {
+        if (reject_close.load(std::memory_order_acquire)) {
           throw std::runtime_error("owned work is still active");
         }
         closed.fetch_add(1U, std::memory_order_relaxed);
@@ -267,17 +268,20 @@ BOOST_AUTO_TEST_CASE(
   MarkInitialized(&protocol, session);
   BOOST_TEST(opened.load(std::memory_order_relaxed) == 1U);
 
-  reject_close = true;
+  reject_close.store(true, std::memory_order_release);
   const auto rejected =
       protocol.Handle(ProtocolRequest(http::verb::delete_, {}, session));
   BOOST_TEST(rejected.result() == http::status::service_unavailable);
-  BOOST_TEST(protocol.Stats().sessions == 1U);
+  BOOST_TEST(protocol.Stats().sessions == 0U);
+  BOOST_TEST(protocol.Stats().terminated_sessions == 1U);
   BOOST_TEST(closed.load(std::memory_order_relaxed) == 0U);
 
-  reject_close = false;
-  const auto removed =
+  reject_close.store(false, std::memory_order_release);
+  BOOST_REQUIRE(WaitFor(
+      [&] { return closed.load(std::memory_order_relaxed) == 1U; }, 2s));
+  const auto already_removed =
       protocol.Handle(ProtocolRequest(http::verb::delete_, {}, session));
-  BOOST_TEST(removed.result() == http::status::ok);
+  BOOST_TEST(already_removed.result() == http::status::not_found);
   BOOST_TEST(protocol.Stats().sessions == 0U);
   BOOST_TEST(protocol.Stats().terminated_sessions == 1U);
   BOOST_TEST(closed.load(std::memory_order_relaxed) == 1U);
@@ -336,7 +340,7 @@ BOOST_AUTO_TEST_CASE(
                         .endpoint_path = "/mcp",
                         .endpoint_port = 43123U,
                         .uninitialized_session_timeout = 100ms},
-      {}, {}, [&](std::string_view, bool is_opened) {
+      {}, {}, [&](std::string_view, bool is_opened, std::stop_token) {
         if (is_opened) {
           opened.fetch_add(1U, std::memory_order_relaxed);
           return;
@@ -389,7 +393,7 @@ BOOST_AUTO_TEST_CASE(
                         .endpoint_path = "/mcp",
                         .endpoint_port = 43123U,
                         .uninitialized_session_timeout = 5ms},
-      {}, {}, [&](std::string_view, bool is_opened) {
+      {}, {}, [&](std::string_view, bool is_opened, std::stop_token) {
         if (is_opened) {
           opening.store(true, std::memory_order_release);
           std::unique_lock<std::mutex> lock(callback_mutex);
@@ -451,7 +455,7 @@ BOOST_AUTO_TEST_CASE(
                         .endpoint_path = "/mcp",
                         .endpoint_port = 43123U,
                         .uninitialized_session_timeout = 100ms},
-      {}, {}, [&](std::string_view, bool is_opened) {
+      {}, {}, [&](std::string_view, bool is_opened, std::stop_token) {
         if (!is_opened) {
           close_attempts.fetch_add(1U, std::memory_order_relaxed);
           throw std::runtime_error("cleanup still busy");
@@ -470,16 +474,52 @@ BOOST_AUTO_TEST_CASE(
     return stats.sessions == 0U &&
            stats.expired_sessions == kMcpMaximumSessions;
   }));
+  static_cast<void>(Initialize(&protocol));
+  BOOST_REQUIRE(WaitFor(
+      [&] {
+        const McpProtocolStats stats = protocol.Stats();
+        return stats.expired_sessions == kMcpMaximumSessions + 1U &&
+               stats.failed_session_cleanups == kMcpMaximumSessions + 1U;
+      },
+      3s));
+  BOOST_REQUIRE(WaitFor(
+      [&] {
+        return close_attempts.load(std::memory_order_relaxed) ==
+               2U * (kMcpMaximumSessions + 1U) + 1U;
+      },
+      500ms));
   const std::string replacement = Initialize(&protocol);
   MarkInitialized(&protocol, replacement);
   BOOST_TEST(protocol.Stats().sessions == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_protocol_shutdown_cancels_an_active_session_cleanup_callback) {
+  std::atomic<bool> cleanup_entered = false;
+  auto protocol = std::make_unique<McpProtocol>(
+      McpProtocolConfig{.bearer_token = std::string(kTestToken),
+                        .endpoint_path = "/mcp",
+                        .endpoint_port = 43123U,
+                        .uninitialized_session_timeout = 5ms},
+      McpToolHandler{}, McpResourceHandler{},
+      [&](std::string_view, bool is_opened, std::stop_token stop_token) {
+        if (is_opened) {
+          return;
+        }
+        cleanup_entered.store(true, std::memory_order_release);
+        while (!stop_token.stop_requested()) {
+          std::this_thread::sleep_for(1ms);
+        }
+      });
+  static_cast<void>(Initialize(protocol.get()));
   BOOST_REQUIRE(WaitFor(
-      [&] {
-        return protocol.Stats().failed_session_cleanups == kMcpMaximumSessions;
-      },
-      3s));
-  BOOST_TEST(close_attempts.load(std::memory_order_relaxed) ==
-             2U * kMcpMaximumSessions);
+      [&] { return cleanup_entered.load(std::memory_order_acquire); }, 500ms));
+
+  const auto started = std::chrono::steady_clock::now();
+  protocol.reset();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  BOOST_TEST(elapsed.count() < 500);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_protocol_reconnect_resumes_after_event_cursor) {

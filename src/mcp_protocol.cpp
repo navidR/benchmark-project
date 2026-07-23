@@ -426,19 +426,22 @@ struct McpProtocol::Impl {
     if (!session_handler) {
       return;
     }
+    std::stop_source shutdown;
+    shutdown.request_stop();
     for (const std::string& session_id : session_ids) {
       try {
-        session_handler(session_id, false);
+        session_handler(session_id, false, shutdown.get_token());
       } catch (...) {
       }
     }
   }
 
   bool InvokeSessionClose(std::string_view session_id,
+                          std::stop_token stop_token,
                           std::string* error_message = nullptr) {
     try {
       if (session_handler) {
-        session_handler(session_id, false);
+        session_handler(session_id, false, stop_token);
       }
     } catch (const std::exception& error) {
       if (error_message != nullptr) {
@@ -455,14 +458,29 @@ struct McpProtocol::Impl {
   }
 
   bool FinishExplicitSessionClose(std::string_view session_id,
-                                  McpSessionState previous_state,
+                                  std::stop_token stop_token,
                                   std::string* error_message) {
-    if (!InvokeSessionClose(session_id, error_message)) {
+    if (!InvokeSessionClose(session_id, stop_token, error_message)) {
       std::lock_guard<std::mutex> lock(mutex);
       const auto session = sessions.find(session_id);
       if (session != sessions.end() &&
           session->second.state == McpSessionState::kClosing) {
-        session->second.state = previous_state;
+        if (pending_cleanup.size() < kMaximumPendingSessionCleanups) {
+          pending_cleanup.push_back(McpPendingSessionCleanup{
+              .session_id = std::string(session_id),
+              .retry_at =
+                  std::chrono::steady_clock::now() + std::chrono::seconds(1),
+              .failed_attempts = 1U,
+              .in_progress = false});
+        } else {
+          ++stats.failed_session_cleanups;
+          if (failed_cleanup.size() == kMcpMaximumSessions) {
+            failed_cleanup.pop_front();
+          }
+          failed_cleanup.emplace_back(session_id);
+        }
+        sessions.erase(session);
+        ++stats.terminated_sessions;
       }
       state_changed.notify_all();
       return false;
@@ -594,7 +612,7 @@ struct McpProtocol::Impl {
       next->in_progress = true;
       const std::string session_id = next->session_id;
       lock.unlock();
-      const bool removed = InvokeSessionClose(session_id);
+      const bool removed = InvokeSessionClose(session_id, stop_token);
       lock.lock();
       const auto cleanup =
           std::find_if(pending_cleanup.begin(), pending_cleanup.end(),
@@ -618,15 +636,18 @@ struct McpProtocol::Impl {
         continue;
       }
       ++stats.failed_session_cleanups;
+      std::optional<std::string> final_attempt;
       if (failed_cleanup.size() == kMcpMaximumSessions) {
-        const std::string final_attempt = std::move(failed_cleanup.front());
+        final_attempt = std::move(failed_cleanup.front());
         failed_cleanup.pop_front();
-        lock.unlock();
-        static_cast<void>(InvokeSessionClose(final_attempt));
-        lock.lock();
       }
       failed_cleanup.push_back(session_id);
       pending_cleanup.erase(cleanup);
+      if (final_attempt) {
+        lock.unlock();
+        static_cast<void>(InvokeSessionClose(*final_attempt, stop_token));
+        lock.lock();
+      }
     }
   }
 
@@ -898,7 +919,7 @@ struct McpProtocol::Impl {
 
   http::response<http::string_body> HandleInitialize(
       const http::request<http::string_body>& http_request,
-      const JsonRpcRequest& request) {
+      const JsonRpcRequest& request, std::stop_token stop_token) {
     if (!request.has_id) {
       return JsonResponse(
           http_request, JsonRpcError(nullptr, -32600,
@@ -928,7 +949,7 @@ struct McpProtocol::Impl {
     }
     if (session_handler) {
       try {
-        session_handler(*session_id, true);
+        session_handler(*session_id, true, stop_token);
       } catch (const std::exception& error) {
         {
           std::lock_guard<std::mutex> lock(mutex);
@@ -997,7 +1018,7 @@ struct McpProtocol::Impl {
     }
     if (request.method == "initialize") {
       try {
-        return HandleInitialize(http_request, request);
+        return HandleInitialize(http_request, request, stop_token);
       } catch (const std::invalid_argument& error) {
         return JsonResponse(
             http_request,
@@ -1116,7 +1137,8 @@ struct McpProtocol::Impl {
   }
 
   http::response<http::string_body> HandleDelete(
-      const http::request<http::string_body>& request) {
+      const http::request<http::string_body>& request,
+      std::stop_token stop_token) {
     if (!ValidProtocolVersion(request)) {
       return TextResponse(request, http::status::bad_request,
                           "missing or unsupported MCP-Protocol-Version");
@@ -1126,7 +1148,6 @@ struct McpProtocol::Impl {
       return TextResponse(request, http::status::not_found,
                           "unknown MCP session");
     }
-    McpSessionState previous_state = McpSessionState::kOpening;
     {
       std::unique_lock<std::mutex> lock(mutex);
       const auto session = sessions.find(session_id);
@@ -1145,12 +1166,10 @@ struct McpProtocol::Impl {
         return TextResponse(request, http::status::not_found,
                             "unknown MCP session");
       }
-      previous_state = session->second.state;
       session->second.state = McpSessionState::kClosing;
     }
     std::string cleanup_error;
-    if (!FinishExplicitSessionClose(session_id, previous_state,
-                                    &cleanup_error)) {
+    if (!FinishExplicitSessionClose(session_id, stop_token, &cleanup_error)) {
       if (!cleanup_error.empty()) {
         return TextResponse(request, http::status::service_unavailable,
                             "MCP session cleanup incomplete: " + cleanup_error);
@@ -1202,7 +1221,7 @@ http::response<http::string_body> McpProtocol::Handle(
     case http::verb::get:
       return impl_->HandleGet(request);
     case http::verb::delete_:
-      return impl_->HandleDelete(request);
+      return impl_->HandleDelete(request, stop_token);
     default:
       return TextResponse(request, http::status::method_not_allowed,
                           "MCP endpoint supports POST, GET, and DELETE");

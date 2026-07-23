@@ -48,9 +48,10 @@ using McpToolHandler = std::function<boost::json::value(
     std::stop_token)>;
 using McpResourceHandler = std::function<boost::json::value(
     std::string_view, std::string_view, std::stop_token)>;
-// Automatic expiry may retry opened=false; close handling must be idempotent.
+// Automatic expiry may retry opened=false; close handling must be idempotent,
+// honor cancellation, and return within its own declared cleanup bound.
 using McpSessionHandler =
-    std::function<void(std::string_view, bool /* opened */)>;
+    std::function<void(std::string_view, bool /* opened */, std::stop_token)>;
 
 class McpProtocol {
  public:

@@ -55,7 +55,7 @@ boost::json::object WaitForTerminal(McpDispatcher* dispatcher,
 BOOST_AUTO_TEST_CASE(
     mcp_dispatcher_uses_production_scenario_validation_and_async_results) {
   McpDispatcher dispatcher;
-  dispatcher.SessionHandler()("session-a", true);
+  dispatcher.SessionHandler()("session-a", true, {});
 
   boost::json::object invalid = MinimalDispatcherScenario();
   invalid["simulation"] = boost::json::object{{"unexpected", true}};
@@ -100,7 +100,7 @@ BOOST_AUTO_TEST_CASE(
              boost::json::object{{"scenario", MinimalDispatcherScenario()},
                                  {"unexpected", true}}),
       std::invalid_argument);
-  dispatcher.SessionHandler()("session-a", false);
+  dispatcher.SessionHandler()("session-a", false, {});
   BOOST_TEST(dispatcher.Stats().sessions == 0U);
 }
 
@@ -124,7 +124,7 @@ BOOST_AUTO_TEST_CASE(
                               return McpTypedResult{};
                             }};
   });
-  dispatcher.SessionHandler()("session-a", true);
+  dispatcher.SessionHandler()("session-a", true, {});
   const boost::json::object submitted = Invoke(
       &dispatcher, "run.report", boost::json::object{{"run_id", "run-a"}});
   const auto deadline = std::chrono::steady_clock::now() + 1s;
@@ -133,7 +133,7 @@ BOOST_AUTO_TEST_CASE(
     std::this_thread::sleep_for(1ms);
   }
   BOOST_REQUIRE(started.load(std::memory_order_acquire));
-  dispatcher.SessionHandler()("session-a", false);
+  dispatcher.SessionHandler()("session-a", false, {});
   const McpOperationServiceStats stats = dispatcher.Stats();
   BOOST_TEST(stats.sessions == 0U);
   BOOST_TEST(stats.active_operations == 0U);
@@ -150,7 +150,7 @@ BOOST_AUTO_TEST_CASE(
   std::atomic<std::size_t> delivered = 0U;
   dispatcher.SetNotificationHandler(
       [&](const McpServiceNotification&) { delivered.fetch_add(1U); });
-  dispatcher.SessionHandler()("session-a", true);
+  dispatcher.SessionHandler()("session-a", true, {});
   const boost::json::object subscription =
       Invoke(&dispatcher, "subscription.create",
              boost::json::object{{"run_id", "run-a"},
@@ -186,7 +186,7 @@ BOOST_AUTO_TEST_CASE(
                  .at("message")
                  .as_string() == "ready");
   BOOST_TEST(delivered.load() == 1U);
-  dispatcher.SessionHandler()("session-a", false);
+  dispatcher.SessionHandler()("session-a", false, {});
 }
 
 }  // namespace bbp
