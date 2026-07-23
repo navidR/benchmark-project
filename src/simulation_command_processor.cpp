@@ -10,6 +10,8 @@ namespace {
 
 constexpr std::string_view kCancelledBeforeExecution =
     "simulation command processor stopped before execution";
+constexpr std::string_view kOperationCancelledBeforeExecution =
+    "simulation command operation cancelled before execution";
 
 }  // namespace
 
@@ -56,6 +58,12 @@ void SimulationCommandProcessor::Stop() {
 
 void SimulationCommandProcessor::Run() {
   while (const std::optional<SimulationCommand> command = queue_.WaitPop()) {
+    if (command->operation_stop_source &&
+        command->operation_stop_source->get_token().stop_requested()) {
+      ReportFailure(*command, kOperationCancelledBeforeExecution);
+      ReportOutcome(*command, kOperationCancelledBeforeExecution);
+      continue;
+    }
     try {
       command_handler_(*command);
       ReportOutcome(*command, std::nullopt);

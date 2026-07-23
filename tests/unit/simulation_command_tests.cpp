@@ -1,4 +1,6 @@
 #include <boost/test/unit_test.hpp>
+#include <memory>
+#include <stop_token>
 
 #include "bbp/simulation_command.h"
 
@@ -72,4 +74,19 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kExportNodeReport));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kSetPerfCounters));
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_cancellation_is_optional_and_shared) {
+  bbp::SimulationCommand command;
+  BOOST_TEST(!command.operation_stop_source);
+
+  command.operation_stop_source = std::make_shared<std::stop_source>();
+  bbp::SimulationCommand admitted_command = command;
+  BOOST_REQUIRE(admitted_command.operation_stop_source);
+  BOOST_TEST(
+      !admitted_command.operation_stop_source->get_token().stop_requested());
+
+  BOOST_TEST(command.operation_stop_source->request_stop());
+  BOOST_TEST(
+      admitted_command.operation_stop_source->get_token().stop_requested());
 }

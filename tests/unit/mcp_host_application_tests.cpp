@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
@@ -91,6 +92,14 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(capabilities.at("run_id").is_null());
   BOOST_TEST(capabilities.at("data").as_object().at("lifetime").as_string() ==
              "bbp_process");
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
+        McpOperationKind::kRestartNode}) {
+    BOOST_CHECK(std::find(supported.begin(), supported.end(), operation) !=
+                supported.end());
+  }
 
   const boost::json::object launch = WaitForTerminal(
       &dispatcher,

@@ -86,6 +86,28 @@ namespace {
 std::mutex node_network_state_mutex;
 std::mutex node_resource_state_mutex;
 
+struct StopForwarder {
+  std::stop_source* target = nullptr;
+
+  void operator()() const noexcept { target->request_stop(); }
+};
+
+class CombinedStopToken {
+ public:
+  CombinedStopToken(std::stop_token first, std::stop_token second)
+      : first_callback_(first, StopForwarder{&source_}),
+        second_callback_(second, StopForwarder{&source_}) {}
+
+  [[nodiscard]] std::stop_token get_token() const noexcept {
+    return source_.get_token();
+  }
+
+ private:
+  std::stop_source source_;
+  std::stop_callback<StopForwarder> first_callback_;
+  std::stop_callback<StopForwarder> second_callback_;
+};
+
 void ThrowIfStopRequested(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
     throw SimulationCancelled();
@@ -14508,6 +14530,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
       command_processor = std::make_unique<SimulationCommandProcessor>(
           *active_command_queue,
           [&](const SimulationCommand& command) {
+            const std::stop_token operation_stop_token =
+                command.operation_stop_source
+                    ? command.operation_stop_source->get_token()
+                    : std::stop_token{};
+            CombinedStopToken combined_stop_token(
+                command_rpc_stop_source.get_token(), operation_stop_token);
+            const std::stop_token command_stop_token =
+                combined_stop_token.get_token();
+            ThrowIfStopRequested(command_stop_token);
             WriteEvent(events_path, options.run_id, command.node_id,
                        SimulationEventKind::kOperatorCommandStarted,
                        SimulationCommandDetail(command));
@@ -14591,8 +14622,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   ToChainWalletMode(
                       simulation_registry.wallet_initialization()),
                   receiver.address, send.amount_satoshis, send.fee_satoshis,
-                  std::chrono::seconds(send.timeout_sec),
-                  command_rpc_stop_source.get_token());
+                  std::chrono::seconds(send.timeout_sec), command_stop_token);
               const std::string& txid = RequireSingleWalletTransactionId(
                   transaction, "operator wallet send");
               WriteEvent(events_path, options.run_id, sender_node.config.id,
@@ -14616,8 +14646,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                       .submission_node = sender.node,
                       .load_confirmation = nullptr,
                   },
-                  std::chrono::seconds(send.timeout_sec),
-                  command_rpc_stop_source.get_token());
+                  std::chrono::seconds(send.timeout_sec), command_stop_token);
             } else if (command.kind ==
                        SimulationCommandKind::kSetResourceLimits) {
               if (!command.resource_limit_patch) {
@@ -14661,7 +14690,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                     NodeRuntimeLifecycle::kKilling);
                 if (node.cgroup && node.cgroup->Frozen()) {
                   SetNodeFrozen(options, events_path, node, false,
-                                command_rpc_stop_source.get_token());
+                                command_stop_token);
                 }
                 WriteEvent(events_path, options.run_id, command.node_id,
                            SimulationEventKind::kProcessKillRequested,
@@ -14670,9 +14699,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   static_cast<void>(RequestNodeKill(node));
                   const auto kill_deadline = std::chrono::steady_clock::now() +
                                              std::chrono::seconds(5);
-                  if (!WaitForNodeProcessExitUntil(
-                          node, kill_deadline,
-                          command_rpc_stop_source.get_token())) {
+                  if (!WaitForNodeProcessExitUntil(node, kill_deadline,
+                                                   command_stop_token)) {
                     throw std::runtime_error("node process survived SIGKILL: " +
                                              command.node_id);
                   }
@@ -14742,7 +14770,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   stop_scheduled_miner() || was_paused;
               try {
                 StopNodeProcess(options, events_path, driver, node,
-                                command_rpc_stop_source.get_token());
+                                command_stop_token);
               } catch (...) {
                 if (resume_on_failure && NodeProcessRunning(node)) {
                   block_scheduler->StartMiner(command.node_id);
@@ -14778,8 +14806,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
               try {
                 if (!RestartNode(options, events_path, driver, node,
-                                 lifecycle_epoch,
-                                 command_rpc_stop_source.get_token())) {
+                                 lifecycle_epoch, command_stop_token)) {
                   throw std::runtime_error(
                       "operator restart reached node stop_time before "
                       "completion: " +
@@ -14788,8 +14815,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 if (resume_native_miner) {
                   if (!StartNativeMiningForCurrentProcess(
                           driver, node, run_process_state,
-                          chain_spec.default_reward_address,
-                          command_rpc_stop_source.get_token(),
+                          chain_spec.default_reward_address, command_stop_token,
                           "operator native mining restart")) {
                     throw std::runtime_error(
                         "node process changed during native mining restart: " +
@@ -14816,7 +14842,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               try {
                 RequireNodeRunning(node, "operator freeze");
                 SetNodeFrozen(options, events_path, node, true,
-                              command_rpc_stop_source.get_token());
+                              command_stop_token);
               } catch (...) {
                 if (resume_on_thaw) {
                   block_scheduler->StartMiner(command.node_id);
@@ -14830,7 +14856,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
             } else if (command.kind == SimulationCommandKind::kThawNode) {
               SetNodeFrozen(options, events_path, node, false,
-                            command_rpc_stop_source.get_token());
+                            command_stop_token);
               bool resume_scheduled_miner = false;
               {
                 auto process_guard = run_process_state.Lock();
@@ -14847,16 +14873,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
               RequireNodeRunning(node, "operator block generation");
               const std::uint64_t start_height =
-                  driver
-                      .ReadMetrics(node.config,
-                                   command_rpc_stop_source.get_token())
-                      .height;
-              const std::vector<std::string> hashes =
-                  driver.GenerateBlocks(node.config, *command.block_count,
-                                        chain_spec.default_reward_address,
-                                        command_rpc_stop_source.get_token());
-              RecordGeneratedBlocks(driver, node, hashes,
-                                    command_rpc_stop_source.get_token());
+                  driver.ReadMetrics(node.config, command_stop_token).height;
+              const std::vector<std::string> hashes = driver.GenerateBlocks(
+                  node.config, *command.block_count,
+                  chain_spec.default_reward_address, command_stop_token);
+              RecordGeneratedBlocks(driver, node, hashes, command_stop_token);
               if (start_height >
                   std::numeric_limits<std::uint64_t>::max() - hashes.size()) {
                 throw std::runtime_error(
@@ -14890,8 +14911,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               {
                 std::lock_guard<std::mutex> lock(node_network_state_mutex);
                 qdisc = ReplaceNodeNetworkConditionTransactional(
-                    &node, *command.network_condition,
-                    command_rpc_stop_source.get_token());
+                    &node, *command.network_condition, command_stop_token);
                 updated_network = *node.network;
               }
               WriteEvent(events_path, options.run_id, command.node_id,
@@ -14955,7 +14975,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 result = MutateNetworkBlockRuleTransactional(
                     node, rule,
                     command.kind == SimulationCommandKind::kUnblockNetworkFlow,
-                    command_rpc_stop_source.get_token());
+                    command_stop_token);
               }
               WriteEvent(
                   events_path, options.run_id, command.node_id,
@@ -14976,7 +14996,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               ApplyRuntimeNetworkPartition(
                   options, events_path, nodes, partition,
                   command.kind == SimulationCommandKind::kHealPartition, 0U, 0U,
-                  command_rpc_stop_source.get_token(), command.sequence);
+                  command_stop_token, command.sequence);
             } else if (command.kind ==
                            SimulationCommandKind::kSetResourceProfile ||
                        command.kind ==
@@ -15006,19 +15026,17 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 }
                 ApplyResourceProfileSwitch(options, events_path, nodes,
                                            workload, 0U, 0U,
-                                           command_rpc_stop_source.get_token());
+                                           command_stop_token);
               } else {
                 if (!options.network_profiles.contains(*command.profile)) {
                   throw std::runtime_error("unknown network profile: " +
                                            *command.profile);
                 }
                 ApplyNetworkProfileSwitch(options, events_path, nodes, workload,
-                                          0U, 0U,
-                                          command_rpc_stop_source.get_token());
+                                          0U, 0U, command_stop_token);
               }
             } else {
-              chain_command_executor->Execute(
-                  command, command_rpc_stop_source.get_token());
+              chain_command_executor->Execute(command, command_stop_token);
             }
             WriteEvent(events_path, options.run_id, command.node_id,
                        SimulationEventKind::kOperatorCommandCompleted,

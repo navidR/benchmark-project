@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -75,6 +77,7 @@ struct SimulationCommand {
   std::optional<SimulationWalletSend> wallet_send;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;
+  std::shared_ptr<std::stop_source> operation_stop_source;
 };
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind);

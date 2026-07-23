@@ -1,6 +1,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <boost/json/object.hpp>
 #include <boost/json/serialize.hpp>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "bbp/mcp_dispatcher.h"
@@ -207,7 +209,78 @@ BOOST_AUTO_TEST_CASE(
       WaitForTerminal(&dispatcher, cancellable_submitted);
   BOOST_TEST(cancelled_terminal.at("state").as_string() == "cancelled");
   BOOST_CHECK(std::chrono::steady_clock::now() - cancellation_started < 500ms);
+  BOOST_REQUIRE(cancellable.operation_stop_source);
+  BOOST_TEST(cancellable.operation_stop_source->get_token().stop_requested());
   application.RecordCommandOutcome(cancellable, std::nullopt);
+
+  const std::array typed_node_operations{
+      std::pair{"node.stop", SimulationCommandKind::kStopNode},
+      std::pair{"node.kill", SimulationCommandKind::kKillNode},
+      std::pair{"node.restart", SimulationCommandKind::kRestartNode},
+  };
+  for (const auto& [tool, expected_kind] : typed_node_operations) {
+    const boost::json::object submitted =
+        Invoke(&dispatcher, tool,
+               boost::json::object{{"run_id", "live-application"},
+                                   {"node_id", "firo-1"},
+                                   {"timeout_sec", 30U}});
+    const SimulationCommand typed_command = WaitForQueuedCommand(queue.get());
+    BOOST_CHECK(typed_command.kind == expected_kind);
+    BOOST_TEST(typed_command.node_id == "firo-1");
+    BOOST_TEST(typed_command.confirmed);
+    BOOST_REQUIRE(typed_command.operation_stop_source);
+    BOOST_TEST(
+        !typed_command.operation_stop_source->get_token().stop_requested());
+    application.RecordCommandOutcome(typed_command, std::nullopt);
+    const boost::json::object terminal =
+        WaitForTerminal(&dispatcher, submitted);
+    BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+    const boost::json::object& mutation =
+        terminal.at("terminal_result").as_object();
+    BOOST_TEST(mutation.at("result_family").as_string() == "mutation");
+    BOOST_TEST(mutation.at("run_id").as_string() == "live-application");
+    BOOST_TEST(mutation.at("added_node_ids").as_array().empty());
+    BOOST_TEST(mutation.at("removed_node_ids").as_array().empty());
+    BOOST_TEST(!mutation.at("unchanged").as_bool());
+  }
+
+  const boost::json::object typed_cancellable =
+      Invoke(&dispatcher, "node.restart",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"},
+                                 {"timeout_sec", 30U}});
+  const SimulationCommand cancelled_node_command =
+      WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(cancelled_node_command.operation_stop_source);
+  static_cast<void>(
+      Invoke(&dispatcher, "operation.cancel",
+             boost::json::object{
+                 {"operation_id", typed_cancellable.at("operation_id")}}));
+  const boost::json::object typed_cancelled_terminal =
+      WaitForTerminal(&dispatcher, typed_cancellable);
+  BOOST_TEST(typed_cancelled_terminal.at("state").as_string() == "cancelled");
+  BOOST_TEST(cancelled_node_command.operation_stop_source->get_token()
+                 .stop_requested());
+
+  const auto timeout_started = std::chrono::steady_clock::now();
+  const boost::json::object typed_timeout =
+      Invoke(&dispatcher, "node.stop",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"},
+                                 {"timeout_sec", 1U}});
+  const SimulationCommand timed_out_node_command =
+      WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(timed_out_node_command.operation_stop_source);
+  const boost::json::object typed_timeout_terminal =
+      WaitForTerminal(&dispatcher, typed_timeout);
+  BOOST_TEST(typed_timeout_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(typed_timeout_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "node_operation_timeout");
+  BOOST_CHECK(std::chrono::steady_clock::now() - timeout_started < 1500ms);
+  BOOST_TEST(timed_out_node_command.operation_stop_source->get_token()
+                 .stop_requested());
 
   const boost::json::object stop_submitted =
       Invoke(&dispatcher, "run.stop",

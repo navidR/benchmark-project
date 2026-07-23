@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -99,8 +100,11 @@ class McpLiveApplication {
                                   std::stop_token stop_token);
   void RequireRun(const boost::json::object& arguments) const;
   std::uint64_t SubmitCommand(SimulationCommand command);
-  std::optional<std::string> WaitForCommand(std::uint64_t sequence,
-                                            std::stop_token stop_token);
+  std::optional<std::string> WaitForCommand(
+      std::uint64_t sequence, std::stop_token stop_token,
+      const std::shared_ptr<std::stop_source>& operation_stop_source,
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt);
   boost::json::object ReportSnapshot(std::stop_token stop_token);
   std::string RunState() const;
   std::string CurrentChain() const;

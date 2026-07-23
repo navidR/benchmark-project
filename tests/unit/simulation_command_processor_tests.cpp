@@ -1,7 +1,10 @@
+#include <atomic>
 #include <boost/test/unit_test.hpp>
 #include <future>
+#include <memory>
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -68,6 +71,38 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_reports_and_continues) {
   BOOST_TEST(failures.size() == 1U);
   BOOST_TEST(failures[0].first == 1U);
   BOOST_TEST(failures[0].second == "expected failure");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_rejects_cancelled_operation_before_handler) {
+  bbp::SimulationCommandQueue queue;
+  std::atomic_bool handler_called = false;
+  std::promise<std::string> outcome;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&handler_called](const bbp::SimulationCommand&) {
+        handler_called = true;
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&outcome](const bbp::SimulationCommand&,
+                 std::optional<std::string_view> error) {
+        outcome.set_value(error ? std::string(*error) : std::string{});
+      });
+  bbp::SimulationCommand command;
+  command.kind = bbp::SimulationCommandKind::kKillNode;
+  command.node_id = "firo-1";
+  command.confirmed = true;
+  command.operation_stop_source = std::make_shared<std::stop_source>();
+  BOOST_REQUIRE(command.operation_stop_source->request_stop());
+  queue.PushRuntimeCommand(std::move(command));
+
+  processor.Start();
+  const std::string error = outcome.get_future().get();
+  processor.Stop();
+
+  BOOST_TEST(!handler_called);
+  BOOST_TEST(error ==
+             "simulation command operation cancelled before execution");
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_requires_handlers) {
