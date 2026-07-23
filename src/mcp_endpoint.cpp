@@ -279,10 +279,16 @@ boost::json::object BuildClientConfig(std::string_view run_id,
       {"type", "remote"},
       {"url", endpoint},
       {"headers", boost::json::object{{"Authorization", authorization}}}};
+  boost::json::array supported_protocol_versions;
+  supported_protocol_versions.reserve(kMcpSupportedProtocolVersions.size());
+  for (const std::string_view version : kMcpSupportedProtocolVersions) {
+    supported_protocol_versions.emplace_back(version);
+  }
   return boost::json::object{
       {"run_id", run_id},
       {"endpoint", endpoint},
       {"protocol_version", kMcpProtocolVersion},
+      {"supported_protocol_versions", std::move(supported_protocol_versions)},
       {"transport", "streamable_http"},
       {"authentication",
        boost::json::object{{"type", "bearer"},

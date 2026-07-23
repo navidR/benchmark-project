@@ -208,6 +208,19 @@ BOOST_AUTO_TEST_CASE(mcp_registry_covers_every_tui_command_and_local_action) {
 
 BOOST_AUTO_TEST_CASE(mcp_registry_exposes_every_information_family_and_bound) {
   const boost::json::object document = BuildMcpCapabilityDocument();
+  BOOST_TEST(document.at("protocol_version").as_string() ==
+             kMcpProtocolVersion);
+  const boost::json::array& supported_versions =
+      document.at("supported_protocol_versions").as_array();
+  BOOST_REQUIRE_EQUAL(supported_versions.size(), 2U);
+  BOOST_TEST(supported_versions[0].as_string() == "2025-11-25");
+  BOOST_TEST(supported_versions[1].as_string() == "2025-06-18");
+  BOOST_REQUIRE_EQUAL(supported_versions.size(),
+                      kMcpSupportedProtocolVersions.size());
+  for (std::size_t index = 0U; index < supported_versions.size(); ++index) {
+    BOOST_TEST(supported_versions[index].as_string() ==
+               kMcpSupportedProtocolVersions[index]);
+  }
   const auto families = NamedSet(ArrayField(document, "information_families"));
   BOOST_TEST(families.size() ==
              static_cast<std::size_t>(McpInformationFamily::kCount));

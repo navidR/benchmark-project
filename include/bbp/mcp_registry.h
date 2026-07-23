@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <cstddef>
@@ -11,6 +12,8 @@
 namespace bbp {
 
 inline constexpr std::string_view kMcpProtocolVersion = "2025-11-25";
+inline constexpr std::array<std::string_view, 2U>
+    kMcpSupportedProtocolVersions = {kMcpProtocolVersion, "2025-06-18"};
 inline constexpr std::size_t kMcpListPageSize = 64U;
 inline constexpr std::size_t kMcpMaximumSessions = 16U;
 inline constexpr std::size_t kMcpMaximumTasksPerSession = 64U;

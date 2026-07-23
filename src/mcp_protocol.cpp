@@ -61,6 +61,7 @@ struct McpSession {
   std::chrono::steady_clock::time_point initialization_deadline =
       std::chrono::steady_clock::time_point::max();
   std::string client_name;
+  std::string protocol_version;
   std::deque<McpNotification> notifications;
   std::uint64_t next_notification_sequence = 1U;
   std::map<std::string, std::shared_ptr<McpActiveRequest>, std::less<>>
@@ -137,6 +138,19 @@ bool ConstantTimeEqual(std::string_view left, std::string_view right) {
     difference |= static_cast<std::size_t>(left_byte ^ right_byte);
   }
   return difference == 0U;
+}
+
+bool IsSupportedProtocolVersion(std::string_view version) {
+  return std::find(kMcpSupportedProtocolVersions.begin(),
+                   kMcpSupportedProtocolVersions.end(),
+                   version) != kMcpSupportedProtocolVersions.end();
+}
+
+std::string_view SelectProtocolVersion(std::string_view requested_version) {
+  if (IsSupportedProtocolVersion(requested_version)) {
+    return requested_version;
+  }
+  return kMcpProtocolVersion;
 }
 
 std::string RandomHex(std::size_t byte_count) {
@@ -983,10 +997,22 @@ struct McpProtocol::Impl {
 
   bool ValidProtocolVersion(
       const http::request<http::string_body>& request) const {
-    return HeaderValue(request, kProtocolHeader) == kMcpProtocolVersion;
+    const std::string protocol_version = HeaderValue(request, kProtocolHeader);
+    if (!IsSupportedProtocolVersion(protocol_version)) {
+      return false;
+    }
+    const std::string session_id = HeaderValue(request, kSessionHeader);
+    if (session_id.empty()) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto session = sessions.find(session_id);
+    return session == sessions.end() ||
+           session->second.protocol_version == protocol_version;
   }
 
-  std::optional<std::string> CreateSession(std::string client_name) {
+  std::optional<std::string> CreateSession(std::string client_name,
+                                           std::string protocol_version) {
     std::lock_guard<std::mutex> lock(mutex);
     if (sessions.size() >= kMcpMaximumSessions ||
         pending_cleanup.size() > kMcpMaximumSessions) {
@@ -1008,6 +1034,7 @@ struct McpProtocol::Impl {
                        .initialization_deadline =
                            std::chrono::steady_clock::time_point::max(),
                        .client_name = std::move(client_name),
+                       .protocol_version = std::move(protocol_version),
                        .notifications = {},
                        .next_notification_sequence = 1U,
                        .active_requests = {}});
@@ -1054,7 +1081,8 @@ struct McpProtocol::Impl {
     return true;
   }
 
-  boost::json::object InitializeResult() const {
+  boost::json::object InitializeResult(
+      std::string_view protocol_version) const {
     boost::json::object capabilities;
     capabilities["logging"] = boost::json::object{};
     capabilities["prompts"] = boost::json::object{{"listChanged", false}};
@@ -1065,7 +1093,7 @@ struct McpProtocol::Impl {
     capabilities["experimental"] =
         boost::json::object{{"bbp", CapabilityDocument(config)}};
     return boost::json::object{
-        {"protocolVersion", kMcpProtocolVersion},
+        {"protocolVersion", protocol_version},
         {"capabilities", std::move(capabilities)},
         {"serverInfo", boost::json::object{{"name", "bbp"}, {"version", "1"}}},
         {"instructions",
@@ -1202,15 +1230,11 @@ struct McpProtocol::Impl {
     }
     const std::string requested_version =
         RequiredString(request.params, "protocolVersion");
-    if (requested_version != kMcpProtocolVersion) {
-      return JsonResponse(
-          http_request,
-          JsonRpcError(request.id, -32602, "unsupported MCP protocol version",
-                       boost::json::object{{"supported", kMcpProtocolVersion},
-                                           {"requested", requested_version}}));
-    }
+    const std::string selected_version(
+        SelectProtocolVersion(requested_version));
     const std::string client_name = RequiredClientName(request.params);
-    const std::optional<std::string> session_id = CreateSession(client_name);
+    const std::optional<std::string> session_id =
+        CreateSession(client_name, selected_version);
     if (!session_id) {
       return JsonResponse(
           http_request,
@@ -1243,10 +1267,11 @@ struct McpProtocol::Impl {
       }
     }
     ArmInitializationDeadline(*session_id);
-    auto response = JsonResponse(http_request,
-                                 JsonRpcResult(request.id, InitializeResult()));
+    auto response = JsonResponse(
+        http_request,
+        JsonRpcResult(request.id, InitializeResult(selected_version)));
     response.set(kSessionHeader, *session_id);
-    response.set(kProtocolHeader, kMcpProtocolVersion);
+    response.set(kProtocolHeader, selected_version);
     return response;
   }
 
@@ -1300,7 +1325,8 @@ struct McpProtocol::Impl {
     }
     if (!ValidProtocolVersion(http_request)) {
       return TextResponse(http_request, http::status::bad_request,
-                          "missing or unsupported MCP-Protocol-Version");
+                          "missing, unsupported, or not negotiated for this "
+                          "MCP session: MCP-Protocol-Version");
     }
     const std::optional<std::string> session_id =
         RequireSession(http_request, false);
@@ -1397,7 +1423,8 @@ struct McpProtocol::Impl {
     }
     if (!ValidProtocolVersion(request)) {
       return TextResponse(request, http::status::bad_request,
-                          "missing or unsupported MCP-Protocol-Version");
+                          "missing, unsupported, or not negotiated for this "
+                          "MCP session: MCP-Protocol-Version");
     }
     const std::optional<std::string> session_id = RequireSession(request, true);
     if (!session_id) {
@@ -1447,7 +1474,8 @@ struct McpProtocol::Impl {
       std::stop_token stop_token) {
     if (!ValidProtocolVersion(request)) {
       return TextResponse(request, http::status::bad_request,
-                          "missing or unsupported MCP-Protocol-Version");
+                          "missing, unsupported, or not negotiated for this "
+                          "MCP session: MCP-Protocol-Version");
     }
     const std::string session_id = HeaderValue(request, kSessionHeader);
     if (session_id.empty()) {

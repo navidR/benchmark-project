@@ -309,6 +309,13 @@ boost::json::object BuildMcpCapabilityDocument(
       {"selection_items", kMcpMaximumSelectionItems}};
   boost::json::object document;
   document["protocol_version"] = kMcpProtocolVersion;
+  boost::json::array supported_protocol_versions;
+  supported_protocol_versions.reserve(kMcpSupportedProtocolVersions.size());
+  for (const std::string_view version : kMcpSupportedProtocolVersions) {
+    supported_protocol_versions.emplace_back(version);
+  }
+  document["supported_protocol_versions"] =
+      std::move(supported_protocol_versions);
   document["transport"] = "streamable_http";
   document["authentication"] = "bearer";
   document["chains"] = EnumNames(

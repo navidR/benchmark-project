@@ -108,6 +108,18 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(parsed.is_object());
   const boost::json::object& config = parsed.as_object();
   BOOST_TEST(config.at("endpoint").as_string() == publication.endpoint);
+  BOOST_TEST(config.at("protocol_version").as_string() == kMcpProtocolVersion);
+  const boost::json::array& supported_versions =
+      config.at("supported_protocol_versions").as_array();
+  BOOST_REQUIRE_EQUAL(supported_versions.size(), 2U);
+  BOOST_TEST(supported_versions[0].as_string() == "2025-11-25");
+  BOOST_TEST(supported_versions[1].as_string() == "2025-06-18");
+  BOOST_REQUIRE_EQUAL(supported_versions.size(),
+                      kMcpSupportedProtocolVersions.size());
+  for (std::size_t index = 0U; index < supported_versions.size(); ++index) {
+    BOOST_TEST(supported_versions[index].as_string() ==
+               kMcpSupportedProtocolVersions[index]);
+  }
   BOOST_TEST(config.at("authentication").as_object().at("token").as_string() ==
              token);
   const std::string_view codex_config =

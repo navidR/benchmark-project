@@ -29,7 +29,8 @@ constexpr std::string_view kTestToken =
 
 http::request<http::string_body> ProtocolRequest(
     http::verb method, std::string body = {}, std::string_view session = {},
-    std::string_view token = kTestToken) {
+    std::string_view token = kTestToken,
+    std::string_view protocol_version = kMcpProtocolVersion) {
   http::request<http::string_body> request{method, "/mcp", 11};
   request.set(http::field::host, "127.0.0.1:43123");
   request.set(http::field::authorization, "Bearer " + std::string(token));
@@ -37,20 +38,21 @@ http::request<http::string_body> ProtocolRequest(
   request.set(http::field::content_type, "application/json");
   if (!session.empty()) {
     request.set("Mcp-Session-Id", session);
-    request.set("MCP-Protocol-Version", kMcpProtocolVersion);
+    request.set("MCP-Protocol-Version", protocol_version);
   }
   request.body() = std::move(body);
   request.prepare_payload();
   return request;
 }
 
-std::string InitializeBody(std::uint64_t id) {
+std::string InitializeBody(
+    std::uint64_t id, std::string_view protocol_version = kMcpProtocolVersion) {
   return boost::json::serialize(boost::json::object{
       {"jsonrpc", "2.0"},
       {"id", id},
       {"method", "initialize"},
       {"params", boost::json::object{
-                     {"protocolVersion", kMcpProtocolVersion},
+                     {"protocolVersion", protocol_version},
                      {"capabilities", boost::json::object{}},
                      {"clientInfo", boost::json::object{{"name", "bbp-test"},
                                                         {"version", "1"}}}}}});
@@ -80,14 +82,21 @@ std::string RequestBody(std::uint64_t id, std::string_view method,
                           {"params", std::move(params)}});
 }
 
-std::string Initialize(McpProtocol* protocol,
-                       bool check_resource_subscription = false) {
-  const auto response =
-      protocol->Handle(ProtocolRequest(http::verb::post, InitializeBody(1U)));
+std::string Initialize(
+    McpProtocol* protocol, bool check_resource_subscription = false,
+    std::string_view protocol_version = kMcpProtocolVersion) {
+  const auto response = protocol->Handle(
+      ProtocolRequest(http::verb::post, InitializeBody(1U, protocol_version)));
   BOOST_REQUIRE(response.result() == http::status::ok);
+  const auto protocol_field = response.find("MCP-Protocol-Version");
+  BOOST_REQUIRE(protocol_field != response.end());
+  BOOST_TEST(protocol_field->value() == protocol_version);
+  const boost::json::object initialized =
+      boost::json::parse(response.body()).as_object();
+  BOOST_TEST(
+      initialized.at("result").as_object().at("protocolVersion").as_string() ==
+      protocol_version);
   if (check_resource_subscription) {
-    const boost::json::object initialized =
-        boost::json::parse(response.body()).as_object();
     BOOST_TEST(initialized.at("result")
                    .as_object()
                    .at("capabilities")
@@ -104,9 +113,11 @@ std::string Initialize(McpProtocol* protocol,
   return session;
 }
 
-void MarkInitialized(McpProtocol* protocol, std::string_view session) {
-  const auto response = protocol->Handle(
-      ProtocolRequest(http::verb::post, InitializedBody(), session));
+void MarkInitialized(McpProtocol* protocol, std::string_view session,
+                     std::string_view protocol_version = kMcpProtocolVersion) {
+  const auto response =
+      protocol->Handle(ProtocolRequest(http::verb::post, InitializedBody(),
+                                       session, kTestToken, protocol_version));
   BOOST_REQUIRE(response.result() == http::status::accepted);
 }
 
@@ -227,6 +238,66 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_requires_initialize_notification_order) {
   const McpProtocolStats stats = protocol.Stats();
   BOOST_TEST(stats.sessions == 1U);
   BOOST_TEST(stats.initialized_sessions == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_protocol_negotiates_and_retains_each_supported_session_version) {
+  constexpr std::string_view kStableVersion = "2025-06-18";
+  constexpr std::string_view kNewestVersion = "2025-11-25";
+  constexpr std::string_view kUnsupportedVersion = "2024-11-05";
+  McpProtocol protocol = MakeProtocol();
+
+  const std::string stable_session =
+      Initialize(&protocol, false, kStableVersion);
+  const std::string newest_session =
+      Initialize(&protocol, false, kNewestVersion);
+  BOOST_TEST(stable_session != newest_session);
+  MarkInitialized(&protocol, stable_session, kStableVersion);
+  MarkInitialized(&protocol, newest_session, kNewestVersion);
+
+  const auto stable_ping = protocol.Handle(
+      ProtocolRequest(http::verb::post, RequestBody(2U, "ping"), stable_session,
+                      kTestToken, kStableVersion));
+  BOOST_TEST(stable_ping.result() == http::status::ok);
+  const auto newest_ping = protocol.Handle(
+      ProtocolRequest(http::verb::post, RequestBody(3U, "ping"), newest_session,
+                      kTestToken, kNewestVersion));
+  BOOST_TEST(newest_ping.result() == http::status::ok);
+
+  const auto mismatched_post = protocol.Handle(
+      ProtocolRequest(http::verb::post, RequestBody(4U, "ping"), stable_session,
+                      kTestToken, kNewestVersion));
+  BOOST_TEST(mismatched_post.result() == http::status::bad_request);
+  BOOST_TEST(mismatched_post.body().find(
+                 "not negotiated for this MCP session") != std::string::npos);
+  const auto mismatched_get = protocol.Handle(ProtocolRequest(
+      http::verb::get, {}, newest_session, kTestToken, kStableVersion));
+  BOOST_TEST(mismatched_get.result() == http::status::bad_request);
+  const auto mismatched_delete = protocol.Handle(ProtocolRequest(
+      http::verb::delete_, {}, stable_session, kTestToken, kNewestVersion));
+  BOOST_TEST(mismatched_delete.result() == http::status::bad_request);
+
+  const auto stable_still_active = protocol.Handle(
+      ProtocolRequest(http::verb::post, RequestBody(5U, "ping"), stable_session,
+                      kTestToken, kStableVersion));
+  BOOST_TEST(stable_still_active.result() == http::status::ok);
+
+  const auto fallback_response = protocol.Handle(ProtocolRequest(
+      http::verb::post, InitializeBody(6U, kUnsupportedVersion)));
+  BOOST_REQUIRE(fallback_response.result() == http::status::ok);
+  BOOST_TEST(fallback_response.at("MCP-Protocol-Version") == kNewestVersion);
+  const boost::json::object fallback_body =
+      boost::json::parse(fallback_response.body()).as_object();
+  BOOST_TEST(fallback_body.at("result")
+                 .as_object()
+                 .at("protocolVersion")
+                 .as_string() == kNewestVersion);
+  const std::string fallback_session(fallback_response.at("Mcp-Session-Id"));
+  MarkInitialized(&protocol, fallback_session, kNewestVersion);
+  const auto fallback_ping = protocol.Handle(
+      ProtocolRequest(http::verb::post, RequestBody(7U, "ping"),
+                      fallback_session, kTestToken, kNewestVersion));
+  BOOST_TEST(fallback_ping.result() == http::status::ok);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_protocol_dispatches_registered_tools_and_resources) {
