@@ -8,9 +8,11 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bbp/block_production_policy.h"
@@ -20,6 +22,7 @@
 #include "bbp/perf_counter.h"
 #include "bbp/simulation_partition.h"
 #include "bbp/simulation_wallet_send.h"
+#include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/simulator/resource_limit_patch.h"
 
 namespace bbp {
@@ -120,6 +123,12 @@ struct SimulationCommandOutcome {
   std::optional<std::string> node_lifecycle;
 };
 
+class SimulationCommandOutcomeUnconfirmed final : public std::runtime_error {
+ public:
+  explicit SimulationCommandOutcomeUnconfirmed(std::string message)
+      : std::runtime_error(std::move(message)) {}
+};
+
 struct SimulationNodeProcessObservation {
   bool running = false;
   pid_t pid = -1;
@@ -137,7 +146,13 @@ SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
     const SimulationNodeProcessObservation& initial,
     SimulationNodeRestartPhase phase,
     std::chrono::steady_clock::time_point deadline,
-    const std::function<SimulationNodeProcessObservation()>& observe);
+    const std::function<SimulationNodeProcessObservation()>& observe,
+    const std::function<bool(const SimulationNodeProcessObservation&)>&
+        request_unready_replacement_stop = {});
+
+NodeRuntimeLifecycle ReconciledSimulationNodeRestartLifecycle(
+    NodeRuntimeLifecycle admitted, NodeRuntimeLifecycle observed,
+    SimulationNodeRestartReconciliation reconciliation);
 
 struct SimulationCommand {
   std::uint64_t sequence = 0;

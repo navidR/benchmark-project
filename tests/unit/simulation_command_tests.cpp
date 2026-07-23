@@ -54,7 +54,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
 BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kKillNode));
-  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+  BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kRestartNode));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kSetNetworkProfile));
@@ -172,4 +172,72 @@ BOOST_AUTO_TEST_CASE(
           });
   BOOST_CHECK(reconciliation ==
               bbp::SimulationNodeRestartReconciliation::kReplacementReady);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_restart_cancellation_preserves_same_generation_spawn_failure) {
+  const bbp::SimulationNodeProcessObservation initial{
+      .running = false,
+      .pid = -1,
+      .restart_count = 7U,
+  };
+  const bbp::SimulationNodeRestartReconciliation reconciliation =
+      bbp::ReconcileCancelledSimulationNodeRestart(
+          initial, bbp::SimulationNodeRestartPhase::kOriginalExited,
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(250),
+          [initial] { return initial; });
+  BOOST_REQUIRE(reconciliation ==
+                bbp::SimulationNodeRestartReconciliation::kUnchanged);
+
+  // ChildProcess::Spawn can publish Failed before incrementing restart_count.
+  // Cancellation reconciliation must not restore the admitted Stopped state.
+  BOOST_CHECK(bbp::ReconciledSimulationNodeRestartLifecycle(
+                  bbp::NodeRuntimeLifecycle::kStopped,
+                  bbp::NodeRuntimeLifecycle::kFailed,
+                  reconciliation) == bbp::NodeRuntimeLifecycle::kFailed);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_restart_cancellation_stops_unready_replacement) {
+  const std::filesystem::path run_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-unready-restart-reconciliation-" + std::to_string(getpid()));
+  std::filesystem::remove_all(run_dir);
+  std::filesystem::create_directories(run_dir);
+
+  bbp::ProcessSpec spec;
+  spec.binary = "/bin/sleep";
+  spec.argv = {"10"};
+  spec.cwd = run_dir;
+  spec.stdout_path = run_dir / "stdout.log";
+  spec.stderr_path = run_dir / "stderr.log";
+  bbp::ChildProcess replacement = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  const bbp::SimulationNodeProcessObservation initial{
+      .running = true,
+      .pid = replacement.pid() + 1,
+      .restart_count = 7U,
+  };
+  std::size_t stop_requests = 0U;
+  const bbp::SimulationNodeRestartReconciliation reconciliation =
+      bbp::ReconcileCancelledSimulationNodeRestart(
+          initial, bbp::SimulationNodeRestartPhase::kOriginalExited,
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(250),
+          [&] {
+            return bbp::SimulationNodeProcessObservation{
+                .running = replacement.running(),
+                .pid = replacement.pid(),
+                .restart_count = 8U,
+            };
+          },
+          [&](const bbp::SimulationNodeProcessObservation& expected) {
+            ++stop_requests;
+            BOOST_TEST(expected.pid == replacement.pid());
+            BOOST_TEST(expected.restart_count == 8U);
+            return replacement.RequestKill();
+          });
+  BOOST_CHECK(reconciliation ==
+              bbp::SimulationNodeRestartReconciliation::kStopped);
+  BOOST_TEST(stop_requests == 1U);
+  BOOST_TEST(!replacement.running());
+  std::filesystem::remove_all(run_dir);
 }

@@ -1,7 +1,10 @@
 #pragma once
 
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -45,18 +48,36 @@ class RunProcessState {
     friend class RunProcessState;
 
     explicit NativeMiningRpcGuard(RunProcessState& owner);
+    NativeMiningRpcGuard(RunProcessState& owner, std::adopt_lock_t);
 
     RunProcessState* owner_;
     std::unique_lock<std::mutex> lock_;
   };
 
+  struct NativeMiningRestartIntent {
+    NativeMiningRpcGuard rpc_guard;
+    bool native_miner_active = false;
+    bool scheduled_miner_paused = false;
+  };
+
   [[nodiscard]] Guard Lock();
   [[nodiscard]] NativeMiningRpcGuard LockNativeMiningRpc();
+  [[nodiscard]] std::optional<NativeMiningRpcGuard> TryLockNativeMiningRpcUntil(
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {});
+  [[nodiscard]] std::optional<NativeMiningRestartIntent>
+  TryBeginNativeMiningRestart(std::string_view node_id,
+                              std::chrono::steady_clock::time_point deadline,
+                              std::stop_token stop_token = {});
 
   [[nodiscard]] bool IsActiveNativeMiner(const Guard& guard,
                                          std::string_view node_id) const;
   void AddActiveNativeMiner(const Guard& guard, std::string node_id);
   void RemoveActiveNativeMiner(const Guard& guard, std::string_view node_id);
+  void ReconcileActiveNativeMinerAfterRestartFailure(
+      const NativeMiningRpcGuard& mining_rpc_guard, const Guard& guard,
+      std::string_view node_id, bool original_running_generation_unchanged,
+      bool replacement_mining_confirmed_inactive);
   [[nodiscard]] std::vector<std::string> ActiveNativeMiners(
       const Guard& guard) const;
 
@@ -68,6 +89,7 @@ class RunProcessState {
 
  private:
   void RequireGuard(const Guard& guard) const;
+  void RequireNativeMiningRpcGuard(const NativeMiningRpcGuard& guard) const;
 
   std::mutex mutex_;
   // Native mining RPCs stay outside mutex_, but are serialized so a stale

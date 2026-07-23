@@ -7350,19 +7350,34 @@ bool IsCurrentRunningNodeProcess(NodeRuntime& node,
          node.process.running();
 }
 
-bool StartNativeMiningForCurrentProcess(const ChainDriver& driver,
-                                        NodeRuntime& node,
-                                        RunProcessState& run_process_state,
-                                        std::string_view reward_address,
-                                        std::stop_token stop_token,
-                                        std::string_view action) {
-  auto mining_rpc_guard = run_process_state.LockNativeMiningRpc();
+bool StartNativeMiningForCurrentProcess(
+    const ChainDriver& driver, NodeRuntime& node,
+    RunProcessState& run_process_state, std::string_view reward_address,
+    std::stop_token stop_token, std::string_view action,
+    std::optional<std::chrono::steady_clock::time_point> lock_deadline =
+        std::nullopt,
+    bool* rpc_attempted = nullptr) {
+  std::optional<RunProcessState::NativeMiningRpcGuard> mining_rpc_guard;
+  if (lock_deadline) {
+    mining_rpc_guard = run_process_state.TryLockNativeMiningRpcUntil(
+        *lock_deadline, stop_token);
+    if (!mining_rpc_guard) {
+      ThrowIfStopRequested(stop_token);
+      throw std::runtime_error("native mining RPC lock deadline expired: " +
+                               node.config.id);
+    }
+  } else {
+    mining_rpc_guard.emplace(run_process_state.LockNativeMiningRpc());
+  }
   NodeProcessGeneration generation;
   {
     auto process_guard = run_process_state.Lock();
     generation = RunningNodeProcessGeneration(node, process_guard, action);
   }
 
+  if (rpc_attempted != nullptr) {
+    *rpc_attempted = true;
+  }
   driver.StartMining(node.config, std::string(reward_address), stop_token);
 
   bool current_process_running = false;
@@ -7392,6 +7407,41 @@ void StopNativeMining(const ChainDriver& driver, NodeRuntime& node,
   driver.StopMining(node.config, stop_token);
   auto process_guard = run_process_state.Lock();
   run_process_state.RemoveActiveNativeMiner(process_guard, node.config.id);
+}
+
+bool StopNativeMiningBeforeDeadline(
+    const ChainDriver& driver, const NodeRuntime& node,
+    std::chrono::steady_clock::time_point deadline, std::string* error) {
+  if (std::chrono::steady_clock::now() >= deadline) {
+    *error = "native mining compensation deadline expired";
+    return false;
+  }
+  std::stop_source operation_stop_source;
+  std::jthread deadline_timer(
+      [deadline, &operation_stop_source](std::stop_token timer_stop_token) {
+        try {
+          WaitUntil(deadline, timer_stop_token);
+        } catch (const SimulationCancelled&) {
+          return;
+        }
+        operation_stop_source.request_stop();
+      });
+  try {
+    driver.StopMining(node.config, operation_stop_source.get_token());
+  } catch (const std::exception& failure) {
+    deadline_timer.request_stop();
+    deadline_timer.join();
+    *error = failure.what();
+    return false;
+  } catch (...) {
+    deadline_timer.request_stop();
+    deadline_timer.join();
+    *error = "unknown native mining compensation failure";
+    return false;
+  }
+  deadline_timer.request_stop();
+  deadline_timer.join();
+  return true;
 }
 
 void PublishOperatorConnectionCommand(const Options& options,
@@ -9867,7 +9917,19 @@ void StartNodeProcessAttempt(
   }
   WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kStarting);
-  ChildProcess spawned = ChildProcess::Spawn(process, node.cgroup->path());
+  ChildProcess spawned;
+  try {
+    spawned = ChildProcess::Spawn(process, node.cgroup->path());
+  } catch (...) {
+    {
+      auto process_guard = LockNodeProcessState(node);
+      ResetNodePerfCounters(node, process_guard);
+      node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
+    }
+    WriteNodeStateEvent(events_path, options.run_id, node,
+                        NodeRuntimeLifecycle::kFailed);
+    throw;
+  }
   const std::uint64_t restart_count =
       restart_attempt ? node.IncrementRestartCount() : node.RestartCount();
   pid_t process_pid = -1;
@@ -12858,15 +12920,6 @@ std::string RestartPolicyAppliedDetail(const NodeRuntime& node, int wait_status,
   return boost::json::serialize(detail);
 }
 
-std::string RestartPeerConnectionDetail(std::string_view peer_address,
-                                        std::uint64_t restart_count) {
-  boost::json::object detail;
-  detail["reason"] = "restart_topology_restore";
-  detail["peer_address"] = std::string(peer_address);
-  detail["restart_count"] = restart_count;
-  return boost::json::serialize(detail);
-}
-
 bool WaitForNodeFrozenState(const Cgroup& cgroup, bool expected,
                             std::stop_token stop_token);
 void SetNodeFrozen(const Options& options,
@@ -12879,14 +12932,16 @@ struct NodeRestartAdmission {
   bool admitted = false;
 };
 
-bool RestartNode(
-    const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, NodeRuntime& node,
-    std::chrono::steady_clock::time_point lifecycle_epoch,
-    std::stop_token stop_token, std::string_view reason = "requested",
-    const std::set<std::string>* available_peer_addresses = nullptr,
-    SimulationCommandControl* operation_control = nullptr,
-    NodeRestartAdmission* admitted_state = nullptr) {
+bool RestartNode(const Options& options,
+                 const std::filesystem::path& events_path,
+                 const ChainDriver& driver,
+                 PeerConnectivityController& peer_connectivity_controller,
+                 NodeRuntime& node,
+                 std::chrono::steady_clock::time_point lifecycle_epoch,
+                 std::stop_token stop_token,
+                 std::string_view reason = "requested",
+                 SimulationCommandControl* operation_control = nullptr,
+                 NodeRestartAdmission* admitted_state = nullptr) {
   ThrowIfStopRequested(stop_token);
   if (!node.cgroup) {
     throw std::runtime_error("node restart requires a node cgroup");
@@ -13013,97 +13068,13 @@ bool RestartNode(
         SimulationNodeRestartPhase::kReplacementReady,
         std::memory_order_release);
   }
-  const std::uint64_t restart_count = node.RestartCount();
-  std::optional<std::chrono::steady_clock::time_point> node_stop_deadline;
-  if (node.lifecycle_policy.stop_time) {
-    node_stop_deadline = SteadyDeadline(
-        lifecycle_epoch,
-        options.time_scale.WallDuration(*node.lifecycle_policy.stop_time));
-    if (std::chrono::steady_clock::now() >= *node_stop_deadline) {
-      ApplyDeclarativeStopDuringStart(options, events_path, driver, node,
-                                      lifecycle_epoch, stop_token);
-      return false;
-    }
-  }
-  std::stop_source peer_stop_source;
-  std::stop_callback stop_peers_on_request(
-      stop_token, [&peer_stop_source] { peer_stop_source.request_stop(); });
-  std::optional<std::jthread> node_stop_timer;
-  if (node_stop_deadline) {
-    node_stop_timer.emplace([deadline = *node_stop_deadline, &peer_stop_source](
-                                std::stop_token timer_stop_token) {
-      try {
-        WaitUntil(deadline, timer_stop_token);
-      } catch (const SimulationCancelled&) {
-        return;
-      }
-      peer_stop_source.request_stop();
-    });
-  }
-  const auto stop_node_timer = [&] {
-    if (node_stop_timer) {
-      node_stop_timer->request_stop();
-      if (node_stop_timer->joinable()) {
-        node_stop_timer->join();
-      }
-      node_stop_timer.reset();
-    }
-  };
-  std::vector<std::string> restart_peers;
-  {
-    std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
-    restart_peers = node.config.connect_peers;
-  }
-  try {
-    for (const std::string& peer : restart_peers) {
-      if (available_peer_addresses != nullptr &&
-          !available_peer_addresses->contains(peer)) {
-        continue;
-      }
-      ThrowIfStopRequested(peer_stop_source.get_token());
-      driver.ConnectPeer(node.config, peer, peer_stop_source.get_token());
-      driver.WaitForPeerAddress(node.config, peer,
-                                std::chrono::seconds(options.ready_timeout_sec),
-                                peer_stop_source.get_token());
-      WriteEvent(events_path, options.run_id, node.config.id,
-                 SimulationEventKind::kPeerConnected,
-                 RestartPeerConnectionDetail(peer, restart_count));
-    }
-  } catch (const SimulationCancelled&) {
-    stop_node_timer();
-    if (stop_token.stop_requested()) {
-      throw;
-    }
-    if (node_stop_deadline &&
-        std::chrono::steady_clock::now() >= *node_stop_deadline) {
-      ApplyDeclarativeStopDuringStart(options, events_path, driver, node,
-                                      lifecycle_epoch, stop_token);
-      return false;
-    }
-    throw;
-  } catch (...) {
-    stop_node_timer();
-    {
-      auto process_guard = LockNodeProcessState(node);
-      node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
-    }
-    WriteNodeStateEvent(events_path, options.run_id, node,
-                        NodeRuntimeLifecycle::kFailed);
-    throw;
-  }
-  stop_node_timer();
-  if (node_stop_deadline &&
-      std::chrono::steady_clock::now() >= *node_stop_deadline) {
-    ApplyDeclarativeStopDuringStart(options, events_path, driver, node,
-                                    lifecycle_epoch, stop_token);
-    return false;
-  }
   {
     auto process_guard = LockNodeProcessState(node);
     node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
   }
   WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kRunning);
+  peer_connectivity_controller.RequestTopologyRestore(node.config.id);
   if (operation_control != nullptr) {
     operation_control->restart_phase.store(
         SimulationNodeRestartPhase::kCompleted, std::memory_order_release);
@@ -13113,7 +13084,9 @@ bool RestartNode(
 
 void ApplyRuntimeNodeRestarts(
     const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    const ChainDriver& driver,
+    PeerConnectivityController& peer_connectivity_controller,
+    std::vector<NodeRuntime>& nodes,
     std::chrono::steady_clock::time_point lifecycle_epoch,
     std::stop_token stop_token) {
   for (uint32_t node_index : options.runtime_node_restarts) {
@@ -13121,8 +13094,8 @@ void ApplyRuntimeNodeRestarts(
     if (node_index >= nodes.size()) {
       throw std::runtime_error("runtime restart node is out of range");
     }
-    if (!RestartNode(options, events_path, driver, nodes[node_index],
-                     lifecycle_epoch, stop_token)) {
+    if (!RestartNode(options, events_path, driver, peer_connectivity_controller,
+                     nodes[node_index], lifecycle_epoch, stop_token)) {
       throw std::runtime_error(
           "runtime restart reached node stop_time before completion: " +
           nodes[node_index].config.id);
@@ -14543,12 +14516,18 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   const PeerCountPolicy& policy) {
                 boost::json::object detail;
                 detail["peer_node_id"] = peer_node_id;
-                detail["minimum_peer_count"] = policy.minimum();
-                detail["maximum_peer_count"] = policy.maximum();
-                const SimulationEventKind event_kind =
-                    action == PeerConnectivityAction::kConnected
-                        ? SimulationEventKind::kPeerPolicyConnected
-                        : SimulationEventKind::kPeerPolicyDisconnected;
+                SimulationEventKind event_kind;
+                if (action == PeerConnectivityAction::kTopologyRestored) {
+                  detail["reason"] = "restart_topology_restore";
+                  event_kind = SimulationEventKind::kPeerConnected;
+                } else {
+                  detail["minimum_peer_count"] = policy.minimum();
+                  detail["maximum_peer_count"] = policy.maximum();
+                  event_kind =
+                      action == PeerConnectivityAction::kConnected
+                          ? SimulationEventKind::kPeerPolicyConnected
+                          : SimulationEventKind::kPeerPolicyDisconnected;
+                }
                 WriteEvent(events_path, options.run_id, std::string(node_id),
                            event_kind, boost::json::serialize(detail));
                 BBP_LOG(info) << SimulationEventKindName(event_kind) << " "
@@ -14950,18 +14929,30 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             } else if (command.kind == SimulationCommandKind::kRestartNode) {
               bool was_paused = false;
               bool resume_native_miner = false;
+              bool native_mining_rpc_attempted = false;
               NodeRestartAdmission restart_admission;
               SimulationCommandControl local_restart_control;
               SimulationCommandControl* restart_control =
                   command.operation_control ? command.operation_control.get()
                                             : &local_restart_control;
-              {
-                auto process_guard = run_process_state.Lock();
-                was_paused = run_process_state.IsPausedScheduledMiner(
-                    process_guard, command.node_id);
-                resume_native_miner = run_process_state.IsActiveNativeMiner(
-                    process_guard, command.node_id);
+              const auto resume_intent_deadline =
+                  restart_control->absolute_deadline.value_or(
+                      std::chrono::steady_clock::now() +
+                      std::chrono::seconds(options.ready_timeout_sec));
+              std::optional<RunProcessState::NativeMiningRestartIntent>
+                  restart_intent =
+                      run_process_state.TryBeginNativeMiningRestart(
+                          command.node_id, resume_intent_deadline,
+                          command_stop_token);
+              if (!restart_intent) {
+                ThrowIfStopRequested(command_stop_token);
+                throw std::runtime_error(
+                    "native mining RPC lock deadline expired before node "
+                    "restart: " +
+                    command.node_id);
               }
+              was_paused = restart_intent->scheduled_miner_paused;
+              resume_native_miner = restart_intent->native_miner_active;
               const bool resume_scheduled_miner =
                   stop_scheduled_miner() || was_paused;
               if (resume_scheduled_miner) {
@@ -14970,50 +14961,92 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                                       command.node_id);
               }
               try {
-                if (!RestartNode(options, events_path, driver, node,
+                if (!RestartNode(options, events_path, driver,
+                                 *peer_connectivity_controller, node,
                                  lifecycle_epoch, command_stop_token,
-                                 "requested", nullptr, restart_control,
+                                 "requested", restart_control,
                                  &restart_admission)) {
                   throw std::runtime_error(
                       "operator restart reached node stop_time before "
                       "completion: " +
                       node.config.id);
                 }
+                restart_intent.reset();
                 if (resume_native_miner) {
                   if (!StartNativeMiningForCurrentProcess(
                           driver, node, run_process_state,
                           chain_spec.default_reward_address, command_stop_token,
-                          "operator native mining restart")) {
+                          "operator native mining restart",
+                          restart_control->absolute_deadline,
+                          &native_mining_rpc_attempted)) {
                     throw std::runtime_error(
                         "node process changed during native mining restart: " +
                         node.config.id);
                   }
                 }
               } catch (...) {
+                restart_intent.reset();
                 bool resume_miner_after_failure = true;
+                auto reconciliation_deadline =
+                    std::chrono::steady_clock::now() +
+                    kSimulationCommandCancellationReconciliation;
+                if (restart_control->absolute_deadline) {
+                  reconciliation_deadline =
+                      std::min(reconciliation_deadline,
+                               *restart_control->absolute_deadline);
+                }
                 if (command_stop_token.stop_requested() &&
                     restart_admission.admitted) {
-                  auto reconciliation_deadline =
-                      std::chrono::steady_clock::now() +
-                      kSimulationCommandCancellationReconciliation;
-                  if (command.operation_control &&
-                      command.operation_control->absolute_deadline) {
-                    reconciliation_deadline =
-                        std::min(reconciliation_deadline,
-                                 *command.operation_control->absolute_deadline);
-                  }
                   const SimulationNodeRestartReconciliation reconciliation =
                       ReconcileCancelledSimulationNodeRestart(
                           restart_admission.process,
                           restart_control->restart_phase.load(
                               std::memory_order_acquire),
-                          reconciliation_deadline, [&] {
+                          reconciliation_deadline,
+                          [&] {
                             auto process_guard = run_process_state.Lock();
                             return SimulationNodeProcessObservation{
                                 .running = node.process.running(),
                                 .pid = node.process.pid(),
                                 .restart_count = node.RestartCount(),
                             };
+                          },
+                          [&](const SimulationNodeProcessObservation&
+                                  expected) {
+                            bool requested = false;
+                            try {
+                              {
+                                auto process_guard = run_process_state.Lock();
+                                if (node.process.running() &&
+                                    node.process.pid() == expected.pid &&
+                                    node.RestartCount() ==
+                                        expected.restart_count) {
+                                  requested = node.process.RequestKill();
+                                }
+                              }
+                            } catch (const std::exception& error) {
+                              BBP_LOG(error)
+                                  << "failed to stop unready replacement "
+                                  << expected.pid << " for " << command.node_id
+                                  << ": " << error.what();
+                              return false;
+                            }
+                            if (requested) {
+                              try {
+                                WriteEvent(
+                                    events_path, options.run_id,
+                                    command.node_id,
+                                    SimulationEventKind::kProcessKillRequested,
+                                    "restart cancellation reconciliation pid=" +
+                                        std::to_string(expected.pid));
+                              } catch (const std::exception& error) {
+                                BBP_LOG(error)
+                                    << "failed to record unready replacement "
+                                       "stop for "
+                                    << command.node_id << ": " << error.what();
+                              }
+                            }
+                            return requested;
                           });
                   const bool unchanged =
                       reconciliation ==
@@ -15024,11 +15057,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   const bool replacement_ready =
                       reconciliation ==
                       SimulationNodeRestartReconciliation::kReplacementReady;
+                  NodeRuntimeLifecycle observed_lifecycle;
+                  {
+                    auto process_guard = run_process_state.Lock();
+                    observed_lifecycle = node.Lifecycle();
+                  }
                   const NodeRuntimeLifecycle reconciled_state =
-                      unchanged           ? restart_admission.lifecycle
-                      : stopped           ? NodeRuntimeLifecycle::kStopped
-                      : replacement_ready ? NodeRuntimeLifecycle::kRunning
-                                          : NodeRuntimeLifecycle::kRestarting;
+                      ReconciledSimulationNodeRestartLifecycle(
+                          restart_admission.lifecycle, observed_lifecycle,
+                          reconciliation);
                   bool state_changed = false;
                   {
                     auto process_guard = run_process_state.Lock();
@@ -15036,8 +15073,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                       AttachNodePerfCounters(node, process_guard);
                     } else {
                       ResetNodePerfCounters(node, process_guard);
-                      run_process_state.RemoveActiveNativeMiner(
-                          process_guard, command.node_id);
                     }
                     if (node.Lifecycle() != reconciled_state) {
                       node.SetLifecycle(reconciled_state);
@@ -15046,15 +15081,73 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   }
                   if (!unchanged && !stopped && !replacement_ready) {
                     resume_miner_after_failure = false;
-                    if (command.operation_control) {
-                      command.operation_control->outcome_unconfirmed.store(
-                          true, std::memory_order_release);
-                    }
+                    restart_control->outcome_unconfirmed.store(
+                        true, std::memory_order_release);
                   }
                   if (state_changed) {
                     WriteNodeStateEvent(events_path, options.run_id, node,
                                         reconciled_state);
                   }
+                }
+                if (resume_native_miner && restart_admission.admitted) {
+                  auto mining_rpc_guard =
+                      run_process_state.TryLockNativeMiningRpcUntil(
+                          reconciliation_deadline);
+                  bool original_running_generation_unchanged = false;
+                  bool replacement_running = false;
+                  if (mining_rpc_guard) {
+                    auto process_guard = run_process_state.Lock();
+                    original_running_generation_unchanged =
+                        restart_admission.process.running &&
+                        node.process.running() &&
+                        node.process.pid() == restart_admission.process.pid &&
+                        node.RestartCount() ==
+                            restart_admission.process.restart_count;
+                    replacement_running =
+                        !original_running_generation_unchanged &&
+                        node.process.running();
+                  }
+
+                  bool replacement_mining_confirmed_inactive =
+                      mining_rpc_guard &&
+                      (!replacement_running || !native_mining_rpc_attempted);
+                  std::string compensation_error;
+                  if (mining_rpc_guard && replacement_running &&
+                      native_mining_rpc_attempted) {
+                    replacement_mining_confirmed_inactive =
+                        StopNativeMiningBeforeDeadline(driver, node,
+                                                       reconciliation_deadline,
+                                                       &compensation_error);
+                  } else if (!mining_rpc_guard) {
+                    compensation_error =
+                        "native mining RPC lock deadline expired";
+                  }
+
+                  if (mining_rpc_guard) {
+                    auto process_guard = run_process_state.Lock();
+                    run_process_state
+                        .ReconcileActiveNativeMinerAfterRestartFailure(
+                            *mining_rpc_guard, process_guard, command.node_id,
+                            original_running_generation_unchanged,
+                            replacement_mining_confirmed_inactive);
+                  }
+                  if (!original_running_generation_unchanged &&
+                      !replacement_mining_confirmed_inactive) {
+                    resume_miner_after_failure = false;
+                    restart_control->outcome_unconfirmed.store(
+                        true, std::memory_order_release);
+                    BBP_LOG(warning)
+                        << "native mining state remains active after failed "
+                           "restart reconciliation for "
+                        << command.node_id << ": " << compensation_error;
+                  }
+                }
+                if (!command.operation_control &&
+                    restart_control->outcome_unconfirmed.load(
+                        std::memory_order_acquire)) {
+                  simulation_stop_source.request_stop();
+                  throw SimulationCommandOutcomeUnconfirmed(
+                      ExceptionMessage(std::current_exception()));
                 }
                 if (resume_scheduled_miner && resume_miner_after_failure &&
                     NodeProcessRunning(node)) {
@@ -15270,7 +15363,17 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                           0U, 0U, command_stop_token);
               }
             } else {
-              chain_command_executor->Execute(command, command_stop_token);
+              try {
+                chain_command_executor->Execute(command, command_stop_token);
+              } catch (const PeerMutationOutcomeUnconfirmed&) {
+                if (command.operation_control) {
+                  command.operation_control->outcome_unconfirmed.store(
+                      true, std::memory_order_release);
+                } else {
+                  simulation_stop_source.request_stop();
+                }
+                throw;
+              }
             }
             WriteEvent(events_path, options.run_id, command.node_id,
                        SimulationEventKind::kOperatorCommandCompleted,
@@ -15471,29 +15574,16 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   "it: " +
                   node.config.id);
             }
-            std::set<std::string> available_peer_addresses;
-            for (const NodeRuntime& candidate : nodes) {
-              if (candidate.config.id != node.config.id &&
-                  candidate.AllowsChainMetrics()) {
-                available_peer_addresses.insert(NodePeerEndpoint(candidate));
-              }
-            }
-            node_restarted =
-                RestartNode(options, events_path, driver, node, lifecycle_epoch,
-                            operation_stop_token, "restart_policy",
-                            &available_peer_addresses);
-            if (node_restarted) {
-              ConnectAvailableStartupPeers(options, events_path, driver, nodes,
-                                           index, lifecycle_epoch,
-                                           operation_stop_token);
-              if (configured_miners.contains(node.config.id) &&
-                  options.block_production.enabled &&
-                  options.block_production.difficulty) {
-                RequireNodeRunning(node, "restart mining difficulty restore");
-                driver.SetMiningDifficulty(node.config,
-                                           *options.block_production.difficulty,
-                                           operation_stop_token);
-              }
+            node_restarted = RestartNode(
+                options, events_path, driver, *peer_connectivity_controller,
+                node, lifecycle_epoch, operation_stop_token, "restart_policy");
+            if (node_restarted && configured_miners.contains(node.config.id) &&
+                options.block_production.enabled &&
+                options.block_production.difficulty) {
+              RequireNodeRunning(node, "restart mining difficulty restore");
+              driver.SetMiningDifficulty(node.config,
+                                         *options.block_production.difficulty,
+                                         operation_stop_token);
             }
             if (node_restarted && block_scheduler &&
                 configured_miners.contains(node.config.id)) {
@@ -15655,7 +15745,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     ApplyRuntimeNetworkPartitions(options, events_path, nodes, stop_token);
     ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes, stop_token);
     ApplyRuntimeNetworkUnblockRules(options, events_path, nodes, stop_token);
-    ApplyRuntimeNodeRestarts(options, events_path, driver, nodes,
+    ApplyRuntimeNodeRestarts(options, events_path, driver,
+                             *peer_connectivity_controller, nodes,
                              lifecycle_epoch, stop_token);
     ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
     if (!timed_node_lifecycle) {
@@ -15819,7 +15910,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             const RestartNodeWorkload& workload =
                 scenario_workload.restart_node;
             NodeRuntime& node = nodes[workload.node - 1U];
-            if (!RestartNode(options, events_path, driver, node,
+            if (!RestartNode(options, events_path, driver,
+                             *peer_connectivity_controller, node,
                              lifecycle_epoch, stop_token)) {
               throw std::runtime_error(
                   "restart_node workload reached node stop_time before "

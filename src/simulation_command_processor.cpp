@@ -115,7 +115,31 @@ void SimulationCommandProcessor::Run() {
       ReportOutcome(*command, CancellationOutcome(
                                   *command, error.what(),
                                   SimulationCommandCancellationCause::kNone));
+    } catch (const SimulationCommandOutcomeUnconfirmed& error) {
+      ReportOutcome(
+          *command,
+          SimulationCommandOutcome{
+              .state = SimulationCommandOutcomeState::kOutcomeUnconfirmed,
+              .cancellation_cause = CancellationCause(
+                  *command, SimulationCommandCancellationCause::kNone),
+              .error = error.what(),
+              .node_lifecycle = std::nullopt,
+          });
     } catch (const std::exception& error) {
+      if (command->operation_control &&
+          command->operation_control->outcome_unconfirmed.load(
+              std::memory_order_acquire)) {
+        ReportOutcome(
+            *command,
+            SimulationCommandOutcome{
+                .state = SimulationCommandOutcomeState::kOutcomeUnconfirmed,
+                .cancellation_cause = CancellationCause(
+                    *command, SimulationCommandCancellationCause::kNone),
+                .error = error.what(),
+                .node_lifecycle = std::nullopt,
+            });
+        continue;
+      }
       ReportFailure(*command, error.what());
       ReportOutcome(
           *command,
@@ -127,6 +151,20 @@ void SimulationCommandProcessor::Run() {
               .node_lifecycle = std::nullopt,
           });
     } catch (...) {
+      if (command->operation_control &&
+          command->operation_control->outcome_unconfirmed.load(
+              std::memory_order_acquire)) {
+        ReportOutcome(
+            *command,
+            SimulationCommandOutcome{
+                .state = SimulationCommandOutcomeState::kOutcomeUnconfirmed,
+                .cancellation_cause = CancellationCause(
+                    *command, SimulationCommandCancellationCause::kNone),
+                .error = "unknown exception",
+                .node_lifecycle = std::nullopt,
+            });
+        continue;
+      }
       ReportFailure(*command, "unknown exception");
       ReportOutcome(
           *command,

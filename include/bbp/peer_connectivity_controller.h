@@ -1,9 +1,14 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <set>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -18,6 +23,12 @@ namespace bbp {
 enum class PeerConnectivityAction {
   kConnected,
   kDisconnected,
+  kTopologyRestored,
+};
+
+class PeerMutationOutcomeUnconfirmed : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 class PeerConnectivityController {
@@ -46,6 +57,7 @@ class PeerConnectivityController {
   void Start();
   void Stop();
   void SetPolicy(std::string_view node_id, PeerCountPolicy policy);
+  void RequestTopologyRestore(std::string_view changed_node_id);
   void SetAllowedPeers(std::string_view node_id,
                        std::vector<std::string> peer_node_ids);
   void ValidateAllowedPeerUpdate(std::string_view node_id,
@@ -75,11 +87,23 @@ class PeerConnectivityController {
                               std::stop_token stop_token) const;
   void ValidatePolicy(std::string_view node_id,
                       const PeerCountPolicy& policy) const;
+  std::unique_lock<std::mutex> LockRpc(std::stop_token stop_token);
+  std::uint64_t NextTopologyRestoreSequence();
   void Run(std::stop_token stop_token);
   void EnforcePolicies(std::stop_token stop_token);
-  void EnforcePolicy(const ChainNodeConfig& node, const PeerCountPolicy& policy,
+  bool EnforcePolicy(const ChainNodeConfig& node,
+                     const std::vector<std::string>& allowed_peer_ids,
+                     const PeerCountPolicy* policy,
+                     std::optional<std::uint64_t> restore_request_sequence,
+                     std::string_view changed_node_id,
+                     std::uint64_t expected_configuration_sequence,
                      std::stop_token stop_token);
-  void ReportFailure(std::string_view node_id, std::string_view error);
+  void ReportFailure(
+      std::string_view node_id, std::string_view error,
+      std::optional<std::uint64_t> expected_configuration_sequence);
+  void ReportRestorationFailure(
+      std::string_view node_id, std::string_view error,
+      std::optional<std::uint64_t> expected_configuration_sequence);
 
   const ChainDriver& driver_;
   std::vector<ChainNodeConfig> nodes_;
@@ -90,7 +114,16 @@ class PeerConnectivityController {
   ActionHandler action_handler_;
   FailureHandler failure_handler_;
   std::map<std::string, std::string> last_failures_;
+  std::map<std::string, std::string> last_restoration_failures_;
   std::mutex operation_mutex_;
+  std::mutex rpc_mutex_;
+  std::mutex restoration_mutex_;
+  std::atomic<std::uint64_t> configuration_sequence_ = 0U;
+  std::atomic<std::uint64_t> topology_restore_sequence_ = 0U;
+  std::map<std::pair<std::string, std::string>, std::uint64_t>
+      topology_restore_suppressions_;
+  std::vector<std::atomic<std::uint64_t>> topology_restore_requests_;
+  std::vector<std::uint64_t> topology_restore_completions_;
   std::jthread thread_;
   bool started_ = false;
 };

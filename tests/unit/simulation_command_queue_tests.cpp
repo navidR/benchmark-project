@@ -365,10 +365,10 @@ BOOST_AUTO_TEST_CASE(
       std::runtime_error);
   BOOST_TEST(!queue.TryPop());
 
-  queue.Push(bbp::SimulationCommandKind::kRestartNode, "firo-1", true);
+  queue.Push(bbp::SimulationCommandKind::kRestartNode, "firo-1");
   const std::optional<bbp::SimulationCommand> command = queue.TryPop();
   BOOST_REQUIRE(command);
-  BOOST_TEST(command->confirmed);
+  BOOST_TEST(!command->confirmed);
 }
 
 BOOST_AUTO_TEST_CASE(

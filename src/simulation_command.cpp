@@ -27,7 +27,9 @@ SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
     const SimulationNodeProcessObservation& initial,
     SimulationNodeRestartPhase phase,
     std::chrono::steady_clock::time_point deadline,
-    const std::function<SimulationNodeProcessObservation()>& observe) {
+    const std::function<SimulationNodeProcessObservation()>& observe,
+    const std::function<bool(const SimulationNodeProcessObservation&)>&
+        request_unready_replacement_stop) {
   if (!observe) {
     throw std::invalid_argument(
         "node restart reconciliation requires a process observer");
@@ -38,6 +40,7 @@ SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
                observation.restart_count == initial.restart_count &&
                (!initial.running || observation.pid == initial.pid);
       };
+  bool unready_replacement_stop_attempted = false;
   while (true) {
     const SimulationNodeProcessObservation current = observe();
     if (phase == SimulationNodeRestartPhase::kBeforeStop) {
@@ -49,6 +52,13 @@ SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
         current.restart_count == initial.restart_count) {
       return SimulationNodeRestartReconciliation::kUnchanged;
     }
+    if (unready_replacement_stop_attempted && !current.running) {
+      return SimulationNodeRestartReconciliation::kStopped;
+    }
+    if (phase >= SimulationNodeRestartPhase::kOriginalExited &&
+        !current.running) {
+      return SimulationNodeRestartReconciliation::kStopped;
+    }
     if (!current.running && current.restart_count == initial.restart_count) {
       return SimulationNodeRestartReconciliation::kStopped;
     }
@@ -58,6 +68,18 @@ SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
          current.restart_count != initial.restart_count)) {
       return SimulationNodeRestartReconciliation::kReplacementReady;
     }
+    const bool changed_running_generation =
+        current.running && (current.pid != initial.pid ||
+                            current.restart_count != initial.restart_count);
+    if (changed_running_generation &&
+        phase < SimulationNodeRestartPhase::kReplacementReady &&
+        !unready_replacement_stop_attempted) {
+      if (!request_unready_replacement_stop) {
+        return SimulationNodeRestartReconciliation::kUnconfirmed;
+      }
+      static_cast<void>(request_unready_replacement_stop(current));
+      unready_replacement_stop_attempted = true;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
       return SimulationNodeRestartReconciliation::kUnconfirmed;
@@ -66,6 +88,25 @@ SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
         std::chrono::milliseconds(5),
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
   }
+}
+
+NodeRuntimeLifecycle ReconciledSimulationNodeRestartLifecycle(
+    NodeRuntimeLifecycle admitted, NodeRuntimeLifecycle observed,
+    SimulationNodeRestartReconciliation reconciliation) {
+  if (observed == NodeRuntimeLifecycle::kFailed) {
+    return NodeRuntimeLifecycle::kFailed;
+  }
+  switch (reconciliation) {
+    case SimulationNodeRestartReconciliation::kUnchanged:
+      return admitted;
+    case SimulationNodeRestartReconciliation::kStopped:
+      return NodeRuntimeLifecycle::kStopped;
+    case SimulationNodeRestartReconciliation::kReplacementReady:
+      return NodeRuntimeLifecycle::kRunning;
+    case SimulationNodeRestartReconciliation::kUnconfirmed:
+      return NodeRuntimeLifecycle::kRestarting;
+  }
+  throw std::logic_error("unknown node restart reconciliation");
 }
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
@@ -225,7 +266,6 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kSetPeerCountPolicy:
     case SimulationCommandKind::kFreezeNode:
     case SimulationCommandKind::kStopNode:
-    case SimulationCommandKind::kRestartNode:
     case SimulationCommandKind::kSetResourceProfile:
     case SimulationCommandKind::kSetResourceLimits:
     case SimulationCommandKind::kSetNetworkProfile:
@@ -241,6 +281,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kSetBlockProductionPolicy:
     case SimulationCommandKind::kSetMiningDifficulty:
     case SimulationCommandKind::kConnectPeer:
+    case SimulationCommandKind::kRestartNode:
     case SimulationCommandKind::kThawNode:
     case SimulationCommandKind::kUnblockNetworkFlow:
     case SimulationCommandKind::kHealPartition:

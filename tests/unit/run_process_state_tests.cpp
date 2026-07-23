@@ -68,6 +68,149 @@ BOOST_AUTO_TEST_CASE(run_process_state_serializes_miner_transition_stress) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    run_process_state_reconciles_native_miner_after_restart_failure) {
+  bbp::RunProcessState state;
+  {
+    auto mining_guard = state.LockNativeMiningRpc();
+    auto guard = state.Lock();
+    state.AddActiveNativeMiner(guard, "node-1");
+    state.ReconcileActiveNativeMinerAfterRestartFailure(mining_guard, guard,
+                                                        "node-1", false, true);
+    BOOST_TEST(!state.IsActiveNativeMiner(guard, "node-1"));
+
+    state.AddActiveNativeMiner(guard, "node-1");
+    state.ReconcileActiveNativeMinerAfterRestartFailure(mining_guard, guard,
+                                                        "node-1", false, false);
+    BOOST_TEST(state.IsActiveNativeMiner(guard, "node-1"));
+
+    state.ReconcileActiveNativeMinerAfterRestartFailure(mining_guard, guard,
+                                                        "node-1", true, true);
+    BOOST_TEST(state.IsActiveNativeMiner(guard, "node-1"));
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_process_state_native_mining_reconciliation_lock_is_bounded) {
+  bbp::RunProcessState state;
+  std::atomic<bool> locked = false;
+  std::atomic<bool> release = false;
+  std::jthread holder([&] {
+    auto mining_guard = state.LockNativeMiningRpc();
+    locked.store(true, std::memory_order_release);
+    while (!release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  });
+  while (!locked.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  const auto started_at = std::chrono::steady_clock::now();
+  const auto deadline = started_at + std::chrono::milliseconds(20);
+  std::optional<bbp::RunProcessState::NativeMiningRpcGuard> timed_guard =
+      state.TryLockNativeMiningRpcUntil(deadline);
+  const auto elapsed = std::chrono::steady_clock::now() - started_at;
+  BOOST_TEST(!timed_guard);
+  BOOST_TEST(elapsed < std::chrono::milliseconds(250));
+
+  std::stop_source stop_source;
+  std::jthread canceler([&](std::stop_token) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    stop_source.request_stop();
+  });
+  const auto cancellation_started_at = std::chrono::steady_clock::now();
+  timed_guard = state.TryLockNativeMiningRpcUntil(
+      cancellation_started_at + std::chrono::milliseconds(250),
+      stop_source.get_token());
+  const auto cancellation_elapsed =
+      std::chrono::steady_clock::now() - cancellation_started_at;
+  BOOST_TEST(!timed_guard);
+  BOOST_TEST(cancellation_elapsed < std::chrono::milliseconds(200));
+  canceler.join();
+
+  release.store(true, std::memory_order_release);
+  holder.join();
+  timed_guard = state.TryLockNativeMiningRpcUntil(
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+  BOOST_REQUIRE(timed_guard);
+  timed_guard.reset();
+  timed_guard = state.TryLockNativeMiningRpcUntil(
+      std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+  BOOST_TEST(!timed_guard);
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_process_state_resume_snapshot_waits_for_native_mining_publication) {
+  bbp::RunProcessState state;
+  std::atomic<bool> rpc_started = false;
+  std::atomic<bool> publish_miner = false;
+  std::jthread start_rpc([&] {
+    auto mining_guard = state.LockNativeMiningRpc();
+    rpc_started.store(true, std::memory_order_release);
+    while (!publish_miner.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    auto guard = state.Lock();
+    state.AddActiveNativeMiner(guard, "node-1");
+  });
+  while (!rpc_started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::jthread publisher([&](std::stop_token) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    publish_miner.store(true, std::memory_order_release);
+  });
+
+  std::optional<bbp::RunProcessState::NativeMiningRpcGuard> mining_guard =
+      state.TryLockNativeMiningRpcUntil(std::chrono::steady_clock::now() +
+                                        std::chrono::milliseconds(250));
+  BOOST_REQUIRE(mining_guard);
+  auto guard = state.Lock();
+  BOOST_TEST(state.IsActiveNativeMiner(guard, "node-1"));
+  publisher.join();
+  start_rpc.join();
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_process_state_restart_intent_holds_late_mining_publication) {
+  bbp::RunProcessState state;
+  std::optional<bbp::RunProcessState::NativeMiningRestartIntent>
+      restart_intent = state.TryBeginNativeMiningRestart(
+          "node-1",
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(250));
+  BOOST_REQUIRE(restart_intent);
+  BOOST_TEST(!restart_intent->native_miner_active);
+
+  std::atomic<bool> publisher_waiting = false;
+  std::atomic<bool> restart_completed = false;
+  std::atomic<bool> publication_preceded_restart = false;
+  std::jthread publisher([&] {
+    publisher_waiting.store(true, std::memory_order_release);
+    auto mining_guard = state.LockNativeMiningRpc();
+    publication_preceded_restart.store(
+        !restart_completed.load(std::memory_order_acquire),
+        std::memory_order_release);
+    auto guard = state.Lock();
+    state.AddActiveNativeMiner(guard, "node-1");
+  });
+  while (!publisher_waiting.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  {
+    auto guard = state.Lock();
+    BOOST_TEST(!state.IsActiveNativeMiner(guard, "node-1"));
+  }
+
+  restart_completed.store(true, std::memory_order_release);
+  restart_intent.reset();
+  publisher.join();
+  BOOST_TEST(!publication_preceded_restart.load(std::memory_order_acquire));
+  auto guard = state.Lock();
+  BOOST_TEST(state.IsActiveNativeMiner(guard, "node-1"));
+}
+
+BOOST_AUTO_TEST_CASE(
     run_process_state_serializes_native_mining_generation_reconciliation) {
   const std::filesystem::path run_dir =
       std::filesystem::temp_directory_path() /

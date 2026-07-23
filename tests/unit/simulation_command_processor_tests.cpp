@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/run_process_state.h"
+#include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
@@ -112,6 +114,137 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(result.error);
   BOOST_TEST(*result.error ==
              "simulation command operation cancelled before execution");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_preserves_outcome_unconfirmed_failure) {
+  bbp::SimulationCommandQueue queue;
+  std::atomic_bool failure_reported = false;
+  std::promise<bbp::SimulationCommandOutcome> outcome;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [](const bbp::SimulationCommand& command) {
+        command.operation_control->outcome_unconfirmed.store(
+            true, std::memory_order_release);
+        throw std::runtime_error("physical state read-back timed out");
+      },
+      [&failure_reported](const bbp::SimulationCommand&, std::string_view) {
+        failure_reported = true;
+      },
+      [&outcome](const bbp::SimulationCommand&,
+                 const bbp::SimulationCommandOutcome& result) {
+        outcome.set_value(result);
+      });
+  bbp::SimulationCommand command;
+  command.kind = bbp::SimulationCommandKind::kRestartNode;
+  command.node_id = "firo-1";
+  command.confirmed = true;
+  command.operation_control = std::make_shared<bbp::SimulationCommandControl>();
+  queue.PushRuntimeCommand(std::move(command));
+
+  processor.Start();
+  const bbp::SimulationCommandOutcome result = outcome.get_future().get();
+  processor.Stop();
+
+  BOOST_TEST(!failure_reported);
+  BOOST_CHECK(result.state ==
+              bbp::SimulationCommandOutcomeState::kOutcomeUnconfirmed);
+  BOOST_REQUIRE(result.error);
+  BOOST_TEST(*result.error == "physical state read-back timed out");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_preserves_local_outcome_unconfirmed_failure) {
+  bbp::SimulationCommandQueue queue;
+  std::atomic_bool failure_reported = false;
+  std::promise<bbp::SimulationCommandOutcome> outcome;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [](const bbp::SimulationCommand&) {
+        throw bbp::SimulationCommandOutcomeUnconfirmed(
+            "physical state read-back timed out");
+      },
+      [&failure_reported](const bbp::SimulationCommand&, std::string_view) {
+        failure_reported = true;
+      },
+      [&outcome](const bbp::SimulationCommand&,
+                 const bbp::SimulationCommandOutcome& result) {
+        outcome.set_value(result);
+      });
+  queue.Push(bbp::SimulationCommandKind::kRestartNode, "firo-1");
+
+  processor.Start();
+  const bbp::SimulationCommandOutcome result = outcome.get_future().get();
+  processor.Stop();
+
+  BOOST_TEST(!failure_reported);
+  BOOST_CHECK(result.state ==
+              bbp::SimulationCommandOutcomeState::kOutcomeUnconfirmed);
+  BOOST_REQUIRE(result.error);
+  BOOST_TEST(*result.error == "physical state read-back timed out");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_local_restart_lock_wait_is_cancellable) {
+  bbp::SimulationCommandQueue queue;
+  bbp::RunProcessState run_process_state;
+  std::optional<bbp::RunProcessState::NativeMiningRpcGuard> held_guard =
+      run_process_state.LockNativeMiningRpc();
+  std::stop_source command_rpc_stop_source;
+  std::promise<void> handler_started;
+  std::atomic_bool restart_admitted = false;
+  std::atomic_bool processor_stopped = false;
+  std::promise<bbp::SimulationCommandOutcome> outcome;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&](const bbp::SimulationCommand&) {
+        handler_started.set_value();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        auto restart_intent = run_process_state.TryBeginNativeMiningRestart(
+            "firo-1", deadline, command_rpc_stop_source.get_token());
+        if (!restart_intent) {
+          if (command_rpc_stop_source.stop_requested()) {
+            throw bbp::SimulationCancelled();
+          }
+          throw std::runtime_error(
+              "native mining RPC lock deadline expired before node restart");
+        }
+        restart_admitted = true;
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&outcome](const bbp::SimulationCommand&,
+                 const bbp::SimulationCommandOutcome& result) {
+        outcome.set_value(result);
+      });
+  queue.Push(bbp::SimulationCommandKind::kRestartNode, "firo-1");
+  processor.Start();
+  handler_started.get_future().wait();
+
+  const auto cancellation_started_at = std::chrono::steady_clock::now();
+  command_rpc_stop_source.request_stop();
+  std::jthread stopper([&] {
+    processor.Stop();
+    processor_stopped.store(true, std::memory_order_release);
+  });
+  const auto completion_deadline =
+      cancellation_started_at + std::chrono::milliseconds(500);
+  while (!processor_stopped.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < completion_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool stopped_before_release =
+      processor_stopped.load(std::memory_order_acquire);
+  const auto cancellation_elapsed =
+      std::chrono::steady_clock::now() - cancellation_started_at;
+  held_guard.reset();
+  stopper.join();
+  const bbp::SimulationCommandOutcome result = outcome.get_future().get();
+
+  BOOST_TEST(stopped_before_release);
+  BOOST_TEST(cancellation_elapsed < std::chrono::seconds(1));
+  BOOST_TEST(!restart_admitted);
+  BOOST_CHECK(result.state == bbp::SimulationCommandOutcomeState::kCancelled);
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_requires_handlers) {
