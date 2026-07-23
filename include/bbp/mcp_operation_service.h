@@ -30,6 +30,7 @@ enum class McpOperationState {
 
 std::string_view McpOperationStateName(McpOperationState state);
 bool IsTerminalMcpOperationState(McpOperationState state);
+void ValidateMcpIdentifier(std::string_view value, std::string_view label);
 
 struct McpOperationProgress {
   std::uint64_t completed = 0U;
@@ -70,6 +71,12 @@ struct McpOperationCancellation {
 class McpOperationCancelled : public std::runtime_error {
  public:
   McpOperationCancelled();
+  McpOperationCancelled(std::string message, boost::json::array diagnostics);
+
+  const boost::json::array& diagnostics() const noexcept;
+
+ private:
+  boost::json::array diagnostics_;
 };
 
 class McpOperationFailure : public std::runtime_error {
@@ -186,9 +193,9 @@ class McpOperationService {
   void RegisterSession(std::string session_id);
   bool RemoveSession(std::string_view session_id,
                      std::chrono::milliseconds timeout);
-  boost::json::value ExecuteSessionRequest(
-      std::string_view session_id, McpSessionRequestHandler handler,
-      std::stop_token stop_token = {});
+  boost::json::value ExecuteSessionRequest(std::string_view session_id,
+                                           McpSessionRequestHandler handler,
+                                           std::stop_token stop_token = {});
 
   McpOperationSnapshot Submit(std::string_view session_id,
                               McpOperationKind kind,

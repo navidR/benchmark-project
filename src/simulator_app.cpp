@@ -8517,7 +8517,7 @@ std::uint32_t WriteMetricsSnapshot(
       runtime.cgroup_path = node.cgroup->path().string();
     }
     if (node.network_namespace) {
-      struct stat namespace_stat{};
+      struct stat namespace_stat {};
       if (fstat(node.network_namespace->fd(), &namespace_stat) != 0) {
         throw std::runtime_error("fstat node network namespace failed");
       }
@@ -9747,7 +9747,8 @@ void StopNodeProcess(const Options& options,
                      const std::filesystem::path& events_path,
                      const ChainDriver& driver, NodeRuntime& node,
                      std::stop_token stop_token,
-                     bool allow_rpc_unavailable = false);
+                     bool allow_rpc_unavailable = false,
+                     SimulationCommandControl* operation_control = nullptr);
 
 std::string RestartDetail(pid_t pid, uint64_t restart_count,
                           std::string_view reason);
@@ -12872,12 +12873,20 @@ void SetNodeFrozen(const Options& options,
                    const std::filesystem::path& events_path, NodeRuntime& node,
                    bool frozen, std::stop_token stop_token);
 
+struct NodeRestartAdmission {
+  SimulationNodeProcessObservation process;
+  NodeRuntimeLifecycle lifecycle = NodeRuntimeLifecycle::kDefined;
+  bool admitted = false;
+};
+
 bool RestartNode(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver, NodeRuntime& node,
     std::chrono::steady_clock::time_point lifecycle_epoch,
     std::stop_token stop_token, std::string_view reason = "requested",
-    const std::set<std::string>* available_peer_addresses = nullptr) {
+    const std::set<std::string>* available_peer_addresses = nullptr,
+    SimulationCommandControl* operation_control = nullptr,
+    NodeRestartAdmission* admitted_state = nullptr) {
   ThrowIfStopRequested(stop_token);
   if (!node.cgroup) {
     throw std::runtime_error("node restart requires a node cgroup");
@@ -12904,6 +12913,15 @@ bool RestartNode(
           node.config.id +
           " (state=" + std::string(NodeRuntimeLifecycleName(lifecycle)) + ")");
     }
+    if (admitted_state != nullptr) {
+      admitted_state->process = {
+          .running = node.process.running(),
+          .pid = node.process.pid(),
+          .restart_count = node.RestartCount(),
+      };
+      admitted_state->lifecycle = lifecycle;
+      admitted_state->admitted = true;
+    }
     node.SetLifecycle(NodeRuntimeLifecycle::kRestarting);
     ResetNodePerfCounters(node, process_guard);
   }
@@ -12918,11 +12936,20 @@ bool RestartNode(
   if (NodeProcessRunning(node)) {
     WriteEvent(events_path, options.run_id, node.config.id,
                SimulationEventKind::kRpcStop);
+    if (operation_control != nullptr) {
+      operation_control->restart_phase.store(
+          SimulationNodeRestartPhase::kStopRequested,
+          std::memory_order_release);
+    }
     try {
       driver.Stop(node.config, stop_token);
     } catch (...) {
       bool restored_running = false;
-      {
+      const bool cancellation_after_stop_request =
+          operation_control != nullptr && stop_token.stop_requested() &&
+          operation_control->restart_phase.load(std::memory_order_acquire) >=
+              SimulationNodeRestartPhase::kStopRequested;
+      if (!cancellation_after_stop_request) {
         auto process_guard = LockNodeProcessState(node);
         if (node.process.running()) {
           AttachNodePerfCounters(node, process_guard);
@@ -12939,6 +12966,11 @@ bool RestartNode(
   } else {
     WriteEvent(events_path, options.run_id, node.config.id,
                SimulationEventKind::kRpcStopSkipped, "process is not running");
+    if (operation_control != nullptr) {
+      operation_control->restart_phase.store(
+          SimulationNodeRestartPhase::kOriginalExited,
+          std::memory_order_release);
+    }
   }
   const auto exit_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -12967,10 +12999,19 @@ bool RestartNode(
       throw;
     }
   }
+  if (operation_control != nullptr) {
+    operation_control->restart_phase.store(
+        SimulationNodeRestartPhase::kOriginalExited, std::memory_order_release);
+  }
   ThrowIfStopRequested(stop_token);
   if (!StartNodeProcessWithPolicy(options, events_path, driver, node, reason,
                                   lifecycle_epoch, true, false, stop_token)) {
     return false;
+  }
+  if (operation_control != nullptr) {
+    operation_control->restart_phase.store(
+        SimulationNodeRestartPhase::kReplacementReady,
+        std::memory_order_release);
   }
   const std::uint64_t restart_count = node.RestartCount();
   std::optional<std::chrono::steady_clock::time_point> node_stop_deadline;
@@ -13063,6 +13104,10 @@ bool RestartNode(
   }
   WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kRunning);
+  if (operation_control != nullptr) {
+    operation_control->restart_phase.store(
+        SimulationNodeRestartPhase::kCompleted, std::memory_order_release);
+  }
   return true;
 }
 
@@ -13130,7 +13175,8 @@ void SetNodeFrozen(const Options& options,
 void StopNodeProcess(const Options& options,
                      const std::filesystem::path& events_path,
                      const ChainDriver& driver, NodeRuntime& node,
-                     std::stop_token stop_token, bool allow_rpc_unavailable) {
+                     std::stop_token stop_token, bool allow_rpc_unavailable,
+                     SimulationCommandControl* operation_control) {
   ThrowIfStopRequested(stop_token);
   bool rpc_stop_requested = false;
   {
@@ -13211,18 +13257,55 @@ void StopNodeProcess(const Options& options,
                                node.config.id);
     }
   } catch (...) {
+    if (operation_control && operation_control->stop_source.stop_requested() &&
+        rpc_stop_requested) {
+      auto reconciliation_deadline =
+          std::chrono::steady_clock::now() +
+          kSimulationCommandCancellationReconciliation;
+      if (operation_control->absolute_deadline) {
+        reconciliation_deadline = std::min(
+            reconciliation_deadline, *operation_control->absolute_deadline);
+      }
+      if (WaitForNodeProcessExitUntil(node, reconciliation_deadline)) {
+        {
+          auto process_guard = LockNodeProcessState(node);
+          ResetNodePerfCounters(node, process_guard);
+          node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+        }
+        WriteNodeStateEvent(events_path, options.run_id, node,
+                            NodeRuntimeLifecycle::kStopped);
+        throw;
+      }
+      operation_control->outcome_unconfirmed.store(true,
+                                                   std::memory_order_release);
+    }
     bool restored_running = false;
+    bool reconciled_stopped = false;
     if (!allow_rpc_unavailable) {
       auto process_guard = LockNodeProcessState(node);
-      if (node.process.running()) {
+      const bool outcome_unconfirmed =
+          operation_control && operation_control->outcome_unconfirmed.load(
+                                   std::memory_order_acquire);
+      if (node.process.running() && !outcome_unconfirmed) {
         AttachNodePerfCounters(node, process_guard);
         node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
         restored_running = true;
+      } else if (!node.process.running()) {
+        if (operation_control) {
+          operation_control->outcome_unconfirmed.store(
+              false, std::memory_order_release);
+        }
+        ResetNodePerfCounters(node, process_guard);
+        node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+        reconciled_stopped = true;
       }
     }
     if (restored_running) {
       WriteNodeStateEvent(events_path, options.run_id, node,
                           NodeRuntimeLifecycle::kRunning);
+    } else if (reconciled_stopped) {
+      WriteNodeStateEvent(events_path, options.run_id, node,
+                          NodeRuntimeLifecycle::kStopped);
     }
     throw;
   }
@@ -14145,12 +14228,18 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
       command_processor->Stop();
     } else if (active_command_queue != nullptr) {
       for (const SimulationCommand& command : active_command_queue->Cancel()) {
-        constexpr std::string_view kError =
+        constexpr std::string_view kCancellation =
             "simulation stopped before command processor startup";
-        WriteEvent(events_path, options.run_id, command.node_id,
-                   SimulationEventKind::kOperatorCommandFailed,
-                   SimulationCommandDetail(command, kError));
-        record_scheduled_command_outcome(command, kError);
+        record_scheduled_command_outcome(command, std::nullopt);
+        mcp_application.RecordCommandOutcome(
+            command,
+            SimulationCommandOutcome{
+                .state = SimulationCommandOutcomeState::kCancelled,
+                .cancellation_cause =
+                    SimulationCommandCancellationCause::kApplicationShutdown,
+                .error = std::string(kCancellation),
+                .node_lifecycle = std::nullopt,
+            });
       }
     }
   };
@@ -14531,8 +14620,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           *active_command_queue,
           [&](const SimulationCommand& command) {
             const std::stop_token operation_stop_token =
-                command.operation_stop_source
-                    ? command.operation_stop_source->get_token()
+                command.operation_control
+                    ? command.operation_control->stop_source.get_token()
                     : std::stop_token{};
             CombinedStopToken combined_stop_token(
                 command_rpc_stop_source.get_token(), operation_stop_token);
@@ -14665,8 +14754,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
               const bool resume_on_failure =
                   stop_scheduled_miner() || was_paused;
+              pid_t pid = -1;
               try {
-                pid_t pid = -1;
                 {
                   auto process_guard = run_process_state.Lock();
                   if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning) {
@@ -14704,19 +14793,50 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                     throw std::runtime_error("node process survived SIGKILL: " +
                                              command.node_id);
                   }
+                } catch (const SimulationCancelled&) {
+                  auto reconciliation_deadline =
+                      std::chrono::steady_clock::now() +
+                      kSimulationCommandCancellationReconciliation;
+                  if (command.operation_control &&
+                      command.operation_control->absolute_deadline) {
+                    reconciliation_deadline =
+                        std::min(reconciliation_deadline,
+                                 *command.operation_control->absolute_deadline);
+                  }
+                  if (!WaitForNodeProcessExitUntil(node,
+                                                   reconciliation_deadline)) {
+                    if (command.operation_control) {
+                      command.operation_control->outcome_unconfirmed.store(
+                          true, std::memory_order_release);
+                    }
+                    throw;
+                  }
+                  throw;
                 } catch (...) {
                   bool restored_running = false;
+                  bool reconciled_killed = false;
                   {
                     auto process_guard = run_process_state.Lock();
                     if (node.process.running()) {
                       AttachNodePerfCounters(node, process_guard);
                       node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
                       restored_running = true;
+                    } else if (node.Lifecycle() ==
+                               NodeRuntimeLifecycle::kKilling) {
+                      ResetNodePerfCounters(node, process_guard);
+                      node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
+                      reconciled_killed = true;
                     }
                   }
                   if (restored_running) {
                     WriteNodeStateEvent(events_path, options.run_id, node,
                                         NodeRuntimeLifecycle::kRunning);
+                  } else if (reconciled_killed) {
+                    WriteEvent(events_path, options.run_id, command.node_id,
+                               SimulationEventKind::kProcessKilled,
+                               "pid=" + std::to_string(pid));
+                    WriteNodeStateEvent(events_path, options.run_id, node,
+                                        NodeRuntimeLifecycle::kKilled);
                   }
                   throw;
                 }
@@ -14731,24 +14851,52 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                     NodeRuntimeLifecycle::kKilled);
               } catch (...) {
                 bool restored_running = false;
+                bool reconciled_killed = false;
+                const bool outcome_unconfirmed =
+                    command.operation_control &&
+                    command.operation_control->outcome_unconfirmed.load(
+                        std::memory_order_acquire);
                 {
                   auto process_guard = run_process_state.Lock();
                   if (node.Lifecycle() == NodeRuntimeLifecycle::kKilling &&
-                      node.process.running()) {
+                      node.process.running() && !outcome_unconfirmed) {
                     AttachNodePerfCounters(node, process_guard);
                     node.SetLifecycle(NodeRuntimeLifecycle::kRunning);
                     restored_running = true;
+                  } else if (node.Lifecycle() ==
+                                 NodeRuntimeLifecycle::kKilling &&
+                             !node.process.running()) {
+                    if (command.operation_control) {
+                      command.operation_control->outcome_unconfirmed.store(
+                          false, std::memory_order_release);
+                    }
+                    ResetNodePerfCounters(node, process_guard);
+                    node.SetLifecycle(NodeRuntimeLifecycle::kKilled);
+                    reconciled_killed = true;
                   }
                 }
                 if (restored_running) {
                   WriteNodeStateEvent(events_path, options.run_id, node,
                                       NodeRuntimeLifecycle::kRunning);
+                } else if (reconciled_killed) {
+                  WriteEvent(events_path, options.run_id, command.node_id,
+                             SimulationEventKind::kProcessKilled,
+                             "pid=" + std::to_string(pid));
+                  WriteNodeStateEvent(events_path, options.run_id, node,
+                                      NodeRuntimeLifecycle::kKilled);
                 }
-                if (resume_on_failure && NodeProcessRunning(node)) {
+                const bool node_running = NodeProcessRunning(node);
+                if (resume_on_failure && node_running && !outcome_unconfirmed) {
                   block_scheduler->StartMiner(command.node_id);
                   auto process_guard = run_process_state.Lock();
                   static_cast<void>(run_process_state.ResumeScheduledMiner(
                       process_guard, command.node_id));
+                } else if (!node_running) {
+                  auto process_guard = run_process_state.Lock();
+                  static_cast<void>(run_process_state.ResumeScheduledMiner(
+                      process_guard, command.node_id));
+                  run_process_state.RemoveActiveNativeMiner(process_guard,
+                                                            command.node_id);
                 }
                 throw;
               }
@@ -14770,13 +14918,25 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   stop_scheduled_miner() || was_paused;
               try {
                 StopNodeProcess(options, events_path, driver, node,
-                                command_stop_token);
+                                command_stop_token, false,
+                                command.operation_control.get());
               } catch (...) {
-                if (resume_on_failure && NodeProcessRunning(node)) {
+                const bool node_running = NodeProcessRunning(node);
+                const bool outcome_unconfirmed =
+                    command.operation_control &&
+                    command.operation_control->outcome_unconfirmed.load(
+                        std::memory_order_acquire);
+                if (resume_on_failure && node_running && !outcome_unconfirmed) {
                   block_scheduler->StartMiner(command.node_id);
                   auto process_guard = run_process_state.Lock();
                   static_cast<void>(run_process_state.ResumeScheduledMiner(
                       process_guard, command.node_id));
+                } else if (!node_running) {
+                  auto process_guard = run_process_state.Lock();
+                  static_cast<void>(run_process_state.ResumeScheduledMiner(
+                      process_guard, command.node_id));
+                  run_process_state.RemoveActiveNativeMiner(process_guard,
+                                                            command.node_id);
                 }
                 throw;
               }
@@ -14790,6 +14950,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             } else if (command.kind == SimulationCommandKind::kRestartNode) {
               bool was_paused = false;
               bool resume_native_miner = false;
+              NodeRestartAdmission restart_admission;
+              SimulationCommandControl local_restart_control;
+              SimulationCommandControl* restart_control =
+                  command.operation_control ? command.operation_control.get()
+                                            : &local_restart_control;
               {
                 auto process_guard = run_process_state.Lock();
                 was_paused = run_process_state.IsPausedScheduledMiner(
@@ -14806,7 +14971,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
               try {
                 if (!RestartNode(options, events_path, driver, node,
-                                 lifecycle_epoch, command_stop_token)) {
+                                 lifecycle_epoch, command_stop_token,
+                                 "requested", nullptr, restart_control,
+                                 &restart_admission)) {
                   throw std::runtime_error(
                       "operator restart reached node stop_time before "
                       "completion: " +
@@ -14823,7 +14990,74 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   }
                 }
               } catch (...) {
-                if (resume_scheduled_miner && NodeProcessRunning(node)) {
+                bool resume_miner_after_failure = true;
+                if (command_stop_token.stop_requested() &&
+                    restart_admission.admitted) {
+                  auto reconciliation_deadline =
+                      std::chrono::steady_clock::now() +
+                      kSimulationCommandCancellationReconciliation;
+                  if (command.operation_control &&
+                      command.operation_control->absolute_deadline) {
+                    reconciliation_deadline =
+                        std::min(reconciliation_deadline,
+                                 *command.operation_control->absolute_deadline);
+                  }
+                  const SimulationNodeRestartReconciliation reconciliation =
+                      ReconcileCancelledSimulationNodeRestart(
+                          restart_admission.process,
+                          restart_control->restart_phase.load(
+                              std::memory_order_acquire),
+                          reconciliation_deadline, [&] {
+                            auto process_guard = run_process_state.Lock();
+                            return SimulationNodeProcessObservation{
+                                .running = node.process.running(),
+                                .pid = node.process.pid(),
+                                .restart_count = node.RestartCount(),
+                            };
+                          });
+                  const bool unchanged =
+                      reconciliation ==
+                      SimulationNodeRestartReconciliation::kUnchanged;
+                  const bool stopped =
+                      reconciliation ==
+                      SimulationNodeRestartReconciliation::kStopped;
+                  const bool replacement_ready =
+                      reconciliation ==
+                      SimulationNodeRestartReconciliation::kReplacementReady;
+                  const NodeRuntimeLifecycle reconciled_state =
+                      unchanged           ? restart_admission.lifecycle
+                      : stopped           ? NodeRuntimeLifecycle::kStopped
+                      : replacement_ready ? NodeRuntimeLifecycle::kRunning
+                                          : NodeRuntimeLifecycle::kRestarting;
+                  bool state_changed = false;
+                  {
+                    auto process_guard = run_process_state.Lock();
+                    if (reconciled_state == NodeRuntimeLifecycle::kRunning) {
+                      AttachNodePerfCounters(node, process_guard);
+                    } else {
+                      ResetNodePerfCounters(node, process_guard);
+                      run_process_state.RemoveActiveNativeMiner(
+                          process_guard, command.node_id);
+                    }
+                    if (node.Lifecycle() != reconciled_state) {
+                      node.SetLifecycle(reconciled_state);
+                      state_changed = true;
+                    }
+                  }
+                  if (!unchanged && !stopped && !replacement_ready) {
+                    resume_miner_after_failure = false;
+                    if (command.operation_control) {
+                      command.operation_control->outcome_unconfirmed.store(
+                          true, std::memory_order_release);
+                    }
+                  }
+                  if (state_changed) {
+                    WriteNodeStateEvent(events_path, options.run_id, node,
+                                        reconciled_state);
+                  }
+                }
+                if (resume_scheduled_miner && resume_miner_after_failure &&
+                    NodeProcessRunning(node)) {
                   block_scheduler->StartMiner(command.node_id);
                   auto process_guard = run_process_state.Lock();
                   static_cast<void>(run_process_state.ResumeScheduledMiner(
@@ -15055,9 +15289,34 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 << command.node_id << " failed: " << error;
           },
           [&](const SimulationCommand& command,
-              std::optional<std::string_view> error) {
-            record_scheduled_command_outcome(command, error);
-            mcp_application.RecordCommandOutcome(command, error);
+              const SimulationCommandOutcome& outcome) {
+            SimulationCommandOutcome authoritative_outcome = outcome;
+            const auto node = std::find_if(
+                nodes.begin(), nodes.end(), [&](const NodeRuntime& candidate) {
+                  return candidate.config.id == command.node_id;
+                });
+            if (node != nodes.end()) {
+              auto process_guard = run_process_state.Lock();
+              std::string lifecycle(
+                  NodeRuntimeLifecycleName(node->Lifecycle()));
+              std::transform(
+                  lifecycle.begin(), lifecycle.end(), lifecycle.begin(),
+                  [](char character) {
+                    return character >= 'A' && character <= 'Z'
+                               ? static_cast<char>(character - 'A' + 'a')
+                               : character;
+                  });
+              authoritative_outcome.node_lifecycle = std::move(lifecycle);
+            }
+            record_scheduled_command_outcome(
+                command, authoritative_outcome.state ==
+                                     SimulationCommandOutcomeState::kFailed &&
+                                 authoritative_outcome.error
+                             ? std::optional<std::string_view>(
+                                   *authoritative_outcome.error)
+                             : std::nullopt);
+            mcp_application.RecordCommandOutcome(command,
+                                                 authoritative_outcome);
           });
     }
     const std::set<std::string> configured_miners(miner_node_ids.begin(),

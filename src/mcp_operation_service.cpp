@@ -71,17 +71,21 @@ std::string RandomId(std::string_view prefix) {
   return result;
 }
 
-void ValidateIdentifier(std::string_view value, std::string_view label) {
+void ValidateIdentifierImpl(std::string_view value, std::string_view label) {
   if (value.empty() || value.size() > kMaximumIdentifierBytes) {
     throw std::invalid_argument(std::string(label) +
                                 " must contain 1..128 bytes");
   }
-  for (const char character : value) {
+  for (std::size_t index = 0U; index < value.size(); ++index) {
+    const char character = value[index];
+    const bool alphanumeric = (character >= 'a' && character <= 'z') ||
+                              (character >= 'A' && character <= 'Z') ||
+                              (character >= '0' && character <= '9');
     const bool valid = (character >= 'a' && character <= 'z') ||
                        (character >= 'A' && character <= 'Z') ||
                        (character >= '0' && character <= '9') ||
                        character == '_' || character == '.' || character == '-';
-    if (!valid) {
+    if (!valid || (index == 0U && !alphanumeric)) {
       throw std::invalid_argument(std::string(label) +
                                   " contains an invalid character");
     }
@@ -137,7 +141,7 @@ std::string BoundedErrorMessage(std::string_view message) {
 
 void ValidateError(McpOperationError* error) {
   try {
-    ValidateIdentifier(error->code, "MCP operation error code");
+    ValidateMcpIdentifier(error->code, "MCP operation error code");
   } catch (const std::invalid_argument&) {
     error->code = "invalid_error_code";
   }
@@ -155,7 +159,9 @@ void ValidateError(McpOperationError* error) {
     const boost::json::object& diagnostic = value.as_object();
     for (const auto& member : diagnostic) {
       if (member.key() != "code" && member.key() != "message" &&
-          member.key() != "path" && member.key() != "recoverable") {
+          member.key() != "path" && member.key() != "recoverable" &&
+          member.key() != "node_id" && member.key() != "action" &&
+          member.key() != "state" && member.key() != "command_id") {
         diagnostics_valid = false;
         break;
       }
@@ -170,7 +176,7 @@ void ValidateError(McpOperationError* error) {
       break;
     }
     try {
-      ValidateIdentifier(code->as_string(), "MCP diagnostic code");
+      ValidateMcpIdentifier(code->as_string(), "MCP diagnostic code");
     } catch (const std::invalid_argument&) {
       diagnostics_valid = false;
       break;
@@ -184,6 +190,23 @@ void ValidateError(McpOperationError* error) {
         (recoverable != nullptr && !recoverable->is_bool())) {
       diagnostics_valid = false;
       break;
+    }
+    for (const std::string_view identifier :
+         {"node_id", "action", "state", "command_id"}) {
+      const boost::json::value* member = diagnostic.if_contains(identifier);
+      if (member == nullptr) {
+        continue;
+      }
+      if (!member->is_string()) {
+        diagnostics_valid = false;
+        break;
+      }
+      try {
+        ValidateMcpIdentifier(member->as_string(), identifier);
+      } catch (const std::invalid_argument&) {
+        diagnostics_valid = false;
+        break;
+      }
     }
   }
   if (!diagnostics_valid) {
@@ -221,7 +244,7 @@ void ValidateEvidenceRecord(const McpEvidenceRecord& record) {
   const auto validate_optional_identifier = [](const auto& value,
                                                std::string_view label) {
     if (value) {
-      ValidateIdentifier(*value, label);
+      ValidateMcpIdentifier(*value, label);
     }
   };
   validate_optional_identifier(record.node_id, "evidence node id");
@@ -251,6 +274,10 @@ McpServiceNotification OperationNotification(
 
 }  // namespace
 
+void ValidateMcpIdentifier(std::string_view value, std::string_view label) {
+  ValidateIdentifierImpl(value, label);
+}
+
 std::string_view McpOperationStateName(McpOperationState state) {
   switch (state) {
     case McpOperationState::kQueued:
@@ -277,6 +304,15 @@ bool IsTerminalMcpOperationState(McpOperationState state) {
 
 McpOperationCancelled::McpOperationCancelled()
     : std::runtime_error("MCP operation cancelled") {}
+
+McpOperationCancelled::McpOperationCancelled(std::string message,
+                                             boost::json::array diagnostics)
+    : std::runtime_error(std::move(message)),
+      diagnostics_(std::move(diagnostics)) {}
+
+const boost::json::array& McpOperationCancelled::diagnostics() const noexcept {
+  return diagnostics_;
+}
 
 McpOperationFailure::McpOperationFailure(std::string code, std::string message,
                                          bool retryable,
@@ -701,7 +737,7 @@ struct McpOperationService::Impl {
       error = McpOperationError{.code = "cancelled",
                                 .message = cancelled.what(),
                                 .retryable = false,
-                                .diagnostics = {}};
+                                .diagnostics = cancelled.diagnostics()};
       terminal_state = McpOperationState::kCancelled;
     } catch (const McpOperationFailure& failure) {
       error = McpOperationError{.code = failure.code(),
@@ -962,7 +998,7 @@ McpOperationService::McpOperationService(
 McpOperationService::~McpOperationService() = default;
 
 void McpOperationService::RegisterSession(std::string session_id) {
-  ValidateIdentifier(session_id, "MCP session id");
+  ValidateMcpIdentifier(session_id, "MCP session id");
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->stats.accepting) {
     throw std::runtime_error("MCP operation service is shutting down");
@@ -1049,8 +1085,7 @@ boost::json::value McpOperationService::ExecuteSessionRequest(
     std::string_view session_id, McpSessionRequestHandler handler,
     std::stop_token stop_token) {
   if (!handler) {
-    throw std::invalid_argument(
-        "MCP session request handler must be callable");
+    throw std::invalid_argument("MCP session request handler must be callable");
   }
   std::stop_source combined_stop_source;
   std::stop_token session_stop_token;
@@ -1067,12 +1102,10 @@ boost::json::value McpOperationService::ExecuteSessionRequest(
     session_stop_token = session.request_stop_source.get_token();
   }
 
-  std::stop_callback stop_on_request(stop_token, [&] {
-    combined_stop_source.request_stop();
-  });
-  std::stop_callback stop_on_session(session_stop_token, [&] {
-    combined_stop_source.request_stop();
-  });
+  std::stop_callback stop_on_request(
+      stop_token, [&] { combined_stop_source.request_stop(); });
+  std::stop_callback stop_on_session(
+      session_stop_token, [&] { combined_stop_source.request_stop(); });
   const auto release_request = [&] {
     {
       std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -1084,8 +1117,7 @@ boost::json::value McpOperationService::ExecuteSessionRequest(
       --session->second.waiters;
       if (impl_->shutdown_phase == Impl::ShutdownPhase::kStopping &&
           impl_->shutdown_owner_is_request &&
-          !impl_->shutdown_owner_is_worker &&
-          impl_->shutdown_workers_joined &&
+          !impl_->shutdown_owner_is_worker && impl_->shutdown_workers_joined &&
           impl_->SessionWaitersDrainedLocked()) {
         impl_->FinalizeShutdownLocked();
       }
@@ -1281,7 +1313,7 @@ McpSubscriptionSnapshot McpOperationService::CreateSubscription(
         "MCP subscription node selection exceeds its retained bound");
   }
   for (const std::string& node_id : request.node_ids) {
-    ValidateIdentifier(node_id, "MCP subscription node id");
+    ValidateMcpIdentifier(node_id, "MCP subscription node id");
   }
   std::sort(request.node_ids.begin(), request.node_ids.end());
   if (std::adjacent_find(request.node_ids.begin(), request.node_ids.end()) !=

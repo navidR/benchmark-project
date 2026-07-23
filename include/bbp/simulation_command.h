@@ -1,6 +1,11 @@
 #pragma once
 
+#include <sys/types.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -58,6 +63,82 @@ struct SimulationNetworkFlow {
   std::uint32_t handle = 0;
 };
 
+enum class SimulationCommandCancellationCause {
+  kNone,
+  kClientCancel,
+  kDeadline,
+  kApplicationShutdown,
+};
+
+enum class SimulationCommandOutcomeState {
+  kSucceeded,
+  kFailed,
+  kCancelled,
+  kTimedOut,
+  kOutcomeUnconfirmed,
+};
+
+enum class SimulationNodeRestartPhase {
+  kBeforeStop,
+  kStopRequested,
+  kOriginalExited,
+  kReplacementReady,
+  kCompleted,
+};
+
+std::string_view SimulationNodeRestartPhaseName(
+    SimulationNodeRestartPhase phase);
+
+inline constexpr auto kSimulationCommandCancellationReconciliation =
+    std::chrono::milliseconds(250);
+
+struct SimulationCommandControl {
+  std::stop_source stop_source;
+  std::atomic<SimulationCommandCancellationCause> cancellation_cause{
+      SimulationCommandCancellationCause::kNone};
+  std::atomic_bool outcome_unconfirmed{false};
+  std::atomic<SimulationNodeRestartPhase> restart_phase{
+      SimulationNodeRestartPhase::kBeforeStop};
+  std::optional<std::chrono::steady_clock::time_point> absolute_deadline;
+
+  bool RequestCancellation(SimulationCommandCancellationCause cause) noexcept {
+    SimulationCommandCancellationCause expected =
+        SimulationCommandCancellationCause::kNone;
+    const bool recorded = cancellation_cause.compare_exchange_strong(
+        expected, cause, std::memory_order_acq_rel, std::memory_order_acquire);
+    stop_source.request_stop();
+    return recorded;
+  }
+};
+
+struct SimulationCommandOutcome {
+  SimulationCommandOutcomeState state =
+      SimulationCommandOutcomeState::kSucceeded;
+  SimulationCommandCancellationCause cancellation_cause =
+      SimulationCommandCancellationCause::kNone;
+  std::optional<std::string> error;
+  std::optional<std::string> node_lifecycle;
+};
+
+struct SimulationNodeProcessObservation {
+  bool running = false;
+  pid_t pid = -1;
+  std::uint64_t restart_count = 0U;
+};
+
+enum class SimulationNodeRestartReconciliation {
+  kUnchanged,
+  kStopped,
+  kReplacementReady,
+  kUnconfirmed,
+};
+
+SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
+    const SimulationNodeProcessObservation& initial,
+    SimulationNodeRestartPhase phase,
+    std::chrono::steady_clock::time_point deadline,
+    const std::function<SimulationNodeProcessObservation()>& observe);
+
 struct SimulationCommand {
   std::uint64_t sequence = 0;
   SimulationCommandKind kind = SimulationCommandKind::kIncreaseLogVerbosity;
@@ -77,7 +158,7 @@ struct SimulationCommand {
   std::optional<SimulationWalletSend> wallet_send;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;
-  std::shared_ptr<std::stop_source> operation_stop_source;
+  std::shared_ptr<SimulationCommandControl> operation_control;
 };
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind);

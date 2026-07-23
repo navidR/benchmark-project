@@ -16,7 +16,7 @@ class SimulationCommandProcessor {
   using FailureHandler =
       std::function<void(const SimulationCommand&, std::string_view)>;
   using OutcomeHandler = std::function<void(const SimulationCommand&,
-                                            std::optional<std::string_view>)>;
+                                            const SimulationCommandOutcome&)>;
 
   SimulationCommandProcessor(SimulationCommandQueue& queue,
                              CommandHandler command_handler,
@@ -35,7 +35,7 @@ class SimulationCommandProcessor {
   void ReportFailure(const SimulationCommand& command,
                      std::string_view detail) const;
   void ReportOutcome(const SimulationCommand& command,
-                     std::optional<std::string_view> error) const;
+                     const SimulationCommandOutcome& outcome) const;
 
   SimulationCommandQueue& queue_;
   CommandHandler command_handler_;

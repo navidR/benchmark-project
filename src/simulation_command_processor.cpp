@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "bbp/logging.h"
+#include "bbp/simulation_cancelled.h"
 
 namespace bbp {
 namespace {
@@ -12,6 +13,37 @@ constexpr std::string_view kCancelledBeforeExecution =
     "simulation command processor stopped before execution";
 constexpr std::string_view kOperationCancelledBeforeExecution =
     "simulation command operation cancelled before execution";
+
+SimulationCommandCancellationCause CancellationCause(
+    const SimulationCommand& command,
+    SimulationCommandCancellationCause fallback) {
+  if (!command.operation_control) {
+    return fallback;
+  }
+  const SimulationCommandCancellationCause cause =
+      command.operation_control->cancellation_cause.load(
+          std::memory_order_acquire);
+  return cause == SimulationCommandCancellationCause::kNone ? fallback : cause;
+}
+
+SimulationCommandOutcome CancellationOutcome(
+    const SimulationCommand& command, std::string_view error,
+    SimulationCommandCancellationCause fallback) {
+  const SimulationCommandCancellationCause cause =
+      CancellationCause(command, fallback);
+  return SimulationCommandOutcome{
+      .state = command.operation_control &&
+                       command.operation_control->outcome_unconfirmed.load(
+                           std::memory_order_acquire)
+                   ? SimulationCommandOutcomeState::kOutcomeUnconfirmed
+               : cause == SimulationCommandCancellationCause::kDeadline
+                   ? SimulationCommandOutcomeState::kTimedOut
+                   : SimulationCommandOutcomeState::kCancelled,
+      .cancellation_cause = cause,
+      .error = std::string(error),
+      .node_lifecycle = std::nullopt,
+  };
+}
 
 }  // namespace
 
@@ -50,29 +82,61 @@ void SimulationCommandProcessor::Stop() {
     thread_.join();
   }
   for (const SimulationCommand& command : cancelled) {
-    ReportFailure(command, kCancelledBeforeExecution);
-    ReportOutcome(command, kCancelledBeforeExecution);
+    ReportOutcome(
+        command, CancellationOutcome(
+                     command, kCancelledBeforeExecution,
+                     SimulationCommandCancellationCause::kApplicationShutdown));
   }
   started_ = false;
 }
 
 void SimulationCommandProcessor::Run() {
   while (const std::optional<SimulationCommand> command = queue_.WaitPop()) {
-    if (command->operation_stop_source &&
-        command->operation_stop_source->get_token().stop_requested()) {
-      ReportFailure(*command, kOperationCancelledBeforeExecution);
-      ReportOutcome(*command, kOperationCancelledBeforeExecution);
+    if (command->operation_control &&
+        command->operation_control->stop_source.stop_requested()) {
+      ReportOutcome(*command,
+                    CancellationOutcome(
+                        *command, kOperationCancelledBeforeExecution,
+                        SimulationCommandCancellationCause::kClientCancel));
       continue;
     }
     try {
       command_handler_(*command);
-      ReportOutcome(*command, std::nullopt);
+      ReportOutcome(
+          *command,
+          SimulationCommandOutcome{
+              .state = SimulationCommandOutcomeState::kSucceeded,
+              .cancellation_cause = CancellationCause(
+                  *command, SimulationCommandCancellationCause::kNone),
+              .error = std::nullopt,
+              .node_lifecycle = std::nullopt,
+          });
+    } catch (const SimulationCancelled& error) {
+      ReportOutcome(*command, CancellationOutcome(
+                                  *command, error.what(),
+                                  SimulationCommandCancellationCause::kNone));
     } catch (const std::exception& error) {
       ReportFailure(*command, error.what());
-      ReportOutcome(*command, error.what());
+      ReportOutcome(
+          *command,
+          SimulationCommandOutcome{
+              .state = SimulationCommandOutcomeState::kFailed,
+              .cancellation_cause = CancellationCause(
+                  *command, SimulationCommandCancellationCause::kNone),
+              .error = error.what(),
+              .node_lifecycle = std::nullopt,
+          });
     } catch (...) {
       ReportFailure(*command, "unknown exception");
-      ReportOutcome(*command, "unknown exception");
+      ReportOutcome(
+          *command,
+          SimulationCommandOutcome{
+              .state = SimulationCommandOutcomeState::kFailed,
+              .cancellation_cause = CancellationCause(
+                  *command, SimulationCommandCancellationCause::kNone),
+              .error = "unknown exception",
+              .node_lifecycle = std::nullopt,
+          });
     }
   }
 }
@@ -92,12 +156,12 @@ void SimulationCommandProcessor::ReportFailure(const SimulationCommand& command,
 
 void SimulationCommandProcessor::ReportOutcome(
     const SimulationCommand& command,
-    std::optional<std::string_view> error) const {
+    const SimulationCommandOutcome& outcome) const {
   if (!outcome_handler_) {
     return;
   }
   try {
-    outcome_handler_(command, error);
+    outcome_handler_(command, outcome);
   } catch (const std::exception& callback_error) {
     BBP_LOG(error) << "simulation command outcome handler failed for command "
                    << command.sequence << ": " << callback_error.what();

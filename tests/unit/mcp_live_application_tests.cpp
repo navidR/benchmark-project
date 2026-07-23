@@ -21,6 +21,8 @@
 #include "bbp/mcp_run_evidence.h"
 #include "bbp/run_ownership.h"
 #include "bbp/scenario_service.h"
+#include "bbp/simulation_cancelled.h"
+#include "bbp/simulation_command_processor.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/util.h"
 
@@ -44,6 +46,18 @@ class LiveApplicationDirectory {
 
  private:
   std::filesystem::path path_;
+};
+
+class AtomicReleaseGuard {
+ public:
+  explicit AtomicReleaseGuard(std::atomic_bool* release) : release_(release) {}
+  ~AtomicReleaseGuard() { release_->store(true, std::memory_order_release); }
+
+  AtomicReleaseGuard(const AtomicReleaseGuard&) = delete;
+  AtomicReleaseGuard& operator=(const AtomicReleaseGuard&) = delete;
+
+ private:
+  std::atomic_bool* release_;
 };
 
 boost::json::object LiveScenario() {
@@ -97,6 +111,18 @@ McpOperationSnapshot WaitForTerminal(McpOperationService* service,
       service->WaitForOperation("live-session", operation_id, 2s);
   BOOST_REQUIRE(static_cast<bool>(terminal));
   return *terminal;
+}
+
+SimulationCommandOutcome CommandOutcome(
+    SimulationCommandOutcomeState state,
+    std::optional<std::string> error = std::nullopt,
+    std::optional<std::string> node_lifecycle = std::nullopt,
+    SimulationCommandCancellationCause cause =
+        SimulationCommandCancellationCause::kNone) {
+  return SimulationCommandOutcome{.state = state,
+                                  .cancellation_cause = cause,
+                                  .error = std::move(error),
+                                  .node_lifecycle = std::move(node_lifecycle)};
 }
 
 }  // namespace
@@ -174,7 +200,8 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object command_submitted =
       Invoke(&dispatcher, "simulation.command", command_arguments);
   const SimulationCommand command = WaitForQueuedCommand(queue.get());
-  application.RecordCommandOutcome(command, std::nullopt);
+  application.RecordCommandOutcome(
+      command, CommandOutcome(SimulationCommandOutcomeState::kSucceeded));
   const boost::json::object command_terminal =
       WaitForTerminal(&dispatcher, command_submitted);
   BOOST_TEST(command_terminal.at("state").as_string() == "succeeded");
@@ -186,7 +213,9 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object failed_submitted =
       Invoke(&dispatcher, "simulation.command", command_arguments);
   const SimulationCommand failed = WaitForQueuedCommand(queue.get());
-  application.RecordCommandOutcome(failed, "production command failure");
+  application.RecordCommandOutcome(
+      failed, CommandOutcome(SimulationCommandOutcomeState::kFailed,
+                             "production command failure"));
   const boost::json::object failed_terminal =
       WaitForTerminal(&dispatcher, failed_submitted);
   BOOST_TEST(failed_terminal.at("state").as_string() == "failed");
@@ -205,20 +234,41 @@ BOOST_AUTO_TEST_CASE(
              boost::json::object{
                  {"operation_id", cancellable_submitted.at("operation_id")}});
   BOOST_TEST(cancellation.at("cancel_requested").as_bool());
+  BOOST_TEST(cancellation.at("state").as_string() == "cancelling");
+  BOOST_REQUIRE(cancellable.operation_control);
+  BOOST_TEST(cancellable.operation_control->stop_source.stop_requested());
+  application.RecordCommandOutcome(
+      cancellable,
+      CommandOutcome(SimulationCommandOutcomeState::kCancelled,
+                     "simulation stop requested", std::nullopt,
+                     SimulationCommandCancellationCause::kClientCancel));
   const boost::json::object cancelled_terminal =
       WaitForTerminal(&dispatcher, cancellable_submitted);
   BOOST_TEST(cancelled_terminal.at("state").as_string() == "cancelled");
   BOOST_CHECK(std::chrono::steady_clock::now() - cancellation_started < 500ms);
-  BOOST_REQUIRE(cancellable.operation_stop_source);
-  BOOST_TEST(cancellable.operation_stop_source->get_token().stop_requested());
-  application.RecordCommandOutcome(cancellable, std::nullopt);
+
+  const SimulationCommandQueueStats queue_before_invalid_node = queue->Stats();
+  BOOST_CHECK_THROW(Invoke(&dispatcher, "node.stop",
+                           boost::json::object{{"run_id", "live-application"},
+                                               {"node_id", "bad/node"},
+                                               {"timeout_sec", 30U}}),
+                    std::invalid_argument);
+  const SimulationCommandQueueStats queue_after_invalid_node = queue->Stats();
+  BOOST_TEST(queue_after_invalid_node.size == queue_before_invalid_node.size);
+  BOOST_TEST(queue_after_invalid_node.maximum_size ==
+             queue_before_invalid_node.maximum_size);
+  BOOST_TEST(queue_after_invalid_node.rejected ==
+             queue_before_invalid_node.rejected);
 
   const std::array typed_node_operations{
       std::pair{"node.stop", SimulationCommandKind::kStopNode},
       std::pair{"node.kill", SimulationCommandKind::kKillNode},
       std::pair{"node.restart", SimulationCommandKind::kRestartNode},
   };
-  for (const auto& [tool, expected_kind] : typed_node_operations) {
+  const std::array expected_actions{"stop", "kill", "restart"};
+  const std::array expected_states{"stopped", "killed", "running"};
+  for (std::size_t index = 0U; index < typed_node_operations.size(); ++index) {
+    const auto& [tool, expected_kind] = typed_node_operations[index];
     const boost::json::object submitted =
         Invoke(&dispatcher, tool,
                boost::json::object{{"run_id", "live-application"},
@@ -228,10 +278,11 @@ BOOST_AUTO_TEST_CASE(
     BOOST_CHECK(typed_command.kind == expected_kind);
     BOOST_TEST(typed_command.node_id == "firo-1");
     BOOST_TEST(typed_command.confirmed);
-    BOOST_REQUIRE(typed_command.operation_stop_source);
-    BOOST_TEST(
-        !typed_command.operation_stop_source->get_token().stop_requested());
-    application.RecordCommandOutcome(typed_command, std::nullopt);
+    BOOST_REQUIRE(typed_command.operation_control);
+    BOOST_TEST(!typed_command.operation_control->stop_source.stop_requested());
+    application.RecordCommandOutcome(
+        typed_command, CommandOutcome(SimulationCommandOutcomeState::kSucceeded,
+                                      std::nullopt, expected_states[index]));
     const boost::json::object terminal =
         WaitForTerminal(&dispatcher, submitted);
     BOOST_TEST(terminal.at("state").as_string() == "succeeded");
@@ -241,6 +292,14 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(mutation.at("run_id").as_string() == "live-application");
     BOOST_TEST(mutation.at("added_node_ids").as_array().empty());
     BOOST_TEST(mutation.at("removed_node_ids").as_array().empty());
+    BOOST_TEST(
+        mutation.at("affected_node_ids").as_array().front().as_string() ==
+        "firo-1");
+    BOOST_TEST(mutation.at("action").as_string() ==
+               "node." + std::string(expected_actions[index]));
+    BOOST_TEST(mutation.at("state").as_string() == expected_states[index]);
+    BOOST_TEST(std::string(mutation.at("command_id").as_string())
+                   .starts_with("command-"));
     BOOST_TEST(!mutation.at("unchanged").as_bool());
   }
 
@@ -251,16 +310,26 @@ BOOST_AUTO_TEST_CASE(
                                  {"timeout_sec", 30U}});
   const SimulationCommand cancelled_node_command =
       WaitForQueuedCommand(queue.get());
-  BOOST_REQUIRE(cancelled_node_command.operation_stop_source);
+  BOOST_REQUIRE(cancelled_node_command.operation_control);
   static_cast<void>(
       Invoke(&dispatcher, "operation.cancel",
              boost::json::object{
                  {"operation_id", typed_cancellable.at("operation_id")}}));
+  const boost::json::object typed_cancelling =
+      Invoke(&dispatcher, "operation.get",
+             boost::json::object{
+                 {"operation_id", typed_cancellable.at("operation_id")}});
+  BOOST_TEST(typed_cancelling.at("state").as_string() == "cancelling");
+  BOOST_TEST(
+      cancelled_node_command.operation_control->stop_source.stop_requested());
+  application.RecordCommandOutcome(
+      cancelled_node_command,
+      CommandOutcome(SimulationCommandOutcomeState::kCancelled,
+                     "simulation stop requested", "running",
+                     SimulationCommandCancellationCause::kClientCancel));
   const boost::json::object typed_cancelled_terminal =
       WaitForTerminal(&dispatcher, typed_cancellable);
   BOOST_TEST(typed_cancelled_terminal.at("state").as_string() == "cancelled");
-  BOOST_TEST(cancelled_node_command.operation_stop_source->get_token()
-                 .stop_requested());
 
   const auto timeout_started = std::chrono::steady_clock::now();
   const boost::json::object typed_timeout =
@@ -270,7 +339,24 @@ BOOST_AUTO_TEST_CASE(
                                  {"timeout_sec", 1U}});
   const SimulationCommand timed_out_node_command =
       WaitForQueuedCommand(queue.get());
-  BOOST_REQUIRE(timed_out_node_command.operation_stop_source);
+  BOOST_REQUIRE(timed_out_node_command.operation_control);
+  const auto cancellation_deadline = std::chrono::steady_clock::now() + 900ms;
+  while (
+      !timed_out_node_command.operation_control->stop_source.stop_requested() &&
+      std::chrono::steady_clock::now() < cancellation_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  BOOST_TEST(
+      timed_out_node_command.operation_control->stop_source.stop_requested());
+  const boost::json::object timing_out = Invoke(
+      &dispatcher, "operation.get",
+      boost::json::object{{"operation_id", typed_timeout.at("operation_id")}});
+  BOOST_TEST(timing_out.at("state").as_string() == "running");
+  application.RecordCommandOutcome(
+      timed_out_node_command,
+      CommandOutcome(SimulationCommandOutcomeState::kTimedOut,
+                     "simulation stop requested", "running",
+                     SimulationCommandCancellationCause::kDeadline));
   const boost::json::object typed_timeout_terminal =
       WaitForTerminal(&dispatcher, typed_timeout);
   BOOST_TEST(typed_timeout_terminal.at("state").as_string() == "failed");
@@ -279,8 +365,6 @@ BOOST_AUTO_TEST_CASE(
                  .at("code")
                  .as_string() == "node_operation_timeout");
   BOOST_CHECK(std::chrono::steady_clock::now() - timeout_started < 1500ms);
-  BOOST_TEST(timed_out_node_command.operation_stop_source->get_token()
-                 .stop_requested());
 
   const boost::json::object stop_submitted =
       Invoke(&dispatcher, "run.stop",
@@ -318,6 +402,195 @@ BOOST_AUTO_TEST_CASE(
                  .at("state")
                  .as_string() == "stopped");
 
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_node_lifecycle_terminal_waits_for_command_owner_reconciliation) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::atomic_bool run_stop_requested = false;
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .request_run_stop = [&] { run_stop_requested = true; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  application.MarkRunStarted();
+  std::atomic_uint32_t owner_started = 0U;
+  std::atomic_uint32_t owner_reconciled = 0U;
+  std::atomic_uint32_t failure_reports = 0U;
+  std::atomic_bool hold_owner = false;
+  std::atomic_bool release_owner = false;
+  SimulationCommandProcessor processor(
+      *queue,
+      [&](const SimulationCommand& command) {
+        if (!command.operation_control) {
+          throw std::runtime_error("MCP command stop source is missing");
+        }
+        owner_started.fetch_add(1U, std::memory_order_release);
+        const std::stop_token command_stop_token =
+            command.operation_control->stop_source.get_token();
+        while (!command_stop_token.stop_requested()) {
+          std::this_thread::sleep_for(1ms);
+        }
+        while (hold_owner.load(std::memory_order_acquire) &&
+               !release_owner.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(1ms);
+        }
+        std::this_thread::sleep_for(25ms);
+        owner_reconciled.fetch_add(1U, std::memory_order_release);
+        throw SimulationCancelled();
+      },
+      [&](const SimulationCommand&, std::string_view) {
+        failure_reports.fetch_add(1U, std::memory_order_release);
+      },
+      [&](const SimulationCommand& command,
+          const SimulationCommandOutcome& outcome) {
+        SimulationCommandOutcome authoritative = outcome;
+        authoritative.node_lifecycle = "running";
+        application.RecordCommandOutcome(command, authoritative);
+      });
+  processor.Start();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  AtomicReleaseGuard release_guard(&release_owner);
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object cancellable =
+      Invoke(&dispatcher, "node.kill",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"},
+                                 {"timeout_sec", 30U}});
+  const auto owner_start_deadline = std::chrono::steady_clock::now() + 1s;
+  while (owner_started.load(std::memory_order_acquire) != 1U &&
+         std::chrono::steady_clock::now() < owner_start_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  BOOST_TEST(owner_started.load(std::memory_order_acquire) == 1U);
+  const boost::json::object cancelling = Invoke(
+      &dispatcher, "operation.cancel",
+      boost::json::object{{"operation_id", cancellable.at("operation_id")}});
+  BOOST_TEST(cancelling.at("state").as_string() == "cancelling");
+  const boost::json::object cancelled =
+      WaitForTerminal(&dispatcher, cancellable);
+  BOOST_TEST(cancelled.at("state").as_string() == "cancelled");
+  BOOST_TEST(owner_reconciled.load(std::memory_order_acquire) == 1U);
+  BOOST_TEST(failure_reports.load(std::memory_order_acquire) == 0U);
+  const boost::json::array& cancelled_diagnostics =
+      cancelled.at("terminal_error").as_object().at("diagnostics").as_array();
+  BOOST_REQUIRE_EQUAL(cancelled_diagnostics.size(), 1U);
+  BOOST_TEST(
+      cancelled_diagnostics.front().as_object().at("node_id").as_string() ==
+      "firo-1");
+  BOOST_TEST(
+      cancelled_diagnostics.front().as_object().at("action").as_string() ==
+      "node.kill");
+  BOOST_TEST(
+      cancelled_diagnostics.front().as_object().at("state").as_string() ==
+      "running");
+
+  const auto timeout_started = std::chrono::steady_clock::now();
+  const boost::json::object timing_out =
+      Invoke(&dispatcher, "node.restart",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"},
+                                 {"timeout_sec", 1U}});
+  const boost::json::object timed_out =
+      WaitForTerminal(&dispatcher, timing_out);
+  const auto timeout_elapsed =
+      std::chrono::steady_clock::now() - timeout_started;
+  BOOST_TEST(timed_out.at("state").as_string() == "failed");
+  BOOST_TEST(
+      timed_out.at("terminal_error").as_object().at("code").as_string() ==
+      "node_operation_timeout");
+  BOOST_TEST(owner_started.load(std::memory_order_acquire) == 2U);
+  BOOST_TEST(owner_reconciled.load(std::memory_order_acquire) == 2U);
+  BOOST_TEST(failure_reports.load(std::memory_order_acquire) == 0U);
+  BOOST_CHECK(timeout_elapsed < 1200ms);
+
+  hold_owner.store(true, std::memory_order_release);
+  const boost::json::object unconfirmed =
+      Invoke(&dispatcher, "node.stop",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"},
+                                 {"timeout_sec", 30U}});
+  const auto third_owner_deadline = std::chrono::steady_clock::now() + 1s;
+  while (owner_started.load(std::memory_order_acquire) != 3U &&
+         std::chrono::steady_clock::now() < third_owner_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  BOOST_TEST(owner_started.load(std::memory_order_acquire) == 3U);
+  const auto unconfirmed_started = std::chrono::steady_clock::now();
+  static_cast<void>(Invoke(
+      &dispatcher, "operation.cancel",
+      boost::json::object{{"operation_id", unconfirmed.at("operation_id")}}));
+  const boost::json::object unconfirmed_terminal =
+      WaitForTerminal(&dispatcher, unconfirmed);
+  BOOST_TEST(unconfirmed_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(unconfirmed_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "node_outcome_unconfirmed");
+  BOOST_CHECK(std::chrono::steady_clock::now() - unconfirmed_started < 500ms);
+  BOOST_TEST(run_stop_requested.load(std::memory_order_acquire));
+  release_owner.store(true, std::memory_order_release);
+  const auto third_reconciled_deadline = std::chrono::steady_clock::now() + 1s;
+  while (owner_reconciled.load(std::memory_order_acquire) != 3U &&
+         std::chrono::steady_clock::now() < third_reconciled_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  BOOST_TEST(owner_reconciled.load(std::memory_order_acquire) == 3U);
+  BOOST_TEST(failure_reports.load(std::memory_order_acquire) == 0U);
+  const boost::json::object immutable_terminal = Invoke(
+      &dispatcher, "operation.get",
+      boost::json::object{{"operation_id", unconfirmed.at("operation_id")}});
+  BOOST_TEST(immutable_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(immutable_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "node_outcome_unconfirmed");
+
+  hold_owner.store(false, std::memory_order_release);
+  release_owner.store(false, std::memory_order_release);
+  const boost::json::object shutdown_operation =
+      Invoke(&dispatcher, "node.kill",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"},
+                                 {"timeout_sec", 30U}});
+  const auto fourth_owner_deadline = std::chrono::steady_clock::now() + 1s;
+  while (owner_started.load(std::memory_order_acquire) != 4U &&
+         std::chrono::steady_clock::now() < fourth_owner_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  BOOST_TEST(owner_started.load(std::memory_order_acquire) == 4U);
+  const boost::json::object stop_run =
+      Invoke(&dispatcher, "run.stop",
+             boost::json::object{{"run_id", "live-application"}});
+  BOOST_TEST(WaitForTerminal(&dispatcher, stop_run).at("state").as_string() ==
+             "succeeded");
+  const boost::json::object shutdown_terminal =
+      WaitForTerminal(&dispatcher, shutdown_operation);
+  BOOST_TEST(shutdown_terminal.at("state").as_string() == "cancelled");
+  const boost::json::array& shutdown_diagnostics =
+      shutdown_terminal.at("terminal_error")
+          .as_object()
+          .at("diagnostics")
+          .as_array();
+  BOOST_REQUIRE_EQUAL(shutdown_diagnostics.size(), 1U);
+  BOOST_TEST(shutdown_diagnostics.front().as_object().at("code").as_string() ==
+             "application_shutdown");
+  BOOST_TEST(owner_reconciled.load(std::memory_order_acquire) == 4U);
+  BOOST_TEST(failure_reports.load(std::memory_order_acquire) == 0U);
+
+  processor.Stop();
   dispatcher.Shutdown();
   application.Shutdown();
 }

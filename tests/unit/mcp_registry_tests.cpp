@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <array>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
@@ -6,6 +8,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bbp/chain_kind.h"
@@ -125,6 +128,36 @@ const boost::json::object& VariantWithConst(const boost::json::array& variants,
   }
   BOOST_FAIL("missing schema variant " << name);
   return variants.front().as_object();
+}
+
+const boost::json::object& LifecycleOperationConstraint(
+    const boost::json::object& operation_schema, std::string_view operation,
+    std::string_view state) {
+  for (const boost::json::value& constraint :
+       operation_schema.at("allOf").as_array()) {
+    const boost::json::object& object = constraint.as_object();
+    const boost::json::value* condition = object.if_contains("if");
+    if (condition == nullptr) {
+      continue;
+    }
+    const boost::json::object& condition_properties =
+        condition->as_object().at("properties").as_object();
+    const boost::json::value* operation_property =
+        condition_properties.if_contains("operation");
+    const boost::json::value* state_property =
+        condition_properties.if_contains("state");
+    if (operation_property != nullptr &&
+        operation_property->as_object().if_contains("const") != nullptr &&
+        operation_property->as_object().at("const").as_string() == operation &&
+        state_property != nullptr &&
+        state_property->as_object().if_contains("const") != nullptr &&
+        state_property->as_object().at("const").as_string() == state) {
+      return object;
+    }
+  }
+  BOOST_FAIL("missing lifecycle operation constraint " << operation << " "
+                                                       << state);
+  return operation_schema;
 }
 
 }  // namespace
@@ -537,7 +570,96 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
                  .contains("terminal_result"));
   BOOST_TEST(
       operation_schema.at("properties").as_object().contains("terminal_error"));
-  BOOST_TEST(operation_schema.at("allOf").as_array().size() == 3U);
+  BOOST_TEST(operation_schema.at("allOf").as_array().size() == 9U);
+
+  const boost::json::object mutation_schema =
+      BuildMcpResultSchema(McpResultFamily::kMutation);
+  const boost::json::object& mutation_properties =
+      mutation_schema.at("properties").as_object();
+  BOOST_TEST(mutation_properties.contains("affected_node_ids"));
+  BOOST_TEST(mutation_properties.contains("action"));
+  BOOST_TEST(mutation_properties.contains("state"));
+  BOOST_TEST(mutation_properties.contains("command_id"));
+
+  const std::array lifecycle_operations{
+      std::pair{McpOperationKind::kStopNode, "stopped"},
+      std::pair{McpOperationKind::kKillNode, "killed"},
+      std::pair{McpOperationKind::kRestartNode, "running"},
+  };
+  const std::set<std::string> lifecycle_required{"affected_node_ids", "action",
+                                                 "state", "command_id"};
+  for (const auto& [operation, expected_state] : lifecycle_operations) {
+    const std::string_view operation_name = McpOperationKindName(operation);
+    const boost::json::object output = BuildMcpOperationOutputSchema(operation);
+    const boost::json::object& direct =
+        output.at("oneOf").as_array().front().as_object();
+    const std::set<std::string> direct_required =
+        StringSet(direct.at("required").as_array());
+    BOOST_TEST(std::includes(direct_required.begin(), direct_required.end(),
+                             lifecycle_required.begin(),
+                             lifecycle_required.end()));
+    BOOST_TEST(direct.at("properties")
+                   .as_object()
+                   .at("action")
+                   .as_object()
+                   .at("const")
+                   .as_string() == operation_name);
+    BOOST_TEST(direct.at("properties")
+                   .as_object()
+                   .at("state")
+                   .as_object()
+                   .at("const")
+                   .as_string() == expected_state);
+
+    const boost::json::object& nested =
+        LifecycleOperationConstraint(operation_schema, operation_name,
+                                     "succeeded")
+            .at("then")
+            .as_object()
+            .at("properties")
+            .as_object()
+            .at("terminal_result")
+            .as_object();
+    BOOST_TEST(StringSet(nested.at("required").as_array()) ==
+               lifecycle_required);
+    BOOST_TEST(nested.at("properties")
+                   .as_object()
+                   .at("action")
+                   .as_object()
+                   .at("const")
+                   .as_string() == operation_name);
+    BOOST_TEST(nested.at("properties")
+                   .as_object()
+                   .at("state")
+                   .as_object()
+                   .at("const")
+                   .as_string() == expected_state);
+
+    const boost::json::object& cancelled_diagnostic =
+        LifecycleOperationConstraint(operation_schema, operation_name,
+                                     "cancelled")
+            .at("then")
+            .as_object()
+            .at("properties")
+            .as_object()
+            .at("terminal_error")
+            .as_object()
+            .at("properties")
+            .as_object()
+            .at("diagnostics")
+            .as_object()
+            .at("contains")
+            .as_object();
+    BOOST_TEST(StringSet(cancelled_diagnostic.at("required").as_array()) ==
+               std::set<std::string>({"action", "code", "command_id", "message",
+                                      "node_id", "state"}));
+    BOOST_TEST(cancelled_diagnostic.at("properties")
+                   .as_object()
+                   .at("action")
+                   .as_object()
+                   .at("const")
+                   .as_string() == operation_name);
+  }
 }
 
 }  // namespace bbp

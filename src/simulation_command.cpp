@@ -1,8 +1,72 @@
 #include "bbp/simulation_command.h"
 
+#include <algorithm>
 #include <stdexcept>
+#include <thread>
 
 namespace bbp {
+
+std::string_view SimulationNodeRestartPhaseName(
+    SimulationNodeRestartPhase phase) {
+  switch (phase) {
+    case SimulationNodeRestartPhase::kBeforeStop:
+      return "before_stop";
+    case SimulationNodeRestartPhase::kStopRequested:
+      return "stop_requested";
+    case SimulationNodeRestartPhase::kOriginalExited:
+      return "original_exited";
+    case SimulationNodeRestartPhase::kReplacementReady:
+      return "replacement_ready";
+    case SimulationNodeRestartPhase::kCompleted:
+      return "completed";
+  }
+  throw std::logic_error("unknown node restart phase");
+}
+
+SimulationNodeRestartReconciliation ReconcileCancelledSimulationNodeRestart(
+    const SimulationNodeProcessObservation& initial,
+    SimulationNodeRestartPhase phase,
+    std::chrono::steady_clock::time_point deadline,
+    const std::function<SimulationNodeProcessObservation()>& observe) {
+  if (!observe) {
+    throw std::invalid_argument(
+        "node restart reconciliation requires a process observer");
+  }
+  const auto same_generation =
+      [&](const SimulationNodeProcessObservation& observation) {
+        return observation.running == initial.running &&
+               observation.restart_count == initial.restart_count &&
+               (!initial.running || observation.pid == initial.pid);
+      };
+  while (true) {
+    const SimulationNodeProcessObservation current = observe();
+    if (phase == SimulationNodeRestartPhase::kBeforeStop) {
+      return same_generation(current)
+                 ? SimulationNodeRestartReconciliation::kUnchanged
+                 : SimulationNodeRestartReconciliation::kUnconfirmed;
+    }
+    if (!initial.running && !current.running &&
+        current.restart_count == initial.restart_count) {
+      return SimulationNodeRestartReconciliation::kUnchanged;
+    }
+    if (!current.running && current.restart_count == initial.restart_count) {
+      return SimulationNodeRestartReconciliation::kStopped;
+    }
+    if (current.running &&
+        phase >= SimulationNodeRestartPhase::kReplacementReady &&
+        (current.pid != initial.pid ||
+         current.restart_count != initial.restart_count)) {
+      return SimulationNodeRestartReconciliation::kReplacementReady;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return SimulationNodeRestartReconciliation::kUnconfirmed;
+    }
+    std::this_thread::sleep_for(std::min(
+        std::chrono::milliseconds(5),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+  }
+}
 
 std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
   switch (kind) {

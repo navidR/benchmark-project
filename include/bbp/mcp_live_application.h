@@ -66,7 +66,7 @@ class McpLiveApplication {
   // through this service. Outcomes for unrelated TUI/scenario commands are
   // deliberately ignored and therefore do not consume retained state.
   void RecordCommandOutcome(const SimulationCommand& command,
-                            std::optional<std::string_view> error);
+                            const SimulationCommandOutcome& outcome);
   void MarkRunStarted();
   void MarkRunStopping();
   void MarkRunStopped();
@@ -87,7 +87,8 @@ class McpLiveApplication {
 
   struct PendingCommand {
     bool completed = false;
-    std::optional<std::string> error;
+    bool detached = false;
+    std::optional<SimulationCommandOutcome> outcome;
   };
 
   void BeginRequest();
@@ -100,10 +101,12 @@ class McpLiveApplication {
                                   std::stop_token stop_token);
   void RequireRun(const boost::json::object& arguments) const;
   std::uint64_t SubmitCommand(SimulationCommand command);
-  std::optional<std::string> WaitForCommand(
+  SimulationCommandOutcome WaitForCommand(
       std::uint64_t sequence, std::stop_token stop_token,
-      const std::shared_ptr<std::stop_source>& operation_stop_source,
-      std::optional<std::chrono::steady_clock::time_point> deadline =
+      const std::shared_ptr<SimulationCommandControl>& operation_control,
+      std::optional<std::chrono::steady_clock::time_point>
+          cancellation_deadline = std::nullopt,
+      std::optional<std::chrono::steady_clock::time_point> terminal_deadline =
           std::nullopt);
   boost::json::object ReportSnapshot(std::stop_token stop_token);
   std::string RunState() const;
@@ -116,12 +119,13 @@ class McpLiveApplication {
   std::condition_variable requests_drained_;
   std::map<std::uint64_t, PendingCommand> pending_commands_;
   std::stop_source request_stop_source_;
+  std::stop_source run_stop_source_;
   std::size_t active_requests_ = 0U;
   bool run_started_ = false;
   bool stop_requested_ = false;
   bool run_stopped_ = false;
   bool shutdown_ = false;
-  std::timed_mutex report_mutex_;
+  std::mutex report_mutex_;
 };
 
 }  // namespace bbp

@@ -343,7 +343,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -368,7 +368,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .wallet_send = std::nullopt,
       .confirmed = false,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -393,7 +393,7 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .wallet_send = std::nullopt,
       .confirmed = false,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -429,7 +429,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -454,7 +454,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -482,7 +482,7 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -540,7 +540,7 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -570,7 +570,7 @@ std::uint64_t SimulationCommandQueue::PushResourceLimits(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -596,7 +596,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkCondition(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -643,7 +643,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -678,7 +678,7 @@ std::uint64_t SimulationCommandQueue::PushPartitionCommand(
       .wallet_send = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -733,7 +733,7 @@ std::uint64_t SimulationCommandQueue::PushPerfCounters(
       .wallet_send = std::nullopt,
       .confirmed = false,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 
@@ -778,7 +778,7 @@ std::uint64_t SimulationCommandQueue::PushWalletSend(std::string sender_node_id,
       .wallet_send = send,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
-      .operation_stop_source = nullptr,
+      .operation_control = nullptr,
   });
 }
 

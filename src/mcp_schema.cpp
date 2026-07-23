@@ -669,7 +669,8 @@ boost::json::array OperationNames(
 
 std::array<bool, static_cast<std::size_t>(McpResultFamily::kCount)>
 SelectedResultFamilies(std::span<const McpOperationKind> operations) {
-  std::array<bool, static_cast<std::size_t>(McpResultFamily::kCount)> selected{};
+  std::array<bool, static_cast<std::size_t>(McpResultFamily::kCount)>
+      selected{};
   for (const McpOperationKind operation : operations) {
     selected[static_cast<std::size_t>(McpOperationResultFamily(operation))] =
         true;
@@ -705,6 +706,10 @@ boost::json::object DiagnosticSchema() {
   properties["message"] = StringSchema(1U);
   properties["path"] = StringSchema();
   properties["recoverable"] = TypeSchema("boolean");
+  properties["node_id"] = IdentifierSchema();
+  properties["action"] = IdentifierSchema();
+  properties["state"] = IdentifierSchema();
+  properties["command_id"] = IdentifierSchema();
   return ClosedObject(std::move(properties), Required({"code", "message"}));
 }
 
@@ -1345,9 +1350,9 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kQueryEvidence:
       add_run();
-      properties["families"] = ArraySchema(
-          InformationFamilySchema(information_families), 1U,
-          information_families.size(), true);
+      properties["families"] =
+          ArraySchema(InformationFamilySchema(information_families), 1U,
+                      information_families.size(), true);
       properties["node_ids"] =
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       properties["cursor"] = CursorSchema();
@@ -1379,9 +1384,9 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kCreateSubscription:
       add_run();
-      properties["families"] = ArraySchema(
-          InformationFamilySchema(information_families), 1U,
-          information_families.size(), true);
+      properties["families"] =
+          ArraySchema(InformationFamilySchema(information_families), 1U,
+                      information_families.size(), true);
       properties["node_ids"] =
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       properties["cursor"] = CursorSchema();
@@ -1409,10 +1414,52 @@ boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation) {
              static_cast<std::size_t>(McpInformationFamily::kCount)>
       information_families{};
   for (std::size_t index = 0U; index < information_families.size(); ++index) {
-    information_families[index] =
-        static_cast<McpInformationFamily>(index);
+    information_families[index] = static_cast<McpInformationFamily>(index);
   }
   return BuildMcpOperationInputSchema(operation, information_families);
+}
+
+bool IsTypedNodeLifecycleOperation(McpOperationKind operation) {
+  return operation == McpOperationKind::kStopNode ||
+         operation == McpOperationKind::kKillNode ||
+         operation == McpOperationKind::kRestartNode;
+}
+
+std::string_view TypedNodeLifecycleState(McpOperationKind operation) {
+  switch (operation) {
+    case McpOperationKind::kStopNode:
+      return "stopped";
+    case McpOperationKind::kKillNode:
+      return "killed";
+    case McpOperationKind::kRestartNode:
+      return "running";
+    default:
+      throw std::logic_error("operation is not a typed node lifecycle action");
+  }
+}
+
+boost::json::object TypedNodeLifecycleMutationSchema(
+    McpOperationKind operation) {
+  boost::json::object schema = BuildMcpResultSchema(McpResultFamily::kMutation);
+  boost::json::object& properties = schema.at("properties").as_object();
+  properties["action"] = ConstStringSchema(McpOperationKindName(operation));
+  properties["state"] = ConstStringSchema(TypedNodeLifecycleState(operation));
+  boost::json::array& required = schema.at("required").as_array();
+  for (const std::string_view field :
+       {"affected_node_ids", "action", "state", "command_id"}) {
+    required.emplace_back(field);
+  }
+  return schema;
+}
+
+boost::json::object TypedNodeLifecycleCancellationDiagnosticSchema(
+    McpOperationKind operation) {
+  boost::json::object schema = DiagnosticSchema();
+  schema.at("properties").as_object()["action"] =
+      ConstStringSchema(McpOperationKindName(operation));
+  schema["required"] =
+      Required({"code", "message", "node_id", "action", "state", "command_id"});
+  return schema;
 }
 
 boost::json::object BuildMcpResultSchema(
@@ -1459,6 +1506,12 @@ boost::json::object BuildMcpResultSchema(
           ArraySchema(IdentifierSchema(), 0U, kMaximumSafeCollection, true);
       properties["removed_node_ids"] =
           ArraySchema(IdentifierSchema(), 0U, kMaximumSafeCollection, true);
+      properties["affected_node_ids"] =
+          ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
+      properties["action"] = StringSchema(1U);
+      properties["state"] =
+          StringEnumSchema(boost::json::array{"running", "stopped", "killed"});
+      properties["command_id"] = IdentifierSchema();
       properties["unchanged"] = TypeSchema("boolean");
       require({"run_id", "added_node_ids", "removed_node_ids", "unchanged"});
       break;
@@ -1585,6 +1638,61 @@ boost::json::object BuildMcpResultSchema(
                            boost::json::object{
                                {"required",
                                 Required({"terminal_error"})}}}}}}}}});
+        for (const McpOperationKind operation : selected_operations) {
+          if (!IsTypedNodeLifecycleOperation(operation)) {
+            continue;
+          }
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation",
+                         ConstStringSchema(McpOperationKindName(operation))},
+                        {"state", ConstStringSchema("succeeded")}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"terminal_result",
+                         boost::json::object{
+                             {"properties",
+                              boost::json::object{
+                                  {"result_family",
+                                   ConstStringSchema("mutation")},
+                                  {"action",
+                                   ConstStringSchema(
+                                       McpOperationKindName(operation))},
+                                  {"state",
+                                   ConstStringSchema(
+                                       TypedNodeLifecycleState(operation))}}},
+                             {"required",
+                              Required({"affected_node_ids", "action", "state",
+                                        "command_id"})}}}}}}}});
+          boost::json::object cancelled_diagnostics{
+              {"contains",
+               TypedNodeLifecycleCancellationDiagnosticSchema(operation)},
+              {"minContains", 1U}};
+          boost::json::object terminal_error_constraint{
+              {"properties",
+               boost::json::object{
+                   {"diagnostics", std::move(cancelled_diagnostics)}}}};
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation",
+                         ConstStringSchema(McpOperationKindName(operation))},
+                        {"state", ConstStringSchema("cancelled")}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then", boost::json::object{
+                           {"properties",
+                            boost::json::object{
+                                {"terminal_error",
+                                 std::move(terminal_error_constraint)}}}}}});
+        }
       }
       break;
     case McpResultFamily::kSubscription:
@@ -1644,15 +1752,17 @@ boost::json::object BuildMcpOperationOutputSchema(
   boost::json::array choices;
   const McpResultFamily result_family = McpOperationResultFamily(operation);
   choices.emplace_back(
-      result_family == McpResultFamily::kOperation
+      IsTypedNodeLifecycleOperation(operation)
+          ? TypedNodeLifecycleMutationSchema(operation)
+      : result_family == McpResultFamily::kOperation
           ? BuildMcpResultSchema(result_family, selected_operations)
           : BuildMcpResultSchema(result_family));
   if (result_family != McpResultFamily::kOperation) {
     // Long actions return their stable operation immediately; callers then
     // use operation.get/subscriptions for progress and the typed terminal
     // result. Fast application services may still return the direct family.
-    choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kOperation,
-                                              selected_operations));
+    choices.emplace_back(
+        BuildMcpResultSchema(McpResultFamily::kOperation, selected_operations));
   }
   if (result_family != McpResultFamily::kError) {
     choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kError));
@@ -1699,8 +1809,7 @@ boost::json::array BuildMcpToolRegistry(
              static_cast<std::size_t>(McpInformationFamily::kCount)>
       information_families{};
   for (std::size_t index = 0U; index < information_families.size(); ++index) {
-    information_families[index] =
-        static_cast<McpInformationFamily>(index);
+    information_families[index] = static_cast<McpInformationFamily>(index);
   }
   return BuildMcpToolRegistry(selected_operations, information_families);
 }

@@ -77,31 +77,40 @@ BOOST_AUTO_TEST_CASE(
     simulation_command_processor_rejects_cancelled_operation_before_handler) {
   bbp::SimulationCommandQueue queue;
   std::atomic_bool handler_called = false;
-  std::promise<std::string> outcome;
+  std::atomic_bool failure_reported = false;
+  std::promise<bbp::SimulationCommandOutcome> outcome;
   bbp::SimulationCommandProcessor processor(
       queue,
       [&handler_called](const bbp::SimulationCommand&) {
         handler_called = true;
       },
-      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&failure_reported](const bbp::SimulationCommand&, std::string_view) {
+        failure_reported = true;
+      },
       [&outcome](const bbp::SimulationCommand&,
-                 std::optional<std::string_view> error) {
-        outcome.set_value(error ? std::string(*error) : std::string{});
+                 const bbp::SimulationCommandOutcome& result) {
+        outcome.set_value(result);
       });
   bbp::SimulationCommand command;
   command.kind = bbp::SimulationCommandKind::kKillNode;
   command.node_id = "firo-1";
   command.confirmed = true;
-  command.operation_stop_source = std::make_shared<std::stop_source>();
-  BOOST_REQUIRE(command.operation_stop_source->request_stop());
+  command.operation_control = std::make_shared<bbp::SimulationCommandControl>();
+  BOOST_REQUIRE(command.operation_control->RequestCancellation(
+      bbp::SimulationCommandCancellationCause::kClientCancel));
   queue.PushRuntimeCommand(std::move(command));
 
   processor.Start();
-  const std::string error = outcome.get_future().get();
+  const bbp::SimulationCommandOutcome result = outcome.get_future().get();
   processor.Stop();
 
   BOOST_TEST(!handler_called);
-  BOOST_TEST(error ==
+  BOOST_TEST(!failure_reported);
+  BOOST_CHECK(result.state == bbp::SimulationCommandOutcomeState::kCancelled);
+  BOOST_CHECK(result.cancellation_cause ==
+              bbp::SimulationCommandCancellationCause::kClientCancel);
+  BOOST_REQUIRE(result.error);
+  BOOST_TEST(*result.error ==
              "simulation command operation cancelled before execution");
 }
 
@@ -158,10 +167,8 @@ BOOST_AUTO_TEST_CASE(
       },
       [](const bbp::SimulationCommand&, std::string_view) {},
       [&outcomes, &all_outcomes](const bbp::SimulationCommand& command,
-                                 std::optional<std::string_view> error) {
-        outcomes.emplace_back(
-            command.sequence,
-            error ? std::optional<std::string>(*error) : std::nullopt);
+                                 const bbp::SimulationCommandOutcome& outcome) {
+        outcomes.emplace_back(command.sequence, outcome.error);
         if (outcomes.size() == 3U) {
           all_outcomes.set_value();
         }
@@ -200,7 +207,7 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
-    simulation_command_processor_fails_pending_commands_in_fifo_order) {
+    simulation_command_processor_cancels_pending_commands_in_fifo_order) {
   bbp::SimulationCommandQueue queue;
   std::promise<void> first_started;
   std::promise<void> release_first;
@@ -219,10 +226,8 @@ BOOST_AUTO_TEST_CASE(
         failures.emplace_back(command.sequence, error);
       },
       [&](const bbp::SimulationCommand& command,
-          std::optional<std::string_view> error) {
-        outcomes.emplace_back(
-            command.sequence,
-            error ? std::optional<std::string>(*error) : std::nullopt);
+          const bbp::SimulationCommandOutcome& outcome) {
+        outcomes.emplace_back(command.sequence, outcome.error);
       });
 
   queue.Push(bbp::SimulationCommandKind::kIncreaseLogVerbosity, "firo-1");
@@ -240,19 +245,16 @@ BOOST_AUTO_TEST_CASE(
 
   BOOST_REQUIRE_EQUAL(handled.size(), 1U);
   BOOST_TEST(handled[0] == 1U);
-  BOOST_REQUIRE_EQUAL(failures.size(), 2U);
-  BOOST_TEST(failures[0].first == 2U);
-  BOOST_TEST(failures[1].first == 3U);
-  BOOST_TEST(failures[0].second ==
-             "simulation command processor stopped before execution");
-  BOOST_TEST(failures[1].second == failures[0].second);
+  BOOST_TEST(failures.empty());
   BOOST_REQUIRE_EQUAL(outcomes.size(), 3U);
   BOOST_TEST(outcomes[0].first == 1U);
   BOOST_TEST(!outcomes[0].second);
   BOOST_TEST(outcomes[1].first == 2U);
   BOOST_REQUIRE(outcomes[1].second);
-  BOOST_TEST(*outcomes[1].second == failures[0].second);
+  BOOST_TEST(*outcomes[1].second ==
+             "simulation command processor stopped before execution");
   BOOST_TEST(outcomes[2].first == 3U);
   BOOST_REQUIRE(outcomes[2].second);
-  BOOST_TEST(*outcomes[2].second == failures[1].second);
+  BOOST_TEST(*outcomes[2].second ==
+             "simulation command processor stopped before execution");
 }

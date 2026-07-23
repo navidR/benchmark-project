@@ -572,7 +572,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                         false);
             }
             stop_requested_ = true;
+            command_outcome_ready_.notify_all();
           }
+          run_stop_source_.request_stop();
           config_.request_run_stop();
           return McpTypedResult{
               .family = McpResultFamily::kRunLifecycle,
@@ -709,6 +711,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   SimulationCommand command;
   if (typed_node_operation) {
     command.node_id = RequireString(arguments, "node_id");
+    ValidateMcpIdentifier(command.node_id, "MCP node operation node_id");
     const std::uint64_t timeout_seconds =
         OptionalUnsigned(arguments, "timeout_sec", 30U);
     if (timeout_seconds == 0U ||
@@ -734,46 +737,182 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       .progress_total = 1U,
       .executor = [this, command = std::move(command), command_timeout,
                    typed_node_operation](McpOperationContext& context) mutable {
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (shutdown_ || stop_requested_ || run_stopped_) {
+            throw McpOperationFailure(
+                "run_not_active", "the managed run is no longer active", false);
+          }
+        }
         CombinedStopToken cancellation(context.stop_token(),
-                                       request_stop_source_.get_token());
+                                       run_stop_source_.get_token());
         const std::stop_token stop_token = cancellation.token();
-        const auto operation_stop_source = std::make_shared<std::stop_source>();
-        std::stop_callback stop_command_on_cancellation(
-            stop_token,
-            [operation_stop_source] { operation_stop_source->request_stop(); });
+        const auto operation_control =
+            std::make_shared<SimulationCommandControl>();
+        std::stop_callback stop_command_on_client_cancellation(
+            context.stop_token(), [operation_control] {
+              operation_control->RequestCancellation(
+                  SimulationCommandCancellationCause::kClientCancel);
+            });
+        std::stop_callback stop_command_on_application_shutdown(
+            run_stop_source_.get_token(), [operation_control] {
+              operation_control->RequestCancellation(
+                  SimulationCommandCancellationCause::kApplicationShutdown);
+            });
         ThrowIfCancelled(stop_token);
-        command.operation_stop_source = operation_stop_source;
+        const SimulationCommandKind command_kind = command.kind;
+        const std::string command_node_id = command.node_id;
+        const std::string command_action =
+            command_kind == SimulationCommandKind::kStopNode   ? "node.stop"
+            : command_kind == SimulationCommandKind::kKillNode ? "node.kill"
+            : command_kind == SimulationCommandKind::kRestartNode
+                ? "node.restart"
+                : std::string(SimulationCommandKindName(command_kind));
+        const auto operation_started = std::chrono::steady_clock::now();
+        const std::optional<std::chrono::steady_clock::time_point>
+            terminal_deadline =
+                command_timeout
+                    ? std::optional<std::chrono::steady_clock::time_point>(
+                          operation_started + *command_timeout)
+                    : std::nullopt;
+        const std::optional<std::chrono::steady_clock::time_point>
+            cancellation_deadline =
+                terminal_deadline
+                    ? std::optional<std::chrono::steady_clock::time_point>(
+                          *terminal_deadline -
+                          kSimulationCommandCancellationReconciliation)
+                    : std::nullopt;
+        operation_control->absolute_deadline = terminal_deadline;
+        command.operation_control = operation_control;
         const std::uint64_t sequence = SubmitCommand(std::move(command));
-        const std::optional<std::chrono::steady_clock::time_point> deadline =
-            command_timeout
-                ? std::optional<std::chrono::steady_clock::time_point>(
-                      std::chrono::steady_clock::now() + *command_timeout)
-                : std::nullopt;
-        const std::optional<std::string> error = WaitForCommand(
-            sequence, stop_token, operation_stop_source, deadline);
-        if (error) {
+        const SimulationCommandOutcome outcome =
+            WaitForCommand(sequence, stop_token, operation_control,
+                           cancellation_deadline, terminal_deadline);
+        if (outcome.state == SimulationCommandOutcomeState::kCancelled) {
+          if (typed_node_operation) {
+            const bool application_shutdown =
+                outcome.cancellation_cause ==
+                SimulationCommandCancellationCause::kApplicationShutdown;
+            const std::string message =
+                application_shutdown
+                    ? "the application shut down after reconciling the node "
+                      "operation"
+                    : "the client cancelled the node operation after its "
+                      "authoritative state was reconciled";
+            throw McpOperationCancelled(
+                message,
+                boost::json::array{boost::json::object{
+                    {"code", application_shutdown ? "application_shutdown"
+                                                  : "node_operation_cancelled"},
+                    {"message", message},
+                    {"path", "command-" + std::to_string(sequence)},
+                    {"node_id", command_node_id},
+                    {"action", command_action},
+                    {"state", outcome.node_lifecycle.value_or("indeterminate")},
+                    {"command_id", "command-" + std::to_string(sequence)},
+                    {"recoverable", false}}});
+          }
+          throw McpOperationCancelled();
+        }
+        if (outcome.state == SimulationCommandOutcomeState::kTimedOut) {
+          const std::string timeout_message =
+              command_kind == SimulationCommandKind::kRestartNode
+                  ? "node.restart timed out during phase " +
+                        std::string(SimulationNodeRestartPhaseName(
+                            operation_control->restart_phase.load(
+                                std::memory_order_acquire))) +
+                        " before authoritative lifecycle reconciliation"
+                  : command_action +
+                        " timed out before authoritative lifecycle "
+                        "reconciliation";
+          throw McpOperationFailure(
+              "node_operation_timeout",
+              "node operation command #" + std::to_string(sequence) +
+                  " exceeded timeout_sec: " + timeout_message,
+              false,
+              boost::json::array{boost::json::object{
+                  {"code", "node_operation_timeout"},
+                  {"message", timeout_message},
+                  {"path", "command-" + std::to_string(sequence)},
+                  {"node_id", command_node_id},
+                  {"action", command_action},
+                  {"state", outcome.node_lifecycle.value_or("indeterminate")},
+                  {"command_id", "command-" + std::to_string(sequence)},
+                  {"recoverable", false}}});
+        }
+        if (outcome.state ==
+            SimulationCommandOutcomeState::kOutcomeUnconfirmed) {
+          config_.request_run_stop();
+          throw McpOperationFailure(
+              typed_node_operation ? "node_outcome_unconfirmed"
+                                   : "command_outcome_unconfirmed",
+              (typed_node_operation ? "node operation command #"
+                                    : "simulation command #") +
+                  std::to_string(sequence) +
+                  " did not publish authoritative state within its "
+                  "cancellation bound",
+              false,
+              boost::json::array{boost::json::object{
+                  {"code", typed_node_operation
+                               ? "node_outcome_unconfirmed"
+                               : "command_outcome_unconfirmed"},
+                  {"message",
+                   typed_node_operation
+                       ? "the selected node state is indeterminate; run stop "
+                         "was requested and blind retry is unsafe"
+                       : "the command state is indeterminate; run stop was "
+                         "requested and blind retry is unsafe"},
+                  {"path", command_node_id},
+                  {"node_id", command_node_id},
+                  {"action", command_action},
+                  {"state", outcome.node_lifecycle.value_or("indeterminate")},
+                  {"command_id", "command-" + std::to_string(sequence)},
+                  {"recoverable", false}}});
+        }
+        if (outcome.state == SimulationCommandOutcomeState::kFailed) {
+          const std::string error =
+              outcome.error.value_or("command failed without an error");
           throw McpOperationFailure(
               typed_node_operation ? "node_operation_failed"
                                    : "simulation_command_failed",
               (typed_node_operation ? "node operation command #"
                                     : "simulation command #") +
-                  std::to_string(sequence) + " failed: " + *error,
+                  std::to_string(sequence) + " failed: " + error,
               false,
               boost::json::array{boost::json::object{
                   {"code", typed_node_operation ? "node_operation_failed"
                                                 : "simulation_command_failed"},
-                  {"message", *error},
+                  {"message", error},
                   {"path", "command-" + std::to_string(sequence)},
+                  {"node_id", command_node_id},
+                  {"action", command_action},
+                  {"state", outcome.node_lifecycle.value_or("indeterminate")},
+                  {"command_id", "command-" + std::to_string(sequence)},
                   {"recoverable", false}}});
         }
+        if (outcome.state != SimulationCommandOutcomeState::kSucceeded) {
+          throw std::logic_error("unknown simulation command outcome state");
+        }
         if (typed_node_operation) {
-          return McpTypedResult{.family = McpResultFamily::kMutation,
-                                .value = boost::json::object{
-                                    {"result_family", "mutation"},
-                                    {"run_id", config_.run_id},
-                                    {"added_node_ids", boost::json::array{}},
-                                    {"removed_node_ids", boost::json::array{}},
-                                    {"unchanged", false}}};
+          if (!outcome.node_lifecycle) {
+            throw McpOperationFailure(
+                "node_outcome_unconfirmed",
+                "successful node operation omitted authoritative lifecycle "
+                "state",
+                false);
+          }
+          return McpTypedResult{
+              .family = McpResultFamily::kMutation,
+              .value = boost::json::object{
+                  {"result_family", "mutation"},
+                  {"run_id", config_.run_id},
+                  {"added_node_ids", boost::json::array{}},
+                  {"removed_node_ids", boost::json::array{}},
+                  {"affected_node_ids", boost::json::array{command_node_id}},
+                  {"action", command_action},
+                  {"state", *outcome.node_lifecycle},
+                  {"command_id", "command-" + std::to_string(sequence)},
+                  {"unchanged", false}}};
         }
         return McpTypedResult{
             .family = McpResultFamily::kRuntimeCommand,
@@ -1017,6 +1156,13 @@ std::uint64_t McpLiveApplication::SubmitCommand(SimulationCommand command) {
     throw McpOperationFailure("run_not_active", "the managed run is stopping",
                               false);
   }
+  if (pending_commands_.size() >= kMcpMaximumRetainedOperations) {
+    throw McpOperationFailure(
+        "command_capacity_reached",
+        "MCP command correlation capacity reached its explicit 256-entry "
+        "bound",
+        true);
+  }
   const std::uint64_t sequence =
       config_.command_queue->PushRuntimeCommand(std::move(command));
   const auto [entry, inserted] =
@@ -1028,81 +1174,114 @@ std::uint64_t McpLiveApplication::SubmitCommand(SimulationCommand command) {
   return sequence;
 }
 
-std::optional<std::string> McpLiveApplication::WaitForCommand(
+SimulationCommandOutcome McpLiveApplication::WaitForCommand(
     std::uint64_t sequence, std::stop_token stop_token,
-    const std::shared_ptr<std::stop_source>& operation_stop_source,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    const std::shared_ptr<SimulationCommandControl>& operation_control,
+    std::optional<std::chrono::steady_clock::time_point> cancellation_deadline,
+    std::optional<std::chrono::steady_clock::time_point> terminal_deadline) {
   std::stop_callback wake_on_cancellation(
       stop_token, [this] { command_outcome_ready_.notify_all(); });
   std::unique_lock<std::mutex> lock(mutex_);
-  const auto terminal = [&] {
+  const auto stop_or_terminal = [&] {
     const auto pending = pending_commands_.find(sequence);
     return stop_token.stop_requested() || stop_requested_ || run_stopped_ ||
            shutdown_ || pending == pending_commands_.end() ||
            pending->second.completed;
   };
-  bool deadline_reached = false;
-  if (deadline) {
-    deadline_reached =
-        !command_outcome_ready_.wait_until(lock, *deadline, terminal);
+  bool cancellation_deadline_reached = false;
+  if (cancellation_deadline) {
+    cancellation_deadline_reached = !command_outcome_ready_.wait_until(
+        lock, *cancellation_deadline, stop_or_terminal);
   } else {
-    command_outcome_ready_.wait(lock, terminal);
+    command_outcome_ready_.wait(lock, stop_or_terminal);
   }
-  const auto pending = pending_commands_.find(sequence);
+  auto pending = pending_commands_.find(sequence);
   if (pending == pending_commands_.end()) {
     throw std::logic_error("MCP simulation command outcome was lost");
   }
   if (pending->second.completed) {
-    std::optional<std::string> error = std::move(pending->second.error);
+    if (!pending->second.outcome) {
+      throw std::logic_error("MCP simulation command outcome is missing");
+    }
+    SimulationCommandOutcome outcome = std::move(*pending->second.outcome);
     pending_commands_.erase(pending);
-    return error;
+    return outcome;
   }
   const bool cancelled = stop_token.stop_requested();
   const bool run_ended = stop_requested_ || run_stopped_ || shutdown_;
-  pending_commands_.erase(pending);
+  if (!cancelled && !run_ended && !cancellation_deadline_reached) {
+    throw std::logic_error("MCP simulation command wait ended unexpectedly");
+  }
   lock.unlock();
-  operation_stop_source->request_stop();
-  if (cancelled) {
-    throw McpOperationCancelled();
+  if (cancellation_deadline_reached) {
+    operation_control->RequestCancellation(
+        SimulationCommandCancellationCause::kDeadline);
+  } else if (run_ended) {
+    operation_control->RequestCancellation(
+        SimulationCommandCancellationCause::kApplicationShutdown);
+  } else {
+    operation_control->RequestCancellation(
+        SimulationCommandCancellationCause::kClientCancel);
   }
-  if (deadline_reached) {
-    throw McpOperationFailure(
-        "node_operation_timeout",
-        "node operation command #" + std::to_string(sequence) +
-            " did not produce a terminal outcome before timeout_sec",
-        false,
-        boost::json::array{boost::json::object{
-            {"code", "node_operation_timeout"},
-            {"message",
-             "the admitted node command was cancelled at its "
-             "wall-clock deadline"},
-            {"path", "command-" + std::to_string(sequence)},
-            {"recoverable", false}}});
+  lock.lock();
+  auto drain_deadline = std::chrono::steady_clock::now() +
+                        kSimulationCommandCancellationReconciliation;
+  if (terminal_deadline) {
+    drain_deadline = std::min(drain_deadline, *terminal_deadline);
   }
-  if (run_ended) {
-    throw McpOperationFailure("run_stopped_before_command_outcome",
-                              "the run stopped before the command produced a "
-                              "terminal outcome",
-                              false);
+  const bool owner_reconciled =
+      command_outcome_ready_.wait_until(lock, drain_deadline, [&] {
+        const auto outcome = pending_commands_.find(sequence);
+        return outcome == pending_commands_.end() || outcome->second.completed;
+      });
+  pending = pending_commands_.find(sequence);
+  if (pending == pending_commands_.end()) {
+    throw std::logic_error("MCP simulation command outcome was lost");
   }
-  throw std::logic_error("MCP simulation command wait ended unexpectedly");
+  if (!owner_reconciled || !pending->second.completed) {
+    pending->second.detached = true;
+    lock.unlock();
+    config_.request_run_stop();
+    return SimulationCommandOutcome{
+        .state = SimulationCommandOutcomeState::kOutcomeUnconfirmed,
+        .cancellation_cause = operation_control->cancellation_cause.load(
+            std::memory_order_acquire),
+        .error =
+            "the simulator owner exceeded the 250ms cancellation "
+            "reconciliation bound",
+        .node_lifecycle = std::nullopt,
+    };
+  }
+  if (!pending->second.outcome) {
+    throw std::logic_error("MCP simulation command outcome is missing");
+  }
+  SimulationCommandOutcome outcome = std::move(*pending->second.outcome);
+  pending_commands_.erase(pending);
+  return outcome;
 }
 
 void McpLiveApplication::RecordCommandOutcome(
-    const SimulationCommand& command, std::optional<std::string_view> error) {
+    const SimulationCommand& command, const SimulationCommandOutcome& outcome) {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto pending = pending_commands_.find(command.sequence);
   if (pending == pending_commands_.end()) {
     return;
   }
+  if (pending->second.detached) {
+    pending_commands_.erase(pending);
+    command_outcome_ready_.notify_all();
+    return;
+  }
   if (pending->second.completed) {
-    pending->second.error =
-        "simulation command processor published more than one outcome";
+    pending->second.outcome = SimulationCommandOutcome{
+        .state = SimulationCommandOutcomeState::kFailed,
+        .cancellation_cause = SimulationCommandCancellationCause::kNone,
+        .error = "simulation command processor published more than one outcome",
+        .node_lifecycle = std::nullopt,
+    };
   } else {
     pending->second.completed = true;
-    if (error) {
-      pending->second.error = std::string(*error);
-    }
+    pending->second.outcome = outcome;
   }
   command_outcome_ready_.notify_all();
 }
@@ -1112,11 +1291,12 @@ boost::json::object McpLiveApplication::ReportSnapshot(
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
   }
-  std::unique_lock<std::timed_mutex> lock(report_mutex_, std::defer_lock);
-  while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
+  std::unique_lock<std::mutex> lock(report_mutex_, std::defer_lock);
+  while (!lock.try_lock()) {
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
@@ -1219,6 +1399,7 @@ void McpLiveApplication::MarkRunStopping() {
     }
     command_outcome_ready_.notify_all();
   }
+  run_stop_source_.request_stop();
   if (notify && config_.run_stopping) {
     config_.run_stopping();
   }
@@ -1238,6 +1419,7 @@ void McpLiveApplication::MarkRunStopped() {
     }
     command_outcome_ready_.notify_all();
   }
+  run_stop_source_.request_stop();
   if (notify && config_.run_stopped) {
     config_.run_stopped();
   }
@@ -1251,6 +1433,7 @@ void McpLiveApplication::Shutdown() {
     command_outcome_ready_.notify_all();
   }
   request_stop_source_.request_stop();
+  run_stop_source_.request_stop();
   std::unique_lock<std::mutex> lock(mutex_);
   requests_drained_.wait(lock, [this] { return active_requests_ == 0U; });
 }
