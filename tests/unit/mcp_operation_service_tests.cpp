@@ -79,6 +79,26 @@ McpOperationExecutor CancellableExecutor(std::atomic<bool>* started = nullptr) {
   };
 }
 
+McpOperationExecutor StatsReentrantStopExecutor(
+    McpOperationService* service, std::atomic<bool>* callback_ready,
+    std::atomic<bool>* callback_completed) {
+  return [service, callback_ready,
+          callback_completed](McpOperationContext& context) {
+    std::stop_callback on_stop(context.stop_token(),
+                               [service, callback_completed] {
+                                 static_cast<void>(service->Stats());
+                                 callback_completed->store(
+                                     true, std::memory_order_release);
+                               });
+    callback_ready->store(true, std::memory_order_release);
+    while (!context.stop_requested()) {
+      std::this_thread::yield();
+    }
+    context.ThrowIfCancelled();
+    return ValidationResult();
+  };
+}
+
 McpEvidenceRecord Evidence(McpInformationFamily family, std::string node_id,
                            std::string message) {
   return McpEvidenceRecord{.family = family,
@@ -577,6 +597,37 @@ BOOST_AUTO_TEST_CASE(mcp_operation_terminal_callback_can_shutdown_reentrantly) {
   BOOST_TEST(stats.active_workers == 0U);
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_session_request_shutdown_defers_completion_until_lease_exit) {
+  std::atomic<bool> stop_callback_completed = false;
+  std::chrono::steady_clock::duration shutdown_duration{};
+  std::size_t sessions_before_lease_exit = 0U;
+  McpOperationService service;
+  service.RegisterSession("session-a");
+
+  static_cast<void>(service.ExecuteSessionRequest(
+      "session-a", [&](std::stop_token stop_token) {
+        std::stop_callback on_stop(stop_token, [&] {
+          static_cast<void>(service.Stats());
+          stop_callback_completed.store(true, std::memory_order_release);
+        });
+        const auto began = std::chrono::steady_clock::now();
+        service.Shutdown();
+        shutdown_duration = std::chrono::steady_clock::now() - began;
+        sessions_before_lease_exit = service.Stats().sessions;
+        return boost::json::object{};
+      }));
+
+  BOOST_CHECK(shutdown_duration < 500ms);
+  BOOST_TEST(stop_callback_completed.load(std::memory_order_acquire));
+  BOOST_TEST(sessions_before_lease_exit == 1U);
+  const McpOperationServiceStats stats = service.Stats();
+  BOOST_TEST(!stats.accepting);
+  BOOST_TEST(stats.sessions == 0U);
+  BOOST_TEST(stats.active_operations == 0U);
+  BOOST_TEST(stats.active_workers == 0U);
+}
+
 BOOST_AUTO_TEST_CASE(mcp_operation_concurrent_shutdown_waits_for_worker_owner) {
   std::atomic<bool> stop_seen = false;
   std::atomic<bool> release_worker = false;
@@ -634,6 +685,127 @@ BOOST_AUTO_TEST_CASE(mcp_operation_concurrent_shutdown_waits_for_worker_owner) {
   BOOST_TEST(sessions_while_worker_active == 1U);
   BOOST_TEST(first_returned.load(std::memory_order_acquire));
   BOOST_TEST(second_returned.load(std::memory_order_acquire));
+  const McpOperationServiceStats stats = service.Stats();
+  BOOST_TEST(stats.sessions == 0U);
+  BOOST_TEST(stats.active_operations == 0U);
+  BOOST_TEST(stats.active_workers == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_session_removal_cancels_and_waits_for_synchronous_requests) {
+  std::atomic<bool> request_started = false;
+  std::atomic<bool> cancellation_seen = false;
+  std::atomic<bool> stop_callback_completed = false;
+  std::atomic<bool> request_finished = false;
+  McpOperationService service;
+  service.RegisterSession("session-a");
+
+  std::jthread request([&] {
+    static_cast<void>(service.ExecuteSessionRequest(
+        "session-a", [&](std::stop_token stop_token) {
+          std::stop_callback on_stop(stop_token, [&] {
+            static_cast<void>(service.Stats());
+            stop_callback_completed.store(true, std::memory_order_release);
+          });
+          request_started.store(true, std::memory_order_release);
+          const auto deadline = std::chrono::steady_clock::now() + 2s;
+          while (!stop_token.stop_requested() &&
+                 std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+          }
+          cancellation_seen.store(stop_token.stop_requested(),
+                                  std::memory_order_release);
+          request_finished.store(true, std::memory_order_release);
+          return boost::json::object{};
+        }));
+  });
+  const auto start_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!request_started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < start_deadline) {
+    std::this_thread::yield();
+  }
+
+  BOOST_REQUIRE(request_started.load(std::memory_order_acquire));
+  BOOST_TEST(service.RemoveSession("session-a", 1s));
+  BOOST_TEST(cancellation_seen.load(std::memory_order_acquire));
+  BOOST_TEST(stop_callback_completed.load(std::memory_order_acquire));
+  BOOST_TEST(request_finished.load(std::memory_order_acquire));
+  request.join();
+  BOOST_TEST(service.Stats().sessions == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_worker_stop_callbacks_reenter_stats_during_removal_and_shutdown) {
+  std::atomic<bool> removal_callback_ready = false;
+  std::atomic<bool> removal_callback_completed = false;
+  std::atomic<bool> shutdown_callback_ready = false;
+  std::atomic<bool> shutdown_callback_completed = false;
+  McpOperationService service;
+  service.RegisterSession("session-remove");
+  static_cast<void>(service.Submit(
+      "session-remove", McpOperationKind::kValidateScenario, 1U,
+      StatsReentrantStopExecutor(&service, &removal_callback_ready,
+                                 &removal_callback_completed)));
+  const auto removal_ready_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!removal_callback_ready.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < removal_ready_deadline) {
+    std::this_thread::yield();
+  }
+  BOOST_REQUIRE(removal_callback_ready.load(std::memory_order_acquire));
+
+  const auto removal_began = std::chrono::steady_clock::now();
+  BOOST_TEST(service.RemoveSession("session-remove", 1s));
+  BOOST_CHECK(std::chrono::steady_clock::now() - removal_began < 500ms);
+  BOOST_TEST(removal_callback_completed.load(std::memory_order_acquire));
+
+  service.RegisterSession("session-shutdown");
+  static_cast<void>(service.Submit(
+      "session-shutdown", McpOperationKind::kValidateScenario, 1U,
+      StatsReentrantStopExecutor(&service, &shutdown_callback_ready,
+                                 &shutdown_callback_completed)));
+  const auto shutdown_ready_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!shutdown_callback_ready.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < shutdown_ready_deadline) {
+    std::this_thread::yield();
+  }
+  BOOST_REQUIRE(shutdown_callback_ready.load(std::memory_order_acquire));
+
+  const auto shutdown_began = std::chrono::steady_clock::now();
+  service.Shutdown();
+  BOOST_CHECK(std::chrono::steady_clock::now() - shutdown_began < 500ms);
+  BOOST_TEST(shutdown_callback_completed.load(std::memory_order_acquire));
+  const McpOperationServiceStats stats = service.Stats();
+  BOOST_TEST(stats.sessions == 0U);
+  BOOST_TEST(stats.active_operations == 0U);
+  BOOST_TEST(stats.active_workers == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_cancel_stop_callback_can_reenter_stats) {
+  std::atomic<bool> callback_ready = false;
+  std::atomic<bool> callback_completed = false;
+  McpOperationService service;
+  service.RegisterSession("session-a");
+  const McpOperationSnapshot submitted = service.Submit(
+      "session-a", McpOperationKind::kValidateScenario, 1U,
+      StatsReentrantStopExecutor(&service, &callback_ready,
+                                 &callback_completed));
+  const auto ready_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!callback_ready.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    std::this_thread::yield();
+  }
+  BOOST_REQUIRE(callback_ready.load(std::memory_order_acquire));
+
+  const auto began = std::chrono::steady_clock::now();
+  const McpOperationCancellation cancellation =
+      service.CancelOperation("session-a", submitted.operation_id);
+  BOOST_CHECK(std::chrono::steady_clock::now() - began < 500ms);
+  BOOST_TEST(cancellation.request_accepted);
+  BOOST_TEST(callback_completed.load(std::memory_order_acquire));
+  BOOST_CHECK(
+      WaitForTerminal(&service, "session-a", submitted.operation_id).state ==
+      McpOperationState::kCancelled);
+  service.Shutdown();
   const McpOperationServiceStats stats = service.Stats();
   BOOST_TEST(stats.sessions == 0U);
   BOOST_TEST(stats.active_operations == 0U);

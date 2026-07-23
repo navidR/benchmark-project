@@ -78,7 +78,10 @@ McpServer MakeServer(
           .request_timeout = timeout},
       McpProtocolConfig{.bearer_token = std::string(kServerToken),
                         .endpoint_path = "/mcp",
-                        .endpoint_port = 0U},
+                        .endpoint_port = 0U,
+                        .allowed_operations = {},
+                        .allowed_information_families = {},
+                        .read_only = false},
       [](std::string_view name, const boost::json::object&, std::string_view,
          std::stop_token) { return boost::json::object{{"tool", name}}; },
       [](std::string_view uri, std::string_view, std::stop_token) {
@@ -146,7 +149,10 @@ BOOST_AUTO_TEST_CASE(mcp_server_shutdown_cancels_silent_connections) {
 
 BOOST_AUTO_TEST_CASE(mcp_server_rejects_non_loopback_binding) {
   McpServer server(McpServerConfig{.bind_address = "0.0.0.0"},
-                   McpProtocolConfig{.bearer_token = std::string(kServerToken)},
+                   McpProtocolConfig{.bearer_token = std::string(kServerToken),
+                                     .allowed_operations = {},
+                                     .allowed_information_families = {},
+                                     .read_only = false},
                    {}, {});
   BOOST_CHECK_THROW(server.Start(), std::runtime_error);
 }

@@ -1,6 +1,7 @@
 #include "bbp/mcp_live_application.h"
 
 #include <algorithm>
+#include <array>
 #include <boost/json/array.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
@@ -10,6 +11,7 @@
 #include <initializer_list>
 #include <limits>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -27,6 +29,30 @@
 
 namespace bbp {
 namespace {
+
+constexpr std::array kLiveOperations = {
+    McpOperationKind::kValidateScenario,
+    McpOperationKind::kResolveScenario,
+    McpOperationKind::kStopRun,
+    McpOperationKind::kReportRun,
+    McpOperationKind::kInvokeRuntimeCommand,
+    McpOperationKind::kQueryEvidence,
+    McpOperationKind::kQueryLogs,
+    McpOperationKind::kFollowLogs,
+    McpOperationKind::kReadArtifact,
+    McpOperationKind::kGetOperation,
+    McpOperationKind::kCancelOperation,
+};
+
+constexpr std::array kRetainedOperations = {
+    McpOperationKind::kValidateScenario, McpOperationKind::kResolveScenario,
+    McpOperationKind::kReportRun,        McpOperationKind::kGetOperation,
+    McpOperationKind::kCancelOperation,
+};
+
+constexpr std::array kOwnedRunOperations = {
+    McpOperationKind::kQueryEvidence, McpOperationKind::kQueryLogs,
+    McpOperationKind::kFollowLogs, McpOperationKind::kReadArtifact};
 
 const boost::json::value& RequireMember(const boost::json::object& object,
                                         std::string_view name) {
@@ -73,6 +99,19 @@ std::uint64_t OptionalUnsigned(const boost::json::object& object,
   }
   throw std::invalid_argument("MCP application argument " + std::string(name) +
                               " must be an unsigned integer");
+}
+
+std::optional<std::uint32_t> Uint32Value(const boost::json::value& value) {
+  if (value.is_uint64() &&
+      value.as_uint64() <= std::numeric_limits<std::uint32_t>::max()) {
+    return static_cast<std::uint32_t>(value.as_uint64());
+  }
+  if (value.is_int64() && value.as_int64() >= 0 &&
+      static_cast<std::uint64_t>(value.as_int64()) <=
+          std::numeric_limits<std::uint32_t>::max()) {
+    return static_cast<std::uint32_t>(value.as_int64());
+  }
+  return std::nullopt;
 }
 
 bool OptionalBoolean(const boost::json::object& object, std::string_view name,
@@ -196,31 +235,65 @@ boost::json::object ResourceEnvelope(McpInformationFamily family,
   };
 }
 
-boost::json::object BuildSchemaDocument() {
+boost::json::object BuildSchemaDocument(
+    std::span<const McpOperationKind> selected_operations,
+    std::span<const McpInformationFamily> selected_information_families) {
   boost::json::object operation_schemas;
   const std::span<const McpNamedCapability> operations = McpOperationRegistry();
-  for (std::size_t index = 0U; index < operations.size(); ++index) {
-    const auto kind = static_cast<McpOperationKind>(index);
+  for (const McpOperationKind kind : selected_operations) {
+    const std::size_t index = static_cast<std::size_t>(kind);
+    if (index >= operations.size()) {
+      throw std::logic_error("unknown MCP operation kind");
+    }
     operation_schemas[operations[index].name] = boost::json::object{
-        {"input", BuildMcpOperationInputSchema(kind)},
-        {"output", BuildMcpOperationOutputSchema(kind)},
+        {"input",
+         BuildMcpOperationInputSchema(kind, selected_information_families)},
+        {"output",
+         BuildMcpOperationOutputSchema(kind, selected_operations)},
     };
   }
   return boost::json::object{
       {"scenario", BuildMcpScenarioSchema()},
       {"simulation_command", BuildMcpSimulationCommandSchema()},
       {"operations", std::move(operation_schemas)},
-      {"resources", BuildMcpResourceRegistry()},
+      {"resources", BuildMcpResourceRegistry(selected_information_families)},
   };
 }
 
-boost::json::value ReadJsonObjectFile(const std::filesystem::path& path) {
-  const boost::json::value value = boost::json::parse(ReadText(path));
+boost::json::value ReadJsonObjectFile(const std::filesystem::path& path,
+                                      std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw McpOperationCancelled();
+  }
+  boost::json::value value;
+  try {
+    value = boost::json::parse(
+        ReadText(path, kMcpMaximumRetainedResultBytes, stop_token));
+  } catch (...) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    throw;
+  }
+  if (stop_token.stop_requested()) {
+    throw McpOperationCancelled();
+  }
   if (!value.is_object()) {
     throw std::runtime_error("MCP run document is not a JSON object: " +
                              path.string());
   }
   return value;
+}
+
+void RequireDocumentRunIdentity(const boost::json::object& document,
+                                std::string_view run_id,
+                                std::string_view document_kind) {
+  const boost::json::value* actual = document.if_contains("run_id");
+  if (actual == nullptr || !actual->is_string() ||
+      actual->as_string() != run_id) {
+    throw std::runtime_error("MCP " + std::string(document_kind) +
+                             " identity does not match the selected run");
+  }
 }
 
 boost::json::object EvidencePage(std::string_view run_id,
@@ -277,6 +350,19 @@ McpLiveApplication::McpLiveApplication(Config config)
   if (config_.run_root.empty()) {
     throw std::invalid_argument("MCP live application requires a run root");
   }
+  if (config_.retained_run) {
+    if (config_.retained_run->chain.empty() ||
+        config_.retained_run->state.empty()) {
+      throw std::invalid_argument(
+          "MCP retained application requires persisted run metadata");
+    }
+    if (config_.options != nullptr || config_.command_queue != nullptr ||
+        config_.request_run_stop) {
+      throw std::invalid_argument(
+          "MCP retained application cannot own live run controls");
+    }
+    return;
+  }
   if (config_.options == nullptr) {
     throw std::invalid_argument("MCP live application requires run options");
   }
@@ -306,10 +392,56 @@ McpApplicationResourceReader McpLiveApplication::ResourceReader() {
   };
 }
 
+std::vector<McpOperationKind> McpLiveApplication::SupportedOperations() const {
+  if (!config_.retained_run) {
+    return {kLiveOperations.begin(), kLiveOperations.end()};
+  }
+  std::vector<McpOperationKind> operations{kRetainedOperations.begin(),
+                                           kRetainedOperations.end()};
+  if (config_.retained_run->has_owned_artifacts) {
+    operations.insert(operations.end(), kOwnedRunOperations.begin(),
+                      kOwnedRunOperations.end());
+  }
+  return operations;
+}
+
+std::vector<McpInformationFamily>
+McpLiveApplication::SupportedInformationFamilies() const {
+  std::vector<McpInformationFamily> information_families;
+  information_families.reserve(
+      static_cast<std::size_t>(McpInformationFamily::kCount));
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(McpInformationFamily::kCount);
+       ++index) {
+    const McpInformationFamily family =
+        static_cast<McpInformationFamily>(index);
+    if (config_.retained_run && !config_.retained_run->has_owned_artifacts &&
+        (family == McpInformationFamily::kArtifacts ||
+         family == McpInformationFamily::kArtifactContents)) {
+      continue;
+    }
+    information_families.push_back(family);
+  }
+  return information_families;
+}
+
+bool McpLiveApplication::read_only() const {
+  return config_.retained_run.has_value();
+}
+
 McpOperationPlan McpLiveApplication::BuildOperation(
     McpOperationKind kind, const boost::json::object& arguments,
     std::string_view session_id) {
   static_cast<void>(session_id);
+  const std::vector<McpOperationKind> supported = SupportedOperations();
+  if (std::find(supported.begin(), supported.end(), kind) == supported.end()) {
+    throw McpOperationFailure(
+        config_.retained_run ? "read_only_run" : "operation_unavailable",
+        config_.retained_run
+            ? "the retained run is read-only and cannot execute this operation"
+            : "the operation is unavailable in the current live run",
+        false);
+  }
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
       kind != McpOperationKind::kInvokeRuntimeCommand &&
@@ -325,6 +457,11 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     if (shutdown_) {
       throw std::runtime_error("MCP live application is shutting down");
     }
+    if (!config_.retained_run && kind != McpOperationKind::kStopRun &&
+        !run_started_ && !run_stopped_) {
+      throw McpOperationFailure("run_not_ready",
+                                "the managed run is still starting", true);
+    }
   }
 
   if (kind == McpOperationKind::kStopRun) {
@@ -333,7 +470,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           context.ThrowIfCancelled();
           {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (shutdown_) {
+            if (shutdown_ || stop_requested_ || run_stopped_) {
               throw McpOperationFailure("run_not_active",
                                         "the managed run is no longer active",
                                         false);
@@ -341,12 +478,12 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             stop_requested_ = true;
           }
           config_.request_run_stop();
-          return McpTypedResult{.family = McpResultFamily::kRunLifecycle,
-                                .value = boost::json::object{
-                                    {"result_family", "run_lifecycle"},
-                                    {"run_id", config_.run_id},
-                                    {"state", "stopping"},
-                                    {"node_count", config_.options->nodes}}};
+          return McpTypedResult{
+              .family = McpResultFamily::kRunLifecycle,
+              .value = boost::json::object{{"result_family", "run_lifecycle"},
+                                           {"run_id", config_.run_id},
+                                           {"state", "stopping"},
+                                           {"node_count", NodeCount()}}};
         }};
   }
 
@@ -355,6 +492,12 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         OptionalStringArray(arguments, "node_ids");
     const bool include_artifacts =
         OptionalBoolean(arguments, "include_artifacts", false);
+    if (include_artifacts && config_.retained_run &&
+        !config_.retained_run->has_owned_artifacts) {
+      throw McpOperationFailure(
+          "artifact_unavailable",
+          "the retained run has no verified owned artifacts", false);
+    }
     return McpOperationPlan{
         .progress_total = 1U,
         .executor = [this, node_ids,
@@ -368,8 +511,20 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             node_reports.reserve(node_ids.size());
             for (const std::string& node_id : node_ids) {
               context.ThrowIfCancelled();
-              const boost::json::value node_report = boost::json::parse(
-                  BuildNodeReportJson(config_.run_root, node_id, 0U));
+              boost::json::value node_report;
+              try {
+                node_report = boost::json::parse(BuildNodeReportJson(
+                    config_.run_root, node_id, 0U, context.stop_token()));
+              } catch (...) {
+                context.ThrowIfCancelled();
+                throw;
+              }
+              if (!node_report.is_object()) {
+                throw std::runtime_error(
+                    "MCP node report is not a JSON object");
+              }
+              RequireDocumentRunIdentity(node_report.as_object(),
+                                         config_.run_id, "node report");
               node_reports.push_back(node_report);
             }
             report =
@@ -487,30 +642,55 @@ boost::json::value McpLiveApplication::ReadResource(
       throw std::runtime_error("MCP live application is shutting down");
     }
   }
+  const std::vector<McpInformationFamily> supported =
+      SupportedInformationFamilies();
+  if (std::find(supported.begin(), supported.end(), family) ==
+      supported.end()) {
+    throw McpOperationFailure(
+        "resource_unavailable",
+        "the requested resource is unavailable in the current endpoint", false);
+  }
 
   if (family == McpInformationFamily::kCapabilities) {
-    boost::json::object capabilities = BuildMcpCapabilityDocument();
+    if (config_.retained_run) {
+      static_cast<void>(ReportSnapshot(stop_token));
+    }
+    const std::vector<McpOperationKind> selected = SupportedOperations();
+    const std::vector<McpInformationFamily> information_families =
+        SupportedInformationFamilies();
+    boost::json::object capabilities =
+        BuildMcpCapabilityDocument(selected, information_families);
+    capabilities["access_mode"] = read_only() ? "read_only" : "read_write";
     capabilities["current_run"] =
         boost::json::object{{"run_id", config_.run_id},
-                            {"chain", ChainKindName(config_.options->chain)},
+                            {"chain", CurrentChain()},
                             {"state", RunState()},
-                            {"node_count", config_.options->nodes}};
+                            {"node_count", NodeCount()}};
     return ResourceEnvelope(family, config_.run_id, std::move(capabilities));
   }
   if (family == McpInformationFamily::kSchemas) {
-    return ResourceEnvelope(family, config_.run_id, BuildSchemaDocument());
-  }
-  if (family == McpInformationFamily::kResolvedScenario) {
+    const std::vector<McpOperationKind> selected = SupportedOperations();
+    const std::vector<McpInformationFamily> information_families =
+        SupportedInformationFamilies();
     return ResourceEnvelope(
         family, config_.run_id,
-        ReadJsonObjectFile(config_.run_root / "resolved-scenario.json"));
+        BuildSchemaDocument(selected, information_families));
+  }
+  if (family == McpInformationFamily::kResolvedScenario) {
+    boost::json::value scenario = ReadJsonObjectFile(
+        config_.run_root / "resolved-scenario.json", stop_token);
+    RequireDocumentRunIdentity(scenario.as_object(), config_.run_id,
+                               "resolved scenario");
+    return ResourceEnvelope(family, config_.run_id, std::move(scenario));
   }
   if (family == McpInformationFamily::kSourceScenario) {
     const std::filesystem::path source =
         config_.run_root / "source-scenario.json";
     if (std::filesystem::exists(source)) {
-      return ResourceEnvelope(family, config_.run_id,
-                              ReadJsonObjectFile(source));
+      boost::json::value scenario = ReadJsonObjectFile(source, stop_token);
+      RequireDocumentRunIdentity(scenario.as_object(), config_.run_id,
+                                 "source scenario");
+      return ResourceEnvelope(family, config_.run_id, std::move(scenario));
     }
     return ResourceEnvelope(
         family, config_.run_id,
@@ -519,13 +699,15 @@ boost::json::value McpLiveApplication::ReadResource(
             {"reason", "this run did not retain a source scenario document"}});
   }
   if (family == McpInformationFamily::kRunRegistry) {
+    if (config_.retained_run) {
+      static_cast<void>(ReportSnapshot(stop_token));
+    }
     return ResourceEnvelope(
         family, config_.run_id,
-        boost::json::array{boost::json::object{
-            {"run_id", config_.run_id},
-            {"state", RunState()},
-            {"chain", ChainKindName(config_.options->chain)},
-            {"node_count", config_.options->nodes}}});
+        boost::json::array{boost::json::object{{"run_id", config_.run_id},
+                                               {"state", RunState()},
+                                               {"chain", CurrentChain()},
+                                               {"node_count", NodeCount()}}});
   }
 
   boost::json::object report = ReportSnapshot(stop_token);
@@ -637,9 +819,14 @@ boost::json::value McpLiveApplication::ReadResource(
       break;
     case McpInformationFamily::kProgress:
     case McpInformationFamily::kOperations:
+      data = boost::json::object{
+          {"available_through",
+           boost::json::array{"operation.get", "operation.cancel"}}};
+      break;
     case McpInformationFamily::kNotifications:
       data = boost::json::object{
-          {"available_through", "operation and subscription tools"}};
+          {"transport", "MCP SSE GET stream"},
+          {"methods", boost::json::array{"notifications/progress"}}};
       break;
     case McpInformationFamily::kCapabilities:
     case McpInformationFamily::kSchemas:
@@ -691,8 +878,9 @@ std::optional<std::string> McpLiveApplication::WaitForCommand(
   std::unique_lock<std::mutex> lock(mutex_);
   command_outcome_ready_.wait(lock, [&] {
     const auto pending = pending_commands_.find(sequence);
-    return stop_token.stop_requested() || shutdown_ ||
-           pending == pending_commands_.end() || pending->second.completed;
+    return stop_token.stop_requested() || stop_requested_ || run_stopped_ ||
+           shutdown_ || pending == pending_commands_.end() ||
+           pending->second.completed;
   });
   const auto pending = pending_commands_.find(sequence);
   if (pending == pending_commands_.end()) {
@@ -738,20 +926,114 @@ boost::json::object McpLiveApplication::ReportSnapshot(
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
   }
-  std::lock_guard<std::mutex> lock(report_mutex_);
-  boost::json::object report = BuildRunReport(config_.run_root);
+  std::unique_lock<std::timed_mutex> lock(report_mutex_, std::defer_lock);
+  while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+  }
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
+  }
+  boost::json::object report;
+  try {
+    report = BuildRunReport(config_.run_root, stop_token);
+  } catch (...) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    throw;
+  }
+  if (stop_token.stop_requested()) {
+    throw McpOperationCancelled();
+  }
+  const boost::json::value* run_id = report.if_contains("run_id");
+  if (run_id == nullptr || !run_id->is_string() ||
+      run_id->as_string() != config_.run_id) {
+    throw std::runtime_error(
+        "MCP report identity does not match the selected run");
+  }
+  if (config_.retained_run) {
+    const boost::json::value* chain = report.if_contains("chain");
+    const boost::json::value* state = report.if_contains("status");
+    const boost::json::value* nodes = report.if_contains("nodes");
+    const std::optional<std::uint32_t> node_count =
+        nodes == nullptr ? std::nullopt : Uint32Value(*nodes);
+    if (chain == nullptr || !chain->is_string() ||
+        chain->as_string() != config_.retained_run->chain || state == nullptr ||
+        !state->is_string() || !node_count) {
+      throw std::runtime_error("MCP retained report metadata is inconsistent");
+    }
+    std::lock_guard<std::mutex> state_lock(mutex_);
+    config_.retained_run->state = std::string(state->as_string());
+    config_.retained_run->node_count = *node_count;
   }
   return report;
 }
 
 std::string McpLiveApplication::RunState() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (shutdown_ || stop_requested_) {
+  if (config_.retained_run) {
+    return config_.retained_run->state;
+  }
+  if (run_stopped_ || shutdown_) {
+    return "stopped";
+  }
+  if (stop_requested_) {
     return "stopping";
   }
+  if (!run_started_) {
+    return "starting";
+  }
   return config_.options->nodes == 0U ? "empty" : "active";
+}
+
+std::string McpLiveApplication::CurrentChain() const {
+  if (config_.retained_run) {
+    return config_.retained_run->chain;
+  }
+  return std::string(ChainKindName(config_.options->chain));
+}
+
+std::uint32_t McpLiveApplication::NodeCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (config_.retained_run) {
+    return config_.retained_run->node_count;
+  }
+  return config_.options->nodes;
+}
+
+void McpLiveApplication::MarkRunStarted() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (config_.retained_run) {
+    return;
+  }
+  if (stop_requested_ || run_stopped_ || shutdown_) {
+    return;
+  }
+  run_started_ = true;
+}
+
+void McpLiveApplication::MarkRunStopping() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (config_.retained_run) {
+    return;
+  }
+  if (run_stopped_ || shutdown_) {
+    return;
+  }
+  stop_requested_ = true;
+  command_outcome_ready_.notify_all();
+}
+
+void McpLiveApplication::MarkRunStopped() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (config_.retained_run) {
+    return;
+  }
+  stop_requested_ = true;
+  run_stopped_ = true;
+  command_outcome_ready_.notify_all();
 }
 
 void McpLiveApplication::Shutdown() {

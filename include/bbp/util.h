@@ -2,9 +2,11 @@
 
 #include <boost/json/value.hpp>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,6 +14,8 @@
 namespace bbp {
 
 std::string ReadText(const std::filesystem::path& path);
+std::string ReadText(const std::filesystem::path& path,
+                     std::size_t maximum_bytes, std::stop_token stop_token);
 void WriteText(const std::filesystem::path& path, std::string_view text);
 void AppendLine(const std::filesystem::path& path, std::string_view text);
 void EnsureDirectory(const std::filesystem::path& path);

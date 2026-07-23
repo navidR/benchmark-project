@@ -157,12 +157,56 @@ boost::json::array StringArray(std::span<const std::string_view> values) {
   return result;
 }
 
-boost::json::array NamedArray(std::span<const McpNamedCapability> values) {
+boost::json::array NamedOperationArray(
+    std::span<const McpOperationKind> operations) {
   boost::json::array result;
-  result.reserve(values.size());
-  for (const McpNamedCapability& value : values) {
+  result.reserve(operations.size());
+  for (const McpOperationKind operation : operations) {
+    const std::size_t index = EnumCount(operation);
+    if (index >= kOperations.size()) {
+      throw std::logic_error("unknown MCP operation kind");
+    }
+    result.emplace_back(
+        boost::json::object{{"name", kOperations[index].name},
+                            {"description", kOperations[index].description}});
+  }
+  return result;
+}
+
+boost::json::array NamedInformationFamilyArray(
+    std::span<const McpInformationFamily> information_families) {
+  boost::json::array result;
+  result.reserve(information_families.size());
+  for (const McpInformationFamily family : information_families) {
+    const std::size_t index = EnumCount(family);
+    if (index >= kInformationFamilies.size()) {
+      throw std::logic_error("unknown MCP information family");
+    }
     result.emplace_back(boost::json::object{
-        {"name", value.name}, {"description", value.description}});
+        {"name", kInformationFamilies[index].name},
+        {"description", kInformationFamilies[index].description}});
+  }
+  return result;
+}
+
+boost::json::array NamedResultFamilyArray(
+    std::span<const McpOperationKind> operations) {
+  std::array<bool, EnumCount(McpResultFamily::kCount)> selected{};
+  for (const McpOperationKind operation : operations) {
+    selected[EnumCount(McpOperationResultFamily(operation))] = true;
+  }
+  if (!operations.empty()) {
+    selected[EnumCount(McpResultFamily::kOperation)] = true;
+    selected[EnumCount(McpResultFamily::kError)] = true;
+  }
+  boost::json::array result;
+  for (std::size_t index = 0U; index < selected.size(); ++index) {
+    if (!selected[index]) {
+      continue;
+    }
+    result.emplace_back(boost::json::object{
+        {"name", kResultFamilies[index].name},
+        {"description", kResultFamilies[index].description}});
   }
   return result;
 }
@@ -221,19 +265,38 @@ std::span<const std::string_view> McpScenarioMemberRegistry() {
 }
 
 boost::json::array BuildMcpResourceRegistry() {
+  std::array<McpInformationFamily,
+             EnumCount(McpInformationFamily::kCount)>
+      information_families{};
+  for (std::size_t index = 0U; index < information_families.size(); ++index) {
+    information_families[index] =
+        static_cast<McpInformationFamily>(index);
+  }
+  return BuildMcpResourceRegistry(information_families);
+}
+
+boost::json::array BuildMcpResourceRegistry(
+    std::span<const McpInformationFamily> information_families) {
   boost::json::array resources;
-  resources.reserve(kInformationFamilies.size());
-  for (const McpNamedCapability& family : kInformationFamilies) {
+  resources.reserve(information_families.size());
+  for (const McpInformationFamily family : information_families) {
+    const std::size_t index = EnumCount(family);
+    if (index >= kInformationFamilies.size()) {
+      throw std::logic_error("unknown MCP information family");
+    }
+    const McpNamedCapability& descriptor = kInformationFamilies[index];
     resources.emplace_back(
-        boost::json::object{{"uri", "bbp:///" + std::string(family.name)},
-                            {"name", family.name},
-                            {"description", family.description},
+        boost::json::object{{"uri", "bbp:///" + std::string(descriptor.name)},
+                            {"name", descriptor.name},
+                            {"description", descriptor.description},
                             {"mimeType", "application/json"}});
   }
   return resources;
 }
 
-boost::json::object BuildMcpCapabilityDocument() {
+boost::json::object BuildMcpCapabilityDocument(
+    std::span<const McpOperationKind> operations,
+    std::span<const McpInformationFamily> information_families) {
   boost::json::object limits{
       {"list_page_size", kMcpListPageSize},
       {"sessions", kMcpMaximumSessions},
@@ -264,12 +327,34 @@ boost::json::object BuildMcpCapabilityDocument() {
   document["tui_local_actions"] = EnumNames(
       TuiLocalAction::kCount,
       [](TuiLocalAction action) { return TuiLocalActionName(action); });
-  document["operations"] = NamedArray(kOperations);
-  document["information_families"] = NamedArray(kInformationFamilies);
-  document["result_families"] = NamedArray(kResultFamilies);
+  document["operations"] = NamedOperationArray(operations);
+  document["information_families"] =
+      NamedInformationFamilyArray(information_families);
+  document["result_families"] = NamedResultFamilyArray(operations);
   document["scenario_schema"] = BuildMcpScenarioSchema();
   document["limits"] = std::move(limits);
   return document;
+}
+
+boost::json::object BuildMcpCapabilityDocument(
+    std::span<const McpOperationKind> operations) {
+  std::array<McpInformationFamily,
+             EnumCount(McpInformationFamily::kCount)>
+      information_families{};
+  for (std::size_t index = 0U; index < information_families.size(); ++index) {
+    information_families[index] =
+        static_cast<McpInformationFamily>(index);
+  }
+  return BuildMcpCapabilityDocument(operations, information_families);
+}
+
+boost::json::object BuildMcpCapabilityDocument() {
+  std::array<McpOperationKind, EnumCount(McpOperationKind::kCount)>
+      operations{};
+  for (std::size_t index = 0U; index < operations.size(); ++index) {
+    operations[index] = static_cast<McpOperationKind>(index);
+  }
+  return BuildMcpCapabilityDocument(operations);
 }
 
 }  // namespace bbp

@@ -195,22 +195,32 @@ McpOperationPlan BuiltInPlan(McpOperationKind kind,
                              const boost::json::object& arguments) {
   if (kind == McpOperationKind::kValidateScenario) {
     boost::json::object scenario = RequireObject(arguments, "scenario");
-    return McpOperationPlan{
-        .progress_total = 1U,
-        .executor = [scenario = std::move(scenario)](McpOperationContext&) {
-          return ValidationResult(std::move(scenario));
-        }};
+    return McpOperationPlan{.progress_total = 1U,
+                            .executor = [scenario = std::move(scenario)](
+                                            McpOperationContext& context) {
+                              context.ThrowIfCancelled();
+                              McpTypedResult result =
+                                  ValidationResult(std::move(scenario));
+                              context.ThrowIfCancelled();
+                              return result;
+                            }};
   }
   if (kind == McpOperationKind::kResolveScenario) {
     boost::json::object scenario = RequireObject(arguments, "scenario");
     return McpOperationPlan{
         .progress_total = 1U,
-        .executor = [scenario = std::move(scenario)](McpOperationContext&) {
+        .executor = [scenario =
+                         std::move(scenario)](McpOperationContext& context) {
+          context.ThrowIfCancelled();
           try {
+            boost::json::object resolved = ResolveScenario(scenario);
+            context.ThrowIfCancelled();
             return McpTypedResult{.family = McpResultFamily::kScenario,
                                   .value = boost::json::object{
                                       {"result_family", "scenario"},
-                                      {"scenario", ResolveScenario(scenario)}}};
+                                      {"scenario", std::move(resolved)}}};
+          } catch (const McpOperationCancelled&) {
+            throw;
           } catch (const std::exception& error) {
             throw McpOperationFailure("invalid_scenario", error.what(), false);
           }
@@ -277,6 +287,18 @@ McpOperationServiceStats McpDispatcher::Stats() const {
 void McpDispatcher::Shutdown() { operations_.Shutdown(); }
 
 boost::json::value McpDispatcher::InvokeTool(
+    std::string_view name, const boost::json::object& arguments,
+    std::string_view session_id, std::stop_token stop_token) {
+  return operations_.ExecuteSessionRequest(
+      session_id,
+      [&](std::stop_token request_stop_token) {
+        return InvokeToolInSession(name, arguments, session_id,
+                                   request_stop_token);
+      },
+      stop_token);
+}
+
+boost::json::value McpDispatcher::InvokeToolInSession(
     std::string_view name, const boost::json::object& arguments,
     std::string_view session_id, std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
@@ -349,6 +371,17 @@ boost::json::value McpDispatcher::InvokeTool(
 boost::json::value McpDispatcher::ReadResource(std::string_view uri,
                                                std::string_view session_id,
                                                std::stop_token stop_token) {
+  return operations_.ExecuteSessionRequest(
+      session_id,
+      [&](std::stop_token request_stop_token) {
+        return ReadResourceInSession(uri, session_id, request_stop_token);
+      },
+      stop_token);
+}
+
+boost::json::value McpDispatcher::ReadResourceInSession(
+    std::string_view uri, std::string_view session_id,
+    std::stop_token stop_token) {
   constexpr std::string_view kPrefix = "bbp:///";
   if (!uri.starts_with(kPrefix)) {
     throw std::invalid_argument("invalid BBP MCP resource URI");

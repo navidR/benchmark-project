@@ -61,6 +61,68 @@ std::string ReadText(const std::filesystem::path& path) {
   return buffer.str();
 }
 
+std::string ReadText(const std::filesystem::path& path,
+                     std::size_t maximum_bytes, std::stop_token stop_token) {
+  if (maximum_bytes == 0U) {
+    throw std::invalid_argument("maximum text read size must be positive");
+  }
+  const int fd =
+      open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0) {
+    throw IoError(path, "open");
+  }
+  std::string text;
+  try {
+    struct stat status{};
+    if (fstat(fd, &status) != 0) {
+      throw IoError(path, "inspect");
+    }
+    if (!S_ISREG(status.st_mode) || status.st_size < 0) {
+      throw std::runtime_error("text input is not a regular file: " +
+                               path.string());
+    }
+    const std::uintmax_t initial_size =
+        static_cast<std::uintmax_t>(status.st_size);
+    if (initial_size > maximum_bytes) {
+      throw std::runtime_error("text input exceeds byte limit: " +
+                               path.string());
+    }
+    text.reserve(static_cast<std::size_t>(initial_size));
+    std::array<char, 64U * 1024U> buffer{};
+    while (true) {
+      if (stop_token.stop_requested()) {
+        throw std::runtime_error("text read was cancelled");
+      }
+      const ssize_t count = read(fd, buffer.data(), buffer.size());
+      if (count == 0) {
+        break;
+      }
+      if (count < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw IoError(path, "read");
+      }
+      const std::size_t chunk_size = static_cast<std::size_t>(count);
+      if (chunk_size > maximum_bytes - text.size()) {
+        throw std::runtime_error("text input exceeds byte limit: " +
+                                 path.string());
+      }
+      text.append(buffer.data(), chunk_size);
+    }
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("text read was cancelled");
+    }
+  } catch (...) {
+    static_cast<void>(close(fd));
+    throw;
+  }
+  if (close(fd) != 0) {
+    throw IoError(path, "close");
+  }
+  return text;
+}
+
 void WriteText(const std::filesystem::path& path, std::string_view text) {
   int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) {

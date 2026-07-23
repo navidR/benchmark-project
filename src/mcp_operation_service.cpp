@@ -23,6 +23,23 @@ namespace {
 constexpr std::size_t kMaximumIdentifierBytes = 128U;
 thread_local const void* g_mcp_operation_worker = nullptr;
 
+struct McpSessionRequestFrame {
+  const void* implementation;
+  const McpSessionRequestFrame* previous;
+};
+
+thread_local const McpSessionRequestFrame* g_mcp_session_request = nullptr;
+
+bool CurrentThreadHasSessionRequest(const void* implementation) {
+  for (const McpSessionRequestFrame* frame = g_mcp_session_request;
+       frame != nullptr; frame = frame->previous) {
+    if (frame->implementation == implementation) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::string RandomId(std::string_view prefix) {
   std::array<unsigned char, 16U> bytes{};
   std::size_t offset = 0U;
@@ -328,6 +345,8 @@ struct McpOperationService::Impl {
   struct SessionRecord {
     std::size_t active_operations = 0U;
     std::size_t waiters = 0U;
+    std::stop_source request_stop_source;
+    bool closing = false;
     std::map<std::string, SubscriptionRecord, std::less<>> subscriptions;
   };
 
@@ -481,6 +500,10 @@ struct McpOperationService::Impl {
   }
 
   bool CurrentThreadIsWorker() const { return g_mcp_operation_worker == this; }
+
+  bool CurrentThreadIsSessionRequest() const {
+    return CurrentThreadHasSessionRequest(this);
+  }
 
   void CollectDeferredWorkersLocked(std::vector<std::jthread>* workers) {
     const std::thread::id current_thread = std::this_thread::get_id();
@@ -825,6 +848,7 @@ struct McpOperationService::Impl {
 
   void Shutdown() {
     std::vector<std::jthread> workers;
+    std::vector<std::stop_source> stop_sources;
     std::vector<McpServiceNotification> notifications;
     const auto join_workers = [](std::vector<std::jthread>* joinable_workers) {
       for (std::jthread& worker : *joinable_workers) {
@@ -844,7 +868,7 @@ struct McpOperationService::Impl {
       }
       if (shutdown_phase == ShutdownPhase::kStopping) {
         if (shutdown_owner == std::this_thread::get_id() ||
-            CurrentThreadIsWorker()) {
+            CurrentThreadIsWorker() || CurrentThreadIsSessionRequest()) {
           return;
         }
         state_changed.wait(lock, [this] {
@@ -859,6 +883,7 @@ struct McpOperationService::Impl {
       shutdown_phase = ShutdownPhase::kStopping;
       shutdown_owner = std::this_thread::get_id();
       shutdown_owner_is_worker = CurrentThreadIsWorker();
+      shutdown_owner_is_request = CurrentThreadIsSessionRequest();
       stats.accepting = false;
       CollectDeferredWorkersLocked(&workers);
       for (auto& [id, operation] : operations) {
@@ -871,7 +896,7 @@ struct McpOperationService::Impl {
             notifications.push_back(OperationNotification(operation.snapshot));
           }
           if (operation.worker) {
-            operation.worker->request_stop();
+            stop_sources.push_back(operation.worker->get_stop_source());
           }
         }
         if (!operation.worker ||
@@ -881,11 +906,15 @@ struct McpOperationService::Impl {
       }
       for (auto& [session_id, session] : sessions) {
         static_cast<void>(session_id);
+        stop_sources.push_back(session.request_stop_source);
         for (auto& [subscription_id, subscription] : session.subscriptions) {
           static_cast<void>(subscription_id);
           subscription.active = false;
         }
       }
+    }
+    for (std::stop_source& stop_source : stop_sources) {
+      stop_source.request_stop();
     }
     state_changed.notify_all();
     Deliver(std::move(notifications));
@@ -895,7 +924,7 @@ struct McpOperationService::Impl {
     {
       std::unique_lock<std::mutex> lock(mutex);
       shutdown_workers_joined = true;
-      if (!shutdown_owner_is_worker) {
+      if (!shutdown_owner_is_worker && !shutdown_owner_is_request) {
         state_changed.wait(lock,
                            [this] { return SessionWaitersDrainedLocked(); });
         FinalizeShutdownLocked();
@@ -920,6 +949,7 @@ struct McpOperationService::Impl {
   ShutdownPhase shutdown_phase = ShutdownPhase::kRunning;
   std::thread::id shutdown_owner;
   bool shutdown_owner_is_worker = false;
+  bool shutdown_owner_is_request = false;
   bool shutdown_workers_joined = false;
 };
 
@@ -954,9 +984,12 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
         "MCP session removal timeout cannot be negative");
   }
   std::vector<McpServiceNotification> notifications;
+  std::vector<std::stop_source> stop_sources;
   std::vector<std::jthread> workers;
   std::unique_lock<std::mutex> lock(impl_->mutex);
   Impl::SessionRecord& session = impl_->RequireSessionLocked(session_id);
+  session.closing = true;
+  stop_sources.push_back(session.request_stop_source);
   for (auto& [id, operation] : impl_->operations) {
     static_cast<void>(id);
     if (operation.snapshot.session_id != session_id ||
@@ -970,15 +1003,18 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
       notifications.push_back(OperationNotification(operation.snapshot));
     }
     if (operation.worker) {
-      operation.worker->request_stop();
+      stop_sources.push_back(operation.worker->get_stop_source());
     }
   }
   for (auto& [id, subscription] : session.subscriptions) {
     static_cast<void>(id);
     subscription.active = false;
   }
-  impl_->state_changed.notify_all();
   lock.unlock();
+  for (std::stop_source& stop_source : stop_sources) {
+    stop_source.request_stop();
+  }
+  impl_->state_changed.notify_all();
   impl_->Deliver(std::move(notifications));
   lock.lock();
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -1009,6 +1045,70 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
   return true;
 }
 
+boost::json::value McpOperationService::ExecuteSessionRequest(
+    std::string_view session_id, McpSessionRequestHandler handler,
+    std::stop_token stop_token) {
+  if (!handler) {
+    throw std::invalid_argument(
+        "MCP session request handler must be callable");
+  }
+  std::stop_source combined_stop_source;
+  std::stop_token session_stop_token;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->stats.accepting) {
+      throw std::runtime_error("MCP operation service is shutting down");
+    }
+    Impl::SessionRecord& session = impl_->RequireSessionLocked(session_id);
+    if (session.closing) {
+      throw std::runtime_error("MCP operation session is closing");
+    }
+    ++session.waiters;
+    session_stop_token = session.request_stop_source.get_token();
+  }
+
+  std::stop_callback stop_on_request(stop_token, [&] {
+    combined_stop_source.request_stop();
+  });
+  std::stop_callback stop_on_session(session_stop_token, [&] {
+    combined_stop_source.request_stop();
+  });
+  const auto release_request = [&] {
+    {
+      std::lock_guard<std::mutex> lock(impl_->mutex);
+      const auto session = impl_->sessions.find(session_id);
+      if (session == impl_->sessions.end() || session->second.waiters == 0U) {
+        throw std::logic_error(
+            "MCP session request accounting is inconsistent");
+      }
+      --session->second.waiters;
+      if (impl_->shutdown_phase == Impl::ShutdownPhase::kStopping &&
+          impl_->shutdown_owner_is_request &&
+          !impl_->shutdown_owner_is_worker &&
+          impl_->shutdown_workers_joined &&
+          impl_->SessionWaitersDrainedLocked()) {
+        impl_->FinalizeShutdownLocked();
+      }
+    }
+    impl_->state_changed.notify_all();
+  };
+
+  const McpSessionRequestFrame request_frame{impl_.get(),
+                                             g_mcp_session_request};
+  g_mcp_session_request = &request_frame;
+  boost::json::value result;
+  try {
+    result = handler(combined_stop_source.get_token());
+  } catch (...) {
+    g_mcp_session_request = request_frame.previous;
+    release_request();
+    throw;
+  }
+  g_mcp_session_request = request_frame.previous;
+  release_request();
+  return result;
+}
+
 McpOperationSnapshot McpOperationService::Submit(
     std::string_view session_id, McpOperationKind kind,
     std::uint64_t progress_total, McpOperationExecutor executor) {
@@ -1028,6 +1128,9 @@ McpOperationSnapshot McpOperationService::Submit(
       throw std::runtime_error("MCP operation service is shutting down");
     }
     Impl::SessionRecord& session = impl_->RequireSessionLocked(session_id);
+    if (session.closing) {
+      throw std::runtime_error("MCP operation session is closing");
+    }
     if (session.active_operations >= impl_->config.maximum_tasks_per_session) {
       throw std::runtime_error("MCP per-session task capacity reached");
     }
@@ -1097,6 +1200,7 @@ McpOperationSnapshot McpOperationService::GetOperation(
 McpOperationCancellation McpOperationService::CancelOperation(
     std::string_view session_id, std::string_view operation_id) {
   McpOperationCancellation cancellation;
+  std::optional<std::stop_source> stop_source;
   bool notify = false;
   {
     std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -1109,12 +1213,15 @@ McpOperationCancellation McpOperationService::CancelOperation(
       operation.snapshot.state = McpOperationState::kCancelling;
       impl_->IncrementSequenceLocked(&operation.snapshot);
       if (operation.worker) {
-        operation.worker->request_stop();
+        stop_source = operation.worker->get_stop_source();
       }
       cancellation.request_accepted = true;
       notify = true;
     }
     cancellation.operation = operation.snapshot;
+  }
+  if (stop_source) {
+    stop_source->request_stop();
   }
   impl_->state_changed.notify_all();
   if (notify) {
@@ -1190,6 +1297,9 @@ McpSubscriptionSnapshot McpOperationService::CreateSubscription(
     throw std::runtime_error("MCP operation service is shutting down");
   }
   Impl::SessionRecord& session = impl_->RequireSessionLocked(session_id);
+  if (session.closing) {
+    throw std::runtime_error("MCP operation session is closing");
+  }
   if (impl_->next_admission_sequence ==
       std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("MCP subscription admission sequence overflow");

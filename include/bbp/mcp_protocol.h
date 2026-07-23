@@ -11,6 +11,9 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#include "bbp/mcp_registry.h"
 
 namespace bbp {
 
@@ -41,6 +44,11 @@ struct McpProtocolConfig {
   std::uint16_t endpoint_port = 0U;
   std::chrono::milliseconds uninitialized_session_timeout =
       std::chrono::seconds(30);
+  // Empty means the complete registry. A non-empty list is the exact surface
+  // advertised and accepted by this endpoint.
+  std::vector<McpOperationKind> allowed_operations;
+  std::vector<McpInformationFamily> allowed_information_families;
+  bool read_only = false;
 };
 
 using McpToolHandler = std::function<boost::json::value(

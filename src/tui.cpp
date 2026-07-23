@@ -3183,13 +3183,17 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
     bool report_has_backlog = false;
     try {
       if (!live_report) {
-        live_report.emplace(run_root);
+        live_report.emplace(run_root, stop_token);
       }
-      report =
-          &live_report->Refresh(once ? std::numeric_limits<std::size_t>::max()
-                                     : kMaximumReportRecordsPerLiveRefresh);
+      report = &live_report->Refresh(
+          once ? std::numeric_limits<std::size_t>::max()
+               : kMaximumReportRecordsPerLiveRefresh,
+          stop_token);
       report_has_backlog = live_report->last_refresh_stats().has_backlog;
     } catch (const std::exception& e) {
+      if (stop_token.stop_requested()) {
+        return FinishTui(&state, 0);
+      }
       error = e.what();
     }
     state.selected_node = ClampNodeSelection(*report, state.selected_node);

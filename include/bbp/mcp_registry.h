@@ -147,14 +147,35 @@ std::span<const McpNamedCapability> McpResultFamilyRegistry();
 std::span<const std::string_view> McpScenarioMemberRegistry();
 
 boost::json::object BuildMcpCapabilityDocument();
+boost::json::object BuildMcpCapabilityDocument(
+    std::span<const McpOperationKind> operations);
+boost::json::object BuildMcpCapabilityDocument(
+    std::span<const McpOperationKind> operations,
+    std::span<const McpInformationFamily> information_families);
 boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind);
 boost::json::object BuildMcpScenarioSchema();
 boost::json::object BuildMcpWorkloadSchema();
 boost::json::object BuildMcpSimulationCommandSchema();
 boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation);
+boost::json::object BuildMcpOperationInputSchema(
+    McpOperationKind operation,
+    std::span<const McpInformationFamily> information_families);
 boost::json::object BuildMcpResultSchema(McpResultFamily family);
+boost::json::object BuildMcpResultSchema(
+    McpResultFamily family,
+    std::span<const McpOperationKind> operations);
 boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation);
+boost::json::object BuildMcpOperationOutputSchema(
+    McpOperationKind operation,
+    std::span<const McpOperationKind> operations);
 boost::json::array BuildMcpToolRegistry();
+boost::json::array BuildMcpToolRegistry(
+    std::span<const McpOperationKind> operations);
+boost::json::array BuildMcpToolRegistry(
+    std::span<const McpOperationKind> operations,
+    std::span<const McpInformationFamily> information_families);
 boost::json::array BuildMcpResourceRegistry();
+boost::json::array BuildMcpResourceRegistry(
+    std::span<const McpInformationFamily> information_families);
 
 }  // namespace bbp

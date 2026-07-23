@@ -20,6 +20,7 @@ class ApplicationInstanceLock {
  private:
   std::filesystem::path state_directory_;
   int lock_fd_ = -1;
+  bool process_guard_held_ = false;
 };
 
 }  // namespace bbp

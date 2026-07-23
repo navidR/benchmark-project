@@ -145,6 +145,48 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_dispatcher_session_close_drains_a_synchronous_resource_read) {
+  std::atomic<bool> read_started = false;
+  std::atomic<bool> cancellation_seen = false;
+  std::atomic<bool> read_finished = false;
+  McpDispatcher dispatcher(
+      {}, {},
+      [&](McpInformationFamily family, std::string_view session_id,
+          std::stop_token stop_token) {
+        BOOST_CHECK(family == McpInformationFamily::kLogs);
+        BOOST_TEST(session_id == "session-a");
+        read_started.store(true, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!stop_token.stop_requested() &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        cancellation_seen.store(stop_token.stop_requested(),
+                                std::memory_order_release);
+        read_finished.store(true, std::memory_order_release);
+        return boost::json::object{};
+      });
+  dispatcher.SessionHandler()("session-a", true, {});
+  const McpResourceHandler read_resource = dispatcher.ResourceHandler();
+  std::jthread reader([&] {
+    static_cast<void>(
+        read_resource("bbp:///logs", "session-a", std::stop_token{}));
+  });
+  const auto start_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!read_started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < start_deadline) {
+    std::this_thread::yield();
+  }
+
+  BOOST_REQUIRE(read_started.load(std::memory_order_acquire));
+  dispatcher.SessionHandler()("session-a", false, {});
+  BOOST_TEST(cancellation_seen.load(std::memory_order_acquire));
+  BOOST_TEST(read_finished.load(std::memory_order_acquire));
+  reader.join();
+  BOOST_TEST(dispatcher.Stats().sessions == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_dispatcher_subscriptions_filter_and_forward_bounded_notifications) {
   McpDispatcher dispatcher;
   std::atomic<std::size_t> delivered = 0U;

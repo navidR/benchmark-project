@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <string_view>
 
@@ -22,7 +23,8 @@ struct RunReportRefreshStats {
 
 class IncrementalRunReport {
  public:
-  explicit IncrementalRunReport(const std::filesystem::path& run_root);
+  explicit IncrementalRunReport(const std::filesystem::path& run_root,
+                                std::stop_token stop_token = {});
   ~IncrementalRunReport();
 
   IncrementalRunReport(IncrementalRunReport&&) noexcept;
@@ -32,7 +34,8 @@ class IncrementalRunReport {
 
   const boost::json::object& Refresh(
       std::size_t maximum_records_per_file =
-          std::numeric_limits<std::size_t>::max());
+          std::numeric_limits<std::size_t>::max(),
+      std::stop_token stop_token = {});
   const RunReportRefreshStats& last_refresh_stats() const;
 
  private:
@@ -40,10 +43,13 @@ class IncrementalRunReport {
   std::unique_ptr<Impl> impl_;
 };
 
-boost::json::object BuildRunReport(const std::filesystem::path& run_root);
-std::string BuildRunReportJson(const std::filesystem::path& run_root);
+boost::json::object BuildRunReport(const std::filesystem::path& run_root,
+                                   std::stop_token stop_token = {});
+std::string BuildRunReportJson(const std::filesystem::path& run_root,
+                               std::stop_token stop_token = {});
 std::string BuildNodeReportJson(const std::filesystem::path& run_root,
                                 std::string_view node_id,
-                                std::uint64_t operator_command_sequence);
+                                std::uint64_t operator_command_sequence,
+                                std::stop_token stop_token = {});
 
 }  // namespace bbp

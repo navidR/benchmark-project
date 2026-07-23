@@ -45,6 +45,10 @@ struct McpNotification {
   std::string json;
 };
 
+struct McpActiveRequest {
+  std::stop_source stop_source;
+};
+
 enum class McpSessionState {
   kOpening,
   kAwaitingInitialization,
@@ -59,6 +63,8 @@ struct McpSession {
   std::string client_name;
   std::deque<McpNotification> notifications;
   std::uint64_t next_notification_sequence = 1U;
+  std::map<std::string, std::shared_ptr<McpActiveRequest>, std::less<>>
+      active_requests;
 };
 
 struct McpPendingSessionCleanup {
@@ -261,6 +267,26 @@ JsonRpcRequest ParseJsonRpcRequest(const boost::json::value& value) {
   return request;
 }
 
+bool IsJsonRpcNotificationEnvelope(const boost::json::value& value) {
+  if (!value.is_object()) {
+    return false;
+  }
+  const boost::json::object& object = value.as_object();
+  const boost::json::value* version = object.if_contains("jsonrpc");
+  const boost::json::value* method = object.if_contains("method");
+  return version != nullptr && version->is_string() &&
+         version->as_string() == "2.0" && method != nullptr &&
+         method->is_string() && !method->as_string().empty() &&
+         object.if_contains("id") == nullptr;
+}
+
+std::string JsonRpcRequestKey(const boost::json::value& id) {
+  if (!id.is_string() && !id.is_int64() && !id.is_uint64()) {
+    throw std::invalid_argument("JSON-RPC request id is invalid");
+  }
+  return boost::json::serialize(id);
+}
+
 std::optional<std::size_t> ParseCursor(const boost::json::object& params) {
   const boost::json::value* cursor = params.if_contains("cursor");
   if (cursor == nullptr) {
@@ -280,8 +306,70 @@ std::optional<std::size_t> ParseCursor(const boost::json::object& params) {
   return value;
 }
 
-boost::json::object ToolPage(const boost::json::object& params) {
-  const boost::json::array all = BuildMcpToolRegistry();
+bool OperationAllowed(const McpProtocolConfig& config,
+                      McpOperationKind operation) {
+  return config.allowed_operations.empty() ||
+         std::find(config.allowed_operations.begin(),
+                   config.allowed_operations.end(),
+                   operation) != config.allowed_operations.end();
+}
+
+bool InformationFamilyAllowed(const McpProtocolConfig& config,
+                              McpInformationFamily family) {
+  return config.allowed_information_families.empty() ||
+         std::find(config.allowed_information_families.begin(),
+                   config.allowed_information_families.end(),
+                   family) != config.allowed_information_families.end();
+}
+
+std::vector<McpOperationKind> EffectiveOperations(
+    const McpProtocolConfig& config) {
+  if (!config.allowed_operations.empty()) {
+    return config.allowed_operations;
+  }
+  std::vector<McpOperationKind> operations;
+  operations.reserve(static_cast<std::size_t>(McpOperationKind::kCount));
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(McpOperationKind::kCount); ++index) {
+    operations.push_back(static_cast<McpOperationKind>(index));
+  }
+  return operations;
+}
+
+std::vector<McpInformationFamily> EffectiveInformationFamilies(
+    const McpProtocolConfig& config) {
+  if (!config.allowed_information_families.empty()) {
+    return config.allowed_information_families;
+  }
+  std::vector<McpInformationFamily> information_families;
+  information_families.reserve(
+      static_cast<std::size_t>(McpInformationFamily::kCount));
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(McpInformationFamily::kCount);
+       ++index) {
+    information_families.push_back(
+        static_cast<McpInformationFamily>(index));
+  }
+  return information_families;
+}
+
+boost::json::object CapabilityDocument(const McpProtocolConfig& config) {
+  const std::vector<McpOperationKind> operations = EffectiveOperations(config);
+  const std::vector<McpInformationFamily> information_families =
+      EffectiveInformationFamilies(config);
+  boost::json::object document =
+      BuildMcpCapabilityDocument(operations, information_families);
+  document["access_mode"] = config.read_only ? "read_only" : "read_write";
+  return document;
+}
+
+boost::json::object ToolPage(const boost::json::object& params,
+                             const McpProtocolConfig& config) {
+  const std::vector<McpOperationKind> operations = EffectiveOperations(config);
+  const std::vector<McpInformationFamily> information_families =
+      EffectiveInformationFamilies(config);
+  const boost::json::array all =
+      BuildMcpToolRegistry(operations, information_families);
   const std::size_t begin = ParseCursor(params).value_or(0U);
   if (begin > all.size()) {
     throw std::invalid_argument("tool cursor is out of range");
@@ -299,8 +387,12 @@ boost::json::object ToolPage(const boost::json::object& params) {
   return result;
 }
 
-boost::json::object ResourcePage(const boost::json::object& params) {
-  const boost::json::array all = BuildMcpResourceRegistry();
+boost::json::object ResourcePage(const boost::json::object& params,
+                                 const McpProtocolConfig& config) {
+  const std::vector<McpInformationFamily> information_families =
+      EffectiveInformationFamilies(config);
+  const boost::json::array all =
+      BuildMcpResourceRegistry(information_families);
   const std::size_t begin = ParseCursor(params).value_or(0U);
   if (begin > all.size()) {
     throw std::invalid_argument("resource cursor is out of range");
@@ -318,24 +410,63 @@ boost::json::object ResourcePage(const boost::json::object& params) {
   return result;
 }
 
-bool RegisteredTool(std::string_view name) {
-  return std::any_of(McpOperationRegistry().begin(),
-                     McpOperationRegistry().end(),
-                     [name](const McpNamedCapability& operation) {
-                       return operation.name == name;
-                     });
+std::optional<McpOperationKind> RegisteredTool(std::string_view name) {
+  const std::span<const McpNamedCapability> operations = McpOperationRegistry();
+  const auto found = std::find_if(operations.begin(), operations.end(),
+                                  [name](const McpNamedCapability& operation) {
+                                    return operation.name == name;
+                                  });
+  if (found == operations.end()) {
+    return std::nullopt;
+  }
+  return static_cast<McpOperationKind>(
+      static_cast<std::size_t>(found - operations.begin()));
 }
 
-bool RegisteredResource(std::string_view uri) {
+std::optional<McpInformationFamily> RegisteredResource(std::string_view uri) {
   constexpr std::string_view kPrefix = "bbp:///";
   if (!uri.starts_with(kPrefix)) {
-    return false;
+    return std::nullopt;
   }
   const std::string_view name = uri.substr(kPrefix.size());
-  return std::any_of(
-      McpInformationFamilyRegistry().begin(),
-      McpInformationFamilyRegistry().end(),
+  const std::span<const McpNamedCapability> information_families =
+      McpInformationFamilyRegistry();
+  const auto found = std::find_if(
+      information_families.begin(), information_families.end(),
       [name](const McpNamedCapability& family) { return family.name == name; });
+  if (found == information_families.end()) {
+    return std::nullopt;
+  }
+  return static_cast<McpInformationFamily>(
+      static_cast<std::size_t>(found - information_families.begin()));
+}
+
+void ValidateSelectedInformationFamilies(
+    McpOperationKind operation, const boost::json::object& arguments,
+    const McpProtocolConfig& config) {
+  if (operation != McpOperationKind::kQueryEvidence &&
+      operation != McpOperationKind::kCreateSubscription) {
+    return;
+  }
+  const boost::json::value* families = arguments.if_contains("families");
+  if (families == nullptr || !families->is_array()) {
+    return;
+  }
+  for (const boost::json::value& value : families->as_array()) {
+    if (!value.is_string()) {
+      continue;
+    }
+    const std::string uri =
+        "bbp:///" + std::string(value.as_string().data(),
+                                value.as_string().size());
+    const std::optional<McpInformationFamily> family =
+        RegisteredResource(uri);
+    if (family && !InformationFamilyAllowed(config, *family)) {
+      throw std::invalid_argument(
+          "requested BBP information family is unavailable in the current "
+          "endpoint");
+    }
+  }
 }
 
 std::string RequiredString(const boost::json::object& params,
@@ -369,6 +500,36 @@ std::string RequiredClientName(const boost::json::object& params) {
 }  // namespace
 
 struct McpProtocol::Impl {
+  class RequestRegistration {
+   public:
+    RequestRegistration(Impl* implementation, std::string session_id,
+                        std::string request_key,
+                        std::shared_ptr<McpActiveRequest> request)
+        : implementation_(implementation),
+          session_id_(std::move(session_id)),
+          request_key_(std::move(request_key)),
+          request_(std::move(request)) {}
+
+    ~RequestRegistration() {
+      implementation_->FinishRequest(session_id_, request_key_, request_);
+    }
+
+    RequestRegistration(const RequestRegistration&) = delete;
+    RequestRegistration& operator=(const RequestRegistration&) = delete;
+
+    std::stop_token stop_token() const {
+      return request_->stop_source.get_token();
+    }
+
+    void RequestStop() { request_->stop_source.request_stop(); }
+
+   private:
+    Impl* implementation_;
+    std::string session_id_;
+    std::string request_key_;
+    std::shared_ptr<McpActiveRequest> request_;
+  };
+
   Impl(McpProtocolConfig config_value, McpToolHandler tool_handler_value,
        McpResourceHandler resource_handler_value,
        McpSessionHandler session_handler_value)
@@ -388,6 +549,31 @@ struct McpProtocol::Impl {
         std::chrono::milliseconds::zero()) {
       throw std::runtime_error(
           "MCP uninitialized session timeout must be positive");
+    }
+    std::array<bool, static_cast<std::size_t>(McpOperationKind::kCount)> seen{};
+    for (const McpOperationKind operation : config.allowed_operations) {
+      const std::size_t index = static_cast<std::size_t>(operation);
+      if (index >= seen.size() || seen[index]) {
+        throw std::runtime_error(
+            "MCP allowed operation list is invalid or contains duplicates");
+      }
+      seen[index] = true;
+    }
+    std::array<bool, static_cast<std::size_t>(McpInformationFamily::kCount)>
+        seen_information{};
+    for (const McpInformationFamily family :
+         config.allowed_information_families) {
+      const std::size_t index = static_cast<std::size_t>(family);
+      if (index >= seen_information.size() || seen_information[index]) {
+        throw std::runtime_error(
+            "MCP allowed information family list is invalid or contains "
+            "duplicates");
+      }
+      seen_information[index] = true;
+    }
+    if (config.read_only && config.allowed_operations.empty()) {
+      throw std::runtime_error(
+          "read-only MCP protocol requires an explicit operation list");
     }
     deadline_worker = std::jthread(
         [this](std::stop_token stop_token) { ExpirationLoop(stop_token); });
@@ -455,6 +641,71 @@ struct McpProtocol::Impl {
       return false;
     }
     return true;
+  }
+
+  std::unique_ptr<RequestRegistration> RegisterRequest(
+      std::string_view session_id, const boost::json::value& request_id) {
+    const std::string request_key = JsonRpcRequestKey(request_id);
+    auto request = std::make_shared<McpActiveRequest>();
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto session = sessions.find(session_id);
+    if (session == sessions.end() ||
+        session->second.state != McpSessionState::kInitialized) {
+      return {};
+    }
+    if (!session->second.active_requests
+             .emplace(request_key, request)
+             .second) {
+      throw std::invalid_argument(
+          "JSON-RPC request id is already active in this session");
+    }
+    return std::make_unique<RequestRegistration>(
+        this, std::string(session_id), request_key, std::move(request));
+  }
+
+  void FinishRequest(
+      std::string_view session_id, std::string_view request_key,
+      const std::shared_ptr<McpActiveRequest>& expected_request) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto session = sessions.find(session_id);
+      if (session == sessions.end()) {
+        return;
+      }
+      const auto request =
+          session->second.active_requests.find(request_key);
+      if (request != session->second.active_requests.end() &&
+          request->second == expected_request) {
+        session->second.active_requests.erase(request);
+      }
+      state_changed.notify_all();
+    } catch (...) {
+    }
+  }
+
+  void CancelRequest(std::string_view session_id,
+                     const boost::json::object& params) {
+    const boost::json::value* request_id = params.if_contains("requestId");
+    if (request_id == nullptr) {
+      throw std::invalid_argument(
+          "notifications/cancelled requires requestId");
+    }
+    const std::string request_key = JsonRpcRequestKey(*request_id);
+    std::shared_ptr<McpActiveRequest> request;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto session = sessions.find(session_id);
+      if (session == sessions.end()) {
+        return;
+      }
+      const auto active = session->second.active_requests.find(request_key);
+      if (active != session->second.active_requests.end()) {
+        request = active->second;
+      }
+    }
+    if (request) {
+      request->stop_source.request_stop();
+    }
   }
 
   bool FinishExplicitSessionClose(std::string_view session_id,
@@ -758,7 +1009,8 @@ struct McpProtocol::Impl {
                            std::chrono::steady_clock::time_point::max(),
                        .client_name = std::move(client_name),
                        .notifications = {},
-                       .next_notification_sequence = 1U});
+                       .next_notification_sequence = 1U,
+                       .active_requests = {}});
     stats.maximum_sessions = std::max(stats.maximum_sessions, sessions.size());
     return id;
   }
@@ -807,11 +1059,11 @@ struct McpProtocol::Impl {
     capabilities["logging"] = boost::json::object{};
     capabilities["prompts"] = boost::json::object{{"listChanged", false}};
     capabilities["resources"] =
-        boost::json::object{{"subscribe", true}, {"listChanged", false}};
+        boost::json::object{{"subscribe", false}, {"listChanged", false}};
     capabilities["tools"] = boost::json::object{{"listChanged", false}};
     capabilities["completions"] = boost::json::object{};
     capabilities["experimental"] =
-        boost::json::object{{"bbp", BuildMcpCapabilityDocument()}};
+        boost::json::object{{"bbp", CapabilityDocument(config)}};
     return boost::json::object{
         {"protocolVersion", kMcpProtocolVersion},
         {"capabilities", std::move(capabilities)},
@@ -825,13 +1077,17 @@ struct McpProtocol::Impl {
                                   std::string_view session_id,
                                   std::stop_token stop_token) {
     if (uri == "bbp:///capabilities") {
-      return BuildMcpCapabilityDocument();
+      return CapabilityDocument(config);
     }
     if (uri == "bbp:///schemas") {
-      const boost::json::object capabilities = BuildMcpCapabilityDocument();
+      const boost::json::object capabilities = CapabilityDocument(config);
       return boost::json::object{
           {"scenario", BuildMcpScenarioSchema()},
-          {"tools", BuildMcpToolRegistry()},
+          {"tools",
+           BuildMcpToolRegistry(EffectiveOperations(config),
+                                EffectiveInformationFamilies(config))},
+          {"resources",
+           BuildMcpResourceRegistry(EffectiveInformationFamilies(config))},
           {"results", capabilities.at("result_families")}};
     }
     if (!resource_handler) {
@@ -847,10 +1103,10 @@ struct McpProtocol::Impl {
       return boost::json::object{};
     }
     if (request.method == "tools/list") {
-      return ToolPage(request.params);
+      return ToolPage(request.params, config);
     }
     if (request.method == "resources/list") {
-      return ResourcePage(request.params);
+      return ResourcePage(request.params, config);
     }
     if (request.method == "prompts/list") {
       return boost::json::object{{"prompts", boost::json::array{}}};
@@ -867,8 +1123,14 @@ struct McpProtocol::Impl {
     }
     if (request.method == "resources/read") {
       const std::string uri = RequiredString(request.params, "uri");
-      if (!RegisteredResource(uri)) {
+      const std::optional<McpInformationFamily> family =
+          RegisteredResource(uri);
+      if (!family) {
         throw std::invalid_argument("unknown BBP resource URI");
+      }
+      if (!InformationFamilyAllowed(config, *family)) {
+        throw std::invalid_argument(
+            "BBP resource is unavailable in the current endpoint");
       }
       boost::json::value value = ReadResource(uri, session_id, stop_token);
       return boost::json::object{
@@ -879,8 +1141,15 @@ struct McpProtocol::Impl {
     }
     if (request.method == "tools/call") {
       const std::string name = RequiredString(request.params, "name");
-      if (!RegisteredTool(name)) {
+      const std::optional<McpOperationKind> operation = RegisteredTool(name);
+      if (!operation) {
         throw std::invalid_argument("unknown BBP tool");
+      }
+      if (!OperationAllowed(config, *operation)) {
+        throw std::invalid_argument(
+            config.read_only
+                ? "BBP tool is unavailable for a retained read-only run"
+                : "BBP tool is unavailable in the current endpoint");
       }
       boost::json::object arguments;
       if (const boost::json::value* value =
@@ -890,6 +1159,7 @@ struct McpProtocol::Impl {
         }
         arguments = value->as_object();
       }
+      ValidateSelectedInformationFamilies(*operation, arguments, config);
       boost::json::value result;
       try {
         if (!tool_handler) {
@@ -968,10 +1238,8 @@ struct McpProtocol::Impl {
         }
         return JsonResponse(
             http_request,
-            JsonRpcError(request.id, -32001,
-                         "MCP application session capacity reached",
-                         "non-standard exception"),
-            http::status::service_unavailable);
+            JsonRpcError(request.id, -32603, "internal error",
+                         "non-standard callback exception"));
       }
     }
     ArmInitializationDeadline(*session_id);
@@ -1010,8 +1278,13 @@ struct McpProtocol::Impl {
     try {
       request = ParseJsonRpcRequest(parsed);
     } catch (const std::exception& error) {
-      std::lock_guard<std::mutex> lock(mutex);
-      ++stats.malformed_requests;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++stats.malformed_requests;
+      }
+      if (IsJsonRpcNotificationEnvelope(parsed)) {
+        return TextResponse(http_request, http::status::accepted, "");
+      }
       return JsonResponse(
           http_request,
           JsonRpcError(nullptr, -32600, "invalid request", error.what()));
@@ -1062,13 +1335,41 @@ struct McpProtocol::Impl {
               request.id, -32002,
               "MCP session has not received notifications/initialized"));
     }
+    if (request.method == "notifications/cancelled") {
+      if (request.has_id) {
+        return JsonResponse(
+            http_request,
+            JsonRpcError(request.id, -32600,
+                         "notifications/cancelled must not have an id"));
+      }
+      try {
+        CancelRequest(*session_id, request.params);
+      } catch (const std::invalid_argument&) {
+      }
+      return TextResponse(http_request, http::status::accepted, "");
+    }
     if (!request.has_id) {
       return TextResponse(http_request, http::status::accepted, "");
     }
+    std::unique_ptr<RequestRegistration> active_request;
     try {
+      active_request = RegisterRequest(*session_id, request.id);
+    } catch (const std::invalid_argument& error) {
       return JsonResponse(
-          http_request, JsonRpcResult(request.id, Dispatch(request, *session_id,
-                                                           stop_token)));
+          http_request,
+          JsonRpcError(request.id, -32600, "invalid request", error.what()));
+    }
+    if (!active_request) {
+      return TextResponse(http_request, http::status::not_found,
+                          "unknown MCP session");
+    }
+    std::stop_callback stop_on_transport(
+        stop_token, [&] { active_request->RequestStop(); });
+    try {
+      return JsonResponse(http_request,
+                          JsonRpcResult(request.id,
+                                        Dispatch(request, *session_id,
+                                                 active_request->stop_token())));
     } catch (const std::invalid_argument& error) {
       return JsonResponse(
           http_request,
@@ -1080,6 +1381,11 @@ struct McpProtocol::Impl {
       return JsonResponse(
           http_request,
           JsonRpcError(request.id, -32603, "internal error", error.what()));
+    } catch (...) {
+      return JsonResponse(
+          http_request,
+          JsonRpcError(request.id, -32603, "internal error",
+                       "non-standard callback exception"));
     }
   }
 
@@ -1148,6 +1454,7 @@ struct McpProtocol::Impl {
       return TextResponse(request, http::status::not_found,
                           "unknown MCP session");
     }
+    std::vector<std::shared_ptr<McpActiveRequest>> active_requests;
     {
       std::unique_lock<std::mutex> lock(mutex);
       const auto session = sessions.find(session_id);
@@ -1167,6 +1474,15 @@ struct McpProtocol::Impl {
                             "unknown MCP session");
       }
       session->second.state = McpSessionState::kClosing;
+      active_requests.reserve(session->second.active_requests.size());
+      for (const auto& [request_key, active_request] :
+           session->second.active_requests) {
+        static_cast<void>(request_key);
+        active_requests.push_back(active_request);
+      }
+    }
+    for (const auto& active_request : active_requests) {
+      active_request->stop_source.request_stop();
     }
     std::string cleanup_error;
     if (!FinishExplicitSessionClose(session_id, stop_token, &cleanup_error)) {

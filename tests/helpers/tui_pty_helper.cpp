@@ -652,6 +652,43 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   RequireOwnedResourcesRemoved(run_root, 0U, {}, {});
 }
 
+void CheckRetainedMcpLifecycle(const std::filesystem::path& command,
+                               const std::filesystem::path& run_root) {
+  OwnedTemporaryDirectory directory("retained-mcp");
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::filesystem::path mcp_path = home_directory / ".bbp" / "mcp";
+  const std::filesystem::path token_path = mcp_path / "token";
+  const std::filesystem::path client_path = mcp_path / "client.json";
+
+  PtyProcess process(command,
+                     {"--run", run_root.string(), "--refresh-ms", "50"}, 30,
+                     120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "retained MCP TUI"));
+  const std::string client =
+      WaitForFileText(client_path, "\"codex_config_toml\"", 5s);
+  RequireContains(client, "\"run_id\":\"tui-fixture\"",
+                  "retained MCP run identity");
+  RequirePrivateMcpPath(mcp_path, S_IFDIR, 0700);
+  RequirePrivateMcpPath(token_path, S_IFREG, 0600);
+  RequirePrivateMcpPath(client_path, S_IFREG, 0600);
+  if (!process.Running()) {
+    throw std::runtime_error("retained TUI exited while MCP was published");
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(
+      process.ReadUntil("Confirm exit", 3s, "retained MCP exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "retained MCP TUI exit");
+  if (std::filesystem::exists(token_path) ||
+      std::filesystem::exists(client_path)) {
+    throw std::runtime_error("MCP credentials survived retained TUI cleanup");
+  }
+  RequirePrivateMcpPath(mcp_path, S_IFDIR, 0700);
+}
+
 void CheckFiniteDirectLoadOption(const std::filesystem::path& command,
                                  const std::filesystem::path& daemon,
                                  const std::filesystem::path& benchmark_root) {
@@ -1065,6 +1102,16 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
       std::cerr << "empty control-plane regression failed: " << error.what()
                 << '\n';
+      return 1;
+    }
+  }
+  if (argc == 4 && std::string_view(argv[1]) == "--retained-mcp") {
+    try {
+      CheckRetainedMcpLifecycle(argv[2], argv[3]);
+      std::cout << "retained TUI and MCP lifecycle checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "retained MCP regression failed: " << error.what() << '\n';
       return 1;
     }
   }

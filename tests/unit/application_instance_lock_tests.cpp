@@ -83,6 +83,9 @@ BOOST_AUTO_TEST_CASE(
   {
     ApplicationInstanceLock lock(state_directory);
     BOOST_TEST(lock.state_directory() == state_directory);
+    BOOST_CHECK_THROW(
+        static_cast<void>(ApplicationInstanceLock{state_directory}),
+        std::runtime_error);
     BOOST_TEST(ChildAcquisitionResult(state_directory) == 2);
   }
   BOOST_TEST(ChildAcquisitionResult(state_directory) == 0);

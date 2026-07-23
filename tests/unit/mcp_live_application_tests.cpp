@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <boost/json/object.hpp>
 #include <boost/json/serialize.hpp>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "bbp/mcp_dispatcher.h"
 #include "bbp/mcp_live_application.h"
@@ -103,9 +105,20 @@ BOOST_AUTO_TEST_CASE(
   McpLiveApplication application(McpLiveApplication::Config{
       .run_id = "live-application",
       .run_root = temporary.path(),
+      .retained_run = std::nullopt,
       .options = &options,
       .command_queue = &queue,
       .request_run_stop = [&] { stop_requested.store(true); }});
+  const boost::json::value starting_registry = application.ResourceReader()(
+      McpInformationFamily::kRunRegistry, "live-session", std::stop_token{});
+  BOOST_TEST(starting_registry.as_object()
+                 .at("data")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("state")
+                 .as_string() == "starting");
+  application.MarkRunStarted();
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
   dispatcher.SessionHandler()("live-session", true, {});
@@ -189,7 +202,155 @@ BOOST_AUTO_TEST_CASE(
       WaitForTerminal(&dispatcher, stop_submitted);
   BOOST_TEST(stop_terminal.at("state").as_string() == "succeeded");
   BOOST_TEST(stop_requested.load());
+  const boost::json::object rejected_submitted =
+      Invoke(&dispatcher, "simulation.command", command_arguments);
+  const boost::json::object rejected_terminal =
+      WaitForTerminal(&dispatcher, rejected_submitted);
+  BOOST_TEST(rejected_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(rejected_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "run_not_active");
+  const boost::json::value stopping_registry = application.ResourceReader()(
+      McpInformationFamily::kRunRegistry, "live-session", std::stop_token{});
+  BOOST_TEST(stopping_registry.as_object()
+                 .at("data")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("state")
+                 .as_string() == "stopping");
+  application.MarkRunStopped();
+  const boost::json::value stopped_registry = application.ResourceReader()(
+      McpInformationFamily::kRunRegistry, "live-session", std::stop_token{});
+  BOOST_TEST(stopped_registry.as_object()
+                 .at("data")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("state")
+                 .as_string() == "stopped");
 
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_retained_application_is_truthful_read_only_and_uses_persisted_status) {
+  LiveApplicationDirectory temporary;
+  const boost::json::object scenario = LiveScenario();
+  WriteText(temporary.path() / "resolved-scenario.json",
+            boost::json::serialize(ResolveScenario(scenario)) + "\n");
+  AppendLine(
+      temporary.path() / "events.jsonl",
+      R"({"run_id":"live-application","node_id":"sim","event":"run_started"})");
+  AppendLine(
+      temporary.path() / "events.jsonl",
+      R"({"run_id":"live-application","node_id":"sim","event":"run_failed","detail":"expected retained failure"})");
+
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run =
+          McpLiveApplication::RetainedRun{
+              .chain = "firo", .node_count = 1U, .state = "failed"},
+      .request_run_stop = {}});
+  BOOST_TEST(application.read_only());
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kReportRun) != supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kStopRun) == supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kReadArtifact) == supported.end());
+  const std::vector<McpInformationFamily> supported_information =
+      application.SupportedInformationFamilies();
+  BOOST_CHECK(std::find(supported_information.begin(),
+                        supported_information.end(),
+                        McpInformationFamily::kArtifacts) ==
+              supported_information.end());
+  try {
+    static_cast<void>(
+        application.ResourceReader()(McpInformationFamily::kArtifacts,
+                                     "retained-session", std::stop_token{}));
+    BOOST_FAIL("unowned retained artifacts were exposed");
+  } catch (const McpOperationFailure& failure) {
+    BOOST_TEST(failure.code() == "resource_unavailable");
+  }
+
+  const boost::json::object registry =
+      application
+          .ResourceReader()(McpInformationFamily::kRunRegistry,
+                            "retained-session", std::stop_token{})
+          .as_object();
+  BOOST_TEST(registry.at("data")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("state")
+                 .as_string() == "failed");
+
+  const boost::json::object capabilities =
+      application
+          .ResourceReader()(McpInformationFamily::kCapabilities,
+                            "retained-session", std::stop_token{})
+          .as_object()
+          .at("data")
+          .as_object();
+  BOOST_TEST(capabilities.at("access_mode").as_string() == "read_only");
+  BOOST_TEST(capabilities.at("operations").as_array().size() ==
+             supported.size());
+
+  const boost::json::object notifications =
+      application
+          .ResourceReader()(McpInformationFamily::kNotifications,
+                            "retained-session", std::stop_token{})
+          .as_object()
+          .at("data")
+          .as_object();
+  BOOST_TEST(notifications.at("transport").as_string() ==
+             "MCP SSE GET stream");
+  BOOST_TEST(notifications.if_contains("available_through") == nullptr);
+
+  try {
+    static_cast<void>(application.OperationFactory()(
+        McpOperationKind::kReportRun,
+        boost::json::object{{"run_id", "live-application"},
+                            {"include_artifacts", true}},
+        "retained-session"));
+    BOOST_FAIL("unowned retained artifacts were included in a report");
+  } catch (const McpOperationFailure& failure) {
+    BOOST_TEST(failure.code() == "artifact_unavailable");
+  }
+
+  try {
+    static_cast<void>(application.OperationFactory()(
+        McpOperationKind::kStopRun,
+        boost::json::object{{"run_id", "live-application"}},
+        "retained-session"));
+    BOOST_FAIL("retained mutation was accepted");
+  } catch (const McpOperationFailure& failure) {
+    BOOST_TEST(failure.code() == "read_only_run");
+  }
+
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+  const boost::json::object report_terminal = WaitForTerminal(
+      &dispatcher, Invoke(&dispatcher, "run.report",
+                          boost::json::object{{"run_id", "live-application"}}));
+  BOOST_TEST(report_terminal.at("state").as_string() == "succeeded");
+  BOOST_TEST(report_terminal.at("terminal_result")
+                 .as_object()
+                 .at("items")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("data")
+                 .as_object()
+                 .at("status")
+                 .as_string() == "failed");
   dispatcher.Shutdown();
   application.Shutdown();
 }
@@ -230,9 +391,11 @@ BOOST_AUTO_TEST_CASE(
   McpLiveApplication application(
       McpLiveApplication::Config{.run_id = "live-application",
                                  .run_root = temporary.path(),
+                                 .retained_run = std::nullopt,
                                  .options = &options,
                                  .command_queue = &queue,
                                  .request_run_stop = [] {}});
+  application.MarkRunStarted();
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
   dispatcher.SessionHandler()("live-session", true, {});
@@ -373,6 +536,26 @@ BOOST_AUTO_TEST_CASE(
 
   dispatcher.Shutdown();
   application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(mcp_evidence_rejects_records_from_a_different_run) {
+  LiveApplicationDirectory temporary;
+  const RunOwnership ownership =
+      CreateRunOwnership("live-application", temporary.path());
+  WriteRunOwnershipMarker(ownership);
+  AppendLine(
+      temporary.path() / "events.jsonl",
+      R"({"run_id":"other","node_id":"sim","event":"run_failed"})");
+  McpRunEvidenceQuery query;
+  query.families = {McpInformationFamily::kEvents};
+
+  BOOST_CHECK_EXCEPTION(
+      QueryMcpRunEvidence("live-application", temporary.path(), query),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()).find(
+                   "record run_id does not match the selected run") !=
+               std::string::npos;
+      });
 }
 
 BOOST_AUTO_TEST_CASE(

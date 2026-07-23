@@ -1,8 +1,11 @@
 #define BOOST_TEST_MODULE BlockchainBenchmarkProjectUtilTests
 
+#include <unistd.h>
+
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
 #include <filesystem>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -34,4 +37,20 @@ BOOST_AUTO_TEST_CASE(require_executable_rejects_directories) {
   BOOST_CHECK_THROW(
       bbp::RequireExecutable(std::filesystem::temp_directory_path()),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(bounded_text_read_honors_size_and_cancellation) {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("bbp-util-read-" + std::to_string(getpid()));
+  bbp::WriteText(path, "abcdef");
+
+  BOOST_TEST(bbp::ReadText(path, 6U, {}) == "abcdef");
+  BOOST_CHECK_THROW(bbp::ReadText(path, 5U, {}), std::runtime_error);
+  std::stop_source stop_source;
+  stop_source.request_stop();
+  BOOST_CHECK_THROW(bbp::ReadText(path, 6U, stop_source.get_token()),
+                    std::runtime_error);
+
+  std::filesystem::remove(path);
 }

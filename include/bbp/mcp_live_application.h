@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -9,6 +10,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "bbp/mcp_dispatcher.h"
 #include "bbp/simulation_command.h"
@@ -24,9 +26,17 @@ struct Options;
 // outcome publication; report_mutex_ serializes production report snapshots.
 class McpLiveApplication {
  public:
+  struct RetainedRun {
+    std::string chain;
+    std::uint32_t node_count = 0U;
+    std::string state;
+    bool has_owned_artifacts = false;
+  };
+
   struct Config {
     std::string run_id;
     std::filesystem::path run_root;
+    std::optional<RetainedRun> retained_run;
     const Options* options = nullptr;
     SimulationCommandQueue* command_queue = nullptr;
     std::function<void()> request_run_stop;
@@ -40,12 +50,18 @@ class McpLiveApplication {
 
   McpApplicationOperationFactory OperationFactory();
   McpApplicationResourceReader ResourceReader();
+  std::vector<McpOperationKind> SupportedOperations() const;
+  std::vector<McpInformationFamily> SupportedInformationFamilies() const;
+  bool read_only() const;
 
   // Called exactly once by SimulationCommandProcessor for commands submitted
   // through this service. Outcomes for unrelated TUI/scenario commands are
   // deliberately ignored and therefore do not consume retained state.
   void RecordCommandOutcome(const SimulationCommand& command,
                             std::optional<std::string_view> error);
+  void MarkRunStarted();
+  void MarkRunStopping();
+  void MarkRunStopped();
   void Shutdown();
 
  private:
@@ -66,14 +82,18 @@ class McpLiveApplication {
                                             std::stop_token stop_token);
   boost::json::object ReportSnapshot(std::stop_token stop_token);
   std::string RunState() const;
+  std::string CurrentChain() const;
+  std::uint32_t NodeCount() const;
 
   Config config_;
   mutable std::mutex mutex_;
   std::condition_variable command_outcome_ready_;
   std::map<std::uint64_t, PendingCommand> pending_commands_;
+  bool run_started_ = false;
   bool stop_requested_ = false;
+  bool run_stopped_ = false;
   bool shutdown_ = false;
-  std::mutex report_mutex_;
+  std::timed_mutex report_mutex_;
 };
 
 }  // namespace bbp

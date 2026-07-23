@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,33 @@ namespace {
 
 constexpr std::string_view kStateDirectoryName = ".bbp";
 constexpr std::string_view kLockFileName = "bbp.lock";
+
+std::atomic<pid_t>& LocalProcessLockOwner() {
+  static std::atomic<pid_t> owner{0};
+  return owner;
+}
+
+void AcquireLocalProcessGuard() {
+  std::atomic<pid_t>& owner = LocalProcessLockOwner();
+  const pid_t current_pid = getpid();
+  pid_t observed = owner.load(std::memory_order_acquire);
+  for (;;) {
+    if (observed == current_pid) {
+      throw std::runtime_error("another BBP instance is already running");
+    }
+    if (owner.compare_exchange_weak(observed, current_pid,
+                                    std::memory_order_acq_rel,
+                                    std::memory_order_acquire)) {
+      return;
+    }
+  }
+}
+
+void ReleaseLocalProcessGuard() noexcept {
+  pid_t expected = getpid();
+  static_cast<void>(LocalProcessLockOwner().compare_exchange_strong(
+      expected, 0, std::memory_order_release, std::memory_order_relaxed));
+}
 
 std::runtime_error SystemError(std::string_view action,
                                const std::filesystem::path& path,
@@ -105,18 +133,21 @@ ApplicationInstanceLock::ApplicationInstanceLock()
 ApplicationInstanceLock::ApplicationInstanceLock(
     std::filesystem::path state_directory)
     : state_directory_(std::move(state_directory)) {
-  const int state_directory_fd = OpenPrivateStateDirectory(state_directory_);
+  AcquireLocalProcessGuard();
+  process_guard_held_ = true;
   const std::filesystem::path lock_path = state_directory_ / kLockFileName;
-  lock_fd_ =
-      openat(state_directory_fd, kLockFileName.data(),
-             O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
-  const int open_error = errno;
-  close(state_directory_fd);
-  if (lock_fd_ < 0) {
-    throw SystemError("open BBP instance lock", lock_path, open_error);
-  }
-
   try {
+    const int state_directory_fd =
+        OpenPrivateStateDirectory(state_directory_);
+    lock_fd_ =
+        openat(state_directory_fd, kLockFileName.data(),
+               O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+               S_IRUSR | S_IWUSR);
+    const int open_error = errno;
+    close(state_directory_fd);
+    if (lock_fd_ < 0) {
+      throw SystemError("open BBP instance lock", lock_path, open_error);
+    }
     struct stat status{};
     if (fstat(lock_fd_, &status) != 0) {
       throw SystemError("inspect BBP instance lock", lock_path);
@@ -149,6 +180,10 @@ ApplicationInstanceLock::ApplicationInstanceLock(
   } catch (...) {
     close(lock_fd_);
     lock_fd_ = -1;
+    if (process_guard_held_) {
+      ReleaseLocalProcessGuard();
+      process_guard_held_ = false;
+    }
     throw;
   }
 }
@@ -156,6 +191,9 @@ ApplicationInstanceLock::ApplicationInstanceLock(
 ApplicationInstanceLock::~ApplicationInstanceLock() {
   if (lock_fd_ >= 0) {
     close(lock_fd_);
+  }
+  if (process_guard_held_) {
+    ReleaseLocalProcessGuard();
   }
 }
 

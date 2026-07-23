@@ -11,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 
@@ -89,6 +90,36 @@ boost::json::object TransactionLoadProgressDetail(
 }
 
 }  // namespace
+
+BOOST_AUTO_TEST_CASE(run_report_honors_pre_requested_cancellation) {
+  const std::filesystem::path dir = MakeTestDir("cancelled-report");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"cancelled","chain":"firo","nodes":1})");
+  std::stop_source stop_source;
+  stop_source.request_stop();
+
+  BOOST_CHECK_THROW(bbp::BuildRunReport(dir, stop_source.get_token()),
+                    std::runtime_error);
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(run_report_rejects_records_from_a_different_run) {
+  const std::filesystem::path dir = MakeTestDir("mismatched-run-record");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"expected","chain":"firo","nodes":1})");
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      R"({"run_id":"other","node_id":"sim","event":"run_failed"})");
+
+  BOOST_CHECK_EXCEPTION(
+      bbp::BuildRunReport(dir), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()).find(
+                   "run_id does not match resolved scenario") !=
+               std::string::npos;
+      });
+  std::filesystem::remove_all(dir);
+}
 
 BOOST_AUTO_TEST_CASE(item10_prefixed_report_retention_reproducer) {
   const std::filesystem::path dir = MakeTestDir("item10-prefixed-report");

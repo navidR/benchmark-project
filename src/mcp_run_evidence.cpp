@@ -1109,6 +1109,13 @@ boost::json::object QueryMcpRunEvidence(std::string_view run_id,
     if (!parsed.is_object()) {
       throw std::runtime_error("MCP evidence record is not a JSON object");
     }
+    const boost::json::value* record_run_id =
+        parsed.as_object().if_contains("run_id");
+    if (record_run_id == nullptr || !record_run_id->is_string() ||
+        record_run_id->as_string() != run_id) {
+      throw std::runtime_error(
+          "MCP evidence record run_id does not match the selected run");
+    }
     const bool node_matches = MatchesNode(node_ids, parsed.as_object());
     const std::size_t first_family =
         had_pending_family ? cursor.pending_family : 0U;

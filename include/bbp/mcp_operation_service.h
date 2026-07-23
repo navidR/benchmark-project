@@ -105,6 +105,8 @@ class McpOperationContext {
 
 using McpOperationExecutor =
     std::function<McpTypedResult(McpOperationContext&)>;
+using McpSessionRequestHandler =
+    std::function<boost::json::value(std::stop_token)>;
 
 struct McpEvidenceRecord {
   McpInformationFamily family = McpInformationFamily::kCount;
@@ -184,6 +186,9 @@ class McpOperationService {
   void RegisterSession(std::string session_id);
   bool RemoveSession(std::string_view session_id,
                      std::chrono::milliseconds timeout);
+  boost::json::value ExecuteSessionRequest(
+      std::string_view session_id, McpSessionRequestHandler handler,
+      std::stop_token stop_token = {});
 
   McpOperationSnapshot Submit(std::string_view session_id,
                               McpOperationKind kind,

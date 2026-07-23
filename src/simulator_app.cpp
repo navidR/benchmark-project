@@ -13956,17 +13956,64 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
   return boost::json::serialize(detail);
 }
 
-int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
-                         const std::filesystem::path& state_directory,
+void PrepareManagedRunRoot(Options* options) {
+  const std::filesystem::path run_root = BenchmarkRunRoot(*options);
+  if (std::filesystem::exists(run_root)) {
+    if (!options->replace_run) {
+      throw std::runtime_error(
+          "run directory already exists: " + run_root.string() +
+          " (use --replace-run to remove it)");
+    }
+    const RunOwnership previous_ownership =
+        LoadRunOwnership(options->run_id, run_root);
+    Cgroup::RemoveStaleRun(previous_ownership);
+    std::error_code ec;
+    std::filesystem::remove_all(run_root, ec);
+    if (ec) {
+      throw std::runtime_error("remove existing run directory failed: " +
+                               ec.message());
+    }
+  }
+  EnsureDirectory(run_root);
+  options->run_ownership = CreateRunOwnership(options->run_id, run_root);
+  WriteRunOwnershipMarker(RequireRunOwnership(*options));
+  AttachRunLogFile(run_root);
+  BBP_LOG(info) << "starting run " << options->run_id;
+  EnsureDirectory(run_root / "nodes");
+}
+
+void RemovePreparedRunRoot(const Options& options) {
+  const RunOwnership& expected = RequireRunOwnership(options);
+  const RunOwnership loaded =
+      LoadRunOwnership(options.run_id, expected.run_root);
+  if (loaded != expected) {
+    throw std::runtime_error(
+        "refusing to remove a prepared run with changed ownership: " +
+        expected.run_root.string());
+  }
+  std::error_code error;
+  std::filesystem::remove_all(expected.run_root, error);
+  if (error) {
+    throw std::runtime_error("remove prepared run directory failed: " +
+                             error.message());
+  }
+  if (std::filesystem::exists(expected.run_root)) {
+    throw std::runtime_error("prepared run directory survived cleanup: " +
+                             expected.run_root.string());
+  }
+}
+
+int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
+                         McpLiveApplication& mcp_application,
+                         std::stop_source& simulation_stop_source,
                          std::stop_token external_stop_token = {}) {
-  std::stop_source simulation_stop_source;
   std::stop_callback stop_simulation_on_external_request(
-      external_stop_token,
-      [&simulation_stop_source] { simulation_stop_source.request_stop(); });
+      external_stop_token, [&] {
+        mcp_application.MarkRunStopping();
+        simulation_stop_source.request_stop();
+      });
   const std::stop_token stop_token = simulation_stop_source.get_token();
-  SimulationCommandQueue scenario_command_queue;
-  SimulationCommandQueue* active_command_queue =
-      command_queue != nullptr ? command_queue : &scenario_command_queue;
+  SimulationCommandQueue* active_command_queue = &command_queue;
   std::mutex scheduled_command_outcome_mutex;
   std::condition_variable_any scheduled_command_outcome_ready;
   std::map<std::uint32_t, std::optional<std::string>>
@@ -14003,74 +14050,20 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         return outcome;
       };
   const auto run_root = BenchmarkRunRoot(options);
-  if (std::filesystem::exists(run_root)) {
-    if (!options.replace_run) {
-      throw std::runtime_error(
-          "run directory already exists: " + run_root.string() +
-          " (use --replace-run to remove it)");
-    }
-    const RunOwnership previous_ownership =
-        LoadRunOwnership(options.run_id, run_root);
-    Cgroup::RemoveStaleRun(previous_ownership);
-    std::error_code ec;
-    std::filesystem::remove_all(run_root, ec);
-    if (ec) {
-      throw std::runtime_error("remove existing run directory failed: " +
-                               ec.message());
-    }
-  }
-  EnsureDirectory(run_root);
-  options.run_ownership = CreateRunOwnership(options.run_id, run_root);
-  WriteRunOwnershipMarker(RequireRunOwnership(options));
-  AttachRunLogFile(run_root);
-  BBP_LOG(info) << "starting run " << options.run_id;
-  EnsureDirectory(run_root / "nodes");
-  std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
-  if (options.isolate_network && !options.empty_control_plane) {
-    network_allocation_lock = std::make_unique<NetworkAllocationLock>();
-    RequireRunNetworkInterfacesAvailable(options, stop_token);
-    options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
-        options.run_id, options.nodes, ListIpv4Routes(stop_token));
-  }
+  static_cast<void>(RequireRunOwnership(options));
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   RuntimePeerTopology runtime_topology(options.topology.peer_topology,
                                        options.nodes,
                                        options.empty_control_plane);
   SimulationRegistry simulation_registry = SimulationRegistry::FromTopology(
       options.topology, options.wallet_initialization);
-  WriteScenarioFiles(options, run_root, chain_spec);
 
   const auto events_path = run_root / "events.jsonl";
   const auto metrics_path = run_root / "metrics.jsonl";
   const auto wallet_metrics_path = run_root / "wallet-metrics.jsonl";
   WriteEvent(events_path, options.run_id, "sim",
              SimulationEventKind::kRunStarted);
-
-  McpLiveApplication mcp_application(
-      McpLiveApplication::Config{.run_id = options.run_id,
-                                 .run_root = run_root,
-                                 .options = &options,
-                                 .command_queue = active_command_queue,
-                                 .request_run_stop = [&simulation_stop_source] {
-                                   simulation_stop_source.request_stop();
-                                 }});
-  McpEndpoint mcp_endpoint(McpEndpointConfig{.state_directory = state_directory,
-                                             .run_id = options.run_id,
-                                             .server = {},
-                                             .dispatcher = {}},
-                           mcp_application.OperationFactory(),
-                           mcp_application.ResourceReader());
-  try {
-    mcp_endpoint.Start();
-    const McpEndpointPublication publication = mcp_endpoint.publication();
-    BBP_LOG(info) << "MCP endpoint listening at " << publication.endpoint
-                  << "; client_config="
-                  << publication.client_config_file.string();
-  } catch (const std::exception& error) {
-    WriteEvent(events_path, options.run_id, "sim",
-               SimulationEventKind::kRunFailed, error.what());
-    throw;
-  }
+  mcp_application.MarkRunStarted();
 
   std::unique_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
   ChainDriver& driver = *driver_owner;
@@ -14181,6 +14174,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     }
   };
   const auto handle_run_failure = [&](std::string_view detail) {
+    mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
     cleanup_step("command processor shutdown", stop_command_processor);
@@ -14231,9 +14225,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         WriteNodeLogTails(events_path, options, driver, nodes);
       });
     }
-    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
+    mcp_application.MarkRunStopped();
   };
   const auto handle_run_cancellation = [&]() {
+    mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
     cleanup_step("command processor shutdown", stop_command_processor);
@@ -14262,10 +14257,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRunFinished);
     });
-    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
+    mcp_application.MarkRunStopped();
     BBP_LOG(info) << "cancelled run " << options.run_id;
   };
   const auto handle_simulation_duration = [&]() {
+    mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
     cleanup_step("command processor shutdown", stop_command_processor);
@@ -14307,7 +14303,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRunFinished);
     });
-    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
+    mcp_application.MarkRunStopped();
     BBP_LOG(info) << "simulation duration reached for run " << options.run_id;
   };
   const bool timed_node_lifecycle = HasTimedNodeLifecycle(options);
@@ -14325,7 +14321,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
         const auto duration_deadline = SteadyDeadline(epoch, wall_duration);
         duration_timer.emplace([duration_deadline, &simulation_duration_reached,
                                 &duration_stop_requested_at_ms,
-                                &simulation_stop_source,
+                                &mcp_application, &simulation_stop_source,
                                 epoch](std::stop_token timer_stop_token) {
           try {
             WaitUntil(duration_deadline, timer_stop_token);
@@ -14336,16 +14332,20 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
               ElapsedMilliseconds(epoch, std::chrono::steady_clock::now()),
               std::memory_order_release);
           simulation_duration_reached.store(true, std::memory_order_release);
+          mcp_application.MarkRunStopping();
           simulation_stop_source.request_stop();
         });
       };
-  try {
-    Cgroup::PrepareRun(RequireRunOwnership(options).cgroup_name);
-  } catch (const std::exception& error) {
-    WriteEvent(events_path, options.run_id, "sim",
-               SimulationEventKind::kRunFailed, error.what());
-    cleanup_step("MCP endpoint shutdown", [&] { mcp_endpoint.Stop(); });
-    throw;
+  if (!options.empty_control_plane) {
+    try {
+      Cgroup::PrepareRun(RequireRunOwnership(options).cgroup_name);
+    } catch (const std::exception& error) {
+      mcp_application.MarkRunStopping();
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kRunFailed, error.what());
+      mcp_application.MarkRunStopped();
+      throw;
+    }
   }
   lifecycle_epoch = std::chrono::steady_clock::now();
   event_engine_epoch = lifecycle_epoch;
@@ -14356,7 +14356,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     StartNodes(options, run_root, events_path, chain_spec, driver,
                runtime_topology, nodes, run_process_state, lifecycle_epoch,
                stop_token);
-    network_allocation_lock.reset();
     PublishOperatorConnectionCommand(options, run_root, events_path, driver,
                                      nodes, &operator_connection_resolved);
     const std::vector<std::uint32_t> miner_indexes =
@@ -15248,6 +15247,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
             lifecycle_failure = std::current_exception();
           }
         }
+        mcp_application.MarkRunStopping();
         simulation_stop_source.request_stop();
       }
     });
@@ -15697,6 +15697,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
 
     metrics_collector->Wait();
     ThrowIfStopRequested(stop_token);
+    mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
     stop_command_processor();
@@ -15715,7 +15716,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
     log_collector->Stop();
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRunFinished);
-    mcp_endpoint.Stop();
+    mcp_application.MarkRunStopped();
     BBP_LOG(info) << "finished run " << options.run_id;
   } catch (const SimulationCancelled&) {
     stop_lifecycle_supervisor();
@@ -15751,41 +15752,43 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue* command_queue,
   return 0;
 }
 
-int RunBenchmarkWithTui(Options options,
-                        const std::filesystem::path& state_directory,
-                        std::stop_token signal_stop_token) {
+int RunBenchmarkWithTui(Options options, SimulationCommandQueue& command_queue,
+                        McpLiveApplication& mcp_application,
+                        std::stop_source& simulation_stop_source,
+                        std::stop_source& application_stop_source) {
   SetConsoleLoggingEnabled(false);
   try {
     const auto run_root = BenchmarkRunRoot(options);
     std::exception_ptr simulation_failure;
     std::exception_ptr tui_failure;
     int simulation_result = 1;
-    SimulationCommandQueue command_queue;
-    std::stop_source stop_source;
-    std::stop_callback cancel_on_signal(signal_stop_token, [&] {
-      stop_source.request_stop();
-      command_queue.Close();
-    });
 
     std::thread simulation_thread([&options, &simulation_failure,
                                    &simulation_result, &command_queue,
-                                   &state_directory, &stop_source]() {
+                                   &mcp_application, &simulation_stop_source,
+                                   &application_stop_source]() {
       try {
         simulation_result = RunBenchmarkHeadless(
-            options, &command_queue, state_directory, stop_source.get_token());
+            options, command_queue, mcp_application, simulation_stop_source,
+            application_stop_source.get_token());
       } catch (...) {
+        mcp_application.MarkRunStopping();
+        application_stop_source.request_stop();
+        command_queue.Close();
+        mcp_application.MarkRunStopped();
         simulation_failure = std::current_exception();
       }
     });
 
     int tui_result = 1;
     try {
-      tui_result = RunTuiReport(run_root, false, options.tui_refresh_ms,
-                                &command_queue, stop_source.get_token());
+      tui_result =
+          RunTuiReport(run_root, false, options.tui_refresh_ms, &command_queue,
+                       application_stop_source.get_token());
     } catch (...) {
       tui_failure = std::current_exception();
     }
-    stop_source.request_stop();
+    application_stop_source.request_stop();
     command_queue.Close();
     simulation_thread.join();
 
@@ -15811,6 +15814,107 @@ std::filesystem::path ResolveRunReference(
     return reference;
   }
   return benchmark_root / reference;
+}
+
+struct RetainedRunContext {
+  std::string run_id;
+  McpLiveApplication::RetainedRun metadata;
+};
+
+RetainedRunContext LoadRetainedRunContext(
+    const std::filesystem::path& run_root) {
+  const boost::json::object report = BuildRunReport(run_root);
+  const std::string run_id = JsonStringField(report, "run_id");
+  RequireSafeScenarioIdentifier(run_id, "retained run id");
+  const std::string chain = JsonStringField(report, "chain");
+  static_cast<void>(ParseChainKind(chain));
+  const std::string state = JsonStringField(report, "status");
+  if (state != "finished" && state != "failed" && state != "cancelled" &&
+      state != "incomplete") {
+    throw std::runtime_error("invalid retained run status: " + state);
+  }
+  bool has_owned_artifacts = false;
+  try {
+    static_cast<void>(LoadRunOwnership(run_id, run_root));
+    has_owned_artifacts = true;
+  } catch (const std::exception&) {
+    // Reports from older or externally copied runs remain readable, but their
+    // files are not exposed without a valid ownership marker.
+  }
+  return RetainedRunContext{.run_id = run_id,
+                            .metadata = McpLiveApplication::RetainedRun{
+                                .chain = chain,
+                                .node_count = JsonUint32Field(report, "nodes"),
+                                .state = state,
+                                .has_owned_artifacts = has_owned_artifacts}};
+}
+
+int RunRetainedTuiWithMcp(const Options& cli_options,
+                          const std::filesystem::path& run_root,
+                          const std::filesystem::path& state_directory) {
+  const RetainedRunContext retained = LoadRetainedRunContext(run_root);
+  SignalStopMonitor signal_monitor;
+  McpLiveApplication mcp_application(
+      McpLiveApplication::Config{.run_id = retained.run_id,
+                                 .run_root = run_root,
+                                 .retained_run = retained.metadata,
+                                 .request_run_stop = {}});
+  McpEndpoint mcp_endpoint(
+      McpEndpointConfig{
+          .state_directory = state_directory,
+          .run_id = retained.run_id,
+          .server = {},
+          .dispatcher = {},
+          .allowed_operations = mcp_application.SupportedOperations(),
+          .allowed_information_families =
+              mcp_application.SupportedInformationFamilies(),
+          .read_only = mcp_application.read_only()},
+      mcp_application.OperationFactory(), mcp_application.ResourceReader());
+
+  SetConsoleLoggingEnabled(false);
+  std::exception_ptr application_failure;
+  int result = 1;
+  try {
+    mcp_endpoint.Start();
+    result =
+        RunTuiReport(run_root, cli_options.tui_once, cli_options.tui_refresh_ms,
+                     nullptr, signal_monitor.GetToken());
+  } catch (...) {
+    application_failure = std::current_exception();
+  }
+
+  std::exception_ptr cleanup_failure;
+  const auto capture_cleanup_failure = [&](auto&& action) {
+    try {
+      action();
+    } catch (...) {
+      if (!cleanup_failure) {
+        cleanup_failure = std::current_exception();
+      }
+    }
+  };
+  bool endpoint_drained = false;
+  capture_cleanup_failure([&] {
+    mcp_endpoint.StopAdmissionAndDrain();
+    endpoint_drained = true;
+  });
+  if (endpoint_drained) {
+    capture_cleanup_failure([&] { mcp_application.Shutdown(); });
+    capture_cleanup_failure([&] { mcp_endpoint.Stop(); });
+  }
+  SetConsoleLoggingEnabled(true);
+
+  if (application_failure) {
+    std::rethrow_exception(application_failure);
+  }
+  if (cleanup_failure) {
+    std::rethrow_exception(cleanup_failure);
+  }
+  if (signal_monitor.ReceivedSignal() != 0) {
+    BBP_LOG(info) << "graceful shutdown completed after signal "
+                  << signal_monitor.ReceivedSignal();
+  }
+  return result;
 }
 
 }  // namespace
@@ -15866,9 +15970,9 @@ int SimulatorApp::Run(int argc, char** argv) {
     return 0;
   }
   if (!options.tui_run.empty()) {
-    return RunTuiReport(
-        ResolveRunReference(options.output_dir, options.tui_run),
-        options.tui_once, options.tui_refresh_ms);
+    return RunRetainedTuiWithMcp(
+        options, ResolveRunReference(options.output_dir, options.tui_run),
+        instance_lock.state_directory());
   }
   if (options.probe_capabilities) {
     BBP_LOG(info) << CapabilityProbeJson();
@@ -15942,20 +16046,141 @@ int SimulatorApp::Run(int argc, char** argv) {
     CleanupRun(options);
     return 0;
   }
-  if (options.no_tui) {
-    SignalStopMonitor signal_monitor;
-    const int result =
-        RunBenchmarkHeadless(options, nullptr, instance_lock.state_directory(),
-                             signal_monitor.GetToken());
-    if (signal_monitor.ReceivedSignal() != 0) {
-      BBP_LOG(info) << "graceful shutdown completed after signal "
-                    << signal_monitor.ReceivedSignal();
-    }
-    return result;
-  }
+
   SignalStopMonitor signal_monitor;
-  const int result = RunBenchmarkWithTui(
-      options, instance_lock.state_directory(), signal_monitor.GetToken());
+  SimulationCommandQueue command_queue;
+  std::stop_source simulation_stop_source;
+  std::stop_source application_stop_source;
+  const std::filesystem::path run_root = BenchmarkRunRoot(options);
+  McpLiveApplication mcp_application(
+      McpLiveApplication::Config{.run_id = options.run_id,
+                                 .run_root = run_root,
+                                 .retained_run = std::nullopt,
+                                 .options = &options,
+                                 .command_queue = &command_queue,
+                                 .request_run_stop = [&] {
+                                   simulation_stop_source.request_stop();
+                                   command_queue.Close();
+                                 }});
+  std::stop_callback cancel_on_signal(signal_monitor.GetToken(), [&] {
+    mcp_application.MarkRunStopping();
+    application_stop_source.request_stop();
+    simulation_stop_source.request_stop();
+    command_queue.Close();
+  });
+  McpEndpoint mcp_endpoint(
+      McpEndpointConfig{
+          .state_directory = instance_lock.state_directory(),
+          .run_id = options.run_id,
+          .server = {},
+          .dispatcher = {},
+          .allowed_operations = mcp_application.SupportedOperations(),
+          .allowed_information_families =
+              mcp_application.SupportedInformationFamilies(),
+          .read_only = false},
+      mcp_application.OperationFactory(), mcp_application.ResourceReader());
+
+  std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
+  bool run_prepared = false;
+  try {
+    if (simulation_stop_source.stop_requested()) {
+      return 0;
+    }
+    PrepareManagedRunRoot(&options);
+    run_prepared = true;
+    const std::stop_token setup_stop_token =
+        simulation_stop_source.get_token();
+    if (options.isolate_network && !options.empty_control_plane) {
+      network_allocation_lock = std::make_unique<NetworkAllocationLock>();
+      RequireRunNetworkInterfacesAvailable(options, setup_stop_token);
+      options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
+          options.run_id, options.nodes, ListIpv4Routes(setup_stop_token));
+    }
+    ThrowIfStopRequested(setup_stop_token);
+    WriteScenarioFiles(options, run_root, ChainDriverSpecFor(options.chain));
+    ThrowIfStopRequested(setup_stop_token);
+    mcp_endpoint.Start();
+  } catch (...) {
+    const std::exception_ptr setup_failure = std::current_exception();
+    std::exception_ptr setup_cleanup_failure;
+    const auto capture_setup_cleanup_failure = [&](auto&& action) {
+      try {
+        action();
+      } catch (...) {
+        if (!setup_cleanup_failure) {
+          setup_cleanup_failure = std::current_exception();
+        }
+      }
+    };
+    bool endpoint_drained = false;
+    capture_setup_cleanup_failure([&] {
+      mcp_endpoint.StopAdmissionAndDrain();
+      endpoint_drained = true;
+    });
+    if (endpoint_drained) {
+      capture_setup_cleanup_failure([&] { mcp_application.Shutdown(); });
+      if (run_prepared) {
+        capture_setup_cleanup_failure(
+            [&] { RemovePreparedRunRoot(options); });
+      }
+      capture_setup_cleanup_failure([&] { mcp_endpoint.Stop(); });
+    }
+    if (setup_cleanup_failure) {
+      throw std::runtime_error(
+          "run setup failed: " + ExceptionMessage(setup_failure) +
+          "; setup cleanup also failed: " +
+          ExceptionMessage(setup_cleanup_failure));
+    }
+    std::rethrow_exception(setup_failure);
+  }
+  const McpEndpointPublication publication = mcp_endpoint.publication();
+  BBP_LOG(info) << "MCP endpoint listening at " << publication.endpoint
+                << "; client_config="
+                << publication.client_config_file.string();
+
+  int result = 1;
+  std::exception_ptr application_failure;
+  try {
+    if (options.no_tui) {
+      result = RunBenchmarkHeadless(options, command_queue, mcp_application,
+                                    simulation_stop_source,
+                                    application_stop_source.get_token());
+    } else {
+      result =
+          RunBenchmarkWithTui(options, command_queue, mcp_application,
+                              simulation_stop_source, application_stop_source);
+    }
+  } catch (...) {
+    application_failure = std::current_exception();
+  }
+
+  std::exception_ptr cleanup_failure;
+  const auto capture_cleanup_failure = [&](auto&& action) {
+    try {
+      action();
+    } catch (...) {
+      if (!cleanup_failure) {
+        cleanup_failure = std::current_exception();
+      }
+    }
+  };
+  bool endpoint_drained = false;
+  capture_cleanup_failure([&] {
+    mcp_endpoint.StopAdmissionAndDrain();
+    endpoint_drained = true;
+  });
+  if (endpoint_drained) {
+    capture_cleanup_failure([&] { mcp_application.MarkRunStopped(); });
+    capture_cleanup_failure([&] { mcp_application.Shutdown(); });
+    capture_cleanup_failure([&] { mcp_endpoint.Stop(); });
+  }
+
+  if (application_failure) {
+    std::rethrow_exception(application_failure);
+  }
+  if (cleanup_failure) {
+    std::rethrow_exception(cleanup_failure);
+  }
   if (signal_monitor.ReceivedSignal() != 0) {
     BBP_LOG(info) << "graceful shutdown completed after signal "
                   << signal_monitor.ReceivedSignal();

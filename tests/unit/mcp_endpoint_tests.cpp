@@ -89,7 +89,10 @@ BOOST_AUTO_TEST_CASE(
   McpEndpoint endpoint(McpEndpointConfig{.state_directory = state_directory,
                                          .run_id = "endpoint-test",
                                          .server = {},
-                                         .dispatcher = {}});
+                                         .dispatcher = {},
+                                         .allowed_operations = {},
+                                         .allowed_information_families = {},
+                                         .read_only = false});
   endpoint.Start();
   BOOST_REQUIRE(endpoint.running());
   const McpEndpointPublication publication = endpoint.publication();
@@ -130,13 +133,19 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE_NE(publication.port, 0U);
   BOOST_TEST(Initialize(publication.port, token).result() == http::status::ok);
 
+  endpoint.StopAdmissionAndDrain();
+  BOOST_TEST(!endpoint.running());
+  BOOST_TEST(std::filesystem::is_regular_file(publication.token_file));
+  BOOST_TEST(std::filesystem::is_regular_file(publication.client_config_file));
+  BOOST_TEST(endpoint.DispatcherStats().active_workers == 0U);
+  BOOST_CHECK_THROW(endpoint.Start(), std::runtime_error);
+
   endpoint.Stop();
   BOOST_TEST(!endpoint.running());
   BOOST_TEST(!std::filesystem::exists(publication.token_file));
   BOOST_TEST(!std::filesystem::exists(publication.client_config_file));
   BOOST_TEST(
       std::filesystem::is_directory(state_directory / kMcpEndpointDirectory));
-  BOOST_TEST(endpoint.DispatcherStats().active_workers == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_endpoint_replaces_stale_publication_files) {
@@ -151,7 +160,10 @@ BOOST_AUTO_TEST_CASE(mcp_endpoint_replaces_stale_publication_files) {
   McpEndpoint endpoint(McpEndpointConfig{.state_directory = state_directory,
                                          .run_id = "endpoint-replacement-test",
                                          .server = {},
-                                         .dispatcher = {}});
+                                         .dispatcher = {},
+                                         .allowed_operations = {},
+                                         .allowed_information_families = {},
+                                         .read_only = false});
   endpoint.Start();
   const McpEndpointPublication publication = endpoint.publication();
   BOOST_TEST(ReadText(publication.token_file) != "stale-token\n");
@@ -179,7 +191,10 @@ BOOST_AUTO_TEST_CASE(
       .state_directory = state_directory,
       .run_id = "endpoint-failure-test",
       .server = McpServerConfig{.bind_address = "invalid-address"},
-      .dispatcher = {}});
+      .dispatcher = {},
+      .allowed_operations = {},
+      .allowed_information_families = {},
+      .read_only = false});
   BOOST_CHECK_THROW(endpoint.Start(), std::runtime_error);
 
   BOOST_TEST(!std::filesystem::exists(publication_directory / kMcpTokenFile));
@@ -200,7 +215,10 @@ BOOST_AUTO_TEST_CASE(mcp_endpoint_refuses_a_replaced_cleanup_path) {
   McpEndpoint endpoint(McpEndpointConfig{.state_directory = state_directory,
                                          .run_id = "endpoint-replaced-test",
                                          .server = {},
-                                         .dispatcher = {}});
+                                         .dispatcher = {},
+                                         .allowed_operations = {},
+                                         .allowed_information_families = {},
+                                         .read_only = false});
   endpoint.Start();
 
   std::filesystem::rename(publication_directory, displaced_directory);

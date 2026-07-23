@@ -316,7 +316,7 @@ struct McpEndpoint::Impl {
 
   void Start() {
     std::lock_guard<std::mutex> lock(lifecycle_mutex);
-    if (started || stopped) {
+    if (started || stopped || services_stopped) {
       throw std::runtime_error("MCP endpoint cannot be started in this state");
     }
     static_cast<void>(
@@ -362,7 +362,13 @@ struct McpEndpoint::Impl {
                               publication_directory);
       token = RandomToken();
       McpProtocolConfig protocol_config{
-          .bearer_token = token, .endpoint_path = "/mcp", .endpoint_port = 0U};
+          .bearer_token = token,
+          .endpoint_path = "/mcp",
+          .endpoint_port = 0U,
+          .allowed_operations = config.allowed_operations,
+          .allowed_information_families =
+              config.allowed_information_families,
+          .read_only = config.read_only};
       server = std::make_unique<McpServer>(
           config.server, std::move(protocol_config), dispatcher.ToolHandler(),
           dispatcher.ResourceHandler(), dispatcher.SessionHandler());
@@ -410,20 +416,25 @@ struct McpEndpoint::Impl {
       return;
     }
     std::exception_ptr failure;
-    try {
-      StopServicesUnlocked();
-    } catch (...) {
-      failure = std::current_exception();
-    }
-    try {
-      RemovePublicationsUnlocked();
-    } catch (...) {
-      if (!failure) {
+    if (!services_stopped) {
+      try {
+        StopServicesUnlocked();
+      } catch (...) {
         failure = std::current_exception();
       }
     }
+    if (services_stopped) {
+      try {
+        RemovePublicationsUnlocked();
+      } catch (...) {
+        if (!failure) {
+          failure = std::current_exception();
+        }
+      }
+    }
     started = false;
-    stopped = failure == nullptr;
+    stopped =
+        services_stopped && !publication_directory_opened && failure == nullptr;
     std::fill(token.begin(), token.end(), '\0');
     token.clear();
     if (failure) {
@@ -431,15 +442,58 @@ struct McpEndpoint::Impl {
     }
   }
 
-  void StopServicesUnlocked() {
-    dispatcher.SetNotificationHandler({});
-    if (server) {
-      server->Stop();
+  void StopAdmissionAndDrain() {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex);
+    if (services_stopped || stopped) {
+      return;
     }
-    dispatcher.Shutdown();
-    {
+    StopServicesUnlocked();
+  }
+
+  void StopServicesUnlocked() {
+    if (services_stopped) {
+      return;
+    }
+    std::exception_ptr failure;
+    dispatcher.SetNotificationHandler({});
+    if (!server) {
+      server_stopped = true;
+    }
+    if (!server_stopped && server) {
+      try {
+        server->Stop();
+        const McpServerStats stats = server->Stats();
+        if (stats.running || stats.active_connections != 0U ||
+            stats.queued_connections != 0U) {
+          throw std::runtime_error("MCP server did not drain every connection");
+        }
+        server_stopped = true;
+      } catch (...) {
+        failure = std::current_exception();
+      }
+    }
+    if (!dispatcher_stopped) {
+      try {
+        dispatcher.Shutdown();
+        if (dispatcher.Stats().active_workers != 0U) {
+          throw std::runtime_error(
+              "MCP dispatcher did not drain every operation worker");
+        }
+        dispatcher_stopped = true;
+      } catch (...) {
+        if (!failure) {
+          failure = std::current_exception();
+        }
+      }
+    }
+    if (server_stopped) {
       std::lock_guard<std::mutex> notification_lock(notification_mutex);
       server.reset();
+    }
+    started = false;
+    services_stopped = server_stopped && dispatcher_stopped;
+    if (failure) {
+      std::rethrow_exception(failure);
     }
   }
 
@@ -502,22 +556,26 @@ struct McpEndpoint::Impl {
   }
 
   void StopUnlockedNoThrow() noexcept {
-    try {
-      StopServicesUnlocked();
-    } catch (const std::exception& error) {
-      BBP_LOG(error) << "MCP service cleanup failed: " << error.what();
-    } catch (...) {
-      BBP_LOG(error) << "MCP service cleanup failed";
+    if (!services_stopped) {
+      try {
+        StopServicesUnlocked();
+      } catch (const std::exception& error) {
+        BBP_LOG(error) << "MCP service cleanup failed: " << error.what();
+      } catch (...) {
+        BBP_LOG(error) << "MCP service cleanup failed";
+      }
     }
-    try {
-      RemovePublicationsUnlocked();
-    } catch (const std::exception& error) {
-      BBP_LOG(error) << "MCP credential cleanup failed: " << error.what();
-    } catch (...) {
-      BBP_LOG(error) << "MCP credential cleanup failed";
+    if (services_stopped) {
+      try {
+        RemovePublicationsUnlocked();
+      } catch (const std::exception& error) {
+        BBP_LOG(error) << "MCP credential cleanup failed: " << error.what();
+      } catch (...) {
+        BBP_LOG(error) << "MCP credential cleanup failed";
+      }
     }
     started = false;
-    stopped = !publication_directory_opened;
+    stopped = services_stopped && !publication_directory_opened;
     std::fill(token.begin(), token.end(), '\0');
     token.clear();
   }
@@ -542,6 +600,9 @@ struct McpEndpoint::Impl {
   McpEndpointPublication current_publication;
   std::string token;
   bool publication_directory_opened = false;
+  bool server_stopped = false;
+  bool dispatcher_stopped = false;
+  bool services_stopped = false;
   bool started = false;
   bool stopped = false;
 };
@@ -556,6 +617,8 @@ McpEndpoint::McpEndpoint(McpEndpointConfig config,
 McpEndpoint::~McpEndpoint() = default;
 
 void McpEndpoint::Start() { impl_->Start(); }
+
+void McpEndpoint::StopAdmissionAndDrain() { impl_->StopAdmissionAndDrain(); }
 
 void McpEndpoint::Stop() { impl_->Stop(); }
 

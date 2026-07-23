@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "bbp/mcp_dispatcher.h"
 #include "bbp/mcp_server.h"
@@ -20,6 +21,9 @@ struct McpEndpointConfig {
   std::string run_id;
   McpServerConfig server;
   McpDispatcherConfig dispatcher;
+  std::vector<McpOperationKind> allowed_operations;
+  std::vector<McpInformationFamily> allowed_information_families;
+  bool read_only = false;
 };
 
 struct McpEndpointPublication {
@@ -43,6 +47,9 @@ class McpEndpoint {
   McpEndpoint& operator=(const McpEndpoint&) = delete;
 
   void Start();
+  // Stops listener admission and drains/cancels dispatcher work while retaining
+  // the published client files for final application cleanup.
+  void StopAdmissionAndDrain();
   void Stop();
   bool running() const;
   McpEndpointPublication publication() const;

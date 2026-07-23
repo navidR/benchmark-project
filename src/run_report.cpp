@@ -36,6 +36,7 @@ namespace bbp {
 namespace {
 
 constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
+constexpr std::size_t kMaximumResolvedScenarioBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaximumNodeMetricHistorySamples = 120U;
 constexpr std::size_t kMaximumOperatorCommandSummaries =
     kMaximumRunReportSummaryRecords;
@@ -57,6 +58,12 @@ constexpr std::size_t kMaximumTransactionLoadAttemptSummaries =
     kMaximumRunReportSummaryRecords;
 constexpr std::size_t kMaximumTransactionLoadCompletionSummaries =
     kMaximumRunReportSummaryRecords;
+
+void ThrowIfReportCancelled(std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("run report refresh was cancelled");
+  }
+}
 
 struct NodeReport {
   std::optional<std::uint64_t> index;
@@ -613,11 +620,15 @@ void LoadProcessControlFields(const boost::json::object& scenario,
 }
 
 void LoadResolvedScenario(const std::filesystem::path& path,
-                          boost::json::object* report) {
+                          boost::json::object* report,
+                          std::stop_token stop_token) {
+  ThrowIfReportCancelled(stop_token);
   if (!std::filesystem::exists(path)) {
     return;
   }
-  boost::json::value value = boost::json::parse(ReadText(path));
+  boost::json::value value = boost::json::parse(
+      ReadText(path, kMaximumResolvedScenarioBytes, stop_token));
+  ThrowIfReportCancelled(stop_token);
   if (!value.is_object()) {
     throw std::runtime_error("resolved scenario is not a JSON object: " +
                              path.string());
@@ -1817,12 +1828,14 @@ struct IncrementalRunReport::Impl {
     bool completed = false;
   };
 
-  explicit Impl(std::filesystem::path root) : run_root(std::move(root)) {
+  explicit Impl(std::filesystem::path root, std::stop_token stop_token)
+      : run_root(std::move(root)) {
+    ThrowIfReportCancelled(stop_token);
     if (!std::filesystem::is_directory(run_root)) {
       throw std::runtime_error("run root is not a directory: " +
                                run_root.string());
     }
-    Reset();
+    Reset(stop_token);
   }
 
   boost::json::array& Array(std::string_view field) {
@@ -1996,10 +2009,13 @@ struct IncrementalRunReport::Impl {
     return result;
   }
 
-  void Reset() {
+  void Reset(std::stop_token stop_token) {
+    ThrowIfReportCancelled(stop_token);
     report = {};
     report["run_root"] = std::filesystem::absolute(run_root).string();
-    LoadResolvedScenario(run_root / "resolved-scenario.json", &report);
+    LoadResolvedScenario(run_root / "resolved-scenario.json", &report,
+                         stop_token);
+    expected_run_id = OptionalStringField(report, "run_id");
 
     boost::json::array topology_current_edges;
     const boost::json::value* topology_initial_edges =
@@ -2046,6 +2062,7 @@ struct IncrementalRunReport::Impl {
         "operator_commands",
     };
     for (const std::string_view field : kArrayFields) {
+      ThrowIfReportCancelled(stop_token);
       report[field] = boost::json::array{};
     }
     report["operator_connection_command"] = nullptr;
@@ -2105,7 +2122,7 @@ struct IncrementalRunReport::Impl {
 
   static std::optional<FileObservation> ObserveFile(
       const std::filesystem::path& path) {
-    struct stat status {};
+    struct stat status{};
     if (::stat(path.c_str(), &status) != 0) {
       const int error = errno;
       if (error == ENOENT) {
@@ -2163,7 +2180,8 @@ struct IncrementalRunReport::Impl {
   template <typename Callback>
   bool ConsumeFile(const std::filesystem::path& path, InputCursor* cursor,
                    std::size_t maximum_records, std::uint64_t* records_read,
-                   Callback callback) {
+                   std::stop_token stop_token, Callback callback) {
+    ThrowIfReportCancelled(stop_token);
     const std::optional<FileObservation> initial_observation =
         ObserveFile(path);
     if (!initial_observation) {
@@ -2189,6 +2207,7 @@ struct IncrementalRunReport::Impl {
     std::string line;
     std::size_t lines_consumed = 0;
     while (lines_consumed < maximum_records) {
+      ThrowIfReportCancelled(stop_token);
       const std::uint64_t line_offset = cursor->offset;
       if (!std::getline(input, line)) {
         break;
@@ -2213,6 +2232,7 @@ struct IncrementalRunReport::Impl {
       ++lines_consumed;
     }
 
+    ThrowIfReportCancelled(stop_token);
     cursor->observed_exists = true;
     const std::optional<FileObservation> final_observation = ObserveFile(path);
     if (!final_observation ||
@@ -2225,6 +2245,7 @@ struct IncrementalRunReport::Impl {
   }
 
   void ProcessEvent(const boost::json::object& event) {
+    RequireMatchingRunId(event, "event");
     ++event_count;
     const std::string event_name = OptionalStringField(event, "event");
     const std::string node_id = OptionalStringField(event, "node_id");
@@ -2466,6 +2487,7 @@ struct IncrementalRunReport::Impl {
   }
 
   void ProcessMetric(const boost::json::object& metric) {
+    RequireMatchingRunId(metric, "metric");
     ++metric_count;
     const std::string node_id = OptionalStringField(metric, "node_id");
     if (node_id.empty()) {
@@ -2490,6 +2512,7 @@ struct IncrementalRunReport::Impl {
   }
 
   void ProcessWalletMetric(const boost::json::object& metric) {
+    RequireMatchingRunId(metric, "wallet metric");
     const std::optional<std::uint64_t> wallet_index =
         OptionalUint64Field(metric, "wallet_index");
     if (!wallet_index || *wallet_index == 0U) {
@@ -2535,32 +2558,53 @@ struct IncrementalRunReport::Impl {
     AddTopologyViewSummaries(&report);
   }
 
-  const boost::json::object& Refresh(std::size_t maximum_records_per_file) {
-    if (ScenarioFileChanged() || AnyInputFileWasReplaced()) {
-      Reset();
+  void RequireMatchingRunId(const boost::json::object& record,
+                            std::string_view record_kind) const {
+    if (expected_run_id.empty()) {
+      return;
     }
+    const boost::json::value* run_id = record.if_contains("run_id");
+    if (run_id == nullptr || !run_id->is_string() ||
+        run_id->as_string() != expected_run_id) {
+      throw std::runtime_error(std::string(record_kind) +
+                               " run_id does not match resolved scenario");
+    }
+  }
+
+  const boost::json::object& Refresh(std::size_t maximum_records_per_file,
+                                     std::stop_token stop_token) {
+    ThrowIfReportCancelled(stop_token);
+    if (ScenarioFileChanged() || AnyInputFileWasReplaced()) {
+      Reset(stop_token);
+    }
+    ThrowIfReportCancelled(stop_token);
     stats = {};
     const bool event_backlog = ConsumeFile(
         run_root / "events.jsonl", &event_cursor, maximum_records_per_file,
-        &stats.event_records,
+        &stats.event_records, stop_token,
         [this](const boost::json::object& event) { ProcessEvent(event); });
+    ThrowIfReportCancelled(stop_token);
     const bool metric_backlog = ConsumeFile(
         run_root / "metrics.jsonl", &metric_cursor, maximum_records_per_file,
-        &stats.metric_records,
+        &stats.metric_records, stop_token,
         [this](const boost::json::object& metric) { ProcessMetric(metric); });
+    ThrowIfReportCancelled(stop_token);
     const bool wallet_metric_backlog =
         ConsumeFile(run_root / "wallet-metrics.jsonl", &wallet_metric_cursor,
                     maximum_records_per_file, &stats.wallet_metric_records,
-                    [this](const boost::json::object& metric) {
+                    stop_token, [this](const boost::json::object& metric) {
                       ProcessWalletMetric(metric);
                     });
     stats.has_backlog =
         event_backlog || metric_backlog || wallet_metric_backlog;
+    ThrowIfReportCancelled(stop_token);
     UpdateReport();
+    ThrowIfReportCancelled(stop_token);
     return report;
   }
 
   std::filesystem::path run_root;
+  std::string expected_run_id;
   boost::json::object report;
   std::uint64_t event_count = 0;
   std::uint64_t metric_count = 0;
@@ -2592,8 +2636,8 @@ struct IncrementalRunReport::Impl {
 };
 
 IncrementalRunReport::IncrementalRunReport(
-    const std::filesystem::path& run_root)
-    : impl_(std::make_unique<Impl>(run_root)) {}
+    const std::filesystem::path& run_root, std::stop_token stop_token)
+    : impl_(std::make_unique<Impl>(run_root, stop_token)) {}
 
 IncrementalRunReport::~IncrementalRunReport() = default;
 
@@ -2604,36 +2648,41 @@ IncrementalRunReport& IncrementalRunReport::operator=(
     IncrementalRunReport&&) noexcept = default;
 
 const boost::json::object& IncrementalRunReport::Refresh(
-    std::size_t maximum_records_per_file) {
-  return impl_->Refresh(maximum_records_per_file);
+    std::size_t maximum_records_per_file, std::stop_token stop_token) {
+  return impl_->Refresh(maximum_records_per_file, stop_token);
 }
 
 const RunReportRefreshStats& IncrementalRunReport::last_refresh_stats() const {
   return impl_->stats;
 }
 
-boost::json::object BuildRunReport(const std::filesystem::path& run_root) {
-  IncrementalRunReport report(run_root);
-  return report.Refresh();
+boost::json::object BuildRunReport(const std::filesystem::path& run_root,
+                                   std::stop_token stop_token) {
+  IncrementalRunReport report(run_root, stop_token);
+  return report.Refresh(std::numeric_limits<std::size_t>::max(), stop_token);
 }
 
-std::string BuildRunReportJson(const std::filesystem::path& run_root) {
-  return boost::json::serialize(BuildRunReport(run_root));
+std::string BuildRunReportJson(const std::filesystem::path& run_root,
+                               std::stop_token stop_token) {
+  return boost::json::serialize(BuildRunReport(run_root, stop_token));
 }
 
 std::string BuildNodeReportJson(const std::filesystem::path& run_root,
                                 std::string_view node_id,
-                                std::uint64_t operator_command_sequence) {
+                                std::uint64_t operator_command_sequence,
+                                std::stop_token stop_token) {
   if (node_id.empty()) {
     throw std::runtime_error("node report requires a node id");
   }
-  const boost::json::object full_report = BuildRunReport(run_root);
+  const boost::json::object full_report = BuildRunReport(run_root, stop_token);
+  ThrowIfReportCancelled(stop_token);
   const boost::json::array* nodes = ArrayField(full_report, "nodes_summary");
   if (nodes == nullptr) {
     throw std::runtime_error("run report has no node summaries");
   }
   const boost::json::object* selected_node = nullptr;
   for (const boost::json::value& node_value : *nodes) {
+    ThrowIfReportCancelled(stop_token);
     if (node_value.is_object() &&
         OptionalStringField(node_value.as_object(), "node_id") == node_id) {
       selected_node = &node_value.as_object();
@@ -2669,10 +2718,12 @@ std::string BuildNodeReportJson(const std::filesystem::path& run_root,
       "network_profiles",
   };
   for (const std::string_view field : kContextFields) {
+    ThrowIfReportCancelled(stop_token);
     CopyField(full_report, field, &report);
   }
   report["operator_command_sequence"] = operator_command_sequence;
   report["node"] = *selected_node;
+  ThrowIfReportCancelled(stop_token);
   return boost::json::serialize(report);
 }
 

@@ -647,10 +647,48 @@ boost::json::object InformationFamilySchema() {
       }));
 }
 
-boost::json::object ResultFamilyNameSchema() {
-  return StringEnumSchema(EnumNames(
-      McpResultFamily::kCount,
-      [](McpResultFamily family) { return McpResultFamilyName(family); }));
+boost::json::object InformationFamilySchema(
+    std::span<const McpInformationFamily> information_families) {
+  boost::json::array names;
+  names.reserve(information_families.size());
+  for (const McpInformationFamily family : information_families) {
+    names.emplace_back(McpInformationFamilyName(family));
+  }
+  return StringEnumSchema(std::move(names));
+}
+
+boost::json::array OperationNames(
+    std::span<const McpOperationKind> operations) {
+  boost::json::array names;
+  names.reserve(operations.size());
+  for (const McpOperationKind operation : operations) {
+    names.emplace_back(McpOperationKindName(operation));
+  }
+  return names;
+}
+
+std::array<bool, static_cast<std::size_t>(McpResultFamily::kCount)>
+SelectedResultFamilies(std::span<const McpOperationKind> operations) {
+  std::array<bool, static_cast<std::size_t>(McpResultFamily::kCount)> selected{};
+  for (const McpOperationKind operation : operations) {
+    selected[static_cast<std::size_t>(McpOperationResultFamily(operation))] =
+        true;
+  }
+  selected[static_cast<std::size_t>(McpResultFamily::kError)] = true;
+  return selected;
+}
+
+boost::json::object ResultFamilyNameSchema(
+    std::span<const McpOperationKind> operations) {
+  const auto selected = SelectedResultFamilies(operations);
+  boost::json::array names;
+  for (std::size_t index = 0U; index < selected.size(); ++index) {
+    if (selected[index]) {
+      names.emplace_back(
+          McpResultFamilyName(static_cast<McpResultFamily>(index)));
+    }
+  }
+  return StringEnumSchema(std::move(names));
 }
 
 boost::json::object BoundedLimitSchema() {
@@ -1124,7 +1162,9 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
   throw std::logic_error("unknown MCP operation kind");
 }
 
-boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation) {
+boost::json::object BuildMcpOperationInputSchema(
+    McpOperationKind operation,
+    std::span<const McpInformationFamily> information_families) {
   boost::json::object properties;
   boost::json::array required;
   const auto add_run = [&] {
@@ -1306,8 +1346,8 @@ boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation) {
     case McpOperationKind::kQueryEvidence:
       add_run();
       properties["families"] = ArraySchema(
-          InformationFamilySchema(), 1U,
-          static_cast<std::size_t>(McpInformationFamily::kCount), true);
+          InformationFamilySchema(information_families), 1U,
+          information_families.size(), true);
       properties["node_ids"] =
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       properties["cursor"] = CursorSchema();
@@ -1340,8 +1380,8 @@ boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation) {
     case McpOperationKind::kCreateSubscription:
       add_run();
       properties["families"] = ArraySchema(
-          InformationFamilySchema(), 1U,
-          static_cast<std::size_t>(McpInformationFamily::kCount), true);
+          InformationFamilySchema(information_families), 1U,
+          information_families.size(), true);
       properties["node_ids"] =
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       properties["cursor"] = CursorSchema();
@@ -1364,7 +1404,20 @@ boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation) {
   return AddDraft(ClosedObject(std::move(properties), std::move(required)));
 }
 
-boost::json::object BuildMcpResultSchema(McpResultFamily family) {
+boost::json::object BuildMcpOperationInputSchema(McpOperationKind operation) {
+  std::array<McpInformationFamily,
+             static_cast<std::size_t>(McpInformationFamily::kCount)>
+      information_families{};
+  for (std::size_t index = 0U; index < information_families.size(); ++index) {
+    information_families[index] =
+        static_cast<McpInformationFamily>(index);
+  }
+  return BuildMcpOperationInputSchema(operation, information_families);
+}
+
+boost::json::object BuildMcpResultSchema(
+    McpResultFamily family,
+    std::span<const McpOperationKind> selected_operations) {
   boost::json::object properties;
   boost::json::array constraints;
   properties["result_family"] = ConstStringSchema(McpResultFamilyName(family));
@@ -1459,24 +1512,26 @@ boost::json::object BuildMcpResultSchema(McpResultFamily family) {
       break;
     case McpResultFamily::kOperation:
       properties["operation_id"] = IdentifierSchema();
-      properties["operation"] = StringEnumSchema(
-          EnumNames(McpOperationKind::kCount, [](McpOperationKind operation) {
-            return McpOperationKindName(operation);
-          }));
+      properties["operation"] =
+          StringEnumSchema(OperationNames(selected_operations));
       properties["state"] = OperationStateSchema();
       properties["progress_completed"] = Uint64Schema();
       properties["progress_total"] = Uint64Schema();
       properties["cancel_requested"] = TypeSchema("boolean");
-      properties["terminal_result_family"] = ResultFamilyNameSchema();
+      properties["terminal_result_family"] =
+          ResultFamilyNameSchema(selected_operations);
       require({"operation_id", "operation", "state", "progress_completed",
                "progress_total", "cancel_requested", "terminal_result_family"});
       {
+        const auto selected_results =
+            SelectedResultFamilies(selected_operations);
         boost::json::array terminal_results;
         for (std::size_t index = 0U;
              index < static_cast<std::size_t>(McpResultFamily::kCount);
              ++index) {
           const auto result_family = static_cast<McpResultFamily>(index);
-          if (result_family == McpResultFamily::kError) {
+          if (!selected_results[index] ||
+              result_family == McpResultFamily::kError) {
             continue;
           }
           if (result_family == McpResultFamily::kOperation) {
@@ -1573,15 +1628,31 @@ boost::json::object BuildMcpResultSchema(McpResultFamily family) {
   return AddDraft(std::move(schema));
 }
 
-boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation) {
+boost::json::object BuildMcpResultSchema(McpResultFamily family) {
+  std::array<McpOperationKind,
+             static_cast<std::size_t>(McpOperationKind::kCount)>
+      operations{};
+  for (std::size_t index = 0U; index < operations.size(); ++index) {
+    operations[index] = static_cast<McpOperationKind>(index);
+  }
+  return BuildMcpResultSchema(family, operations);
+}
+
+boost::json::object BuildMcpOperationOutputSchema(
+    McpOperationKind operation,
+    std::span<const McpOperationKind> selected_operations) {
   boost::json::array choices;
   const McpResultFamily result_family = McpOperationResultFamily(operation);
-  choices.emplace_back(BuildMcpResultSchema(result_family));
+  choices.emplace_back(
+      result_family == McpResultFamily::kOperation
+          ? BuildMcpResultSchema(result_family, selected_operations)
+          : BuildMcpResultSchema(result_family));
   if (result_family != McpResultFamily::kOperation) {
     // Long actions return their stable operation immediately; callers then
     // use operation.get/subscriptions for progress and the typed terminal
     // result. Fast application services may still return the direct family.
-    choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kOperation));
+    choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kOperation,
+                                              selected_operations));
   }
   if (result_family != McpResultFamily::kError) {
     choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kError));
@@ -1589,20 +1660,59 @@ boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation) {
   return AddDraft(boost::json::object{{"oneOf", std::move(choices)}});
 }
 
-boost::json::array BuildMcpToolRegistry() {
-  const std::span<const McpNamedCapability> operations = McpOperationRegistry();
-  boost::json::array tools;
-  tools.reserve(operations.size());
+boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation) {
+  std::array<McpOperationKind,
+             static_cast<std::size_t>(McpOperationKind::kCount)>
+      operations{};
   for (std::size_t index = 0U; index < operations.size(); ++index) {
-    const McpOperationKind operation = static_cast<McpOperationKind>(index);
+    operations[index] = static_cast<McpOperationKind>(index);
+  }
+  return BuildMcpOperationOutputSchema(operation, operations);
+}
+
+boost::json::array BuildMcpToolRegistry(
+    std::span<const McpOperationKind> selected_operations,
+    std::span<const McpInformationFamily> information_families) {
+  const std::span<const McpNamedCapability> registry = McpOperationRegistry();
+  boost::json::array tools;
+  tools.reserve(selected_operations.size());
+  for (const McpOperationKind operation : selected_operations) {
+    const std::size_t index = static_cast<std::size_t>(operation);
+    if (index >= registry.size()) {
+      throw std::logic_error("unknown MCP operation kind");
+    }
     tools.emplace_back(boost::json::object{
-        {"name", operations[index].name},
-        {"description", operations[index].description},
-        {"inputSchema", BuildMcpOperationInputSchema(operation)},
-        {"outputSchema", BuildMcpOperationOutputSchema(operation)},
+        {"name", registry[index].name},
+        {"description", registry[index].description},
+        {"inputSchema",
+         BuildMcpOperationInputSchema(operation, information_families)},
+        {"outputSchema",
+         BuildMcpOperationOutputSchema(operation, selected_operations)},
         {"execution", boost::json::object{{"taskSupport", "optional"}}}});
   }
   return tools;
+}
+
+boost::json::array BuildMcpToolRegistry(
+    std::span<const McpOperationKind> selected_operations) {
+  std::array<McpInformationFamily,
+             static_cast<std::size_t>(McpInformationFamily::kCount)>
+      information_families{};
+  for (std::size_t index = 0U; index < information_families.size(); ++index) {
+    information_families[index] =
+        static_cast<McpInformationFamily>(index);
+  }
+  return BuildMcpToolRegistry(selected_operations, information_families);
+}
+
+boost::json::array BuildMcpToolRegistry() {
+  std::array<McpOperationKind,
+             static_cast<std::size_t>(McpOperationKind::kCount)>
+      operations{};
+  for (std::size_t index = 0U; index < operations.size(); ++index) {
+    operations[index] = static_cast<McpOperationKind>(index);
+  }
+  return BuildMcpToolRegistry(operations);
 }
 
 }  // namespace bbp
