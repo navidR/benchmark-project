@@ -281,6 +281,31 @@ void RuntimePeerTopology::PreserveCommonStateFrom(
   }
 }
 
+void RuntimePeerTopology::PreserveRemappedStateFrom(
+    const RuntimePeerTopology& previous,
+    const std::vector<std::optional<std::uint32_t>>& old_to_new) {
+  if (old_to_new.size() != previous.node_count_) {
+    throw std::invalid_argument(
+        "runtime topology remap size must match the previous node count");
+  }
+  std::map<EdgeKey, const RuntimePeerTopologyEdge*> previous_edges;
+  for (const RuntimePeerTopologyEdge& edge : previous.edges_) {
+    const std::optional<std::uint32_t> from = old_to_new[edge.from];
+    const std::optional<std::uint32_t> to = old_to_new[edge.to];
+    if (from && to) {
+      previous_edges.emplace(EdgeKey{*from, *to}, &edge);
+    }
+  }
+  for (RuntimePeerTopologyEdge& edge : edges_) {
+    const auto previous_edge = previous_edges.find(EdgeKey{edge.from, edge.to});
+    if (previous_edge == previous_edges.end()) {
+      continue;
+    }
+    edge.active = previous_edge->second->active;
+    edge.condition = previous_edge->second->condition;
+  }
+}
+
 RuntimePeerTopologyEdge& RuntimePeerTopology::MutableEdge(std::uint32_t from,
                                                           std::uint32_t to) {
   const auto edge = std::find_if(

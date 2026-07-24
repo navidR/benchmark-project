@@ -23,6 +23,8 @@ SimulationCommand ParseAndValidateSimulationCommand(
 // parsers. Capacity and live-inventory checks remain simulator-owned.
 SimulationNodeAddRequest ParseAndValidateSimulationNodeAddRequest(
     const boost::json::object& request, const Options& options);
+SimulationNodeRemoveRequest ParseAndValidateSimulationNodeRemoveRequest(
+    const boost::json::object& request, const Options& options);
 
 // Parses one live wallet transaction workload through the production scenario
 // field parser and validates it against the active simulation options.

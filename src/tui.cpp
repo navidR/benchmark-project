@@ -2656,6 +2656,12 @@ bool QueueParsedNodeCommand(
       }
       node_id = "sim";
       target = "the simulation";
+    } else if (parsed.kind == SimulationCommandKind::kRemoveNodes) {
+      if (!parsed.node_remove) {
+        throw std::runtime_error("node-remove payload is missing");
+      }
+      node_id = "sim";
+      target = "the simulation";
     } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
       perf_target = ResolvePerfCounterTarget(
           report,
@@ -2768,6 +2774,8 @@ bool QueueParsedNodeCommand(
             *parsed.block_production_policy);
       } else if (parsed.kind == SimulationCommandKind::kAddNodes) {
         sequence = command_queue->PushAddNodes(*parsed.node_add);
+      } else if (parsed.kind == SimulationCommandKind::kRemoveNodes) {
+        sequence = command_queue->PushRemoveNodes(*parsed.node_remove);
       } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
         if (!perf_target) {
           throw std::runtime_error("perf counter target is missing");

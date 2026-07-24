@@ -272,6 +272,45 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    scenario_service_node_remove_parser_enforces_active_batch_bounds) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 3U;
+  const Options options = ParseAndValidateScenario(scenario);
+
+  const SimulationNodeRemoveRequest request =
+      ParseAndValidateSimulationNodeRemoveRequest(
+          boost::json::object{
+              {"node_ids", boost::json::array{"firo-2", "firo-3"}},
+              {"timeout_sec", 41U}},
+          options);
+  BOOST_TEST(request.node_ids == std::vector<std::string>({"firo-2", "firo-3"}),
+             boost::test_tools::per_element());
+  BOOST_TEST(request.timeout_sec == 41U);
+
+  BOOST_CHECK_THROW(
+      ParseAndValidateSimulationNodeRemoveRequest(
+          boost::json::object{
+              {"node_ids", boost::json::array{"firo-2", "firo-2"}}},
+          options),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      ParseAndValidateSimulationNodeRemoveRequest(
+          boost::json::object{{"node_ids", boost::json::array{"firo-missing"}}},
+          options),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      ParseAndValidateSimulationNodeRemoveRequest(
+          boost::json::object{{"node_ids", boost::json::array{}}}, options),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      ParseAndValidateSimulationNodeRemoveRequest(
+          boost::json::object{{"node_ids", boost::json::array{"firo-2"}},
+                              {"timeout_sec", 0U}},
+          options),
+      std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
     scenario_service_preflights_scheduled_node_adds_in_execution_order) {
   boost::json::object scenario = MinimalScenario();
   scenario["node_capacity"] = 4U;
@@ -400,6 +439,111 @@ BOOST_AUTO_TEST_CASE(
       [](const std::runtime_error& error) {
         return std::string(error.what()) ==
                "scheduled node.add node id is already reserved: reserved";
+      });
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_service_plans_selected_remove_then_add_without_id_reuse) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 3U;
+  scenario["node_capacity"] = 3U;
+  scenario["events"] = boost::json::array{
+      boost::json::object{
+          {"at", "1s"},
+          {"action", "remove_nodes"},
+          {"node_remove",
+           boost::json::object{{"node_ids", boost::json::array{"firo-2"}},
+                               {"timeout_sec", 20U}}}},
+      boost::json::object{
+          {"at", "2s"},
+          {"action", "add_nodes"},
+          {"node_add", boost::json::object{{"chain", "firo"}, {"count", 1U}}}}};
+
+  const Options options = ParseAndValidateScenario(scenario);
+  BOOST_REQUIRE_EQUAL(options.scheduled_events.size(), 2U);
+  const SimulationCommand& remove =
+      std::get<SimulationCommand>(options.scheduled_events[0U].action);
+  BOOST_CHECK(remove.kind == SimulationCommandKind::kRemoveNodes);
+  BOOST_TEST(remove.node_id == "sim");
+  BOOST_REQUIRE(remove.node_remove);
+  BOOST_TEST(
+      remove.node_remove->node_ids == std::vector<std::string>({"firo-2"}),
+      boost::test_tools::per_element());
+  BOOST_TEST(remove.node_remove->timeout_sec == 20U);
+  const SimulationCommand& add =
+      std::get<SimulationCommand>(options.scheduled_events[1U].action);
+  BOOST_REQUIRE(add.node_add);
+  BOOST_TEST(add.node_add->node_ids == std::vector<std::string>({"firo-4"}),
+             boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_service_rejects_reusing_or_removing_inactive_scheduled_id) {
+  boost::json::object reused = MinimalScenario();
+  reused["nodes"] = 2U;
+  reused["node_capacity"] = 2U;
+  reused["events"] = boost::json::array{
+      boost::json::object{
+          {"at", "1s"},
+          {"action", "remove_nodes"},
+          {"node_remove",
+           boost::json::object{{"node_ids", boost::json::array{"firo-2"}}}}},
+      boost::json::object{
+          {"at", "2s"},
+          {"action", "add_nodes"},
+          {"node_add",
+           boost::json::object{{"chain", "firo"},
+                               {"count", 1U},
+                               {"node_ids", boost::json::array{"firo-2"}}}}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(reused), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scheduled node.add node id is already reserved: firo-2";
+      });
+
+  boost::json::object removed_twice = MinimalScenario();
+  removed_twice["nodes"] = 2U;
+  removed_twice["events"] = boost::json::array{
+      boost::json::object{
+          {"at", "1s"},
+          {"action", "remove_nodes"},
+          {"node_remove",
+           boost::json::object{{"node_ids", boost::json::array{"firo-2"}}}}},
+      boost::json::object{
+          {"at", "2s"},
+          {"action", "remove_nodes"},
+          {"node_remove",
+           boost::json::object{{"node_ids", boost::json::array{"firo-2"}}}}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(removed_twice), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "node.remove references an inactive node id: firo-2";
+      });
+}
+
+BOOST_AUTO_TEST_CASE(scenario_service_rejects_scheduled_removal_of_role_node) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 3U;
+  scenario["topology"] =
+      boost::json::object{{"node_count", 3U},
+                          {"wallet_node_count", 1U},
+                          {"miner_node_count", 1U},
+                          {"wallet_nodes", boost::json::array{2U}},
+                          {"miner_nodes", boost::json::array{3U}}};
+  scenario["events"] = boost::json::array{boost::json::object{
+      {"at", "1s"},
+      {"action", "remove_nodes"},
+      {"node_remove",
+       boost::json::object{{"node_ids", boost::json::array{"firo-2"}}}}}};
+
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(scenario), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scheduled node.remove requires wallet.remove before removing "
+               "wallet node firo-2";
       });
 }
 

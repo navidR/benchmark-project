@@ -79,6 +79,99 @@ void SimulationRegistry::SetRuntimeNodeCount(uint32_t node_count) {
   topology_.node_count = node_count;
 }
 
+SimulationRegistry SimulationRegistry::RemapRuntimeNodes(
+    const std::vector<std::optional<std::uint32_t>>& old_to_new,
+    PeerTopologyConfig peer_topology) const {
+  if (old_to_new.size() != topology_.node_count) {
+    throw std::invalid_argument(
+        "runtime role node remap size must match the current node count");
+  }
+  std::vector<bool> seen(old_to_new.size(), false);
+  std::uint32_t next_node_count = 0U;
+  for (const std::optional<std::uint32_t> mapped : old_to_new) {
+    if (!mapped) {
+      continue;
+    }
+    if (*mapped >= old_to_new.size() || seen[*mapped]) {
+      throw std::invalid_argument(
+          "runtime role node remap must contain unique compact indexes");
+    }
+    seen[*mapped] = true;
+    next_node_count = std::max(next_node_count, *mapped + 1U);
+  }
+  if (std::find(seen.begin(), seen.begin() + next_node_count, false) !=
+      seen.begin() + next_node_count) {
+    throw std::invalid_argument(
+        "runtime role node remap must contain unique compact indexes");
+  }
+
+  SimulationRegistry next = *this;
+  const auto remap_role_nodes = [&](const std::vector<std::uint32_t>& nodes,
+                                    std::string_view role) {
+    std::vector<std::uint32_t> remapped;
+    remapped.reserve(nodes.size());
+    for (const std::uint32_t node : nodes) {
+      if (node >= old_to_new.size() || !old_to_new[node]) {
+        throw std::runtime_error("cannot remove a node with the " +
+                                 std::string(role) + " role");
+      }
+      remapped.push_back(*old_to_new[node]);
+    }
+    return remapped;
+  };
+  next.topology_.node_count = next_node_count;
+  next.topology_.wallet_nodes =
+      remap_role_nodes(topology_.wallet_nodes, "wallet");
+  next.topology_.miner_nodes = remap_role_nodes(topology_.miner_nodes, "miner");
+  next.topology_.wallet_node_count =
+      static_cast<std::uint32_t>(next.topology_.wallet_nodes.size());
+  next.topology_.miner_node_count =
+      static_cast<std::uint32_t>(next.topology_.miner_nodes.size());
+  next.topology_.peer_topology = std::move(peer_topology);
+  next.topology_.peer_connectivity.clear();
+  next.topology_.peer_connectivity.reserve(topology_.peer_connectivity.size());
+  for (const PeerConnectivityPolicy& policy : topology_.peer_connectivity) {
+    if (policy.node >= old_to_new.size()) {
+      throw std::runtime_error(
+          "runtime peer connectivity node is out of range");
+    }
+    if (!old_to_new[policy.node]) {
+      continue;
+    }
+    PeerConnectivityPolicy remapped = policy;
+    remapped.node = *old_to_new[policy.node];
+    const std::vector<std::uint32_t> eligible = ResolvePeerTopologyPeerIndexes(
+        next.topology_.peer_topology, next_node_count, remapped.node);
+    if (remapped.mode == PeerConnectivityMode::kAllPeers) {
+      if (eligible.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error(
+            "runtime all-peers eligibility exceeds uint32");
+      }
+      const std::uint32_t count = static_cast<std::uint32_t>(eligible.size());
+      remapped.peer_count = PeerCountPolicy(count, count);
+    } else {
+      const std::size_t maximum_possible =
+          next_node_count == 0U ? 0U : next_node_count - 1U;
+      if (remapped.peer_count.maximum() > maximum_possible ||
+          remapped.peer_count.minimum() > eligible.size()) {
+        throw std::runtime_error(
+            "runtime peer connectivity policy is incompatible with the "
+            "remapped node set");
+      }
+    }
+    next.topology_.peer_connectivity.push_back(std::move(remapped));
+  }
+  for (WalletIdentity& wallet : next.wallets_) {
+    if (wallet.node == 0U || wallet.node > old_to_new.size() ||
+        !old_to_new[wallet.node - 1U]) {
+      throw std::runtime_error(
+          "cannot remove a node backing a registered wallet");
+    }
+    wallet.node = *old_to_new[wallet.node - 1U] + 1U;
+  }
+  return next;
+}
+
 WalletIdentity& SimulationRegistry::MutableWalletByIndex(size_t wallet_index) {
   if (wallet_index >= wallets_.size()) {
     throw std::runtime_error("wallet index is out of range");

@@ -93,9 +93,9 @@ class McpLiveApplication {
   void SetWorkloadService(std::shared_ptr<McpLiveWorkloadService> service);
   void SetRoleService(std::shared_ptr<McpLiveRoleService> service);
 
-  // Called exactly once by SimulationCommandProcessor. Successful node-add
-  // outcomes keep the shared live inventory synchronized across MCP, TUI, and
-  // scheduled commands; only MCP-submitted outcomes consume pending state.
+  // Called exactly once by SimulationCommandProcessor. Successful node
+  // mutations keep the shared live inventory synchronized across MCP, TUI,
+  // and scheduled commands; only MCP-submitted outcomes consume pending state.
   void RecordCommandOutcome(const SimulationCommand& command,
                             const SimulationCommandOutcome& outcome);
   void MarkRunStarted();

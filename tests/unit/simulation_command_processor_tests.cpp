@@ -30,6 +30,13 @@ bbp::SimulationNodeAddRequest NodeAddRequest(std::string node_id) {
   };
 }
 
+bbp::SimulationNodeRemoveRequest NodeRemoveRequest(std::string node_id) {
+  return bbp::SimulationNodeRemoveRequest{
+      .node_ids = {std::move(node_id)},
+      .timeout_sec = 30U,
+  };
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
@@ -174,8 +181,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(result.cancellation_cause ==
               bbp::SimulationCommandCancellationCause::kDeadline);
   BOOST_REQUIRE(result.error);
-  BOOST_TEST(*result.error ==
-             "node-add rollback completed after its deadline");
+  BOOST_TEST(*result.error == "node-add rollback completed after its deadline");
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -464,7 +470,7 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
-    simulation_command_processor_shutdown_cancels_queued_node_add_controls) {
+    simulation_command_processor_shutdown_cancels_queued_node_mutations) {
   bbp::SimulationCommandQueue queue;
   std::promise<void> first_started;
   std::promise<void> release_first;
@@ -498,6 +504,8 @@ BOOST_AUTO_TEST_CASE(
   scheduled.scheduled_event_sequence = 1U;
   const std::uint64_t scheduled_sequence =
       queue.PushScenarioCommand(std::move(scheduled));
+  const std::uint64_t remove_sequence =
+      queue.PushRemoveNodes(NodeRemoveRequest("remove"));
 
   processor.Start();
   first_started.get_future().wait();
@@ -511,13 +519,15 @@ BOOST_AUTO_TEST_CASE(
 
   BOOST_REQUIRE_EQUAL(handled.size(), 1U);
   BOOST_TEST(handled.front() == active_sequence);
-  BOOST_REQUIRE_EQUAL(outcomes.size(), 3U);
+  BOOST_REQUIRE_EQUAL(outcomes.size(), 4U);
   BOOST_TEST(outcomes.front().first.sequence == active_sequence);
   for (std::size_t index = 1U; index < outcomes.size(); ++index) {
     const bbp::SimulationCommand& command = outcomes[index].first;
     const bbp::SimulationCommandOutcome& outcome = outcomes[index].second;
-    BOOST_TEST(command.sequence ==
-               (index == 1U ? tui_sequence : scheduled_sequence));
+    const std::uint64_t expected_sequence = index == 1U   ? tui_sequence
+                                            : index == 2U ? scheduled_sequence
+                                                          : remove_sequence;
+    BOOST_TEST(command.sequence == expected_sequence);
     BOOST_REQUIRE(command.operation_control);
     BOOST_CHECK(command.operation_control->CommitPhase() ==
                 bbp::SimulationCommandCommitPhase::kCancelled);
@@ -532,7 +542,7 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
-    simulation_command_processor_rejects_node_add_success_without_commit) {
+    simulation_command_processor_rejects_node_remove_success_without_commit) {
   bbp::SimulationCommandQueue queue;
   std::promise<bbp::SimulationCommandOutcome> outcome;
   std::shared_ptr<bbp::SimulationCommandControl> control;
@@ -546,7 +556,8 @@ BOOST_AUTO_TEST_CASE(
                 bbp::SimulationCommandCancellationCause::kNone,
             .error = std::nullopt,
             .node_lifecycle = std::nullopt,
-            .added_node_ids = {"uncommitted-add"},
+            .added_node_ids = {},
+            .removed_node_ids = {"uncommitted-remove"},
             .inventory_generation = 2U,
             .final_node_count = 2U,
         };
@@ -556,7 +567,7 @@ BOOST_AUTO_TEST_CASE(
           const bbp::SimulationCommandOutcome& result) {
         outcome.set_value(result);
       });
-  queue.PushAddNodes(NodeAddRequest("uncommitted-add"));
+  queue.PushRemoveNodes(NodeRemoveRequest("uncommitted-remove"));
 
   processor.Start();
   const bbp::SimulationCommandOutcome result = outcome.get_future().get();
@@ -571,7 +582,7 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
-    simulation_command_processor_rejects_terminal_outcomes_after_add_commit) {
+    simulation_command_processor_rejects_terminal_outcomes_after_node_mutation_commit) {
   bbp::SimulationCommandQueue queue;
   std::vector<bbp::SimulationCommandOutcome> outcomes;
   std::promise<void> all_outcomes;
@@ -580,10 +591,10 @@ BOOST_AUTO_TEST_CASE(
       [](const bbp::SimulationCommand& command)
           -> bbp::SimulationCommandOutcome {
         if (!command.operation_control) {
-          throw std::logic_error("node-add command has no commit control");
+          throw std::logic_error("node mutation command has no commit control");
         }
         if (!command.operation_control->TryBeginCommit()) {
-          throw std::logic_error("node-add commit was not admitted");
+          throw std::logic_error("node mutation commit was not admitted");
         }
         if (command.sequence == 1U) {
           throw bbp::SimulationCancelled();
@@ -600,7 +611,7 @@ BOOST_AUTO_TEST_CASE(
         }
       });
   queue.PushAddNodes(NodeAddRequest("commit-started-add"));
-  queue.PushAddNodes(NodeAddRequest("committed-add"));
+  queue.PushRemoveNodes(NodeRemoveRequest("committed-remove"));
 
   processor.Start();
   all_outcomes.get_future().wait();

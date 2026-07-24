@@ -41,6 +41,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
     McpOperationKind::kAddNode,
+    McpOperationKind::kRemoveNode,
     McpOperationKind::kStopNode,
     McpOperationKind::kKillNode,
     McpOperationKind::kRestartNode,
@@ -132,6 +133,30 @@ std::optional<std::string> NodeAddOutcomeError(
       *outcome.final_node_count < outcome.added_node_ids.size()) {
     return "successful node-add outcome omitted its inventory generation or "
            "final node count";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> NodeRemoveOutcomeError(
+    const SimulationCommand& command, const SimulationCommandOutcome& outcome) {
+  if (!command.node_remove) {
+    return "successful node-remove outcome has no request";
+  }
+  if (outcome.removed_node_ids != command.node_remove->node_ids ||
+      outcome.removed_node_ids.empty()) {
+    return "successful node-remove outcome differs from its requested node ids";
+  }
+  std::set<std::string> unique;
+  for (const std::string& node_id : outcome.removed_node_ids) {
+    if (!IsSafeNodeAddIdentifier(node_id) || !unique.insert(node_id).second) {
+      return "successful node-remove outcome has an unsafe or duplicate node "
+             "id";
+    }
+  }
+  if (!outcome.inventory_generation || *outcome.inventory_generation == 0U ||
+      !outcome.final_node_count) {
+    return "successful node-remove outcome omitted its inventory generation "
+           "or final node count";
   }
   return std::nullopt;
 }
@@ -674,6 +699,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kReportRun &&
       kind != McpOperationKind::kInvokeRuntimeCommand &&
       kind != McpOperationKind::kAddNode &&
+      kind != McpOperationKind::kRemoveNode &&
       kind != McpOperationKind::kStopNode &&
       kind != McpOperationKind::kKillNode &&
       kind != McpOperationKind::kRestartNode &&
@@ -911,7 +937,10 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                     kind == McpOperationKind::kKillNode ||
                                     kind == McpOperationKind::kRestartNode;
   const bool direct_node_add_operation = kind == McpOperationKind::kAddNode;
+  const bool direct_node_remove_operation =
+      kind == McpOperationKind::kRemoveNode;
   bool node_add_operation = direct_node_add_operation;
+  bool node_remove_operation = direct_node_remove_operation;
   std::optional<std::chrono::steady_clock::duration> command_timeout;
   SimulationCommand command;
   const auto node_capacity_failure_plan =
@@ -951,6 +980,20 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       return node_capacity_failure_plan(request, validation_options);
     }
     command.confirmed = true;
+  } else if (node_remove_operation) {
+    Options validation_options = *config_.options;
+    McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
+    validation_options.nodes =
+        static_cast<std::uint32_t>(inventory.node_ids.size());
+    validation_options.node_ids = std::move(inventory.node_ids);
+    boost::json::object request = arguments;
+    request.erase("run_id");
+    command.kind = SimulationCommandKind::kRemoveNodes;
+    command.node_id = "sim";
+    command.node_remove = ParseAndValidateSimulationNodeRemoveRequest(
+        request, validation_options);
+    command.confirmed = true;
+    command_timeout = std::chrono::seconds(command.node_remove->timeout_sec);
   } else if (typed_node_operation) {
     command.node_id = RequireString(arguments, "node_id");
     ValidateMcpIdentifier(command.node_id, "MCP node operation node_id");
@@ -997,13 +1040,19 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                         validation_options);
     }
     node_add_operation = command.kind == SimulationCommandKind::kAddNodes;
+    node_remove_operation = command.kind == SimulationCommandKind::kRemoveNodes;
+    if (node_remove_operation) {
+      command_timeout = std::chrono::seconds(command.node_remove->timeout_sec);
+    }
   }
   return McpOperationPlan{
-      .progress_total =
-          node_add_operation ? kSimulationNodeAddProgressTotal : 1U,
+      .progress_total = node_add_operation || node_remove_operation
+                            ? kSimulationNodeAddProgressTotal
+                            : 1U,
       .executor = [this, command = std::move(command), command_timeout,
                    typed_node_operation, node_add_operation,
-                   direct_node_add_operation](
+                   node_remove_operation, direct_node_add_operation,
+                   direct_node_remove_operation](
                       McpOperationContext& context) mutable {
         {
           std::lock_guard<std::mutex> lock(mutex_);
@@ -1037,8 +1086,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             : command_kind == SimulationCommandKind::kKillNode ? "node.kill"
             : command_kind == SimulationCommandKind::kRestartNode
                 ? "node.restart"
-            : command_kind == SimulationCommandKind::kAddNodes
-                ? "node.add"
+            : command_kind == SimulationCommandKind::kAddNodes ? "node.add"
+            : command_kind == SimulationCommandKind::kRemoveNodes
+                ? "node.remove"
                 : std::string(SimulationCommandKindName(command_kind));
         const auto operation_started = std::chrono::steady_clock::now();
         const std::optional<std::chrono::steady_clock::time_point>
@@ -1058,14 +1108,16 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         command.operation_control = operation_control;
         const std::uint64_t sequence = SubmitCommand(std::move(command));
         const std::chrono::steady_clock::duration reconciliation_bound =
-            node_add_operation ? kSimulationNodeAddCancellationReconciliation
-                               : kSimulationCommandCancellationReconciliation;
+            node_add_operation || node_remove_operation
+                ? kSimulationNodeAddCancellationReconciliation
+                : kSimulationCommandCancellationReconciliation;
         const SimulationCommandOutcome outcome = [&] {
           try {
-            return WaitForCommand(sequence, stop_token, operation_control,
-                                  cancellation_deadline, terminal_deadline,
-                                  reconciliation_bound,
-                                  node_add_operation ? &context : nullptr);
+            return WaitForCommand(
+                sequence, stop_token, operation_control, cancellation_deadline,
+                terminal_deadline, reconciliation_bound,
+                node_add_operation || node_remove_operation ? &context
+                                                            : nullptr);
           } catch (...) {
             DetachPendingCommand(sequence);
             throw;
@@ -1126,8 +1178,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         if (outcome.state ==
             SimulationCommandOutcomeState::kOutcomeUnconfirmed) {
           config_.request_run_stop();
-          const bool node_operation =
-              typed_node_operation || node_add_operation;
+          const bool node_operation = typed_node_operation ||
+                                      node_add_operation ||
+                                      node_remove_operation;
           throw McpOperationFailure(
               node_operation ? "node_outcome_unconfirmed"
                              : "command_outcome_unconfirmed",
@@ -1161,14 +1214,16 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           const std::optional<SimulationNodeResourceFailure> resource_failure =
               node_add_operation ? operation_control->NodeResourceFailure()
                                  : std::nullopt;
-          const bool node_operation =
-              typed_node_operation || node_add_operation;
+          const bool node_operation = typed_node_operation ||
+                                      node_add_operation ||
+                                      node_remove_operation;
           const std::string code =
-              capacity_failure       ? "node_capacity_exceeded"
-              : resource_failure     ? "node_resource_unavailable"
-              : node_add_operation   ? "node_add_failed"
-              : typed_node_operation ? "node_operation_failed"
-                                     : "simulation_command_failed";
+              capacity_failure        ? "node_capacity_exceeded"
+              : resource_failure      ? "node_resource_unavailable"
+              : node_add_operation    ? "node_add_failed"
+              : node_remove_operation ? "node_remove_failed"
+              : typed_node_operation  ? "node_operation_failed"
+                                      : "simulation_command_failed";
           boost::json::array diagnostics;
           if (capacity_failure) {
             diagnostics =
@@ -1272,6 +1327,53 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                   {"removed_node_ids", boost::json::array{}},
                   {"affected_node_ids", std::move(affected_node_ids)},
                   {"action", "node.add"},
+                  {"command_id", "command-" + std::to_string(sequence)},
+                  {"inventory_generation", *outcome.inventory_generation},
+                  {"final_node_count", *outcome.final_node_count},
+                  {"unchanged", false}}};
+        }
+        if (node_remove_operation) {
+          if (outcome.removed_node_ids.empty() ||
+              !outcome.inventory_generation || !outcome.final_node_count) {
+            config_.request_run_stop();
+            throw McpOperationFailure(
+                "node_outcome_unconfirmed",
+                "successful node.remove omitted its authoritative removal "
+                "result",
+                false);
+          }
+          boost::json::array removed_node_ids;
+          boost::json::array affected_node_ids;
+          removed_node_ids.reserve(outcome.removed_node_ids.size());
+          affected_node_ids.reserve(outcome.removed_node_ids.size());
+          for (const std::string& node_id : outcome.removed_node_ids) {
+            removed_node_ids.emplace_back(node_id);
+            affected_node_ids.emplace_back(node_id);
+          }
+          if (!direct_node_remove_operation) {
+            return McpTypedResult{
+                .family = McpResultFamily::kRuntimeCommand,
+                .value = boost::json::object{
+                    {"result_family", "runtime_command"},
+                    {"run_id", config_.run_id},
+                    {"command_id", "command-" + std::to_string(sequence)},
+                    {"accepted", true},
+                    {"state", "succeeded"},
+                    {"action", "node.remove"},
+                    {"removed_node_ids", std::move(removed_node_ids)},
+                    {"affected_node_ids", std::move(affected_node_ids)},
+                    {"inventory_generation", *outcome.inventory_generation},
+                    {"final_node_count", *outcome.final_node_count}}};
+          }
+          return McpTypedResult{
+              .family = McpResultFamily::kMutation,
+              .value = boost::json::object{
+                  {"result_family", "mutation"},
+                  {"run_id", config_.run_id},
+                  {"added_node_ids", boost::json::array{}},
+                  {"removed_node_ids", std::move(removed_node_ids)},
+                  {"affected_node_ids", std::move(affected_node_ids)},
+                  {"action", "node.remove"},
                   {"command_id", "command-" + std::to_string(sequence)},
                   {"inventory_generation", *outcome.inventory_generation},
                   {"final_node_count", *outcome.final_node_count},
@@ -1706,6 +1808,7 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
             "reconciliation bound",
         .node_lifecycle = std::nullopt,
         .added_node_ids = {},
+        .removed_node_ids = {},
         .inventory_generation = std::nullopt,
         .final_node_count = std::nullopt,
     };
@@ -1730,7 +1833,10 @@ void McpLiveApplication::RecordCommandOutcome(
     } catch (...) {
     }
   };
-  if (command.kind == SimulationCommandKind::kAddNodes) {
+  if (command.kind == SimulationCommandKind::kAddNodes ||
+      command.kind == SimulationCommandKind::kRemoveNodes) {
+    const bool adding = command.kind == SimulationCommandKind::kAddNodes;
+    const std::string mutation_name = adding ? "node-add" : "node-remove";
     try {
       const std::optional<SimulationCommandCommitPhase> commit_phase =
           command.operation_control
@@ -1747,11 +1853,13 @@ void McpLiveApplication::RecordCommandOutcome(
           (outcome.state == SimulationCommandOutcomeState::kFailed &&
            *commit_phase != SimulationCommandCommitPhase::kOpen);
       if (phase_mismatch) {
-        mark_outcome_unconfirmed(
-            "node-add outcome does not match its authoritative commit phase");
+        mark_outcome_unconfirmed(mutation_name +
+                                 " outcome does not match its authoritative "
+                                 "commit phase");
       } else if (outcome.state == SimulationCommandOutcomeState::kSucceeded) {
         const std::optional<std::string> validation_error =
-            NodeAddOutcomeError(command, outcome);
+            adding ? NodeAddOutcomeError(command, outcome)
+                   : NodeRemoveOutcomeError(command, outcome);
         const std::optional<std::uint64_t> initial_generation =
             command.operation_control->InitialInventoryGeneration();
         const std::optional<std::vector<std::string>> initial_node_ids =
@@ -1762,13 +1870,13 @@ void McpLiveApplication::RecordCommandOutcome(
                    *initial_generation ==
                        std::numeric_limits<std::uint64_t>::max() ||
                    *initial_generation + 1U != *outcome.inventory_generation) {
-          mark_outcome_unconfirmed(
-              "successful node-add outcome reused or skipped its "
-              "authoritative inventory generation");
+          mark_outcome_unconfirmed("successful " + mutation_name +
+                                   " outcome reused or skipped its "
+                                   "authoritative inventory generation");
         } else if (!initial_node_ids) {
-          mark_outcome_unconfirmed(
-              "successful node-add outcome omitted its authoritative initial "
-              "node identities");
+          mark_outcome_unconfirmed("successful " + mutation_name +
+                                   " outcome omitted its authoritative initial "
+                                   "node identities");
         } else {
           const McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
           const bool generation_mismatch =
@@ -1776,34 +1884,59 @@ void McpLiveApplication::RecordCommandOutcome(
           const bool count_mismatch =
               inventory.node_ids.size() != *outcome.final_node_count ||
               *outcome.final_node_count > config_.options->node_capacity;
-          const std::size_t expected_count =
-              initial_node_ids->size() + outcome.added_node_ids.size();
-          const bool identity_mismatch =
-              count_mismatch || expected_count != inventory.node_ids.size() ||
-              !std::equal(initial_node_ids->begin(), initial_node_ids->end(),
-                          inventory.node_ids.begin()) ||
-              !std::equal(
-                  outcome.added_node_ids.begin(), outcome.added_node_ids.end(),
-                  inventory.node_ids.begin() +
-                      static_cast<std::vector<std::string>::difference_type>(
-                          initial_node_ids->size()));
+          bool identity_mismatch = count_mismatch;
+          if (adding) {
+            const std::size_t expected_count =
+                initial_node_ids->size() + outcome.added_node_ids.size();
+            identity_mismatch =
+                identity_mismatch ||
+                expected_count != inventory.node_ids.size() ||
+                !std::equal(initial_node_ids->begin(), initial_node_ids->end(),
+                            inventory.node_ids.begin()) ||
+                !std::equal(
+                    outcome.added_node_ids.begin(),
+                    outcome.added_node_ids.end(),
+                    inventory.node_ids.begin() +
+                        static_cast<std::vector<std::string>::difference_type>(
+                            initial_node_ids->size()));
+          } else {
+            const std::set<std::string> removed(
+                outcome.removed_node_ids.begin(),
+                outcome.removed_node_ids.end());
+            std::vector<std::string> expected;
+            if (removed.size() > initial_node_ids->size()) {
+              identity_mismatch = true;
+            } else {
+              expected.reserve(initial_node_ids->size() - removed.size());
+              for (const std::string& node_id : *initial_node_ids) {
+                if (!removed.contains(node_id)) {
+                  expected.push_back(node_id);
+                }
+              }
+              identity_mismatch =
+                  identity_mismatch || expected != inventory.node_ids;
+            }
+          }
           if (generation_mismatch) {
             mark_outcome_unconfirmed(
-                "successful node-add outcome does not match the authoritative "
+                "successful " + mutation_name +
+                " outcome does not match the authoritative "
                 "inventory generation");
-          } else if (count_mismatch || identity_mismatch) {
-            mark_outcome_unconfirmed(
-                "successful node-add outcome does not preserve and append the "
-                "authoritative node identities");
+          } else if (identity_mismatch) {
+            mark_outcome_unconfirmed("successful " + mutation_name +
+                                     " outcome does not publish the expected "
+                                     "authoritative node identities");
           }
         }
       }
     } catch (const std::exception& error) {
-      mark_outcome_unconfirmed("node-add outcome reconciliation failed: " +
-                               std::string(error.what()));
-    } catch (...) {
       mark_outcome_unconfirmed(
-          "node-add outcome reconciliation failed with an unknown exception");
+          mutation_name +
+          " outcome reconciliation failed: " + std::string(error.what()));
+    } catch (...) {
+      mark_outcome_unconfirmed(mutation_name +
+                               " outcome reconciliation failed with an "
+                               "unknown exception");
     }
   }
   std::optional<SimulationCommandOutcome> published_outcome = validated_outcome;
@@ -1824,6 +1957,7 @@ void McpLiveApplication::RecordCommandOutcome(
               "simulation command processor published more than one outcome",
           .node_lifecycle = std::nullopt,
           .added_node_ids = {},
+          .removed_node_ids = {},
           .inventory_generation = std::nullopt,
           .final_node_count = std::nullopt,
       };
@@ -1853,6 +1987,13 @@ void McpLiveApplication::RecordCommandOutcome(
       added_node_ids.emplace_back(node_id);
     }
     data["added_node_ids"] = std::move(added_node_ids);
+  }
+  if (!published_outcome->removed_node_ids.empty()) {
+    boost::json::array removed_node_ids;
+    for (const std::string& node_id : published_outcome->removed_node_ids) {
+      removed_node_ids.emplace_back(node_id);
+    }
+    data["removed_node_ids"] = std::move(removed_node_ids);
   }
   if (published_outcome->inventory_generation) {
     data["inventory_generation"] = *published_outcome->inventory_generation;

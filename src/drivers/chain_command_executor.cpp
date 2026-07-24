@@ -142,6 +142,7 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
     case SimulationCommandKind::kSetPerfCounters:
     case SimulationCommandKind::kSendWalletTransaction:
     case SimulationCommandKind::kAddNodes:
+    case SimulationCommandKind::kRemoveNodes:
     case SimulationCommandKind::kCount:
       throw std::runtime_error(
           "command must be handled by the simulator resource owner");

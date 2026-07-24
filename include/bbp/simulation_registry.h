@@ -103,6 +103,9 @@ class SimulationRegistry {
   void AddWallet(WalletIdentity wallet);
   void AddMinerNode(uint32_t node_index);
   void SetRuntimeNodeCount(uint32_t node_count);
+  SimulationRegistry RemapRuntimeNodes(
+      const std::vector<std::optional<std::uint32_t>>& old_to_new,
+      PeerTopologyConfig peer_topology) const;
   WalletIdentity& MutableWalletByIndex(size_t wallet_index);
   const WalletIdentity& WalletByIndex(size_t wallet_index) const;
 

@@ -3233,7 +3233,8 @@ SimulationCommand ParseScheduledSimulationCommand(
       kind == SimulationCommandKind::kPartitionNodes ||
       kind == SimulationCommandKind::kHealPartition ||
       kind == SimulationCommandKind::kSetPerfCounters ||
-      kind == SimulationCommandKind::kAddNodes) {
+      kind == SimulationCommandKind::kAddNodes ||
+      kind == SimulationCommandKind::kRemoveNodes) {
     command.node_id = "sim";
   } else {
     command.node_id = ScenarioCommandNodeId(object, "node", options);
@@ -3432,6 +3433,14 @@ SimulationCommand ParseScheduledSimulationCommand(
     }
     command.node_add = ParseAndValidateSimulationNodeAddRequest(
         node_add->as_object(), options);
+  } else if (kind == SimulationCommandKind::kRemoveNodes) {
+    const boost::json::value* node_remove = object.if_contains("node_remove");
+    if (node_remove == nullptr || !node_remove->is_object()) {
+      throw std::runtime_error(
+          "scenario scheduled command node_remove must be an object");
+    }
+    command.node_remove = ParseAndValidateSimulationNodeRemoveRequest(
+        node_remove->as_object(), options);
   }
   command.scheduled_event_sequence = 1U;
   SimulationCommandQueue validation_queue;
@@ -3951,6 +3960,15 @@ void ApplyScheduledScenarioEvents(
   }
   std::set<std::string> planned_node_id_set(planned_node_ids.begin(),
                                             planned_node_ids.end());
+  std::set<std::string> planned_used_node_id_set = planned_node_id_set;
+  std::set<std::string> planned_wallet_node_ids;
+  for (const std::uint32_t node : options.topology.wallet_nodes) {
+    planned_wallet_node_ids.insert(ScenarioNodeId(options, node));
+  }
+  std::set<std::string> planned_miner_node_ids;
+  for (const std::uint32_t node : options.topology.miner_nodes) {
+    planned_miner_node_ids.insert(ScenarioNodeId(options, node));
+  }
   for (const ScheduledInput& input : ordered_inputs) {
     const boost::json::object& event = events[input.source_index].as_object();
     const std::string action_name = JsonStringField(event, "action");
@@ -3983,14 +4001,16 @@ void ApplyScheduledScenarioEvents(
           const std::string& prefix =
               ChainDriverSpecFor(options.chain).node_id_prefix;
           reserved_ids.reserve(command.node_add->count);
-          for (std::uint32_t suffix = 1U;
-               suffix <= options.node_capacity &&
+          for (std::uint64_t suffix = 1U;
+               suffix <= std::numeric_limits<std::uint32_t>::max() &&
                reserved_ids.size() < command.node_add->count;
                ++suffix) {
             const std::string candidate = prefix + "-" + std::to_string(suffix);
-            if (planned_node_id_set.insert(candidate).second) {
-              reserved_ids.push_back(candidate);
+            if (!planned_used_node_id_set.insert(candidate).second) {
+              continue;
             }
+            planned_node_id_set.insert(candidate);
+            reserved_ids.push_back(candidate);
           }
           if (reserved_ids.size() != command.node_add->count) {
             throw std::runtime_error(
@@ -3998,16 +4018,51 @@ void ApplyScheduledScenarioEvents(
           }
         } else {
           for (const std::string& node_id : reserved_ids) {
-            if (!planned_node_id_set.insert(node_id).second) {
+            if (!planned_used_node_id_set.insert(node_id).second) {
               throw std::runtime_error(
                   "scheduled node.add node id is already reserved: " + node_id);
             }
+            planned_node_id_set.insert(node_id);
           }
         }
         planned_node_ids.insert(planned_node_ids.end(), reserved_ids.begin(),
                                 reserved_ids.end());
         command.node_add->node_ids = std::move(reserved_ids);
         planned_node_count += command.node_add->count;
+      } else if (command.kind == SimulationCommandKind::kRemoveNodes) {
+        for (const std::string& node_id : command.node_remove->node_ids) {
+          if (planned_wallet_node_ids.contains(node_id)) {
+            throw std::runtime_error(
+                "scheduled node.remove requires wallet.remove before "
+                "removing wallet node " +
+                node_id);
+          }
+          if (planned_miner_node_ids.contains(node_id)) {
+            throw std::runtime_error(
+                "scheduled node.remove requires miner.remove before removing "
+                "miner node " +
+                node_id);
+          }
+          if (!planned_node_id_set.erase(node_id)) {
+            throw std::runtime_error(
+                "scheduled node.remove references an inactive node id: " +
+                node_id);
+          }
+          const auto planned = std::find(planned_node_ids.begin(),
+                                         planned_node_ids.end(), node_id);
+          if (planned == planned_node_ids.end()) {
+            throw std::logic_error(
+                "scheduled node.remove planned identity state diverged");
+          }
+          planned_node_ids.erase(planned);
+        }
+        const std::uint32_t removed_count =
+            static_cast<std::uint32_t>(command.node_remove->node_ids.size());
+        if (removed_count > planned_node_count) {
+          throw std::logic_error(
+              "scheduled node.remove planned count would underflow");
+        }
+        planned_node_count -= removed_count;
       }
       options.scheduled_events.emplace_back(input.at, sequence,
                                             std::move(command));
@@ -4680,6 +4735,13 @@ std::vector<ConfiguredScenarioAction> ConfiguredScenarioActions(
         std::get<SimulationCommand>(event.action);
     if (command.kind == SimulationCommandKind::kAddNodes) {
       planned_node_count += command.node_add->count;
+    } else if (command.kind == SimulationCommandKind::kRemoveNodes) {
+      const std::uint32_t removed_count =
+          static_cast<std::uint32_t>(command.node_remove->node_ids.size());
+      if (removed_count > planned_node_count) {
+        throw std::logic_error("configured node.remove count would underflow");
+      }
+      planned_node_count -= removed_count;
     }
   }
   return actions;
@@ -8337,6 +8399,10 @@ class TransactionObservationTracker {
 
   std::size_t CancelWorkload(std::string_view workload_id) {
     return observations_.CancelWorkload(workload_id);
+  }
+
+  [[nodiscard]] bool HasPending() const {
+    return !observations_.PendingTransactions().empty();
   }
 
   void TrackAndWaitForVisibility(Reservation reservation,
@@ -14946,12 +15012,12 @@ std::vector<std::string> DynamicTopologyPeerIds(
 }
 
 std::vector<std::string> DynamicRestartPeerEndpoints(
-    const Options& options, const RuntimePeerTopology& topology,
+    const NodeRoleTopology& role_topology, const RuntimePeerTopology& topology,
     const std::vector<ChainNodeConfig>& configs, std::uint32_t node_index) {
   std::vector<std::uint32_t> peer_indexes =
       topology.ActivePeerIndexes(node_index);
   const PeerConnectivityPolicy* policy =
-      FindPeerConnectivityPolicy(options.topology, node_index);
+      FindPeerConnectivityPolicy(role_topology, node_index);
   if (policy != nullptr) {
     const std::uint32_t initial_peer_count = policy->peer_count.minimum();
     if (initial_peer_count > peer_indexes.size()) {
@@ -15201,12 +15267,13 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
   std::vector<std::string> node_ids = request.node_ids;
   if (node_ids.empty()) {
     node_ids.reserve(request.count);
-    for (std::uint32_t suffix = 1U;
-         suffix <= inventory.capacity() && node_ids.size() < request.count;
+    for (std::uint64_t suffix = 1U;
+         suffix <= std::numeric_limits<std::uint32_t>::max() &&
+         node_ids.size() < request.count;
          ++suffix) {
       const std::string candidate =
           chain_spec.node_id_prefix + "-" + std::to_string(suffix);
-      if (used_ids.contains(candidate) ||
+      if (used_ids.contains(candidate) || inventory.WasNodeIdUsed(candidate) ||
           RuntimeNodeRootEntryExists(RequireRunOwnership(options), candidate)) {
         continue;
       }
@@ -15215,8 +15282,8 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     }
     if (node_ids.size() != request.count) {
       throw std::runtime_error(
-          "node-add could not allocate canonical node ids within the "
-          "configured capacity");
+          "node-add could not allocate canonical node ids within the uint32 "
+          "identity space");
     }
   } else {
     if (node_ids.size() != request.count) {
@@ -15225,9 +15292,10 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     }
     for (const std::string& node_id : node_ids) {
       RequireSafeScenarioIdentifier(node_id, "node-add node id");
-      if (!used_ids.insert(node_id).second) {
-        throw std::runtime_error("node-add node id is already active: " +
-                                 node_id);
+      if (!used_ids.insert(node_id).second ||
+          inventory.WasNodeIdUsed(node_id)) {
+        throw std::runtime_error(
+            "node-add node id was already used by this run: " + node_id);
       }
       if (RuntimeNodeRootEntryExists(RequireRunOwnership(options), node_id)) {
         throw std::runtime_error(
@@ -15279,7 +15347,8 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
   }
   for (std::uint32_t index = 0U; index < final_count; ++index) {
     final_configs[index].connect_peers = DynamicRestartPeerEndpoints(
-        options, *next_runtime_topology, final_configs, index);
+        before_registry.registry().topology(), *next_runtime_topology,
+        final_configs, index);
   }
   std::vector<ChainNodeConfig> startup_configs = final_configs;
   for (std::uint32_t index = static_cast<std::uint32_t>(before.size());
@@ -16168,6 +16237,694 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
   return result;
 }
 
+struct RuntimeNodeRemoveResult {
+  std::vector<std::string> removed_node_ids;
+  std::uint64_t inventory_generation = 0U;
+  std::uint32_t final_node_count = 0U;
+};
+
+RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, RuntimeNodeInventory& inventory,
+    RuntimeWalletRegistry& runtime_registry,
+    PeerConnectivityController& peer_controller,
+    std::unique_ptr<RuntimePeerTopology>* runtime_topology,
+    PeerTopologyConfig* live_topology_config,
+    const std::shared_ptr<LiveWalletWorkloadRegistry>& wallet_workloads,
+    const TransactionObservationTracker& transaction_tracker,
+    const SimulationNodeRemoveRequest& request,
+    SimulationCommandControl* operation_control, std::stop_token stop_token) {
+  if (request.node_ids.empty() ||
+      request.node_ids.size() > kSimulationNodeRemoveMaximumCount) {
+    throw std::runtime_error("node-remove count is out of range");
+  }
+  if (runtime_topology == nullptr || !*runtime_topology ||
+      live_topology_config == nullptr || !wallet_workloads) {
+    throw std::logic_error("node-remove runtime services are unavailable");
+  }
+  RuntimeNodeSnapshot before = inventory.Snapshot();
+  RuntimeWalletSnapshot before_registry = runtime_registry.Snapshot();
+  if (request.node_ids.size() > before.size()) {
+    throw std::runtime_error("node-remove count exceeds the active node count");
+  }
+  if (before.generation() == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("node-remove inventory generation overflow");
+  }
+  if (operation_control != nullptr) {
+    std::vector<std::string> initial_node_ids;
+    initial_node_ids.reserve(before.size());
+    for (const NodeRuntime& node : before) {
+      initial_node_ids.push_back(node.config.id);
+    }
+    if (!operation_control->RecordInitialInventory(
+            before.generation(), std::move(initial_node_ids))) {
+      throw std::logic_error(
+          "node-remove command has a conflicting initial inventory");
+    }
+  }
+
+  std::set<std::string> requested_ids;
+  for (const std::string& node_id : request.node_ids) {
+    RequireSafeScenarioIdentifier(node_id, "node-remove node id");
+    if (!requested_ids.insert(node_id).second) {
+      throw std::runtime_error("node-remove node ids must be unique");
+    }
+  }
+  std::vector<std::optional<std::uint32_t>> old_to_new(before.size());
+  std::vector<std::uint32_t> retained_old_indexes;
+  std::vector<std::uint32_t> removed_old_indexes;
+  std::vector<ChainNodeConfig> final_configs;
+  std::vector<std::uint32_t> final_resource_slots;
+  std::set<std::string> found_ids;
+  final_configs.reserve(before.size() - request.node_ids.size());
+  final_resource_slots.reserve(before.size() - request.node_ids.size());
+  {
+    std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+    for (std::uint32_t old_index = 0U; old_index < before.size(); ++old_index) {
+      const NodeRuntime& node = before[old_index];
+      if (requested_ids.contains(node.config.id)) {
+        found_ids.insert(node.config.id);
+        removed_old_indexes.push_back(old_index);
+        continue;
+      }
+      const std::uint32_t next_index =
+          static_cast<std::uint32_t>(retained_old_indexes.size());
+      old_to_new[old_index] = next_index;
+      retained_old_indexes.push_back(old_index);
+      final_configs.push_back(node.config);
+      final_resource_slots.push_back(before.slot(old_index));
+    }
+  }
+  if (found_ids != requested_ids) {
+    throw std::runtime_error(
+        "node-remove references an unknown active node id");
+  }
+
+  const NodeRoleTopology& before_roles = before_registry.registry().topology();
+  for (const std::uint32_t removed : removed_old_indexes) {
+    if (std::find(before_roles.wallet_nodes.begin(),
+                  before_roles.wallet_nodes.end(),
+                  removed) != before_roles.wallet_nodes.end()) {
+      throw std::runtime_error(
+          "node-remove requires wallet.remove before removing wallet node " +
+          before[removed].config.id);
+    }
+    if (std::find(before_roles.miner_nodes.begin(),
+                  before_roles.miner_nodes.end(),
+                  removed) != before_roles.miner_nodes.end()) {
+      throw std::runtime_error(
+          "node-remove requires miner.remove before removing miner node " +
+          before[removed].config.id);
+    }
+  }
+  {
+    std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
+    {
+      std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
+      records.reserve(wallet_workloads->records.size());
+      for (const auto& [id, record] : wallet_workloads->records) {
+        static_cast<void>(id);
+        records.push_back(record);
+      }
+    }
+    for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (!IsTerminalLiveWalletWorkloadState(record->state)) {
+        throw std::runtime_error(
+            "node-remove is unavailable while wallet workload " + record->id +
+            " is " + std::string(LiveWalletWorkloadStateName(record->state)));
+      }
+    }
+  }
+  if (transaction_tracker.HasPending()) {
+    throw std::runtime_error(
+        "node-remove is unavailable while transaction observations are "
+        "pending");
+  }
+
+  const std::uint32_t final_count =
+      static_cast<std::uint32_t>(final_configs.size());
+  PeerTopologyConfig next_topology_config =
+      RemapPeerTopologyConfig(*live_topology_config, old_to_new);
+  auto next_runtime_topology = std::make_unique<RuntimePeerTopology>(
+      next_topology_config, final_count, final_count == 0U);
+  if (final_count != 0U) {
+    next_runtime_topology->PreserveRemappedStateFrom(**runtime_topology,
+                                                     old_to_new);
+  }
+  SimulationRegistry next_registry =
+      before_registry.registry().RemapRuntimeNodes(old_to_new,
+                                                   next_topology_config);
+  for (std::uint32_t index = 0U; index < final_count; ++index) {
+    final_configs[index].connect_peers = DynamicRestartPeerEndpoints(
+        next_registry.topology(), *next_runtime_topology, final_configs, index);
+  }
+  if (!options.isolate_network &&
+      std::any_of(next_runtime_topology->edges().begin(),
+                  next_runtime_topology->edges().end(),
+                  [](const RuntimePeerTopologyEdge& edge) {
+                    return edge.active && edge.condition.has_value();
+                  })) {
+    throw std::runtime_error(
+        "node-remove conditioned topology requires isolated networking");
+  }
+  if (options.chain == ChainKind::kMonero) {
+    for (std::size_t first = 0U; first < retained_old_indexes.size(); ++first) {
+      for (std::size_t second = first + 1U;
+           second < retained_old_indexes.size(); ++second) {
+        if ((*runtime_topology)
+                ->PhysicalPeerRequired(retained_old_indexes[first],
+                                       retained_old_indexes[second]) !=
+            next_runtime_topology->PhysicalPeerRequired(
+                static_cast<std::uint32_t>(first),
+                static_cast<std::uint32_t>(second))) {
+          throw std::runtime_error(
+              "Monero node-remove cannot change physical connectivity "
+              "between surviving nodes");
+        }
+      }
+    }
+  }
+
+  PeerConnectivityController::AllowedPeerMap final_allowed_peers;
+  for (std::uint32_t index = 0U; index < final_count; ++index) {
+    final_allowed_peers.emplace(
+        final_configs[index].id,
+        DynamicTopologyPeerIds(*next_runtime_topology, final_configs, index));
+  }
+  auto peer_rpc_lease = peer_controller.AcquireRpcMutationLease(stop_token);
+  auto prepared_peer_registration = peer_controller.PrepareFinalRegistration(
+      final_configs, {}, final_allowed_peers, {}, peer_rpc_lease);
+
+  std::vector<std::vector<DirectionalNetworkPolicy>> prior_policies(
+      retained_old_indexes.size());
+  std::vector<std::vector<DirectionalNetworkPolicy>> desired_policies(
+      retained_old_indexes.size());
+  std::vector<std::vector<std::string>> desired_process_start_peers(
+      retained_old_indexes.size());
+  std::vector<std::uint32_t> old_resource_slots;
+  if (options.isolate_network) {
+    old_resource_slots.reserve(before.size());
+    for (std::size_t index = 0U; index < before.size(); ++index) {
+      old_resource_slots.push_back(before.slot(index));
+    }
+  }
+  {
+    std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+    for (std::size_t next_index = 0U; next_index < retained_old_indexes.size();
+         ++next_index) {
+      NodeRuntime& node = before[retained_old_indexes[next_index]];
+      if (options.isolate_network) {
+        prior_policies[next_index] = node.directional_network_policies;
+        const std::vector<DirectionalNetworkPolicy> expected =
+            DynamicDirectionalNetworkPolicies(
+                **runtime_topology, NetworkAddressPlan(options),
+                old_resource_slots, retained_old_indexes[next_index]);
+        if (prior_policies[next_index] != expected) {
+          throw std::runtime_error(
+              "node-remove directional policy state does not match the "
+              "current topology");
+        }
+        desired_policies[next_index] = DynamicDirectionalNetworkPolicies(
+            *next_runtime_topology, NetworkAddressPlan(options),
+            final_resource_slots, static_cast<std::uint32_t>(next_index));
+      }
+      if (node.uses_physical_start_connect_peers) {
+        desired_process_start_peers[next_index] =
+            DynamicPhysicalTopologyPeerEndpoints(
+                *next_runtime_topology, final_configs,
+                static_cast<std::uint32_t>(next_index));
+      }
+    }
+  }
+
+  std::vector<std::vector<std::string>> candidate_endpoints(before.size());
+  std::vector<std::optional<std::set<std::string>>> prior_connections(
+      before.size());
+  for (std::size_t source = 0U; source < before.size(); ++source) {
+    candidate_endpoints[source].reserve(before.size() - 1U);
+    for (std::size_t target = 0U; target < before.size(); ++target) {
+      if (source != target) {
+        candidate_endpoints[source].push_back(
+            before[target].config.p2p_host + ":" +
+            std::to_string(before[target].config.p2p_port));
+      }
+    }
+    if (before[source].AllowsChainMetrics()) {
+      const std::vector<std::string> connected = driver.ConnectedPeerAddresses(
+          before[source].config, candidate_endpoints[source], stop_token);
+      prior_connections[source].emplace(connected.begin(), connected.end());
+    }
+  }
+
+  RuntimeNodeResourceManifest prior_manifest =
+      RuntimeNodeResourceManifestFor(options, before);
+  const std::optional<RuntimeNodeResourceManifest> stored_manifest =
+      TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+  if (!stored_manifest || *stored_manifest != prior_manifest) {
+    throw std::runtime_error(
+        "node-remove runtime resource manifest does not match the live "
+        "inventory");
+  }
+  RuntimeNodeResourceManifest pending_manifest = prior_manifest;
+  for (RuntimeNodeResourceEntry& entry : pending_manifest.nodes) {
+    if (requested_ids.contains(entry.node_id)) {
+      entry.state = RuntimeNodeResourceState::kPendingRemove;
+    }
+  }
+  try {
+    WriteRuntimeNodeResourceManifest(pending_manifest);
+    const std::optional<RuntimeNodeResourceManifest> pending_readback =
+        TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+    if (!pending_readback || *pending_readback != pending_manifest) {
+      throw std::runtime_error(
+          "node-remove pending resource manifest read-back failed");
+    }
+  } catch (...) {
+    const std::exception_ptr pending_failure = std::current_exception();
+    try {
+      WriteRuntimeNodeResourceManifest(prior_manifest);
+      const std::optional<RuntimeNodeResourceManifest> restored =
+          TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+      if (!restored || *restored != prior_manifest) {
+        throw std::runtime_error(
+            "node-remove prior resource manifest restoration read-back "
+            "failed");
+      }
+    } catch (...) {
+      throw SimulationCommandOutcomeUnconfirmed(
+          "node-remove pending resource manifest publication failed: " +
+          ExceptionMessage(pending_failure) +
+          "; prior manifest restoration failed: " +
+          ExceptionMessage(std::current_exception()));
+    }
+    std::rethrow_exception(pending_failure);
+  }
+
+  std::vector<bool> policy_updated(retained_old_indexes.size(), false);
+  bool peer_mutation_started = false;
+  bool published = false;
+  RuntimeNodeRemoveResult result{.removed_node_ids = request.node_ids};
+  try {
+    if (options.isolate_network) {
+      for (std::size_t next_index = 0U;
+           next_index < retained_old_indexes.size(); ++next_index) {
+        if (prior_policies[next_index] == desired_policies[next_index]) {
+          continue;
+        }
+        NodeRuntime& node = before[retained_old_indexes[next_index]];
+        std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+        if (!node.network_namespace || !node.network) {
+          throw std::runtime_error(
+              "surviving isolated node lost its network resource");
+        }
+        UpdateDirectionalNetworkPoliciesInNamespace(
+            node.network_namespace->fd(), node.network->peer_name,
+            prior_policies[next_index], desired_policies[next_index],
+            stop_token);
+        node.directional_network_policies.swap(desired_policies[next_index]);
+        policy_updated[next_index] = true;
+      }
+    }
+    if (operation_control != nullptr) {
+      operation_control->ReportProgress(1U);
+    }
+
+    peer_mutation_started = true;
+    const auto peer_visible = [&](std::uint32_t source, std::uint32_t target) {
+      if (!before[source].AllowsChainMetrics() ||
+          !before[target].AllowsChainMetrics()) {
+        return false;
+      }
+      const std::string endpoint =
+          before[target].config.p2p_host + ":" +
+          std::to_string(before[target].config.p2p_port);
+      return !driver
+                  .ConnectedPeerAddresses(before[source].config, {endpoint},
+                                          stop_token)
+                  .empty();
+    };
+    for (std::uint32_t first = 0U; first < before.size(); ++first) {
+      for (std::uint32_t second = first + 1U; second < before.size();
+           ++second) {
+        if (!before[first].AllowsChainMetrics() ||
+            !before[second].AllowsChainMetrics()) {
+          continue;
+        }
+        const bool visible_from_first = peer_visible(first, second);
+        const bool visible_from_second = peer_visible(second, first);
+        const bool connected = visible_from_first || visible_from_second;
+        const bool should_connect =
+            old_to_new[first] && old_to_new[second] &&
+            next_runtime_topology->PhysicalPeerRequired(*old_to_new[first],
+                                                        *old_to_new[second]);
+        if (connected == should_connect) {
+          continue;
+        }
+        ThrowIfStopRequested(stop_token);
+        std::uint32_t source = first;
+        std::uint32_t target = second;
+        if (!should_connect && !visible_from_first && visible_from_second) {
+          source = second;
+          target = first;
+        }
+        const std::string endpoint =
+            before[target].config.p2p_host + ":" +
+            std::to_string(before[target].config.p2p_port);
+        if (should_connect) {
+          driver.ConnectPeer(before[source].config, endpoint, stop_token);
+          driver.WaitForPeerAddress(before[source].config, endpoint,
+                                    std::chrono::seconds(request.timeout_sec),
+                                    stop_token);
+        } else {
+          driver.DisconnectPeer(before[source].config, endpoint, stop_token);
+          driver.WaitForPeerAddressAbsent(
+              before[source].config, endpoint,
+              std::chrono::seconds(request.timeout_sec), stop_token);
+        }
+        if ((peer_visible(first, second) || peer_visible(second, first)) !=
+            should_connect) {
+          throw std::runtime_error(
+              "node-remove physical peer mutation read-back failed");
+        }
+      }
+    }
+    if (operation_control != nullptr) {
+      operation_control->ReportProgress(2U);
+    }
+
+    boost::json::array published_node_ids;
+    boost::json::array published_node_configs;
+    published_node_ids.reserve(final_count);
+    published_node_configs.reserve(final_count);
+    for (std::uint32_t index = 0U; index < final_count; ++index) {
+      published_node_ids.emplace_back(final_configs[index].id);
+      published_node_configs.push_back(RuntimePublishedNodeConfig(
+          options, before[retained_old_indexes[index]], final_configs[index],
+          index, &next_registry.topology()));
+    }
+    boost::json::object published_topology;
+    if (final_count == 0U) {
+      published_topology["type"] = "full_mesh";
+      published_topology["resolved_edges"] = boost::json::array{};
+    } else {
+      AddPeerTopologyJson(next_topology_config, final_count,
+                          &published_topology);
+    }
+    const boost::json::object generation_detail{
+        {"generation", before.generation() + 1U},
+        {"node_count", final_count},
+        {"node_ids", std::move(published_node_ids)},
+        {"node_configs", std::move(published_node_configs)},
+        {"topology", std::move(published_topology)},
+        {"topology_current_edges",
+         RuntimePeerTopologyEdgesJson(*next_runtime_topology)},
+        {"removed_node_ids",
+         [&] {
+           boost::json::array ids;
+           for (const std::string& id : request.node_ids) {
+             ids.emplace_back(id);
+           }
+           return ids;
+         }()},
+        {"manifest_state", "live"}};
+
+    std::unique_lock<std::timed_mutex> publication_lock =
+        AcquireRuntimePublicationLock(stop_token);
+    RuntimeNodeInventory::PreparedRemoval prepared_inventory =
+        inventory.PrepareRemoval(before.generation(), request.node_ids,
+                                 final_configs);
+    RuntimeWalletRegistry::PreparedAppend prepared_registry =
+        runtime_registry.PrepareReplace(before_registry.generation(),
+                                        std::move(next_registry));
+    std::unique_lock<std::mutex> network_lock(node_network_state_mutex);
+    if (operation_control != nullptr) {
+      if (!operation_control->TryBeginCommit()) {
+        throw SimulationCancelled();
+      }
+    } else {
+      ThrowIfStopRequested(stop_token);
+    }
+    prepared_peer_registration.Commit();
+    for (std::size_t next_index = 0U; next_index < retained_old_indexes.size();
+         ++next_index) {
+      NodeRuntime& node = before[retained_old_indexes[next_index]];
+      node.config.connect_peers.swap(final_configs[next_index].connect_peers);
+      if (node.uses_physical_start_connect_peers) {
+        node.process_start_connect_peers.swap(
+            desired_process_start_peers[next_index]);
+      }
+    }
+    runtime_topology->swap(next_runtime_topology);
+    static_assert(std::is_nothrow_swappable_v<PeerTopologyConfig>);
+    using std::swap;
+    swap(*live_topology_config, next_topology_config);
+    RuntimeNodeSnapshot published_nodes = prepared_inventory.Commit();
+    const RuntimeWalletSnapshot published_registry = prepared_registry.Commit();
+    published = true;
+    result.inventory_generation = published_nodes.generation();
+    result.final_node_count =
+        static_cast<std::uint32_t>(published_nodes.size());
+    network_lock.unlock();
+    publication_lock.unlock();
+    if (operation_control != nullptr) {
+      operation_control->ReportProgress(3U);
+    }
+
+    before = RuntimeNodeSnapshot{};
+    before_registry = RuntimeWalletSnapshot{};
+    const auto cleanup_deadline =
+        operation_control && operation_control->absolute_deadline
+            ? *operation_control->absolute_deadline
+            : std::chrono::steady_clock::now() +
+                  std::chrono::seconds(request.timeout_sec);
+    while (!prepared_inventory.ReadersDrained()) {
+      if (std::chrono::steady_clock::now() >= cleanup_deadline) {
+        throw SimulationCommandOutcomeUnconfirmed(
+            "node-remove published but pre-publication readers did not drain "
+            "before timeout");
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (operation_control != nullptr) {
+      operation_control->ReportProgress(4U);
+    }
+
+    std::vector<NodeRuntime> retired_nodes;
+    std::vector<std::uint32_t> retired_slots;
+    retired_nodes.reserve(prepared_inventory.retired_nodes().size());
+    retired_slots.reserve(prepared_inventory.retired_nodes().size());
+    for (const RuntimeNodeInsertion& retired :
+         prepared_inventory.retired_nodes()) {
+      retired_slots.push_back(retired.slot);
+      retired_nodes.push_back(std::move(*retired.runtime));
+    }
+    for (const NodeRuntime& survivor : published_nodes) {
+      for (const NodeRuntime& retired : retired_nodes) {
+        ChainNodeConfig permit_config = survivor.config;
+        const std::string retired_endpoint = NodePeerEndpoint(retired);
+        if (std::find(permit_config.connect_peers.begin(),
+                      permit_config.connect_peers.end(),
+                      retired_endpoint) == permit_config.connect_peers.end()) {
+          permit_config.connect_peers.push_back(retired_endpoint);
+        }
+        driver.ConnectPeer(permit_config, retired_endpoint, stop_token);
+      }
+    }
+    Options cleanup_options = options;
+    cleanup_options.cleanup_policy = CleanupPolicy::kAutomatic;
+    const std::vector<bool> cleaned =
+        StopNodes(cleanup_options, events_path, driver, retired_nodes, false,
+                  false, &retired_slots, cleanup_deadline);
+    if (cleaned.size() != retired_nodes.size() ||
+        std::find(cleaned.begin(), cleaned.end(), false) != cleaned.end()) {
+      throw SimulationCommandOutcomeUnconfirmed(
+          "node-remove resource cleanup was not positively verified");
+    }
+    for (std::size_t index = 0U; index < retired_nodes.size(); ++index) {
+      const auto manifest_entry = std::find_if(
+          pending_manifest.nodes.begin(), pending_manifest.nodes.end(),
+          [&](const RuntimeNodeResourceEntry& entry) {
+            return entry.node_id == retired_nodes[index].config.id;
+          });
+      if (manifest_entry == pending_manifest.nodes.end()) {
+        throw SimulationCommandOutcomeUnconfirmed(
+            "node-remove lost a retired manifest entry");
+      }
+      RemoveRuntimeNodeRoot(RequireRunOwnership(options), *manifest_entry,
+                            cleanup_deadline);
+      if (RuntimeNodeRootEntryExists(RequireRunOwnership(options),
+                                     manifest_entry->node_id)) {
+        throw SimulationCommandOutcomeUnconfirmed(
+            "node-remove retired node root survived cleanup");
+      }
+    }
+    RuntimeNodeResourceManifest final_manifest =
+        RuntimeNodeResourceManifestFor(options, published_nodes);
+    try {
+      WriteRuntimeNodeResourceManifest(final_manifest);
+      const std::optional<RuntimeNodeResourceManifest> final_readback =
+          TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+      if (!final_readback || *final_readback != final_manifest) {
+        throw std::runtime_error(
+            "node-remove final resource manifest read-back failed");
+      }
+    } catch (...) {
+      const std::exception_ptr promotion_failure = std::current_exception();
+      try {
+        WriteRuntimeNodeResourceManifest(pending_manifest);
+        const std::optional<RuntimeNodeResourceManifest> restored =
+            TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+        if (!restored || *restored != pending_manifest) {
+          throw std::runtime_error(
+              "node-remove pending resource manifest restoration read-back "
+              "failed");
+        }
+      } catch (...) {
+        throw SimulationCommandOutcomeUnconfirmed(
+            "node-remove final resource manifest promotion failed: " +
+            ExceptionMessage(promotion_failure) +
+            "; pending manifest restoration failed: " +
+            ExceptionMessage(std::current_exception()));
+      }
+      throw SimulationCommandOutcomeUnconfirmed(
+          "node-remove final resource manifest promotion failed: " +
+          ExceptionMessage(promotion_failure));
+    }
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kRuntimeGenerationPublished,
+               boost::json::serialize(generation_detail));
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kRuntimeRoleGenerationPublished,
+               boost::json::serialize(RuntimeRoleGenerationDetail(
+                   published_registry, published_nodes)));
+    if (operation_control != nullptr) {
+      operation_control->MarkCommitted();
+      operation_control->ReportProgress(kSimulationNodeAddProgressTotal);
+    }
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    if (published) {
+      if (operation_control != nullptr) {
+        operation_control->outcome_unconfirmed.store(true,
+                                                     std::memory_order_release);
+      }
+      throw SimulationCommandOutcomeUnconfirmed(ExceptionMessage(failure));
+    }
+    std::vector<std::string> rollback_errors;
+    constexpr auto kRollbackTimeout = std::chrono::seconds(10);
+    const auto rollback_deadline =
+        std::chrono::steady_clock::now() + kRollbackTimeout;
+    std::stop_source rollback_stop_source;
+    std::jthread rollback_timer([rollback_deadline, &rollback_stop_source](
+                                    std::stop_token timer_stop_token) {
+      try {
+        WaitUntil(rollback_deadline, timer_stop_token);
+      } catch (const SimulationCancelled&) {
+        return;
+      }
+      rollback_stop_source.request_stop();
+    });
+    const std::stop_token rollback_stop_token =
+        rollback_stop_source.get_token();
+    const auto require_rollback_time = [&] {
+      if (rollback_stop_token.stop_requested() ||
+          std::chrono::steady_clock::now() >= rollback_deadline) {
+        throw std::runtime_error("node-remove rollback deadline expired");
+      }
+    };
+    const auto rollback = [&](std::string_view description,
+                              const auto& action) {
+      try {
+        require_rollback_time();
+        action();
+      } catch (...) {
+        rollback_errors.push_back(std::string(description) + ": " +
+                                  ExceptionMessage(std::current_exception()));
+      }
+    };
+    if (peer_mutation_started) {
+      for (std::size_t source = 0U; source < before.size(); ++source) {
+        if (!prior_connections[source]) {
+          continue;
+        }
+        rollback("restore peer state for " + before[source].config.id, [&] {
+          const std::vector<std::string> observed =
+              driver.ConnectedPeerAddresses(before[source].config,
+                                            candidate_endpoints[source],
+                                            rollback_stop_token);
+          const std::set<std::string> current(observed.begin(), observed.end());
+          for (const std::string& endpoint : candidate_endpoints[source]) {
+            const bool was_connected =
+                prior_connections[source]->contains(endpoint);
+            const bool is_connected = current.contains(endpoint);
+            if (was_connected == is_connected) {
+              continue;
+            }
+            if (was_connected) {
+              driver.ConnectPeer(before[source].config, endpoint,
+                                 rollback_stop_token);
+              driver.WaitForPeerAddress(before[source].config, endpoint,
+                                        kRollbackTimeout, rollback_stop_token);
+            } else {
+              driver.DisconnectPeer(before[source].config, endpoint,
+                                    rollback_stop_token);
+              driver.WaitForPeerAddressAbsent(before[source].config, endpoint,
+                                              kRollbackTimeout,
+                                              rollback_stop_token);
+            }
+          }
+          const std::vector<std::string> restored =
+              driver.ConnectedPeerAddresses(before[source].config,
+                                            candidate_endpoints[source],
+                                            rollback_stop_token);
+          if (std::set<std::string>(restored.begin(), restored.end()) !=
+              *prior_connections[source]) {
+            throw std::runtime_error(
+                "peer state differs from its pre-remove snapshot");
+          }
+        });
+      }
+    }
+    if (options.isolate_network) {
+      for (std::size_t next_index = 0U;
+           next_index < retained_old_indexes.size(); ++next_index) {
+        if (!policy_updated[next_index]) {
+          continue;
+        }
+        NodeRuntime& node = before[retained_old_indexes[next_index]];
+        rollback("restore directional policy for " + node.config.id, [&] {
+          std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+          UpdateDirectionalNetworkPoliciesInNamespace(
+              node.network_namespace->fd(), node.network->peer_name,
+              node.directional_network_policies, prior_policies[next_index],
+              rollback_stop_token);
+          node.directional_network_policies.swap(prior_policies[next_index]);
+        });
+      }
+    }
+    rollback("restore resource manifest", [&] {
+      WriteRuntimeNodeResourceManifest(prior_manifest);
+      const std::optional<RuntimeNodeResourceManifest> restored =
+          TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+      if (!restored || *restored != prior_manifest) {
+        throw std::runtime_error(
+            "node-remove resource manifest rollback read-back failed");
+      }
+    });
+    if (!rollback_errors.empty()) {
+      std::string detail = "node-remove failed: " + ExceptionMessage(failure) +
+                           "; rollback could not be verified";
+      for (const std::string& error : rollback_errors) {
+        detail += "; " + error;
+      }
+      throw SimulationCommandOutcomeUnconfirmed(std::move(detail));
+    }
+    std::rethrow_exception(failure);
+  }
+  return result;
+}
+
 std::filesystem::path BenchmarkRunRoot(const Options& options) {
   return std::filesystem::absolute(options.output_dir) / options.run_id;
 }
@@ -16608,13 +17365,31 @@ std::string SimulationCommandDetail(
     add["sync_timeout_sec"] = command.node_add->sync_timeout_sec;
     detail["node_add"] = std::move(add);
   }
-  if (outcome != nullptr && command.kind == SimulationCommandKind::kAddNodes) {
+  if (command.node_remove) {
+    boost::json::object remove;
+    boost::json::array node_ids;
+    for (const std::string& node_id : command.node_remove->node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    remove["node_ids"] = std::move(node_ids);
+    remove["timeout_sec"] = command.node_remove->timeout_sec;
+    detail["node_remove"] = std::move(remove);
+  }
+  if (outcome != nullptr &&
+      (command.kind == SimulationCommandKind::kAddNodes ||
+       command.kind == SimulationCommandKind::kRemoveNodes)) {
     boost::json::array added_node_ids;
     added_node_ids.reserve(outcome->added_node_ids.size());
     for (const std::string& node_id : outcome->added_node_ids) {
       added_node_ids.emplace_back(node_id);
     }
     detail["added_node_ids"] = std::move(added_node_ids);
+    boost::json::array removed_node_ids;
+    removed_node_ids.reserve(outcome->removed_node_ids.size());
+    for (const std::string& node_id : outcome->removed_node_ids) {
+      removed_node_ids.emplace_back(node_id);
+    }
+    detail["removed_node_ids"] = std::move(removed_node_ids);
     if (outcome->inventory_generation) {
       detail["inventory_generation"] = *outcome->inventory_generation;
     }
@@ -16886,7 +17661,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
       for (const SimulationCommand& command : active_command_queue->Cancel()) {
         constexpr std::string_view kCancellation =
             "simulation stopped before command processor startup";
-        if (command.kind == SimulationCommandKind::kAddNodes &&
+        if ((command.kind == SimulationCommandKind::kAddNodes ||
+             command.kind == SimulationCommandKind::kRemoveNodes) &&
             command.operation_control) {
           static_cast<void>(command.operation_control->RequestCancellation(
               SimulationCommandCancellationCause::kApplicationShutdown));
@@ -16901,6 +17677,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 .error = std::string(kCancellation),
                 .node_lifecycle = std::nullopt,
                 .added_node_ids = {},
+                .removed_node_ids = {},
                 .inventory_generation = std::nullopt,
                 .final_node_count = std::nullopt,
             });
@@ -17337,7 +18114,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             SimulationCommandOutcome command_outcome;
             std::stop_callback application_shutdown_callback(
                 command_rpc_stop_source.get_token(), [&] {
-                  if (command.kind == SimulationCommandKind::kAddNodes &&
+                  if ((command.kind == SimulationCommandKind::kAddNodes ||
+                       command.kind == SimulationCommandKind::kRemoveNodes) &&
                       command.operation_control) {
                     static_cast<void>(
                         command.operation_control->RequestCancellation(
@@ -17373,7 +18151,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 command.kind != SimulationCommandKind::kExportNodeReport &&
                 command.kind !=
                     SimulationCommandKind::kSetBlockProductionPolicy &&
-                command.kind != SimulationCommandKind::kAddNodes;
+                command.kind != SimulationCommandKind::kAddNodes &&
+                command.kind != SimulationCommandKind::kRemoveNodes;
             const bool needs_direct_node =
                 needs_runtime_snapshot &&
                 command.kind != SimulationCommandKind::kSetPerfCounters &&
@@ -17425,6 +18204,22 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                     error.failure());
                 throw;
               }
+            } else if (command.kind == SimulationCommandKind::kRemoveNodes) {
+              if (!command.node_remove) {
+                throw std::runtime_error("node-remove payload is missing");
+              }
+              std::lock_guard<std::mutex> topology_lock(runtime_topology_mutex);
+              RuntimeNodeRemoveResult removed = RemoveRuntimeNodesTransactional(
+                  options, events_path, driver, node_inventory,
+                  runtime_wallet_registry, *peer_connectivity_controller,
+                  &runtime_topology, &live_topology_config, wallet_workloads,
+                  transaction_tracker, *command.node_remove,
+                  command.operation_control.get(), command_stop_token);
+              command_outcome.removed_node_ids =
+                  std::move(removed.removed_node_ids);
+              command_outcome.inventory_generation =
+                  removed.inventory_generation;
+              command_outcome.final_node_count = removed.final_node_count;
             } else if (command.kind ==
                        SimulationCommandKind::kExportNodeReport) {
               ExportNodeReport(run_root, command);
@@ -18193,10 +18988,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   SimulationEventKind::kOperatorCommandCompleted,
                   SimulationCommandDetail(command, {}, &command_outcome));
             } catch (const std::exception& error) {
-              if (command.kind == SimulationCommandKind::kAddNodes &&
-                  !command_outcome.added_node_ids.empty()) {
+              if ((command.kind == SimulationCommandKind::kAddNodes &&
+                   !command_outcome.added_node_ids.empty()) ||
+                  (command.kind == SimulationCommandKind::kRemoveNodes &&
+                   !command_outcome.removed_node_ids.empty())) {
                 throw SimulationCommandOutcomeUnconfirmed(
-                    "node-add published but completion evidence failed: " +
+                    "node mutation published but completion evidence failed: " +
                     std::string(error.what()));
               }
               throw;
@@ -18276,158 +19073,163 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         std::condition_variable_any wakeup;
         std::mutex wakeup_mutex;
         while (!operation_stop_token.stop_requested()) {
-          const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
-          for (std::size_t index = 0; index < nodes.size(); ++index) {
-            if (operation_stop_token.stop_requested()) {
-              return;
-            }
+          {
             auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
                                                          operation_stop_token);
-            NodeRuntime& node = nodes[index];
-            const auto now = std::chrono::steady_clock::now();
-            const bool stop_due =
-                node.lifecycle_policy.stop_time &&
-                now >= SteadyDeadline(lifecycle_epoch,
-                                      options.time_scale.WallDuration(
-                                          *node.lifecycle_policy.stop_time));
-            if (stop_due && !node.DeclarativeStopApplied()) {
-              if (block_scheduler && is_configured_miner(node.config.id)) {
-                block_scheduler->StopMiner(node.config.id);
+            const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
+            for (std::size_t index = 0; index < nodes.size(); ++index) {
+              if (operation_stop_token.stop_requested()) {
+                return;
               }
-              if (node.DeclarativeStopApplied()) {
-                continue;
-              }
-              node.MarkDeclarativeStopApplied();
-              WriteEvent(
-                  events_path, options.run_id, node.config.id,
-                  SimulationEventKind::kNodeStopDeadlineReached,
-                  NodeLifecycleDeadlineDetail(
-                      node, options.time_scale, lifecycle_epoch,
-                      *node.lifecycle_policy.stop_time, "declarative_stop"));
-              if (NodeProcessRunning(node)) {
-                StopNodeProcess(options, events_path, driver, node,
-                                operation_stop_token);
-              } else {
+              NodeRuntime& node = nodes[index];
+              const auto now = std::chrono::steady_clock::now();
+              const bool stop_due =
+                  node.lifecycle_policy.stop_time &&
+                  now >= SteadyDeadline(lifecycle_epoch,
+                                        options.time_scale.WallDuration(
+                                            *node.lifecycle_policy.stop_time));
+              if (stop_due && !node.DeclarativeStopApplied()) {
+                if (block_scheduler && is_configured_miner(node.config.id)) {
+                  block_scheduler->StopMiner(node.config.id);
+                }
+                if (node.DeclarativeStopApplied()) {
+                  continue;
+                }
+                node.MarkDeclarativeStopApplied();
+                WriteEvent(
+                    events_path, options.run_id, node.config.id,
+                    SimulationEventKind::kNodeStopDeadlineReached,
+                    NodeLifecycleDeadlineDetail(
+                        node, options.time_scale, lifecycle_epoch,
+                        *node.lifecycle_policy.stop_time, "declarative_stop"));
+                if (NodeProcessRunning(node)) {
+                  StopNodeProcess(options, events_path, driver, node,
+                                  operation_stop_token);
+                } else {
+                  {
+                    auto process_guard = run_process_state.Lock();
+                    ResetNodePerfCounters(node, process_guard);
+                    node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+                  }
+                  WriteNodeStateEvent(events_path, options.run_id, node,
+                                      NodeRuntimeLifecycle::kStopped);
+                }
                 {
                   auto process_guard = run_process_state.Lock();
-                  ResetNodePerfCounters(node, process_guard);
-                  node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
+                  run_process_state.RemoveActiveNativeMiner(process_guard,
+                                                            node.config.id);
                 }
-                WriteNodeStateEvent(events_path, options.run_id, node,
-                                    NodeRuntimeLifecycle::kStopped);
-              }
-              {
-                auto process_guard = run_process_state.Lock();
-                run_process_state.RemoveActiveNativeMiner(process_guard,
-                                                          node.config.id);
-              }
-              continue;
-            }
-
-            bool node_started = false;
-            if (node.lifecycle_policy.start_time &&
-                node.Lifecycle() == NodeRuntimeLifecycle::kCgroupReady &&
-                now >= SteadyDeadline(lifecycle_epoch,
-                                      options.time_scale.WallDuration(
-                                          *node.lifecycle_policy.start_time))) {
-              WriteEvent(
-                  events_path, options.run_id, node.config.id,
-                  SimulationEventKind::kNodeStartDeadlineReached,
-                  NodeLifecycleDeadlineDetail(
-                      node, options.time_scale, lifecycle_epoch,
-                      *node.lifecycle_policy.start_time, "declarative_start"));
-              node_started = StartPreparedNode(
-                  options, events_path, driver, node, "declarative_start",
-                  lifecycle_epoch, operation_stop_token);
-              if (node_started) {
-                ConnectAvailableStartupPeers(options, events_path, driver,
-                                             nodes, index, lifecycle_epoch,
-                                             operation_stop_token);
-                if (is_configured_miner(node.config.id) &&
-                    options.block_production.enabled &&
-                    options.block_production.difficulty) {
-                  RequireNodeRunning(node, "declarative mining difficulty");
-                  driver.SetMiningDifficulty(
-                      node.config, *options.block_production.difficulty,
-                      operation_stop_token);
-                }
-                PublishOperatorConnectionCommand(options, run_root, events_path,
-                                                 driver, nodes,
-                                                 &operator_connection_resolved);
-              }
-            }
-            if (node_started && block_scheduler &&
-                is_configured_miner(node.config.id)) {
-              block_scheduler->StartMiner(node.config.id);
-            } else if (node_started && options.block_production.enabled &&
-                       options.block_production.mode ==
-                           MiningMode::kNativeMining &&
-                       is_configured_miner(node.config.id)) {
-              static_cast<void>(StartNativeMiningForCurrentProcess(
-                  driver, node, run_process_state,
-                  chain_spec.default_reward_address, operation_stop_token,
-                  "declarative native mining start"));
-            }
-
-            bool node_restarted = false;
-            std::optional<int> exited_wait_status;
-            std::string process_exit_detail;
-            {
-              auto process_guard = run_process_state.Lock();
-              if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning ||
-                  node.process.running()) {
                 continue;
               }
-              exited_wait_status = node.process.exit_status();
-              if (!exited_wait_status) {
-                throw std::runtime_error("node exited without a wait status: " +
-                                         node.config.id);
+
+              bool node_started = false;
+              if (node.lifecycle_policy.start_time &&
+                  node.Lifecycle() == NodeRuntimeLifecycle::kCgroupReady &&
+                  now >=
+                      SteadyDeadline(lifecycle_epoch,
+                                     options.time_scale.WallDuration(
+                                         *node.lifecycle_policy.start_time))) {
+                WriteEvent(events_path, options.run_id, node.config.id,
+                           SimulationEventKind::kNodeStartDeadlineReached,
+                           NodeLifecycleDeadlineDetail(
+                               node, options.time_scale, lifecycle_epoch,
+                               *node.lifecycle_policy.start_time,
+                               "declarative_start"));
+                node_started = StartPreparedNode(
+                    options, events_path, driver, node, "declarative_start",
+                    lifecycle_epoch, operation_stop_token);
+                if (node_started) {
+                  ConnectAvailableStartupPeers(options, events_path, driver,
+                                               nodes, index, lifecycle_epoch,
+                                               operation_stop_token);
+                  if (is_configured_miner(node.config.id) &&
+                      options.block_production.enabled &&
+                      options.block_production.difficulty) {
+                    RequireNodeRunning(node, "declarative mining difficulty");
+                    driver.SetMiningDifficulty(
+                        node.config, *options.block_production.difficulty,
+                        operation_stop_token);
+                  }
+                  PublishOperatorConnectionCommand(
+                      options, run_root, events_path, driver, nodes,
+                      &operator_connection_resolved);
+                }
               }
-              ResetNodePerfCounters(node, process_guard);
-              process_exit_detail =
-                  ProcessExitDetail(node.process, process_guard);
-              node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
-            }
-            WriteEvent(events_path, options.run_id, node.config.id,
-                       SimulationEventKind::kProcessExited,
-                       process_exit_detail);
-            WriteEvent(events_path, options.run_id, node.config.id,
-                       SimulationEventKind::kState,
-                       NodeRuntimeLifecycleName(NodeRuntimeLifecycle::kFailed));
-            const bool restart = NodeRestartPolicyAllowsRestart(
-                node.lifecycle_policy.restart_policy, *exited_wait_status);
-            WriteEvent(
-                events_path, options.run_id, node.config.id,
-                SimulationEventKind::kRestartPolicyApplied,
-                RestartPolicyAppliedDetail(node, *exited_wait_status, restart));
-            if (!restart) {
-              throw std::runtime_error(
-                  "node process exited and restart policy did not restart "
-                  "it: " +
-                  node.config.id);
-            }
-            node_restarted = RestartNode(
-                options, events_path, driver, *peer_connectivity_controller,
-                node, lifecycle_epoch, operation_stop_token, "restart_policy");
-            if (node_restarted && is_configured_miner(node.config.id) &&
-                options.block_production.enabled &&
-                options.block_production.difficulty) {
-              RequireNodeRunning(node, "restart mining difficulty restore");
-              driver.SetMiningDifficulty(node.config,
-                                         *options.block_production.difficulty,
-                                         operation_stop_token);
-            }
-            if (node_restarted && block_scheduler &&
-                is_configured_miner(node.config.id)) {
-              block_scheduler->StartMiner(node.config.id);
-            } else if (node_restarted && options.block_production.enabled &&
-                       options.block_production.mode ==
-                           MiningMode::kNativeMining &&
-                       is_configured_miner(node.config.id)) {
-              static_cast<void>(StartNativeMiningForCurrentProcess(
-                  driver, node, run_process_state,
-                  chain_spec.default_reward_address, operation_stop_token,
-                  "restart-policy native mining restore"));
+              if (node_started && block_scheduler &&
+                  is_configured_miner(node.config.id)) {
+                block_scheduler->StartMiner(node.config.id);
+              } else if (node_started && options.block_production.enabled &&
+                         options.block_production.mode ==
+                             MiningMode::kNativeMining &&
+                         is_configured_miner(node.config.id)) {
+                static_cast<void>(StartNativeMiningForCurrentProcess(
+                    driver, node, run_process_state,
+                    chain_spec.default_reward_address, operation_stop_token,
+                    "declarative native mining start"));
+              }
+
+              bool node_restarted = false;
+              std::optional<int> exited_wait_status;
+              std::string process_exit_detail;
+              {
+                auto process_guard = run_process_state.Lock();
+                if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning ||
+                    node.process.running()) {
+                  continue;
+                }
+                exited_wait_status = node.process.exit_status();
+                if (!exited_wait_status) {
+                  throw std::runtime_error(
+                      "node exited without a wait status: " + node.config.id);
+                }
+                ResetNodePerfCounters(node, process_guard);
+                process_exit_detail =
+                    ProcessExitDetail(node.process, process_guard);
+                node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
+              }
+              WriteEvent(events_path, options.run_id, node.config.id,
+                         SimulationEventKind::kProcessExited,
+                         process_exit_detail);
+              WriteEvent(
+                  events_path, options.run_id, node.config.id,
+                  SimulationEventKind::kState,
+                  NodeRuntimeLifecycleName(NodeRuntimeLifecycle::kFailed));
+              const bool restart = NodeRestartPolicyAllowsRestart(
+                  node.lifecycle_policy.restart_policy, *exited_wait_status);
+              WriteEvent(events_path, options.run_id, node.config.id,
+                         SimulationEventKind::kRestartPolicyApplied,
+                         RestartPolicyAppliedDetail(node, *exited_wait_status,
+                                                    restart));
+              if (!restart) {
+                throw std::runtime_error(
+                    "node process exited and restart policy did not restart "
+                    "it: " +
+                    node.config.id);
+              }
+              node_restarted = RestartNode(
+                  options, events_path, driver, *peer_connectivity_controller,
+                  node, lifecycle_epoch, operation_stop_token,
+                  "restart_policy");
+              if (node_restarted && is_configured_miner(node.config.id) &&
+                  options.block_production.enabled &&
+                  options.block_production.difficulty) {
+                RequireNodeRunning(node, "restart mining difficulty restore");
+                driver.SetMiningDifficulty(node.config,
+                                           *options.block_production.difficulty,
+                                           operation_stop_token);
+              }
+              if (node_restarted && block_scheduler &&
+                  is_configured_miner(node.config.id)) {
+                block_scheduler->StartMiner(node.config.id);
+              } else if (node_restarted && options.block_production.enabled &&
+                         options.block_production.mode ==
+                             MiningMode::kNativeMining &&
+                         is_configured_miner(node.config.id)) {
+                static_cast<void>(StartNativeMiningForCurrentProcess(
+                    driver, node, run_process_state,
+                    chain_spec.default_reward_address, operation_stop_token,
+                    "restart-policy native mining restore"));
+              }
             }
           }
           std::unique_lock<std::mutex> wait_lock(wakeup_mutex);
@@ -21536,6 +22338,58 @@ SimulationNodeAddRequest ParseAndValidateSimulationNodeAddRequest(
         "node.add network");
     result.network = ParseNetworkConditionObject(network->as_object());
     ValidateNetworkCondition(*result.network);
+  }
+  return result;
+}
+
+SimulationNodeRemoveRequest ParseAndValidateSimulationNodeRemoveRequest(
+    const boost::json::object& request, const Options& options) {
+  constexpr std::array<std::string_view, 2U> kFields = {"node_ids",
+                                                        "timeout_sec"};
+  RejectUnsupportedFields(request, kFields, "node.remove request");
+  SimulationNodeRemoveRequest result;
+  const boost::json::value* node_ids = request.if_contains("node_ids");
+  if (node_ids == nullptr || !node_ids->is_array()) {
+    throw std::runtime_error("node.remove node_ids must be an array");
+  }
+  if (node_ids->as_array().empty() ||
+      node_ids->as_array().size() > kSimulationNodeRemoveMaximumCount) {
+    throw std::runtime_error("node.remove node_ids size must be in 1.." +
+                             std::to_string(kSimulationNodeRemoveMaximumCount));
+  }
+  std::set<std::string> unique;
+  std::set<std::string> active_ids;
+  if (options.node_ids.empty()) {
+    const std::string& prefix =
+        ChainDriverSpecFor(options.chain).node_id_prefix;
+    for (std::uint32_t index = 0U; index < options.nodes; ++index) {
+      active_ids.insert(prefix + "-" + std::to_string(index + 1U));
+    }
+  } else {
+    active_ids.insert(options.node_ids.begin(), options.node_ids.end());
+  }
+  result.node_ids.reserve(node_ids->as_array().size());
+  for (const boost::json::value& value : node_ids->as_array()) {
+    if (!value.is_string()) {
+      throw std::runtime_error("node.remove node_ids must contain strings");
+    }
+    std::string node_id(value.as_string());
+    RequireSafeScenarioIdentifier(node_id, "node.remove node id");
+    if (!unique.insert(node_id).second) {
+      throw std::runtime_error("node.remove node_ids must be unique");
+    }
+    if (!active_ids.contains(node_id)) {
+      throw std::runtime_error("node.remove references an inactive node id: " +
+                               node_id);
+    }
+    result.node_ids.push_back(std::move(node_id));
+  }
+  result.timeout_sec = JsonOptionalUint32Field(request, "timeout_sec", 30U);
+  if (result.timeout_sec == 0U ||
+      result.timeout_sec > kSimulationNodeAddMaximumTimeoutSeconds) {
+    throw std::runtime_error(
+        "node.remove timeout_sec must be in 1.." +
+        std::to_string(kSimulationNodeAddMaximumTimeoutSeconds));
   }
   return result;
 }

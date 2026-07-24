@@ -24,6 +24,7 @@ constexpr std::array kHostOperations = {
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
     McpOperationKind::kAddNode,
+    McpOperationKind::kRemoveNode,
     McpOperationKind::kStopNode,
     McpOperationKind::kKillNode,
     McpOperationKind::kRestartNode,

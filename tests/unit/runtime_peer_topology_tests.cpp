@@ -162,3 +162,32 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(expanded.Edge(0U, 2U), std::runtime_error);
   BOOST_CHECK_NO_THROW(expanded.Edge(0U, 3U));
 }
+
+BOOST_AUTO_TEST_CASE(
+    runtime_peer_topology_carries_state_across_selected_node_remap) {
+  bbp::PeerTopologyConfig config;
+  config.kind = bbp::PeerTopologyKind::kCustomEdgeList;
+  config.edges = {
+      {.from = 0U, .to = 1U, .bidirectional = false},
+      {.from = 0U, .to = 2U, .bidirectional = false},
+      {.from = 2U, .to = 3U, .bidirectional = false},
+  };
+  bbp::RuntimePeerTopology previous(config, 4U);
+  bbp::NetworkCondition delayed;
+  delayed.delay_ms = 31U;
+  previous.SetCondition(0U, 2U, delayed);
+  previous.SetActive(0U, 2U, false);
+
+  const std::vector<std::optional<std::uint32_t>> old_to_new = {
+      0U, std::nullopt, 1U, 2U};
+  const bbp::PeerTopologyConfig remapped_config =
+      bbp::RemapPeerTopologyConfig(config, old_to_new);
+  bbp::RuntimePeerTopology remapped(remapped_config, 3U);
+  remapped.PreserveRemappedStateFrom(previous, old_to_new);
+
+  BOOST_TEST(!remapped.Edge(0U, 1U).active);
+  BOOST_REQUIRE(remapped.Edge(0U, 1U).condition);
+  BOOST_CHECK(*remapped.Edge(0U, 1U).condition == delayed);
+  BOOST_TEST(remapped.Edge(1U, 2U).active);
+  BOOST_CHECK_THROW(remapped.Edge(0U, 2U), std::runtime_error);
+}

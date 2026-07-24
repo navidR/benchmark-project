@@ -24,6 +24,23 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
   BOOST_TEST(*add.node_add->binary == "/opt/monerod");
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("add-nodes firo 17", 0U),
                     std::runtime_error);
+  const bbp::ParsedTuiCommand remove =
+      bbp::TuiCommandParser::Parse("remove-nodes firo-2 firo-4", 0U);
+  BOOST_CHECK(remove.kind == bbp::SimulationCommandKind::kRemoveNodes);
+  BOOST_REQUIRE(remove.node_remove);
+  BOOST_TEST(remove.node_remove->node_ids ==
+                 std::vector<std::string>({"firo-2", "firo-4"}),
+             boost::test_tools::per_element());
+  BOOST_TEST(remove.node_remove->timeout_sec == 30U);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("remove-nodes firo-2 firo-2", 0U),
+      std::runtime_error);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("remove-nodes", 0U),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse(
+          "remove-nodes 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17", 0U),
+      std::runtime_error);
 
   BOOST_CHECK(bbp::TuiCommandParser::Parse("reconnect", 0U).kind ==
               bbp::SimulationCommandKind::kReconnectNode);

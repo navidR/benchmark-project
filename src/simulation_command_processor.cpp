@@ -25,8 +25,9 @@ SimulationCommandCancellationCause CancellationCause(
   return cause == SimulationCommandCancellationCause::kNone ? fallback : cause;
 }
 
-bool NodeAddCommitStarted(const SimulationCommand& command) {
-  if (command.kind != SimulationCommandKind::kAddNodes ||
+bool NodeMutationCommitStarted(const SimulationCommand& command) {
+  if ((command.kind != SimulationCommandKind::kAddNodes &&
+       command.kind != SimulationCommandKind::kRemoveNodes) ||
       !command.operation_control) {
     return false;
   }
@@ -36,8 +37,9 @@ bool NodeAddCommitStarted(const SimulationCommand& command) {
          phase == SimulationCommandCommitPhase::kCommitted;
 }
 
-bool NodeAddCancellationWon(const SimulationCommand& command) {
-  return command.kind == SimulationCommandKind::kAddNodes &&
+bool NodeMutationCancellationWon(const SimulationCommand& command) {
+  return (command.kind == SimulationCommandKind::kAddNodes ||
+          command.kind == SimulationCommandKind::kRemoveNodes) &&
          command.operation_control &&
          command.operation_control->CommitPhase() ==
              SimulationCommandCommitPhase::kCancelled;
@@ -47,7 +49,7 @@ bool OutcomeUnconfirmed(const SimulationCommand& command) {
   return (command.operation_control &&
           command.operation_control->outcome_unconfirmed.load(
               std::memory_order_acquire)) ||
-         NodeAddCommitStarted(command);
+         NodeMutationCommitStarted(command);
 }
 
 SimulationCommandOutcome CancellationOutcome(
@@ -65,6 +67,7 @@ SimulationCommandOutcome CancellationOutcome(
       .error = std::string(error),
       .node_lifecycle = std::nullopt,
       .added_node_ids = {},
+      .removed_node_ids = {},
       .inventory_generation = std::nullopt,
       .final_node_count = std::nullopt,
   };
@@ -104,7 +107,8 @@ void SimulationCommandProcessor::Stop() {
   }
   std::vector<SimulationCommand> cancelled = queue_.Cancel();
   for (SimulationCommand& command : cancelled) {
-    if (command.kind == SimulationCommandKind::kAddNodes &&
+    if ((command.kind == SimulationCommandKind::kAddNodes ||
+         command.kind == SimulationCommandKind::kRemoveNodes) &&
         command.operation_control) {
       static_cast<void>(command.operation_control->RequestCancellation(
           SimulationCommandCancellationCause::kApplicationShutdown));
@@ -141,13 +145,14 @@ void SimulationCommandProcessor::Run() {
       outcome.cancellation_cause = CancellationCause(
           *command, SimulationCommandCancellationCause::kNone);
       outcome.error = std::nullopt;
-      if (command->kind == SimulationCommandKind::kAddNodes &&
+      if ((command->kind == SimulationCommandKind::kAddNodes ||
+           command->kind == SimulationCommandKind::kRemoveNodes) &&
           (!command->operation_control ||
            command->operation_control->CommitPhase() !=
                SimulationCommandCommitPhase::kCommitted)) {
         outcome.state = SimulationCommandOutcomeState::kOutcomeUnconfirmed;
         outcome.error =
-            "node-add handler reported success without committing its "
+            "node mutation handler reported success without committing its "
             "authoritative inventory generation";
       }
       ReportOutcome(*command, outcome);
@@ -165,15 +170,15 @@ void SimulationCommandProcessor::Run() {
               .error = error.what(),
               .node_lifecycle = std::nullopt,
               .added_node_ids = {},
+              .removed_node_ids = {},
               .inventory_generation = std::nullopt,
               .final_node_count = std::nullopt,
           });
     } catch (const std::exception& error) {
-      if (NodeAddCancellationWon(*command)) {
-        ReportOutcome(*command,
-                      CancellationOutcome(
-                          *command, error.what(),
-                          SimulationCommandCancellationCause::kNone));
+      if (NodeMutationCancellationWon(*command)) {
+        ReportOutcome(*command, CancellationOutcome(
+                                    *command, error.what(),
+                                    SimulationCommandCancellationCause::kNone));
         continue;
       }
       if (OutcomeUnconfirmed(*command)) {
@@ -186,6 +191,7 @@ void SimulationCommandProcessor::Run() {
                 .error = error.what(),
                 .node_lifecycle = std::nullopt,
                 .added_node_ids = {},
+                .removed_node_ids = {},
                 .inventory_generation = std::nullopt,
                 .final_node_count = std::nullopt,
             });
@@ -201,15 +207,15 @@ void SimulationCommandProcessor::Run() {
               .error = error.what(),
               .node_lifecycle = std::nullopt,
               .added_node_ids = {},
+              .removed_node_ids = {},
               .inventory_generation = std::nullopt,
               .final_node_count = std::nullopt,
           });
     } catch (...) {
-      if (NodeAddCancellationWon(*command)) {
-        ReportOutcome(
-            *command,
-            CancellationOutcome(*command, "unknown exception",
-                                SimulationCommandCancellationCause::kNone));
+      if (NodeMutationCancellationWon(*command)) {
+        ReportOutcome(*command, CancellationOutcome(
+                                    *command, "unknown exception",
+                                    SimulationCommandCancellationCause::kNone));
         continue;
       }
       if (OutcomeUnconfirmed(*command)) {
@@ -222,6 +228,7 @@ void SimulationCommandProcessor::Run() {
                 .error = "unknown exception",
                 .node_lifecycle = std::nullopt,
                 .added_node_ids = {},
+                .removed_node_ids = {},
                 .inventory_generation = std::nullopt,
                 .final_node_count = std::nullopt,
             });
@@ -237,6 +244,7 @@ void SimulationCommandProcessor::Run() {
               .error = "unknown exception",
               .node_lifecycle = std::nullopt,
               .added_node_ids = {},
+              .removed_node_ids = {},
               .inventory_generation = std::nullopt,
               .final_node_count = std::nullopt,
           });

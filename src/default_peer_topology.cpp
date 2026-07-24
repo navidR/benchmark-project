@@ -415,4 +415,160 @@ std::vector<std::uint32_t> ResolvePeerTopologyPeerIndexes(
   return peers;
 }
 
+PeerTopologyConfig RemapPeerTopologyConfig(
+    const PeerTopologyConfig& topology,
+    const std::vector<std::optional<std::uint32_t>>& old_to_new) {
+  std::uint32_t next_node_count = 0U;
+  std::vector<bool> seen(old_to_new.size(), false);
+  for (const std::optional<std::uint32_t> mapped : old_to_new) {
+    if (!mapped) {
+      continue;
+    }
+    if (*mapped >= old_to_new.size() || seen[*mapped]) {
+      throw std::invalid_argument(
+          "peer topology node remap must contain unique compact indexes");
+    }
+    seen[*mapped] = true;
+    next_node_count = std::max(next_node_count, *mapped + 1U);
+  }
+  if (std::find(seen.begin(), seen.begin() + next_node_count, false) !=
+      seen.begin() + next_node_count) {
+    throw std::invalid_argument(
+        "peer topology node remap must contain unique compact indexes");
+  }
+  if (next_node_count == 0U) {
+    return PeerTopologyConfig{};
+  }
+
+  PeerTopologyConfig result = topology;
+  const auto map_node =
+      [&](std::uint32_t node) -> std::optional<std::uint32_t> {
+    if (node >= old_to_new.size()) {
+      throw std::invalid_argument(
+          "peer topology contains an out-of-range node during remap");
+    }
+    return old_to_new[node];
+  };
+
+  if (result.kind == PeerTopologyKind::kStar) {
+    const std::optional<std::uint32_t> center = map_node(result.star_center);
+    result.star_center = center.value_or(0U);
+  } else if (result.kind == PeerTopologyKind::kRandomGraph) {
+    result.average_degree =
+        std::min(result.average_degree, next_node_count - 1U);
+  } else if (result.kind == PeerTopologyKind::kScaleFreeGraph &&
+             next_node_count > 1U) {
+    if (result.average_degree != 0U) {
+      result.average_degree =
+          std::min(result.average_degree, next_node_count - 1U);
+    }
+    if (result.attachment_count != 0U) {
+      result.attachment_count =
+          std::min(result.attachment_count, next_node_count - 1U);
+    }
+  }
+
+  if (result.kind == PeerTopologyKind::kCustomEdgeList) {
+    result.edges.clear();
+    for (const PeerTopologyEdge& edge : topology.edges) {
+      const std::optional<std::uint32_t> from = map_node(edge.from);
+      const std::optional<std::uint32_t> to = map_node(edge.to);
+      if (!from || !to) {
+        continue;
+      }
+      PeerTopologyEdge remapped = edge;
+      remapped.from = *from;
+      remapped.to = *to;
+      result.edges.push_back(std::move(remapped));
+    }
+  }
+
+  const auto remap_groups =
+      [&](const std::vector<std::vector<std::uint32_t>>& groups) {
+        std::vector<std::vector<std::uint32_t>> remapped;
+        remapped.reserve(groups.size());
+        for (const std::vector<std::uint32_t>& group : groups) {
+          std::vector<std::uint32_t> members;
+          members.reserve(group.size());
+          for (const std::uint32_t node : group) {
+            if (const std::optional<std::uint32_t> mapped = map_node(node)) {
+              members.push_back(*mapped);
+            }
+          }
+          if (!members.empty()) {
+            remapped.push_back(std::move(members));
+          }
+        }
+        return remapped;
+      };
+  if (result.kind == PeerTopologyKind::kPartitionedGroups) {
+    result.groups = remap_groups(topology.groups);
+  }
+
+  if (result.kind == PeerTopologyKind::kLatencyMatrix) {
+    std::vector<std::uint32_t> retained_old_nodes(next_node_count);
+    for (std::uint32_t old = 0U; old < old_to_new.size(); ++old) {
+      if (old_to_new[old]) {
+        retained_old_nodes[*old_to_new[old]] = old;
+      }
+    }
+    result.latency_matrix_ms.assign(
+        next_node_count,
+        std::vector<std::optional<std::uint32_t>>(next_node_count));
+    for (std::uint32_t from = 0U; from < next_node_count; ++from) {
+      const std::uint32_t old_from = retained_old_nodes[from];
+      if (old_from >= topology.latency_matrix_ms.size()) {
+        throw std::invalid_argument(
+            "peer topology latency matrix is incomplete during remap");
+      }
+      for (std::uint32_t to = 0U; to < next_node_count; ++to) {
+        const std::uint32_t old_to = retained_old_nodes[to];
+        if (old_to >= topology.latency_matrix_ms[old_from].size()) {
+          throw std::invalid_argument(
+              "peer topology latency matrix is incomplete during remap");
+        }
+        result.latency_matrix_ms[from][to] =
+            topology.latency_matrix_ms[old_from][old_to];
+      }
+    }
+  }
+
+  if (result.kind == PeerTopologyKind::kInternetLikeRegionGraph) {
+    result.regions.clear();
+    std::vector<std::optional<std::uint32_t>> region_remap(
+        topology.regions.size());
+    for (std::uint32_t region = 0U; region < topology.regions.size();
+         ++region) {
+      std::vector<std::uint32_t> members;
+      members.reserve(topology.regions[region].size());
+      for (const std::uint32_t node : topology.regions[region]) {
+        if (const std::optional<std::uint32_t> mapped = map_node(node)) {
+          members.push_back(*mapped);
+        }
+      }
+      if (!members.empty()) {
+        region_remap[region] =
+            static_cast<std::uint32_t>(result.regions.size());
+        result.regions.push_back(std::move(members));
+      }
+    }
+    result.region_edges.clear();
+    for (const PeerTopologyRegionEdge& edge : topology.region_edges) {
+      if (edge.from_region >= region_remap.size() ||
+          edge.to_region >= region_remap.size()) {
+        throw std::invalid_argument(
+            "peer topology region edge is out of range during remap");
+      }
+      if (!region_remap[edge.from_region] || !region_remap[edge.to_region]) {
+        continue;
+      }
+      PeerTopologyRegionEdge remapped = edge;
+      remapped.from_region = *region_remap[edge.from_region];
+      remapped.to_region = *region_remap[edge.to_region];
+      result.region_edges.push_back(std::move(remapped));
+    }
+  }
+  return result;
+}
+
 }  // namespace bbp

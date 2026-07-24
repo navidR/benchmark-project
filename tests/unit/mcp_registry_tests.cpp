@@ -694,6 +694,80 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
   BOOST_REQUIRE(runtime_output.contains("allOf"));
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_node_remove_schema_is_shared_and_allows_empty_final_inventory) {
+  const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
+  const boost::json::object& generic = VariantWithConst(
+      command_schema.at("oneOf").as_array(), "kind", "remove_nodes");
+  const boost::json::object& generic_request =
+      generic.at("properties").as_object().at("node_remove").as_object();
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::array& scheduled_variants = scenario.at("properties")
+                                                     .as_object()
+                                                     .at("events")
+                                                     .as_object()
+                                                     .at("items")
+                                                     .as_object()
+                                                     .at("oneOf")
+                                                     .as_array();
+  const boost::json::object& scheduled =
+      VariantWithConst(scheduled_variants, "action", "remove_nodes");
+  const boost::json::object& scheduled_request =
+      scheduled.at("properties").as_object().at("node_remove").as_object();
+  BOOST_TEST(generic_request == scheduled_request);
+  BOOST_TEST(!scheduled.at("properties").as_object().contains("node"));
+
+  const boost::json::object direct =
+      BuildMcpOperationInputSchema(McpOperationKind::kRemoveNode);
+  const boost::json::object& direct_properties =
+      direct.at("properties").as_object();
+  const boost::json::object& request_properties =
+      generic_request.at("properties").as_object();
+  BOOST_TEST(direct_properties.at("node_ids") ==
+             request_properties.at("node_ids"));
+  BOOST_TEST(direct_properties.at("timeout_sec") ==
+             request_properties.at("timeout_sec"));
+  BOOST_TEST(
+      direct_properties.at("node_ids").as_object().at("maxItems").as_uint64() ==
+      kSimulationNodeRemoveMaximumCount);
+  BOOST_TEST(
+      direct_properties.at("node_ids").as_object().at("uniqueItems").as_bool());
+  BOOST_TEST(direct_properties.at("timeout_sec")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == kSimulationNodeAddMaximumTimeoutSeconds);
+
+  const boost::json::object direct_output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kRemoveNode)
+          .at("oneOf")
+          .as_array()
+          .front()
+          .as_object();
+  const boost::json::object& output_properties =
+      direct_output.at("properties").as_object();
+  BOOST_TEST(
+      output_properties.at("action").as_object().at("const").as_string() ==
+      "node.remove");
+  BOOST_TEST(output_properties.at("added_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(output_properties.at("removed_node_ids")
+                 .as_object()
+                 .at("minItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(output_properties.at("final_node_count")
+                 .as_object()
+                 .at("minimum")
+                 .as_uint64() == 0U);
+
+  const boost::json::object runtime_output =
+      BuildMcpResultSchema(McpResultFamily::kRuntimeCommand);
+  BOOST_TEST(
+      runtime_output.at("properties").as_object().contains("removed_node_ids"));
+}
+
 BOOST_AUTO_TEST_CASE(mcp_wallet_and_perf_schemas_preserve_production_types) {
   const boost::json::object wallet_send =
       BuildMcpScenarioObjectSchema(ScenarioObjectKind::kWalletSend);

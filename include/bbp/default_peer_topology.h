@@ -130,4 +130,8 @@ std::vector<std::uint32_t> ResolvePeerTopologyPeerIndexes(
     const PeerTopologyConfig& topology, std::uint32_t node_count,
     std::uint32_t node_index);
 
+PeerTopologyConfig RemapPeerTopologyConfig(
+    const PeerTopologyConfig& topology,
+    const std::vector<std::optional<std::uint32_t>>& old_to_new);
+
 }  // namespace bbp

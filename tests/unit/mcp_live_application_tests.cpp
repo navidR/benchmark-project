@@ -140,6 +140,7 @@ SimulationCommandOutcome CommandOutcome(
                                   .error = std::move(error),
                                   .node_lifecycle = std::move(node_lifecycle),
                                   .added_node_ids = {},
+                                  .removed_node_ids = {},
                                   .inventory_generation = std::nullopt,
                                   .final_node_count = std::nullopt};
 }
@@ -153,6 +154,21 @@ SimulationCommandOutcome NodeAddOutcome(std::vector<std::string> node_ids,
       .error = std::nullopt,
       .node_lifecycle = std::nullopt,
       .added_node_ids = std::move(node_ids),
+      .removed_node_ids = {},
+      .inventory_generation = inventory_generation,
+      .final_node_count = final_node_count};
+}
+
+SimulationCommandOutcome NodeRemoveOutcome(std::vector<std::string> node_ids,
+                                           std::uint64_t inventory_generation,
+                                           std::uint32_t final_node_count) {
+  return SimulationCommandOutcome{
+      .state = SimulationCommandOutcomeState::kSucceeded,
+      .cancellation_cause = SimulationCommandCancellationCause::kNone,
+      .error = std::nullopt,
+      .node_lifecycle = std::nullopt,
+      .added_node_ids = {},
+      .removed_node_ids = std::move(node_ids),
       .inventory_generation = inventory_generation,
       .final_node_count = final_node_count};
 }
@@ -925,6 +941,226 @@ BOOST_AUTO_TEST_CASE(
                  .at("code")
                  .as_string() == "node_outcome_unconfirmed");
   BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) >= 3U);
+
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_node_remove_has_direct_generic_cancellation_and_inventory_parity) {
+  LiveApplicationDirectory temporary;
+  boost::json::object scenario = LiveScenario();
+  scenario["nodes"] = 4U;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::mutex inventory_mutex;
+  McpLiveNodeInventorySnapshot inventory = InitialInventory(*options);
+  std::atomic_uint32_t run_stop_requests = 0U;
+  const auto publish_inventory = [&](std::uint64_t generation,
+                                     std::vector<std::string> node_ids) {
+    std::lock_guard<std::mutex> lock(inventory_mutex);
+    inventory.generation = generation;
+    inventory.node_ids = std::move(node_ids);
+  };
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [&] {
+            std::lock_guard<std::mutex> lock(inventory_mutex);
+            return inventory;
+          },
+      .publication_mutex = {},
+      .request_run_stop = [&] { ++run_stop_requests; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object direct_submitted = Invoke(
+      &dispatcher, "node.remove",
+      boost::json::object{{"run_id", "live-application"},
+                          {"node_ids", boost::json::array{"firo-2", "firo-4"}},
+                          {"timeout_sec", 45U}});
+  const SimulationCommand direct_command = WaitForQueuedCommand(queue.get());
+  BOOST_CHECK(direct_command.kind == SimulationCommandKind::kRemoveNodes);
+  BOOST_REQUIRE(direct_command.node_remove);
+  BOOST_TEST(direct_command.node_remove->node_ids ==
+                 std::vector<std::string>({"firo-2", "firo-4"}),
+             boost::test_tools::per_element());
+  BOOST_TEST(direct_command.node_remove->timeout_sec == 45U);
+  publish_inventory(2U, {"firo-1", "firo-3"});
+  MarkNodeAddCommitted(direct_command, 1U,
+                       {"firo-1", "firo-2", "firo-3", "firo-4"});
+  BOOST_TEST(!direct_command.operation_control->RequestCancellation(
+      SimulationCommandCancellationCause::kClientCancel));
+  BOOST_TEST(direct_command.operation_control->ReportProgress(
+      kSimulationNodeAddProgressTotal));
+  application.RecordCommandOutcome(
+      direct_command, NodeRemoveOutcome({"firo-2", "firo-4"}, 2U, 2U));
+  const boost::json::object direct_terminal =
+      WaitForTerminal(&dispatcher, direct_submitted);
+  BOOST_TEST(direct_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& direct_result =
+      direct_terminal.at("terminal_result").as_object();
+  BOOST_TEST(direct_result.at("result_family").as_string() == "mutation");
+  BOOST_TEST(direct_result.at("action").as_string() == "node.remove");
+  BOOST_TEST(direct_result.at("added_node_ids").as_array().empty());
+  BOOST_TEST(direct_result.at("removed_node_ids").as_array().size() == 2U);
+  BOOST_TEST(direct_result.at("affected_node_ids").as_array() ==
+             direct_result.at("removed_node_ids").as_array());
+  BOOST_TEST(direct_result.at("inventory_generation").as_uint64() == 2U);
+  BOOST_TEST(direct_result.at("final_node_count").as_uint64() == 2U);
+
+  const boost::json::object generic_submitted = Invoke(
+      &dispatcher, "simulation.command",
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"command",
+           boost::json::object{
+               {"kind", "remove_nodes"},
+               {"node_remove",
+                boost::json::object{{"node_ids", boost::json::array{"firo-1"}},
+                                    {"timeout_sec", 39U}}}}}});
+  const SimulationCommand generic_command = WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(generic_command.node_remove);
+  BOOST_TEST(generic_command.node_remove->timeout_sec == 39U);
+  publish_inventory(3U, {"firo-3"});
+  MarkNodeAddCommitted(generic_command, 2U, {"firo-1", "firo-3"});
+  BOOST_TEST(generic_command.operation_control->ReportProgress(
+      kSimulationNodeAddProgressTotal));
+  application.RecordCommandOutcome(generic_command,
+                                   NodeRemoveOutcome({"firo-1"}, 3U, 1U));
+  const boost::json::object generic_terminal =
+      WaitForTerminal(&dispatcher, generic_submitted);
+  BOOST_TEST(generic_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& generic_result =
+      generic_terminal.at("terminal_result").as_object();
+  BOOST_TEST(generic_result.at("result_family").as_string() ==
+             "runtime_command");
+  BOOST_TEST(generic_result.at("action").as_string() == "node.remove");
+  BOOST_TEST(
+      generic_result.at("removed_node_ids").as_array().front().as_string() ==
+      "firo-1");
+  BOOST_TEST(generic_result.at("final_node_count").as_uint64() == 1U);
+  BOOST_TEST(application.current_node_count() == 1U);
+
+  const boost::json::object cancelled_submitted =
+      Invoke(&dispatcher, "node.remove",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_ids", boost::json::array{"firo-3"}}});
+  const SimulationCommand cancelled_command = WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(cancelled_command.operation_control);
+  BOOST_TEST(cancelled_command.operation_control->RequestCancellation(
+      SimulationCommandCancellationCause::kClientCancel));
+  application.RecordCommandOutcome(
+      cancelled_command,
+      CommandOutcome(SimulationCommandOutcomeState::kCancelled, std::nullopt,
+                     std::nullopt,
+                     SimulationCommandCancellationCause::kClientCancel));
+  const boost::json::object cancelled_terminal =
+      WaitForTerminal(&dispatcher, cancelled_submitted);
+  BOOST_TEST(cancelled_terminal.at("state").as_string() == "cancelled");
+  BOOST_TEST(application.current_node_count() == 1U);
+  BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) == 0U);
+
+  const boost::json::object empty_submitted =
+      Invoke(&dispatcher, "node.remove",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_ids", boost::json::array{"firo-3"}}});
+  const SimulationCommand empty_command = WaitForQueuedCommand(queue.get());
+  publish_inventory(4U, {});
+  MarkNodeAddCommitted(empty_command, 3U, {"firo-3"});
+  BOOST_TEST(empty_command.operation_control->ReportProgress(
+      kSimulationNodeAddProgressTotal));
+  application.RecordCommandOutcome(empty_command,
+                                   NodeRemoveOutcome({"firo-3"}, 4U, 0U));
+  const boost::json::object empty_terminal =
+      WaitForTerminal(&dispatcher, empty_submitted);
+  BOOST_TEST(empty_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& empty_result =
+      empty_terminal.at("terminal_result").as_object();
+  BOOST_TEST(empty_result.at("removed_node_ids").as_array().size() == 1U);
+  BOOST_TEST(empty_result.at("final_node_count").as_uint64() == 0U);
+  BOOST_TEST(application.current_node_count() == 0U);
+
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_node_remove_terminalizes_invalid_generation_count_and_identity) {
+  LiveApplicationDirectory temporary;
+  boost::json::object scenario = LiveScenario();
+  scenario["nodes"] = 3U;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::mutex inventory_mutex;
+  McpLiveNodeInventorySnapshot inventory = InitialInventory(*options);
+  std::atomic_uint32_t run_stop_requests = 0U;
+  const auto publish_inventory = [&](std::uint64_t generation,
+                                     std::vector<std::string> node_ids) {
+    std::lock_guard<std::mutex> lock(inventory_mutex);
+    inventory.generation = generation;
+    inventory.node_ids = std::move(node_ids);
+  };
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [&] {
+            std::lock_guard<std::mutex> lock(inventory_mutex);
+            return inventory;
+          },
+      .publication_mutex = {},
+      .request_run_stop = [&] { ++run_stop_requests; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const auto require_unconfirmed =
+      [&](std::vector<std::string> published_ids,
+          std::uint64_t published_generation, std::uint64_t outcome_generation,
+          std::uint32_t final_count,
+          std::vector<std::string> outcome_removed_ids) {
+        publish_inventory(1U, {"firo-1", "firo-2", "firo-3"});
+        const boost::json::object submitted = Invoke(
+            &dispatcher, "node.remove",
+            boost::json::object{{"run_id", "live-application"},
+                                {"node_ids", boost::json::array{"firo-2"}}});
+        const SimulationCommand command = WaitForQueuedCommand(queue.get());
+        MarkNodeAddCommitted(command, 1U, {"firo-1", "firo-2", "firo-3"});
+        publish_inventory(published_generation, std::move(published_ids));
+        application.RecordCommandOutcome(
+            command, NodeRemoveOutcome(std::move(outcome_removed_ids),
+                                       outcome_generation, final_count));
+        const boost::json::object terminal =
+            WaitForTerminal(&dispatcher, submitted);
+        BOOST_TEST(terminal.at("state").as_string() == "failed");
+        BOOST_TEST(
+            terminal.at("terminal_error").as_object().at("code").as_string() ==
+            "node_outcome_unconfirmed");
+      };
+  require_unconfirmed({"firo-1", "firo-3"}, 1U, 1U, 2U, {"firo-2"});
+  require_unconfirmed({"firo-1", "firo-3"}, 2U, 2U, 1U, {"firo-2"});
+  require_unconfirmed({"replacement", "firo-3"}, 2U, 2U, 2U, {"firo-2"});
+  require_unconfirmed({"firo-1", "firo-3"}, 2U, 2U, 2U, {"firo-1"});
+  BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) >= 4U);
 
   dispatcher.Shutdown();
   application.Shutdown();

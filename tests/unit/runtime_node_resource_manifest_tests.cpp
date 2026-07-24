@@ -39,10 +39,9 @@ class ManifestTestRoot {
   bbp::RunOwnership ownership_;
 };
 
-bbp::RuntimeNodeResourceEntry Entry(
-    std::string id, std::uint32_t slot,
-    bbp::RuntimeNodeResourceState state =
-        bbp::RuntimeNodeResourceState::kLive) {
+bbp::RuntimeNodeResourceEntry Entry(std::string id, std::uint32_t slot,
+                                    bbp::RuntimeNodeResourceState state =
+                                        bbp::RuntimeNodeResourceState::kLive) {
   return bbp::RuntimeNodeResourceEntry{
       .node_id = std::move(id),
       .slot = slot,
@@ -64,8 +63,7 @@ BOOST_AUTO_TEST_CASE(
       .nodes = {},
   };
   bbp::WriteRuntimeNodeResourceManifest(manifest);
-  const auto empty =
-      bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
+  const auto empty = bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
   BOOST_REQUIRE(empty);
   BOOST_TEST(empty->nodes.empty());
   BOOST_TEST(empty->isolated_network);
@@ -73,10 +71,10 @@ BOOST_AUTO_TEST_CASE(
   manifest.nodes = {
       Entry("firo-1", 0U),
       Entry("firo-2", 1U, bbp::RuntimeNodeResourceState::kPendingAdd),
+      Entry("firo-3", 2U, bbp::RuntimeNodeResourceState::kPendingRemove),
   };
   bbp::WriteRuntimeNodeResourceManifest(manifest);
-  const auto loaded =
-      bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
+  const auto loaded = bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
   BOOST_REQUIRE(loaded);
   BOOST_CHECK(*loaded == manifest);
 }
@@ -86,12 +84,11 @@ BOOST_AUTO_TEST_CASE(
   ManifestTestRoot root;
   const bbp::RuntimeNodeResourceEntry entry = Entry("firo-1", 0U);
   bbp::PrepareRuntimeNodeRoot(root.ownership(), entry);
-  BOOST_TEST(
-      bbp::RuntimeNodeRootEntryExists(root.ownership(), entry.node_id));
+  BOOST_TEST(bbp::RuntimeNodeRootEntryExists(root.ownership(), entry.node_id));
 
-  const std::filesystem::path outside = root.path().parent_path() /
-                                        ("bbp-runtime-outside-" +
-                                         std::to_string(getpid()));
+  const std::filesystem::path outside =
+      root.path().parent_path() /
+      ("bbp-runtime-outside-" + std::to_string(getpid()));
   std::filesystem::remove_all(outside);
   std::filesystem::create_directories(outside);
   bbp::WriteText(outside / "sentinel", "preserve\n");
@@ -120,11 +117,10 @@ BOOST_AUTO_TEST_CASE(
   const bbp::RuntimeNodeResourceEntry entry = Entry("firo-1", 0U);
   std::filesystem::create_directory(root.path() / "nodes" / entry.node_id);
 
-  BOOST_CHECK_THROW(
-      bbp::RemoveRuntimeNodeRoot(root.ownership(), entry),
-      std::runtime_error);
-  BOOST_TEST(std::filesystem::is_directory(
-      root.path() / "nodes" / entry.node_id));
+  BOOST_CHECK_THROW(bbp::RemoveRuntimeNodeRoot(root.ownership(), entry),
+                    std::runtime_error);
+  BOOST_TEST(
+      std::filesystem::is_directory(root.path() / "nodes" / entry.node_id));
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -141,8 +137,7 @@ BOOST_AUTO_TEST_CASE(
   const std::string manifest_before = bbp::ReadText(manifest_path);
 
   const bbp::RuntimeNodeResourceEntry entry = Entry("firo-1", 0U);
-  const std::filesystem::path collision =
-      root.path() / "nodes" / entry.node_id;
+  const std::filesystem::path collision = root.path() / "nodes" / entry.node_id;
   std::filesystem::create_directory(collision);
   bbp::WriteText(collision / "sentinel", "foreign\n");
   bool acquired = true;
@@ -152,8 +147,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!acquired);
   BOOST_TEST(bbp::ReadText(collision / "sentinel") == "foreign\n");
   BOOST_TEST(bbp::ReadText(manifest_path) == manifest_before);
-  const auto loaded =
-      bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
+  const auto loaded = bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
   BOOST_REQUIRE(loaded);
   BOOST_CHECK(*loaded == manifest);
 }
@@ -184,8 +178,7 @@ BOOST_AUTO_TEST_CASE(
   ManifestTestRoot root;
   const bbp::RuntimeNodeResourceEntry entry = Entry("firo-1", 0U);
   bbp::PrepareRuntimeNodeRoot(root.ownership(), entry);
-  const std::filesystem::path node_root =
-      root.path() / "nodes" / entry.node_id;
+  const std::filesystem::path node_root = root.path() / "nodes" / entry.node_id;
   std::filesystem::path nested = node_root;
   for (std::size_t depth = 0U; depth < 66U; ++depth) {
     nested /= "d";
@@ -206,8 +199,7 @@ BOOST_AUTO_TEST_CASE(
   ManifestTestRoot root;
   const bbp::RuntimeNodeResourceEntry entry = Entry("firo-1", 0U);
   bbp::PrepareRuntimeNodeRoot(root.ownership(), entry);
-  bbp::WriteText(root.path() / "nodes" / entry.node_id /
-                     ".bbp-rpc-cookie",
+  bbp::WriteText(root.path() / "nodes" / entry.node_id / ".bbp-rpc-cookie",
                  "owned\n");
 
   const std::filesystem::path outside =
@@ -215,8 +207,7 @@ BOOST_AUTO_TEST_CASE(
       ("bbp-runtime-credential-outside-" + std::to_string(getpid()));
   std::filesystem::remove_all(outside);
   std::filesystem::create_directories(outside / entry.node_id);
-  bbp::WriteText(outside / entry.node_id / ".bbp-rpc-cookie",
-                 "outside\n");
+  bbp::WriteText(outside / entry.node_id / ".bbp-rpc-cookie", "outside\n");
   const std::filesystem::path original_nodes = root.path() / "nodes-owned";
   std::filesystem::rename(root.path() / "nodes", original_nodes);
   std::filesystem::create_directory_symlink(outside, root.path() / "nodes");
@@ -224,14 +215,14 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(
       bbp::CleanupRuntimeNodeRpcCredential(root.ownership(), entry),
       std::runtime_error);
-  BOOST_TEST(std::filesystem::exists(
-      outside / entry.node_id / ".bbp-rpc-cookie"));
+  BOOST_TEST(
+      std::filesystem::exists(outside / entry.node_id / ".bbp-rpc-cookie"));
 
   std::filesystem::remove(root.path() / "nodes");
   std::filesystem::rename(original_nodes, root.path() / "nodes");
   bbp::CleanupRuntimeNodeRpcCredential(root.ownership(), entry);
-  BOOST_TEST(!std::filesystem::exists(
-      root.path() / "nodes" / entry.node_id / ".bbp-rpc-cookie"));
+  BOOST_TEST(!std::filesystem::exists(root.path() / "nodes" / entry.node_id /
+                                      ".bbp-rpc-cookie"));
   bbp::RemoveRuntimeNodeRoot(root.ownership(), entry);
   std::filesystem::remove_all(outside);
 }
@@ -256,8 +247,8 @@ BOOST_AUTO_TEST_CASE(
     BOOST_CHECK_THROW(bbp::RemoveRuntimeNodeRoot(root.ownership(), entry),
                       std::runtime_error);
     BOOST_TEST(std::filesystem::exists(outside / "sentinel"));
-    BOOST_TEST(std::filesystem::exists(
-        root.path() / "nodes" / entry.node_id / ".bbp-node"));
+    BOOST_TEST(std::filesystem::exists(root.path() / "nodes" / entry.node_id /
+                                       ".bbp-node"));
     BOOST_REQUIRE_EQUAL(umount2(mounted.c_str(), MNT_DETACH), 0);
     std::filesystem::remove(mounted);
   } else {
@@ -283,8 +274,8 @@ BOOST_AUTO_TEST_CASE(
   if (mount(outside.c_str(), mounted.c_str(), nullptr, MS_BIND, nullptr) == 0) {
     BOOST_CHECK_THROW(bbp::RemoveOwnedRunRoot(root.ownership()),
                       std::runtime_error);
-    BOOST_TEST(std::filesystem::exists(
-        root.path() / std::string(bbp::kRunMarkerFile)));
+    BOOST_TEST(std::filesystem::exists(root.path() /
+                                       std::string(bbp::kRunMarkerFile)));
     BOOST_TEST(std::filesystem::exists(outside / "sentinel"));
     BOOST_REQUIRE_EQUAL(umount2(mounted.c_str(), MNT_DETACH), 0);
     std::filesystem::remove(mounted);

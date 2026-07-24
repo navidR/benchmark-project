@@ -433,6 +433,83 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_validates_node_add_request) {
   BOOST_TEST(!queue.TryPop());
 }
 
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_node_remove_request) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationNodeRemoveRequest request{
+      .node_ids = {"firo-2", "firo-4"},
+      .timeout_sec = 47U,
+  };
+
+  const std::uint64_t sequence = queue.PushRemoveNodes(request);
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->sequence == sequence);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kRemoveNodes);
+  BOOST_TEST(command->node_id == "sim");
+  BOOST_TEST(command->confirmed);
+  BOOST_REQUIRE(command->operation_control);
+  BOOST_CHECK(command->operation_control->CommitPhase() ==
+              bbp::SimulationCommandCommitPhase::kOpen);
+  BOOST_REQUIRE(command->node_remove);
+  BOOST_TEST(command->node_remove->node_ids == request.node_ids,
+             boost::test_tools::per_element());
+  BOOST_TEST(command->node_remove->timeout_sec == request.timeout_sec);
+  BOOST_TEST(!command->node_add);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_validates_node_remove_request) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationNodeRemoveRequest valid{
+      .node_ids = {"firo-2", "firo-3"},
+      .timeout_sec = 30U,
+  };
+
+  bbp::SimulationNodeRemoveRequest invalid = valid;
+  invalid.node_ids.clear();
+  BOOST_CHECK_THROW(queue.PushRemoveNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.node_ids = {"firo-2", "firo-2"};
+  BOOST_CHECK_THROW(queue.PushRemoveNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.node_ids = {"firo-2", ""};
+  BOOST_CHECK_THROW(queue.PushRemoveNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.timeout_sec = 0U;
+  BOOST_CHECK_THROW(queue.PushRemoveNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.timeout_sec = bbp::kSimulationNodeAddMaximumTimeoutSeconds + 1U;
+  BOOST_CHECK_THROW(queue.PushRemoveNodes(invalid), std::runtime_error);
+
+  bbp::SimulationCommand wrong_target;
+  wrong_target.kind = bbp::SimulationCommandKind::kRemoveNodes;
+  wrong_target.node_id = "firo-1";
+  wrong_target.node_remove = valid;
+  wrong_target.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(wrong_target), std::runtime_error);
+
+  bbp::SimulationCommand unconfirmed;
+  unconfirmed.kind = bbp::SimulationCommandKind::kRemoveNodes;
+  unconfirmed.node_id = "sim";
+  unconfirmed.node_remove = valid;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(unconfirmed), std::runtime_error);
+
+  bbp::SimulationCommand missing_payload;
+  missing_payload.kind = bbp::SimulationCommandKind::kRemoveNodes;
+  missing_payload.node_id = "sim";
+  missing_payload.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(missing_payload),
+                    std::runtime_error);
+
+  bbp::SimulationCommand unexpected_payload;
+  unexpected_payload.kind = bbp::SimulationCommandKind::kRestartNode;
+  unexpected_payload.node_id = "firo-1";
+  unexpected_payload.node_remove = valid;
+  unexpected_payload.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(unexpected_payload),
+                    std::runtime_error);
+  BOOST_TEST(!queue.TryPop());
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
   bbp::SimulationCommandQueue queue;
   queue.PushBlockProductionPolicy(

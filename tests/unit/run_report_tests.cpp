@@ -178,6 +178,12 @@ BOOST_AUTO_TEST_CASE(
                       {"node_id", "sim"},
                       {"event", "runtime_role_generation_published"},
                       {"detail", boost::json::serialize(role_detail)}}));
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"generation","node_id":"firo-1","node_index":1,"chain":"firo","role":"miner","timestamp_ms":1})");
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"generation","node_id":"firo-retired","node_index":3,"chain":"firo","role":"base","timestamp_ms":1})");
 
   const boost::json::object report = bbp::BuildRunReport(dir);
   BOOST_TEST(JsonInteger(report, "inventory_generation") == 2U);
@@ -191,6 +197,12 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(report.at("node_configs").as_array().size() == 2U);
   BOOST_TEST(report.at("topology_current_edges").as_array().size() == 2U);
   BOOST_TEST(report.at("nodes_summary").as_array().size() == 2U);
+  BOOST_TEST(report.at("nodes_summary")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("metric_samples")
+                 .as_uint64() == 1U);
   BOOST_TEST(report.at("nodes_summary")
                  .as_array()
                  .back()

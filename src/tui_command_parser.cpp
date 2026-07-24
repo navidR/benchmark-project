@@ -18,8 +18,9 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 30> kCommandNames = {
+constexpr std::array<std::string_view, 31> kCommandNames = {
     "add-nodes",
+    "remove-nodes",
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -162,6 +163,25 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       ParsedTuiCommand parsed;
       parsed.kind = SimulationCommandKind::kAddNodes;
       parsed.node_add = std::move(request);
+      return parsed;
+    }
+    if (tokens[0] == "remove-nodes") {
+      if (tokens.size() < 2U ||
+          tokens.size() > kSimulationNodeRemoveMaximumCount + 1U) {
+        throw std::runtime_error("usage: remove-nodes <node-id> [node-id...]");
+      }
+      SimulationNodeRemoveRequest request;
+      std::set<std::string> unique;
+      request.node_ids.reserve(tokens.size() - 1U);
+      for (std::size_t index = 1U; index < tokens.size(); ++index) {
+        if (!unique.insert(tokens[index]).second) {
+          throw std::runtime_error("remove-nodes node ids must be unique");
+        }
+        request.node_ids.push_back(tokens[index]);
+      }
+      ParsedTuiCommand parsed;
+      parsed.kind = SimulationCommandKind::kRemoveNodes;
+      parsed.node_remove = std::move(request);
       return parsed;
     }
     if (tokens[0] == "firo-qt") {

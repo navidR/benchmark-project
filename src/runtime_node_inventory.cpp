@@ -157,6 +157,7 @@ void RuntimeNodeInventory::Initialize(std::vector<NodeRuntime>& nodes) {
   generation->sequence = 1U;
   generation->nodes = std::move(insertions);
   generation->configs = std::move(configs);
+  used_node_ids_ = std::move(node_ids);
   generation_ = std::move(generation);
 }
 
@@ -172,6 +173,11 @@ NodeConfigSnapshot RuntimeNodeInventory::ConfigSnapshot() const {
     generation = generation_;
   }
   return NodeConfigSnapshot(generation->configs, generation);
+}
+
+bool RuntimeNodeInventory::WasNodeIdUsed(std::string_view node_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return used_node_ids_.contains(std::string(node_id));
 }
 
 RuntimeNodeSnapshot RuntimeNodeInventory::PublishAppend(
@@ -210,6 +216,17 @@ RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
   std::vector<RuntimeNodeInsertion> next = generation_->nodes;
   next.reserve(next.size() + insertions.size());
   next.insert(next.end(), insertions.begin(), insertions.end());
+  std::set<std::string> next_used_node_ids = used_node_ids_;
+  for (const RuntimeNodeInsertion& insertion : insertions) {
+    if (!insertion.runtime) {
+      throw std::invalid_argument("runtime node insertion is empty");
+    }
+    if (!next_used_node_ids.insert(insertion.runtime->config.id).second) {
+      throw std::invalid_argument(
+          "runtime node id was already used by this run: " +
+          insertion.runtime->config.id);
+    }
+  }
   auto next_generation =
       MakeGeneration(generation_->sequence + 1U, std::move(next), capacity_);
   if (!published_configs.empty()) {
@@ -227,7 +244,8 @@ RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
     }
     next_generation->configs = published_configs;
   }
-  return PreparedAppend(this, std::move(lock), std::move(next_generation));
+  return PreparedAppend(this, std::move(lock), std::move(next_generation),
+                        std::move(next_used_node_ids));
 }
 
 RuntimeNodeSnapshot RuntimeNodeInventory::PreparedAppend::Commit() noexcept {
@@ -236,11 +254,86 @@ RuntimeNodeSnapshot RuntimeNodeInventory::PreparedAppend::Commit() noexcept {
     std::terminate();
   }
   owner_->generation_.swap(generation_);
+  owner_->used_node_ids_.swap(used_node_ids_);
   RuntimeNodeSnapshot snapshot(owner_->generation_);
   lock_.unlock();
   owner_ = nullptr;
   generation_.reset();
   return snapshot;
+}
+
+RuntimeNodeInventory::PreparedRemoval RuntimeNodeInventory::PrepareRemoval(
+    std::uint64_t expected_generation,
+    const std::vector<std::string>& removed_node_ids,
+    const std::vector<ChainNodeConfig>& published_configs) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (generation_->sequence != expected_generation) {
+    throw std::runtime_error(
+        "runtime node inventory changed before removal publication");
+  }
+  if (removed_node_ids.empty()) {
+    throw std::invalid_argument(
+        "runtime node removal requires at least one node id");
+  }
+  if (generation_->sequence == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("runtime node inventory generation overflow");
+  }
+  const std::set<std::string> removed_ids(removed_node_ids.begin(),
+                                          removed_node_ids.end());
+  if (removed_ids.size() != removed_node_ids.size()) {
+    throw std::invalid_argument(
+        "runtime node removal contains a duplicate node id");
+  }
+
+  std::vector<RuntimeNodeInsertion> retained;
+  std::vector<RuntimeNodeInsertion> retired;
+  retained.reserve(generation_->nodes.size());
+  retired.reserve(removed_ids.size());
+  for (const RuntimeNodeInsertion& insertion : generation_->nodes) {
+    if (removed_ids.contains(insertion.runtime->config.id)) {
+      retired.push_back(insertion);
+    } else {
+      retained.push_back(insertion);
+    }
+  }
+  if (retired.size() != removed_ids.size()) {
+    throw std::invalid_argument(
+        "runtime node removal references an unknown node id");
+  }
+  auto next_generation = MakeGeneration(generation_->sequence + 1U,
+                                        std::move(retained), capacity_);
+  if (published_configs.size() != next_generation->nodes.size()) {
+    throw std::invalid_argument(
+        "runtime node removal published configs must match the next "
+        "generation");
+  }
+  for (std::size_t index = 0U; index < published_configs.size(); ++index) {
+    if (published_configs[index].id !=
+        next_generation->nodes[index].runtime->config.id) {
+      throw std::invalid_argument(
+          "runtime node removal config identity does not match its runtime");
+    }
+  }
+  next_generation->configs = published_configs;
+  return PreparedRemoval(this, std::move(lock), std::move(next_generation),
+                         std::move(retired));
+}
+
+RuntimeNodeSnapshot RuntimeNodeInventory::PreparedRemoval::Commit() noexcept {
+  if (owner_ == nullptr || !lock_.owns_lock() ||
+      lock_.mutex() != &owner_->mutex_ || !generation_ || committed_) {
+    std::terminate();
+  }
+  owner_->generation_.swap(generation_);
+  RuntimeNodeSnapshot snapshot(owner_->generation_);
+  lock_.unlock();
+  owner_ = nullptr;
+  committed_ = true;
+  return snapshot;
+}
+
+bool RuntimeNodeInventory::PreparedRemoval::ReadersDrained() const noexcept {
+  return committed_ && generation_.use_count() == 1U;
 }
 
 std::shared_ptr<RuntimeNodeSnapshot::Generation>

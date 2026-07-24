@@ -2090,6 +2090,7 @@ struct IncrementalRunReport::Impl {
     active_network_partitions.clear();
     transaction_load_live.clear();
     wallet_workload_instances.clear();
+    runtime_active_node_ids.reset();
     event_cursor = {};
     metric_cursor = {};
     wallet_metric_cursor = {};
@@ -2526,6 +2527,7 @@ struct IncrementalRunReport::Impl {
         std::erase_if(nodes, [&](const auto& item) {
           return !active_node_ids.contains(item.first);
         });
+        runtime_active_node_ids = std::move(active_node_ids);
         report["inventory_generation"] = *generation;
         report["nodes"] = *node_count;
         report["node_ids"] = *node_ids;
@@ -2733,6 +2735,10 @@ struct IncrementalRunReport::Impl {
     if (node_id.empty()) {
       return;
     }
+    if (runtime_active_node_ids &&
+        !runtime_active_node_ids->contains(node_id)) {
+      return;
+    }
     NodeReport& node = nodes[node_id];
     if (!node.index) {
       node.index = OptionalUint64Field(metric, "node_index");
@@ -2877,6 +2883,7 @@ struct IncrementalRunReport::Impl {
   bool simulation_duration_reached = false;
   std::map<std::string, std::uint64_t> event_counts;
   std::map<std::string, NodeReport> nodes;
+  std::optional<std::set<std::string>> runtime_active_node_ids;
   std::map<std::uint64_t, WalletReport> wallets;
   std::map<std::string, boost::json::object> active_network_partitions;
   std::map<std::uint64_t, TransactionLoadLiveReport> transaction_load_live;

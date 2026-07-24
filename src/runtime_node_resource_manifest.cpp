@@ -22,8 +22,8 @@
 #include <system_error>
 #include <utility>
 
-#include "bbp/simulator/constants.h"
 #include "bbp/drivers/chain_driver_registry.h"
+#include "bbp/simulator/constants.h"
 
 namespace bbp {
 namespace {
@@ -50,8 +50,7 @@ class UniqueFd {
 
   UniqueFd(const UniqueFd&) = delete;
   UniqueFd& operator=(const UniqueFd&) = delete;
-  UniqueFd(UniqueFd&& other) noexcept
-      : fd_(std::exchange(other.fd_, -1)) {}
+  UniqueFd(UniqueFd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
   UniqueFd& operator=(UniqueFd&& other) noexcept {
     if (this != &other) {
       if (fd_ >= 0) {
@@ -80,9 +79,9 @@ struct DirectoryCloser {
 using DirectoryPointer = std::unique_ptr<DIR, DirectoryCloser>;
 
 [[noreturn]] void ThrowErrno(std::string_view operation, int error) {
-  throw std::runtime_error(std::string(operation) + " failed: " +
-                           std::error_code(error, std::generic_category())
-                               .message());
+  throw std::runtime_error(
+      std::string(operation) +
+      " failed: " + std::error_code(error, std::generic_category()).message());
 }
 
 void RequireSafeNodeId(std::string_view node_id) {
@@ -91,11 +90,10 @@ void RequireSafeNodeId(std::string_view node_id) {
         "runtime resource node id must be 1..32 characters");
   }
   for (const char character : node_id) {
-    const bool safe =
-        (character >= 'a' && character <= 'z') ||
-        (character >= 'A' && character <= 'Z') ||
-        (character >= '0' && character <= '9') || character == '-' ||
-        character == '_';
+    const bool safe = (character >= 'a' && character <= 'z') ||
+                      (character >= 'A' && character <= 'Z') ||
+                      (character >= '0' && character <= '9') ||
+                      character == '-' || character == '_';
     if (!safe) {
       throw std::runtime_error(
           "runtime resource node id contains an unsafe character");
@@ -107,6 +105,8 @@ std::string_view StateName(RuntimeNodeResourceState state) {
   switch (state) {
     case RuntimeNodeResourceState::kPendingAdd:
       return "pending_add";
+    case RuntimeNodeResourceState::kPendingRemove:
+      return "pending_remove";
     case RuntimeNodeResourceState::kLive:
       return "live";
   }
@@ -116,6 +116,9 @@ std::string_view StateName(RuntimeNodeResourceState state) {
 RuntimeNodeResourceState ParseState(std::string_view state) {
   if (state == "pending_add") {
     return RuntimeNodeResourceState::kPendingAdd;
+  }
+  if (state == "pending_remove") {
+    return RuntimeNodeResourceState::kPendingRemove;
   }
   if (state == "live") {
     return RuntimeNodeResourceState::kLive;
@@ -171,7 +174,8 @@ void RequireManifest(const RuntimeNodeResourceManifest& manifest) {
         "runtime resource manifest ownership no longer matches its run");
   }
   if (manifest.nodes.size() > kMaximumManifestNodes) {
-    throw std::runtime_error("runtime resource manifest node count is too large");
+    throw std::runtime_error(
+        "runtime resource manifest node count is too large");
   }
   std::set<std::string> node_ids;
   std::set<std::uint32_t> slots;
@@ -210,16 +214,15 @@ UniqueFd OpenOwnedRunRoot(const RunOwnership& ownership) {
   if (!run_root.valid()) {
     ThrowErrno("open owned run root", errno);
   }
-  struct stat opened_status {};
+  struct stat opened_status{};
   if (fstat(run_root.get(), &opened_status) != 0) {
     ThrowErrno("inspect owned run root", errno);
   }
-  if (!S_ISDIR(opened_status.st_mode) ||
-      opened_status.st_uid != geteuid()) {
+  if (!S_ISDIR(opened_status.st_mode) || opened_status.st_uid != geteuid()) {
     throw std::runtime_error(
         "owned run root is not an effective-user-owned directory");
   }
-  struct stat path_status {};
+  struct stat path_status{};
   if (fstatat(AT_FDCWD, ownership.run_root.c_str(), &path_status,
               AT_SYMLINK_NOFOLLOW) != 0) {
     ThrowErrno("reinspect owned run root path", errno);
@@ -234,12 +237,10 @@ UniqueFd OpenOwnedRunRoot(const RunOwnership& ownership) {
   const boost::json::value marker = boost::json::parse(
       ReadBoundedFileAt(run_root.get(), kRunMarkerFile, 4096U));
   if (!marker.is_object()) {
-    throw std::runtime_error(
-        "opened run ownership marker is not an object");
+    throw std::runtime_error("opened run ownership marker is not an object");
   }
   const boost::json::object& object = marker.as_object();
-  RejectUnknownFields(object,
-                      {"version", "run_id", "run_root", "resource_id"},
+  RejectUnknownFields(object, {"version", "run_id", "run_root", "resource_id"},
                       "opened run ownership marker");
   if (RequiredUnsigned(object, "version") != 1U ||
       RequiredString(object, "run_id") != ownership.run_id ||
@@ -259,7 +260,7 @@ UniqueFd OpenNodesDirectory(const RunOwnership& ownership) {
   if (!nodes.valid()) {
     ThrowErrno("open owned runtime nodes directory", errno);
   }
-  struct stat status {};
+  struct stat status{};
   if (fstat(nodes.get(), &status) != 0) {
     ThrowErrno("inspect owned runtime nodes directory", errno);
   }
@@ -285,8 +286,7 @@ void WriteAll(int descriptor, std::string_view text,
       ThrowErrno(description, errno);
     }
     if (written == 0) {
-      throw std::runtime_error(std::string(description) +
-                               " made no progress");
+      throw std::runtime_error(std::string(description) + " made no progress");
     }
     text.remove_prefix(static_cast<std::size_t>(written));
   }
@@ -295,12 +295,12 @@ void WriteAll(int descriptor, std::string_view text,
 std::string ReadBoundedFileAt(int parent, std::string_view name,
                               std::size_t maximum) {
   const std::string filename(name);
-  UniqueFd file(openat(parent, filename.c_str(),
-                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+  UniqueFd file(
+      openat(parent, filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
   if (!file.valid()) {
     ThrowErrno("open runtime ownership file", errno);
   }
-  struct stat status {};
+  struct stat status{};
   if (fstat(file.get(), &status) != 0) {
     ThrowErrno("inspect runtime ownership file", errno);
   }
@@ -338,8 +338,7 @@ std::string ReadBoundedFileAt(int parent, std::string_view name,
       ThrowErrno("verify runtime ownership file length", errno);
     }
     if (count != 0) {
-      throw std::runtime_error(
-          "runtime ownership file grew while it was read");
+      throw std::runtime_error("runtime ownership file grew while it was read");
     }
     break;
   }
@@ -367,8 +366,9 @@ std::string RequiredString(const boost::json::object& object,
                            std::string_view field) {
   const boost::json::value* value = object.if_contains(field);
   if (value == nullptr || !value->is_string()) {
-    throw std::runtime_error("runtime resource manifest field is not a string: " +
-                             std::string(field));
+    throw std::runtime_error(
+        "runtime resource manifest field is not a string: " +
+        std::string(field));
   }
   return std::string(value->as_string());
 }
@@ -380,8 +380,7 @@ void RejectUnknownFields(const boost::json::object& object,
     const std::string_view field(member.key().data(), member.key().size());
     if (!fields.contains(field)) {
       throw std::runtime_error(std::string(description) +
-                               " has unsupported field: " +
-                               std::string(field));
+                               " has unsupported field: " + std::string(field));
     }
   }
 }
@@ -399,9 +398,8 @@ boost::json::object NodeMarker(const RunOwnership& ownership,
 
 void RequireNodeMarker(int node_directory, const RunOwnership& ownership,
                        const RuntimeNodeResourceEntry& entry) {
-  const boost::json::value parsed =
-      boost::json::parse(ReadBoundedFileAt(node_directory, kNodeMarkerName,
-                                           4096U));
+  const boost::json::value parsed = boost::json::parse(
+      ReadBoundedFileAt(node_directory, kNodeMarkerName, 4096U));
   if (!parsed.is_object()) {
     throw std::runtime_error("runtime node ownership marker is not an object");
   }
@@ -424,24 +422,22 @@ bool SameIdentity(const struct stat& first, const struct stat& second) {
 }
 
 std::uint64_t MountId(int descriptor) {
-  struct statx status {};
+  struct statx status{};
   if (statx(descriptor, "", AT_EMPTY_PATH | AT_NO_AUTOMOUNT, STATX_MNT_ID,
             &status) != 0) {
     ThrowErrno("inspect runtime mount identity", errno);
   }
   if ((status.stx_mask & STATX_MNT_ID) == 0U) {
-    throw std::runtime_error(
-        "kernel did not report a runtime mount identity");
+    throw std::runtime_error("kernel did not report a runtime mount identity");
   }
   return status.stx_mnt_id;
 }
 
 std::uint64_t MountIdAt(int parent, std::string_view name) {
   const std::string filename(name);
-  struct statx status {};
-  if (statx(parent, filename.c_str(),
-            AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT, STATX_MNT_ID,
-            &status) != 0) {
+  struct statx status{};
+  if (statx(parent, filename.c_str(), AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+            STATX_MNT_ID, &status) != 0) {
     ThrowErrno("inspect runtime path mount identity", errno);
   }
   if ((status.stx_mask & STATX_MNT_ID) == 0U) {
@@ -454,21 +450,20 @@ std::uint64_t MountIdAt(int parent, std::string_view name) {
 UniqueFd OpenOwnedNodeRoot(int nodes, const RunOwnership& ownership,
                            const RuntimeNodeResourceEntry& entry,
                            struct stat* opened_status = nullptr) {
-  struct stat before {};
-  if (fstatat(nodes, entry.node_id.c_str(), &before,
-              AT_SYMLINK_NOFOLLOW) != 0) {
+  struct stat before{};
+  if (fstatat(nodes, entry.node_id.c_str(), &before, AT_SYMLINK_NOFOLLOW) !=
+      0) {
     ThrowErrno("inspect runtime node root", errno);
   }
   if (!S_ISDIR(before.st_mode)) {
-    throw std::runtime_error(
-        "runtime node root is not a directory");
+    throw std::runtime_error("runtime node root is not a directory");
   }
   UniqueFd node(openat(nodes, entry.node_id.c_str(),
                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
   if (!node.valid()) {
     ThrowErrno("open runtime node root", errno);
   }
-  struct stat opened {};
+  struct stat opened{};
   if (fstat(node.get(), &opened) != 0) {
     ThrowErrno("inspect opened runtime node root", errno);
   }
@@ -489,10 +484,9 @@ UniqueFd OpenOwnedNodeRoot(int nodes, const RunOwnership& ownership,
 void WriteNodeMarker(int node_directory, const RunOwnership& ownership,
                      const RuntimeNodeResourceEntry& entry) {
   const std::string marker_name(kNodeMarkerName);
-  UniqueFd marker(openat(
-      node_directory, marker_name.c_str(),
-      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-      S_IRUSR | S_IWUSR));
+  UniqueFd marker(openat(node_directory, marker_name.c_str(),
+                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                         S_IRUSR | S_IWUSR));
   if (!marker.valid()) {
     ThrowErrno("create runtime node ownership marker", errno);
   }
@@ -505,12 +499,10 @@ void WriteNodeMarker(int node_directory, const RunOwnership& ownership,
   RequireNodeMarker(node_directory, ownership, entry);
 }
 
-std::vector<std::string> DirectoryNames(int descriptor,
-                                        std::size_t* visited_entries,
-                                        std::optional<
-                                            std::chrono::steady_clock::time_point>
-                                            absolute_deadline,
-                                        std::stop_token stop_token) {
+std::vector<std::string> DirectoryNames(
+    int descriptor, std::size_t* visited_entries,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
   const int duplicate = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
   if (duplicate < 0) {
     ThrowErrno("duplicate runtime node directory", errno);
@@ -553,12 +545,11 @@ std::vector<std::string> DirectoryNames(int descriptor,
   return names;
 }
 
-void RemoveDirectoryContents(int directory, std::size_t depth,
-                             std::size_t* visited_entries,
-                             std::optional<std::string_view> preserved_entry,
-                             std::optional<std::chrono::steady_clock::time_point>
-                                 absolute_deadline,
-                             std::stop_token stop_token) {
+void RemoveDirectoryContents(
+    int directory, std::size_t depth, std::size_t* visited_entries,
+    std::optional<std::string_view> preserved_entry,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
     throw std::runtime_error("runtime node cleanup was cancelled");
   }
@@ -570,13 +561,12 @@ void RemoveDirectoryContents(int directory, std::size_t depth,
     throw std::runtime_error(
         "runtime node cleanup exceeded its directory-depth bound");
   }
-  for (const std::string& name :
-       DirectoryNames(directory, visited_entries, absolute_deadline,
-                      stop_token)) {
+  for (const std::string& name : DirectoryNames(
+           directory, visited_entries, absolute_deadline, stop_token)) {
     if (preserved_entry && name == *preserved_entry) {
       continue;
     }
-    struct stat before {};
+    struct stat before{};
     if (fstatat(directory, name.c_str(), &before, AT_SYMLINK_NOFOLLOW) != 0) {
       ThrowErrno("inspect runtime node cleanup entry", errno);
     }
@@ -592,7 +582,7 @@ void RemoveDirectoryContents(int directory, std::size_t depth,
     if (!child.valid()) {
       ThrowErrno("open runtime node cleanup directory", errno);
     }
-    struct stat opened {};
+    struct stat opened{};
     if (fstat(child.get(), &opened) != 0) {
       ThrowErrno("inspect opened runtime node cleanup directory", errno);
     }
@@ -607,7 +597,7 @@ void RemoveDirectoryContents(int directory, std::size_t depth,
     }
     RemoveDirectoryContents(child.get(), depth + 1U, visited_entries,
                             std::nullopt, absolute_deadline, stop_token);
-    struct stat current {};
+    struct stat current{};
     if (fstatat(directory, name.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0) {
       ThrowErrno("reinspect runtime node cleanup directory", errno);
     }
@@ -647,7 +637,8 @@ void WriteRuntimeNodeResourceManifest(
       }) +
       "\n";
   if (contents.size() > kMaximumManifestBytes) {
-    throw std::runtime_error("runtime resource manifest exceeds its size bound");
+    throw std::runtime_error(
+        "runtime resource manifest exceeds its size bound");
   }
 
   UniqueFd run_root = OpenOwnedRunRoot(manifest.ownership);
@@ -668,7 +659,7 @@ void WriteRuntimeNodeResourceManifest(
     if (fsync(file.get()) != 0) {
       ThrowErrno("sync runtime resource manifest", errno);
     }
-    struct stat temporary_status {};
+    struct stat temporary_status{};
     if (fstat(file.get(), &temporary_status) != 0) {
       ThrowErrno("inspect runtime resource manifest temporary", errno);
     }
@@ -686,7 +677,7 @@ void WriteRuntimeNodeResourceManifest(
     if (fsync(run_root.get()) != 0) {
       ThrowErrno("sync runtime resource manifest directory", errno);
     }
-    struct stat published_status {};
+    struct stat published_status{};
     if (fstatat(run_root.get(), published.c_str(), &published_status,
                 AT_SYMLINK_NOFOLLOW) != 0) {
       ThrowErrno("read back runtime resource manifest", errno);
@@ -710,40 +701,37 @@ void WriteRuntimeNodeResourceManifest(
   }
 }
 
-std::optional<RuntimeNodeResourceManifest>
-TryLoadRuntimeNodeResourceManifest(const RunOwnership& ownership) {
+std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
+    const RunOwnership& ownership) {
   UniqueFd run_root = OpenOwnedRunRoot(ownership);
-  struct stat status {};
+  struct stat status{};
   const std::string name(kManifestName);
-  if (fstatat(run_root.get(), name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+  if (fstatat(run_root.get(), name.c_str(), &status, AT_SYMLINK_NOFOLLOW) !=
+      0) {
     if (errno == ENOENT) {
       return std::nullopt;
     }
     ThrowErrno("inspect runtime resource manifest", errno);
   }
   if (!S_ISREG(status.st_mode)) {
-    throw std::runtime_error(
-        "runtime resource manifest is not a regular file");
+    throw std::runtime_error("runtime resource manifest is not a regular file");
   }
-  const boost::json::value parsed =
-      boost::json::parse(ReadBoundedFileAt(run_root.get(), kManifestName,
-                                           kMaximumManifestBytes));
+  const boost::json::value parsed = boost::json::parse(
+      ReadBoundedFileAt(run_root.get(), kManifestName, kMaximumManifestBytes));
   if (!parsed.is_object()) {
     throw std::runtime_error("runtime resource manifest is not an object");
   }
   const boost::json::object& object = parsed.as_object();
-  RejectUnknownFields(object,
-                      {"version", "run_id", "resource_id",
-                       "isolated_network", "nodes"},
-                      "runtime resource manifest");
+  RejectUnknownFields(
+      object, {"version", "run_id", "resource_id", "isolated_network", "nodes"},
+      "runtime resource manifest");
   if (RequiredUnsigned(object, "version") != kManifestVersion ||
       RequiredString(object, "run_id") != ownership.run_id ||
       RequiredString(object, "resource_id") != ownership.resource_id) {
     throw std::runtime_error(
         "runtime resource manifest does not match run ownership");
   }
-  const boost::json::value* isolated =
-      object.if_contains("isolated_network");
+  const boost::json::value* isolated = object.if_contains("isolated_network");
   const boost::json::value* node_values = object.if_contains("nodes");
   if (isolated == nullptr || !isolated->is_bool() || node_values == nullptr ||
       !node_values->is_array() ||
@@ -768,8 +756,7 @@ TryLoadRuntimeNodeResourceManifest(const RunOwnership& ownership) {
                         "runtime resource manifest node entry");
     const std::uint64_t slot = RequiredUnsigned(node, "slot");
     if (slot > std::numeric_limits<std::uint32_t>::max()) {
-      throw std::runtime_error(
-          "runtime resource manifest slot exceeds uint32");
+      throw std::runtime_error("runtime resource manifest slot exceeds uint32");
     }
     manifest.nodes.push_back(RuntimeNodeResourceEntry{
         .node_id = RequiredString(node, "id"),
@@ -787,7 +774,7 @@ bool RuntimeNodeRootEntryExists(const RunOwnership& ownership,
                                 std::string_view node_id) {
   RequireSafeNodeId(node_id);
   UniqueFd nodes = OpenNodesDirectory(ownership);
-  struct stat status {};
+  struct stat status{};
   const std::string name(node_id);
   if (fstatat(nodes.get(), name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
     if (errno == ENOENT) {
@@ -834,16 +821,14 @@ void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
     std::string cleanup_error;
     if (unlinkat(node.get(), std::string(kNodeMarkerName).c_str(), 0) != 0 &&
         errno != ENOENT) {
-      cleanup_error =
-          std::error_code(errno, std::generic_category()).message();
+      cleanup_error = std::error_code(errno, std::generic_category()).message();
     }
     if (unlinkat(nodes.get(), entry.node_id.c_str(), AT_REMOVEDIR) == 0) {
       if (acquired != nullptr) {
         *acquired = false;
       }
     } else if (cleanup_error.empty()) {
-      cleanup_error =
-          std::error_code(errno, std::generic_category()).message();
+      cleanup_error = std::error_code(errno, std::generic_category()).message();
     }
     if (!cleanup_error.empty()) {
       try {
@@ -851,17 +836,15 @@ void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
       } catch (const std::exception& error) {
         throw std::runtime_error(
             std::string(error.what()) +
-            "; failed runtime node root acquisition cleanup: " +
-            cleanup_error);
+            "; failed runtime node root acquisition cleanup: " + cleanup_error);
       }
     }
     std::rethrow_exception(original);
   }
 }
 
-void VerifyRuntimeNodeRootOwnership(
-    const RunOwnership& ownership,
-    const RuntimeNodeResourceEntry& entry) {
+void VerifyRuntimeNodeRootOwnership(const RunOwnership& ownership,
+                                    const RuntimeNodeResourceEntry& entry) {
   RequireEntry(entry);
   UniqueFd nodes = OpenNodesDirectory(ownership);
   static_cast<void>(OpenOwnedNodeRoot(nodes.get(), ownership, entry));
@@ -870,25 +853,22 @@ void VerifyRuntimeNodeRootOwnership(
 void CleanupCookieAt(int node_directory) {
   constexpr std::string_view kCredentialName = ".bbp-rpc-cookie";
   const std::string credential(kCredentialName);
-  if (unlinkat(node_directory, credential.c_str(), 0) != 0 &&
-      errno != ENOENT) {
+  if (unlinkat(node_directory, credential.c_str(), 0) != 0 && errno != ENOENT) {
     ThrowErrno("remove runtime node RPC credential", errno);
   }
-  struct stat status {};
+  struct stat status{};
   if (fstatat(node_directory, credential.c_str(), &status,
               AT_SYMLINK_NOFOLLOW) == 0 ||
       errno != ENOENT) {
-    throw std::runtime_error(
-        "runtime node RPC credential survived cleanup");
+    throw std::runtime_error("runtime node RPC credential survived cleanup");
   }
 }
 
-void CleanupRuntimeNodeRpcCredential(
-    const RunOwnership& ownership,
-    const RuntimeNodeResourceEntry& entry) {
+void CleanupRuntimeNodeRpcCredential(const RunOwnership& ownership,
+                                     const RuntimeNodeResourceEntry& entry) {
   RequireEntry(entry);
   UniqueFd nodes = OpenNodesDirectory(ownership);
-  struct stat present {};
+  struct stat present{};
   if (fstatat(nodes.get(), entry.node_id.c_str(), &present,
               AT_SYMLINK_NOFOLLOW) != 0) {
     if (errno == ENOENT) {
@@ -904,15 +884,14 @@ void CleanupRuntimeNodeRpcCredential(
   CleanupCookieAt(node.get());
 }
 
-void CleanupLegacyRuntimeNodeRpcCredential(
-    const RunOwnership& ownership, std::string_view node_id,
-    ChainKind chain) {
+void CleanupLegacyRuntimeNodeRpcCredential(const RunOwnership& ownership,
+                                           std::string_view node_id,
+                                           ChainKind chain) {
   RequireSafeNodeId(node_id);
   UniqueFd nodes = OpenNodesDirectory(ownership);
-  struct stat before {};
+  struct stat before{};
   const std::string name(node_id);
-  if (fstatat(nodes.get(), name.c_str(), &before,
-              AT_SYMLINK_NOFOLLOW) != 0) {
+  if (fstatat(nodes.get(), name.c_str(), &before, AT_SYMLINK_NOFOLLOW) != 0) {
     if (errno == ENOENT) {
       return;
     }
@@ -923,7 +902,7 @@ void CleanupLegacyRuntimeNodeRpcCredential(
   if (!node.valid()) {
     ThrowErrno("open legacy runtime node root", errno);
   }
-  struct stat opened {};
+  struct stat opened{};
   if (fstat(node.get(), &opened) != 0) {
     ThrowErrno("inspect opened legacy runtime node root", errno);
   }
@@ -940,14 +919,13 @@ void CleanupLegacyRuntimeNodeRpcCredential(
   }
 }
 
-void RemoveRuntimeNodeRoot(const RunOwnership& ownership,
-                           const RuntimeNodeResourceEntry& entry,
-                           std::optional<std::chrono::steady_clock::time_point>
-                               absolute_deadline,
-                           std::stop_token stop_token) {
+void RemoveRuntimeNodeRoot(
+    const RunOwnership& ownership, const RuntimeNodeResourceEntry& entry,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
   RequireEntry(entry);
   UniqueFd nodes = OpenNodesDirectory(ownership);
-  struct stat present {};
+  struct stat present{};
   if (fstatat(nodes.get(), entry.node_id.c_str(), &present,
               AT_SYMLINK_NOFOLLOW) != 0) {
     if (errno == ENOENT) {
@@ -955,15 +933,14 @@ void RemoveRuntimeNodeRoot(const RunOwnership& ownership,
     }
     ThrowErrno("inspect runtime node root before cleanup", errno);
   }
-  struct stat opened {};
-  UniqueFd node =
-      OpenOwnedNodeRoot(nodes.get(), ownership, entry, &opened);
+  struct stat opened{};
+  UniqueFd node = OpenOwnedNodeRoot(nodes.get(), ownership, entry, &opened);
 
   std::size_t visited_entries = 0U;
   RemoveDirectoryContents(node.get(), 0U, &visited_entries, kNodeMarkerName,
                           absolute_deadline, stop_token);
   RequireNodeMarker(node.get(), ownership, entry);
-  struct stat current {};
+  struct stat current{};
   if (fstatat(nodes.get(), entry.node_id.c_str(), &current,
               AT_SYMLINK_NOFOLLOW) != 0) {
     ThrowErrno("reinspect runtime node root before removal", errno);
@@ -1001,7 +978,7 @@ void RemoveOwnedRunRoot(
     std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
     std::stop_token stop_token) {
   UniqueFd run_root = OpenOwnedRunRoot(ownership);
-  struct stat opened {};
+  struct stat opened{};
   if (fstat(run_root.get(), &opened) != 0) {
     ThrowErrno("inspect owned run root before removal", errno);
   }
@@ -1015,7 +992,7 @@ void RemoveOwnedRunRoot(
   if (!parent.valid()) {
     ThrowErrno("open owned run parent", errno);
   }
-  struct stat parent_status {};
+  struct stat parent_status{};
   if (fstat(parent.get(), &parent_status) != 0) {
     ThrowErrno("inspect owned run parent", errno);
   }
@@ -1024,13 +1001,12 @@ void RemoveOwnedRunRoot(
     throw std::runtime_error(
         "owned run root removal refuses unsafe ownership or a mount boundary");
   }
-  struct stat linked {};
+  struct stat linked{};
   if (fstatat(parent.get(), name.c_str(), &linked, AT_SYMLINK_NOFOLLOW) != 0) {
     ThrowErrno("reinspect owned run root before removal", errno);
   }
   if (!SameIdentity(opened, linked)) {
-    throw std::runtime_error(
-        "owned run root identity changed before removal");
+    throw std::runtime_error("owned run root identity changed before removal");
   }
 
   std::size_t visited_entries = 0U;
@@ -1039,8 +1015,7 @@ void RemoveOwnedRunRoot(
   const std::string marker_contents =
       ReadBoundedFileAt(run_root.get(), kRunMarkerFile, 4096U);
   if (LoadRunOwnership(ownership.run_id, ownership.run_root) != ownership) {
-    throw std::runtime_error(
-        "run ownership changed before final root removal");
+    throw std::runtime_error("run ownership changed before final root removal");
   }
   const std::string marker_name(kRunMarkerFile);
   if (unlinkat(run_root.get(), marker_name.c_str(), 0) != 0) {
@@ -1052,8 +1027,7 @@ void RemoveOwnedRunRoot(
   if (unlinkat(parent.get(), name.c_str(), AT_REMOVEDIR) != 0) {
     const int remove_error = errno;
     UniqueFd marker(openat(run_root.get(), marker_name.c_str(),
-                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
-                               O_NOFOLLOW,
+                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                            S_IRUSR | S_IWUSR));
     if (!marker.valid()) {
       throw std::runtime_error(
@@ -1062,8 +1036,7 @@ void RemoveOwnedRunRoot(
           "; ownership marker restoration failed: " +
           std::error_code(errno, std::generic_category()).message());
     }
-    WriteAll(marker.get(), marker_contents,
-             "restore run ownership marker");
+    WriteAll(marker.get(), marker_contents, "restore run ownership marker");
     if (fsync(marker.get()) != 0 || fsync(run_root.get()) != 0) {
       ThrowErrno("sync restored run ownership marker", errno);
     }

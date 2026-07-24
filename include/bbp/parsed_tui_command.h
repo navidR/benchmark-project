@@ -52,6 +52,7 @@ struct ParsedTuiCommand {
   std::vector<PerfCounterKind> perf_counter_kinds;
   std::optional<SimulationWalletSend> wallet_send;
   std::optional<SimulationNodeAddRequest> node_add = std::nullopt;
+  std::optional<SimulationNodeRemoveRequest> node_remove = std::nullopt;
   std::optional<TuiLocalAction> local_action = std::nullopt;
 };
 

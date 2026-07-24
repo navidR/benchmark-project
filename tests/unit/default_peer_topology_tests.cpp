@@ -310,3 +310,98 @@ BOOST_AUTO_TEST_CASE(peer_topology_region_graph_uses_region_gateways) {
   BOOST_REQUIRE(one_way_gateway->condition.has_value());
   BOOST_CHECK(*one_way_gateway->condition == one_way);
 }
+
+BOOST_AUTO_TEST_CASE(
+    peer_topology_remaps_selected_custom_group_and_matrix_nodes) {
+  const std::vector<std::optional<std::uint32_t>> old_to_new = {
+      0U, std::nullopt, 1U, 2U};
+
+  bbp::NetworkCondition condition;
+  condition.delay_ms = 19U;
+  bbp::PeerTopologyConfig custom;
+  custom.kind = bbp::PeerTopologyKind::kCustomEdgeList;
+  custom.edges = {
+      {.from = 0U,
+       .to = 2U,
+       .bidirectional = false,
+       .active = true,
+       .latency_ms = 19U,
+       .condition = condition},
+      {.from = 1U, .to = 2U, .bidirectional = false},
+      {.from = 3U, .to = 0U, .bidirectional = false},
+  };
+  const bbp::PeerTopologyConfig remapped_custom =
+      bbp::RemapPeerTopologyConfig(custom, old_to_new);
+  BOOST_REQUIRE_EQUAL(remapped_custom.edges.size(), 2U);
+  BOOST_TEST(remapped_custom.edges[0U].from == 0U);
+  BOOST_TEST(remapped_custom.edges[0U].to == 1U);
+  BOOST_REQUIRE(remapped_custom.edges[0U].condition);
+  BOOST_CHECK(*remapped_custom.edges[0U].condition == condition);
+  BOOST_TEST(remapped_custom.edges[1U].from == 2U);
+  BOOST_TEST(remapped_custom.edges[1U].to == 0U);
+
+  bbp::PeerTopologyConfig grouped;
+  grouped.kind = bbp::PeerTopologyKind::kPartitionedGroups;
+  grouped.groups = {{0U, 1U}, {2U, 3U}};
+  const bbp::PeerTopologyConfig remapped_groups =
+      bbp::RemapPeerTopologyConfig(grouped, old_to_new);
+  BOOST_REQUIRE_EQUAL(remapped_groups.groups.size(), 2U);
+  BOOST_TEST(remapped_groups.groups[0U] == std::vector<std::uint32_t>({0U}),
+             boost::test_tools::per_element());
+  BOOST_TEST(remapped_groups.groups[1U] == std::vector<std::uint32_t>({1U, 2U}),
+             boost::test_tools::per_element());
+  BOOST_CHECK_NO_THROW(bbp::ResolvePeerTopologyEdges(remapped_groups, 3U));
+
+  bbp::PeerTopologyConfig matrix;
+  matrix.kind = bbp::PeerTopologyKind::kLatencyMatrix;
+  matrix.latency_matrix_ms = {
+      {0U, 1U, 2U, 3U},
+      {4U, 0U, 5U, 6U},
+      {7U, 8U, 0U, 9U},
+      {10U, 11U, 12U, 0U},
+  };
+  const bbp::PeerTopologyConfig remapped_matrix =
+      bbp::RemapPeerTopologyConfig(matrix, old_to_new);
+  const std::vector<std::vector<std::optional<std::uint32_t>>> expected = {
+      {0U, 2U, 3U}, {7U, 0U, 9U}, {10U, 12U, 0U}};
+  BOOST_CHECK(remapped_matrix.latency_matrix_ms == expected);
+  BOOST_CHECK_NO_THROW(bbp::ResolvePeerTopologyEdges(remapped_matrix, 3U));
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_topology_remaps_regions_generated_graphs_and_empty_inventory) {
+  bbp::PeerTopologyConfig regions;
+  regions.kind = bbp::PeerTopologyKind::kInternetLikeRegionGraph;
+  regions.regions = {{0U}, {1U}, {2U, 3U}};
+  regions.region_edges = {
+      {.from_region = 0U, .to_region = 1U, .bidirectional = false},
+      {.from_region = 0U, .to_region = 2U, .bidirectional = false},
+  };
+  const bbp::PeerTopologyConfig remapped_regions =
+      bbp::RemapPeerTopologyConfig(regions, {0U, std::nullopt, 1U, 2U});
+  BOOST_REQUIRE_EQUAL(remapped_regions.regions.size(), 2U);
+  BOOST_TEST(
+      remapped_regions.regions[1U] == std::vector<std::uint32_t>({1U, 2U}),
+      boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(remapped_regions.region_edges.size(), 1U);
+  BOOST_TEST(remapped_regions.region_edges.front().from_region == 0U);
+  BOOST_TEST(remapped_regions.region_edges.front().to_region == 1U);
+  BOOST_CHECK_NO_THROW(bbp::ResolvePeerTopologyEdges(remapped_regions, 3U));
+
+  bbp::PeerTopologyConfig random;
+  random.kind = bbp::PeerTopologyKind::kRandomGraph;
+  random.seed = 73U;
+  random.average_degree = 3U;
+  const bbp::PeerTopologyConfig remapped_random =
+      bbp::RemapPeerTopologyConfig(random, {0U, 1U, std::nullopt, 2U, 3U});
+  BOOST_TEST(remapped_random.average_degree == 3U);
+  BOOST_TEST(SameEdges(bbp::ResolvePeerTopologyEdges(remapped_random, 4U),
+                       bbp::ResolvePeerTopologyEdges(remapped_random, 4U)));
+
+  const bbp::PeerTopologyConfig empty =
+      bbp::RemapPeerTopologyConfig(random, {std::nullopt, std::nullopt});
+  BOOST_CHECK(empty.kind == bbp::PeerTopologyKind::kFullMesh);
+  BOOST_TEST(empty.edges.empty());
+  BOOST_TEST(empty.groups.empty());
+  BOOST_TEST(empty.regions.empty());
+}

@@ -16,6 +16,7 @@ namespace bbp {
 
 inline constexpr std::uint32_t kSimulationNodeAddMaximumCount = 16U;
 inline constexpr std::uint32_t kSimulationNodeAddMaximumTimeoutSeconds = 600U;
+inline constexpr std::uint32_t kSimulationNodeRemoveMaximumCount = 16U;
 
 struct SimulationNodeResourceFailure {
   std::string resource_kind;
@@ -50,6 +51,11 @@ struct SimulationNodeAddRequest {
   std::optional<NetworkCondition> network;
   std::uint32_t ready_timeout_sec = 30U;
   std::uint32_t sync_timeout_sec = 30U;
+};
+
+struct SimulationNodeRemoveRequest {
+  std::vector<std::string> node_ids;
+  std::uint32_t timeout_sec = 30U;
 };
 
 }  // namespace bbp

@@ -6,6 +6,8 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -115,14 +117,51 @@ class RuntimeNodeInventory {
 
     PreparedAppend(
         RuntimeNodeInventory* owner, std::unique_lock<std::mutex> lock,
-        std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation)
+        std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation,
+        std::set<std::string> used_node_ids)
         : owner_(owner),
           lock_(std::move(lock)),
-          generation_(std::move(generation)) {}
+          generation_(std::move(generation)),
+          used_node_ids_(std::move(used_node_ids)) {}
 
     RuntimeNodeInventory* owner_ = nullptr;
     std::unique_lock<std::mutex> lock_;
     std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation_;
+    std::set<std::string> used_node_ids_;
+  };
+
+  class PreparedRemoval {
+   public:
+    PreparedRemoval(PreparedRemoval&&) noexcept = default;
+    PreparedRemoval& operator=(PreparedRemoval&&) noexcept = default;
+
+    PreparedRemoval(const PreparedRemoval&) = delete;
+    PreparedRemoval& operator=(const PreparedRemoval&) = delete;
+
+    [[nodiscard]] RuntimeNodeSnapshot Commit() noexcept;
+    [[nodiscard]] bool ReadersDrained() const noexcept;
+    [[nodiscard]] const std::vector<RuntimeNodeInsertion>& retired_nodes()
+        const noexcept {
+      return retired_nodes_;
+    }
+
+   private:
+    friend class RuntimeNodeInventory;
+
+    PreparedRemoval(
+        RuntimeNodeInventory* owner, std::unique_lock<std::mutex> lock,
+        std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation,
+        std::vector<RuntimeNodeInsertion> retired_nodes)
+        : owner_(owner),
+          lock_(std::move(lock)),
+          generation_(std::move(generation)),
+          retired_nodes_(std::move(retired_nodes)) {}
+
+    RuntimeNodeInventory* owner_ = nullptr;
+    std::unique_lock<std::mutex> lock_;
+    std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation_;
+    std::vector<RuntimeNodeInsertion> retired_nodes_;
+    bool committed_ = false;
   };
 
   explicit RuntimeNodeInventory(std::uint32_t capacity);
@@ -133,6 +172,7 @@ class RuntimeNodeInventory {
   void Initialize(std::vector<NodeRuntime>& nodes);
   [[nodiscard]] RuntimeNodeSnapshot Snapshot() const;
   [[nodiscard]] NodeConfigSnapshot ConfigSnapshot() const;
+  [[nodiscard]] bool WasNodeIdUsed(std::string_view node_id) const;
   [[nodiscard]] std::uint32_t capacity() const { return capacity_; }
 
   RuntimeNodeSnapshot PublishAppend(
@@ -145,6 +185,10 @@ class RuntimeNodeInventory {
       std::uint64_t expected_generation,
       const std::vector<RuntimeNodeInsertion>& insertions,
       const std::vector<ChainNodeConfig>& published_configs);
+  PreparedRemoval PrepareRemoval(
+      std::uint64_t expected_generation,
+      const std::vector<std::string>& removed_node_ids,
+      const std::vector<ChainNodeConfig>& published_configs);
 
  private:
   static std::shared_ptr<RuntimeNodeSnapshot::Generation> MakeGeneration(
@@ -154,6 +198,7 @@ class RuntimeNodeInventory {
   const std::uint32_t capacity_;
   mutable std::mutex mutex_;
   std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation_;
+  std::set<std::string> used_node_ids_;
 };
 
 }  // namespace bbp

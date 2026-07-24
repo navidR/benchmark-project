@@ -123,3 +123,45 @@ BOOST_AUTO_TEST_CASE(
              boost::test_tools::per_element());
   BOOST_TEST(after.registry().topology().miner_node_count == 2U);
 }
+
+BOOST_AUTO_TEST_CASE(
+    runtime_wallet_registry_replaces_remapped_roles_immutably) {
+  bbp::NodeRoleTopology topology;
+  topology.configured = true;
+  topology.node_count = 3U;
+  topology.wallet_node_count = 1U;
+  topology.miner_node_count = 1U;
+  topology.wallet_nodes = {2U};
+  topology.miner_nodes = {2U};
+  topology.allow_miner_wallet_overlap = true;
+  bbp::SimulationRegistry initial =
+      bbp::SimulationRegistry::FromTopology(topology, {});
+  bbp::WalletIdentity& wallet = initial.MutableWalletByIndex(0U);
+  wallet.node_id = "firo-3";
+  wallet.address = "address-3";
+  wallet.funding_address = "funding-3";
+
+  bbp::RuntimeWalletRegistry registry;
+  registry.Initialize(initial);
+  const bbp::RuntimeWalletSnapshot before = registry.Snapshot();
+  bbp::SimulationRegistry replacement = before.registry().RemapRuntimeNodes(
+      {0U, std::nullopt, 1U}, bbp::PeerTopologyConfig{});
+  auto prepared =
+      registry.PrepareReplace(before.generation(), std::move(replacement));
+  BOOST_TEST(before.registry().topology().node_count == 3U);
+
+  const bbp::RuntimeWalletSnapshot after = prepared.Commit();
+  BOOST_TEST(after.generation() == before.generation() + 1U);
+  BOOST_TEST(after.registry().topology().node_count == 2U);
+  BOOST_TEST(after.registry().topology().wallet_nodes ==
+                 std::vector<std::uint32_t>({1U}),
+             boost::test_tools::per_element());
+  BOOST_TEST(after.registry().topology().miner_nodes ==
+                 std::vector<std::uint32_t>({1U}),
+             boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(after.wallets().size(), 1U);
+  BOOST_TEST(after.wallets().front().node == 2U);
+  BOOST_TEST(after.wallets().front().node_id == "firo-3");
+  BOOST_TEST(before.registry().topology().node_count == 3U);
+  BOOST_TEST(before.wallets().front().node == 3U);
+}

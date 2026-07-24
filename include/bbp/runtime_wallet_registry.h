@@ -69,6 +69,8 @@ class RuntimeWalletRegistry {
                                std::vector<WalletIdentity> wallets,
                                std::vector<std::uint32_t> miner_nodes,
                                std::uint32_t runtime_node_count);
+  PreparedAppend PrepareReplace(std::uint64_t expected_generation,
+                                SimulationRegistry registry);
 
  private:
   mutable std::mutex mutex_;

@@ -384,7 +384,8 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "runtime_node_restarts" || field == "runtime_node_freezes" ||
       field == "resource_limits" || field == "network_condition" ||
       field == "network_flow" || field == "partition" ||
-      field == "perf_target" || field == "wallet_send" || field == "node_add") {
+      field == "perf_target" || field == "wallet_send" || field == "node_add" ||
+      field == "node_remove") {
     return TypeSchema("object");
   }
   if (field == "chain_daemon" || field == "output_dir" ||
@@ -518,6 +519,7 @@ boost::json::object NodeAddTopologySchema() {
 }
 
 boost::json::object NodeMutationConfigSchema();
+boost::json::object NodeRemoveConfigSchema();
 
 boost::json::object WorkloadVariant(WorkloadKind kind,
                                     std::string_view discriminator,
@@ -665,6 +667,9 @@ boost::json::object CommandVariant(SimulationCommandKind kind,
   }
   if (properties.contains("node_add")) {
     properties["node_add"] = NodeMutationConfigSchema();
+  }
+  if (properties.contains("node_remove")) {
+    properties["node_remove"] = NodeRemoveConfigSchema();
   }
   for (const std::string_view field : ScenarioCommandFields(kind)) {
     required.emplace_back(field);
@@ -828,6 +833,15 @@ boost::json::object NodeMutationConfigSchema() {
   properties["sync_timeout_sec"] =
       IntegerSchema(1U, kSimulationNodeAddMaximumTimeoutSeconds);
   return ClosedObject(std::move(properties), Required({"chain", "count"}));
+}
+
+boost::json::object NodeRemoveConfigSchema() {
+  boost::json::object properties;
+  properties["node_ids"] = ArraySchema(NodeAddIdentifierSchema(), 1U,
+                                       kSimulationNodeRemoveMaximumCount, true);
+  properties["timeout_sec"] =
+      IntegerSchema(1U, kSimulationNodeAddMaximumTimeoutSeconds);
+  return ClosedObject(std::move(properties), Required({"node_ids"}));
 }
 
 boost::json::object PerfCounterArraySchema() {
@@ -1335,6 +1349,14 @@ boost::json::object BuildMcpOperationInputSchema(
       required.emplace_back("request");
       break;
     case McpOperationKind::kRemoveNode:
+      add_run();
+      properties["node_ids"] =
+          ArraySchema(NodeAddIdentifierSchema(), 1U,
+                      kSimulationNodeRemoveMaximumCount, true);
+      required.emplace_back("node_ids");
+      properties["timeout_sec"] =
+          IntegerSchema(1U, kSimulationNodeAddMaximumTimeoutSeconds);
+      break;
     case McpOperationKind::kStopNode:
     case McpOperationKind::kKillNode:
     case McpOperationKind::kRestartNode:
@@ -1594,6 +1616,29 @@ boost::json::object NodeAddMutationSchema() {
   return schema;
 }
 
+boost::json::object NodeRemoveMutationSchema() {
+  boost::json::object schema = BuildMcpResultSchema(McpResultFamily::kMutation);
+  boost::json::object& properties = schema.at("properties").as_object();
+  properties["added_node_ids"] =
+      ArraySchema(NodeAddIdentifierSchema(), 0U, 0U, true);
+  properties["removed_node_ids"] = ArraySchema(
+      NodeAddIdentifierSchema(), 1U, kSimulationNodeRemoveMaximumCount, true);
+  properties["affected_node_ids"] = ArraySchema(
+      NodeAddIdentifierSchema(), 1U, kSimulationNodeRemoveMaximumCount, true);
+  properties["action"] = ConstStringSchema("node.remove");
+  properties["inventory_generation"] = IntegerSchema();
+  properties["final_node_count"] = IntegerSchema();
+  properties["unchanged"] =
+      boost::json::object{{"type", "boolean"}, {"const", false}};
+  boost::json::array& required = schema.at("required").as_array();
+  for (const std::string_view field :
+       {"affected_node_ids", "action", "command_id", "inventory_generation",
+        "final_node_count"}) {
+    required.emplace_back(field);
+  }
+  return schema;
+}
+
 boost::json::object TypedNodeLifecycleCancellationDiagnosticSchema(
     McpOperationKind operation) {
   boost::json::object schema = DiagnosticSchema();
@@ -1642,6 +1687,9 @@ boost::json::object BuildMcpResultSchema(
       properties["action"] = IdentifierSchema();
       properties["added_node_ids"] = ArraySchema(
           NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
+      properties["removed_node_ids"] =
+          ArraySchema(NodeAddIdentifierSchema(), 1U,
+                      kSimulationNodeRemoveMaximumCount, true);
       properties["affected_node_ids"] = ArraySchema(
           NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
       properties["inventory_generation"] = Uint64Schema();
@@ -1657,6 +1705,17 @@ boost::json::object BuildMcpResultSchema(
            boost::json::object{
                {"required",
                 Required({"added_node_ids", "affected_node_ids",
+                          "inventory_generation", "final_node_count"})}}}});
+      constraints.emplace_back(boost::json::object{
+          {"if", boost::json::object{{"properties",
+                                      boost::json::object{
+                                          {"action",
+                                           ConstStringSchema("node.remove")}}},
+                                     {"required", Required({"action"})}}},
+          {"then",
+           boost::json::object{
+               {"required",
+                Required({"removed_node_ids", "affected_node_ids",
                           "inventory_generation", "final_node_count"})}}}});
       break;
     case McpResultFamily::kMutation:
@@ -1960,7 +2019,8 @@ boost::json::object BuildMcpOperationOutputSchema(
   choices.emplace_back(
       IsTypedNodeLifecycleOperation(operation)
           ? TypedNodeLifecycleMutationSchema(operation)
-      : operation == McpOperationKind::kAddNode ? NodeAddMutationSchema()
+      : operation == McpOperationKind::kAddNode    ? NodeAddMutationSchema()
+      : operation == McpOperationKind::kRemoveNode ? NodeRemoveMutationSchema()
       : result_family == McpResultFamily::kOperation
           ? BuildMcpResultSchema(result_family, selected_operations)
           : BuildMcpResultSchema(result_family));

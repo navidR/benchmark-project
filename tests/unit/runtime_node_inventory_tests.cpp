@@ -162,3 +162,96 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(unchanged.size() == 1U);
   BOOST_TEST(unchanged.front().config.id == "node-1");
 }
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_inventory_removes_selected_nodes_after_readers_drain) {
+  bbp::RuntimeNodeInventory inventory(4U);
+  std::vector<bbp::NodeRuntime> initial;
+  initial.push_back(RuntimeNode("node-1"));
+  initial.push_back(RuntimeNode("node-2"));
+  initial.push_back(RuntimeNode("node-3"));
+  inventory.Initialize(initial);
+
+  bbp::RuntimeNodeSnapshot old_reader = inventory.Snapshot();
+  bbp::NodeRuntime* first = &old_reader[0U];
+  bbp::NodeRuntime* retired = &old_reader[1U];
+  bbp::NodeRuntime* third = &old_reader[2U];
+  std::vector<bbp::ChainNodeConfig> published_configs = {old_reader[0U].config,
+                                                         old_reader[2U].config};
+  published_configs[0U].connect_peers = {"node-3:18444"};
+
+  auto prepared = inventory.PrepareRemoval(old_reader.generation(), {"node-2"},
+                                           published_configs);
+  BOOST_TEST(old_reader.size() == 3U);
+  const bbp::RuntimeNodeSnapshot after = prepared.Commit();
+
+  BOOST_TEST(after.generation() == 2U);
+  BOOST_REQUIRE_EQUAL(after.size(), 2U);
+  BOOST_TEST(&after[0U] == first);
+  BOOST_TEST(&after[1U] == third);
+  BOOST_TEST(after.slot(0U) == 0U);
+  BOOST_TEST(after.slot(1U) == 2U);
+  BOOST_TEST(inventory.WasNodeIdUsed("node-2"));
+  BOOST_TEST(!inventory.WasNodeIdUsed("node-4"));
+  BOOST_REQUIRE_EQUAL(prepared.retired_nodes().size(), 1U);
+  BOOST_TEST(prepared.retired_nodes().front().slot == 1U);
+  BOOST_TEST(prepared.retired_nodes().front().runtime.get() == retired);
+  BOOST_TEST(!prepared.ReadersDrained());
+  BOOST_TEST(inventory.ConfigSnapshot().nodes()[0U].connect_peers ==
+                 std::vector<std::string>({"node-3:18444"}),
+             boost::test_tools::per_element());
+
+  old_reader = bbp::RuntimeNodeSnapshot{};
+  BOOST_TEST(prepared.ReadersDrained());
+
+  const std::vector<bbp::RuntimeNodeInsertion> reused_id{
+      {.slot = 1U,
+       .runtime = std::make_shared<bbp::NodeRuntime>(RuntimeNode("node-2"))}};
+  BOOST_CHECK_THROW(inventory.PrepareAppend(after.generation(), reused_id),
+                    std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_inventory_removal_validation_and_abandonment_are_atomic) {
+  bbp::RuntimeNodeInventory inventory(3U);
+  std::vector<bbp::NodeRuntime> initial;
+  initial.push_back(RuntimeNode("node-1"));
+  initial.push_back(RuntimeNode("node-2"));
+  inventory.Initialize(initial);
+  const bbp::RuntimeNodeSnapshot before = inventory.Snapshot();
+  const std::vector<bbp::ChainNodeConfig> retained{before[0U].config};
+
+  BOOST_CHECK_THROW(
+      inventory.PrepareRemoval(before.generation(), {"missing"}, retained),
+      std::invalid_argument);
+  BOOST_CHECK_THROW(inventory.PrepareRemoval(before.generation(),
+                                             {"node-2", "node-2"}, retained),
+                    std::invalid_argument);
+  BOOST_TEST(inventory.Snapshot().generation() == before.generation());
+  BOOST_TEST(inventory.Snapshot().size() == before.size());
+
+  {
+    auto abandoned =
+        inventory.PrepareRemoval(before.generation(), {"node-2"}, retained);
+    static_cast<void>(abandoned);
+  }
+  const bbp::RuntimeNodeSnapshot unchanged = inventory.Snapshot();
+  BOOST_TEST(unchanged.generation() == before.generation());
+  BOOST_REQUIRE_EQUAL(unchanged.size(), 2U);
+  BOOST_TEST(unchanged[0U].config.id == "node-1");
+  BOOST_TEST(unchanged[1U].config.id == "node-2");
+}
+
+BOOST_AUTO_TEST_CASE(runtime_node_inventory_rejects_empty_append_runtime) {
+  bbp::RuntimeNodeInventory inventory(2U);
+  std::vector<bbp::NodeRuntime> initial;
+  initial.push_back(RuntimeNode("node-1"));
+  inventory.Initialize(initial);
+  const std::vector<bbp::RuntimeNodeInsertion> empty_runtime{
+      {.slot = 1U, .runtime = nullptr}};
+
+  BOOST_CHECK_THROW(
+      inventory.PrepareAppend(inventory.Snapshot().generation(), empty_runtime),
+      std::invalid_argument);
+  BOOST_TEST(inventory.Snapshot().size() == 1U);
+}

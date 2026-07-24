@@ -28,8 +28,7 @@ class RuntimePeerTopology {
   const RuntimePeerTopologyEdge& Edge(std::uint32_t from,
                                       std::uint32_t to) const;
   std::vector<std::uint32_t> ActivePeerIndexes(std::uint32_t node_index) const;
-  bool PhysicalPeerRequired(std::uint32_t first,
-                            std::uint32_t second) const;
+  bool PhysicalPeerRequired(std::uint32_t first, std::uint32_t second) const;
   bool PreservesPhysicalPeerRequirementsFrom(
       const RuntimePeerTopology& previous,
       std::uint32_t common_node_count) const;
@@ -44,6 +43,9 @@ class RuntimePeerTopology {
   RuntimePeerTopologyEdge RestoreBaseline(std::uint32_t from, std::uint32_t to);
   void RestoreState(const RuntimePeerTopologyEdge& state);
   void PreserveCommonStateFrom(const RuntimePeerTopology& previous);
+  void PreserveRemappedStateFrom(
+      const RuntimePeerTopology& previous,
+      const std::vector<std::optional<std::uint32_t>>& old_to_new);
 
  private:
   RuntimePeerTopologyEdge& MutableEdge(std::uint32_t from, std::uint32_t to);

@@ -91,3 +91,72 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(overlap.topology().miner_nodes == std::vector<std::uint32_t>({1U}),
              boost::test_tools::per_element());
 }
+
+BOOST_AUTO_TEST_CASE(
+    simulation_registry_remaps_surviving_roles_and_all_peer_policy) {
+  bbp::NodeRoleTopology topology;
+  topology.configured = true;
+  topology.node_count = 4U;
+  topology.wallet_node_count = 2U;
+  topology.miner_node_count = 1U;
+  topology.allow_miner_wallet_overlap = true;
+  topology.wallet_nodes = {0U, 3U};
+  topology.miner_nodes = {3U};
+  topology.peer_connectivity = {{.node = 0U,
+                                 .mode = bbp::PeerConnectivityMode::kAllPeers,
+                                 .peer_count = bbp::PeerCountPolicy(3U, 3U)}};
+  bbp::SimulationRegistry registry =
+      bbp::SimulationRegistry::FromTopology(topology, {});
+  registry.MutableWalletByIndex(0U).node_id = "firo-1";
+  registry.MutableWalletByIndex(1U).node_id = "firo-4";
+
+  const bbp::SimulationRegistry remapped = registry.RemapRuntimeNodes(
+      {0U, std::nullopt, 1U, 2U}, bbp::PeerTopologyConfig{});
+
+  BOOST_TEST(remapped.topology().node_count == 3U);
+  BOOST_TEST(
+      remapped.topology().wallet_nodes == std::vector<std::uint32_t>({0U, 2U}),
+      boost::test_tools::per_element());
+  BOOST_TEST(
+      remapped.topology().miner_nodes == std::vector<std::uint32_t>({2U}),
+      boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(remapped.wallets().size(), 2U);
+  BOOST_TEST(remapped.wallets()[0U].node == 1U);
+  BOOST_TEST(remapped.wallets()[0U].node_id == "firo-1");
+  BOOST_TEST(remapped.wallets()[1U].node == 3U);
+  BOOST_TEST(remapped.wallets()[1U].node_id == "firo-4");
+  BOOST_REQUIRE_EQUAL(remapped.topology().peer_connectivity.size(), 1U);
+  const bbp::PeerConnectivityPolicy& policy =
+      remapped.topology().peer_connectivity.front();
+  BOOST_TEST(policy.node == 0U);
+  BOOST_CHECK(policy.mode == bbp::PeerConnectivityMode::kAllPeers);
+  BOOST_TEST(policy.peer_count.minimum() == 2U);
+  BOOST_TEST(policy.peer_count.maximum() == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_registry_rejects_role_removal_and_incompatible_fixed_policy) {
+  bbp::NodeRoleTopology role_topology;
+  role_topology.configured = true;
+  role_topology.node_count = 3U;
+  role_topology.wallet_node_count = 1U;
+  role_topology.wallet_nodes = {1U};
+  const bbp::SimulationRegistry roles =
+      bbp::SimulationRegistry::FromTopology(role_topology, {});
+  BOOST_CHECK_THROW(roles.RemapRuntimeNodes({0U, std::nullopt, 1U},
+                                            bbp::PeerTopologyConfig{}),
+                    std::runtime_error);
+
+  bbp::NodeRoleTopology policy_topology;
+  policy_topology.configured = true;
+  policy_topology.node_count = 4U;
+  policy_topology.peer_connectivity = {
+      {.node = 0U,
+       .mode = bbp::PeerConnectivityMode::kFixedCount,
+       .peer_count = bbp::PeerCountPolicy(3U, 3U)}};
+  const bbp::SimulationRegistry fixed =
+      bbp::SimulationRegistry::FromTopology(policy_topology, {});
+  BOOST_CHECK_THROW(fixed.RemapRuntimeNodes({0U, std::nullopt, 1U, 2U},
+                                            bbp::PeerTopologyConfig{}),
+                    std::runtime_error);
+}

@@ -60,6 +60,7 @@ enum class SimulationCommandKind {
   kSetPerfCounters,
   kSendWalletTransaction,
   kAddNodes,
+  kRemoveNodes,
   kCount,
 };
 
@@ -218,12 +219,11 @@ struct SimulationCommandControl {
     if (completed > kSimulationNodeAddProgressTotal) {
       return false;
     }
-    std::uint64_t current =
-        progress_completed.load(std::memory_order_acquire);
+    std::uint64_t current = progress_completed.load(std::memory_order_acquire);
     while (completed > current) {
-      if (progress_completed.compare_exchange_weak(
-              current, completed, std::memory_order_release,
-              std::memory_order_acquire)) {
+      if (progress_completed.compare_exchange_weak(current, completed,
+                                                   std::memory_order_release,
+                                                   std::memory_order_acquire)) {
         return true;
       }
     }
@@ -265,6 +265,7 @@ struct SimulationCommandOutcome {
   std::optional<std::string> error;
   std::optional<std::string> node_lifecycle;
   std::vector<std::string> added_node_ids;
+  std::vector<std::string> removed_node_ids;
   std::optional<std::uint64_t> inventory_generation;
   std::optional<std::uint32_t> final_node_count;
 };
@@ -318,6 +319,7 @@ struct SimulationCommand {
   std::vector<PerfCounterKind> perf_counter_kinds;
   std::optional<SimulationWalletSend> wallet_send;
   std::optional<SimulationNodeAddRequest> node_add;
+  std::optional<SimulationNodeRemoveRequest> node_remove;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;
   std::shared_ptr<SimulationCommandControl> operation_control;

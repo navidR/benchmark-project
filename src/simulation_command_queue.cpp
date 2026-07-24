@@ -24,7 +24,8 @@ std::size_t SimulationCommandPayloadCount(const SimulationCommand& command) {
          static_cast<std::size_t>(command.perf_counter_target.has_value()) +
          static_cast<std::size_t>(!command.perf_counter_kinds.empty()) +
          static_cast<std::size_t>(command.wallet_send.has_value()) +
-         static_cast<std::size_t>(command.node_add.has_value());
+         static_cast<std::size_t>(command.node_add.has_value()) +
+         static_cast<std::size_t>(command.node_remove.has_value());
 }
 
 void RequirePayload(const SimulationCommand& command, bool expected_present,
@@ -230,6 +231,34 @@ void ValidateNodeAddCommand(const SimulationCommand& command) {
   }
 }
 
+void ValidateNodeRemoveCommand(const SimulationCommand& command) {
+  RequirePayload(command, command.node_remove.has_value(), 1U);
+  if (command.node_id != "sim") {
+    throw std::runtime_error("remove-nodes command must target sim");
+  }
+  const SimulationNodeRemoveRequest& request = *command.node_remove;
+  if (request.node_ids.empty() ||
+      request.node_ids.size() > kSimulationNodeRemoveMaximumCount) {
+    throw std::runtime_error("remove-nodes count must be in 1.." +
+                             std::to_string(kSimulationNodeRemoveMaximumCount));
+  }
+  std::set<std::string> unique_node_ids;
+  for (const std::string& node_id : request.node_ids) {
+    if (node_id.empty()) {
+      throw std::runtime_error("remove-nodes node id must not be empty");
+    }
+    if (!unique_node_ids.insert(node_id).second) {
+      throw std::runtime_error("remove-nodes node ids must be unique");
+    }
+  }
+  if (request.timeout_sec == 0U ||
+      request.timeout_sec > kSimulationNodeAddMaximumTimeoutSeconds) {
+    throw std::runtime_error(
+        "remove-nodes timeout must be in 1.." +
+        std::to_string(kSimulationNodeAddMaximumTimeoutSeconds));
+  }
+}
+
 void ValidateSimulationCommand(const SimulationCommand& command) {
   if (command.sequence != 0U) {
     throw std::runtime_error(
@@ -326,6 +355,9 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
     case SimulationCommandKind::kAddNodes:
       ValidateNodeAddCommand(command);
       break;
+    case SimulationCommandKind::kRemoveNodes:
+      ValidateNodeRemoveCommand(command);
+      break;
     case SimulationCommandKind::kCount:
       throw std::runtime_error("unknown simulation command kind");
   }
@@ -374,6 +406,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kSetPerfCounters:
     case SimulationCommandKind::kSendWalletTransaction:
     case SimulationCommandKind::kAddNodes:
+    case SimulationCommandKind::kRemoveNodes:
     case SimulationCommandKind::kCount:
       throw std::runtime_error(
           "simulation command kind requires a typed payload method");
@@ -396,6 +429,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -422,6 +456,7 @@ std::uint64_t SimulationCommandQueue::PushBlockProductionPolicy(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = false,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -448,6 +483,7 @@ std::uint64_t SimulationCommandQueue::PushMiningDifficulty(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = false,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -485,6 +521,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -511,6 +548,7 @@ std::uint64_t SimulationCommandQueue::PushPeerCountPolicy(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -540,6 +578,7 @@ std::uint64_t SimulationCommandQueue::PushGenerateBlocks(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -599,6 +638,7 @@ std::uint64_t SimulationCommandQueue::PushProfileCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -630,6 +670,7 @@ std::uint64_t SimulationCommandQueue::PushResourceLimits(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -657,6 +698,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkCondition(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -705,6 +747,7 @@ std::uint64_t SimulationCommandQueue::PushNetworkFlowCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -741,6 +784,7 @@ std::uint64_t SimulationCommandQueue::PushPartitionCommand(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -797,6 +841,7 @@ std::uint64_t SimulationCommandQueue::PushPerfCounters(
       .perf_counter_kinds = std::move(kinds),
       .wallet_send = std::nullopt,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = false,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -843,6 +888,7 @@ std::uint64_t SimulationCommandQueue::PushWalletSend(std::string sender_node_id,
       .perf_counter_kinds = {},
       .wallet_send = send,
       .node_add = std::nullopt,
+      .node_remove = std::nullopt,
       .confirmed = confirmed,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
@@ -869,7 +915,35 @@ std::uint64_t SimulationCommandQueue::PushAddNodes(
       .perf_counter_kinds = {},
       .wallet_send = std::nullopt,
       .node_add = std::move(request),
+      .node_remove = std::nullopt,
       .confirmed = false,
+      .scheduled_event_sequence = std::nullopt,
+      .operation_control = nullptr,
+  });
+}
+
+std::uint64_t SimulationCommandQueue::PushRemoveNodes(
+    SimulationNodeRemoveRequest request) {
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kRemoveNodes,
+      .node_id = "sim",
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
+      .partition = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
+      .node_add = std::nullopt,
+      .node_remove = std::move(request),
+      .confirmed = true,
       .scheduled_event_sequence = std::nullopt,
       .operation_control = nullptr,
   });
@@ -877,7 +951,8 @@ std::uint64_t SimulationCommandQueue::PushAddNodes(
 
 std::uint64_t SimulationCommandQueue::PushCommand(SimulationCommand command) {
   ValidateSimulationCommand(command);
-  if (command.kind == SimulationCommandKind::kAddNodes &&
+  if ((command.kind == SimulationCommandKind::kAddNodes ||
+       command.kind == SimulationCommandKind::kRemoveNodes) &&
       !command.operation_control) {
     command.operation_control = std::make_shared<SimulationCommandControl>();
   }

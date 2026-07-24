@@ -44,6 +44,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kSetPerfCounters,
       bbp::SimulationCommandKind::kSendWalletTransaction,
       bbp::SimulationCommandKind::kAddNodes,
+      bbp::SimulationCommandKind::kRemoveNodes,
   };
 
   for (bbp::SimulationCommandKind kind : kKinds) {
@@ -87,6 +88,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kSetPerfCounters));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kAddNodes));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kRemoveNodes));
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_cancellation_is_optional_and_shared) {
@@ -191,11 +194,10 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(control.ReportProgress(1U));
   BOOST_TEST(control.ReportProgress(4U));
   BOOST_TEST(!control.ReportProgress(3U));
-  BOOST_TEST(!control.ReportProgress(
-      bbp::kSimulationNodeAddProgressTotal + 1U));
-  BOOST_TEST(control.progress_completed.load(std::memory_order_acquire) == 4U);
   BOOST_TEST(
-      control.ReportProgress(bbp::kSimulationNodeAddProgressTotal));
+      !control.ReportProgress(bbp::kSimulationNodeAddProgressTotal + 1U));
+  BOOST_TEST(control.progress_completed.load(std::memory_order_acquire) == 4U);
+  BOOST_TEST(control.ReportProgress(bbp::kSimulationNodeAddProgressTotal));
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_outcome_carries_added_node_ids) {
@@ -205,6 +207,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_outcome_carries_added_node_ids) {
       .error = std::nullopt,
       .node_lifecycle = std::nullopt,
       .added_node_ids = {"firo-2", "firo-3"},
+      .removed_node_ids = {},
       .inventory_generation = 2U,
       .final_node_count = 3U};
   BOOST_REQUIRE_EQUAL(outcome.added_node_ids.size(), 2U);

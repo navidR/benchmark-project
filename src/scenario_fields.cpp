@@ -413,6 +413,7 @@ std::span<const std::string_view> ScenarioCommandFields(
   static constexpr auto kPerf = Fields("perf_target", "perf_counters");
   static constexpr auto kWallet = Fields("wallet_send");
   static constexpr auto kNodeAdd = Fields("node_add");
+  static constexpr auto kNodeRemove = Fields("node_remove");
   switch (kind) {
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:
@@ -456,6 +457,8 @@ std::span<const std::string_view> ScenarioCommandFields(
       return kWallet;
     case SimulationCommandKind::kAddNodes:
       return kNodeAdd;
+    case SimulationCommandKind::kRemoveNodes:
+      return kNodeRemove;
     case SimulationCommandKind::kCount:
       break;
   }
@@ -470,7 +473,8 @@ bool ScenarioCommandFieldAllowed(SimulationCommandKind kind,
            kind != SimulationCommandKind::kPartitionNodes &&
            kind != SimulationCommandKind::kHealPartition &&
            kind != SimulationCommandKind::kSetPerfCounters &&
-           kind != SimulationCommandKind::kAddNodes;
+           kind != SimulationCommandKind::kAddNodes &&
+           kind != SimulationCommandKind::kRemoveNodes;
   }
   return Contains(fields, field);
 }
