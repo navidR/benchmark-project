@@ -104,6 +104,16 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(registry.AddMinerNode(0U), std::runtime_error);
   BOOST_CHECK_THROW(registry.AddMinerNode(4U), std::runtime_error);
   BOOST_CHECK_THROW(registry.AddMinerNode(1U), std::runtime_error);
+  registry.RemoveMinerNodes({3U});
+  BOOST_TEST(
+      registry.topology().miner_nodes == std::vector<std::uint32_t>({0U}),
+      boost::test_tools::per_element());
+  BOOST_TEST(registry.topology().miner_node_count == 1U);
+  BOOST_CHECK_THROW(registry.RemoveMinerNodes({3U}), std::runtime_error);
+  BOOST_CHECK_THROW(registry.RemoveMinerNodes({0U, 0U}), std::runtime_error);
+  registry.RemoveMinerNodes({0U});
+  BOOST_TEST(registry.topology().miner_nodes.empty());
+  BOOST_TEST(registry.topology().miner_node_count == 0U);
 
   topology.allow_miner_wallet_overlap = true;
   bbp::SimulationRegistry overlap =

@@ -47,6 +47,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kRestartNode,
     McpOperationKind::kAddWallet,
     McpOperationKind::kAddMiner,
+    McpOperationKind::kRemoveMiner,
     McpOperationKind::kAddMasternode,
     McpOperationKind::kRemoveMasternode,
     McpOperationKind::kRestartMasternode,
@@ -708,6 +709,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kRestartNode &&
       kind != McpOperationKind::kAddWallet &&
       kind != McpOperationKind::kAddMiner &&
+      kind != McpOperationKind::kRemoveMiner &&
       kind != McpOperationKind::kAddMasternode &&
       kind != McpOperationKind::kRemoveMasternode &&
       kind != McpOperationKind::kRestartMasternode &&
@@ -756,6 +758,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
 
   if (kind == McpOperationKind::kAddWallet ||
       kind == McpOperationKind::kAddMiner ||
+      kind == McpOperationKind::kRemoveMiner ||
       kind == McpOperationKind::kAddMasternode ||
       kind == McpOperationKind::kRemoveMasternode ||
       kind == McpOperationKind::kRestartMasternode) {

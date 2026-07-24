@@ -144,6 +144,17 @@ BOOST_AUTO_TEST_CASE(
                  std::vector<std::uint32_t>({0U, 1U}),
              boost::test_tools::per_element());
   BOOST_TEST(after.registry().topology().miner_node_count == 2U);
+
+  bbp::SimulationRegistry replacement = after.registry();
+  replacement.RemoveMinerNodes({1U});
+  auto prepared_removal =
+      registry.PrepareReplace(after.generation(), std::move(replacement));
+  const bbp::RuntimeWalletSnapshot removed = prepared_removal.Commit();
+  BOOST_TEST(removed.generation() == after.generation() + 1U);
+  BOOST_TEST(removed.registry().topology().miner_nodes ==
+                 std::vector<std::uint32_t>({0U}),
+             boost::test_tools::per_element());
+  BOOST_TEST(after.registry().topology().miner_node_count == 2U);
 }
 
 BOOST_AUTO_TEST_CASE(

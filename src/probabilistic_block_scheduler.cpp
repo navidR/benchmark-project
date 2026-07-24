@@ -5,8 +5,11 @@
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int_distribution.hpp>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <utility>
+
+#include "bbp/simulation_cancelled.h"
 
 namespace bbp {
 
@@ -88,6 +91,10 @@ ProbabilisticBlockScheduler::PrepareAddMiners(
         "block scheduler miner addition cannot be empty");
   }
   std::unique_lock<std::mutex> lock(mutex_);
+  if (membership_mutation_pending_) {
+    throw std::logic_error(
+        "block scheduler membership mutation is already pending");
+  }
   std::vector<std::string> next_ids = miner_node_ids_;
   std::vector<bool> next_active = active_miners_;
   std::vector<bool> next_in_flight = in_flight_miners_;
@@ -122,6 +129,114 @@ void ProbabilisticBlockScheduler::PreparedAdd::Commit() noexcept {
   lock_.unlock();
   owner_->condition_.notify_all();
   owner_ = nullptr;
+}
+
+ProbabilisticBlockScheduler::PreparedRemove::PreparedRemove(
+    PreparedRemove&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)),
+      lock_(std::move(other.lock_)),
+      miner_node_ids_(std::move(other.miner_node_ids_)),
+      active_miners_(std::move(other.active_miners_)),
+      in_flight_miners_(std::move(other.in_flight_miners_)) {}
+
+ProbabilisticBlockScheduler::PreparedRemove::~PreparedRemove() { Abandon(); }
+
+void ProbabilisticBlockScheduler::PreparedRemove::Abandon() noexcept {
+  if (owner_ == nullptr) {
+    return;
+  }
+  if (!lock_.owns_lock() || lock_.mutex() != &owner_->mutex_ ||
+      !owner_->membership_mutation_pending_) {
+    std::terminate();
+  }
+  owner_->membership_mutation_pending_ = false;
+  lock_.unlock();
+  owner_->condition_.notify_all();
+  owner_ = nullptr;
+}
+
+void ProbabilisticBlockScheduler::PreparedRemove::Commit() noexcept {
+  if (owner_ == nullptr || !lock_.owns_lock() ||
+      lock_.mutex() != &owner_->mutex_ ||
+      !owner_->membership_mutation_pending_) {
+    std::terminate();
+  }
+  owner_->miner_node_ids_.swap(miner_node_ids_);
+  owner_->active_miners_.swap(active_miners_);
+  owner_->in_flight_miners_.swap(in_flight_miners_);
+  owner_->membership_mutation_pending_ = false;
+  lock_.unlock();
+  owner_->condition_.notify_all();
+  owner_ = nullptr;
+}
+
+ProbabilisticBlockScheduler::PreparedRemove
+ProbabilisticBlockScheduler::PrepareRemoveMiners(
+    std::vector<std::string> node_ids, std::stop_token stop_token) {
+  if (node_ids.empty()) {
+    throw std::invalid_argument(
+        "block scheduler miner removal cannot be empty");
+  }
+  const std::set<std::string> requested(node_ids.begin(), node_ids.end());
+  if (requested.size() != node_ids.size() || requested.contains("")) {
+    throw std::invalid_argument(
+        "block scheduler miner removal must contain unique nonempty ids");
+  }
+
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (const std::string& node_id : requested) {
+    if (std::find(miner_node_ids_.begin(), miner_node_ids_.end(), node_id) ==
+        miner_node_ids_.end()) {
+      throw std::invalid_argument("block scheduler miner is not configured: " +
+                                  node_id);
+    }
+  }
+  if (membership_mutation_pending_) {
+    throw std::logic_error(
+        "block scheduler membership mutation is already pending");
+  }
+  membership_mutation_pending_ = true;
+  condition_.notify_all();
+  const auto selected_in_flight = [&] {
+    for (std::size_t index = 0U; index < miner_node_ids_.size(); ++index) {
+      if (requested.contains(miner_node_ids_[index]) &&
+          in_flight_miners_[index]) {
+        return true;
+      }
+    }
+    return false;
+  };
+  if (!condition_.wait(lock, stop_token,
+                       [&] { return !selected_in_flight(); })) {
+    membership_mutation_pending_ = false;
+    lock.unlock();
+    condition_.notify_all();
+    throw SimulationCancelled();
+  }
+
+  try {
+    std::vector<std::string> next_ids;
+    std::vector<bool> next_active;
+    std::vector<bool> next_in_flight;
+    next_ids.reserve(miner_node_ids_.size() - requested.size());
+    next_active.reserve(active_miners_.size() - requested.size());
+    next_in_flight.reserve(in_flight_miners_.size() - requested.size());
+    for (std::size_t index = 0U; index < miner_node_ids_.size(); ++index) {
+      if (requested.contains(miner_node_ids_[index])) {
+        continue;
+      }
+      next_ids.push_back(miner_node_ids_[index]);
+      next_active.push_back(active_miners_[index]);
+      next_in_flight.push_back(in_flight_miners_[index]);
+    }
+    return PreparedRemove(this, std::move(lock), std::move(next_ids),
+                          std::move(next_active), std::move(next_in_flight));
+  } catch (...) {
+    membership_mutation_pending_ = false;
+    lock.unlock();
+    condition_.notify_all();
+    throw;
+  }
 }
 
 void ProbabilisticBlockScheduler::StartMiner(const std::string& node_id) {
@@ -177,6 +292,9 @@ void ProbabilisticBlockScheduler::Run() {
     std::size_t selected_index = 0U;
     {
       std::unique_lock<std::mutex> lock(mutex_);
+      condition_.wait(lock, [this] {
+        return stop_requested_ || !membership_mutation_pending_;
+      });
       if (stop_requested_) {
         return;
       }
@@ -195,7 +313,8 @@ void ProbabilisticBlockScheduler::Run() {
         }
       }
       if (condition_.wait_until(lock, next_draw, [this] {
-            return stop_requested_ || policy_changed_;
+            return stop_requested_ || policy_changed_ ||
+                   membership_mutation_pending_;
           })) {
         if (stop_requested_) {
           return;

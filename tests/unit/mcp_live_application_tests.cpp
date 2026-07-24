@@ -2259,7 +2259,8 @@ BOOST_AUTO_TEST_CASE(
              "cancelled");
 }
 
-BOOST_AUTO_TEST_CASE(mcp_live_miner_add_routes_role_result_and_cancellation) {
+BOOST_AUTO_TEST_CASE(
+    mcp_live_miner_lifecycle_routes_role_results_and_cancellation) {
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -2283,16 +2284,35 @@ BOOST_AUTO_TEST_CASE(mcp_live_miner_add_routes_role_result_and_cancellation) {
       application.SupportedOperations();
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kAddMiner) != supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kRemoveMiner) != supported.end());
 
   auto service = std::make_shared<McpLiveRoleService>();
   service->operation = [](McpOperationKind kind,
                           const boost::json::object& arguments,
                           std::stop_token stop_token) {
-    BOOST_CHECK(kind == McpOperationKind::kAddMiner);
-    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
+    BOOST_CHECK(kind == McpOperationKind::kAddMiner ||
+                kind == McpOperationKind::kRemoveMiner);
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
+    if (kind == McpOperationKind::kRemoveMiner) {
+      BOOST_TEST(arguments.at("node_ids").as_array() ==
+                 boost::json::array{"firo-1"});
+      return boost::json::object{
+          {"node_ids", boost::json::array{"firo-1"}},
+          {"assigned_roles", boost::json::array{}},
+          {"removed_roles", boost::json::array{"miner"}},
+          {"action", "miner.remove"},
+          {"state", "removed"},
+          {"created_node_ids", boost::json::array{}},
+          {"role_generation", 3U},
+          {"final_miner_count", 0U},
+          {"inventory_generation", 1U},
+          {"final_node_count", 1U},
+      };
+    }
+    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
     if (const boost::json::value* node_ids = arguments.if_contains("node_ids");
         node_ids != nullptr &&
         node_ids->as_array().front().as_string() == "firo-cancel") {
@@ -2332,6 +2352,22 @@ BOOST_AUTO_TEST_CASE(mcp_live_miner_add_routes_role_result_and_cancellation) {
   BOOST_TEST(result.at("action").as_string() == "miner.add");
   BOOST_TEST(result.at("node_ids").as_array() == boost::json::array{"firo-1"});
   BOOST_TEST(result.at("role_generation").as_uint64() == 2U);
+
+  const boost::json::object removed =
+      Invoke(&dispatcher, "miner.remove",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_ids", boost::json::array{"firo-1"}}});
+  const boost::json::object removed_terminal =
+      WaitForTerminal(&dispatcher, removed);
+  BOOST_TEST(removed_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& removed_result =
+      removed_terminal.at("terminal_result").as_object();
+  BOOST_TEST(removed_result.at("result_family").as_string() == "role_mutation");
+  BOOST_TEST(removed_result.at("action").as_string() == "miner.remove");
+  BOOST_TEST(removed_result.at("state").as_string() == "removed");
+  BOOST_TEST(removed_result.at("removed_roles").as_array() ==
+             boost::json::array{"miner"});
+  BOOST_TEST(removed_result.at("final_miner_count").as_uint64() == 0U);
 
   const boost::json::object created =
       Invoke(&dispatcher, "miner.add",

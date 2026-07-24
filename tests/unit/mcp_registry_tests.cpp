@@ -526,6 +526,10 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
       BuildMcpOperationInputSchema(McpOperationKind::kAddMiner);
   const boost::json::object& miner_create_nodes =
       miner_add.at("properties").as_object().at("create_nodes").as_object();
+  const boost::json::object miner_remove =
+      BuildMcpOperationInputSchema(McpOperationKind::kRemoveMiner);
+  const boost::json::object& miner_remove_node_ids =
+      miner_remove.at("properties").as_object().at("node_ids").as_object();
   BOOST_TEST(wallet_add.at("properties")
                  .as_object()
                  .at("count")
@@ -548,6 +552,10 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                  .as_object()
                  .at("maxItems")
                  .as_uint64() == kSimulationNodeAddMaximumCount);
+  BOOST_TEST(miner_remove_node_ids.at("minItems").as_uint64() == 1U);
+  BOOST_TEST(miner_remove_node_ids.at("uniqueItems").as_bool());
+  BOOST_TEST(
+      StringSet(ArrayField(miner_remove, "required")).contains("node_ids"));
   const boost::json::object& request_properties =
       direct_request.at("properties").as_object();
   BOOST_TEST(
@@ -681,6 +689,20 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                  .at("maximum")
                  .as_uint64() == std::numeric_limits<std::uint32_t>::max());
   BOOST_REQUIRE(miner_output.contains("allOf"));
+  const boost::json::object miner_remove_output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kRemoveMiner)
+          .at("oneOf")
+          .as_array()
+          .front()
+          .as_object();
+  const boost::json::object& miner_remove_output_properties =
+      miner_remove_output.at("properties").as_object();
+  for (const std::string_view field :
+       {"action", "state", "created_node_ids", "role_generation",
+        "final_miner_count", "inventory_generation", "final_node_count"}) {
+    BOOST_TEST(miner_remove_output_properties.contains(field));
+  }
+  BOOST_REQUIRE(miner_remove_output.contains("allOf"));
 
   const boost::json::object runtime_output =
       BuildMcpResultSchema(McpResultFamily::kRuntimeCommand);

@@ -77,6 +77,24 @@ void SimulationRegistry::AddMinerNode(uint32_t node_index) {
       static_cast<uint32_t>(topology_.miner_nodes.size());
 }
 
+void SimulationRegistry::RemoveMinerNodes(
+    const std::vector<uint32_t>& node_indexes) {
+  std::set<uint32_t> requested(node_indexes.begin(), node_indexes.end());
+  if (requested.size() != node_indexes.size()) {
+    throw std::runtime_error("miner removal contains duplicate node indexes");
+  }
+  for (const uint32_t node_index : requested) {
+    if (std::find(topology_.miner_nodes.begin(), topology_.miner_nodes.end(),
+                  node_index) == topology_.miner_nodes.end()) {
+      throw std::runtime_error("miner removal references an unregistered node");
+    }
+  }
+  std::erase_if(topology_.miner_nodes,
+                [&](uint32_t node) { return requested.contains(node); });
+  topology_.miner_node_count =
+      static_cast<uint32_t>(topology_.miner_nodes.size());
+}
+
 void SimulationRegistry::AddMasternode(MasternodeIdentity masternode) {
   if (masternode.node == 0U || masternode.node > topology_.node_count) {
     throw std::runtime_error("masternode backing node is out of range");

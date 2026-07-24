@@ -1795,18 +1795,20 @@ boost::json::object BuildMcpResultSchema(
       properties["inventory_generation"] = Uint64Schema(1U);
       properties["final_node_count"] = IntegerSchema(1U);
       require({"run_id", "node_ids", "assigned_roles", "removed_roles"});
-      constraints.emplace_back(boost::json::object{
-          {"if", boost::json::object{{"properties",
-                                      boost::json::object{
-                                          {"action",
-                                           ConstStringSchema("miner.add")}}},
-                                     {"required", Required({"action"})}}},
-          {"then",
-           boost::json::object{
-               {"required",
-                Required({"state", "created_node_ids", "role_generation",
-                          "final_miner_count", "inventory_generation",
-                          "final_node_count"})}}}});
+      for (const std::string_view action : {"miner.add", "miner.remove"}) {
+        constraints.emplace_back(boost::json::object{
+            {"if",
+             boost::json::object{
+                 {"properties",
+                  boost::json::object{{"action", ConstStringSchema(action)}}},
+                 {"required", Required({"action"})}}},
+            {"then",
+             boost::json::object{
+                 {"required",
+                  Required({"state", "created_node_ids", "role_generation",
+                            "final_miner_count", "inventory_generation",
+                            "final_node_count"})}}}});
+      }
       for (const std::string_view action :
            {"masternode.add", "masternode.remove", "masternode.restart"}) {
         constraints.emplace_back(boost::json::object{

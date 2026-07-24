@@ -11,6 +11,7 @@
 
 #include "bbp/block_production_policy.h"
 #include "bbp/probabilistic_block_scheduler.h"
+#include "bbp/simulation_cancelled.h"
 
 namespace {
 
@@ -241,4 +242,84 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(miners.front() == "node-2");
   BOOST_CHECK_THROW(scheduler.PrepareAddMiners({"node-2"}),
                     std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(
+    probabilistic_block_scheduler_prepares_removes_and_readds_miners) {
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1", "node-2"}, bbp::BlockProductionPolicy(1ms, 0.0, 7U),
+      [](const std::string&) {},
+      [](const std::string&, std::string_view) {
+        BOOST_FAIL("block production should not fail");
+      });
+
+  {
+    auto abandoned = scheduler.PrepareRemoveMiners({"node-2"});
+    static_cast<void>(abandoned);
+  }
+  BOOST_TEST(scheduler.StopMiner("node-2"));
+  scheduler.StartMiner("node-2");
+
+  auto prepared = scheduler.PrepareRemoveMiners({"node-2"});
+  prepared.Commit();
+  BOOST_CHECK_THROW(scheduler.StopMiner("node-2"), std::runtime_error);
+
+  auto readded = scheduler.PrepareAddMiners({"node-2"});
+  readded.Commit();
+  BOOST_TEST(scheduler.StopMiner("node-2"));
+  BOOST_CHECK_THROW(scheduler.PrepareRemoveMiners({"node-1", "node-1"}),
+                    std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(
+    probabilistic_block_scheduler_cancels_in_flight_miner_removal) {
+  std::mutex mutex;
+  std::condition_variable state_changed;
+  bool handler_started = false;
+  bool release_handler = false;
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1"}, bbp::BlockProductionPolicy(1ms, 1.0, 1U),
+      [&](const std::string&) {
+        std::unique_lock<std::mutex> lock(mutex);
+        handler_started = true;
+        state_changed.notify_all();
+        state_changed.wait(lock,
+                           [&release_handler] { return release_handler; });
+      },
+      [](const std::string&, std::string_view) {
+        BOOST_FAIL("block production should not fail");
+      });
+
+  scheduler.Start();
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    BOOST_REQUIRE(state_changed.wait_for(
+        lock, 1s, [&handler_started] { return handler_started; }));
+  }
+
+  std::stop_source cancellation;
+  std::exception_ptr removal_failure;
+  std::thread remove_thread([&] {
+    try {
+      static_cast<void>(
+          scheduler.PrepareRemoveMiners({"node-1"}, cancellation.get_token()));
+    } catch (...) {
+      removal_failure = std::current_exception();
+    }
+  });
+  std::this_thread::sleep_for(20ms);
+  cancellation.request_stop();
+  remove_thread.join();
+  BOOST_REQUIRE(removal_failure);
+  BOOST_CHECK_EXCEPTION(std::rethrow_exception(removal_failure),
+                        bbp::SimulationCancelled,
+                        [](const bbp::SimulationCancelled&) { return true; });
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_handler = true;
+  }
+  state_changed.notify_all();
+  scheduler.Stop();
+  BOOST_TEST(scheduler.StopMiner("node-1"));
 }
