@@ -1377,9 +1377,9 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kAddMiner:
       add_run();
-      properties["node_ids"] =
-          ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
-      properties["count"] = IntegerSchema(1U, kMaximumSafeCollection);
+      properties["node_ids"] = ArraySchema(
+          IdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
+      properties["count"] = IntegerSchema(1U, kSimulationNodeAddMaximumCount);
       properties["create_nodes"] = NodeMutationConfigSchema();
       properties["wallet_node_id"] = IdentifierSchema();
       required.emplace_back("count");
@@ -1700,7 +1700,27 @@ boost::json::object BuildMcpResultSchema(
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       properties["assigned_roles"] = ArraySchema(RoleSchema(), 0U, 4U, true);
       properties["removed_roles"] = ArraySchema(RoleSchema(), 0U, 4U, true);
+      properties["action"] = StringSchema(1U);
+      properties["state"] = StringSchema(1U);
+      properties["created_node_ids"] = ArraySchema(
+          IdentifierSchema(), 0U, kSimulationNodeAddMaximumCount, true);
+      properties["role_generation"] = Uint64Schema(1U);
+      properties["final_miner_count"] = IntegerSchema();
+      properties["inventory_generation"] = Uint64Schema(1U);
+      properties["final_node_count"] = IntegerSchema(1U);
       require({"run_id", "node_ids", "assigned_roles", "removed_roles"});
+      constraints.emplace_back(boost::json::object{
+          {"if", boost::json::object{{"properties",
+                                      boost::json::object{
+                                          {"action",
+                                           ConstStringSchema("miner.add")}}},
+                                     {"required", Required({"action"})}}},
+          {"then",
+           boost::json::object{
+               {"required",
+                Required({"state", "created_node_ids", "role_generation",
+                          "final_miner_count", "inventory_generation",
+                          "final_node_count"})}}}});
       break;
     case McpResultFamily::kWorkload:
       properties["run_id"] = IdentifierSchema();

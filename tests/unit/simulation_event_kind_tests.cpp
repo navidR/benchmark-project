@@ -46,6 +46,8 @@ BOOST_AUTO_TEST_CASE(simulation_event_kind_names_round_trip) {
       bbp::SimulationEventKind::kNetworkBlockRemoved,
       bbp::SimulationEventKind::kNetworkPartitionApplied,
       bbp::SimulationEventKind::kNetworkPartitionHealed,
+      bbp::SimulationEventKind::kRuntimeGenerationPublished,
+      bbp::SimulationEventKind::kRuntimeRoleGenerationPublished,
       bbp::SimulationEventKind::kTopologyEdgeUpdated,
       bbp::SimulationEventKind::kTopologyEdgeUpdateRollbackFailed,
       bbp::SimulationEventKind::kRestartRequested,

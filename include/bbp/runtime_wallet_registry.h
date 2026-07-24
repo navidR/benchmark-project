@@ -65,6 +65,10 @@ class RuntimeWalletRegistry {
   PreparedAppend PrepareAppend(std::uint64_t expected_generation,
                                std::vector<WalletIdentity> wallets,
                                std::uint32_t runtime_node_count);
+  PreparedAppend PrepareUpdate(std::uint64_t expected_generation,
+                               std::vector<WalletIdentity> wallets,
+                               std::vector<std::uint32_t> miner_nodes,
+                               std::uint32_t runtime_node_count);
 
  private:
   mutable std::mutex mutex_;

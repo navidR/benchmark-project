@@ -2023,4 +2023,104 @@ BOOST_AUTO_TEST_CASE(
              "cancelled");
 }
 
+BOOST_AUTO_TEST_CASE(mcp_live_miner_add_routes_role_result_and_cancellation) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kAddMiner) != supported.end());
+
+  auto service = std::make_shared<McpLiveRoleService>();
+  service->operation = [](McpOperationKind kind,
+                          const boost::json::object& arguments,
+                          std::stop_token stop_token) {
+    BOOST_CHECK(kind == McpOperationKind::kAddMiner);
+    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    if (const boost::json::value* node_ids = arguments.if_contains("node_ids");
+        node_ids != nullptr &&
+        node_ids->as_array().front().as_string() == "firo-cancel") {
+      throw SimulationCancelled();
+    }
+    const bool created = arguments.contains("create_nodes");
+    return boost::json::object{
+        {"node_ids", boost::json::array{created ? "firo-2" : "firo-1"}},
+        {"assigned_roles", boost::json::array{"miner"}},
+        {"removed_roles", boost::json::array{}},
+        {"action", "miner.add"},
+        {"state", "ready"},
+        {"created_node_ids",
+         created ? boost::json::array{"firo-2"} : boost::json::array{}},
+        {"role_generation", 2U},
+        {"final_miner_count", 1U},
+        {"inventory_generation", created ? 2U : 1U},
+        {"final_node_count", created ? 2U : 1U},
+    };
+  };
+  application.SetRoleService(service);
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object submitted =
+      Invoke(&dispatcher, "miner.add",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"count", 1U}});
+  const boost::json::object terminal = WaitForTerminal(&dispatcher, submitted);
+  BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& result =
+      terminal.at("terminal_result").as_object();
+  BOOST_TEST(result.at("result_family").as_string() == "role_mutation");
+  BOOST_TEST(result.at("action").as_string() == "miner.add");
+  BOOST_TEST(result.at("node_ids").as_array() == boost::json::array{"firo-1"});
+  BOOST_TEST(result.at("role_generation").as_uint64() == 2U);
+
+  const boost::json::object created =
+      Invoke(&dispatcher, "miner.add",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"count", 1U},
+                 {"create_nodes",
+                  boost::json::object{{"chain", "firo"}, {"count", 1U}}}});
+  const boost::json::object created_terminal =
+      WaitForTerminal(&dispatcher, created);
+  BOOST_TEST(created_terminal.at("state").as_string() == "succeeded");
+  BOOST_TEST(created_terminal.at("terminal_result")
+                 .as_object()
+                 .at("created_node_ids")
+                 .as_array() == boost::json::array{"firo-2"});
+
+  const boost::json::object cancelled = Invoke(
+      &dispatcher, "miner.add",
+      boost::json::object{{"run_id", "live-application"},
+                          {"node_ids", boost::json::array{"firo-cancel"}},
+                          {"count", 1U}});
+  BOOST_TEST(WaitForTerminal(&dispatcher, cancelled).at("state").as_string() ==
+             "cancelled");
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
 }  // namespace bbp

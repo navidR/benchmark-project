@@ -522,6 +522,10 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
       BuildMcpOperationInputSchema(McpOperationKind::kAddWallet);
   const boost::json::object& wallet_create_node =
       wallet_add.at("properties").as_object().at("create_node").as_object();
+  const boost::json::object miner_add =
+      BuildMcpOperationInputSchema(McpOperationKind::kAddMiner);
+  const boost::json::object& miner_create_nodes =
+      miner_add.at("properties").as_object().at("create_nodes").as_object();
   BOOST_TEST(wallet_add.at("properties")
                  .as_object()
                  .at("count")
@@ -531,6 +535,19 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
   BOOST_TEST(generic_request == scheduled_request);
   BOOST_TEST(generic_request == direct_request);
   BOOST_TEST(generic_request == wallet_create_node);
+  BOOST_TEST(generic_request == miner_create_nodes);
+  BOOST_TEST(miner_add.at("properties")
+                 .as_object()
+                 .at("count")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == kSimulationNodeAddMaximumCount);
+  BOOST_TEST(miner_add.at("properties")
+                 .as_object()
+                 .at("node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == kSimulationNodeAddMaximumCount);
   const boost::json::object& request_properties =
       direct_request.at("properties").as_object();
   BOOST_TEST(
@@ -642,6 +659,28 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                  .as_object()
                  .at("maximum")
                  .as_uint64() == std::numeric_limits<std::uint32_t>::max());
+  const boost::json::object miner_output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kAddMiner)
+          .at("oneOf")
+          .as_array()
+          .front()
+          .as_object();
+  const boost::json::object& miner_output_properties =
+      miner_output.at("properties").as_object();
+  for (const std::string_view field :
+       {"action", "state", "created_node_ids", "role_generation",
+        "final_miner_count", "inventory_generation", "final_node_count"}) {
+    BOOST_TEST(miner_output_properties.contains(field));
+  }
+  BOOST_TEST(miner_output_properties.at("final_miner_count")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == std::numeric_limits<std::uint32_t>::max());
+  BOOST_TEST(miner_output_properties.at("final_node_count")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == std::numeric_limits<std::uint32_t>::max());
+  BOOST_REQUIRE(miner_output.contains("allOf"));
 
   const boost::json::object runtime_output =
       BuildMcpResultSchema(McpResultFamily::kRuntimeCommand);
@@ -783,6 +822,15 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
   BOOST_TEST(mutation_properties.contains("wallets"));
   BOOST_TEST(mutation_properties.contains("wallet_generation"));
   BOOST_TEST(mutation_properties.contains("final_wallet_count"));
+  const boost::json::object role_mutation_schema =
+      BuildMcpResultSchema(McpResultFamily::kRoleMutation);
+  const boost::json::object& role_mutation_properties =
+      role_mutation_schema.at("properties").as_object();
+  for (const std::string_view field :
+       {"action", "state", "created_node_ids", "role_generation",
+        "final_miner_count", "inventory_generation", "final_node_count"}) {
+    BOOST_TEST(role_mutation_properties.contains(field));
+  }
 
   const std::array lifecycle_operations{
       std::pair{McpOperationKind::kStopNode, "stopped"},

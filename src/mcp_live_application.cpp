@@ -45,6 +45,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kKillNode,
     McpOperationKind::kRestartNode,
     McpOperationKind::kAddWallet,
+    McpOperationKind::kAddMiner,
     McpOperationKind::kQueryEvidence,
     McpOperationKind::kQueryLogs,
     McpOperationKind::kFollowLogs,
@@ -677,6 +678,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kKillNode &&
       kind != McpOperationKind::kRestartNode &&
       kind != McpOperationKind::kAddWallet &&
+      kind != McpOperationKind::kAddMiner &&
       kind != McpOperationKind::kQueryEvidence &&
       kind != McpOperationKind::kQueryLogs &&
       kind != McpOperationKind::kFollowLogs &&
@@ -720,7 +722,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         }};
   }
 
-  if (kind == McpOperationKind::kAddWallet) {
+  if (kind == McpOperationKind::kAddWallet ||
+      kind == McpOperationKind::kAddMiner) {
     const std::shared_ptr<McpLiveRoleService> role_service = RoleService();
     if (!role_service) {
       throw McpOperationFailure(
@@ -740,9 +743,13 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           } catch (const SimulationCancelled&) {
             throw McpOperationCancelled();
           }
-          result["result_family"] = "mutation";
+          const McpResultFamily result_family =
+              kind == McpOperationKind::kAddWallet
+                  ? McpResultFamily::kMutation
+                  : McpResultFamily::kRoleMutation;
+          result["result_family"] = McpResultFamilyName(result_family);
           result["run_id"] = config_.run_id;
-          return McpTypedResult{.family = McpResultFamily::kMutation,
+          return McpTypedResult{.family = result_family,
                                 .value = std::move(result)};
         }};
   }
@@ -1420,7 +1427,8 @@ boost::json::value McpLiveApplication::ReadResource(
       break;
     case McpInformationFamily::kRoles:
       data = SelectReportFields(
-          report, {"node_configs", "wallets_summary", "block_production"});
+          report, {"node_configs", "wallets_summary", "block_production",
+                   "role_generation", "miner_node_count", "miner_node_ids"});
       break;
     case McpInformationFamily::kPeers:
       data = SelectReportFields(report, {"nodes_summary", "peer_connects",
@@ -1439,8 +1447,10 @@ boost::json::value McpLiveApplication::ReadResource(
           report, {"wallets_summary", "wallet_funding", "wallet_transactions"});
       break;
     case McpInformationFamily::kMining:
-      data = SelectReportFields(report, {"block_production", "generated_blocks",
-                                         "scheduled_blocks", "nodes_summary"});
+      data = SelectReportFields(
+          report, {"block_production", "generated_blocks", "scheduled_blocks",
+                   "nodes_summary", "role_generation", "miner_node_count",
+                   "miner_node_ids"});
       break;
     case McpInformationFamily::kTransactionLoad:
       data = SelectReportFields(

@@ -89,3 +89,37 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(before.registry().topology().node_count == 1U);
   BOOST_TEST(before.wallets().empty());
 }
+
+BOOST_AUTO_TEST_CASE(
+    runtime_wallet_registry_prepares_atomic_miner_role_generation) {
+  bbp::RuntimeWalletRegistry registry;
+  registry.Initialize(EmptyRegistry(2U));
+  const bbp::RuntimeWalletSnapshot before = registry.Snapshot();
+
+  {
+    auto abandoned = registry.PrepareUpdate(before.generation(), {}, {1U}, 3U);
+    BOOST_TEST(abandoned.Commit().registry().topology().node_count == 3U);
+  }
+  const bbp::RuntimeWalletSnapshot after_first = registry.Snapshot();
+  BOOST_TEST(after_first.generation() == before.generation() + 1U);
+
+  {
+    auto abandoned =
+        registry.PrepareUpdate(after_first.generation(), {}, {0U}, 3U);
+    static_cast<void>(abandoned);
+  }
+  BOOST_TEST(registry.Snapshot().generation() == after_first.generation());
+  BOOST_TEST(registry.Snapshot().registry().topology().miner_nodes ==
+                 std::vector<std::uint32_t>({1U}),
+             boost::test_tools::per_element());
+
+  auto prepared =
+      registry.PrepareUpdate(after_first.generation(), {}, {0U}, 3U);
+  const bbp::RuntimeWalletSnapshot after = prepared.Commit();
+  BOOST_TEST(after.generation() == after_first.generation() + 1U);
+  BOOST_TEST(after.registry().topology().node_count == 3U);
+  BOOST_TEST(after.registry().topology().miner_nodes ==
+                 std::vector<std::uint32_t>({0U, 1U}),
+             boost::test_tools::per_element());
+  BOOST_TEST(after.registry().topology().miner_node_count == 2U);
+}

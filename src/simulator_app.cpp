@@ -1049,17 +1049,24 @@ bool NodeListContains(const std::vector<uint32_t>& nodes, uint32_t node_index) {
   return false;
 }
 
-std::string NodeRoleName(const Options& options, std::uint32_t node_index) {
-  if (node_index < options.node_roles.size()) {
-    return options.node_roles[node_index];
-  }
-  const bool wallet =
-      NodeListContains(options.topology.wallet_nodes, node_index);
-  const bool miner = NodeListContains(options.topology.miner_nodes, node_index);
+std::string NodeRoleName(const NodeRoleTopology& topology,
+                         std::uint32_t node_index) {
+  const bool wallet = NodeListContains(topology.wallet_nodes, node_index);
+  const bool miner = NodeListContains(topology.miner_nodes, node_index);
   return wallet && miner ? "wallet_miner"
          : wallet        ? "wallet"
          : miner         ? "miner"
                          : "base";
+}
+
+std::string NodeRoleName(const Options& options, std::uint32_t node_index,
+                         const NodeRoleTopology* runtime_topology = nullptr) {
+  if (runtime_topology == nullptr && node_index < options.node_roles.size()) {
+    return options.node_roles[node_index];
+  }
+  return NodeRoleName(
+      runtime_topology != nullptr ? *runtime_topology : options.topology,
+      node_index);
 }
 
 const PeerConnectivityPolicy* FindPeerConnectivityPolicy(
@@ -8741,6 +8748,44 @@ boost::json::object RuntimeWalletGenerationDetail(
   };
 }
 
+boost::json::object RuntimeRoleGenerationDetail(
+    const RuntimeWalletSnapshot& snapshot, const RuntimeNodeSnapshot& nodes) {
+  const NodeRoleTopology& topology = snapshot.registry().topology();
+  if (topology.node_count != nodes.size()) {
+    throw std::logic_error(
+        "runtime role generation does not match node inventory");
+  }
+  boost::json::array miner_nodes;
+  boost::json::array miner_node_ids;
+  miner_nodes.reserve(topology.miner_nodes.size());
+  miner_node_ids.reserve(topology.miner_nodes.size());
+  for (const std::uint32_t node_index : topology.miner_nodes) {
+    if (node_index >= nodes.size()) {
+      throw std::logic_error(
+          "runtime role generation contains an invalid miner node");
+    }
+    miner_nodes.emplace_back(node_index + 1U);
+    miner_node_ids.emplace_back(nodes[node_index].config.id);
+  }
+  boost::json::array node_roles;
+  node_roles.reserve(nodes.size());
+  for (std::size_t index = 0U; index < nodes.size(); ++index) {
+    node_roles.emplace_back(boost::json::object{
+        {"node", index + 1U},
+        {"node_id", nodes[index].config.id},
+        {"role", NodeRoleName(topology, static_cast<std::uint32_t>(index))},
+    });
+  }
+  return boost::json::object{
+      {"generation", snapshot.generation()},
+      {"node_count", nodes.size()},
+      {"miner_count", topology.miner_nodes.size()},
+      {"miner_nodes", std::move(miner_nodes)},
+      {"miner_node_ids", std::move(miner_node_ids)},
+      {"node_roles", std::move(node_roles)},
+  };
+}
+
 std::string ProcessExitDetail(const ChildProcess& process,
                               const RunProcessState::Guard&) {
   const bool running = process.running();
@@ -8812,7 +8857,8 @@ std::uint32_t WriteMetricsSnapshot(
     const ChainDriver& driver, auto& nodes, RunProcessState& run_process_state,
     const NodeMetricsFailureHandler& node_failure_handler = {},
     const MetricsStopRequested& stop_requested = {},
-    std::stop_token stop_token = {}) {
+    std::stop_token stop_token = {},
+    const NodeRoleTopology* runtime_topology = nullptr) {
   std::uint32_t sample_count = 0U;
   struct NetworkMetricsState {
     std::optional<NodeVethConfig> network;
@@ -8861,8 +8907,8 @@ std::uint32_t WriteMetricsSnapshot(
     NodeRuntimeMetrics runtime;
     runtime.node_index = static_cast<std::uint32_t>(node_index + 1U);
     runtime.chain = std::string(ChainKindName(options.chain));
-    runtime.role =
-        NodeRoleName(options, static_cast<std::uint32_t>(node_index));
+    runtime.role = NodeRoleName(options, static_cast<std::uint32_t>(node_index),
+                                runtime_topology);
     runtime.lifecycle = NodeRuntimeLifecycleName(node.Lifecycle());
     runtime.data_dir = node.config.data_dir.string();
     runtime.log_dir = node.config.log_dir.string();
@@ -10918,10 +10964,10 @@ RuntimeNodeResourceManifest RuntimeNodeResourceManifestFor(
   return manifest;
 }
 
-boost::json::object RuntimePublishedNodeConfig(const Options& options,
-                                               const NodeRuntime& runtime,
-                                               const ChainNodeConfig& config,
-                                               std::uint32_t node_index) {
+boost::json::object RuntimePublishedNodeConfig(
+    const Options& options, const NodeRuntime& runtime,
+    const ChainNodeConfig& config, std::uint32_t node_index,
+    const NodeRoleTopology* runtime_topology = nullptr) {
   const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   boost::json::object node{
       {"index", node_index + 1U},
@@ -10929,7 +10975,7 @@ boost::json::object RuntimePublishedNodeConfig(const Options& options,
       {"chain", chain_spec.name},
       {"binary", config.binary.string()},
       {"data_dir", config.data_dir.generic_string()},
-      {"role", NodeRoleName(options, node_index)},
+      {"role", NodeRoleName(options, node_index, runtime_topology)},
       {"lifecycle", std::string(NodeRuntimeLifecycleName(runtime.Lifecycle()))},
       {"restart_policy", std::string(NodeRestartPolicyName(
                              runtime.lifecycle_policy.restart_policy))}};
@@ -11602,6 +11648,7 @@ void ApplyResourcePressureWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const std::filesystem::path& metrics_path, const ChainDriver& driver,
     auto& nodes, RunProcessState& run_process_state,
+    const NodeRoleTopology& runtime_role_topology,
     const ResourcePressureWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
@@ -11648,7 +11695,8 @@ void ApplyResourcePressureWorkload(
     WaitForDuration(std::chrono::milliseconds(workload.duration_ms),
                     stop_token);
     WriteMetricsSnapshot(metrics_path, options, driver, nodes,
-                         run_process_state, {}, {}, stop_token);
+                         run_process_state, {}, {}, stop_token,
+                         &runtime_role_topology);
   } catch (...) {
     const std::exception_ptr original_error = std::current_exception();
     try {
@@ -14985,13 +15033,24 @@ struct RuntimeNodeAddResult {
   std::vector<WalletIdentity> added_wallets;
   std::optional<std::uint64_t> wallet_generation;
   std::optional<std::size_t> final_wallet_count;
+  std::optional<std::uint64_t> role_generation;
+  std::optional<std::size_t> final_miner_count;
+};
+
+enum class RuntimeNodeAdditionRole {
+  kBase,
+  kWallet,
+  kMiner,
 };
 
 RuntimeNodeAddResult AddRuntimeNodesTransactional(
     const Options& options, const std::filesystem::path& run_root,
     const std::filesystem::path& events_path, const ChainDriverSpec& chain_spec,
     const ChainDriver& driver, RuntimeNodeInventory& inventory,
-    RuntimeWalletRegistry* wallet_registry,
+    RuntimeWalletRegistry& runtime_registry, RuntimeNodeAdditionRole added_role,
+    ProbabilisticBlockScheduler* block_scheduler,
+    std::vector<std::string>* configured_miner_node_ids,
+    std::mutex* configured_miner_node_ids_mutex,
     PeerConnectivityController& peer_controller,
     std::unique_ptr<RuntimePeerTopology>* runtime_topology,
     PeerTopologyConfig* live_topology_config,
@@ -15007,12 +15066,36 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     throw std::runtime_error("node-add count must be greater than zero");
   }
   const RuntimeNodeSnapshot before = inventory.Snapshot();
-  RuntimeWalletSnapshot before_wallets;
-  if (wallet_registry != nullptr) {
-    before_wallets = wallet_registry->Snapshot();
-    if (before_wallets.wallets().size() >
+  const RuntimeWalletSnapshot before_registry = runtime_registry.Snapshot();
+  if (added_role == RuntimeNodeAdditionRole::kWallet) {
+    if (before_registry.wallets().size() >
         std::numeric_limits<std::uint32_t>::max() - request.count) {
       throw std::overflow_error("wallet.add wallet index exceeds uint32");
+    }
+  }
+  if (added_role == RuntimeNodeAdditionRole::kMiner) {
+    if (configured_miner_node_ids == nullptr ||
+        configured_miner_node_ids_mutex == nullptr) {
+      throw std::logic_error(
+          "miner node addition requires configured-miner state");
+    }
+    if (options.block_production.enabled &&
+        options.block_production.mode == MiningMode::kNativeMining) {
+      throw UnsupportedChainOperation("runtime miner addition",
+                                      "transactional native-miner activation");
+    }
+    if (options.block_production.enabled &&
+        options.block_production.difficulty) {
+      throw UnsupportedChainOperation(
+          "runtime miner addition",
+          "transactional mining-difficulty activation");
+    }
+    if (options.block_production.enabled &&
+        options.block_production.mode ==
+            MiningMode::kScheduledBlockProduction &&
+        block_scheduler == nullptr) {
+      throw std::logic_error(
+          "scheduled miner addition requires the block scheduler");
     }
   }
   if (before.generation() == std::numeric_limits<std::uint64_t>::max()) {
@@ -15170,7 +15253,8 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     config_request.node_index = resource_slots.at(before.size() + index);
     config_request.node_id = node_ids[index];
     config_request.network = ChainNetwork::kRegtest;
-    config_request.wallet_enabled = wallet_registry != nullptr;
+    config_request.wallet_enabled =
+        added_role == RuntimeNodeAdditionRole::kWallet;
     ChainNodeConfig config = MakeChainNodeConfig(chain_spec, config_request);
     if (options.isolate_network) {
       config.rpc_host =
@@ -15834,16 +15918,16 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     }
 
     std::vector<WalletIdentity> added_wallets;
-    if (wallet_registry != nullptr) {
+    if (added_role == RuntimeNodeAdditionRole::kWallet) {
       const WalletInitialization initialization =
-          before_wallets.registry().wallet_initialization();
+          before_registry.registry().wallet_initialization();
       added_wallets.reserve(insertions.size());
       for (std::size_t offset = 0U; offset < insertions.size(); ++offset) {
         ThrowIfStopRequested(stop_token);
         NodeRuntime& node = *insertions[offset].runtime;
         WalletIdentity wallet{
             .wallet_index = static_cast<std::uint32_t>(
-                before_wallets.wallets().size() + offset + 1U),
+                before_registry.wallets().size() + offset + 1U),
             .node = static_cast<std::uint32_t>(before.size() + offset + 1U),
             .node_id = node.config.id,
             .address = {},
@@ -15872,6 +15956,23 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
       }
     }
 
+    std::vector<std::uint32_t> added_miner_nodes;
+    if (added_role == RuntimeNodeAdditionRole::kMiner) {
+      added_miner_nodes.reserve(insertions.size());
+      for (std::size_t offset = 0U; offset < insertions.size(); ++offset) {
+        added_miner_nodes.push_back(
+            static_cast<std::uint32_t>(before.size() + offset));
+      }
+    }
+    SimulationRegistry next_registry = before_registry.registry();
+    next_registry.SetRuntimeNodeCount(final_count);
+    for (const WalletIdentity& wallet : added_wallets) {
+      next_registry.AddWallet(wallet);
+    }
+    for (const std::uint32_t miner_node : added_miner_nodes) {
+      next_registry.AddMinerNode(miner_node);
+    }
+
     boost::json::array published_node_ids;
     boost::json::array published_node_configs;
     published_node_ids.reserve(final_count);
@@ -15879,7 +15980,8 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     for (std::uint32_t index = 0U; index < final_count; ++index) {
       published_node_ids.emplace_back(final_configs[index].id);
       published_node_configs.push_back(RuntimePublishedNodeConfig(
-          options, runtime_at(index), final_configs[index], index));
+          options, runtime_at(index), final_configs[index], index,
+          &next_registry.topology()));
     }
     boost::json::object published_topology;
     AddPeerTopologyJson(next_topology_config, final_count, &published_topology);
@@ -15919,10 +16021,32 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
         AcquireRuntimePublicationLock(stop_token);
     RuntimeNodeInventory::PreparedAppend prepared =
         inventory.PrepareAppend(before.generation(), insertions, final_configs);
-    std::optional<RuntimeWalletRegistry::PreparedAppend> prepared_wallet_append;
-    if (wallet_registry != nullptr) {
-      prepared_wallet_append.emplace(wallet_registry->PrepareAppend(
-          before_wallets.generation(), added_wallets, final_count));
+    RuntimeWalletRegistry::PreparedAppend prepared_registry_update =
+        runtime_registry.PrepareUpdate(before_registry.generation(),
+                                       added_wallets, added_miner_nodes,
+                                       final_count);
+    std::optional<ProbabilisticBlockScheduler::PreparedAdd>
+        prepared_scheduler_add;
+    std::vector<std::string> next_configured_miner_node_ids;
+    std::optional<std::unique_lock<std::mutex>> configured_miner_node_ids_lock;
+    if (added_role == RuntimeNodeAdditionRole::kMiner) {
+      configured_miner_node_ids_lock.emplace(*configured_miner_node_ids_mutex);
+      next_configured_miner_node_ids = *configured_miner_node_ids;
+      next_configured_miner_node_ids.reserve(
+          next_configured_miner_node_ids.size() + node_ids.size());
+      for (const std::string& node_id : node_ids) {
+        if (std::find(next_configured_miner_node_ids.begin(),
+                      next_configured_miner_node_ids.end(),
+                      node_id) != next_configured_miner_node_ids.end()) {
+          throw std::logic_error("new miner node is already configured: " +
+                                 node_id);
+        }
+        next_configured_miner_node_ids.push_back(node_id);
+      }
+      if (block_scheduler != nullptr) {
+        prepared_scheduler_add.emplace(
+            block_scheduler->PrepareAddMiners(node_ids));
+      }
     }
     std::unique_lock<std::mutex> network_lock(node_network_state_mutex);
     if (operation_control != nullptr) {
@@ -15946,19 +16070,25 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     using std::swap;
     swap(*live_topology_config, next_topology_config);
     const RuntimeNodeSnapshot published_nodes = prepared.Commit();
-    std::optional<RuntimeWalletSnapshot> published_wallets;
-    if (prepared_wallet_append) {
-      static_assert(
-          std::is_nothrow_move_constructible_v<RuntimeWalletSnapshot>);
-      published_wallets.emplace(prepared_wallet_append->Commit());
+    static_assert(std::is_nothrow_move_constructible_v<RuntimeWalletSnapshot>);
+    const RuntimeWalletSnapshot published_registry =
+        prepared_registry_update.Commit();
+    if (prepared_scheduler_add) {
+      prepared_scheduler_add->Commit();
+    }
+    if (added_role == RuntimeNodeAdditionRole::kMiner) {
+      configured_miner_node_ids->swap(next_configured_miner_node_ids);
     }
     published = true;
     result.inventory_generation = published_nodes.generation();
     result.final_node_count =
         static_cast<std::uint32_t>(published_nodes.size());
-    if (published_wallets) {
-      result.wallet_generation = published_wallets->generation();
-      result.final_wallet_count = published_wallets->wallets().size();
+    result.role_generation = published_registry.generation();
+    result.final_miner_count =
+        published_registry.registry().topology().miner_nodes.size();
+    if (added_role == RuntimeNodeAdditionRole::kWallet) {
+      result.wallet_generation = published_registry.generation();
+      result.final_wallet_count = published_registry.wallets().size();
     }
     RuntimeNodeResourceManifest live_manifest = pending_manifest;
     for (RuntimeNodeResourceEntry& entry : live_manifest.nodes) {
@@ -15990,11 +16120,15 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRuntimeGenerationPublished,
                boost::json::serialize(published_generation_detail));
-    if (published_wallets) {
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kRuntimeRoleGenerationPublished,
+               boost::json::serialize(RuntimeRoleGenerationDetail(
+                   published_registry, published_nodes)));
+    if (added_role == RuntimeNodeAdditionRole::kWallet) {
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRuntimeWalletGenerationPublished,
                  boost::json::serialize(RuntimeWalletGenerationDetail(
-                     *published_wallets, added_wallets)));
+                     published_registry, added_wallets)));
     }
     for (const std::string& record : staged_event_records) {
       AppendLine(events_path, record);
@@ -16652,6 +16786,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
   std::shared_ptr<McpLiveRoleService> installed_role_service;
   std::mutex lifecycle_failure_mutex;
   std::timed_mutex node_mutation_mutex;
+  std::mutex configured_miner_node_ids_mutex;
   std::timed_mutex block_generation_mutex;
   std::mutex runtime_topology_mutex;
   std::exception_ptr lifecycle_failure;
@@ -17056,6 +17191,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                    stop_token);
       }
     }
+    const auto is_configured_miner = [&](std::string_view node_id) {
+      std::lock_guard<std::mutex> lock(configured_miner_node_ids_mutex);
+      return std::find(miner_node_ids.begin(), miner_node_ids.end(), node_id) !=
+             miner_node_ids.end();
+    };
     if (options.block_production.enabled &&
         options.block_production.mode ==
             MiningMode::kScheduledBlockProduction &&
@@ -17141,8 +17281,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           driver, [&] { return node_inventory.ConfigSnapshot(); },
           [&](const ChainNodeConfig& config,
               std::stop_token command_stop_token) {
-            if (std::find(miner_node_ids.begin(), miner_node_ids.end(),
-                          config.id) == miner_node_ids.end()) {
+            if (!is_configured_miner(config.id)) {
               throw std::runtime_error("node is not a configured miner: " +
                                        config.id);
             }
@@ -17171,8 +17310,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           },
           [&](const ChainNodeConfig& config, MiningDifficulty difficulty,
               std::stop_token command_stop_token) {
-            if (std::find(miner_node_ids.begin(), miner_node_ids.end(),
-                          config.id) == miner_node_ids.end()) {
+            if (!is_configured_miner(config.id)) {
               throw std::runtime_error("node is not a configured miner: " +
                                        config.id);
             }
@@ -17225,9 +17363,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                        SimulationEventKind::kOperatorCommandStarted,
                        SimulationCommandDetail(command));
             const bool scheduled_miner =
-                block_scheduler &&
-                std::find(miner_node_ids.begin(), miner_node_ids.end(),
-                          command.node_id) != miner_node_ids.end();
+                block_scheduler && is_configured_miner(command.node_id);
             const auto stop_scheduled_miner = [&] {
               return scheduled_miner
                          ? block_scheduler->StopMiner(command.node_id)
@@ -17272,10 +17408,13 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               try {
                 RuntimeNodeAddResult added = AddRuntimeNodesTransactional(
                     options, run_root, events_path, chain_spec, driver,
-                    node_inventory, nullptr, *peer_connectivity_controller,
-                    &runtime_topology, &live_topology_config, run_process_state,
-                    lifecycle_epoch, *command.node_add,
-                    command.operation_control.get(), command_stop_token);
+                    node_inventory, runtime_wallet_registry,
+                    RuntimeNodeAdditionRole::kBase, block_scheduler.get(),
+                    &miner_node_ids, &configured_miner_node_ids_mutex,
+                    *peer_connectivity_controller, &runtime_topology,
+                    &live_topology_config, run_process_state, lifecycle_epoch,
+                    *command.node_add, command.operation_control.get(),
+                    command_stop_token);
                 command_outcome.added_node_ids =
                     std::move(added.added_node_ids);
                 command_outcome.inventory_generation =
@@ -18116,12 +18255,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                                  authoritative_outcome);
           });
     }
-    const std::set<std::string> configured_miners(miner_node_ids.begin(),
-                                                  miner_node_ids.end());
     if (block_scheduler) {
       for (const NodeRuntime& node : nodes) {
-        if (configured_miners.contains(node.config.id) &&
-            !node.AllowsChainMetrics()) {
+        if (is_configured_miner(node.config.id) && !node.AllowsChainMetrics()) {
           block_scheduler->StopMiner(node.config.id);
         }
       }
@@ -18155,8 +18291,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                       options.time_scale.WallDuration(
                                           *node.lifecycle_policy.stop_time));
             if (stop_due && !node.DeclarativeStopApplied()) {
-              if (block_scheduler &&
-                  configured_miners.contains(node.config.id)) {
+              if (block_scheduler && is_configured_miner(node.config.id)) {
                 block_scheduler->StopMiner(node.config.id);
               }
               if (node.DeclarativeStopApplied()) {
@@ -18208,7 +18343,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 ConnectAvailableStartupPeers(options, events_path, driver,
                                              nodes, index, lifecycle_epoch,
                                              operation_stop_token);
-                if (configured_miners.contains(node.config.id) &&
+                if (is_configured_miner(node.config.id) &&
                     options.block_production.enabled &&
                     options.block_production.difficulty) {
                   RequireNodeRunning(node, "declarative mining difficulty");
@@ -18222,12 +18357,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
             }
             if (node_started && block_scheduler &&
-                configured_miners.contains(node.config.id)) {
+                is_configured_miner(node.config.id)) {
               block_scheduler->StartMiner(node.config.id);
             } else if (node_started && options.block_production.enabled &&
                        options.block_production.mode ==
                            MiningMode::kNativeMining &&
-                       configured_miners.contains(node.config.id)) {
+                       is_configured_miner(node.config.id)) {
               static_cast<void>(StartNativeMiningForCurrentProcess(
                   driver, node, run_process_state,
                   chain_spec.default_reward_address, operation_stop_token,
@@ -18274,7 +18409,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             node_restarted = RestartNode(
                 options, events_path, driver, *peer_connectivity_controller,
                 node, lifecycle_epoch, operation_stop_token, "restart_policy");
-            if (node_restarted && configured_miners.contains(node.config.id) &&
+            if (node_restarted && is_configured_miner(node.config.id) &&
                 options.block_production.enabled &&
                 options.block_production.difficulty) {
               RequireNodeRunning(node, "restart mining difficulty restore");
@@ -18283,12 +18418,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                          operation_stop_token);
             }
             if (node_restarted && block_scheduler &&
-                configured_miners.contains(node.config.id)) {
+                is_configured_miner(node.config.id)) {
               block_scheduler->StartMiner(node.config.id);
             } else if (node_restarted && options.block_production.enabled &&
                        options.block_production.mode ==
                            MiningMode::kNativeMining &&
-                       configured_miners.contains(node.config.id)) {
+                       is_configured_miner(node.config.id)) {
               static_cast<void>(StartNativeMiningForCurrentProcess(
                   driver, node, run_process_state,
                   chain_spec.default_reward_address, operation_stop_token,
@@ -18357,7 +18492,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                  << node.config.id << ": " << error;
               },
               [&] { return metrics_collector->StopRequested(); },
-              metrics_rpc_stop_source.get_token());
+              metrics_rpc_stop_source.get_token(),
+              wallet_snapshot ? &wallet_snapshot->registry().topology()
+                              : nullptr);
           if (metrics_collector->StopRequested()) {
             return;
           }
@@ -19126,6 +19263,453 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     role_service->operation = [&](McpOperationKind kind,
                                   const boost::json::object& arguments,
                                   std::stop_token operation_stop_token) {
+      if (kind == McpOperationKind::kAddMiner) {
+        constexpr std::array<std::string_view, 6U> kAllowedFields = {
+            "run_id",       "node_ids",       "count",
+            "create_nodes", "wallet_node_id", "timeout_sec"};
+        RejectUnsupportedFields(arguments, kAllowedFields, "miner.add");
+        const std::uint32_t count =
+            JsonOptionalUint32Field(arguments, "count", 0U);
+        if (count == 0U || count > kSimulationNodeAddMaximumCount) {
+          throw std::invalid_argument("miner.add count must be in 1..16");
+        }
+        const std::uint32_t timeout_sec =
+            JsonOptionalUint32Field(arguments, "timeout_sec", 30U);
+        if (timeout_sec == 0U || timeout_sec > 3600U) {
+          throw std::invalid_argument(
+              "miner.add timeout_sec must be in 1..3600");
+        }
+
+        std::vector<std::string> requested_node_ids;
+        if (const boost::json::value* node_ids =
+                arguments.if_contains("node_ids")) {
+          if (!node_ids->is_array()) {
+            throw std::invalid_argument("miner.add node_ids must be an array");
+          }
+          std::set<std::string> unique_node_ids;
+          requested_node_ids.reserve(node_ids->as_array().size());
+          for (const boost::json::value& node_id : node_ids->as_array()) {
+            if (!node_id.is_string()) {
+              throw std::invalid_argument(
+                  "miner.add node_ids must contain strings");
+            }
+            std::string id(node_id.as_string());
+            RequireSafeScenarioIdentifier(id, "miner.add node_ids");
+            if (!unique_node_ids.insert(id).second) {
+              throw std::invalid_argument("miner.add node_ids must be unique");
+            }
+            requested_node_ids.push_back(std::move(id));
+          }
+          if (requested_node_ids.size() != count) {
+            throw std::invalid_argument(
+                "miner.add count must match node_ids size");
+          }
+        }
+
+        std::optional<std::string> wallet_node_id;
+        if (arguments.if_contains("wallet_node_id") != nullptr) {
+          wallet_node_id = JsonOptionalStringField(arguments, "wallet_node_id",
+                                                   std::string_view());
+          RequireSafeScenarioIdentifier(*wallet_node_id,
+                                        "miner.add wallet_node_id");
+          if (count != 1U) {
+            throw std::invalid_argument(
+                "miner.add wallet_node_id requires count=1");
+          }
+        }
+        const boost::json::value* create_nodes =
+            arguments.if_contains("create_nodes");
+        if (create_nodes != nullptr && !create_nodes->is_object()) {
+          throw std::invalid_argument(
+              "miner.add create_nodes must be an object");
+        }
+        const std::uint32_t selector_count =
+            (!requested_node_ids.empty() ? 1U : 0U) +
+            (wallet_node_id ? 1U : 0U) + (create_nodes != nullptr ? 1U : 0U);
+        if (selector_count > 1U) {
+          throw std::invalid_argument(
+              "miner.add node_ids, wallet_node_id, and create_nodes are "
+              "mutually exclusive");
+        }
+
+        if (options.block_production.enabled &&
+            options.block_production.mode == MiningMode::kNativeMining) {
+          const UnsupportedChainOperation error(
+              ChainKindName(options.chain),
+              "transactional runtime native-miner activation");
+          throw McpOperationFailure("unsupported_chain_operation", error.what(),
+                                    false);
+        }
+        if (options.block_production.enabled &&
+            options.block_production.difficulty) {
+          const UnsupportedChainOperation error(
+              ChainKindName(options.chain),
+              "transactional runtime mining-difficulty activation");
+          throw McpOperationFailure("unsupported_chain_operation", error.what(),
+                                    false);
+        }
+        if (options.block_production.enabled &&
+            options.block_production.mode ==
+                MiningMode::kScheduledBlockProduction &&
+            block_scheduler == nullptr) {
+          throw McpOperationFailure(
+              "mining_scheduler_unavailable",
+              "miner.add requires the active scheduled block producer", true);
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(timeout_sec);
+        std::stop_source bounded_stop_source;
+        std::atomic_bool deadline_expired = false;
+        std::stop_callback stop_on_operation(
+            operation_stop_token,
+            [&bounded_stop_source] { bounded_stop_source.request_stop(); });
+        std::jthread deadline_timer(
+            [deadline, &bounded_stop_source,
+             &deadline_expired](std::stop_token timer_stop_token) {
+              try {
+                WaitUntil(deadline, timer_stop_token);
+              } catch (const SimulationCancelled&) {
+                return;
+              }
+              deadline_expired.store(true, std::memory_order_release);
+              bounded_stop_source.request_stop();
+            });
+        const std::stop_token bounded_stop_token =
+            bounded_stop_source.get_token();
+        SimulationCommandControl role_control;
+        role_control.absolute_deadline = deadline;
+        std::stop_callback cancel_role_publication(bounded_stop_token, [&] {
+          static_cast<void>(role_control.RequestCancellation(
+              deadline_expired.load(std::memory_order_acquire)
+                  ? SimulationCommandCancellationCause::kDeadline
+                  : SimulationCommandCancellationCause::kClientCancel));
+        });
+        ThrowIfStopRequested(bounded_stop_token);
+        auto mutation_lock =
+            AcquireNodeMutationLock(node_mutation_mutex, bounded_stop_token);
+        const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
+        const RuntimeWalletSnapshot before_roles =
+            runtime_wallet_registry.Snapshot();
+        const NodeRoleTopology& before_topology =
+            before_roles.registry().topology();
+
+        if (create_nodes != nullptr) {
+          Options validation_options = options;
+          validation_options.nodes =
+              static_cast<std::uint32_t>(current_nodes.size());
+          SimulationNodeAddRequest node_request;
+          try {
+            node_request = ParseAndValidateSimulationNodeAddRequest(
+                create_nodes->as_object(), validation_options);
+          } catch (const std::runtime_error& error) {
+            if (std::string_view(error.what()) !=
+                "node.add request exceeds the configured node capacity") {
+              throw;
+            }
+            throw McpOperationFailure(
+                "node_capacity_exceeded", error.what(), false,
+                boost::json::array{boost::json::object{
+                    {"code", "node_capacity_exceeded"},
+                    {"message",
+                     "the requested miner-node batch exceeds available "
+                     "capacity"},
+                    {"path", "create_nodes.count"},
+                    {"requested_count", count},
+                    {"current_node_count", current_nodes.size()},
+                    {"node_capacity", node_inventory.capacity()},
+                    {"available_node_capacity",
+                     current_nodes.size() <= node_inventory.capacity()
+                         ? node_inventory.capacity() - current_nodes.size()
+                         : 0U},
+                    {"recoverable", false}}});
+          }
+          if (node_request.count != count) {
+            throw std::invalid_argument(
+                "miner.add count must match create_nodes.count");
+          }
+
+          RuntimeNodeAddResult added;
+          try {
+            std::lock_guard<std::mutex> topology_lock(runtime_topology_mutex);
+            added = AddRuntimeNodesTransactional(
+                options, run_root, events_path, chain_spec, driver,
+                node_inventory, runtime_wallet_registry,
+                RuntimeNodeAdditionRole::kMiner, block_scheduler.get(),
+                &miner_node_ids, &configured_miner_node_ids_mutex,
+                *peer_connectivity_controller, &runtime_topology,
+                &live_topology_config, run_process_state, lifecycle_epoch,
+                node_request, &role_control, bounded_stop_token);
+          } catch (const SimulationNodeResourceUnavailable& error) {
+            if (role_control.CommitPhase() ==
+                SimulationCommandCommitPhase::kCancelled) {
+              throw SimulationCancelled();
+            }
+            const SimulationNodeResourceFailure& failure = error.failure();
+            throw McpOperationFailure(
+                "node_resource_unavailable", error.what(), true,
+                boost::json::array{boost::json::object{
+                    {"code", "node_resource_unavailable"},
+                    {"message", error.what()},
+                    {"path", "create_nodes"},
+                    {"resource_kind", failure.resource_kind},
+                    {"node_id", failure.node_id},
+                    {"address", failure.address},
+                    {"port", failure.port},
+                    {"purpose", failure.purpose},
+                    {"mutation_started", failure.mutation_started},
+                    {"action", "miner.add"},
+                    {"recoverable", true}}});
+          } catch (const SimulationCommandOutcomeUnconfirmed& error) {
+            mcp_application.MarkRunStopping();
+            simulation_stop_source.request_stop();
+            throw McpOperationFailure(
+                "miner_add_outcome_unconfirmed",
+                "miner.add create_nodes outcome is unconfirmed: " +
+                    std::string(error.what()),
+                false);
+          } catch (const std::exception&) {
+            if (role_control.CommitPhase() ==
+                SimulationCommandCommitPhase::kCancelled) {
+              throw SimulationCancelled();
+            }
+            throw;
+          } catch (...) {
+            if (role_control.CommitPhase() ==
+                SimulationCommandCommitPhase::kCancelled) {
+              throw SimulationCancelled();
+            }
+            throw;
+          }
+
+          try {
+            if (!added.role_generation || !added.final_miner_count ||
+                added.added_node_ids.size() != count) {
+              throw std::logic_error(
+                  "miner.add create_nodes omitted its joint publication "
+                  "evidence");
+            }
+            boost::json::array node_ids;
+            boost::json::array created_node_ids;
+            node_ids.reserve(added.added_node_ids.size());
+            created_node_ids.reserve(added.added_node_ids.size());
+            for (const std::string& node_id : added.added_node_ids) {
+              node_ids.emplace_back(node_id);
+              created_node_ids.emplace_back(node_id);
+            }
+            return boost::json::object{
+                {"node_ids", std::move(node_ids)},
+                {"assigned_roles", boost::json::array{"miner"}},
+                {"removed_roles", boost::json::array{}},
+                {"action", "miner.add"},
+                {"state", "ready"},
+                {"created_node_ids", std::move(created_node_ids)},
+                {"role_generation", *added.role_generation},
+                {"final_miner_count", *added.final_miner_count},
+                {"inventory_generation", added.inventory_generation},
+                {"final_node_count", added.final_node_count},
+            };
+          } catch (...) {
+            mcp_application.MarkRunStopping();
+            simulation_stop_source.request_stop();
+            throw McpOperationFailure(
+                "miner_add_outcome_unconfirmed",
+                "miner.add create_nodes published but completion evidence "
+                "failed: " +
+                    ExceptionMessage(std::current_exception()),
+                false);
+          }
+        }
+
+        const auto is_wallet_node = [&](std::size_t index) {
+          return NodeListContains(before_topology.wallet_nodes,
+                                  static_cast<std::uint32_t>(index));
+        };
+        const auto is_miner_node = [&](std::size_t index) {
+          return NodeListContains(before_topology.miner_nodes,
+                                  static_cast<std::uint32_t>(index));
+        };
+        const auto require_compatible_index = [&](std::size_t index) {
+          if (is_miner_node(index)) {
+            throw McpOperationFailure("miner_already_configured",
+                                      "miner.add node is already a miner: " +
+                                          current_nodes[index].config.id,
+                                      false);
+          }
+          if (is_wallet_node(index) &&
+              !before_topology.allow_miner_wallet_overlap) {
+            throw McpOperationFailure(
+                "role_conflict",
+                "miner.add cannot overlap the selected wallet role: " +
+                    current_nodes[index].config.id,
+                false);
+          }
+        };
+
+        std::vector<std::size_t> selected_indexes;
+        selected_indexes.reserve(count);
+        if (!requested_node_ids.empty()) {
+          for (const std::string& requested_node_id : requested_node_ids) {
+            const auto selected =
+                std::find_if(current_nodes.begin(), current_nodes.end(),
+                             [&](const NodeRuntime& node) {
+                               return node.config.id == requested_node_id;
+                             });
+            if (selected == current_nodes.end()) {
+              throw McpOperationFailure(
+                  "node_not_found",
+                  "miner.add node is not active: " + requested_node_id, false);
+            }
+            const std::size_t index = static_cast<std::size_t>(
+                std::distance(current_nodes.begin(), selected));
+            require_compatible_index(index);
+            selected_indexes.push_back(index);
+          }
+        } else if (wallet_node_id) {
+          if (!before_topology.allow_miner_wallet_overlap) {
+            throw McpOperationFailure(
+                "role_conflict",
+                "miner.add wallet_node_id requires miner-wallet overlap "
+                "permission",
+                false);
+          }
+          const auto selected =
+              std::find_if(current_nodes.begin(), current_nodes.end(),
+                           [&](const NodeRuntime& node) {
+                             return node.config.id == *wallet_node_id;
+                           });
+          if (selected == current_nodes.end()) {
+            throw McpOperationFailure(
+                "node_not_found",
+                "miner.add wallet node is not active: " + *wallet_node_id,
+                false);
+          }
+          const std::size_t index = static_cast<std::size_t>(
+              std::distance(current_nodes.begin(), selected));
+          if (!is_wallet_node(index)) {
+            throw McpOperationFailure(
+                "wallet_role_required",
+                "miner.add wallet_node_id is not a registered wallet node: " +
+                    *wallet_node_id,
+                false);
+          }
+          require_compatible_index(index);
+          selected_indexes.push_back(index);
+        } else {
+          auto process_guard = run_process_state.Lock();
+          const auto select_compatible = [&](bool wallet_nodes) {
+            for (std::size_t index = 0U; index < current_nodes.size() &&
+                                         selected_indexes.size() < count;
+                 ++index) {
+              NodeRuntime& node = current_nodes[index];
+              if (is_miner_node(index) ||
+                  is_wallet_node(index) != wallet_nodes ||
+                  (wallet_nodes &&
+                   !before_topology.allow_miner_wallet_overlap) ||
+                  !node.AllowsChainMetrics() || !node.process.running()) {
+                continue;
+              }
+              selected_indexes.push_back(index);
+            }
+          };
+          select_compatible(false);
+          if (selected_indexes.size() < count &&
+              before_topology.allow_miner_wallet_overlap) {
+            select_compatible(true);
+          }
+          if (selected_indexes.size() != count) {
+            throw McpOperationFailure(
+                "miner_backing_node_unavailable",
+                "miner.add found fewer compatible running non-miner nodes "
+                "than requested",
+                false);
+          }
+        }
+
+        std::vector<std::uint32_t> selected_role_indexes;
+        std::vector<std::string> selected_node_ids;
+        selected_role_indexes.reserve(selected_indexes.size());
+        selected_node_ids.reserve(selected_indexes.size());
+        {
+          auto process_guard = run_process_state.Lock();
+          for (const std::size_t index : selected_indexes) {
+            NodeRuntime& node = current_nodes[index];
+            RequireNodeRunning(node, process_guard, "miner.add");
+            selected_role_indexes.push_back(static_cast<std::uint32_t>(index));
+            selected_node_ids.push_back(node.config.id);
+          }
+        }
+
+        std::unique_lock<std::timed_mutex> publication_lock =
+            AcquireRuntimePublicationLock(bounded_stop_token);
+        ThrowIfStopRequested(bounded_stop_token);
+        RuntimeWalletRegistry::PreparedAppend prepared_roles =
+            runtime_wallet_registry.PrepareUpdate(
+                before_roles.generation(), {}, selected_role_indexes,
+                static_cast<std::uint32_t>(current_nodes.size()));
+        std::unique_lock<std::mutex> configured_miners_lock(
+            configured_miner_node_ids_mutex);
+        std::vector<std::string> next_miner_node_ids = miner_node_ids;
+        next_miner_node_ids.reserve(next_miner_node_ids.size() +
+                                    selected_node_ids.size());
+        for (const std::string& node_id : selected_node_ids) {
+          if (std::find(next_miner_node_ids.begin(), next_miner_node_ids.end(),
+                        node_id) != next_miner_node_ids.end()) {
+            throw std::logic_error(
+                "miner.add selected an already configured miner: " + node_id);
+          }
+          next_miner_node_ids.push_back(node_id);
+        }
+        std::optional<ProbabilisticBlockScheduler::PreparedAdd>
+            prepared_scheduler;
+        if (block_scheduler != nullptr) {
+          prepared_scheduler.emplace(
+              block_scheduler->PrepareAddMiners(selected_node_ids));
+        }
+        if (!role_control.TryBeginCommit()) {
+          throw SimulationCancelled();
+        }
+        const RuntimeWalletSnapshot published_roles = prepared_roles.Commit();
+        if (prepared_scheduler) {
+          prepared_scheduler->Commit();
+        }
+        miner_node_ids.swap(next_miner_node_ids);
+        role_control.MarkCommitted();
+        configured_miners_lock.unlock();
+
+        try {
+          WriteEvent(events_path, options.run_id, "sim",
+                     SimulationEventKind::kRuntimeRoleGenerationPublished,
+                     boost::json::serialize(RuntimeRoleGenerationDetail(
+                         published_roles, current_nodes)));
+          boost::json::array node_ids;
+          node_ids.reserve(selected_node_ids.size());
+          for (const std::string& node_id : selected_node_ids) {
+            node_ids.emplace_back(node_id);
+          }
+          return boost::json::object{
+              {"node_ids", std::move(node_ids)},
+              {"assigned_roles", boost::json::array{"miner"}},
+              {"removed_roles", boost::json::array{}},
+              {"action", "miner.add"},
+              {"state", "ready"},
+              {"created_node_ids", boost::json::array{}},
+              {"role_generation", published_roles.generation()},
+              {"final_miner_count",
+               published_roles.registry().topology().miner_nodes.size()},
+              {"inventory_generation", current_nodes.generation()},
+              {"final_node_count", current_nodes.size()},
+          };
+        } catch (...) {
+          mcp_application.MarkRunStopping();
+          simulation_stop_source.request_stop();
+          throw McpOperationFailure(
+              "miner_add_outcome_unconfirmed",
+              "miner.add published but completion evidence failed: " +
+                  ExceptionMessage(std::current_exception()),
+              false);
+        }
+      }
       if (kind != McpOperationKind::kAddWallet) {
         throw std::logic_error("unknown live role mutation operation");
       }
@@ -19268,7 +19852,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           std::lock_guard<std::mutex> topology_lock(runtime_topology_mutex);
           added = AddRuntimeNodesTransactional(
               options, run_root, events_path, chain_spec, driver,
-              node_inventory, &runtime_wallet_registry,
+              node_inventory, runtime_wallet_registry,
+              RuntimeNodeAdditionRole::kWallet, block_scheduler.get(),
+              &miner_node_ids, &configured_miner_node_ids_mutex,
               *peer_connectivity_controller, &runtime_topology,
               &live_topology_config, run_process_state, lifecycle_epoch,
               node_request, &node_add_control, bounded_stop_token);
@@ -19463,6 +20049,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                    SimulationEventKind::kRuntimeWalletGenerationPublished,
                    boost::json::serialize(RuntimeWalletGenerationDetail(
                        published, added_wallets)));
+        WriteEvent(events_path, options.run_id, "sim",
+                   SimulationEventKind::kRuntimeRoleGenerationPublished,
+                   boost::json::serialize(
+                       RuntimeRoleGenerationDetail(published, current_nodes)));
 
         boost::json::array affected_node_ids;
         boost::json::array wallets_json;
@@ -19571,7 +20161,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             BBP_LOG(warning) << "initial metrics snapshot skipped "
                              << node.config.id << ": " << error;
           },
-          {}, stop_token);
+          {}, stop_token, &wallet_snapshot.registry().topology());
       WriteWalletMetricsSnapshot(
           wallet_metrics_path, options, driver, nodes,
           wallet_snapshot.registry(),
@@ -19827,8 +20417,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                      WorkloadKind::kResourcePressure) {
             ApplyResourcePressureWorkload(
                 options, events_path, metrics_path, driver, nodes,
-                run_process_state, scenario_workload.resource_pressure,
-                action_index, action_count, stop_token);
+                run_process_state,
+                runtime_wallet_registry.Snapshot().registry().topology(),
+                scenario_workload.resource_pressure, action_index, action_count,
+                stop_token);
           } else if (scenario_workload.kind ==
                      WorkloadKind::kSetNetworkCondition) {
             const NetworkConditionWorkload& workload =
@@ -19886,14 +20478,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                     : workload.name;
             transaction_tracker.ObserveAll(options, events_path, driver, nodes,
                                            stop_token);
-            const std::uint32_t node_metric_samples =
-                WriteMetricsSnapshot(metrics_path, options, driver, nodes,
-                                     run_process_state, {}, {}, stop_token);
+            const RuntimeWalletSnapshot checkpoint_registry =
+                runtime_wallet_registry.Snapshot();
+            const std::uint32_t node_metric_samples = WriteMetricsSnapshot(
+                metrics_path, options, driver, nodes, run_process_state, {}, {},
+                stop_token, &checkpoint_registry.registry().topology());
             const std::uint32_t wallet_metric_samples =
                 WriteWalletMetricsSnapshot(
                     wallet_metrics_path, options, driver, nodes,
-                    runtime_wallet_registry.Snapshot().registry(), {},
-                    stop_token);
+                    checkpoint_registry.registry(), {}, stop_token);
             WriteEvent(events_path, options.run_id, "sim",
                        SimulationEventKind::kCheckpointRecorded,
                        CheckpointWorkloadDetail(action_index, action_count,
@@ -19956,11 +20549,14 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                    stop_token);
     WriteTransactionLoadCompletions(options, events_path,
                                     pending_transaction_load_completions);
+    const RuntimeWalletSnapshot final_registry =
+        runtime_wallet_registry.Snapshot();
     WriteMetricsSnapshot(metrics_path, options, driver, final_nodes,
-                         run_process_state, {}, {}, stop_token);
-    WriteWalletMetricsSnapshot(
-        wallet_metrics_path, options, driver, final_nodes,
-        runtime_wallet_registry.Snapshot().registry(), {}, stop_token);
+                         run_process_state, {}, {}, stop_token,
+                         &final_registry.registry().topology());
+    WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver,
+                               final_nodes, final_registry.registry(), {},
+                               stop_token);
 
     StopNodes(options, events_path, driver, final_nodes);
     log_collector->Stop();

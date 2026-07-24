@@ -50,6 +50,27 @@ void SimulationRegistry::AddWallet(WalletIdentity wallet) {
   wallets_.push_back(std::move(wallet));
 }
 
+void SimulationRegistry::AddMinerNode(uint32_t node_index) {
+  if (node_index >= topology_.node_count) {
+    throw std::runtime_error("miner node is out of range");
+  }
+  if (std::find(topology_.miner_nodes.begin(), topology_.miner_nodes.end(),
+                node_index) != topology_.miner_nodes.end()) {
+    throw std::runtime_error("miner node is already registered");
+  }
+  if (!topology_.allow_miner_wallet_overlap &&
+      std::find(topology_.wallet_nodes.begin(), topology_.wallet_nodes.end(),
+                node_index) != topology_.wallet_nodes.end()) {
+    throw std::runtime_error(
+        "miner node overlaps a wallet node without overlap permission");
+  }
+  topology_.miner_nodes.push_back(node_index);
+  std::sort(topology_.miner_nodes.begin(), topology_.miner_nodes.end());
+  topology_.configured = true;
+  topology_.miner_node_count =
+      static_cast<uint32_t>(topology_.miner_nodes.size());
+}
+
 void SimulationRegistry::SetRuntimeNodeCount(uint32_t node_count) {
   if (node_count < topology_.node_count) {
     throw std::runtime_error(

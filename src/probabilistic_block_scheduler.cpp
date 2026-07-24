@@ -80,6 +80,50 @@ void ProbabilisticBlockScheduler::Stop() {
   }
 }
 
+ProbabilisticBlockScheduler::PreparedAdd
+ProbabilisticBlockScheduler::PrepareAddMiners(
+    std::vector<std::string> node_ids) {
+  if (node_ids.empty()) {
+    throw std::invalid_argument(
+        "block scheduler miner addition cannot be empty");
+  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  std::vector<std::string> next_ids = miner_node_ids_;
+  std::vector<bool> next_active = active_miners_;
+  std::vector<bool> next_in_flight = in_flight_miners_;
+  next_ids.reserve(next_ids.size() + node_ids.size());
+  next_active.reserve(next_active.size() + node_ids.size());
+  next_in_flight.reserve(next_in_flight.size() + node_ids.size());
+  for (std::string& node_id : node_ids) {
+    if (node_id.empty()) {
+      throw std::invalid_argument("block scheduler miner id cannot be empty");
+    }
+    if (std::find(next_ids.begin(), next_ids.end(), node_id) !=
+        next_ids.end()) {
+      throw std::invalid_argument("block scheduler miner is already present: " +
+                                  node_id);
+    }
+    next_ids.push_back(std::move(node_id));
+    next_active.push_back(true);
+    next_in_flight.push_back(false);
+  }
+  return PreparedAdd(this, std::move(lock), std::move(next_ids),
+                     std::move(next_active), std::move(next_in_flight));
+}
+
+void ProbabilisticBlockScheduler::PreparedAdd::Commit() noexcept {
+  if (owner_ == nullptr || !lock_.owns_lock() ||
+      lock_.mutex() != &owner_->mutex_) {
+    std::terminate();
+  }
+  owner_->miner_node_ids_.swap(miner_node_ids_);
+  owner_->active_miners_.swap(active_miners_);
+  owner_->in_flight_miners_.swap(in_flight_miners_);
+  lock_.unlock();
+  owner_->condition_.notify_all();
+  owner_ = nullptr;
+}
+
 void ProbabilisticBlockScheduler::StartMiner(const std::string& node_id) {
   {
     std::lock_guard<std::mutex> lock(mutex_);

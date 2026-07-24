@@ -51,6 +51,13 @@ RuntimeWalletSnapshot RuntimeWalletRegistry::Snapshot() const {
 RuntimeWalletRegistry::PreparedAppend RuntimeWalletRegistry::PrepareAppend(
     std::uint64_t expected_generation, std::vector<WalletIdentity> wallets,
     std::uint32_t runtime_node_count) {
+  return PrepareUpdate(expected_generation, std::move(wallets), {},
+                       runtime_node_count);
+}
+
+RuntimeWalletRegistry::PreparedAppend RuntimeWalletRegistry::PrepareUpdate(
+    std::uint64_t expected_generation, std::vector<WalletIdentity> wallets,
+    std::vector<std::uint32_t> miner_nodes, std::uint32_t runtime_node_count) {
   std::unique_lock<std::mutex> lock(mutex_);
   if (generation_->sequence == 0U) {
     throw std::logic_error("runtime wallet registry is not initialized");
@@ -59,9 +66,10 @@ RuntimeWalletRegistry::PreparedAppend RuntimeWalletRegistry::PrepareAppend(
     throw std::runtime_error(
         "runtime wallet registry changed before publication");
   }
-  if (wallets.empty()) {
+  if (wallets.empty() && miner_nodes.empty() &&
+      runtime_node_count == generation_->registry.topology().node_count) {
     throw std::invalid_argument(
-        "runtime wallet publication requires at least one wallet");
+        "runtime role publication requires a state change");
   }
   if (generation_->sequence == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("runtime wallet registry generation overflow");
@@ -87,6 +95,14 @@ RuntimeWalletRegistry::PreparedAppend RuntimeWalletRegistry::PrepareAppend(
           "runtime wallet publication contains a duplicate address");
     }
     next.AddWallet(std::move(wallet));
+  }
+  std::set<std::uint32_t> unique_miner_nodes;
+  for (const std::uint32_t miner_node : miner_nodes) {
+    if (!unique_miner_nodes.insert(miner_node).second) {
+      throw std::invalid_argument(
+          "runtime role publication contains a duplicate miner node");
+    }
+    next.AddMinerNode(miner_node);
   }
   auto next_generation = std::make_shared<RuntimeWalletSnapshot::Generation>(
       RuntimeWalletSnapshot::Generation{

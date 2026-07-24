@@ -160,9 +160,31 @@ BOOST_AUTO_TEST_CASE(
                       {"node_id", "sim"},
                       {"event", "runtime_generation_published"},
                       {"detail", boost::json::serialize(detail)}}));
+  const boost::json::object role_detail{
+      {"generation", 3U},
+      {"node_count", 2U},
+      {"miner_count", 1U},
+      {"miner_nodes", boost::json::array{1U}},
+      {"miner_node_ids", boost::json::array{"firo-1"}},
+      {"node_roles",
+       boost::json::array{
+           boost::json::object{
+               {"node", 1U}, {"node_id", "firo-1"}, {"role", "miner"}},
+           boost::json::object{
+               {"node", 2U}, {"node_id", "firo-2"}, {"role", "base"}}}}};
+  bbp::AppendLine(dir / "events.jsonl",
+                  boost::json::serialize(boost::json::object{
+                      {"run_id", "generation"},
+                      {"node_id", "sim"},
+                      {"event", "runtime_role_generation_published"},
+                      {"detail", boost::json::serialize(role_detail)}}));
 
   const boost::json::object report = bbp::BuildRunReport(dir);
   BOOST_TEST(JsonInteger(report, "inventory_generation") == 2U);
+  BOOST_TEST(JsonInteger(report, "role_generation") == 3U);
+  BOOST_TEST(JsonInteger(report, "miner_node_count") == 1U);
+  BOOST_TEST(report.at("miner_node_ids").as_array() ==
+             boost::json::array{"firo-1"});
   BOOST_TEST(JsonInteger(report, "nodes") == 2U);
   BOOST_TEST(report.at("node_ids").as_array() ==
              boost::json::array({"firo-1", "firo-2"}));
@@ -174,7 +196,23 @@ BOOST_AUTO_TEST_CASE(
                  .back()
                  .as_object()
                  .at("role")
+                 .as_string() == "base");
+  BOOST_TEST(report.at("nodes_summary")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("role")
                  .as_string() == "miner");
+  BOOST_TEST(report.at("node_configs")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("role")
+                 .as_string() == "miner");
+  BOOST_TEST(
+      JsonInteger(report.at("topology").as_object(), "miner_node_count") == 1U);
+  BOOST_TEST(report.at("topology").as_object().at("miner_nodes").as_array() ==
+             boost::json::array{1U});
   std::filesystem::remove_all(dir);
 }
 

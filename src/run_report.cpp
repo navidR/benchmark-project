@@ -2534,6 +2534,154 @@ struct IncrementalRunReport::Impl {
         report["topology_current_edges"] = *topology_current_edges;
         break;
       }
+      case SimulationEventKind::kRuntimeRoleGenerationPublished: {
+        const boost::json::value detail = ParseEventDetail(event);
+        if (!detail.is_object()) {
+          throw std::runtime_error(
+              "runtime role generation publication detail is not an object");
+        }
+        const boost::json::object& publication = detail.as_object();
+        const std::optional<std::uint64_t> generation =
+            OptionalUint64Field(publication, "generation");
+        const std::optional<std::uint64_t> node_count =
+            OptionalUint64Field(publication, "node_count");
+        const std::optional<std::uint64_t> miner_count =
+            OptionalUint64Field(publication, "miner_count");
+        const boost::json::value* miner_nodes =
+            publication.if_contains("miner_nodes");
+        const boost::json::value* miner_node_ids =
+            publication.if_contains("miner_node_ids");
+        const boost::json::value* node_roles =
+            publication.if_contains("node_roles");
+        const boost::json::value* report_node_configs =
+            report.if_contains("node_configs");
+        boost::json::value* report_topology = report.if_contains("topology");
+        if (!generation || *generation == 0U || !node_count || !miner_count ||
+            *miner_count > *node_count || miner_nodes == nullptr ||
+            !miner_nodes->is_array() || miner_node_ids == nullptr ||
+            !miner_node_ids->is_array() || node_roles == nullptr ||
+            !node_roles->is_array() || report_node_configs == nullptr ||
+            !report_node_configs->is_array() || report_topology == nullptr ||
+            !report_topology->is_object() ||
+            miner_nodes->as_array().size() != *miner_count ||
+            miner_node_ids->as_array().size() != *miner_count ||
+            node_roles->as_array().size() != *node_count ||
+            report_node_configs->as_array().size() != *node_count) {
+          throw std::runtime_error(
+              "runtime role generation publication is incomplete");
+        }
+
+        std::map<std::uint64_t, std::string> configured_ids_by_node;
+        std::set<std::string> configured_node_ids;
+        for (const boost::json::value& value :
+             report_node_configs->as_array()) {
+          if (!value.is_object()) {
+            throw std::runtime_error(
+                "runtime role generation report node config is invalid");
+          }
+          const boost::json::object& config = value.as_object();
+          const std::optional<std::uint64_t> node =
+              OptionalUint64Field(config, "index");
+          const std::string node_id = OptionalStringField(config, "id");
+          if (!node || *node == 0U || *node > *node_count || node_id.empty() ||
+              !configured_ids_by_node.emplace(*node, node_id).second ||
+              !configured_node_ids.insert(node_id).second) {
+            throw std::runtime_error(
+                "runtime role generation report identity is invalid");
+          }
+        }
+
+        std::set<std::uint64_t> unique_miner_nodes;
+        std::set<std::string> unique_miner_node_ids;
+        for (std::size_t index = 0U; index < miner_nodes->as_array().size();
+             ++index) {
+          const boost::json::value& node_value = miner_nodes->as_array()[index];
+          const boost::json::value& id_value =
+              miner_node_ids->as_array()[index];
+          std::optional<std::uint64_t> node;
+          if (node_value.is_uint64()) {
+            node = node_value.as_uint64();
+          } else if (node_value.is_int64() && node_value.as_int64() >= 0) {
+            node = static_cast<std::uint64_t>(node_value.as_int64());
+          }
+          if (!node || *node == 0U || *node > *node_count ||
+              !unique_miner_nodes.insert(*node).second ||
+              !id_value.is_string() || id_value.as_string().empty() ||
+              !unique_miner_node_ids.insert(std::string(id_value.as_string()))
+                   .second ||
+              configured_ids_by_node.at(*node) != id_value.as_string()) {
+            throw std::runtime_error(
+                "runtime role generation miner identity is invalid");
+          }
+        }
+
+        std::map<std::string, std::string> published_roles;
+        std::set<std::uint64_t> unique_role_nodes;
+        boost::json::array published_wallet_nodes;
+        for (const boost::json::value& value : node_roles->as_array()) {
+          if (!value.is_object()) {
+            throw std::runtime_error(
+                "runtime role generation node role is invalid");
+          }
+          const boost::json::object& role = value.as_object();
+          const std::optional<std::uint64_t> node =
+              OptionalUint64Field(role, "node");
+          const std::string node_id = OptionalStringField(role, "node_id");
+          const std::string role_name = OptionalStringField(role, "role");
+          if (!node || *node == 0U || *node > *node_count ||
+              !unique_role_nodes.insert(*node).second || node_id.empty() ||
+              !published_roles.emplace(node_id, role_name).second ||
+              (role_name != "base" && role_name != "wallet" &&
+               role_name != "miner" && role_name != "wallet_miner")) {
+            throw std::runtime_error(
+                "runtime role generation node role is invalid");
+          }
+          if (configured_ids_by_node.at(*node) != node_id) {
+            throw std::runtime_error(
+                "runtime role generation node identity is inconsistent");
+          }
+          const bool expected_miner = unique_miner_nodes.contains(*node);
+          const bool role_is_miner =
+              role_name == "miner" || role_name == "wallet_miner";
+          if (expected_miner != role_is_miner ||
+              (expected_miner && !unique_miner_node_ids.contains(node_id))) {
+            throw std::runtime_error(
+                "runtime role generation miner role is inconsistent");
+          }
+          if (role_name == "wallet" || role_name == "wallet_miner") {
+            published_wallet_nodes.emplace_back(*node);
+          }
+        }
+
+        boost::json::array updated_configs = report_node_configs->as_array();
+        for (boost::json::value& value : updated_configs) {
+          if (!value.is_object()) {
+            throw std::runtime_error(
+                "runtime role generation report node config is invalid");
+          }
+          boost::json::object& config = value.as_object();
+          const std::string node_id = OptionalStringField(config, "id");
+          const auto found = published_roles.find(node_id);
+          if (found == published_roles.end()) {
+            throw std::runtime_error(
+                "runtime role generation report identity is inconsistent");
+          }
+          config["role"] = found->second;
+          nodes[node_id].role = found->second;
+        }
+
+        boost::json::object updated_topology = report_topology->as_object();
+        updated_topology["wallet_node_count"] = published_wallet_nodes.size();
+        updated_topology["wallet_nodes"] = std::move(published_wallet_nodes);
+        updated_topology["miner_node_count"] = *miner_count;
+        updated_topology["miner_nodes"] = *miner_nodes;
+        report["role_generation"] = *generation;
+        report["miner_node_count"] = *miner_count;
+        report["miner_node_ids"] = *miner_node_ids;
+        report["node_configs"] = std::move(updated_configs);
+        report["topology"] = std::move(updated_topology);
+        break;
+      }
       case SimulationEventKind::kDirectionalNetworkPoliciesVerified:
         AppendDirectionalPolicyVerification(
             event, &Array("directional_network_policy_verifications"));

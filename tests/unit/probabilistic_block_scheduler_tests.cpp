@@ -203,3 +203,42 @@ BOOST_AUTO_TEST_CASE(probabilistic_block_scheduler_resumes_stopped_miner) {
 
   BOOST_CHECK_THROW(scheduler.StartMiner("unknown"), std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(
+    probabilistic_block_scheduler_prepares_and_commits_miner_addition) {
+  std::mutex mutex;
+  std::condition_variable produced;
+  std::vector<std::string> miners;
+  bbp::ProbabilisticBlockScheduler scheduler(
+      {"node-1"}, bbp::BlockProductionPolicy(1ms, 1.0, 7U),
+      [&](const std::string& node_id) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          miners.push_back(node_id);
+        }
+        produced.notify_all();
+      },
+      [](const std::string&, std::string_view) {
+        BOOST_FAIL("block production should not fail");
+      });
+
+  {
+    auto abandoned = scheduler.PrepareAddMiners({"node-2"});
+    static_cast<void>(abandoned);
+  }
+  BOOST_CHECK_THROW(scheduler.StopMiner("node-2"), std::runtime_error);
+
+  scheduler.StopMiner("node-1");
+  auto prepared = scheduler.PrepareAddMiners({"node-2"});
+  prepared.Commit();
+  scheduler.Start();
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    BOOST_REQUIRE(
+        produced.wait_for(lock, 1s, [&miners] { return !miners.empty(); }));
+  }
+  scheduler.Stop();
+  BOOST_TEST(miners.front() == "node-2");
+  BOOST_CHECK_THROW(scheduler.PrepareAddMiners({"node-2"}),
+                    std::invalid_argument);
+}

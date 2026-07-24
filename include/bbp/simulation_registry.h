@@ -101,6 +101,7 @@ class SimulationRegistry {
   }
 
   void AddWallet(WalletIdentity wallet);
+  void AddMinerNode(uint32_t node_index);
   void SetRuntimeNodeCount(uint32_t node_count);
   WalletIdentity& MutableWalletByIndex(size_t wallet_index);
   const WalletIdentity& WalletByIndex(size_t wallet_index) const;
