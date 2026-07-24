@@ -10,7 +10,7 @@ class SimulatorApp {
 #ifdef BBP_ENABLE_TEST_HOOKS
 bool RuntimeNodeSupportDestructionAllowedForTest(
     bool daemon_absence_verified, bool exact_cgroup_acquired,
-    bool exact_cgroup_empty);
+    bool exact_cgroup_empty, bool allow_partial_preparation = false);
 #endif
 
 }  // namespace bbp

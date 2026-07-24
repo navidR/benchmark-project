@@ -434,14 +434,20 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     runtime_node_support_destruction_requires_both_positive_verifications) {
-  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(false, true,
-                                                               true));
-  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(true, false,
-                                                               true));
-  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(true, true,
-                                                               false));
+  BOOST_TEST(
+      !bbp::RuntimeNodeSupportDestructionAllowedForTest(false, true, true));
+  BOOST_TEST(
+      !bbp::RuntimeNodeSupportDestructionAllowedForTest(true, false, true));
+  BOOST_TEST(
+      !bbp::RuntimeNodeSupportDestructionAllowedForTest(true, true, false));
   BOOST_TEST(
       bbp::RuntimeNodeSupportDestructionAllowedForTest(true, true, true));
+  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(false, false,
+                                                               false, true));
+  BOOST_TEST(bbp::RuntimeNodeSupportDestructionAllowedForTest(true, false,
+                                                              false, true));
+  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(true, true,
+                                                               false, true));
 }
 
 BOOST_AUTO_TEST_CASE(cgroup_refuses_unprepared_and_preexisting_run_ownership) {

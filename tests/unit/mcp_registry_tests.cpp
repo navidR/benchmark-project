@@ -518,8 +518,19 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
       BuildMcpOperationInputSchema(McpOperationKind::kAddNode);
   const boost::json::object& direct_request =
       direct.at("properties").as_object().at("request").as_object();
+  const boost::json::object wallet_add =
+      BuildMcpOperationInputSchema(McpOperationKind::kAddWallet);
+  const boost::json::object& wallet_create_node =
+      wallet_add.at("properties").as_object().at("create_node").as_object();
+  BOOST_TEST(wallet_add.at("properties")
+                 .as_object()
+                 .at("count")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == kSimulationNodeAddMaximumCount);
   BOOST_TEST(generic_request == scheduled_request);
   BOOST_TEST(generic_request == direct_request);
+  BOOST_TEST(generic_request == wallet_create_node);
   const boost::json::object& request_properties =
       direct_request.at("properties").as_object();
   BOOST_TEST(
@@ -617,7 +628,20 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
   BOOST_TEST(output_properties.at("final_node_count")
                  .as_object()
                  .at("maximum")
-                 .as_uint64() == kSimulationNodeAddMaximumCount);
+                 .as_uint64() == std::numeric_limits<std::uint32_t>::max());
+  const boost::json::object wallet_output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kAddWallet)
+          .at("oneOf")
+          .as_array()
+          .front()
+          .as_object();
+  const boost::json::object& wallet_output_properties =
+      wallet_output.at("properties").as_object();
+  BOOST_TEST(wallet_output_properties.contains("inventory_generation"));
+  BOOST_TEST(wallet_output_properties.at("final_node_count")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == std::numeric_limits<std::uint32_t>::max());
 
   const boost::json::object runtime_output =
       BuildMcpResultSchema(McpResultFamily::kRuntimeCommand);

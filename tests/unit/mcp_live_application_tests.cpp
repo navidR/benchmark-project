@@ -1947,23 +1947,29 @@ BOOST_AUTO_TEST_CASE(
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
-    if (arguments.at("node_id").as_string() == "firo-cancel") {
+    const boost::json::value* node_id = arguments.if_contains("node_id");
+    if (node_id != nullptr && node_id->as_string() == "firo-cancel") {
       throw SimulationCancelled();
     }
+    const bool create_node = arguments.contains("create_node");
     return boost::json::object{
-        {"added_node_ids", boost::json::array{}},
+        {"added_node_ids",
+         create_node ? boost::json::array{"firo-2"} : boost::json::array{}},
         {"removed_node_ids", boost::json::array{}},
-        {"affected_node_ids", boost::json::array{"firo-1"}},
+        {"affected_node_ids",
+         boost::json::array{create_node ? "firo-2" : "firo-1"}},
         {"action", "wallet.add"},
         {"state", "ready"},
         {"unchanged", false},
         {"wallets", boost::json::array{boost::json::object{
                         {"wallet_index", 1U},
-                        {"node", 1U},
-                        {"node_id", "firo-1"},
+                        {"node", create_node ? 2U : 1U},
+                        {"node_id", create_node ? "firo-2" : "firo-1"},
                         {"mode", "public"},
                         {"address", "wallet-address"},
                         {"funding_address", "wallet-address"}}}},
+        {"inventory_generation", create_node ? 2U : 1U},
+        {"final_node_count", create_node ? 2U : 1U},
         {"wallet_generation", 2U},
         {"final_wallet_count", 1U},
     };
@@ -1989,6 +1995,23 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(result.at("state").as_string() == "ready");
   BOOST_TEST(result.at("wallet_generation").as_uint64() == 2U);
   BOOST_TEST(result.at("wallets").as_array().size() == 1U);
+
+  const boost::json::object created = Invoke(
+      &dispatcher, "wallet.add",
+      boost::json::object{{"run_id", "live-application"},
+                          {"count", 1U},
+                          {"mode", "public"},
+                          {"create_node", boost::json::object{{"chain", "firo"},
+                                                              {"count", 1U}}}});
+  const boost::json::object created_terminal =
+      WaitForTerminal(&dispatcher, created);
+  BOOST_TEST(created_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& created_result =
+      created_terminal.at("terminal_result").as_object();
+  BOOST_TEST(created_result.at("added_node_ids").as_array() ==
+             boost::json::array{"firo-2"});
+  BOOST_TEST(created_result.at("inventory_generation").as_uint64() == 2U);
+  BOOST_TEST(created_result.at("final_node_count").as_uint64() == 2U);
 
   const boost::json::object cancelled =
       Invoke(&dispatcher, "wallet.add",

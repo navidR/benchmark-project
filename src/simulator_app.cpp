@@ -14453,8 +14453,11 @@ void ApplyRuntimeNodeFreezes(const Options& options,
 
 bool RuntimeNodeSupportDestructionAllowed(bool daemon_absence_verified,
                                           bool exact_cgroup_acquired,
-                                          bool exact_cgroup_empty) {
-  return daemon_absence_verified && exact_cgroup_acquired && exact_cgroup_empty;
+                                          bool exact_cgroup_empty,
+                                          bool allow_partial_preparation) {
+  return daemon_absence_verified &&
+         (exact_cgroup_acquired ? exact_cgroup_empty
+                                : allow_partial_preparation);
 }
 
 std::vector<bool> StopNodes(
@@ -14464,7 +14467,8 @@ std::vector<bool> StopNodes(
     const std::vector<std::uint32_t>* explicit_resource_slots = nullptr,
     std::optional<std::chrono::steady_clock::time_point> absolute_deadline =
         std::nullopt,
-    std::stop_token cleanup_stop_token = {}) {
+    std::stop_token cleanup_stop_token = {},
+    bool allow_partial_preparation = false) {
   const auto shutdown_timeout =
       best_effort ? std::chrono::seconds(2) : std::chrono::seconds(15);
   auto shutdown_deadline = std::chrono::steady_clock::now() + shutdown_timeout;
@@ -14753,12 +14757,13 @@ std::vector<bool> StopNodes(
         node.cgroup->KillAll(shutdown_deadline, cleanup_stop_token);
         exact_cgroup_empty = node.cgroup->Empty();
       }
-      if (!RuntimeNodeSupportDestructionAllowed(daemon_absence_verified,
-                                                exact_cgroup_acquired,
-                                                exact_cgroup_empty)) {
+      if (!RuntimeNodeSupportDestructionAllowed(
+              daemon_absence_verified, exact_cgroup_acquired,
+              exact_cgroup_empty, allow_partial_preparation)) {
         throw std::runtime_error(
             "refusing support-resource destruction without verified daemon "
-            "absence and an empty exact-owned cgroup: " +
+            "absence and an empty exact-owned cgroup or an explicitly "
+            "permitted unacquired candidate cgroup: " +
             node.config.id);
       }
 
@@ -14772,15 +14777,24 @@ std::vector<bool> StopNodes(
       }
       bool network_identity_verified_absent = false;
       if (node.network) {
-        if (!node.network_namespace ||
-            !node.network_namespace->node_veth_identity()) {
+        if (!node.network_namespace) {
+          throw std::runtime_error(
+              "refusing node network deletion without its namespace: " +
+              node.config.id);
+        }
+        if (!node.network_namespace->node_veth_identity() &&
+            !allow_partial_preparation) {
           throw std::runtime_error(
               "refusing node network deletion without its acquired identity: " +
               node.config.id);
         }
-        DeleteNodeVethNetwork(*node.network,
-                              *node.network_namespace->node_veth_identity(),
-                              cleanup_stop_token);
+        if (node.network_namespace->node_veth_identity()) {
+          DeleteNodeVethNetwork(*node.network,
+                                *node.network_namespace->node_veth_identity(),
+                                cleanup_stop_token);
+        } else {
+          DeleteNodeVethNetwork(*node.network, cleanup_stop_token);
+        }
         network_identity_verified_absent = true;
         cleanup_step("network removed event", [&] {
           WriteEvent(events_path, options.run_id, node.config.id,
@@ -14791,7 +14805,8 @@ std::vector<bool> StopNodes(
         node.network_namespace->StopAndVerify(shutdown_deadline,
                                               cleanup_stop_token);
       }
-      if (options.cleanup_policy != CleanupPolicy::kRetainCgroups) {
+      if (options.cleanup_policy != CleanupPolicy::kRetainCgroups &&
+          node.cgroup) {
         try {
           node.cgroup->Remove(shutdown_deadline, cleanup_stop_token);
         } catch (const std::exception& error) {
@@ -14963,10 +14978,20 @@ bool SimulationCommandRequiresNodeMutationLock(SimulationCommandKind kind) {
   }
 }
 
-std::vector<std::string> AddRuntimeNodesTransactional(
+struct RuntimeNodeAddResult {
+  std::vector<std::string> added_node_ids;
+  std::uint64_t inventory_generation = 0U;
+  std::uint32_t final_node_count = 0U;
+  std::vector<WalletIdentity> added_wallets;
+  std::optional<std::uint64_t> wallet_generation;
+  std::optional<std::size_t> final_wallet_count;
+};
+
+RuntimeNodeAddResult AddRuntimeNodesTransactional(
     const Options& options, const std::filesystem::path& run_root,
     const std::filesystem::path& events_path, const ChainDriverSpec& chain_spec,
     const ChainDriver& driver, RuntimeNodeInventory& inventory,
+    RuntimeWalletRegistry* wallet_registry,
     PeerConnectivityController& peer_controller,
     std::unique_ptr<RuntimePeerTopology>* runtime_topology,
     PeerTopologyConfig* live_topology_config,
@@ -14982,6 +15007,14 @@ std::vector<std::string> AddRuntimeNodesTransactional(
     throw std::runtime_error("node-add count must be greater than zero");
   }
   const RuntimeNodeSnapshot before = inventory.Snapshot();
+  RuntimeWalletSnapshot before_wallets;
+  if (wallet_registry != nullptr) {
+    before_wallets = wallet_registry->Snapshot();
+    if (before_wallets.wallets().size() >
+        std::numeric_limits<std::uint32_t>::max() - request.count) {
+      throw std::overflow_error("wallet.add wallet index exceeds uint32");
+    }
+  }
   if (before.generation() == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("node-add inventory generation overflow");
   }
@@ -15137,7 +15170,7 @@ std::vector<std::string> AddRuntimeNodesTransactional(
     config_request.node_index = resource_slots.at(before.size() + index);
     config_request.node_id = node_ids[index];
     config_request.network = ChainNetwork::kRegtest;
-    config_request.wallet_enabled = false;
+    config_request.wallet_enabled = wallet_registry != nullptr;
     ChainNodeConfig config = MakeChainNodeConfig(chain_spec, config_request);
     if (options.isolate_network) {
       config.rpc_host =
@@ -15310,6 +15343,8 @@ std::vector<std::string> AddRuntimeNodesTransactional(
   std::vector<bool> directional_policy_updated(before.size(), false);
   bool physical_peer_mutation_started = false;
   bool published = false;
+  RuntimeNodeAddResult result;
+  result.added_node_ids = node_ids;
   const std::filesystem::path staged_events_path =
       run_root / ".runtime-node-add-events.pending";
   bool staged_events_created = false;
@@ -15384,7 +15419,7 @@ std::vector<std::string> AddRuntimeNodesTransactional(
         resource_cleanup_verified =
             StopNodes(rollback_options, staged_events_path, driver,
                       cleanup_nodes, true, false, &cleanup_resource_slots,
-                      rollback_deadline, rollback_stop_token);
+                      rollback_deadline, rollback_stop_token, true);
         if (resource_cleanup_verified.size() != cleanup_nodes.size()) {
           throw std::runtime_error(
               "candidate cleanup returned an invalid result count");
@@ -15798,6 +15833,45 @@ std::vector<std::string> AddRuntimeNodesTransactional(
       operation_control->ReportProgress(4U);
     }
 
+    std::vector<WalletIdentity> added_wallets;
+    if (wallet_registry != nullptr) {
+      const WalletInitialization initialization =
+          before_wallets.registry().wallet_initialization();
+      added_wallets.reserve(insertions.size());
+      for (std::size_t offset = 0U; offset < insertions.size(); ++offset) {
+        ThrowIfStopRequested(stop_token);
+        NodeRuntime& node = *insertions[offset].runtime;
+        WalletIdentity wallet{
+            .wallet_index = static_cast<std::uint32_t>(
+                before_wallets.wallets().size() + offset + 1U),
+            .node = static_cast<std::uint32_t>(before.size() + offset + 1U),
+            .node_id = node.config.id,
+            .address = {},
+            .funding_address = {},
+        };
+        WriteEvent(staged_events_path, options.run_id, node.config.id,
+                   SimulationEventKind::kWalletAddressRequested,
+                   WalletAddressDetail(wallet, initialization));
+        wallet.address = driver.CreateWalletAddress(
+            node.config, ToChainWalletMode(initialization), stop_token);
+        if (wallet.address.empty()) {
+          throw std::runtime_error(
+              "wallet.add chain RPC returned an empty address");
+        }
+        wallet.funding_address = driver.CreateWalletFundingAddress(
+            node.config, ToChainWalletMode(initialization), wallet.address,
+            stop_token);
+        if (wallet.funding_address.empty()) {
+          throw std::runtime_error(
+              "wallet.add chain RPC returned an empty funding address");
+        }
+        WriteEvent(staged_events_path, options.run_id, node.config.id,
+                   SimulationEventKind::kWalletAddressCreated,
+                   WalletAddressDetail(wallet, initialization));
+        added_wallets.push_back(std::move(wallet));
+      }
+    }
+
     boost::json::array published_node_ids;
     boost::json::array published_node_configs;
     published_node_ids.reserve(final_count);
@@ -15841,10 +15915,15 @@ std::vector<std::string> AddRuntimeNodesTransactional(
       staged_offset = end + 1U;
     }
 
-    RuntimeNodeInventory::PreparedAppend prepared =
-        inventory.PrepareAppend(before.generation(), insertions, final_configs);
     std::unique_lock<std::timed_mutex> publication_lock =
         AcquireRuntimePublicationLock(stop_token);
+    RuntimeNodeInventory::PreparedAppend prepared =
+        inventory.PrepareAppend(before.generation(), insertions, final_configs);
+    std::optional<RuntimeWalletRegistry::PreparedAppend> prepared_wallet_append;
+    if (wallet_registry != nullptr) {
+      prepared_wallet_append.emplace(wallet_registry->PrepareAppend(
+          before_wallets.generation(), added_wallets, final_count));
+    }
     std::unique_lock<std::mutex> network_lock(node_network_state_mutex);
     if (operation_control != nullptr) {
       if (!operation_control->TryBeginCommit()) {
@@ -15866,8 +15945,21 @@ std::vector<std::string> AddRuntimeNodesTransactional(
     static_assert(std::is_nothrow_swappable_v<PeerTopologyConfig>);
     using std::swap;
     swap(*live_topology_config, next_topology_config);
-    static_cast<void>(prepared.Commit());
+    const RuntimeNodeSnapshot published_nodes = prepared.Commit();
+    std::optional<RuntimeWalletSnapshot> published_wallets;
+    if (prepared_wallet_append) {
+      static_assert(
+          std::is_nothrow_move_constructible_v<RuntimeWalletSnapshot>);
+      published_wallets.emplace(prepared_wallet_append->Commit());
+    }
     published = true;
+    result.inventory_generation = published_nodes.generation();
+    result.final_node_count =
+        static_cast<std::uint32_t>(published_nodes.size());
+    if (published_wallets) {
+      result.wallet_generation = published_wallets->generation();
+      result.final_wallet_count = published_wallets->wallets().size();
+    }
     RuntimeNodeResourceManifest live_manifest = pending_manifest;
     for (RuntimeNodeResourceEntry& entry : live_manifest.nodes) {
       entry.state = RuntimeNodeResourceState::kLive;
@@ -15898,6 +15990,12 @@ std::vector<std::string> AddRuntimeNodesTransactional(
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRuntimeGenerationPublished,
                boost::json::serialize(published_generation_detail));
+    if (published_wallets) {
+      WriteEvent(events_path, options.run_id, "sim",
+                 SimulationEventKind::kRuntimeWalletGenerationPublished,
+                 boost::json::serialize(RuntimeWalletGenerationDetail(
+                     *published_wallets, added_wallets)));
+    }
     for (const std::string& record : staged_event_records) {
       AppendLine(events_path, record);
     }
@@ -15906,6 +16004,7 @@ std::vector<std::string> AddRuntimeNodesTransactional(
       operation_control->MarkCommitted();
       operation_control->ReportProgress(kSimulationNodeAddProgressTotal);
     }
+    result.added_wallets = std::move(added_wallets);
   } catch (...) {
     const std::exception_ptr failure = std::current_exception();
     if (published) {
@@ -15932,7 +16031,7 @@ std::vector<std::string> AddRuntimeNodesTransactional(
     }
     std::rethrow_exception(failure);
   }
-  return node_ids;
+  return result;
 }
 
 std::filesystem::path BenchmarkRunRoot(const Options& options) {
@@ -17145,9 +17244,22 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 command.kind != SimulationCommandKind::kSendWalletTransaction &&
                 command.kind != SimulationCommandKind::kPartitionNodes &&
                 command.kind != SimulationCommandKind::kHealPartition;
-            const RuntimeNodeSnapshot nodes = needs_runtime_snapshot
-                                                  ? node_inventory.Snapshot()
-                                                  : RuntimeNodeSnapshot{};
+            RuntimeNodeSnapshot nodes;
+            std::optional<RuntimeWalletSnapshot> command_wallet_snapshot;
+            if (needs_runtime_snapshot) {
+              if (command.kind ==
+                  SimulationCommandKind::kSendWalletTransaction) {
+                std::unique_lock<std::timed_mutex> publication_lock =
+                    AcquireRuntimePublicationLock(command_stop_token);
+                nodes = node_inventory.Snapshot();
+                if (wallets_initialized.load(std::memory_order_acquire)) {
+                  command_wallet_snapshot.emplace(
+                      runtime_wallet_registry.Snapshot());
+                }
+              } else {
+                nodes = node_inventory.Snapshot();
+              }
+            }
             NodeRuntime unused_node;
             NodeRuntime& node =
                 needs_direct_node ? FindNodeRuntimeById(nodes, command.node_id)
@@ -17158,23 +17270,22 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
               std::lock_guard<std::mutex> topology_lock(runtime_topology_mutex);
               try {
-                command_outcome.added_node_ids = AddRuntimeNodesTransactional(
+                RuntimeNodeAddResult added = AddRuntimeNodesTransactional(
                     options, run_root, events_path, chain_spec, driver,
-                    node_inventory, *peer_connectivity_controller,
+                    node_inventory, nullptr, *peer_connectivity_controller,
                     &runtime_topology, &live_topology_config, run_process_state,
                     lifecycle_epoch, *command.node_add,
                     command.operation_control.get(), command_stop_token);
+                command_outcome.added_node_ids =
+                    std::move(added.added_node_ids);
+                command_outcome.inventory_generation =
+                    added.inventory_generation;
+                command_outcome.final_node_count = added.final_node_count;
               } catch (const SimulationNodeResourceUnavailable& error) {
                 command.operation_control->RecordNodeResourceFailure(
                     error.failure());
                 throw;
               }
-              const RuntimeNodeSnapshot published_nodes =
-                  node_inventory.Snapshot();
-              command_outcome.inventory_generation =
-                  published_nodes.generation();
-              command_outcome.final_node_count =
-                  static_cast<std::uint32_t>(published_nodes.size());
             } else if (command.kind ==
                        SimulationCommandKind::kExportNodeReport) {
               ExportNodeReport(run_root, command);
@@ -17201,8 +17312,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                           send.fee_satoshis) {
                 throw std::runtime_error("wallet send payload is invalid");
               }
-              const RuntimeWalletSnapshot wallet_snapshot =
-                  runtime_wallet_registry.Snapshot();
+              if (!command_wallet_snapshot) {
+                throw std::runtime_error(
+                    "wallet registry snapshot is unavailable for live sends");
+              }
+              const RuntimeWalletSnapshot& wallet_snapshot =
+                  *command_wallet_snapshot;
               const SimulationRegistry& registry = wallet_snapshot.registry();
               const WalletIdentity& sender = registry.WalletByIndex(
                   static_cast<std::size_t>(send.sender_wallet_index - 1U));
@@ -18219,11 +18334,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         options.metrics_sample_count, options.metrics_interval,
         [&](std::uint32_t sample) {
           RuntimeNodeSnapshot nodes;
+          std::optional<RuntimeWalletSnapshot> wallet_snapshot;
           {
             std::unique_lock<std::timed_mutex> publication_lock =
                 AcquireRuntimePublicationLock(
                     metrics_rpc_stop_source.get_token());
             nodes = node_inventory.Snapshot();
+            if (wallets_initialized.load(std::memory_order_acquire)) {
+              wallet_snapshot.emplace(runtime_wallet_registry.Snapshot());
+            }
           }
           WriteMetricsSnapshot(
               metrics_path, options, driver, nodes, run_process_state,
@@ -18242,12 +18361,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           if (metrics_collector->StopRequested()) {
             return;
           }
-          if (wallets_initialized.load(std::memory_order_acquire)) {
-            const RuntimeWalletSnapshot wallet_snapshot =
-                runtime_wallet_registry.Snapshot();
+          if (wallet_snapshot) {
             WriteWalletMetricsSnapshot(
                 wallet_metrics_path, options, driver, nodes,
-                wallet_snapshot.registry(),
+                wallet_snapshot->registry(),
                 [&](std::uint32_t wallet_index, const NodeRuntime& node,
                     std::string_view error) {
                   boost::json::object detail;
@@ -19017,12 +19134,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           "mode",       "create_node", "readiness_confirmations",
           "timeout_sec"};
       RejectUnsupportedFields(arguments, kAllowedFields, "wallet.add");
-      if (arguments.if_contains("create_node") != nullptr) {
-        throw McpOperationFailure(
-            "wallet_node_creation_unavailable",
-            "wallet.add create_node is not available until wallet-enabled "
-            "node creation joins the node-add transaction",
-            false);
+      const boost::json::value* create_node =
+          arguments.if_contains("create_node");
+      if (create_node != nullptr && !create_node->is_object()) {
+        throw std::invalid_argument("wallet.add create_node must be an object");
       }
       const std::uint32_t count =
           JsonOptionalUint32Field(arguments, "count", 0U);
@@ -19061,20 +19176,27 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               "wallet.add with node_id requires count=1");
         }
       }
+      if (requested_node_id && create_node != nullptr) {
+        throw std::invalid_argument(
+            "wallet.add node_id and create_node are mutually exclusive");
+      }
 
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
       std::stop_source bounded_stop_source;
+      std::atomic_bool deadline_expired = false;
       std::stop_callback stop_on_operation(
           operation_stop_token,
           [&bounded_stop_source] { bounded_stop_source.request_stop(); });
       std::jthread deadline_timer(
-          [deadline, &bounded_stop_source](std::stop_token timer_stop_token) {
+          [deadline, &bounded_stop_source,
+           &deadline_expired](std::stop_token timer_stop_token) {
             try {
               WaitUntil(deadline, timer_stop_token);
             } catch (const SimulationCancelled&) {
               return;
             }
+            deadline_expired.store(true, std::memory_order_release);
             bounded_stop_source.request_stop();
           });
       const std::stop_token bounded_stop_token =
@@ -19092,6 +19214,148 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         throw McpOperationFailure(
             "wallet_mode_conflict",
             "wallet.add mode must match the active run wallet mode", false);
+      }
+
+      if (create_node != nullptr) {
+        Options validation_options = options;
+        validation_options.nodes =
+            static_cast<std::uint32_t>(current_nodes.size());
+        SimulationNodeAddRequest node_request;
+        try {
+          node_request = ParseAndValidateSimulationNodeAddRequest(
+              create_node->as_object(), validation_options);
+        } catch (const std::runtime_error& error) {
+          if (std::string_view(error.what()) !=
+              "node.add request exceeds the configured node capacity") {
+            throw;
+          }
+          throw McpOperationFailure(
+              "node_capacity_exceeded", error.what(), false,
+              boost::json::array{boost::json::object{
+                  {"code", "node_capacity_exceeded"},
+                  {"message",
+                   "the requested wallet-node batch exceeds available "
+                   "capacity"},
+                  {"path", "create_node.count"},
+                  {"requested_count", count},
+                  {"current_node_count", current_nodes.size()},
+                  {"node_capacity", node_inventory.capacity()},
+                  {"available_node_capacity",
+                   current_nodes.size() <= node_inventory.capacity()
+                       ? node_inventory.capacity() - current_nodes.size()
+                       : 0U},
+                  {"recoverable", false}}});
+        }
+        if (node_request.count != count) {
+          throw std::invalid_argument(
+              "wallet.add count must match create_node.count");
+        }
+
+        SimulationCommandControl node_add_control;
+        node_add_control.absolute_deadline = deadline;
+        std::stop_callback cancel_node_add(bounded_stop_token, [&] {
+          static_cast<void>(node_add_control.RequestCancellation(
+              deadline_expired.load(std::memory_order_acquire)
+                  ? SimulationCommandCancellationCause::kDeadline
+                  : SimulationCommandCancellationCause::kClientCancel));
+        });
+        const auto cancellation_won = [&] {
+          return node_add_control.CommitPhase() ==
+                 SimulationCommandCommitPhase::kCancelled;
+        };
+        RuntimeNodeAddResult added;
+        try {
+          std::lock_guard<std::mutex> topology_lock(runtime_topology_mutex);
+          added = AddRuntimeNodesTransactional(
+              options, run_root, events_path, chain_spec, driver,
+              node_inventory, &runtime_wallet_registry,
+              *peer_connectivity_controller, &runtime_topology,
+              &live_topology_config, run_process_state, lifecycle_epoch,
+              node_request, &node_add_control, bounded_stop_token);
+        } catch (const SimulationNodeResourceUnavailable& error) {
+          if (cancellation_won()) {
+            throw SimulationCancelled();
+          }
+          const SimulationNodeResourceFailure& failure = error.failure();
+          throw McpOperationFailure(
+              "node_resource_unavailable", error.what(), true,
+              boost::json::array{boost::json::object{
+                  {"code", "node_resource_unavailable"},
+                  {"message", error.what()},
+                  {"path", "create_node"},
+                  {"resource_kind", failure.resource_kind},
+                  {"node_id", failure.node_id},
+                  {"address", failure.address},
+                  {"port", failure.port},
+                  {"purpose", failure.purpose},
+                  {"mutation_started", failure.mutation_started},
+                  {"action", "wallet.add"},
+                  {"recoverable", true}}});
+        } catch (const SimulationCommandOutcomeUnconfirmed& error) {
+          mcp_application.MarkRunStopping();
+          simulation_stop_source.request_stop();
+          throw McpOperationFailure(
+              "wallet_add_outcome_unconfirmed",
+              "wallet.add create_node outcome is unconfirmed: " +
+                  std::string(error.what()),
+              false);
+        } catch (const std::exception&) {
+          if (cancellation_won()) {
+            throw SimulationCancelled();
+          }
+          throw;
+        } catch (...) {
+          if (cancellation_won()) {
+            throw SimulationCancelled();
+          }
+          throw;
+        }
+
+        try {
+          if (!added.wallet_generation || !added.final_wallet_count ||
+              added.added_wallets.size() != count ||
+              added.added_node_ids.size() != count) {
+            throw std::logic_error(
+                "wallet.add create_node omitted its joint publication "
+                "evidence");
+          }
+          boost::json::array added_node_ids;
+          boost::json::array affected_node_ids;
+          boost::json::array wallets_json;
+          added_node_ids.reserve(added.added_node_ids.size());
+          affected_node_ids.reserve(added.added_node_ids.size());
+          wallets_json.reserve(added.added_wallets.size());
+          for (const std::string& node_id : added.added_node_ids) {
+            added_node_ids.emplace_back(node_id);
+            affected_node_ids.emplace_back(node_id);
+          }
+          for (const WalletIdentity& wallet : added.added_wallets) {
+            wallets_json.push_back(
+                RuntimeWalletIdentityJson(wallet, initialization));
+          }
+          return boost::json::object{
+              {"added_node_ids", std::move(added_node_ids)},
+              {"removed_node_ids", boost::json::array{}},
+              {"affected_node_ids", std::move(affected_node_ids)},
+              {"action", "wallet.add"},
+              {"state", "ready"},
+              {"unchanged", false},
+              {"wallets", std::move(wallets_json)},
+              {"inventory_generation", added.inventory_generation},
+              {"final_node_count", added.final_node_count},
+              {"wallet_generation", *added.wallet_generation},
+              {"final_wallet_count", *added.final_wallet_count},
+          };
+        } catch (...) {
+          mcp_application.MarkRunStopping();
+          simulation_stop_source.request_stop();
+          throw McpOperationFailure(
+              "wallet_add_outcome_unconfirmed",
+              "wallet.add create_node published but completion evidence "
+              "failed: " +
+                  ExceptionMessage(std::current_exception()),
+              false);
+        }
       }
 
       std::vector<std::size_t> selected_indexes;
@@ -19181,13 +19445,13 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         added_wallets.push_back(std::move(wallet));
       }
 
+      std::unique_lock<std::timed_mutex> publication_lock =
+          AcquireRuntimePublicationLock(bounded_stop_token);
+      ThrowIfStopRequested(bounded_stop_token);
       RuntimeWalletRegistry::PreparedAppend prepared =
           runtime_wallet_registry.PrepareAppend(
               before_wallets.generation(), added_wallets,
               static_cast<std::uint32_t>(current_nodes.size()));
-      std::unique_lock<std::timed_mutex> publication_lock =
-          AcquireRuntimePublicationLock(bounded_stop_token);
-      ThrowIfStopRequested(bounded_stop_token);
       const RuntimeWalletSnapshot published = prepared.Commit();
       try {
         for (const WalletIdentity& wallet : added_wallets) {
@@ -19217,6 +19481,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             {"state", "ready"},
             {"unchanged", false},
             {"wallets", std::move(wallets_json)},
+            {"inventory_generation", current_nodes.generation()},
+            {"final_node_count", current_nodes.size()},
             {"wallet_generation", published.generation()},
             {"final_wallet_count", published.wallets().size()},
         };
@@ -19285,10 +19551,12 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStarted();
     {
       RuntimeNodeSnapshot nodes;
+      RuntimeWalletSnapshot wallet_snapshot;
       {
         std::unique_lock<std::timed_mutex> publication_lock =
             AcquireRuntimePublicationLock(stop_token);
         nodes = node_inventory.Snapshot();
+        wallet_snapshot = runtime_wallet_registry.Snapshot();
       }
       WriteMetricsSnapshot(
           metrics_path, options, driver, nodes, run_process_state,
@@ -19306,7 +19574,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           {}, stop_token);
       WriteWalletMetricsSnapshot(
           wallet_metrics_path, options, driver, nodes,
-          runtime_wallet_registry.Snapshot().registry(),
+          wallet_snapshot.registry(),
           [&](std::uint32_t wallet_index, const NodeRuntime& node,
               std::string_view error) {
             boost::json::object detail;
@@ -20516,11 +20784,12 @@ int RunRetainedTuiWithMcp(const Options& cli_options,
 }  // namespace
 
 #ifdef BBP_ENABLE_TEST_HOOKS
-bool RuntimeNodeSupportDestructionAllowedForTest(bool daemon_absence_verified,
-                                                 bool exact_cgroup_acquired,
-                                                 bool exact_cgroup_empty) {
+bool RuntimeNodeSupportDestructionAllowedForTest(
+    bool daemon_absence_verified, bool exact_cgroup_acquired,
+    bool exact_cgroup_empty, bool allow_partial_preparation) {
   return RuntimeNodeSupportDestructionAllowed(
-      daemon_absence_verified, exact_cgroup_acquired, exact_cgroup_empty);
+      daemon_absence_verified, exact_cgroup_acquired, exact_cgroup_empty,
+      allow_partial_preparation);
 }
 #endif
 

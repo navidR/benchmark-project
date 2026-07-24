@@ -7,10 +7,10 @@
 
 namespace {
 
-bbp::SimulationRegistry EmptyRegistry() {
+bbp::SimulationRegistry EmptyRegistry(std::uint32_t node_count = 2U) {
   bbp::NodeRoleTopology topology;
   topology.configured = true;
-  topology.node_count = 2U;
+  topology.node_count = node_count;
   return bbp::SimulationRegistry::FromTopology(topology, {});
 }
 
@@ -31,11 +31,18 @@ BOOST_AUTO_TEST_CASE(runtime_wallet_registry_publishes_one_atomic_generation) {
   registry.Initialize(EmptyRegistry());
   const bbp::RuntimeWalletSnapshot before = registry.Snapshot();
 
+  {
+    auto abandoned = registry.PrepareAppend(
+        before.generation(), {Wallet(1U, "firo-1", "abandoned-address")}, 2U);
+    BOOST_TEST(before.wallets().empty());
+  }
+  BOOST_TEST(registry.Snapshot().generation() == before.generation());
+
   auto prepared = registry.PrepareAppend(
       before.generation(),
       {Wallet(1U, "firo-1", "address-1"), Wallet(2U, "firo-2", "address-2")},
       2U);
-  BOOST_TEST(registry.Snapshot().wallets().empty());
+  BOOST_TEST(before.wallets().empty());
 
   const bbp::RuntimeWalletSnapshot after = prepared.Commit();
   BOOST_TEST(after.generation() == before.generation() + 1U);
@@ -62,4 +69,23 @@ BOOST_AUTO_TEST_CASE(runtime_wallet_registry_rejects_stale_or_invalid_append) {
       registry.PrepareAppend(registry.Snapshot().generation(),
                              {Wallet(3U, "firo-3", "address-3")}, 2U),
       std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_wallet_registry_prepares_wallet_role_for_new_node_generation) {
+  bbp::RuntimeWalletRegistry registry;
+  registry.Initialize(EmptyRegistry(1U));
+  const bbp::RuntimeWalletSnapshot before = registry.Snapshot();
+
+  auto prepared = registry.PrepareAppend(
+      before.generation(), {Wallet(2U, "firo-2", "address-2")}, 2U);
+  BOOST_TEST(before.registry().topology().node_count == 1U);
+
+  const bbp::RuntimeWalletSnapshot after = prepared.Commit();
+  BOOST_TEST(after.registry().topology().node_count == 2U);
+  BOOST_TEST(after.registry().topology().wallet_nodes ==
+                 std::vector<std::uint32_t>{1U},
+             boost::test_tools::per_element());
+  BOOST_TEST(before.registry().topology().node_count == 1U);
+  BOOST_TEST(before.wallets().empty());
 }

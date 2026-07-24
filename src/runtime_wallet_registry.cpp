@@ -51,7 +51,7 @@ RuntimeWalletSnapshot RuntimeWalletRegistry::Snapshot() const {
 RuntimeWalletRegistry::PreparedAppend RuntimeWalletRegistry::PrepareAppend(
     std::uint64_t expected_generation, std::vector<WalletIdentity> wallets,
     std::uint32_t runtime_node_count) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   if (generation_->sequence == 0U) {
     throw std::logic_error("runtime wallet registry is not initialized");
   }
@@ -93,22 +93,18 @@ RuntimeWalletRegistry::PreparedAppend RuntimeWalletRegistry::PrepareAppend(
           .sequence = generation_->sequence + 1U,
           .registry = std::move(next),
       });
-  return PreparedAppend(this, expected_generation, std::move(next_generation));
+  return PreparedAppend(this, std::move(lock), std::move(next_generation));
 }
 
-RuntimeWalletSnapshot RuntimeWalletRegistry::PreparedAppend::Commit() {
-  if (owner_ == nullptr || !generation_) {
-    throw std::logic_error("runtime wallet append is not prepared");
-  }
-  std::lock_guard<std::mutex> lock(owner_->mutex_);
-  if (owner_->generation_->sequence != expected_generation_) {
-    throw std::runtime_error(
-        "runtime wallet registry changed before publication");
+RuntimeWalletSnapshot RuntimeWalletRegistry::PreparedAppend::Commit() noexcept {
+  if (owner_ == nullptr || !lock_.owns_lock() ||
+      lock_.mutex() != &owner_->mutex_ || !generation_) {
+    std::terminate();
   }
   owner_->generation_.swap(generation_);
   RuntimeWalletSnapshot snapshot(owner_->generation_);
+  lock_.unlock();
   owner_ = nullptr;
-  expected_generation_ = 0U;
   generation_.reset();
   return snapshot;
 }

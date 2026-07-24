@@ -21,7 +21,8 @@ class RuntimeWalletSnapshot {
   struct Generation;
   friend class RuntimeWalletRegistry;
 
-  explicit RuntimeWalletSnapshot(std::shared_ptr<const Generation> generation)
+  explicit RuntimeWalletSnapshot(
+      std::shared_ptr<const Generation> generation) noexcept
       : generation_(std::move(generation)) {}
 
   std::shared_ptr<const Generation> generation_;
@@ -37,20 +38,20 @@ class RuntimeWalletRegistry {
     PreparedAppend(const PreparedAppend&) = delete;
     PreparedAppend& operator=(const PreparedAppend&) = delete;
 
-    [[nodiscard]] RuntimeWalletSnapshot Commit();
+    [[nodiscard]] RuntimeWalletSnapshot Commit() noexcept;
 
    private:
     friend class RuntimeWalletRegistry;
 
     PreparedAppend(
-        RuntimeWalletRegistry* owner, std::uint64_t expected_generation,
+        RuntimeWalletRegistry* owner, std::unique_lock<std::mutex> lock,
         std::shared_ptr<const RuntimeWalletSnapshot::Generation> generation)
         : owner_(owner),
-          expected_generation_(expected_generation),
+          lock_(std::move(lock)),
           generation_(std::move(generation)) {}
 
     RuntimeWalletRegistry* owner_ = nullptr;
-    std::uint64_t expected_generation_ = 0U;
+    std::unique_lock<std::mutex> lock_;
     std::shared_ptr<const RuntimeWalletSnapshot::Generation> generation_;
   };
 
