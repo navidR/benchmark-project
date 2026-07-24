@@ -2148,7 +2148,7 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
-    mcp_live_wallet_add_routes_authoritative_role_mutation_service) {
+    mcp_live_wallet_lifecycle_routes_authoritative_role_mutation_service) {
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -2172,12 +2172,37 @@ BOOST_AUTO_TEST_CASE(
       application.SupportedOperations();
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kAddWallet) != supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kRemoveWallet) != supported.end());
 
   auto service = std::make_shared<McpLiveRoleService>();
   service->operation = [](McpOperationKind kind,
                           const boost::json::object& arguments,
                           std::stop_token stop_token) {
-    BOOST_CHECK(kind == McpOperationKind::kAddWallet);
+    BOOST_CHECK(kind == McpOperationKind::kAddWallet ||
+                kind == McpOperationKind::kRemoveWallet);
+    if (kind == McpOperationKind::kRemoveWallet) {
+      BOOST_TEST(arguments.at("node_id").as_string() == "firo-1");
+      return boost::json::object{
+          {"added_node_ids", boost::json::array{}},
+          {"removed_node_ids", boost::json::array{}},
+          {"affected_node_ids", boost::json::array{"firo-1"}},
+          {"action", "wallet.remove"},
+          {"state", "removed"},
+          {"unchanged", false},
+          {"wallets", boost::json::array{boost::json::object{
+                          {"wallet_index", 1U},
+                          {"node", 1U},
+                          {"node_id", "firo-1"},
+                          {"mode", "public"},
+                          {"address", "wallet-address"},
+                          {"funding_address", "wallet-address"}}}},
+          {"inventory_generation", 1U},
+          {"final_node_count", 1U},
+          {"wallet_generation", 3U},
+          {"final_wallet_count", 0U},
+      };
+    }
     BOOST_TEST(arguments.at("count").as_uint64() == 1U);
     BOOST_TEST(arguments.at("mode").as_string() == "public");
     if (stop_token.stop_requested()) {
@@ -2231,6 +2256,20 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(result.at("state").as_string() == "ready");
   BOOST_TEST(result.at("wallet_generation").as_uint64() == 2U);
   BOOST_TEST(result.at("wallets").as_array().size() == 1U);
+
+  const boost::json::object removed =
+      Invoke(&dispatcher, "wallet.remove",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"}});
+  const boost::json::object removed_terminal =
+      WaitForTerminal(&dispatcher, removed);
+  BOOST_TEST(removed_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& removed_result =
+      removed_terminal.at("terminal_result").as_object();
+  BOOST_TEST(removed_result.at("result_family").as_string() == "mutation");
+  BOOST_TEST(removed_result.at("action").as_string() == "wallet.remove");
+  BOOST_TEST(removed_result.at("state").as_string() == "removed");
+  BOOST_TEST(removed_result.at("final_wallet_count").as_uint64() == 0U);
 
   const boost::json::object created = Invoke(
       &dispatcher, "wallet.add",

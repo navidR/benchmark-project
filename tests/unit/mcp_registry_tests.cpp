@@ -522,6 +522,8 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
       BuildMcpOperationInputSchema(McpOperationKind::kAddWallet);
   const boost::json::object& wallet_create_node =
       wallet_add.at("properties").as_object().at("create_node").as_object();
+  const boost::json::object wallet_remove =
+      BuildMcpOperationInputSchema(McpOperationKind::kRemoveWallet);
   const boost::json::object miner_add =
       BuildMcpOperationInputSchema(McpOperationKind::kAddMiner);
   const boost::json::object& miner_create_nodes =
@@ -536,6 +538,8 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                  .as_object()
                  .at("maximum")
                  .as_uint64() == kSimulationNodeAddMaximumCount);
+  BOOST_TEST(
+      StringSet(ArrayField(wallet_remove, "required")).contains("node_id"));
   BOOST_TEST(generic_request == scheduled_request);
   BOOST_TEST(generic_request == direct_request);
   BOOST_TEST(generic_request == wallet_create_node);
@@ -667,6 +671,20 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                  .as_object()
                  .at("maximum")
                  .as_uint64() == std::numeric_limits<std::uint32_t>::max());
+  const boost::json::object wallet_remove_output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kRemoveWallet)
+          .at("oneOf")
+          .as_array()
+          .front()
+          .as_object();
+  const boost::json::object& wallet_remove_output_properties =
+      wallet_remove_output.at("properties").as_object();
+  for (const std::string_view field :
+       {"affected_node_ids", "action", "state", "wallets", "wallet_generation",
+        "final_wallet_count", "inventory_generation", "final_node_count"}) {
+    BOOST_TEST(wallet_remove_output_properties.contains(field));
+  }
+  BOOST_REQUIRE(wallet_remove_output.contains("allOf"));
   const boost::json::object miner_output =
       BuildMcpOperationOutputSchema(McpOperationKind::kAddMiner)
           .at("oneOf")

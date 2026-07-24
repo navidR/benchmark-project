@@ -124,6 +124,7 @@ class SimulationRegistry {
   }
 
   void AddWallet(WalletIdentity wallet);
+  void RemoveWalletNode(uint32_t node_index);
   void AddMinerNode(uint32_t node_index);
   void RemoveMinerNodes(const std::vector<uint32_t>& node_indexes);
   void AddMasternode(MasternodeIdentity masternode);

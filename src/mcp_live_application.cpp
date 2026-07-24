@@ -46,6 +46,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kKillNode,
     McpOperationKind::kRestartNode,
     McpOperationKind::kAddWallet,
+    McpOperationKind::kRemoveWallet,
     McpOperationKind::kAddMiner,
     McpOperationKind::kRemoveMiner,
     McpOperationKind::kAddMasternode,
@@ -708,6 +709,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kKillNode &&
       kind != McpOperationKind::kRestartNode &&
       kind != McpOperationKind::kAddWallet &&
+      kind != McpOperationKind::kRemoveWallet &&
       kind != McpOperationKind::kAddMiner &&
       kind != McpOperationKind::kRemoveMiner &&
       kind != McpOperationKind::kAddMasternode &&
@@ -757,6 +759,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   }
 
   if (kind == McpOperationKind::kAddWallet ||
+      kind == McpOperationKind::kRemoveWallet ||
       kind == McpOperationKind::kAddMiner ||
       kind == McpOperationKind::kRemoveMiner ||
       kind == McpOperationKind::kAddMasternode ||
@@ -782,7 +785,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             throw McpOperationCancelled();
           }
           const McpResultFamily result_family =
-              kind == McpOperationKind::kAddWallet
+              kind == McpOperationKind::kAddWallet ||
+                      kind == McpOperationKind::kRemoveWallet
                   ? McpResultFamily::kMutation
                   : McpResultFamily::kRoleMutation;
           result["result_family"] = McpResultFamilyName(result_family);

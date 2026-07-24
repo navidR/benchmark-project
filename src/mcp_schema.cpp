@@ -1752,8 +1752,8 @@ boost::json::object BuildMcpResultSchema(
       properties["affected_node_ids"] =
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       properties["action"] = StringSchema(1U);
-      properties["state"] = StringEnumSchema(
-          boost::json::array{"running", "stopped", "killed", "ready"});
+      properties["state"] = StringEnumSchema(boost::json::array{
+          "running", "stopped", "killed", "ready", "removed"});
       properties["command_id"] = IdentifierSchema();
       properties["unchanged"] = TypeSchema("boolean");
       properties["wallets"] = ArraySchema(WalletMutationIdentitySchema(), 1U,
@@ -1769,6 +1769,19 @@ boost::json::object BuildMcpResultSchema(
                                           {"action",
                                            ConstStringSchema("wallet.add")}}},
                                      {"required", Required({"action"})}}},
+          {"then",
+           boost::json::object{
+               {"required",
+                Required({"affected_node_ids", "state", "wallets",
+                          "wallet_generation", "final_wallet_count",
+                          "inventory_generation", "final_node_count"})}}}});
+      constraints.emplace_back(boost::json::object{
+          {"if",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"action", ConstStringSchema("wallet.remove")}}},
+               {"required", Required({"action"})}}},
           {"then",
            boost::json::object{
                {"required",

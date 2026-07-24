@@ -56,6 +56,29 @@ void SimulationRegistry::AddWallet(WalletIdentity wallet) {
   wallets_.push_back(std::move(wallet));
 }
 
+void SimulationRegistry::RemoveWalletNode(uint32_t node_index) {
+  const auto role = std::find(topology_.wallet_nodes.begin(),
+                              topology_.wallet_nodes.end(), node_index);
+  if (role == topology_.wallet_nodes.end()) {
+    throw std::runtime_error("wallet removal references an unregistered node");
+  }
+  const auto removed_begin = std::remove_if(
+      wallets_.begin(), wallets_.end(),
+      [node_index](const WalletIdentity& wallet) {
+        return wallet.node != 0U && wallet.node - 1U == node_index;
+      });
+  if (removed_begin == wallets_.end()) {
+    throw std::runtime_error("wallet role has no registered wallet identity");
+  }
+  wallets_.erase(removed_begin, wallets_.end());
+  topology_.wallet_nodes.erase(role);
+  topology_.wallet_node_count =
+      static_cast<uint32_t>(topology_.wallet_nodes.size());
+  for (std::size_t index = 0U; index < wallets_.size(); ++index) {
+    wallets_[index].wallet_index = static_cast<uint32_t>(index + 1U);
+  }
+}
+
 void SimulationRegistry::AddMinerNode(uint32_t node_index) {
   if (node_index >= topology_.node_count) {
     throw std::runtime_error("miner node is out of range");

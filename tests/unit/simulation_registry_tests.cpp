@@ -40,7 +40,7 @@ bbp::MasternodeIdentity Masternode(std::uint32_t node, std::string node_id,
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(simulation_registry_initializes_wallet_nodes) {
-  const bbp::SimulationRegistry registry =
+  bbp::SimulationRegistry registry =
       bbp::SimulationRegistry::FromTopology(TestTopology(), {});
 
   BOOST_REQUIRE_EQUAL(registry.wallets().size(), 2U);
@@ -48,6 +48,18 @@ BOOST_AUTO_TEST_CASE(simulation_registry_initializes_wallet_nodes) {
   BOOST_TEST(registry.wallets()[0].node == 1U);
   BOOST_TEST(registry.wallets()[0].address.empty());
   BOOST_TEST(registry.wallets()[1].node == 3U);
+
+  registry.RemoveWalletNode(0U);
+  BOOST_TEST(registry.topology().wallet_nodes == std::vector<std::uint32_t>{2U},
+             boost::test_tools::per_element());
+  BOOST_TEST(registry.topology().wallet_node_count == 1U);
+  BOOST_REQUIRE_EQUAL(registry.wallets().size(), 1U);
+  BOOST_TEST(registry.wallets().front().wallet_index == 1U);
+  BOOST_TEST(registry.wallets().front().node == 3U);
+  BOOST_CHECK_THROW(registry.RemoveWalletNode(0U), std::runtime_error);
+  registry.RemoveWalletNode(2U);
+  BOOST_TEST(registry.wallets().empty());
+  BOOST_TEST(registry.topology().wallet_nodes.empty());
 }
 
 BOOST_AUTO_TEST_CASE(simulation_registry_accepts_private_wallet_mode) {

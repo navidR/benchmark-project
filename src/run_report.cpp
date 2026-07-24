@@ -2536,6 +2536,93 @@ struct IncrementalRunReport::Impl {
         report["topology_current_edges"] = *topology_current_edges;
         break;
       }
+      case SimulationEventKind::kRuntimeWalletGenerationPublished: {
+        const boost::json::value detail = ParseEventDetail(event);
+        if (!detail.is_object()) {
+          throw std::runtime_error(
+              "runtime wallet generation publication detail is not an "
+              "object");
+        }
+        const boost::json::object& publication = detail.as_object();
+        const std::optional<std::uint64_t> generation =
+            OptionalUint64Field(publication, "generation");
+        const std::optional<std::uint64_t> wallet_count =
+            OptionalUint64Field(publication, "wallet_count");
+        const boost::json::value* current_wallets =
+            publication.if_contains("current_wallets");
+        if (!generation || *generation == 0U || !wallet_count) {
+          throw std::runtime_error(
+              "runtime wallet generation publication is incomplete");
+        }
+        report["wallet_generation"] = *generation;
+        if (current_wallets == nullptr) {
+          break;
+        }
+        if (!current_wallets->is_array() ||
+            current_wallets->as_array().size() != *wallet_count) {
+          throw std::runtime_error(
+              "runtime wallet generation current wallets are invalid");
+        }
+
+        std::map<std::uint64_t, WalletReport> next_wallets;
+        std::map<std::uint64_t, std::uint64_t> next_wallet_nodes;
+        std::set<std::string> addresses;
+        for (const boost::json::value& value : current_wallets->as_array()) {
+          if (!value.is_object()) {
+            throw std::runtime_error(
+                "runtime wallet generation identity is invalid");
+          }
+          const boost::json::object& identity = value.as_object();
+          const std::optional<std::uint64_t> wallet_index =
+              OptionalUint64Field(identity, "wallet_index");
+          const std::optional<std::uint64_t> node =
+              OptionalUint64Field(identity, "node");
+          const std::string node_id = OptionalStringField(identity, "node_id");
+          const std::string address = OptionalStringField(identity, "address");
+          const std::string funding_address =
+              OptionalStringField(identity, "funding_address");
+          const std::string mode = OptionalStringField(identity, "mode");
+          const std::optional<WalletPrivacyMode> parsed_mode =
+              WalletPrivacyModeFromName(mode);
+          if (!wallet_index || *wallet_index == 0U ||
+              *wallet_index > *wallet_count || !node || *node == 0U ||
+              node_id.empty() || address.empty() || funding_address.empty() ||
+              !parsed_mode || !addresses.insert(address).second ||
+              next_wallets.contains(*wallet_index)) {
+            throw std::runtime_error(
+                "runtime wallet generation identity is invalid");
+          }
+
+          WalletReport wallet;
+          const auto prior = std::find_if(
+              wallets.begin(), wallets.end(), [&](const auto& entry) {
+                return entry.second.address == address;
+              });
+          if (prior != wallets.end()) {
+            wallet = prior->second;
+          }
+          wallet.wallet_index = *wallet_index;
+          wallet.node = *node;
+          wallet.address = address;
+          wallet.funding_address = funding_address;
+          wallet.mode = *parsed_mode;
+          wallet.unknown_mode.clear();
+          next_wallets.emplace(*wallet_index, std::move(wallet));
+          next_wallet_nodes.emplace(*wallet_index, *node);
+        }
+        for (std::size_t offset = 0U;
+             offset < current_wallets->as_array().size(); ++offset) {
+          const std::uint64_t expected_index =
+              static_cast<std::uint64_t>(offset) + 1U;
+          if (!next_wallets.contains(expected_index)) {
+            throw std::runtime_error(
+                "runtime wallet generation indexes are not contiguous");
+          }
+        }
+        wallets.swap(next_wallets);
+        runtime_active_wallet_nodes = std::move(next_wallet_nodes);
+        break;
+      }
       case SimulationEventKind::kRuntimeRoleGenerationPublished: {
         const boost::json::value detail = ParseEventDetail(event);
         if (!detail.is_object()) {
@@ -2905,6 +2992,15 @@ struct IncrementalRunReport::Impl {
     if (!wallet_index || *wallet_index == 0U) {
       return;
     }
+    if (runtime_active_wallet_nodes) {
+      const auto active = runtime_active_wallet_nodes->find(*wallet_index);
+      const std::optional<std::uint64_t> node =
+          OptionalUint64Field(metric, "node");
+      if (active == runtime_active_wallet_nodes->end() || !node ||
+          *node != active->second) {
+        return;
+      }
+    }
     WalletReport& wallet = wallets[*wallet_index];
     wallet.wallet_index = *wallet_index;
     CopyOptionalUint64Field(metric, "node", &wallet.node);
@@ -3026,6 +3122,8 @@ struct IncrementalRunReport::Impl {
   std::map<std::string, NodeReport> nodes;
   std::optional<std::set<std::string>> runtime_active_node_ids;
   std::map<std::uint64_t, WalletReport> wallets;
+  std::optional<std::map<std::uint64_t, std::uint64_t>>
+      runtime_active_wallet_nodes;
   std::map<std::string, boost::json::object> active_network_partitions;
   std::map<std::uint64_t, TransactionLoadLiveReport> transaction_load_live;
   std::map<std::string, boost::json::object> wallet_workload_instances;

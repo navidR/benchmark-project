@@ -72,6 +72,17 @@ BOOST_AUTO_TEST_CASE(runtime_wallet_registry_publishes_one_atomic_generation) {
   BOOST_TEST(after.wallets()[0].node_id == "firo-1");
   BOOST_TEST(after.registry().topology().wallet_node_count == 2U);
   BOOST_TEST(before.wallets().empty());
+
+  bbp::SimulationRegistry replacement = after.registry();
+  replacement.RemoveWalletNode(0U);
+  auto removal =
+      registry.PrepareReplace(after.generation(), std::move(replacement));
+  const bbp::RuntimeWalletSnapshot removed = removal.Commit();
+  BOOST_TEST(removed.generation() == after.generation() + 1U);
+  BOOST_REQUIRE_EQUAL(removed.wallets().size(), 1U);
+  BOOST_TEST(removed.wallets().front().wallet_index == 1U);
+  BOOST_TEST(removed.wallets().front().node_id == "firo-2");
+  BOOST_TEST(after.wallets().size() == 2U);
 }
 
 BOOST_AUTO_TEST_CASE(runtime_wallet_registry_rejects_stale_or_invalid_append) {

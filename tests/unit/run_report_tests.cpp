@@ -289,6 +289,73 @@ BOOST_AUTO_TEST_CASE(
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    run_report_applies_wallet_removal_generation_and_ignores_late_metrics) {
+  const std::filesystem::path dir =
+      MakeTestDir("runtime-wallet-removal-report");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"load","chain":"firo","nodes":2,"node_configs":[{"index":1,"id":"firo-1","chain":"firo","role":"wallet"},{"index":2,"id":"firo-2","chain":"firo","role":"wallet"}]})");
+  AppendDetailEvent(dir, "wallet_address_created",
+                    boost::json::object{{"wallet_index", 1U},
+                                        {"node", 1U},
+                                        {"strategy", "driver_rpc"},
+                                        {"mode", "public"},
+                                        {"address", "address-1"},
+                                        {"funding_address", "funding-1"}},
+                    "firo-1");
+  AppendDetailEvent(dir, "wallet_address_created",
+                    boost::json::object{{"wallet_index", 2U},
+                                        {"node", 2U},
+                                        {"strategy", "driver_rpc"},
+                                        {"mode", "public"},
+                                        {"address", "address-2"},
+                                        {"funding_address", "funding-2"}},
+                    "firo-2");
+  AppendDetailEvent(
+      dir, "runtime_wallet_generation_published",
+      boost::json::object{
+          {"generation", 2U},
+          {"wallet_count", 1U},
+          {"node_ids", boost::json::array{"firo-1"}},
+          {"wallets", boost::json::array{}},
+          {"removed_wallets", boost::json::array{boost::json::object{
+                                  {"wallet_index", 1U},
+                                  {"node", 1U},
+                                  {"node_id", "firo-1"},
+                                  {"mode", "public"},
+                                  {"address", "address-1"},
+                                  {"funding_address", "funding-1"}}}},
+          {"current_wallets", boost::json::array{boost::json::object{
+                                  {"wallet_index", 1U},
+                                  {"node", 2U},
+                                  {"node_id", "firo-2"},
+                                  {"mode", "public"},
+                                  {"address", "address-2"},
+                                  {"funding_address", "funding-2"}}}}});
+  bbp::AppendLine(
+      dir / "wallet-metrics.jsonl",
+      R"({"run_id":"load","wallet_index":1,"node":1,"mode":"public","transaction_count":11})");
+  bbp::AppendLine(
+      dir / "wallet-metrics.jsonl",
+      R"({"run_id":"load","wallet_index":2,"node":2,"mode":"public","transaction_count":22})");
+  bbp::AppendLine(
+      dir / "wallet-metrics.jsonl",
+      R"({"run_id":"load","wallet_index":1,"node":2,"mode":"public","transaction_count":33})");
+
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  BOOST_TEST(JsonInteger(report, "wallet_generation") == 2U);
+  const boost::json::array& wallets = report.at("wallets_summary").as_array();
+  BOOST_REQUIRE_EQUAL(wallets.size(), 1U);
+  const boost::json::object& wallet = wallets.front().as_object();
+  BOOST_TEST(JsonInteger(wallet, "wallet_index") == 1U);
+  BOOST_TEST(JsonInteger(wallet, "node") == 2U);
+  BOOST_TEST(wallet.at("address").as_string() == "address-2");
+  BOOST_TEST(JsonInteger(wallet.at("last_metrics").as_object(),
+                         "transaction_count") == 33U);
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(item10_prefixed_report_retention_reproducer) {
   const std::filesystem::path dir = MakeTestDir("item10-prefixed-report");
   bbp::WriteText(dir / "resolved-scenario.json",
