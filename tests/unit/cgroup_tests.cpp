@@ -12,14 +12,18 @@
 #include <boost/test/unit_test.hpp>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "bbp/cgroup.h"
 #include "bbp/network.h"
+#include "bbp/process.h"
 #include "bbp/run_ownership.h"
 #include "bbp/simulator_app.h"
 #include "bbp/util.h"
@@ -101,6 +105,114 @@ class ChildGuard {
  private:
   pid_t pid_ = -1;
 };
+
+std::set<std::string> ControllerSet(const std::filesystem::path& path) {
+  const std::vector<std::string> controllers =
+      bbp::SplitWhitespace(bbp::ReadText(path));
+  return std::set<std::string>(controllers.begin(), controllers.end());
+}
+
+std::string ControllerNames(const std::set<std::string>& controllers) {
+  std::string result;
+  for (const std::string& controller : controllers) {
+    if (!result.empty()) {
+      result += ", ";
+    }
+    result += controller;
+  }
+  return result;
+}
+
+class TestScopeRunGuard {
+ public:
+  TestScopeRunGuard(bbp::CgroupScopeTestConfig config, std::string run_id)
+      : config_(std::move(config)), run_id_(std::move(run_id)) {
+    bbp::PrepareCgroupRunInTestScope(config_, run_id_);
+    active_ = true;
+  }
+
+  TestScopeRunGuard(const TestScopeRunGuard&) = delete;
+  TestScopeRunGuard& operator=(const TestScopeRunGuard&) = delete;
+
+  ~TestScopeRunGuard() {
+    try {
+      Remove();
+    } catch (const std::exception&) {
+    }
+  }
+
+  void Remove() {
+    if (!active_) {
+      return;
+    }
+    bbp::RemoveCgroupRunInTestScope(config_, run_id_);
+    active_ = false;
+  }
+
+ private:
+  bbp::CgroupScopeTestConfig config_;
+  std::string run_id_;
+  bool active_ = false;
+};
+
+class ChildProcessCollection {
+ public:
+  ChildProcessCollection() { children_.reserve(3U); }
+  ChildProcessCollection(const ChildProcessCollection&) = delete;
+  ChildProcessCollection& operator=(const ChildProcessCollection&) = delete;
+
+  ~ChildProcessCollection() { Stop(); }
+
+  bbp::ChildProcess& Add(bbp::ChildProcess child) {
+    children_.push_back(std::move(child));
+    return children_.back();
+  }
+
+  void Stop() {
+    for (bbp::ChildProcess& child : children_) {
+      try {
+        child.Terminate(std::chrono::seconds(2));
+      } catch (const std::exception&) {
+        try {
+          child.Kill();
+        } catch (const std::exception&) {
+        }
+      }
+    }
+  }
+
+ private:
+  std::vector<bbp::ChildProcess> children_;
+};
+
+std::map<std::string, std::string> RootProcessCgroups() {
+  std::map<std::string, std::string> result;
+  for (const std::string& pid :
+       bbp::SplitWhitespace(bbp::ReadText("/sys/fs/cgroup/cgroup.procs"))) {
+    const std::filesystem::path cgroup = "/proc/" + pid + "/cgroup";
+    std::error_code error;
+    if (std::filesystem::exists(cgroup, error) && !error) {
+      result.emplace(pid, bbp::ReadText(cgroup));
+    }
+  }
+  return result;
+}
+
+bool WaitForExecutable(pid_t pid, const std::filesystem::path& executable,
+                       std::chrono::milliseconds timeout) {
+  const std::filesystem::path expected = std::filesystem::canonical(executable);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  do {
+    std::error_code error;
+    const std::filesystem::path observed = std::filesystem::read_symlink(
+        "/proc/" + std::to_string(pid) + "/exe", error);
+    if (!error && observed == expected) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
 
 std::unique_ptr<PreparedRunGuard> PreparePrivilegedTestRun(std::string run_id) {
   try {
@@ -333,6 +445,11 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(cgroup_refuses_unprepared_and_preexisting_run_ownership) {
+  std::unique_ptr<PreparedRunGuard> delegated_parent =
+      PreparePrivilegedTestRun(UniqueRunId("foreign-parent"));
+  if (!delegated_parent) {
+    return;
+  }
   const std::string run_id = UniqueRunId("foreign");
   const std::filesystem::path run_path = RunCgroupPath(run_id);
   std::error_code ec;
@@ -754,7 +871,302 @@ BOOST_AUTO_TEST_CASE(network_namespace_helper_is_owned_by_node_cgroup) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    native_cgroup_scope_rejects_root_controller_gaps_before_mutation) {
+  const std::string suffix = UniqueRunId("native-preflight");
+  const std::filesystem::path root = "/sys/fs/cgroup";
+  const std::filesystem::path not_enabled_root = root / suffix;
+  const std::filesystem::path unavailable_root =
+      not_enabled_root / "unavailable";
+  const std::filesystem::path not_enabled_state =
+      TestDirectory(suffix + "-not-enabled-state");
+  const std::filesystem::path unavailable_state =
+      TestDirectory(suffix + "-unavailable-state");
+  std::error_code error;
+  std::filesystem::remove(not_enabled_state, error);
+  error.clear();
+  std::filesystem::remove(unavailable_state, error);
+  error.clear();
+  BOOST_REQUIRE(std::filesystem::create_directory(not_enabled_root, error));
+  BOOST_REQUIRE(!error);
+  BOOST_REQUIRE(std::filesystem::create_directory(unavailable_root, error));
+  BOOST_REQUIRE(!error);
+
+  try {
+    const std::set<std::string> required = {"cpu", "io", "memory", "pids"};
+    const bbp::CgroupScopeTestConfig unavailable_config{
+        .root = unavailable_root,
+        .simulator_name = "bbp-unavailable",
+        .state_file = unavailable_state,
+        .allow_root_process_move = false,
+    };
+    BOOST_CHECK_EXCEPTION(
+        bbp::PrepareCgroupRunInTestScope(unavailable_config, "unavailable-run"),
+        std::runtime_error, [](const std::runtime_error& failure) {
+          return std::string(failure.what())
+                         .find(
+                             "required native cgroup root controllers "
+                             "unavailable") != std::string::npos &&
+                 std::string(failure.what()).find("cpu, io, memory, pids") !=
+                     std::string::npos;
+        });
+    BOOST_TEST(!std::filesystem::exists(unavailable_state));
+    BOOST_TEST(!std::filesystem::exists(unavailable_root / "bbp-unavailable"));
+
+    const std::set<std::string> root_enabled =
+        ControllerSet(root / "cgroup.subtree_control");
+    const bool root_has_all_enabled =
+        std::includes(root_enabled.begin(), root_enabled.end(),
+                      required.begin(), required.end());
+    const std::filesystem::path& root_with_enablement_gap =
+        root_has_all_enabled ? not_enabled_root : root;
+    const std::set<std::string> gap_enabled =
+        ControllerSet(root_with_enablement_gap / "cgroup.subtree_control");
+    std::set<std::string> not_enabled;
+    std::set_difference(required.begin(), required.end(), gap_enabled.begin(),
+                        gap_enabled.end(),
+                        std::inserter(not_enabled, not_enabled.end()));
+    const std::string missing_names = ControllerNames(not_enabled);
+    const bbp::CgroupScopeTestConfig not_enabled_config{
+        .root = root_with_enablement_gap,
+        .simulator_name = "bbp-" + suffix + "-not-enabled",
+        .state_file = not_enabled_state,
+        .allow_root_process_move = false,
+    };
+    BOOST_CHECK_EXCEPTION(
+        bbp::PrepareCgroupRunInTestScope(not_enabled_config, "not-enabled-run"),
+        std::runtime_error, [missing_names](const std::runtime_error& failure) {
+          return std::string(failure.what())
+                         .find(
+                             "required native cgroup root controllers not "
+                             "enabled") != std::string::npos &&
+                 std::string(failure.what()).find(missing_names) !=
+                     std::string::npos;
+        });
+    BOOST_TEST(!std::filesystem::exists(not_enabled_state));
+    BOOST_TEST(!std::filesystem::exists(root_with_enablement_gap /
+                                        not_enabled_config.simulator_name));
+  } catch (...) {
+    std::filesystem::remove(unavailable_root, error);
+    error.clear();
+    std::filesystem::remove(not_enabled_root, error);
+    throw;
+  }
+
+  BOOST_REQUIRE(std::filesystem::remove(unavailable_root, error));
+  BOOST_REQUIRE(!error);
+  error.clear();
+  BOOST_REQUIRE(std::filesystem::remove(not_enabled_root, error));
+  BOOST_REQUIRE(!error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    native_cgroup_scope_preserves_every_preexisting_root_process) {
+  const std::filesystem::path root = "/sys/fs/cgroup";
+  const std::set<std::string> required = {"cpu", "io", "memory", "pids"};
+  const std::set<std::string> enabled =
+      ControllerSet(root / "cgroup.subtree_control");
+  if (!std::includes(enabled.begin(), enabled.end(), required.begin(),
+                     required.end())) {
+    BOOST_TEST_MESSAGE(
+        "skipping native root-process regression: this namespaced cgroup "
+        "root does not have all required controllers already enabled");
+    return;
+  }
+
+  const pid_t pid = fork();
+  BOOST_REQUIRE(pid >= 0);
+  if (pid == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+  ChildGuard child(pid);
+  if (!TryAttachPrivilegedTestProcess(root, pid,
+                                      "native root-process regression")) {
+    return;
+  }
+
+  const std::string suffix = UniqueRunId("native-root");
+  const std::filesystem::path state_file = TestDirectory(suffix + "-state");
+  std::error_code error;
+  std::filesystem::remove(state_file, error);
+  const bbp::CgroupScopeTestConfig config{
+      .root = root,
+      .simulator_name = "bbp-" + suffix,
+      .state_file = state_file,
+      .allow_root_process_move = false,
+  };
+  const std::filesystem::path simulator = root / config.simulator_name;
+  const std::string run_id = "native-run";
+  const std::string child_cgroup_before =
+      bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup");
+  const std::map<std::string, std::string> processes_before =
+      RootProcessCgroups();
+
+  TestScopeRunGuard run(config, run_id);
+  BOOST_TEST(std::filesystem::is_directory(simulator / run_id));
+  std::size_t intermediate_cgroups = 0U;
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(simulator)) {
+    if (entry.is_directory()) {
+      ++intermediate_cgroups;
+      BOOST_TEST(entry.path().filename() == run_id);
+    }
+  }
+  BOOST_TEST(intermediate_cgroups == 1U);
+  BOOST_TEST(bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup") ==
+             child_cgroup_before);
+  for (const auto& [existing_pid, cgroup_before] : processes_before) {
+    const std::filesystem::path cgroup = "/proc/" + existing_pid + "/cgroup";
+    error.clear();
+    if (std::filesystem::exists(cgroup, error) && !error) {
+      BOOST_TEST(bbp::ReadText(cgroup) == cgroup_before);
+    }
+  }
+
+  run.Remove();
+  BOOST_TEST(!std::filesystem::exists(simulator));
+  BOOST_TEST(!std::filesystem::exists(state_file));
+  BOOST_TEST(bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup") ==
+             child_cgroup_before);
+
+  kill(pid, SIGKILL);
+  const int status = child.Wait();
+  BOOST_REQUIRE(WIFSIGNALED(status));
+  BOOST_TEST(WTERMSIG(status) == SIGKILL);
+}
+
+BOOST_AUTO_TEST_CASE(
+    production_cgroup_launches_three_firod_processes_in_distinct_limited_nodes) {
+  const char* binary_environment = std::getenv("BBP_REAL_FIROD");
+  if (binary_environment == nullptr || *binary_environment == '\0') {
+    BOOST_TEST_MESSAGE(
+        "BBP_REAL_FIROD is unset; real Firo cgroup integration not requested");
+    return;
+  }
+  const std::filesystem::path binary = binary_environment;
+  BOOST_REQUIRE(std::filesystem::is_regular_file(binary));
+
+  const std::string suffix = UniqueRunId("native-firod");
+  const std::filesystem::path root = "/sys/fs/cgroup";
+  const std::filesystem::path data_root = TestDirectory(suffix + "-data");
+  const std::filesystem::path foreign = root / (suffix + "-foreign");
+  const std::string run_id = UniqueRunId("firod-run");
+  const std::filesystem::path run_root = RunCgroupPath(run_id);
+  const std::string root_controllers_before =
+      bbp::ReadText(root / "cgroup.subtree_control");
+  const std::map<std::string, std::string> processes_before =
+      RootProcessCgroups();
+  std::error_code error;
+  std::filesystem::remove_all(data_root, error);
+  error.clear();
+  BOOST_REQUIRE(std::filesystem::create_directory(foreign, error));
+  BOOST_REQUIRE(!error);
+
+  try {
+    std::filesystem::create_directories(data_root);
+    std::unique_ptr<PreparedRunGuard> run = PreparePrivilegedTestRun(run_id);
+    if (!run) {
+      std::filesystem::remove(foreign, error);
+      std::filesystem::remove_all(data_root, error);
+      return;
+    }
+    std::vector<bbp::Cgroup> nodes;
+    nodes.reserve(3U);
+    ChildProcessCollection children;
+    std::set<pid_t> pids;
+
+    for (std::size_t index = 0U; index < 3U; ++index) {
+      const std::string node_id = "node-" + std::to_string(index + 1U);
+      nodes.push_back(bbp::Cgroup::Create(run_id, node_id));
+      bbp::Cgroup& node = nodes.back();
+      const std::filesystem::path& node_root = node.path();
+
+      for (std::string_view file :
+           {"cpu.max", "memory.max", "io.weight", "pids.max"}) {
+        BOOST_TEST(std::filesystem::exists(node_root / file));
+      }
+      const std::uint64_t cpu_weight = 250U + static_cast<std::uint64_t>(index);
+      const std::uint64_t io_weight = 350U + static_cast<std::uint64_t>(index);
+      node.SetCpuMax(50000U, 100000U);
+      node.SetCpuWeight(cpu_weight);
+      node.SetMemoryHigh(805306368U);
+      node.SetMemoryMax(1073741824U);
+      node.SetIoWeight(io_weight);
+      node.SetPidsMax(512U);
+      BOOST_TEST(bbp::ReadText(node_root / "cpu.max") == "50000 100000\n");
+      BOOST_TEST(bbp::ReadText(node_root / "cpu.weight") ==
+                 std::to_string(cpu_weight) + "\n");
+      BOOST_TEST(bbp::ReadText(node_root / "memory.high") == "805306368\n");
+      BOOST_TEST(bbp::ReadText(node_root / "memory.max") == "1073741824\n");
+      BOOST_TEST(bbp::ReadText(node_root / "io.weight") ==
+                 "default " + std::to_string(io_weight) + "\n");
+      BOOST_TEST(bbp::ReadText(node_root / "pids.max") == "512\n");
+
+      const std::filesystem::path node_data = data_root / node_id;
+      std::filesystem::create_directories(node_data);
+      bbp::ProcessSpec process;
+      process.binary = binary;
+      process.cwd = node_data;
+      process.stdout_path = node_data / "stdout.log";
+      process.stderr_path = node_data / "stderr.log";
+      process.argv = {
+          "-regtest",          "-datadir=" + node_data.string(),
+          "-server=0",         "-listen=0",
+          "-dnsseed=0",        "-fixedseeds=0",
+          "-dandelion=0",      "-listenonion=0",
+          "-discover=0",       "-upnp=0",
+          "-printtoconsole=0",
+      };
+      bbp::ChildProcess& child =
+          children.Add(bbp::ChildProcess::Spawn(process, node.access_path()));
+      BOOST_REQUIRE(pids.insert(child.pid()).second);
+      const std::vector<std::string> members =
+          bbp::SplitWhitespace(bbp::ReadText(node_root / "cgroup.procs"));
+      BOOST_CHECK(std::find(members.begin(), members.end(),
+                            std::to_string(child.pid())) != members.end());
+      BOOST_REQUIRE_MESSAGE(
+          WaitForExecutable(child.pid(), binary, std::chrono::seconds(5)),
+          "firod did not survive exec; stderr: "
+              << bbp::ReadText(process.stderr_path));
+      BOOST_TEST(
+          bbp::ReadText("/proc/" + std::to_string(child.pid()) + "/cgroup")
+              .find("/bbp/" + run_id + "/" + node_id) != std::string::npos);
+    }
+
+    children.Stop();
+    bbp::Cgroup::RemoveRun(run_id);
+    run->Release();
+    BOOST_TEST(!std::filesystem::exists(run_root));
+    BOOST_TEST(std::filesystem::is_directory(foreign));
+    BOOST_TEST(bbp::ReadText(root / "cgroup.subtree_control") ==
+               root_controllers_before);
+    for (const auto& [existing_pid, cgroup_before] : processes_before) {
+      const std::filesystem::path cgroup = "/proc/" + existing_pid + "/cgroup";
+      error.clear();
+      if (std::filesystem::exists(cgroup, error) && !error) {
+        BOOST_TEST(bbp::ReadText(cgroup) == cgroup_before);
+      }
+    }
+  } catch (...) {
+    std::filesystem::remove(foreign, error);
+    std::filesystem::remove_all(data_root, error);
+    throw;
+  }
+
+  error.clear();
+  BOOST_REQUIRE(std::filesystem::remove(foreign, error));
+  BOOST_REQUIRE(!error);
+  std::filesystem::remove_all(data_root);
+}
+
+BOOST_AUTO_TEST_CASE(
     cgroup_scope_restores_processes_and_controller_state_once) {
+  std::unique_ptr<PreparedRunGuard> delegated_parent =
+      PreparePrivilegedTestRun(UniqueRunId("scope-parent"));
+  if (!delegated_parent) {
+    return;
+  }
   const std::string suffix = UniqueRunId("scope");
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
@@ -889,6 +1301,11 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     cgroup_scope_recovers_an_exact_bound_pending_created_run) {
+  std::unique_ptr<PreparedRunGuard> delegated_parent =
+      PreparePrivilegedTestRun(UniqueRunId("pending-parent"));
+  if (!delegated_parent) {
+    return;
+  }
   const std::string suffix = UniqueRunId("scope-pending");
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
@@ -964,6 +1381,11 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(cgroup_scope_prepare_failure_restores_partial_mutations) {
+  std::unique_ptr<PreparedRunGuard> delegated_parent =
+      PreparePrivilegedTestRun(UniqueRunId("rollback-parent"));
+  if (!delegated_parent) {
+    return;
+  }
   const std::string suffix = UniqueRunId("scope-rollback");
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;

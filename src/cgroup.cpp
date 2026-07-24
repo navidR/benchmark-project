@@ -1,11 +1,13 @@
 #include "bbp/cgroup.h"
 
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1054,6 +1056,54 @@ void RequireControllersAvailable(
   }
 }
 
+std::set<std::string> RequiredControllers() {
+  return {"cpu", "io", "memory", "pids"};
+}
+
+std::string ControllerList(const std::set<std::string>& controllers) {
+  std::string result;
+  for (const std::string& controller : controllers) {
+    if (!result.empty()) {
+      result += ", ";
+    }
+    result += controller;
+  }
+  return result;
+}
+
+void RequireNativeCgroupRoot(const std::filesystem::path& root) {
+  struct statfs filesystem_status {};
+  if (statfs(root.c_str(), &filesystem_status) != 0) {
+    throw std::runtime_error("inspect native cgroup root failed at " +
+                             root.string() + ": " + std::strerror(errno));
+  }
+  if (filesystem_status.f_type != CGROUP2_SUPER_MAGIC) {
+    throw std::runtime_error("cgroup v2 is not mounted at native root " +
+                             root.string());
+  }
+  if (access(root.c_str(), W_OK) != 0 ||
+      access((root / "cgroup.subtree_control").c_str(), W_OK) != 0) {
+    throw std::runtime_error("native cgroup root is not writable at " +
+                             root.string() + ": " + std::strerror(errno));
+  }
+
+  const std::set<std::string> required = RequiredControllers();
+  const std::set<std::string> unavailable =
+      SetDifference(required, ControllerSet(root / "cgroup.controllers"));
+  if (!unavailable.empty()) {
+    throw std::runtime_error(
+        "required native cgroup root controllers unavailable at " +
+        root.string() + ": " + ControllerList(unavailable));
+  }
+  const std::set<std::string> not_enabled =
+      SetDifference(required, ControllerSet(root / "cgroup.subtree_control"));
+  if (!not_enabled.empty()) {
+    throw std::runtime_error(
+        "required native cgroup root controllers not enabled at " +
+        root.string() + ": " + ControllerList(not_enabled));
+  }
+}
+
 bool CgroupProcsEmpty(const std::filesystem::path& dir) {
   return SplitWhitespace(ReadText(dir / "cgroup.procs")).empty();
 }
@@ -1458,22 +1508,26 @@ CgroupScopeState NewCgroupScopeState(const CgroupScopeConfig& config) {
 void StartCgroupScope(const CgroupScopeConfig& config,
                       const CgroupScopeState& state) {
   const CgroupPaths paths = CgroupPathsForScope(config, "state-probe");
+  if (!config.allow_root_process_move &&
+      !state.root_controllers_added.empty()) {
+    throw std::runtime_error(
+        "native cgroup root unexpectedly requires controller mutation at " +
+        paths.root.string() + ": " +
+        ControllerList(state.root_controllers_added));
+  }
   if (!state.simulator_preexisting) {
     CreateCgroupDirectoryExclusive(paths.simulator, "simulator");
   }
-  const std::filesystem::path controller =
-      paths.simulator / state.controller_name;
-  CreateCgroupDirectoryExclusive(controller, "controller");
-  if (!CgroupProcsEmpty(paths.root)) {
-    if (!config.allow_root_process_move) {
-      throw std::runtime_error(
-          "cgroup root contains processes outside a movable Docker scope: " +
-          paths.root.string());
+  if (config.allow_root_process_move) {
+    const std::filesystem::path controller =
+        paths.simulator / state.controller_name;
+    CreateCgroupDirectoryExclusive(controller, "controller");
+    if (!CgroupProcsEmpty(paths.root)) {
+      MoveCgroupProcesses(paths.root, controller,
+                          "could not delegate cgroup root");
     }
-    MoveCgroupProcesses(paths.root, controller,
-                        "could not delegate cgroup root");
+    SetControllers(paths.root, state.root_controllers_added, '+');
   }
-  SetControllers(paths.root, state.root_controllers_added, '+');
   RequireControllersAvailable(paths.simulator, {"cpu", "io", "memory", "pids"});
   SetControllers(paths.simulator, state.simulator_controllers_added, '+');
 }
@@ -1615,6 +1669,9 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
                              config.root.string());
   }
   CgroupScopeLock scope_lock(config.root);
+  if (!config.allow_root_process_move) {
+    RequireNativeCgroupRoot(config.root);
+  }
   const CgroupPaths requested_paths = CgroupPathsForScope(config, run_id);
   const bool scope_state_exists = ScopeStateExists(config);
   if (!scope_state_exists && std::filesystem::exists(requested_paths.run)) {
