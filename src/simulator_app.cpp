@@ -59,6 +59,7 @@
 #include "bbp/run_ownership.h"
 #include "bbp/run_process_state.h"
 #include "bbp/run_report.h"
+#include "bbp/runtime_node_inventory.h"
 #include "bbp/runtime_peer_topology.h"
 #include "bbp/scenario_fields.h"
 #include "bbp/scenario_service.h"
@@ -7448,8 +7449,7 @@ void PublishOperatorConnectionCommand(const Options& options,
                                       const std::filesystem::path& run_root,
                                       const std::filesystem::path& events_path,
                                       const ChainDriver& driver,
-                                      const std::vector<NodeRuntime>& nodes,
-                                      bool* resolved) {
+                                      const auto& nodes, bool* resolved) {
   if (*resolved) {
     return;
   }
@@ -7550,10 +7550,9 @@ std::string PeerCountWaitDetail(uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
-std::string PeerAddress(const Options& options,
-                        const std::vector<NodeRuntime>& nodes, uint32_t node) {
+std::string PeerAddress(const auto& nodes, uint32_t node) {
   const uint32_t node_index = node - 1U;
-  return PeerHost(options, node_index) + ":" +
+  return nodes[node_index].config.p2p_host + ":" +
          std::to_string(nodes[node_index].config.p2p_port);
 }
 
@@ -8050,8 +8049,7 @@ class TransactionObservationTracker {
     std::vector<std::string> required_node_ids;
   };
 
-  [[nodiscard]] std::optional<Reservation> TryReserve(
-      const std::vector<NodeRuntime>& nodes) {
+  [[nodiscard]] std::optional<Reservation> TryReserve(const auto& nodes) {
     std::vector<std::string> required_node_ids = ObservableNodeIds(nodes);
     std::optional<TransactionObservationStore::Reservation> observation =
         observations_.TryReserve();
@@ -8064,7 +8062,7 @@ class TransactionObservationTracker {
     };
   }
 
-  [[nodiscard]] Reservation Reserve(const std::vector<NodeRuntime>& nodes) {
+  [[nodiscard]] Reservation Reserve(const auto& nodes) {
     std::vector<std::string> required_node_ids = ObservableNodeIds(nodes);
     return Reservation{
         .observation = observations_.Reserve(),
@@ -8085,11 +8083,13 @@ class TransactionObservationTracker {
                                    reservation.required_node_ids);
   }
 
-  void TrackAndWaitForVisibility(
-      Reservation reservation, const Options& options,
-      const std::filesystem::path& events_path, const ChainDriver& driver,
-      const std::vector<NodeRuntime>& nodes, TrackedTransaction transaction,
-      std::chrono::seconds timeout, std::stop_token stop_token) {
+  void TrackAndWaitForVisibility(Reservation reservation,
+                                 const Options& options,
+                                 const std::filesystem::path& events_path,
+                                 const ChainDriver& driver, const auto& nodes,
+                                 TrackedTransaction transaction,
+                                 std::chrono::seconds timeout,
+                                 std::stop_token stop_token) {
     const TrackedTransaction tracked = transaction;
     Track(std::move(reservation), std::move(transaction));
     for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
@@ -8107,8 +8107,7 @@ class TransactionObservationTracker {
 
   void ObserveAll(const Options& options,
                   const std::filesystem::path& events_path,
-                  const ChainDriver& driver,
-                  const std::vector<NodeRuntime>& nodes,
+                  const ChainDriver& driver, const auto& nodes,
                   std::stop_token stop_token) {
     const std::vector<TrackedTransaction> transactions =
         observations_.PendingTransactions();
@@ -8131,7 +8130,7 @@ class TransactionObservationTracker {
 
   std::vector<TransactionSetObservation> ObserveTrackedSetsUntilVisible(
       const Options& options, const std::filesystem::path& events_path,
-      const ChainDriver& driver, const std::vector<NodeRuntime>& nodes,
+      const ChainDriver& driver, const auto& nodes,
       const std::vector<std::vector<TrackedTransaction>>& transaction_sets,
       std::chrono::seconds timeout, std::stop_token stop_token) {
     std::vector<TransactionSetObservation> results(transaction_sets.size());
@@ -8216,8 +8215,7 @@ class TransactionObservationTracker {
   }
 
  private:
-  static std::vector<std::string> ObservableNodeIds(
-      const std::vector<NodeRuntime>& nodes) {
+  static std::vector<std::string> ObservableNodeIds(const auto& nodes) {
     std::vector<std::string> node_ids;
     node_ids.reserve(nodes.size());
     for (const NodeRuntime& node : nodes) {
@@ -8283,7 +8281,7 @@ const std::string& RequireSingleWalletTransactionId(
 
 std::vector<TransactionLoadConfirmation::ObservationKey>
 ExpectedTransactionLoadObservations(const std::vector<std::string>& txids,
-                                    const std::vector<NodeRuntime>& nodes) {
+                                    const auto& nodes) {
   std::size_t observable_node_count = 0U;
   for (const NodeRuntime& node : nodes) {
     if (node.AllowsChainMetrics()) {
@@ -8453,8 +8451,7 @@ using MetricsStopRequested = std::function<bool()>;
 
 std::uint32_t WriteMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
-    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
-    RunProcessState& run_process_state,
+    const ChainDriver& driver, auto& nodes, RunProcessState& run_process_state,
     const NodeMetricsFailureHandler& node_failure_handler = {},
     const MetricsStopRequested& stop_requested = {},
     std::stop_token stop_token = {}) {
@@ -8706,7 +8703,7 @@ using WalletMetricsFailureHandler =
 
 std::uint32_t WriteWalletMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
-    const ChainDriver& driver, const std::vector<NodeRuntime>& nodes,
+    const ChainDriver& driver, const auto& nodes,
     const WalletMetricsFailureHandler& failure_handler = {},
     std::stop_token stop_token = {}) {
   if (!options.wallet_backed_workload_requested) {
@@ -8817,7 +8814,7 @@ void WriteNodeLogTail(const std::filesystem::path& events_path,
 
 void WriteNodeLogTails(const std::filesystem::path& events_path,
                        const Options& options, const ChainDriver& driver,
-                       std::vector<NodeRuntime>& nodes) {
+                       auto& nodes) {
   for (NodeRuntime& node : nodes) {
     WriteNodeLogTail(events_path, options, driver, node);
   }
@@ -10255,7 +10252,7 @@ std::string NodePeerEndpoint(const NodeRuntime& node) {
 
 void ConnectAvailableStartupPeers(
     const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    const ChainDriver& driver, auto& nodes,
     std::optional<std::size_t> changed_node,
     std::chrono::steady_clock::time_point lifecycle_epoch,
     std::stop_token stop_token) {
@@ -10645,8 +10642,7 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
 
 void InitializeWalletNodes(const Options& options,
                            const std::filesystem::path& events_path,
-                           const ChainDriver& driver,
-                           std::vector<NodeRuntime>& nodes,
+                           const ChainDriver& driver, auto& nodes,
                            SimulationRegistry& registry,
                            std::stop_token stop_token) {
   if (!options.wallet_backed_workload_requested) {
@@ -10839,13 +10835,10 @@ std::string ResourceProfileUpdateDetail(const ProfileSwitchWorkload& workload,
   return boost::json::serialize(detail);
 }
 
-void ApplyResourceProfileSwitch(const Options& options,
-                                const std::filesystem::path& events_path,
-                                std::vector<NodeRuntime>& nodes,
-                                const ProfileSwitchWorkload& workload,
-                                uint32_t workload_index,
-                                uint32_t workload_count,
-                                std::stop_token stop_token) {
+void ApplyResourceProfileSwitch(
+    const Options& options, const std::filesystem::path& events_path,
+    auto& nodes, const ProfileSwitchWorkload& workload, uint32_t workload_index,
+    uint32_t workload_count, std::stop_token stop_token) {
   const ResourceLimits& desired =
       options.resource_profiles.at(workload.profile);
   struct PreviousState {
@@ -10923,8 +10916,7 @@ void ApplyResourceProfileSwitch(const Options& options,
 
 void ApplyRuntimeResourceLimitUpdates(const Options& options,
                                       const std::filesystem::path& events_path,
-                                      std::vector<NodeRuntime>& nodes,
-                                      std::stop_token stop_token) {
+                                      auto& nodes, std::stop_token stop_token) {
   for (const auto& [node_index, patch] :
        options.runtime_node_resource_updates) {
     ThrowIfStopRequested(stop_token);
@@ -10957,7 +10949,7 @@ std::string ResourcePressureDetail(const ResourcePressureWorkload& workload,
 void ApplyResourcePressureWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const std::filesystem::path& metrics_path, const ChainDriver& driver,
-    std::vector<NodeRuntime>& nodes, RunProcessState& run_process_state,
+    auto& nodes, RunProcessState& run_process_state,
     const ResourcePressureWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
@@ -11046,12 +11038,11 @@ void ApplyConnectPeerWorkload(const Options& options,
                               const std::filesystem::path& events_path,
                               const ChainDriver& driver,
                               PeerConnectivityController& controller,
-                              std::vector<NodeRuntime>& nodes,
-                              const ConnectPeerWorkload& workload,
+                              auto& nodes, const ConnectPeerWorkload& workload,
                               uint32_t workload_index, uint32_t workload_count,
                               std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
-  const std::string address = PeerAddress(options, nodes, workload.peer);
+  const std::string address = PeerAddress(nodes, workload.peer);
   const std::vector<std::string> before_addresses =
       driver.PeerAddresses(node.config, stop_token);
   const bool connected_before =
@@ -11077,11 +11068,11 @@ void ApplyConnectPeerWorkload(const Options& options,
 void ApplyDisconnectPeerWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver, PeerConnectivityController& controller,
-    std::vector<NodeRuntime>& nodes, const DisconnectPeerWorkload& workload,
+    auto& nodes, const DisconnectPeerWorkload& workload,
     uint32_t workload_index, uint32_t workload_count,
     std::stop_token stop_token) {
   NodeRuntime& node = nodes[workload.node - 1U];
-  const std::string address = PeerAddress(options, nodes, workload.peer);
+  const std::string address = PeerAddress(nodes, workload.peer);
   const std::vector<std::string> before_addresses =
       driver.PeerAddresses(node.config, stop_token);
   const bool connected_before =
@@ -11105,7 +11096,7 @@ void ApplyDisconnectPeerWorkload(
 }
 
 std::vector<std::string> RuntimeTopologyAllowedPeers(
-    const RuntimePeerTopology& topology, const std::vector<NodeRuntime>& nodes,
+    const RuntimePeerTopology& topology, const auto& nodes,
     std::uint32_t node_index) {
   std::vector<std::string> allowed;
   for (const std::uint32_t peer_index :
@@ -11175,7 +11166,7 @@ void ApplyTopologyEdgeWorkload(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriverSpec& chain_spec, const ChainDriver& driver,
     PeerConnectivityController& controller,
-    RuntimePeerTopology& runtime_topology, std::vector<NodeRuntime>& nodes,
+    RuntimePeerTopology& runtime_topology, auto& nodes,
     const TopologyEdgeWorkload& workload, WorkloadKind action,
     std::uint32_t workload_index, std::uint32_t workload_count,
     std::stop_token stop_token) {
@@ -11218,7 +11209,7 @@ void ApplyTopologyEdgeWorkload(
         "runtime restart-peer state does not match topology model");
   }
 
-  const std::string peer_address = PeerAddress(options, nodes, workload.to);
+  const std::string peer_address = PeerAddress(nodes, workload.to);
   std::vector<std::string> before_peer_addresses;
   bool connected_before = false;
 
@@ -11423,7 +11414,7 @@ void ApplyTopologyEdgeWorkload(
 
 void ApplySendRawTransactionWorkload(
     const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    const ChainDriver& driver, auto& nodes,
     TransactionObservationTracker& transaction_tracker,
     const SendRawTransactionWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
@@ -11489,8 +11480,7 @@ void ApplySendRawTransactionWorkload(
 
 void ApplyWalletTransactionsWorkload(
     const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
-    const SimulationRegistry& registry,
+    const ChainDriver& driver, auto& nodes, const SimulationRegistry& registry,
     TransactionObservationTracker& transaction_tracker,
     std::vector<PendingTransactionLoadCompletion>* pending_load_completions,
     const WalletTransactionsWorkload& workload, uint32_t workload_index,
@@ -12276,7 +12266,7 @@ QdiscInfo ReplaceNodeNetworkConditionTransactional(
 
 void ApplyRuntimeNetworkConditionUpdates(
     const Options& options, const std::filesystem::path& events_path,
-    std::vector<NodeRuntime>& nodes, std::stop_token stop_token) {
+    auto& nodes, std::stop_token stop_token) {
   for (const auto& [node_index, condition] :
        options.runtime_node_network_conditions) {
     ThrowIfStopRequested(stop_token);
@@ -12326,7 +12316,7 @@ std::string NetworkProfileUpdateDetail(
 
 void ApplyNetworkProfileSwitch(const Options& options,
                                const std::filesystem::path& events_path,
-                               std::vector<NodeRuntime>& nodes,
+                               auto& nodes,
                                const ProfileSwitchWorkload& workload,
                                uint32_t workload_index, uint32_t workload_count,
                                std::stop_token stop_token) {
@@ -12588,8 +12578,7 @@ NetworkBlockMutationResult MutateNetworkBlockRuleTransactional(
 
 void ApplyRuntimeNetworkBlockRules(const Options& options,
                                    const std::filesystem::path& events_path,
-                                   std::vector<NodeRuntime>& nodes,
-                                   std::stop_token stop_token) {
+                                   auto& nodes, std::stop_token stop_token) {
   for (const NetworkBlockRule& rule : options.runtime_node_blocks) {
     ThrowIfStopRequested(stop_token);
     if (rule.node_index >= nodes.size()) {
@@ -12611,8 +12600,7 @@ void ApplyRuntimeNetworkBlockRules(const Options& options,
 
 void ApplyRuntimeNetworkUnblockRules(const Options& options,
                                      const std::filesystem::path& events_path,
-                                     std::vector<NodeRuntime>& nodes,
-                                     std::stop_token stop_token) {
+                                     auto& nodes, std::stop_token stop_token) {
   for (const NetworkBlockRule& rule : options.runtime_node_unblocks) {
     ThrowIfStopRequested(stop_token);
     if (rule.node_index >= nodes.size()) {
@@ -12632,8 +12620,7 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
   }
 }
 
-std::uint32_t PartitionNodeIndex(const std::vector<NodeRuntime>& nodes,
-                                 std::string_view node_id) {
+std::uint32_t PartitionNodeIndex(const auto& nodes, std::string_view node_id) {
   const auto node = std::find_if(nodes.begin(), nodes.end(),
                                  [&](const NodeRuntime& candidate) {
                                    return candidate.config.id == node_id;
@@ -12650,9 +12637,8 @@ std::uint32_t PartitionNodeIndex(const std::vector<NodeRuntime>& nodes,
   return static_cast<std::uint32_t>(index);
 }
 
-NetworkPartitionRule RuntimePartitionRule(
-    const SimulationPartition& partition,
-    const std::vector<NodeRuntime>& nodes) {
+NetworkPartitionRule RuntimePartitionRule(const SimulationPartition& partition,
+                                          const auto& nodes) {
   NetworkPartitionRule rule;
   rule.group_a.reserve(partition.group_a.node_ids.size());
   rule.group_b.reserve(partition.group_b.node_ids.size());
@@ -12668,8 +12654,7 @@ NetworkPartitionRule RuntimePartitionRule(
 }
 
 NetworkBlockRule MakeP2pBlockRule(uint32_t src_node_index,
-                                  uint32_t dst_node_index,
-                                  const std::vector<NodeRuntime>& nodes) {
+                                  uint32_t dst_node_index, const auto& nodes) {
   if (src_node_index >= nodes.size() || dst_node_index >= nodes.size()) {
     throw std::runtime_error("partition node is out of range");
   }
@@ -12687,8 +12672,7 @@ NetworkBlockRule MakeP2pBlockRule(uint32_t src_node_index,
 }
 
 std::vector<NetworkBlockRule> PartitionBlockRules(
-    const NetworkPartitionRule& partition,
-    const std::vector<NodeRuntime>& nodes) {
+    const NetworkPartitionRule& partition, const auto& nodes) {
   std::vector<NetworkBlockRule> rules;
   rules.reserve((partition.group_a.size() * partition.group_b.size()) * 2U);
   for (uint32_t node_a : partition.group_a) {
@@ -12738,8 +12722,8 @@ std::string NetworkPartitionDetail(
 
 void ApplyRuntimeNetworkPartition(
     const Options& options, const std::filesystem::path& events_path,
-    std::vector<NodeRuntime>& nodes, const NetworkPartitionRule& partition,
-    bool heal, uint32_t workload_index = 0, uint32_t workload_count = 0,
+    auto& nodes, const NetworkPartitionRule& partition, bool heal,
+    uint32_t workload_index = 0, uint32_t workload_count = 0,
     std::stop_token stop_token = {},
     std::optional<std::uint64_t> operator_sequence = std::nullopt) {
   struct PartitionRuleState {
@@ -12856,8 +12840,7 @@ void ApplyRuntimeNetworkPartition(
 
 void ApplyRuntimeNetworkPartitions(const Options& options,
                                    const std::filesystem::path& events_path,
-                                   std::vector<NodeRuntime>& nodes,
-                                   std::stop_token stop_token) {
+                                   auto& nodes, std::stop_token stop_token) {
   for (const NetworkPartitionRule& partition : options.runtime_partitions) {
     ThrowIfStopRequested(stop_token);
     ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, false,
@@ -12867,7 +12850,7 @@ void ApplyRuntimeNetworkPartitions(const Options& options,
 
 void ApplyRuntimeNetworkPartitionHeals(const Options& options,
                                        const std::filesystem::path& events_path,
-                                       std::vector<NodeRuntime>& nodes,
+                                       auto& nodes,
                                        std::stop_token stop_token) {
   for (const NetworkPartitionRule& partition :
        options.runtime_partition_heals) {
@@ -13085,8 +13068,7 @@ bool RestartNode(const Options& options,
 void ApplyRuntimeNodeRestarts(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver,
-    PeerConnectivityController& peer_connectivity_controller,
-    std::vector<NodeRuntime>& nodes,
+    PeerConnectivityController& peer_connectivity_controller, auto& nodes,
     std::chrono::steady_clock::time_point lifecycle_epoch,
     std::stop_token stop_token) {
   for (uint32_t node_index : options.runtime_node_restarts) {
@@ -13335,8 +13317,7 @@ void FreezeNodeForDuration(const Options& options,
 
 void ApplyRuntimeNodeFreezes(const Options& options,
                              const std::filesystem::path& events_path,
-                             std::vector<NodeRuntime>& nodes,
-                             std::stop_token stop_token) {
+                             auto& nodes, std::stop_token stop_token) {
   for (const FreezeRequest& freeze : options.runtime_node_freezes) {
     ThrowIfStopRequested(stop_token);
     if (freeze.node_index >= nodes.size()) {
@@ -13369,7 +13350,7 @@ bool RunNodeCleanupStep(bool best_effort, std::string_view description,
 }
 
 void StopNodes(const Options& options, const std::filesystem::path& events_path,
-               const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+               const ChainDriver& driver, auto& nodes,
                bool best_effort = false) {
   const auto shutdown_timeout =
       best_effort ? std::chrono::seconds(2) : std::chrono::seconds(15);
@@ -13623,8 +13604,7 @@ std::vector<std::uint32_t> ConfiguredMinerIndexes(const Options& options) {
   return {options.generate_node - 1U};
 }
 
-NodeRuntime& FindNodeRuntimeById(std::vector<NodeRuntime>& nodes,
-                                 const std::string& node_id) {
+NodeRuntime& FindNodeRuntimeById(auto& nodes, const std::string& node_id) {
   const auto node = std::find_if(nodes.begin(), nodes.end(),
                                  [&node_id](const NodeRuntime& candidate) {
                                    return candidate.config.id == node_id;
@@ -13752,8 +13732,7 @@ void RequireNodePerfCounterAttachment(const NodeRuntime& node,
   }
 }
 
-void ApplyPerfCounterCommand(const SimulationCommand& command,
-                             std::vector<NodeRuntime>& nodes,
+void ApplyPerfCounterCommand(const SimulationCommand& command, auto& nodes,
                              const RunProcessState::Guard& process_guard) {
   if (!command.perf_counter_target) {
     throw std::runtime_error("perf counter command requires a typed target");
@@ -13846,7 +13825,7 @@ void ApplyPerfCounterCommand(const SimulationCommand& command,
 }
 
 std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
-    const Options& options, const std::vector<NodeRuntime>& nodes) {
+    const Options& options, const auto& nodes) {
   std::map<std::string, PeerCountPolicy> policies;
   for (const PeerConnectivityPolicy& policy :
        options.topology.peer_connectivity) {
@@ -13860,8 +13839,7 @@ std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
 }
 
 PeerConnectivityController::AllowedPeerMap InitialAllowedPeers(
-    const RuntimePeerTopology& topology,
-    const std::vector<NodeRuntime>& nodes) {
+    const RuntimePeerTopology& topology, const auto& nodes) {
   PeerConnectivityController::AllowedPeerMap allowed;
   for (std::uint32_t node_index = 0; node_index < nodes.size(); ++node_index) {
     std::vector<std::string> peer_ids;
@@ -14145,7 +14123,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
 
   std::unique_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
   ChainDriver& driver = *driver_owner;
-  std::vector<NodeRuntime> nodes;
+  std::vector<NodeRuntime> startup_nodes;
+  RuntimeNodeInventory node_inventory(chain_spec.max_nodes);
+  RuntimeNodeSnapshot nodes;
   std::unique_ptr<NodeLogCollector> log_collector;
   std::unique_ptr<PeriodicMetricsCollector> metrics_collector;
   std::unique_ptr<ProbabilisticBlockScheduler> block_scheduler;
@@ -14226,6 +14206,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     if (block_scheduler) {
       block_scheduler->Stop();
     }
+    const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
     std::exception_ptr first_failure;
     std::vector<std::string> active_native_miners;
     {
@@ -14235,7 +14216,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     }
     for (const std::string& node_id : active_native_miners) {
       try {
-        StopNativeMining(driver, FindNodeRuntimeById(nodes, node_id),
+        StopNativeMining(driver, FindNodeRuntimeById(current_nodes, node_id),
                          run_process_state);
       } catch (...) {
         if (!first_failure) {
@@ -14270,7 +14251,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         metrics_collector->Stop();
       }
     });
-    for (auto& node : nodes) {
+    const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
+    for (auto& node : current_nodes) {
       cleanup_step("failed node state event", [&] {
         TransitionNodeState(events_path, options.run_id, node,
                             NodeRuntimeLifecycle::kFailed);
@@ -14282,18 +14264,19 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     });
     if (!log_collector) {
       cleanup_step("node log tail collection", [&] {
-        WriteNodeLogTails(events_path, options, driver, nodes);
+        WriteNodeLogTails(events_path, options, driver, current_nodes);
       });
     }
-    cleanup_step("node shutdown",
-                 [&] { StopNodes(options, events_path, driver, nodes, true); });
-    for (auto& node : nodes) {
+    cleanup_step("node shutdown", [&] {
+      StopNodes(options, events_path, driver, current_nodes, true);
+    });
+    for (auto& node : current_nodes) {
       cleanup_step("node process fallback signal",
                    [&] { static_cast<void>(RequestNodeKill(node)); });
     }
     const auto fallback_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    for (auto& node : nodes) {
+    for (auto& node : current_nodes) {
       cleanup_step("node process fallback shutdown", [&] {
         if (!WaitForNodeProcessExitUntil(node, fallback_deadline)) {
           throw std::runtime_error("node process survived fallback SIGKILL: " +
@@ -14306,7 +14289,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                    [&] { log_collector->Stop(); });
     } else {
       cleanup_step("final node log tail collection", [&] {
-        WriteNodeLogTails(events_path, options, driver, nodes);
+        WriteNodeLogTails(events_path, options, driver, current_nodes);
       });
     }
     mcp_application.MarkRunStopped();
@@ -14328,13 +14311,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRunCancelled);
     });
-    cleanup_step("node shutdown",
-                 [&] { StopNodes(options, events_path, driver, nodes, true); });
+    const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
+    cleanup_step("node shutdown", [&] {
+      StopNodes(options, events_path, driver, current_nodes, true);
+    });
     cleanup_step("node log collector shutdown", [&] {
       if (log_collector) {
         log_collector->Stop();
       } else {
-        WriteNodeLogTails(events_path, options, driver, nodes);
+        WriteNodeLogTails(events_path, options, driver, current_nodes);
       }
     });
     cleanup_step("run finished event", [&] {
@@ -14374,13 +14359,15 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                  SimulationEventKind::kSimulationDurationReached,
                  boost::json::serialize(detail));
     });
-    cleanup_step("node shutdown",
-                 [&] { StopNodes(options, events_path, driver, nodes, true); });
+    const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
+    cleanup_step("node shutdown", [&] {
+      StopNodes(options, events_path, driver, current_nodes, true);
+    });
     cleanup_step("node log collector shutdown", [&] {
       if (log_collector) {
         log_collector->Stop();
       } else {
-        WriteNodeLogTails(events_path, options, driver, nodes);
+        WriteNodeLogTails(events_path, options, driver, current_nodes);
       }
     });
     cleanup_step("run finished event", [&] {
@@ -14420,26 +14407,43 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           simulation_stop_source.request_stop();
         });
       };
-  if (!options.empty_control_plane) {
-    try {
-      Cgroup::PrepareRun(RequireRunOwnership(options).cgroup_name);
-    } catch (const std::exception& error) {
-      mcp_application.MarkRunStopping();
-      WriteEvent(events_path, options.run_id, "sim",
-                 SimulationEventKind::kRunFailed, error.what());
-      mcp_application.MarkRunStopped();
-      throw;
-    }
+  try {
+    Cgroup::PrepareRun(RequireRunOwnership(options).cgroup_name);
+  } catch (const std::exception& error) {
+    mcp_application.MarkRunStopping();
+    WriteEvent(events_path, options.run_id, "sim",
+               SimulationEventKind::kRunFailed, error.what());
+    mcp_application.MarkRunStopped();
+    throw;
   }
   lifecycle_epoch = std::chrono::steady_clock::now();
   event_engine_epoch = lifecycle_epoch;
   if (timed_node_lifecycle) {
     start_duration_timer(event_engine_epoch);
   }
+  const auto initialize_node_inventory = [&] {
+    try {
+      node_inventory.Initialize(startup_nodes);
+      nodes = node_inventory.Snapshot();
+    } catch (...) {
+      const std::exception_ptr initialization_failure =
+          std::current_exception();
+      cleanup_step("startup node shutdown after inventory failure", [&] {
+        StopNodes(options, events_path, driver, startup_nodes, true);
+      });
+      std::rethrow_exception(initialization_failure);
+    }
+  };
   try {
-    StartNodes(options, run_root, events_path, chain_spec, driver,
-               runtime_topology, nodes, run_process_state, lifecycle_epoch,
-               stop_token);
+    try {
+      StartNodes(options, run_root, events_path, chain_spec, driver,
+                 runtime_topology, startup_nodes, run_process_state,
+                 lifecycle_epoch, stop_token);
+    } catch (...) {
+      initialize_node_inventory();
+      throw;
+    }
+    initialize_node_inventory();
     PublishOperatorConnectionCommand(options, run_root, events_path, driver,
                                      nodes, &operator_connection_resolved);
     const std::vector<std::uint32_t> miner_indexes =
@@ -14471,7 +14475,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
       block_scheduler = std::make_unique<ProbabilisticBlockScheduler>(
           miner_node_ids, options.block_production.policy,
           [&](const std::string& node_id) {
-            NodeRuntime& miner = FindNodeRuntimeById(nodes, node_id);
+            const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
+            NodeRuntime& miner = FindNodeRuntimeById(current_nodes, node_id);
             {
               auto process_guard = run_process_state.Lock();
               RequireNodeRunning(miner, process_guard,
@@ -14496,19 +14501,19 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                              << node_id << ": " << error;
           });
     }
-    std::vector<ChainNodeConfig> log_nodes;
-    log_nodes.reserve(nodes.size());
-    for (const NodeRuntime& node : nodes) {
-      log_nodes.push_back(node.config);
-    }
-    if (!nodes.empty()) {
+    {
+      const NodeConfigSnapshot initial_node_configs =
+          node_inventory.ConfigSnapshot();
       peer_connectivity_controller =
           std::make_unique<PeerConnectivityController>(
-              driver, log_nodes, InitialPeerCountPolicies(options, nodes),
+              driver, initial_node_configs.nodes(),
+              InitialPeerCountPolicies(options, nodes),
               InitialAllowedPeers(runtime_topology, nodes),
               options.metrics_interval,
               [&](std::string_view node_id) {
-                return FindNodeRuntimeById(nodes, std::string(node_id))
+                const RuntimeNodeSnapshot current_nodes =
+                    node_inventory.Snapshot();
+                return FindNodeRuntimeById(current_nodes, std::string(node_id))
                     .AllowsChainMetrics();
               },
               [&](std::string_view node_id, std::string_view peer_node_id,
@@ -14541,9 +14546,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                  << node_id << ": " << error;
               });
     }
-    if (active_command_queue != nullptr && !nodes.empty()) {
+    if (active_command_queue != nullptr) {
       chain_command_executor = std::make_unique<ChainCommandExecutor>(
-          driver, log_nodes,
+          driver, [&] { return node_inventory.ConfigSnapshot(); },
           [&](const ChainNodeConfig& config,
               std::stop_token command_stop_token) {
             if (std::find(miner_node_ids.begin(), miner_node_ids.end(),
@@ -14559,7 +14564,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               }
               block_scheduler->StopMiner(config.id);
             } else {
-              StopNativeMining(driver, FindNodeRuntimeById(nodes, config.id),
+              const RuntimeNodeSnapshot current_nodes =
+                  node_inventory.Snapshot();
+              StopNativeMining(driver,
+                               FindNodeRuntimeById(current_nodes, config.id),
                                run_process_state, command_stop_token);
             }
           },
@@ -14619,10 +14627,23 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                          ? block_scheduler->StopMiner(command.node_id)
                          : false;
             };
+            const bool needs_runtime_snapshot =
+                command.kind != SimulationCommandKind::kExportNodeReport &&
+                command.kind !=
+                    SimulationCommandKind::kSetBlockProductionPolicy;
+            const bool needs_direct_node =
+                needs_runtime_snapshot &&
+                command.kind != SimulationCommandKind::kSetPerfCounters &&
+                command.kind != SimulationCommandKind::kSendWalletTransaction &&
+                command.kind != SimulationCommandKind::kPartitionNodes &&
+                command.kind != SimulationCommandKind::kHealPartition;
+            const RuntimeNodeSnapshot nodes = needs_runtime_snapshot
+                                                  ? node_inventory.Snapshot()
+                                                  : RuntimeNodeSnapshot{};
+            NodeRuntime unused_node;
             NodeRuntime& node =
-                command.node_id == "sim"
-                    ? nodes.front()
-                    : FindNodeRuntimeById(nodes, command.node_id);
+                needs_direct_node ? FindNodeRuntimeById(nodes, command.node_id)
+                                  : unused_node;
             if (command.kind == SimulationCommandKind::kExportNodeReport) {
               ExportNodeReport(run_root, command);
             } else if (command.kind ==
@@ -14980,7 +15001,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                           restart_control->absolute_deadline,
                           &native_mining_rpc_attempted)) {
                     throw std::runtime_error(
-                        "node process changed during native mining restart: " +
+                        "node process changed during native mining "
+                        "restart: " +
                         node.config.id);
                   }
                 }
@@ -15037,7 +15059,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                     events_path, options.run_id,
                                     command.node_id,
                                     SimulationEventKind::kProcessKillRequested,
-                                    "restart cancellation reconciliation pid=" +
+                                    "restart cancellation "
+                                    "reconciliation pid=" +
                                         std::to_string(expected.pid));
                               } catch (const std::exception& error) {
                                 BBP_LOG(error)
@@ -15394,6 +15417,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           [&](const SimulationCommand& command,
               const SimulationCommandOutcome& outcome) {
             SimulationCommandOutcome authoritative_outcome = outcome;
+            const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
             const auto node = std::find_if(
                 nodes.begin(), nodes.end(), [&](const NodeRuntime& candidate) {
                   return candidate.config.id == command.node_id;
@@ -15446,6 +15470,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         std::condition_variable_any wakeup;
         std::mutex wakeup_mutex;
         while (!operation_stop_token.stop_requested()) {
+          const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
           for (std::size_t index = 0; index < nodes.size(); ++index) {
             if (operation_stop_token.stop_requested()) {
               return;
@@ -15619,8 +15644,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
       }
     });
     log_collector = std::make_unique<NodeLogCollector>(
-        driver, std::move(log_nodes), options.metrics_interval,
-        kMaxLogTailBytes,
+        driver, [&] { return node_inventory.ConfigSnapshot(); },
+        options.metrics_interval, kMaxLogTailBytes,
         [&](const ChainNodeConfig& config, ChainLogSource source,
             const LogTailChunk& chunk) {
           WriteLogTailChunkEvent(events_path, options, config, source, chunk);
@@ -15629,6 +15654,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     metrics_collector = std::make_unique<PeriodicMetricsCollector>(
         options.metrics_sample_count, options.metrics_interval,
         [&](std::uint32_t sample) {
+          const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
           WriteMetricsSnapshot(
               metrics_path, options, driver, nodes, run_process_state,
               [&](const NodeRuntime& node, std::string_view error) {
@@ -15700,55 +15726,60 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         block_scheduler->Start();
       }
     }
+    nodes = RuntimeNodeSnapshot{};
     if (command_processor) {
       command_processor->Start();
     }
 
     ThrowIfStopRequested(stop_token);
     mcp_application.MarkRunStarted();
-    WriteMetricsSnapshot(
-        metrics_path, options, driver, nodes, run_process_state,
-        [&](const NodeRuntime& node, std::string_view error) {
-          boost::json::object detail;
-          detail["sample"] = 0;
-          detail["initial"] = true;
-          detail["error"] = error;
-          WriteEvent(events_path, options.run_id, node.config.id,
-                     SimulationEventKind::kMetricsNodeUnavailable,
-                     boost::json::serialize(detail));
-          BBP_LOG(warning) << "initial metrics snapshot skipped "
-                           << node.config.id << ": " << error;
-        },
-        {}, stop_token);
-    WriteWalletMetricsSnapshot(
-        wallet_metrics_path, options, driver, nodes,
-        [&](std::uint32_t wallet_index, const NodeRuntime& node,
-            std::string_view error) {
-          boost::json::object detail;
-          detail["sample"] = 0;
-          detail["initial"] = true;
-          detail["wallet_index"] = wallet_index;
-          detail["error"] = error;
-          WriteEvent(events_path, options.run_id, node.config.id,
-                     SimulationEventKind::kWalletMetricsUnavailable,
-                     boost::json::serialize(detail));
-          BBP_LOG(warning) << "initial wallet metrics snapshot skipped #"
-                           << wallet_index << " on " << node.config.id << ": "
-                           << error;
-        },
-        stop_token);
+    {
+      const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
+      WriteMetricsSnapshot(
+          metrics_path, options, driver, nodes, run_process_state,
+          [&](const NodeRuntime& node, std::string_view error) {
+            boost::json::object detail;
+            detail["sample"] = 0;
+            detail["initial"] = true;
+            detail["error"] = error;
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kMetricsNodeUnavailable,
+                       boost::json::serialize(detail));
+            BBP_LOG(warning) << "initial metrics snapshot skipped "
+                             << node.config.id << ": " << error;
+          },
+          {}, stop_token);
+      WriteWalletMetricsSnapshot(
+          wallet_metrics_path, options, driver, nodes,
+          [&](std::uint32_t wallet_index, const NodeRuntime& node,
+              std::string_view error) {
+            boost::json::object detail;
+            detail["sample"] = 0;
+            detail["initial"] = true;
+            detail["wallet_index"] = wallet_index;
+            detail["error"] = error;
+            WriteEvent(events_path, options.run_id, node.config.id,
+                       SimulationEventKind::kWalletMetricsUnavailable,
+                       boost::json::serialize(detail));
+            BBP_LOG(warning)
+                << "initial wallet metrics snapshot skipped #" << wallet_index
+                << " on " << node.config.id << ": " << error;
+          },
+          stop_token);
 
-    ApplyRuntimeResourceLimitUpdates(options, events_path, nodes, stop_token);
-    ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes,
+      ApplyRuntimeResourceLimitUpdates(options, events_path, nodes, stop_token);
+      ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes,
+                                          stop_token);
+      ApplyRuntimeNetworkBlockRules(options, events_path, nodes, stop_token);
+      ApplyRuntimeNetworkPartitions(options, events_path, nodes, stop_token);
+      ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes,
                                         stop_token);
-    ApplyRuntimeNetworkBlockRules(options, events_path, nodes, stop_token);
-    ApplyRuntimeNetworkPartitions(options, events_path, nodes, stop_token);
-    ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes, stop_token);
-    ApplyRuntimeNetworkUnblockRules(options, events_path, nodes, stop_token);
-    ApplyRuntimeNodeRestarts(options, events_path, driver,
-                             *peer_connectivity_controller, nodes,
-                             lifecycle_epoch, stop_token);
-    ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
+      ApplyRuntimeNetworkUnblockRules(options, events_path, nodes, stop_token);
+      ApplyRuntimeNodeRestarts(options, events_path, driver,
+                               *peer_connectivity_controller, nodes,
+                               lifecycle_epoch, stop_token);
+      ApplyRuntimeNodeFreezes(options, events_path, nodes, stop_token);
+    }
     if (!timed_node_lifecycle) {
       event_engine_epoch = std::chrono::steady_clock::now();
       start_duration_timer(event_engine_epoch);
@@ -15805,6 +15836,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                                      " failed: " + *outcome);
           }
         } else {
+          const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
           const ScenarioWorkload& scenario_workload =
               std::get<ScenarioWorkload>(runtime_action.action);
           if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
@@ -16073,16 +16105,17 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     stop_command_processor();
     stop_peer_connectivity();
     stop_block_production();
-    transaction_tracker.ObserveAll(options, events_path, driver, nodes,
+    const RuntimeNodeSnapshot final_nodes = node_inventory.Snapshot();
+    transaction_tracker.ObserveAll(options, events_path, driver, final_nodes,
                                    stop_token);
     WriteTransactionLoadCompletions(options, events_path,
                                     pending_transaction_load_completions);
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes,
+    WriteMetricsSnapshot(metrics_path, options, driver, final_nodes,
                          run_process_state, {}, {}, stop_token);
-    WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver, nodes, {},
-                               stop_token);
+    WriteWalletMetricsSnapshot(wallet_metrics_path, options, driver,
+                               final_nodes, {}, stop_token);
 
-    StopNodes(options, events_path, driver, nodes);
+    StopNodes(options, events_path, driver, final_nodes);
     log_collector->Stop();
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRunFinished);
