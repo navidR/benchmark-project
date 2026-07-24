@@ -4,12 +4,14 @@
 #include <vector>
 
 #include "bbp/drivers/chain_driver.h"
+#include "bbp/node_config_snapshot.h"
 #include "bbp/simulation_command.h"
 
 namespace bbp {
 
 class ChainCommandExecutor {
  public:
+  using NodeProvider = std::function<NodeConfigSnapshot()>;
   using StopMiningHandler = std::function<void(const ChainNodeConfig& config,
                                                std::stop_token stop_token)>;
   using BlockProductionPolicyHandler =
@@ -31,15 +33,23 @@ class ChainCommandExecutor {
                        PeerHandler connect_peer_handler,
                        PeerHandler disconnect_peer_handler,
                        PeerCountPolicyHandler peer_count_policy_handler);
+  ChainCommandExecutor(const ChainDriver& driver, NodeProvider node_provider,
+                       StopMiningHandler stop_mining_handler,
+                       BlockProductionPolicyHandler policy_handler,
+                       MiningDifficultyHandler difficulty_handler,
+                       PeerHandler connect_peer_handler,
+                       PeerHandler disconnect_peer_handler,
+                       PeerCountPolicyHandler peer_count_policy_handler);
 
   void Execute(const SimulationCommand& command,
                std::stop_token stop_token = {}) const;
 
  private:
-  const ChainNodeConfig& FindNode(const std::string& node_id) const;
+  static const ChainNodeConfig& FindNode(
+      const std::vector<ChainNodeConfig>& nodes, const std::string& node_id);
 
   const ChainDriver& driver_;
-  std::vector<ChainNodeConfig> nodes_;
+  NodeProvider node_provider_;
   StopMiningHandler stop_mining_handler_;
   BlockProductionPolicyHandler policy_handler_;
   MiningDifficultyHandler difficulty_handler_;

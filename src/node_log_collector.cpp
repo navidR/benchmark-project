@@ -1,6 +1,7 @@
 #include "bbp/node_log_collector.h"
 
 #include <algorithm>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -34,13 +35,21 @@ NodeLogCollector::NodeLogCollector(const ChainDriver& driver,
                                    std::chrono::milliseconds interval,
                                    std::uint64_t maximum_chunk_bytes,
                                    ChunkHandler handler)
+    : NodeLogCollector(
+          driver,
+          [nodes = std::move(nodes)] { return NodeConfigSnapshot(nodes); },
+          interval, maximum_chunk_bytes, std::move(handler)) {}
+
+NodeLogCollector::NodeLogCollector(const ChainDriver& driver,
+                                   NodeProvider node_provider,
+                                   std::chrono::milliseconds interval,
+                                   std::uint64_t maximum_chunk_bytes,
+                                   ChunkHandler handler)
     : driver_(driver),
-      nodes_(std::move(nodes)),
+      node_provider_(std::move(node_provider)),
       interval_(interval),
       maximum_chunk_bytes_(maximum_chunk_bytes),
-      handler_(std::move(handler)),
-      cursors_(nodes_.size()),
-      last_errors_(nodes_.size()) {
+      handler_(std::move(handler)) {
   if (interval_ <= std::chrono::milliseconds::zero()) {
     throw std::runtime_error("node log collection interval must be positive");
   }
@@ -49,6 +58,9 @@ NodeLogCollector::NodeLogCollector(const ChainDriver& driver,
   }
   if (!handler_) {
     throw std::runtime_error("node log collector requires a chunk handler");
+  }
+  if (!node_provider_) {
+    throw std::runtime_error("node log collector requires a node provider");
   }
 }
 
@@ -83,7 +95,9 @@ void NodeLogCollector::Stop() {
   if (thread_.joinable()) {
     thread_.join();
   }
-  PollOnce();
+  if (!handler_failure_) {
+    PollOnce();
+  }
   started_ = false;
   if (handler_failure_) {
     std::rethrow_exception(handler_failure_);
@@ -92,7 +106,12 @@ void NodeLogCollector::Stop() {
 
 void NodeLogCollector::Run() {
   while (true) {
-    PollOnce();
+    try {
+      PollOnce();
+    } catch (...) {
+      handler_failure_ = std::current_exception();
+      return;
+    }
     std::unique_lock<std::mutex> lock(mutex_);
     if (handler_failure_ ||
         wakeup_.wait_for(lock, interval_, [this] { return stopping_; })) {
@@ -102,34 +121,42 @@ void NodeLogCollector::Run() {
 }
 
 void NodeLogCollector::PollOnce() {
-  for (std::size_t node_index = 0; node_index < nodes_.size(); ++node_index) {
+  const NodeConfigSnapshot snapshot = node_provider_();
+  const std::vector<ChainNodeConfig>& nodes = snapshot.nodes();
+  std::set<std::string> active_node_ids;
+  for (const ChainNodeConfig& node : nodes) {
+    if (node.id.empty() || !active_node_ids.insert(node.id).second) {
+      throw std::runtime_error(
+          "node log collector provider returned an empty or duplicate node "
+          "id");
+    }
+    std::array<LogTailCursor, 3>& node_cursors = cursors_[node.id];
+    std::array<std::string, 3>& node_errors = last_errors_[node.id];
     for (ChainLogSource source : kLogSources) {
       const std::size_t source_index = SourceIndex(source);
       std::optional<LogTailChunk> chunk;
       try {
-        chunk = driver_.ReadLogTail(nodes_[node_index], source,
-                                    cursors_[node_index][source_index],
+        chunk = driver_.ReadLogTail(node, source, node_cursors[source_index],
                                     maximum_chunk_bytes_);
-        last_errors_[node_index][source_index].clear();
+        node_errors[source_index].clear();
       } catch (const std::exception& error) {
         const std::string message = error.what();
-        if (message != last_errors_[node_index][source_index]) {
+        if (message != node_errors[source_index]) {
           BBP_LOG(warning) << "cannot read " << ChainLogSourceName(source)
-                           << " for " << nodes_[node_index].id << ": "
-                           << message;
-          last_errors_[node_index][source_index] = message;
+                           << " for " << node.id << ": " << message;
+          node_errors[source_index] = message;
         }
         continue;
       }
       if (!chunk) {
         continue;
       }
-      cursors_[node_index][source_index] = chunk->next_cursor;
+      node_cursors[source_index] = chunk->next_cursor;
       if (chunk->text.empty() && !chunk->truncated && !chunk->offset_reset) {
         continue;
       }
       try {
-        handler_(nodes_[node_index], source, *chunk);
+        handler_(node, source, *chunk);
       } catch (...) {
         handler_failure_ = std::current_exception();
         std::lock_guard<std::mutex> lock(mutex_);
@@ -139,6 +166,12 @@ void NodeLogCollector::PollOnce() {
       }
     }
   }
+  std::erase_if(cursors_, [&](const auto& item) {
+    return !active_node_ids.contains(item.first);
+  });
+  std::erase_if(last_errors_, [&](const auto& item) {
+    return !active_node_ids.contains(item.first);
+  });
 }
 
 }  // namespace bbp

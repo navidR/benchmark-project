@@ -20,6 +20,19 @@ std::string PeerEndpoint(const ChainNodeConfig& config) {
   return config.p2p_host + ":" + std::to_string(config.p2p_port);
 }
 
+const ChainNodeConfig& FindNodeConfig(const std::vector<ChainNodeConfig>& nodes,
+                                      std::string_view node_id) {
+  const auto node = std::find_if(nodes.begin(), nodes.end(),
+                                 [node_id](const ChainNodeConfig& candidate) {
+                                   return candidate.id == node_id;
+                                 });
+  if (node == nodes.end()) {
+    throw std::runtime_error("unknown simulation node: " +
+                             std::string(node_id));
+  }
+  return *node;
+}
+
 std::string ExceptionMessage(const std::exception_ptr& error) {
   try {
     std::rethrow_exception(error);
@@ -54,13 +67,7 @@ PeerConnectivityController::PeerConnectivityController(
       interval_(interval),
       node_available_handler_(std::move(node_available_handler)),
       action_handler_(std::move(action_handler)),
-      failure_handler_(std::move(failure_handler)),
-      topology_restore_requests_(nodes_.size()),
-      topology_restore_completions_(nodes_.size(), 0U) {
-  if (nodes_.empty()) {
-    throw std::runtime_error(
-        "peer connectivity controller requires at least one node");
-  }
+      failure_handler_(std::move(failure_handler)) {
   if (interval_.count() <= 0) {
     throw std::runtime_error(
         "peer connectivity controller interval must be positive");
@@ -80,10 +87,20 @@ PeerConnectivityController::PeerConnectivityController(
           "peer connectivity controller is missing allowed peers for " +
           node.id);
     }
-    ValidateAllowedPeers(node.id, allowed->second);
+    ValidateAllowedPeersUnlocked(node.id, allowed->second);
+    topology_restore_requests_.emplace(node.id, 0U);
+    topology_restore_completions_.emplace(node.id, 0U);
   }
   for (const auto& [node_id, policy] : policies_) {
-    ValidatePolicy(node_id, policy);
+    const std::size_t maximum_possible = nodes_.size() - 1U;
+    if (policy.maximum() > maximum_possible) {
+      throw std::runtime_error("maximum peer count for " + node_id +
+                               " exceeds available simulation peers");
+    }
+    if (policy.minimum() > AllowedPeersUnlocked(node_id).size()) {
+      throw std::runtime_error("minimum peer count for " + node_id +
+                               " exceeds allowed logical peers");
+    }
   }
 }
 
@@ -109,10 +126,116 @@ void PeerConnectivityController::Stop() {
   started_ = false;
 }
 
+void PeerConnectivityController::RegisterNode(
+    ChainNodeConfig node, std::optional<PeerCountPolicy> policy,
+    std::vector<std::string> allowed_peer_node_ids) {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  if (node.id.empty()) {
+    throw std::runtime_error(
+        "peer connectivity controller node id must not be empty");
+  }
+  if (std::any_of(nodes_.begin(), nodes_.end(),
+                  [&](const ChainNodeConfig& candidate) {
+                    return candidate.id == node.id;
+                  })) {
+    throw std::runtime_error("simulation node is already registered: " +
+                             node.id);
+  }
+  const std::string registered_node_id = node.id;
+  nodes_.push_back(std::move(node));
+  try {
+    const auto [allowed, allowed_inserted] = allowed_peers_.emplace(
+        registered_node_id, std::move(allowed_peer_node_ids));
+    if (!allowed_inserted) {
+      throw std::logic_error(
+          "peer connectivity node registry is internally inconsistent");
+    }
+    ValidateAllowedPeersUnlocked(registered_node_id, allowed->second);
+    if (policy) {
+      const std::size_t maximum_possible = nodes_.size() - 1U;
+      if (policy->maximum() > maximum_possible ||
+          policy->minimum() > allowed->second.size()) {
+        throw std::runtime_error(
+            "peer policy is incompatible with the registered node set");
+      }
+      policies_.emplace(registered_node_id, *policy);
+    }
+    {
+      std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+      topology_restore_requests_.emplace(registered_node_id, 0U);
+      topology_restore_completions_.emplace(registered_node_id, 0U);
+    }
+  } catch (...) {
+    policies_.erase(registered_node_id);
+    allowed_peers_.erase(registered_node_id);
+    {
+      std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+      topology_restore_requests_.erase(registered_node_id);
+      topology_restore_completions_.erase(registered_node_id);
+    }
+    nodes_.pop_back();
+    throw;
+  }
+  configuration_sequence_.fetch_add(1U, std::memory_order_release);
+}
+
+void PeerConnectivityController::UnregisterNode(std::string_view node_id,
+                                                std::stop_token stop_token) {
+  auto rpc_lock = LockRpc(stop_token);
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  const std::string key(node_id);
+  const auto node = std::find_if(nodes_.begin(), nodes_.end(),
+                                 [&](const ChainNodeConfig& candidate) {
+                                   return candidate.id == node_id;
+                                 });
+  if (node == nodes_.end()) {
+    throw std::runtime_error("unknown simulation node: " + key);
+  }
+  for (const auto& [source_id, allowed] : allowed_peers_) {
+    if (source_id != key &&
+        std::find(allowed.begin(), allowed.end(), key) != allowed.end()) {
+      throw std::runtime_error(
+          "cannot unregister a node retained by an allowed peer set: " + key);
+    }
+  }
+  const std::size_t remaining_peer_capacity =
+      nodes_.size() > 1U ? nodes_.size() - 2U : 0U;
+  for (const auto& [source_id, policy] : policies_) {
+    if (source_id != key && policy.maximum() > remaining_peer_capacity) {
+      throw std::runtime_error(
+          "cannot unregister a node while a peer policy exceeds the "
+          "remaining node set: " +
+          source_id);
+    }
+  }
+  nodes_.erase(node);
+  policies_.erase(key);
+  allowed_peers_.erase(key);
+  last_failures_.erase(key);
+  last_restoration_failures_.erase(key);
+  {
+    std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+    topology_restore_requests_.erase(key);
+    topology_restore_completions_.erase(key);
+    std::erase_if(topology_restore_suppressions_, [&](const auto& item) {
+      return item.first.first == key || item.first.second == key;
+    });
+  }
+  configuration_sequence_.fetch_add(1U, std::memory_order_release);
+}
+
 void PeerConnectivityController::SetPolicy(std::string_view node_id,
                                            PeerCountPolicy policy) {
   std::lock_guard<std::mutex> lock(operation_mutex_);
-  ValidatePolicy(node_id, policy);
+  const std::size_t maximum_possible = nodes_.size() - 1U;
+  if (policy.maximum() > maximum_possible) {
+    throw std::runtime_error("maximum peer count for " + std::string(node_id) +
+                             " exceeds available simulation peers");
+  }
+  if (policy.minimum() > AllowedPeersUnlocked(node_id).size()) {
+    throw std::runtime_error("minimum peer count for " + std::string(node_id) +
+                             " exceeds allowed logical peers");
+  }
   policies_.insert_or_assign(std::string(node_id), policy);
   last_failures_.erase(std::string(node_id));
   last_restoration_failures_.erase(std::string(node_id));
@@ -121,16 +244,11 @@ void PeerConnectivityController::SetPolicy(std::string_view node_id,
 
 void PeerConnectivityController::RequestTopologyRestore(
     std::string_view changed_node_id) {
-  const ChainNodeConfig& node = FindNode(changed_node_id);
-  const std::size_t index = static_cast<std::size_t>(&node - nodes_.data());
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  const std::string node_id = FindNodeUnlocked(changed_node_id).id;
   const std::uint64_t requested = NextTopologyRestoreSequence();
-  std::uint64_t current =
-      topology_restore_requests_[index].load(std::memory_order_relaxed);
-  while (current < requested &&
-         !topology_restore_requests_[index].compare_exchange_weak(
-             current, requested, std::memory_order_release,
-             std::memory_order_relaxed)) {
-  }
+  std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+  topology_restore_requests_.at(node_id) = requested;
 }
 
 void PeerConnectivityController::SetAllowedPeers(
@@ -153,15 +271,25 @@ void PeerConnectivityController::ValidateAllowedPeerUpdate(
 std::vector<std::string> PeerConnectivityController::AllowedPeersFor(
     std::string_view node_id) {
   std::lock_guard<std::mutex> lock(operation_mutex_);
-  return AllowedPeers(node_id);
+  return AllowedPeersUnlocked(node_id);
 }
 
 void PeerConnectivityController::ConnectPeer(std::string_view node_id,
                                              std::string_view peer_node_id,
                                              std::chrono::seconds timeout,
                                              std::stop_token stop_token) {
-  const ChainNodeConfig& node = FindNode(node_id);
-  const ChainNodeConfig& peer = FindNode(peer_node_id);
+  ChainNodeConfig node;
+  ChainNodeConfig peer;
+  std::vector<ChainNodeConfig> nodes;
+  std::uint64_t expected_configuration_sequence = 0U;
+  {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    node = FindNodeUnlocked(node_id);
+    peer = FindNodeUnlocked(peer_node_id);
+    nodes = nodes_;
+    expected_configuration_sequence =
+        configuration_sequence_.load(std::memory_order_acquire);
+  }
   if (node.id == peer.id) {
     throw std::runtime_error("peer source and target must differ");
   }
@@ -171,20 +299,28 @@ void PeerConnectivityController::ConnectPeer(std::string_view node_id,
   auto rpc_lock = LockRpc(stop_token);
   {
     std::lock_guard<std::mutex> lock(operation_mutex_);
-    const std::vector<std::string>& allowed = AllowedPeers(node.id);
+    if (configuration_sequence_.load(std::memory_order_acquire) !=
+        expected_configuration_sequence) {
+      throw std::runtime_error(
+          "peer connection node inventory changed before admission");
+    }
+    node = FindNodeUnlocked(node_id);
+    peer = FindNodeUnlocked(peer_node_id);
+    nodes = nodes_;
+    const std::vector<std::string>& allowed = AllowedPeersUnlocked(node.id);
     if (std::find(allowed.begin(), allowed.end(), peer.id) == allowed.end()) {
       throw std::runtime_error(
           "peer target is not an active logical edge from " + node.id + ": " +
           peer.id);
     }
   }
-  RequireUnambiguousPeerIdentity(node, stop_token);
+  RequireUnambiguousPeerIdentity(nodes, node, stop_token);
   const std::string endpoint = PeerEndpoint(peer);
   SetPeerConnectionState(node, endpoint, true, timeout, stop_token);
   bool still_allowed = false;
   {
     std::lock_guard<std::mutex> lock(operation_mutex_);
-    const std::vector<std::string>& allowed = AllowedPeers(node.id);
+    const std::vector<std::string>& allowed = AllowedPeersUnlocked(node.id);
     still_allowed =
         std::find(allowed.begin(), allowed.end(), peer.id) != allowed.end();
   }
@@ -210,8 +346,18 @@ void PeerConnectivityController::DisconnectPeer(std::string_view node_id,
                                                 std::string_view peer_node_id,
                                                 std::chrono::seconds timeout,
                                                 std::stop_token stop_token) {
-  const ChainNodeConfig& node = FindNode(node_id);
-  const ChainNodeConfig& peer = FindNode(peer_node_id);
+  ChainNodeConfig node;
+  ChainNodeConfig peer;
+  std::vector<ChainNodeConfig> nodes;
+  std::uint64_t expected_configuration_sequence = 0U;
+  {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    node = FindNodeUnlocked(node_id);
+    peer = FindNodeUnlocked(peer_node_id);
+    nodes = nodes_;
+    expected_configuration_sequence =
+        configuration_sequence_.load(std::memory_order_acquire);
+  }
   if (node.id == peer.id) {
     throw std::runtime_error("peer source and target must differ");
   }
@@ -219,7 +365,18 @@ void PeerConnectivityController::DisconnectPeer(std::string_view node_id,
     throw std::runtime_error("peer source node is not running");
   }
   auto rpc_lock = LockRpc(stop_token);
-  RequireUnambiguousPeerIdentity(node, stop_token);
+  {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    if (configuration_sequence_.load(std::memory_order_acquire) !=
+        expected_configuration_sequence) {
+      throw std::runtime_error(
+          "peer disconnection node inventory changed before admission");
+    }
+    node = FindNodeUnlocked(node_id);
+    peer = FindNodeUnlocked(peer_node_id);
+    nodes = nodes_;
+  }
+  RequireUnambiguousPeerIdentity(nodes, node, stop_token);
   const std::string endpoint = PeerEndpoint(peer);
   SetPeerConnectionState(node, endpoint, false, timeout, stop_token);
   const std::uint64_t sequence = NextTopologyRestoreSequence();
@@ -288,19 +445,13 @@ void PeerConnectivityController::SetPeerConnectionState(
   }
 }
 
-const ChainNodeConfig& PeerConnectivityController::FindNode(
+const ChainNodeConfig& PeerConnectivityController::FindNodeUnlocked(
     std::string_view node_id) const {
-  const auto node =
-      std::find_if(nodes_.begin(), nodes_.end(),
-                   [node_id](const auto& item) { return item.id == node_id; });
-  if (node == nodes_.end()) {
-    throw std::runtime_error("unknown simulation node: " +
-                             std::string(node_id));
-  }
-  return *node;
+  return FindNodeConfig(nodes_, node_id);
 }
 
-const std::vector<std::string>& PeerConnectivityController::AllowedPeers(
+const std::vector<std::string>&
+PeerConnectivityController::AllowedPeersUnlocked(
     std::string_view node_id) const {
   const auto allowed = allowed_peers_.find(std::string(node_id));
   if (allowed == allowed_peers_.end()) {
@@ -310,13 +461,13 @@ const std::vector<std::string>& PeerConnectivityController::AllowedPeers(
   return allowed->second;
 }
 
-void PeerConnectivityController::ValidateAllowedPeers(
+void PeerConnectivityController::ValidateAllowedPeersUnlocked(
     std::string_view node_id,
     const std::vector<std::string>& peer_node_ids) const {
-  const ChainNodeConfig& node = FindNode(node_id);
+  const ChainNodeConfig& node = FindNodeUnlocked(node_id);
   std::set<std::string> unique;
   for (const std::string& peer_node_id : peer_node_ids) {
-    const ChainNodeConfig& peer = FindNode(peer_node_id);
+    const ChainNodeConfig& peer = FindNodeUnlocked(peer_node_id);
     if (peer.id == node.id) {
       throw std::runtime_error("allowed peer set must not contain its node");
     }
@@ -330,7 +481,7 @@ void PeerConnectivityController::ValidateAllowedPeers(
 void PeerConnectivityController::ValidateAllowedPeerUpdateUnlocked(
     std::string_view node_id,
     const std::vector<std::string>& peer_node_ids) const {
-  ValidateAllowedPeers(node_id, peer_node_ids);
+  ValidateAllowedPeersUnlocked(node_id, peer_node_ids);
   const auto policy = policies_.find(std::string(node_id));
   if (policy != policies_.end() &&
       policy->second.minimum() > peer_node_ids.size()) {
@@ -341,30 +492,17 @@ void PeerConnectivityController::ValidateAllowedPeerUpdateUnlocked(
 }
 
 void PeerConnectivityController::RequireUnambiguousPeerIdentity(
-    const ChainNodeConfig& node, std::stop_token stop_token) const {
+    const std::vector<ChainNodeConfig>& nodes, const ChainNodeConfig& node,
+    std::stop_token stop_token) const {
   std::vector<std::string> candidate_endpoints;
-  candidate_endpoints.reserve(nodes_.size() - 1U);
-  for (const ChainNodeConfig& candidate : nodes_) {
+  candidate_endpoints.reserve(nodes.size() - 1U);
+  for (const ChainNodeConfig& candidate : nodes) {
     if (candidate.id != node.id) {
       candidate_endpoints.push_back(PeerEndpoint(candidate));
     }
   }
   static_cast<void>(
       driver_.ConnectedPeerAddresses(node, candidate_endpoints, stop_token));
-}
-
-void PeerConnectivityController::ValidatePolicy(
-    std::string_view node_id, const PeerCountPolicy& policy) const {
-  static_cast<void>(FindNode(node_id));
-  const std::size_t maximum_possible = nodes_.size() - 1U;
-  if (policy.maximum() > maximum_possible) {
-    throw std::runtime_error("maximum peer count for " + std::string(node_id) +
-                             " exceeds available simulation peers");
-  }
-  if (policy.minimum() > AllowedPeers(node_id).size()) {
-    throw std::runtime_error("minimum peer count for " + std::string(node_id) +
-                             " exceeds allowed logical peers");
-  }
 }
 
 std::unique_lock<std::mutex> PeerConnectivityController::LockRpc(
@@ -407,15 +545,22 @@ void PeerConnectivityController::Run(std::stop_token stop_token) {
 }
 
 void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
+  std::vector<ChainNodeConfig> nodes;
   std::map<std::string, PeerCountPolicy> policies;
   AllowedPeerMap allowed_peers;
+  std::map<std::string, std::uint64_t> topology_restore_requests;
+  std::map<std::string, std::uint64_t> topology_restore_completions;
   std::uint64_t configuration_sequence = 0U;
   {
     std::lock_guard<std::mutex> lock(operation_mutex_);
+    nodes = nodes_;
     policies = policies_;
     allowed_peers = allowed_peers_;
     configuration_sequence =
         configuration_sequence_.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+    topology_restore_requests = topology_restore_requests_;
+    topology_restore_completions = topology_restore_completions_;
   }
   for (const auto& [node_id, policy] : policies) {
     if (stop_token.stop_requested()) {
@@ -425,8 +570,9 @@ void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
       continue;
     }
     try {
-      if (EnforcePolicy(FindNode(node_id), allowed_peers.at(node_id), &policy,
-                        std::nullopt, {}, configuration_sequence, stop_token)) {
+      if (EnforcePolicy(FindNodeConfig(nodes, node_id), nodes,
+                        allowed_peers.at(node_id), &policy, std::nullopt, {},
+                        configuration_sequence, stop_token)) {
         std::lock_guard<std::mutex> lock(operation_mutex_);
         last_failures_.erase(node_id);
       }
@@ -448,17 +594,15 @@ void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
     }
   }
 
-  for (std::size_t changed_index = 0; changed_index < nodes_.size();
-       ++changed_index) {
+  for (const ChainNodeConfig& changed_node : nodes) {
     const std::uint64_t requested =
-        topology_restore_requests_[changed_index].load(
-            std::memory_order_acquire);
-    if (requested == topology_restore_completions_[changed_index]) {
+        topology_restore_requests.at(changed_node.id);
+    if (requested == topology_restore_completions.at(changed_node.id)) {
       continue;
     }
-    const std::string& changed_node_id = nodes_[changed_index].id;
+    const std::string& changed_node_id = changed_node.id;
     bool restored = true;
-    for (const ChainNodeConfig& source : nodes_) {
+    for (const ChainNodeConfig& source : nodes) {
       const std::vector<std::string>& allowed = allowed_peers.at(source.id);
       const bool affected = source.id == changed_node_id ||
                             std::find(allowed.begin(), allowed.end(),
@@ -475,8 +619,9 @@ void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
         if (policy != policies.end()) {
           continue;
         }
-        if (!EnforcePolicy(source, allowed, nullptr, requested, changed_node_id,
-                           configuration_sequence, stop_token)) {
+        if (!EnforcePolicy(source, nodes, allowed, nullptr, requested,
+                           changed_node_id, configuration_sequence,
+                           stop_token)) {
           restored = false;
         } else {
           std::lock_guard<std::mutex> lock(operation_mutex_);
@@ -504,13 +649,18 @@ void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
     }
     if (restored && configuration_sequence_.load(std::memory_order_acquire) ==
                         configuration_sequence) {
-      topology_restore_completions_[changed_index] = requested;
+      std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+      const auto current = topology_restore_requests_.find(changed_node_id);
+      if (current != topology_restore_requests_.end() &&
+          current->second == requested) {
+        topology_restore_completions_[changed_node_id] = requested;
+      }
     }
   }
 }
 
 bool PeerConnectivityController::EnforcePolicy(
-    const ChainNodeConfig& node,
+    const ChainNodeConfig& node, const std::vector<ChainNodeConfig>& nodes,
     const std::vector<std::string>& allowed_peer_ids,
     const PeerCountPolicy* policy,
     std::optional<std::uint64_t> restore_request_sequence,
@@ -545,7 +695,7 @@ bool PeerConnectivityController::EnforcePolicy(
   std::vector<std::string> all_candidate_endpoints;
   std::set<std::string> allowed_peer_id_set(allowed_peer_ids.begin(),
                                             allowed_peer_ids.end());
-  for (const ChainNodeConfig& candidate : nodes_) {
+  for (const ChainNodeConfig& candidate : nodes) {
     if (candidate.id == node.id) {
       continue;
     }
@@ -558,7 +708,7 @@ bool PeerConnectivityController::EnforcePolicy(
       continue;
     }
     ++eligible_peer_count;
-    const ChainNodeConfig& candidate = FindNode(peer_node_id);
+    const ChainNodeConfig& candidate = FindNodeConfig(nodes, peer_node_id);
     if (!node_available_handler_(candidate.id)) {
       continue;
     }

@@ -2,6 +2,7 @@
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -10,6 +11,8 @@
 #include <thread>
 #include <vector>
 
+#include "bbp/drivers/chain_command_executor.h"
+#include "bbp/node_log_collector.h"
 #include "bbp/peer_connectivity_controller.h"
 #include "bbp/simulation_cancelled.h"
 
@@ -20,10 +23,19 @@ class TestChainDriver final : public bbp::ChainDriver {
   bbp::ProcessSpec RenderProcess(const bbp::ChainNodeConfig&) const override {
     return {};
   }
-  std::optional<bbp::LogTailChunk> ReadLogTail(const bbp::ChainNodeConfig&,
+  std::optional<bbp::LogTailChunk> ReadLogTail(const bbp::ChainNodeConfig& node,
                                                bbp::ChainLogSource,
                                                const bbp::LogTailCursor&,
                                                std::uint64_t) const override {
+    if (block_log_read_.load(std::memory_order_acquire) &&
+        node.id == blocked_log_node_id_) {
+      log_read_blocked_.store(true, std::memory_order_release);
+      while (!release_log_read_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++log_read_counts_[node.id];
     return std::nullopt;
   }
   bbp::RpcEndpoint Endpoint(const bbp::ChainNodeConfig&) const override {
@@ -189,6 +201,7 @@ class TestChainDriver final : public bbp::ChainDriver {
                       const std::string& address,
                       std::stop_token) const override {
     std::lock_guard<std::mutex> lock(mutex_);
+    ++disconnect_call_count_;
     if (disconnect_failure_) {
       const std::string message = std::move(*disconnect_failure_);
       disconnect_failure_.reset();
@@ -196,9 +209,22 @@ class TestChainDriver final : public bbp::ChainDriver {
     }
     connections_[config.id].erase(address);
   }
-  void ChangeLogVerbosity(const bbp::ChainNodeConfig&,
+  void ChangeLogVerbosity(const bbp::ChainNodeConfig& config,
                           bbp::ChainLogVerbosityChange,
-                          std::stop_token) const override {}
+                          std::stop_token stop_token) const override {
+    if (block_verbosity_.load(std::memory_order_acquire) &&
+        config.id == blocked_verbosity_node_id_) {
+      verbosity_blocked_.store(true, std::memory_order_release);
+      while (!release_verbosity_.load(std::memory_order_acquire)) {
+        if (stop_token.stop_requested()) {
+          throw bbp::SimulationCancelled();
+        }
+        std::this_thread::yield();
+      }
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_verbosity_node_ = config.id;
+  }
   void SetMiningDifficulty(const bbp::ChainNodeConfig&, bbp::MiningDifficulty,
                            std::stop_token) const override {}
   void StartMining(const bbp::ChainNodeConfig&, const std::string&,
@@ -213,6 +239,54 @@ class TestChainDriver final : public bbp::ChainDriver {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = connections_.find(node_id);
     return found == connections_.end() ? 0U : found->second.size();
+  }
+
+  std::uint64_t LogReadCount(const std::string& node_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = log_read_counts_.find(node_id);
+    return found == log_read_counts_.end() ? 0U : found->second;
+  }
+
+  std::string LastVerbosityNode() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_verbosity_node_;
+  }
+
+  std::uint64_t DisconnectCallCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return disconnect_call_count_;
+  }
+
+  void BlockLogReadFor(std::string node_id) {
+    blocked_log_node_id_ = std::move(node_id);
+    release_log_read_.store(false, std::memory_order_release);
+    log_read_blocked_.store(false, std::memory_order_release);
+    block_log_read_.store(true, std::memory_order_release);
+  }
+
+  bool LogReadBlocked() const {
+    return log_read_blocked_.load(std::memory_order_acquire);
+  }
+
+  void ReleaseLogRead() {
+    release_log_read_.store(true, std::memory_order_release);
+    block_log_read_.store(false, std::memory_order_release);
+  }
+
+  void BlockVerbosityFor(std::string node_id) {
+    blocked_verbosity_node_id_ = std::move(node_id);
+    release_verbosity_.store(false, std::memory_order_release);
+    verbosity_blocked_.store(false, std::memory_order_release);
+    block_verbosity_.store(true, std::memory_order_release);
+  }
+
+  bool VerbosityBlocked() const {
+    return verbosity_blocked_.load(std::memory_order_acquire);
+  }
+
+  void ReleaseVerbosity() {
+    release_verbosity_.store(true, std::memory_order_release);
+    block_verbosity_.store(false, std::memory_order_release);
   }
 
   bool IsConnected(const std::string& node_id,
@@ -277,6 +351,17 @@ class TestChainDriver final : public bbp::ChainDriver {
  private:
   mutable std::mutex mutex_;
   mutable std::map<std::string, std::set<std::string>> connections_;
+  mutable std::map<std::string, std::uint64_t> log_read_counts_;
+  mutable std::string last_verbosity_node_;
+  mutable std::uint64_t disconnect_call_count_ = 0U;
+  std::string blocked_log_node_id_;
+  std::string blocked_verbosity_node_id_;
+  mutable std::atomic<bool> block_log_read_ = false;
+  mutable std::atomic<bool> log_read_blocked_ = false;
+  mutable std::atomic<bool> release_log_read_ = false;
+  mutable std::atomic<bool> block_verbosity_ = false;
+  mutable std::atomic<bool> verbosity_blocked_ = false;
+  mutable std::atomic<bool> release_verbosity_ = false;
   mutable bool ignore_next_connect_ = false;
   mutable std::optional<std::string> disconnect_failure_;
   mutable std::optional<std::string> connected_wait_failure_;
@@ -322,6 +407,226 @@ bool WaitFor(const std::function<bool()>& predicate) {
 }
 
 }  // namespace
+
+BOOST_AUTO_TEST_CASE(chain_command_executor_resolves_live_node_inventory) {
+  TestChainDriver driver;
+  std::mutex nodes_mutex;
+  std::vector<bbp::ChainNodeConfig> nodes = TestNodes();
+  std::shared_ptr<int> generation;
+  bbp::ChainCommandExecutor executor(
+      driver,
+      [&] {
+        std::lock_guard<std::mutex> lock(nodes_mutex);
+        return bbp::NodeConfigSnapshot(nodes, generation);
+      },
+      [](const bbp::ChainNodeConfig&, std::stop_token) {},
+      [](bbp::BlockProductionPolicy) {},
+      [](const bbp::ChainNodeConfig&, bbp::MiningDifficulty, std::stop_token) {
+      },
+      [](const bbp::ChainNodeConfig&, const bbp::ChainNodeConfig&,
+         std::stop_token) {},
+      [](const bbp::ChainNodeConfig&, const bbp::ChainNodeConfig&,
+         std::stop_token) {},
+      [](const bbp::ChainNodeConfig&, bbp::PeerCountPolicy) {});
+
+  bbp::SimulationCommand command;
+  command.kind = bbp::SimulationCommandKind::kIncreaseLogVerbosity;
+  command.node_id = "node-4";
+  BOOST_CHECK_THROW(executor.Execute(command), std::runtime_error);
+
+  bbp::ChainNodeConfig added;
+  added.id = "node-4";
+  std::weak_ptr<int> generation_lease;
+  {
+    std::lock_guard<std::mutex> lock(nodes_mutex);
+    nodes.push_back(added);
+    generation = std::make_shared<int>(4);
+    generation_lease = generation;
+  }
+  driver.BlockVerbosityFor("node-4");
+  std::jthread execution([&] { executor.Execute(command); });
+  BOOST_REQUIRE(WaitFor([&] { return driver.VerbosityBlocked(); }));
+  {
+    std::lock_guard<std::mutex> lock(nodes_mutex);
+    nodes.clear();
+    generation.reset();
+  }
+  BOOST_TEST(!generation_lease.expired());
+  driver.ReleaseVerbosity();
+  execution.join();
+  BOOST_TEST(driver.LastVerbosityNode() == "node-4");
+  BOOST_TEST(generation_lease.expired());
+}
+
+BOOST_AUTO_TEST_CASE(node_log_collector_tracks_live_node_inventory) {
+  TestChainDriver driver;
+  std::mutex nodes_mutex;
+  std::vector<bbp::ChainNodeConfig> nodes = {TestNodes().front()};
+  std::shared_ptr<int> generation = std::make_shared<int>(1);
+  std::weak_ptr<int> generation_lease = generation;
+  bbp::NodeLogCollector collector(
+      driver,
+      [&] {
+        std::lock_guard<std::mutex> lock(nodes_mutex);
+        return bbp::NodeConfigSnapshot(nodes, generation);
+      },
+      std::chrono::milliseconds(5), 1024U,
+      [](const bbp::ChainNodeConfig&, bbp::ChainLogSource,
+         const bbp::LogTailChunk&) {});
+
+  driver.BlockLogReadFor("node-1");
+  collector.Start();
+  BOOST_REQUIRE(WaitFor([&] { return driver.LogReadBlocked(); }));
+  {
+    std::lock_guard<std::mutex> lock(nodes_mutex);
+    nodes.clear();
+    generation.reset();
+  }
+  BOOST_TEST(!generation_lease.expired());
+  driver.ReleaseLogRead();
+  BOOST_REQUIRE(WaitFor([&] { return generation_lease.expired(); }));
+  const std::uint64_t removed_read_count = driver.LogReadCount("node-1");
+  std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  BOOST_TEST(driver.LogReadCount("node-1") == removed_read_count);
+  collector.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_registers_live_node_transactionally) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+  controller.Start();
+
+  bbp::ChainNodeConfig node;
+  node.id = "node-4";
+  node.p2p_host = "10.0.0.4";
+  node.p2p_port = 18003U;
+  controller.RegisterNode(node, std::nullopt, {"node-1", "node-2", "node-3"});
+  controller.SetAllowedPeers("node-1", {"node-2", "node-3", "node-4"});
+  controller.SetAllowedPeers("node-2", {"node-1", "node-3", "node-4"});
+  controller.SetAllowedPeers("node-3", {"node-1", "node-2", "node-4"});
+  controller.RequestTopologyRestore("node-4");
+  BOOST_REQUIRE(
+      WaitFor([&] { return driver.ConnectionCount("node-4") == 3U; }));
+
+  bbp::ChainNodeConfig invalid = node;
+  invalid.id = "node-5";
+  BOOST_CHECK_THROW(controller.RegisterNode(invalid, std::nullopt, {"missing"}),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(controller.RequestTopologyRestore("node-5"),
+                    std::runtime_error);
+
+  controller.SetAllowedPeers("node-1", {"node-2", "node-3"});
+  controller.SetAllowedPeers("node-2", {"node-1", "node-3"});
+  controller.SetAllowedPeers("node-3", {"node-1", "node-2"});
+  controller.UnregisterNode("node-4");
+  BOOST_CHECK_THROW(controller.AllowedPeersFor("node-4"), std::runtime_error);
+  controller.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_bounds_cancelled_unregistration) {
+  TestChainDriver driver;
+  driver.BlockConnectedWaitFor("node-1");
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+  bbp::ChainNodeConfig node;
+  node.id = "node-4";
+  node.p2p_host = "10.0.0.4";
+  node.p2p_port = 18003U;
+  controller.RegisterNode(node, std::nullopt, {});
+  controller.RequestTopologyRestore("node-1");
+  controller.Start();
+  BOOST_REQUIRE(WaitFor([&] { return driver.ConnectedWaitBlocked(); }));
+
+  std::stop_source stop_source;
+  std::atomic<bool> cancelled = false;
+  std::jthread unregister([&] {
+    try {
+      controller.UnregisterNode("node-4", stop_source.get_token());
+    } catch (const bbp::SimulationCancelled&) {
+      cancelled.store(true, std::memory_order_release);
+    }
+  });
+  stop_source.request_stop();
+  unregister.join();
+  BOOST_TEST(cancelled.load(std::memory_order_acquire));
+  BOOST_TEST(controller.AllowedPeersFor("node-4").empty());
+
+  driver.ReleaseConnectedWait();
+  controller.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(peer_connectivity_controller_supports_empty_inventory) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, {}, {}, {}, std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+  controller.Start();
+
+  bbp::ChainNodeConfig node;
+  node.id = "node-1";
+  node.p2p_host = "10.0.0.1";
+  node.p2p_port = 18000U;
+  controller.RegisterNode(node, std::nullopt, {});
+  BOOST_TEST(controller.AllowedPeersFor("node-1").empty());
+  controller.UnregisterNode("node-1");
+  BOOST_CHECK_THROW(controller.AllowedPeersFor("node-1"), std::runtime_error);
+  controller.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_rejects_removed_disconnect_generation) {
+  TestChainDriver driver;
+  std::atomic<bool> availability_check_blocked = false;
+  std::atomic<bool> release_availability_check = false;
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [&](std::string_view node_id) {
+        if (node_id == "node-1") {
+          availability_check_blocked.store(true, std::memory_order_release);
+          while (!release_availability_check.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+          }
+        }
+        return true;
+      },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  std::atomic<bool> rejected = false;
+  std::jthread disconnect([&] {
+    try {
+      controller.DisconnectPeer("node-1", "node-2", std::chrono::seconds(1));
+    } catch (const std::runtime_error&) {
+      rejected.store(true, std::memory_order_release);
+    }
+  });
+  BOOST_REQUIRE(WaitFor([&] {
+    return availability_check_blocked.load(std::memory_order_acquire);
+  }));
+  controller.SetAllowedPeers("node-1", {"node-3"});
+  controller.SetAllowedPeers("node-3", {"node-1"});
+  controller.UnregisterNode("node-2");
+  release_availability_check.store(true, std::memory_order_release);
+  disconnect.join();
+
+  BOOST_TEST(rejected.load(std::memory_order_acquire));
+  BOOST_TEST(driver.DisconnectCallCount() == 0U);
+}
 
 BOOST_AUTO_TEST_CASE(peer_connectivity_controller_enforces_typed_range) {
   TestChainDriver driver;

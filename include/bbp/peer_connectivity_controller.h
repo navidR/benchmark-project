@@ -56,6 +56,10 @@ class PeerConnectivityController {
 
   void Start();
   void Stop();
+  void RegisterNode(ChainNodeConfig node, std::optional<PeerCountPolicy> policy,
+                    std::vector<std::string> allowed_peer_node_ids);
+  void UnregisterNode(std::string_view node_id,
+                      std::stop_token stop_token = {});
   void SetPolicy(std::string_view node_id, PeerCountPolicy policy);
   void RequestTopologyRestore(std::string_view changed_node_id);
   void SetAllowedPeers(std::string_view node_id,
@@ -71,27 +75,28 @@ class PeerConnectivityController {
                       std::stop_token stop_token = {});
 
  private:
-  const ChainNodeConfig& FindNode(std::string_view node_id) const;
-  const std::vector<std::string>& AllowedPeers(std::string_view node_id) const;
-  void ValidateAllowedPeers(
+  const ChainNodeConfig& FindNodeUnlocked(std::string_view node_id) const;
+  const std::vector<std::string>& AllowedPeersUnlocked(
+      std::string_view node_id) const;
+  void ValidateAllowedPeersUnlocked(
       std::string_view node_id,
       const std::vector<std::string>& peer_node_ids) const;
   void ValidateAllowedPeerUpdateUnlocked(
       std::string_view node_id,
       const std::vector<std::string>& peer_node_ids) const;
-  void RequireUnambiguousPeerIdentity(const ChainNodeConfig& node,
+  void RequireUnambiguousPeerIdentity(const std::vector<ChainNodeConfig>& nodes,
+                                      const ChainNodeConfig& node,
                                       std::stop_token stop_token) const;
   void SetPeerConnectionState(const ChainNodeConfig& node,
                               const std::string& endpoint, bool connected,
                               std::chrono::seconds timeout,
                               std::stop_token stop_token) const;
-  void ValidatePolicy(std::string_view node_id,
-                      const PeerCountPolicy& policy) const;
   std::unique_lock<std::mutex> LockRpc(std::stop_token stop_token);
   std::uint64_t NextTopologyRestoreSequence();
   void Run(std::stop_token stop_token);
   void EnforcePolicies(std::stop_token stop_token);
   bool EnforcePolicy(const ChainNodeConfig& node,
+                     const std::vector<ChainNodeConfig>& nodes,
                      const std::vector<std::string>& allowed_peer_ids,
                      const PeerCountPolicy* policy,
                      std::optional<std::uint64_t> restore_request_sequence,
@@ -115,15 +120,15 @@ class PeerConnectivityController {
   FailureHandler failure_handler_;
   std::map<std::string, std::string> last_failures_;
   std::map<std::string, std::string> last_restoration_failures_;
-  std::mutex operation_mutex_;
+  mutable std::mutex operation_mutex_;
   std::mutex rpc_mutex_;
   std::mutex restoration_mutex_;
   std::atomic<std::uint64_t> configuration_sequence_ = 0U;
   std::atomic<std::uint64_t> topology_restore_sequence_ = 0U;
   std::map<std::pair<std::string, std::string>, std::uint64_t>
       topology_restore_suppressions_;
-  std::vector<std::atomic<std::uint64_t>> topology_restore_requests_;
-  std::vector<std::uint64_t> topology_restore_completions_;
+  std::map<std::string, std::uint64_t> topology_restore_requests_;
+  std::map<std::string, std::uint64_t> topology_restore_completions_;
   std::jthread thread_;
   bool started_ = false;
 };

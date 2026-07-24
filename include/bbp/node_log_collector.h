@@ -6,22 +6,28 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "bbp/drivers/chain_driver.h"
+#include "bbp/node_config_snapshot.h"
 
 namespace bbp {
 
 class NodeLogCollector {
  public:
+  using NodeProvider = std::function<NodeConfigSnapshot()>;
   using ChunkHandler = std::function<void(const ChainNodeConfig&,
                                           ChainLogSource, const LogTailChunk&)>;
 
   NodeLogCollector(const ChainDriver& driver,
                    std::vector<ChainNodeConfig> nodes,
+                   std::chrono::milliseconds interval,
+                   std::uint64_t maximum_chunk_bytes, ChunkHandler handler);
+  NodeLogCollector(const ChainDriver& driver, NodeProvider node_provider,
                    std::chrono::milliseconds interval,
                    std::uint64_t maximum_chunk_bytes, ChunkHandler handler);
   NodeLogCollector(const NodeLogCollector&) = delete;
@@ -36,12 +42,12 @@ class NodeLogCollector {
   void PollOnce();
 
   const ChainDriver& driver_;
-  std::vector<ChainNodeConfig> nodes_;
+  NodeProvider node_provider_;
   std::chrono::milliseconds interval_;
   std::uint64_t maximum_chunk_bytes_;
   ChunkHandler handler_;
-  std::vector<std::array<LogTailCursor, 3>> cursors_;
-  std::vector<std::array<std::string, 3>> last_errors_;
+  std::map<std::string, std::array<LogTailCursor, 3>> cursors_;
+  std::map<std::string, std::array<std::string, 3>> last_errors_;
   std::mutex mutex_;
   std::condition_variable wakeup_;
   std::thread thread_;
