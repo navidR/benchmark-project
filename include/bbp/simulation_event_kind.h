@@ -23,6 +23,7 @@ enum class SimulationEventKind {
   kStartupPeerConnected,
   kWalletAddressRequested,
   kWalletAddressCreated,
+  kRuntimeWalletGenerationPublished,
   kWalletFunded,
   kResourceLimitsUpdated,
   kResourceProfileUpdated,

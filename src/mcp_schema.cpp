@@ -700,6 +700,20 @@ boost::json::object RoleSchema() {
       boost::json::array{"base", "wallet", "miner", "masternode"});
 }
 
+boost::json::object WalletMutationIdentitySchema() {
+  boost::json::object properties;
+  properties["wallet_index"] = IntegerSchema(1U);
+  properties["node"] = IntegerSchema(1U);
+  properties["node_id"] = IdentifierSchema();
+  properties["mode"] =
+      StringEnumSchema(boost::json::array{"public", "private"});
+  properties["address"] = StringSchema(1U);
+  properties["funding_address"] = StringSchema(1U);
+  return ClosedObject(std::move(properties),
+                      Required({"wallet_index", "node", "node_id", "mode",
+                                "address", "funding_address"}));
+}
+
 boost::json::object RunStateSchema() {
   return StringEnumSchema(boost::json::array{"empty", "starting", "active",
                                              "stopping", "stopped", "failed",
@@ -1656,11 +1670,25 @@ boost::json::object BuildMcpResultSchema(
       properties["affected_node_ids"] =
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       properties["action"] = StringSchema(1U);
-      properties["state"] =
-          StringEnumSchema(boost::json::array{"running", "stopped", "killed"});
+      properties["state"] = StringEnumSchema(
+          boost::json::array{"running", "stopped", "killed", "ready"});
       properties["command_id"] = IdentifierSchema();
       properties["unchanged"] = TypeSchema("boolean");
+      properties["wallets"] = ArraySchema(WalletMutationIdentitySchema(), 1U,
+                                          kMaximumSafeCollection);
+      properties["wallet_generation"] = IntegerSchema(1U);
+      properties["final_wallet_count"] = Uint64Schema();
       require({"run_id", "added_node_ids", "removed_node_ids", "unchanged"});
+      constraints.emplace_back(boost::json::object{
+          {"if", boost::json::object{{"properties",
+                                      boost::json::object{
+                                          {"action",
+                                           ConstStringSchema("wallet.add")}}},
+                                     {"required", Required({"action"})}}},
+          {"then", boost::json::object{
+                       {"required", Required({"affected_node_ids", "state",
+                                              "wallets", "wallet_generation",
+                                              "final_wallet_count"})}}}});
       break;
     case McpResultFamily::kRoleMutation:
       properties["run_id"] = IdentifierSchema();

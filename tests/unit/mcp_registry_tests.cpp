@@ -756,6 +756,9 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
   BOOST_TEST(mutation_properties.contains("action"));
   BOOST_TEST(mutation_properties.contains("state"));
   BOOST_TEST(mutation_properties.contains("command_id"));
+  BOOST_TEST(mutation_properties.contains("wallets"));
+  BOOST_TEST(mutation_properties.contains("wallet_generation"));
+  BOOST_TEST(mutation_properties.contains("final_wallet_count"));
 
   const std::array lifecycle_operations{
       std::pair{McpOperationKind::kStopNode, "stopped"},

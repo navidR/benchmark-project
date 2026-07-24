@@ -1911,4 +1911,93 @@ BOOST_AUTO_TEST_CASE(
   application.Shutdown();
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_live_wallet_add_routes_authoritative_role_mutation_service) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kAddWallet) != supported.end());
+
+  auto service = std::make_shared<McpLiveRoleService>();
+  service->operation = [](McpOperationKind kind,
+                          const boost::json::object& arguments,
+                          std::stop_token stop_token) {
+    BOOST_CHECK(kind == McpOperationKind::kAddWallet);
+    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
+    BOOST_TEST(arguments.at("mode").as_string() == "public");
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    if (arguments.at("node_id").as_string() == "firo-cancel") {
+      throw SimulationCancelled();
+    }
+    return boost::json::object{
+        {"added_node_ids", boost::json::array{}},
+        {"removed_node_ids", boost::json::array{}},
+        {"affected_node_ids", boost::json::array{"firo-1"}},
+        {"action", "wallet.add"},
+        {"state", "ready"},
+        {"unchanged", false},
+        {"wallets", boost::json::array{boost::json::object{
+                        {"wallet_index", 1U},
+                        {"node", 1U},
+                        {"node_id", "firo-1"},
+                        {"mode", "public"},
+                        {"address", "wallet-address"},
+                        {"funding_address", "wallet-address"}}}},
+        {"wallet_generation", 2U},
+        {"final_wallet_count", 1U},
+    };
+  };
+  application.SetRoleService(service);
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object submitted =
+      Invoke(&dispatcher, "wallet.add",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-1"},
+                                 {"count", 1U},
+                                 {"mode", "public"}});
+  const boost::json::object terminal = WaitForTerminal(&dispatcher, submitted);
+  BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& result =
+      terminal.at("terminal_result").as_object();
+  BOOST_TEST(result.at("result_family").as_string() == "mutation");
+  BOOST_TEST(result.at("action").as_string() == "wallet.add");
+  BOOST_TEST(result.at("state").as_string() == "ready");
+  BOOST_TEST(result.at("wallet_generation").as_uint64() == 2U);
+  BOOST_TEST(result.at("wallets").as_array().size() == 1U);
+
+  const boost::json::object cancelled =
+      Invoke(&dispatcher, "wallet.add",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-cancel"},
+                                 {"count", 1U},
+                                 {"mode", "public"}});
+  BOOST_TEST(WaitForTerminal(&dispatcher, cancelled).at("state").as_string() ==
+             "cancelled");
+}
+
 }  // namespace bbp

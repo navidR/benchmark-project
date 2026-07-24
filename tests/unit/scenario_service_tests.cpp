@@ -172,6 +172,21 @@ BOOST_AUTO_TEST_CASE(scenario_service_preserves_absent_wallet_lifetime_limit) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    scenario_service_initializes_explicit_wallet_role_without_workload) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] =
+      boost::json::array{boost::json::object{{"id", "firo-wallet"},
+                                             {"chain", "firo"},
+                                             {"role", "wallet"},
+                                             {"binary", "/bin/true"}}};
+
+  const Options options = ParseAndValidateScenario(scenario);
+  BOOST_TEST(options.wallet_backed_workload_requested);
+  BOOST_REQUIRE_EQUAL(options.topology.wallet_nodes.size(), 1U);
+  BOOST_TEST(options.topology.wallet_nodes.front() == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(
     scenario_service_parses_live_commands_with_scheduled_rules) {
   const Options options = ParseAndValidateScenario(MinimalScenario());
   const boost::json::object input{

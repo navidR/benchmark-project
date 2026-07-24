@@ -80,6 +80,7 @@ struct WalletInitialization {
 struct WalletIdentity {
   uint32_t wallet_index = 0;
   uint32_t node = 1;
+  std::string node_id;
   std::string address;
   std::string funding_address;
 };
@@ -100,6 +101,7 @@ class SimulationRegistry {
   }
 
   void AddWallet(WalletIdentity wallet);
+  void SetRuntimeNodeCount(uint32_t node_count);
   WalletIdentity& MutableWalletByIndex(size_t wallet_index);
   const WalletIdentity& WalletByIndex(size_t wallet_index) const;
 

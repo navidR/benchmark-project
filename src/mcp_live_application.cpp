@@ -26,6 +26,7 @@
 #include "bbp/mcp_run_evidence.h"
 #include "bbp/run_report.h"
 #include "bbp/scenario_service.h"
+#include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulator/options.h"
 #include "bbp/util.h"
@@ -43,6 +44,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kStopNode,
     McpOperationKind::kKillNode,
     McpOperationKind::kRestartNode,
+    McpOperationKind::kAddWallet,
     McpOperationKind::kQueryEvidence,
     McpOperationKind::kQueryLogs,
     McpOperationKind::kFollowLogs,
@@ -674,6 +676,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kStopNode &&
       kind != McpOperationKind::kKillNode &&
       kind != McpOperationKind::kRestartNode &&
+      kind != McpOperationKind::kAddWallet &&
       kind != McpOperationKind::kQueryEvidence &&
       kind != McpOperationKind::kQueryLogs &&
       kind != McpOperationKind::kFollowLogs &&
@@ -713,6 +716,33 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           result["result_family"] = "workload";
           result["run_id"] = config_.run_id;
           return McpTypedResult{.family = McpResultFamily::kWorkload,
+                                .value = std::move(result)};
+        }};
+  }
+
+  if (kind == McpOperationKind::kAddWallet) {
+    const std::shared_ptr<McpLiveRoleService> role_service = RoleService();
+    if (!role_service) {
+      throw McpOperationFailure(
+          "role_service_unavailable",
+          "the simulator role mutation service is unavailable", true);
+    }
+    return McpOperationPlan{
+        .progress_total = 3U,
+        .executor = [this, role_service, kind,
+                     arguments](McpOperationContext& context) {
+          CombinedStopToken cancellation(context.stop_token(),
+                                         run_stop_source_.get_token());
+          boost::json::object result;
+          try {
+            result =
+                role_service->operation(kind, arguments, cancellation.token());
+          } catch (const SimulationCancelled&) {
+            throw McpOperationCancelled();
+          }
+          result["result_family"] = "mutation";
+          result["run_id"] = config_.run_id;
+          return McpTypedResult{.family = McpResultFamily::kMutation,
                                 .value = std::move(result)};
         }};
   }
@@ -1949,6 +1979,28 @@ std::shared_ptr<McpLiveWorkloadService> McpLiveApplication::WorkloadService()
   return workload_service_;
 }
 
+void McpLiveApplication::SetRoleService(
+    std::shared_ptr<McpLiveRoleService> service) {
+  if (config_.retained_run) {
+    throw std::logic_error(
+        "retained MCP application cannot install a role service");
+  }
+  if (service && !service->operation) {
+    throw std::invalid_argument(
+        "MCP role service requires an operation callback");
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (shutdown_) {
+    throw std::runtime_error("MCP live application is shutting down");
+  }
+  role_service_ = std::move(service);
+}
+
+std::shared_ptr<McpLiveRoleService> McpLiveApplication::RoleService() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return role_service_;
+}
+
 McpLiveNodeInventorySnapshot McpLiveApplication::LiveNodeInventory() const {
   if (config_.retained_run || !config_.node_inventory_snapshot) {
     throw std::logic_error("authoritative live node inventory is unavailable");
@@ -2116,6 +2168,7 @@ void McpLiveApplication::Shutdown() {
   std::unique_lock<std::mutex> lock(mutex_);
   requests_drained_.wait(lock, [this] { return active_requests_ == 0U; });
   workload_service_.reset();
+  role_service_.reset();
 }
 
 }  // namespace bbp

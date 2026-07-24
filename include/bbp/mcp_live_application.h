@@ -37,6 +37,15 @@ struct McpLiveWorkloadService {
   std::function<boost::json::value(bool history, std::stop_token)> read;
 };
 
+// Simulator-owned role mutation service. MCP supplies typed arguments and
+// cancellation; the simulator owns driver calls, transactional publication,
+// evidence, and shared runtime state.
+struct McpLiveRoleService {
+  std::function<boost::json::object(
+      McpOperationKind, const boost::json::object&, std::stop_token)>
+      operation;
+};
+
 // Lifetime bridge between the embedded MCP endpoint and one simulator run.
 // Config references remain valid until the endpoint has stopped all request
 // and operation workers. mutex_ owns admission, shutdown, and MCP command
@@ -82,6 +91,7 @@ class McpLiveApplication {
   bool read_only() const;
   std::uint32_t current_node_count() const;
   void SetWorkloadService(std::shared_ptr<McpLiveWorkloadService> service);
+  void SetRoleService(std::shared_ptr<McpLiveRoleService> service);
 
   // Called exactly once by SimulationCommandProcessor. Successful node-add
   // outcomes keep the shared live inventory synchronized across MCP, TUI, and
@@ -143,6 +153,7 @@ class McpLiveApplication {
   std::uint32_t NodeCount() const;
   McpLiveNodeInventorySnapshot LiveNodeInventory() const;
   std::shared_ptr<McpLiveWorkloadService> WorkloadService() const;
+  std::shared_ptr<McpLiveRoleService> RoleService() const;
   void PublishEvidence(
       McpInformationFamily family, std::string kind, std::string message,
       std::optional<std::string> node_id = std::nullopt,
@@ -155,6 +166,7 @@ class McpLiveApplication {
   std::condition_variable requests_drained_;
   std::map<std::uint64_t, PendingCommand> pending_commands_;
   std::shared_ptr<McpLiveWorkloadService> workload_service_;
+  std::shared_ptr<McpLiveRoleService> role_service_;
   std::stop_source request_stop_source_;
   std::stop_source run_stop_source_;
   std::size_t active_requests_ = 0U;

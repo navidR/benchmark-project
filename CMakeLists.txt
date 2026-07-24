@@ -272,6 +272,7 @@ add_executable(bbp
   src/run_process_state.cpp
   src/scenario_fields.cpp
   src/runtime_node_inventory.cpp
+  src/runtime_wallet_registry.cpp
   src/scheduled_scenario_event.cpp
   src/simulation_command.cpp
   src/simulation_command_processor.cpp
@@ -411,6 +412,7 @@ if(BUILD_TESTING)
     tests/unit/run_ownership_tests.cpp
     tests/unit/run_process_state_tests.cpp
     tests/unit/runtime_node_inventory_tests.cpp
+    tests/unit/runtime_wallet_registry_tests.cpp
     tests/unit/scenario_fields_tests.cpp
     tests/unit/scenario_service_tests.cpp
     tests/unit/scheduled_scenario_event_tests.cpp
@@ -493,6 +495,7 @@ if(BUILD_TESTING)
     src/run_report.cpp
     src/runtime_node_resource_manifest.cpp
     src/runtime_node_inventory.cpp
+    src/runtime_wallet_registry.cpp
     src/runtime_peer_topology.cpp
     src/scenario_fields.cpp
     src/simulator_app.cpp
