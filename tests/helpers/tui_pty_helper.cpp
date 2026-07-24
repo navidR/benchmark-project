@@ -1093,7 +1093,7 @@ void CheckIndefiniteDirectLoadLifecycle(
                                       "indefinite direct load"));
   const std::string resolved = WaitForFileText(
       run_root / "resolved-scenario.json", "\"metrics_sample_count\":0", 10s);
-  RequireContains(resolved, "\"transaction_count\":2",
+  RequireContains(resolved, "\"transaction_count\":null",
                   "indefinite direct load options");
   std::string after_workload =
       WaitForFileText(events_path, "\\\"transaction_index\\\":2", 30s);
@@ -1135,7 +1135,11 @@ void CheckIndefiniteDirectLoadLifecycle(
       WaitForFileText(events_path, "\"event\":\"run_finished\"", 5s);
   RequireContains(finished, "\"event\":\"run_cancelled\"",
                   "explicit direct-load exit");
-  RequireContains(finished, "\"event\":\"transaction_load_completed\"",
+  RequireContains(finished, "\"event\":\"wallet_workload_state\"",
+                  "explicit direct-load exit");
+  RequireContains(finished, "\\\"state\\\":\\\"cancelled\\\"",
+                  "explicit direct-load exit");
+  RequireContains(finished, "\\\"outstanding\\\":0",
                   "explicit direct-load exit");
   RequireOwnedResourcesRemoved(
       run_root, 2U, daemon_pids,
