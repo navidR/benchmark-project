@@ -2442,6 +2442,76 @@ struct IncrementalRunReport::Impl {
         AppendEventSummary(event, &Array("network_partition_heals"));
         RememberActivePartition(event, false, &active_network_partitions);
         break;
+      case SimulationEventKind::kRuntimeGenerationPublished: {
+        const boost::json::value detail = ParseEventDetail(event);
+        if (!detail.is_object()) {
+          throw std::runtime_error(
+              "runtime generation publication detail is not an object");
+        }
+        const boost::json::object& publication = detail.as_object();
+        const std::optional<std::uint64_t> generation =
+            OptionalUint64Field(publication, "generation");
+        const std::optional<std::uint64_t> node_count =
+            OptionalUint64Field(publication, "node_count");
+        const boost::json::value* node_ids =
+            publication.if_contains("node_ids");
+        const boost::json::value* node_configs =
+            publication.if_contains("node_configs");
+        const boost::json::value* topology =
+            publication.if_contains("topology");
+        const boost::json::value* topology_current_edges =
+            publication.if_contains("topology_current_edges");
+        if (!generation || !node_count || node_ids == nullptr ||
+            !node_ids->is_array() || node_configs == nullptr ||
+            !node_configs->is_array() || topology == nullptr ||
+            !topology->is_object() || topology_current_edges == nullptr ||
+            !topology_current_edges->is_array() ||
+            node_ids->as_array().size() != *node_count ||
+            node_configs->as_array().size() != *node_count ||
+            OptionalStringField(publication, "manifest_state") != "live") {
+          throw std::runtime_error(
+              "runtime generation publication is incomplete");
+        }
+        std::set<std::string> active_node_ids;
+        for (const boost::json::value& value : node_ids->as_array()) {
+          if (!value.is_string() ||
+              !active_node_ids.insert(std::string(value.as_string())).second) {
+            throw std::runtime_error(
+                "runtime generation publication node ids are invalid");
+          }
+        }
+        for (const boost::json::value& value : node_configs->as_array()) {
+          if (!value.is_object()) {
+            throw std::runtime_error(
+                "runtime generation publication node config is invalid");
+          }
+          const boost::json::object& config = value.as_object();
+          const std::string node_id = OptionalStringField(config, "id");
+          if (!active_node_ids.contains(node_id)) {
+            throw std::runtime_error(
+                "runtime generation node config identity is inconsistent");
+          }
+          NodeReport& node = nodes[node_id];
+          node.index = OptionalUint64Field(config, "index");
+          node.chain = OptionalStringField(config, "chain");
+          node.role = OptionalStringField(config, "role");
+          const std::string lifecycle =
+              OptionalStringField(config, "lifecycle");
+          if (!lifecycle.empty()) {
+            RememberNodeState(lifecycle, &node);
+          }
+        }
+        std::erase_if(nodes, [&](const auto& item) {
+          return !active_node_ids.contains(item.first);
+        });
+        report["inventory_generation"] = *generation;
+        report["nodes"] = *node_count;
+        report["node_ids"] = *node_ids;
+        report["node_configs"] = *node_configs;
+        report["topology"] = *topology;
+        report["topology_current_edges"] = *topology_current_edges;
+        break;
+      }
       case SimulationEventKind::kDirectionalNetworkPoliciesVerified:
         AppendDirectionalPolicyVerification(
             event, &Array("directional_network_policy_verifications"));

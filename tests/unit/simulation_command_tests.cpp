@@ -1,11 +1,15 @@
 #include <unistd.h>
 
+#include <atomic>
+#include <barrier>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <filesystem>
 #include <memory>
 #include <stop_token>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "bbp/process.h"
 #include "bbp/simulation_command.h"
@@ -39,6 +43,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kExportNodeReport,
       bbp::SimulationCommandKind::kSetPerfCounters,
       bbp::SimulationCommandKind::kSendWalletTransaction,
+      bbp::SimulationCommandKind::kAddNodes,
   };
 
   for (bbp::SimulationCommandKind kind : kKinds) {
@@ -80,6 +85,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kExportNodeReport));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kSetPerfCounters));
+  BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kAddNodes));
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_cancellation_is_optional_and_shared) {
@@ -94,13 +101,115 @@ BOOST_AUTO_TEST_CASE(simulation_command_cancellation_is_optional_and_shared) {
   BOOST_TEST(command.operation_control->RequestCancellation(
       bbp::SimulationCommandCancellationCause::kClientCancel));
   BOOST_TEST(admitted_command.operation_control->stop_source.stop_requested());
-  BOOST_CHECK(admitted_command.operation_control->cancellation_cause.load() ==
+  BOOST_CHECK(admitted_command.operation_control->CancellationCause() ==
               bbp::SimulationCommandCancellationCause::kClientCancel);
   admitted_command.operation_control->restart_phase.store(
       bbp::SimulationNodeRestartPhase::kReplacementReady);
   BOOST_TEST(bbp::SimulationNodeRestartPhaseName(
                  command.operation_control->restart_phase.load()) ==
              "replacement_ready");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_cancellation_and_commit_publish_one_atomic_state) {
+  bbp::SimulationCommandControl cancelled;
+  BOOST_TEST(cancelled.RequestCancellation(
+      bbp::SimulationCommandCancellationCause::kDeadline));
+  BOOST_TEST(!cancelled.TryBeginCommit());
+  BOOST_CHECK(cancelled.CommitPhase() ==
+              bbp::SimulationCommandCommitPhase::kCancelled);
+  BOOST_CHECK(cancelled.CancellationCause() ==
+              bbp::SimulationCommandCancellationCause::kDeadline);
+  BOOST_TEST(cancelled.stop_source.stop_requested());
+  BOOST_TEST(!cancelled.RequestCancellation(
+      bbp::SimulationCommandCancellationCause::kClientCancel));
+  BOOST_CHECK(cancelled.CancellationCause() ==
+              bbp::SimulationCommandCancellationCause::kDeadline);
+
+  bbp::SimulationCommandControl committed;
+  BOOST_TEST(committed.TryBeginCommit());
+  BOOST_TEST(!committed.RequestCancellation(
+      bbp::SimulationCommandCancellationCause::kClientCancel));
+  BOOST_TEST(!committed.stop_source.stop_requested());
+  committed.MarkCommitted();
+  BOOST_CHECK(committed.CommitPhase() ==
+              bbp::SimulationCommandCommitPhase::kCommitted);
+  BOOST_CHECK(committed.CancellationCause() ==
+              bbp::SimulationCommandCancellationCause::kNone);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_cancellation_races_commit_with_exactly_one_winner) {
+  for (std::size_t iteration = 0U; iteration < 200U; ++iteration) {
+    bbp::SimulationCommandControl control;
+    std::barrier release(3);
+    bool cancellation_won = false;
+    bool commit_won = false;
+    std::jthread cancellation([&] {
+      release.arrive_and_wait();
+      cancellation_won = control.RequestCancellation(
+          bbp::SimulationCommandCancellationCause::kClientCancel);
+    });
+    std::jthread commit([&] {
+      release.arrive_and_wait();
+      commit_won = control.TryBeginCommit();
+    });
+    release.arrive_and_wait();
+    cancellation.join();
+    commit.join();
+
+    BOOST_TEST(cancellation_won != commit_won);
+    if (commit_won) {
+      BOOST_TEST(!control.stop_source.stop_requested());
+      control.MarkCommitted();
+      BOOST_CHECK(control.CommitPhase() ==
+                  bbp::SimulationCommandCommitPhase::kCommitted);
+    } else {
+      BOOST_TEST(control.stop_source.stop_requested());
+      BOOST_CHECK(control.CommitPhase() ==
+                  bbp::SimulationCommandCommitPhase::kCancelled);
+      BOOST_CHECK(control.CancellationCause() ==
+                  bbp::SimulationCommandCancellationCause::kClientCancel);
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_control_preserves_initial_inventory_and_bounds_progress) {
+  bbp::SimulationCommandControl control;
+  BOOST_TEST(control.RecordInitialInventory(7U, {"firo-1", "firo-2"}));
+  BOOST_TEST(control.RecordInitialInventory(7U, {"firo-1", "firo-2"}));
+  BOOST_TEST(!control.RecordInitialInventory(8U, {"firo-1", "firo-2"}));
+  BOOST_TEST(!control.RecordInitialInventory(7U, {"replacement", "firo-2"}));
+  BOOST_REQUIRE(control.InitialInventoryGeneration());
+  BOOST_TEST(*control.InitialInventoryGeneration() == 7U);
+  BOOST_REQUIRE(control.InitialInventoryNodeIds());
+  BOOST_TEST(*control.InitialInventoryNodeIds() ==
+             std::vector<std::string>({"firo-1", "firo-2"}));
+
+  BOOST_TEST(control.ReportProgress(1U));
+  BOOST_TEST(control.ReportProgress(1U));
+  BOOST_TEST(control.ReportProgress(4U));
+  BOOST_TEST(!control.ReportProgress(3U));
+  BOOST_TEST(!control.ReportProgress(
+      bbp::kSimulationNodeAddProgressTotal + 1U));
+  BOOST_TEST(control.progress_completed.load(std::memory_order_acquire) == 4U);
+  BOOST_TEST(
+      control.ReportProgress(bbp::kSimulationNodeAddProgressTotal));
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_outcome_carries_added_node_ids) {
+  const bbp::SimulationCommandOutcome outcome{
+      .state = bbp::SimulationCommandOutcomeState::kSucceeded,
+      .cancellation_cause = bbp::SimulationCommandCancellationCause::kNone,
+      .error = std::nullopt,
+      .node_lifecycle = std::nullopt,
+      .added_node_ids = {"firo-2", "firo-3"},
+      .inventory_generation = 2U,
+      .final_node_count = 3U};
+  BOOST_REQUIRE_EQUAL(outcome.added_node_ids.size(), 2U);
+  BOOST_TEST(outcome.added_node_ids[0] == "firo-2");
+  BOOST_TEST(outcome.added_node_ids[1] == "firo-3");
 }
 
 BOOST_AUTO_TEST_CASE(

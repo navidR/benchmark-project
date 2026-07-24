@@ -530,6 +530,140 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_registers_mutually_referencing_batch) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, {}, {}, {}, std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+  std::vector<bbp::ChainNodeConfig> nodes(2);
+  nodes[0].id = "node-1";
+  nodes[1].id = "node-2";
+
+  controller.RegisterNodes(
+      nodes,
+      {{"node-1", bbp::PeerCountPolicy(1U, 1U)}, {"node-2", std::nullopt}},
+      {{"node-1", {"node-2"}}, {"node-2", {"node-1"}}});
+
+  BOOST_TEST(controller.AllowedPeersFor("node-1") ==
+                 std::vector<std::string>({"node-2"}),
+             boost::test_tools::per_element());
+  BOOST_TEST(controller.AllowedPeersFor("node-2") ==
+                 std::vector<std::string>({"node-1"}),
+             boost::test_tools::per_element());
+  controller.SetPolicy("node-2", bbp::PeerCountPolicy(1U, 1U));
+  controller.RequestTopologyRestore("node-1");
+  controller.RequestTopologyRestore("node-2");
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_prepares_atomic_final_map_and_resizes_only_all_peers) {
+  const auto final_nodes = [] {
+    std::vector<bbp::ChainNodeConfig> nodes = TestNodes();
+    bbp::ChainNodeConfig added;
+    added.id = "node-4";
+    added.p2p_host = "10.0.0.4";
+    added.p2p_port = 18003U;
+    nodes.push_back(std::move(added));
+    return nodes;
+  }();
+  const bbp::PeerConnectivityController::AllowedPeerMap final_allowed{
+      {"node-1", {"node-2", "node-3", "node-4"}},
+      {"node-2", {"node-1", "node-3", "node-4"}},
+      {"node-3", {"node-1", "node-2", "node-4"}},
+      {"node-4", {"node-1", "node-2", "node-3"}},
+  };
+
+  TestChainDriver all_peer_driver;
+  bbp::PeerConnectivityController all_peer_controller(
+      all_peer_driver, TestNodes(), {{"node-1", bbp::PeerCountPolicy(2U, 2U)}},
+      FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {}, {"node-1"});
+  {
+    auto lease = all_peer_controller.AcquireRpcMutationLease();
+    auto prepared = all_peer_controller.PrepareFinalRegistration(
+        final_nodes, {{"node-4", std::nullopt}}, final_allowed, {}, lease);
+    BOOST_TEST(all_peer_driver.ConnectionCount("node-1") == 0U);
+    prepared.Commit();
+  }
+  BOOST_TEST(all_peer_controller.AllowedPeersFor("node-1") ==
+                 std::vector<std::string>({"node-2", "node-3", "node-4"}),
+             boost::test_tools::per_element());
+  all_peer_controller.RequestTopologyRestore("node-1");
+  all_peer_controller.Start();
+  BOOST_REQUIRE(
+      WaitFor([&] { return all_peer_driver.ConnectionCount("node-1") == 3U; }));
+  all_peer_controller.Stop();
+
+  TestChainDriver fixed_driver;
+  bbp::PeerConnectivityController fixed_controller(
+      fixed_driver, TestNodes(), {{"node-1", bbp::PeerCountPolicy(2U, 2U)}},
+      FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+  {
+    auto lease = fixed_controller.AcquireRpcMutationLease();
+    auto prepared = fixed_controller.PrepareFinalRegistration(
+        final_nodes, {{"node-4", std::nullopt}}, final_allowed, {}, lease);
+    prepared.Commit();
+  }
+  fixed_controller.RequestTopologyRestore("node-1");
+  fixed_controller.Start();
+  BOOST_REQUIRE(
+      WaitFor([&] { return fixed_driver.ConnectionCount("node-1") == 2U; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  BOOST_TEST(fixed_driver.ConnectionCount("node-1") == 2U);
+  fixed_controller.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(peer_connectivity_controller_rejects_batch_atomically) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+  std::vector<bbp::ChainNodeConfig> nodes(2);
+  nodes[0].id = "node-4";
+  nodes[1].id = "node-5";
+
+  BOOST_CHECK_THROW(
+      controller.RegisterNodes(
+          nodes, {{"node-4", std::nullopt}, {"node-5", std::nullopt}},
+          {{"node-4", {"node-5"}}, {"node-5", {"missing"}}}),
+      std::runtime_error);
+  BOOST_CHECK_THROW(controller.AllowedPeersFor("node-4"), std::runtime_error);
+  BOOST_CHECK_THROW(controller.AllowedPeersFor("node-5"), std::runtime_error);
+  BOOST_TEST(controller.AllowedPeersFor("node-1") ==
+                 std::vector<std::string>({"node-2", "node-3"}),
+             boost::test_tools::per_element());
+
+  controller.RegisterNodes(
+      nodes, {{"node-4", std::nullopt}, {"node-5", std::nullopt}},
+      {{"node-1", {"node-2", "node-3", "node-4", "node-5"}},
+       {"node-4", {"node-1", "node-5"}},
+       {"node-5", {"node-1", "node-4"}}});
+  BOOST_TEST(
+      controller.AllowedPeersFor("node-1") ==
+          std::vector<std::string>({"node-2", "node-3", "node-4", "node-5"}),
+      boost::test_tools::per_element());
+  BOOST_TEST(controller.AllowedPeersFor("node-4") ==
+                 std::vector<std::string>({"node-1", "node-5"}),
+             boost::test_tools::per_element());
+  BOOST_TEST(controller.AllowedPeersFor("node-5") ==
+                 std::vector<std::string>({"node-1", "node-4"}),
+             boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(
     peer_connectivity_controller_bounds_cancelled_unregistration) {
   TestChainDriver driver;
   driver.BlockConnectedWaitFor("node-1");
@@ -652,6 +786,27 @@ BOOST_AUTO_TEST_CASE(peer_connectivity_controller_enforces_typed_range) {
       WaitFor([&] { return driver.ConnectionCount("node-1") == 1U; }));
   BOOST_TEST(driver.IsConnected("node-1", "10.0.0.2:18001"));
   BOOST_TEST(!driver.IsConnected("node-1", "10.0.0.3:18002"));
+  controller.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_preserves_reverse_directed_session) {
+  TestChainDriver driver;
+  const std::vector<bbp::ChainNodeConfig> nodes = TestNodes();
+  driver.ConnectPeer(nodes[1], "10.0.0.1:18000", {});
+  bbp::PeerConnectivityController controller(
+      driver, nodes, {{"node-2", bbp::PeerCountPolicy(0U, 0U)}},
+      {{"node-1", {"node-2"}}, {"node-2", {}}, {"node-3", {}}},
+      std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  controller.Start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  BOOST_TEST(driver.IsConnected("node-2", "10.0.0.1:18000"));
+  BOOST_TEST(driver.DisconnectCallCount() == 0U);
   controller.Stop();
 }
 

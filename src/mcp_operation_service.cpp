@@ -161,7 +161,14 @@ void ValidateError(McpOperationError* error) {
       if (member.key() != "code" && member.key() != "message" &&
           member.key() != "path" && member.key() != "recoverable" &&
           member.key() != "node_id" && member.key() != "action" &&
-          member.key() != "state" && member.key() != "command_id") {
+          member.key() != "state" && member.key() != "command_id" &&
+          member.key() != "requested_count" &&
+          member.key() != "current_node_count" &&
+          member.key() != "node_capacity" &&
+          member.key() != "available_node_capacity" &&
+          member.key() != "resource_kind" && member.key() != "address" &&
+          member.key() != "port" && member.key() != "purpose" &&
+          member.key() != "mutation_started") {
         diagnostics_valid = false;
         break;
       }
@@ -192,7 +199,8 @@ void ValidateError(McpOperationError* error) {
       break;
     }
     for (const std::string_view identifier :
-         {"node_id", "action", "state", "command_id"}) {
+         {"node_id", "action", "state", "command_id", "resource_kind",
+          "purpose"}) {
       const boost::json::value* member = diagnostic.if_contains(identifier);
       if (member == nullptr) {
         continue;
@@ -207,6 +215,31 @@ void ValidateError(McpOperationError* error) {
         diagnostics_valid = false;
         break;
       }
+    }
+    for (const std::string_view count :
+         {"requested_count", "current_node_count", "node_capacity",
+          "available_node_capacity"}) {
+      const boost::json::value* member = diagnostic.if_contains(count);
+      if (member != nullptr &&
+          !(member->is_uint64() ||
+            (member->is_int64() && member->as_int64() >= 0))) {
+        diagnostics_valid = false;
+        break;
+      }
+    }
+    const boost::json::value* address = diagnostic.if_contains("address");
+    const boost::json::value* port = diagnostic.if_contains("port");
+    const boost::json::value* mutation_started =
+        diagnostic.if_contains("mutation_started");
+    if ((address != nullptr &&
+         (!address->is_string() || address->as_string().empty() ||
+          address->as_string().size() > kMcpMaximumEvidenceTextBytes)) ||
+        (port != nullptr &&
+         !(port->is_uint64() && port->as_uint64() > 0U &&
+           port->as_uint64() <= 65535U)) ||
+        (mutation_started != nullptr && !mutation_started->is_bool())) {
+      diagnostics_valid = false;
+      break;
     }
   }
   if (!diagnostics_valid) {
@@ -689,10 +722,8 @@ struct McpOperationService::Impl {
         if (operation_sequence <= pending_sequence) {
           return;
         }
-        pending_notifications.erase(pending);
-        pending_notifications.push_back(
-            PendingNotification{.key = std::move(key),
-                                .notification = std::move(notification)});
+        pending->notification = std::move(notification);
+        std::rotate(pending, pending + 1, pending_notifications.end());
         return;
       }
       pending->notification = std::move(notification);
@@ -705,9 +736,8 @@ struct McpOperationService::Impl {
       throw std::logic_error(
           "MCP service notification queue exceeded its bound");
     }
-    pending_notifications.push_back(
-        PendingNotification{.key = std::move(key),
-                            .notification = std::move(notification)});
+    pending_notifications.push_back(PendingNotification{
+        .key = std::move(key), .notification = std::move(notification)});
   }
 
   void DrainNotifications() {
@@ -719,50 +749,95 @@ struct McpOperationService::Impl {
       }
       notification_delivery_active = true;
     }
-    for (;;) {
-      McpServiceNotification notification;
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (pending_notifications.empty()) {
-          notification_delivery_active = false;
-          state_changed.notify_all();
-          return;
-        }
-        notification =
-            std::move(pending_notifications.front().notification);
-        pending_notifications.pop_front();
-      }
-      bool handler_failed = false;
-      try {
-        notification_handler(notification);
-      } catch (...) {
-        handler_failed = true;
-      }
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (handler_failed) {
-          ++stats.notification_handler_failures;
-        }
-        if (notification.method == kMcpOperationUpdatedNotification) {
-          const boost::json::object& params = notification.params.as_object();
-          const std::string operation_id(
-              params.at("operation_id").as_string());
-          const auto operation = operations.find(operation_id);
-          if (operation != operations.end() &&
-              operation->second.snapshot.session_id ==
-                  notification.session_id) {
-            operation->second.last_delivered_notification_sequence = std::max(
-                operation->second.last_delivered_notification_sequence,
-                params.at("sequence").as_uint64());
+    try {
+      for (;;) {
+        McpServiceNotification notification;
+        std::string operation_notification_key;
+        bool operation_notification = false;
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          if (pending_notifications.empty()) {
+            notification_delivery_active = false;
+            state_changed.notify_all();
+            return;
+          }
+          operation_notification =
+              pending_notifications.front().notification.method ==
+              kMcpOperationUpdatedNotification;
+          if (operation_notification) {
+            operation_notification_key = pending_notifications.front().key;
+            notification = pending_notifications.front().notification;
+          } else {
+            notification =
+                std::move(pending_notifications.front().notification);
+            pending_notifications.pop_front();
           }
         }
+        bool handler_failed = false;
+        try {
+          notification_handler(notification);
+        } catch (...) {
+          handler_failed = true;
+        }
+        const bool operation_handler_failed =
+            handler_failed && operation_notification;
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          if (handler_failed) {
+            ++stats.notification_handler_failures;
+          }
+          if (operation_notification) {
+            const boost::json::object& params = notification.params.as_object();
+            const std::uint64_t delivered_sequence =
+                params.at("sequence").as_uint64();
+            const auto pending = std::find_if(
+                pending_notifications.begin(), pending_notifications.end(),
+                [&](const PendingNotification& candidate) {
+                  return candidate.key == operation_notification_key;
+                });
+            if (pending == pending_notifications.end()) {
+              throw std::logic_error(
+                  "MCP in-flight operation notification lost its queue slot");
+            }
+            if (handler_failed) {
+              std::rotate(pending, pending + 1, pending_notifications.end());
+              notification_delivery_active = false;
+            } else {
+              const std::string_view operation_id =
+                  params.at("operation_id").as_string();
+              const auto operation = operations.find(operation_id);
+              if (operation != operations.end() &&
+                  operation->second.snapshot.session_id ==
+                      notification.session_id) {
+                operation->second.last_delivered_notification_sequence =
+                    std::max(
+                        operation->second.last_delivered_notification_sequence,
+                        delivered_sequence);
+              }
+              if (pending->notification.params.as_object()
+                      .at("sequence")
+                      .as_uint64() <= delivered_sequence) {
+                pending_notifications.erase(pending);
+              }
+            }
+          }
+        }
+        state_changed.notify_all();
+        if (operation_handler_failed) {
+          return;
+        }
+      }
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        notification_delivery_active = false;
       }
       state_changed.notify_all();
+      throw;
     }
   }
 
-  void QueueOperationNotificationLocked(
-      const McpOperationSnapshot& snapshot) {
+  void QueueOperationNotificationLocked(const McpOperationSnapshot& snapshot) {
     QueueNotificationLocked(OperationNotification(snapshot));
   }
 
@@ -1052,6 +1127,7 @@ struct McpOperationService::Impl {
         CollectFinishedWorkersLocked(&workers);
         lock.unlock();
         join_workers(&workers);
+        DrainNotifications();
         return;
       }
       if (shutdown_phase == ShutdownPhase::kStopping) {
@@ -1065,6 +1141,7 @@ struct McpOperationService::Impl {
         CollectFinishedWorkersLocked(&workers);
         lock.unlock();
         join_workers(&workers);
+        DrainNotifications();
         return;
       }
 
@@ -1644,8 +1721,7 @@ void McpOperationService::Publish(McpEvidenceRecord record) {
     }
     for (auto& [session_id, session] : impl_->sessions) {
       for (auto& [subscription_id, subscription] : session.subscriptions) {
-        if (!subscription.active ||
-            subscription.run_id != record.run_id ||
+        if (!subscription.active || subscription.run_id != record.run_id ||
             !ContainsFamily(subscription.families, record.family) ||
             !ContainsNode(subscription.node_ids, record.node_id)) {
           continue;

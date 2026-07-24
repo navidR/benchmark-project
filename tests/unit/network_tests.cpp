@@ -1,7 +1,9 @@
 #include <libmnl/libmnl.h>
 #include <linux/if_ether.h>
 #include <linux/pkt_sched.h>
+#include <net/if.h>
 #include <netinet/in.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -73,12 +75,35 @@ bool ExplicitPrivilegeFailure(const std::exception& error) {
          message.find(std::strerror(EACCES)) != std::string::npos;
 }
 
+void RenameLinkForTest(const std::string& current,
+                       const std::string& replacement) {
+  const int descriptor = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) {
+    throw std::runtime_error("open link rename socket failed");
+  }
+  ifreq request{};
+  std::strncpy(request.ifr_name, current.c_str(), IFNAMSIZ - 1);
+  std::strncpy(request.ifr_newname, replacement.c_str(), IFNAMSIZ - 1);
+  if (ioctl(descriptor, SIOCSIFNAME, &request) != 0) {
+    const int error = errno;
+    close(descriptor);
+    throw std::runtime_error("rename test link failed: " +
+                             std::string(std::strerror(error)));
+  }
+  close(descriptor);
+}
+
 class ScopedNamespaceVeth {
  public:
   ScopedNamespaceVeth()
       : network_namespace_(bbp::NetworkNamespace::Create()),
         config_(UniqueVethConfig()) {
-    bbp::SetupNodeVethNetwork(network_namespace_.fd(), config_);
+    std::optional<bbp::NodeVethIdentity> acquired;
+    bbp::SetupNodeVethNetwork(network_namespace_.fd(), config_, &acquired);
+    if (!acquired) {
+      throw std::runtime_error("test veth setup returned no acquired identity");
+    }
+    identity_ = std::move(*acquired);
     setup_ = true;
   }
 
@@ -87,7 +112,7 @@ class ScopedNamespaceVeth {
 
   ~ScopedNamespaceVeth() {
     if (setup_) {
-      bbp::DeleteNodeVethNetwork(config_);
+      bbp::DeleteNodeVethNetwork(config_, identity_);
     }
   }
 
@@ -97,6 +122,7 @@ class ScopedNamespaceVeth {
  private:
   bbp::NetworkNamespace network_namespace_;
   bbp::NodeVethConfig config_;
+  bbp::NodeVethIdentity identity_;
   bool setup_ = false;
 };
 
@@ -104,9 +130,9 @@ class ScopedParentVeth {
  public:
   explicit ScopedParentVeth(bbp::NodeVethConfig config)
       : config_(std::move(config)) {
-    bbp::CreateVethPair(config_.host_name, config_.peer_name,
-                        config_.host_ownership_alias,
-                        config_.peer_ownership_alias);
+    identity_ = bbp::CreateVethPair(
+        config_.host_name, config_.peer_name, config_.host_ownership_alias,
+        config_.peer_ownership_alias);
     created_ = true;
   }
 
@@ -116,14 +142,17 @@ class ScopedParentVeth {
   ~ScopedParentVeth() {
     if (created_) {
       try {
-        bbp::DeleteLink(config_.host_name);
+        bbp::DeleteNodeVethNetwork(config_, identity_);
       } catch (const std::exception&) {
       }
     }
   }
 
+  const bbp::NodeVethIdentity& identity() const { return identity_; }
+
  private:
   bbp::NodeVethConfig config_;
+  bbp::NodeVethIdentity identity_;
   bool created_ = false;
 };
 
@@ -258,6 +287,111 @@ BOOST_AUTO_TEST_CASE(rtnetlink_incomplete_dump_is_never_returned) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    veth_deletion_resolver_accepts_rename_but_rejects_replacement_and_reuse) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  const bbp::NodeVethIdentity acquired{
+      .host =
+          {
+              .index = 101,
+              .linked_index = 102,
+              .name = config.host_name,
+              .ownership_alias = config.host_ownership_alias,
+              .kind = "veth",
+          },
+      .peer =
+          {
+              .index = 102,
+              .linked_index = 101,
+              .name = config.peer_name,
+              .ownership_alias = config.peer_ownership_alias,
+              .kind = "veth",
+          },
+  };
+  const std::vector<bbp::LinkInfo> replacements{
+      {
+          .index = 201,
+          .linked_index = 202,
+          .name = config.host_name,
+          .ownership_alias = config.host_ownership_alias,
+          .kind = "veth",
+      },
+      {
+          .index = 202,
+          .linked_index = 201,
+          .name = config.peer_name,
+          .ownership_alias = config.peer_ownership_alias,
+          .kind = "veth",
+      },
+  };
+
+  std::vector<bbp::LinkInfo> renamed{
+      {
+          .index = acquired.host.index,
+          .linked_index = acquired.host.linked_index,
+          .name = config.host_name + "r",
+          .ownership_alias = config.host_ownership_alias,
+          .kind = "veth",
+      },
+      {
+          .index = acquired.peer.index,
+          .linked_index = acquired.peer.linked_index,
+          .name = config.peer_name + "r",
+          .ownership_alias = config.peer_ownership_alias,
+          .kind = "veth",
+      },
+      {
+          .index = 401,
+          .linked_index = 0,
+          .name = config.host_name,
+          .ownership_alias = "foreign-owner",
+          .kind = "dummy",
+      },
+  };
+  const std::optional<int> renamed_index =
+      bbp::ResolveNodeVethDeletionIndexForTest(config, acquired, renamed);
+  BOOST_REQUIRE(renamed_index.has_value());
+  BOOST_TEST(*renamed_index == acquired.host.index);
+
+  BOOST_CHECK_EXCEPTION(
+      bbp::ResolveNodeVethDeletionIndexForTest(config, acquired, replacements),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()).find("replacement") !=
+               std::string::npos;
+      });
+
+  std::vector<bbp::LinkInfo> reused_ifindex = replacements;
+  reused_ifindex.front().index = acquired.host.index;
+  BOOST_CHECK_THROW(
+      bbp::ResolveNodeVethDeletionIndexForTest(config, acquired, reused_ifindex),
+      std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    veth_intent_only_stale_cleanup_refuses_a_live_reused_name) {
+  const bbp::NodeVethConfig stale = UniqueVethConfig();
+  const std::vector<bbp::LinkInfo> foreign_reuse{
+      {
+          .index = 301,
+          .linked_index = 0,
+          .name = stale.host_name,
+          .ownership_alias = "foreign-owner",
+          .kind = "dummy",
+      },
+  };
+
+  BOOST_CHECK_EXCEPTION(
+      bbp::RequireIntentOnlyNodeVethAbsentForTest(stale, foreign_reuse),
+      std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()).find(
+                   "exact acquired veth identity is required") !=
+               std::string::npos;
+      });
+  BOOST_CHECK_NO_THROW(
+      bbp::RequireIntentOnlyNodeVethAbsentForTest(stale, {}));
+}
+
+BOOST_AUTO_TEST_CASE(
     veth_cleanup_surfaces_deletion_failure_and_preserves_link) {
   const bbp::NodeVethConfig config = UniqueVethConfig();
   try {
@@ -266,7 +400,8 @@ BOOST_AUTO_TEST_CASE(
       bbp::ScopedNetlinkFailurePlan plan(
           {{1U, bbp::NetlinkFailurePhase::kBeforeSend}});
       BOOST_CHECK_EXCEPTION(
-          bbp::DeleteNodeVethNetwork(config), std::runtime_error,
+          bbp::DeleteNodeVethNetwork(config, pair.identity()),
+          std::runtime_error,
           [](const std::runtime_error& error) {
             return std::string(error.what())
                        .find(
@@ -293,10 +428,10 @@ BOOST_AUTO_TEST_CASE(
 BOOST_AUTO_TEST_CASE(veth_cleanup_returns_only_after_kernel_absence_readback) {
   const bbp::NodeVethConfig config = UniqueVethConfig();
   try {
-    bbp::CreateVethPair(config.host_name, config.peer_name,
-                        config.host_ownership_alias,
-                        config.peer_ownership_alias);
-    bbp::DeleteNodeVethNetwork(config);
+    const bbp::NodeVethIdentity identity = bbp::CreateVethPair(
+        config.host_name, config.peer_name, config.host_ownership_alias,
+        config.peer_ownership_alias);
+    bbp::DeleteNodeVethNetwork(config, identity);
     const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
     BOOST_TEST(std::none_of(
         links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
@@ -312,36 +447,62 @@ BOOST_AUTO_TEST_CASE(veth_cleanup_returns_only_after_kernel_absence_readback) {
   }
 }
 
+BOOST_AUTO_TEST_CASE(veth_cleanup_deletes_a_renamed_acquired_endpoint) {
+  const bbp::NodeVethConfig config = UniqueVethConfig();
+  const std::string renamed = config.host_name.substr(0U, 13U) + "r";
+  try {
+    ScopedParentVeth pair(config);
+    RenameLinkForTest(config.host_name, renamed);
+    bbp::DeleteNodeVethNetwork(config, pair.identity());
+    const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
+    BOOST_TEST(std::none_of(
+        links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
+          return link.index == pair.identity().host.index ||
+                 link.ownership_alias == config.host_ownership_alias ||
+                 link.ownership_alias == config.peer_ownership_alias;
+        }));
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged renamed-link cleanup test: " << error.what());
+      return;
+    }
+    throw;
+  }
+}
+
 BOOST_AUTO_TEST_CASE(
     veth_creation_post_send_failure_rolls_back_verified_owned_pair) {
   const bbp::NodeVethConfig config = UniqueVethConfig();
   try {
+    std::string failure;
     {
       bbp::ScopedNetlinkFailurePlan plan(
           {{1U, bbp::NetlinkFailurePhase::kAfterSend}});
-      BOOST_CHECK_EXCEPTION(
-          bbp::CreateVethPair(config.host_name, config.peer_name,
-                              config.host_ownership_alias,
-                              config.peer_ownership_alias),
-          std::runtime_error, [](const std::runtime_error& error) {
-            const std::string message = error.what();
-            return message.find(
-                       "injected netlink failure after send at request 1") !=
-                       std::string::npos &&
-                   message.find("rollback failed") == std::string::npos;
-          });
+      try {
+        static_cast<void>(bbp::CreateVethPair(
+            config.host_name, config.peer_name, config.host_ownership_alias,
+            config.peer_ownership_alias));
+        BOOST_FAIL("injected post-send veth creation failure did not fail");
+      } catch (const std::runtime_error& error) {
+        if (ExplicitPrivilegeFailure(error)) {
+          BOOST_TEST_MESSAGE(
+              "skipping privileged creation-rollback test: " << error.what());
+          return;
+        }
+        failure = error.what();
+      }
     }
+    BOOST_TEST(
+        failure.find("injected netlink failure after send at request 1") !=
+        std::string::npos);
+    BOOST_TEST(failure.find("rollback failed") == std::string::npos);
     const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();
     BOOST_TEST(std::none_of(
         links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
           return link.name == config.host_name || link.name == config.peer_name;
         }));
-  } catch (const std::exception& error) {
-    if (ExplicitPrivilegeFailure(error)) {
-      BOOST_TEST_MESSAGE(
-          "skipping privileged creation-rollback test: " << error.what());
-      return;
-    }
+  } catch (const std::exception&) {
     throw;
   }
 }
@@ -350,13 +511,14 @@ BOOST_AUTO_TEST_CASE(veth_setup_reports_original_and_rollback_failures) {
   const bbp::NodeVethConfig config = UniqueVethConfig();
   try {
     bbp::NetworkNamespace network_namespace = bbp::NetworkNamespace::Create();
+    std::optional<bbp::NodeVethIdentity> acquired;
     std::string failure;
     {
       bbp::ScopedNetlinkFailurePlan plan(
           {{4U, bbp::NetlinkFailurePhase::kBeforeSend},
            {5U, bbp::NetlinkFailurePhase::kBeforeSend}});
       try {
-        bbp::SetupNodeVethNetwork(network_namespace.fd(), config);
+        bbp::SetupNodeVethNetwork(network_namespace.fd(), config, &acquired);
         BOOST_FAIL("injected setup and rollback failures did not fail setup");
       } catch (const std::runtime_error& error) {
         failure = error.what();
@@ -374,7 +536,8 @@ BOOST_AUTO_TEST_CASE(veth_setup_reports_original_and_rollback_failures) {
         std::any_of(links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
           return link.name == config.host_name;
         }));
-    bbp::DeleteNodeVethNetwork(config);
+    BOOST_REQUIRE(acquired.has_value());
+    bbp::DeleteNodeVethNetwork(config, *acquired);
   } catch (const std::exception& error) {
     if (ExplicitPrivilegeFailure(error)) {
       BOOST_TEST_MESSAGE(
@@ -389,11 +552,12 @@ BOOST_AUTO_TEST_CASE(veth_setup_failure_completes_verified_rollback) {
   const bbp::NodeVethConfig config = UniqueVethConfig();
   try {
     bbp::NetworkNamespace network_namespace = bbp::NetworkNamespace::Create();
+    std::optional<bbp::NodeVethIdentity> acquired;
     {
       bbp::ScopedNetlinkFailurePlan plan(
           {{4U, bbp::NetlinkFailurePhase::kBeforeSend}});
       BOOST_CHECK_EXCEPTION(
-          bbp::SetupNodeVethNetwork(network_namespace.fd(), config),
+          bbp::SetupNodeVethNetwork(network_namespace.fd(), config, &acquired),
           std::runtime_error, [](const std::runtime_error& error) {
             const std::string message = error.what();
             return message.find(
@@ -407,6 +571,7 @@ BOOST_AUTO_TEST_CASE(veth_setup_failure_completes_verified_rollback) {
         links.begin(), links.end(), [&](const bbp::LinkInfo& link) {
           return link.name == config.host_name || link.name == config.peer_name;
         }));
+    BOOST_TEST(!acquired.has_value());
   } catch (const std::exception& error) {
     if (ExplicitPrivilegeFailure(error)) {
       BOOST_TEST_MESSAGE(
@@ -524,8 +689,9 @@ BOOST_AUTO_TEST_CASE(veth_setup_refuses_and_preserves_name_collisions) {
   try {
     bbp::NetworkNamespace network_namespace = bbp::NetworkNamespace::Create();
     ScopedParentVeth foreign(config);
+    std::optional<bbp::NodeVethIdentity> acquired;
     BOOST_CHECK_EXCEPTION(
-        bbp::SetupNodeVethNetwork(network_namespace.fd(), config),
+        bbp::SetupNodeVethNetwork(network_namespace.fd(), config, &acquired),
         std::runtime_error, [](const std::runtime_error& error) {
           return std::string(error.what()).find("non-owned veth") !=
                  std::string::npos;
@@ -557,9 +723,10 @@ BOOST_AUTO_TEST_CASE(veth_cleanup_preserves_a_colliding_foreign_owner) {
   try {
     ScopedParentVeth pair(foreign);
     BOOST_CHECK_EXCEPTION(
-        bbp::DeleteNodeVethNetwork(colliding), std::runtime_error,
+        bbp::DeleteNodeVethNetwork(colliding, pair.identity()),
+        std::runtime_error,
         [](const std::runtime_error& error) {
-          return std::string(error.what()).find("foreign ownership alias") !=
+          return std::string(error.what()).find("does not match requested") !=
                  std::string::npos;
         });
     const std::vector<bbp::LinkInfo> links = bbp::ListNetworkLinks();

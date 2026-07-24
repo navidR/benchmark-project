@@ -12,7 +12,8 @@ namespace bbp {
 
 class SimulationCommandProcessor {
  public:
-  using CommandHandler = std::function<void(const SimulationCommand&)>;
+  using CommandHandler =
+      std::function<SimulationCommandOutcome(const SimulationCommand&)>;
   using FailureHandler =
       std::function<void(const SimulationCommand&, std::string_view)>;
   using OutcomeHandler = std::function<void(const SimulationCommand&,

@@ -110,3 +110,55 @@ BOOST_AUTO_TEST_CASE(runtime_node_inventory_rejects_nonatomic_publication) {
                     std::runtime_error);
   BOOST_TEST(inventory.Snapshot().size() == 2U);
 }
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_inventory_prepares_without_publishing_until_commit) {
+  bbp::RuntimeNodeInventory inventory(2U);
+  std::vector<bbp::NodeRuntime> initial;
+  initial.push_back(RuntimeNode("node-1"));
+  inventory.Initialize(initial);
+  const bbp::RuntimeNodeSnapshot before = inventory.Snapshot();
+  auto candidate = std::make_shared<bbp::NodeRuntime>(RuntimeNode("node-2"));
+  const std::vector<bbp::RuntimeNodeInsertion> insertions{
+      {.slot = 1U, .runtime = candidate}};
+  std::vector<bbp::ChainNodeConfig> published_configs;
+  published_configs.push_back(before.front().config);
+  published_configs.back().connect_peers = {"127.0.0.1:18445"};
+  published_configs.push_back(candidate->config);
+
+  bbp::RuntimeNodeInventory::PreparedAppend prepared = inventory.PrepareAppend(
+      before.generation(), insertions, published_configs);
+  BOOST_TEST(before.size() == 1U);
+  BOOST_TEST(before.front().config.id == "node-1");
+  const bbp::RuntimeNodeSnapshot after = prepared.Commit();
+
+  BOOST_TEST(after.generation() == before.generation() + 1U);
+  BOOST_TEST(after.size() == 2U);
+  BOOST_TEST(after.back().config.id == "node-2");
+  BOOST_TEST(&after.back() == candidate.get());
+  const bbp::NodeConfigSnapshot configs = inventory.ConfigSnapshot();
+  BOOST_TEST(configs.nodes().front().connect_peers ==
+                 std::vector<std::string>({"127.0.0.1:18445"}),
+             boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_inventory_abandoned_prepare_leaves_generation_unchanged) {
+  bbp::RuntimeNodeInventory inventory(2U);
+  std::vector<bbp::NodeRuntime> initial;
+  initial.push_back(RuntimeNode("node-1"));
+  inventory.Initialize(initial);
+  const std::uint64_t generation = inventory.Snapshot().generation();
+  auto candidate = std::make_shared<bbp::NodeRuntime>(RuntimeNode("node-2"));
+  {
+    const std::vector<bbp::RuntimeNodeInsertion> insertions{
+        {.slot = 1U, .runtime = candidate}};
+    auto prepared = inventory.PrepareAppend(generation, insertions);
+    static_cast<void>(prepared);
+  }
+
+  const bbp::RuntimeNodeSnapshot unchanged = inventory.Snapshot();
+  BOOST_TEST(unchanged.generation() == generation);
+  BOOST_TEST(unchanged.size() == 1U);
+  BOOST_TEST(unchanged.front().config.id == "node-1");
+}

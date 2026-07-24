@@ -14,6 +14,17 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_typed_block_policy) {
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
+  const bbp::ParsedTuiCommand add =
+      bbp::TuiCommandParser::Parse("add-nodes monero 3 /opt/monerod", 0U);
+  BOOST_CHECK(add.kind == bbp::SimulationCommandKind::kAddNodes);
+  BOOST_REQUIRE(add.node_add);
+  BOOST_CHECK(add.node_add->chain == bbp::ChainKind::kMonero);
+  BOOST_TEST(add.node_add->count == 3U);
+  BOOST_REQUIRE(add.node_add->binary);
+  BOOST_TEST(*add.node_add->binary == "/opt/monerod");
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("add-nodes firo 17", 0U),
+                    std::runtime_error);
+
   BOOST_CHECK(bbp::TuiCommandParser::Parse("reconnect", 0U).kind ==
               bbp::SimulationCommandKind::kReconnectNode);
   const bbp::ParsedTuiCommand difficulty =

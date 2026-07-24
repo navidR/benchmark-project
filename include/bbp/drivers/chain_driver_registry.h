@@ -44,6 +44,8 @@ const ChainDriverSpec& DefaultChainDriverSpec();
 std::unique_ptr<ChainDriver> CreateDefaultChainDriver();
 const ChainDriverSpec& ChainDriverSpecFor(ChainKind chain);
 std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain);
+std::string EffectiveP2pBindAddress(ChainKind chain,
+                                    const ChainNodeConfig& config);
 ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
                                     const ChainNodeConfigRequest& request);
 

@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <future>
 #include <limits>
 #include <mutex>
@@ -1139,7 +1140,11 @@ auto ExecuteInNetworkNamespace(int netns_fd,
 }
 
 void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence,
-                        bool* acknowledged = nullptr) {
+                        bool* acknowledged = nullptr,
+                        std::stop_token stop_token = {},
+                        std::optional<std::chrono::steady_clock::time_point>
+                            absolute_deadline = std::nullopt,
+                        const std::function<void()>& on_acknowledged = {}) {
   if (acknowledged != nullptr) {
     *acknowledged = false;
   }
@@ -1161,13 +1166,20 @@ void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence,
 #endif
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
-  const ssize_t received = socket.ReceiveUntil(
-      buffer.data(), buffer.size(),
-      std::chrono::steady_clock::now() + kNetlinkAcknowledgementTimeout, {});
+  auto receive_deadline =
+      std::chrono::steady_clock::now() + kNetlinkAcknowledgementTimeout;
+  if (absolute_deadline) {
+    receive_deadline = std::min(receive_deadline, *absolute_deadline);
+  }
+  const ssize_t received = socket.ReceiveUntil(buffer.data(), buffer.size(),
+                                               receive_deadline, stop_token);
   ValidateNetlinkAcknowledgement(buffer.data(), static_cast<size_t>(received),
                                  sequence, port_id);
   if (acknowledged != nullptr) {
     *acknowledged = true;
+  }
+  if (on_acknowledged) {
+    on_acknowledged();
   }
 #ifdef BBP_ENABLE_TEST_HOOKS
   if (injected_after_send) {
@@ -1266,63 +1278,15 @@ std::string ExceptionMessage(const std::exception_ptr& error) {
   }
 }
 
-void DeleteLinkAndVerifyAbsent(const std::string& name,
-                               std::stop_token stop_token) {
-  DeleteLink(name);
-  const std::vector<LinkInfo> remaining = ListNetworkLinks(stop_token);
-  if (HasLinkNamed(remaining, name)) {
-    throw std::runtime_error(
-        "deleted network interface remained after kernel read-back: " + name);
+void DeleteLinkIndexAndVerifyAbsent(int index, const std::string& name,
+                                    std::stop_token stop_token) {
+  if (index <= 0) {
+    throw std::runtime_error("invalid network interface index for deletion");
   }
-}
-
-void SetLinkOwnershipAlias(const std::string& name,
-                           const std::string& ownership_alias);
-
-void RollBackCreatedVethPair(const std::string& host_name,
-                             const std::string& peer_name,
-                             const std::string& host_ownership_alias,
-                             const std::string& peer_ownership_alias) {
-  if (host_ownership_alias.empty() || peer_ownership_alias.empty()) {
-    throw std::runtime_error(
-        "cannot verify ownership of an ambiguously created veth pair");
-  }
-
-  SetLinkOwnershipAlias(host_name, host_ownership_alias);
-  const std::vector<LinkInfo> links = ListNetworkLinks();
-  const auto find_link = [&](const std::string& name) {
-    return std::find_if(
-        links.begin(), links.end(),
-        [&](const LinkInfo& candidate) { return candidate.name == name; });
-  };
-  const auto host = find_link(host_name);
-  const auto peer = find_link(peer_name);
-  if (host == links.end() || host->ownership_alias != host_ownership_alias) {
-    throw std::runtime_error(
-        "acknowledged veth owner alias was not visible before rollback");
-  }
-  if (peer == links.end()) {
-    throw std::runtime_error(
-        "acknowledged veth peer was not visible before rollback");
-  }
-
-  DeleteLink(host_name);
-  const std::vector<LinkInfo> remaining = ListNetworkLinks();
-  if (HasLinkNamed(remaining, host_name) ||
-      HasLinkNamed(remaining, peer_name)) {
-    throw std::runtime_error(
-        "ambiguously created veth pair remained after rollback read-back");
-  }
-}
-
-void SetLinkOwnershipAlias(const std::string& name,
-                           const std::string& ownership_alias) {
-  RequireInterfaceName(name);
-  RequireOwnershipAlias(ownership_alias);
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
   nlmsghdr* nlh = mnl_nlmsg_put_header(buffer.data());
-  nlh->nlmsg_type = RTM_NEWLINK;
+  nlh->nlmsg_type = RTM_DELLINK;
   nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
   const uint32_t sequence = NextSequence();
   nlh->nlmsg_seq = sequence;
@@ -1330,10 +1294,243 @@ void SetLinkOwnershipAlias(const std::string& name,
   auto* message = static_cast<ifinfomsg*>(
       mnl_nlmsg_put_extra_header(nlh, sizeof(ifinfomsg)));
   message->ifi_family = AF_UNSPEC;
-  mnl_attr_put_str(nlh, IFLA_IFNAME, name.c_str());
-  mnl_attr_put_strz(nlh, IFLA_IFALIAS, ownership_alias.c_str());
+  message->ifi_index = index;
 
-  SendNetlinkRequest(nlh, sequence);
+  SendNetlinkRequest(nlh, sequence, nullptr, stop_token);
+  const std::vector<LinkInfo> remaining = ListNetworkLinks(stop_token);
+  if (std::any_of(
+          remaining.begin(), remaining.end(),
+          [index](const LinkInfo& link) { return link.index == index; })) {
+    throw std::runtime_error(
+        "deleted network interface remained after kernel read-back: " + name);
+  }
+}
+
+VethEndpointIdentity VethIdentityFromLink(const LinkInfo& link) {
+  return VethEndpointIdentity{
+      .index = link.index,
+      .linked_index = link.linked_index,
+      .name = link.name,
+      .ownership_alias = link.ownership_alias,
+      .kind = link.kind,
+  };
+}
+
+bool LinkMatchesAcquiredVethIdentity(
+    const LinkInfo& link, const VethEndpointIdentity& identity) {
+  return link.index == identity.index &&
+         link.linked_index == identity.linked_index &&
+         link.ownership_alias == identity.ownership_alias &&
+         link.kind == identity.kind;
+}
+
+void RequireReciprocalVethIdentity(const NodeVethIdentity& identity) {
+  if (identity.host.index <= 0 || identity.peer.index <= 0 ||
+      identity.host.index == identity.peer.index ||
+      identity.host.linked_index != identity.peer.index ||
+      identity.peer.linked_index != identity.host.index ||
+      identity.host.kind != "veth" || identity.peer.kind != "veth") {
+    throw std::runtime_error(
+        "acquired veth endpoints are not an exact reciprocal pair");
+  }
+}
+
+void RequireVethIdentityMatchesIntent(const NodeVethConfig& config,
+                                      const NodeVethIdentity& identity) {
+  RequireReciprocalVethIdentity(identity);
+  if (identity.host.name != config.host_name ||
+      identity.peer.name != config.peer_name ||
+      identity.host.ownership_alias != config.host_ownership_alias ||
+      identity.peer.ownership_alias != config.peer_ownership_alias) {
+    throw std::runtime_error(
+        "acquired veth identity does not match requested endpoint intent");
+  }
+}
+
+NodeVethIdentity CaptureCreatedVethIdentity(
+    const std::vector<LinkInfo>& links, const std::string& host_name,
+    const std::string& peer_name) {
+  const auto find_unique_name = [&](const std::string& name) {
+    const auto first =
+        std::find_if(links.begin(), links.end(), [&](const LinkInfo& link) {
+          return link.name == name;
+        });
+    if (first == links.end()) {
+      throw std::runtime_error(
+          "acknowledged veth endpoint was not visible during identity capture: " +
+          name);
+    }
+    if (std::find_if(std::next(first), links.end(),
+                     [&](const LinkInfo& link) { return link.name == name; }) !=
+        links.end()) {
+      throw std::runtime_error(
+          "acknowledged veth endpoint name was ambiguous during identity "
+          "capture: " +
+          name);
+    }
+    return first;
+  };
+
+  const auto host = find_unique_name(host_name);
+  const auto peer = find_unique_name(peer_name);
+  NodeVethIdentity identity{
+      .host = VethIdentityFromLink(*host),
+      .peer = VethIdentityFromLink(*peer),
+  };
+  RequireReciprocalVethIdentity(identity);
+  return identity;
+}
+
+void VerifyMovedVethIdentity(const NodeVethConfig& config,
+                             const NodeVethIdentity& acquired_identity,
+                             int netns_fd, std::stop_token stop_token) {
+  const auto require_exact_endpoint =
+      [](const std::vector<LinkInfo>& links,
+         const VethEndpointIdentity& acquired, std::string_view endpoint) {
+        const auto live =
+            std::find_if(links.begin(), links.end(), [&](const LinkInfo& link) {
+              return link.index == acquired.index;
+            });
+        if (live == links.end() ||
+            !LinkMatchesAcquiredVethIdentity(*live, acquired) ||
+            live->name != acquired.name) {
+          throw std::runtime_error(
+              "moved " + std::string(endpoint) +
+              " veth does not match its exact acquired identity");
+        }
+        if (std::find_if(links.begin(), links.end(),
+                         [&](const LinkInfo& link) {
+                           return link.index != acquired.index &&
+                                  link.ownership_alias ==
+                                      acquired.ownership_alias;
+                         }) != links.end()) {
+          throw std::runtime_error(
+              "moved " + std::string(endpoint) +
+              " veth ownership alias is ambiguous");
+        }
+      };
+
+  const std::vector<LinkInfo> host_links = ListNetworkLinks(stop_token);
+  const std::vector<LinkInfo> peer_links = ExecuteInNetworkNamespace(
+      netns_fd, [stop_token]() { return ListNetworkLinks(stop_token); });
+  require_exact_endpoint(host_links, acquired_identity.host, "host");
+  require_exact_endpoint(peer_links, acquired_identity.peer, "peer");
+  RequireVethIdentityMatchesIntent(config, acquired_identity);
+}
+
+std::optional<int> ResolveNodeVethDeletionIndex(
+    const NodeVethConfig& config, const NodeVethIdentity& acquired_identity,
+    const std::vector<LinkInfo>& links) {
+  RequireVethIdentityMatchesIntent(config, acquired_identity);
+
+  const auto host_by_index =
+      std::find_if(links.begin(), links.end(), [&](const LinkInfo& link) {
+        return link.index == acquired_identity.host.index;
+      });
+  const auto host_by_alias =
+      std::find_if(links.begin(), links.end(), [&](const LinkInfo& link) {
+        return link.ownership_alias ==
+               acquired_identity.host.ownership_alias;
+      });
+  const auto peer_by_alias =
+      std::find_if(links.begin(), links.end(), [&](const LinkInfo& link) {
+        return link.ownership_alias ==
+               acquired_identity.peer.ownership_alias;
+      });
+
+  const auto require_unique_alias =
+      [&](const auto first, const std::string& alias,
+          std::string_view endpoint) {
+        if (first != links.end() &&
+            std::find_if(std::next(first), links.end(),
+                         [&](const LinkInfo& link) {
+                           return link.ownership_alias == alias;
+                         }) != links.end()) {
+          throw std::runtime_error(
+              "refusing ambiguous acquired " + std::string(endpoint) +
+              " veth ownership alias");
+        }
+      };
+  require_unique_alias(host_by_alias, acquired_identity.host.ownership_alias,
+                       "host");
+  require_unique_alias(peer_by_alias, acquired_identity.peer.ownership_alias,
+                       "peer");
+
+  if (host_by_alias != links.end() &&
+      (host_by_index == links.end() ||
+       host_by_alias->index != host_by_index->index)) {
+    throw std::runtime_error(
+        "refusing replacement of acquired host veth identity: " +
+        host_by_alias->name);
+  }
+  if (peer_by_alias != links.end() &&
+      !LinkMatchesAcquiredVethIdentity(*peer_by_alias,
+                                      acquired_identity.peer)) {
+    throw std::runtime_error(
+        "refusing replacement of acquired peer veth identity: " +
+        peer_by_alias->name);
+  }
+
+  if (host_by_index == links.end()) {
+    if (peer_by_alias != links.end()) {
+      throw std::runtime_error(
+          "acquired veth peer remained after its host identity disappeared");
+    }
+    return std::nullopt;
+  }
+  if (!LinkMatchesAcquiredVethIdentity(*host_by_index,
+                                       acquired_identity.host)) {
+    throw std::runtime_error(
+        "refusing reused or replaced acquired host veth ifindex: " +
+        std::to_string(acquired_identity.host.index));
+  }
+
+  if (peer_by_alias != links.end() &&
+      (host_by_index->linked_index != peer_by_alias->index ||
+       peer_by_alias->linked_index != host_by_index->index)) {
+    throw std::runtime_error(
+        "refusing non-reciprocal acquired veth endpoints");
+  }
+  return host_by_index->index;
+}
+
+void DeleteAcquiredVethPair(const NodeVethConfig& config,
+                            const NodeVethIdentity& acquired_identity,
+                            std::stop_token stop_token) {
+  const std::vector<LinkInfo> before = ListNetworkLinks(stop_token);
+  const std::optional<int> deletion_index =
+      ResolveNodeVethDeletionIndex(config, acquired_identity, before);
+  if (!deletion_index) {
+    return;
+  }
+
+  DeleteLinkIndexAndVerifyAbsent(*deletion_index,
+                                 acquired_identity.host.name, stop_token);
+  const std::vector<LinkInfo> remaining = ListNetworkLinks(stop_token);
+  for (const LinkInfo& link : remaining) {
+    if ((!acquired_identity.host.ownership_alias.empty() &&
+         link.ownership_alias == acquired_identity.host.ownership_alias) ||
+        (!acquired_identity.peer.ownership_alias.empty() &&
+         link.ownership_alias == acquired_identity.peer.ownership_alias)) {
+      throw std::runtime_error(
+          "veth endpoint ownership was replaced during deletion read-back: " +
+          link.name);
+    }
+  }
+}
+
+void RequireIntentOnlyNodeVethAbsent(
+    const NodeVethConfig& config, const std::vector<LinkInfo>& links) {
+  for (const LinkInfo& link : links) {
+    if (link.name == config.host_name || link.name == config.peer_name ||
+        link.ownership_alias == config.host_ownership_alias ||
+        link.ownership_alias == config.peer_ownership_alias) {
+      throw std::runtime_error(
+          "exact acquired veth identity is required for deletion; refusing "
+          "intent-only endpoint: " +
+          link.name);
+    }
+  }
 }
 
 std::string ProbeName(char suffix) {
@@ -1491,6 +1688,18 @@ bool CopyMessagePayload(const nlmsghdr* message, Payload* payload) {
   return true;
 }
 
+int ParseLinkInfoAttr(const nlattr* attr, void* data) {
+  auto* link = static_cast<LinkInfo*>(data);
+  const std::uint16_t type = mnl_attr_get_type(attr);
+  if (type == IFLA_INFO_KIND) {
+    if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0) {
+      return MNL_CB_ERROR;
+    }
+    link->kind = mnl_attr_get_str(attr);
+  }
+  return MNL_CB_OK;
+}
+
 int ParseLinkAttr(const nlattr* attr, void* data) {
   auto* link = static_cast<LinkInfo*>(data);
   const uint16_t type = mnl_attr_get_type(attr);
@@ -1508,6 +1717,17 @@ int ParseLinkAttr(const nlattr* attr, void* data) {
       return MNL_CB_ERROR;
     }
     link->ownership_alias = mnl_attr_get_str(attr);
+  }
+  if (type == IFLA_LINK) {
+    if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0) {
+      return MNL_CB_ERROR;
+    }
+    link->linked_index =
+        static_cast<int>(mnl_attr_get_u32(attr));
+  }
+  if (type == IFLA_LINKINFO &&
+      mnl_attr_parse_nested(attr, ParseLinkInfoAttr, link) < 0) {
+    return MNL_CB_ERROR;
   }
   if (type == IFLA_STATS64) {
     if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0 ||
@@ -2439,24 +2659,75 @@ NetworkNamespace& NetworkNamespace::operator=(
   Stop();
   helper_pid_ = other.helper_pid_;
   fd_ = other.fd_;
+  node_veth_identity_ = std::move(other.node_veth_identity_);
   other.helper_pid_ = -1;
   other.fd_ = -1;
+  other.node_veth_identity_.reset();
   return *this;
 }
 
 NetworkNamespace::~NetworkNamespace() { Stop(); }
 
 void NetworkNamespace::Stop() {
+  try {
+    StopAndVerify(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+  } catch (const std::exception&) {
+  }
+}
+
+void NetworkNamespace::StopAndVerify(
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  StopHelperAndVerify(deadline, stop_token);
   if (fd_ >= 0) {
-    close(fd_);
+    if (close(fd_) != 0 && errno != EINTR) {
+      throw std::runtime_error("close network namespace descriptor failed: " +
+                               std::string(std::strerror(errno)));
+    }
     fd_ = -1;
   }
+}
+
+void NetworkNamespace::StopHelperAndVerify(
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("network namespace stop cancelled");
+  }
+  if (std::chrono::steady_clock::now() >= deadline) {
+    throw std::runtime_error("network namespace stop deadline expired");
+  }
   if (helper_pid_ > 0) {
-    kill(helper_pid_, SIGKILL);
-    int status = 0;
-    while (waitpid(helper_pid_, &status, 0) < 0 && errno == EINTR) {
+    if (kill(helper_pid_, SIGKILL) != 0 && errno != ESRCH) {
+      throw std::runtime_error("kill network namespace helper failed: " +
+                               std::string(std::strerror(errno)));
     }
-    helper_pid_ = -1;
+    int status = 0;
+    while (true) {
+      if (stop_token.stop_requested()) {
+        throw std::runtime_error("network namespace stop cancelled");
+      }
+      const pid_t waited = waitpid(helper_pid_, &status, WNOHANG);
+      if (waited == helper_pid_) {
+        helper_pid_ = -1;
+        return;
+      }
+      if (waited < 0 && errno == EINTR) {
+        continue;
+      }
+      if (waited < 0) {
+        throw std::runtime_error("wait for network namespace helper failed: " +
+                                 std::string(std::strerror(errno)));
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error(
+            "network namespace helper survived its stop deadline");
+      }
+      const auto remaining = deadline - std::chrono::steady_clock::now();
+      std::this_thread::sleep_for(std::min(
+          std::chrono::milliseconds(10),
+          std::chrono::duration_cast<std::chrono::milliseconds>(remaining)));
+    }
   }
 }
 
@@ -2646,16 +2917,29 @@ std::vector<TcFilterInfo> ListTcFiltersForInterfaceParentInNamespace(
   });
 }
 
-void CreateVethPair(const std::string& host_name, const std::string& peer_name,
-                    const std::string& host_ownership_alias,
-                    const std::string& peer_ownership_alias) {
+NodeVethIdentity CreateVethPair(
+    const std::string& host_name, const std::string& peer_name,
+    const std::string& host_ownership_alias,
+    const std::string& peer_ownership_alias,
+    std::optional<NodeVethIdentity>* acquired_identity,
+    std::stop_token stop_token) {
   RequireInterfaceName(host_name);
   RequireInterfaceName(peer_name);
+  if (host_name == peer_name) {
+    throw std::runtime_error("veth endpoint names must be distinct");
+  }
   if (!host_ownership_alias.empty()) {
     RequireOwnershipAlias(host_ownership_alias);
   }
   if (!peer_ownership_alias.empty()) {
     RequireOwnershipAlias(peer_ownership_alias);
+  }
+  if (!host_ownership_alias.empty() &&
+      host_ownership_alias == peer_ownership_alias) {
+    throw std::runtime_error("veth endpoint ownership aliases must be distinct");
+  }
+  if (acquired_identity != nullptr) {
+    acquired_identity->reset();
   }
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
@@ -2689,15 +2973,38 @@ void CreateVethPair(const std::string& host_name, const std::string& peer_name,
   mnl_attr_nest_end(nlh, link_info);
 
   bool creation_acknowledged = false;
+  std::optional<NodeVethIdentity> captured_identity;
+  NodeVethConfig intent;
+  intent.host_name = host_name;
+  intent.peer_name = peer_name;
+  intent.host_ownership_alias = host_ownership_alias;
+  intent.peer_ownership_alias = peer_ownership_alias;
   try {
-    SendNetlinkRequest(nlh, sequence, &creation_acknowledged);
+    SendNetlinkRequest(
+        nlh, sequence, &creation_acknowledged, stop_token, std::nullopt, [&] {
+          captured_identity = CaptureCreatedVethIdentity(
+              ListNetworkLinks(stop_token), host_name, peer_name);
+          if (acquired_identity != nullptr) {
+            *acquired_identity = *captured_identity;
+          }
+          RequireVethIdentityMatchesIntent(intent, *captured_identity);
+        });
   } catch (...) {
     const std::exception_ptr original = std::current_exception();
-    if (creation_acknowledged && !host_ownership_alias.empty() &&
-        !peer_ownership_alias.empty()) {
+    if (creation_acknowledged && captured_identity) {
       try {
-        RollBackCreatedVethPair(host_name, peer_name, host_ownership_alias,
-                                peer_ownership_alias);
+        NodeVethConfig captured_intent = intent;
+        captured_intent.host_name = captured_identity->host.name;
+        captured_intent.peer_name = captured_identity->peer.name;
+        captured_intent.host_ownership_alias =
+            captured_identity->host.ownership_alias;
+        captured_intent.peer_ownership_alias =
+            captured_identity->peer.ownership_alias;
+        DeleteAcquiredVethPair(captured_intent, *captured_identity, stop_token);
+        captured_identity.reset();
+        if (acquired_identity != nullptr) {
+          acquired_identity->reset();
+        }
       } catch (...) {
         throw std::runtime_error(ExceptionMessage(original) +
                                  "; veth creation rollback failed: " +
@@ -2706,24 +3013,11 @@ void CreateVethPair(const std::string& host_name, const std::string& peer_name,
     }
     std::rethrow_exception(original);
   }
-  try {
-    if (!host_ownership_alias.empty()) {
-      SetLinkOwnershipAlias(host_name, host_ownership_alias);
-    }
-    if (!peer_ownership_alias.empty()) {
-      SetLinkOwnershipAlias(peer_name, peer_ownership_alias);
-    }
-  } catch (...) {
-    const std::exception_ptr original = std::current_exception();
-    try {
-      DeleteLinkAndVerifyAbsent(host_name, {});
-    } catch (...) {
-      throw std::runtime_error(
-          ExceptionMessage(original) +
-          "; rollback failed: " + ExceptionMessage(std::current_exception()));
-    }
-    std::rethrow_exception(original);
+  if (!captured_identity) {
+    throw std::runtime_error(
+        "acknowledged veth creation returned without an acquired identity");
   }
+  return *captured_identity;
 }
 
 void DeleteLink(const std::string& name) {
@@ -2744,10 +3038,15 @@ void DeleteLink(const std::string& name) {
   SendNetlinkRequest(nlh, sequence);
 }
 
-void MoveLinkToNamespace(const std::string& name, int netns_fd) {
+void MoveLinkToNamespaceWithExactIndex(
+    const std::string& name, int netns_fd,
+    std::optional<int> exact_target_index) {
   RequireInterfaceName(name);
   if (netns_fd < 0) {
     throw std::runtime_error("invalid network namespace fd");
+  }
+  if (exact_target_index && *exact_target_index <= 0) {
+    throw std::runtime_error("invalid exact target interface index");
   }
 
   std::array<char, MNL_SOCKET_DUMP_SIZE> buffer{};
@@ -2762,8 +3061,16 @@ void MoveLinkToNamespace(const std::string& name, int netns_fd) {
   message->ifi_family = AF_UNSPEC;
   mnl_attr_put_str(nlh, IFLA_IFNAME, name.c_str());
   mnl_attr_put_u32(nlh, IFLA_NET_NS_FD, static_cast<uint32_t>(netns_fd));
+  if (exact_target_index) {
+    mnl_attr_put_u32(nlh, IFLA_NEW_IFINDEX,
+                     static_cast<std::uint32_t>(*exact_target_index));
+  }
 
   SendNetlinkRequest(nlh, sequence);
+}
+
+void MoveLinkToNamespace(const std::string& name, int netns_fd) {
+  MoveLinkToNamespaceWithExactIndex(name, netns_fd, std::nullopt);
 }
 
 void SetLinkUp(const std::string& name, bool up) {
@@ -3505,8 +3812,10 @@ void ReplaceNetworkConditionQdisc(const std::string& if_name,
   ReplaceRootNetemQdisc(if_name, condition);
 }
 
-void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
-                          std::stop_token stop_token) {
+void SetupNodeVethNetwork(
+    int netns_fd, const NodeVethConfig& config,
+    std::optional<NodeVethIdentity>* acquired_identity,
+    std::stop_token stop_token) {
   if (netns_fd < 0) {
     throw std::runtime_error("invalid network namespace fd");
   }
@@ -3518,46 +3827,46 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
   if (config.host_name == config.peer_name) {
     throw std::runtime_error("node veth endpoint names must be distinct");
   }
+  RequireOwnershipAlias(config.host_ownership_alias);
+  RequireOwnershipAlias(config.peer_ownership_alias);
+  if (config.host_ownership_alias == config.peer_ownership_alias) {
+    throw std::runtime_error(
+        "veth endpoint ownership aliases must be distinct");
+  }
+  if (acquired_identity == nullptr) {
+    throw std::runtime_error(
+        "node veth setup requires an acquired identity output");
+  }
+  acquired_identity->reset();
 
   const std::vector<LinkInfo> existing_links = ListNetworkLinks(stop_token);
   if (HasLinkNamed(existing_links, config.host_name) ||
-      HasLinkNamed(existing_links, config.peer_name)) {
+      HasLinkNamed(existing_links, config.peer_name) ||
+      std::any_of(existing_links.begin(), existing_links.end(),
+                  [&](const LinkInfo& link) {
+                    return link.ownership_alias ==
+                               config.host_ownership_alias ||
+                           link.ownership_alias ==
+                               config.peer_ownership_alias;
+                  })) {
     throw std::runtime_error(
-        "refusing to replace a pre-existing, non-owned veth endpoint");
+        "refusing to replace a pre-existing, non-owned veth endpoint identity");
   }
 
-  bool pair_created = false;
+  std::optional<NodeVethIdentity> created_identity;
   try {
-    CreateVethPair(config.host_name, config.peer_name,
-                   config.host_ownership_alias, config.peer_ownership_alias);
-    pair_created = true;
-    if (!config.host_ownership_alias.empty() ||
-        !config.peer_ownership_alias.empty()) {
-      const std::vector<LinkInfo> created_links = ListNetworkLinks(stop_token);
-      const auto require_created_alias = [&](const std::string& name,
-                                             const std::string& alias) {
-        if (alias.empty()) {
-          return;
-        }
-        const auto created = std::find_if(
-            created_links.begin(), created_links.end(),
-            [&](const LinkInfo& link) { return link.name == name; });
-        if (created == created_links.end() ||
-            created->ownership_alias != alias) {
-          throw std::runtime_error(
-              "created veth endpoint ownership alias read-back failed: " +
-              name);
-        }
-      };
-      require_created_alias(config.host_name, config.host_ownership_alias);
-      require_created_alias(config.peer_name, config.peer_ownership_alias);
-    }
+    const NodeVethIdentity identity = CreateVethPair(
+        config.host_name, config.peer_name, config.host_ownership_alias,
+        config.peer_ownership_alias, &created_identity, stop_token);
+    *acquired_identity = identity;
     AddIpv4Address(config.host_name, config.host_address, config.prefix_len);
     SetLinkUp(config.host_name, true);
     if (config.apply_condition) {
       ReplaceNetworkConditionQdisc(config.host_name, config.condition);
     }
-    MoveLinkToNamespace(config.peer_name, netns_fd);
+    MoveLinkToNamespaceWithExactIndex(config.peer_name, netns_fd,
+                                      created_identity->peer.index);
+    VerifyMovedVethIdentity(config, *created_identity, netns_fd, stop_token);
 
     ExecuteInNetworkNamespace(netns_fd, [&config]() {
       SetLinkUp("lo", true);
@@ -3567,9 +3876,14 @@ void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
     });
   } catch (...) {
     const std::exception_ptr original = std::current_exception();
-    if (pair_created) {
+    if (created_identity) {
+      *acquired_identity = *created_identity;
+    }
+    if (created_identity) {
       try {
-        DeleteNodeVethNetwork(config, {});
+        DeleteNodeVethNetwork(config, *created_identity, stop_token);
+        created_identity.reset();
+        acquired_identity->reset();
       } catch (...) {
         throw std::runtime_error(ExceptionMessage(original) +
                                  "; veth rollback failed: " +
@@ -3584,25 +3898,38 @@ void DeleteNodeVethNetwork(const NodeVethConfig& config,
                            std::stop_token stop_token) {
   RequireOwnershipAlias(config.host_ownership_alias);
   RequireOwnershipAlias(config.peer_ownership_alias);
-  const auto delete_owned_link = [&](const std::string& name,
-                                     const std::string& expected_alias) {
-    const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
-    const auto link = std::find_if(
-        links.begin(), links.end(),
-        [&](const LinkInfo& candidate) { return candidate.name == name; });
-    if (link == links.end()) {
-      return;
-    }
-    if (link->ownership_alias != expected_alias) {
-      throw std::runtime_error(
-          "refusing to delete veth endpoint with foreign ownership alias: " +
-          name);
-    }
-    DeleteLinkAndVerifyAbsent(name, stop_token);
-  };
-  delete_owned_link(config.host_name, config.host_ownership_alias);
-  delete_owned_link(config.peer_name, config.peer_ownership_alias);
+  if (config.host_ownership_alias == config.peer_ownership_alias) {
+    throw std::runtime_error(
+        "veth endpoint ownership aliases must be distinct");
+  }
+
+  RequireIntentOnlyNodeVethAbsent(config, ListNetworkLinks(stop_token));
 }
+
+void DeleteNodeVethNetwork(const NodeVethConfig& config,
+                           const NodeVethIdentity& acquired_identity,
+                           std::stop_token stop_token) {
+  RequireOwnershipAlias(config.host_ownership_alias);
+  RequireOwnershipAlias(config.peer_ownership_alias);
+  if (config.host_ownership_alias == config.peer_ownership_alias) {
+    throw std::runtime_error(
+        "veth endpoint ownership aliases must be distinct");
+  }
+  DeleteAcquiredVethPair(config, acquired_identity, stop_token);
+}
+
+#ifdef BBP_ENABLE_TEST_HOOKS
+std::optional<int> ResolveNodeVethDeletionIndexForTest(
+    const NodeVethConfig& config, const NodeVethIdentity& acquired_identity,
+    const std::vector<LinkInfo>& links) {
+  return ResolveNodeVethDeletionIndex(config, acquired_identity, links);
+}
+
+void RequireIntentOnlyNodeVethAbsentForTest(
+    const NodeVethConfig& config, const std::vector<LinkInfo>& links) {
+  RequireIntentOnlyNodeVethAbsent(config, links);
+}
+#endif
 
 std::vector<LinkInfo> ListNetworkLinksInNamespace(int netns_fd,
                                                   std::stop_token stop_token) {

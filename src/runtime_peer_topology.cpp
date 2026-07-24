@@ -156,6 +156,42 @@ std::vector<std::uint32_t> RuntimePeerTopology::ActivePeerIndexes(
   return peers;
 }
 
+bool RuntimePeerTopology::PhysicalPeerRequired(std::uint32_t first,
+                                               std::uint32_t second) const {
+  if (first >= node_count_ || second >= node_count_) {
+    throw std::out_of_range("runtime topology node index is out of range");
+  }
+  if (first == second) {
+    return false;
+  }
+  return std::any_of(edges_.begin(), edges_.end(),
+                     [first, second](const RuntimePeerTopologyEdge& edge) {
+                       return edge.active &&
+                              ((edge.from == first && edge.to == second) ||
+                               (edge.from == second && edge.to == first));
+                     });
+}
+
+bool RuntimePeerTopology::PreservesPhysicalPeerRequirementsFrom(
+    const RuntimePeerTopology& previous,
+    std::uint32_t common_node_count) const {
+  if (common_node_count > node_count_ ||
+      common_node_count > previous.node_count_) {
+    throw std::out_of_range(
+        "common runtime topology node count is out of range");
+  }
+  for (std::uint32_t first = 0U; first < common_node_count; ++first) {
+    for (std::uint32_t second = first + 1U; second < common_node_count;
+         ++second) {
+      if (PhysicalPeerRequired(first, second) !=
+          previous.PhysicalPeerRequired(first, second)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 std::vector<DirectionalNetworkPolicy> RuntimePeerTopology::DirectionalPolicies(
     const SimulationNetworkAddressPlan& address_plan,
     std::uint32_t node_index) const {
@@ -227,6 +263,22 @@ void RuntimePeerTopology::RestoreState(const RuntimePeerTopologyEdge& state) {
     ValidateNetworkCondition(*state.condition);
   }
   edge = state;
+}
+
+void RuntimePeerTopology::PreserveCommonStateFrom(
+    const RuntimePeerTopology& previous) {
+  std::map<EdgeKey, const RuntimePeerTopologyEdge*> previous_edges;
+  for (const RuntimePeerTopologyEdge& edge : previous.edges_) {
+    previous_edges.emplace(EdgeKey{edge.from, edge.to}, &edge);
+  }
+  for (RuntimePeerTopologyEdge& edge : edges_) {
+    const auto previous_edge = previous_edges.find(EdgeKey{edge.from, edge.to});
+    if (previous_edge == previous_edges.end()) {
+      continue;
+    }
+    edge.active = previous_edge->second->active;
+    edge.condition = previous_edge->second->condition;
+  }
 }
 
 RuntimePeerTopologyEdge& RuntimePeerTopology::MutableEdge(std::uint32_t from,

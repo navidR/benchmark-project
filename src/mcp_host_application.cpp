@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/mcp_live_application.h"
 #include "bbp/mcp_registry.h"
 
@@ -22,6 +23,7 @@ constexpr std::array kHostOperations = {
     McpOperationKind::kStopRun,
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
+    McpOperationKind::kAddNode,
     McpOperationKind::kStopNode,
     McpOperationKind::kKillNode,
     McpOperationKind::kRestartNode,
@@ -90,11 +92,15 @@ boost::json::object RunLifecycleJson(const McpRunLifecycleResult& result) {
 }
 
 boost::json::object RunSnapshotJson(const McpHostedRunSnapshot& snapshot) {
-  return boost::json::object{{"generation", snapshot.generation},
-                             {"run_id", snapshot.run_id},
-                             {"state", snapshot.state},
-                             {"chain", snapshot.chain},
-                             {"node_count", snapshot.node_count}};
+  return boost::json::object{
+      {"generation", snapshot.generation},
+      {"run_id", snapshot.run_id},
+      {"state", snapshot.state},
+      {"chain", snapshot.chain},
+      {"node_count", snapshot.node_count},
+      {"node_capacity", snapshot.node_capacity},
+      {"chain_node_maximum", snapshot.chain_node_maximum},
+      {"available_node_capacity", snapshot.available_node_capacity}};
 }
 
 boost::json::object ResourceEnvelope(std::string_view host_id,
@@ -261,6 +267,13 @@ boost::json::value McpHostApplication::ReadResource(
         BuildMcpCapabilityDocument(operations, information_families);
     capabilities["access_mode"] = "read_write";
     capabilities["lifetime"] = "bbp_process";
+    boost::json::object chain_limits;
+    for (std::size_t index = 0U;
+         index < static_cast<std::size_t>(ChainKind::kCount); ++index) {
+      const auto chain = static_cast<ChainKind>(index);
+      chain_limits[ChainKindName(chain)] = ChainDriverSpecFor(chain).max_nodes;
+    }
+    capabilities["chain_node_maximums"] = std::move(chain_limits);
     capabilities["current_run"] =
         run ? boost::json::value(RunSnapshotJson(*run))
             : boost::json::value(nullptr);
@@ -295,9 +308,8 @@ boost::json::value McpHostApplication::ReadResource(
              boost::json::array{"operation.get", "operation.cancel"}}});
   }
   if (family == McpInformationFamily::kNotifications) {
-    return ResourceEnvelope(
-        config_.host_id, run ? &*run : nullptr, family,
-        BuildMcpNotificationDiscovery(operations));
+    return ResourceEnvelope(config_.host_id, run ? &*run : nullptr, family,
+                            BuildMcpNotificationDiscovery(operations));
   }
 
   if (!run || !run->application) {

@@ -5,8 +5,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -20,6 +23,7 @@
 #include "bbp/network.h"
 #include "bbp/peer_count_policy.h"
 #include "bbp/perf_counter.h"
+#include "bbp/simulation_node_add.h"
 #include "bbp/simulation_partition.h"
 #include "bbp/simulation_wallet_send.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
@@ -55,6 +59,7 @@ enum class SimulationCommandKind {
   kExportNodeReport,
   kSetPerfCounters,
   kSendWalletTransaction,
+  kAddNodes,
   kCount,
 };
 
@@ -89,29 +94,167 @@ enum class SimulationNodeRestartPhase {
   kCompleted,
 };
 
+enum class SimulationCommandCommitPhase {
+  kOpen,
+  kCancelled,
+  kCommitStarted,
+  kCommitted,
+};
+
 std::string_view SimulationNodeRestartPhaseName(
     SimulationNodeRestartPhase phase);
 
 inline constexpr auto kSimulationCommandCancellationReconciliation =
     std::chrono::milliseconds(250);
+inline constexpr auto kSimulationNodeAddCancellationReconciliation =
+    std::chrono::seconds(30);
+inline constexpr std::uint64_t kSimulationNodeAddProgressTotal = 5U;
 
 struct SimulationCommandControl {
   std::stop_source stop_source;
-  std::atomic<SimulationCommandCancellationCause> cancellation_cause{
-      SimulationCommandCancellationCause::kNone};
   std::atomic_bool outcome_unconfirmed{false};
   std::atomic<SimulationNodeRestartPhase> restart_phase{
       SimulationNodeRestartPhase::kBeforeStop};
+  std::atomic<std::uint32_t> commit_state{
+      EncodeCommitState(SimulationCommandCommitPhase::kOpen,
+                        SimulationCommandCancellationCause::kNone)};
+  std::atomic<std::uint64_t> progress_completed{0U};
+  std::atomic<std::uint64_t> initial_inventory_generation{
+      kUnsetInventoryGeneration};
   std::optional<std::chrono::steady_clock::time_point> absolute_deadline;
 
   bool RequestCancellation(SimulationCommandCancellationCause cause) noexcept {
-    SimulationCommandCancellationCause expected =
-        SimulationCommandCancellationCause::kNone;
-    const bool recorded = cancellation_cause.compare_exchange_strong(
-        expected, cause, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (cause == SimulationCommandCancellationCause::kNone) {
+      return false;
+    }
+    std::uint32_t expected =
+        EncodeCommitState(SimulationCommandCommitPhase::kOpen,
+                          SimulationCommandCancellationCause::kNone);
+    const bool recorded = commit_state.compare_exchange_strong(
+        expected,
+        EncodeCommitState(SimulationCommandCommitPhase::kCancelled, cause),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+    if (!recorded) {
+      return false;
+    }
     stop_source.request_stop();
-    return recorded;
+    return true;
   }
+
+  bool TryBeginCommit() noexcept {
+    std::uint32_t expected =
+        EncodeCommitState(SimulationCommandCommitPhase::kOpen,
+                          SimulationCommandCancellationCause::kNone);
+    return commit_state.compare_exchange_strong(
+        expected,
+        EncodeCommitState(SimulationCommandCommitPhase::kCommitStarted,
+                          SimulationCommandCancellationCause::kNone),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+  }
+
+  void MarkCommitted() noexcept {
+    std::uint32_t expected =
+        EncodeCommitState(SimulationCommandCommitPhase::kCommitStarted,
+                          SimulationCommandCancellationCause::kNone);
+    if (!commit_state.compare_exchange_strong(
+            expected,
+            EncodeCommitState(SimulationCommandCommitPhase::kCommitted,
+                              SimulationCommandCancellationCause::kNone),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+      std::terminate();
+    }
+  }
+
+  [[nodiscard]] SimulationCommandCommitPhase CommitPhase() const noexcept {
+    return static_cast<SimulationCommandCommitPhase>(
+        commit_state.load(std::memory_order_acquire) & 0xffU);
+  }
+
+  [[nodiscard]] SimulationCommandCancellationCause CancellationCause()
+      const noexcept {
+    return static_cast<SimulationCommandCancellationCause>(
+        (commit_state.load(std::memory_order_acquire) >> 8U) & 0xffU);
+  }
+
+  bool RecordInitialInventory(std::uint64_t generation,
+                              std::vector<std::string> node_ids) {
+    if (generation == kUnsetInventoryGeneration) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(initial_inventory_mutex_);
+    const std::uint64_t recorded_generation =
+        initial_inventory_generation.load(std::memory_order_acquire);
+    if (recorded_generation != kUnsetInventoryGeneration) {
+      return recorded_generation == generation &&
+             initial_inventory_node_ids_ == node_ids;
+    }
+    initial_inventory_node_ids_ = std::move(node_ids);
+    std::uint64_t expected = kUnsetInventoryGeneration;
+    return initial_inventory_generation.compare_exchange_strong(
+        expected, generation, std::memory_order_release,
+        std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] std::optional<std::uint64_t> InitialInventoryGeneration()
+      const noexcept {
+    const std::uint64_t generation =
+        initial_inventory_generation.load(std::memory_order_acquire);
+    return generation == kUnsetInventoryGeneration
+               ? std::nullopt
+               : std::optional<std::uint64_t>(generation);
+  }
+
+  [[nodiscard]] std::optional<std::vector<std::string>>
+  InitialInventoryNodeIds() const {
+    std::lock_guard<std::mutex> lock(initial_inventory_mutex_);
+    if (initial_inventory_generation.load(std::memory_order_acquire) ==
+        kUnsetInventoryGeneration) {
+      return std::nullopt;
+    }
+    return initial_inventory_node_ids_;
+  }
+
+  bool ReportProgress(std::uint64_t completed) noexcept {
+    if (completed > kSimulationNodeAddProgressTotal) {
+      return false;
+    }
+    std::uint64_t current =
+        progress_completed.load(std::memory_order_acquire);
+    while (completed > current) {
+      if (progress_completed.compare_exchange_weak(
+              current, completed, std::memory_order_release,
+              std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return completed == current;
+  }
+
+  void RecordNodeResourceFailure(SimulationNodeResourceFailure failure) {
+    std::lock_guard<std::mutex> lock(resource_failure_mutex_);
+    node_resource_failure_ = std::move(failure);
+  }
+
+  std::optional<SimulationNodeResourceFailure> NodeResourceFailure() const {
+    std::lock_guard<std::mutex> lock(resource_failure_mutex_);
+    return node_resource_failure_;
+  }
+
+ private:
+  static constexpr std::uint64_t kUnsetInventoryGeneration =
+      std::numeric_limits<std::uint64_t>::max();
+
+  static constexpr std::uint32_t EncodeCommitState(
+      SimulationCommandCommitPhase phase,
+      SimulationCommandCancellationCause cause) noexcept {
+    return static_cast<std::uint32_t>(phase) |
+           (static_cast<std::uint32_t>(cause) << 8U);
+  }
+
+  mutable std::mutex initial_inventory_mutex_;
+  std::vector<std::string> initial_inventory_node_ids_;
+  mutable std::mutex resource_failure_mutex_;
+  std::optional<SimulationNodeResourceFailure> node_resource_failure_;
 };
 
 struct SimulationCommandOutcome {
@@ -121,6 +264,9 @@ struct SimulationCommandOutcome {
       SimulationCommandCancellationCause::kNone;
   std::optional<std::string> error;
   std::optional<std::string> node_lifecycle;
+  std::vector<std::string> added_node_ids;
+  std::optional<std::uint64_t> inventory_generation;
+  std::optional<std::uint32_t> final_node_count;
 };
 
 class SimulationCommandOutcomeUnconfirmed final : public std::runtime_error {
@@ -171,6 +317,7 @@ struct SimulationCommand {
   std::optional<PerfCounterTarget> perf_counter_target;
   std::vector<PerfCounterKind> perf_counter_kinds;
   std::optional<SimulationWalletSend> wallet_send;
+  std::optional<SimulationNodeAddRequest> node_add;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;
   std::shared_ptr<SimulationCommandControl> operation_control;

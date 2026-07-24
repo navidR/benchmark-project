@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stop_token>
 
 namespace bbp {
@@ -14,6 +15,7 @@ struct TuiRunSnapshot {
   std::uint64_t generation = 0;
   std::filesystem::path run_root;
   std::shared_ptr<SimulationCommandQueue> command_queue;
+  std::shared_ptr<std::timed_mutex> publication_mutex;
 };
 
 using TuiRunSnapshotProvider = std::function<TuiRunSnapshot()>;

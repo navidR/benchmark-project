@@ -32,6 +32,7 @@ class RunProcessState {
     friend class RunProcessState;
 
     explicit Guard(RunProcessState& owner);
+    Guard(RunProcessState& owner, std::adopt_lock_t);
 
     RunProcessState* owner_;
     std::unique_lock<std::mutex> lock_;
@@ -61,6 +62,9 @@ class RunProcessState {
   };
 
   [[nodiscard]] Guard Lock();
+  [[nodiscard]] std::optional<Guard> TryLockUntil(
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {});
   [[nodiscard]] NativeMiningRpcGuard LockNativeMiningRpc();
   [[nodiscard]] std::optional<NativeMiningRpcGuard> TryLockNativeMiningRpcUntil(
       std::chrono::steady_clock::time_point deadline,

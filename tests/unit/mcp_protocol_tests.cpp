@@ -1278,7 +1278,7 @@ BOOST_AUTO_TEST_CASE(
       McpProtocolConfig{.bearer_token = std::string(kTestToken),
                         .endpoint_path = "/mcp",
                         .endpoint_port = 43123U,
-                        .uninitialized_session_timeout = 100ms,
+                        .uninitialized_session_timeout = 1s,
                         .allowed_operations = {},
                         .allowed_information_families = {},
                         .read_only = false},

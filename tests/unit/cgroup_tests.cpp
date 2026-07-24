@@ -1,11 +1,17 @@
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <boost/json/array.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
+#include <boost/json/value.hpp>
 #include <boost/test/unit_test.hpp>
 #include <cerrno>
+#include <chrono>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -15,6 +21,7 @@
 #include "bbp/cgroup.h"
 #include "bbp/network.h"
 #include "bbp/run_ownership.h"
+#include "bbp/simulator_app.h"
 #include "bbp/util.h"
 
 namespace {
@@ -101,6 +108,17 @@ std::unique_ptr<PreparedRunGuard> PreparePrivilegedTestRun(std::string run_id) {
   } catch (const std::exception& error) {
     BOOST_TEST_MESSAGE("skipping privileged cgroup test: " << error.what());
     return nullptr;
+  }
+}
+
+bool TryAttachPrivilegedTestProcess(const std::filesystem::path& cgroup,
+                                    pid_t pid, std::string_view test_name) {
+  try {
+    bbp::WriteText(cgroup / "cgroup.procs", std::to_string(pid));
+    return true;
+  } catch (const std::exception& error) {
+    BOOST_TEST_MESSAGE("skipping " << test_name << ": " << error.what());
+    return false;
   }
 }
 
@@ -261,6 +279,59 @@ BOOST_AUTO_TEST_CASE(cgroup_metrics_reject_duplicate_memory_stat_keys) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    cgroup_operations_refuse_a_replacement_at_the_acquired_path) {
+  const std::filesystem::path root = TestDirectory("bound-replacement");
+  const std::filesystem::path acquired_path = root / "node";
+  const std::filesystem::path displaced_path = root / "displaced";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(acquired_path);
+
+  {
+    const bbp::Cgroup cgroup(acquired_path);
+    std::filesystem::rename(acquired_path, displaced_path);
+    std::filesystem::create_directory(acquired_path);
+    bbp::WriteText(acquired_path / "sentinel", "foreign\n");
+
+    const auto rejects_replacement = [](const std::runtime_error& error) {
+      return std::string(error.what()).find("replaced cgroup") !=
+             std::string::npos;
+    };
+    BOOST_CHECK_EXCEPTION(cgroup.AttachPid(getpid()), std::runtime_error,
+                          rejects_replacement);
+    BOOST_CHECK_EXCEPTION(cgroup.SetMemoryMax(4096U), std::runtime_error,
+                          rejects_replacement);
+    BOOST_CHECK_EXCEPTION(cgroup.ReadMetrics(), std::runtime_error,
+                          rejects_replacement);
+    BOOST_CHECK_EXCEPTION(
+        cgroup.KillAll(std::chrono::steady_clock::now() +
+                       std::chrono::seconds(1)),
+        std::runtime_error, rejects_replacement);
+    BOOST_CHECK_EXCEPTION(
+        cgroup.Remove(std::chrono::steady_clock::now() +
+                      std::chrono::seconds(1)),
+        std::runtime_error, rejects_replacement);
+
+    BOOST_TEST(bbp::ReadText(acquired_path / "sentinel") == "foreign\n");
+    BOOST_TEST(!std::filesystem::exists(acquired_path / "cgroup.procs"));
+    BOOST_TEST(!std::filesystem::exists(acquired_path / "memory.max"));
+    BOOST_TEST(std::filesystem::is_directory(acquired_path));
+  }
+  std::filesystem::remove_all(root);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_support_destruction_requires_both_positive_verifications) {
+  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(false, true,
+                                                               true));
+  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(true, false,
+                                                               true));
+  BOOST_TEST(!bbp::RuntimeNodeSupportDestructionAllowedForTest(true, true,
+                                                               false));
+  BOOST_TEST(
+      bbp::RuntimeNodeSupportDestructionAllowedForTest(true, true, true));
+}
+
 BOOST_AUTO_TEST_CASE(cgroup_refuses_unprepared_and_preexisting_run_ownership) {
   const std::string run_id = UniqueRunId("foreign");
   const std::filesystem::path run_path = RunCgroupPath(run_id);
@@ -340,8 +411,8 @@ BOOST_AUTO_TEST_CASE(stale_cleanup_is_scoped_to_one_same_id_run_instance) {
   bbp::WriteRunOwnershipMarker(second);
 
   try {
-    bbp::Cgroup::PrepareRun(first.cgroup_name);
-    bbp::Cgroup::PrepareRun(second.cgroup_name);
+    bbp::Cgroup::PrepareRun(first);
+    bbp::Cgroup::PrepareRun(second);
   } catch (const std::exception& error) {
     BOOST_TEST_MESSAGE(
         "skipping privileged same-id ownership test: " << error.what());
@@ -394,6 +465,136 @@ BOOST_AUTO_TEST_CASE(stale_cleanup_is_scoped_to_one_same_id_run_instance) {
   std::filesystem::remove_all(parent);
 }
 
+BOOST_AUTO_TEST_CASE(
+    stale_cgroup_cleanup_refuses_an_exact_resource_id_collision) {
+  const std::string first_run_id = UniqueRunId("collision-owner");
+  const std::string second_run_id = UniqueRunId("collision-request");
+  const std::filesystem::path parent = TestDirectory("resource-collision");
+  const std::filesystem::path first_root = parent / first_run_id;
+  const std::filesystem::path second_root = parent / second_run_id;
+  std::filesystem::remove_all(parent);
+  std::filesystem::create_directories(first_root);
+  std::filesystem::create_directories(second_root);
+  const bbp::RunOwnership first =
+      bbp::CreateRunOwnership(first_run_id, first_root);
+  bbp::WriteRunOwnershipMarker(first);
+  bbp::RunOwnership collision = first;
+  collision.run_id = second_run_id;
+  collision.run_root = std::filesystem::canonical(second_root);
+  bbp::WriteRunOwnershipMarker(collision);
+
+  try {
+    bbp::Cgroup::PrepareRun(first);
+  } catch (const std::exception& error) {
+    BOOST_TEST_MESSAGE(
+        "skipping privileged resource-collision test: " << error.what());
+    std::filesystem::remove_all(parent);
+    return;
+  }
+
+  try {
+    const bbp::Cgroup node = bbp::Cgroup::Create(first.cgroup_name, "node-1");
+    const pid_t pid = fork();
+    BOOST_REQUIRE(pid >= 0);
+    if (pid == 0) {
+      for (;;) {
+        pause();
+      }
+    }
+    ChildGuard child(pid);
+    node.AttachPid(pid);
+
+    BOOST_CHECK_EXCEPTION(
+        bbp::Cgroup::RemoveStaleRun(collision), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what())
+                     .find("binding does not match exact run ownership") !=
+                 std::string::npos;
+        });
+    BOOST_TEST(std::filesystem::is_directory(RunCgroupPath(first.cgroup_name)));
+    BOOST_TEST(kill(pid, 0) == 0);
+
+    bbp::Cgroup::RemoveRun(first.cgroup_name);
+    const int status = child.Wait();
+    BOOST_REQUIRE(WIFSIGNALED(status));
+    BOOST_TEST(WTERMSIG(status) == SIGKILL);
+  } catch (...) {
+    try {
+      bbp::Cgroup::RemoveRun(first.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    std::filesystem::remove_all(parent);
+    throw;
+  }
+  std::filesystem::remove_all(parent);
+}
+
+BOOST_AUTO_TEST_CASE(
+    stale_cgroup_cleanup_refuses_replaced_run_root_and_cgroup_inodes) {
+  const std::string run_id = UniqueRunId("inode-owner");
+  const std::filesystem::path parent = TestDirectory("inode-owner");
+  const std::filesystem::path run_root = parent / run_id;
+  const std::filesystem::path displaced_root = parent / "displaced";
+  std::filesystem::remove_all(parent);
+  std::filesystem::create_directories(run_root);
+  const bbp::RunOwnership ownership = bbp::CreateRunOwnership(run_id, run_root);
+  bbp::WriteRunOwnershipMarker(ownership);
+
+  try {
+    bbp::Cgroup::PrepareRun(ownership);
+  } catch (const std::exception& error) {
+    BOOST_TEST_MESSAGE(
+        "skipping privileged inode-ownership test: " << error.what());
+    std::filesystem::remove_all(parent);
+    return;
+  }
+
+  try {
+    std::filesystem::rename(run_root, displaced_root);
+    std::filesystem::create_directory(run_root);
+    bbp::WriteRunOwnershipMarker(ownership);
+    BOOST_CHECK_EXCEPTION(
+        bbp::Cgroup::RemoveStaleRun(ownership), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what())
+                     .find("binding does not match exact run ownership") !=
+                 std::string::npos;
+        });
+    BOOST_TEST(
+        std::filesystem::is_directory(RunCgroupPath(ownership.cgroup_name)));
+    std::filesystem::remove_all(run_root);
+    std::filesystem::rename(displaced_root, run_root);
+
+    const std::filesystem::path cgroup_path =
+        RunCgroupPath(ownership.cgroup_name);
+    BOOST_REQUIRE(std::filesystem::remove(cgroup_path));
+    BOOST_REQUIRE(std::filesystem::create_directory(cgroup_path));
+    BOOST_CHECK_EXCEPTION(
+        bbp::Cgroup::RemoveStaleRun(ownership), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what())
+                     .find("replaced run cgroup identity") != std::string::npos;
+        });
+    BOOST_TEST(std::filesystem::is_directory(cgroup_path));
+    BOOST_REQUIRE(std::filesystem::remove(cgroup_path));
+    bbp::Cgroup::RemoveRun(ownership.cgroup_name);
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(RunCgroupPath(ownership.cgroup_name), ignored);
+    try {
+      bbp::Cgroup::RemoveRun(ownership.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    if (std::filesystem::exists(displaced_root) &&
+        !std::filesystem::exists(run_root)) {
+      std::filesystem::rename(displaced_root, run_root, ignored);
+    }
+    std::filesystem::remove_all(parent);
+    throw;
+  }
+  std::filesystem::remove_all(parent);
+}
+
 BOOST_AUTO_TEST_CASE(cgroup_recursively_kills_and_removes_nested_descendants) {
   std::unique_ptr<PreparedRunGuard> run =
       PreparePrivilegedTestRun(UniqueRunId("nested"));
@@ -431,6 +632,100 @@ BOOST_AUTO_TEST_CASE(cgroup_recursively_kills_and_removes_nested_descendants) {
   bbp::Cgroup::RemoveRun(run->run_id());
 }
 
+BOOST_AUTO_TEST_CASE(cgroup_pidfd_fallback_kills_a_helper_and_its_descendant) {
+  std::unique_ptr<PreparedRunGuard> run =
+      PreparePrivilegedTestRun(UniqueRunId("pidfd-fallback"));
+  if (!run) {
+    return;
+  }
+  const bbp::Cgroup node = bbp::Cgroup::Create(run->run_id(), "node-1");
+  int release_fork[2] = {-1, -1};
+  int descendant_pipe[2] = {-1, -1};
+  BOOST_REQUIRE(pipe(release_fork) == 0);
+  BOOST_REQUIRE(pipe(descendant_pipe) == 0);
+  BOOST_REQUIRE(prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0);
+  const pid_t helper = fork();
+  BOOST_REQUIRE(helper >= 0);
+  if (helper == 0) {
+    close(release_fork[1]);
+    close(descendant_pipe[0]);
+    char release = 0;
+    ssize_t received = -1;
+    do {
+      received = read(release_fork[0], &release, 1U);
+    } while (received < 0 && errno == EINTR);
+    if (received != 1) {
+      _exit(20);
+    }
+    const pid_t descendant = fork();
+    if (descendant < 0) {
+      _exit(21);
+    }
+    if (descendant == 0) {
+      for (;;) {
+        pause();
+      }
+    }
+    ssize_t written = -1;
+    do {
+      written = write(descendant_pipe[1], &descendant, sizeof(descendant));
+    } while (written < 0 && errno == EINTR);
+    if (written != static_cast<ssize_t>(sizeof(descendant))) {
+      _exit(22);
+    }
+    for (;;) {
+      pause();
+    }
+  }
+  close(release_fork[0]);
+  close(descendant_pipe[1]);
+  ChildGuard helper_guard(helper);
+  try {
+    node.AttachPid(helper);
+    BOOST_REQUIRE(write(release_fork[1], "x", 1U) == 1);
+    close(release_fork[1]);
+    release_fork[1] = -1;
+    pid_t descendant = -1;
+    ssize_t received = -1;
+    do {
+      received = read(descendant_pipe[0], &descendant, sizeof(descendant));
+    } while (received < 0 && errno == EINTR);
+    BOOST_REQUIRE(received == static_cast<ssize_t>(sizeof(descendant)));
+    close(descendant_pipe[0]);
+    descendant_pipe[0] = -1;
+
+    bbp::KillCgroupProcessesWithPidfdFallbackForTest(
+        node.path(),
+        std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    const int helper_status = helper_guard.Wait();
+    int descendant_status = 0;
+    pid_t waited = -1;
+    do {
+      waited = waitpid(descendant, &descendant_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    BOOST_REQUIRE(waited == descendant);
+    BOOST_REQUIRE(WIFSIGNALED(helper_status));
+    BOOST_REQUIRE(WIFSIGNALED(descendant_status));
+    BOOST_TEST(WTERMSIG(helper_status) == SIGKILL);
+    BOOST_TEST(WTERMSIG(descendant_status) == SIGKILL);
+    BOOST_TEST(bbp::SplitWhitespace(bbp::ReadText(node.path() / "cgroup.procs"))
+                   .empty());
+    node.Remove(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    bbp::Cgroup::RemoveRun(run->run_id());
+    run->Release();
+    BOOST_REQUIRE(prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) == 0);
+  } catch (...) {
+    if (release_fork[1] >= 0) {
+      close(release_fork[1]);
+    }
+    if (descendant_pipe[0] >= 0) {
+      close(descendant_pipe[0]);
+    }
+    static_cast<void>(prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0));
+    throw;
+  }
+}
+
 BOOST_AUTO_TEST_CASE(network_namespace_helper_is_owned_by_node_cgroup) {
   std::unique_ptr<PreparedRunGuard> run =
       PreparePrivilegedTestRun(UniqueRunId("netns"));
@@ -440,7 +735,7 @@ BOOST_AUTO_TEST_CASE(network_namespace_helper_is_owned_by_node_cgroup) {
   const bbp::Cgroup node = bbp::Cgroup::Create(run->run_id(), "node-1");
   bbp::NetworkNamespace network_namespace;
   try {
-    network_namespace = bbp::NetworkNamespace::Create(node.path());
+    network_namespace = bbp::NetworkNamespace::Create(node.access_path());
   } catch (const std::exception& error) {
     BOOST_TEST_MESSAGE(
         "skipping privileged network namespace test: " << error.what());
@@ -480,8 +775,12 @@ BOOST_AUTO_TEST_CASE(
     }
   }
   ChildGuard child(pid);
+  if (!TryAttachPrivilegedTestProcess(scope_root, pid,
+                                      "real cgroup scope test")) {
+    std::filesystem::remove(scope_root, error);
+    return;
+  }
   try {
-    bbp::WriteText(scope_root / "cgroup.procs", std::to_string(pid));
     const std::string process_cgroup_before =
         bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup");
     const std::string root_controllers_before =
@@ -588,6 +887,82 @@ BOOST_AUTO_TEST_CASE(
   }
 }
 
+BOOST_AUTO_TEST_CASE(
+    cgroup_scope_recovers_an_exact_bound_pending_created_run) {
+  const std::string suffix = UniqueRunId("scope-pending");
+  const std::filesystem::path scope_root =
+      std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
+  const std::filesystem::path state_file =
+      TestDirectory("scope-pending-state");
+  const std::filesystem::path ownership_roots =
+      TestDirectory("scope-pending-roots");
+  std::error_code error;
+  std::filesystem::remove(state_file, error);
+  std::filesystem::remove_all(ownership_roots, error);
+  error.clear();
+  if (!std::filesystem::create_directory(scope_root, error)) {
+    BOOST_TEST_MESSAGE(
+        "skipping real pending-recovery test: " << error.message());
+    return;
+  }
+  std::filesystem::create_directories(ownership_roots / "first");
+  std::filesystem::create_directories(ownership_roots / "second");
+  const bbp::RunOwnership first = bbp::CreateRunOwnership(
+      UniqueRunId("pending-first"), ownership_roots / "first");
+  const bbp::RunOwnership second = bbp::CreateRunOwnership(
+      UniqueRunId("pending-second"), ownership_roots / "second");
+  bbp::WriteRunOwnershipMarker(first);
+  bbp::WriteRunOwnershipMarker(second);
+  const bbp::CgroupScopeTestConfig config{
+      .root = scope_root,
+      .simulator_name = "bbp",
+      .state_file = state_file,
+  };
+
+  try {
+    bbp::PrepareCgroupRunInTestScope(config, first);
+  } catch (const std::exception& failure) {
+    BOOST_TEST_MESSAGE(
+        "skipping real pending-recovery test: " << failure.what());
+    std::filesystem::remove(scope_root, error);
+    std::filesystem::remove_all(ownership_roots);
+    return;
+  }
+
+  try {
+    boost::json::value state = boost::json::parse(bbp::ReadText(state_file));
+    BOOST_REQUIRE(state.is_object());
+    state.as_object()["active_runs"] = boost::json::array{};
+    state.as_object()["pending_run"] = first.cgroup_name;
+    state.as_object()["pending_run_created"] = true;
+    bbp::WriteText(state_file, boost::json::serialize(state) + "\n");
+
+    bbp::PrepareCgroupRunInTestScope(config, second);
+    BOOST_TEST(!std::filesystem::exists(scope_root / "bbp" /
+                                        first.cgroup_name));
+    BOOST_TEST(std::filesystem::is_directory(scope_root / "bbp" /
+                                             second.cgroup_name));
+    bbp::RemoveCgroupRunInTestScope(config, second.cgroup_name);
+    BOOST_TEST(!std::filesystem::exists(state_file));
+    BOOST_TEST(!std::filesystem::exists(scope_root / "bbp"));
+    BOOST_REQUIRE(std::filesystem::remove(scope_root, error));
+    BOOST_REQUIRE(!error);
+  } catch (...) {
+    try {
+      bbp::RemoveCgroupRunInTestScope(config, first.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    try {
+      bbp::RemoveCgroupRunInTestScope(config, second.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    std::filesystem::remove(scope_root, error);
+    std::filesystem::remove_all(ownership_roots);
+    throw;
+  }
+  std::filesystem::remove_all(ownership_roots);
+}
+
 BOOST_AUTO_TEST_CASE(cgroup_scope_prepare_failure_restores_partial_mutations) {
   const std::string suffix = UniqueRunId("scope-rollback");
   const std::filesystem::path scope_root =
@@ -614,8 +989,16 @@ BOOST_AUTO_TEST_CASE(cgroup_scope_prepare_failure_restores_partial_mutations) {
     }
   }
   ChildGuard child(pid);
+  if (!TryAttachPrivilegedTestProcess(scope_root, pid,
+                                      "real cgroup rollback test")) {
+    std::filesystem::remove(simulator / run_id, error);
+    error.clear();
+    std::filesystem::remove(simulator, error);
+    error.clear();
+    std::filesystem::remove(scope_root, error);
+    return;
+  }
   try {
-    bbp::WriteText(scope_root / "cgroup.procs", std::to_string(pid));
     const std::string process_cgroup_before =
         bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup");
     const std::string root_controllers_before =

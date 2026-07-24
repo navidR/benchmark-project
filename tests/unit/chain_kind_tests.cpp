@@ -55,6 +55,20 @@ BOOST_AUTO_TEST_CASE(later_chain_drivers_are_registered) {
   BOOST_CHECK(dynamic_cast<bbp::MoneroDriver*>(monero_driver.get()) != nullptr);
 }
 
+BOOST_AUTO_TEST_CASE(chain_p2p_bind_defaults_match_daemon_argv_semantics) {
+  bbp::ChainNodeConfig config;
+  config.p2p_host = "127.0.0.1";
+  BOOST_TEST(bbp::EffectiveP2pBindAddress(bbp::ChainKind::kFiro, config) ==
+             "0.0.0.0");
+  BOOST_TEST(bbp::EffectiveP2pBindAddress(bbp::ChainKind::kBitcoin, config) ==
+             "0.0.0.0");
+  BOOST_TEST(bbp::EffectiveP2pBindAddress(bbp::ChainKind::kMonero, config) ==
+             "127.0.0.1");
+  config.p2p_bind = "10.20.30.40";
+  BOOST_TEST(bbp::EffectiveP2pBindAddress(bbp::ChainKind::kFiro, config) ==
+             "10.20.30.40");
+}
+
 BOOST_AUTO_TEST_CASE(bitcoin_node_config_uses_chain_ports_and_prefix) {
   bbp::ChainNodeConfigRequest request;
   request.run_id = "bitcoin-test";

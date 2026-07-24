@@ -49,7 +49,7 @@ class HttpClient {
       std::stop_token stop_token) const;
 
   std::chrono::milliseconds timeout_;
-  mutable std::mutex digest_mutex_;
+  mutable std::timed_mutex digest_mutex_;
 };
 
 }  // namespace bbp

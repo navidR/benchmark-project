@@ -136,6 +136,7 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
                   .chain = "firo", .node_count = 1U, .state = "starting"},
           .options = {},
           .command_queue = {},
+          .publication_mutex = {},
           .request_run_stop = {},
           .run_started = {},
           .run_stopping = {},

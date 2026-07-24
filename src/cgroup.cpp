@@ -5,6 +5,7 @@
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -43,7 +44,7 @@ constexpr std::string_view kSimulatorRootName = "bbp";
 constexpr std::string_view kCgroupScopeStateFile =
     "/tmp/blockchain-benchmark-project-cgroup-scope-v1.json";
 constexpr std::string_view kOwnedControllerPrefix = ".bbp-controller-v1-";
-constexpr std::uint64_t kCgroupScopeStateVersion = 1U;
+constexpr std::uint64_t kCgroupScopeStateVersion = 2U;
 
 std::mutex prepared_runs_mutex;
 std::set<std::string> prepared_runs;
@@ -61,6 +62,23 @@ struct CgroupScopeConfig {
   bool allow_root_process_move = false;
 };
 
+struct CgroupPathIdentity {
+  std::uint64_t device = 0U;
+  std::uint64_t inode = 0U;
+
+  bool operator==(const CgroupPathIdentity&) const = default;
+};
+
+struct CgroupRunBinding {
+  std::string run_id;
+  std::filesystem::path run_root;
+  std::string resource_id;
+  CgroupPathIdentity run_root_identity;
+  CgroupPathIdentity cgroup_identity;
+
+  bool operator==(const CgroupRunBinding&) const = default;
+};
+
 struct CgroupScopeState {
   std::filesystem::path root;
   std::string simulator_name;
@@ -71,6 +89,7 @@ struct CgroupScopeState {
   std::set<std::string> root_controllers_added;
   std::set<std::string> simulator_controllers_added;
   std::set<std::string> active_runs;
+  std::map<std::string, CgroupRunBinding> run_bindings;
   std::optional<std::string> pending_run;
   bool pending_run_created = false;
 };
@@ -78,34 +97,74 @@ struct CgroupScopeState {
 class CgroupScopeLock {
  public:
   explicit CgroupScopeLock(const std::filesystem::path& root) {
-    fd_ = open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd_ < 0) {
-      throw std::runtime_error("open cgroup scope lock failed for " +
-                               root.string() + ": " + std::strerror(errno));
-    }
+    Open(root);
     int result = 0;
     do {
       result = flock(fd_, LOCK_EX);
     } while (result != 0 && errno == EINTR);
     if (result != 0) {
+      ThrowLockFailure(root, errno);
+    }
+  }
+
+  CgroupScopeLock(const std::filesystem::path& root,
+                  std::chrono::steady_clock::time_point deadline,
+                  std::stop_token stop_token) {
+    Open(root);
+    for (;;) {
+      if (stop_token.stop_requested()) {
+        Close();
+        throw std::runtime_error("cgroup scope lock cancelled for " +
+                                 root.string());
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        Close();
+        throw std::runtime_error("cgroup scope lock deadline expired for " +
+                                 root.string());
+      }
+      if (flock(fd_, LOCK_EX | LOCK_NB) == 0) {
+        return;
+      }
       const int error = errno;
-      close(fd_);
-      fd_ = -1;
-      throw std::runtime_error("lock cgroup scope failed for " + root.string() +
-                               ": " + std::strerror(error));
+      if (error != EINTR && error != EAGAIN && error != EWOULDBLOCK) {
+        ThrowLockFailure(root, error);
+      }
+      std::this_thread::sleep_for(std::min(
+          std::chrono::milliseconds(5),
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                now)));
     }
   }
 
   CgroupScopeLock(const CgroupScopeLock&) = delete;
   CgroupScopeLock& operator=(const CgroupScopeLock&) = delete;
 
-  ~CgroupScopeLock() {
-    if (fd_ >= 0) {
-      close(fd_);
+  ~CgroupScopeLock() { Close(); }
+
+ private:
+  void Open(const std::filesystem::path& root) {
+    fd_ = open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd_ < 0) {
+      throw std::runtime_error("open cgroup scope lock failed for " +
+                               root.string() + ": " + std::strerror(errno));
     }
   }
 
- private:
+  void Close() noexcept {
+    if (fd_ >= 0) {
+      static_cast<void>(close(fd_));
+      fd_ = -1;
+    }
+  }
+
+  [[noreturn]] void ThrowLockFailure(const std::filesystem::path& root,
+                                     int error) {
+    Close();
+    throw std::runtime_error("lock cgroup scope failed for " + root.string() +
+                             ": " + std::strerror(error));
+  }
+
   int fd_ = -1;
 };
 
@@ -126,6 +185,34 @@ CgroupPaths CgroupPathsForScope(const CgroupScopeConfig& config,
   const std::filesystem::path simulator = config.root / config.simulator_name;
   return CgroupPaths{
       .root = config.root, .simulator = simulator, .run = simulator / run_id};
+}
+
+CgroupPathIdentity DirectoryIdentity(const std::filesystem::path& path,
+                                     std::string_view description) {
+  const int fd =
+      open(path.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    throw std::runtime_error("open " + std::string(description) +
+                             " for ownership identity failed: " +
+                             path.string() + ": " + std::strerror(errno));
+  }
+  struct stat status {};
+  if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
+    const int error = errno;
+    close(fd);
+    throw std::runtime_error("read " + std::string(description) +
+                             " ownership identity failed: " + path.string() +
+                             ": " + std::strerror(error));
+  }
+  if (close(fd) != 0) {
+    throw std::runtime_error("close " + std::string(description) +
+                             " ownership identity failed: " + path.string() +
+                             ": " + std::strerror(errno));
+  }
+  return CgroupPathIdentity{
+      .device = static_cast<std::uint64_t>(status.st_dev),
+      .inode = static_cast<std::uint64_t>(status.st_ino),
+  };
 }
 
 bool RunWasPrepared(const std::string& run_id) {
@@ -319,6 +406,23 @@ boost::json::array StringSetJson(const std::set<std::string>& values) {
   return result;
 }
 
+boost::json::object RunBindingsJson(
+    const std::map<std::string, CgroupRunBinding>& bindings) {
+  boost::json::object result;
+  for (const auto& [cgroup_name, binding] : bindings) {
+    result[cgroup_name] = boost::json::object{
+        {"run_id", binding.run_id},
+        {"run_root", binding.run_root.string()},
+        {"resource_id", binding.resource_id},
+        {"run_root_device", binding.run_root_identity.device},
+        {"run_root_inode", binding.run_root_identity.inode},
+        {"cgroup_device", binding.cgroup_identity.device},
+        {"cgroup_inode", binding.cgroup_identity.inode},
+    };
+  }
+  return result;
+}
+
 std::string SerializeCgroupScopeState(const CgroupScopeState& state) {
   boost::json::object object;
   object["version"] = kCgroupScopeStateVersion;
@@ -335,6 +439,7 @@ std::string SerializeCgroupScopeState(const CgroupScopeState& state) {
   object["simulator_controllers_added"] =
       StringSetJson(state.simulator_controllers_added);
   object["active_runs"] = StringSetJson(state.active_runs);
+  object["run_bindings"] = RunBindingsJson(state.run_bindings);
   if (state.pending_run) {
     object["pending_run"] = *state.pending_run;
   } else {
@@ -402,6 +507,19 @@ std::string ScopeString(const boost::json::object& object,
   return std::string(value.as_string());
 }
 
+std::uint64_t ScopeUint64(const boost::json::object& object,
+                          std::string_view field) {
+  const boost::json::value& value = RequiredScopeField(object, field);
+  if (value.is_uint64()) {
+    return value.as_uint64();
+  }
+  if (value.is_int64() && value.as_int64() >= 0) {
+    return static_cast<std::uint64_t>(value.as_int64());
+  }
+  throw std::runtime_error("cgroup scope state field is not uint64: " +
+                           std::string(field));
+}
+
 enum class ScopeSetKind { kRunIds, kControllers, kManagedControllers };
 
 std::set<std::string> ScopeStringSet(const boost::json::object& object,
@@ -444,6 +562,66 @@ std::set<std::string> ScopeStringSet(const boost::json::object& object,
   return result;
 }
 
+std::map<std::string, CgroupRunBinding> ScopeRunBindings(
+    const boost::json::object& object) {
+  const boost::json::value& value = RequiredScopeField(object, "run_bindings");
+  if (!value.is_object()) {
+    throw std::runtime_error(
+        "cgroup scope state run_bindings is not an object");
+  }
+  std::map<std::string, CgroupRunBinding> bindings;
+  for (const auto& member : value.as_object()) {
+    const std::string cgroup_name(member.key());
+    if (cgroup_name.size() != 32U ||
+        !std::all_of(cgroup_name.begin(), cgroup_name.end(),
+                     [](char value) {
+                       return (value >= '0' && value <= '9') ||
+                              (value >= 'a' && value <= 'f');
+                     }) ||
+        !member.value().is_object()) {
+      throw std::runtime_error(
+          "cgroup scope state contains an invalid run binding");
+    }
+    const boost::json::object& binding_object = member.value().as_object();
+    const std::set<std::string_view> fields = {
+        "run_id",         "run_root",      "resource_id",  "run_root_device",
+        "run_root_inode", "cgroup_device", "cgroup_inode",
+    };
+    for (const auto& field : binding_object) {
+      if (!fields.contains(field.key())) {
+        throw std::runtime_error(
+            "cgroup scope run binding has an unsupported field");
+      }
+    }
+    CgroupRunBinding binding{
+        .run_id = ScopeString(binding_object, "run_id"),
+        .run_root = ScopeString(binding_object, "run_root"),
+        .resource_id = ScopeString(binding_object, "resource_id"),
+        .run_root_identity =
+            CgroupPathIdentity{
+                .device = ScopeUint64(binding_object, "run_root_device"),
+                .inode = ScopeUint64(binding_object, "run_root_inode"),
+            },
+        .cgroup_identity =
+            CgroupPathIdentity{
+                .device = ScopeUint64(binding_object, "cgroup_device"),
+                .inode = ScopeUint64(binding_object, "cgroup_inode"),
+            },
+    };
+    RequireSafeRunId(binding.run_id);
+    if (!binding.run_root.is_absolute() ||
+        binding.run_root.lexically_normal() != binding.run_root ||
+        binding.resource_id != cgroup_name ||
+        binding.run_root_identity.inode == 0U ||
+        binding.cgroup_identity.inode == 0U) {
+      throw std::runtime_error(
+          "cgroup scope state run binding is inconsistent");
+    }
+    bindings.emplace(cgroup_name, std::move(binding));
+  }
+  return bindings;
+}
+
 CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
   const boost::json::value parsed =
       boost::json::parse(ReadOwnedScopeState(config.state_file));
@@ -462,6 +640,7 @@ CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
       "root_controllers_added",
       "simulator_controllers_added",
       "active_runs",
+      "run_bindings",
       "pending_run",
       "pending_run_created",
   };
@@ -473,13 +652,12 @@ CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
     }
   }
   const boost::json::value& version = RequiredScopeField(object, "version");
-  const bool supported_version =
-      (version.is_uint64() &&
-       version.as_uint64() == kCgroupScopeStateVersion) ||
-      (version.is_int64() && version.as_int64() >= 0 &&
-       static_cast<std::uint64_t>(version.as_int64()) ==
-           kCgroupScopeStateVersion);
-  if (!supported_version) {
+  const std::uint64_t version_number =
+      version.is_uint64() ? version.as_uint64()
+      : version.is_int64() && version.as_int64() >= 0
+          ? static_cast<std::uint64_t>(version.as_int64())
+          : 0U;
+  if (version_number != 1U && version_number != kCgroupScopeStateVersion) {
     throw std::runtime_error("cgroup scope state version is unsupported");
   }
   const boost::json::value& preexisting =
@@ -503,6 +681,9 @@ CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
       object, "simulator_controllers_added", ScopeSetKind::kManagedControllers);
   state.active_runs =
       ScopeStringSet(object, "active_runs", ScopeSetKind::kRunIds);
+  state.run_bindings = object.if_contains("run_bindings") != nullptr
+                           ? ScopeRunBindings(object)
+                           : std::map<std::string, CgroupRunBinding>{};
   const boost::json::value& pending = RequiredScopeField(object, "pending_run");
   if (pending.is_string()) {
     state.pending_run = std::string(pending.as_string());
@@ -521,6 +702,15 @@ CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
   if (!state.pending_run && state.pending_run_created) {
     throw std::runtime_error(
         "cgroup scope state marks a missing pending run as created");
+  }
+  for (const auto& [cgroup_name, binding] : state.run_bindings) {
+    static_cast<void>(binding);
+    const bool recoverable_pending_binding =
+        state.pending_run_created && state.pending_run == cgroup_name;
+    if (!state.active_runs.contains(cgroup_name) &&
+        !recoverable_pending_binding) {
+      throw std::runtime_error("cgroup scope state binding has no active run");
+    }
   }
   if (state.root != config.root ||
       state.simulator_name != config.simulator_name ||
@@ -868,21 +1058,158 @@ bool CgroupProcsEmpty(const std::filesystem::path& dir) {
   return SplitWhitespace(ReadText(dir / "cgroup.procs")).empty();
 }
 
-void WaitForCgroupProcsEmpty(const std::filesystem::path& dir) {
-  for (int attempt = 0; attempt < 50; ++attempt) {
+std::vector<pid_t> CgroupPids(const std::filesystem::path& dir) {
+  std::vector<pid_t> pids;
+  for (const std::string& text :
+       SplitWhitespace(ReadText(dir / "cgroup.procs"))) {
+    pid_t pid = 0;
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), pid);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        pid <= 0) {
+      throw std::runtime_error("cgroup.procs contains an invalid PID: " + text);
+    }
+    pids.push_back(pid);
+  }
+  return pids;
+}
+
+int OpenPidfd(pid_t pid) {
+#ifdef SYS_pidfd_open
+  for (;;) {
+    const int descriptor = static_cast<int>(syscall(SYS_pidfd_open, pid, 0U));
+    if (descriptor >= 0 || errno == ESRCH) {
+      return descriptor;
+    }
+    if (errno != EINTR) {
+      throw std::runtime_error("pidfd_open failed for cgroup process " +
+                               std::to_string(pid) + ": " +
+                               std::strerror(errno));
+    }
+  }
+#else
+  static_cast<void>(pid);
+  throw std::runtime_error(
+      "pidfd_open is unavailable for cgroup process cleanup");
+#endif
+}
+
+void SignalPidfd(int descriptor, pid_t pid) {
+#ifdef SYS_pidfd_send_signal
+  for (;;) {
+    if (syscall(SYS_pidfd_send_signal, descriptor, SIGKILL, nullptr, 0U) == 0 ||
+        errno == ESRCH) {
+      return;
+    }
+    if (errno != EINTR) {
+      throw std::runtime_error("pidfd_send_signal failed for cgroup process " +
+                               std::to_string(pid) + ": " +
+                               std::strerror(errno));
+    }
+  }
+#else
+  static_cast<void>(descriptor);
+  static_cast<void>(pid);
+  throw std::runtime_error(
+      "pidfd_send_signal is unavailable for cgroup process cleanup");
+#endif
+}
+
+void WaitForCgroupProcsEmpty(const std::filesystem::path& dir,
+                             std::chrono::steady_clock::time_point deadline,
+                             std::stop_token stop_token) {
+  while (true) {
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("cgroup process wait cancelled: " +
+                               dir.string());
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      throw std::runtime_error("cgroup process wait deadline expired: " +
+                               dir.string());
+    }
     if (CgroupProcsEmpty(dir)) {
       return;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::this_thread::sleep_for(std::min(
+        std::chrono::milliseconds(20),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
   }
-  throw std::runtime_error("cgroup still contains processes after kill: " +
-                           dir.string());
 }
 
-void KillCgroupIfSupported(const std::filesystem::path& dir) {
-  if (std::filesystem::exists(dir / "cgroup.kill")) {
+void KillCgroupProcesses(const std::filesystem::path& dir,
+                         std::chrono::steady_clock::time_point deadline,
+                         std::stop_token stop_token,
+                         bool force_pidfd_fallback = false) {
+  if (!force_pidfd_fallback && std::filesystem::exists(dir / "cgroup.kill")) {
     WriteCgroupFile(dir, "cgroup.kill", "1");
-    WaitForCgroupProcsEmpty(dir);
+    WaitForCgroupProcsEmpty(dir, deadline, stop_token);
+    return;
+  }
+  while (true) {
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("cgroup process kill cancelled: " +
+                               dir.string());
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error("cgroup process kill deadline expired: " +
+                               dir.string());
+    }
+    const std::vector<pid_t> pids = CgroupPids(dir);
+    if (pids.empty()) {
+      return;
+    }
+    for (const pid_t pid : pids) {
+      if (stop_token.stop_requested()) {
+        throw std::runtime_error("cgroup process kill cancelled: " +
+                                 dir.string());
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("cgroup process kill deadline expired: " +
+                                 dir.string());
+      }
+      const int pidfd = OpenPidfd(pid);
+      if (pidfd < 0) {
+        continue;
+      }
+      try {
+        const std::vector<pid_t> current = CgroupPids(dir);
+        if (std::find(current.begin(), current.end(), pid) != current.end()) {
+          if (stop_token.stop_requested()) {
+            throw std::runtime_error("cgroup process kill cancelled: " +
+                                     dir.string());
+          }
+          if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("cgroup process kill deadline expired: " +
+                                     dir.string());
+          }
+          SignalPidfd(pidfd, pid);
+        }
+      } catch (...) {
+        close(pidfd);
+        throw;
+      }
+      if (close(pidfd) != 0) {
+        throw std::runtime_error("close pidfd failed for cgroup process " +
+                                 std::to_string(pid) + ": " +
+                                 std::strerror(errno));
+      }
+      if (stop_token.stop_requested()) {
+        throw std::runtime_error("cgroup process kill cancelled: " +
+                                 dir.string());
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("cgroup process kill deadline expired: " +
+                                 dir.string());
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < deadline) {
+      std::this_thread::sleep_for(std::min(
+          std::chrono::milliseconds(5),
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                now)));
+    }
   }
 }
 
@@ -943,7 +1270,9 @@ void CreateCgroupDirectoryExclusive(const std::filesystem::path& path,
 }
 
 std::vector<std::filesystem::path> DescendantCgroupsDeepestFirst(
-    const std::filesystem::path& run_root) {
+    const std::filesystem::path& run_root,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
   std::vector<std::filesystem::path> paths;
   std::error_code ec;
   std::filesystem::recursive_directory_iterator iterator(
@@ -954,6 +1283,14 @@ std::vector<std::filesystem::path> DescendantCgroupsDeepestFirst(
                              ": " + ec.message());
   }
   while (iterator != end) {
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("cgroup traversal cancelled for " +
+                               run_root.string());
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error("cgroup traversal deadline expired for " +
+                               run_root.string());
+    }
     const bool is_directory = iterator->is_directory(ec);
     if (ec) {
       throw std::runtime_error("inspect run cgroup entry failed for " +
@@ -998,19 +1335,21 @@ void RemoveCgroupDirectory(const std::filesystem::path& path,
   }
 }
 
-void RemoveRunCgroup(const CgroupScopeConfig& config,
-                     const std::string& run_id) {
+void RemoveRunCgroup(const CgroupScopeConfig& config, const std::string& run_id,
+                     std::chrono::steady_clock::time_point deadline,
+                     std::stop_token stop_token,
+                     bool force_pidfd_fallback = false) {
   const std::filesystem::path run_root =
       CgroupPathsForScope(config, run_id).run;
   if (!std::filesystem::exists(run_root)) {
     return;
   }
-  KillCgroupIfSupported(run_root);
   for (const std::filesystem::path& path :
-       DescendantCgroupsDeepestFirst(run_root)) {
-    KillCgroupIfSupported(path);
+       DescendantCgroupsDeepestFirst(run_root, deadline, stop_token)) {
+    KillCgroupProcesses(path, deadline, stop_token, force_pidfd_fallback);
     RemoveCgroupDirectory(path, "descendant");
   }
+  KillCgroupProcesses(run_root, deadline, stop_token, force_pidfd_fallback);
   RemoveCgroupDirectory(run_root, "run");
 }
 
@@ -1104,6 +1443,7 @@ CgroupScopeState NewCgroupScopeState(const CgroupScopeConfig& config) {
       .root_controllers_added = {},
       .simulator_controllers_added = {},
       .active_runs = {},
+      .run_bindings = {},
       .pending_run = std::nullopt,
       .pending_run_created = false,
   };
@@ -1175,7 +1515,8 @@ void RemoveScopeStateFile(const CgroupScopeConfig& config) {
 
 void RestoreCgroupScope(const CgroupScopeConfig& config,
                         const CgroupScopeState& state) {
-  if (!state.active_runs.empty() || state.pending_run) {
+  if (!state.active_runs.empty() || !state.run_bindings.empty() ||
+      state.pending_run) {
     throw std::runtime_error(
         "refusing to restore cgroup scope while owned runs remain");
   }
@@ -1224,33 +1565,76 @@ void RecoverInterruptedCgroupPreparation(const CgroupScopeConfig& config,
     return;
   }
   if (state->pending_run_created) {
-    RemoveRunCgroup(config, *state->pending_run);
+    const auto binding = state->run_bindings.find(*state->pending_run);
+    if (binding == state->run_bindings.end()) {
+      throw std::runtime_error(
+          "refusing recovery deletion for an unbound pending run cgroup");
+    }
+    const std::filesystem::path run_cgroup =
+        CgroupPathsForScope(config, *state->pending_run).run;
+    if (DirectoryIdentity(binding->second.run_root, "run root") !=
+            binding->second.run_root_identity ||
+        DirectoryIdentity(run_cgroup, "run cgroup") !=
+            binding->second.cgroup_identity) {
+      throw std::runtime_error(
+          "refusing recovery deletion for a replaced pending run resource");
+    }
+    RemoveRunCgroup(config, *state->pending_run,
+                    std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                    {});
   }
+  state->run_bindings.erase(*state->pending_run);
   state->pending_run.reset();
   state->pending_run_created = false;
   WriteCgroupScopeState(config.state_file, *state);
 }
 
 void PrepareRunInScope(const CgroupScopeConfig& config,
-                       const std::string& run_id) {
+                       const std::string& run_id,
+                       const RunOwnership* ownership = nullptr) {
   RequireSafeRunId(run_id);
+  std::optional<CgroupRunBinding> run_binding;
+  if (ownership != nullptr) {
+    const RunOwnership loaded =
+        LoadRunOwnership(ownership->run_id, ownership->run_root);
+    if (loaded != *ownership || ownership->cgroup_name != run_id ||
+        ownership->resource_id != run_id) {
+      throw std::runtime_error(
+          "run cgroup ownership does not match the prepared resource");
+    }
+    run_binding = CgroupRunBinding{
+        .run_id = ownership->run_id,
+        .run_root = ownership->run_root,
+        .resource_id = ownership->resource_id,
+        .run_root_identity = DirectoryIdentity(ownership->run_root, "run root"),
+        .cgroup_identity = {},
+    };
+  }
   if (!std::filesystem::exists(config.root / "cgroup.controllers")) {
     throw std::runtime_error("cgroup v2 is not mounted at " +
                              config.root.string());
   }
   CgroupScopeLock scope_lock(config.root);
+  const CgroupPaths requested_paths = CgroupPathsForScope(config, run_id);
+  const bool scope_state_exists = ScopeStateExists(config);
+  if (!scope_state_exists && std::filesystem::exists(requested_paths.run)) {
+    throw std::runtime_error(
+        "refusing to adopt pre-existing run cgroup: " +
+        requested_paths.run.string());
+  }
   std::optional<CgroupScopeState> state;
   bool run_created = false;
   bool attempted_run = false;
   bool scope_published = false;
   try {
-    if (ScopeStateExists(config)) {
+    if (scope_state_exists) {
       state = LoadCgroupScopeState(config);
       RecoverInterruptedCgroupPreparation(config, &*state);
       for (auto iterator = state->active_runs.begin();
            iterator != state->active_runs.end();) {
         if (!std::filesystem::exists(
                 CgroupPathsForScope(config, *iterator).run)) {
+          state->run_bindings.erase(*iterator);
           iterator = state->active_runs.erase(iterator);
         } else {
           ++iterator;
@@ -1285,6 +1669,10 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
     const CgroupPaths paths = CgroupPathsForScope(config, run_id);
     CreateCgroupDirectoryExclusive(paths.run, "run");
     run_created = true;
+    if (run_binding) {
+      run_binding->cgroup_identity = DirectoryIdentity(paths.run, "run cgroup");
+      state->run_bindings.emplace(run_id, *run_binding);
+    }
     state->pending_run_created = true;
     WriteCgroupScopeState(config.state_file, *state);
     RequireControllersAvailable(paths.run, {"cpu", "io", "memory", "pids"});
@@ -1299,10 +1687,13 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
     try {
       if (state && (attempted_run || scope_published)) {
         if (run_created) {
-          RemoveRunCgroup(config, run_id);
+          RemoveRunCgroup(
+              config, run_id,
+              std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
         }
         if (attempted_run) {
           state->active_runs.erase(run_id);
+          state->run_bindings.erase(run_id);
           if (state->pending_run == run_id) {
             state->pending_run.reset();
             state->pending_run_created = false;
@@ -1325,19 +1716,65 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
 }
 
 void RemoveRunInScope(const CgroupScopeConfig& config,
-                      const std::string& run_id) {
+                      const std::string& run_id,
+                      const RunOwnership* expected_ownership,
+                      std::chrono::steady_clock::time_point deadline,
+                      std::stop_token stop_token) {
   RequireSafeRunId(run_id);
-  CgroupScopeLock scope_lock(config.root);
-  RemoveRunCgroup(config, run_id);
+  CgroupScopeLock scope_lock(config.root, deadline, stop_token);
   if (!ScopeStateExists(config)) {
+    if (std::filesystem::exists(CgroupPathsForScope(config, run_id).run)) {
+      throw std::runtime_error(
+          "refusing to remove a run cgroup without scope ownership state: " +
+          run_id);
+    }
     return;
   }
   CgroupScopeState state = LoadCgroupScopeState(config);
+  if (!state.active_runs.contains(run_id) && state.pending_run != run_id) {
+    throw std::runtime_error(
+        "refusing to remove a run cgroup absent from scope ownership state: " +
+        run_id);
+  }
+  const auto binding = state.run_bindings.find(run_id);
+  if (expected_ownership != nullptr) {
+    if (binding == state.run_bindings.end()) {
+      throw std::runtime_error(
+          "refusing stale cgroup cleanup for an unbound legacy scope entry");
+    }
+    const RunOwnership loaded = LoadRunOwnership(expected_ownership->run_id,
+                                                 expected_ownership->run_root);
+    const CgroupRunBinding expected{
+        .run_id = expected_ownership->run_id,
+        .run_root = expected_ownership->run_root,
+        .resource_id = expected_ownership->resource_id,
+        .run_root_identity =
+            DirectoryIdentity(expected_ownership->run_root, "run root"),
+        .cgroup_identity = binding->second.cgroup_identity,
+    };
+    if (loaded != *expected_ownership ||
+        expected_ownership->cgroup_name != run_id ||
+        binding->second != expected) {
+      throw std::runtime_error(
+          "stale cgroup scope binding does not match exact run ownership");
+    }
+  }
+  const std::filesystem::path run_cgroup =
+      CgroupPathsForScope(config, run_id).run;
+  if (binding != state.run_bindings.end() &&
+      std::filesystem::exists(run_cgroup) &&
+      DirectoryIdentity(run_cgroup, "run cgroup") !=
+          binding->second.cgroup_identity) {
+    throw std::runtime_error(
+        "refusing to remove a replaced run cgroup identity: " + run_id);
+  }
+  RemoveRunCgroup(config, run_id, deadline, stop_token);
   if (state.pending_run == run_id) {
     state.pending_run.reset();
     state.pending_run_created = false;
   }
   state.active_runs.erase(run_id);
+  state.run_bindings.erase(run_id);
   WriteCgroupScopeState(config.state_file, state);
   if (state.active_runs.empty() && !state.pending_run) {
     RestoreCgroupScope(config, state);
@@ -1370,6 +1807,131 @@ std::string BlockDeviceIdText(const BlockDeviceId& device) {
   return std::to_string(device.major) + ":" + std::to_string(device.minor);
 }
 
+Cgroup::Cgroup(std::filesystem::path path)
+    : path_(std::filesystem::absolute(std::move(path)).lexically_normal()) {
+  name_ = path_.filename().string();
+  if (name_.empty() || name_ == "." || name_ == "..") {
+    throw std::runtime_error("cgroup path has no safe directory name: " +
+                             path_.string());
+  }
+  std::filesystem::path parent = path_.parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+  parent_fd_ =
+      open(parent.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (parent_fd_ < 0) {
+    throw std::runtime_error("open cgroup parent failed for " + path_.string() +
+                             ": " + std::strerror(errno));
+  }
+  fd_ = openat(parent_fd_, name_.c_str(),
+               O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd_ < 0) {
+    const int error = errno;
+    Close();
+    throw std::runtime_error("open cgroup identity failed for " +
+                             path_.string() + ": " + std::strerror(error));
+  }
+  struct stat status {};
+  if (fstat(fd_, &status) != 0 || !S_ISDIR(status.st_mode)) {
+    const int error = errno == 0 ? ENOTDIR : errno;
+    Close();
+    throw std::runtime_error("inspect cgroup identity failed for " +
+                             path_.string() + ": " + std::strerror(error));
+  }
+  device_ = static_cast<std::uint64_t>(status.st_dev);
+  inode_ = static_cast<std::uint64_t>(status.st_ino);
+  try {
+    RequireBoundIdentity();
+  } catch (...) {
+    Close();
+    throw;
+  }
+}
+
+Cgroup::Cgroup(Cgroup&& other) noexcept { *this = std::move(other); }
+
+Cgroup& Cgroup::operator=(Cgroup&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  Close();
+  path_ = std::move(other.path_);
+  name_ = std::move(other.name_);
+  parent_fd_ = other.parent_fd_;
+  fd_ = other.fd_;
+  device_ = other.device_;
+  inode_ = other.inode_;
+  removed_ = other.removed_;
+  other.parent_fd_ = -1;
+  other.fd_ = -1;
+  other.device_ = 0U;
+  other.inode_ = 0U;
+  other.removed_ = true;
+  return *this;
+}
+
+Cgroup::~Cgroup() { Close(); }
+
+void Cgroup::Close() noexcept {
+  if (fd_ >= 0) {
+    static_cast<void>(close(fd_));
+    fd_ = -1;
+  }
+  if (parent_fd_ >= 0) {
+    static_cast<void>(close(parent_fd_));
+    parent_fd_ = -1;
+  }
+}
+
+void Cgroup::RequireBoundIdentity() const {
+  if (removed_) {
+    throw std::runtime_error("cgroup was already removed: " + path_.string());
+  }
+  if (fd_ < 0 || parent_fd_ < 0) {
+    throw std::runtime_error("cgroup has no acquired directory identity: " +
+                             path_.string());
+  }
+  const auto exact_identity = [&](const struct stat& status) {
+    return S_ISDIR(status.st_mode) &&
+           static_cast<std::uint64_t>(status.st_dev) == device_ &&
+           static_cast<std::uint64_t>(status.st_ino) == inode_;
+  };
+  struct stat opened {};
+  if (fstat(fd_, &opened) != 0) {
+    throw std::runtime_error("inspect acquired cgroup fd failed for " +
+                             path_.string() + ": " + std::strerror(errno));
+  }
+  if (!exact_identity(opened)) {
+    throw std::runtime_error("acquired cgroup fd identity changed for " +
+                             path_.string());
+  }
+  struct stat parent_entry {};
+  if (fstatat(parent_fd_, name_.c_str(), &parent_entry,
+              AT_SYMLINK_NOFOLLOW) != 0) {
+    throw std::runtime_error("acquired cgroup path disappeared for " +
+                             path_.string() + ": " + std::strerror(errno));
+  }
+  if (!exact_identity(parent_entry)) {
+    throw std::runtime_error(
+        "refusing replaced cgroup directory identity: " + path_.string());
+  }
+  struct stat path_entry {};
+  if (fstatat(AT_FDCWD, path_.c_str(), &path_entry, AT_SYMLINK_NOFOLLOW) != 0) {
+    throw std::runtime_error("acquired cgroup pathname disappeared for " +
+                             path_.string() + ": " + std::strerror(errno));
+  }
+  if (!exact_identity(path_entry)) {
+    throw std::runtime_error(
+        "refusing replaced cgroup pathname identity: " + path_.string());
+  }
+}
+
+std::filesystem::path Cgroup::access_path() const {
+  RequireBoundIdentity();
+  return std::filesystem::path("/proc/self/fd") / std::to_string(fd_);
+}
+
 void Cgroup::PrepareRun(const std::string& run_id) {
   RequireSafeRunId(run_id);
   if (RunWasPrepared(run_id)) {
@@ -1380,7 +1942,27 @@ void Cgroup::PrepareRun(const std::string& run_id) {
   try {
     RecordPreparedRun(run_id);
   } catch (...) {
-    RemoveRunInScope(ProductionCgroupScopeConfig(), run_id);
+    RemoveRunInScope(
+        ProductionCgroupScopeConfig(), run_id, nullptr,
+        std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+    throw;
+  }
+}
+
+void Cgroup::PrepareRun(const RunOwnership& ownership) {
+  const std::string& run_id = ownership.cgroup_name;
+  RequireSafeRunId(run_id);
+  if (RunWasPrepared(run_id)) {
+    throw std::runtime_error(
+        "run cgroup is already prepared by this process: " + run_id);
+  }
+  PrepareRunInScope(ProductionCgroupScopeConfig(), run_id, &ownership);
+  try {
+    RecordPreparedRun(run_id);
+  } catch (...) {
+    RemoveRunInScope(
+        ProductionCgroupScopeConfig(), run_id, &ownership,
+        std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
     throw;
   }
 }
@@ -1407,6 +1989,13 @@ Cgroup Cgroup::Create(const std::string& run_id, const std::string& node_id) {
 }
 
 void Cgroup::RemoveRun(const std::string& run_id) {
+  RemoveRun(run_id,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10));
+}
+
+void Cgroup::RemoveRun(const std::string& run_id,
+                       std::chrono::steady_clock::time_point deadline,
+                       std::stop_token stop_token) {
   RequireSafeRunId(run_id);
   const std::filesystem::path run_root = CgroupPathsForRun(run_id).run;
   if (!RunWasPrepared(run_id)) {
@@ -1416,7 +2005,8 @@ void Cgroup::RemoveRun(const std::string& run_id) {
     throw std::runtime_error("refusing to remove an unowned run cgroup: " +
                              run_root.string());
   }
-  RemoveRunInScope(ProductionCgroupScopeConfig(), run_id);
+  RemoveRunInScope(ProductionCgroupScopeConfig(), run_id, nullptr, deadline,
+                   stop_token);
   ForgetPreparedRun(run_id);
 }
 
@@ -1426,7 +2016,9 @@ void Cgroup::RemoveStaleRun(const RunOwnership& ownership) {
   if (loaded != ownership) {
     throw std::runtime_error("stale cgroup ownership fields do not match");
   }
-  RemoveRunInScope(ProductionCgroupScopeConfig(), ownership.cgroup_name);
+  RemoveRunInScope(
+      ProductionCgroupScopeConfig(), ownership.cgroup_name, &ownership,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
   ForgetPreparedRun(ownership.cgroup_name);
 }
 
@@ -1443,6 +2035,18 @@ void PrepareCgroupRunInTestScope(const CgroupScopeTestConfig& config,
       run_id);
 }
 
+void PrepareCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                 const RunOwnership& ownership) {
+  PrepareRunInScope(
+      CgroupScopeConfig{
+          .root = config.root,
+          .simulator_name = config.simulator_name,
+          .state_file = config.state_file,
+          .allow_root_process_move = config.allow_root_process_move,
+      },
+      ownership.cgroup_name, &ownership);
+}
+
 void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
                                 const std::string& run_id) {
   RemoveRunInScope(
@@ -1452,7 +2056,28 @@ void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
           .state_file = config.state_file,
           .allow_root_process_move = config.allow_root_process_move,
       },
-      run_id);
+      run_id, nullptr,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+}
+
+void RemoveStaleCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                     const RunOwnership& ownership) {
+  RemoveRunInScope(
+      CgroupScopeConfig{
+          .root = config.root,
+          .simulator_name = config.simulator_name,
+          .state_file = config.state_file,
+          .allow_root_process_move = config.allow_root_process_move,
+      },
+      ownership.cgroup_name, &ownership,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+}
+
+void KillCgroupProcessesWithPidfdFallbackForTest(
+    const std::filesystem::path& path,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  KillCgroupProcesses(path, deadline, stop_token, true);
 }
 #endif
 
@@ -1465,7 +2090,7 @@ CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {
   Cgroup cgroup = Cgroup::Create(probe.run_id, probe.node_id);
   pid_t child = fork();
   if (child < 0) {
-    cgroup.Remove();
+    cgroup.Remove(std::chrono::steady_clock::now() + std::chrono::seconds(1));
     Cgroup::RemoveRun(probe.run_id);
     throw std::runtime_error(std::string("fork failed: ") +
                              std::strerror(errno));
@@ -1491,14 +2116,16 @@ CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {
     probe.frozen_after_thaw = cgroup.Frozen();
     kill(child, SIGKILL);
     waitpid(child, nullptr, 0);
-    cgroup.Remove();
+    cgroup.Remove(std::chrono::steady_clock::now() + std::chrono::seconds(1));
     Cgroup::RemoveRun(probe.run_id);
   } catch (...) {
     kill(child, SIGKILL);
     waitpid(child, nullptr, 0);
     try {
-      cgroup.KillAll();
-      cgroup.Remove();
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      cgroup.KillAll(deadline);
+      cgroup.Remove(deadline);
       Cgroup::RemoveRun(probe.run_id);
     } catch (const std::exception&) {
     }
@@ -1508,15 +2135,21 @@ CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {
 }
 
 void Cgroup::AttachPid(pid_t pid) const {
-  WriteCgroupFile(path_, "cgroup.procs", std::to_string(pid));
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "cgroup.procs", std::to_string(pid));
+  RequireBoundIdentity();
 }
 
 void Cgroup::SetMemoryMax(uint64_t bytes) const {
-  WriteCgroupFile(path_, "memory.max", std::to_string(bytes));
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "memory.max", std::to_string(bytes));
+  RequireBoundIdentity();
 }
 
 void Cgroup::SetMemoryHigh(uint64_t bytes) const {
-  WriteCgroupFile(path_, "memory.high", std::to_string(bytes));
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "memory.high", std::to_string(bytes));
+  RequireBoundIdentity();
 }
 
 void Cgroup::SetCpuMax(std::optional<uint64_t> quota_us,
@@ -1524,18 +2157,22 @@ void Cgroup::SetCpuMax(std::optional<uint64_t> quota_us,
   std::string value = quota_us ? std::to_string(*quota_us) : "max";
   value += " ";
   value += std::to_string(period_us);
-  WriteCgroupFile(path_, "cpu.max", value);
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "cpu.max", value);
+  RequireBoundIdentity();
 }
 
 void Cgroup::SetCpuWeight(uint64_t weight) const {
   if (weight < 1U || weight > 10000U) {
     throw std::runtime_error("cpu.weight must be in 1..10000");
   }
-  WriteCgroupFile(path_, "cpu.weight", std::to_string(weight));
-  if (ParseSingleUint(path_ / "cpu.weight") != weight) {
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "cpu.weight", std::to_string(weight));
+  if (ParseSingleUint(bound / "cpu.weight") != weight) {
     throw std::runtime_error("cpu.weight read-back verification failed for " +
                              path_.string());
   }
+  RequireBoundIdentity();
 }
 
 void Cgroup::SetIoMax(const IoLimit& limit) const {
@@ -1560,9 +2197,10 @@ void Cgroup::SetIoMax(const IoLimit& limit) const {
       " wbps=" + value_text(limit.write_bytes_per_sec) +
       " riops=" + value_text(limit.read_operations_per_sec) +
       " wiops=" + value_text(limit.write_operations_per_sec);
-  WriteCgroupFile(path_, "io.max", value);
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "io.max", value);
 
-  const std::vector<IoLimit> actual = ParseIoMax(path_ / "io.max");
+  const std::vector<IoLimit> actual = ParseIoMax(bound / "io.max");
   const auto found =
       std::find_if(actual.begin(), actual.end(), [&](const IoLimit& candidate) {
         return candidate.device == limit.device;
@@ -1576,45 +2214,51 @@ void Cgroup::SetIoMax(const IoLimit& limit) const {
                              path_.string() + " device " +
                              BlockDeviceIdText(limit.device));
   }
+  RequireBoundIdentity();
 }
 
 void Cgroup::SetIoWeight(uint64_t weight) const {
   if (weight < 1U || weight > 10000U) {
     throw std::runtime_error("io.weight must be in 1..10000");
   }
-  WriteCgroupFile(path_, "io.weight", "default " + std::to_string(weight));
-  if (ParseIoWeight(path_ / "io.weight") != weight) {
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "io.weight", "default " + std::to_string(weight));
+  if (ParseIoWeight(bound / "io.weight") != weight) {
     throw std::runtime_error("io.weight read-back verification failed for " +
                              path_.string());
   }
+  RequireBoundIdentity();
 }
 
 void Cgroup::SetPidsMax(uint64_t n) const {
-  WriteCgroupFile(path_, "pids.max", std::to_string(n));
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "pids.max", std::to_string(n));
+  RequireBoundIdentity();
 }
 
 CgroupMetrics Cgroup::ReadMetrics() const {
+  const std::filesystem::path bound = access_path();
   CgroupMetrics metrics;
-  metrics.cpu_usage_usec = ParseKeyValue(path_ / "cpu.stat", "usage_usec");
+  metrics.cpu_usage_usec = ParseKeyValue(bound / "cpu.stat", "usage_usec");
   metrics.cpu_throttled_usec =
-      ParseKeyValue(path_ / "cpu.stat", "throttled_usec");
+      ParseKeyValue(bound / "cpu.stat", "throttled_usec");
   metrics.cpu_pressure_some_total_usec =
-      ParsePressureTotal(path_ / "cpu.pressure", "some");
+      ParsePressureTotal(bound / "cpu.pressure", "some");
   metrics.cpu_pressure_full_total_usec =
-      ParsePressureTotal(path_ / "cpu.pressure", "full");
-  metrics.memory_current = ParseSingleUint(path_ / "memory.current");
-  if (std::filesystem::exists(path_ / "memory.peak")) {
-    metrics.memory_peak = ParseSingleUint(path_ / "memory.peak");
+      ParsePressureTotal(bound / "cpu.pressure", "full");
+  metrics.memory_current = ParseSingleUint(bound / "memory.current");
+  if (std::filesystem::exists(bound / "memory.peak")) {
+    metrics.memory_peak = ParseSingleUint(bound / "memory.peak");
   }
-  metrics.memory_high_limit_bytes = ParseMaxOrUint(path_ / "memory.high");
-  metrics.memory_max_limit_bytes = ParseMaxOrUint(path_ / "memory.max");
-  const CpuMaxValue cpu_max = ParseCpuMax(path_ / "cpu.max");
+  metrics.memory_high_limit_bytes = ParseMaxOrUint(bound / "memory.high");
+  metrics.memory_max_limit_bytes = ParseMaxOrUint(bound / "memory.max");
+  const CpuMaxValue cpu_max = ParseCpuMax(bound / "cpu.max");
   metrics.cpu_quota_us = cpu_max.quota_us;
   metrics.cpu_period_us = cpu_max.period_us;
-  metrics.cpu_weight = ParseSingleUint(path_ / "cpu.weight");
-  metrics.io_weight = ParseIoWeight(path_ / "io.weight");
-  metrics.io_limits = ParseIoMax(path_ / "io.max");
-  const IoStatTotals io = ParseIoStat(path_ / "io.stat");
+  metrics.cpu_weight = ParseSingleUint(bound / "cpu.weight");
+  metrics.io_weight = ParseIoWeight(bound / "io.weight");
+  metrics.io_limits = ParseIoMax(bound / "io.max");
+  const IoStatTotals io = ParseIoStat(bound / "io.stat");
   metrics.io_read_bytes = io.read_bytes;
   metrics.io_write_bytes = io.write_bytes;
   metrics.io_read_operations = io.read_operations;
@@ -1622,45 +2266,114 @@ CgroupMetrics Cgroup::ReadMetrics() const {
   metrics.io_discard_bytes = io.discard_bytes;
   metrics.io_discard_operations = io.discard_operations;
   metrics.io_pressure_some_total_usec =
-      ParsePressureTotal(path_ / "io.pressure", "some");
+      ParsePressureTotal(bound / "io.pressure", "some");
   metrics.io_pressure_full_total_usec =
-      ParsePressureTotal(path_ / "io.pressure", "full");
-  metrics.pids_current = ParseSingleUint(path_ / "pids.current");
-  metrics.pids_max_limit = ParseMaxOrUint(path_ / "pids.max");
-  metrics.pids_max_events = ParseKeyValue(path_ / "pids.events", "max");
+      ParsePressureTotal(bound / "io.pressure", "full");
+  metrics.pids_current = ParseSingleUint(bound / "pids.current");
+  metrics.pids_max_limit = ParseMaxOrUint(bound / "pids.max");
+  metrics.pids_max_events = ParseKeyValue(bound / "pids.events", "max");
   metrics.cgroup_populated =
-      ParseKeyValue(path_ / "cgroup.events", "populated");
-  metrics.cgroup_frozen = ParseKeyValue(path_ / "cgroup.events", "frozen");
-  metrics.memory_low = ParseKeyValue(path_ / "memory.events", "low");
-  metrics.memory_high = ParseKeyValue(path_ / "memory.events", "high");
-  metrics.memory_max = ParseKeyValue(path_ / "memory.events", "max");
-  metrics.oom = ParseKeyValue(path_ / "memory.events", "oom");
-  metrics.oom_kill = ParseKeyValue(path_ / "memory.events", "oom_kill");
+      ParseKeyValue(bound / "cgroup.events", "populated");
+  metrics.cgroup_frozen = ParseKeyValue(bound / "cgroup.events", "frozen");
+  metrics.memory_low = ParseKeyValue(bound / "memory.events", "low");
+  metrics.memory_high = ParseKeyValue(bound / "memory.events", "high");
+  metrics.memory_max = ParseKeyValue(bound / "memory.events", "max");
+  metrics.oom = ParseKeyValue(bound / "memory.events", "oom");
+  metrics.oom_kill = ParseKeyValue(bound / "memory.events", "oom_kill");
   metrics.oom_group_kill =
-      ParseKeyValue(path_ / "memory.events", "oom_group_kill");
-  metrics.memory_stat = ParseMemoryStat(path_ / "memory.stat");
+      ParseKeyValue(bound / "memory.events", "oom_group_kill");
+  metrics.memory_stat = ParseMemoryStat(bound / "memory.stat");
+  RequireBoundIdentity();
   return metrics;
 }
 
-void Cgroup::Freeze() const { WriteCgroupFile(path_, "cgroup.freeze", "1"); }
+void Cgroup::Freeze() const {
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "cgroup.freeze", "1");
+  RequireBoundIdentity();
+}
 
-void Cgroup::Thaw() const { WriteCgroupFile(path_, "cgroup.freeze", "0"); }
+void Cgroup::Thaw() const {
+  const std::filesystem::path bound = access_path();
+  WriteCgroupFile(bound, "cgroup.freeze", "0");
+  RequireBoundIdentity();
+}
 
-bool Cgroup::Frozen() const { return ReadFrozenState(path_); }
+bool Cgroup::Frozen() const {
+  const bool frozen = ReadFrozenState(access_path());
+  RequireBoundIdentity();
+  return frozen;
+}
 
-void Cgroup::KillAll() const {
-  if (std::filesystem::exists(path_ / "cgroup.kill")) {
-    WriteCgroupFile(path_, "cgroup.kill", "1");
-    WaitForCgroupProcsEmpty(path_);
+bool Cgroup::Empty() const {
+  const std::filesystem::path bound = access_path();
+  const bool empty =
+      CgroupProcsEmpty(bound) &&
+      ParseKeyValue(bound / "cgroup.events", "populated") == 0U;
+  RequireBoundIdentity();
+  return empty;
+}
+
+void Cgroup::KillAll(std::chrono::steady_clock::time_point deadline,
+                     std::stop_token stop_token) const {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("cgroup process kill cancelled: " +
+                             path_.string());
+  }
+  if (std::chrono::steady_clock::now() >= deadline) {
+    throw std::runtime_error("cgroup process kill deadline expired: " +
+                             path_.string());
+  }
+  KillCgroupProcesses(access_path(), deadline, stop_token);
+  RequireBoundIdentity();
+  if (!Empty()) {
+    throw std::runtime_error("owned cgroup remained populated after kill: " +
+                             path_.string());
   }
 }
 
-void Cgroup::Remove() const {
-  std::error_code ec;
-  std::filesystem::remove(path_, ec);
-  if (ec) {
+void Cgroup::Remove(std::chrono::steady_clock::time_point deadline,
+                    std::stop_token stop_token) const {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("cgroup removal cancelled: " + path_.string());
+  }
+  if (std::chrono::steady_clock::now() >= deadline) {
+    throw std::runtime_error("cgroup removal deadline expired: " +
+                             path_.string());
+  }
+  if (removed_) {
+    struct stat replacement {};
+    if (fstatat(parent_fd_, name_.c_str(), &replacement,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+      throw std::runtime_error(
+          "refusing replacement at removed cgroup path: " + path_.string());
+    }
+    if (errno != ENOENT) {
+      throw std::runtime_error("inspect removed cgroup path failed for " +
+                               path_.string() + ": " + std::strerror(errno));
+    }
+    return;
+  }
+  const std::filesystem::path bound = access_path();
+  WaitForCgroupProcsEmpty(bound, deadline, stop_token);
+  if (!Empty()) {
+    throw std::runtime_error("refusing to remove a populated owned cgroup: " +
+                             path_.string());
+  }
+  RequireBoundIdentity();
+  if (unlinkat(parent_fd_, name_.c_str(), AT_REMOVEDIR) != 0) {
     throw std::runtime_error("remove cgroup failed for " + path_.string() +
-                             ": " + ec.message());
+                             ": " + std::strerror(errno));
+  }
+  removed_ = true;
+  struct stat remaining {};
+  if (fstatat(parent_fd_, name_.c_str(), &remaining, AT_SYMLINK_NOFOLLOW) == 0) {
+    throw std::runtime_error(
+        "replacement appeared at removed cgroup path: " + path_.string());
+  }
+  if (errno != ENOENT) {
+    throw std::runtime_error("verify removed cgroup path failed for " +
+                             path_.string() + ": " + std::strerror(errno));
   }
 }
 

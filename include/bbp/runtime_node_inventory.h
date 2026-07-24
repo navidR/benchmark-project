@@ -100,6 +100,31 @@ class RuntimeNodeSnapshot {
 // after publication; each snapshot leases its complete generation.
 class RuntimeNodeInventory {
  public:
+  class PreparedAppend {
+   public:
+    PreparedAppend(PreparedAppend&&) noexcept = default;
+    PreparedAppend& operator=(PreparedAppend&&) noexcept = default;
+
+    PreparedAppend(const PreparedAppend&) = delete;
+    PreparedAppend& operator=(const PreparedAppend&) = delete;
+
+    [[nodiscard]] RuntimeNodeSnapshot Commit() noexcept;
+
+   private:
+    friend class RuntimeNodeInventory;
+
+    PreparedAppend(
+        RuntimeNodeInventory* owner, std::unique_lock<std::mutex> lock,
+        std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation)
+        : owner_(owner),
+          lock_(std::move(lock)),
+          generation_(std::move(generation)) {}
+
+    RuntimeNodeInventory* owner_ = nullptr;
+    std::unique_lock<std::mutex> lock_;
+    std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation_;
+  };
+
   explicit RuntimeNodeInventory(std::uint32_t capacity);
 
   RuntimeNodeInventory(const RuntimeNodeInventory&) = delete;
@@ -113,9 +138,16 @@ class RuntimeNodeInventory {
   RuntimeNodeSnapshot PublishAppend(
       std::uint64_t expected_generation,
       const std::vector<RuntimeNodeInsertion>& insertions);
+  PreparedAppend PrepareAppend(
+      std::uint64_t expected_generation,
+      const std::vector<RuntimeNodeInsertion>& insertions);
+  PreparedAppend PrepareAppend(
+      std::uint64_t expected_generation,
+      const std::vector<RuntimeNodeInsertion>& insertions,
+      const std::vector<ChainNodeConfig>& published_configs);
 
  private:
-  static std::shared_ptr<const RuntimeNodeSnapshot::Generation> MakeGeneration(
+  static std::shared_ptr<RuntimeNodeSnapshot::Generation> MakeGeneration(
       std::uint64_t generation, std::vector<RuntimeNodeInsertion> nodes,
       std::uint32_t capacity);
 

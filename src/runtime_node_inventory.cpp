@@ -1,6 +1,7 @@
 #include "bbp/runtime_node_inventory.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -176,7 +177,21 @@ NodeConfigSnapshot RuntimeNodeInventory::ConfigSnapshot() const {
 RuntimeNodeSnapshot RuntimeNodeInventory::PublishAppend(
     std::uint64_t expected_generation,
     const std::vector<RuntimeNodeInsertion>& insertions) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  PreparedAppend prepared = PrepareAppend(expected_generation, insertions);
+  return prepared.Commit();
+}
+
+RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
+    std::uint64_t expected_generation,
+    const std::vector<RuntimeNodeInsertion>& insertions) {
+  return PrepareAppend(expected_generation, insertions, {});
+}
+
+RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
+    std::uint64_t expected_generation,
+    const std::vector<RuntimeNodeInsertion>& insertions,
+    const std::vector<ChainNodeConfig>& published_configs) {
+  std::unique_lock<std::mutex> lock(mutex_);
   if (generation_->sequence != expected_generation) {
     throw std::runtime_error(
         "runtime node inventory changed before publication");
@@ -189,15 +204,46 @@ RuntimeNodeSnapshot RuntimeNodeInventory::PublishAppend(
     throw std::runtime_error(
         "runtime node publication exceeds configured capacity");
   }
+  if (generation_->sequence == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("runtime node inventory generation overflow");
+  }
   std::vector<RuntimeNodeInsertion> next = generation_->nodes;
   next.reserve(next.size() + insertions.size());
   next.insert(next.end(), insertions.begin(), insertions.end());
-  generation_ =
+  auto next_generation =
       MakeGeneration(generation_->sequence + 1U, std::move(next), capacity_);
-  return RuntimeNodeSnapshot(generation_);
+  if (!published_configs.empty()) {
+    if (published_configs.size() != next_generation->nodes.size()) {
+      throw std::invalid_argument(
+          "runtime node published configs must match the next generation");
+    }
+    for (std::size_t index = 0U; index < published_configs.size(); ++index) {
+      if (published_configs[index].id !=
+          next_generation->nodes[index].runtime->config.id) {
+        throw std::invalid_argument(
+            "runtime node published config identity does not match its "
+            "runtime");
+      }
+    }
+    next_generation->configs = published_configs;
+  }
+  return PreparedAppend(this, std::move(lock), std::move(next_generation));
 }
 
-std::shared_ptr<const RuntimeNodeSnapshot::Generation>
+RuntimeNodeSnapshot RuntimeNodeInventory::PreparedAppend::Commit() noexcept {
+  if (owner_ == nullptr || !lock_.owns_lock() ||
+      lock_.mutex() != &owner_->mutex_ || !generation_) {
+    std::terminate();
+  }
+  owner_->generation_.swap(generation_);
+  RuntimeNodeSnapshot snapshot(owner_->generation_);
+  lock_.unlock();
+  owner_ = nullptr;
+  generation_.reset();
+  return snapshot;
+}
+
+std::shared_ptr<RuntimeNodeSnapshot::Generation>
 RuntimeNodeInventory::MakeGeneration(std::uint64_t generation,
                                      std::vector<RuntimeNodeInsertion> nodes,
                                      std::uint32_t capacity) {

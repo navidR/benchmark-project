@@ -19,4 +19,9 @@ boost::json::object ResolveScenario(const boost::json::object& scenario);
 SimulationCommand ParseAndValidateSimulationCommand(
     const boost::json::object& command, const Options& options);
 
+// Parses the closed node.add request through the production scenario value
+// parsers. Capacity and live-inventory checks remain simulator-owned.
+SimulationNodeAddRequest ParseAndValidateSimulationNodeAddRequest(
+    const boost::json::object& request, const Options& options);
+
 }  // namespace bbp

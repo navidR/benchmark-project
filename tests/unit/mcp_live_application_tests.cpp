@@ -10,12 +10,14 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/mcp_dispatcher.h"
 #include "bbp/mcp_live_application.h"
 #include "bbp/mcp_run_evidence.h"
@@ -67,6 +69,20 @@ boost::json::object LiveScenario() {
       {"run_id", "live-application"},
       {"nodes", 1U},
       {"block_production", boost::json::object{{"enabled", false}}}};
+}
+
+McpLiveNodeInventorySnapshot InitialInventory(const Options& options) {
+  McpLiveNodeInventorySnapshot result{.generation = 1U,
+                                      .node_ids = options.node_ids};
+  if (result.node_ids.empty()) {
+    const std::string& prefix =
+        ChainDriverSpecFor(options.chain).node_id_prefix;
+    result.node_ids.reserve(options.nodes);
+    for (std::uint32_t index = 0U; index < options.nodes; ++index) {
+      result.node_ids.push_back(prefix + "-" + std::to_string(index + 1U));
+    }
+  }
+  return result;
 }
 
 boost::json::object Invoke(McpDispatcher* dispatcher, std::string_view tool,
@@ -122,7 +138,33 @@ SimulationCommandOutcome CommandOutcome(
   return SimulationCommandOutcome{.state = state,
                                   .cancellation_cause = cause,
                                   .error = std::move(error),
-                                  .node_lifecycle = std::move(node_lifecycle)};
+                                  .node_lifecycle = std::move(node_lifecycle),
+                                  .added_node_ids = {},
+                                  .inventory_generation = std::nullopt,
+                                  .final_node_count = std::nullopt};
+}
+
+SimulationCommandOutcome NodeAddOutcome(std::vector<std::string> node_ids,
+                                        std::uint64_t inventory_generation,
+                                        std::uint32_t final_node_count) {
+  return SimulationCommandOutcome{
+      .state = SimulationCommandOutcomeState::kSucceeded,
+      .cancellation_cause = SimulationCommandCancellationCause::kNone,
+      .error = std::nullopt,
+      .node_lifecycle = std::nullopt,
+      .added_node_ids = std::move(node_ids),
+      .inventory_generation = inventory_generation,
+      .final_node_count = final_node_count};
+}
+
+void MarkNodeAddCommitted(const SimulationCommand& command,
+                          std::uint64_t initial_generation,
+                          std::vector<std::string> initial_node_ids) {
+  BOOST_REQUIRE(command.operation_control);
+  BOOST_TEST(command.operation_control->RecordInitialInventory(
+      initial_generation, std::move(initial_node_ids)));
+  BOOST_TEST(command.operation_control->TryBeginCommit());
+  command.operation_control->MarkCommitted();
 }
 
 }  // namespace
@@ -148,6 +190,9 @@ BOOST_AUTO_TEST_CASE(
       .retained_run = std::nullopt,
       .options = options,
       .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
       .request_run_stop = [&] { stop_requested.store(true); },
       .run_started = {},
       .run_stopping = {},
@@ -274,6 +319,36 @@ BOOST_AUTO_TEST_CASE(
       WaitForTerminal(&dispatcher, cancellable_submitted);
   BOOST_TEST(cancelled_terminal.at("state").as_string() == "cancelled");
   BOOST_CHECK(std::chrono::steady_clock::now() - cancellation_started < 500ms);
+
+  const boost::json::object tui_outcome_subscription =
+      Invoke(&dispatcher, "subscription.create",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"families", boost::json::array{"events"}}});
+  SimulationCommand tui_command;
+  tui_command.sequence = 99U;
+  tui_command.kind = SimulationCommandKind::kIncreaseLogVerbosity;
+  tui_command.node_id = "firo-1";
+  tui_command.confirmed = true;
+  application.RecordCommandOutcome(
+      tui_command, CommandOutcome(SimulationCommandOutcomeState::kSucceeded));
+  const boost::json::object tui_outcome_page =
+      Invoke(&dispatcher, "subscription.poll",
+             boost::json::object{
+                 {"subscription_id",
+                  tui_outcome_subscription.at("subscription_id")},
+                 {"cursor", "0"},
+                 {"limit", 8U}});
+  BOOST_REQUIRE_EQUAL(tui_outcome_page.at("items").as_array().size(), 1U);
+  const boost::json::object& tui_outcome =
+      tui_outcome_page.at("items").as_array().front().as_object();
+  BOOST_TEST(tui_outcome.at("kind").as_string() == "command_outcome");
+  BOOST_TEST(tui_outcome.at("data")
+                 .as_object()
+                 .at("command_id")
+                 .as_string() == "command-99");
+  BOOST_TEST(tui_outcome.at("data").as_object().at("state").as_string() ==
+             "succeeded");
 
   const SimulationCommandQueueStats queue_before_invalid_node = queue->Stats();
   BOOST_CHECK_THROW(Invoke(&dispatcher, "node.stop",
@@ -447,6 +522,431 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_node_add_reports_progress_exact_inventory_and_generic_parity) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::atomic_uint32_t run_stop_requests = 0U;
+  std::atomic_uint64_t inventory_reads = 0U;
+  std::mutex inventory_mutex;
+  std::mutex evidence_mutex;
+  std::vector<McpEvidenceRecord> evidence;
+  McpLiveNodeInventorySnapshot inventory = InitialInventory(*options);
+  const auto publish_inventory = [&](std::uint64_t generation,
+                                     std::vector<std::string> node_ids) {
+    std::lock_guard<std::mutex> lock(inventory_mutex);
+    inventory.generation = generation;
+    inventory.node_ids = std::move(node_ids);
+  };
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [&] {
+            inventory_reads.fetch_add(1U, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(inventory_mutex);
+            return inventory;
+          },
+      .publication_mutex = {},
+      .request_run_stop = [&] { ++run_stop_requests; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence =
+          [&](McpEvidenceRecord record) {
+            std::lock_guard<std::mutex> lock(evidence_mutex);
+            evidence.push_back(std::move(record));
+          },
+      .close_run_subscriptions = [](std::string_view) {}});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object direct_submitted = Invoke(
+      &dispatcher, "node.add",
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"request",
+           boost::json::object{
+               {"chain", "firo"},
+               {"count", 2U},
+               {"node_ids", boost::json::array{"added-a", "added-b"}}}}});
+  const SimulationCommand direct_command = WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(direct_command.operation_control);
+  for (std::uint64_t phase = 1U; phase < kSimulationNodeAddProgressTotal;
+       ++phase) {
+    BOOST_TEST(direct_command.operation_control->ReportProgress(phase));
+    const auto deadline = std::chrono::steady_clock::now() + 500ms;
+    std::uint64_t observed = 0U;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const boost::json::object snapshot =
+          Invoke(&dispatcher, "operation.get",
+                 boost::json::object{
+                     {"operation_id", direct_submitted.at("operation_id")}});
+      observed = snapshot.at("progress_completed").as_uint64();
+      if (observed >= phase) {
+        break;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+    BOOST_TEST(observed == phase);
+  }
+  BOOST_TEST(!direct_command.operation_control->ReportProgress(3U));
+  BOOST_TEST(!direct_command.operation_control->ReportProgress(
+      kSimulationNodeAddProgressTotal + 1U));
+  BOOST_TEST(direct_command.operation_control->progress_completed.load(
+                 std::memory_order_acquire) ==
+             kSimulationNodeAddProgressTotal - 1U);
+  BOOST_TEST(direct_command.operation_control->ReportProgress(
+      kSimulationNodeAddProgressTotal));
+  publish_inventory(2U, {"firo-1", "added-a", "added-b"});
+  MarkNodeAddCommitted(direct_command, 1U, {"firo-1"});
+  application.RecordCommandOutcome(
+      direct_command, NodeAddOutcome({"added-a", "added-b"}, 2U, 3U));
+  {
+    std::lock_guard<std::mutex> lock(evidence_mutex);
+    BOOST_REQUIRE(!evidence.empty());
+    const McpEvidenceRecord& outcome_evidence = evidence.back();
+    BOOST_REQUIRE(outcome_evidence.data);
+    BOOST_TEST(outcome_evidence.kind.value_or("") == "command_outcome");
+    BOOST_TEST(outcome_evidence.data->as_object()
+                   .at("inventory_generation")
+                   .as_uint64() == 2U);
+    BOOST_TEST(outcome_evidence.data->as_object()
+                   .at("final_node_count")
+                   .as_uint64() == 3U);
+  }
+  const boost::json::object direct_terminal =
+      WaitForTerminal(&dispatcher, direct_submitted);
+  BOOST_TEST(direct_terminal.at("state").as_string() == "succeeded");
+  BOOST_TEST(direct_terminal.at("progress_completed").as_uint64() ==
+             kSimulationNodeAddProgressTotal);
+  const boost::json::object& direct_result =
+      direct_terminal.at("terminal_result").as_object();
+  BOOST_TEST(direct_result.at("result_family").as_string() == "mutation");
+  BOOST_TEST(direct_result.at("action").as_string() == "node.add");
+  BOOST_TEST(direct_result.at("added_node_ids").as_array().size() == 2U);
+  BOOST_TEST(direct_result.at("affected_node_ids").as_array() ==
+             direct_result.at("added_node_ids").as_array());
+  BOOST_TEST(direct_result.at("removed_node_ids").as_array().empty());
+  BOOST_TEST(direct_result.at("inventory_generation").as_uint64() == 2U);
+  BOOST_TEST(direct_result.at("final_node_count").as_uint64() == 3U);
+  BOOST_TEST(!direct_result.at("unchanged").as_bool());
+
+  const boost::json::object generic_submitted =
+      Invoke(&dispatcher, "simulation.command",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"command",
+                  boost::json::object{
+                      {"kind", "add_nodes"},
+                      {"node_add",
+                       boost::json::object{
+                           {"chain", "firo"},
+                           {"count", 1U},
+                           {"node_ids", boost::json::array{"added-c"}}}}}}});
+  const SimulationCommand generic_command = WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(generic_command.operation_control);
+  BOOST_TEST(generic_command.operation_control->ReportProgress(
+      kSimulationNodeAddProgressTotal));
+  publish_inventory(3U, {"firo-1", "added-a", "added-b", "added-c"});
+  MarkNodeAddCommitted(generic_command, 2U,
+                       {"firo-1", "added-a", "added-b"});
+  application.RecordCommandOutcome(generic_command,
+                                   NodeAddOutcome({"added-c"}, 3U, 4U));
+  const boost::json::object generic_terminal =
+      WaitForTerminal(&dispatcher, generic_submitted);
+  BOOST_TEST(generic_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& generic_result =
+      generic_terminal.at("terminal_result").as_object();
+  BOOST_TEST(generic_result.at("result_family").as_string() ==
+             "runtime_command");
+  BOOST_TEST(generic_result.at("action").as_string() == "node.add");
+  BOOST_TEST(
+      generic_result.at("added_node_ids").as_array().front().as_string() ==
+      "added-c");
+  BOOST_TEST(generic_result.at("final_node_count").as_uint64() == 4U);
+  BOOST_TEST(generic_result.at("inventory_generation").as_uint64() == 3U);
+
+  const boost::json::object capabilities =
+      application
+          .ResourceReader()(McpInformationFamily::kCapabilities, "live-session",
+                            std::stop_token{})
+          .as_object()
+          .at("data")
+          .as_object()
+          .at("current_run")
+          .as_object();
+  BOOST_TEST(capabilities.at("node_count").as_uint64() == 4U);
+  BOOST_TEST(capabilities.at("node_capacity").as_uint64() == 16U);
+  BOOST_TEST(capabilities.at("chain_node_maximum").as_uint64() == 16U);
+  BOOST_TEST(capabilities.at("available_node_capacity").as_uint64() == 12U);
+  const std::uint64_t registry_reads_before =
+      inventory_reads.load(std::memory_order_relaxed);
+  const boost::json::value run_registry =
+      application.ResourceReader()(McpInformationFamily::kRunRegistry,
+                                   "live-session", std::stop_token{});
+  const boost::json::object& run_registry_entry =
+      run_registry
+          .as_object()
+          .at("data")
+          .as_array()
+          .front()
+          .as_object();
+  BOOST_TEST(inventory_reads.load(std::memory_order_relaxed) ==
+             registry_reads_before + 1U);
+  BOOST_TEST(run_registry_entry.at("node_count").as_uint64() == 4U);
+  BOOST_TEST(run_registry_entry.at("available_node_capacity").as_uint64() ==
+             12U);
+
+  const boost::json::object over_capacity = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "node.add",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"request",
+                  boost::json::object{{"chain", "firo"}, {"count", 13U}}}}));
+  BOOST_TEST(over_capacity.at("state").as_string() == "failed");
+  const boost::json::object& capacity_error =
+      over_capacity.at("terminal_error").as_object();
+  BOOST_TEST(capacity_error.at("code").as_string() == "node_capacity_exceeded");
+  const boost::json::object& capacity_diagnostic =
+      capacity_error.at("diagnostics").as_array().front().as_object();
+  BOOST_TEST(capacity_diagnostic.at("requested_count").as_uint64() == 13U);
+  BOOST_TEST(capacity_diagnostic.at("current_node_count").as_uint64() == 4U);
+  BOOST_TEST(capacity_diagnostic.at("node_capacity").as_uint64() == 16U);
+  BOOST_TEST(capacity_diagnostic.at("available_node_capacity").as_uint64() ==
+             12U);
+  BOOST_TEST(!queue->TryPop().has_value());
+  const boost::json::object generic_over_capacity = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "simulation.command",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"command",
+                  boost::json::object{
+                      {"kind", "add_nodes"},
+                      {"node_add", boost::json::object{{"chain", "firo"},
+                                                       {"count", 13U}}}}}}));
+  BOOST_TEST(generic_over_capacity.at("state").as_string() == "failed");
+  const boost::json::object& generic_capacity_error =
+      generic_over_capacity.at("terminal_error").as_object();
+  BOOST_TEST(generic_capacity_error.at("code").as_string() ==
+             "node_capacity_exceeded");
+  BOOST_TEST(generic_capacity_error.at("diagnostics")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("available_node_capacity")
+                 .as_uint64() == 12U);
+  BOOST_TEST(!queue->TryPop().has_value());
+
+  const boost::json::object unavailable_submitted =
+      Invoke(&dispatcher, "node.add",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"request",
+                  boost::json::object{{"chain", "firo"}, {"count", 1U}}}});
+  const SimulationCommand unavailable_command =
+      WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(unavailable_command.operation_control);
+  unavailable_command.operation_control->RecordNodeResourceFailure(
+      SimulationNodeResourceFailure{
+          .resource_kind = "tcp_port",
+          .node_id = "firo-5",
+          .address = "0.0.0.0",
+          .port = 18172U,
+          .purpose = "P2P",
+          .mutation_started = false,
+      });
+  application.RecordCommandOutcome(
+      unavailable_command,
+      CommandOutcome(SimulationCommandOutcomeState::kFailed,
+                     "node-add P2P endpoint is unavailable"));
+  const boost::json::object unavailable_terminal =
+      WaitForTerminal(&dispatcher, unavailable_submitted);
+  BOOST_TEST(unavailable_terminal.at("state").as_string() == "failed");
+  const boost::json::object& unavailable_error =
+      unavailable_terminal.at("terminal_error").as_object();
+  BOOST_TEST(unavailable_error.at("code").as_string() ==
+             "node_resource_unavailable");
+  const boost::json::object& unavailable_diagnostic =
+      unavailable_error.at("diagnostics").as_array().front().as_object();
+  BOOST_TEST(unavailable_diagnostic.at("resource_kind").as_string() ==
+             "tcp_port");
+  BOOST_TEST(unavailable_diagnostic.at("node_id").as_string() == "firo-5");
+  BOOST_TEST(unavailable_diagnostic.at("address").as_string() == "0.0.0.0");
+  BOOST_TEST(unavailable_diagnostic.at("port").as_uint64() == 18172U);
+  BOOST_TEST(unavailable_diagnostic.at("purpose").as_string() == "P2P");
+  BOOST_TEST(!unavailable_diagnostic.at("mutation_started").as_bool());
+
+  const auto require_unconfirmed =
+      [&](boost::json::object request, std::vector<std::string> outcome_ids,
+          std::uint64_t generation, std::uint32_t final_count) {
+        const boost::json::object submitted =
+            Invoke(&dispatcher, "node.add",
+                   boost::json::object{{"run_id", "live-application"},
+                                       {"request", std::move(request)}});
+        const SimulationCommand command = WaitForQueuedCommand(queue.get());
+        MarkNodeAddCommitted(
+            command, 3U, {"firo-1", "added-a", "added-b", "added-c"});
+        application.RecordCommandOutcome(
+            command,
+            NodeAddOutcome(std::move(outcome_ids), generation, final_count));
+        const boost::json::object terminal =
+            WaitForTerminal(&dispatcher, submitted);
+        BOOST_TEST(terminal.at("state").as_string() == "failed");
+        BOOST_TEST(
+            terminal.at("terminal_error").as_object().at("code").as_string() ==
+            "node_outcome_unconfirmed");
+        BOOST_TEST(application.current_node_count() == 4U);
+      };
+  require_unconfirmed(boost::json::object{{"chain", "firo"}, {"count", 1U}},
+                      {"stale-generation"}, 3U, 5U);
+  require_unconfirmed(boost::json::object{{"chain", "firo"}, {"count", 1U}},
+                      {"skipped-generation"}, 5U, 5U);
+  require_unconfirmed(boost::json::object{{"chain", "firo"}, {"count", 1U}},
+                      {"bad/id"}, 4U, 5U);
+  require_unconfirmed(boost::json::object{{"chain", "firo"}, {"count", 2U}},
+                      {"duplicate", "duplicate"}, 4U, 6U);
+  require_unconfirmed(
+      boost::json::object{{"chain", "firo"},
+                          {"count", 1U},
+                          {"node_ids", boost::json::array{"requested"}}},
+      {"different"}, 4U, 5U);
+  BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) >= 5U);
+
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_node_add_reconciliation_terminalizes_inventory_failures_and_preserves_existing_ids) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::mutex inventory_mutex;
+  McpLiveNodeInventorySnapshot inventory = InitialInventory(*options);
+  bool inventory_read_fails = false;
+  std::atomic_uint32_t run_stop_requests = 0U;
+  const auto publish_inventory = [&](std::uint64_t generation,
+                                     std::vector<std::string> node_ids) {
+    std::lock_guard<std::mutex> lock(inventory_mutex);
+    inventory.generation = generation;
+    inventory.node_ids = std::move(node_ids);
+  };
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [&] {
+            std::lock_guard<std::mutex> lock(inventory_mutex);
+            if (inventory_read_fails) {
+              throw std::runtime_error("expected inventory read failure");
+            }
+            return inventory;
+          },
+      .publication_mutex = {},
+      .request_run_stop = [&] { ++run_stop_requests; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object unreadable_submitted = Invoke(
+      &dispatcher, "node.add",
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"request",
+           boost::json::object{
+               {"chain", "firo"},
+               {"count", 1U},
+               {"node_ids", boost::json::array{"firo-2"}}}}});
+  const SimulationCommand unreadable_command =
+      WaitForQueuedCommand(queue.get());
+  MarkNodeAddCommitted(unreadable_command, 1U, {"firo-1"});
+  publish_inventory(2U, {"firo-1", "firo-2"});
+  {
+    std::lock_guard<std::mutex> lock(inventory_mutex);
+    inventory_read_fails = true;
+  }
+  application.RecordCommandOutcome(
+      unreadable_command, NodeAddOutcome({"firo-2"}, 2U, 2U));
+  {
+    std::lock_guard<std::mutex> lock(inventory_mutex);
+    inventory_read_fails = false;
+  }
+  const boost::json::object unreadable_terminal =
+      WaitForTerminal(&dispatcher, unreadable_submitted);
+  BOOST_TEST(unreadable_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(unreadable_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "node_outcome_unconfirmed");
+
+  const boost::json::object cancelled_submitted = Invoke(
+      &dispatcher, "node.add",
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"request", boost::json::object{{"chain", "firo"}, {"count", 1U}}}});
+  const SimulationCommand cancelled_command =
+      WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(cancelled_command.operation_control);
+  BOOST_TEST(cancelled_command.operation_control->RequestCancellation(
+      SimulationCommandCancellationCause::kClientCancel));
+  application.RecordCommandOutcome(
+      cancelled_command,
+      CommandOutcome(SimulationCommandOutcomeState::kFailed,
+                     "failure published after cancellation won"));
+  const boost::json::object cancelled_terminal =
+      WaitForTerminal(&dispatcher, cancelled_submitted);
+  BOOST_TEST(cancelled_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(cancelled_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "node_outcome_unconfirmed");
+
+  const boost::json::object replaced_submitted = Invoke(
+      &dispatcher, "node.add",
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"request",
+           boost::json::object{
+               {"chain", "firo"},
+               {"count", 1U},
+               {"node_ids", boost::json::array{"firo-3"}}}}});
+  const SimulationCommand replaced_command =
+      WaitForQueuedCommand(queue.get());
+  MarkNodeAddCommitted(replaced_command, 2U, {"firo-1", "firo-2"});
+  publish_inventory(3U, {"replacement", "firo-2", "firo-3"});
+  application.RecordCommandOutcome(
+      replaced_command, NodeAddOutcome({"firo-3"}, 3U, 3U));
+  const boost::json::object replaced_terminal =
+      WaitForTerminal(&dispatcher, replaced_submitted);
+  BOOST_TEST(replaced_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(replaced_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "node_outcome_unconfirmed");
+  BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) >= 3U);
+
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_node_lifecycle_terminal_waits_for_command_owner_reconciliation) {
   LiveApplicationDirectory temporary;
   const auto options =
@@ -459,6 +959,9 @@ BOOST_AUTO_TEST_CASE(
       .retained_run = std::nullopt,
       .options = options,
       .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
       .request_run_stop = [&] { run_stop_requested = true; },
       .run_started = {},
       .run_stopping = {},
@@ -488,6 +991,7 @@ BOOST_AUTO_TEST_CASE(
         std::this_thread::sleep_for(25ms);
         owner_reconciled.fetch_add(1U, std::memory_order_release);
         throw SimulationCancelled();
+        return SimulationCommandOutcome{};
       },
       [&](const SimulationCommand&, std::string_view) {
         failure_reports.fetch_add(1U, std::memory_order_release);
@@ -641,16 +1145,19 @@ BOOST_AUTO_TEST_CASE(
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
   auto queue = std::make_shared<SimulationCommandQueue>();
-  McpLiveApplication application(
-      McpLiveApplication::Config{.run_id = "live-application",
-                                 .run_root = temporary.path(),
-                                 .retained_run = std::nullopt,
-                                 .options = options,
-                                 .command_queue = queue,
-                                 .request_run_stop = [] {},
-                                 .run_started = {},
-                                 .run_stopping = {},
-                                 .run_stopped = {}});
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
   application.MarkRunStarted();
 
   McpOperationPlan stale_plan = application.OperationFactory()(
@@ -702,21 +1209,24 @@ BOOST_AUTO_TEST_CASE(
   const std::shared_future<void> release_request =
       release_request_promise.get_future().share();
   auto queue = std::make_shared<SimulationCommandQueue>();
-  McpLiveApplication application(
-      McpLiveApplication::Config{.run_id = "live-application",
-                                 .run_root = temporary.path(),
-                                 .retained_run = std::nullopt,
-                                 .options = options,
-                                 .command_queue = queue,
-                                 .request_run_stop = [] {},
-                                 .run_started = {},
-                                 .run_stopping = {},
-                                 .run_stopped = {},
-                                 .request_admitted_test_hook =
-                                     [&] {
-                                       request_admitted_promise.set_value();
-                                       release_request.wait();
-                                     }});
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .request_admitted_test_hook =
+          [&] {
+            request_admitted_promise.set_value();
+            release_request.wait();
+          }});
   application.MarkRunStarted();
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
@@ -775,6 +1285,7 @@ BOOST_AUTO_TEST_CASE(
               .chain = "firo", .node_count = 1U, .state = "failed"},
       .options = {},
       .command_queue = {},
+      .publication_mutex = {},
       .request_run_stop = {},
       .run_started = {},
       .run_stopping = {},
@@ -844,10 +1355,9 @@ BOOST_AUTO_TEST_CASE(
              kMcpOperationUpdatedNotification);
   const boost::json::object& notification_schemas =
       notifications.at("schemas").as_object();
-  BOOST_REQUIRE_EQUAL(notification_schemas.size(),
-                      notification_methods.size());
-  BOOST_TEST(!notification_schemas.contains(
-      kMcpSubscriptionUpdatedNotification));
+  BOOST_REQUIRE_EQUAL(notification_schemas.size(), notification_methods.size());
+  BOOST_TEST(
+      !notification_schemas.contains(kMcpSubscriptionUpdatedNotification));
   BOOST_TEST(notifications.if_contains("available_through") == nullptr);
 
   try {
@@ -926,16 +1436,19 @@ BOOST_AUTO_TEST_CASE(
       "/etc/passwd", temporary.path() / "nodes" / "firo-1" / "escape.log");
 
   auto queue = std::make_shared<SimulationCommandQueue>();
-  McpLiveApplication application(
-      McpLiveApplication::Config{.run_id = "live-application",
-                                 .run_root = temporary.path(),
-                                 .retained_run = std::nullopt,
-                                 .options = options,
-                                 .command_queue = queue,
-                                 .request_run_stop = [] {},
-                                 .run_started = {},
-                                 .run_stopping = {},
-                                 .run_stopped = {}});
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
   application.MarkRunStarted();
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
@@ -947,7 +1460,9 @@ BOOST_AUTO_TEST_CASE(
              boost::json::object{{"run_id", "live-application"},
                                  {"families", boost::json::array{"events"}},
                                  {"limit", 2U}}));
-  BOOST_TEST(evidence_terminal.at("state").as_string() == "succeeded");
+  BOOST_REQUIRE_MESSAGE(
+      evidence_terminal.at("state").as_string() == "succeeded",
+      boost::json::serialize(evidence_terminal));
   const boost::json::object& first_page =
       evidence_terminal.at("terminal_result").as_object();
   BOOST_REQUIRE_EQUAL(first_page.at("items").as_array().size(), 2U);

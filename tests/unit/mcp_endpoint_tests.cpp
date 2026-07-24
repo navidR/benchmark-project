@@ -67,8 +67,7 @@ http::response<http::string_body> Exchange(
   stream.connect(tcp::endpoint(asio::ip::address_v4::loopback(), port));
   http::request<http::string_body> request{method, "/mcp", 11};
   request.set(http::field::host, "127.0.0.1:" + std::to_string(port));
-  request.set(http::field::origin,
-              "http://127.0.0.1:" + std::to_string(port));
+  request.set(http::field::origin, "http://127.0.0.1:" + std::to_string(port));
   request.set(http::field::content_type, "application/json");
   request.set(http::field::accept, accept);
   request.set(http::field::authorization, "Bearer " + std::string(token));
@@ -90,15 +89,15 @@ http::response<http::string_body> Initialize(std::uint16_t port,
   return Exchange(
       port, token, http::verb::post,
       boost::json::serialize(boost::json::object{
-      {"jsonrpc", "2.0"},
-      {"id", 1U},
-      {"method", "initialize"},
-      {"params",
-       boost::json::object{
-           {"protocolVersion", kMcpProtocolVersion},
-           {"capabilities", boost::json::object{}},
-      {"clientInfo", boost::json::object{{"name", "endpoint-test"},
-                                              {"version", "1"}}}}}}));
+          {"jsonrpc", "2.0"},
+          {"id", 1U},
+          {"method", "initialize"},
+          {"params",
+           boost::json::object{
+               {"protocolVersion", kMcpProtocolVersion},
+               {"capabilities", boost::json::object{}},
+               {"clientInfo", boost::json::object{{"name", "endpoint-test"},
+                                                  {"version", "1"}}}}}}));
 }
 
 boost::json::object EndpointLiveScenario() {
@@ -212,13 +211,12 @@ BOOST_AUTO_TEST_CASE(
   const auto initialized = Initialize(publication.port, token);
   BOOST_REQUIRE(initialized.result() == http::status::ok);
   const std::string session_id(initialized.at("Mcp-Session-Id"));
-  const auto marked = Exchange(
-      publication.port, token, http::verb::post,
-      boost::json::serialize(
-          boost::json::object{{"jsonrpc", "2.0"},
-                              {"method", "notifications/initialized"},
-                              {"params", boost::json::object{}}}),
-      session_id);
+  const auto marked = Exchange(publication.port, token, http::verb::post,
+                               boost::json::serialize(boost::json::object{
+                                   {"jsonrpc", "2.0"},
+                                   {"method", "notifications/initialized"},
+                                   {"params", boost::json::object{}}}),
+                               session_id);
   BOOST_REQUIRE(marked.result() == http::status::accepted);
 
   const auto submitted = Exchange(
@@ -234,15 +232,14 @@ BOOST_AUTO_TEST_CASE(
                 boost::json::object{{"scenario", boost::json::object{}}}}}}}),
       session_id);
   BOOST_REQUIRE(submitted.result() == http::status::ok);
-  const std::string operation_id(
-      boost::json::parse(submitted.body())
-          .as_object()
-          .at("result")
-          .as_object()
-          .at("structuredContent")
-          .as_object()
-          .at("operation_id")
-          .as_string());
+  const std::string operation_id(boost::json::parse(submitted.body())
+                                     .as_object()
+                                     .at("result")
+                                     .as_object()
+                                     .at("structuredContent")
+                                     .as_object()
+                                     .at("operation_id")
+                                     .as_string());
 
   std::string terminal_state;
   const auto deadline =
@@ -262,15 +259,14 @@ BOOST_AUTO_TEST_CASE(
                   boost::json::object{{"operation_id", operation_id}}}}}}),
         session_id);
     BOOST_REQUIRE(operation.result() == http::status::ok);
-    terminal_state =
-        boost::json::parse(operation.body())
-            .as_object()
-            .at("result")
-            .as_object()
-            .at("structuredContent")
-            .as_object()
-            .at("state")
-            .as_string();
+    terminal_state = boost::json::parse(operation.body())
+                         .as_object()
+                         .at("result")
+                         .as_object()
+                         .at("structuredContent")
+                         .as_object()
+                         .at("state")
+                         .as_string();
     if (terminal_state == "succeeded") {
       break;
     }
@@ -278,9 +274,8 @@ BOOST_AUTO_TEST_CASE(
   }
   BOOST_REQUIRE(terminal_state == "succeeded");
 
-  const auto events =
-      Exchange(publication.port, token, http::verb::get, {}, session_id,
-               "text/event-stream");
+  const auto events = Exchange(publication.port, token, http::verb::get, {},
+                               session_id, "text/event-stream");
   BOOST_REQUIRE(events.result() == http::status::ok);
   BOOST_TEST(events.body().find(
                  "\"method\":\"bbp/notifications/operation_updated\"") !=
@@ -300,8 +295,8 @@ BOOST_AUTO_TEST_CASE(
 BOOST_AUTO_TEST_CASE(
     mcp_endpoint_publishes_authoritative_run_scoped_lifecycle_evidence) {
   EndpointTestDirectory temporary;
-  const auto options =
-      std::make_shared<Options>(ParseAndValidateScenario(EndpointLiveScenario()));
+  const auto options = std::make_shared<Options>(
+      ParseAndValidateScenario(EndpointLiveScenario()));
   auto command_queue = std::make_shared<SimulationCommandQueue>();
   McpEndpoint* endpoint_pointer = nullptr;
   McpLiveApplication application(McpLiveApplication::Config{
@@ -310,6 +305,12 @@ BOOST_AUTO_TEST_CASE(
       .retained_run = std::nullopt,
       .options = options,
       .command_queue = command_queue,
+      .node_inventory_snapshot =
+          [] {
+            return McpLiveNodeInventorySnapshot{.generation = 1U,
+                                                .node_ids = {"firo-1"}};
+          },
+      .publication_mutex = {},
       .request_run_stop = [] {},
       .run_started = {},
       .run_stopping = {},
@@ -325,15 +326,14 @@ BOOST_AUTO_TEST_CASE(
             endpoint_pointer->CloseRunSubscriptions(run_id);
           }});
   McpEndpoint endpoint(
-      McpEndpointConfig{
-          .state_directory = temporary.path(),
-          .run_id = "endpoint-live-run",
-          .server = {},
-          .dispatcher = {},
-          .allowed_operations = application.SupportedOperations(),
-          .allowed_information_families =
-              application.SupportedInformationFamilies(),
-          .read_only = false},
+      McpEndpointConfig{.state_directory = temporary.path(),
+                        .run_id = "endpoint-live-run",
+                        .server = {},
+                        .dispatcher = {},
+                        .allowed_operations = application.SupportedOperations(),
+                        .allowed_information_families =
+                            application.SupportedInformationFamilies(),
+                        .read_only = false},
       application.OperationFactory(), application.ResourceReader());
   endpoint_pointer = &endpoint;
   endpoint.Start();
@@ -344,15 +344,13 @@ BOOST_AUTO_TEST_CASE(
   const auto initialized = Initialize(publication.port, token);
   BOOST_REQUIRE(initialized.result() == http::status::ok);
   const std::string session_id(initialized.at("Mcp-Session-Id"));
-  BOOST_REQUIRE(
-      Exchange(
-          publication.port, token, http::verb::post,
-          boost::json::serialize(
-              boost::json::object{{"jsonrpc", "2.0"},
-                                  {"method", "notifications/initialized"},
-                                  {"params", boost::json::object{}}}),
-          session_id)
-          .result() == http::status::accepted);
+  BOOST_REQUIRE(Exchange(publication.port, token, http::verb::post,
+                         boost::json::serialize(boost::json::object{
+                             {"jsonrpc", "2.0"},
+                             {"method", "notifications/initialized"},
+                             {"params", boost::json::object{}}}),
+                         session_id)
+                    .result() == http::status::accepted);
 
   const auto created = Exchange(
       publication.port, token, http::verb::post,
@@ -369,13 +367,12 @@ BOOST_AUTO_TEST_CASE(
                     {"families", boost::json::array{"lifecycle"}}}}}}}),
       session_id);
   BOOST_REQUIRE(created.result() == http::status::ok);
-  const boost::json::object created_result =
-      boost::json::parse(created.body())
-          .as_object()
-          .at("result")
-          .as_object()
-          .at("structuredContent")
-          .as_object();
+  const boost::json::object created_result = boost::json::parse(created.body())
+                                                 .as_object()
+                                                 .at("result")
+                                                 .as_object()
+                                                 .at("structuredContent")
+                                                 .as_object();
   const std::string subscription_id(
       created_result.at("subscription_id").as_string());
   BOOST_TEST(created_result.at("run_id").as_string() == "endpoint-live-run");
@@ -398,21 +395,18 @@ BOOST_AUTO_TEST_CASE(
                                     {"limit", 8U}}}}}}),
       session_id);
   BOOST_REQUIRE(polled.result() == http::status::ok);
-  const boost::json::object page =
-      boost::json::parse(polled.body())
-          .as_object()
-          .at("result")
-          .as_object()
-          .at("structuredContent")
-          .as_object();
+  const boost::json::object page = boost::json::parse(polled.body())
+                                       .as_object()
+                                       .at("result")
+                                       .as_object()
+                                       .at("structuredContent")
+                                       .as_object();
   BOOST_TEST(page.at("run_id").as_string() == "endpoint-live-run");
   BOOST_TEST(!page.at("active").as_bool());
   const boost::json::array& items = page.at("items").as_array();
   BOOST_REQUIRE_EQUAL(items.size(), 3U);
-  BOOST_TEST(items.front().as_object().at("kind").as_string() ==
-             "run_started");
-  BOOST_TEST(items.back().as_object().at("kind").as_string() ==
-             "run_stopped");
+  BOOST_TEST(items.front().as_object().at("kind").as_string() == "run_started");
+  BOOST_TEST(items.back().as_object().at("kind").as_string() == "run_stopped");
   for (const boost::json::value& item : items) {
     BOOST_TEST(item.as_object().at("run_id").as_string() ==
                "endpoint-live-run");

@@ -22,6 +22,8 @@ namespace bbp {
 
 struct NodeRuntime {
   ChainNodeConfig config;
+  std::vector<std::string> process_start_connect_peers;
+  bool uses_physical_start_connect_peers = false;
   std::optional<Cgroup> cgroup;
   std::optional<NetworkNamespace> network_namespace;
   std::optional<NodeVethConfig> network;

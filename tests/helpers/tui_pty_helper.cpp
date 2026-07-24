@@ -1,5 +1,8 @@
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pty.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -206,6 +209,47 @@ class OwnedTemporaryDirectory {
   std::filesystem::path root_;
 };
 
+class TcpListener {
+ public:
+  TcpListener(std::string_view address, std::uint16_t port) {
+    descriptor_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (descriptor_ < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "create TCP collision listener");
+    }
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(port);
+    if (inet_pton(AF_INET, std::string(address).c_str(),
+                  &endpoint.sin_addr) != 1) {
+      close(descriptor_);
+      descriptor_ = -1;
+      throw std::runtime_error("invalid TCP collision-listener address");
+    }
+    if (bind(descriptor_, reinterpret_cast<const sockaddr*>(&endpoint),
+             sizeof(endpoint)) != 0 ||
+        listen(descriptor_, 1) != 0) {
+      const int error = errno;
+      close(descriptor_);
+      descriptor_ = -1;
+      throw std::system_error(error, std::generic_category(),
+                              "bind TCP collision listener");
+    }
+  }
+
+  TcpListener(const TcpListener&) = delete;
+  TcpListener& operator=(const TcpListener&) = delete;
+
+  ~TcpListener() {
+    if (descriptor_ >= 0) {
+      static_cast<void>(close(descriptor_));
+    }
+  }
+
+ private:
+  int descriptor_ = -1;
+};
+
 class OwnedRunCopy {
  public:
   OwnedRunCopy(const std::filesystem::path& source, std::string_view label)
@@ -309,6 +353,198 @@ void RequireExitZero(PtyProcess* process, std::string_view context) {
   }
 }
 
+std::string DaemonArgumentValue(int argc, char** argv,
+                                std::string_view prefix) {
+  for (int index = 1; index < argc; ++index) {
+    const std::string_view argument(argv[index]);
+    if (argument.starts_with(prefix)) {
+      return std::string(argument.substr(prefix.size()));
+    }
+  }
+  throw std::runtime_error("ready daemon missing argument " +
+                           std::string(prefix));
+}
+
+void SendAll(int descriptor, std::string_view text) {
+  while (!text.empty()) {
+    const ssize_t sent =
+        send(descriptor, text.data(), text.size(), MSG_NOSIGNAL);
+    if (sent < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::system_error(errno, std::generic_category(),
+                              "send ready-daemon response");
+    }
+    text.remove_prefix(static_cast<std::size_t>(sent));
+  }
+}
+
+std::string ReadHttpRequest(int descriptor) {
+  constexpr std::size_t kMaximumRequestBytes = 64U * 1024U;
+  std::string request;
+  std::size_t expected_size = 0U;
+  while (expected_size == 0U || request.size() < expected_size) {
+    char buffer[4096];
+    const ssize_t received = recv(descriptor, buffer, sizeof(buffer), 0);
+    if (received < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::system_error(errno, std::generic_category(),
+                              "read ready-daemon request");
+    }
+    if (received == 0) {
+      throw std::runtime_error("ready-daemon request ended early");
+    }
+    request.append(buffer, static_cast<std::size_t>(received));
+    if (request.size() > kMaximumRequestBytes) {
+      throw std::runtime_error("ready-daemon request is too large");
+    }
+    const std::size_t header_end = request.find("\r\n\r\n");
+    if (header_end != std::string::npos && expected_size == 0U) {
+      constexpr std::string_view kContentLength = "\r\nContent-Length: ";
+      const std::size_t field = request.find(kContentLength);
+      if (field == std::string::npos || field >= header_end) {
+        throw std::runtime_error("ready-daemon request has no content length");
+      }
+      const std::size_t value_begin = field + kContentLength.size();
+      const std::size_t value_end = request.find("\r\n", value_begin);
+      const std::size_t content_length =
+          std::stoul(request.substr(value_begin, value_end - value_begin));
+      expected_size = header_end + 4U + content_length;
+      if (expected_size > kMaximumRequestBytes) {
+        throw std::runtime_error("ready-daemon request is too large");
+      }
+    }
+  }
+  return request;
+}
+
+std::string RpcMethod(std::string_view request) {
+  constexpr std::string_view kMethod = "\"method\":\"";
+  const std::size_t begin_field = request.find(kMethod);
+  if (begin_field == std::string_view::npos) {
+    throw std::runtime_error("ready-daemon request has no RPC method");
+  }
+  const std::size_t begin = begin_field + kMethod.size();
+  const std::size_t end = request.find('"', begin);
+  if (end == std::string_view::npos) {
+    throw std::runtime_error("ready-daemon RPC method is malformed");
+  }
+  return std::string(request.substr(begin, end - begin));
+}
+
+std::string RpcResult(std::string_view method) {
+  if (method == "getblockchaininfo") {
+    return R"({"blocks":0,"headers":0,"bestblockhash":"00","initialblockdownload":false,"verificationprogress":1.0,"difficulty":1.0,"mediantime":0,"chainwork":"00"})";
+  }
+  if (method == "getnetworkinfo") {
+    return R"({"version":1,"protocolversion":1,"subversion":"/bbp-test/","connections":0})";
+  }
+  if (method == "getmempoolinfo") {
+    return R"({"size":0,"bytes":0})";
+  }
+  if (method == "getblockheader") {
+    return R"({"time":0})";
+  }
+  if (method == "getnetworkhashps") {
+    return "0";
+  }
+  if (method == "getpeerinfo") {
+    return "[]";
+  }
+  if (method == "stop") {
+    return "null";
+  }
+  throw std::runtime_error("ready daemon received unsupported RPC method " +
+                           std::string(method));
+}
+
+int RunReadyFiroDaemon(int argc, char** argv) {
+  const std::filesystem::path cookie =
+      DaemonArgumentValue(argc, argv, "-rpccookiefile=");
+  const std::string bind_address = DaemonArgumentValue(argc, argv, "-rpcbind=");
+  const unsigned long parsed_port =
+      std::stoul(DaemonArgumentValue(argc, argv, "-rpcport="));
+  if (parsed_port == 0U || parsed_port > 65535U) {
+    throw std::runtime_error("ready-daemon RPC port is out of range");
+  }
+  {
+    std::ofstream stream(cookie);
+    if (!stream) {
+      throw std::runtime_error("could not create ready-daemon RPC cookie");
+    }
+    stream << "bbp-test:bbp-test";
+  }
+  if (chmod(cookie.c_str(), 0600) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "protect ready-daemon RPC cookie");
+  }
+
+  const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+  if (listener < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "create ready-daemon listener");
+  }
+  const auto close_listener = [&] { static_cast<void>(close(listener)); };
+  int reuse = 1;
+  if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) !=
+      0) {
+    const int error = errno;
+    close_listener();
+    throw std::system_error(error, std::generic_category(),
+                            "configure ready-daemon listener");
+  }
+  sockaddr_in endpoint{};
+  endpoint.sin_family = AF_INET;
+  endpoint.sin_port = htons(static_cast<std::uint16_t>(parsed_port));
+  if (inet_pton(AF_INET, bind_address.c_str(), &endpoint.sin_addr) != 1) {
+    close_listener();
+    throw std::runtime_error("ready-daemon RPC bind address is invalid");
+  }
+  if (bind(listener, reinterpret_cast<const sockaddr*>(&endpoint),
+           sizeof(endpoint)) != 0 ||
+      listen(listener, 16) != 0) {
+    const int error = errno;
+    close_listener();
+    throw std::system_error(error, std::generic_category(),
+                            "bind ready-daemon listener");
+  }
+
+  bool stop = false;
+  while (!stop) {
+    int connection;
+    do {
+      connection = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+    } while (connection < 0 && errno == EINTR);
+    if (connection < 0) {
+      const int error = errno;
+      close_listener();
+      throw std::system_error(error, std::generic_category(),
+                              "accept ready-daemon request");
+    }
+    try {
+      const std::string method = RpcMethod(ReadHttpRequest(connection));
+      const std::string body = "{\"result\":" + RpcResult(method) +
+                               ",\"error\":null,\"id\":\"bbp\"}";
+      const std::string response =
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+          "Connection: close\r\nContent-Length: " +
+          std::to_string(body.size()) + "\r\n\r\n" + body;
+      SendAll(connection, response);
+      stop = method == "stop";
+    } catch (...) {
+      static_cast<void>(close(connection));
+      close_listener();
+      throw;
+    }
+    static_cast<void>(close(connection));
+  }
+  close_listener();
+  return 0;
+}
+
 std::filesystem::path LauncherPathFromOutput(std::string_view output) {
   constexpr std::string_view prefix = "/tmp/bbp-firo-qt-";
   constexpr std::size_t random_length = 6U;
@@ -401,6 +637,17 @@ void CheckCommandErrorOnErrorFrame(const std::filesystem::path& command,
   PtyProcess process(command, {"--run", run.run_root().string()}, 30, 100);
   static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 3s,
                                       "command-error report"));
+  run.AppendEvent(
+      "{\"run_id\":\"tui-fixture\",\"node_id\":\"sim\","
+      "\"timestamp\":\"2026-07-22T00:00:00Z\","
+      "\"event\":\"operator_command_completed\","
+      "\"detail\":\"{\\\"sequence\\\":9000,"
+      "\\\"kind\\\":\\\"add_nodes\\\","
+      "\\\"added_node_ids\\\":[\\\"firo-2\\\"],"
+      "\\\"inventory_generation\\\":2,"
+      "\\\"final_node_count\\\":2}\"}");
+  static_cast<void>(process.ReadUntil("generation 2, 2 total nodes", 3s,
+                                      "numeric node-add completion status"));
   run.AppendEvent(
       "{\"run_id\":\"tui-fixture\",\"node_id\":\"firo-1\","
       "\"timestamp\":\"2026-07-22T00:00:00Z\","
@@ -577,7 +824,6 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   const std::filesystem::path mcp_path = home_directory / ".bbp" / "mcp";
   const std::filesystem::path token_path = mcp_path / "token";
   const std::filesystem::path client_path = mcp_path / "client.json";
-
   PtyProcess process(
       command,
       {"--benchmark-root", benchmark_root.string(), "--run-id", run_id,
@@ -618,6 +864,16 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error("empty control plane exited without a request");
   }
 
+  process.Write("c");
+  static_cast<void>(process.ReadUntil("add-nodes <chain> <count> [binary]", 3s,
+                                      "empty control-plane command palette"));
+  process.Write("\x1b");
+  static_cast<void>(process.ReadFor(100ms));
+  if (!process.Running() || !std::filesystem::exists(client_path)) {
+    throw std::runtime_error(
+        "closing the zero-node command palette stopped the control plane");
+  }
+
   process.Write("\x1b");
   static_cast<void>(
       process.ReadUntil("Confirm exit", 3s, "empty control-plane exit modal"));
@@ -646,6 +902,69 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   if (std::filesystem::exists(run_root)) {
     throw std::runtime_error("empty editor TUI left a synthetic benchmark run");
   }
+}
+
+void CheckZeroToOnePublication(const std::filesystem::path& command,
+                               const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("zero-to-one");
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::filesystem::path ready_daemon = directory.root() / "ready-firod";
+  std::filesystem::copy_file(helper_binary, ready_daemon);
+  std::filesystem::permissions(ready_daemon,
+                               std::filesystem::perms::owner_read |
+                                   std::filesystem::perms::owner_write |
+                                   std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::replace);
+  const std::string active_run_id =
+      "active-zero-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path active_run_root = benchmark_root / active_run_id;
+  const std::filesystem::path active_events = active_run_root / "events.jsonl";
+  PtyProcess active_process(
+      command,
+      {"--benchmark-root", benchmark_root.string(), "--run-id", active_run_id,
+       "--nodes", "0", "--node-capacity", "2", "--node-binary",
+       ready_daemon.string(), "--refresh-ms", "50", "--metrics-interval",
+       "50ms"},
+      30, 120, home_directory);
+  static_cast<void>(active_process.ReadUntil("Blockchain Benchmark Project TUI",
+                                             5s,
+                                             "active zero-node control plane"));
+  static_cast<void>(
+      WaitForFileText(active_events, "\"event\":\"run_started\"", 5s));
+
+  active_process.Write("c");
+  static_cast<void>(
+      active_process.ReadUntil("add-nodes <chain> <count> [binary]", 3s,
+                               "active zero-node command palette"));
+  active_process.Write("add-nodes firo 1\n");
+  static_cast<void>(active_process.ReadUntil("generation 2, 1 total nodes", 10s,
+                                             "zero-to-one publication status"));
+  const std::string published_events = WaitForFileText(
+      active_events, "\"event\":\"runtime_generation_published\"", 3s);
+  RequireContains(published_events, "\\\"generation\\\":2",
+                  "zero-to-one published generation");
+  RequireContains(published_events, "\\\"node_count\\\":1",
+                  "zero-to-one published node count");
+  RequireContains(published_events, "\\\"node_ids\\\":[\\\"firo-1\\\"]",
+                  "zero-to-one published node IDs");
+  RequireContains(published_events, "\"event\":\"operator_command_completed\"",
+                  "zero-to-one command completion");
+  RequireContains(published_events, "\\\"final_node_count\\\":1",
+                  "zero-to-one command outcome");
+  const pid_t added_daemon_pid = ProcessStartedPid(published_events);
+  if (!active_process.Running() || !ProcessExists(added_daemon_pid)) {
+    throw std::runtime_error(
+        "zero-to-one publication did not retain its live node");
+  }
+
+  active_process.Write("\x1b");
+  static_cast<void>(active_process.ReadUntil(
+      "Confirm exit", 3s, "active zero-node confirmed exit modal"));
+  active_process.Write("y");
+  RequireExitZero(&active_process, "active zero-node TUI exit");
+  WaitForProcessExit(added_daemon_pid, 3s);
 }
 
 void CheckRetainedMcpLifecycle(const std::filesystem::path& command,
@@ -1070,13 +1389,23 @@ int RunIdleDaemon() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (std::filesystem::path(argv[0]).filename() == "firo-qt") {
+  const std::filesystem::path executable_name =
+      std::filesystem::path(argv[0]).filename();
+  if (executable_name == "firo-qt") {
     const char* marker = std::getenv("BBP_TUI_FIRO_QT_EXECUTION_MARKER");
     if (marker != nullptr) {
       std::ofstream stream(marker);
       stream << "executed\n";
     }
     return 0;
+  }
+  if (executable_name == "ready-firod") {
+    try {
+      return RunReadyFiroDaemon(argc, argv);
+    } catch (const std::exception& error) {
+      std::cerr << "ready Firo daemon failed: " << error.what() << '\n';
+      return 1;
+    }
   }
   if (argc == 5 && std::string_view(argv[1]) == "--direct-load-lifecycle") {
     try {
@@ -1127,6 +1456,7 @@ int main(int argc, char** argv) {
     CheckPaletteOnErrorFrame(command, complete_run);
     CheckCommandErrorOnErrorFrame(command, complete_run);
     CheckActiveRunLifecycle(command, std::filesystem::canonical(argv[0]));
+    CheckZeroToOnePublication(command, std::filesystem::canonical(argv[0]));
     std::cout << "canonical modal, shared error-frame overlays, and active "
                  "RunBenchmarkWithTui lifecycle checks passed\n";
     return 0;

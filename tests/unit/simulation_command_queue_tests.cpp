@@ -302,6 +302,137 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_wallet_send_identity) {
       std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_node_add_request) {
+  bbp::SimulationCommandQueue queue;
+  bbp::SimulationNodeAddRequest request{
+      .chain = bbp::ChainKind::kBitcoin,
+      .count = 2U,
+      .node_ids = {"bitcoin-2", "bitcoin-4"},
+      .binary = "/opt/bitcoin/bin/bitcoind",
+      .topology =
+          bbp::PeerTopologyConfig{
+              .kind = bbp::PeerTopologyKind::kRing,
+              .seed = 0U,
+              .star_center = 0U,
+              .average_degree = 0U,
+              .attachment_count = 0U,
+              .edges = {},
+              .groups = {},
+              .latency_matrix_ms = {},
+              .regions = {},
+              .region_edges = {},
+          },
+      .resources =
+          bbp::ResourceLimits{
+              .memory_high_bytes = 1024U,
+              .memory_max_bytes = 2048U,
+              .cpu_quota_us = 50000U,
+              .cpu_period_us = 100000U,
+              .cpu_weight = 100U,
+              .io_weight = 100U,
+              .io_limits = {},
+              .pids_max = 64U,
+          },
+      .network =
+          bbp::NetworkCondition{
+              .bandwidth_mbps = 100U,
+              .delay_ms = 5U,
+          },
+      .ready_timeout_sec = 11U,
+      .sync_timeout_sec = 17U,
+  };
+
+  const std::uint64_t sequence = queue.PushAddNodes(request);
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->sequence == sequence);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kAddNodes);
+  BOOST_TEST(command->node_id == "sim");
+  BOOST_TEST(!command->confirmed);
+  BOOST_REQUIRE(command->operation_control);
+  BOOST_CHECK(command->operation_control->CommitPhase() ==
+              bbp::SimulationCommandCommitPhase::kOpen);
+  BOOST_REQUIRE(command->node_add);
+  BOOST_CHECK(command->node_add->chain == request.chain);
+  BOOST_TEST(command->node_add->count == request.count);
+  BOOST_TEST(command->node_add->node_ids == request.node_ids,
+             boost::test_tools::per_element());
+  BOOST_REQUIRE(command->node_add->binary);
+  BOOST_TEST(*command->node_add->binary == *request.binary);
+  BOOST_REQUIRE(command->node_add->topology);
+  BOOST_CHECK(command->node_add->topology->kind ==
+              bbp::PeerTopologyKind::kRing);
+  BOOST_REQUIRE(command->node_add->resources);
+  BOOST_TEST(command->node_add->resources->memory_max_bytes == 2048U);
+  BOOST_REQUIRE(command->node_add->network);
+  BOOST_TEST(command->node_add->network->delay_ms == 5U);
+  BOOST_TEST(command->node_add->ready_timeout_sec == 11U);
+  BOOST_TEST(command->node_add->sync_timeout_sec == 17U);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_command_queue_validates_node_add_request) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationNodeAddRequest valid{
+      .chain = bbp::ChainKind::kFiro,
+      .count = 2U,
+      .node_ids = {"firo-2", "firo-3"},
+      .binary = std::nullopt,
+      .topology = std::nullopt,
+      .resources = std::nullopt,
+      .network = std::nullopt,
+      .ready_timeout_sec = 30U,
+      .sync_timeout_sec = 30U,
+  };
+
+  bbp::SimulationNodeAddRequest invalid = valid;
+  invalid.count = 0U;
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.chain = bbp::ChainKind::kCount;
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.node_ids = {"firo-2"};
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.node_ids = {"firo-2", "firo-2"};
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.node_ids = {"firo-2", ""};
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.binary = "";
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.ready_timeout_sec = 0U;
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+  invalid = valid;
+  invalid.sync_timeout_sec = 0U;
+  BOOST_CHECK_THROW(queue.PushAddNodes(invalid), std::runtime_error);
+
+  bbp::SimulationCommand wrong_target;
+  wrong_target.kind = bbp::SimulationCommandKind::kAddNodes;
+  wrong_target.node_id = "firo-1";
+  wrong_target.node_add = valid;
+  wrong_target.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(wrong_target), std::runtime_error);
+
+  bbp::SimulationCommand unexpected_payload;
+  unexpected_payload.kind = bbp::SimulationCommandKind::kRestartNode;
+  unexpected_payload.node_id = "firo-1";
+  unexpected_payload.node_add = valid;
+  unexpected_payload.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(unexpected_payload),
+                    std::runtime_error);
+
+  bbp::SimulationCommand missing_payload;
+  missing_payload.kind = bbp::SimulationCommandKind::kAddNodes;
+  missing_payload.node_id = "sim";
+  missing_payload.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(missing_payload),
+                    std::runtime_error);
+  BOOST_TEST(!queue.TryPop());
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
   bbp::SimulationCommandQueue queue;
   queue.PushBlockProductionPolicy(

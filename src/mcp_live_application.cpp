@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "bbp/chain_kind.h"
+#include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/logging.h"
 #include "bbp/mcp_registry.h"
 #include "bbp/mcp_run_evidence.h"
@@ -38,6 +39,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kStopRun,
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
+    McpOperationKind::kAddNode,
     McpOperationKind::kStopNode,
     McpOperationKind::kKillNode,
     McpOperationKind::kRestartNode,
@@ -83,6 +85,64 @@ class CombinedStopToken {
 };
 
 constexpr std::uint64_t kMaximumNodeOperationTimeoutSeconds = 3600U;
+
+bool IsSafeNodeAddIdentifier(std::string_view value) {
+  return !value.empty() && value.size() <= 32U &&
+         std::all_of(value.begin(), value.end(), [](char character) {
+           return (character >= 'a' && character <= 'z') ||
+                  (character >= 'A' && character <= 'Z') ||
+                  (character >= '0' && character <= '9') || character == '-' ||
+                  character == '_';
+         });
+}
+
+std::optional<std::string> NodeAddOutcomeError(
+    const SimulationCommand& command, const SimulationCommandOutcome& outcome) {
+  if (!command.node_add) {
+    return "successful node-add outcome has no request";
+  }
+  if (outcome.added_node_ids.empty() ||
+      outcome.added_node_ids.size() != command.node_add->count) {
+    return "successful node-add outcome has the wrong node-id count";
+  }
+  std::set<std::string> unique;
+  for (const std::string& node_id : outcome.added_node_ids) {
+    if (!IsSafeNodeAddIdentifier(node_id) || !unique.insert(node_id).second) {
+      return "successful node-add outcome has an unsafe or duplicate node id";
+    }
+  }
+  if (!command.node_add->node_ids.empty() &&
+      outcome.added_node_ids != command.node_add->node_ids) {
+    return "successful node-add outcome differs from its explicit node ids";
+  }
+  if (!outcome.inventory_generation || *outcome.inventory_generation == 0U ||
+      !outcome.final_node_count ||
+      *outcome.final_node_count < outcome.added_node_ids.size()) {
+    return "successful node-add outcome omitted its inventory generation or "
+           "final node count";
+  }
+  return std::nullopt;
+}
+
+bool IsNodeCapacityFailure(std::string_view message) {
+  return message == "node.add request exceeds the configured node capacity" ||
+         message == "node-add request exceeds the configured node capacity";
+}
+
+boost::json::array NodeCapacityDiagnostics(std::uint64_t requested,
+                                           std::uint32_t current,
+                                           std::uint32_t capacity) {
+  return boost::json::array{boost::json::object{
+      {"code", "node_capacity_exceeded"},
+      {"message", "the requested node batch exceeds available capacity"},
+      {"path", "request.count"},
+      {"requested_count", requested},
+      {"current_node_count", current},
+      {"node_capacity", capacity},
+      {"available_node_capacity",
+       current <= capacity ? capacity - current : 0U},
+  }};
+}
 
 void ThrowIfCancelled(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
@@ -423,8 +483,8 @@ McpLiveApplication::McpLiveApplication(Config config)
           "MCP retained application requires persisted run metadata");
     }
     if (config_.options != nullptr || config_.command_queue != nullptr ||
-        config_.request_run_stop || config_.run_started ||
-        config_.run_stopping || config_.run_stopped ||
+        config_.node_inventory_snapshot || config_.request_run_stop ||
+        config_.run_started || config_.run_stopping || config_.run_stopped ||
         config_.publish_evidence || config_.close_run_subscriptions) {
       throw std::invalid_argument(
           "MCP retained application cannot own live run controls");
@@ -437,6 +497,10 @@ McpLiveApplication::McpLiveApplication(Config config)
   if (config_.command_queue == nullptr) {
     throw std::invalid_argument(
         "MCP live application requires a simulation command queue");
+  }
+  if (!config_.node_inventory_snapshot) {
+    throw std::invalid_argument(
+        "MCP live application requires an authoritative node inventory");
   }
   if (!config_.request_run_stop) {
     throw std::invalid_argument(
@@ -582,14 +646,14 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     if (shutdown_ || run_stopped_) {
       throw McpOperationFailure(
           "run_not_active",
-          "subscriptions require a managed run that has not terminated",
-          false);
+          "subscriptions require a managed run that has not terminated", false);
     }
     return {};
   }
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
       kind != McpOperationKind::kInvokeRuntimeCommand &&
+      kind != McpOperationKind::kAddNode &&
       kind != McpOperationKind::kStopNode &&
       kind != McpOperationKind::kKillNode &&
       kind != McpOperationKind::kRestartNode &&
@@ -656,9 +720,11 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                          request_stop_source_.get_token());
           const std::stop_token stop_token = cancellation.token();
           ThrowIfCancelled(stop_token);
+          std::unique_lock<std::timed_mutex> publication_lock =
+              AcquirePublicationLock(stop_token);
           boost::json::value report;
           if (node_ids.empty()) {
-            report = ReportSnapshot(stop_token);
+            report = ReportSnapshot(stop_token, true);
           } else {
             boost::json::array node_reports;
             node_reports.reserve(node_ids.size());
@@ -716,8 +782,13 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           const auto deadline = std::chrono::steady_clock::now() + kFollowWait;
           while (true) {
             ThrowIfCancelled(stop_token);
+            std::unique_lock<std::timed_mutex> publication_lock =
+                AcquirePublicationLock(stop_token);
             boost::json::object page = QueryMcpRunEvidence(
                 config_.run_id, config_.run_root, query, stop_token);
+            if (publication_lock.owns_lock()) {
+              publication_lock.unlock();
+            }
             ThrowIfCancelled(stop_token);
             if (!follow || !page.at("items").as_array().empty() ||
                 std::chrono::steady_clock::now() >= deadline) {
@@ -749,6 +820,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                          request_stop_source_.get_token());
           const std::stop_token stop_token = cancellation.token();
           ThrowIfCancelled(stop_token);
+          std::unique_lock<std::timed_mutex> publication_lock =
+              AcquirePublicationLock(stop_token);
           return McpTypedResult{.family = McpResultFamily::kArtifactContent,
                                 .value = ReadMcpRunArtifact(
                                     config_.run_id, config_.run_root,
@@ -759,9 +832,48 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   const bool typed_node_operation = kind == McpOperationKind::kStopNode ||
                                     kind == McpOperationKind::kKillNode ||
                                     kind == McpOperationKind::kRestartNode;
+  const bool direct_node_add_operation = kind == McpOperationKind::kAddNode;
+  bool node_add_operation = direct_node_add_operation;
   std::optional<std::chrono::steady_clock::duration> command_timeout;
   SimulationCommand command;
-  if (typed_node_operation) {
+  const auto node_capacity_failure_plan =
+      [](const boost::json::object& request,
+         const Options& validation_options) -> McpOperationPlan {
+    const std::uint64_t requested_count =
+        OptionalUnsigned(request, "count", 0U);
+    const std::uint32_t current_count = validation_options.nodes;
+    const std::uint32_t capacity = validation_options.node_capacity;
+    return McpOperationPlan{
+        .progress_total = kSimulationNodeAddProgressTotal,
+        .executor = [requested_count, current_count,
+                     capacity](McpOperationContext&) -> McpTypedResult {
+          throw McpOperationFailure(
+              "node_capacity_exceeded",
+              "node.add request exceeds the configured node capacity", false,
+              NodeCapacityDiagnostics(requested_count, current_count,
+                                      capacity));
+        }};
+  };
+  if (node_add_operation) {
+    Options validation_options = *config_.options;
+    McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
+    validation_options.nodes =
+        static_cast<std::uint32_t>(inventory.node_ids.size());
+    validation_options.node_ids = std::move(inventory.node_ids);
+    command.kind = SimulationCommandKind::kAddNodes;
+    command.node_id = "sim";
+    const boost::json::object& request = RequireObject(arguments, "request");
+    try {
+      command.node_add =
+          ParseAndValidateSimulationNodeAddRequest(request, validation_options);
+    } catch (const std::runtime_error& error) {
+      if (!IsNodeCapacityFailure(error.what())) {
+        throw;
+      }
+      return node_capacity_failure_plan(request, validation_options);
+    }
+    command.confirmed = true;
+  } else if (typed_node_operation) {
     command.node_id = RequireString(arguments, "node_id");
     ValidateMcpIdentifier(command.node_id, "MCP node operation node_id");
     const std::uint64_t timeout_seconds =
@@ -782,13 +894,39 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     command.confirmed = true;
     command_timeout = std::chrono::seconds(timeout_seconds);
   } else {
-    command = ParseAndValidateSimulationCommand(
-        RequireObject(arguments, "command"), *config_.options);
+    Options validation_options = *config_.options;
+    McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
+    validation_options.nodes =
+        static_cast<std::uint32_t>(inventory.node_ids.size());
+    validation_options.node_ids = std::move(inventory.node_ids);
+    const boost::json::object& command_request =
+        RequireObject(arguments, "command");
+    try {
+      command =
+          ParseAndValidateSimulationCommand(command_request, validation_options);
+    } catch (const std::runtime_error& error) {
+      const boost::json::value* command_kind =
+          command_request.if_contains("kind");
+      const boost::json::value* node_add =
+          command_request.if_contains("node_add");
+      if (!IsNodeCapacityFailure(error.what()) || command_kind == nullptr ||
+          !command_kind->is_string() ||
+          command_kind->as_string() != "add_nodes" || node_add == nullptr ||
+          !node_add->is_object()) {
+        throw;
+      }
+      return node_capacity_failure_plan(node_add->as_object(),
+                                        validation_options);
+    }
+    node_add_operation = command.kind == SimulationCommandKind::kAddNodes;
   }
   return McpOperationPlan{
-      .progress_total = 1U,
+      .progress_total =
+          node_add_operation ? kSimulationNodeAddProgressTotal : 1U,
       .executor = [this, command = std::move(command), command_timeout,
-                   typed_node_operation](McpOperationContext& context) mutable {
+                   typed_node_operation, node_add_operation,
+                   direct_node_add_operation](
+                      McpOperationContext& context) mutable {
         {
           std::lock_guard<std::mutex> lock(mutex_);
           if (shutdown_ || stop_requested_ || run_stopped_) {
@@ -813,12 +951,16 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             });
         ThrowIfCancelled(stop_token);
         const SimulationCommandKind command_kind = command.kind;
+        const std::uint32_t expected_added_node_count =
+            command.node_add ? command.node_add->count : 0U;
         const std::string command_node_id = command.node_id;
         const std::string command_action =
             command_kind == SimulationCommandKind::kStopNode   ? "node.stop"
             : command_kind == SimulationCommandKind::kKillNode ? "node.kill"
             : command_kind == SimulationCommandKind::kRestartNode
                 ? "node.restart"
+            : command_kind == SimulationCommandKind::kAddNodes
+                ? "node.add"
                 : std::string(SimulationCommandKindName(command_kind));
         const auto operation_started = std::chrono::steady_clock::now();
         const std::optional<std::chrono::steady_clock::time_point>
@@ -837,9 +979,20 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         operation_control->absolute_deadline = terminal_deadline;
         command.operation_control = operation_control;
         const std::uint64_t sequence = SubmitCommand(std::move(command));
-        const SimulationCommandOutcome outcome =
-            WaitForCommand(sequence, stop_token, operation_control,
-                           cancellation_deadline, terminal_deadline);
+        const std::chrono::steady_clock::duration reconciliation_bound =
+            node_add_operation ? kSimulationNodeAddCancellationReconciliation
+                               : kSimulationCommandCancellationReconciliation;
+        const SimulationCommandOutcome outcome = [&] {
+          try {
+            return WaitForCommand(
+                sequence, stop_token, operation_control, cancellation_deadline,
+                terminal_deadline, reconciliation_bound,
+                node_add_operation ? &context : nullptr);
+          } catch (...) {
+            DetachPendingCommand(sequence);
+            throw;
+          }
+        }();
         if (outcome.state == SimulationCommandOutcomeState::kCancelled) {
           if (typed_node_operation) {
             const bool application_shutdown =
@@ -895,21 +1048,22 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         if (outcome.state ==
             SimulationCommandOutcomeState::kOutcomeUnconfirmed) {
           config_.request_run_stop();
+          const bool node_operation =
+              typed_node_operation || node_add_operation;
           throw McpOperationFailure(
-              typed_node_operation ? "node_outcome_unconfirmed"
-                                   : "command_outcome_unconfirmed",
-              (typed_node_operation ? "node operation command #"
-                                    : "simulation command #") +
+              node_operation ? "node_outcome_unconfirmed"
+                             : "command_outcome_unconfirmed",
+              (node_operation ? "node operation command #"
+                              : "simulation command #") +
                   std::to_string(sequence) +
                   " did not publish authoritative state within its "
                   "cancellation bound",
               false,
               boost::json::array{boost::json::object{
-                  {"code", typed_node_operation
-                               ? "node_outcome_unconfirmed"
-                               : "command_outcome_unconfirmed"},
+                  {"code", node_operation ? "node_outcome_unconfirmed"
+                                          : "command_outcome_unconfirmed"},
                   {"message",
-                   typed_node_operation
+                   node_operation
                        ? "the selected node state is indeterminate; run stop "
                          "was requested and blind retry is unsafe"
                        : "the command state is indeterminate; run stop was "
@@ -924,23 +1078,56 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         if (outcome.state == SimulationCommandOutcomeState::kFailed) {
           const std::string error =
               outcome.error.value_or("command failed without an error");
-          throw McpOperationFailure(
-              typed_node_operation ? "node_operation_failed"
-                                   : "simulation_command_failed",
-              (typed_node_operation ? "node operation command #"
-                                    : "simulation command #") +
-                  std::to_string(sequence) + " failed: " + error,
-              false,
-              boost::json::array{boost::json::object{
-                  {"code", typed_node_operation ? "node_operation_failed"
-                                                : "simulation_command_failed"},
-                  {"message", error},
-                  {"path", "command-" + std::to_string(sequence)},
-                  {"node_id", command_node_id},
-                  {"action", command_action},
-                  {"state", outcome.node_lifecycle.value_or("indeterminate")},
-                  {"command_id", "command-" + std::to_string(sequence)},
-                  {"recoverable", false}}});
+          const bool capacity_failure =
+              node_add_operation && IsNodeCapacityFailure(error);
+          const std::optional<SimulationNodeResourceFailure> resource_failure =
+              node_add_operation ? operation_control->NodeResourceFailure()
+                                 : std::nullopt;
+          const bool node_operation =
+              typed_node_operation || node_add_operation;
+          const std::string code = capacity_failure ? "node_capacity_exceeded"
+                                   : resource_failure
+                                       ? "node_resource_unavailable"
+                                   : node_add_operation ? "node_add_failed"
+                                   : typed_node_operation
+                                       ? "node_operation_failed"
+                                       : "simulation_command_failed";
+          boost::json::array diagnostics;
+          if (capacity_failure) {
+            diagnostics =
+                NodeCapacityDiagnostics(expected_added_node_count, NodeCount(),
+                                        config_.options->node_capacity);
+          } else if (resource_failure) {
+            diagnostics.emplace_back(boost::json::object{
+                {"code", code},
+                {"message", error},
+                {"path", "request"},
+                {"resource_kind", resource_failure->resource_kind},
+                {"node_id", resource_failure->node_id},
+                {"address", resource_failure->address},
+                {"port", resource_failure->port},
+                {"purpose", resource_failure->purpose},
+                {"mutation_started", resource_failure->mutation_started},
+                {"action", command_action},
+                {"command_id", "command-" + std::to_string(sequence)},
+                {"recoverable", true}});
+          } else {
+            diagnostics.emplace_back(boost::json::object{
+                {"code", code},
+                {"message", error},
+                {"path", "command-" + std::to_string(sequence)},
+                {"node_id", command_node_id},
+                {"action", command_action},
+                {"state", outcome.node_lifecycle.value_or("indeterminate")},
+                {"command_id", "command-" + std::to_string(sequence)},
+                {"recoverable", false}});
+          }
+          throw McpOperationFailure(code,
+                                    (node_operation ? "node operation command #"
+                                                    : "simulation command #") +
+                                        std::to_string(sequence) +
+                                        " failed: " + error,
+                                    false, std::move(diagnostics));
         }
         if (outcome.state != SimulationCommandOutcomeState::kSucceeded) {
           throw std::logic_error("unknown simulation command outcome state");
@@ -964,6 +1151,53 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                   {"action", command_action},
                   {"state", *outcome.node_lifecycle},
                   {"command_id", "command-" + std::to_string(sequence)},
+                  {"unchanged", false}}};
+        }
+        if (node_add_operation) {
+          if (outcome.added_node_ids.size() != expected_added_node_count ||
+              outcome.added_node_ids.empty()) {
+            config_.request_run_stop();
+            throw McpOperationFailure(
+                "node_outcome_unconfirmed",
+                "successful node.add omitted its exact authoritative node "
+                "identity set",
+                false);
+          }
+          boost::json::array added_node_ids;
+          boost::json::array affected_node_ids;
+          added_node_ids.reserve(outcome.added_node_ids.size());
+          affected_node_ids.reserve(outcome.added_node_ids.size());
+          for (const std::string& node_id : outcome.added_node_ids) {
+            added_node_ids.emplace_back(node_id);
+            affected_node_ids.emplace_back(node_id);
+          }
+          if (!direct_node_add_operation) {
+            return McpTypedResult{
+                .family = McpResultFamily::kRuntimeCommand,
+                .value = boost::json::object{
+                    {"result_family", "runtime_command"},
+                    {"run_id", config_.run_id},
+                    {"command_id", "command-" + std::to_string(sequence)},
+                    {"accepted", true},
+                    {"state", "succeeded"},
+                    {"action", "node.add"},
+                    {"added_node_ids", std::move(added_node_ids)},
+                    {"affected_node_ids", std::move(affected_node_ids)},
+                    {"inventory_generation", *outcome.inventory_generation},
+                    {"final_node_count", *outcome.final_node_count}}};
+          }
+          return McpTypedResult{
+              .family = McpResultFamily::kMutation,
+              .value = boost::json::object{
+                  {"result_family", "mutation"},
+                  {"run_id", config_.run_id},
+                  {"added_node_ids", std::move(added_node_ids)},
+                  {"removed_node_ids", boost::json::array{}},
+                  {"affected_node_ids", std::move(affected_node_ids)},
+                  {"action", "node.add"},
+                  {"command_id", "command-" + std::to_string(sequence)},
+                  {"inventory_generation", *outcome.inventory_generation},
+                  {"final_node_count", *outcome.final_node_count},
                   {"unchanged", false}}};
         }
         return McpTypedResult{
@@ -1009,11 +1243,23 @@ boost::json::value McpLiveApplication::ReadResource(
     boost::json::object capabilities =
         BuildMcpCapabilityDocument(selected, information_families);
     capabilities["access_mode"] = read_only() ? "read_only" : "read_write";
-    capabilities["current_run"] =
-        boost::json::object{{"run_id", config_.run_id},
-                            {"chain", CurrentChain()},
-                            {"state", RunState()},
-                            {"node_count", NodeCount()}};
+    const std::uint32_t node_count = NodeCount();
+    const ChainKind chain = config_.retained_run
+                                ? ParseChainKind(config_.retained_run->chain)
+                                : config_.options->chain;
+    const std::uint32_t node_capacity =
+        config_.retained_run ? node_count : config_.options->node_capacity;
+    capabilities["current_run"] = boost::json::object{
+        {"run_id", config_.run_id},
+        {"chain", CurrentChain()},
+        {"state", RunState(node_count)},
+        {"node_count", node_count},
+        {"node_capacity", node_capacity},
+        {"chain_node_maximum", ChainDriverSpecFor(chain).max_nodes},
+        {"available_node_capacity", config_.retained_run ? 0U
+                                    : node_count <= node_capacity
+                                        ? node_capacity - node_count
+                                        : 0U}};
     return ResourceEnvelope(family, config_.run_id, std::move(capabilities));
   }
   if (family == McpInformationFamily::kSchemas) {
@@ -1050,12 +1296,28 @@ boost::json::value McpLiveApplication::ReadResource(
     if (config_.retained_run) {
       static_cast<void>(ReportSnapshot(stop_token));
     }
+    const std::uint32_t node_count = NodeCount();
+    const std::uint32_t node_capacity =
+        config_.retained_run ? node_count : config_.options->node_capacity;
     return ResourceEnvelope(
         family, config_.run_id,
-        boost::json::array{boost::json::object{{"run_id", config_.run_id},
-                                               {"state", RunState()},
-                                               {"chain", CurrentChain()},
-                                               {"node_count", NodeCount()}}});
+        boost::json::array{boost::json::object{
+            {"run_id", config_.run_id},
+            {"state", RunState(node_count)},
+            {"chain", CurrentChain()},
+            {"node_count", node_count},
+            {"node_capacity", node_capacity},
+            {"chain_node_maximum",
+             ChainDriverSpecFor(
+                 config_.retained_run
+                     ? ParseChainKind(config_.retained_run->chain)
+                     : config_.options->chain)
+                 .max_nodes},
+            {"available_node_capacity",
+             config_.retained_run ? 0U
+             : node_count <= node_capacity
+                 ? node_capacity - node_count
+                 : 0U}}});
   }
 
   boost::json::object report = ReportSnapshot(stop_token);
@@ -1224,11 +1486,35 @@ std::uint64_t McpLiveApplication::SubmitCommand(SimulationCommand command) {
   return sequence;
 }
 
+void McpLiveApplication::DetachPendingCommand(
+    std::uint64_t sequence) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto pending = pending_commands_.find(sequence);
+    if (pending == pending_commands_.end()) {
+      return;
+    }
+    if (pending->second.completed) {
+      pending_commands_.erase(pending);
+    } else {
+      pending->second.detached = true;
+    }
+    command_outcome_ready_.notify_all();
+  } catch (...) {
+  }
+}
+
 SimulationCommandOutcome McpLiveApplication::WaitForCommand(
     std::uint64_t sequence, std::stop_token stop_token,
     const std::shared_ptr<SimulationCommandControl>& operation_control,
     std::optional<std::chrono::steady_clock::time_point> cancellation_deadline,
-    std::optional<std::chrono::steady_clock::time_point> terminal_deadline) {
+    std::optional<std::chrono::steady_clock::time_point> terminal_deadline,
+    std::chrono::steady_clock::duration reconciliation_bound,
+    McpOperationContext* progress_context) {
+  if (reconciliation_bound <= std::chrono::steady_clock::duration::zero()) {
+    throw std::invalid_argument(
+        "simulation command reconciliation bound must be positive");
+  }
   std::stop_callback wake_on_cancellation(
       stop_token, [this] { command_outcome_ready_.notify_all(); });
   std::unique_lock<std::mutex> lock(mutex_);
@@ -1239,7 +1525,33 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
            pending->second.completed;
   };
   bool cancellation_deadline_reached = false;
-  if (cancellation_deadline) {
+  if (progress_context != nullptr) {
+    std::uint64_t last_progress = 0U;
+    while (!stop_or_terminal()) {
+      const auto poll_deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+      const auto wait_deadline =
+          cancellation_deadline
+              ? std::min(poll_deadline, *cancellation_deadline)
+              : poll_deadline;
+      static_cast<void>(command_outcome_ready_.wait_until(lock, wait_deadline,
+                                                          stop_or_terminal));
+      const std::uint64_t progress =
+          operation_control->progress_completed.load(std::memory_order_acquire);
+      if (progress > last_progress) {
+        lock.unlock();
+        progress_context->ReportProgress(progress);
+        lock.lock();
+        last_progress = progress;
+      }
+      if (cancellation_deadline &&
+          std::chrono::steady_clock::now() >= *cancellation_deadline &&
+          !stop_or_terminal()) {
+        cancellation_deadline_reached = true;
+        break;
+      }
+    }
+  } else if (cancellation_deadline) {
     cancellation_deadline_reached = !command_outcome_ready_.wait_until(
         lock, *cancellation_deadline, stop_or_terminal);
   } else {
@@ -1274,8 +1586,7 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
         SimulationCommandCancellationCause::kClientCancel);
   }
   lock.lock();
-  auto drain_deadline = std::chrono::steady_clock::now() +
-                        kSimulationCommandCancellationReconciliation;
+  auto drain_deadline = std::chrono::steady_clock::now() + reconciliation_bound;
   if (terminal_deadline) {
     drain_deadline = std::min(drain_deadline, *terminal_deadline);
   }
@@ -1294,12 +1605,14 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
     config_.request_run_stop();
     return SimulationCommandOutcome{
         .state = SimulationCommandOutcomeState::kOutcomeUnconfirmed,
-        .cancellation_cause = operation_control->cancellation_cause.load(
-            std::memory_order_acquire),
+        .cancellation_cause = operation_control->CancellationCause(),
         .error =
-            "the simulator owner exceeded the 250ms cancellation "
+            "the simulator owner exceeded its declared cancellation "
             "reconciliation bound",
         .node_lifecycle = std::nullopt,
+        .added_node_ids = {},
+        .inventory_generation = std::nullopt,
+        .final_node_count = std::nullopt,
     };
   }
   if (!pending->second.outcome) {
@@ -1312,16 +1625,107 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
 
 void McpLiveApplication::RecordCommandOutcome(
     const SimulationCommand& command, const SimulationCommandOutcome& outcome) {
-  std::optional<SimulationCommandOutcome> published_outcome;
+  SimulationCommandOutcome validated_outcome = outcome;
+  const auto mark_outcome_unconfirmed = [&](std::string error) {
+    validated_outcome.state =
+        SimulationCommandOutcomeState::kOutcomeUnconfirmed;
+    validated_outcome.error = std::move(error);
+    try {
+      config_.request_run_stop();
+    } catch (...) {
+    }
+  };
+  if (command.kind == SimulationCommandKind::kAddNodes) {
+    try {
+      const std::optional<SimulationCommandCommitPhase> commit_phase =
+          command.operation_control
+              ? std::optional<SimulationCommandCommitPhase>(
+                    command.operation_control->CommitPhase())
+              : std::nullopt;
+      const bool phase_mismatch =
+          !commit_phase ||
+          (outcome.state == SimulationCommandOutcomeState::kSucceeded &&
+           *commit_phase != SimulationCommandCommitPhase::kCommitted) ||
+          ((outcome.state == SimulationCommandOutcomeState::kCancelled ||
+            outcome.state == SimulationCommandOutcomeState::kTimedOut) &&
+           *commit_phase != SimulationCommandCommitPhase::kCancelled) ||
+          (outcome.state == SimulationCommandOutcomeState::kFailed &&
+           *commit_phase != SimulationCommandCommitPhase::kOpen);
+      if (phase_mismatch) {
+        mark_outcome_unconfirmed(
+            "node-add outcome does not match its authoritative commit phase");
+      } else if (outcome.state ==
+                 SimulationCommandOutcomeState::kSucceeded) {
+        const std::optional<std::string> validation_error =
+            NodeAddOutcomeError(command, outcome);
+        const std::optional<std::uint64_t> initial_generation =
+            command.operation_control->InitialInventoryGeneration();
+        const std::optional<std::vector<std::string>> initial_node_ids =
+            command.operation_control->InitialInventoryNodeIds();
+        if (validation_error) {
+          mark_outcome_unconfirmed(*validation_error);
+        } else if (!initial_generation ||
+                   *initial_generation ==
+                       std::numeric_limits<std::uint64_t>::max() ||
+                   *initial_generation + 1U !=
+                       *outcome.inventory_generation) {
+          mark_outcome_unconfirmed(
+              "successful node-add outcome reused or skipped its "
+              "authoritative inventory generation");
+        } else if (!initial_node_ids) {
+          mark_outcome_unconfirmed(
+              "successful node-add outcome omitted its authoritative initial "
+              "node identities");
+        } else {
+          const McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
+          const bool generation_mismatch =
+              *outcome.inventory_generation != inventory.generation;
+          const bool count_mismatch =
+              inventory.node_ids.size() != *outcome.final_node_count ||
+              *outcome.final_node_count > config_.options->node_capacity;
+          const std::size_t expected_count =
+              initial_node_ids->size() + outcome.added_node_ids.size();
+          const bool identity_mismatch =
+              count_mismatch || expected_count != inventory.node_ids.size() ||
+              !std::equal(initial_node_ids->begin(), initial_node_ids->end(),
+                          inventory.node_ids.begin()) ||
+              !std::equal(
+                  outcome.added_node_ids.begin(),
+                  outcome.added_node_ids.end(),
+                  inventory.node_ids.begin() +
+                      static_cast<std::vector<std::string>::difference_type>(
+                          initial_node_ids->size()));
+          if (generation_mismatch) {
+            mark_outcome_unconfirmed(
+                "successful node-add outcome does not match the authoritative "
+                "inventory generation");
+          } else if (count_mismatch || identity_mismatch) {
+            mark_outcome_unconfirmed(
+                "successful node-add outcome does not preserve and append the "
+                "authoritative node identities");
+          }
+        }
+      }
+    } catch (const std::exception& error) {
+      mark_outcome_unconfirmed(
+          "node-add outcome reconciliation failed: " +
+          std::string(error.what()));
+    } catch (...) {
+      mark_outcome_unconfirmed(
+          "node-add outcome reconciliation failed with an unknown exception");
+    }
+  }
+  std::optional<SimulationCommandOutcome> published_outcome =
+      validated_outcome;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto pending = pending_commands_.find(command.sequence);
     if (pending == pending_commands_.end()) {
-      return;
-    }
-    if (pending->second.detached) {
+      // TUI and scheduled commands have no MCP-local waiter, but their shared
+      // authoritative outcomes are still public evidence.
+    } else if (pending->second.detached) {
       pending_commands_.erase(pending);
-      published_outcome = outcome;
+      published_outcome = validated_outcome;
     } else if (pending->second.completed) {
       pending->second.outcome = SimulationCommandOutcome{
           .state = SimulationCommandOutcomeState::kFailed,
@@ -1329,12 +1733,15 @@ void McpLiveApplication::RecordCommandOutcome(
           .error =
               "simulation command processor published more than one outcome",
           .node_lifecycle = std::nullopt,
+          .added_node_ids = {},
+          .inventory_generation = std::nullopt,
+          .final_node_count = std::nullopt,
       };
       published_outcome = pending->second.outcome;
     } else {
       pending->second.completed = true;
-      pending->second.outcome = outcome;
-      published_outcome = outcome;
+      pending->second.outcome = validated_outcome;
+      published_outcome = validated_outcome;
     }
     command_outcome_ready_.notify_all();
   }
@@ -1350,6 +1757,19 @@ void McpLiveApplication::RecordCommandOutcome(
   if (published_outcome->node_lifecycle) {
     data["node_lifecycle"] = *published_outcome->node_lifecycle;
   }
+  if (!published_outcome->added_node_ids.empty()) {
+    boost::json::array added_node_ids;
+    for (const std::string& node_id : published_outcome->added_node_ids) {
+      added_node_ids.emplace_back(node_id);
+    }
+    data["added_node_ids"] = std::move(added_node_ids);
+  }
+  if (published_outcome->inventory_generation) {
+    data["inventory_generation"] = *published_outcome->inventory_generation;
+  }
+  if (published_outcome->final_node_count) {
+    data["final_node_count"] = *published_outcome->final_node_count;
+  }
   PublishEvidence(McpInformationFamily::kEvents, "command_outcome",
                   "simulation command reached an authoritative outcome",
                   command.node_id.empty()
@@ -1359,7 +1779,7 @@ void McpLiveApplication::RecordCommandOutcome(
 }
 
 boost::json::object McpLiveApplication::ReportSnapshot(
-    std::stop_token stop_token) {
+    std::stop_token stop_token, bool publication_locked) {
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
   }
@@ -1372,6 +1792,10 @@ boost::json::object McpLiveApplication::ReportSnapshot(
   }
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
+  }
+  std::unique_lock<std::timed_mutex> publication_lock;
+  if (!publication_locked) {
+    publication_lock = AcquirePublicationLock(stop_token);
   }
   boost::json::object report;
   try {
@@ -1409,7 +1833,8 @@ boost::json::object McpLiveApplication::ReportSnapshot(
   return report;
 }
 
-std::string McpLiveApplication::RunState() const {
+std::string McpLiveApplication::RunState(
+    std::optional<std::uint32_t> live_node_count) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (config_.retained_run) {
     return config_.retained_run->state;
@@ -1423,7 +1848,9 @@ std::string McpLiveApplication::RunState() const {
   if (!run_started_) {
     return "starting";
   }
-  return config_.options->nodes == 0U ? "empty" : "active";
+  const std::uint32_t node_count =
+      live_node_count ? *live_node_count : NodeCount();
+  return node_count == 0U ? "empty" : "active";
 }
 
 std::string McpLiveApplication::CurrentChain() const {
@@ -1434,11 +1861,59 @@ std::string McpLiveApplication::CurrentChain() const {
 }
 
 std::uint32_t McpLiveApplication::NodeCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
   if (config_.retained_run) {
+    std::lock_guard<std::mutex> lock(mutex_);
     return config_.retained_run->node_count;
   }
-  return config_.options->nodes;
+  const std::size_t count = LiveNodeInventory().node_ids.size();
+  if (count > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::overflow_error("MCP live node inventory exceeds uint32");
+  }
+  return static_cast<std::uint32_t>(count);
+}
+
+std::uint32_t McpLiveApplication::current_node_count() const {
+  return NodeCount();
+}
+
+McpLiveNodeInventorySnapshot McpLiveApplication::LiveNodeInventory() const {
+  if (config_.retained_run || !config_.node_inventory_snapshot) {
+    throw std::logic_error("authoritative live node inventory is unavailable");
+  }
+  std::unique_lock<std::timed_mutex> publication_lock =
+      AcquirePublicationLock({});
+  McpLiveNodeInventorySnapshot snapshot = config_.node_inventory_snapshot();
+  if (snapshot.node_ids.size() > config_.options->node_capacity ||
+      snapshot.node_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::logic_error(
+        "authoritative live node inventory exceeds configured capacity");
+  }
+  std::set<std::string> unique;
+  for (const std::string& node_id : snapshot.node_ids) {
+    if (!IsSafeNodeAddIdentifier(node_id) || !unique.insert(node_id).second) {
+      throw std::logic_error(
+          "authoritative live node inventory has an invalid identity");
+    }
+  }
+  return snapshot;
+}
+
+std::unique_lock<std::timed_mutex>
+McpLiveApplication::AcquirePublicationLock(std::stop_token stop_token) const {
+  if (!config_.publication_mutex) {
+    return {};
+  }
+  std::unique_lock<std::timed_mutex> lock(*config_.publication_mutex,
+                                          std::defer_lock);
+  while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+  }
+  if (stop_token.stop_requested()) {
+    throw McpOperationCancelled();
+  }
+  return lock;
 }
 
 void McpLiveApplication::MarkRunStarted() {
@@ -1458,8 +1933,7 @@ void McpLiveApplication::MarkRunStarted() {
   }
   if (notify) {
     PublishEvidence(McpInformationFamily::kLifecycle, "run_started",
-                    "managed run entered its active lifecycle",
-                    std::nullopt,
+                    "managed run entered its active lifecycle", std::nullopt,
                     boost::json::object{{"state", RunState()}});
   }
 }

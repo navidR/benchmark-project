@@ -265,6 +265,7 @@ add_executable(bbp
   src/process_control_config.cpp
   src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
+  src/runtime_node_resource_manifest.cpp
   src/runtime_peer_topology.cpp
   src/resource_limit_patch.cpp
   src/run_ownership.cpp
@@ -404,6 +405,7 @@ if(BUILD_TESTING)
     tests/unit/process_control_config_tests.cpp
     tests/unit/probabilistic_block_scheduler_tests.cpp
     tests/unit/run_report_tests.cpp
+    tests/unit/runtime_node_resource_manifest_tests.cpp
     tests/unit/runtime_peer_topology_tests.cpp
     tests/unit/resource_limit_patch_tests.cpp
     tests/unit/run_ownership_tests.cpp
@@ -489,6 +491,7 @@ if(BUILD_TESTING)
     src/run_ownership.cpp
     src/run_process_state.cpp
     src/run_report.cpp
+    src/runtime_node_resource_manifest.cpp
     src/runtime_node_inventory.cpp
     src/runtime_peer_topology.cpp
     src/scenario_fields.cpp

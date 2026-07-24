@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -54,15 +55,50 @@ std::string ExceptionMessage(const std::exception_ptr& error) {
 
 }  // namespace
 
+struct PeerConnectivityController::PreparedFinalState {
+  std::vector<ChainNodeConfig> nodes;
+  std::map<std::string, PeerCountPolicy> policies;
+  std::set<std::string> all_peer_policy_node_ids;
+  AllowedPeerMap allowed_peers;
+  std::map<std::string, std::string> last_failures;
+  std::map<std::string, std::string> last_restoration_failures;
+  std::map<std::pair<std::string, std::string>, std::uint64_t>
+      topology_restore_suppressions;
+  std::map<std::string, std::uint64_t> topology_restore_requests;
+  std::map<std::string, std::uint64_t> topology_restore_completions;
+};
+
+PeerConnectivityController::PreparedFinalRegistration::
+    PreparedFinalRegistration(PeerConnectivityController* owner,
+                              std::unique_lock<std::mutex> operation_lock,
+                              std::unique_lock<std::mutex> restoration_lock,
+                              std::unique_ptr<PreparedFinalState> state)
+    : owner_(owner),
+      operation_lock_(std::move(operation_lock)),
+      restoration_lock_(std::move(restoration_lock)),
+      state_(std::move(state)) {}
+
+PeerConnectivityController::PreparedFinalRegistration::
+    PreparedFinalRegistration(PreparedFinalRegistration&&) noexcept = default;
+
+PeerConnectivityController::PreparedFinalRegistration&
+PeerConnectivityController::PreparedFinalRegistration::operator=(
+    PreparedFinalRegistration&&) noexcept = default;
+
+PeerConnectivityController::PreparedFinalRegistration::
+    ~PreparedFinalRegistration() = default;
+
 PeerConnectivityController::PeerConnectivityController(
     const ChainDriver& driver, std::vector<ChainNodeConfig> nodes,
     std::map<std::string, PeerCountPolicy> policies,
     AllowedPeerMap allowed_peers, std::chrono::milliseconds interval,
     NodeAvailableHandler node_available_handler, ActionHandler action_handler,
-    FailureHandler failure_handler)
+    FailureHandler failure_handler,
+    std::set<std::string> all_peer_policy_node_ids)
     : driver_(driver),
       nodes_(std::move(nodes)),
       policies_(std::move(policies)),
+      all_peer_policy_node_ids_(std::move(all_peer_policy_node_ids)),
       allowed_peers_(std::move(allowed_peers)),
       interval_(interval),
       node_available_handler_(std::move(node_available_handler)),
@@ -90,6 +126,19 @@ PeerConnectivityController::PeerConnectivityController(
     ValidateAllowedPeersUnlocked(node.id, allowed->second);
     topology_restore_requests_.emplace(node.id, 0U);
     topology_restore_completions_.emplace(node.id, 0U);
+  }
+  for (const std::string& node_id : all_peer_policy_node_ids_) {
+    const auto policy = policies_.find(node_id);
+    if (policy == policies_.end()) {
+      throw std::runtime_error("all-peers mode requires a peer policy for " +
+                               node_id);
+    }
+    const std::size_t count = AllowedPeersUnlocked(node_id).size();
+    if (count > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::overflow_error("all-peers policy count exceeds uint32");
+    }
+    policy->second = PeerCountPolicy(static_cast<std::uint32_t>(count),
+                                     static_cast<std::uint32_t>(count));
   }
   for (const auto& [node_id, policy] : policies_) {
     const std::size_t maximum_possible = nodes_.size() - 1U;
@@ -129,54 +178,320 @@ void PeerConnectivityController::Stop() {
 void PeerConnectivityController::RegisterNode(
     ChainNodeConfig node, std::optional<PeerCountPolicy> policy,
     std::vector<std::string> allowed_peer_node_ids) {
+  const std::string node_id = node.id;
+  std::vector<ChainNodeConfig> nodes;
+  nodes.push_back(std::move(node));
+  OptionalPolicyMap policies;
+  policies.emplace(node_id, std::move(policy));
+  AllowedPeerMap allowed_peers;
+  allowed_peers.emplace(node_id, std::move(allowed_peer_node_ids));
+  RegisterNodes(nodes, policies, allowed_peers);
+}
+
+void PeerConnectivityController::RegisterNodes(
+    const std::vector<ChainNodeConfig>& nodes,
+    const OptionalPolicyMap& policies, const AllowedPeerMap& allowed_peers) {
   std::lock_guard<std::mutex> lock(operation_mutex_);
-  if (node.id.empty()) {
+  if (nodes.empty()) {
     throw std::runtime_error(
-        "peer connectivity controller node id must not be empty");
+        "peer connectivity controller registration batch must not be empty");
   }
-  if (std::any_of(nodes_.begin(), nodes_.end(),
-                  [&](const ChainNodeConfig& candidate) {
-                    return candidate.id == node.id;
-                  })) {
-    throw std::runtime_error("simulation node is already registered: " +
-                             node.id);
-  }
-  const std::string registered_node_id = node.id;
-  nodes_.push_back(std::move(node));
-  try {
-    const auto [allowed, allowed_inserted] = allowed_peers_.emplace(
-        registered_node_id, std::move(allowed_peer_node_ids));
-    if (!allowed_inserted) {
-      throw std::logic_error(
-          "peer connectivity node registry is internally inconsistent");
+
+  std::set<std::string> batch_ids;
+  for (const ChainNodeConfig& node : nodes) {
+    if (node.id.empty()) {
+      throw std::runtime_error(
+          "peer connectivity controller node id must not be empty");
     }
-    ValidateAllowedPeersUnlocked(registered_node_id, allowed->second);
-    if (policy) {
-      const std::size_t maximum_possible = nodes_.size() - 1U;
-      if (policy->maximum() > maximum_possible ||
-          policy->minimum() > allowed->second.size()) {
-        throw std::runtime_error(
-            "peer policy is incompatible with the registered node set");
+    if (!batch_ids.insert(node.id).second) {
+      throw std::runtime_error(
+          "peer connectivity controller registration batch contains a "
+          "duplicate node id: " +
+          node.id);
+    }
+    if (std::any_of(nodes_.begin(), nodes_.end(),
+                    [&](const ChainNodeConfig& candidate) {
+                      return candidate.id == node.id;
+                    })) {
+      throw std::runtime_error("simulation node is already registered: " +
+                               node.id);
+    }
+  }
+  if (policies.size() != nodes.size()) {
+    throw std::runtime_error(
+        "peer connectivity controller registration batch requires one "
+        "optional policy entry for every node");
+  }
+  if (allowed_peers.size() < nodes.size()) {
+    throw std::runtime_error(
+        "peer connectivity controller registration batch requires allowed "
+        "peers for every new node");
+  }
+  for (const std::string& node_id : batch_ids) {
+    if (!policies.contains(node_id)) {
+      throw std::runtime_error(
+          "peer connectivity controller registration batch is missing a "
+          "policy entry for " +
+          node_id);
+    }
+    if (!allowed_peers.contains(node_id)) {
+      throw std::runtime_error(
+          "peer connectivity controller registration batch is missing "
+          "allowed peers for " +
+          node_id);
+    }
+  }
+  for (const auto& [node_id, policy] : policies) {
+    static_cast<void>(policy);
+    if (!batch_ids.contains(node_id)) {
+      throw std::runtime_error(
+          "peer connectivity controller registration batch contains an "
+          "extra policy entry for " +
+          node_id);
+    }
+  }
+  std::vector<ChainNodeConfig> next_nodes = nodes_;
+  next_nodes.reserve(next_nodes.size() + nodes.size());
+  next_nodes.insert(next_nodes.end(), nodes.begin(), nodes.end());
+  for (const auto& [node_id, peers] : allowed_peers) {
+    static_cast<void>(peers);
+    if (std::none_of(
+            next_nodes.begin(), next_nodes.end(),
+            [&](const ChainNodeConfig& node) { return node.id == node_id; })) {
+      throw std::runtime_error(
+          "peer connectivity controller registration batch contains extra "
+          "allowed peers for " +
+          node_id);
+    }
+  }
+
+  const std::size_t maximum_possible = next_nodes.size() - 1U;
+  for (const auto& [node_id, peers] : allowed_peers) {
+    std::set<std::string> unique_peers;
+    for (const std::string& peer_node_id : peers) {
+      const ChainNodeConfig& peer = FindNodeConfig(next_nodes, peer_node_id);
+      if (peer.id == node_id) {
+        throw std::runtime_error("allowed peer set must not contain its node");
       }
-      policies_.emplace(registered_node_id, *policy);
+      if (!unique_peers.insert(peer.id).second) {
+        throw std::runtime_error(
+            "allowed peer set contains a duplicate peer: " + peer.id);
+      }
     }
-    {
-      std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
-      topology_restore_requests_.emplace(registered_node_id, 0U);
-      topology_restore_completions_.emplace(registered_node_id, 0U);
+    const auto new_policy = policies.find(node_id);
+    const auto existing_policy = policies_.find(node_id);
+    const std::optional<PeerCountPolicy> policy =
+        new_policy != policies.end()
+            ? new_policy->second
+            : (existing_policy != policies_.end()
+                   ? std::optional<PeerCountPolicy>(existing_policy->second)
+                   : std::nullopt);
+    if (policy && (policy->maximum() > maximum_possible ||
+                   policy->minimum() > peers.size())) {
+      throw std::runtime_error(
+          "peer policy is incompatible with the registered node set");
     }
-  } catch (...) {
-    policies_.erase(registered_node_id);
-    allowed_peers_.erase(registered_node_id);
-    {
-      std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
-      topology_restore_requests_.erase(registered_node_id);
-      topology_restore_completions_.erase(registered_node_id);
-    }
-    nodes_.pop_back();
-    throw;
   }
+
+  std::map<std::string, PeerCountPolicy> next_policies = policies_;
+  AllowedPeerMap next_allowed_peers = allowed_peers_;
+  for (const auto& [node_id, peers] : allowed_peers) {
+    next_allowed_peers.insert_or_assign(node_id, peers);
+  }
+  for (const ChainNodeConfig& node : nodes) {
+    const std::optional<PeerCountPolicy>& policy = policies.at(node.id);
+    if (policy && !next_policies.emplace(node.id, *policy).second) {
+      throw std::logic_error(
+          "peer connectivity policy registry is internally inconsistent");
+    }
+  }
+
+  std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+  auto next_topology_restore_requests = topology_restore_requests_;
+  auto next_topology_restore_completions = topology_restore_completions_;
+  for (const ChainNodeConfig& node : nodes) {
+    if (!next_topology_restore_requests.emplace(node.id, 0U).second ||
+        !next_topology_restore_completions.emplace(node.id, 0U).second) {
+      throw std::logic_error(
+          "peer connectivity restoration registry is internally "
+          "inconsistent");
+    }
+  }
+
+  nodes_.swap(next_nodes);
+  policies_.swap(next_policies);
+  allowed_peers_.swap(next_allowed_peers);
+  topology_restore_requests_.swap(next_topology_restore_requests);
+  topology_restore_completions_.swap(next_topology_restore_completions);
   configuration_sequence_.fetch_add(1U, std::memory_order_release);
+}
+
+PeerConnectivityController::RpcMutationLease
+PeerConnectivityController::AcquireRpcMutationLease(
+    std::stop_token stop_token) {
+  return RpcMutationLease(LockRpc(stop_token));
+}
+
+PeerConnectivityController::PreparedFinalRegistration
+PeerConnectivityController::PrepareFinalRegistration(
+    const std::vector<ChainNodeConfig>& final_nodes,
+    const OptionalPolicyMap& new_policies,
+    const AllowedPeerMap& final_allowed_peers,
+    const std::set<std::string>& new_all_peer_policy_node_ids,
+    const RpcMutationLease& lease) {
+  if (!lease.lock_.owns_lock() || lease.lock_.mutex() != &rpc_mutex_) {
+    throw std::logic_error(
+        "peer final registration requires its controller RPC lease");
+  }
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
+  std::unique_lock<std::mutex> restoration_lock(restoration_mutex_);
+  if (final_nodes.size() < nodes_.size()) {
+    throw std::runtime_error(
+        "peer final registration must retain every existing node");
+  }
+
+  std::set<std::string> final_ids;
+  for (const ChainNodeConfig& node : final_nodes) {
+    if (node.id.empty() || !final_ids.insert(node.id).second) {
+      throw std::runtime_error(
+          "peer final registration has an empty or duplicate node id");
+    }
+  }
+  std::set<std::string> existing_ids;
+  for (const ChainNodeConfig& node : nodes_) {
+    existing_ids.insert(node.id);
+    if (!final_ids.contains(node.id)) {
+      throw std::runtime_error(
+          "peer final registration omitted existing node: " + node.id);
+    }
+  }
+  std::set<std::string> new_ids;
+  std::set_difference(final_ids.begin(), final_ids.end(), existing_ids.begin(),
+                      existing_ids.end(),
+                      std::inserter(new_ids, new_ids.end()));
+  if (new_policies.size() != new_ids.size()) {
+    throw std::runtime_error(
+        "peer final registration requires one optional policy for every "
+        "new node");
+  }
+  for (const auto& [node_id, policy] : new_policies) {
+    static_cast<void>(policy);
+    if (!new_ids.contains(node_id)) {
+      throw std::runtime_error(
+          "peer final registration contains a policy for a non-new node: " +
+          node_id);
+    }
+  }
+  for (const std::string& node_id : new_all_peer_policy_node_ids) {
+    if (!new_ids.contains(node_id)) {
+      throw std::runtime_error(
+          "peer final registration all-peers mode is limited to new nodes");
+    }
+    const auto policy = new_policies.find(node_id);
+    if (policy == new_policies.end() || !policy->second) {
+      throw std::runtime_error(
+          "peer final registration all-peers node requires a policy");
+    }
+  }
+  if (final_allowed_peers.size() != final_nodes.size()) {
+    throw std::runtime_error(
+        "peer final registration requires an exact allowed-peer map");
+  }
+  for (const ChainNodeConfig& node : final_nodes) {
+    const auto allowed = final_allowed_peers.find(node.id);
+    if (allowed == final_allowed_peers.end()) {
+      throw std::runtime_error(
+          "peer final registration is missing allowed peers for " + node.id);
+    }
+    std::set<std::string> unique;
+    for (const std::string& peer_id : allowed->second) {
+      if (!final_ids.contains(peer_id)) {
+        throw std::runtime_error(
+            "peer final registration references unknown peer: " + peer_id);
+      }
+      if (peer_id == node.id || !unique.insert(peer_id).second) {
+        throw std::runtime_error(
+            "peer final registration contains a self or duplicate peer");
+      }
+    }
+  }
+
+  auto state = std::make_unique<PreparedFinalState>();
+  state->nodes = final_nodes;
+  state->policies = policies_;
+  state->all_peer_policy_node_ids = all_peer_policy_node_ids_;
+  state->allowed_peers = final_allowed_peers;
+  state->last_failures = last_failures_;
+  state->last_restoration_failures = last_restoration_failures_;
+  state->topology_restore_suppressions = topology_restore_suppressions_;
+  state->topology_restore_requests = topology_restore_requests_;
+  state->topology_restore_completions = topology_restore_completions_;
+  for (const std::string& node_id : new_ids) {
+    const std::optional<PeerCountPolicy>& policy = new_policies.at(node_id);
+    if (policy) {
+      state->policies.emplace(node_id, *policy);
+    }
+    state->topology_restore_requests.emplace(node_id, 0U);
+    state->topology_restore_completions.emplace(node_id, 0U);
+  }
+  state->all_peer_policy_node_ids.insert(new_all_peer_policy_node_ids.begin(),
+                                         new_all_peer_policy_node_ids.end());
+  for (const std::string& node_id : state->all_peer_policy_node_ids) {
+    const auto policy = state->policies.find(node_id);
+    if (policy == state->policies.end()) {
+      throw std::logic_error("peer all-peers registry lost its typed policy");
+    }
+    const std::size_t count = state->allowed_peers.at(node_id).size();
+    if (count > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::overflow_error("all-peers policy count exceeds uint32");
+    }
+    policy->second = PeerCountPolicy(static_cast<std::uint32_t>(count),
+                                     static_cast<std::uint32_t>(count));
+  }
+  const std::size_t maximum_possible =
+      final_nodes.empty() ? 0U : final_nodes.size() - 1U;
+  for (const auto& [node_id, policy] : state->policies) {
+    if (!final_ids.contains(node_id) || policy.maximum() > maximum_possible ||
+        policy.minimum() > state->allowed_peers.at(node_id).size()) {
+      throw std::runtime_error(
+          "peer policy is incompatible with the final node set: " + node_id);
+    }
+  }
+  std::erase_if(state->topology_restore_suppressions, [&](const auto& item) {
+    const auto allowed = state->allowed_peers.find(item.first.first);
+    return allowed == state->allowed_peers.end() ||
+           std::find(allowed->second.begin(), allowed->second.end(),
+                     item.first.second) == allowed->second.end();
+  });
+  for (const ChainNodeConfig& node : final_nodes) {
+    state->last_failures.erase(node.id);
+    state->last_restoration_failures.erase(node.id);
+  }
+  return PreparedFinalRegistration(this, std::move(operation_lock),
+                                   std::move(restoration_lock),
+                                   std::move(state));
+}
+
+void PeerConnectivityController::PreparedFinalRegistration::Commit() noexcept {
+  if (owner_ == nullptr || !state_ || !operation_lock_.owns_lock() ||
+      operation_lock_.mutex() != &owner_->operation_mutex_ ||
+      !restoration_lock_.owns_lock() ||
+      restoration_lock_.mutex() != &owner_->restoration_mutex_ || committed_) {
+    std::terminate();
+  }
+  owner_->nodes_.swap(state_->nodes);
+  owner_->policies_.swap(state_->policies);
+  owner_->all_peer_policy_node_ids_.swap(state_->all_peer_policy_node_ids);
+  owner_->allowed_peers_.swap(state_->allowed_peers);
+  owner_->last_failures_.swap(state_->last_failures);
+  owner_->last_restoration_failures_.swap(state_->last_restoration_failures);
+  owner_->topology_restore_suppressions_.swap(
+      state_->topology_restore_suppressions);
+  owner_->topology_restore_requests_.swap(state_->topology_restore_requests);
+  owner_->topology_restore_completions_.swap(
+      state_->topology_restore_completions);
+  owner_->configuration_sequence_.fetch_add(1U, std::memory_order_release);
+  committed_ = true;
 }
 
 void PeerConnectivityController::UnregisterNode(std::string_view node_id,
@@ -210,6 +525,7 @@ void PeerConnectivityController::UnregisterNode(std::string_view node_id,
   }
   nodes_.erase(node);
   policies_.erase(key);
+  all_peer_policy_node_ids_.erase(key);
   allowed_peers_.erase(key);
   last_failures_.erase(key);
   last_restoration_failures_.erase(key);
@@ -237,6 +553,7 @@ void PeerConnectivityController::SetPolicy(std::string_view node_id,
                              " exceeds allowed logical peers");
   }
   policies_.insert_or_assign(std::string(node_id), policy);
+  all_peer_policy_node_ids_.erase(std::string(node_id));
   last_failures_.erase(std::string(node_id));
   last_restoration_failures_.erase(std::string(node_id));
   configuration_sequence_.fetch_add(1U, std::memory_order_release);
@@ -571,8 +888,8 @@ void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
     }
     try {
       if (EnforcePolicy(FindNodeConfig(nodes, node_id), nodes,
-                        allowed_peers.at(node_id), &policy, std::nullopt, {},
-                        configuration_sequence, stop_token)) {
+                        allowed_peers.at(node_id), allowed_peers, &policy,
+                        std::nullopt, {}, configuration_sequence, stop_token)) {
         std::lock_guard<std::mutex> lock(operation_mutex_);
         last_failures_.erase(node_id);
       }
@@ -619,8 +936,8 @@ void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
         if (policy != policies.end()) {
           continue;
         }
-        if (!EnforcePolicy(source, nodes, allowed, nullptr, requested,
-                           changed_node_id, configuration_sequence,
+        if (!EnforcePolicy(source, nodes, allowed, allowed_peers, nullptr,
+                           requested, changed_node_id, configuration_sequence,
                            stop_token)) {
           restored = false;
         } else {
@@ -662,6 +979,7 @@ void PeerConnectivityController::EnforcePolicies(std::stop_token stop_token) {
 bool PeerConnectivityController::EnforcePolicy(
     const ChainNodeConfig& node, const std::vector<ChainNodeConfig>& nodes,
     const std::vector<std::string>& allowed_peer_ids,
+    const AllowedPeerMap& all_allowed_peers,
     const PeerCountPolicy* policy,
     std::optional<std::uint64_t> restore_request_sequence,
     std::string_view changed_node_id,
@@ -734,7 +1052,14 @@ bool PeerConnectivityController::EnforcePolicy(
   const std::set<std::string> connected(connected_addresses.begin(),
                                         connected_addresses.end());
   for (std::size_t index = 0; index < all_candidates.size(); ++index) {
+    const auto reverse_allowed = all_allowed_peers.find(
+        all_candidates[index]->id);
+    const bool reverse_requires_physical_session =
+        reverse_allowed != all_allowed_peers.end() &&
+        std::find(reverse_allowed->second.begin(), reverse_allowed->second.end(),
+                  node.id) != reverse_allowed->second.end();
     if (allowed_peer_id_set.contains(all_candidates[index]->id) ||
+        reverse_requires_physical_session ||
         !connected.contains(all_candidate_endpoints[index])) {
       continue;
     }

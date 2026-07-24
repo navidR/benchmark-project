@@ -139,6 +139,60 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!timed_guard);
 }
 
+BOOST_AUTO_TEST_CASE(run_process_state_cleanup_lock_is_bounded) {
+  bbp::RunProcessState state;
+  std::atomic<bool> locked = false;
+  std::atomic<bool> release = false;
+  std::jthread holder([&] {
+    auto guard = state.Lock();
+    locked.store(true, std::memory_order_release);
+    while (!release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  });
+  while (!locked.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  const auto started_at = std::chrono::steady_clock::now();
+  std::optional<bbp::RunProcessState::Guard> timed_guard =
+      state.TryLockUntil(started_at + std::chrono::milliseconds(20));
+  BOOST_TEST(!timed_guard);
+  const auto lock_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - started_at)
+                                   .count();
+  BOOST_TEST(lock_elapsed_ns <
+             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::milliseconds(250))
+                 .count());
+
+  std::stop_source stop_source;
+  std::jthread canceler([&](std::stop_token) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    stop_source.request_stop();
+  });
+  const auto cancellation_started_at = std::chrono::steady_clock::now();
+  timed_guard = state.TryLockUntil(
+      cancellation_started_at + std::chrono::milliseconds(250),
+      stop_source.get_token());
+  BOOST_TEST(!timed_guard);
+  const auto cancellation_elapsed_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - cancellation_started_at)
+          .count();
+  BOOST_TEST(cancellation_elapsed_ns <
+             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::milliseconds(200))
+                 .count());
+
+  release.store(true, std::memory_order_release);
+  holder.join();
+  canceler.join();
+  timed_guard = state.TryLockUntil(std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(50));
+  BOOST_REQUIRE(timed_guard);
+}
+
 BOOST_AUTO_TEST_CASE(
     run_process_state_resume_snapshot_waits_for_native_mining_publication) {
   bbp::RunProcessState state;

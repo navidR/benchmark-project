@@ -96,13 +96,13 @@ std::string_view ScenarioObjectKindName(ScenarioObjectKind kind) {
 
 std::span<const std::string_view> ScenarioObjectFields(
     ScenarioObjectKind kind) {
-  static constexpr auto kRoot =
-      Fields("simulation", "chains", "chain", "chain_daemon", "output_dir",
-             "run_id", "topology", "nodes", "node_count", "block_production",
-             "generate_node", "ready_timeout_sec", "sync_timeout_sec",
-             "metrics_sample_count", "metrics_interval_ms", "isolated_network",
-             "workloads", "events", "resources", "resource_profiles", "process",
-             "network", "network_profiles", "generate_blocks");
+  static constexpr auto kRoot = Fields(
+      "simulation", "chains", "chain", "chain_daemon", "output_dir", "run_id",
+      "topology", "nodes", "node_count", "node_capacity", "block_production",
+      "generate_node", "ready_timeout_sec", "sync_timeout_sec",
+      "metrics_sample_count", "metrics_interval_ms", "isolated_network",
+      "workloads", "events", "resources", "resource_profiles", "process",
+      "network", "network_profiles", "generate_blocks");
   static constexpr auto kSimulation =
       Fields("name", "seed", "duration", "time_scale", "cleanup_policy",
              "privilege_mode", "log_retention_policy", "metrics_interval",
@@ -411,6 +411,7 @@ std::span<const std::string_view> ScenarioCommandFields(
   static constexpr auto kPartition = Fields("partition");
   static constexpr auto kPerf = Fields("perf_target", "perf_counters");
   static constexpr auto kWallet = Fields("wallet_send");
+  static constexpr auto kNodeAdd = Fields("node_add");
   switch (kind) {
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:
@@ -452,6 +453,8 @@ std::span<const std::string_view> ScenarioCommandFields(
       return kPerf;
     case SimulationCommandKind::kSendWalletTransaction:
       return kWallet;
+    case SimulationCommandKind::kAddNodes:
+      return kNodeAdd;
     case SimulationCommandKind::kCount:
       break;
   }
@@ -465,7 +468,8 @@ bool ScenarioCommandFieldAllowed(SimulationCommandKind kind,
     return kind != SimulationCommandKind::kSetBlockProductionPolicy &&
            kind != SimulationCommandKind::kPartitionNodes &&
            kind != SimulationCommandKind::kHealPartition &&
-           kind != SimulationCommandKind::kSetPerfCounters;
+           kind != SimulationCommandKind::kSetPerfCounters &&
+           kind != SimulationCommandKind::kAddNodes;
   }
   return Contains(fields, field);
 }

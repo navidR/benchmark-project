@@ -216,6 +216,27 @@ std::unique_ptr<ChainDriver> CreateChainDriver(ChainKind chain) {
                            std::string(ChainKindName(chain)));
 }
 
+std::string EffectiveP2pBindAddress(ChainKind chain,
+                                    const ChainNodeConfig& config) {
+  if (!config.p2p_bind.empty()) {
+    return config.p2p_bind;
+  }
+  switch (chain) {
+    case ChainKind::kFiro:
+    case ChainKind::kBitcoin:
+      return "0.0.0.0";
+    case ChainKind::kMonero:
+      if (config.p2p_host.empty()) {
+        throw std::runtime_error(
+            "Monero P2P bind address and host must not both be empty");
+      }
+      return config.p2p_host;
+    case ChainKind::kCount:
+      break;
+  }
+  throw std::runtime_error("chain P2P bind address is unavailable");
+}
+
 ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
                                     const ChainNodeConfigRequest& request) {
   const std::string node_id =

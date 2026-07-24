@@ -473,6 +473,153 @@ BOOST_AUTO_TEST_CASE(mcp_scheduled_events_cover_every_registered_action) {
   }
 }
 
+BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
+  const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
+  const boost::json::object& generic = VariantWithConst(
+      command_schema.at("oneOf").as_array(), "kind", "add_nodes");
+  const boost::json::object& generic_request =
+      generic.at("properties").as_object().at("node_add").as_object();
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::array& scenario_nodes = scenario.at("properties")
+                                                 .as_object()
+                                                 .at("nodes")
+                                                 .as_object()
+                                                 .at("oneOf")
+                                                 .as_array();
+  BOOST_REQUIRE_EQUAL(scenario_nodes.size(), 2U);
+  BOOST_TEST(scenario_nodes[0].as_object().at("minimum").as_uint64() == 0U);
+  BOOST_TEST(scenario_nodes[1].as_object().at("minItems").as_uint64() == 1U);
+  const boost::json::array& scheduled_variants = scenario.at("properties")
+                                                     .as_object()
+                                                     .at("events")
+                                                     .as_object()
+                                                     .at("items")
+                                                     .as_object()
+                                                     .at("oneOf")
+                                                     .as_array();
+  const boost::json::object& scheduled =
+      VariantWithConst(scheduled_variants, "action", "add_nodes");
+  const boost::json::object& scheduled_request =
+      scheduled.at("properties").as_object().at("node_add").as_object();
+
+  const boost::json::object direct =
+      BuildMcpOperationInputSchema(McpOperationKind::kAddNode);
+  const boost::json::object& direct_request =
+      direct.at("properties").as_object().at("request").as_object();
+  BOOST_TEST(generic_request == scheduled_request);
+  BOOST_TEST(generic_request == direct_request);
+  const boost::json::object& request_properties =
+      direct_request.at("properties").as_object();
+  BOOST_TEST(
+      request_properties.at("count").as_object().at("maximum").as_uint64() ==
+      kSimulationNodeAddMaximumCount);
+  BOOST_TEST(request_properties.at("node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == kSimulationNodeAddMaximumCount);
+  BOOST_TEST(request_properties.at("node_ids")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("maxLength")
+                 .as_uint64() == 32U);
+  const boost::json::array& topology_variants =
+      request_properties.at("topology").as_object().at("oneOf").as_array();
+  const boost::json::object& star =
+      VariantWithConst(topology_variants, "type", "star");
+  const boost::json::object& center_node =
+      star.at("properties").as_object().at("center_node").as_object();
+  BOOST_TEST(center_node.at("type").as_string() == "integer");
+  BOOST_TEST(center_node.at("minimum").as_uint64() == 1U);
+  BOOST_TEST(center_node.at("maximum").as_uint64() ==
+             kSimulationNodeAddMaximumCount);
+  const boost::json::object& custom =
+      VariantWithConst(topology_variants, "type", "custom_edge_list");
+  const boost::json::object& edge_properties = custom.at("properties")
+                                                   .as_object()
+                                                   .at("edges")
+                                                   .as_object()
+                                                   .at("items")
+                                                   .as_object()
+                                                   .at("properties")
+                                                   .as_object();
+  for (const std::string_view selector : {"from", "to"}) {
+    const boost::json::object& schema =
+        edge_properties.at(selector).as_object();
+    BOOST_TEST(schema.at("type").as_string() == "integer");
+    BOOST_TEST(schema.at("minimum").as_uint64() == 1U);
+    BOOST_TEST(schema.at("maximum").as_uint64() ==
+               kSimulationNodeAddMaximumCount);
+  }
+  const boost::json::object& internet_like =
+      VariantWithConst(topology_variants, "type", "internet_like_region_graph");
+  const boost::json::object& region_edge_properties =
+      internet_like.at("properties")
+          .as_object()
+          .at("region_edges")
+          .as_object()
+          .at("items")
+          .as_object()
+          .at("properties")
+          .as_object();
+  for (const std::string_view selector : {"from_region", "to_region"}) {
+    const boost::json::object& schema =
+        region_edge_properties.at(selector).as_object();
+    BOOST_TEST(schema.at("type").as_string() == "integer");
+    BOOST_TEST(schema.at("minimum").as_uint64() == 1U);
+    BOOST_TEST(schema.at("maximum").as_uint64() ==
+               kSimulationNodeAddMaximumCount);
+  }
+  for (const std::string_view rejected :
+       {"node_count", "wallet_node_count", "miner_node_count", "wallet_nodes",
+        "miner_nodes", "wallet_initialization", "peer_connectivity"}) {
+    BOOST_TEST(!star.at("properties").as_object().contains(rejected));
+  }
+
+  const boost::json::object direct_output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kAddNode)
+          .at("oneOf")
+          .as_array()
+          .front()
+          .as_object();
+  const boost::json::object& output_properties =
+      direct_output.at("properties").as_object();
+  BOOST_TEST(
+      output_properties.at("action").as_object().at("const").as_string() ==
+      "node.add");
+  BOOST_TEST(output_properties.at("added_node_ids")
+                 .as_object()
+                 .at("minItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(output_properties.at("removed_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(
+      output_properties.at("unchanged").as_object().at("const").as_bool() ==
+      false);
+  BOOST_TEST(output_properties.at("inventory_generation")
+                 .as_object()
+                 .at("type")
+                 .as_string() == "integer");
+  BOOST_TEST(output_properties.at("final_node_count")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == kSimulationNodeAddMaximumCount);
+
+  const boost::json::object runtime_output =
+      BuildMcpResultSchema(McpResultFamily::kRuntimeCommand);
+  const boost::json::object& runtime_properties =
+      runtime_output.at("properties").as_object();
+  for (const std::string_view field :
+       {"action", "added_node_ids", "affected_node_ids", "inventory_generation",
+        "final_node_count"}) {
+    BOOST_TEST(runtime_properties.contains(field));
+  }
+  BOOST_REQUIRE(runtime_output.contains("allOf"));
+}
+
 BOOST_AUTO_TEST_CASE(mcp_wallet_and_perf_schemas_preserve_production_types) {
   const boost::json::object wallet_send =
       BuildMcpScenarioObjectSchema(ScenarioObjectKind::kWalletSend);

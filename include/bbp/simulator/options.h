@@ -54,7 +54,9 @@ struct Options {
   PrivilegeMode privilege_mode = PrivilegeMode::kDirect;
   LogRetentionPolicy log_retention_policy = LogRetentionPolicy::kPreserve;
   bool empty_control_plane = false;
+  bool initial_run_requested = false;
   std::uint32_t nodes = 1;
+  std::uint32_t node_capacity = 0;
   std::vector<std::string> node_ids;
   std::vector<std::string> node_roles;
   std::vector<ScenarioNodeConfig> scenario_node_configs;

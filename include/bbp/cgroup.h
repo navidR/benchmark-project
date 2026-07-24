@@ -2,11 +2,13 @@
 
 #include <sys/types.h>
 
+#include <chrono>
 #include <compare>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -82,14 +84,24 @@ struct CgroupFreezeProbe {
 class Cgroup {
  public:
   static void PrepareRun(const std::string& run_id);
+  static void PrepareRun(const RunOwnership& ownership);
   static Cgroup Create(const std::string& run_id, const std::string& node_id);
   static void RemoveRun(const std::string& run_id);
+  static void RemoveRun(const std::string& run_id,
+                        std::chrono::steady_clock::time_point deadline,
+                        std::stop_token stop_token = {});
   static void RemoveStaleRun(const RunOwnership& ownership);
   static CgroupFreezeProbe ProbeFreezeThaw();
 
-  explicit Cgroup(std::filesystem::path path) : path_(std::move(path)) {}
+  explicit Cgroup(std::filesystem::path path);
+  Cgroup(const Cgroup&) = delete;
+  Cgroup& operator=(const Cgroup&) = delete;
+  Cgroup(Cgroup&& other) noexcept;
+  Cgroup& operator=(Cgroup&& other) noexcept;
+  ~Cgroup();
 
   const std::filesystem::path& path() const { return path_; }
+  std::filesystem::path access_path() const;
 
   void AttachPid(pid_t pid) const;
   void SetMemoryMax(uint64_t bytes) const;
@@ -103,11 +115,23 @@ class Cgroup {
   void Freeze() const;
   void Thaw() const;
   bool Frozen() const;
-  void KillAll() const;
-  void Remove() const;
+  bool Empty() const;
+  void KillAll(std::chrono::steady_clock::time_point deadline,
+               std::stop_token stop_token = {}) const;
+  void Remove(std::chrono::steady_clock::time_point deadline,
+              std::stop_token stop_token = {}) const;
 
  private:
+  void RequireBoundIdentity() const;
+  void Close() noexcept;
+
   std::filesystem::path path_;
+  std::string name_;
+  int parent_fd_ = -1;
+  int fd_ = -1;
+  std::uint64_t device_ = 0U;
+  std::uint64_t inode_ = 0U;
+  mutable bool removed_ = false;
 };
 
 #ifdef BBP_ENABLE_TEST_HOOKS
@@ -120,8 +144,16 @@ struct CgroupScopeTestConfig {
 
 void PrepareCgroupRunInTestScope(const CgroupScopeTestConfig& config,
                                  const std::string& run_id);
+void PrepareCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                 const RunOwnership& ownership);
 void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
                                 const std::string& run_id);
+void RemoveStaleCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                     const RunOwnership& ownership);
+void KillCgroupProcessesWithPidfdFallbackForTest(
+    const std::filesystem::path& path,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token = {});
 #endif
 
 }  // namespace bbp

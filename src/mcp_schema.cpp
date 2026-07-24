@@ -80,6 +80,13 @@ boost::json::object IdentifierSchema() {
                              {"pattern", "^[A-Za-z0-9][A-Za-z0-9_.-]*$"}};
 }
 
+boost::json::object NodeAddIdentifierSchema() {
+  return boost::json::object{{"type", "string"},
+                             {"minLength", 1U},
+                             {"maxLength", 32U},
+                             {"pattern", "^[A-Za-z0-9_-]{1,32}$"}};
+}
+
 boost::json::object IntegerSchema(std::uint64_t minimum = 0U,
                                   std::uint64_t maximum = kMaximumUint32) {
   return boost::json::object{
@@ -286,7 +293,7 @@ boost::json::object GenericFieldSchema(std::string_view field) {
             [](PerfCounterKind kind) { return PerfCounterKindName(kind); })),
         1U, kPerfCounterKinds.size(), true);
   }
-  if (field == "count" || field == "node_count" ||
+  if (field == "count" || field == "node_count" || field == "node_capacity" ||
       field == "wallet_node_count" || field == "miner_node_count" ||
       field == "average_degree" || field == "attachment_count" ||
       field == "minimum_peer_count" || field == "maximum_peer_count" ||
@@ -376,7 +383,7 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "runtime_node_restarts" || field == "runtime_node_freezes" ||
       field == "resource_limits" || field == "network_condition" ||
       field == "network_flow" || field == "partition" ||
-      field == "perf_target" || field == "wallet_send") {
+      field == "perf_target" || field == "wallet_send" || field == "node_add") {
     return TypeSchema("object");
   }
   if (field == "chain_daemon" || field == "output_dir" ||
@@ -450,6 +457,66 @@ boost::json::object TopologySchema() {
   }
   return boost::json::object{{"oneOf", std::move(variants)}};
 }
+
+boost::json::object NodeAddTopologySchema() {
+  const auto bounded_selector = [] {
+    return IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+  };
+  boost::json::array variants;
+  variants.reserve(static_cast<std::size_t>(PeerTopologyKind::kCount));
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(PeerTopologyKind::kCount); ++index) {
+    const auto kind = static_cast<PeerTopologyKind>(index);
+    boost::json::object properties;
+    properties["type"] = ConstStringSchema(PeerTopologyKindName(kind));
+    for (const std::string_view field : ScenarioTopologyKindFields(kind)) {
+      properties[field] = GenericFieldSchema(field);
+    }
+    if (properties.contains("center_node")) {
+      properties["center_node"] = bounded_selector();
+    }
+    if (properties.contains("latency_matrix_ms")) {
+      properties["latency_matrix_ms"] =
+          ArraySchema(ArraySchema(Nullable(IntegerSchema()), 1U,
+                                  kSimulationNodeAddMaximumCount),
+                      1U, kSimulationNodeAddMaximumCount);
+    }
+    if (properties.contains("groups") || properties.contains("regions")) {
+      const char* field = properties.contains("groups") ? "groups" : "regions";
+      properties[field] = ArraySchema(
+          ArraySchema(IntegerSchema(1U, kSimulationNodeAddMaximumCount), 1U,
+                      kSimulationNodeAddMaximumCount, true),
+          1U, kSimulationNodeAddMaximumCount);
+    }
+    if (kind == PeerTopologyKind::kCustomEdgeList) {
+      boost::json::object edge =
+          BuildMcpScenarioObjectSchema(ScenarioObjectKind::kTopologyEdge);
+      boost::json::object& edge_properties = edge.at("properties").as_object();
+      edge_properties["from"] = bounded_selector();
+      edge_properties["to"] = bounded_selector();
+      properties["edges"] = ArraySchema(
+          std::move(edge), 0U,
+          kSimulationNodeAddMaximumCount * kSimulationNodeAddMaximumCount);
+    } else if (kind == PeerTopologyKind::kInternetLikeRegionGraph) {
+      boost::json::object region_edge =
+          BuildMcpScenarioObjectSchema(ScenarioObjectKind::kTopologyRegionEdge);
+      boost::json::object& region_edge_properties =
+          region_edge.at("properties").as_object();
+      region_edge_properties["from_region"] = bounded_selector();
+      region_edge_properties["to_region"] = bounded_selector();
+      properties["region_edges"] = ArraySchema(
+          std::move(region_edge), 0U,
+          kSimulationNodeAddMaximumCount * kSimulationNodeAddMaximumCount);
+    }
+    variants.push_back(
+        ClosedObject(std::move(properties), kind == PeerTopologyKind::kFullMesh
+                                                ? boost::json::array{}
+                                                : Required({"type"})));
+  }
+  return boost::json::object{{"oneOf", std::move(variants)}};
+}
+
+boost::json::object NodeMutationConfigSchema();
 
 boost::json::object WorkloadVariant(WorkloadKind kind,
                                     std::string_view discriminator,
@@ -590,6 +657,9 @@ boost::json::object CommandVariant(SimulationCommandKind kind,
     properties["wallet_send"] =
         BuildMcpScenarioObjectSchema(ScenarioObjectKind::kWalletSend);
   }
+  if (properties.contains("node_add")) {
+    properties["node_add"] = NodeMutationConfigSchema();
+  }
   for (const std::string_view field : ScenarioCommandFields(kind)) {
     required.emplace_back(field);
   }
@@ -710,21 +780,32 @@ boost::json::object DiagnosticSchema() {
   properties["action"] = IdentifierSchema();
   properties["state"] = IdentifierSchema();
   properties["command_id"] = IdentifierSchema();
+  properties["requested_count"] = Uint64Schema();
+  properties["current_node_count"] = Uint64Schema();
+  properties["node_capacity"] = Uint64Schema();
+  properties["available_node_capacity"] = Uint64Schema();
+  properties["resource_kind"] = IdentifierSchema();
+  properties["address"] = StringSchema(1U);
+  properties["port"] = IntegerSchema(1U, 65535U);
+  properties["purpose"] = IdentifierSchema();
+  properties["mutation_started"] = TypeSchema("boolean");
   return ClosedObject(std::move(properties), Required({"code", "message"}));
 }
 
 boost::json::object NodeMutationConfigSchema() {
   boost::json::object properties;
   properties["chain"] = ChainSchema();
-  properties["count"] = IntegerSchema(1U, kMaximumSafeCollection);
-  properties["node_ids"] =
-      ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
+  properties["count"] = IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+  properties["node_ids"] = ArraySchema(NodeAddIdentifierSchema(), 1U,
+                                       kSimulationNodeAddMaximumCount, true);
   properties["binary"] = StringSchema(1U);
-  properties["topology"] = TopologySchema();
+  properties["topology"] = NodeAddTopologySchema();
   properties["resources"] = ResourceLimitsSchema();
   properties["network"] = NetworkConditionSchema();
-  properties["ready_timeout_sec"] = IntegerSchema(1U);
-  properties["sync_timeout_sec"] = IntegerSchema(1U);
+  properties["ready_timeout_sec"] =
+      IntegerSchema(1U, kSimulationNodeAddMaximumTimeoutSeconds);
+  properties["sync_timeout_sec"] =
+      IntegerSchema(1U, kSimulationNodeAddMaximumTimeoutSeconds);
   return ClosedObject(std::move(properties), Required({"chain", "count"}));
 }
 
@@ -1003,7 +1084,7 @@ boost::json::object BuildMcpScenarioSchema() {
                           {"additionalProperties", false}};
   properties["topology"] = TopologySchema();
   properties["nodes"] =
-      OneOf({IntegerSchema(1U),
+      OneOf({IntegerSchema(0U),
              ArraySchema(
                  BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNode), 1U)});
   properties["block_production"] =
@@ -1454,6 +1535,30 @@ boost::json::object TypedNodeLifecycleMutationSchema(
   return schema;
 }
 
+boost::json::object NodeAddMutationSchema() {
+  boost::json::object schema = BuildMcpResultSchema(McpResultFamily::kMutation);
+  boost::json::object& properties = schema.at("properties").as_object();
+  properties["added_node_ids"] = ArraySchema(
+      NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
+  properties["removed_node_ids"] =
+      ArraySchema(NodeAddIdentifierSchema(), 0U, 0U, true);
+  properties["affected_node_ids"] = ArraySchema(
+      NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
+  properties["action"] = ConstStringSchema("node.add");
+  properties["inventory_generation"] = IntegerSchema();
+  properties["final_node_count"] =
+      IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+  properties["unchanged"] =
+      boost::json::object{{"type", "boolean"}, {"const", false}};
+  boost::json::array& required = schema.at("required").as_array();
+  for (const std::string_view field :
+       {"affected_node_ids", "action", "command_id", "inventory_generation",
+        "final_node_count"}) {
+    required.emplace_back(field);
+  }
+  return schema;
+}
+
 boost::json::object TypedNodeLifecycleCancellationDiagnosticSchema(
     McpOperationKind operation) {
   boost::json::object schema = DiagnosticSchema();
@@ -1499,7 +1604,25 @@ boost::json::object BuildMcpResultSchema(
       properties["operation_id"] = IdentifierSchema();
       properties["accepted"] = TypeSchema("boolean");
       properties["state"] = OperationStateSchema();
+      properties["action"] = IdentifierSchema();
+      properties["added_node_ids"] = ArraySchema(
+          NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
+      properties["affected_node_ids"] = ArraySchema(
+          NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
+      properties["inventory_generation"] = Uint64Schema();
+      properties["final_node_count"] = IntegerSchema();
       require({"run_id", "command_id", "accepted", "state"});
+      constraints.emplace_back(boost::json::object{
+          {"if",
+           boost::json::object{
+               {"properties",
+                boost::json::object{{"action", ConstStringSchema("node.add")}}},
+               {"required", Required({"action"})}}},
+          {"then",
+           boost::json::object{
+               {"required",
+                Required({"added_node_ids", "affected_node_ids",
+                          "inventory_generation", "final_node_count"})}}}});
       break;
     case McpResultFamily::kMutation:
       properties["run_id"] = IdentifierSchema();
@@ -1758,6 +1881,7 @@ boost::json::object BuildMcpOperationOutputSchema(
   choices.emplace_back(
       IsTypedNodeLifecycleOperation(operation)
           ? TypedNodeLifecycleMutationSchema(operation)
+      : operation == McpOperationKind::kAddNode ? NodeAddMutationSchema()
       : result_family == McpResultFamily::kOperation
           ? BuildMcpResultSchema(result_family, selected_operations)
           : BuildMcpResultSchema(result_family));
@@ -1795,7 +1919,7 @@ boost::json::object BuildMcpNotificationDiscovery(
   for (const McpOperationKind operation : operations) {
     operation_names.emplace_back(McpOperationKindName(operation));
   }
-  boost::json::array states{"queued", "running",   "cancelling",
+  boost::json::array states{"queued",    "running",   "cancelling",
                             "cancelled", "succeeded", "failed"};
 
   boost::json::array methods{kMcpOperationUpdatedNotification};
@@ -1818,10 +1942,9 @@ boost::json::object BuildMcpNotificationDiscovery(
                             {"item", EvidenceRecordSchema()}},
         {"subscription_id", "item"}));
   }
-  return boost::json::object{
-      {"transport", "MCP SSE GET stream"},
-      {"methods", std::move(methods)},
-      {"schemas", std::move(schemas)}};
+  return boost::json::object{{"transport", "MCP SSE GET stream"},
+                             {"methods", std::move(methods)},
+                             {"schemas", std::move(schemas)}};
 }
 
 boost::json::array BuildMcpToolRegistry(

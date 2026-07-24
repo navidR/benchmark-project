@@ -121,6 +121,67 @@ BOOST_AUTO_TEST_CASE(run_report_rejects_records_from_a_different_run) {
   std::filesystem::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(
+    run_report_applies_runtime_generation_as_one_complete_snapshot) {
+  const std::filesystem::path dir = MakeTestDir("runtime-generation-report");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"generation","chain":"firo","nodes":0,"node_configs":[],"topology_initial_edges":[]})");
+  const boost::json::object detail{
+      {"generation", 2U},
+      {"node_count", 2U},
+      {"node_ids", boost::json::array{"firo-1", "firo-2"}},
+      {"node_configs",
+       boost::json::array{
+           boost::json::object{{"index", 1U},
+                               {"id", "firo-1"},
+                               {"chain", "firo"},
+                               {"role", "base"},
+                               {"lifecycle", "running"}},
+           boost::json::object{{"index", 2U},
+                               {"id", "firo-2"},
+                               {"chain", "firo"},
+                               {"role", "miner"},
+                               {"lifecycle", "running"}}}},
+      {"topology", boost::json::object{{"type", "full_mesh"}}},
+      {"topology_current_edges",
+       boost::json::array{
+           boost::json::object{{"from", 1U},
+                               {"to", 2U},
+                               {"band", 1U},
+                               {"active", true},
+                               {"condition", nullptr}},
+           boost::json::object{{"from", 2U},
+                               {"to", 1U},
+                               {"band", 1U},
+                               {"active", true},
+                               {"condition", nullptr}}}},
+      {"manifest_state", "live"}};
+  bbp::AppendLine(
+      dir / "events.jsonl",
+      boost::json::serialize(boost::json::object{
+          {"run_id", "generation"},
+          {"node_id", "sim"},
+          {"event", "runtime_generation_published"},
+          {"detail", boost::json::serialize(detail)}}));
+
+  const boost::json::object report = bbp::BuildRunReport(dir);
+  BOOST_TEST(JsonInteger(report, "inventory_generation") == 2U);
+  BOOST_TEST(JsonInteger(report, "nodes") == 2U);
+  BOOST_TEST(report.at("node_ids").as_array() ==
+             boost::json::array({"firo-1", "firo-2"}));
+  BOOST_TEST(report.at("node_configs").as_array().size() == 2U);
+  BOOST_TEST(report.at("topology_current_edges").as_array().size() == 2U);
+  BOOST_TEST(report.at("nodes_summary").as_array().size() == 2U);
+  BOOST_TEST(report.at("nodes_summary")
+                 .as_array()
+                 .back()
+                 .as_object()
+                 .at("role")
+                 .as_string() == "miner");
+  std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(item10_prefixed_report_retention_reproducer) {
   const std::filesystem::path dir = MakeTestDir("item10-prefixed-report");
   bbp::WriteText(dir / "resolved-scenario.json",

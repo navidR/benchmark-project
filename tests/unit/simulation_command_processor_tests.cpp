@@ -14,6 +14,24 @@
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
 
+namespace {
+
+bbp::SimulationNodeAddRequest NodeAddRequest(std::string node_id) {
+  return bbp::SimulationNodeAddRequest{
+      .chain = bbp::ChainKind::kFiro,
+      .count = 1U,
+      .node_ids = {std::move(node_id)},
+      .binary = std::nullopt,
+      .topology = std::nullopt,
+      .resources = std::nullopt,
+      .network = std::nullopt,
+      .ready_timeout_sec = 30U,
+      .sync_timeout_sec = 30U,
+  };
+}
+
+}  // namespace
+
 BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
   bbp::SimulationCommandQueue queue;
   std::vector<bbp::SimulationCommand> handled;
@@ -26,6 +44,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
         if (handled.size() == 2U) {
           handled_all.set_value();
         }
+        return bbp::SimulationCommandOutcome{};
       },
       [&failures](const bbp::SimulationCommand&, std::string_view detail) {
         failures.emplace_back(detail);
@@ -56,6 +75,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_reports_and_continues) {
         }
         handled.push_back(command.sequence);
         handled_all.set_value();
+        return bbp::SimulationCommandOutcome{};
       },
       [&failures](const bbp::SimulationCommand& command,
                   std::string_view detail) {
@@ -85,6 +105,7 @@ BOOST_AUTO_TEST_CASE(
       queue,
       [&handler_called](const bbp::SimulationCommand&) {
         handler_called = true;
+        return bbp::SimulationCommandOutcome{};
       },
       [&failure_reported](const bbp::SimulationCommand&, std::string_view) {
         failure_reported = true;
@@ -117,6 +138,47 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_preserves_cancellation_that_wins_during_handler) {
+  bbp::SimulationCommandQueue queue;
+  std::atomic_bool failure_reported = false;
+  std::promise<bbp::SimulationCommandOutcome> outcome;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [](const bbp::SimulationCommand& command)
+          -> bbp::SimulationCommandOutcome {
+        if (!command.operation_control) {
+          throw std::logic_error("node-add command has no operation control");
+        }
+        if (!command.operation_control->RequestCancellation(
+                bbp::SimulationCommandCancellationCause::kDeadline)) {
+          throw std::logic_error("node-add cancellation did not win");
+        }
+        throw std::runtime_error(
+            "node-add rollback completed after its deadline");
+      },
+      [&failure_reported](const bbp::SimulationCommand&, std::string_view) {
+        failure_reported = true;
+      },
+      [&outcome](const bbp::SimulationCommand&,
+                 const bbp::SimulationCommandOutcome& result) {
+        outcome.set_value(result);
+      });
+  queue.PushAddNodes(NodeAddRequest("cancelled-add"));
+
+  processor.Start();
+  const bbp::SimulationCommandOutcome result = outcome.get_future().get();
+  processor.Stop();
+
+  BOOST_TEST(!failure_reported);
+  BOOST_CHECK(result.state == bbp::SimulationCommandOutcomeState::kTimedOut);
+  BOOST_CHECK(result.cancellation_cause ==
+              bbp::SimulationCommandCancellationCause::kDeadline);
+  BOOST_REQUIRE(result.error);
+  BOOST_TEST(*result.error ==
+             "node-add rollback completed after its deadline");
+}
+
+BOOST_AUTO_TEST_CASE(
     simulation_command_processor_preserves_outcome_unconfirmed_failure) {
   bbp::SimulationCommandQueue queue;
   std::atomic_bool failure_reported = false;
@@ -127,6 +189,7 @@ BOOST_AUTO_TEST_CASE(
         command.operation_control->outcome_unconfirmed.store(
             true, std::memory_order_release);
         throw std::runtime_error("physical state read-back timed out");
+        return bbp::SimulationCommandOutcome{};
       },
       [&failure_reported](const bbp::SimulationCommand&, std::string_view) {
         failure_reported = true;
@@ -163,6 +226,7 @@ BOOST_AUTO_TEST_CASE(
       [](const bbp::SimulationCommand&) {
         throw bbp::SimulationCommandOutcomeUnconfirmed(
             "physical state read-back timed out");
+        return bbp::SimulationCommandOutcome{};
       },
       [&failure_reported](const bbp::SimulationCommand&, std::string_view) {
         failure_reported = true;
@@ -211,6 +275,7 @@ BOOST_AUTO_TEST_CASE(
               "native mining RPC lock deadline expired before node restart");
         }
         restart_admitted = true;
+        return bbp::SimulationCommandOutcome{};
       },
       [](const bbp::SimulationCommand&, std::string_view) {},
       [&outcome](const bbp::SimulationCommand&,
@@ -255,7 +320,10 @@ BOOST_AUTO_TEST_CASE(simulation_command_processor_requires_handlers) {
           [](const bbp::SimulationCommand&, std::string_view) {}),
       std::runtime_error);
   BOOST_CHECK_THROW(bbp::SimulationCommandProcessor(
-                        queue, [](const bbp::SimulationCommand&) {},
+                        queue,
+                        [](const bbp::SimulationCommand&) {
+                          return bbp::SimulationCommandOutcome{};
+                        },
                         bbp::SimulationCommandProcessor::FailureHandler{}),
                     std::runtime_error);
 }
@@ -268,6 +336,7 @@ BOOST_AUTO_TEST_CASE(
       queue,
       [&handled](const bbp::SimulationCommand& command) {
         handled.set_value(command);
+        return bbp::SimulationCommandOutcome{};
       },
       [](const bbp::SimulationCommand&, std::string_view) {});
   bbp::ResourceLimitPatch patch;
@@ -297,6 +366,7 @@ BOOST_AUTO_TEST_CASE(
         if (command.sequence == 2U) {
           throw std::runtime_error("scheduled failure");
         }
+        return bbp::SimulationCommandOutcome{};
       },
       [](const bbp::SimulationCommand&, std::string_view) {},
       [&outcomes, &all_outcomes](const bbp::SimulationCommand& command,
@@ -354,6 +424,7 @@ BOOST_AUTO_TEST_CASE(
         handled.push_back(command.sequence);
         first_started.set_value();
         release.wait();
+        return bbp::SimulationCommandOutcome{};
       },
       [&](const bbp::SimulationCommand& command, std::string_view error) {
         failures.emplace_back(command.sequence, error);
@@ -390,4 +461,155 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(outcomes[2].second);
   BOOST_TEST(*outcomes[2].second ==
              "simulation command processor stopped before execution");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_shutdown_cancels_queued_node_add_controls) {
+  bbp::SimulationCommandQueue queue;
+  std::promise<void> first_started;
+  std::promise<void> release_first;
+  const std::shared_future<void> release = release_first.get_future().share();
+  std::vector<std::uint64_t> handled;
+  std::vector<std::pair<bbp::SimulationCommand, bbp::SimulationCommandOutcome>>
+      outcomes;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&](const bbp::SimulationCommand& command) {
+        handled.push_back(command.sequence);
+        first_started.set_value();
+        release.wait();
+        return bbp::SimulationCommandOutcome{};
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&](const bbp::SimulationCommand& command,
+          const bbp::SimulationCommandOutcome& outcome) {
+        outcomes.emplace_back(command, outcome);
+      });
+
+  const std::uint64_t active_sequence =
+      queue.Push(bbp::SimulationCommandKind::kIncreaseLogVerbosity, "firo-1");
+  const std::uint64_t tui_sequence =
+      queue.PushAddNodes(NodeAddRequest("tui-add"));
+  bbp::SimulationCommand scheduled;
+  scheduled.kind = bbp::SimulationCommandKind::kAddNodes;
+  scheduled.node_id = "sim";
+  scheduled.node_add = NodeAddRequest("scheduled-add");
+  scheduled.confirmed = true;
+  scheduled.scheduled_event_sequence = 1U;
+  const std::uint64_t scheduled_sequence =
+      queue.PushScenarioCommand(std::move(scheduled));
+
+  processor.Start();
+  first_started.get_future().wait();
+  std::future<void> stopped =
+      std::async(std::launch::async, [&] { processor.Stop(); });
+  while (!queue.IsClosed()) {
+    std::this_thread::yield();
+  }
+  release_first.set_value();
+  stopped.get();
+
+  BOOST_REQUIRE_EQUAL(handled.size(), 1U);
+  BOOST_TEST(handled.front() == active_sequence);
+  BOOST_REQUIRE_EQUAL(outcomes.size(), 3U);
+  BOOST_TEST(outcomes.front().first.sequence == active_sequence);
+  for (std::size_t index = 1U; index < outcomes.size(); ++index) {
+    const bbp::SimulationCommand& command = outcomes[index].first;
+    const bbp::SimulationCommandOutcome& outcome = outcomes[index].second;
+    BOOST_TEST(command.sequence ==
+               (index == 1U ? tui_sequence : scheduled_sequence));
+    BOOST_REQUIRE(command.operation_control);
+    BOOST_CHECK(command.operation_control->CommitPhase() ==
+                bbp::SimulationCommandCommitPhase::kCancelled);
+    BOOST_CHECK(command.operation_control->CancellationCause() ==
+                bbp::SimulationCommandCancellationCause::kApplicationShutdown);
+    BOOST_TEST(command.operation_control->stop_source.stop_requested());
+    BOOST_CHECK(outcome.state ==
+                bbp::SimulationCommandOutcomeState::kCancelled);
+    BOOST_CHECK(outcome.cancellation_cause ==
+                bbp::SimulationCommandCancellationCause::kApplicationShutdown);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_rejects_node_add_success_without_commit) {
+  bbp::SimulationCommandQueue queue;
+  std::promise<bbp::SimulationCommandOutcome> outcome;
+  std::shared_ptr<bbp::SimulationCommandControl> control;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&](const bbp::SimulationCommand& command) {
+        control = command.operation_control;
+        return bbp::SimulationCommandOutcome{
+            .state = bbp::SimulationCommandOutcomeState::kSucceeded,
+            .cancellation_cause =
+                bbp::SimulationCommandCancellationCause::kNone,
+            .error = std::nullopt,
+            .node_lifecycle = std::nullopt,
+            .added_node_ids = {"uncommitted-add"},
+            .inventory_generation = 2U,
+            .final_node_count = 2U,
+        };
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&](const bbp::SimulationCommand&,
+          const bbp::SimulationCommandOutcome& result) {
+        outcome.set_value(result);
+      });
+  queue.PushAddNodes(NodeAddRequest("uncommitted-add"));
+
+  processor.Start();
+  const bbp::SimulationCommandOutcome result = outcome.get_future().get();
+  processor.Stop();
+
+  BOOST_REQUIRE(control);
+  BOOST_CHECK(control->CommitPhase() ==
+              bbp::SimulationCommandCommitPhase::kOpen);
+  BOOST_CHECK(result.state ==
+              bbp::SimulationCommandOutcomeState::kOutcomeUnconfirmed);
+  BOOST_REQUIRE(result.error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_rejects_terminal_outcomes_after_add_commit) {
+  bbp::SimulationCommandQueue queue;
+  std::vector<bbp::SimulationCommandOutcome> outcomes;
+  std::promise<void> all_outcomes;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [](const bbp::SimulationCommand& command)
+          -> bbp::SimulationCommandOutcome {
+        if (!command.operation_control) {
+          throw std::logic_error("node-add command has no commit control");
+        }
+        if (!command.operation_control->TryBeginCommit()) {
+          throw std::logic_error("node-add commit was not admitted");
+        }
+        if (command.sequence == 1U) {
+          throw bbp::SimulationCancelled();
+        }
+        command.operation_control->MarkCommitted();
+        throw std::runtime_error("post-publication evidence failed");
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&](const bbp::SimulationCommand&,
+          const bbp::SimulationCommandOutcome& result) {
+        outcomes.push_back(result);
+        if (outcomes.size() == 2U) {
+          all_outcomes.set_value();
+        }
+      });
+  queue.PushAddNodes(NodeAddRequest("commit-started-add"));
+  queue.PushAddNodes(NodeAddRequest("committed-add"));
+
+  processor.Start();
+  all_outcomes.get_future().wait();
+  processor.Stop();
+
+  BOOST_REQUIRE_EQUAL(outcomes.size(), 2U);
+  for (const bbp::SimulationCommandOutcome& outcome : outcomes) {
+    BOOST_CHECK(outcome.state ==
+                bbp::SimulationCommandOutcomeState::kOutcomeUnconfirmed);
+    BOOST_REQUIRE(outcome.error);
+  }
 }

@@ -21,9 +21,33 @@ SimulationCommandCancellationCause CancellationCause(
     return fallback;
   }
   const SimulationCommandCancellationCause cause =
-      command.operation_control->cancellation_cause.load(
-          std::memory_order_acquire);
+      command.operation_control->CancellationCause();
   return cause == SimulationCommandCancellationCause::kNone ? fallback : cause;
+}
+
+bool NodeAddCommitStarted(const SimulationCommand& command) {
+  if (command.kind != SimulationCommandKind::kAddNodes ||
+      !command.operation_control) {
+    return false;
+  }
+  const SimulationCommandCommitPhase phase =
+      command.operation_control->CommitPhase();
+  return phase == SimulationCommandCommitPhase::kCommitStarted ||
+         phase == SimulationCommandCommitPhase::kCommitted;
+}
+
+bool NodeAddCancellationWon(const SimulationCommand& command) {
+  return command.kind == SimulationCommandKind::kAddNodes &&
+         command.operation_control &&
+         command.operation_control->CommitPhase() ==
+             SimulationCommandCommitPhase::kCancelled;
+}
+
+bool OutcomeUnconfirmed(const SimulationCommand& command) {
+  return (command.operation_control &&
+          command.operation_control->outcome_unconfirmed.load(
+              std::memory_order_acquire)) ||
+         NodeAddCommitStarted(command);
 }
 
 SimulationCommandOutcome CancellationOutcome(
@@ -32,9 +56,7 @@ SimulationCommandOutcome CancellationOutcome(
   const SimulationCommandCancellationCause cause =
       CancellationCause(command, fallback);
   return SimulationCommandOutcome{
-      .state = command.operation_control &&
-                       command.operation_control->outcome_unconfirmed.load(
-                           std::memory_order_acquire)
+      .state = OutcomeUnconfirmed(command)
                    ? SimulationCommandOutcomeState::kOutcomeUnconfirmed
                : cause == SimulationCommandCancellationCause::kDeadline
                    ? SimulationCommandOutcomeState::kTimedOut
@@ -42,6 +64,9 @@ SimulationCommandOutcome CancellationOutcome(
       .cancellation_cause = cause,
       .error = std::string(error),
       .node_lifecycle = std::nullopt,
+      .added_node_ids = {},
+      .inventory_generation = std::nullopt,
+      .final_node_count = std::nullopt,
   };
 }
 
@@ -78,6 +103,13 @@ void SimulationCommandProcessor::Stop() {
     return;
   }
   std::vector<SimulationCommand> cancelled = queue_.Cancel();
+  for (SimulationCommand& command : cancelled) {
+    if (command.kind == SimulationCommandKind::kAddNodes &&
+        command.operation_control) {
+      static_cast<void>(command.operation_control->RequestCancellation(
+          SimulationCommandCancellationCause::kApplicationShutdown));
+    }
+  }
   if (thread_.joinable()) {
     thread_.join();
   }
@@ -101,16 +133,24 @@ void SimulationCommandProcessor::Run() {
       continue;
     }
     try {
-      command_handler_(*command);
-      ReportOutcome(
-          *command,
-          SimulationCommandOutcome{
-              .state = SimulationCommandOutcomeState::kSucceeded,
-              .cancellation_cause = CancellationCause(
-                  *command, SimulationCommandCancellationCause::kNone),
-              .error = std::nullopt,
-              .node_lifecycle = std::nullopt,
-          });
+      SimulationCommandOutcome outcome = command_handler_(*command);
+      if (outcome.state != SimulationCommandOutcomeState::kSucceeded) {
+        throw std::logic_error(
+            "simulation command handler returned a non-success outcome");
+      }
+      outcome.cancellation_cause = CancellationCause(
+          *command, SimulationCommandCancellationCause::kNone);
+      outcome.error = std::nullopt;
+      if (command->kind == SimulationCommandKind::kAddNodes &&
+          (!command->operation_control ||
+           command->operation_control->CommitPhase() !=
+               SimulationCommandCommitPhase::kCommitted)) {
+        outcome.state = SimulationCommandOutcomeState::kOutcomeUnconfirmed;
+        outcome.error =
+            "node-add handler reported success without committing its "
+            "authoritative inventory generation";
+      }
+      ReportOutcome(*command, outcome);
     } catch (const SimulationCancelled& error) {
       ReportOutcome(*command, CancellationOutcome(
                                   *command, error.what(),
@@ -124,11 +164,19 @@ void SimulationCommandProcessor::Run() {
                   *command, SimulationCommandCancellationCause::kNone),
               .error = error.what(),
               .node_lifecycle = std::nullopt,
+              .added_node_ids = {},
+              .inventory_generation = std::nullopt,
+              .final_node_count = std::nullopt,
           });
     } catch (const std::exception& error) {
-      if (command->operation_control &&
-          command->operation_control->outcome_unconfirmed.load(
-              std::memory_order_acquire)) {
+      if (NodeAddCancellationWon(*command)) {
+        ReportOutcome(*command,
+                      CancellationOutcome(
+                          *command, error.what(),
+                          SimulationCommandCancellationCause::kNone));
+        continue;
+      }
+      if (OutcomeUnconfirmed(*command)) {
         ReportOutcome(
             *command,
             SimulationCommandOutcome{
@@ -137,6 +185,9 @@ void SimulationCommandProcessor::Run() {
                     *command, SimulationCommandCancellationCause::kNone),
                 .error = error.what(),
                 .node_lifecycle = std::nullopt,
+                .added_node_ids = {},
+                .inventory_generation = std::nullopt,
+                .final_node_count = std::nullopt,
             });
         continue;
       }
@@ -149,11 +200,19 @@ void SimulationCommandProcessor::Run() {
                   *command, SimulationCommandCancellationCause::kNone),
               .error = error.what(),
               .node_lifecycle = std::nullopt,
+              .added_node_ids = {},
+              .inventory_generation = std::nullopt,
+              .final_node_count = std::nullopt,
           });
     } catch (...) {
-      if (command->operation_control &&
-          command->operation_control->outcome_unconfirmed.load(
-              std::memory_order_acquire)) {
+      if (NodeAddCancellationWon(*command)) {
+        ReportOutcome(
+            *command,
+            CancellationOutcome(*command, "unknown exception",
+                                SimulationCommandCancellationCause::kNone));
+        continue;
+      }
+      if (OutcomeUnconfirmed(*command)) {
         ReportOutcome(
             *command,
             SimulationCommandOutcome{
@@ -162,6 +221,9 @@ void SimulationCommandProcessor::Run() {
                     *command, SimulationCommandCancellationCause::kNone),
                 .error = "unknown exception",
                 .node_lifecycle = std::nullopt,
+                .added_node_ids = {},
+                .inventory_generation = std::nullopt,
+                .final_node_count = std::nullopt,
             });
         continue;
       }
@@ -174,6 +236,9 @@ void SimulationCommandProcessor::Run() {
                   *command, SimulationCommandCancellationCause::kNone),
               .error = "unknown exception",
               .node_lifecycle = std::nullopt,
+              .added_node_ids = {},
+              .inventory_generation = std::nullopt,
+              .final_node_count = std::nullopt,
           });
     }
   }

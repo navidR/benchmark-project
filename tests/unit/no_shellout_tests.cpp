@@ -49,32 +49,28 @@ BOOST_AUTO_TEST_CASE(
   const std::filesystem::path simulator =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
   const std::string source = bbp::ReadText(simulator);
-  const std::string verified_step =
-      "RunNodeCleanupStep(best_effort, \"verified node network removal\", [&] "
-      "{";
-  const std::size_t step = source.find(verified_step);
-  BOOST_REQUIRE(step != std::string::npos);
+  const std::size_t identity_gate = source.find(
+      "!node.network_namespace->node_veth_identity()");
+  BOOST_REQUIRE(identity_gate != std::string::npos);
   const std::size_t deletion =
-      source.find("DeleteNodeVethNetwork(*node.network);", step);
+      source.find("DeleteNodeVethNetwork(", identity_gate);
   BOOST_REQUIRE(deletion != std::string::npos);
   const std::size_t event =
       source.find("SimulationEventKind::kNetworkRemoved", deletion);
   BOOST_REQUIRE(event != std::string::npos);
-  const std::size_t verified_step_end = source.find("      });", event);
-  BOOST_REQUIRE(verified_step_end != std::string::npos);
-  const std::size_t cleaned_gate =
-      source.find("if (network_cleanup_verified)", verified_step_end);
-  BOOST_REQUIRE(cleaned_gate != std::string::npos);
+  const std::size_t verified = source.find(
+      "resource_cleanup_verified[index] = true;", event);
+  BOOST_REQUIRE(verified != std::string::npos);
   const std::size_t cleaned =
-      source.find("NodeRuntimeLifecycle::kCleaned", cleaned_gate);
+      source.find("NodeRuntimeLifecycle::kCleaned", verified);
   BOOST_REQUIRE(cleaned != std::string::npos);
   const std::size_t failed =
       source.find("NodeRuntimeLifecycle::kFailed", cleaned);
   BOOST_REQUIRE(failed != std::string::npos);
+  BOOST_TEST(identity_gate < deletion);
   BOOST_TEST(deletion < event);
-  BOOST_TEST(event < verified_step_end);
-  BOOST_TEST(verified_step_end < cleaned_gate);
-  BOOST_TEST(cleaned_gate < cleaned);
+  BOOST_TEST(event < verified);
+  BOOST_TEST(verified < cleaned);
   BOOST_TEST(cleaned < failed);
 }
 

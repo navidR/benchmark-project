@@ -1,5 +1,6 @@
 #include "bbp/simulation_network_address_plan.h"
 
+#include <algorithm>
 #include <boost/asio/ip/address_v4.hpp>
 #include <boost/asio/ip/network_v4.hpp>
 #include <boost/system/error_code.hpp>
@@ -38,7 +39,8 @@ std::uint32_t PrefixMask(std::uint32_t prefix_length) {
   return std::numeric_limits<std::uint32_t>::max() << (32U - prefix_length);
 }
 
-bool RangeOverlapsRoute(std::uint32_t range_base, const RouteInfo& route) {
+bool RangeOverlapsRoute(std::uint32_t range_base, std::uint32_t address_count,
+                        const RouteInfo& route) {
   if (route.prefix_len == 0U || route.prefix_len > 32U) {
     return false;
   }
@@ -52,14 +54,14 @@ bool RangeOverlapsRoute(std::uint32_t range_base, const RouteInfo& route) {
   const std::uint32_t route_mask = PrefixMask(route.prefix_len);
   const std::uint32_t route_start = route_address.to_uint() & route_mask;
   const std::uint32_t route_end = route_start | ~route_mask;
-  const std::uint32_t range_end = range_base + kAddressesPerRun - 1U;
+  const std::uint32_t range_end = range_base + address_count - 1U;
   return range_base <= route_end && route_start <= range_end;
 }
 
 bool RangeIsAvailable(std::uint32_t range_base,
                       const std::vector<RouteInfo>& routes) {
   for (const RouteInfo& route : routes) {
-    if (RangeOverlapsRoute(range_base, route)) {
+    if (RangeOverlapsRoute(range_base, kAddressesPerRun, route)) {
       return false;
     }
   }
@@ -141,6 +143,46 @@ std::string SimulationNetworkAddressPlan::NodeAddress(
 
 std::uint8_t SimulationNetworkAddressPlan::NodePrefixLength() const {
   return static_cast<std::uint8_t>(kNodePrefixLength);
+}
+
+void SimulationNetworkAddressPlan::RequireNodeSlotsAvailable(
+    const std::vector<std::uint32_t>& node_slots,
+    const std::vector<RouteInfo>& routes) const {
+  RequireNodeSlotsAvailable(node_slots, routes, {});
+}
+
+void SimulationNetworkAddressPlan::RequireNodeSlotsAvailable(
+    const std::vector<std::uint32_t>& node_slots,
+    const std::vector<RouteInfo>& routes,
+    const std::vector<AddressInfo>& addresses) const {
+  for (const std::uint32_t node_slot : node_slots) {
+    if (node_slot >= node_count_) {
+      throw std::out_of_range("network address plan node slot is out of range");
+    }
+    const std::uint32_t node_base =
+        base_address_ + node_slot * kAddressesPerNode;
+    for (const RouteInfo& route : routes) {
+      if (RangeOverlapsRoute(node_base, kAddressesPerNode, route)) {
+        throw std::runtime_error(
+            "isolated simulation node subnet for slot " +
+            std::to_string(node_slot) +
+            " overlaps a route introduced after run launch");
+      }
+    }
+    const std::string host_address = HostAddress(node_slot);
+    const std::string node_address = NodeAddress(node_slot);
+    const auto collision = std::find_if(
+        addresses.begin(), addresses.end(), [&](const AddressInfo& address) {
+          return address.address == host_address ||
+                 address.address == node_address;
+        });
+    if (collision != addresses.end()) {
+      throw std::runtime_error("isolated simulation node address for slot " +
+                               std::to_string(node_slot) +
+                               " is already assigned to interface " +
+                               collision->if_name);
+    }
+  }
 }
 
 std::vector<DirectionalNetworkPolicy> ResolveDirectionalNetworkPolicies(

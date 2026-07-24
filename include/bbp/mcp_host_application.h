@@ -24,6 +24,9 @@ struct McpHostedRunSnapshot {
   std::string state;
   std::string chain;
   std::uint32_t node_count = 0U;
+  std::uint32_t node_capacity = 0U;
+  std::uint32_t chain_node_maximum = 0U;
+  std::uint32_t available_node_capacity = 0U;
   std::shared_ptr<McpLiveApplication> application;
 };
 

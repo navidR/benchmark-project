@@ -296,6 +296,64 @@ BOOST_AUTO_TEST_CASE(http_client_per_call_deadline_bounds_a_silent_server) {
   BOOST_TEST(elapsed.count() < 250);
 }
 
+BOOST_AUTO_TEST_CASE(
+    http_client_digest_serialization_wait_observes_cancellation) {
+  namespace asio = boost::asio;
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context context;
+  tcp::acceptor acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::promise<void> request_received;
+  std::future<void> server = std::async(std::launch::async, [&] {
+    tcp::socket socket(acceptor.get_executor());
+    acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    request_received.set_value();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  });
+
+  const bbp::HttpClient client(std::chrono::seconds(1));
+  const bbp::RpcEndpoint endpoint =
+      DigestEndpoint(acceptor.local_endpoint().port());
+  std::future<bool> lock_owner = std::async(std::launch::async, [&] {
+    try {
+      static_cast<void>(client.PostJson(endpoint, "/", "{}"));
+    } catch (const std::exception&) {
+      return true;
+    }
+    return false;
+  });
+  BOOST_REQUIRE(request_received.get_future().wait_for(
+                    std::chrono::seconds(1)) == std::future_status::ready);
+
+  std::stop_source stop_source;
+  const auto started = std::chrono::steady_clock::now();
+  std::future<bool> waiter = std::async(std::launch::async, [&] {
+    try {
+      static_cast<void>(
+          client.PostJson(endpoint, "/", "{}", stop_source.get_token()));
+    } catch (const bbp::SimulationCancelled&) {
+      return true;
+    }
+    return false;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  stop_source.request_stop();
+  BOOST_REQUIRE(waiter.wait_for(std::chrono::milliseconds(200)) ==
+                std::future_status::ready);
+  BOOST_TEST(waiter.get());
+  BOOST_CHECK(std::chrono::steady_clock::now() - started <
+              std::chrono::milliseconds(250));
+
+  server.get();
+  BOOST_TEST(lock_owner.get());
+}
+
 BOOST_AUTO_TEST_CASE(http_client_rejects_conflicting_authentication_sources) {
   const bbp::HttpClient client(std::chrono::milliseconds(20));
   bbp::RpcEndpoint endpoint;

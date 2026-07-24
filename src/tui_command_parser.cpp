@@ -18,7 +18,8 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 29> kCommandNames = {
+constexpr std::array<std::string_view, 30> kCommandNames = {
+    "add-nodes",
     "block-production",
     "mining-difficulty",
     "stop-mining",
@@ -137,6 +138,32 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
   }
 
   try {
+    if (tokens[0] == "add-nodes") {
+      if (tokens.size() != 3U && tokens.size() != 4U) {
+        throw std::runtime_error(
+            "usage: add-nodes <firo|bitcoin|monero> <count> [binary]");
+      }
+      const std::uint64_t count =
+          ParsePositiveToken(tokens[2], "add-nodes count");
+      if (count > kSimulationNodeAddMaximumCount) {
+        throw std::runtime_error(
+            "add-nodes count must be in 1.." +
+            std::to_string(kSimulationNodeAddMaximumCount));
+      }
+      SimulationNodeAddRequest request;
+      request.chain = ParseChainKind(tokens[1]);
+      request.count = static_cast<std::uint32_t>(count);
+      if (tokens.size() == 4U) {
+        if (tokens[3].empty()) {
+          throw std::runtime_error("add-nodes binary must not be empty");
+        }
+        request.binary = tokens[3];
+      }
+      ParsedTuiCommand parsed;
+      parsed.kind = SimulationCommandKind::kAddNodes;
+      parsed.node_add = std::move(request);
+      return parsed;
+    }
     if (tokens[0] == "firo-qt") {
       RequireArgumentCount(tokens, 1U, "firo-qt");
       ParsedTuiCommand parsed;

@@ -165,6 +165,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "set_perf_counters";
     case SimulationCommandKind::kSendWalletTransaction:
       return "send_wallet_transaction";
+    case SimulationCommandKind::kAddNodes:
+      return "add_nodes";
     case SimulationCommandKind::kCount:
       break;
   }
@@ -254,6 +256,9 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "send_wallet_transaction") {
     return SimulationCommandKind::kSendWalletTransaction;
   }
+  if (name == "add_nodes") {
+    return SimulationCommandKind::kAddNodes;
+  }
   return std::nullopt;
 }
 
@@ -287,6 +292,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kHealPartition:
     case SimulationCommandKind::kExportNodeReport:
     case SimulationCommandKind::kSetPerfCounters:
+    case SimulationCommandKind::kAddNodes:
       return false;
     case SimulationCommandKind::kCount:
       break;

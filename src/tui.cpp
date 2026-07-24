@@ -856,9 +856,19 @@ void RefreshCommandResults(const boost::json::object& report, TuiState* state) {
         state->command_error_open = true;
         break;
       case OperatorCommandStatus::kCompleted:
-        state->command_status =
-            "Command #" + std::to_string(*sequence) + " completed for " +
-            JsonString(command, "node_id", "selected node") + ".";
+        if (JsonString(detail, "kind") == "add_nodes") {
+          state->command_status =
+              "Command #" + std::to_string(*sequence) + " added " +
+              JsonStringArrayText(detail, "added_node_ids", "nodes") +
+              " (generation " +
+              JsonIntegerText(detail, "inventory_generation", "?") + ", " +
+              JsonIntegerText(detail, "final_node_count", "?") +
+              " total nodes).";
+        } else {
+          state->command_status =
+              "Command #" + std::to_string(*sequence) + " completed for " +
+              JsonString(command, "node_id", "selected node") + ".";
+        }
         break;
     }
   }
@@ -1384,7 +1394,9 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
           "stop-mining  disconnect  reconnect  log-more  log-less  firo-qt");
   AddText(top + 5, left + 2, popup_cols - 4,
           "connect-peer <node-id>  disconnect-peer <node-id>");
-  AddText(top + 6, left + 2, popup_cols - 4, "peer-policy <minimum> <maximum>");
+  AddText(top + 6, left + 2, popup_cols - 4,
+          "peer-policy <minimum> <maximum>  add-nodes <chain> <count> "
+          "[binary]");
   AddText(top + 7, left + 2, popup_cols - 4,
           "freeze  thaw  stop-node  restart  kill");
   AddText(top + 8, left + 2, popup_cols - 4, "generate-blocks <count>");
@@ -2601,6 +2613,12 @@ bool QueueParsedNodeCommand(
       if (!parsed.block_production_policy) {
         throw std::runtime_error("block production policy is missing");
       }
+    } else if (parsed.kind == SimulationCommandKind::kAddNodes) {
+      if (!parsed.node_add) {
+        throw std::runtime_error("node-add payload is missing");
+      }
+      node_id = "sim";
+      target = "the simulation";
     } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
       perf_target = ResolvePerfCounterTarget(
           report,
@@ -2711,6 +2729,8 @@ bool QueueParsedNodeCommand(
       if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
         sequence = command_queue->PushBlockProductionPolicy(
             *parsed.block_production_policy);
+      } else if (parsed.kind == SimulationCommandKind::kAddNodes) {
+        sequence = command_queue->PushAddNodes(*parsed.node_add);
       } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {
         if (!perf_target) {
           throw std::runtime_error("perf counter target is missing");
@@ -2922,6 +2942,13 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
     return true;
   }
 
+  if (ch == 'c' || ch == 'C') {
+    state->command_palette_open = true;
+    state->command_input.clear();
+    state->command_input_error.clear();
+    return true;
+  }
+
   const boost::json::array* nodes = NodeSummaries(report);
   if (nodes == nullptr || nodes->empty()) {
     state->selected_node = 0;
@@ -3059,13 +3086,6 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
     } else {
       return false;
     }
-    return true;
-  }
-
-  if (ch == 'c' || ch == 'C') {
-    state->command_palette_open = true;
-    state->command_input.clear();
-    state->command_input_error.clear();
     return true;
   }
 
@@ -3218,6 +3238,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       .generation = 0U,
       .run_root = run_root,
       .command_queue = std::move(shared_command_queue),
+      .publication_mutex = {},
   };
   return RunTuiReport([snapshot]() { return snapshot; }, once, refresh_ms,
                       stop_token);
@@ -3260,6 +3281,18 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
     const bool has_active_run = !snapshot->run_root.empty();
     if (has_active_run) {
       try {
+        std::unique_lock<std::timed_mutex> publication_lock;
+        if (snapshot->publication_mutex) {
+          publication_lock =
+              std::unique_lock<std::timed_mutex>(*snapshot->publication_mutex,
+                                                 std::defer_lock);
+          while (!publication_lock.try_lock_for(
+              std::chrono::milliseconds(10))) {
+            if (stop_token.stop_requested()) {
+              return FinishTui(&state, 0);
+            }
+          }
+        }
         if (!live_report) {
           live_report.emplace(snapshot->run_root, stop_token);
         }

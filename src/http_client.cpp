@@ -627,7 +627,20 @@ HttpResponse HttpClient::PostJsonWithDeadline(
         .response;
   }
 
-  std::lock_guard lock(digest_mutex_);
+  std::unique_lock<std::timed_mutex> lock(digest_mutex_, std::defer_lock);
+  while (!lock.owns_lock()) {
+    if (stop_token.stop_requested()) {
+      throw SimulationCancelled();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      throw boost::system::system_error(
+          beast::error::timeout,
+          "digest RPC serialization deadline expired");
+    }
+    static_cast<void>(
+        lock.try_lock_until(std::min(deadline, now + std::chrono::milliseconds(10))));
+  }
   JsonConnection connection(endpoint, deadline);
   connection.Connect(stop_token);
   HttpExchange challenge_response =

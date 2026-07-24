@@ -11,6 +11,9 @@ namespace bbp {
 RunProcessState::Guard::Guard(RunProcessState& owner)
     : owner_(&owner), lock_(owner.mutex_) {}
 
+RunProcessState::Guard::Guard(RunProcessState& owner, std::adopt_lock_t)
+    : owner_(&owner), lock_(owner.mutex_, std::adopt_lock) {}
+
 RunProcessState::NativeMiningRpcGuard::NativeMiningRpcGuard(
     RunProcessState& owner)
     : owner_(&owner), lock_(owner.native_mining_rpc_mutex_) {}
@@ -20,6 +23,30 @@ RunProcessState::NativeMiningRpcGuard::NativeMiningRpcGuard(
     : owner_(&owner), lock_(owner.native_mining_rpc_mutex_, std::adopt_lock) {}
 
 RunProcessState::Guard RunProcessState::Lock() { return Guard(*this); }
+
+std::optional<RunProcessState::Guard> RunProcessState::TryLockUntil(
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  while (true) {
+    if (stop_token.stop_requested()) {
+      return std::nullopt;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return std::nullopt;
+    }
+    if (mutex_.try_lock()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        mutex_.unlock();
+        return std::nullopt;
+      }
+      return Guard(*this, std::adopt_lock);
+    }
+    std::this_thread::sleep_for(std::min(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+  }
+}
 
 RunProcessState::NativeMiningRpcGuard RunProcessState::LockNativeMiningRpc() {
   return NativeMiningRpcGuard(*this);

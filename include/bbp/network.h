@@ -2,11 +2,14 @@
 
 #include <sys/types.h>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace bbp {
@@ -32,8 +35,10 @@ std::string_view TcFilterKindName(TcFilterKind kind);
 
 struct LinkInfo {
   int index = 0;
+  int linked_index = 0;
   std::string name;
   std::string ownership_alias;
+  std::string kind;
   bool up = false;
   bool has_stats = false;
   std::uint64_t rx_bytes = 0;
@@ -203,6 +208,23 @@ struct DirectionalNetworkPolicyStats {
 void ValidateNetworkCondition(const NetworkCondition& condition);
 void ValidateIpv4Address(std::string_view address, std::string_view field_name);
 
+struct VethEndpointIdentity {
+  int index = 0;
+  int linked_index = 0;
+  std::string name;
+  std::string ownership_alias;
+  std::string kind;
+
+  bool operator==(const VethEndpointIdentity&) const = default;
+};
+
+struct NodeVethIdentity {
+  VethEndpointIdentity host;
+  VethEndpointIdentity peer;
+
+  bool operator==(const NodeVethIdentity&) const = default;
+};
+
 class NetworkNamespace {
  public:
   static NetworkNamespace Create();
@@ -218,7 +240,18 @@ class NetworkNamespace {
 
   int fd() const { return fd_; }
   pid_t helper_pid() const { return helper_pid_; }
+  const std::optional<NodeVethIdentity>& node_veth_identity() const {
+    return node_veth_identity_;
+  }
+  void SetNodeVethIdentity(NodeVethIdentity identity) {
+    node_veth_identity_ = std::move(identity);
+  }
+  void ClearNodeVethIdentity() noexcept { node_veth_identity_.reset(); }
   void Stop();
+  void StopHelperAndVerify(std::chrono::steady_clock::time_point deadline,
+                           std::stop_token stop_token = {});
+  void StopAndVerify(std::chrono::steady_clock::time_point deadline,
+                     std::stop_token stop_token = {});
 
  private:
   NetworkNamespace(pid_t helper_pid, int fd)
@@ -226,6 +259,7 @@ class NetworkNamespace {
 
   pid_t helper_pid_ = -1;
   int fd_ = -1;
+  std::optional<NodeVethIdentity> node_veth_identity_;
 };
 
 struct NodeVethConfig {
@@ -466,9 +500,12 @@ bool TcFilterMatchesEgressIpv4TcpDrop(const TcFilterInfo& filter,
                                       std::uint16_t dst_port,
                                       std::uint32_t handle);
 NetworkNamespaceProbe ProbeIsolatedNetworkNamespace();
-void CreateVethPair(const std::string& host_name, const std::string& peer_name,
-                    const std::string& host_ownership_alias = {},
-                    const std::string& peer_ownership_alias = {});
+NodeVethIdentity CreateVethPair(
+    const std::string& host_name, const std::string& peer_name,
+    const std::string& host_ownership_alias = {},
+    const std::string& peer_ownership_alias = {},
+    std::optional<NodeVethIdentity>* acquired_identity = nullptr,
+    std::stop_token stop_token = {});
 void DeleteLink(const std::string& name);
 void MoveLinkToNamespace(const std::string& name, int netns_fd);
 void SetLinkUp(const std::string& name, bool up);
@@ -506,10 +543,22 @@ void UpdateDirectionalNetworkPoliciesInNamespace(
     const std::vector<DirectionalNetworkPolicy>& previous,
     const std::vector<DirectionalNetworkPolicy>& desired,
     std::stop_token stop_token = {});
-void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
-                          std::stop_token stop_token = {});
+void SetupNodeVethNetwork(
+    int netns_fd, const NodeVethConfig& config,
+    std::optional<NodeVethIdentity>* acquired_identity,
+    std::stop_token stop_token = {});
 void DeleteNodeVethNetwork(const NodeVethConfig& config,
                            std::stop_token stop_token = {});
+void DeleteNodeVethNetwork(const NodeVethConfig& config,
+                           const NodeVethIdentity& acquired_identity,
+                           std::stop_token stop_token = {});
+#ifdef BBP_ENABLE_TEST_HOOKS
+std::optional<int> ResolveNodeVethDeletionIndexForTest(
+    const NodeVethConfig& config, const NodeVethIdentity& acquired_identity,
+    const std::vector<LinkInfo>& links);
+void RequireIntentOnlyNodeVethAbsentForTest(
+    const NodeVethConfig& config, const std::vector<LinkInfo>& links);
+#endif
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();
 RouteProbe ProbeIpv4RouteAssignment();

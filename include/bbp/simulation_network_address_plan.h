@@ -23,6 +23,12 @@ class SimulationNetworkAddressPlan {
   std::string HostAddress(std::uint32_t node_index) const;
   std::string NodeAddress(std::uint32_t node_index) const;
   std::uint8_t NodePrefixLength() const;
+  void RequireNodeSlotsAvailable(const std::vector<std::uint32_t>& node_slots,
+                                 const std::vector<RouteInfo>& routes) const;
+  void RequireNodeSlotsAvailable(
+      const std::vector<std::uint32_t>& node_slots,
+      const std::vector<RouteInfo>& routes,
+      const std::vector<AddressInfo>& addresses) const;
 
  private:
   SimulationNetworkAddressPlan(std::uint32_t base_address,

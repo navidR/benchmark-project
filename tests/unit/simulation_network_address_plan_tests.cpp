@@ -43,6 +43,34 @@ BOOST_AUTO_TEST_CASE(simulation_network_plan_ignores_default_route) {
   BOOST_TEST(!plan.Cidr().empty());
 }
 
+BOOST_AUTO_TEST_CASE(
+    simulation_network_plan_revalidates_selected_node_subnets) {
+  const bbp::SimulationNetworkAddressPlan plan =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.210.4.0/26", 16U);
+  bbp::RouteInfo occupied;
+  occupied.destination = "10.210.4.8";
+  occupied.prefix_len = 29U;
+
+  BOOST_CHECK_THROW(plan.RequireNodeSlotsAvailable({2U}, {occupied}),
+                    std::runtime_error);
+  BOOST_CHECK_NO_THROW(plan.RequireNodeSlotsAvailable({1U}, {occupied}));
+
+  bbp::RouteInfo default_route;
+  default_route.destination = "0.0.0.0";
+  default_route.prefix_len = 0U;
+  BOOST_CHECK_NO_THROW(plan.RequireNodeSlotsAvailable({2U}, {default_route}));
+
+  bbp::AddressInfo route_free_collision;
+  route_free_collision.if_name = "foreign0";
+  route_free_collision.address = plan.HostAddress(1U);
+  route_free_collision.prefix_len = 32U;
+  BOOST_CHECK_THROW(
+      plan.RequireNodeSlotsAvailable({1U}, {}, {route_free_collision}),
+      std::runtime_error);
+  BOOST_CHECK_NO_THROW(
+      plan.RequireNodeSlotsAvailable({2U}, {}, {route_free_collision}));
+}
+
 BOOST_AUTO_TEST_CASE(simulation_network_plan_rejects_invalid_persisted_range) {
   BOOST_CHECK_THROW(
       bbp::SimulationNetworkAddressPlan::FromCidr("10.211.0.0/26", 1U),
