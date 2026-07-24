@@ -92,6 +92,21 @@ class FiroDriver final : public ChainDriver {
       const std::string& wallet_address, std::uint64_t minimum_balance_satoshis,
       std::uint64_t minimum_confirmations, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const override;
+  bool SupportsMasternodes() const override;
+  ChainMasternodeRegistration RegisterMasternode(
+      const FiroNodeConfig& funding_wallet_node, const std::string& service,
+      std::stop_token stop_token = {}) const override;
+  std::string RevokeMasternode(const FiroNodeConfig& funding_wallet_node,
+                               const std::string& pro_tx_hash,
+                               const std::string& operator_secret_key,
+                               std::stop_token stop_token = {}) const override;
+  ChainMasternodeStatus ReadMasternodeStatus(
+      const FiroNodeConfig& masternode,
+      std::stop_token stop_token = {}) const override;
+  ChainMasternodeStatus WaitForMasternodeReady(
+      const FiroNodeConfig& masternode, const std::string& pro_tx_hash,
+      std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const override;
   uint64_t WaitForWalletBalance(const FiroNodeConfig& config,
                                 WalletMode wallet_mode,
                                 uint64_t minimum_balance_satoshis,

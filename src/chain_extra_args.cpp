@@ -150,6 +150,8 @@ bool IsSimulatorOwnedOptionName(std::string_view name) {
       "whitelist",
       "whitelistforcerelay",
       "whitelistrelay",
+      "znode",
+      "znodeblsprivkey",
   });
   constexpr auto kOwnedPrefixes = std::to_array<std::string_view>({
       "debug",

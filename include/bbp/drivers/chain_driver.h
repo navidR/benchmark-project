@@ -73,6 +73,13 @@ struct ChainNodeConfig {
   bool listen = true;
   bool wallet_enabled = false;
   std::vector<std::string> connect_peers;
+  struct MasternodeProcessConfig {
+    std::string operator_secret_key;
+    std::string service;
+
+    bool operator==(const MasternodeProcessConfig&) const = default;
+  };
+  std::optional<MasternodeProcessConfig> masternode;
 };
 
 struct ChainUtxo {
@@ -163,6 +170,28 @@ struct ChainWalletFundingResult {
   std::uint64_t minimum_chain_height = 0;
 };
 
+struct ChainMasternodeRegistration {
+  std::string pro_tx_hash;
+  std::string service;
+  std::string collateral_address;
+  std::string owner_address;
+  std::string operator_public_key;
+  std::string operator_secret_key;
+  std::string voting_address;
+  std::string payout_address;
+};
+
+struct ChainMasternodeStatus {
+  std::string pro_tx_hash;
+  std::string service;
+  std::string collateral_hash;
+  std::uint32_t collateral_index = 0U;
+  std::string state;
+  std::string status;
+
+  [[nodiscard]] bool ready() const { return state == "READY"; }
+};
+
 enum class ChainTransactionState {
   kUnknown,
   kMempool,
@@ -237,6 +266,19 @@ class ChainDriver {
       const std::string& wallet_address, std::uint64_t minimum_balance_satoshis,
       std::uint64_t minimum_confirmations, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const;
+  virtual bool SupportsMasternodes() const;
+  virtual ChainMasternodeRegistration RegisterMasternode(
+      const ChainNodeConfig& funding_wallet_node, const std::string& service,
+      std::stop_token stop_token = {}) const;
+  virtual std::string RevokeMasternode(
+      const ChainNodeConfig& funding_wallet_node,
+      const std::string& pro_tx_hash, const std::string& operator_secret_key,
+      std::stop_token stop_token = {}) const;
+  virtual ChainMasternodeStatus ReadMasternodeStatus(
+      const ChainNodeConfig& masternode, std::stop_token stop_token = {}) const;
+  virtual ChainMasternodeStatus WaitForMasternodeReady(
+      const ChainNodeConfig& masternode, const std::string& pro_tx_hash,
+      std::chrono::seconds timeout, std::stop_token stop_token = {}) const;
   virtual uint64_t WaitForWalletBalance(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       uint64_t minimum_balance_satoshis, uint64_t minimum_confirmations,

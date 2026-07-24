@@ -124,6 +124,31 @@ ChainWalletFundingResult ChainDriver::PrepareWalletFunding(
   return {};
 }
 
+bool ChainDriver::SupportsMasternodes() const { return false; }
+
+ChainMasternodeRegistration ChainDriver::RegisterMasternode(
+    const ChainNodeConfig&, const std::string&, std::stop_token) const {
+  throw UnsupportedChainOperation("selected chain", "masternode registration");
+}
+
+std::string ChainDriver::RevokeMasternode(const ChainNodeConfig&,
+                                          const std::string&,
+                                          const std::string&,
+                                          std::stop_token) const {
+  throw UnsupportedChainOperation("selected chain", "masternode revocation");
+}
+
+ChainMasternodeStatus ChainDriver::ReadMasternodeStatus(const ChainNodeConfig&,
+                                                        std::stop_token) const {
+  throw UnsupportedChainOperation("selected chain", "masternode status");
+}
+
+ChainMasternodeStatus ChainDriver::WaitForMasternodeReady(
+    const ChainNodeConfig&, const std::string&, std::chrono::seconds,
+    std::stop_token) const {
+  throw UnsupportedChainOperation("selected chain", "masternode readiness");
+}
+
 void ChainDriver::CleanupRpcCredentials(const ChainNodeConfig&) const {}
 
 }  // namespace bbp

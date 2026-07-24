@@ -120,6 +120,42 @@ std::string PeerHost(const std::string& endpoint,
   return host;
 }
 
+void ValidateMasternodeService(std::string_view service,
+                               std::string_view driver_name) {
+  const std::string uri = "tcp://" + std::string(service);
+  const boost::system::result<boost::urls::url_view> parsed =
+      boost::urls::parse_uri(uri);
+  if (!parsed || parsed->host().empty() || !parsed->has_port()) {
+    throw std::runtime_error("invalid " + std::string(driver_name) +
+                             " masternode service: " + std::string(service));
+  }
+  boost::system::error_code address_error;
+  boost::asio::ip::make_address(parsed->host(), address_error);
+  if (address_error) {
+    throw std::runtime_error(std::string(driver_name) +
+                             " masternode service host is not an IP address: " +
+                             std::string(service));
+  }
+  const std::uint16_t port = parsed->port_number();
+  if (port == 0U) {
+    throw std::runtime_error(
+        "invalid " + std::string(driver_name) +
+        " masternode service port: " + std::string(service));
+  }
+}
+
+void ValidateBlsSecret(std::string_view secret, std::string_view driver_name) {
+  if (secret.size() != 64U ||
+      !std::all_of(secret.begin(), secret.end(), [](char character) {
+        return (character >= '0' && character <= '9') ||
+               (character >= 'a' && character <= 'f') ||
+               (character >= 'A' && character <= 'F');
+      })) {
+    throw std::runtime_error("invalid " + std::string(driver_name) +
+                             " masternode operator secret key");
+  }
+}
+
 bool IsExactBanForAddress(std::string_view subnet,
                           const boost::asio::ip::address& address) {
   boost::system::error_code error;
@@ -740,6 +776,24 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
   if (!config.p2p_bind.empty()) {
     spec.argv.push_back(Arg("-bind", config.p2p_bind));
   }
+  if (config.masternode) {
+    if (!config.listen) {
+      throw std::runtime_error(
+          "Firo masternode process must accept peer connections");
+    }
+    ValidateBlsSecret(config.masternode->operator_secret_key, driver_name_);
+    ValidateMasternodeService(config.masternode->service, driver_name_);
+    const std::string expected_service =
+        config.p2p_host + ":" + std::to_string(config.p2p_port);
+    if (config.masternode->service != expected_service) {
+      throw std::runtime_error(
+          "Firo masternode service must match its node P2P endpoint");
+    }
+    spec.argv.push_back("-znode=1");
+    spec.argv.push_back(
+        Arg("-znodeblsprivkey", config.masternode->operator_secret_key));
+    spec.argv.push_back(Arg("-externalip", config.masternode->service));
+  }
   spec.argv.insert(spec.argv.end(), config.extra_args.arguments().begin(),
                    config.extra_args.arguments().end());
   return spec;
@@ -1118,6 +1172,170 @@ ChainWalletFundingResult FiroDriver::PrepareWalletFunding(
   result.confirmation_blocks_required = 1U;
   result.minimum_chain_height = kRegtestSparkSpendActivationHeight;
   return result;
+}
+
+bool FiroDriver::SupportsMasternodes() const { return true; }
+
+ChainMasternodeRegistration FiroDriver::RegisterMasternode(
+    const FiroNodeConfig& funding_wallet_node, const std::string& service,
+    std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  if (!funding_wallet_node.wallet_enabled) {
+    throw std::runtime_error(
+        "Firo masternode registration requires a wallet-enabled funding node");
+  }
+  ValidateMasternodeService(service, driver_name_);
+
+  const boost::json::value key_result = RpcCall(
+      funding_wallet_node, "bls", boost::json::array{"generate"}, stop_token);
+  if (!key_result.is_object()) {
+    throw std::runtime_error("Firo RPC bls generate returned non-object");
+  }
+  ChainMasternodeRegistration registration;
+  registration.service = service;
+  registration.operator_secret_key =
+      JsonStringMember(key_result.as_object(), "secret");
+  registration.operator_public_key =
+      JsonStringMember(key_result.as_object(), "public");
+  ValidateBlsSecret(registration.operator_secret_key, driver_name_);
+  if (registration.operator_public_key.empty()) {
+    throw std::runtime_error(
+        "Firo RPC bls generate returned an empty public key");
+  }
+
+  registration.collateral_address =
+      ParseWalletAddressResult(RpcCall(funding_wallet_node, "getnewaddress",
+                                       boost::json::array{}, stop_token),
+                               "getnewaddress");
+  registration.owner_address =
+      ParseWalletAddressResult(RpcCall(funding_wallet_node, "getnewaddress",
+                                       boost::json::array{}, stop_token),
+                               "getnewaddress");
+  registration.voting_address =
+      ParseWalletAddressResult(RpcCall(funding_wallet_node, "getnewaddress",
+                                       boost::json::array{}, stop_token),
+                               "getnewaddress");
+  registration.payout_address =
+      ParseWalletAddressResult(RpcCall(funding_wallet_node, "getnewaddress",
+                                       boost::json::array{}, stop_token),
+                               "getnewaddress");
+  const std::set<std::string> unique_addresses = {
+      registration.collateral_address, registration.owner_address,
+      registration.voting_address, registration.payout_address};
+  if (unique_addresses.size() != 4U) {
+    throw std::runtime_error(
+        "Firo masternode registration returned duplicate wallet addresses");
+  }
+
+  boost::json::array params{
+      "register_fund",
+      registration.collateral_address,
+      registration.service,
+      registration.owner_address,
+      registration.operator_public_key,
+      registration.voting_address,
+      0,
+      registration.payout_address,
+  };
+  registration.pro_tx_hash =
+      ParseSingleTxIdResult(
+          RpcCall(funding_wallet_node, "protx", params, stop_token),
+          "protx register_fund")
+          .front();
+  return registration;
+}
+
+std::string FiroDriver::RevokeMasternode(
+    const FiroNodeConfig& funding_wallet_node, const std::string& pro_tx_hash,
+    const std::string& operator_secret_key, std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  if (!funding_wallet_node.wallet_enabled) {
+    throw std::runtime_error(
+        "Firo masternode revocation requires a wallet-enabled funding node");
+  }
+  if (pro_tx_hash.empty()) {
+    throw std::runtime_error(
+        "Firo masternode revocation requires a ProTx hash");
+  }
+  ValidateBlsSecret(operator_secret_key, driver_name_);
+  return ParseSingleTxIdResult(
+             RpcCall(funding_wallet_node, "protx",
+                     boost::json::array{"revoke", pro_tx_hash,
+                                        operator_secret_key, 0},
+                     stop_token),
+             "protx revoke")
+      .front();
+}
+
+ChainMasternodeStatus FiroDriver::ReadMasternodeStatus(
+    const FiroNodeConfig& masternode, std::stop_token stop_token) const {
+  ThrowIfStopRequested(stop_token);
+  const boost::json::value result =
+      RpcCall(masternode, "evoznode", boost::json::array{"status"}, stop_token);
+  if (!result.is_object()) {
+    throw std::runtime_error("Firo RPC evoznode status returned non-object");
+  }
+  const boost::json::object& object = result.as_object();
+  ChainMasternodeStatus status;
+  status.pro_tx_hash = OptionalJsonStringMember(object, "proTxHash");
+  status.service = JsonStringMember(object, "service");
+  status.collateral_hash = OptionalJsonStringMember(object, "collateralHash");
+  if (object.if_contains("collateralIndex") != nullptr) {
+    const std::uint64_t value = JsonUint64Member(object, "collateralIndex");
+    if (value > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(
+          "Firo RPC evoznode status collateral index exceeds uint32");
+    }
+    status.collateral_index = static_cast<std::uint32_t>(value);
+  }
+  status.state = JsonStringMember(object, "state");
+  status.status = JsonStringMember(object, "status");
+  return status;
+}
+
+ChainMasternodeStatus FiroDriver::WaitForMasternodeReady(
+    const FiroNodeConfig& masternode, const std::string& pro_tx_hash,
+    std::chrono::seconds timeout, std::stop_token stop_token) const {
+  if (pro_tx_hash.empty()) {
+    throw std::runtime_error("Firo masternode readiness requires a ProTx hash");
+  }
+  if (!masternode.masternode) {
+    throw std::runtime_error(
+        "Firo masternode readiness requires masternode process configuration");
+  }
+  ValidateMasternodeService(masternode.masternode->service, driver_name_);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  ChainMasternodeStatus last_status;
+  std::string last_error;
+  while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
+    try {
+      last_status = ReadMasternodeStatus(masternode, stop_token);
+    } catch (const SimulationCancelled&) {
+      throw;
+    } catch (const std::exception& error) {
+      last_error = error.what();
+      WaitForNextPoll(stop_token);
+      continue;
+    }
+    if (last_status.ready()) {
+      if (last_status.pro_tx_hash != pro_tx_hash) {
+        throw std::runtime_error(
+            "Firo masternode readiness returned a different ProTx hash");
+      }
+      if (last_status.service != masternode.masternode->service) {
+        throw std::runtime_error(
+            "Firo masternode readiness returned a different service");
+      }
+      return last_status;
+    }
+    WaitForNextPoll(stop_token);
+  }
+  ThrowIfStopRequested(stop_token);
+  throw std::runtime_error(
+      driver_name_ + " masternode did not become ready before timeout; state=" +
+      last_status.state + "; status=" + last_status.status +
+      (last_error.empty() ? "" : "; " + last_error));
 }
 
 uint64_t FiroDriver::WaitForWalletBalance(const FiroNodeConfig& config,

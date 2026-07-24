@@ -540,6 +540,209 @@ BOOST_AUTO_TEST_CASE(firo_process_does_not_persist_simulation_peers) {
   std::filesystem::remove_all(test_dir);
 }
 
+BOOST_AUTO_TEST_CASE(firo_process_renders_owned_masternode_configuration) {
+  const std::filesystem::path test_dir =
+      std::filesystem::temp_directory_path() /
+      ("bbp-firo-masternode-process-" + std::to_string(getpid()));
+  std::filesystem::remove_all(test_dir);
+
+  bbp::FiroNodeConfig config;
+  config.id = "masternode-process-test";
+  config.binary = "/usr/bin/firod";
+  config.data_dir = test_dir / "data";
+  config.log_dir = test_dir / "logs";
+  config.rpc_port = 18888U;
+  config.p2p_host = "10.77.0.2";
+  config.p2p_port = 18168U;
+  config.rpc_authentication = bbp::RpcAuthenticationMode::kCookieFile;
+  config.rpc_cookie_file = config.log_dir / ".bbp-rpc-cookie";
+  config.masternode = bbp::ChainNodeConfig::MasternodeProcessConfig{
+      .operator_secret_key =
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      .service = "10.77.0.2:18168",
+  };
+
+  const bbp::FiroDriver driver(std::chrono::milliseconds(100));
+  BOOST_TEST(driver.SupportsMasternodes());
+  const bbp::ProcessSpec process = driver.RenderProcess(config);
+  BOOST_CHECK(std::ranges::find(process.argv, "-znode=1") !=
+              process.argv.end());
+  BOOST_CHECK(std::ranges::find(process.argv,
+                                "-znodeblsprivkey=" +
+                                    config.masternode->operator_secret_key) !=
+              process.argv.end());
+  BOOST_CHECK(std::ranges::find(process.argv, "-externalip=10.77.0.2:18168") !=
+              process.argv.end());
+
+  config.listen = false;
+  BOOST_CHECK_THROW(driver.RenderProcess(config), std::runtime_error);
+  config.listen = true;
+  config.masternode->service = "10.77.0.3:18168";
+  BOOST_CHECK_THROW(driver.RenderProcess(config), std::runtime_error);
+  config.masternode->service = "10.77.0.2:18168";
+  config.masternode->operator_secret_key = "not-a-secret";
+  BOOST_CHECK_THROW(driver.RenderProcess(config), std::runtime_error);
+  std::filesystem::remove_all(test_dir);
+}
+
+BOOST_AUTO_TEST_CASE(firo_registers_and_revokes_masternode_through_typed_rpc) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::string secret =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  const std::string public_key =
+      "93746e8731c57f87f79b3620a7982924e2931717d49540a85864bd543de11c43"
+      "fb868fd63e501a1db37e19ed59ae6db4";
+  const std::vector<std::string> responses = {
+      R"({"result":{"secret":")" + secret + R"(","public":")" + public_key +
+          R"("},"error":null,"id":"bbp"})",
+      R"({"result":"collateral-address","error":null,"id":"bbp"})",
+      R"({"result":"owner-address","error":null,"id":"bbp"})",
+      R"({"result":"voting-address","error":null,"id":"bbp"})",
+      R"({"result":"payout-address","error":null,"id":"bbp"})",
+      R"({"result":"protx-hash","error":null,"id":"bbp"})",
+      R"({"result":"revoke-hash","error":null,"id":"bbp"})",
+  };
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "masternode-funding-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  config.wallet_enabled = true;
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const bbp::ChainMasternodeRegistration registration =
+      driver.RegisterMasternode(config, "10.77.0.2:18168");
+  BOOST_TEST(registration.pro_tx_hash == "protx-hash");
+  BOOST_TEST(registration.service == "10.77.0.2:18168");
+  BOOST_TEST(registration.collateral_address == "collateral-address");
+  BOOST_TEST(registration.owner_address == "owner-address");
+  BOOST_TEST(registration.operator_public_key == public_key);
+  BOOST_TEST(registration.operator_secret_key == secret);
+  BOOST_TEST(registration.voting_address == "voting-address");
+  BOOST_TEST(registration.payout_address == "payout-address");
+  BOOST_TEST(driver.RevokeMasternode(config, registration.pro_tx_hash,
+                                     registration.operator_secret_key) ==
+             "revoke-hash");
+
+  const std::vector<std::string> methods = served.get();
+  const std::vector<std::string> expected_methods = {
+      "bls",           "getnewaddress", "getnewaddress", "getnewaddress",
+      "getnewaddress", "protx",         "protx",
+  };
+  BOOST_TEST(methods == expected_methods, boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(requests.size(), 7U);
+  BOOST_TEST(requests[0].as_object().at("params").as_array() ==
+             boost::json::array{"generate"});
+  const boost::json::array& registration_params =
+      requests[5].as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(registration_params.size(), 8U);
+  BOOST_TEST(registration_params[0].as_string() == "register_fund");
+  BOOST_TEST(registration_params[1].as_string() == "collateral-address");
+  BOOST_TEST(registration_params[2].as_string() == "10.77.0.2:18168");
+  BOOST_TEST(registration_params[3].as_string() == "owner-address");
+  BOOST_TEST(registration_params[4].as_string() == public_key);
+  BOOST_TEST(registration_params[5].as_string() == "voting-address");
+  BOOST_TEST(registration_params[6].as_int64() == 0);
+  BOOST_TEST(registration_params[7].as_string() == "payout-address");
+  const boost::json::array expected_revoke_params{"revoke", "protx-hash",
+                                                  secret, 0};
+  BOOST_TEST(requests[6].as_object().at("params").as_array() ==
+             expected_revoke_params);
+}
+
+BOOST_AUTO_TEST_CASE(firo_waits_for_exact_masternode_readiness) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"outpoint":"0000:0","service":"10.77.0.2:18168","state":"WAITING_FOR_PROTX","status":"Waiting for ProTx to appear on-chain"},"error":null,"id":"bbp"})",
+      R"({"result":{"outpoint":"protx-hash:0","service":"10.77.0.2:18168","proTxHash":"protx-hash","collateralHash":"protx-hash","collateralIndex":0,"state":"READY","status":"Ready"},"error":null,"id":"bbp"})",
+      R"({"result":{"outpoint":"protx-hash:0","service":"10.77.0.3:18168","proTxHash":"protx-hash","state":"READY","status":"Ready"},"error":null,"id":"bbp"})",
+      R"({"result":{"outpoint":"other-protx-hash:0","service":"10.77.0.2:18168","proTxHash":"other-protx-hash","state":"READY","status":"Ready"},"error":null,"id":"bbp"})",
+  };
+  std::vector<boost::json::value> requests;
+  std::future<std::vector<std::string>> served = std::async(
+      std::launch::async,
+      [&] { return ServeRpcResponses(acceptor, responses, &requests); });
+
+  bbp::FiroNodeConfig config;
+  config.id = "masternode-readiness-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  config.masternode = bbp::ChainNodeConfig::MasternodeProcessConfig{
+      .operator_secret_key =
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      .service = "10.77.0.2:18168",
+  };
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+
+  const std::optional<bbp::ChainNodeConfig::MasternodeProcessConfig>
+      masternode_process = config.masternode;
+  config.masternode.reset();
+  BOOST_CHECK_EXCEPTION(
+      driver.WaitForMasternodeReady(config, "protx-hash",
+                                    std::chrono::seconds(1)),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what())
+                   .find("requires masternode process configuration") !=
+               std::string::npos;
+      });
+  config.masternode = masternode_process;
+
+  const bbp::ChainMasternodeStatus status = driver.WaitForMasternodeReady(
+      config, "protx-hash", std::chrono::seconds(1));
+  BOOST_TEST(status.ready());
+  BOOST_TEST(status.pro_tx_hash == "protx-hash");
+  BOOST_TEST(status.service == "10.77.0.2:18168");
+  BOOST_TEST(status.collateral_hash == "protx-hash");
+  BOOST_TEST(status.collateral_index == 0U);
+  BOOST_TEST(status.status == "Ready");
+
+  BOOST_CHECK_EXCEPTION(
+      driver.WaitForMasternodeReady(config, "protx-hash",
+                                    std::chrono::seconds(1)),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()).find("returned a different service") !=
+               std::string::npos;
+      });
+  BOOST_CHECK_EXCEPTION(driver.WaitForMasternodeReady(config, "protx-hash",
+                                                      std::chrono::seconds(1)),
+                        std::runtime_error,
+                        [](const std::runtime_error& error) {
+                          return std::string(error.what())
+                                     .find("returned a different ProTx hash") !=
+                                 std::string::npos;
+                        });
+
+  const std::vector<std::string> methods = served.get();
+  BOOST_TEST(methods == std::vector<std::string>(
+                            {"evoznode", "evoznode", "evoznode", "evoznode"}),
+             boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(requests.size(), 4U);
+  for (const boost::json::value& request : requests) {
+    BOOST_TEST(request.as_object().at("params").as_array() ==
+               boost::json::array{"status"});
+  }
+}
+
 BOOST_AUTO_TEST_CASE(
     firo_peer_identity_rejects_multiple_candidates_on_the_same_host) {
   bbp::FiroNodeConfig config;

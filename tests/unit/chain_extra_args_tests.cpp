@@ -78,6 +78,8 @@ BOOST_AUTO_TEST_CASE(chain_extra_args_reject_simulator_owned_controls) {
       "--out-peers=1",
       "--in-peers=1",
       "--add-exclusive-node=127.0.0.1:18080",
+      "-znode=1",
+      "-znodeblsprivkey=secret",
   };
   for (const std::string& argument : arguments) {
     BOOST_CHECK_THROW(bbp::ChainExtraArgs({argument}), std::runtime_error);
