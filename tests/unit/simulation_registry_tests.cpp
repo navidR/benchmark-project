@@ -16,6 +16,27 @@ bbp::NodeRoleTopology TestTopology() {
   return topology;
 }
 
+bbp::MasternodeIdentity Masternode(std::uint32_t node, std::string node_id,
+                                   std::string suffix) {
+  return bbp::MasternodeIdentity{
+      .node = node,
+      .node_id = std::move(node_id),
+      .funding_wallet_node_id = "firo-wallet",
+      .pro_tx_hash = "protx-" + suffix,
+      .service = "10.77.0." + suffix + ":18168",
+      .collateral_address = "collateral-" + suffix,
+      .owner_address = "owner-" + suffix,
+      .operator_public_key = "public-" + suffix,
+      .operator_secret_key = "secret-" + suffix,
+      .voting_address = "voting-" + suffix,
+      .payout_address = "payout-" + suffix,
+      .collateral_hash = "collateral-hash-" + suffix,
+      .collateral_index = 1U,
+      .state = "READY",
+      .status = "ready",
+  };
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(simulation_registry_initializes_wallet_nodes) {
@@ -93,6 +114,44 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    simulation_registry_publishes_removes_and_validates_masternodes) {
+  bbp::NodeRoleTopology topology;
+  topology.configured = true;
+  topology.node_count = 3U;
+  topology.wallet_node_count = 1U;
+  topology.miner_node_count = 1U;
+  topology.wallet_nodes = {1U};
+  topology.miner_nodes = {1U};
+  topology.allow_miner_wallet_overlap = true;
+  bbp::SimulationRegistry registry =
+      bbp::SimulationRegistry::FromTopology(topology, {});
+
+  registry.AddMasternode(Masternode(2U, "firo-2", "2"));
+  registry.AddMasternode(Masternode(1U, "firo-1", "1"));
+  BOOST_TEST(registry.topology().masternode_nodes ==
+                 std::vector<std::uint32_t>({0U, 1U}),
+             boost::test_tools::per_element());
+  BOOST_TEST(registry.topology().masternode_node_count == 2U);
+  BOOST_REQUIRE_EQUAL(registry.masternodes().size(), 2U);
+  BOOST_TEST(registry.masternodes().front().node_id == "firo-1");
+  BOOST_TEST(registry.masternodes().front().operator_secret_key == "secret-1");
+  BOOST_CHECK_THROW(registry.AddMasternode(Masternode(1U, "firo-1", "3")),
+                    std::runtime_error);
+  bbp::MasternodeIdentity duplicate_service = Masternode(3U, "firo-3", "3");
+  duplicate_service.service = registry.masternodes().front().service;
+  BOOST_CHECK_THROW(registry.AddMasternode(std::move(duplicate_service)),
+                    std::runtime_error);
+
+  registry.RemoveMasternodeNodes({0U});
+  BOOST_TEST(
+      registry.topology().masternode_nodes == std::vector<std::uint32_t>({1U}),
+      boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(registry.masternodes().size(), 1U);
+  BOOST_TEST(registry.masternodes().front().node_id == "firo-2");
+  BOOST_CHECK_THROW(registry.RemoveMasternodeNodes({0U}), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
     simulation_registry_remaps_surviving_roles_and_all_peer_policy) {
   bbp::NodeRoleTopology topology;
   topology.configured = true;
@@ -109,6 +168,7 @@ BOOST_AUTO_TEST_CASE(
       bbp::SimulationRegistry::FromTopology(topology, {});
   registry.MutableWalletByIndex(0U).node_id = "firo-1";
   registry.MutableWalletByIndex(1U).node_id = "firo-4";
+  registry.AddMasternode(Masternode(4U, "firo-4", "4"));
 
   const bbp::SimulationRegistry remapped = registry.RemapRuntimeNodes(
       {0U, std::nullopt, 1U, 2U}, bbp::PeerTopologyConfig{});
@@ -120,11 +180,17 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(
       remapped.topology().miner_nodes == std::vector<std::uint32_t>({2U}),
       boost::test_tools::per_element());
+  BOOST_TEST(
+      remapped.topology().masternode_nodes == std::vector<std::uint32_t>({2U}),
+      boost::test_tools::per_element());
   BOOST_REQUIRE_EQUAL(remapped.wallets().size(), 2U);
   BOOST_TEST(remapped.wallets()[0U].node == 1U);
   BOOST_TEST(remapped.wallets()[0U].node_id == "firo-1");
   BOOST_TEST(remapped.wallets()[1U].node == 3U);
   BOOST_TEST(remapped.wallets()[1U].node_id == "firo-4");
+  BOOST_REQUIRE_EQUAL(remapped.masternodes().size(), 1U);
+  BOOST_TEST(remapped.masternodes().front().node == 3U);
+  BOOST_TEST(remapped.masternodes().front().node_id == "firo-4");
   BOOST_REQUIRE_EQUAL(remapped.topology().peer_connectivity.size(), 1U);
   const bbp::PeerConnectivityPolicy& policy =
       remapped.topology().peer_connectivity.front();
@@ -145,6 +211,13 @@ BOOST_AUTO_TEST_CASE(
       bbp::SimulationRegistry::FromTopology(role_topology, {});
   BOOST_CHECK_THROW(roles.RemapRuntimeNodes({0U, std::nullopt, 1U},
                                             bbp::PeerTopologyConfig{}),
+                    std::runtime_error);
+
+  bbp::SimulationRegistry masternode_roles =
+      bbp::SimulationRegistry::FromTopology(role_topology, {});
+  masternode_roles.AddMasternode(Masternode(2U, "firo-2", "2"));
+  BOOST_CHECK_THROW(masternode_roles.RemapRuntimeNodes(
+                        {0U, std::nullopt, 1U}, bbp::PeerTopologyConfig{}),
                     std::runtime_error);
 
   bbp::NodeRoleTopology policy_topology;

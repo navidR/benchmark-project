@@ -47,6 +47,9 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kRestartNode,
     McpOperationKind::kAddWallet,
     McpOperationKind::kAddMiner,
+    McpOperationKind::kAddMasternode,
+    McpOperationKind::kRemoveMasternode,
+    McpOperationKind::kRestartMasternode,
     McpOperationKind::kQueryEvidence,
     McpOperationKind::kQueryLogs,
     McpOperationKind::kFollowLogs,
@@ -705,6 +708,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kRestartNode &&
       kind != McpOperationKind::kAddWallet &&
       kind != McpOperationKind::kAddMiner &&
+      kind != McpOperationKind::kAddMasternode &&
+      kind != McpOperationKind::kRemoveMasternode &&
+      kind != McpOperationKind::kRestartMasternode &&
       kind != McpOperationKind::kQueryEvidence &&
       kind != McpOperationKind::kQueryLogs &&
       kind != McpOperationKind::kFollowLogs &&
@@ -749,7 +755,10 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   }
 
   if (kind == McpOperationKind::kAddWallet ||
-      kind == McpOperationKind::kAddMiner) {
+      kind == McpOperationKind::kAddMiner ||
+      kind == McpOperationKind::kAddMasternode ||
+      kind == McpOperationKind::kRemoveMasternode ||
+      kind == McpOperationKind::kRestartMasternode) {
     const std::shared_ptr<McpLiveRoleService> role_service = RoleService();
     if (!role_service) {
       throw McpOperationFailure(
@@ -1529,8 +1538,10 @@ boost::json::value McpLiveApplication::ReadResource(
       break;
     case McpInformationFamily::kRoles:
       data = SelectReportFields(
-          report, {"node_configs", "wallets_summary", "block_production",
-                   "role_generation", "miner_node_count", "miner_node_ids"});
+          report,
+          {"node_configs", "wallets_summary", "block_production",
+           "role_generation", "miner_node_count", "miner_node_ids",
+           "masternode_node_count", "masternode_node_ids", "masternodes"});
       break;
     case McpInformationFamily::kPeers:
       data = SelectReportFields(report, {"nodes_summary", "peer_connects",

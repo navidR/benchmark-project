@@ -2549,15 +2549,48 @@ struct IncrementalRunReport::Impl {
             OptionalUint64Field(publication, "node_count");
         const std::optional<std::uint64_t> miner_count =
             OptionalUint64Field(publication, "miner_count");
+        const std::optional<std::uint64_t> masternode_count =
+            OptionalUint64Field(publication, "masternode_count");
         const boost::json::value* miner_nodes =
             publication.if_contains("miner_nodes");
         const boost::json::value* miner_node_ids =
             publication.if_contains("miner_node_ids");
+        const boost::json::value* masternode_nodes =
+            publication.if_contains("masternode_nodes");
+        const boost::json::value* masternode_node_ids =
+            publication.if_contains("masternode_node_ids");
+        const boost::json::value* masternodes =
+            publication.if_contains("masternodes");
         const boost::json::value* node_roles =
             publication.if_contains("node_roles");
         const boost::json::value* report_node_configs =
             report.if_contains("node_configs");
         boost::json::value* report_topology = report.if_contains("topology");
+        const bool has_masternode_fields =
+            masternode_count || masternode_nodes != nullptr ||
+            masternode_node_ids != nullptr || masternodes != nullptr;
+        const std::uint64_t published_masternode_count =
+            masternode_count.value_or(0U);
+        boost::json::array empty_masternode_array;
+        const boost::json::array* published_masternode_nodes =
+            &empty_masternode_array;
+        const boost::json::array* published_masternode_node_ids =
+            &empty_masternode_array;
+        const boost::json::array* published_masternodes =
+            &empty_masternode_array;
+        if (has_masternode_fields) {
+          if (!masternode_count || masternode_nodes == nullptr ||
+              !masternode_nodes->is_array() || masternode_node_ids == nullptr ||
+              !masternode_node_ids->is_array() || masternodes == nullptr ||
+              !masternodes->is_array()) {
+            throw std::runtime_error(
+                "runtime role generation masternode publication is "
+                "incomplete");
+          }
+          published_masternode_nodes = &masternode_nodes->as_array();
+          published_masternode_node_ids = &masternode_node_ids->as_array();
+          published_masternodes = &masternodes->as_array();
+        }
         if (!generation || *generation == 0U || !node_count || !miner_count ||
             *miner_count > *node_count || miner_nodes == nullptr ||
             !miner_nodes->is_array() || miner_node_ids == nullptr ||
@@ -2567,6 +2600,11 @@ struct IncrementalRunReport::Impl {
             !report_topology->is_object() ||
             miner_nodes->as_array().size() != *miner_count ||
             miner_node_ids->as_array().size() != *miner_count ||
+            published_masternode_count > *node_count ||
+            published_masternode_nodes->size() != published_masternode_count ||
+            published_masternode_node_ids->size() !=
+                published_masternode_count ||
+            published_masternodes->size() != published_masternode_count ||
             node_roles->as_array().size() != *node_count ||
             report_node_configs->as_array().size() != *node_count) {
           throw std::runtime_error(
@@ -2617,6 +2655,85 @@ struct IncrementalRunReport::Impl {
           }
         }
 
+        std::set<std::uint64_t> unique_masternode_nodes;
+        std::set<std::string> unique_masternode_node_ids;
+        for (std::size_t index = 0U; index < published_masternode_nodes->size();
+             ++index) {
+          const boost::json::value& node_value =
+              (*published_masternode_nodes)[index];
+          const boost::json::value& id_value =
+              (*published_masternode_node_ids)[index];
+          std::optional<std::uint64_t> node;
+          if (node_value.is_uint64()) {
+            node = node_value.as_uint64();
+          } else if (node_value.is_int64() && node_value.as_int64() >= 0) {
+            node = static_cast<std::uint64_t>(node_value.as_int64());
+          }
+          if (!node || *node == 0U || *node > *node_count ||
+              !unique_masternode_nodes.insert(*node).second ||
+              !id_value.is_string() || id_value.as_string().empty() ||
+              !unique_masternode_node_ids
+                   .insert(std::string(id_value.as_string()))
+                   .second ||
+              configured_ids_by_node.at(*node) != id_value.as_string()) {
+            throw std::runtime_error(
+                "runtime role generation masternode identity is invalid");
+          }
+        }
+
+        std::set<std::string> unique_pro_tx_hashes;
+        std::set<std::string> unique_masternode_services;
+        std::set<std::uint64_t> identity_masternode_nodes;
+        for (const boost::json::value& value : *published_masternodes) {
+          if (!value.is_object()) {
+            throw std::runtime_error(
+                "runtime role generation masternode is invalid");
+          }
+          const boost::json::object& masternode = value.as_object();
+          const std::optional<std::uint64_t> node =
+              OptionalUint64Field(masternode, "node");
+          const std::optional<std::uint64_t> collateral_index =
+              OptionalUint64Field(masternode, "collateral_index");
+          const std::string node_id =
+              OptionalStringField(masternode, "node_id");
+          const std::string funding_wallet_node_id =
+              OptionalStringField(masternode, "funding_wallet_node_id");
+          const std::string pro_tx_hash =
+              OptionalStringField(masternode, "pro_tx_hash");
+          const std::string service =
+              OptionalStringField(masternode, "service");
+          const std::string collateral_address =
+              OptionalStringField(masternode, "collateral_address");
+          const std::string owner_address =
+              OptionalStringField(masternode, "owner_address");
+          const std::string operator_public_key =
+              OptionalStringField(masternode, "operator_public_key");
+          const std::string voting_address =
+              OptionalStringField(masternode, "voting_address");
+          const std::string payout_address =
+              OptionalStringField(masternode, "payout_address");
+          const std::string state = OptionalStringField(masternode, "state");
+          if (!node || *node == 0U || *node > *node_count ||
+              !collateral_index ||
+              *collateral_index > std::numeric_limits<std::uint32_t>::max() ||
+              node_id.empty() || funding_wallet_node_id.empty() ||
+              pro_tx_hash.empty() || service.empty() ||
+              collateral_address.empty() || owner_address.empty() ||
+              operator_public_key.empty() || voting_address.empty() ||
+              payout_address.empty() || state != "READY" ||
+              masternode.contains("operator_secret_key") ||
+              !identity_masternode_nodes.insert(*node).second ||
+              !unique_pro_tx_hashes.insert(pro_tx_hash).second ||
+              !unique_masternode_services.insert(service).second ||
+              !unique_masternode_nodes.contains(*node) ||
+              !unique_masternode_node_ids.contains(node_id) ||
+              configured_ids_by_node.at(*node) != node_id ||
+              !configured_node_ids.contains(funding_wallet_node_id)) {
+            throw std::runtime_error(
+                "runtime role generation masternode is invalid");
+          }
+        }
+
         std::map<std::string, std::string> published_roles;
         std::set<std::uint64_t> unique_role_nodes;
         boost::json::array published_wallet_nodes;
@@ -2630,11 +2747,24 @@ struct IncrementalRunReport::Impl {
               OptionalUint64Field(role, "node");
           const std::string node_id = OptionalStringField(role, "node_id");
           const std::string role_name = OptionalStringField(role, "role");
+          const bool role_is_wallet = role_name == "wallet" ||
+                                      role_name == "wallet_miner" ||
+                                      role_name == "wallet_masternode" ||
+                                      role_name == "wallet_miner_masternode";
+          const bool role_is_miner = role_name == "miner" ||
+                                     role_name == "wallet_miner" ||
+                                     role_name == "miner_masternode" ||
+                                     role_name == "wallet_miner_masternode";
+          const bool role_is_masternode =
+              role_name == "masternode" || role_name == "wallet_masternode" ||
+              role_name == "miner_masternode" ||
+              role_name == "wallet_miner_masternode";
+          const bool valid_role = role_name == "base" || role_is_wallet ||
+                                  role_is_miner || role_is_masternode;
           if (!node || *node == 0U || *node > *node_count ||
               !unique_role_nodes.insert(*node).second || node_id.empty() ||
               !published_roles.emplace(node_id, role_name).second ||
-              (role_name != "base" && role_name != "wallet" &&
-               role_name != "miner" && role_name != "wallet_miner")) {
+              !valid_role) {
             throw std::runtime_error(
                 "runtime role generation node role is invalid");
           }
@@ -2643,14 +2773,20 @@ struct IncrementalRunReport::Impl {
                 "runtime role generation node identity is inconsistent");
           }
           const bool expected_miner = unique_miner_nodes.contains(*node);
-          const bool role_is_miner =
-              role_name == "miner" || role_name == "wallet_miner";
           if (expected_miner != role_is_miner ||
               (expected_miner && !unique_miner_node_ids.contains(node_id))) {
             throw std::runtime_error(
                 "runtime role generation miner role is inconsistent");
           }
-          if (role_name == "wallet" || role_name == "wallet_miner") {
+          const bool expected_masternode =
+              unique_masternode_nodes.contains(*node);
+          if (expected_masternode != role_is_masternode ||
+              (expected_masternode &&
+               !unique_masternode_node_ids.contains(node_id))) {
+            throw std::runtime_error(
+                "runtime role generation masternode role is inconsistent");
+          }
+          if (role_is_wallet) {
             published_wallet_nodes.emplace_back(*node);
           }
         }
@@ -2677,9 +2813,14 @@ struct IncrementalRunReport::Impl {
         updated_topology["wallet_nodes"] = std::move(published_wallet_nodes);
         updated_topology["miner_node_count"] = *miner_count;
         updated_topology["miner_nodes"] = *miner_nodes;
+        updated_topology["masternode_node_count"] = published_masternode_count;
+        updated_topology["masternode_nodes"] = *published_masternode_nodes;
         report["role_generation"] = *generation;
         report["miner_node_count"] = *miner_count;
         report["miner_node_ids"] = *miner_node_ids;
+        report["masternode_node_count"] = published_masternode_count;
+        report["masternode_node_ids"] = *published_masternode_node_ids;
+        report["masternodes"] = *published_masternodes;
         report["node_configs"] = std::move(updated_configs);
         report["topology"] = std::move(updated_topology);
         break;

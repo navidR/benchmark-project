@@ -93,12 +93,16 @@ class FiroDriver final : public ChainDriver {
       std::uint64_t minimum_confirmations, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const override;
   bool SupportsMasternodes() const override;
+  ChainMasternodeFundingRequirements MasternodeFundingRequirements(
+      std::uint32_t count) const override;
   ChainMasternodeRegistration RegisterMasternode(
       const FiroNodeConfig& funding_wallet_node, const std::string& service,
+      const std::string& funding_address,
       std::stop_token stop_token = {}) const override;
   std::string RevokeMasternode(const FiroNodeConfig& funding_wallet_node,
                                const std::string& pro_tx_hash,
                                const std::string& operator_secret_key,
+                               const std::string& funding_address,
                                std::stop_token stop_token = {}) const override;
   ChainMasternodeStatus ReadMasternodeStatus(
       const FiroNodeConfig& masternode,

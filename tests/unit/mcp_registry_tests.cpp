@@ -902,9 +902,19 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
       role_mutation_schema.at("properties").as_object();
   for (const std::string_view field :
        {"action", "state", "created_node_ids", "role_generation",
-        "final_miner_count", "inventory_generation", "final_node_count"}) {
+        "final_miner_count", "final_masternode_count", "masternodes",
+        "inventory_generation", "final_node_count"}) {
     BOOST_TEST(role_mutation_properties.contains(field));
   }
+  const boost::json::object& masternode_identity =
+      role_mutation_properties.at("masternodes")
+          .as_object()
+          .at("items")
+          .as_object();
+  BOOST_TEST(masternode_identity.at("additionalProperties").as_bool() == false);
+  BOOST_TEST(!masternode_identity.at("properties")
+                  .as_object()
+                  .contains("operator_secret_key"));
 
   const std::array lifecycle_operations{
       std::pair{McpOperationKind::kStopNode, "stopped"},

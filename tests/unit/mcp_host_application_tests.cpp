@@ -99,7 +99,9 @@ BOOST_AUTO_TEST_CASE(
   for (const McpOperationKind operation :
        {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
         McpOperationKind::kRestartNode, McpOperationKind::kAddWallet,
-        McpOperationKind::kAddMiner, McpOperationKind::kStartWorkload,
+        McpOperationKind::kAddMiner, McpOperationKind::kAddMasternode,
+        McpOperationKind::kRemoveMasternode,
+        McpOperationKind::kRestartMasternode, McpOperationKind::kStartWorkload,
         McpOperationKind::kInspectWorkload,
         McpOperationKind::kReconfigureWorkload,
         McpOperationKind::kPauseWorkload, McpOperationKind::kResumeWorkload,

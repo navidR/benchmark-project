@@ -166,12 +166,46 @@ BOOST_AUTO_TEST_CASE(
       {"miner_count", 1U},
       {"miner_nodes", boost::json::array{1U}},
       {"miner_node_ids", boost::json::array{"firo-1"}},
+      {"masternode_count", 2U},
+      {"masternode_nodes", boost::json::array{1U, 2U}},
+      {"masternode_node_ids", boost::json::array{"firo-1", "firo-2"}},
+      {"masternodes",
+       boost::json::array{
+           boost::json::object{{"node", 1U},
+                               {"node_id", "firo-1"},
+                               {"funding_wallet_node_id", "firo-1"},
+                               {"pro_tx_hash", "protx-1"},
+                               {"service", "10.77.0.2:18168"},
+                               {"collateral_address", "collateral-1"},
+                               {"owner_address", "owner-1"},
+                               {"operator_public_key", "operator-public-1"},
+                               {"voting_address", "voting-1"},
+                               {"payout_address", "payout-1"},
+                               {"collateral_hash", "collateral-hash-1"},
+                               {"collateral_index", 1U},
+                               {"state", "READY"},
+                               {"status", "ready"}},
+           boost::json::object{{"node", 2U},
+                               {"node_id", "firo-2"},
+                               {"funding_wallet_node_id", "firo-1"},
+                               {"pro_tx_hash", "protx-2"},
+                               {"service", "10.77.0.6:18168"},
+                               {"collateral_address", "collateral-2"},
+                               {"owner_address", "owner-2"},
+                               {"operator_public_key", "operator-public-2"},
+                               {"voting_address", "voting-2"},
+                               {"payout_address", "payout-2"},
+                               {"collateral_hash", "collateral-hash-2"},
+                               {"collateral_index", 2U},
+                               {"state", "READY"},
+                               {"status", "ready"}}}},
       {"node_roles",
        boost::json::array{
+           boost::json::object{{"node", 1U},
+                               {"node_id", "firo-1"},
+                               {"role", "wallet_miner_masternode"}},
            boost::json::object{
-               {"node", 1U}, {"node_id", "firo-1"}, {"role", "miner"}},
-           boost::json::object{
-               {"node", 2U}, {"node_id", "firo-2"}, {"role", "base"}}}}};
+               {"node", 2U}, {"node_id", "firo-2"}, {"role", "masternode"}}}}};
   bbp::AppendLine(dir / "events.jsonl",
                   boost::json::serialize(boost::json::object{
                       {"run_id", "generation"},
@@ -191,6 +225,15 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(JsonInteger(report, "miner_node_count") == 1U);
   BOOST_TEST(report.at("miner_node_ids").as_array() ==
              boost::json::array{"firo-1"});
+  BOOST_TEST(JsonInteger(report, "masternode_node_count") == 2U);
+  BOOST_TEST(report.at("masternode_node_ids").as_array() ==
+             boost::json::array({"firo-1", "firo-2"}));
+  BOOST_REQUIRE_EQUAL(report.at("masternodes").as_array().size(), 2U);
+  BOOST_TEST(!report.at("masternodes")
+                  .as_array()
+                  .front()
+                  .as_object()
+                  .contains("operator_secret_key"));
   BOOST_TEST(JsonInteger(report, "nodes") == 2U);
   BOOST_TEST(report.at("node_ids").as_array() ==
              boost::json::array({"firo-1", "firo-2"}));
@@ -208,23 +251,41 @@ BOOST_AUTO_TEST_CASE(
                  .back()
                  .as_object()
                  .at("role")
-                 .as_string() == "base");
+                 .as_string() == "masternode");
   BOOST_TEST(report.at("nodes_summary")
                  .as_array()
                  .front()
                  .as_object()
                  .at("role")
-                 .as_string() == "miner");
+                 .as_string() == "wallet_miner_masternode");
   BOOST_TEST(report.at("node_configs")
                  .as_array()
                  .front()
                  .as_object()
                  .at("role")
-                 .as_string() == "miner");
+                 .as_string() == "wallet_miner_masternode");
   BOOST_TEST(
       JsonInteger(report.at("topology").as_object(), "miner_node_count") == 1U);
   BOOST_TEST(report.at("topology").as_object().at("miner_nodes").as_array() ==
              boost::json::array{1U});
+  BOOST_TEST(JsonInteger(report.at("topology").as_object(),
+                         "masternode_node_count") == 2U);
+  BOOST_TEST(
+      report.at("topology").as_object().at("masternode_nodes").as_array() ==
+      boost::json::array({1U, 2U}));
+  boost::json::object leaked_role_detail = role_detail;
+  leaked_role_detail["generation"] = 4U;
+  leaked_role_detail.at("masternodes")
+      .as_array()
+      .front()
+      .as_object()["operator_secret_key"] = "must-not-serialize";
+  bbp::AppendLine(dir / "events.jsonl",
+                  boost::json::serialize(boost::json::object{
+                      {"run_id", "generation"},
+                      {"node_id", "sim"},
+                      {"event", "runtime_role_generation_published"},
+                      {"detail", boost::json::serialize(leaked_role_detail)}}));
+  BOOST_CHECK_THROW(bbp::BuildRunReport(dir), std::runtime_error);
   std::filesystem::remove_all(dir);
 }
 

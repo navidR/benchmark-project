@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 namespace bbp {
@@ -19,6 +20,11 @@ SimulationRegistry SimulationRegistry::FromTopology(
   if (topology.wallet_node_count != topology.wallet_nodes.size()) {
     throw std::runtime_error(
         "resolved topology wallet_nodes size must match wallet_node_count");
+  }
+  if (topology.masternode_node_count != topology.masternode_nodes.size()) {
+    throw std::runtime_error(
+        "resolved topology masternode_nodes size must match "
+        "masternode_node_count");
   }
   registry.wallets_.reserve(topology.wallet_nodes.size());
   for (size_t i = 0; i < topology.wallet_nodes.size(); ++i) {
@@ -69,6 +75,73 @@ void SimulationRegistry::AddMinerNode(uint32_t node_index) {
   topology_.configured = true;
   topology_.miner_node_count =
       static_cast<uint32_t>(topology_.miner_nodes.size());
+}
+
+void SimulationRegistry::AddMasternode(MasternodeIdentity masternode) {
+  if (masternode.node == 0U || masternode.node > topology_.node_count) {
+    throw std::runtime_error("masternode backing node is out of range");
+  }
+  if (masternode.node_id.empty() || masternode.funding_wallet_node_id.empty() ||
+      masternode.pro_tx_hash.empty() || masternode.service.empty() ||
+      masternode.collateral_address.empty() ||
+      masternode.owner_address.empty() ||
+      masternode.operator_public_key.empty() ||
+      masternode.operator_secret_key.empty() ||
+      masternode.voting_address.empty() || masternode.payout_address.empty() ||
+      masternode.state != "READY") {
+    throw std::runtime_error("masternode identity is incomplete");
+  }
+  const uint32_t node_index = masternode.node - 1U;
+  if (std::find(topology_.masternode_nodes.begin(),
+                topology_.masternode_nodes.end(),
+                node_index) != topology_.masternode_nodes.end()) {
+    throw std::runtime_error("masternode node is already registered");
+  }
+  const auto duplicate_identity = [&](const MasternodeIdentity& existing) {
+    return existing.pro_tx_hash == masternode.pro_tx_hash ||
+           existing.service == masternode.service;
+  };
+  if (std::any_of(masternodes_.begin(), masternodes_.end(),
+                  duplicate_identity)) {
+    throw std::runtime_error(
+        "masternode ProTx hash or service is already registered");
+  }
+  topology_.masternode_nodes.push_back(node_index);
+  std::sort(topology_.masternode_nodes.begin(),
+            topology_.masternode_nodes.end());
+  topology_.configured = true;
+  topology_.masternode_node_count =
+      static_cast<uint32_t>(topology_.masternode_nodes.size());
+  masternodes_.push_back(std::move(masternode));
+  std::sort(
+      masternodes_.begin(), masternodes_.end(),
+      [](const MasternodeIdentity& left, const MasternodeIdentity& right) {
+        return left.node < right.node;
+      });
+}
+
+void SimulationRegistry::RemoveMasternodeNodes(
+    const std::vector<uint32_t>& node_indexes) {
+  std::set<uint32_t> requested(node_indexes.begin(), node_indexes.end());
+  if (requested.size() != node_indexes.size()) {
+    throw std::runtime_error(
+        "masternode removal contains duplicate node indexes");
+  }
+  for (const uint32_t node_index : requested) {
+    if (std::find(topology_.masternode_nodes.begin(),
+                  topology_.masternode_nodes.end(),
+                  node_index) == topology_.masternode_nodes.end()) {
+      throw std::runtime_error(
+          "masternode removal references an unregistered node");
+    }
+  }
+  std::erase_if(topology_.masternode_nodes,
+                [&](uint32_t node) { return requested.contains(node); });
+  std::erase_if(masternodes_, [&](const MasternodeIdentity& masternode) {
+    return masternode.node != 0U && requested.contains(masternode.node - 1U);
+  });
+  topology_.masternode_node_count =
+      static_cast<uint32_t>(topology_.masternode_nodes.size());
 }
 
 void SimulationRegistry::SetRuntimeNodeCount(uint32_t node_count) {
@@ -123,10 +196,14 @@ SimulationRegistry SimulationRegistry::RemapRuntimeNodes(
   next.topology_.wallet_nodes =
       remap_role_nodes(topology_.wallet_nodes, "wallet");
   next.topology_.miner_nodes = remap_role_nodes(topology_.miner_nodes, "miner");
+  next.topology_.masternode_nodes =
+      remap_role_nodes(topology_.masternode_nodes, "masternode");
   next.topology_.wallet_node_count =
       static_cast<std::uint32_t>(next.topology_.wallet_nodes.size());
   next.topology_.miner_node_count =
       static_cast<std::uint32_t>(next.topology_.miner_nodes.size());
+  next.topology_.masternode_node_count =
+      static_cast<std::uint32_t>(next.topology_.masternode_nodes.size());
   next.topology_.peer_topology = std::move(peer_topology);
   next.topology_.peer_connectivity.clear();
   next.topology_.peer_connectivity.reserve(topology_.peer_connectivity.size());
@@ -168,6 +245,14 @@ SimulationRegistry SimulationRegistry::RemapRuntimeNodes(
           "cannot remove a node backing a registered wallet");
     }
     wallet.node = *old_to_new[wallet.node - 1U] + 1U;
+  }
+  for (MasternodeIdentity& masternode : next.masternodes_) {
+    if (masternode.node == 0U || masternode.node > old_to_new.size() ||
+        !old_to_new[masternode.node - 1U]) {
+      throw std::runtime_error(
+          "cannot remove a node backing a registered masternode");
+    }
+    masternode.node = *old_to_new[masternode.node - 1U] + 1U;
   }
   return next;
 }

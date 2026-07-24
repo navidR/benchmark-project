@@ -126,12 +126,19 @@ ChainWalletFundingResult ChainDriver::PrepareWalletFunding(
 
 bool ChainDriver::SupportsMasternodes() const { return false; }
 
+ChainMasternodeFundingRequirements ChainDriver::MasternodeFundingRequirements(
+    std::uint32_t) const {
+  throw UnsupportedChainOperation("selected chain", "masternode funding");
+}
+
 ChainMasternodeRegistration ChainDriver::RegisterMasternode(
-    const ChainNodeConfig&, const std::string&, std::stop_token) const {
+    const ChainNodeConfig&, const std::string&, const std::string&,
+    std::stop_token) const {
   throw UnsupportedChainOperation("selected chain", "masternode registration");
 }
 
 std::string ChainDriver::RevokeMasternode(const ChainNodeConfig&,
+                                          const std::string&,
                                           const std::string&,
                                           const std::string&,
                                           std::stop_token) const {

@@ -719,6 +719,30 @@ boost::json::object WalletMutationIdentitySchema() {
                                 "address", "funding_address"}));
 }
 
+boost::json::object MasternodeMutationIdentitySchema() {
+  boost::json::object properties;
+  properties["node"] = IntegerSchema(1U);
+  properties["node_id"] = IdentifierSchema();
+  properties["funding_wallet_node_id"] = IdentifierSchema();
+  properties["pro_tx_hash"] = StringSchema(1U);
+  properties["service"] = StringSchema(1U);
+  properties["collateral_address"] = StringSchema(1U);
+  properties["owner_address"] = StringSchema(1U);
+  properties["operator_public_key"] = StringSchema(1U);
+  properties["voting_address"] = StringSchema(1U);
+  properties["payout_address"] = StringSchema(1U);
+  properties["collateral_hash"] = StringSchema();
+  properties["collateral_index"] = Uint64Schema();
+  properties["state"] = StringSchema(1U);
+  properties["status"] = StringSchema();
+  return ClosedObject(
+      std::move(properties),
+      Required({"node", "node_id", "funding_wallet_node_id", "pro_tx_hash",
+                "service", "collateral_address", "owner_address",
+                "operator_public_key", "voting_address", "payout_address",
+                "collateral_hash", "collateral_index", "state", "status"}));
+}
+
 boost::json::object RunStateSchema() {
   return StringEnumSchema(boost::json::array{"empty", "starting", "active",
                                              "stopping", "stopped", "failed",
@@ -1416,9 +1440,9 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kAddMasternode:
       add_run();
-      properties["node_ids"] =
-          ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
-      properties["count"] = IntegerSchema(1U, kMaximumSafeCollection);
+      properties["node_ids"] = ArraySchema(
+          IdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
+      properties["count"] = IntegerSchema(1U, kSimulationNodeAddMaximumCount);
       properties["create_nodes"] = NodeMutationConfigSchema();
       properties["funding_wallet_id"] = IdentifierSchema();
       required.emplace_back("count");
@@ -1765,6 +1789,9 @@ boost::json::object BuildMcpResultSchema(
           IdentifierSchema(), 0U, kSimulationNodeAddMaximumCount, true);
       properties["role_generation"] = Uint64Schema(1U);
       properties["final_miner_count"] = IntegerSchema();
+      properties["final_masternode_count"] = IntegerSchema();
+      properties["masternodes"] = ArraySchema(
+          MasternodeMutationIdentitySchema(), 1U, kMaximumSafeCollection);
       properties["inventory_generation"] = Uint64Schema(1U);
       properties["final_node_count"] = IntegerSchema(1U);
       require({"run_id", "node_ids", "assigned_roles", "removed_roles"});
@@ -1780,6 +1807,21 @@ boost::json::object BuildMcpResultSchema(
                 Required({"state", "created_node_ids", "role_generation",
                           "final_miner_count", "inventory_generation",
                           "final_node_count"})}}}});
+      for (const std::string_view action :
+           {"masternode.add", "masternode.remove", "masternode.restart"}) {
+        constraints.emplace_back(boost::json::object{
+            {"if",
+             boost::json::object{
+                 {"properties",
+                  boost::json::object{{"action", ConstStringSchema(action)}}},
+                 {"required", Required({"action"})}}},
+            {"then",
+             boost::json::object{
+                 {"required",
+                  Required({"state", "created_node_ids", "role_generation",
+                            "final_masternode_count", "masternodes",
+                            "inventory_generation", "final_node_count"})}}}});
+      }
       break;
     case McpResultFamily::kWorkload:
       properties["run_id"] = IdentifierSchema();

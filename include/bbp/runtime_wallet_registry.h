@@ -16,6 +16,7 @@ class RuntimeWalletSnapshot {
   [[nodiscard]] std::uint64_t generation() const;
   [[nodiscard]] const SimulationRegistry& registry() const;
   [[nodiscard]] const std::vector<WalletIdentity>& wallets() const;
+  [[nodiscard]] const std::vector<MasternodeIdentity>& masternodes() const;
 
  private:
   struct Generation;
@@ -68,6 +69,7 @@ class RuntimeWalletRegistry {
   PreparedAppend PrepareUpdate(std::uint64_t expected_generation,
                                std::vector<WalletIdentity> wallets,
                                std::vector<std::uint32_t> miner_nodes,
+                               std::vector<MasternodeIdentity> masternodes,
                                std::uint32_t runtime_node_count);
   PreparedAppend PrepareReplace(std::uint64_t expected_generation,
                                 SimulationRegistry registry);

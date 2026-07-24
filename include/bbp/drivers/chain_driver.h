@@ -156,6 +156,11 @@ class ChainTransactionInternalRpcFailure : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+class ChainMasternodeOutcomeUnknown : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 struct ChainWalletTransactionResult {
   std::vector<std::string> txids;
   std::string destination_amount;
@@ -190,6 +195,13 @@ struct ChainMasternodeStatus {
   std::string status;
 
   [[nodiscard]] bool ready() const { return state == "READY"; }
+};
+
+struct ChainMasternodeFundingRequirements {
+  std::uint64_t minimum_balance_satoshis = 0U;
+  std::uint64_t minimum_chain_height = 0U;
+  std::uint32_t registration_confirmation_blocks = 0U;
+  std::uint32_t revocation_confirmation_blocks = 0U;
 };
 
 enum class ChainTransactionState {
@@ -267,12 +279,16 @@ class ChainDriver {
       std::uint64_t minimum_confirmations, std::chrono::seconds timeout,
       std::stop_token stop_token = {}) const;
   virtual bool SupportsMasternodes() const;
+  virtual ChainMasternodeFundingRequirements MasternodeFundingRequirements(
+      std::uint32_t count) const;
   virtual ChainMasternodeRegistration RegisterMasternode(
       const ChainNodeConfig& funding_wallet_node, const std::string& service,
+      const std::string& funding_address,
       std::stop_token stop_token = {}) const;
   virtual std::string RevokeMasternode(
       const ChainNodeConfig& funding_wallet_node,
       const std::string& pro_tx_hash, const std::string& operator_secret_key,
+      const std::string& funding_address,
       std::stop_token stop_token = {}) const;
   virtual ChainMasternodeStatus ReadMasternodeStatus(
       const ChainNodeConfig& masternode, std::stop_token stop_token = {}) const;

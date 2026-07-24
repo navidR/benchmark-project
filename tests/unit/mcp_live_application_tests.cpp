@@ -2359,4 +2359,138 @@ BOOST_AUTO_TEST_CASE(mcp_live_miner_add_routes_role_result_and_cancellation) {
   application.Shutdown();
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_live_masternode_lifecycle_routes_redacted_role_results) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  for (const McpOperationKind operation :
+       {McpOperationKind::kAddMasternode, McpOperationKind::kRemoveMasternode,
+        McpOperationKind::kRestartMasternode}) {
+    BOOST_CHECK(std::find(supported.begin(), supported.end(), operation) !=
+                supported.end());
+  }
+
+  auto service = std::make_shared<McpLiveRoleService>();
+  service->operation = [](McpOperationKind kind,
+                          const boost::json::object& arguments,
+                          std::stop_token stop_token) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    const std::string action(McpOperationKindName(kind));
+    const boost::json::array& node_ids = arguments.at("node_ids").as_array();
+    if (node_ids.front().as_string() == "firo-cancel") {
+      throw SimulationCancelled();
+    }
+    const bool adding = kind == McpOperationKind::kAddMasternode;
+    const bool removing = kind == McpOperationKind::kRemoveMasternode;
+    if (adding) {
+      BOOST_TEST(arguments.at("count").as_uint64() == 1U);
+      BOOST_TEST(arguments.at("funding_wallet_id").as_string() ==
+                 "firo-wallet");
+    }
+    boost::json::object identity{
+        {"node", 1U},
+        {"node_id", "firo-1"},
+        {"funding_wallet_node_id", "firo-wallet"},
+        {"pro_tx_hash", "protx"},
+        {"service", "10.77.0.2:18168"},
+        {"collateral_address", "collateral"},
+        {"owner_address", "owner"},
+        {"operator_public_key", "operator-public"},
+        {"voting_address", "voting"},
+        {"payout_address", "payout"},
+        {"collateral_hash", "collateral-hash"},
+        {"collateral_index", 1U},
+        {"state", removing ? "REVOKED" : "READY"},
+        {"status", removing ? "revoked" : "ready"},
+    };
+    return boost::json::object{
+        {"node_ids", boost::json::array{"firo-1"}},
+        {"assigned_roles",
+         adding ? boost::json::array{"masternode"} : boost::json::array{}},
+        {"removed_roles",
+         removing ? boost::json::array{"masternode"} : boost::json::array{}},
+        {"action", action},
+        {"state", removing ? "removed" : "ready"},
+        {"created_node_ids", boost::json::array{}},
+        {"role_generation", removing ? 3U : 2U},
+        {"final_masternode_count", removing ? 0U : 1U},
+        {"masternodes", boost::json::array{std::move(identity)}},
+        {"inventory_generation", 1U},
+        {"final_node_count", 1U},
+    };
+  };
+  application.SetRoleService(service);
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const auto invoke = [&](std::string_view operation,
+                          boost::json::object arguments) {
+    arguments["run_id"] = "live-application";
+    const boost::json::object submitted =
+        Invoke(&dispatcher, operation, std::move(arguments));
+    return WaitForTerminal(&dispatcher, submitted);
+  };
+  const boost::json::object added =
+      invoke("masternode.add",
+             boost::json::object{{"node_ids", boost::json::array{"firo-1"}},
+                                 {"count", 1U},
+                                 {"funding_wallet_id", "firo-wallet"}});
+  BOOST_TEST(added.at("state").as_string() == "succeeded");
+  const boost::json::object& add_result =
+      added.at("terminal_result").as_object();
+  BOOST_TEST(add_result.at("result_family").as_string() == "role_mutation");
+  BOOST_TEST(add_result.at("action").as_string() == "masternode.add");
+  BOOST_TEST(add_result.at("final_masternode_count").as_uint64() == 1U);
+  BOOST_TEST(boost::json::serialize(add_result).find("operator_secret") ==
+             std::string::npos);
+
+  const boost::json::object restarted =
+      invoke("masternode.restart",
+             boost::json::object{{"node_ids", boost::json::array{"firo-1"}}});
+  BOOST_TEST(restarted.at("state").as_string() == "succeeded");
+  BOOST_TEST(restarted.at("terminal_result")
+                 .as_object()
+                 .at("role_generation")
+                 .as_uint64() == 2U);
+
+  const boost::json::object removed =
+      invoke("masternode.remove",
+             boost::json::object{{"node_ids", boost::json::array{"firo-1"}}});
+  BOOST_TEST(removed.at("state").as_string() == "succeeded");
+  BOOST_TEST(removed.at("terminal_result")
+                 .as_object()
+                 .at("removed_roles")
+                 .as_array() == boost::json::array{"masternode"});
+
+  const boost::json::object cancelled = invoke(
+      "masternode.restart",
+      boost::json::object{{"node_ids", boost::json::array{"firo-cancel"}}});
+  BOOST_TEST(cancelled.at("state").as_string() == "cancelled");
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
 }  // namespace bbp

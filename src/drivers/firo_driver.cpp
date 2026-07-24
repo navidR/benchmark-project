@@ -120,8 +120,8 @@ std::string PeerHost(const std::string& endpoint,
   return host;
 }
 
-void ValidateMasternodeService(std::string_view service,
-                               std::string_view driver_name) {
+std::uint16_t ValidateMasternodeService(std::string_view service,
+                                        std::string_view driver_name) {
   const std::string uri = "tcp://" + std::string(service);
   const boost::system::result<boost::urls::url_view> parsed =
       boost::urls::parse_uri(uri);
@@ -142,6 +142,7 @@ void ValidateMasternodeService(std::string_view service,
         "invalid " + std::string(driver_name) +
         " masternode service port: " + std::string(service));
   }
+  return port;
 }
 
 void ValidateBlsSecret(std::string_view secret, std::string_view driver_name) {
@@ -784,10 +785,11 @@ ProcessSpec FiroDriver::RenderProcess(const FiroNodeConfig& config) const {
     ValidateBlsSecret(config.masternode->operator_secret_key, driver_name_);
     ValidateMasternodeService(config.masternode->service, driver_name_);
     const std::string expected_service =
-        config.p2p_host + ":" + std::to_string(config.p2p_port);
+        "127.0.0.1:" + std::to_string(config.p2p_port);
     if (config.masternode->service != expected_service) {
       throw std::runtime_error(
-          "Firo masternode service must match its node P2P endpoint");
+          "Firo regtest masternode service must use the daemon's canonical "
+          "loopback endpoint");
     }
     spec.argv.push_back("-znode=1");
     spec.argv.push_back(
@@ -1176,15 +1178,40 @@ ChainWalletFundingResult FiroDriver::PrepareWalletFunding(
 
 bool FiroDriver::SupportsMasternodes() const { return true; }
 
+ChainMasternodeFundingRequirements FiroDriver::MasternodeFundingRequirements(
+    std::uint32_t count) const {
+  constexpr std::uint64_t kCollateralAndMaximumFeeSatoshis = 101000000000ULL;
+  constexpr std::uint64_t kDip3EnforcementHeight = 550U;
+  if (count == 0U) {
+    throw std::invalid_argument(
+        "Firo masternode funding count must be greater than zero");
+  }
+  if (count > std::numeric_limits<std::uint64_t>::max() /
+                  kCollateralAndMaximumFeeSatoshis) {
+    throw std::overflow_error("Firo masternode funding requirement overflow");
+  }
+  return ChainMasternodeFundingRequirements{
+      .minimum_balance_satoshis = kCollateralAndMaximumFeeSatoshis * count,
+      .minimum_chain_height = kDip3EnforcementHeight,
+      .registration_confirmation_blocks = 1U,
+      .revocation_confirmation_blocks = 1U,
+  };
+}
+
 ChainMasternodeRegistration FiroDriver::RegisterMasternode(
     const FiroNodeConfig& funding_wallet_node, const std::string& service,
-    std::stop_token stop_token) const {
+    const std::string& funding_address, std::stop_token stop_token) const {
   ThrowIfStopRequested(stop_token);
   if (!funding_wallet_node.wallet_enabled) {
     throw std::runtime_error(
         "Firo masternode registration requires a wallet-enabled funding node");
   }
-  ValidateMasternodeService(service, driver_name_);
+  const std::uint16_t service_port =
+      ValidateMasternodeService(service, driver_name_);
+  if (funding_address.empty()) {
+    throw std::runtime_error(
+        "Firo masternode registration requires a funding address");
+  }
 
   const boost::json::value key_result = RpcCall(
       funding_wallet_node, "bls", boost::json::array{"generate"}, stop_token);
@@ -1192,7 +1219,7 @@ ChainMasternodeRegistration FiroDriver::RegisterMasternode(
     throw std::runtime_error("Firo RPC bls generate returned non-object");
   }
   ChainMasternodeRegistration registration;
-  registration.service = service;
+  registration.service = "127.0.0.1:" + std::to_string(service_port);
   registration.operator_secret_key =
       JsonStringMember(key_result.as_object(), "secret");
   registration.operator_public_key =
@@ -1236,18 +1263,32 @@ ChainMasternodeRegistration FiroDriver::RegisterMasternode(
       registration.voting_address,
       0,
       registration.payout_address,
+      funding_address,
   };
-  registration.pro_tx_hash =
-      ParseSingleTxIdResult(
-          RpcCall(funding_wallet_node, "protx", params, stop_token),
-          "protx register_fund")
-          .front();
+  ThrowIfStopRequested(stop_token);
+  try {
+    registration.pro_tx_hash =
+        ParseSingleTxIdResult(
+            RpcCall(funding_wallet_node, "protx", params, stop_token),
+            "protx register_fund")
+            .front();
+  } catch (const FiroRpcError&) {
+    throw;
+  } catch (const std::exception& error) {
+    throw ChainMasternodeOutcomeUnknown(
+        "Firo protx register_fund outcome is unknown: " +
+        std::string(error.what()));
+  } catch (...) {
+    throw ChainMasternodeOutcomeUnknown(
+        "Firo protx register_fund outcome is unknown");
+  }
   return registration;
 }
 
 std::string FiroDriver::RevokeMasternode(
     const FiroNodeConfig& funding_wallet_node, const std::string& pro_tx_hash,
-    const std::string& operator_secret_key, std::stop_token stop_token) const {
+    const std::string& operator_secret_key, const std::string& funding_address,
+    std::stop_token stop_token) const {
   ThrowIfStopRequested(stop_token);
   if (!funding_wallet_node.wallet_enabled) {
     throw std::runtime_error(
@@ -1257,13 +1298,17 @@ std::string FiroDriver::RevokeMasternode(
     throw std::runtime_error(
         "Firo masternode revocation requires a ProTx hash");
   }
+  if (funding_address.empty()) {
+    throw std::runtime_error(
+        "Firo masternode revocation requires a funding address");
+  }
   ValidateBlsSecret(operator_secret_key, driver_name_);
-  return ParseSingleTxIdResult(
-             RpcCall(funding_wallet_node, "protx",
-                     boost::json::array{"revoke", pro_tx_hash,
-                                        operator_secret_key, 0},
-                     stop_token),
-             "protx revoke")
+  return ParseSingleTxIdResult(RpcCall(funding_wallet_node, "protx",
+                                       boost::json::array{"revoke", pro_tx_hash,
+                                                          operator_secret_key,
+                                                          0, funding_address},
+                                       stop_token),
+                               "protx revoke")
       .front();
 }
 
