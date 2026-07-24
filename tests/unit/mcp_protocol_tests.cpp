@@ -263,6 +263,26 @@ BOOST_AUTO_TEST_CASE(
       ProtocolRequest(http::verb::post, RequestBody(3U, "ping"), newest_session,
                       kTestToken, kNewestVersion));
   BOOST_TEST(newest_ping.result() == http::status::ok);
+  const auto require_common_tool_contract = [&](std::string_view session,
+                                                std::string_view version,
+                                                std::uint64_t request_id) {
+    const auto response = protocol.Handle(
+        ProtocolRequest(http::verb::post, RequestBody(request_id, "tools/list"),
+                        session, kTestToken, version));
+    BOOST_REQUIRE(response.result() == http::status::ok);
+    const boost::json::value parsed = boost::json::parse(response.body());
+    const boost::json::array& tools =
+        parsed.as_object().at("result").as_object().at("tools").as_array();
+    BOOST_REQUIRE(!tools.empty());
+    for (const boost::json::value& value : tools) {
+      const boost::json::object& tool = value.as_object();
+      BOOST_TEST(tool.at("outputSchema").as_object().at("type").as_string() ==
+                 "object");
+      BOOST_TEST(tool.if_contains("execution") == nullptr);
+    }
+  };
+  require_common_tool_contract(stable_session, kStableVersion, 8U);
+  require_common_tool_contract(newest_session, kNewestVersion, 9U);
 
   const auto mismatched_post = protocol.Handle(
       ProtocolRequest(http::verb::post, RequestBody(4U, "ping"), stable_session,
@@ -810,8 +830,9 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_bounds_sessions_and_retained_notifications) {
   for (std::size_t index = 0U; index < kMcpMaximumNotificationsPerSession + 1U;
        ++index) {
     protocol.EnqueueNotification(
-        first_session, "notifications/progress",
-        boost::json::object{{"progressToken", index}, {"progress", index}});
+        first_session, kMcpOperationUpdatedNotification,
+        boost::json::object{{"operation_id", index},
+                            {"progress_completed", index}});
   }
   const McpProtocolStats stats = protocol.Stats();
   BOOST_TEST(stats.sessions == kMcpMaximumSessions);
@@ -1042,11 +1063,13 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_reconnect_resumes_after_event_cursor) {
   const std::string session = Initialize(&protocol);
   MarkInitialized(&protocol, session);
   protocol.EnqueueNotification(
-      session, "notifications/progress",
-      boost::json::object{{"progressToken", "operation-a"}, {"progress", 1}});
+      session, kMcpOperationUpdatedNotification,
+      boost::json::object{{"operation_id", "operation-a"},
+                          {"progress_completed", 1}});
   protocol.EnqueueNotification(
-      session, "notifications/progress",
-      boost::json::object{{"progressToken", "operation-a"}, {"progress", 2}});
+      session, kMcpOperationUpdatedNotification,
+      boost::json::object{{"operation_id", "operation-a"},
+                          {"progress_completed", 2}});
 
   auto get = ProtocolRequest(http::verb::get, {}, session);
   get.set(http::field::accept, "text/event-stream");

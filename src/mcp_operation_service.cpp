@@ -240,6 +240,7 @@ bool ContainsNode(const std::vector<std::string>& node_ids,
 }
 
 void ValidateEvidenceRecord(const McpEvidenceRecord& record) {
+  ValidateMcpIdentifier(record.run_id, "evidence run id");
   ValidateInformationFamily(record.family);
   const auto validate_optional_identifier = [](const auto& value,
                                                std::string_view label) {
@@ -261,15 +262,17 @@ void ValidateEvidenceRecord(const McpEvidenceRecord& record) {
 
 McpServiceNotification OperationNotification(
     const McpOperationSnapshot& snapshot) {
-  boost::json::object params{{"progressToken", snapshot.operation_id},
-                             {"progress", snapshot.progress.completed},
-                             {"total", snapshot.progress.total},
-                             {"message", McpOperationStateName(snapshot.state)},
-                             {"operation", McpOperationKindName(snapshot.kind)},
-                             {"sequence", snapshot.sequence}};
-  return McpServiceNotification{.session_id = snapshot.session_id,
-                                .method = "notifications/progress",
-                                .params = std::move(params)};
+  boost::json::object params{
+      {"operation_id", snapshot.operation_id},
+      {"operation", McpOperationKindName(snapshot.kind)},
+      {"state", McpOperationStateName(snapshot.state)},
+      {"progress_completed", snapshot.progress.completed},
+      {"progress_total", snapshot.progress.total},
+      {"sequence", snapshot.sequence}};
+  return McpServiceNotification{
+      .session_id = snapshot.session_id,
+      .method = std::string(kMcpOperationUpdatedNotification),
+      .params = std::move(params)};
 }
 
 }  // namespace
@@ -361,13 +364,20 @@ struct McpOperationService::Impl {
   struct OperationRecord {
     McpOperationSnapshot snapshot;
     std::uint64_t admission_sequence = 0U;
+    std::uint64_t last_delivered_notification_sequence = 0U;
     std::optional<std::jthread> worker;
     std::size_t waiters = 0U;
     bool worker_exited = false;
   };
 
+  struct PendingNotification {
+    std::string key;
+    McpServiceNotification notification;
+  };
+
   struct SubscriptionRecord {
     std::string id;
+    std::string run_id;
     std::vector<McpInformationFamily> families;
     std::vector<std::string> node_ids;
     std::deque<McpEvidenceRecord> notifications;
@@ -583,7 +593,9 @@ struct McpOperationService::Impl {
     for (auto operation = operations.begin(); operation != operations.end();
          ++operation) {
       if (!IsTerminalMcpOperationState(operation->second.snapshot.state) ||
-          operation->second.waiters != 0U) {
+          operation->second.waiters != 0U ||
+          operation->second.last_delivered_notification_sequence <
+              operation->second.snapshot.sequence) {
         continue;
       }
       if (oldest == operations.end() || operation->second.admission_sequence <
@@ -600,22 +612,158 @@ struct McpOperationService::Impl {
     ++stats.evicted_operations;
   }
 
-  void Deliver(std::vector<McpServiceNotification> notifications) {
+  std::string NotificationKey(
+      const McpServiceNotification& notification) const {
+    if (!notification.params.is_object()) {
+      throw std::logic_error("MCP service notification params are not typed");
+    }
+    const boost::json::object& params = notification.params.as_object();
+    std::string_view identifier_name;
+    if (notification.method == kMcpOperationUpdatedNotification) {
+      identifier_name = "operation_id";
+    } else if (notification.method == kMcpSubscriptionUpdatedNotification) {
+      identifier_name = "subscription_id";
+    } else {
+      throw std::logic_error("unknown MCP service notification method");
+    }
+    const boost::json::value* identifier = params.if_contains(identifier_name);
+    if (identifier == nullptr || !identifier->is_string()) {
+      throw std::logic_error(
+          "MCP service notification identifier is not typed");
+    }
+    std::string key = notification.session_id;
+    key.push_back('\0');
+    key.append(notification.method);
+    key.push_back('\0');
+    key.append(identifier->as_string());
+    return key;
+  }
+
+  void ErasePendingNotificationLocked(std::string_view session_id,
+                                      std::string_view method,
+                                      std::string_view identifier) {
+    std::string key(session_id);
+    key.push_back('\0');
+    key.append(method);
+    key.push_back('\0');
+    key.append(identifier);
+    std::erase_if(pending_notifications,
+                  [&](const PendingNotification& notification) {
+                    return notification.key == key;
+                  });
+  }
+
+  void QueueNotificationLocked(McpServiceNotification notification) {
+    std::string key = NotificationKey(notification);
+    OperationRecord* operation_record = nullptr;
+    std::uint64_t operation_sequence = 0U;
+    if (notification.method == kMcpOperationUpdatedNotification) {
+      const boost::json::object& params = notification.params.as_object();
+      const std::string operation_id(params.at("operation_id").as_string());
+      operation_sequence = params.at("sequence").as_uint64();
+      const auto operation = operations.find(operation_id);
+      if (operation == operations.end() ||
+          operation->second.snapshot.session_id != notification.session_id ||
+          operation_sequence <=
+              operation->second.last_delivered_notification_sequence) {
+        return;
+      }
+      operation_record = &operation->second;
+    }
     if (!notification_handler) {
+      if (operation_record != nullptr) {
+        operation_record->last_delivered_notification_sequence =
+            operation_sequence;
+      }
       return;
     }
-    for (const McpServiceNotification& notification : notifications) {
+    const auto pending =
+        std::find_if(pending_notifications.begin(), pending_notifications.end(),
+                     [&](const PendingNotification& candidate) {
+                       return candidate.key == key;
+                     });
+    if (pending != pending_notifications.end()) {
+      if (notification.method == kMcpOperationUpdatedNotification) {
+        const std::uint64_t pending_sequence =
+            pending->notification.params.as_object().at("sequence").as_uint64();
+        if (operation_sequence <= pending_sequence) {
+          return;
+        }
+        pending_notifications.erase(pending);
+        pending_notifications.push_back(
+            PendingNotification{.key = std::move(key),
+                                .notification = std::move(notification)});
+        return;
+      }
+      pending->notification = std::move(notification);
+      return;
+    }
+    const std::size_t maximum_pending =
+        config.maximum_retained_operations +
+        config.maximum_sessions * config.maximum_subscriptions_per_session;
+    if (pending_notifications.size() == maximum_pending) {
+      throw std::logic_error(
+          "MCP service notification queue exceeded its bound");
+    }
+    pending_notifications.push_back(
+        PendingNotification{.key = std::move(key),
+                            .notification = std::move(notification)});
+  }
+
+  void DrainNotifications() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!notification_handler || notification_delivery_active ||
+          pending_notifications.empty()) {
+        return;
+      }
+      notification_delivery_active = true;
+    }
+    for (;;) {
+      McpServiceNotification notification;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pending_notifications.empty()) {
+          notification_delivery_active = false;
+          state_changed.notify_all();
+          return;
+        }
+        notification =
+            std::move(pending_notifications.front().notification);
+        pending_notifications.pop_front();
+      }
+      bool handler_failed = false;
       try {
         notification_handler(notification);
       } catch (...) {
-        std::lock_guard<std::mutex> lock(mutex);
-        ++stats.notification_handler_failures;
+        handler_failed = true;
       }
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (handler_failed) {
+          ++stats.notification_handler_failures;
+        }
+        if (notification.method == kMcpOperationUpdatedNotification) {
+          const boost::json::object& params = notification.params.as_object();
+          const std::string operation_id(
+              params.at("operation_id").as_string());
+          const auto operation = operations.find(operation_id);
+          if (operation != operations.end() &&
+              operation->second.snapshot.session_id ==
+                  notification.session_id) {
+            operation->second.last_delivered_notification_sequence = std::max(
+                operation->second.last_delivered_notification_sequence,
+                params.at("sequence").as_uint64());
+          }
+        }
+      }
+      state_changed.notify_all();
     }
   }
 
-  void NotifyOperation(const McpOperationSnapshot& snapshot) {
-    Deliver({OperationNotification(snapshot)});
+  void QueueOperationNotificationLocked(
+      const McpOperationSnapshot& snapshot) {
+    QueueNotificationLocked(OperationNotification(snapshot));
   }
 
   void ReportProgress(std::string_view operation_id, std::uint64_t completed) {
@@ -643,9 +791,10 @@ struct McpOperationService::Impl {
       target.progress.completed = completed;
       IncrementSequenceLocked(&target);
       snapshot = target;
+      QueueOperationNotificationLocked(snapshot);
     }
     state_changed.notify_all();
-    NotifyOperation(snapshot);
+    DrainNotifications();
   }
 
   void CompleteLocked(OperationRecord* operation, McpOperationState state,
@@ -706,9 +855,10 @@ struct McpOperationService::Impl {
         execute = true;
       }
       snapshot = operation.snapshot;
+      QueueOperationNotificationLocked(snapshot);
     }
     state_changed.notify_all();
-    NotifyOperation(snapshot);
+    DrainNotifications();
     if (!execute) {
       return;
     }
@@ -777,9 +927,10 @@ struct McpOperationService::Impl {
       CompleteLocked(&operation, terminal_state, std::move(result),
                      std::move(error));
       snapshot = operation.snapshot;
+      QueueOperationNotificationLocked(snapshot);
     }
     state_changed.notify_all();
-    NotifyOperation(snapshot);
+    DrainNotifications();
   }
 
   bool SessionWaitersDrainedLocked() const {
@@ -815,12 +966,13 @@ struct McpOperationService::Impl {
           CompleteLocked(&found->second, McpOperationState::kFailed,
                          std::nullopt, std::move(error));
           snapshot = found->second.snapshot;
+          QueueOperationNotificationLocked(snapshot);
           notify = true;
         }
       }
       state_changed.notify_all();
       if (notify) {
-        NotifyOperation(snapshot);
+        DrainNotifications();
       }
     } catch (...) {
     }
@@ -864,6 +1016,7 @@ struct McpOperationService::Impl {
       std::uint64_t after_sequence, std::size_t limit) const {
     McpSubscriptionSnapshot snapshot{.subscription_id = subscription.id,
                                      .session_id = std::string(session_id),
+                                     .run_id = subscription.run_id,
                                      .items = {},
                                      .next_cursor = after_sequence,
                                      .dropped = subscription.dropped,
@@ -885,7 +1038,6 @@ struct McpOperationService::Impl {
   void Shutdown() {
     std::vector<std::jthread> workers;
     std::vector<std::stop_source> stop_sources;
-    std::vector<McpServiceNotification> notifications;
     const auto join_workers = [](std::vector<std::jthread>* joinable_workers) {
       for (std::jthread& worker : *joinable_workers) {
         worker.request_stop();
@@ -929,7 +1081,7 @@ struct McpOperationService::Impl {
             operation.snapshot.cancel_requested = true;
             operation.snapshot.state = McpOperationState::kCancelling;
             IncrementSequenceLocked(&operation.snapshot);
-            notifications.push_back(OperationNotification(operation.snapshot));
+            QueueOperationNotificationLocked(operation.snapshot);
           }
           if (operation.worker) {
             stop_sources.push_back(operation.worker->get_stop_source());
@@ -953,7 +1105,7 @@ struct McpOperationService::Impl {
       stop_source.request_stop();
     }
     state_changed.notify_all();
-    Deliver(std::move(notifications));
+    DrainNotifications();
     join_workers(&workers);
 
     bool completed = false;
@@ -976,6 +1128,7 @@ struct McpOperationService::Impl {
   McpServiceNotificationHandler notification_handler;
   mutable std::mutex mutex;
   mutable std::condition_variable_any state_changed;
+  std::deque<PendingNotification> pending_notifications;
   std::map<std::string, SessionRecord, std::less<>> sessions;
   std::map<std::string, OperationRecord, std::less<>> operations;
   std::vector<std::jthread> deferred_workers;
@@ -987,6 +1140,7 @@ struct McpOperationService::Impl {
   bool shutdown_owner_is_worker = false;
   bool shutdown_owner_is_request = false;
   bool shutdown_workers_joined = false;
+  bool notification_delivery_active = false;
 };
 
 McpOperationService::McpOperationService(
@@ -1019,7 +1173,6 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
     throw std::invalid_argument(
         "MCP session removal timeout cannot be negative");
   }
-  std::vector<McpServiceNotification> notifications;
   std::vector<std::stop_source> stop_sources;
   std::vector<std::jthread> workers;
   std::unique_lock<std::mutex> lock(impl_->mutex);
@@ -1036,7 +1189,7 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
       operation.snapshot.cancel_requested = true;
       operation.snapshot.state = McpOperationState::kCancelling;
       impl_->IncrementSequenceLocked(&operation.snapshot);
-      notifications.push_back(OperationNotification(operation.snapshot));
+      impl_->QueueOperationNotificationLocked(operation.snapshot);
     }
     if (operation.worker) {
       stop_sources.push_back(operation.worker->get_stop_source());
@@ -1051,7 +1204,7 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
     stop_source.request_stop();
   }
   impl_->state_changed.notify_all();
-  impl_->Deliver(std::move(notifications));
+  impl_->DrainNotifications();
   lock.lock();
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   const bool stopped = impl_->state_changed.wait_until(lock, deadline, [&] {
@@ -1068,6 +1221,11 @@ bool McpOperationService::RemoveSession(std::string_view session_id,
     if (operation.snapshot.session_id == session_id && operation.worker) {
       impl_->TakeWorkerLocked(&operation.worker, &workers);
     }
+  }
+  for (const auto& [subscription_id, subscription] : session.subscriptions) {
+    static_cast<void>(subscription);
+    impl_->ErasePendingNotificationLocked(
+        session_id, kMcpSubscriptionUpdatedNotification, subscription_id);
   }
   impl_->sessions.erase(std::string(session_id));
   impl_->stats.sessions = impl_->sessions.size();
@@ -1249,6 +1407,7 @@ McpOperationCancellation McpOperationService::CancelOperation(
       }
       cancellation.request_accepted = true;
       notify = true;
+      impl_->QueueOperationNotificationLocked(operation.snapshot);
     }
     cancellation.operation = operation.snapshot;
   }
@@ -1257,7 +1416,7 @@ McpOperationCancellation McpOperationService::CancelOperation(
   }
   impl_->state_changed.notify_all();
   if (notify) {
-    impl_->NotifyOperation(cancellation.operation);
+    impl_->DrainNotifications();
   }
   return cancellation;
 }
@@ -1290,6 +1449,7 @@ std::optional<McpOperationSnapshot> McpOperationService::WaitForOperation(
 
 McpSubscriptionSnapshot McpOperationService::CreateSubscription(
     std::string_view session_id, McpSubscriptionRequest request) {
+  ValidateMcpIdentifier(request.run_id, "MCP subscription run id");
   if (request.families.empty()) {
     throw std::invalid_argument(
         "MCP subscription requires an information family");
@@ -1353,11 +1513,14 @@ McpSubscriptionSnapshot McpOperationService::CreateSubscription(
     if (oldest == session.subscriptions.end()) {
       throw std::runtime_error("MCP per-session subscription capacity reached");
     }
+    impl_->ErasePendingNotificationLocked(
+        session_id, kMcpSubscriptionUpdatedNotification, oldest->first);
     session.subscriptions.erase(oldest);
   }
   const std::string subscription_id = impl_->UniqueSubscriptionIdLocked();
   Impl::SubscriptionRecord subscription{
       .id = subscription_id,
+      .run_id = std::move(request.run_id),
       .families = std::move(request.families),
       .node_ids = std::move(request.node_ids),
       .notifications = {},
@@ -1434,6 +1597,29 @@ McpSubscriptionSnapshot McpOperationService::CancelSubscription(
   return snapshot;
 }
 
+void McpOperationService::CloseRunSubscriptions(std::string_view run_id) {
+  ValidateMcpIdentifier(run_id, "MCP subscription run id");
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (auto& [session_id, session] : impl_->sessions) {
+      static_cast<void>(session_id);
+      for (auto& [subscription_id, subscription] : session.subscriptions) {
+        static_cast<void>(subscription_id);
+        if (!subscription.active || subscription.run_id != run_id) {
+          continue;
+        }
+        subscription.active = false;
+        if (impl_->stats.active_subscriptions == 0U) {
+          throw std::logic_error(
+              "MCP active subscription accounting underflow");
+        }
+        --impl_->stats.active_subscriptions;
+      }
+    }
+  }
+  impl_->state_changed.notify_all();
+}
+
 void McpOperationService::Publish(McpEvidenceRecord record) {
   ValidateEvidenceRecord(record);
   std::vector<McpServiceNotification> notifications;
@@ -1446,7 +1632,7 @@ void McpOperationService::Publish(McpEvidenceRecord record) {
       for (const auto& [subscription_id, subscription] :
            session.subscriptions) {
         static_cast<void>(subscription_id);
-        if (subscription.active &&
+        if (subscription.active && subscription.run_id == record.run_id &&
             ContainsFamily(subscription.families, record.family) &&
             ContainsNode(subscription.node_ids, record.node_id) &&
             subscription.next_sequence ==
@@ -1459,6 +1645,7 @@ void McpOperationService::Publish(McpEvidenceRecord record) {
     for (auto& [session_id, session] : impl_->sessions) {
       for (auto& [subscription_id, subscription] : session.subscriptions) {
         if (!subscription.active ||
+            subscription.run_id != record.run_id ||
             !ContainsFamily(subscription.families, record.family) ||
             !ContainsNode(subscription.node_ids, record.node_id)) {
           continue;
@@ -1475,16 +1662,18 @@ void McpOperationService::Publish(McpEvidenceRecord record) {
         ++impl_->stats.notifications_published;
         notifications.push_back(McpServiceNotification{
             .session_id = session_id,
-            .method = "notifications/resources/updated",
+            .method = std::string(kMcpSubscriptionUpdatedNotification),
             .params = boost::json::object{
-                {"uri", "bbp:///notifications"},
                 {"subscription_id", subscription_id},
                 {"item", McpEvidenceRecordJson(retained)}}});
       }
     }
+    for (McpServiceNotification& notification : notifications) {
+      impl_->QueueNotificationLocked(std::move(notification));
+    }
   }
   impl_->state_changed.notify_all();
-  impl_->Deliver(std::move(notifications));
+  impl_->DrainNotifications();
 }
 
 McpOperationServiceStats McpOperationService::Stats() const {
@@ -1555,6 +1744,7 @@ boost::json::object McpOperationErrorJson(const McpOperationError& error,
 
 boost::json::object McpEvidenceRecordJson(const McpEvidenceRecord& record) {
   boost::json::object result{
+      {"run_id", record.run_id},
       {"family", McpInformationFamilyName(record.family)},
       {"sequence", record.sequence},
       {"timestamp_ms", record.timestamp_ms}};
@@ -1586,6 +1776,7 @@ boost::json::object McpSubscriptionSnapshotJson(
   return boost::json::object{
       {"result_family", McpResultFamilyName(McpResultFamily::kSubscription)},
       {"subscription_id", snapshot.subscription_id},
+      {"run_id", snapshot.run_id},
       {"items", std::move(items)},
       {"next_cursor", std::to_string(snapshot.next_cursor)},
       {"dropped", snapshot.dropped},

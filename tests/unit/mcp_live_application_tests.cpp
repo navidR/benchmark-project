@@ -141,6 +141,7 @@ BOOST_AUTO_TEST_CASE(
 
   auto queue = std::make_shared<SimulationCommandQueue>();
   std::atomic<bool> stop_requested = false;
+  McpDispatcher* evidence_dispatcher = nullptr;
   McpLiveApplication application(McpLiveApplication::Config{
       .run_id = "live-application",
       .run_root = temporary.path(),
@@ -150,7 +151,17 @@ BOOST_AUTO_TEST_CASE(
       .request_run_stop = [&] { stop_requested.store(true); },
       .run_started = {},
       .run_stopping = {},
-      .run_stopped = {}});
+      .run_stopped = {},
+      .publish_evidence =
+          [&](McpEvidenceRecord record) {
+            BOOST_REQUIRE(evidence_dispatcher != nullptr);
+            evidence_dispatcher->Publish(std::move(record));
+          },
+      .close_run_subscriptions =
+          [&](std::string_view run_id) {
+            BOOST_REQUIRE(evidence_dispatcher != nullptr);
+            evidence_dispatcher->CloseRunSubscriptions(run_id);
+          }});
   const boost::json::value starting_registry = application.ResourceReader()(
       McpInformationFamily::kRunRegistry, "live-session", std::stop_token{});
   BOOST_TEST(starting_registry.as_object()
@@ -160,10 +171,27 @@ BOOST_AUTO_TEST_CASE(
                  .as_object()
                  .at("state")
                  .as_string() == "starting");
-  application.MarkRunStarted();
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
+  evidence_dispatcher = &dispatcher;
   dispatcher.SessionHandler()("live-session", true, {});
+  const boost::json::object subscription =
+      Invoke(&dispatcher, "subscription.create",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"families", boost::json::array{"lifecycle", "events"}}});
+  application.MarkRunStarted();
+  const boost::json::object started_page =
+      Invoke(&dispatcher, "subscription.poll",
+             boost::json::object{
+                 {"subscription_id", subscription.at("subscription_id")},
+                 {"cursor", "0"},
+                 {"limit", 8U}});
+  BOOST_REQUIRE_EQUAL(started_page.at("items").as_array().size(), 1U);
+  const boost::json::object& started_evidence =
+      started_page.at("items").as_array().front().as_object();
+  BOOST_TEST(started_evidence.at("run_id").as_string() == "live-application");
+  BOOST_TEST(started_evidence.at("kind").as_string() == "run_started");
 
   const boost::json::value reports = application.ResourceReader()(
       McpInformationFamily::kReports, "live-session", std::stop_token{});
@@ -401,6 +429,18 @@ BOOST_AUTO_TEST_CASE(
                  .as_object()
                  .at("state")
                  .as_string() == "stopped");
+  const boost::json::object stopped_page =
+      Invoke(&dispatcher, "subscription.poll",
+             boost::json::object{
+                 {"subscription_id", subscription.at("subscription_id")},
+                 {"cursor", "0"},
+                 {"limit", 64U}});
+  BOOST_TEST(!stopped_page.at("active").as_bool());
+  const boost::json::array& lifecycle_items =
+      stopped_page.at("items").as_array();
+  BOOST_REQUIRE(lifecycle_items.size() >= 3U);
+  BOOST_TEST(lifecycle_items.back().as_object().at("kind").as_string() ==
+             "run_stopped");
 
   dispatcher.Shutdown();
   application.Shutdown();
@@ -748,6 +788,9 @@ BOOST_AUTO_TEST_CASE(
                         McpOperationKind::kStopRun) == supported.end());
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kReadArtifact) == supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kCreateSubscription) ==
+              supported.end());
   const std::vector<McpInformationFamily> supported_information =
       application.SupportedInformationFamilies();
   BOOST_CHECK(std::find(supported_information.begin(),
@@ -794,6 +837,17 @@ BOOST_AUTO_TEST_CASE(
           .at("data")
           .as_object();
   BOOST_TEST(notifications.at("transport").as_string() == "MCP SSE GET stream");
+  const boost::json::array& notification_methods =
+      notifications.at("methods").as_array();
+  BOOST_REQUIRE_EQUAL(notification_methods.size(), 1U);
+  BOOST_TEST(notification_methods[0].as_string() ==
+             kMcpOperationUpdatedNotification);
+  const boost::json::object& notification_schemas =
+      notifications.at("schemas").as_object();
+  BOOST_REQUIRE_EQUAL(notification_schemas.size(),
+                      notification_methods.size());
+  BOOST_TEST(!notification_schemas.contains(
+      kMcpSubscriptionUpdatedNotification));
   BOOST_TEST(notifications.if_contains("available_through") == nullptr);
 
   try {

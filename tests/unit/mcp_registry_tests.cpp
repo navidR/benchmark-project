@@ -170,6 +170,8 @@ BOOST_AUTO_TEST_CASE(mcp_registry_mechanically_covers_typed_enums) {
   const auto events = StringSet(ArrayField(document, "events"));
   const auto local_actions =
       StringSet(ArrayField(document, "tui_local_actions"));
+  const auto notification_methods =
+      StringSet(ArrayField(document, "notification_methods"));
 
   BOOST_TEST(chains.size() == static_cast<std::size_t>(ChainKind::kCount));
   BOOST_TEST(workloads.size() ==
@@ -180,6 +182,20 @@ BOOST_AUTO_TEST_CASE(mcp_registry_mechanically_covers_typed_enums) {
              static_cast<std::size_t>(SimulationEventKind::kCount));
   BOOST_TEST(local_actions.size() ==
              static_cast<std::size_t>(TuiLocalAction::kCount));
+  BOOST_TEST(notification_methods.size() == kMcpNotificationMethods.size());
+  for (const std::string_view method : kMcpNotificationMethods) {
+    BOOST_TEST(notification_methods.contains(std::string(method)));
+  }
+  const boost::json::object& notification_schemas =
+      document.at("notification_schemas").as_object();
+  BOOST_REQUIRE(notification_schemas.size() == notification_methods.size());
+  for (const std::string_view method : kMcpNotificationMethods) {
+    const boost::json::object& schema =
+        notification_schemas.at(method).as_object();
+    BOOST_TEST(schema.at("type").as_string() == "object");
+    BOOST_TEST(schema.at("additionalProperties").as_bool() == false);
+    RequireClosedSchemaTree(schema);
+  }
   for (std::size_t index = 0U;
        index < static_cast<std::size_t>(SimulationCommandKind::kCount);
        ++index) {
@@ -533,6 +549,8 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
     BOOST_TEST(input.at("additionalProperties").as_bool() == false);
     RequireClosedSchemaTree(input);
     const boost::json::object& output = tool.at("outputSchema").as_object();
+    BOOST_TEST(output.at("type").as_string() == "object");
+    BOOST_TEST(tool.if_contains("execution") == nullptr);
     const std::size_t expected_output_choices =
         McpOperationResultFamily(operation) == McpResultFamily::kOperation ? 2U
                                                                            : 3U;
@@ -547,7 +565,7 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
                    .at("const")
                    .as_string() ==
                McpResultFamilyName(McpOperationResultFamily(operation)));
-    RequireClosedSchemaTree(output);
+    RequireClosedSchemaTree(output.at("oneOf"));
   }
 
   for (std::size_t index = 0U;

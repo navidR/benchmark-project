@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <stop_token>
@@ -100,8 +102,10 @@ McpOperationExecutor StatsReentrantStopExecutor(
 }
 
 McpEvidenceRecord Evidence(McpInformationFamily family, std::string node_id,
-                           std::string message) {
-  return McpEvidenceRecord{.family = family,
+                           std::string message,
+                           std::string run_id = "run-a") {
+  return McpEvidenceRecord{.run_id = std::move(run_id),
+                           .family = family,
                            .sequence = 0U,
                            .timestamp_ms = 100U,
                            .node_id = std::move(node_id),
@@ -382,7 +386,8 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(static_cast<bool>(terminal.error));
   BOOST_TEST(terminal.error->code == "result_too_large");
 
-  McpSubscriptionRequest request{.families = {McpInformationFamily::kMetrics},
+  McpSubscriptionRequest request{.run_id = "run-a",
+                                 .families = {McpInformationFamily::kMetrics},
                                  .node_ids = std::vector<std::string>(
                                      kMcpMaximumSelectionItems + 1U, "node-1"),
                                  .cursor = 0U};
@@ -411,7 +416,8 @@ BOOST_AUTO_TEST_CASE(mcp_operation_session_removal_cancels_owned_state) {
   service.RegisterSession("session-a");
   const McpSubscriptionSnapshot subscription = service.CreateSubscription(
       "session-a",
-      McpSubscriptionRequest{.families = {McpInformationFamily::kMetrics},
+      McpSubscriptionRequest{.run_id = "run-a",
+                             .families = {McpInformationFamily::kMetrics},
                              .node_ids = {},
                              .cursor = 0U});
   const McpOperationSnapshot submitted =
@@ -443,8 +449,8 @@ BOOST_AUTO_TEST_CASE(
   std::atomic<std::size_t> waiter_failures = 0U;
   McpOperationService service(
       TestConfig(), [&](const McpServiceNotification& notification) {
-        if (notification.method != "notifications/progress" ||
-            notification.params.as_object().at("message").as_string() !=
+        if (notification.method != kMcpOperationUpdatedNotification ||
+            notification.params.as_object().at("state").as_string() !=
                 "succeeded" ||
             removal_started.exchange(true, std::memory_order_acq_rel)) {
           return;
@@ -462,7 +468,8 @@ BOOST_AUTO_TEST_CASE(
   service.RegisterSession("session-a");
   const McpSubscriptionSnapshot subscription = service.CreateSubscription(
       "session-a",
-      McpSubscriptionRequest{.families = {McpInformationFamily::kMetrics},
+      McpSubscriptionRequest{.run_id = "run-a",
+                             .families = {McpInformationFamily::kMetrics},
                              .node_ids = {},
                              .cursor = 0U});
   const McpOperationSnapshot submitted =
@@ -567,8 +574,8 @@ BOOST_AUTO_TEST_CASE(mcp_operation_terminal_callback_can_shutdown_reentrantly) {
   std::atomic<bool> shutdown_returned = false;
   McpOperationService service(
       TestConfig(), [&](const McpServiceNotification& notification) {
-        if (notification.method != "notifications/progress" ||
-            notification.params.as_object().at("message").as_string() !=
+        if (notification.method != kMcpOperationUpdatedNotification ||
+            notification.params.as_object().at("state").as_string() !=
                 "succeeded" ||
             shutdown_started.exchange(true, std::memory_order_acq_rel)) {
           return;
@@ -812,6 +819,125 @@ BOOST_AUTO_TEST_CASE(mcp_cancel_stop_callback_can_reenter_stats) {
   BOOST_TEST(stats.active_workers == 0U);
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_cancel_notifications_never_regress_after_terminal_delivery) {
+  using BlockingStopCallback = std::stop_callback<std::function<void()>>;
+  std::atomic<bool> executor_ready = false;
+  std::atomic<bool> terminal_delivered = false;
+  std::shared_ptr<BlockingStopCallback> blocking_stop_callback;
+  std::mutex delivered_mutex;
+  std::vector<std::uint64_t> delivered_sequences;
+  std::vector<std::string> delivered_states;
+  McpOperationService service(
+      TestConfig(), [&](const McpServiceNotification& notification) {
+        if (notification.method != kMcpOperationUpdatedNotification) {
+          return;
+        }
+        const boost::json::object& params = notification.params.as_object();
+        {
+          std::lock_guard<std::mutex> lock(delivered_mutex);
+          delivered_sequences.push_back(params.at("sequence").as_uint64());
+          delivered_states.emplace_back(params.at("state").as_string());
+        }
+        if (params.at("state").as_string() == "cancelled") {
+          terminal_delivered.store(true, std::memory_order_release);
+        }
+      });
+  service.RegisterSession("session-a");
+  const McpOperationSnapshot submitted = service.Submit(
+      "session-a", McpOperationKind::kValidateScenario, 1U,
+      [&](McpOperationContext& context) {
+        blocking_stop_callback = std::make_shared<BlockingStopCallback>(
+            context.stop_token(), std::function<void()>([&] {
+              while (!terminal_delivered.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+              }
+            }));
+        executor_ready.store(true, std::memory_order_release);
+        while (!context.stop_requested()) {
+          std::this_thread::yield();
+        }
+        context.ThrowIfCancelled();
+        return ValidationResult();
+      });
+  const auto ready_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!executor_ready.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    std::this_thread::yield();
+  }
+  BOOST_REQUIRE(executor_ready.load(std::memory_order_acquire));
+
+  const McpOperationCancellation cancellation =
+      service.CancelOperation("session-a", submitted.operation_id);
+  blocking_stop_callback.reset();
+  BOOST_TEST(cancellation.request_accepted);
+  BOOST_CHECK(
+      WaitForTerminal(&service, "session-a", submitted.operation_id).state ==
+      McpOperationState::kCancelled);
+  service.Shutdown();
+
+  std::lock_guard<std::mutex> lock(delivered_mutex);
+  BOOST_REQUIRE(!delivered_sequences.empty());
+  BOOST_REQUIRE(delivered_sequences.size() == delivered_states.size());
+  for (std::size_t index = 1U; index < delivered_sequences.size(); ++index) {
+    BOOST_TEST(delivered_sequences[index - 1U] < delivered_sequences[index]);
+  }
+  BOOST_TEST(delivered_states.back() == "cancelled");
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_terminal_notification_is_delivered_before_capacity_one_eviction) {
+  std::atomic<bool> terminal_delivery_started = false;
+  std::atomic<bool> release_terminal_delivery = false;
+  std::atomic<bool> terminal_handler_returning = false;
+  McpOperationService service(
+      TestConfig(1U, 1U, 1U, 1U, 1U, 1U),
+      [&](const McpServiceNotification& notification) {
+        const boost::json::object& params = notification.params.as_object();
+        if (notification.method != kMcpOperationUpdatedNotification ||
+            params.at("state").as_string() != "succeeded") {
+          return;
+        }
+        terminal_delivery_started.store(true, std::memory_order_release);
+        while (!release_terminal_delivery.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        terminal_handler_returning.store(true, std::memory_order_release);
+      });
+  service.RegisterSession("session-a");
+  const McpOperationSnapshot first = service.Submit(
+      "session-a", McpOperationKind::kValidateScenario, 1U,
+      [](McpOperationContext&) { return ValidationResult(); });
+  BOOST_CHECK(WaitForTerminal(&service, "session-a", first.operation_id).state ==
+              McpOperationState::kSucceeded);
+  BOOST_REQUIRE(terminal_delivery_started.load(std::memory_order_acquire));
+  BOOST_CHECK_THROW(
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) { return ValidationResult(); }),
+      std::runtime_error);
+
+  release_terminal_delivery.store(true, std::memory_order_release);
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!terminal_handler_returning.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  BOOST_REQUIRE(terminal_handler_returning.load(std::memory_order_acquire));
+  std::optional<McpOperationSnapshot> replacement;
+  while (!replacement && std::chrono::steady_clock::now() < deadline) {
+    try {
+      replacement = service.Submit(
+          "session-a", McpOperationKind::kValidateScenario, 1U,
+          [](McpOperationContext&) { return ValidationResult(); });
+    } catch (const std::runtime_error&) {
+      std::this_thread::yield();
+    }
+  }
+  BOOST_REQUIRE(static_cast<bool>(replacement));
+  BOOST_CHECK(WaitForTerminal(&service, "session-a", replacement->operation_id)
+                  .state == McpOperationState::kSucceeded);
+}
+
 BOOST_AUTO_TEST_CASE(mcp_operation_callbacks_never_run_under_service_lock) {
   McpOperationService* service_pointer = nullptr;
   std::atomic<std::size_t> notifications = 0U;
@@ -838,7 +964,8 @@ BOOST_AUTO_TEST_CASE(mcp_operation_callbacks_never_run_under_service_lock) {
       McpOperationState::kSucceeded);
   service.CreateSubscription(
       "session-a",
-      McpSubscriptionRequest{.families = {McpInformationFamily::kMetrics},
+      McpSubscriptionRequest{.run_id = "run-a",
+                             .families = {McpInformationFamily::kMetrics},
                              .node_ids = {},
                              .cursor = 0U});
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "sample"));
@@ -851,6 +978,7 @@ BOOST_AUTO_TEST_CASE(mcp_subscription_capacity_and_cancellation_are_bounded) {
   service.RegisterSession("session-a");
   service.RegisterSession("session-b");
   const McpSubscriptionRequest request{
+      .run_id = "run-a",
       .families = {McpInformationFamily::kMetrics},
       .node_ids = {},
       .cursor = 0U};
@@ -883,12 +1011,15 @@ BOOST_AUTO_TEST_CASE(
   service.RegisterSession("session-a");
   const McpSubscriptionSnapshot subscription = service.CreateSubscription(
       "session-a",
-      McpSubscriptionRequest{.families = {McpInformationFamily::kMetrics},
+      McpSubscriptionRequest{.run_id = "run-a",
+                             .families = {McpInformationFamily::kMetrics},
                              .node_ids = {"node-1"},
                              .cursor = 0U});
   service.Publish(Evidence(McpInformationFamily::kEvents, "node-1", "wrong"));
   service.Publish(
       Evidence(McpInformationFamily::kMetrics, "node-2", "wrong-node"));
+  service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1",
+                           "wrong-run", "run-b"));
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "one"));
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "two"));
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "three"));
@@ -896,7 +1027,9 @@ BOOST_AUTO_TEST_CASE(
   const McpSubscriptionSnapshot page = service.PollSubscription(
       "session-a", subscription.subscription_id, 0U, 2U);
   BOOST_REQUIRE_EQUAL(page.items.size(), 2U);
+  BOOST_TEST(page.run_id == "run-a");
   BOOST_TEST(page.items[0].sequence == 2U);
+  BOOST_TEST(page.items[0].run_id == "run-a");
   BOOST_TEST(page.items[0].message.value() == "two");
   BOOST_TEST(page.items[1].sequence == 3U);
   BOOST_TEST(page.next_cursor == 3U);
@@ -911,6 +1044,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(resumed.next_cursor == 3U);
   const boost::json::object json = McpSubscriptionSnapshotJson(resumed);
   BOOST_TEST(json.at("result_family").as_string() == "subscription");
+  BOOST_TEST(json.at("run_id").as_string() == "run-a");
   BOOST_TEST(json.at("next_cursor").as_string() == "3");
 }
 
@@ -919,7 +1053,8 @@ BOOST_AUTO_TEST_CASE(mcp_subscription_poll_wakes_on_publish_and_cancel) {
   service.RegisterSession("session-a");
   const McpSubscriptionSnapshot subscription = service.CreateSubscription(
       "session-a",
-      McpSubscriptionRequest{.families = {McpInformationFamily::kMetrics},
+      McpSubscriptionRequest{.run_id = "run-a",
+                             .families = {McpInformationFamily::kMetrics},
                              .node_ids = {},
                              .cursor = 0U});
   std::optional<McpSubscriptionSnapshot> polled;
@@ -951,7 +1086,8 @@ BOOST_AUTO_TEST_CASE(mcp_subscription_concurrent_publish_poll_cancel_is_safe) {
   service.RegisterSession("session-a");
   const McpSubscriptionSnapshot subscription = service.CreateSubscription(
       "session-a",
-      McpSubscriptionRequest{.families = {McpInformationFamily::kMetrics},
+      McpSubscriptionRequest{.run_id = "run-a",
+                             .families = {McpInformationFamily::kMetrics},
                              .node_ids = {},
                              .cursor = 0U});
   std::atomic<bool> start = false;

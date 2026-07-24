@@ -297,9 +297,7 @@ boost::json::value McpHostApplication::ReadResource(
   if (family == McpInformationFamily::kNotifications) {
     return ResourceEnvelope(
         config_.host_id, run ? &*run : nullptr, family,
-        boost::json::object{
-            {"transport", "MCP SSE GET stream"},
-            {"methods", boost::json::array{"notifications/progress"}}});
+        BuildMcpNotificationDiscovery(operations));
   }
 
   if (!run || !run->application) {

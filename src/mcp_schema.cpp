@@ -751,6 +751,7 @@ boost::json::object InstrumentationTargetSchema() {
 
 boost::json::object EvidenceRecordSchema() {
   boost::json::object properties;
+  properties["run_id"] = IdentifierSchema();
   properties["family"] = InformationFamilySchema();
   properties["sequence"] = Uint64Schema();
   properties["timestamp_ms"] = Uint64Schema();
@@ -759,8 +760,9 @@ boost::json::object EvidenceRecordSchema() {
   properties["message"] = StringSchema();
   properties["artifact_id"] = IdentifierSchema();
   properties["data"] = boost::json::object{};
-  return ClosedObject(std::move(properties),
-                      Required({"family", "sequence", "timestamp_ms"}));
+  return ClosedObject(
+      std::move(properties),
+      Required({"run_id", "family", "sequence", "timestamp_ms"}));
 }
 
 boost::json::object ExactAccountingSchema() {
@@ -1696,13 +1698,15 @@ boost::json::object BuildMcpResultSchema(
       }
       break;
     case McpResultFamily::kSubscription:
+      properties["run_id"] = IdentifierSchema();
       properties["subscription_id"] = IdentifierSchema();
       properties["items"] = ArraySchema(EvidenceRecordSchema(), 0U,
                                         kMcpMaximumNotificationsPerSession);
       properties["next_cursor"] = CursorSchema();
       properties["dropped"] = Uint64Schema();
       properties["active"] = TypeSchema("boolean");
-      require({"subscription_id", "items", "next_cursor", "dropped", "active"});
+      require({"run_id", "subscription_id", "items", "next_cursor", "dropped",
+               "active"});
       break;
     case McpResultFamily::kCleanup:
       properties["run_id"] = IdentifierSchema();
@@ -1767,7 +1771,8 @@ boost::json::object BuildMcpOperationOutputSchema(
   if (result_family != McpResultFamily::kError) {
     choices.emplace_back(BuildMcpResultSchema(McpResultFamily::kError));
   }
-  return AddDraft(boost::json::object{{"oneOf", std::move(choices)}});
+  return AddDraft(
+      boost::json::object{{"type", "object"}, {"oneOf", std::move(choices)}});
 }
 
 boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation) {
@@ -1778,6 +1783,45 @@ boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation) {
     operations[index] = static_cast<McpOperationKind>(index);
   }
   return BuildMcpOperationOutputSchema(operation, operations);
+}
+
+boost::json::object BuildMcpNotificationDiscovery(
+    std::span<const McpOperationKind> operations) {
+  const bool subscriptions_supported =
+      std::find(operations.begin(), operations.end(),
+                McpOperationKind::kCreateSubscription) != operations.end();
+  boost::json::array operation_names;
+  operation_names.reserve(operations.size());
+  for (const McpOperationKind operation : operations) {
+    operation_names.emplace_back(McpOperationKindName(operation));
+  }
+  boost::json::array states{"queued", "running",   "cancelling",
+                            "cancelled", "succeeded", "failed"};
+
+  boost::json::array methods{kMcpOperationUpdatedNotification};
+  boost::json::object schemas{
+      {kMcpOperationUpdatedNotification,
+       AddDraft(ClosedObject(
+           boost::json::object{
+               {"operation_id", IdentifierSchema()},
+               {"operation", StringEnumSchema(std::move(operation_names))},
+               {"state", StringEnumSchema(std::move(states))},
+               {"progress_completed", Uint64Schema()},
+               {"progress_total", Uint64Schema()},
+               {"sequence", Uint64Schema()}},
+           {"operation_id", "operation", "state", "progress_completed",
+            "progress_total", "sequence"}))}};
+  if (subscriptions_supported) {
+    methods.emplace_back(kMcpSubscriptionUpdatedNotification);
+    schemas[kMcpSubscriptionUpdatedNotification] = AddDraft(ClosedObject(
+        boost::json::object{{"subscription_id", IdentifierSchema()},
+                            {"item", EvidenceRecordSchema()}},
+        {"subscription_id", "item"}));
+  }
+  return boost::json::object{
+      {"transport", "MCP SSE GET stream"},
+      {"methods", std::move(methods)},
+      {"schemas", std::move(schemas)}};
 }
 
 boost::json::array BuildMcpToolRegistry(
@@ -1797,8 +1841,7 @@ boost::json::array BuildMcpToolRegistry(
         {"inputSchema",
          BuildMcpOperationInputSchema(operation, information_families)},
         {"outputSchema",
-         BuildMcpOperationOutputSchema(operation, selected_operations)},
-        {"execution", boost::json::object{{"taskSupport", "optional"}}}});
+         BuildMcpOperationOutputSchema(operation, selected_operations)}});
   }
   return tools;
 }

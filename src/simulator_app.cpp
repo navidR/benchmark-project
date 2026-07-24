@@ -16242,6 +16242,19 @@ class EditorRunController {
   EditorRunController(const EditorRunController&) = delete;
   EditorRunController& operator=(const EditorRunController&) = delete;
 
+  void SetEvidenceCallbacks(
+      std::function<void(McpEvidenceRecord)> publish_evidence,
+      std::function<void(std::string_view)> close_run_subscriptions) {
+    std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_) {
+      throw std::logic_error(
+          "MCP evidence callbacks must be configured before launching a run");
+    }
+    publish_evidence_ = std::move(publish_evidence);
+    close_run_subscriptions_ = std::move(close_run_subscriptions);
+  }
+
   std::shared_ptr<EditorRunContext> LaunchScenario(
       const boost::json::object& scenario) {
     return Launch(ParseAndValidateScenario(scenario), scenario);
@@ -16468,6 +16481,8 @@ class EditorRunController {
     RequireSafeOutputDirectory(options.output_dir);
     std::lock_guard<std::mutex> transition_lock(transition_mutex_);
     ReapTerminalRun();
+    std::function<void(McpEvidenceRecord)> publish_evidence;
+    std::function<void(std::string_view)> close_run_subscriptions;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (shutdown_) {
@@ -16480,6 +16495,8 @@ class EditorRunController {
             "run_already_active",
             "a managed run is already starting, active, or stopping", true);
       }
+      publish_evidence = publish_evidence_;
+      close_run_subscriptions = close_run_subscriptions_;
     }
 
     auto context = std::make_shared<EditorRunContext>();
@@ -16525,7 +16542,9 @@ class EditorRunController {
                     }
                   }
                 },
-            .run_stopped = {}});
+            .run_stopped = {},
+            .publish_evidence = std::move(publish_evidence),
+            .close_run_subscriptions = std::move(close_run_subscriptions)});
     context->worker = std::jthread([context] {
       try {
         context->result = RunPreparedBenchmark(context);
@@ -16561,6 +16580,8 @@ class EditorRunController {
   mutable std::mutex transition_mutex_;
   mutable std::mutex mutex_;
   std::shared_ptr<EditorRunContext> active_;
+  std::function<void(McpEvidenceRecord)> publish_evidence_;
+  std::function<void(std::string_view)> close_run_subscriptions_;
   std::uint64_t next_generation_ = 1U;
   bool shutdown_ = false;
 };
@@ -16646,6 +16667,13 @@ int RunEditorApplication(Options options,
           .read_only = false,
       },
       host_application.OperationFactory(), host_application.ResourceReader());
+  run_controller.SetEvidenceCallbacks(
+      [&mcp_endpoint](McpEvidenceRecord record) {
+        mcp_endpoint.PublishEvidence(std::move(record));
+      },
+      [&mcp_endpoint](std::string_view run_id) {
+        mcp_endpoint.CloseRunSubscriptions(run_id);
+      });
   std::stop_callback stop_on_signal(signal_monitor.GetToken(), [&] {
     application_stop_source.request_stop();
   });

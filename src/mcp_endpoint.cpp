@@ -661,6 +661,18 @@ McpOperationServiceStats McpEndpoint::DispatcherStats() const {
   return impl_->dispatcher.Stats();
 }
 
+void McpEndpoint::PublishEvidence(McpEvidenceRecord record) {
+  if (impl_->dispatcher.Stats().accepting) {
+    impl_->dispatcher.Publish(std::move(record));
+  }
+}
+
+void McpEndpoint::CloseRunSubscriptions(std::string_view run_id) {
+  if (impl_->dispatcher.Stats().accepting) {
+    impl_->dispatcher.CloseRunSubscriptions(run_id);
+  }
+}
+
 McpDispatcher& McpEndpoint::dispatcher() { return impl_->dispatcher; }
 
 }  // namespace bbp

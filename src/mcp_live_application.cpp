@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "bbp/chain_kind.h"
+#include "bbp/logging.h"
 #include "bbp/mcp_registry.h"
 #include "bbp/mcp_run_evidence.h"
 #include "bbp/run_report.h"
@@ -46,6 +47,9 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kReadArtifact,
     McpOperationKind::kGetOperation,
     McpOperationKind::kCancelOperation,
+    McpOperationKind::kCreateSubscription,
+    McpOperationKind::kPollSubscription,
+    McpOperationKind::kCancelSubscription,
 };
 
 constexpr std::array kRetainedOperations = {
@@ -244,6 +248,37 @@ std::uint64_t EpochMilliseconds() {
   return static_cast<std::uint64_t>(elapsed.count());
 }
 
+std::string_view CommandOutcomeStateName(SimulationCommandOutcomeState state) {
+  switch (state) {
+    case SimulationCommandOutcomeState::kSucceeded:
+      return "succeeded";
+    case SimulationCommandOutcomeState::kFailed:
+      return "failed";
+    case SimulationCommandOutcomeState::kCancelled:
+      return "cancelled";
+    case SimulationCommandOutcomeState::kTimedOut:
+      return "timed_out";
+    case SimulationCommandOutcomeState::kOutcomeUnconfirmed:
+      return "outcome_unconfirmed";
+  }
+  throw std::logic_error("unknown simulation command outcome state");
+}
+
+std::string_view CommandCancellationCauseName(
+    SimulationCommandCancellationCause cause) {
+  switch (cause) {
+    case SimulationCommandCancellationCause::kNone:
+      return "none";
+    case SimulationCommandCancellationCause::kClientCancel:
+      return "client_cancel";
+    case SimulationCommandCancellationCause::kDeadline:
+      return "deadline";
+    case SimulationCommandCancellationCause::kApplicationShutdown:
+      return "application_shutdown";
+  }
+  throw std::logic_error("unknown simulation command cancellation cause");
+}
+
 boost::json::object SelectReportFields(
     const boost::json::object& report,
     std::initializer_list<std::string_view> fields) {
@@ -389,7 +424,8 @@ McpLiveApplication::McpLiveApplication(Config config)
     }
     if (config_.options != nullptr || config_.command_queue != nullptr ||
         config_.request_run_stop || config_.run_started ||
-        config_.run_stopping || config_.run_stopped) {
+        config_.run_stopping || config_.run_stopped ||
+        config_.publish_evidence || config_.close_run_subscriptions) {
       throw std::invalid_argument(
           "MCP retained application cannot own live run controls");
     }
@@ -405,6 +441,11 @@ McpLiveApplication::McpLiveApplication(Config config)
   if (!config_.request_run_stop) {
     throw std::invalid_argument(
         "MCP live application requires a run stop callback");
+  }
+  if (static_cast<bool>(config_.publish_evidence) !=
+      static_cast<bool>(config_.close_run_subscriptions)) {
+    throw std::invalid_argument(
+        "MCP live evidence publisher and subscription closer must be paired");
   }
 }
 
@@ -534,6 +575,17 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             ? "the retained run is read-only and cannot execute this operation"
             : "the operation is unavailable in the current live run",
         false);
+  }
+  if (kind == McpOperationKind::kCreateSubscription) {
+    RequireRun(arguments);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_ || run_stopped_) {
+      throw McpOperationFailure(
+          "run_not_active",
+          "subscriptions require a managed run that has not terminated",
+          false);
+    }
+    return {};
   }
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
@@ -1120,9 +1172,7 @@ boost::json::value McpLiveApplication::ReadResource(
            boost::json::array{"operation.get", "operation.cancel"}}};
       break;
     case McpInformationFamily::kNotifications:
-      data = boost::json::object{
-          {"transport", "MCP SSE GET stream"},
-          {"methods", boost::json::array{"notifications/progress"}}};
+      data = BuildMcpNotificationDiscovery(SupportedOperations());
       break;
     case McpInformationFamily::kCapabilities:
     case McpInformationFamily::kSchemas:
@@ -1262,28 +1312,50 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
 
 void McpLiveApplication::RecordCommandOutcome(
     const SimulationCommand& command, const SimulationCommandOutcome& outcome) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto pending = pending_commands_.find(command.sequence);
-  if (pending == pending_commands_.end()) {
-    return;
-  }
-  if (pending->second.detached) {
-    pending_commands_.erase(pending);
+  std::optional<SimulationCommandOutcome> published_outcome;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto pending = pending_commands_.find(command.sequence);
+    if (pending == pending_commands_.end()) {
+      return;
+    }
+    if (pending->second.detached) {
+      pending_commands_.erase(pending);
+      published_outcome = outcome;
+    } else if (pending->second.completed) {
+      pending->second.outcome = SimulationCommandOutcome{
+          .state = SimulationCommandOutcomeState::kFailed,
+          .cancellation_cause = SimulationCommandCancellationCause::kNone,
+          .error =
+              "simulation command processor published more than one outcome",
+          .node_lifecycle = std::nullopt,
+      };
+      published_outcome = pending->second.outcome;
+    } else {
+      pending->second.completed = true;
+      pending->second.outcome = outcome;
+      published_outcome = outcome;
+    }
     command_outcome_ready_.notify_all();
-    return;
   }
-  if (pending->second.completed) {
-    pending->second.outcome = SimulationCommandOutcome{
-        .state = SimulationCommandOutcomeState::kFailed,
-        .cancellation_cause = SimulationCommandCancellationCause::kNone,
-        .error = "simulation command processor published more than one outcome",
-        .node_lifecycle = std::nullopt,
-    };
-  } else {
-    pending->second.completed = true;
-    pending->second.outcome = outcome;
+  boost::json::object data{
+      {"command_id", "command-" + std::to_string(command.sequence)},
+      {"action", SimulationCommandKindName(command.kind)},
+      {"state", CommandOutcomeStateName(published_outcome->state)},
+      {"cancellation_cause",
+       CommandCancellationCauseName(published_outcome->cancellation_cause)}};
+  if (published_outcome->error) {
+    data["error"] = *published_outcome->error;
   }
-  command_outcome_ready_.notify_all();
+  if (published_outcome->node_lifecycle) {
+    data["node_lifecycle"] = *published_outcome->node_lifecycle;
+  }
+  PublishEvidence(McpInformationFamily::kEvents, "command_outcome",
+                  "simulation command reached an authoritative outcome",
+                  command.node_id.empty()
+                      ? std::nullopt
+                      : std::optional<std::string>(command.node_id),
+                  std::move(data));
 }
 
 boost::json::object McpLiveApplication::ReportSnapshot(
@@ -1384,6 +1456,12 @@ void McpLiveApplication::MarkRunStarted() {
   if (notify && config_.run_started) {
     config_.run_started();
   }
+  if (notify) {
+    PublishEvidence(McpInformationFamily::kLifecycle, "run_started",
+                    "managed run entered its active lifecycle",
+                    std::nullopt,
+                    boost::json::object{{"state", RunState()}});
+  }
 }
 
 void McpLiveApplication::MarkRunStopping() {
@@ -1402,6 +1480,11 @@ void McpLiveApplication::MarkRunStopping() {
   run_stop_source_.request_stop();
   if (notify && config_.run_stopping) {
     config_.run_stopping();
+  }
+  if (notify) {
+    PublishEvidence(McpInformationFamily::kLifecycle, "run_stopping",
+                    "managed run began bounded shutdown", std::nullopt,
+                    boost::json::object{{"state", "stopping"}});
   }
 }
 
@@ -1422,6 +1505,55 @@ void McpLiveApplication::MarkRunStopped() {
   run_stop_source_.request_stop();
   if (notify && config_.run_stopped) {
     config_.run_stopped();
+  }
+  if (notify) {
+    PublishEvidence(McpInformationFamily::kLifecycle, "run_stopped",
+                    "managed run reached its terminal lifecycle", std::nullopt,
+                    boost::json::object{{"state", "stopped"}});
+    CloseRunSubscriptions();
+  }
+}
+
+void McpLiveApplication::PublishEvidence(
+    McpInformationFamily family, std::string kind, std::string message,
+    std::optional<std::string> node_id,
+    std::optional<boost::json::value> data) const noexcept {
+  if (!config_.publish_evidence) {
+    return;
+  }
+  try {
+    config_.publish_evidence(McpEvidenceRecord{
+        .run_id = config_.run_id,
+        .family = family,
+        .sequence = 0U,
+        .timestamp_ms = EpochMilliseconds(),
+        .node_id = std::move(node_id),
+        .kind = std::move(kind),
+        .message = std::move(message),
+        .artifact_id = std::nullopt,
+        .data = std::move(data),
+    });
+  } catch (const std::exception& error) {
+    BBP_LOG(error) << "MCP evidence publication failed for run "
+                   << config_.run_id << ": " << error.what();
+  } catch (...) {
+    BBP_LOG(error) << "MCP evidence publication failed for run "
+                   << config_.run_id << " with a non-standard exception";
+  }
+}
+
+void McpLiveApplication::CloseRunSubscriptions() const noexcept {
+  if (!config_.close_run_subscriptions) {
+    return;
+  }
+  try {
+    config_.close_run_subscriptions(config_.run_id);
+  } catch (const std::exception& error) {
+    BBP_LOG(error) << "MCP subscription closure failed for run "
+                   << config_.run_id << ": " << error.what();
+  } catch (...) {
+    BBP_LOG(error) << "MCP subscription closure failed for run "
+                   << config_.run_id << " with a non-standard exception";
   }
 }
 

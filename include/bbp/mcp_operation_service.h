@@ -116,6 +116,7 @@ using McpSessionRequestHandler =
     std::function<boost::json::value(std::stop_token)>;
 
 struct McpEvidenceRecord {
+  std::string run_id;
   McpInformationFamily family = McpInformationFamily::kCount;
   std::uint64_t sequence = 0U;
   std::uint64_t timestamp_ms = 0U;
@@ -127,6 +128,7 @@ struct McpEvidenceRecord {
 };
 
 struct McpSubscriptionRequest {
+  std::string run_id;
   std::vector<McpInformationFamily> families;
   std::vector<std::string> node_ids;
   std::uint64_t cursor = 0U;
@@ -135,6 +137,7 @@ struct McpSubscriptionRequest {
 struct McpSubscriptionSnapshot {
   std::string subscription_id;
   std::string session_id;
+  std::string run_id;
   std::vector<McpEvidenceRecord> items;
   std::uint64_t next_cursor = 0U;
   std::uint64_t dropped = 0U;
@@ -218,6 +221,7 @@ class McpOperationService {
       std::stop_token stop_token = {}) const;
   McpSubscriptionSnapshot CancelSubscription(std::string_view session_id,
                                              std::string_view subscription_id);
+  void CloseRunSubscriptions(std::string_view run_id);
   void Publish(McpEvidenceRecord record);
 
   McpOperationServiceStats Stats() const;

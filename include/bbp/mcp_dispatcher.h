@@ -47,6 +47,7 @@ class McpDispatcher {
 
   void SetNotificationHandler(McpServiceNotificationHandler handler);
   void Publish(McpEvidenceRecord record);
+  void CloseRunSubscriptions(std::string_view run_id);
   McpOperationServiceStats Stats() const;
   void Shutdown();
 

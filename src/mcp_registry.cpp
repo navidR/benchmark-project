@@ -334,6 +334,10 @@ boost::json::object BuildMcpCapabilityDocument(
   document["tui_local_actions"] = EnumNames(
       TuiLocalAction::kCount,
       [](TuiLocalAction action) { return TuiLocalActionName(action); });
+  boost::json::object notification_discovery =
+      BuildMcpNotificationDiscovery(operations);
+  document["notification_methods"] = notification_discovery.at("methods");
+  document["notification_schemas"] = notification_discovery.at("schemas");
   document["operations"] = NamedOperationArray(operations);
   document["information_families"] =
       NamedInformationFamilyArray(information_families);

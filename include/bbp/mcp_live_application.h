@@ -45,6 +45,8 @@ class McpLiveApplication {
     std::function<void()> run_started;
     std::function<void()> run_stopping;
     std::function<void()> run_stopped;
+    std::function<void(McpEvidenceRecord)> publish_evidence = {};
+    std::function<void(std::string_view)> close_run_subscriptions = {};
 #ifdef BBP_ENABLE_TEST_HOOKS
     std::function<void()> request_admitted_test_hook = {};
 #endif
@@ -112,6 +114,12 @@ class McpLiveApplication {
   std::string RunState() const;
   std::string CurrentChain() const;
   std::uint32_t NodeCount() const;
+  void PublishEvidence(McpInformationFamily family, std::string kind,
+                       std::string message,
+                       std::optional<std::string> node_id = std::nullopt,
+                       std::optional<boost::json::value> data = std::nullopt)
+      const noexcept;
+  void CloseRunSubscriptions() const noexcept;
 
   Config config_;
   mutable std::mutex mutex_;

@@ -280,6 +280,10 @@ void McpDispatcher::Publish(McpEvidenceRecord record) {
   operations_.Publish(std::move(record));
 }
 
+void McpDispatcher::CloseRunSubscriptions(std::string_view run_id) {
+  operations_.CloseRunSubscriptions(run_id);
+}
+
 McpOperationServiceStats McpDispatcher::Stats() const {
   return operations_.Stats();
 }
@@ -319,8 +323,19 @@ boost::json::value McpDispatcher::InvokeToolInSession(
             .operation);
   }
   if (kind == McpOperationKind::kCreateSubscription) {
-    static_cast<void>(RequireString(arguments, "run_id"));
+    const std::string run_id = RequireString(arguments, "run_id");
+    if (!operation_factory_) {
+      throw McpOperationFailure(
+          "run_unavailable",
+          "subscription creation requires an authoritative managed run",
+          false);
+    }
+    // The application factory owns synchronous run validation; subscription
+    // retention remains in this bounded service.
+    static_cast<void>(
+        operation_factory_(kind, arguments, session_id));
     McpSubscriptionRequest request{
+        .run_id = run_id,
         .families = RequireInformationFamilies(arguments),
         .node_ids = OptionalStringArray(arguments, "node_ids"),
         .cursor = OptionalCursor(arguments, "cursor", 0U)};

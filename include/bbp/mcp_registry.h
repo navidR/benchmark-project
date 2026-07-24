@@ -14,6 +14,12 @@ namespace bbp {
 inline constexpr std::string_view kMcpProtocolVersion = "2025-11-25";
 inline constexpr std::array<std::string_view, 2U>
     kMcpSupportedProtocolVersions = {kMcpProtocolVersion, "2025-06-18"};
+inline constexpr std::string_view kMcpOperationUpdatedNotification =
+    "bbp/notifications/operation_updated";
+inline constexpr std::string_view kMcpSubscriptionUpdatedNotification =
+    "bbp/notifications/subscription_updated";
+inline constexpr std::array<std::string_view, 2U> kMcpNotificationMethods = {
+    kMcpOperationUpdatedNotification, kMcpSubscriptionUpdatedNotification};
 inline constexpr std::size_t kMcpListPageSize = 64U;
 inline constexpr std::size_t kMcpMaximumSessions = 16U;
 inline constexpr std::size_t kMcpMaximumTasksPerSession = 64U;
@@ -170,6 +176,8 @@ boost::json::object BuildMcpResultSchema(
 boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation);
 boost::json::object BuildMcpOperationOutputSchema(
     McpOperationKind operation,
+    std::span<const McpOperationKind> operations);
+boost::json::object BuildMcpNotificationDiscovery(
     std::span<const McpOperationKind> operations);
 boost::json::array BuildMcpToolRegistry();
 boost::json::array BuildMcpToolRegistry(

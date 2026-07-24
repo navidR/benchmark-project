@@ -188,17 +188,44 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     mcp_dispatcher_subscriptions_filter_and_forward_bounded_notifications) {
-  McpDispatcher dispatcher;
-  std::atomic<std::size_t> delivered = 0U;
+  McpDispatcher dispatcher(
+      {}, [](McpOperationKind kind, const boost::json::object& arguments,
+             std::string_view) {
+        BOOST_CHECK(kind == McpOperationKind::kCreateSubscription);
+        if (arguments.at("run_id").as_string() != "run-a") {
+          throw McpOperationFailure("run_not_found",
+                                    "the requested run is not managed", false);
+        }
+        return McpOperationPlan{};
+      });
+  std::size_t delivered = 0U;
+  std::string delivered_session;
+  std::string delivered_method;
+  boost::json::value delivered_params;
   dispatcher.SetNotificationHandler(
-      [&](const McpServiceNotification&) { delivered.fetch_add(1U); });
+      [&](const McpServiceNotification& notification) {
+        ++delivered;
+        delivered_session = notification.session_id;
+        delivered_method = notification.method;
+        delivered_params = notification.params;
+      });
   dispatcher.SessionHandler()("session-a", true, {});
   const boost::json::object subscription =
       Invoke(&dispatcher, "subscription.create",
              boost::json::object{{"run_id", "run-a"},
                                  {"families", boost::json::array{"metrics"}},
                                  {"node_ids", boost::json::array{"node-1"}}});
-  dispatcher.Publish(McpEvidenceRecord{.family = McpInformationFamily::kEvents,
+  BOOST_TEST(subscription.at("run_id").as_string() == "run-a");
+  BOOST_CHECK_EXCEPTION(
+      Invoke(&dispatcher, "subscription.create",
+             boost::json::object{{"run_id", "run-b"},
+                                 {"families", boost::json::array{"metrics"}}}),
+      McpOperationFailure,
+      [](const McpOperationFailure& failure) {
+        return failure.code() == "run_not_found";
+      });
+  dispatcher.Publish(McpEvidenceRecord{.run_id = "run-a",
+                                       .family = McpInformationFamily::kEvents,
                                        .sequence = 0U,
                                        .timestamp_ms = 1U,
                                        .node_id = "node-1",
@@ -206,7 +233,17 @@ BOOST_AUTO_TEST_CASE(
                                        .message = std::nullopt,
                                        .artifact_id = std::nullopt,
                                        .data = std::nullopt});
-  dispatcher.Publish(McpEvidenceRecord{.family = McpInformationFamily::kMetrics,
+  dispatcher.Publish(McpEvidenceRecord{.run_id = "run-b",
+                                       .family = McpInformationFamily::kMetrics,
+                                       .sequence = 0U,
+                                       .timestamp_ms = 2U,
+                                       .node_id = "node-1",
+                                       .kind = "foreign",
+                                       .message = "wrong run",
+                                       .artifact_id = std::nullopt,
+                                       .data = std::nullopt});
+  dispatcher.Publish(McpEvidenceRecord{.run_id = "run-a",
+                                       .family = McpInformationFamily::kMetrics,
                                        .sequence = 0U,
                                        .timestamp_ms = 2U,
                                        .node_id = "node-1",
@@ -227,7 +264,36 @@ BOOST_AUTO_TEST_CASE(
                  .as_object()
                  .at("message")
                  .as_string() == "ready");
-  BOOST_TEST(delivered.load() == 1U);
+  BOOST_TEST(delivered == 1U);
+  BOOST_TEST(delivered_session == "session-a");
+  BOOST_TEST(delivered_method == kMcpSubscriptionUpdatedNotification);
+  const boost::json::object& delivered_object = delivered_params.as_object();
+  BOOST_TEST(delivered_object.at("subscription_id") ==
+             subscription.at("subscription_id"));
+  BOOST_TEST(
+      delivered_object.at("item").as_object().at("sequence").as_uint64() == 1U);
+  BOOST_TEST(delivered_object.at("item").as_object().at("run_id").as_string() ==
+             "run-a");
+  dispatcher.CloseRunSubscriptions("run-a");
+  dispatcher.Publish(McpEvidenceRecord{
+      .run_id = "run-a",
+      .family = McpInformationFamily::kMetrics,
+      .sequence = 0U,
+      .timestamp_ms = 3U,
+      .node_id = "node-1",
+      .kind = "late",
+      .message = "must not leak",
+      .artifact_id = std::nullopt,
+      .data = std::nullopt});
+  const boost::json::object closed =
+      Invoke(&dispatcher, "subscription.poll",
+             boost::json::object{
+                 {"subscription_id", subscription.at("subscription_id")},
+                 {"cursor", "1"},
+                 {"limit", 4U}});
+  BOOST_TEST(!closed.at("active").as_bool());
+  BOOST_TEST(closed.at("items").as_array().empty());
+  BOOST_TEST(delivered == 1U);
   dispatcher.SessionHandler()("session-a", false, {});
 }
 

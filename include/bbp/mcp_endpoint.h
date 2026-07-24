@@ -56,6 +56,8 @@ class McpEndpoint {
   McpServerStats ServerStats() const;
   McpProtocolStats ProtocolStats() const;
   McpOperationServiceStats DispatcherStats() const;
+  void PublishEvidence(McpEvidenceRecord record);
+  void CloseRunSubscriptions(std::string_view run_id);
   McpDispatcher& dispatcher();
 
  private:
