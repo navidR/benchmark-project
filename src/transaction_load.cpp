@@ -109,13 +109,17 @@ bool BoundedWalletTransactionQueue::TryPush(WalletTransactionLoadTask task) {
 }
 
 bool BoundedWalletTransactionQueue::TryPushBatch(
-    std::vector<WalletTransactionLoadTask> tasks) {
+    std::vector<WalletTransactionLoadTask> tasks,
+    const std::function<void()>& before_publish) {
   std::lock_guard lock(mutex_);
   if (closed_) {
     throw std::runtime_error("transaction load queue is closed");
   }
   if (tasks.size() > capacity_ || tasks_.size() > capacity_ - tasks.size()) {
     return false;
+  }
+  if (before_publish) {
+    before_publish();
   }
   for (WalletTransactionLoadTask& task : tasks) {
     tasks_.push_back(std::move(task));
@@ -148,6 +152,22 @@ void BoundedWalletTransactionQueue::Close() {
   std::lock_guard lock(mutex_);
   closed_ = true;
   ready_.notify_all();
+}
+
+std::vector<WalletTransactionLoadTask>
+BoundedWalletTransactionQueue::DropPendingAndClose() {
+  std::vector<WalletTransactionLoadTask> dropped;
+  {
+    std::lock_guard lock(mutex_);
+    dropped.reserve(tasks_.size());
+    closed_ = true;
+    while (!tasks_.empty()) {
+      dropped.push_back(std::move(tasks_.front()));
+      tasks_.pop_front();
+    }
+  }
+  ready_.notify_all();
+  return dropped;
 }
 
 std::vector<WalletTransactionLoadTask> BoundedWalletTransactionQueue::Cancel() {
@@ -232,7 +252,10 @@ TransactionLoadBalanceReservations::PlanAndReserve(
   std::unique_lock lock(mutex_);
   std::vector<std::uint64_t> planned_balances = available_balances_;
   std::optional<std::vector<WalletTransactionPlanEntry>> planned =
-      planner->NextBatch(&planned_balances);
+      planner->NextBatch(
+          &planned_balances,
+          static_cast<std::size_t>(std::min<std::uint64_t>(
+              remaining_attempts, std::numeric_limits<std::size_t>::max())));
   if (!planned) {
     return TransactionLoadBatchAdmission{
         .plans = {},
@@ -329,7 +352,8 @@ TransactionLoadBalanceReservations::PlanAndReserve(
 void TransactionLoadBalanceReservations::Settle(
     std::uint64_t transaction_index,
     std::optional<std::uint64_t> actual_available_balance,
-    bool release_if_balance_unavailable) {
+    bool release_if_balance_unavailable,
+    const std::function<void(std::uint64_t)>& on_settled) {
   std::string reconciliation_error;
   {
     std::lock_guard lock(mutex_);
@@ -373,6 +397,9 @@ void TransactionLoadBalanceReservations::Settle(
     reserved_by_sender_[reservation.sender_index] = remaining_reserved;
     reservations_.erase(found);
     ++balance_revision_;
+    if (on_settled) {
+      on_settled(reservation.amount_satoshis);
+    }
   }
   resolved_.notify_all();
   if (!reconciliation_error.empty()) {
@@ -617,16 +644,26 @@ std::optional<TransactionLoadSnapshot>
 TransactionLoadConfirmation::RecordObservation(std::string_view txid,
                                                std::string_view node_id,
                                                bool confirmed) {
-  if (!confirmed) {
-    return std::nullopt;
-  }
   const ObservationKey key{std::string(txid), std::string(node_id)};
   std::lock_guard lock(mutex_);
   if (!expected_observations_.contains(key)) {
     throw std::runtime_error(
         "transaction load confirmation received an unexpected observation");
   }
-  confirmed_observations_.insert(key);
+  visible_observations_.insert(key);
+  if (confirmed) {
+    confirmed_observations_.insert(key);
+  }
+  if (!propagation_recorded_ &&
+      visible_observations_.size() == expected_observations_.size()) {
+    const bool all_confirmed =
+        confirmed_observations_.size() == expected_observations_.size();
+    TransactionLoadSnapshot progress =
+        accounting_->RecordPropagated(all_confirmed);
+    propagation_recorded_ = true;
+    confirmation_recorded_ = all_confirmed;
+    return progress;
+  }
   if (propagation_recorded_ && !confirmation_recorded_ &&
       confirmed_observations_.size() == expected_observations_.size()) {
     TransactionLoadSnapshot progress = accounting_->RecordConfirmed();

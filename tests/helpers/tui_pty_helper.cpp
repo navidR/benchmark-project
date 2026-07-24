@@ -133,8 +133,12 @@ class PtyProcess {
         return output;
       }
     }
-    throw std::runtime_error(std::string(context) +
-                             " did not render: " + std::string(expected));
+    constexpr std::size_t kDiagnosticTail = 8192U;
+    const std::size_t diagnostic_begin =
+        output.size() > kDiagnosticTail ? output.size() - kDiagnosticTail : 0U;
+    throw std::runtime_error(
+        std::string(context) + " did not render: " + std::string(expected) +
+        "\nPTY output tail:\n" + output.substr(diagnostic_begin));
   }
 
   void Write(std::string_view input) const {
@@ -220,8 +224,8 @@ class TcpListener {
     sockaddr_in endpoint{};
     endpoint.sin_family = AF_INET;
     endpoint.sin_port = htons(port);
-    if (inet_pton(AF_INET, std::string(address).c_str(),
-                  &endpoint.sin_addr) != 1) {
+    if (inet_pton(AF_INET, std::string(address).c_str(), &endpoint.sin_addr) !=
+        1) {
       close(descriptor_);
       descriptor_ = -1;
       throw std::runtime_error("invalid TCP collision-listener address");
@@ -1156,6 +1160,7 @@ void WriteActiveScenario(const std::filesystem::path& path) {
     "duration": "120s",
     "metrics_interval": "100ms"
   },
+  "isolated_network": false,
   "nodes": [
     {
       "id": "firo-active",
@@ -1173,35 +1178,15 @@ void WriteActiveScenario(const std::filesystem::path& path) {
   }
 }
 
-std::string AppendActiveOperatorConnectionEvent(
-    const std::filesystem::path& events_path,
+std::string ActiveOperatorConnectionCommand(
     const std::filesystem::path& run_root,
     const std::filesystem::path& qt_binary) {
   const std::filesystem::path data_dir = run_root / "operator" / "firo-qt";
-  const std::string command =
-      "'" + std::filesystem::canonical(qt_binary).string() +
-      "' '-regtest' '-datadir=" + data_dir.string() +
-      "' '-connect=127.0.0.1:18168' '-dns=0' '-dnsseed=0' "
-      "'-forcednsseed=0' '-maxconnections=1' '-listen=0' '-discover=0' "
-      "'-listenonion=0' '-torsetup=0' '-upnp=0'";
-  std::ofstream stream(events_path, std::ios::app);
-  if (!stream) {
-    throw std::runtime_error(
-        "could not append active-run operator connection event");
-  }
-  stream << "{\"run_id\":\"tui-active\",\"node_id\":\"firo-active\","
-            "\"timestamp\":\"2026-07-22T00:00:00Z\","
-            "\"event\":\"operator_connection_command\","
-            "\"detail\":\"{\\\"kind\\\":\\\"manual_firo_gui\\\","
-            "\\\"manual_launch\\\":true,\\\"wallet_enabled\\\":true,"
-            "\\\"discovery_disabled\\\":true,\\\"command\\\":\\\""
-         << command << "\\\",\\\"data_dir\\\":\\\"" << data_dir.string()
-         << "\\\",\\\"peer_endpoint\\\":\\\"127.0.0.1:18168\\\"}\"}\n";
-  if (!stream) {
-    throw std::runtime_error(
-        "could not flush active-run operator connection event");
-  }
-  return command;
+  return "'" + std::filesystem::canonical(qt_binary).string() +
+         "' '-regtest' '-datadir=" + data_dir.string() +
+         "' '-connect=127.0.0.1:18168' '-dns=0' '-dnsseed=0' "
+         "'-forcednsseed=0' '-maxconnections=1' '-listen=0' '-discover=0' "
+         "'-listenonion=0' '-torsetup=0' '-upnp=0'";
 }
 
 std::filesystem::path CopyActiveDaemonFixtures(
@@ -1209,7 +1194,7 @@ std::filesystem::path CopyActiveDaemonFixtures(
     const std::filesystem::path& directory) {
   const std::filesystem::path bin = directory / "bin";
   std::filesystem::create_directory(bin);
-  const std::filesystem::path daemon = bin / "firod";
+  const std::filesystem::path daemon = bin / "ready-firod";
   const std::filesystem::path qt = bin / "firo-qt";
   std::filesystem::copy_file(helper_binary, daemon);
   std::filesystem::copy_file(helper_binary, qt);
@@ -1272,15 +1257,26 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   if (!process.Running() || !ProcessExists(daemon_pid)) {
     throw std::runtime_error("active benchmark was not running before Esc");
   }
+  static_cast<void>(WaitForFileText(
+      events_path, "\"event\":\"operator_connection_command\"", 10s));
 
-  const std::string expected_qt_command = AppendActiveOperatorConnectionEvent(
-      events_path, run_root, daemon.parent_path() / "firo-qt");
+  const std::string expected_qt_command = ActiveOperatorConnectionCommand(
+      run_root, daemon.parent_path() / "firo-qt");
   process.Write("c");
   static_cast<void>(
       process.ReadUntil("Live command", 3s, "active Firo-Qt palette"));
   process.Write("firo-qt\n");
-  auto [first_dialog, first_launcher] =
-      ReadLauncherDialog(process, "active Firo-Qt launcher dialog");
+  const auto first_launcher_result = [&] {
+    try {
+      return ReadLauncherDialog(process, "active Firo-Qt launcher dialog");
+    } catch (const std::exception& error) {
+      throw std::runtime_error(std::string(error.what()) +
+                               "\nactive events:\n" + ReadFile(events_path) +
+                               "\nactive simulator log:\n" +
+                               ReadFile(run_root / "simulator.log"));
+    }
+  }();
+  const auto& [first_dialog, first_launcher] = first_launcher_result;
   static_cast<void>(first_dialog);
   if (ReadFile(first_launcher) !=
       "#!/bin/bash\nexec " + expected_qt_command + "\n") {

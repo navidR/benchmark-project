@@ -18,6 +18,7 @@ bbp::TrackedTransaction Transaction(
   return bbp::TrackedTransaction{
       .txid = std::move(txid),
       .submission_kind = "test",
+      .workload_id = {},
       .workload_index = 1U,
       .workload_count = 1U,
       .transaction_index = 1U,
@@ -30,6 +31,34 @@ bbp::TrackedTransaction Transaction(
 }
 
 }  // namespace
+
+BOOST_AUTO_TEST_CASE(transaction_observation_store_cancels_only_one_workload) {
+  bbp::TransactionObservationStore store(4U);
+  bbp::TrackedTransaction first = Transaction("first-1");
+  first.workload_id = "wallet-workload-1";
+  bbp::TrackedTransaction second = Transaction("first-2");
+  second.workload_id = "wallet-workload-1";
+  bbp::TrackedTransaction other = Transaction("other");
+  other.workload_id = "wallet-workload-2";
+  store.Track(std::move(first), {"node-1"});
+  store.Track(std::move(second), {"node-1"});
+  store.Track(std::move(other), {"node-1"});
+
+  BOOST_TEST(store.CancelWorkload("wallet-workload-1") == 2U);
+  const std::vector<bbp::TrackedTransaction> pending =
+      store.PendingTransactions();
+  BOOST_REQUIRE_EQUAL(pending.size(), 1U);
+  BOOST_TEST(pending.front().txid == "other");
+  BOOST_TEST(pending.front().workload_id == "wallet-workload-2");
+  BOOST_TEST(store.CancelWorkload("wallet-workload-1") == 0U);
+  const bbp::TransactionObservationStoreStats stats = store.Stats();
+  BOOST_TEST(stats.active == 1U);
+  BOOST_TEST(stats.cancelled == 2U);
+  BOOST_TEST(stats.retired == 0U);
+  BOOST_CHECK_THROW(store.Track(Transaction("first-1"), {"node-1"}),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(store.CancelWorkload({}), std::runtime_error);
+}
 
 BOOST_AUTO_TEST_CASE(transaction_observation_store_is_explicitly_bounded) {
   bbp::TransactionObservationStore store(2U);

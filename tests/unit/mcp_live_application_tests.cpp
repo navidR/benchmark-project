@@ -322,9 +322,8 @@ BOOST_AUTO_TEST_CASE(
 
   const boost::json::object tui_outcome_subscription =
       Invoke(&dispatcher, "subscription.create",
-             boost::json::object{
-                 {"run_id", "live-application"},
-                 {"families", boost::json::array{"events"}}});
+             boost::json::object{{"run_id", "live-application"},
+                                 {"families", boost::json::array{"events"}}});
   SimulationCommand tui_command;
   tui_command.sequence = 99U;
   tui_command.kind = SimulationCommandKind::kIncreaseLogVerbosity;
@@ -332,21 +331,18 @@ BOOST_AUTO_TEST_CASE(
   tui_command.confirmed = true;
   application.RecordCommandOutcome(
       tui_command, CommandOutcome(SimulationCommandOutcomeState::kSucceeded));
-  const boost::json::object tui_outcome_page =
-      Invoke(&dispatcher, "subscription.poll",
-             boost::json::object{
-                 {"subscription_id",
-                  tui_outcome_subscription.at("subscription_id")},
-                 {"cursor", "0"},
-                 {"limit", 8U}});
+  const boost::json::object tui_outcome_page = Invoke(
+      &dispatcher, "subscription.poll",
+      boost::json::object{
+          {"subscription_id", tui_outcome_subscription.at("subscription_id")},
+          {"cursor", "0"},
+          {"limit", 8U}});
   BOOST_REQUIRE_EQUAL(tui_outcome_page.at("items").as_array().size(), 1U);
   const boost::json::object& tui_outcome =
       tui_outcome_page.at("items").as_array().front().as_object();
   BOOST_TEST(tui_outcome.at("kind").as_string() == "command_outcome");
-  BOOST_TEST(tui_outcome.at("data")
-                 .as_object()
-                 .at("command_id")
-                 .as_string() == "command-99");
+  BOOST_TEST(tui_outcome.at("data").as_object().at("command_id").as_string() ==
+             "command-99");
   BOOST_TEST(tui_outcome.at("data").as_object().at("state").as_string() ==
              "succeeded");
 
@@ -617,9 +613,9 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(outcome_evidence.data->as_object()
                    .at("inventory_generation")
                    .as_uint64() == 2U);
-    BOOST_TEST(outcome_evidence.data->as_object()
-                   .at("final_node_count")
-                   .as_uint64() == 3U);
+    BOOST_TEST(
+        outcome_evidence.data->as_object().at("final_node_count").as_uint64() ==
+        3U);
   }
   const boost::json::object direct_terminal =
       WaitForTerminal(&dispatcher, direct_submitted);
@@ -655,8 +651,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(generic_command.operation_control->ReportProgress(
       kSimulationNodeAddProgressTotal));
   publish_inventory(3U, {"firo-1", "added-a", "added-b", "added-c"});
-  MarkNodeAddCommitted(generic_command, 2U,
-                       {"firo-1", "added-a", "added-b"});
+  MarkNodeAddCommitted(generic_command, 2U, {"firo-1", "added-a", "added-b"});
   application.RecordCommandOutcome(generic_command,
                                    NodeAddOutcome({"added-c"}, 3U, 4U));
   const boost::json::object generic_terminal =
@@ -688,16 +683,10 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(capabilities.at("available_node_capacity").as_uint64() == 12U);
   const std::uint64_t registry_reads_before =
       inventory_reads.load(std::memory_order_relaxed);
-  const boost::json::value run_registry =
-      application.ResourceReader()(McpInformationFamily::kRunRegistry,
-                                   "live-session", std::stop_token{});
+  const boost::json::value run_registry = application.ResourceReader()(
+      McpInformationFamily::kRunRegistry, "live-session", std::stop_token{});
   const boost::json::object& run_registry_entry =
-      run_registry
-          .as_object()
-          .at("data")
-          .as_array()
-          .front()
-          .as_object();
+      run_registry.as_object().at("data").as_array().front().as_object();
   BOOST_TEST(inventory_reads.load(std::memory_order_relaxed) ==
              registry_reads_before + 1U);
   BOOST_TEST(run_registry_entry.at("node_count").as_uint64() == 4U);
@@ -746,12 +735,11 @@ BOOST_AUTO_TEST_CASE(
                  .as_uint64() == 12U);
   BOOST_TEST(!queue->TryPop().has_value());
 
-  const boost::json::object unavailable_submitted =
-      Invoke(&dispatcher, "node.add",
-             boost::json::object{
-                 {"run_id", "live-application"},
-                 {"request",
-                  boost::json::object{{"chain", "firo"}, {"count", 1U}}}});
+  const boost::json::object unavailable_submitted = Invoke(
+      &dispatcher, "node.add",
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"request", boost::json::object{{"chain", "firo"}, {"count", 1U}}}});
   const SimulationCommand unavailable_command =
       WaitForQueuedCommand(queue.get());
   BOOST_REQUIRE(unavailable_command.operation_control);
@@ -793,8 +781,8 @@ BOOST_AUTO_TEST_CASE(
                    boost::json::object{{"run_id", "live-application"},
                                        {"request", std::move(request)}});
         const SimulationCommand command = WaitForQueuedCommand(queue.get());
-        MarkNodeAddCommitted(
-            command, 3U, {"firo-1", "added-a", "added-b", "added-c"});
+        MarkNodeAddCommitted(command, 3U,
+                             {"firo-1", "added-a", "added-b", "added-c"});
         application.RecordCommandOutcome(
             command,
             NodeAddOutcome(std::move(outcome_ids), generation, final_count));
@@ -870,10 +858,9 @@ BOOST_AUTO_TEST_CASE(
       boost::json::object{
           {"run_id", "live-application"},
           {"request",
-           boost::json::object{
-               {"chain", "firo"},
-               {"count", 1U},
-               {"node_ids", boost::json::array{"firo-2"}}}}});
+           boost::json::object{{"chain", "firo"},
+                               {"count", 1U},
+                               {"node_ids", boost::json::array{"firo-2"}}}}});
   const SimulationCommand unreadable_command =
       WaitForQueuedCommand(queue.get());
   MarkNodeAddCommitted(unreadable_command, 1U, {"firo-1"});
@@ -882,8 +869,8 @@ BOOST_AUTO_TEST_CASE(
     std::lock_guard<std::mutex> lock(inventory_mutex);
     inventory_read_fails = true;
   }
-  application.RecordCommandOutcome(
-      unreadable_command, NodeAddOutcome({"firo-2"}, 2U, 2U));
+  application.RecordCommandOutcome(unreadable_command,
+                                   NodeAddOutcome({"firo-2"}, 2U, 2U));
   {
     std::lock_guard<std::mutex> lock(inventory_mutex);
     inventory_read_fails = false;
@@ -901,8 +888,7 @@ BOOST_AUTO_TEST_CASE(
       boost::json::object{
           {"run_id", "live-application"},
           {"request", boost::json::object{{"chain", "firo"}, {"count", 1U}}}});
-  const SimulationCommand cancelled_command =
-      WaitForQueuedCommand(queue.get());
+  const SimulationCommand cancelled_command = WaitForQueuedCommand(queue.get());
   BOOST_REQUIRE(cancelled_command.operation_control);
   BOOST_TEST(cancelled_command.operation_control->RequestCancellation(
       SimulationCommandCancellationCause::kClientCancel));
@@ -923,16 +909,14 @@ BOOST_AUTO_TEST_CASE(
       boost::json::object{
           {"run_id", "live-application"},
           {"request",
-           boost::json::object{
-               {"chain", "firo"},
-               {"count", 1U},
-               {"node_ids", boost::json::array{"firo-3"}}}}});
-  const SimulationCommand replaced_command =
-      WaitForQueuedCommand(queue.get());
+           boost::json::object{{"chain", "firo"},
+                               {"count", 1U},
+                               {"node_ids", boost::json::array{"firo-3"}}}}});
+  const SimulationCommand replaced_command = WaitForQueuedCommand(queue.get());
   MarkNodeAddCommitted(replaced_command, 2U, {"firo-1", "firo-2"});
   publish_inventory(3U, {"replacement", "firo-2", "firo-3"});
-  application.RecordCommandOutcome(
-      replaced_command, NodeAddOutcome({"firo-3"}, 3U, 3U));
+  application.RecordCommandOutcome(replaced_command,
+                                   NodeAddOutcome({"firo-3"}, 3U, 3U));
   const boost::json::object replaced_terminal =
       WaitForTerminal(&dispatcher, replaced_submitted);
   BOOST_TEST(replaced_terminal.at("state").as_string() == "failed");
@@ -1746,6 +1730,185 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(!std::string(value.as_object().at("relative_path").as_string())
                     .starts_with("mcp"));
   }
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_live_wallet_workload_operations_route_one_stable_lifecycle) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  WriteText(temporary.path() / "resolved-scenario.json",
+            boost::json::serialize(ResolveScenario(LiveScenario())) + "\n");
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+  const std::vector<McpOperationKind> advertised_before_service =
+      application.SupportedOperations();
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStartWorkload, McpOperationKind::kInspectWorkload,
+        McpOperationKind::kReconfigureWorkload,
+        McpOperationKind::kPauseWorkload, McpOperationKind::kResumeWorkload,
+        McpOperationKind::kStopWorkload}) {
+    const bool advertised =
+        std::find(advertised_before_service.begin(),
+                  advertised_before_service.end(),
+                  operation) != advertised_before_service.end();
+    BOOST_TEST(advertised);
+  }
+
+  std::mutex state_mutex;
+  std::string state = "running";
+  std::string terminal_outcome = "none";
+  std::uint64_t revision = 1U;
+  std::uint64_t submitted = 8U;
+  const boost::json::object configuration{{"type", "wallet_transactions"},
+                                          {"strategy", "random_bruteforce"},
+                                          {"retained_balance_percentage", 80.0},
+                                          {"transaction_rate", 2.0},
+                                          {"amount", "1.00000000"},
+                                          {"fee", "0.00001000"}};
+  const auto snapshot = [&] {
+    boost::json::object accounting{{"planned", submitted},
+                                   {"accepted", submitted},
+                                   {"attempted", submitted},
+                                   {"submitted", submitted},
+                                   {"propagated", submitted},
+                                   {"confirmed", submitted - 1U},
+                                   {"rejected", 0U},
+                                   {"timed_out", 0U},
+                                   {"backpressured", 0U},
+                                   {"dropped", 0U},
+                                   {"failed", 0U},
+                                   {"retried", 0U},
+                                   {"cancelled", 0U},
+                                   {"outstanding", 1U},
+                                   {"in_flight", 0U},
+                                   {"reserved_atomic_units", 800U},
+                                   {"released_atomic_units", 800U}};
+    return boost::json::object{{"workload_id", "wallet-workload-1"},
+                               {"state", state},
+                               {"terminal_outcome", terminal_outcome},
+                               {"configuration_revision", revision},
+                               {"configuration", configuration},
+                               {"accounting", std::move(accounting)}};
+  };
+  auto service = std::make_shared<McpLiveWorkloadService>();
+  service->operation = [&](McpOperationKind kind, const boost::json::object&,
+                           std::stop_token stop_token) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    std::lock_guard<std::mutex> lock(state_mutex);
+    switch (kind) {
+      case McpOperationKind::kStartWorkload:
+      case McpOperationKind::kInspectWorkload:
+        break;
+      case McpOperationKind::kReconfigureWorkload:
+        ++revision;
+        submitted += 1U;
+        break;
+      case McpOperationKind::kPauseWorkload:
+        state = "paused";
+        break;
+      case McpOperationKind::kResumeWorkload:
+        state = "running";
+        break;
+      case McpOperationKind::kStopWorkload:
+        state = "stopped";
+        terminal_outcome = "stopped";
+        break;
+      default:
+        throw std::logic_error("unexpected workload operation");
+    }
+    return snapshot();
+  };
+  service->read = [&](bool history, std::stop_token) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    const bool terminal = state == "stopped";
+    if (history != terminal) {
+      return boost::json::value(boost::json::array{});
+    }
+    return boost::json::value(boost::json::array{snapshot()});
+  };
+  application.SetWorkloadService(service);
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const auto invoke_workload = [&](std::string_view tool,
+                                   boost::json::object arguments) {
+    arguments["run_id"] = "live-application";
+    const boost::json::object submitted_operation =
+        Invoke(&dispatcher, tool, std::move(arguments));
+    const boost::json::object terminal =
+        WaitForTerminal(&dispatcher, submitted_operation);
+    BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+    return terminal.at("terminal_result").as_object();
+  };
+  const boost::json::object started =
+      invoke_workload("workload.start",
+                      boost::json::object{{"workload_id", "wallet-workload-1"},
+                                          {"workload", configuration}});
+  BOOST_TEST(started.at("workload_id").as_string() == "wallet-workload-1");
+  BOOST_TEST(
+      started.at("accounting").as_object().at("outstanding").as_uint64() == 1U);
+
+  const boost::json::object inspected = invoke_workload(
+      "workload.inspect",
+      boost::json::object{{"workload_id", "wallet-workload-1"}});
+  BOOST_TEST(inspected.at("state").as_string() == "running");
+  const boost::json::object paused =
+      invoke_workload("workload.pause",
+                      boost::json::object{{"workload_id", "wallet-workload-1"},
+                                          {"timeout_sec", 1U}});
+  BOOST_TEST(paused.at("state").as_string() == "paused");
+  const boost::json::object resumed =
+      invoke_workload("workload.resume",
+                      boost::json::object{{"workload_id", "wallet-workload-1"},
+                                          {"timeout_sec", 1U}});
+  BOOST_TEST(resumed.at("state").as_string() == "running");
+  const boost::json::object reconfigured =
+      invoke_workload("workload.reconfigure",
+                      boost::json::object{{"workload_id", "wallet-workload-1"},
+                                          {"workload", configuration}});
+  BOOST_TEST(reconfigured.at("configuration_revision").as_uint64() == 2U);
+  BOOST_TEST(reconfigured.at("workload_id").as_string() == "wallet-workload-1");
+  const boost::json::object stopped = invoke_workload(
+      "workload.stop", boost::json::object{{"workload_id", "wallet-workload-1"},
+                                           {"policy", "cancel"},
+                                           {"timeout_sec", 1U}});
+  BOOST_TEST(stopped.at("state").as_string() == "stopped");
+  BOOST_TEST(stopped.at("terminal_outcome").as_string() == "stopped");
+
+  const boost::json::value active = application.ResourceReader()(
+      McpInformationFamily::kWorkloads, "live-session", {});
+  BOOST_TEST(active.as_object().at("data").as_array().empty());
+  const boost::json::value history = application.ResourceReader()(
+      McpInformationFamily::kWorkloadHistory, "live-session", {});
+  BOOST_REQUIRE_EQUAL(history.as_object().at("data").as_array().size(), 1U);
+  BOOST_TEST(history.as_object()
+                 .at("data")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("workload_id")
+                 .as_string() == "wallet-workload-1");
+  dispatcher.Shutdown();
+  application.Shutdown();
 }
 
 }  // namespace bbp

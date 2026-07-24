@@ -400,6 +400,43 @@ std::string NetworkLossText(const boost::json::object& metrics) {
 }
 
 std::string WorkloadsSummaryText(const boost::json::object& report) {
+  std::string lifecycle_suffix;
+  const boost::json::value* live_instances =
+      report.if_contains("wallet_workload_instances");
+  const boost::json::value* history_instances =
+      report.if_contains("wallet_workload_history");
+  const std::size_t active_instance_count =
+      live_instances != nullptr && live_instances->is_array()
+          ? live_instances->as_array().size()
+          : 0U;
+  const std::size_t history_instance_count =
+      history_instances != nullptr && history_instances->is_array()
+          ? history_instances->as_array().size()
+          : 0U;
+  const boost::json::object* latest_instance = nullptr;
+  if (active_instance_count != 0U &&
+      live_instances->as_array().back().is_object()) {
+    latest_instance = &live_instances->as_array().back().as_object();
+  } else if (history_instance_count != 0U &&
+             history_instances->as_array().back().is_object()) {
+    latest_instance = &history_instances->as_array().back().as_object();
+  }
+  if (active_instance_count != 0U || history_instance_count != 0U) {
+    lifecycle_suffix =
+        "; wallet instances active=" + std::to_string(active_instance_count) +
+        " history=" + std::to_string(history_instance_count);
+    if (latest_instance != nullptr) {
+      lifecycle_suffix +=
+          " latest=" + JsonString(*latest_instance, "workload_id", "-") + ":" +
+          JsonString(*latest_instance, "state", "-");
+      if (const boost::json::object* accounting =
+              JsonObject(*latest_instance, "accounting")) {
+        lifecycle_suffix +=
+            " accepted=" + JsonMetricText(*accounting, "accepted") +
+            " outstanding=" + JsonMetricText(*accounting, "outstanding");
+      }
+    }
+  }
   std::string load_suffix;
   const boost::json::object* load_detail = nullptr;
   const boost::json::value* live_loads =
@@ -447,12 +484,12 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
           : "; manual GUI command available";
   const boost::json::value* workloads_value = report.if_contains("workloads");
   if (workloads_value == nullptr || !workloads_value->is_array()) {
-    return "workloads: -" + load_suffix + operator_suffix;
+    return "workloads: -" + lifecycle_suffix + load_suffix + operator_suffix;
   }
 
   const boost::json::array& workloads = workloads_value->as_array();
   if (workloads.empty()) {
-    return "workloads: 0" + load_suffix + operator_suffix;
+    return "workloads: 0" + lifecycle_suffix + load_suffix + operator_suffix;
   }
   std::string text = "workloads: " + std::to_string(workloads.size());
   std::size_t index = 0;
@@ -597,7 +634,7 @@ std::string WorkloadsSummaryText(const boost::json::object& report) {
         break;
     }
   }
-  return text + load_suffix + operator_suffix;
+  return text + lifecycle_suffix + load_suffix + operator_suffix;
 }
 
 std::string LifecycleSummaryText(const boost::json::object& report) {
@@ -3283,11 +3320,10 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
       try {
         std::unique_lock<std::timed_mutex> publication_lock;
         if (snapshot->publication_mutex) {
-          publication_lock =
-              std::unique_lock<std::timed_mutex>(*snapshot->publication_mutex,
-                                                 std::defer_lock);
-          while (!publication_lock.try_lock_for(
-              std::chrono::milliseconds(10))) {
+          publication_lock = std::unique_lock<std::timed_mutex>(
+              *snapshot->publication_mutex, std::defer_lock);
+          while (
+              !publication_lock.try_lock_for(std::chrono::milliseconds(10))) {
             if (stop_token.stop_requested()) {
               return FinishTui(&state, 0);
             }

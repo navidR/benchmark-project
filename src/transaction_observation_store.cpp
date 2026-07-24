@@ -109,6 +109,35 @@ void TransactionObservationStore::TrackSet(
   reservation.Commit(std::move(transactions), required_node_ids);
 }
 
+std::size_t TransactionObservationStore::CancelWorkload(
+    std::string_view workload_id) {
+  if (workload_id.empty()) {
+    throw std::runtime_error(
+        "transaction observation workload id must not be empty");
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t cancelled = 0U;
+  auto entry = entries_.begin();
+  while (entry != entries_.end()) {
+    if (entry->transaction.workload_id != workload_id) {
+      ++entry;
+      continue;
+    }
+    const std::string txid = entry->transaction.txid;
+    entry = entries_.erase(entry);
+    if (recent_retired_.size() >= capacity_) {
+      recent_retired_index_.erase(recent_retired_.front());
+      recent_retired_.pop_front();
+    }
+    recent_retired_.push_back(txid);
+    recent_retired_index_.insert(txid);
+    ++cancelled;
+  }
+  CheckedAdd(static_cast<std::uint64_t>(cancelled), "cancelled count",
+             &cancelled_);
+  return cancelled;
+}
+
 void TransactionObservationStore::CommitReservation(
     Reservation* reservation, std::vector<TrackedTransaction> transactions,
     const std::vector<std::string>& required_node_ids) {
@@ -279,6 +308,7 @@ TransactionObservationStoreStats TransactionObservationStore::Stats() const {
       .recent_retired = recent_retired_.size(),
       .tracked = tracked_,
       .retired = retired_,
+      .cancelled = cancelled_,
       .rejected = rejected_,
       .visibility_transitions = visibility_transitions_,
       .confirmation_transitions = confirmation_transitions_,

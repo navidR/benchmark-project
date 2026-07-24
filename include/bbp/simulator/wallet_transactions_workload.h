@@ -99,6 +99,7 @@ struct WalletTransactionsWorkload {
   WalletTransactionFeePolicy fee_policy = WalletTransactionFeePolicy::kFixed;
   std::uint64_t fee_satoshis = 0;
   std::uint64_t fee_reserve_satoshis = 0;
+  std::optional<std::uint32_t> retained_balance_basis_points;
   std::uint64_t random_seed = 0;
   std::vector<std::uint32_t> sender_wallets;
   std::vector<std::uint32_t> receiver_wallets;

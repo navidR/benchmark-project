@@ -2057,6 +2057,8 @@ struct IncrementalRunReport::Impl {
         "topology_edge_rollback_failures",
         "wallet_funding",
         "wallet_transactions",
+        "wallet_workload_instances",
+        "wallet_workload_history",
         "transaction_load_attempts",
         "transaction_load_summaries",
         "operator_commands",
@@ -2087,6 +2089,7 @@ struct IncrementalRunReport::Impl {
     wallets.clear();
     active_network_partitions.clear();
     transaction_load_live.clear();
+    wallet_workload_instances.clear();
     event_cursor = {};
     metric_cursor = {};
     wallet_metric_cursor = {};
@@ -2379,6 +2382,25 @@ struct IncrementalRunReport::Impl {
       case SimulationEventKind::kRawTransactionSubmitted:
         AppendEventSummary(event, &Array("raw_transactions"));
         break;
+      case SimulationEventKind::kWalletWorkloadState: {
+        boost::json::value detail = ParseEventDetail(event);
+        if (!detail.is_object()) {
+          throw std::runtime_error(
+              "wallet workload state detail must be a JSON object");
+        }
+        boost::json::object snapshot = detail.as_object();
+        const boost::json::value* workload_id =
+            snapshot.if_contains("workload_id");
+        if (workload_id == nullptr || !workload_id->is_string() ||
+            workload_id->as_string().empty() ||
+            (!node_id.empty() && workload_id->as_string() != node_id)) {
+          throw std::runtime_error(
+              "wallet workload state has an invalid workload_id");
+        }
+        wallet_workload_instances[std::string(workload_id->as_string())] =
+            std::move(snapshot);
+        break;
+      }
       case SimulationEventKind::kTransactionVisible:
         RememberFallbackTransactionLoadObservation(event, "propagated");
         AppendEventSummary(event, &Array("transaction_visibility"));
@@ -2621,6 +2643,20 @@ struct IncrementalRunReport::Impl {
     report["transaction_load_completed_count"] =
         transaction_load_completed_count;
     report["transaction_load_live"] = TransactionLoadLiveJson();
+    boost::json::array active_workloads;
+    boost::json::array workload_history;
+    for (const auto& [workload_id, snapshot] : wallet_workload_instances) {
+      static_cast<void>(workload_id);
+      const boost::json::value* state = snapshot.if_contains("state");
+      const bool terminal =
+          state != nullptr && state->is_string() &&
+          (state->as_string() == "stopped" ||
+           state->as_string() == "completed" ||
+           state->as_string() == "cancelled" || state->as_string() == "failed");
+      (terminal ? workload_history : active_workloads).emplace_back(snapshot);
+    }
+    report["wallet_workload_instances"] = std::move(active_workloads);
+    report["wallet_workload_history"] = std::move(workload_history);
     report["active_network_partitions"] =
         ActivePartitionsJson(active_network_partitions);
     report["wallets_summary"] = WalletsJson(wallets);
@@ -2696,6 +2732,7 @@ struct IncrementalRunReport::Impl {
   std::map<std::uint64_t, WalletReport> wallets;
   std::map<std::string, boost::json::object> active_network_partitions;
   std::map<std::uint64_t, TransactionLoadLiveReport> transaction_load_live;
+  std::map<std::string, boost::json::object> wallet_workload_instances;
   InputCursor event_cursor;
   InputCursor metric_cursor;
   InputCursor wallet_metric_cursor;

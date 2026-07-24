@@ -107,15 +107,14 @@ BOOST_AUTO_TEST_CASE(run_report_rejects_records_from_a_different_run) {
   const std::filesystem::path dir = MakeTestDir("mismatched-run-record");
   bbp::WriteText(dir / "resolved-scenario.json",
                  R"({"run_id":"expected","chain":"firo","nodes":1})");
-  bbp::AppendLine(
-      dir / "events.jsonl",
-      R"({"run_id":"other","node_id":"sim","event":"run_failed"})");
+  bbp::AppendLine(dir / "events.jsonl",
+                  R"({"run_id":"other","node_id":"sim","event":"run_failed"})");
 
   BOOST_CHECK_EXCEPTION(
       bbp::BuildRunReport(dir), std::runtime_error,
       [](const std::runtime_error& error) {
-        return std::string(error.what()).find(
-                   "run_id does not match resolved scenario") !=
+        return std::string(error.what())
+                   .find("run_id does not match resolved scenario") !=
                std::string::npos;
       });
   std::filesystem::remove_all(dir);
@@ -132,38 +131,35 @@ BOOST_AUTO_TEST_CASE(
       {"node_count", 2U},
       {"node_ids", boost::json::array{"firo-1", "firo-2"}},
       {"node_configs",
-       boost::json::array{
-           boost::json::object{{"index", 1U},
-                               {"id", "firo-1"},
-                               {"chain", "firo"},
-                               {"role", "base"},
-                               {"lifecycle", "running"}},
-           boost::json::object{{"index", 2U},
-                               {"id", "firo-2"},
-                               {"chain", "firo"},
-                               {"role", "miner"},
-                               {"lifecycle", "running"}}}},
+       boost::json::array{boost::json::object{{"index", 1U},
+                                              {"id", "firo-1"},
+                                              {"chain", "firo"},
+                                              {"role", "base"},
+                                              {"lifecycle", "running"}},
+                          boost::json::object{{"index", 2U},
+                                              {"id", "firo-2"},
+                                              {"chain", "firo"},
+                                              {"role", "miner"},
+                                              {"lifecycle", "running"}}}},
       {"topology", boost::json::object{{"type", "full_mesh"}}},
       {"topology_current_edges",
-       boost::json::array{
-           boost::json::object{{"from", 1U},
-                               {"to", 2U},
-                               {"band", 1U},
-                               {"active", true},
-                               {"condition", nullptr}},
-           boost::json::object{{"from", 2U},
-                               {"to", 1U},
-                               {"band", 1U},
-                               {"active", true},
-                               {"condition", nullptr}}}},
+       boost::json::array{boost::json::object{{"from", 1U},
+                                              {"to", 2U},
+                                              {"band", 1U},
+                                              {"active", true},
+                                              {"condition", nullptr}},
+                          boost::json::object{{"from", 2U},
+                                              {"to", 1U},
+                                              {"band", 1U},
+                                              {"active", true},
+                                              {"condition", nullptr}}}},
       {"manifest_state", "live"}};
-  bbp::AppendLine(
-      dir / "events.jsonl",
-      boost::json::serialize(boost::json::object{
-          {"run_id", "generation"},
-          {"node_id", "sim"},
-          {"event", "runtime_generation_published"},
-          {"detail", boost::json::serialize(detail)}}));
+  bbp::AppendLine(dir / "events.jsonl",
+                  boost::json::serialize(boost::json::object{
+                      {"run_id", "generation"},
+                      {"node_id", "sim"},
+                      {"event", "runtime_generation_published"},
+                      {"detail", boost::json::serialize(detail)}}));
 
   const boost::json::object report = bbp::BuildRunReport(dir);
   BOOST_TEST(JsonInteger(report, "inventory_generation") == 2U);
@@ -2386,6 +2382,58 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!load.at("authoritative").as_bool());
   BOOST_TEST(!load.at("completed").as_bool());
   BOOST_TEST(report.at("transaction_load_summaries").as_array().empty());
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_report_tracks_latest_wallet_workload_lifecycle_by_stable_id) {
+  const std::filesystem::path dir =
+      MakeTestDir("run-report-wallet-workload-lifecycle");
+  bbp::WriteText(dir / "resolved-scenario.json",
+                 R"({"run_id":"load","chain":"firo","nodes":1})");
+  boost::json::object running{
+      {"workload_id", "wallet-workload-1"},
+      {"state", "running"},
+      {"terminal_outcome", "none"},
+      {"configuration_revision", 1U},
+      {"configuration", boost::json::object{{"type", "wallet_transactions"}}},
+      {"accounting", boost::json::object{{"planned", 8U},
+                                         {"accepted", 8U},
+                                         {"attempted", 8U},
+                                         {"submitted", 8U},
+                                         {"propagated", 7U},
+                                         {"confirmed", 6U},
+                                         {"rejected", 0U},
+                                         {"timed_out", 0U},
+                                         {"backpressured", 0U},
+                                         {"dropped", 0U},
+                                         {"failed", 0U},
+                                         {"retried", 0U},
+                                         {"cancelled", 0U},
+                                         {"outstanding", 2U},
+                                         {"in_flight", 0U},
+                                         {"reserved_atomic_units", 80U},
+                                         {"released_atomic_units", 80U}}}};
+  AppendDetailEvent(dir, "wallet_workload_state", running, "wallet-workload-1");
+  boost::json::object report = bbp::BuildRunReport(dir);
+  BOOST_REQUIRE_EQUAL(report.at("wallet_workload_instances").as_array().size(),
+                      1U);
+  BOOST_TEST(report.at("wallet_workload_history").as_array().empty());
+
+  boost::json::object stopped = running;
+  stopped["state"] = "stopped";
+  stopped["terminal_outcome"] = "stopped";
+  AppendDetailEvent(dir, "wallet_workload_state", stopped, "wallet-workload-1");
+  report = bbp::BuildRunReport(dir);
+  BOOST_TEST(report.at("wallet_workload_instances").as_array().empty());
+  BOOST_REQUIRE_EQUAL(report.at("wallet_workload_history").as_array().size(),
+                      1U);
+  BOOST_TEST(report.at("wallet_workload_history")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("workload_id")
+                 .as_string() == "wallet-workload-1");
   std::filesystem::remove_all(dir);
 }
 

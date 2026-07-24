@@ -243,7 +243,8 @@ boost::json::object GenericFieldSchema(std::string_view field) {
   }
   if (field == "probability" || field == "difficulty" ||
       field == "time_scale" || field == "transaction_rate" ||
-      field == "bandwidth_mbps" || field == "loss_percent") {
+      field == "bandwidth_mbps" || field == "loss_percent" ||
+      field == "retained_balance_percentage") {
     return NumberSchema();
   }
   if (field == "amount" || field == "fee" || field == "funding_threshold" ||
@@ -600,6 +601,11 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
       properties["interval"] = DistributedDurationSchema();
       properties["fee"] = Fixed8AmountSchema();
       properties["funding_threshold"] = Fixed8AmountSchema();
+      properties["retained_balance_percentage"] =
+          boost::json::object{{"type", "number"},
+                              {"minimum", 0.0},
+                              {"maximum", 99.99},
+                              {"multipleOf", 0.01}};
       properties["sender_wallets"] =
           ArraySchema(IntegerSchema(1U), 1U, kMaximumSafeCollection, true);
       properties["receiver_wallets"] =
@@ -707,7 +713,8 @@ boost::json::object OperationStateSchema() {
 
 boost::json::object WorkloadStateSchema() {
   return StringEnumSchema(boost::json::array{"starting", "running", "paused",
-                                             "stopping", "stopped", "failed"});
+                                             "stopping", "stopped", "completed",
+                                             "cancelled", "failed"});
 }
 
 boost::json::object InformationFamilySchema() {
@@ -849,15 +856,18 @@ boost::json::object EvidenceRecordSchema() {
 boost::json::object ExactAccountingSchema() {
   boost::json::object properties;
   for (const std::string_view field :
-       {"planned", "admitted", "attempted", "submitted", "confirmed", "failed",
-        "cancelled", "in_flight", "reserved_atomic_units",
-        "released_atomic_units"}) {
+       {"planned", "accepted", "attempted", "submitted", "propagated",
+        "confirmed", "rejected", "timed_out", "backpressured", "dropped",
+        "failed", "retried", "cancelled", "outstanding", "in_flight",
+        "reserved_atomic_units", "released_atomic_units"}) {
     properties[field] = Uint64Schema();
   }
   return ClosedObject(
       std::move(properties),
-      Required({"planned", "admitted", "attempted", "submitted", "confirmed",
-                "failed", "cancelled", "in_flight", "reserved_atomic_units",
+      Required({"planned", "accepted", "attempted", "submitted", "propagated",
+                "confirmed", "rejected", "timed_out", "backpressured",
+                "dropped", "failed", "retried", "cancelled", "outstanding",
+                "in_flight", "reserved_atomic_units",
                 "released_atomic_units"}));
 }
 
@@ -1003,6 +1013,7 @@ boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind) {
               ScenarioObjectKind::kRuntimeResourceLimits));
       break;
     case ScenarioObjectKind::kNetwork:
+      properties["isolated"].as_object()["default"] = true;
       properties["default_condition"] = NetworkConditionSchema();
       properties["node_conditions"] = ArraySchema(BuildMcpScenarioObjectSchema(
           ScenarioObjectKind::kNodeNetworkCondition));
@@ -1065,6 +1076,7 @@ boost::json::object BuildMcpScenarioSchema() {
   boost::json::object& properties = schema.at("properties").as_object();
   properties["chain"] = StringEnumSchema(EnumNames(
       ChainKind::kCount, [](ChainKind chain) { return ChainKindName(chain); }));
+  properties["isolated_network"].as_object()["default"] = true;
   properties["simulation"] =
       BuildMcpScenarioObjectSchema(ScenarioObjectKind::kSimulation);
   boost::json::object chain_definitions;
@@ -1226,6 +1238,7 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
     case McpOperationKind::kRestartMasternode:
       return McpResultFamily::kRoleMutation;
     case McpOperationKind::kStartWorkload:
+    case McpOperationKind::kInspectWorkload:
     case McpOperationKind::kReconfigureWorkload:
     case McpOperationKind::kPauseWorkload:
     case McpOperationKind::kResumeWorkload:
@@ -1390,6 +1403,11 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["workload"] = BuildMcpWorkloadSchema();
       required.emplace_back("workload");
       break;
+    case McpOperationKind::kInspectWorkload:
+      add_run();
+      properties["workload_id"] = IdentifierSchema();
+      required.emplace_back("workload_id");
+      break;
     case McpOperationKind::kReconfigureWorkload:
       add_run();
       properties["workload_id"] = IdentifierSchema();
@@ -1404,6 +1422,10 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["workload_id"] = IdentifierSchema();
       required.emplace_back("workload_id");
       add_timeout();
+      if (operation == McpOperationKind::kStopWorkload) {
+        properties["policy"] =
+            StringEnumSchema(boost::json::array{"cancel", "settle"});
+      }
       break;
     case McpOperationKind::kStartInstrumentation:
       add_run();
@@ -1654,8 +1676,14 @@ boost::json::object BuildMcpResultSchema(
       properties["workload_id"] = IdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["state"] = WorkloadStateSchema();
+      properties["terminal_outcome"] = StringEnumSchema(
+          boost::json::array{"none", "stopped", "count_reached",
+                             "duration_expired", "cancelled", "failed"});
+      properties["configuration_revision"] = Uint64Schema();
+      properties["configuration"] = BuildMcpWorkloadSchema();
       properties["accounting"] = ExactAccountingSchema();
-      require({"run_id", "workload_id", "state", "accounting"});
+      require({"run_id", "workload_id", "state", "terminal_outcome",
+               "configuration_revision", "configuration", "accounting"});
       break;
     case McpResultFamily::kInstrumentation:
       properties["run_id"] = IdentifierSchema();

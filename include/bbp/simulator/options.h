@@ -84,7 +84,7 @@ struct Options {
   bool cleanup_run = false;
   bool no_tui = false;
   bool tui_once = false;
-  bool isolate_network = false;
+  bool isolate_network = true;
   std::optional<SimulationNetworkAddressPlan> network_address_plan;
   bool network_condition_requested = false;
   NetworkCondition network_condition;

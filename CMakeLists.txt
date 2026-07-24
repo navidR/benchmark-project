@@ -670,6 +670,16 @@ if(BUILD_TESTING)
       --node-binary /tmp/not-used-by-probe
       --probe-capabilities
   )
+  add_test(NAME bbp-explicit-loopback-network-opt-out
+    COMMAND bbp
+      --no-isolate-network
+      --probe-capabilities
+  )
+  add_argument_failure_test(
+    bbp-conflicting-network-isolation-flags
+    "--isolate-network|--no-isolate-network|--probe-capabilities"
+    "--isolate-network and --no-isolate-network are mutually exclusive"
+  )
   add_test(NAME bbp-valid-peer-churn-scenario
     COMMAND bbp
       --scenario-json
@@ -1873,6 +1883,7 @@ if(BUILD_TESTING)
     COMMAND "${CMAKE_COMMAND}"
       "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
       "-DCAPABILITY_HELPER=$<TARGET_FILE:bbp-no-cap-net-admin-exec>"
+      "-DDAEMON_HELPER=$<TARGET_FILE:bbp-tui-pty-helper>"
       "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/non-isolated-cleanup-test"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/non_isolated_cleanup.cmake"
   )
@@ -2141,10 +2152,11 @@ if(BUILD_TESTING)
     tests/scenarios/invalid-wallet-load-duration-without-rate.json
     "scenario transaction load duration requires transaction_rate"
   )
-  add_cli_failure_test(
-    bbp-invalid-wallet-load-missing-bound
-    tests/scenarios/invalid-wallet-load-missing-bound.json
-    "scenario transaction load must specify exactly one of transaction_count or duration"
+  add_test(NAME bbp-valid-wallet-load-continuous
+    COMMAND bbp
+      --scenario-json
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-wallet-load-continuous.json"
+      --probe-capabilities
   )
   add_cli_failure_test(
     bbp-invalid-wallet-load-zero-concurrency
@@ -2164,7 +2176,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     bbp-invalid-wallet-load-overlap
     tests/scenarios/invalid-wallet-load-overlap.json
-    "scenario transaction load sender_wallets and receiver_wallets must be disjoint"
+    "scenario random_bruteforce uses every wallet and does not accept sender_wallets or receiver_wallets"
   )
   add_cli_failure_test(
     bbp-invalid-wallet-equal-fanout-partial-count
@@ -2194,7 +2206,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     bbp-invalid-wallet-load-missing-sender
     tests/scenarios/invalid-wallet-load-missing-sender.json
-    "scenario transaction load requires nonempty sender_wallets and receiver_wallets"
+    "scenario random_bruteforce requires retained_balance_percentage in 0..99.99"
   )
   add_cli_failure_test(
     bbp-invalid-wallet-load-unsupported-driver

@@ -57,6 +57,7 @@ enum class McpOperationKind {
   kRemoveMasternode,
   kRestartMasternode,
   kStartWorkload,
+  kInspectWorkload,
   kReconfigureWorkload,
   kPauseWorkload,
   kResumeWorkload,
@@ -171,12 +172,10 @@ boost::json::object BuildMcpOperationInputSchema(
     std::span<const McpInformationFamily> information_families);
 boost::json::object BuildMcpResultSchema(McpResultFamily family);
 boost::json::object BuildMcpResultSchema(
-    McpResultFamily family,
-    std::span<const McpOperationKind> operations);
+    McpResultFamily family, std::span<const McpOperationKind> operations);
 boost::json::object BuildMcpOperationOutputSchema(McpOperationKind operation);
 boost::json::object BuildMcpOperationOutputSchema(
-    McpOperationKind operation,
-    std::span<const McpOperationKind> operations);
+    McpOperationKind operation, std::span<const McpOperationKind> operations);
 boost::json::object BuildMcpNotificationDiscovery(
     std::span<const McpOperationKind> operations);
 boost::json::array BuildMcpToolRegistry();

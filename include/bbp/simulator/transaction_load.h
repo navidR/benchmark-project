@@ -56,9 +56,11 @@ class BoundedWalletTransactionQueue {
   explicit BoundedWalletTransactionQueue(std::size_t capacity);
 
   bool TryPush(WalletTransactionLoadTask task);
-  bool TryPushBatch(std::vector<WalletTransactionLoadTask> tasks);
+  bool TryPushBatch(std::vector<WalletTransactionLoadTask> tasks,
+                    const std::function<void()>& before_publish = {});
   std::optional<WalletTransactionLoadTask> Pop(std::stop_token stop_token = {});
   void Close();
+  std::vector<WalletTransactionLoadTask> DropPendingAndClose();
   std::vector<WalletTransactionLoadTask> Cancel();
 
   [[nodiscard]] std::size_t capacity() const;
@@ -100,7 +102,8 @@ class TransactionLoadBalanceReservations {
       const AdmissionCallback& admit_batch);
   void Settle(std::uint64_t transaction_index,
               std::optional<std::uint64_t> actual_available_balance,
-              bool release_if_balance_unavailable);
+              bool release_if_balance_unavailable,
+              const std::function<void(std::uint64_t)>& on_settled = {});
   bool WaitForResolution(std::uint64_t observed_revision,
                          std::stop_token stop_token = {});
 
@@ -190,6 +193,7 @@ class TransactionLoadConfirmation {
   const std::shared_ptr<TransactionLoadAccounting> accounting_;
   const std::set<ObservationKey> expected_observations_;
   mutable std::mutex mutex_;
+  std::set<ObservationKey> visible_observations_;
   std::set<ObservationKey> confirmed_observations_;
   bool propagation_recorded_ = false;
   bool confirmation_recorded_ = false;

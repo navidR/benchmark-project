@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <random>
 #include <vector>
@@ -23,7 +24,8 @@ struct WalletTransactionPlanEntry {
 class WalletTransactionPlanner {
  public:
   WalletTransactionPlanner(std::size_t wallet_count,
-                           const WalletTransactionsWorkload& workload);
+                           const WalletTransactionsWorkload& workload,
+                           std::uint64_t sequence_offset = 0U);
 
   WalletTransactionPlanEntry Next();
 
@@ -40,14 +42,17 @@ class WalletTransactionPlanner {
 class WalletTransactionLoadPlanner {
  public:
   WalletTransactionLoadPlanner(std::size_t wallet_count,
-                               const WalletTransactionsWorkload& workload);
+                               const WalletTransactionsWorkload& workload,
+                               std::uint64_t sequence_offset = 0U);
 
   std::optional<std::vector<WalletTransactionPlanEntry>> NextBatch(
-      std::vector<std::uint64_t>* available_balances);
+      std::vector<std::uint64_t>* available_balances,
+      std::size_t maximum_entries = std::numeric_limits<std::size_t>::max());
   [[nodiscard]] std::size_t batch_size() const;
 
  private:
   WalletTransactionsWorkload workload_;
+  std::size_t wallet_count_ = 0U;
   std::vector<std::size_t> senders_;
   std::vector<std::size_t> receivers_;
   std::vector<std::size_t> equal_sender_order_;
@@ -57,6 +62,9 @@ class WalletTransactionLoadPlanner {
 
 std::uint64_t WalletTransactionDurationAttemptLimit(
     std::chrono::milliseconds duration, const WalletTransactionRate& rate);
+
+std::optional<std::uint64_t> ExplicitWalletTransactionAttemptLimit(
+    const WalletTransactionsWorkload& workload);
 
 std::vector<WalletTransactionPlanEntry> BuildWalletTransactionPlan(
     std::size_t wallet_count, const WalletTransactionsWorkload& workload);

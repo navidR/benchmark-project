@@ -1396,11 +1396,11 @@ BOOST_AUTO_TEST_CASE(
   const bbp::ChainTransactionObservation propagated =
       driver.ObserveTransaction(config, submitted.txids.front());
   BOOST_CHECK(propagated.state == bbp::ChainTransactionState::kMempool);
-  BOOST_TEST(!confirmation.RecordObservation(
-      submitted.txids.front(), config.id,
-      propagated.state == bbp::ChainTransactionState::kConfirmed));
-  const bbp::TransactionLoadSnapshot propagated_progress =
-      confirmation.RecordPropagated(false);
+  const std::optional<bbp::TransactionLoadSnapshot> propagated_progress =
+      confirmation.RecordObservation(
+          submitted.txids.front(), config.id,
+          propagated.state == bbp::ChainTransactionState::kConfirmed);
+  BOOST_REQUIRE(propagated_progress);
   BOOST_TEST(accounting->Snapshot(1s).confirmed == 0U);
 
   const std::vector<std::string> blocks =
@@ -1458,7 +1458,7 @@ BOOST_AUTO_TEST_CASE(
                     boost::json::serialize(progress_event));
   };
   append_progress(submitted_progress);
-  append_progress(propagated_progress);
+  append_progress(*propagated_progress);
   append_progress(*confirmed_progress);
   boost::json::object detail;
   detail["workload_index"] = 1U;

@@ -319,6 +319,17 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_schema_has_unique_authoritative_members) {
   BOOST_TEST(schema.at("x-bbp-members").as_array().size() == members.size());
   BOOST_TEST(schema.at("x-bbp-workload-kinds").as_array().size() ==
              static_cast<std::size_t>(WorkloadKind::kCount));
+  const boost::json::object& properties = schema.at("properties").as_object();
+  BOOST_TEST(
+      properties.at("isolated_network").as_object().at("default").as_bool());
+  BOOST_TEST(properties.at("network")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("isolated")
+                 .as_object()
+                 .at("default")
+                 .as_bool());
 }
 
 BOOST_AUTO_TEST_CASE(mcp_scenario_object_schemas_match_every_descriptor) {

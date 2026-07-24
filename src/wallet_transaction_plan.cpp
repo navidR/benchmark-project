@@ -103,6 +103,28 @@ void RequireDisjointWalletSets(const std::vector<std::size_t>& senders,
   }
 }
 
+std::uint64_t RetainedBalance(std::uint64_t balance,
+                              std::uint32_t retained_basis_points) {
+  constexpr std::uint64_t kBasisPointDenominator = 10'000U;
+  const std::uint64_t whole =
+      (balance / kBasisPointDenominator) * retained_basis_points;
+  const std::uint64_t remainder_product =
+      (balance % kBasisPointDenominator) * retained_basis_points;
+  return whole + remainder_product / kBasisPointDenominator +
+         (remainder_product % kBasisPointDenominator == 0U ? 0U : 1U);
+}
+
+std::uint64_t SeedForSequenceOffset(std::uint64_t seed,
+                                    std::uint64_t sequence_offset) {
+  if (sequence_offset == 0U) {
+    return seed;
+  }
+  std::uint64_t mixed = seed ^ (sequence_offset + 0x9e3779b97f4a7c15ULL);
+  mixed = (mixed ^ (mixed >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  mixed = (mixed ^ (mixed >> 27U)) * 0x94d049bb133111ebULL;
+  return mixed ^ (mixed >> 31U);
+}
+
 }  // namespace
 
 WalletTransactionRate WalletTransactionRate::FromDouble(double value) {
@@ -165,11 +187,13 @@ WalletTransactionRate::WalletTransactionRate(std::uint64_t millionths)
     : millionths_(millionths) {}
 
 WalletTransactionPlanner::WalletTransactionPlanner(
-    std::size_t wallet_count, const WalletTransactionsWorkload& workload)
+    std::size_t wallet_count, const WalletTransactionsWorkload& workload,
+    std::uint64_t sequence_offset)
     : wallet_count_(wallet_count),
       workload_(workload),
       shuffled_wallets_(wallet_count),
-      rng_(workload.random_seed) {
+      rng_(workload.random_seed),
+      transaction_index_(sequence_offset) {
   if (wallet_count_ < 2U) {
     throw std::runtime_error(
         "wallet transaction plan requires at least two wallets");
@@ -321,8 +345,11 @@ WalletTransactionPlanEntry WalletTransactionPlanner::Next() {
 }
 
 WalletTransactionLoadPlanner::WalletTransactionLoadPlanner(
-    std::size_t wallet_count, const WalletTransactionsWorkload& workload)
-    : workload_(workload), rng_(workload.random_seed) {
+    std::size_t wallet_count, const WalletTransactionsWorkload& workload,
+    std::uint64_t sequence_offset)
+    : workload_(workload),
+      wallet_count_(wallet_count),
+      rng_(SeedForSequenceOffset(workload.random_seed, sequence_offset)) {
   if (!IsTransactionLoadStrategy(workload_.strategy)) {
     throw std::runtime_error(
         "transaction load planner requires a load strategy");
@@ -338,15 +365,32 @@ WalletTransactionLoadPlanner::WalletTransactionLoadPlanner(
   if (workload_.fee_satoshis == 0U) {
     throw std::runtime_error("transaction load fee must be greater than zero");
   }
-  senders_ = ResolveSelectedWallets(workload_.sender_wallets, wallet_count,
-                                    "sender_wallets");
-  receivers_ = ResolveSelectedWallets(workload_.receiver_wallets, wallet_count,
-                                      "receiver_wallets");
-  if (senders_.empty() || receivers_.empty()) {
-    throw std::runtime_error(
-        "transaction load requires explicit sender and receiver wallets");
+  if (workload_.strategy == WalletTransferStrategy::kRandomBruteforce) {
+    if (!workload_.sender_wallets.empty() ||
+        !workload_.receiver_wallets.empty()) {
+      throw std::runtime_error(
+          "random_bruteforce uses every wallet and does not accept wallet "
+          "selectors");
+    }
+    if (!workload_.retained_balance_basis_points ||
+        *workload_.retained_balance_basis_points >= 10'000U) {
+      throw std::runtime_error(
+          "random_bruteforce requires retained_balance_percentage in "
+          "0..99.99");
+    }
+    senders_.resize(wallet_count_);
+    std::iota(senders_.begin(), senders_.end(), 0U);
+  } else {
+    senders_ = ResolveSelectedWallets(workload_.sender_wallets, wallet_count,
+                                      "sender_wallets");
+    receivers_ = ResolveSelectedWallets(workload_.receiver_wallets,
+                                        wallet_count, "receiver_wallets");
+    if (senders_.empty() || receivers_.empty()) {
+      throw std::runtime_error(
+          "equal_fanout requires explicit sender and receiver wallets");
+    }
+    RequireDisjointWalletSets(senders_, receivers_);
   }
-  RequireDisjointWalletSets(senders_, receivers_);
   equal_sender_order_ = senders_;
   if (workload_.strategy == WalletTransferStrategy::kEqualFanout) {
     std::shuffle(equal_sender_order_.begin(), equal_sender_order_.end(), rng_);
@@ -355,10 +399,15 @@ WalletTransactionLoadPlanner::WalletTransactionLoadPlanner(
 
 std::optional<std::vector<WalletTransactionPlanEntry>>
 WalletTransactionLoadPlanner::NextBatch(
-    std::vector<std::uint64_t>* available_balances) {
+    std::vector<std::uint64_t>* available_balances,
+    std::size_t maximum_entries) {
   if (available_balances == nullptr) {
     throw std::runtime_error(
         "transaction load planner requires an available-balance ledger");
+  }
+  if (maximum_entries == 0U) {
+    throw std::runtime_error(
+        "transaction load planner maximum entries must be positive");
   }
   for (const std::size_t sender : senders_) {
     if (sender >= available_balances->size()) {
@@ -370,39 +419,41 @@ WalletTransactionLoadPlanner::NextBatch(
       EffectiveWalletTransactionFeeReserveSatoshis(workload_);
 
   if (workload_.strategy == WalletTransferStrategy::kRandomBruteforce) {
-    std::vector<std::size_t> eligible_senders;
-    eligible_senders.reserve(senders_.size());
+    std::vector<WalletTransactionPlanEntry> batch;
+    batch.reserve(std::min(maximum_entries, senders_.size()));
     for (const std::size_t sender : senders_) {
       const std::uint64_t balance = available_balances->at(sender);
-      if (balance <= fee_reserve_satoshis) {
+      const std::uint64_t retained =
+          RetainedBalance(balance, *workload_.retained_balance_basis_points);
+      if (balance < retained || balance - retained <= fee_reserve_satoshis) {
         continue;
       }
+      const std::uint64_t spendable = balance - retained - fee_reserve_satoshis;
       const std::uint64_t maximum =
-          std::min({workload_.amount.maximum_satoshis, balance / 5U,
-                    balance - fee_reserve_satoshis});
-      if (maximum >= workload_.amount.minimum_satoshis) {
-        eligible_senders.push_back(sender);
+          std::min(workload_.amount.maximum_satoshis, spendable);
+      if (maximum < workload_.amount.minimum_satoshis) {
+        continue;
+      }
+      const std::size_t sampled_receiver =
+          SampleIndex(&rng_, wallet_count_ - 1U);
+      const std::size_t receiver =
+          sampled_receiver >= sender ? sampled_receiver + 1U : sampled_receiver;
+      const std::uint64_t amount =
+          SampleInclusive(&rng_, workload_.amount.minimum_satoshis, maximum);
+      available_balances->at(sender) = balance - amount - fee_reserve_satoshis;
+      batch.push_back(WalletTransactionPlanEntry{
+          .sender_index = sender,
+          .receiver_index = receiver,
+          .amount_satoshis = amount,
+          .interval_before = std::chrono::milliseconds(0)});
+      if (batch.size() == maximum_entries) {
+        break;
       }
     }
-    if (eligible_senders.empty()) {
+    if (batch.empty()) {
       return std::nullopt;
     }
-    const std::size_t sender =
-        eligible_senders[SampleIndex(&rng_, eligible_senders.size())];
-    const std::size_t receiver =
-        receivers_[SampleIndex(&rng_, receivers_.size())];
-    const std::uint64_t balance = available_balances->at(sender);
-    const std::uint64_t maximum =
-        std::min({workload_.amount.maximum_satoshis, balance / 5U,
-                  balance - fee_reserve_satoshis});
-    const std::uint64_t amount =
-        SampleInclusive(&rng_, workload_.amount.minimum_satoshis, maximum);
-    available_balances->at(sender) = balance - amount - fee_reserve_satoshis;
-    return std::vector<WalletTransactionPlanEntry>{WalletTransactionPlanEntry{
-        .sender_index = sender,
-        .receiver_index = receiver,
-        .amount_satoshis = amount,
-        .interval_before = std::chrono::milliseconds(0)}};
+    return batch;
   }
 
   if (workload_.strategy != WalletTransferStrategy::kEqualFanout) {
@@ -454,7 +505,7 @@ WalletTransactionLoadPlanner::NextBatch(
 std::size_t WalletTransactionLoadPlanner::batch_size() const {
   return workload_.strategy == WalletTransferStrategy::kEqualFanout
              ? receivers_.size()
-             : 1U;
+             : wallet_count_;
 }
 
 std::uint64_t WalletTransactionDurationAttemptLimit(
@@ -480,6 +531,22 @@ std::uint64_t WalletTransactionDurationAttemptLimit(
         "transaction load duration attempt count exceeds uint64");
   }
   return quotient + (remainder == 0U ? 0U : 1U);
+}
+
+std::optional<std::uint64_t> ExplicitWalletTransactionAttemptLimit(
+    const WalletTransactionsWorkload& workload) {
+  if (workload.transaction_count != 0U) {
+    return static_cast<std::uint64_t>(workload.transaction_count);
+  }
+  if (workload.duration) {
+    if (!workload.transaction_rate) {
+      throw std::runtime_error(
+          "wallet transaction duration requires transaction_rate");
+    }
+    return WalletTransactionDurationAttemptLimit(*workload.duration,
+                                                 *workload.transaction_rate);
+  }
+  return std::nullopt;
 }
 
 std::vector<WalletTransactionPlanEntry> BuildWalletTransactionPlan(

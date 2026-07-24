@@ -49,8 +49,8 @@ BOOST_AUTO_TEST_CASE(
   const std::filesystem::path simulator =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
   const std::string source = bbp::ReadText(simulator);
-  const std::size_t identity_gate = source.find(
-      "!node.network_namespace->node_veth_identity()");
+  const std::size_t identity_gate =
+      source.find("!node.network_namespace->node_veth_identity()");
   BOOST_REQUIRE(identity_gate != std::string::npos);
   const std::size_t deletion =
       source.find("DeleteNodeVethNetwork(", identity_gate);
@@ -58,8 +58,8 @@ BOOST_AUTO_TEST_CASE(
   const std::size_t event =
       source.find("SimulationEventKind::kNetworkRemoved", deletion);
   BOOST_REQUIRE(event != std::string::npos);
-  const std::size_t verified = source.find(
-      "resource_cleanup_verified[index] = true;", event);
+  const std::size_t verified =
+      source.find("resource_cleanup_verified[index] = true;", event);
   BOOST_REQUIRE(verified != std::string::npos);
   const std::size_t cleaned =
       source.find("NodeRuntimeLifecycle::kCleaned", verified);
@@ -85,9 +85,9 @@ BOOST_AUTO_TEST_CASE(
   const std::size_t ownership =
       source.find(".load_confirmation = confirmation", confirmation);
   BOOST_REQUIRE(ownership != std::string::npos);
-  const std::size_t propagated =
-      source.find("confirmation->RecordPropagated", ownership);
-  BOOST_REQUIRE(propagated != std::string::npos);
+  const std::size_t tracker_ownership =
+      source.find("transaction_tracker.TrackSet(", ownership);
+  BOOST_REQUIRE(tracker_ownership != std::string::npos);
   const std::size_t final_observation =
       source.rfind("transaction_tracker.ObserveAll");
   BOOST_REQUIRE(final_observation != std::string::npos);
@@ -95,8 +95,8 @@ BOOST_AUTO_TEST_CASE(
       source.find("WriteTransactionLoadCompletions", final_observation);
   BOOST_REQUIRE(final_completion != std::string::npos);
   BOOST_TEST(confirmation < ownership);
-  BOOST_TEST(ownership < propagated);
-  BOOST_TEST(propagated < final_observation);
+  BOOST_TEST(ownership < tracker_ownership);
+  BOOST_TEST(tracker_ownership < final_observation);
   BOOST_TEST(final_observation < final_completion);
 }
 
@@ -243,8 +243,9 @@ BOOST_AUTO_TEST_CASE(
       source.find("transaction_tracker.Reserve(nodes);", raw_function);
   const std::size_t raw_send =
       source.find("driver.SendRawTransaction(", raw_function);
-  const std::size_t load_function =
-      source.find("void ApplyWalletTransactionsWorkload(", raw_function);
+  const std::size_t load_function = source.find(
+      "WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(",
+      raw_function);
   BOOST_REQUIRE(raw_function != std::string::npos);
   BOOST_REQUIRE(raw_reserve != std::string::npos);
   BOOST_REQUIRE(raw_send != std::string::npos);
@@ -328,7 +329,7 @@ BOOST_AUTO_TEST_CASE(
       "ApplyTransactionLoadRateSchedule(\n"
       "                          &task");
   const std::size_t worker_wait =
-      source.find("WaitForTransactionLoadSchedule(task, load_stop_token)");
+      source.find("task.scheduled_at, load_stop_token,");
   const std::size_t rpc_mutation =
       source.find("driver.SubmitWalletTransaction(", worker_wait);
   BOOST_REQUIRE(task_schedule != std::string::npos);

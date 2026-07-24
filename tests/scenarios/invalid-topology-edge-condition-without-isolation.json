@@ -1,4 +1,5 @@
 {
+  "isolated_network": false,
   "firod": "/tmp/not-used-by-probe",
   "nodes": 2,
   "topology": {

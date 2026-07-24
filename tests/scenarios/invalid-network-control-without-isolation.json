@@ -1,4 +1,5 @@
 {
+  "isolated_network": false,
   "nodes": 1,
   "workloads": [
     {

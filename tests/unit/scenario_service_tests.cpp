@@ -8,6 +8,7 @@
 
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/scenario_service.h"
+#include "bbp/simulator/wallet_transaction_plan.h"
 
 namespace bbp {
 namespace {
@@ -91,12 +92,14 @@ BOOST_AUTO_TEST_CASE(scenario_service_returns_production_resolved_document) {
   const Options options = ParseAndValidateScenario(scenario);
   BOOST_CHECK(options.chain == ChainKind::kFiro);
   BOOST_TEST(options.nodes == 1U);
+  BOOST_TEST(options.isolate_network);
   BOOST_TEST(options.chain_daemon == std::filesystem::path("/bin/true"));
 
   const boost::json::object resolved = ResolveScenario(scenario);
   BOOST_TEST(resolved.at("run_id").as_string() == "scenario-service-test");
   BOOST_TEST(resolved.at("chain").as_string() == "firo");
   BOOST_TEST(resolved.at("nodes").as_uint64() == 1U);
+  BOOST_TEST(resolved.at("isolated_network").as_bool());
   BOOST_TEST(resolved.at("chain_daemon").as_string() == "/bin/true");
   BOOST_TEST(resolved.at("node_configs")
                  .as_array()
@@ -104,6 +107,14 @@ BOOST_AUTO_TEST_CASE(scenario_service_returns_production_resolved_document) {
                  .as_object()
                  .at("id")
                  .as_string() == "firo-1");
+}
+
+BOOST_AUTO_TEST_CASE(scenario_service_preserves_explicit_network_opt_out) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["isolated_network"] = false;
+  const Options options = ParseAndValidateScenario(scenario);
+  BOOST_TEST(!options.isolate_network);
+  BOOST_TEST(!ResolveScenario(scenario).at("isolated_network").as_bool());
 }
 
 BOOST_AUTO_TEST_CASE(scenario_service_allows_explicit_empty_active_run) {
@@ -122,6 +133,42 @@ BOOST_AUTO_TEST_CASE(scenario_service_allows_explicit_empty_active_run) {
   BOOST_TEST(resolved.at("nodes").as_uint64() == 0U);
   BOOST_TEST(resolved.at("node_capacity").as_uint64() ==
              ChainDriverSpecFor(ChainKind::kFiro).max_nodes);
+}
+
+BOOST_AUTO_TEST_CASE(scenario_service_preserves_absent_wallet_lifetime_limit) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 3U;
+  scenario["topology"] =
+      boost::json::object{{"node_count", 3U},
+                          {"wallet_node_count", 2U},
+                          {"miner_node_count", 1U},
+                          {"wallet_nodes", boost::json::array{1U, 2U}},
+                          {"miner_nodes", boost::json::array{3U}}};
+  const Options options = ParseAndValidateScenario(scenario);
+  const WalletTransactionsWorkload continuous =
+      ParseAndValidateWalletTransactionsWorkload(
+          boost::json::object{{"type", "wallet_transactions"},
+                              {"strategy", "random_bruteforce"},
+                              {"retained_balance_percentage", 80.0},
+                              {"transaction_rate", 2.0},
+                              {"amount", "1.00000000"},
+                              {"fee", "0.00001000"}},
+          options);
+  BOOST_TEST(continuous.transaction_count == 0U);
+  BOOST_TEST(!continuous.duration.has_value());
+  BOOST_TEST(!ExplicitWalletTransactionAttemptLimit(continuous).has_value());
+
+  const WalletTransactionsWorkload bounded =
+      ParseAndValidateWalletTransactionsWorkload(
+          boost::json::object{{"type", "wallet_transactions"},
+                              {"strategy", "random_bruteforce"},
+                              {"retained_balance_percentage", 80.0},
+                              {"transaction_count", 8U},
+                              {"amount", "1.00000000"},
+                              {"fee", "0.00001000"}},
+          options);
+  BOOST_REQUIRE(ExplicitWalletTransactionAttemptLimit(bounded));
+  BOOST_TEST(*ExplicitWalletTransactionAttemptLimit(bounded) == 8U);
 }
 
 BOOST_AUTO_TEST_CASE(

@@ -24,4 +24,9 @@ SimulationCommand ParseAndValidateSimulationCommand(
 SimulationNodeAddRequest ParseAndValidateSimulationNodeAddRequest(
     const boost::json::object& request, const Options& options);
 
+// Parses one live wallet transaction workload through the production scenario
+// field parser and validates it against the active simulation options.
+WalletTransactionsWorkload ParseAndValidateWalletTransactionsWorkload(
+    const boost::json::object& workload, const Options& options);
+
 }  // namespace bbp

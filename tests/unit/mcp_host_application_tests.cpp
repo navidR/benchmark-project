@@ -12,6 +12,8 @@
 #include "bbp/mcp_dispatcher.h"
 #include "bbp/mcp_host_application.h"
 #include "bbp/mcp_live_application.h"
+#include "bbp/simulation_command_queue.h"
+#include "bbp/simulator/options.h"
 
 namespace bbp {
 namespace {
@@ -96,9 +98,23 @@ BOOST_AUTO_TEST_CASE(
       application.SupportedOperations();
   for (const McpOperationKind operation :
        {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
-        McpOperationKind::kRestartNode}) {
+        McpOperationKind::kRestartNode, McpOperationKind::kStartWorkload,
+        McpOperationKind::kInspectWorkload,
+        McpOperationKind::kReconfigureWorkload,
+        McpOperationKind::kPauseWorkload, McpOperationKind::kResumeWorkload,
+        McpOperationKind::kStopWorkload}) {
     BOOST_CHECK(std::find(supported.begin(), supported.end(), operation) !=
                 supported.end());
+  }
+
+  try {
+    static_cast<void>(
+        Invoke(&dispatcher, "workload.inspect",
+               boost::json::object{{"run_id", "missing-run"},
+                                   {"workload_id", "wallet-workload-1"}}));
+    BOOST_FAIL("workload inspection without a run must fail");
+  } catch (const McpOperationFailure& error) {
+    BOOST_TEST(error.code() == "run_not_active");
   }
 
   const boost::json::object launch = WaitForTerminal(
@@ -127,6 +143,7 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
+  std::string run_state = "starting";
   const auto live_application =
       std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
           .run_id = "starting-run",
@@ -141,16 +158,17 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
           .run_started = {},
           .run_stopping = {},
           .run_stopped = {}});
+  std::shared_ptr<McpLiveApplication> current_application = live_application;
   McpHostApplication application(McpHostApplication::Config{
       .host_id = "editor-host",
       .snapshot_run =
-          [live_application] {
+          [&current_application, &run_state] {
             return McpHostedRunSnapshot{.generation = 1U,
                                         .run_id = "starting-run",
-                                        .state = "starting",
+                                        .state = run_state,
                                         .chain = "firo",
                                         .node_count = 1U,
-                                        .application = live_application};
+                                        .application = current_application};
           },
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },
@@ -160,6 +178,15 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
                            application.ResourceReader());
   dispatcher.SessionHandler()("host-session", true, {});
 
+  try {
+    static_cast<void>(
+        Invoke(&dispatcher, "workload.inspect",
+               boost::json::object{{"run_id", "starting-run"},
+                                   {"workload_id", "wallet-workload-1"}}));
+    BOOST_FAIL("workload inspection while starting must fail");
+  } catch (const McpOperationFailure& error) {
+    BOOST_TEST(error.code() == "run_not_ready");
+  }
   BOOST_CHECK_THROW(Invoke(&dispatcher, "run.report",
                            boost::json::object{{"run_id", "starting-run"}}),
                     McpOperationFailure);
@@ -167,6 +194,37 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
       application.ResourceReader()(McpInformationFamily::kReports,
                                    "host-session", std::stop_token{}),
       McpOperationFailure);
+
+  run_state = "active";
+  const auto options = std::make_shared<Options>();
+  options->node_capacity = 1U;
+  current_application =
+      std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
+          .run_id = "starting-run",
+          .run_root = "/tmp/bbp-mcp-host-starting-run",
+          .retained_run = {},
+          .options = options,
+          .command_queue = std::make_shared<SimulationCommandQueue>(),
+          .node_inventory_snapshot =
+              [] {
+                return McpLiveNodeInventorySnapshot{.generation = 1U,
+                                                    .node_ids = {"firo-1"}};
+              },
+          .publication_mutex = std::make_shared<std::timed_mutex>(),
+          .request_run_stop = [] {},
+          .run_started = {},
+          .run_stopping = {},
+          .run_stopped = {}});
+  current_application->MarkRunStarted();
+  try {
+    static_cast<void>(
+        Invoke(&dispatcher, "workload.inspect",
+               boost::json::object{{"run_id", "starting-run"},
+                                   {"workload_id", "wallet-workload-1"}}));
+    BOOST_FAIL("workload inspection without a service must fail");
+  } catch (const McpOperationFailure& error) {
+    BOOST_TEST(error.code() == "workload_service_unavailable");
+  }
 
   dispatcher.SessionHandler()("host-session", false, {});
 }

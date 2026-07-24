@@ -127,15 +127,14 @@ std::unique_ptr<boost::asio::ip::tcp::acceptor> ReserveTcpEndpoint(
     std::string_view node_id, std::string_view purpose) {
   const auto unavailable = [&](std::string message) {
     throw SimulationNodeResourceUnavailable(
-        std::move(message),
-        SimulationNodeResourceFailure{
-            .resource_kind = std::string(resource_kind),
-            .node_id = std::string(node_id),
-            .address = std::string(address),
-            .port = port,
-            .purpose = std::string(purpose),
-            .mutation_started = false,
-        });
+        std::move(message), SimulationNodeResourceFailure{
+                                .resource_kind = std::string(resource_kind),
+                                .node_id = std::string(node_id),
+                                .address = std::string(address),
+                                .port = port,
+                                .purpose = std::string(purpose),
+                                .mutation_started = false,
+                            });
   };
   boost::system::error_code error;
   const boost::asio::ip::address parsed_address =
@@ -1776,19 +1775,19 @@ void ValidateWalletTransactionsWorkload(
   const bool has_duration = workload.duration.has_value();
   const bool load_strategy = IsTransactionLoadStrategy(workload.strategy);
   if (load_strategy) {
-    if (has_transaction_count == has_duration) {
+    if (has_transaction_count && has_duration) {
       throw std::runtime_error(
-          "scenario transaction load must specify exactly one of "
-          "transaction_count or duration");
+          "scenario transaction load transaction_count and duration are "
+          "mutually exclusive");
     }
     if (has_duration && !has_transaction_rate) {
       throw std::runtime_error(
           "scenario transaction load duration requires transaction_rate");
     }
-  } else if (has_transaction_count == has_transaction_rate) {
+  } else if (has_transaction_count && has_transaction_rate) {
     throw std::runtime_error(
-        "scenario wallet_transactions must specify exactly one of "
-        "transaction_count or transaction_rate");
+        "scenario wallet_transactions transaction_count and transaction_rate "
+        "are mutually exclusive");
   }
   const std::uint64_t coinbase_confirmations =
       ChainDriverSpecFor(options.chain).coinbase_spendable_confirmations;
@@ -1943,7 +1942,30 @@ void ValidateWalletTransactionsWorkload(
       }
       break;
     case WalletTransferStrategy::kRandomBruteforce:
+      if (!workload.sender_wallets.empty() ||
+          !workload.receiver_wallets.empty()) {
+        throw std::runtime_error(
+            "scenario random_bruteforce uses every wallet and does not "
+            "accept sender_wallets or receiver_wallets");
+      }
+      if (!workload.retained_balance_basis_points ||
+          *workload.retained_balance_basis_points >= 10'000U) {
+        throw std::runtime_error(
+            "scenario random_bruteforce requires "
+            "retained_balance_percentage in 0..99.99");
+      }
+      if (workload.queue_capacity < wallet_count) {
+        throw std::runtime_error(
+            "scenario random_bruteforce queue_capacity must fit one "
+            "all-wallet scheduling cycle");
+      }
+      break;
     case WalletTransferStrategy::kEqualFanout: {
+      if (workload.retained_balance_basis_points) {
+        throw std::runtime_error(
+            "scenario equal_fanout does not accept "
+            "retained_balance_percentage");
+      }
       if (workload.sender_wallets.empty() ||
           workload.receiver_wallets.empty()) {
         throw std::runtime_error(
@@ -1979,12 +2001,9 @@ void ValidateWalletTransactionsWorkload(
               "scenario equal_fanout queue_capacity must fit one complete "
               "receiver batch");
         }
-        const std::uint64_t attempt_limit =
-            has_transaction_count
-                ? static_cast<std::uint64_t>(workload.transaction_count)
-                : WalletTransactionDurationAttemptLimit(
-                      *workload.duration, *workload.transaction_rate);
-        if (attempt_limit % receiver_count != 0U) {
+        const std::optional<std::uint64_t> attempt_limit =
+            ExplicitWalletTransactionAttemptLimit(workload);
+        if (attempt_limit && *attempt_limit % receiver_count != 0U) {
           throw std::runtime_error(
               "scenario equal_fanout attempt limit must contain complete "
               "receiver batches");
@@ -2647,7 +2666,6 @@ void ResolveNodeProfileAssignments(Options* options) {
           " cannot combine network.profile with network.node_conditions");
     }
     options->node_network_conditions.emplace(node_index, profile->second);
-    options->isolate_network = true;
   }
 }
 
@@ -2667,7 +2685,6 @@ void ValidateProfileSwitchReferences(Options* options) {
             "scenario set_network_profile references unknown profile: " +
             workload.profile_switch.profile);
       }
-      options->isolate_network = true;
     }
   };
   for (const ScenarioWorkload& workload : options->workloads) {
@@ -3775,12 +3792,6 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
               "scenario wallet_transactions transaction_rate does not accept "
               "interval");
         }
-      } else if (!load_strategy) {
-        transactions.transaction_count = JsonOptionalUint32Field(
-            workload, "transaction_count",
-            options.topology.configured
-                ? static_cast<uint32_t>(options.topology.wallet_nodes.size())
-                : 0U);
       }
       transactions.amount = ParseAmountDistribution(workload, "amount");
       if (!load_strategy) {
@@ -3805,6 +3816,10 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
               : 0U;
       transactions.funding_threshold_satoshis = JsonOptionalAmountField(
           workload, "funding_threshold", default_funding_threshold);
+      if (workload.if_contains("retained_balance_percentage") != nullptr) {
+        transactions.retained_balance_basis_points =
+            JsonPercentBasisPoints(workload, "retained_balance_percentage");
+      }
       transactions.random_seed =
           JsonOptionalUint64Field(workload, "seed", options.simulation_seed);
       const std::size_t wallet_count = options.topology.wallet_nodes.size();
@@ -3834,6 +3849,12 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
         throw std::runtime_error(
             "scenario wallet_transactions hotspot does not accept "
             "sender_wallets");
+      }
+      if (transactions.strategy == WalletTransferStrategy::kRandomBruteforce &&
+          (sender_wallets_present || receiver_wallets_present)) {
+        throw std::runtime_error(
+            "scenario random_bruteforce uses every wallet and does not "
+            "accept sender_wallets or receiver_wallets");
       }
       transactions.timeout_sec =
           OptionProvided(vm, "sync-timeout-sec")
@@ -4351,7 +4372,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                 static_cast<std::uint32_t>(options.metrics_interval.count())))
             .value();
   }
-  if (!OptionProvided(vm, "isolate-network")) {
+  if (!OptionProvided(vm, "isolate-network") &&
+      !OptionProvided(vm, "no-isolate-network")) {
     options.isolate_network = JsonOptionalBoolField(
         scenario, "isolated_network", options.isolate_network);
   }
@@ -4462,7 +4484,8 @@ void ApplyScenarioJson(const boost::json::object& scenario,
     RejectUnsupportedFields(object,
                             ScenarioObjectFields(ScenarioObjectKind::kNetwork),
                             "scenario network");
-    if (!OptionProvided(vm, "isolate-network")) {
+    if (!OptionProvided(vm, "isolate-network") &&
+        !OptionProvided(vm, "no-isolate-network")) {
       options.isolate_network =
           JsonOptionalBoolField(object, "isolated", options.isolate_network);
     }
@@ -4963,7 +4986,6 @@ void ApplyDirectTransactionLoadOptions(
   }
 
   options->topology.configured = true;
-  options->isolate_network = true;
   options->topology.node_count = options->nodes;
   options->topology.wallet_node_count = wallet_node_count;
   options->topology.miner_node_count = 1U;
@@ -4990,7 +5012,9 @@ void ApplyDirectTransactionLoadOptions(
   load.readiness_confirmations = coinbase_confirmations;
   load.transaction_rate = WalletTransactionRate::FromDouble(2.0);
   load.concurrency = 2U;
-  load.queue_capacity = 8U;
+  load.queue_capacity = strategy == WalletTransferStrategy::kRandomBruteforce
+                            ? std::max<std::uint32_t>(8U, wallet_node_count)
+                            : 8U;
   load.mode = WalletPrivacyMode::kPublic;
   load.amount = AmountDistribution{
       .kind = ValueDistributionKind::kUniform,
@@ -5005,23 +5029,22 @@ void ApplyDirectTransactionLoadOptions(
                                                 load.fee_satoshis);
   load.funding_threshold_satoshis =
       load.amount.maximum_satoshis + load.fee_reserve_satoshis;
+  if (strategy == WalletTransferStrategy::kRandomBruteforce) {
+    load.retained_balance_basis_points = 8'000U;
+  }
   load.random_seed = options->simulation_seed;
   load.timeout_sec = options->sync_timeout_sec;
 
-  const std::uint32_t sender_count = wallet_node_count / 2U;
-  for (std::uint32_t wallet = 1U; wallet <= sender_count; ++wallet) {
-    load.sender_wallets.push_back(wallet);
+  if (strategy == WalletTransferStrategy::kEqualFanout) {
+    const std::uint32_t sender_count = wallet_node_count / 2U;
+    for (std::uint32_t wallet = 1U; wallet <= sender_count; ++wallet) {
+      load.sender_wallets.push_back(wallet);
+    }
+    for (std::uint32_t wallet = sender_count + 1U; wallet <= wallet_node_count;
+         ++wallet) {
+      load.receiver_wallets.push_back(wallet);
+    }
   }
-  for (std::uint32_t wallet = sender_count + 1U; wallet <= wallet_node_count;
-       ++wallet) {
-    load.receiver_wallets.push_back(wallet);
-  }
-  const std::uint32_t receiver_count =
-      static_cast<std::uint32_t>(load.receiver_wallets.size());
-  load.transaction_count = strategy == WalletTransferStrategy::kEqualFanout
-                               ? receiver_count
-                               : receiver_count * 2U;
-
   ScenarioWorkload workload;
   workload.kind = WorkloadKind::kWalletTransactions;
   workload.wallet_transactions = std::move(load);
@@ -5051,6 +5074,8 @@ Options ParseOptions(int argc, char** argv,
   bool no_mining = false;
   bool native_mining = false;
   bool keep_cgroups = false;
+  bool isolate_network = false;
+  bool no_isolate_network = false;
   std::string cleanup_run_id;
   std::uint32_t wallet_node_count = 0U;
   std::string transaction_load_strategy;
@@ -5089,13 +5114,15 @@ Options ParseOptions(int argc, char** argv,
       "transaction-load-strategy", po::value<std::string>(),
       "direct random_bruteforce or equal_fanout load; defaults: full mesh, "
       "isolated namespaces, one miner (the final wallet when all nodes are "
-      "wallets), public driver wallets, two receiver batches for random or "
-      "one complete equal fan-out at 2 tx/s, "
+      "wallets), public driver wallets, all-wallet random redistribution "
+      "retaining 80 percent or one complete equal fan-out at 2 tx/s, "
       "concurrency 2, queue 8, uniform 0.01..0.10 coin random amounts, "
       "fixed 0.00001000 coin fee, simulation seed, and continuous metrics "
       "until explicit stop")(
       "isolate-network",
-      "confine every node to its own benchmark network namespace")(
+      "explicitly select the default per-node isolated networking mode")(
+      "no-isolate-network",
+      "explicitly opt out of per-node isolation and use loopback networking")(
       "metrics-sample-count", po::value<std::uint32_t>(),
       "periodic metric sample limit; zero keeps the run active until explicit "
       "stop, while a positive count makes the run finite")(
@@ -5204,8 +5231,10 @@ Options ParseOptions(int argc, char** argv,
       "cleanup-run",
       po::value<std::string>(&cleanup_run_id)->implicit_value(""),
       "remove stale simulator-owned objects for the optional run id and exit")(
-      "isolate-network", po::bool_switch(&options.isolate_network),
-      "run each chain node in its own network namespace and veth link")(
+      "isolate-network", po::bool_switch(&isolate_network),
+      "explicitly run each chain node in its own network namespace and veth "
+      "link")("no-isolate-network", po::bool_switch(&no_isolate_network),
+              "explicitly use loopback-only node networking")(
       "network-bandwidth-mbps",
       po::value<uint32_t>(&options.network_condition.bandwidth_mbps),
       "TBF bandwidth limit in megabits per second for each isolated node "
@@ -5338,6 +5367,16 @@ Options ParseOptions(int argc, char** argv,
 
   options.chain = ParseChainKind(chain_name);
   options.log_level = ParseLogLevel(log_level_name);
+  if (OptionProvided(vm, "isolate-network") &&
+      OptionProvided(vm, "no-isolate-network")) {
+    throw std::runtime_error(
+        "--isolate-network and --no-isolate-network are mutually exclusive");
+  }
+  if (isolate_network) {
+    options.isolate_network = true;
+  } else if (no_isolate_network) {
+    options.isolate_network = false;
+  }
   if (keep_cgroups) {
     options.cleanup_policy = CleanupPolicy::kRetainCgroups;
   }
@@ -7007,8 +7046,7 @@ void AttachNodePerfCounters(NodeRuntime& node,
                               "node cgroup is unavailable");
       return;
     }
-    const std::filesystem::path exact_cgroup_path =
-        node.cgroup->access_path();
+    const std::filesystem::path exact_cgroup_path = node.cgroup->access_path();
     CgroupPerfCounters counters =
         CgroupPerfCounters::Open(exact_cgroup_path, node.perf_counter_kinds);
     if (!node.process.running() || !node.cgroup ||
@@ -7998,7 +8036,8 @@ std::string WalletTransactionDetail(
 
 std::string TransactionLoadAttemptDetail(
     uint32_t workload_index, uint32_t workload_count,
-    const WalletTransactionsWorkload& workload, std::uint64_t attempt_limit,
+    const WalletTransactionsWorkload& workload,
+    std::optional<std::uint64_t> attempt_limit,
     const WalletTransactionLoadTask& task, const WalletIdentity& sender,
     const WalletIdentity& receiver, TransactionLoadOutcome outcome,
     std::chrono::microseconds latency,
@@ -8008,7 +8047,11 @@ std::string TransactionLoadAttemptDetail(
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
   detail["transaction_index"] = task.transaction_index;
-  detail["attempt_limit"] = attempt_limit;
+  if (attempt_limit) {
+    detail["attempt_limit"] = *attempt_limit;
+  } else {
+    detail["attempt_limit"] = nullptr;
+  }
   detail["strategy"] =
       std::string(WalletTransferStrategyName(workload.strategy));
   detail["mode"] = std::string(WalletPrivacyModeName(workload.mode));
@@ -8121,8 +8164,9 @@ void WriteTransactionLoadProgress(const Options& options,
 
 std::string TransactionLoadCompletedDetail(
     uint32_t workload_index, uint32_t workload_count,
-    const WalletTransactionsWorkload& workload, std::uint64_t attempt_limit,
-    std::size_t queue_maximum_size, const TransactionLoadSnapshot& snapshot) {
+    const WalletTransactionsWorkload& workload,
+    std::optional<std::uint64_t> attempt_limit, std::size_t queue_maximum_size,
+    const TransactionLoadSnapshot& snapshot) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
@@ -8130,7 +8174,11 @@ std::string TransactionLoadCompletedDetail(
       std::string(WalletTransferStrategyName(workload.strategy));
   detail["mode"] = std::string(WalletPrivacyModeName(workload.mode));
   detail["seed"] = workload.random_seed;
-  detail["configured_attempt_limit"] = attempt_limit;
+  if (attempt_limit) {
+    detail["configured_attempt_limit"] = *attempt_limit;
+  } else {
+    detail["configured_attempt_limit"] = nullptr;
+  }
   if (workload.transaction_rate) {
     detail["configured_rate"] = workload.transaction_rate->value();
   } else {
@@ -8270,6 +8318,10 @@ class TransactionObservationTracker {
                 std::vector<TrackedTransaction> transactions) {
     reservation.observation.Commit(std::move(transactions),
                                    reservation.required_node_ids);
+  }
+
+  std::size_t CancelWorkload(std::string_view workload_id) {
+    return observations_.CancelWorkload(workload_id);
   }
 
   void TrackAndWaitForVisibility(Reservation reservation,
@@ -8502,11 +8554,75 @@ struct PendingTransactionLoadCompletion {
   std::uint32_t workload_index = 0U;
   std::uint32_t workload_count = 0U;
   WalletTransactionsWorkload workload;
-  std::uint64_t attempt_limit = 0U;
+  std::optional<std::uint64_t> attempt_limit;
   std::size_t queue_maximum_size = 0U;
   std::shared_ptr<TransactionLoadAccounting> accounting;
   std::chrono::microseconds elapsed{0};
 };
+
+enum class WalletWorkloadExecutionEnd {
+  kCompleted,
+  kYielded,
+  kRefreshBalances,
+};
+
+class WalletWorkloadSettleRequested final : public std::exception {
+ public:
+  const char* what() const noexcept override {
+    return "wallet workload settlement requested";
+  }
+};
+
+struct WalletWorkloadFundingState {
+  uint32_t miner_node = 1;
+  uint64_t start_height = 0;
+  uint64_t target_height = 0;
+  uint64_t ready_height = 0;
+  uint64_t ready_balance_satoshis = 0;
+  std::vector<std::string> hashes;
+  ChainWalletFundingResult preparation;
+  std::vector<std::string> preparation_hashes;
+};
+
+struct WalletWorkloadExecutionContext {
+  std::shared_ptr<TransactionLoadAccounting> accounting;
+  std::string workload_id;
+  std::chrono::steady_clock::time_point started_at;
+  std::uint64_t next_transaction_index = 0U;
+  std::optional<std::vector<WalletWorkloadFundingState>>* prepared_funding =
+      nullptr;
+  std::function<bool()> yield_requested;
+  std::function<bool()> settle_requested;
+  std::function<void(std::uint64_t)> record_planned;
+  std::function<void(std::uint64_t)> record_accepted;
+  std::function<void(std::span<const WalletTransactionPlanEntry>)>
+      record_load_admission;
+  std::function<void(std::uint64_t)> record_released_atomic_units;
+  std::function<void()> execution_started;
+};
+
+struct WalletWorkloadExecutionResult {
+  WalletWorkloadExecutionEnd end = WalletWorkloadExecutionEnd::kCompleted;
+  std::uint64_t next_transaction_index = 0U;
+  std::size_t queue_maximum_size = 0U;
+};
+
+bool WaitUntilWalletWorkloadDeadline(
+    std::chrono::steady_clock::time_point deadline, std::stop_token stop_token,
+    const std::function<bool()>& yield_requested) {
+  constexpr std::chrono::milliseconds kMaximumPoll{25};
+  while (std::chrono::steady_clock::now() < deadline) {
+    ThrowIfStopRequested(stop_token);
+    if (yield_requested && yield_requested()) {
+      return false;
+    }
+    const auto poll_deadline =
+        std::min(deadline, std::chrono::steady_clock::now() + kMaximumPoll);
+    WaitUntil(poll_deadline, stop_token);
+  }
+  ThrowIfStopRequested(stop_token);
+  return !yield_requested || !yield_requested();
+}
 
 void WriteTransactionLoadCompletions(
     const Options& options, const std::filesystem::path& events_path,
@@ -8553,6 +8669,19 @@ void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
     mined_transaction_count += block_transaction_count;
   }
   node.AddMinedTransactions(mined_transaction_count);
+}
+
+std::vector<std::string> GenerateBlocksSerialized(
+    std::timed_mutex& block_generation_mutex, const ChainDriver& driver,
+    const ChainNodeConfig& node, std::uint32_t count,
+    const std::string& reward_address, std::stop_token stop_token) {
+  std::unique_lock<std::timed_mutex> generation_lock(block_generation_mutex,
+                                                     std::defer_lock);
+  while (!generation_lock.try_lock_for(std::chrono::milliseconds(25))) {
+    ThrowIfStopRequested(stop_token);
+  }
+  ThrowIfStopRequested(stop_token);
+  return driver.GenerateBlocks(node, count, reward_address, stop_token);
 }
 
 std::string WalletAddressDetail(const WalletIdentity& wallet,
@@ -8753,7 +8882,7 @@ std::uint32_t WriteMetricsSnapshot(
       runtime.cgroup_path = node.cgroup->path().string();
     }
     if (node.network_namespace) {
-      struct stat namespace_stat {};
+      struct stat namespace_stat{};
       if (fstat(node.network_namespace->fd(), &namespace_stat) != 0) {
         throw std::runtime_error("fstat node network namespace failed");
       }
@@ -9327,6 +9456,12 @@ boost::json::object WalletTransactionsWorkloadJson(
         EffectiveWalletTransactionFeeReserveSatoshis(workload));
     object["fee_reserve_satoshis"] =
         EffectiveWalletTransactionFeeReserveSatoshis(workload);
+    if (workload.retained_balance_basis_points) {
+      object["retained_balance_percentage"] =
+          static_cast<double>(*workload.retained_balance_basis_points) / 100.0;
+      object["retained_balance_basis_points"] =
+          *workload.retained_balance_basis_points;
+    }
   }
   object["amount"] = AmountDistributionConfigurationJson(workload.amount);
   if (workload.interval.kind != ValueDistributionKind::kFixed ||
@@ -10753,19 +10888,17 @@ boost::json::object RuntimePublishedNodeConfig(const Options& options,
       {"binary", config.binary.string()},
       {"data_dir", config.data_dir.generic_string()},
       {"role", NodeRoleName(options, node_index)},
-      {"lifecycle",
-       std::string(NodeRuntimeLifecycleName(runtime.Lifecycle()))},
-      {"restart_policy",
-       std::string(
-           NodeRestartPolicyName(runtime.lifecycle_policy.restart_policy))}};
+      {"lifecycle", std::string(NodeRuntimeLifecycleName(runtime.Lifecycle()))},
+      {"restart_policy", std::string(NodeRestartPolicyName(
+                             runtime.lifecycle_policy.restart_policy))}};
 
   boost::json::array extra_args;
   for (const std::string& argument : config.extra_args.arguments()) {
     extra_args.emplace_back(argument);
   }
-  node["chain_config"] = boost::json::object{
-      {"network", ChainNetworkName(config.network)},
-      {"extra_args", std::move(extra_args)}};
+  node["chain_config"] =
+      boost::json::object{{"network", ChainNetworkName(config.network)},
+                          {"extra_args", std::move(extra_args)}};
 
   boost::json::array rpc_allow_ips;
   for (const std::string& address : config.rpc_allow_ips) {
@@ -10799,12 +10932,12 @@ boost::json::object RuntimePublishedNodeConfig(const Options& options,
   for (const std::string& endpoint : config.connect_peers) {
     connect_peers.emplace_back(endpoint);
   }
-  node["p2p"] = boost::json::object{
-      {"host", config.p2p_host},
-      {"bind", config.p2p_bind},
-      {"port", config.p2p_port},
-      {"listen", config.listen},
-      {"connect_peers", std::move(connect_peers)}};
+  node["p2p"] =
+      boost::json::object{{"host", config.p2p_host},
+                          {"bind", config.p2p_bind},
+                          {"port", config.p2p_port},
+                          {"listen", config.listen},
+                          {"connect_peers", std::move(connect_peers)}};
 
   ScenarioNodeWalletConfig wallet;
   wallet.enabled = config.wallet_enabled;
@@ -10899,8 +11032,7 @@ void PrepareNodeRuntime(
       throw std::runtime_error(
           "node veth setup returned without an acquired identity");
     }
-    runtime.network_namespace->SetNodeVethIdentity(
-        std::move(*acquired_veth));
+    runtime.network_namespace->SetNodeVethIdentity(std::move(*acquired_veth));
     if (runtime.network->apply_condition) {
       const QdiscInfo qdisc =
           VerifyNodeNetworkCondition(*runtime.network, stop_token);
@@ -11005,9 +11137,9 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
           DirectionalNetworkPoliciesForNode(options, runtime_topology, i);
     }
     nodes.emplace_back();
-    startup_manifest.nodes.push_back(RuntimeNodeResourceEntryFor(
-        options, prepared_configs[i], i,
-        RuntimeNodeResourceState::kPendingAdd));
+    startup_manifest.nodes.push_back(
+        RuntimeNodeResourceEntryFor(options, prepared_configs[i], i,
+                                    RuntimeNodeResourceState::kPendingAdd));
     WriteRuntimeNodeResourceManifest(startup_manifest);
     PrepareNodeRuntime(
         options, events_path, nodes.back(), std::move(prepared_configs[i]), i,
@@ -11950,8 +12082,8 @@ void ApplyTopologyEdgeWorkload(
 
 void ApplySendRawTransactionWorkload(
     const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, auto& nodes,
-    TransactionObservationTracker& transaction_tracker,
+    const ChainDriver& driver, std::timed_mutex& block_generation_mutex,
+    auto& nodes, TransactionObservationTracker& transaction_tracker,
     const SendRawTransactionWorkload& workload, uint32_t workload_index,
     uint32_t workload_count, std::stop_token stop_token) {
   NodeRuntime& funder = nodes[workload.funding_node - 1U];
@@ -11960,9 +12092,9 @@ void ApplySendRawTransactionWorkload(
   RequireNodeRunning(submitter, "raw transaction submission");
   const uint64_t start_height =
       driver.ReadMetrics(funder.config, stop_token).height;
-  std::vector<std::string> funding_hashes =
-      driver.GenerateBlocks(funder.config, workload.funding_blocks,
-                            workload.source_address, stop_token);
+  std::vector<std::string> funding_hashes = GenerateBlocksSerialized(
+      block_generation_mutex, driver, funder.config, workload.funding_blocks,
+      workload.source_address, stop_token);
   RecordGeneratedBlocks(driver, funder, funding_hashes, stop_token);
   const uint64_t target_height =
       start_height + static_cast<uint64_t>(funding_hashes.size());
@@ -12002,6 +12134,7 @@ void ApplySendRawTransactionWorkload(
       TrackedTransaction{
           .txid = transaction.txid,
           .submission_kind = "raw_transaction_submitted",
+          .workload_id = {},
           .workload_index = workload_index,
           .workload_count = workload_count,
           .transaction_index = 1U,
@@ -12014,140 +12147,363 @@ void ApplySendRawTransactionWorkload(
       std::chrono::seconds(workload.timeout_sec), stop_token);
 }
 
-void ApplyWalletTransactionsWorkload(
+enum class LiveWalletWorkloadState {
+  kStarting,
+  kRunning,
+  kPaused,
+  kStopping,
+  kStopped,
+  kCompleted,
+  kCancelled,
+  kFailed,
+};
+
+enum class LiveWalletWorkloadRequest {
+  kNone,
+  kPause,
+  kReconfigure,
+  kStopSettle,
+  kStopCancel,
+  kShutdown,
+  kRunFailure,
+};
+
+std::string_view LiveWalletWorkloadStateName(LiveWalletWorkloadState state) {
+  switch (state) {
+    case LiveWalletWorkloadState::kStarting:
+      return "starting";
+    case LiveWalletWorkloadState::kRunning:
+      return "running";
+    case LiveWalletWorkloadState::kPaused:
+      return "paused";
+    case LiveWalletWorkloadState::kStopping:
+      return "stopping";
+    case LiveWalletWorkloadState::kStopped:
+      return "stopped";
+    case LiveWalletWorkloadState::kCompleted:
+      return "completed";
+    case LiveWalletWorkloadState::kCancelled:
+      return "cancelled";
+    case LiveWalletWorkloadState::kFailed:
+      return "failed";
+  }
+  throw std::logic_error("unknown live wallet workload state");
+}
+
+bool IsTerminalLiveWalletWorkloadState(LiveWalletWorkloadState state) {
+  return state == LiveWalletWorkloadState::kStopped ||
+         state == LiveWalletWorkloadState::kCompleted ||
+         state == LiveWalletWorkloadState::kCancelled ||
+         state == LiveWalletWorkloadState::kFailed;
+}
+
+struct LiveWalletWorkloadRecord {
+  mutable std::mutex mutex;
+  std::condition_variable_any changed;
+  std::string id;
+  std::uint32_t ordinal = 0U;
+  WalletTransactionsWorkload workload;
+  std::optional<WalletTransactionsWorkload> pending_workload;
+  std::vector<std::uint32_t> claimed_wallets;
+  LiveWalletWorkloadState state = LiveWalletWorkloadState::kStarting;
+  LiveWalletWorkloadRequest request = LiveWalletWorkloadRequest::kNone;
+  std::string terminal_outcome = "none";
+  std::optional<std::string> failure;
+  std::uint64_t configuration_revision = 1U;
+  std::uint64_t next_transaction_index = 0U;
+  std::uint64_t planned = 0U;
+  std::uint64_t accepted = 0U;
+  std::uint64_t reserved_atomic_units = 0U;
+  std::uint64_t released_atomic_units = 0U;
+  std::uint64_t cancelled_tracking = 0U;
+  std::size_t queue_maximum_size = 0U;
+  std::optional<std::vector<WalletWorkloadFundingState>> prepared_funding;
+  std::chrono::steady_clock::time_point started_at =
+      std::chrono::steady_clock::now();
+  std::stop_source epoch_stop_source;
+  std::shared_ptr<TransactionLoadAccounting> accounting =
+      std::make_shared<TransactionLoadAccounting>();
+  std::thread worker;
+};
+
+struct LiveWalletWorkloadRegistry {
+  mutable std::mutex mutex;
+  std::map<std::string, std::shared_ptr<LiveWalletWorkloadRecord>> records;
+  std::uint64_t next_id = 1U;
+  bool shutting_down = false;
+};
+
+std::vector<std::uint32_t> ClaimedWalletsForWorkload(
+    const WalletTransactionsWorkload& workload, std::size_t wallet_count) {
+  std::vector<std::uint32_t> claimed;
+  switch (workload.strategy) {
+    case WalletTransferStrategy::kRoundRobin:
+    case WalletTransferStrategy::kRandom:
+    case WalletTransferStrategy::kRandomBruteforce:
+      claimed.reserve(wallet_count);
+      for (std::size_t index = 0U; index < wallet_count; ++index) {
+        claimed.push_back(static_cast<std::uint32_t>(index + 1U));
+      }
+      break;
+    case WalletTransferStrategy::kFanout:
+    case WalletTransferStrategy::kEqualFanout:
+      claimed = workload.sender_wallets;
+      break;
+    case WalletTransferStrategy::kHotspot:
+      claimed.reserve(wallet_count);
+      for (std::size_t index = 0U; index < wallet_count; ++index) {
+        const std::uint32_t wallet = static_cast<std::uint32_t>(index + 1U);
+        if (std::find(workload.receiver_wallets.begin(),
+                      workload.receiver_wallets.end(),
+                      wallet) == workload.receiver_wallets.end()) {
+          claimed.push_back(wallet);
+        }
+      }
+      break;
+  }
+  std::sort(claimed.begin(), claimed.end());
+  return claimed;
+}
+
+bool WalletClaimsOverlap(std::span<const std::uint32_t> lhs,
+                         std::span<const std::uint32_t> rhs) {
+  return std::any_of(lhs.begin(), lhs.end(), [&](std::uint32_t wallet) {
+    return std::binary_search(rhs.begin(), rhs.end(), wallet);
+  });
+}
+
+void CheckedWalletWorkloadAdd(std::uint64_t amount, std::uint64_t* target,
+                              std::string_view field) {
+  if (*target > std::numeric_limits<std::uint64_t>::max() - amount) {
+    throw std::runtime_error("wallet workload " + std::string(field) +
+                             " accounting exceeds uint64");
+  }
+  *target += amount;
+}
+
+boost::json::object LiveWalletWorkloadJson(
+    const LiveWalletWorkloadRecord& record) {
+  std::lock_guard<std::mutex> lock(record.mutex);
+  const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - record.started_at);
+  const TransactionLoadSnapshot accounting =
+      record.accounting->Snapshot(elapsed);
+  const std::uint64_t in_flight = record.accepted >= accounting.attempted
+                                      ? record.accepted - accounting.attempted
+                                      : 0U;
+  const std::uint64_t awaiting_confirmation =
+      accounting.submitted >= accounting.confirmed
+          ? accounting.submitted - accounting.confirmed
+          : 0U;
+  const std::uint64_t tracked_awaiting_confirmation =
+      awaiting_confirmation >= record.cancelled_tracking
+          ? awaiting_confirmation - record.cancelled_tracking
+          : 0U;
+  if (in_flight > std::numeric_limits<std::uint64_t>::max() -
+                      tracked_awaiting_confirmation) {
+    throw std::runtime_error(
+        "wallet workload outstanding accounting exceeds uint64");
+  }
+  if (accounting.cancelled >
+      std::numeric_limits<std::uint64_t>::max() - record.cancelled_tracking) {
+    throw std::runtime_error(
+        "wallet workload cancellation accounting exceeds uint64");
+  }
+  boost::json::object exact{
+      {"planned", record.planned},
+      {"accepted", record.accepted},
+      {"attempted", accounting.attempted},
+      {"submitted", accounting.submitted},
+      {"propagated", accounting.propagated},
+      {"confirmed", accounting.confirmed},
+      {"rejected", accounting.rejected},
+      {"timed_out", accounting.timed_out},
+      {"backpressured", accounting.backpressured},
+      {"dropped", accounting.dropped},
+      {"failed", accounting.failed},
+      {"retried", 0U},
+      {"cancelled", accounting.cancelled + record.cancelled_tracking},
+      {"cancelled_tracking", record.cancelled_tracking},
+      {"outstanding", in_flight + tracked_awaiting_confirmation},
+      {"in_flight", in_flight},
+      {"reserved_atomic_units", record.reserved_atomic_units},
+      {"released_atomic_units", record.released_atomic_units},
+  };
+  boost::json::object result{
+      {"workload_id", record.id},
+      {"state", LiveWalletWorkloadStateName(record.state)},
+      {"terminal_outcome", record.terminal_outcome},
+      {"configuration_revision", record.configuration_revision},
+      {"configuration", WalletTransactionsWorkloadJson(record.workload)},
+      {"accounting", std::move(exact)},
+      {"queue_maximum_depth", record.queue_maximum_size},
+  };
+  if (record.failure) {
+    result["failure"] = *record.failure;
+  } else {
+    result["failure"] = nullptr;
+  }
+  return result;
+}
+
+void WriteLiveWalletWorkloadState(const std::filesystem::path& events_path,
+                                  const Options& options,
+                                  const LiveWalletWorkloadRecord& record) {
+  WriteEvent(events_path, options.run_id, record.id,
+             SimulationEventKind::kWalletWorkloadState,
+             boost::json::serialize(LiveWalletWorkloadJson(record)));
+}
+
+WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
     const Options& options, const std::filesystem::path& events_path,
-    const ChainDriver& driver, auto& nodes, const SimulationRegistry& registry,
+    const ChainDriver& driver, std::timed_mutex& block_generation_mutex,
+    auto& nodes, const SimulationRegistry& registry,
     TransactionObservationTracker& transaction_tracker,
     std::vector<PendingTransactionLoadCompletion>* pending_load_completions,
     const WalletTransactionsWorkload& workload, uint32_t workload_index,
-    uint32_t workload_count, std::stop_token stop_token) {
-  struct FundingState {
-    uint32_t miner_node = 1;
-    uint64_t start_height = 0;
-    uint64_t target_height = 0;
-    uint64_t ready_height = 0;
-    uint64_t ready_balance_satoshis = 0;
-    std::vector<std::string> hashes;
-    ChainWalletFundingResult preparation;
-    std::vector<std::string> preparation_hashes;
-  };
-
+    uint32_t workload_count, std::stop_token stop_token,
+    WalletWorkloadExecutionContext* execution = nullptr) {
   const std::vector<WalletIdentity>& wallets = registry.wallets();
-  const std::vector<uint32_t> funding_miner_indexes =
-      WalletFundingMinerNodes(registry.topology().miner_nodes, wallets.size(),
-                              workload.funding_strategy, workload.random_seed);
-  std::vector<FundingState> funding;
-  funding.reserve(wallets.size());
-  for (size_t wallet_index = 0; wallet_index < wallets.size(); ++wallet_index) {
-    ThrowIfStopRequested(stop_token);
-    const WalletIdentity& wallet = wallets[wallet_index];
-    if (wallet.address.empty() || wallet.funding_address.empty()) {
-      throw std::runtime_error(
-          "wallet-backed workload requires initialized WalletNode addresses "
-          "and funding addresses");
-    }
-    const uint32_t miner_node = funding_miner_indexes[wallet_index] + 1U;
-    NodeRuntime& miner = nodes[miner_node - 1U];
-    RequireNodeRunning(miner, "wallet funding");
-    FundingState state;
-    state.miner_node = miner_node;
-    state.start_height = driver.ReadMetrics(miner.config, stop_token).height;
-    state.hashes =
-        driver.GenerateBlocks(miner.config, workload.funding_blocks_per_wallet,
-                              wallet.funding_address, stop_token);
-    RecordGeneratedBlocks(driver, miner, state.hashes, stop_token);
-    if (state.start_height >
-        std::numeric_limits<std::uint64_t>::max() - state.hashes.size()) {
-      throw std::runtime_error("wallet funding target height overflow");
-    }
-    state.target_height =
-        state.start_height + static_cast<uint64_t>(state.hashes.size());
-    for (NodeRuntime& node : nodes) {
-      if (!node.AllowsChainMetrics()) {
-        continue;
-      }
-      driver.WaitForHeight(node.config, state.target_height,
-                           std::chrono::seconds(workload.timeout_sec),
-                           stop_token);
-    }
-    NodeRuntime& wallet_node = nodes[wallet.node - 1U];
-    RequireNodeRunning(wallet_node, "wallet funding preparation");
-    state.preparation = driver.PrepareWalletFunding(
-        wallet_node.config, ToChainWalletMode(registry.wallet_initialization()),
-        wallet.address, workload.funding_threshold_satoshis,
-        workload.readiness_confirmations,
-        std::chrono::seconds(workload.timeout_sec), stop_token);
-    for (const std::string& txid : state.preparation.txids) {
-      for (NodeRuntime& node : nodes) {
-        if (!node.AllowsChainMetrics()) {
-          continue;
-        }
-        driver.WaitForMempoolTransaction(
-            node.config, txid, std::chrono::seconds(workload.timeout_sec),
-            stop_token);
-      }
-    }
-    state.ready_height = state.target_height;
-    if (state.preparation.confirmation_blocks_required != 0U &&
-        state.preparation.txids.empty()) {
-      throw std::runtime_error(
-          "wallet funding preparation requested confirmation blocks without "
-          "transaction ids");
-    }
-    std::uint64_t preparation_block_count =
-        state.preparation.confirmation_blocks_required;
-    if (state.preparation.minimum_chain_height > state.ready_height) {
-      preparation_block_count =
-          std::max(preparation_block_count,
-                   state.preparation.minimum_chain_height - state.ready_height);
-    }
-    if (preparation_block_count > std::numeric_limits<std::uint32_t>::max()) {
-      throw std::runtime_error(
-          "wallet funding preparation block count exceeds uint32");
-    }
-    if (preparation_block_count != 0U) {
-      state.preparation_hashes = driver.GenerateBlocks(
-          miner.config, static_cast<std::uint32_t>(preparation_block_count),
-          wallet.funding_address, stop_token);
-      if (state.preparation_hashes.size() != preparation_block_count) {
+  std::vector<WalletWorkloadFundingState> new_funding;
+  std::vector<WalletWorkloadFundingState>* funding = nullptr;
+  if (execution != nullptr && execution->prepared_funding != nullptr &&
+      execution->prepared_funding->has_value()) {
+    funding = &execution->prepared_funding->value();
+  } else {
+    const std::vector<uint32_t> funding_miner_indexes = WalletFundingMinerNodes(
+        registry.topology().miner_nodes, wallets.size(),
+        workload.funding_strategy, workload.random_seed);
+    new_funding.reserve(wallets.size());
+    for (size_t wallet_index = 0; wallet_index < wallets.size();
+         ++wallet_index) {
+      ThrowIfStopRequested(stop_token);
+      const WalletIdentity& wallet = wallets[wallet_index];
+      if (wallet.address.empty() || wallet.funding_address.empty()) {
         throw std::runtime_error(
-            "wallet funding preparation returned an unexpected block count");
+            "wallet-backed workload requires initialized WalletNode addresses "
+            "and funding addresses");
       }
-      RecordGeneratedBlocks(driver, miner, state.preparation_hashes,
-                            stop_token);
-      if (state.ready_height > std::numeric_limits<std::uint64_t>::max() -
-                                   state.preparation_hashes.size()) {
-        throw std::runtime_error("wallet funding ready height overflow");
+      const uint32_t miner_node = funding_miner_indexes[wallet_index] + 1U;
+      NodeRuntime& miner = nodes[miner_node - 1U];
+      RequireNodeRunning(miner, "wallet funding");
+      WalletWorkloadFundingState state;
+      state.miner_node = miner_node;
+      state.start_height = driver.ReadMetrics(miner.config, stop_token).height;
+      state.hashes =
+          GenerateBlocksSerialized(block_generation_mutex, driver, miner.config,
+                                   workload.funding_blocks_per_wallet,
+                                   wallet.funding_address, stop_token);
+      RecordGeneratedBlocks(driver, miner, state.hashes, stop_token);
+      if (state.start_height >
+          std::numeric_limits<std::uint64_t>::max() - state.hashes.size()) {
+        throw std::runtime_error("wallet funding target height overflow");
       }
-      state.ready_height +=
-          static_cast<uint64_t>(state.preparation_hashes.size());
+      state.target_height =
+          state.start_height + static_cast<uint64_t>(state.hashes.size());
       for (NodeRuntime& node : nodes) {
         if (!node.AllowsChainMetrics()) {
           continue;
         }
-        driver.WaitForHeight(node.config, state.ready_height,
+        driver.WaitForHeight(node.config, state.target_height,
                              std::chrono::seconds(workload.timeout_sec),
                              stop_token);
       }
+      NodeRuntime& wallet_node = nodes[wallet.node - 1U];
+      RequireNodeRunning(wallet_node, "wallet funding preparation");
+      state.preparation = driver.PrepareWalletFunding(
+          wallet_node.config,
+          ToChainWalletMode(registry.wallet_initialization()), wallet.address,
+          workload.funding_threshold_satoshis, workload.readiness_confirmations,
+          std::chrono::seconds(workload.timeout_sec), stop_token);
+      for (const std::string& txid : state.preparation.txids) {
+        for (NodeRuntime& node : nodes) {
+          if (!node.AllowsChainMetrics()) {
+            continue;
+          }
+          driver.WaitForMempoolTransaction(
+              node.config, txid, std::chrono::seconds(workload.timeout_sec),
+              stop_token);
+        }
+      }
+      state.ready_height = state.target_height;
+      if (state.preparation.confirmation_blocks_required != 0U &&
+          state.preparation.txids.empty()) {
+        throw std::runtime_error(
+            "wallet funding preparation requested confirmation blocks without "
+            "transaction ids");
+      }
+      std::uint64_t preparation_block_count =
+          state.preparation.confirmation_blocks_required;
+      if (state.preparation.minimum_chain_height > state.ready_height) {
+        preparation_block_count = std::max(
+            preparation_block_count,
+            state.preparation.minimum_chain_height - state.ready_height);
+      }
+      if (preparation_block_count > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error(
+            "wallet funding preparation block count exceeds uint32");
+      }
+      if (preparation_block_count != 0U) {
+        state.preparation_hashes = GenerateBlocksSerialized(
+            block_generation_mutex, driver, miner.config,
+            static_cast<std::uint32_t>(preparation_block_count),
+            wallet.funding_address, stop_token);
+        if (state.preparation_hashes.size() != preparation_block_count) {
+          throw std::runtime_error(
+              "wallet funding preparation returned an unexpected block count");
+        }
+        RecordGeneratedBlocks(driver, miner, state.preparation_hashes,
+                              stop_token);
+        if (state.ready_height > std::numeric_limits<std::uint64_t>::max() -
+                                     state.preparation_hashes.size()) {
+          throw std::runtime_error("wallet funding ready height overflow");
+        }
+        state.ready_height +=
+            static_cast<uint64_t>(state.preparation_hashes.size());
+        for (NodeRuntime& node : nodes) {
+          if (!node.AllowsChainMetrics()) {
+            continue;
+          }
+          driver.WaitForHeight(node.config, state.ready_height,
+                               std::chrono::seconds(workload.timeout_sec),
+                               stop_token);
+        }
+      }
+      if (state.ready_height < state.preparation.minimum_chain_height) {
+        throw std::runtime_error(
+            "wallet funding preparation did not reach its minimum chain "
+            "height");
+      }
+      state.ready_balance_satoshis = driver.WaitForWalletBalance(
+          wallet_node.config,
+          ToChainWalletMode(registry.wallet_initialization()),
+          workload.funding_threshold_satoshis, workload.readiness_confirmations,
+          std::chrono::seconds(workload.timeout_sec), stop_token);
+      WriteEvent(events_path, options.run_id, wallet_node.config.id,
+                 SimulationEventKind::kWalletFunded,
+                 WalletFundingDetail(
+                     workload_index, workload_count, workload, wallet,
+                     miner_node, state.start_height, state.target_height,
+                     static_cast<uint64_t>(state.hashes.size()),
+                     state.ready_height, state.preparation,
+                     static_cast<uint64_t>(state.preparation_hashes.size()),
+                     state.ready_balance_satoshis));
+      new_funding.push_back(std::move(state));
     }
-    if (state.ready_height < state.preparation.minimum_chain_height) {
-      throw std::runtime_error(
-          "wallet funding preparation did not reach its minimum chain height");
+    if (execution != nullptr && execution->prepared_funding != nullptr) {
+      execution->prepared_funding->emplace(std::move(new_funding));
+      funding = &execution->prepared_funding->value();
+    } else {
+      funding = &new_funding;
     }
-    state.ready_balance_satoshis = driver.WaitForWalletBalance(
-        wallet_node.config, ToChainWalletMode(registry.wallet_initialization()),
-        workload.funding_threshold_satoshis, workload.readiness_confirmations,
-        std::chrono::seconds(workload.timeout_sec), stop_token);
-    WriteEvent(events_path, options.run_id, wallet_node.config.id,
-               SimulationEventKind::kWalletFunded,
-               WalletFundingDetail(
-                   workload_index, workload_count, workload, wallet, miner_node,
-                   state.start_height, state.target_height,
-                   static_cast<uint64_t>(state.hashes.size()),
-                   state.ready_height, state.preparation,
-                   static_cast<uint64_t>(state.preparation_hashes.size()),
-                   state.ready_balance_satoshis));
-    funding.push_back(std::move(state));
+  }
+  if (funding == nullptr || funding->size() != wallets.size()) {
+    throw std::runtime_error(
+        "wallet workload funding preparation is incomplete");
+  }
+
+  if (execution && execution->execution_started) {
+    execution->execution_started();
   }
 
   if (IsTransactionLoadStrategy(workload.strategy)) {
@@ -12166,12 +12522,11 @@ void ApplyWalletTransactionsWorkload(
               .available_balance_satoshis;
     }
 
-    const std::uint64_t attempt_limit =
-        workload.transaction_count != 0U
-            ? static_cast<std::uint64_t>(workload.transaction_count)
-            : WalletTransactionDurationAttemptLimit(*workload.duration,
-                                                    *workload.transaction_rate);
-    WalletTransactionLoadPlanner planner(wallets.size(), workload);
+    const std::optional<std::uint64_t> attempt_limit =
+        ExplicitWalletTransactionAttemptLimit(workload);
+    WalletTransactionLoadPlanner planner(
+        wallets.size(), workload,
+        execution ? execution->next_transaction_index : 0U);
     BoundedWalletTransactionQueue queue(workload.queue_capacity);
     if (workload.queue_capacity >
             std::numeric_limits<std::size_t>::max() - workload.concurrency ||
@@ -12184,9 +12539,24 @@ void ApplyWalletTransactionsWorkload(
         std::move(initial_available_balances),
         EffectiveWalletTransactionFeeReserveSatoshis(workload),
         workload.queue_capacity + workload.concurrency + planner.batch_size());
-    auto accounting = std::make_shared<TransactionLoadAccounting>();
+    std::shared_ptr<TransactionLoadAccounting> accounting =
+        execution ? execution->accounting
+                  : std::make_shared<TransactionLoadAccounting>();
+    if (!accounting) {
+      throw std::runtime_error(
+          "wallet workload execution accounting is missing");
+    }
     std::vector<std::mutex> sender_submission_mutexes(wallets.size());
-    const auto load_started_at = std::chrono::steady_clock::now();
+    const auto load_started_at =
+        execution ? execution->started_at : std::chrono::steady_clock::now();
+    const std::optional<std::chrono::steady_clock::time_point>
+        duration_deadline =
+            workload.duration
+                ? std::optional<std::chrono::steady_clock::time_point>(
+                      SteadyDeadline(
+                          load_started_at,
+                          options.time_scale.WallDuration(*workload.duration)))
+                : std::nullopt;
     std::mutex infrastructure_error_mutex;
     std::exception_ptr infrastructure_error;
     std::atomic<bool> worker_cancelled = false;
@@ -12221,8 +12591,10 @@ void ApplyWalletTransactionsWorkload(
         [&](std::vector<WalletTransactionLoadTask> dropped_tasks) {
           for (const WalletTransactionLoadTask& task : dropped_tasks) {
             try {
-              balance_reservations.Settle(task.transaction_index, std::nullopt,
-                                          true);
+              balance_reservations.Settle(
+                  task.transaction_index, std::nullopt, true,
+                  execution ? execution->record_released_atomic_units
+                            : std::function<void(std::uint64_t)>{});
             } catch (...) {
               record_infrastructure_error(std::current_exception());
             }
@@ -12251,8 +12623,8 @@ void ApplyWalletTransactionsWorkload(
               const WalletIdentity& sender = wallets.at(task.plan.sender_index);
               const WalletIdentity& receiver =
                   wallets.at(task.plan.receiver_index);
-              const FundingState& sender_funding =
-                  funding.at(task.plan.sender_index);
+              const WalletWorkloadFundingState& sender_funding =
+                  funding->at(task.plan.sender_index);
               NodeRuntime& sender_node = nodes.at(sender.node - 1U);
               TransactionLoadOutcome outcome = TransactionLoadOutcome::kFailed;
               ChainWalletTransactionResult transaction;
@@ -12273,10 +12645,20 @@ void ApplyWalletTransactionsWorkload(
                     std::defer_lock);
                 try {
                   if (queue.cancelled() ||
-                      !WaitForTransactionLoadSchedule(task, load_stop_token)) {
+                      !WaitUntilWalletWorkloadDeadline(
+                          task.scheduled_at, load_stop_token,
+                          execution ? execution->settle_requested
+                                    : std::function<bool()>{})) {
+                    throw WalletWorkloadSettleRequested();
+                  }
+                  if (queue.cancelled()) {
                     throw SimulationCancelled();
                   }
                   sender_submission_lock.lock();
+                  if (execution && execution->settle_requested &&
+                      execution->settle_requested()) {
+                    throw WalletWorkloadSettleRequested();
+                  }
                   if (queue.cancelled()) {
                     throw SimulationCancelled();
                   }
@@ -12309,6 +12691,7 @@ void ApplyWalletTransactionsWorkload(
                     tracked.push_back(TrackedTransaction{
                         .txid = txid,
                         .submission_kind = "wallet_transaction_submitted",
+                        .workload_id = execution ? execution->workload_id : "",
                         .workload_index = workload_index,
                         .workload_count = workload_count,
                         .transaction_index = task.transaction_index,
@@ -12356,6 +12739,11 @@ void ApplyWalletTransactionsWorkload(
                   outcome = TransactionLoadOutcome::kFailed;
                   error_class = "internal_rpc";
                   error_message = error.what();
+                } catch (const WalletWorkloadSettleRequested& error) {
+                  outcome = TransactionLoadOutcome::kDropped;
+                  error_class = "settled";
+                  error_message = error.what();
+                  release_if_balance_unavailable = true;
                 } catch (const SimulationCancelled& error) {
                   outcome = TransactionLoadOutcome::kCancelled;
                   error_class = "cancellation";
@@ -12409,7 +12797,9 @@ void ApplyWalletTransactionsWorkload(
                 try {
                   balance_reservations.Settle(
                       task.transaction_index, actual_available_balance,
-                      !submitted && release_if_balance_unavailable);
+                      !submitted && release_if_balance_unavailable,
+                      execution ? execution->record_released_atomic_units
+                                : std::function<void(std::uint64_t)>{});
                 } catch (...) {
                   record_infrastructure_error(std::current_exception());
                 }
@@ -12467,10 +12857,6 @@ void ApplyWalletTransactionsWorkload(
                 if (observations.front().observation_error) {
                   record_load_progress(accounting->RecordObservationError());
                 }
-                if (observations.front().propagated) {
-                  record_load_progress(confirmation->RecordPropagated(
-                      observations.front().confirmed));
-                }
               } catch (const SimulationCancelled&) {
                 try {
                   record_load_progress(accounting->RecordObservationError());
@@ -12504,11 +12890,27 @@ void ApplyWalletTransactionsWorkload(
     }
 
     std::exception_ptr producer_error;
-    const auto rate_epoch = std::chrono::steady_clock::now();
-    std::uint64_t transaction_index = 0U;
+    const auto rate_epoch =
+        execution ? execution->started_at : std::chrono::steady_clock::now();
+    std::uint64_t transaction_index =
+        execution ? execution->next_transaction_index : 0U;
+    bool yielded = false;
+    bool balance_refresh_required = false;
     try {
-      while (transaction_index < attempt_limit) {
+      while (!attempt_limit || transaction_index < *attempt_limit) {
         ThrowIfStopRequested(load_stop_token);
+        if (duration_deadline &&
+            std::chrono::steady_clock::now() >= *duration_deadline) {
+          break;
+        }
+        if (execution && execution->yield_requested &&
+            execution->yield_requested()) {
+          if (execution->settle_requested && execution->settle_requested()) {
+            record_dropped_tasks(queue.DropPendingAndClose());
+          }
+          yielded = true;
+          break;
+        }
         const std::chrono::steady_clock::time_point batch_admission_at =
             std::chrono::steady_clock::now();
         if (workload.transaction_rate) {
@@ -12522,14 +12924,34 @@ void ApplyWalletTransactionsWorkload(
           ApplyTransactionLoadRateSchedule(
               &first_task, *workload.transaction_rate, options.time_scale,
               rate_epoch, transaction_index);
-          WaitUntil(first_task.scheduled_at, load_stop_token);
+          const std::chrono::steady_clock::time_point admission_deadline =
+              duration_deadline
+                  ? std::min(first_task.scheduled_at, *duration_deadline)
+                  : first_task.scheduled_at;
+          if (!WaitUntilWalletWorkloadDeadline(
+                  admission_deadline, load_stop_token,
+                  execution ? execution->yield_requested
+                            : std::function<bool()>{})) {
+            if (execution && execution->settle_requested &&
+                execution->settle_requested()) {
+              record_dropped_tasks(queue.DropPendingAndClose());
+            }
+            yielded = true;
+            break;
+          }
+          if (duration_deadline &&
+              std::chrono::steady_clock::now() >= *duration_deadline) {
+            break;
+          }
         }
 
         std::vector<WalletTransactionLoadTask> tasks;
         const TransactionLoadBatchAdmission admission =
             balance_reservations.PlanAndReserve(
                 &planner, transaction_index + 1U,
-                attempt_limit - transaction_index,
+                attempt_limit ? *attempt_limit - transaction_index
+                              : std::numeric_limits<std::uint64_t>::max() -
+                                    transaction_index,
                 [&](const std::vector<WalletTransactionPlanEntry>& plans) {
                   tasks.reserve(plans.size());
                   for (std::size_t offset = 0U; offset < plans.size();
@@ -12548,14 +12970,23 @@ void ApplyWalletTransactionsWorkload(
                     }
                     tasks.push_back(std::move(task));
                   }
-                  return queue.TryPushBatch(tasks);
+                  return queue.TryPushBatch(tasks, [&] {
+                    if (execution && execution->record_load_admission) {
+                      execution->record_load_admission(plans);
+                    }
+                  });
                 });
+        if (admission.has_plan() && execution && execution->record_planned) {
+          execution->record_planned(
+              static_cast<std::uint64_t>(admission.plans.size()));
+        }
         if (!admission.has_plan()) {
           if (balance_reservations.WaitForResolution(admission.balance_revision,
                                                      load_stop_token)) {
             continue;
           }
           ThrowIfStopRequested(load_stop_token);
+          balance_refresh_required = true;
           break;
         }
         if (!admission.admitted) {
@@ -12579,6 +13010,14 @@ void ApplyWalletTransactionsWorkload(
           }
         }
         transaction_index += static_cast<std::uint64_t>(admission.plans.size());
+        if (execution != nullptr) {
+          execution->next_transaction_index = transaction_index;
+        }
+        if (workload.strategy == WalletTransferStrategy::kRandomBruteforce &&
+            admission.admitted) {
+          balance_refresh_required = true;
+          break;
+        }
       }
     } catch (...) {
       producer_error = std::current_exception();
@@ -12599,7 +13038,7 @@ void ApplyWalletTransactionsWorkload(
     }
     const bool cancelled = queue.cancelled() || worker_cancelled.load() ||
                            load_stop_token.stop_requested();
-    if (cancelled) {
+    if (cancelled && execution == nullptr) {
       const auto elapsed =
           std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now() - load_started_at);
@@ -12624,6 +13063,18 @@ void ApplyWalletTransactionsWorkload(
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - load_started_at);
+    if (execution != nullptr) {
+      execution->next_transaction_index = transaction_index;
+      return WalletWorkloadExecutionResult{
+          .end = yielded ? WalletWorkloadExecutionEnd::kYielded
+                 : balance_refresh_required &&
+                         (!attempt_limit || transaction_index < *attempt_limit)
+                     ? WalletWorkloadExecutionEnd::kRefreshBalances
+                     : WalletWorkloadExecutionEnd::kCompleted,
+          .next_transaction_index = transaction_index,
+          .queue_maximum_size = queue.maximum_size(),
+      };
+    }
     if (pending_load_completions == nullptr) {
       throw std::runtime_error(
           "transaction load completion destination is missing");
@@ -12642,16 +13093,38 @@ void ApplyWalletTransactionsWorkload(
         .accounting = std::move(accounting),
         .elapsed = elapsed,
     });
-    return;
+    return WalletWorkloadExecutionResult{
+        .end = WalletWorkloadExecutionEnd::kCompleted,
+        .next_transaction_index = transaction_index,
+        .queue_maximum_size = queue.maximum_size(),
+    };
   }
 
-  WalletTransactionPlanner transaction_planner(wallets.size(), workload);
-  const auto rate_epoch = std::chrono::steady_clock::now();
-  std::uint64_t transaction_index = 0U;
-  while (workload.transaction_rate ||
+  WalletTransactionPlanner transaction_planner(
+      wallets.size(), workload,
+      execution ? execution->next_transaction_index : 0U);
+  const auto rate_epoch =
+      execution ? execution->started_at : std::chrono::steady_clock::now();
+  std::shared_ptr<TransactionLoadAccounting> accounting =
+      execution ? execution->accounting : nullptr;
+  std::uint64_t transaction_index =
+      execution ? execution->next_transaction_index : 0U;
+  while (workload.transaction_count == 0U ||
          transaction_index < workload.transaction_count) {
     ThrowIfStopRequested(stop_token);
+    if (execution && execution->yield_requested &&
+        execution->yield_requested()) {
+      execution->next_transaction_index = transaction_index;
+      return WalletWorkloadExecutionResult{
+          .end = WalletWorkloadExecutionEnd::kYielded,
+          .next_transaction_index = transaction_index,
+          .queue_maximum_size = 0U,
+      };
+    }
     const WalletTransactionPlanEntry plan_entry = transaction_planner.Next();
+    if (execution && execution->record_planned) {
+      execution->record_planned(1U);
+    }
     std::optional<std::chrono::milliseconds> scheduled_simulation_elapsed;
     std::optional<std::chrono::milliseconds> scheduled_wall_elapsed;
     if (workload.transaction_rate) {
@@ -12659,29 +13132,84 @@ void ApplyWalletTransactionsWorkload(
           workload.transaction_rate->SimulationElapsedBefore(transaction_index);
       scheduled_wall_elapsed =
           options.time_scale.WallDuration(*scheduled_simulation_elapsed);
-      WaitUntil(SteadyDeadline(rate_epoch, *scheduled_wall_elapsed),
-                stop_token);
+      if (!WaitUntilWalletWorkloadDeadline(
+              SteadyDeadline(rate_epoch, *scheduled_wall_elapsed), stop_token,
+              execution ? execution->yield_requested
+                        : std::function<bool()>{})) {
+        execution->next_transaction_index = transaction_index;
+        return WalletWorkloadExecutionResult{
+            .end = WalletWorkloadExecutionEnd::kYielded,
+            .next_transaction_index = transaction_index,
+            .queue_maximum_size = 0U,
+        };
+      }
     } else if (plan_entry.interval_before != std::chrono::milliseconds(0)) {
-      WaitForDuration(plan_entry.interval_before, stop_token);
+      if (!WaitUntilWalletWorkloadDeadline(
+              SteadyDeadline(std::chrono::steady_clock::now(),
+                             plan_entry.interval_before),
+              stop_token,
+              execution ? execution->yield_requested
+                        : std::function<bool()>{})) {
+        execution->next_transaction_index = transaction_index;
+        return WalletWorkloadExecutionResult{
+            .end = WalletWorkloadExecutionEnd::kYielded,
+            .next_transaction_index = transaction_index,
+            .queue_maximum_size = 0U,
+        };
+      }
     }
     const size_t sender_index = plan_entry.sender_index;
     const size_t receiver_index = plan_entry.receiver_index;
     const WalletIdentity& sender = wallets[sender_index];
     const WalletIdentity& receiver = wallets[receiver_index];
-    const FundingState& sender_funding = funding[sender_index];
+    const WalletWorkloadFundingState& sender_funding =
+        funding->at(sender_index);
     NodeRuntime& sender_node = nodes[sender.node - 1U];
     RequireNodeRunning(sender_node, "wallet transaction submission");
 
     TransactionObservationTracker::Reservation observation_reservation =
         transaction_tracker.Reserve(nodes);
-    const ChainWalletTransactionResult transaction =
-        driver.SendWalletTransaction(
-            sender_node.config,
-            ToChainWalletMode(registry.wallet_initialization()),
-            receiver.address, plan_entry.amount_satoshis, workload.fee_satoshis,
-            std::chrono::seconds(workload.timeout_sec), stop_token);
+    if (execution && execution->record_accepted) {
+      execution->record_accepted(1U);
+    }
+    ChainWalletTransactionResult transaction;
+    try {
+      transaction = driver.SendWalletTransaction(
+          sender_node.config,
+          ToChainWalletMode(registry.wallet_initialization()), receiver.address,
+          plan_entry.amount_satoshis, workload.fee_satoshis,
+          std::chrono::seconds(workload.timeout_sec), stop_token);
+    } catch (const ChainTransactionRejected&) {
+      if (accounting) {
+        static_cast<void>(accounting->RecordOutcome(
+            TransactionLoadOutcome::kRejected, std::chrono::microseconds(0)));
+      }
+      throw;
+    } catch (const ChainTransactionTimedOut&) {
+      if (accounting) {
+        static_cast<void>(accounting->RecordOutcome(
+            TransactionLoadOutcome::kTimedOut, std::chrono::microseconds(0)));
+      }
+      throw;
+    } catch (const SimulationCancelled&) {
+      if (accounting) {
+        static_cast<void>(accounting->RecordOutcome(
+            TransactionLoadOutcome::kCancelled, std::chrono::microseconds(0)));
+      }
+      throw;
+    } catch (...) {
+      if (accounting) {
+        static_cast<void>(accounting->RecordOutcome(
+            TransactionLoadOutcome::kFailed, std::chrono::microseconds(0)));
+      }
+      throw;
+    }
     const std::string& txid = RequireSingleWalletTransactionId(
         transaction, "wallet transaction submission");
+    if (accounting) {
+      static_cast<void>(accounting->RecordOutcome(
+          TransactionLoadOutcome::kSubmitted, std::chrono::microseconds(0)));
+    }
     WriteEvent(
         events_path, options.run_id, sender_node.config.id,
         SimulationEventKind::kWalletTransactionSubmitted,
@@ -12695,9 +13223,16 @@ void ApplyWalletTransactionsWorkload(
             sender_funding.ready_balance_satoshis, plan_entry.amount_satoshis,
             plan_entry.interval_before, scheduled_simulation_elapsed,
             scheduled_wall_elapsed, transaction));
+    std::shared_ptr<TransactionLoadConfirmation> confirmation;
+    if (accounting) {
+      confirmation = std::make_shared<TransactionLoadConfirmation>(
+          accounting,
+          ExpectedTransactionLoadObservations(transaction.txids, nodes));
+    }
     TrackedTransaction tracked{
         .txid = txid,
         .submission_kind = "wallet_transaction_submitted",
+        .workload_id = execution ? execution->workload_id : "",
         .workload_index = workload_index,
         .workload_count = workload_count,
         .transaction_index = transaction_index + 1U,
@@ -12711,9 +13246,9 @@ void ApplyWalletTransactionsWorkload(
                 : std::nullopt,
         .txid_index = 1U,
         .submission_node = sender.node,
-        .load_confirmation = nullptr,
+        .load_confirmation = confirmation,
     };
-    if (workload.transaction_rate) {
+    if (execution || workload.transaction_rate) {
       transaction_tracker.Track(std::move(observation_reservation),
                                 std::move(tracked));
     } else {
@@ -12722,7 +13257,7 @@ void ApplyWalletTransactionsWorkload(
           nodes, std::move(tracked), std::chrono::seconds(workload.timeout_sec),
           stop_token);
     }
-    if (workload.transaction_rate) {
+    if (!execution && workload.transaction_rate) {
       transaction_tracker.ObserveAll(options, events_path, driver, nodes,
                                      stop_token);
     }
@@ -12730,7 +13265,15 @@ void ApplyWalletTransactionsWorkload(
       throw std::runtime_error("wallet transaction index exceeds uint64");
     }
     ++transaction_index;
+    if (execution) {
+      execution->next_transaction_index = transaction_index;
+    }
   }
+  return WalletWorkloadExecutionResult{
+      .end = WalletWorkloadExecutionEnd::kCompleted,
+      .next_transaction_index = transaction_index,
+      .queue_maximum_size = 0U,
+  };
 }
 
 void RestoreNodeNetworkCondition(const NodeVethConfig& previous) {
@@ -13864,11 +14407,10 @@ void ApplyRuntimeNodeFreezes(const Options& options,
   }
 }
 
-bool RuntimeNodeSupportDestructionAllowed(
-    bool daemon_absence_verified, bool exact_cgroup_acquired,
-    bool exact_cgroup_empty) {
-  return daemon_absence_verified && exact_cgroup_acquired &&
-         exact_cgroup_empty;
+bool RuntimeNodeSupportDestructionAllowed(bool daemon_absence_verified,
+                                          bool exact_cgroup_acquired,
+                                          bool exact_cgroup_empty) {
+  return daemon_absence_verified && exact_cgroup_acquired && exact_cgroup_empty;
 }
 
 std::vector<bool> StopNodes(
@@ -13917,8 +14459,8 @@ std::vector<bool> StopNodes(
   };
   const auto lock_process_state = [&](NodeRuntime& node) {
     if (node.run_process_state == nullptr) {
-      throw std::logic_error(
-          "node has no run process synchronization state: " + node.config.id);
+      throw std::logic_error("node has no run process synchronization state: " +
+                             node.config.id);
     }
     std::optional<RunProcessState::Guard> guard =
         node.run_process_state->TryLockUntil(shutdown_deadline,
@@ -14003,9 +14545,9 @@ std::vector<bool> StopNodes(
   for (const std::size_t index : running_processes) {
     if (cleanup_stop_token.stop_requested() ||
         std::chrono::steady_clock::now() >= shutdown_deadline) {
-      rpc_failures[index] = std::make_exception_ptr(std::runtime_error(
-          "node RPC stop deadline expired before request: " +
-          nodes[index].config.id));
+      rpc_failures[index] = std::make_exception_ptr(
+          std::runtime_error("node RPC stop deadline expired before request: " +
+                             nodes[index].config.id));
       continue;
     }
     try {
@@ -14031,10 +14573,10 @@ std::vector<bool> StopNodes(
     if (process_running) {
       const auto now = std::chrono::steady_clock::now();
       if (now < shutdown_deadline) {
-        std::this_thread::sleep_for(std::min(
-            std::chrono::milliseconds(20),
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                shutdown_deadline - now)));
+        std::this_thread::sleep_for(
+            std::min(std::chrono::milliseconds(20),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         shutdown_deadline - now)));
       }
     }
   }
@@ -14073,10 +14615,10 @@ std::vector<bool> StopNodes(
     if (terminating_processes) {
       const auto now = std::chrono::steady_clock::now();
       if (now < terminate_deadline) {
-        std::this_thread::sleep_for(std::min(
-            std::chrono::milliseconds(20),
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                terminate_deadline - now)));
+        std::this_thread::sleep_for(
+            std::min(std::chrono::milliseconds(20),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         terminate_deadline - now)));
       }
     }
   }
@@ -14110,10 +14652,10 @@ std::vector<bool> StopNodes(
     if (killed_processes_running) {
       const auto now = std::chrono::steady_clock::now();
       if (now < kill_deadline) {
-        std::this_thread::sleep_for(std::min(
-            std::chrono::milliseconds(20),
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                kill_deadline - now)));
+        std::this_thread::sleep_for(
+            std::min(std::chrono::milliseconds(20),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         kill_deadline - now)));
       }
     }
   }
@@ -14167,9 +14709,9 @@ std::vector<bool> StopNodes(
         node.cgroup->KillAll(shutdown_deadline, cleanup_stop_token);
         exact_cgroup_empty = node.cgroup->Empty();
       }
-      if (!RuntimeNodeSupportDestructionAllowed(
-              daemon_absence_verified, exact_cgroup_acquired,
-              exact_cgroup_empty)) {
+      if (!RuntimeNodeSupportDestructionAllowed(daemon_absence_verified,
+                                                exact_cgroup_acquired,
+                                                exact_cgroup_empty)) {
         throw std::runtime_error(
             "refusing support-resource destruction without verified daemon "
             "absence and an empty exact-owned cgroup: " +
@@ -14192,9 +14734,9 @@ std::vector<bool> StopNodes(
               "refusing node network deletion without its acquired identity: " +
               node.config.id);
         }
-        DeleteNodeVethNetwork(
-            *node.network, *node.network_namespace->node_veth_identity(),
-            cleanup_stop_token);
+        DeleteNodeVethNetwork(*node.network,
+                              *node.network_namespace->node_veth_identity(),
+                              cleanup_stop_token);
         network_identity_verified_absent = true;
         cleanup_step("network removed event", [&] {
           WriteEvent(events_path, options.run_id, node.config.id,
@@ -14222,7 +14764,8 @@ std::vector<bool> StopNodes(
                                       RuntimeNodeResourceState::kLive));
       if (node.process.running()) {
         throw std::runtime_error(
-            "node process changed while resource cleanup held its state lock: " +
+            "node process changed while resource cleanup held its state "
+            "lock: " +
             node.config.id);
       }
       if (network_identity_verified_absent) {
@@ -14235,8 +14778,7 @@ std::vector<bool> StopNodes(
                             NodeRuntimeLifecycle::kCleaned);
       });
     } catch (...) {
-      record_failure("node support-resource cleanup",
-                     std::current_exception());
+      record_failure("node support-resource cleanup", std::current_exception());
       node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
       cleanup_step("cleanup failure state event", [&] {
         WriteNodeStateEvent(events_path, options.run_id, node,
@@ -14617,10 +15159,10 @@ std::vector<std::string> AddRuntimeNodesTransactional(
           port_reservation_context,
           config.rpc_bind.empty() ? config.rpc_host : config.rpc_bind,
           config.rpc_port, "tcp_port", config.id, "RPC");
-      reservation.p2p = ReserveTcpEndpoint(
-          port_reservation_context, EffectiveP2pBindAddress(options.chain,
-                                                            config),
-          config.p2p_port, "tcp_port", config.id, "P2P");
+      reservation.p2p =
+          ReserveTcpEndpoint(port_reservation_context,
+                             EffectiveP2pBindAddress(options.chain, config),
+                             config.p2p_port, "tcp_port", config.id, "P2P");
       port_reservations.push_back(std::move(reservation));
     }
   }
@@ -15143,9 +15685,8 @@ std::vector<std::string> AddRuntimeNodesTransactional(
       operation_control->ReportProgress(3U);
     }
 
-    const auto sync_deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::seconds(request.sync_timeout_sec);
+    const auto sync_deadline = std::chrono::steady_clock::now() +
+                               std::chrono::seconds(request.sync_timeout_sec);
     std::stop_source sync_stop_source;
     std::stop_callback stop_sync_on_request(
         stop_token, [&sync_stop_source] { sync_stop_source.request_stop(); });
@@ -15185,8 +15726,7 @@ std::vector<std::string> AddRuntimeNodesTransactional(
                           return metric.sync_status ==
                                      ChainSyncStatus::kSynced &&
                                  metric.height == synchronized_tip.height &&
-                                 metric.best_hash ==
-                                     synchronized_tip.best_hash;
+                                 metric.best_hash == synchronized_tip.best_hash;
                         });
         if (synchronized) {
           break;
@@ -15201,15 +15741,14 @@ std::vector<std::string> AddRuntimeNodesTransactional(
           "node-add chain synchronization deadline expired");
     }
     for (RuntimeNodeInsertion& insertion : insertions) {
-      WriteEvent(
-          staged_events_path, options.run_id, insertion.runtime->config.id,
-          SimulationEventKind::kHeightReached,
-          boost::json::serialize(boost::json::object{
-              {"height", synchronized_tip.height},
-              {"best_hash", synchronized_tip.best_hash},
-              {"sync_status",
-               std::string(ChainSyncStatusName(
-                   synchronized_tip.sync_status))}}));
+      WriteEvent(staged_events_path, options.run_id,
+                 insertion.runtime->config.id,
+                 SimulationEventKind::kHeightReached,
+                 boost::json::serialize(boost::json::object{
+                     {"height", synchronized_tip.height},
+                     {"best_hash", synchronized_tip.best_hash},
+                     {"sync_status", std::string(ChainSyncStatusName(
+                                         synchronized_tip.sync_status))}}));
     }
     if (operation_control != nullptr) {
       operation_control->ReportProgress(4U);
@@ -15225,8 +15764,7 @@ std::vector<std::string> AddRuntimeNodesTransactional(
           options, runtime_at(index), final_configs[index], index));
     }
     boost::json::object published_topology;
-    AddPeerTopologyJson(next_topology_config, final_count,
-                        &published_topology);
+    AddPeerTopologyJson(next_topology_config, final_count, &published_topology);
     const std::uint64_t published_generation = before.generation() + 1U;
     const boost::json::object published_generation_detail{
         {"generation", published_generation},
@@ -15953,6 +16491,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
   std::unique_ptr<SimulationCommandProcessor> command_processor;
   std::optional<std::jthread> duration_timer;
   std::optional<std::jthread> lifecycle_supervisor;
+  std::optional<std::jthread> transaction_observer;
   std::optional<std::chrono::steady_clock::time_point> simulation_epoch;
   std::atomic<bool> simulation_duration_reached = false;
   std::atomic<std::uint64_t> duration_stop_requested_at_ms = 0U;
@@ -15964,8 +16503,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
   TransactionObservationTracker transaction_tracker;
   std::vector<PendingTransactionLoadCompletion>
       pending_transaction_load_completions;
+  auto wallet_workloads = std::make_shared<LiveWalletWorkloadRegistry>();
+  std::shared_ptr<McpLiveWorkloadService> installed_workload_service;
   std::mutex lifecycle_failure_mutex;
   std::timed_mutex node_mutation_mutex;
+  std::timed_mutex block_generation_mutex;
   std::mutex runtime_topology_mutex;
   std::exception_ptr lifecycle_failure;
   std::stop_callback cancel_command_rpc(stop_token, [&command_rpc_stop_source] {
@@ -15994,6 +16536,59 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         lifecycle_supervisor->join();
       }
       lifecycle_supervisor.reset();
+    }
+  };
+  const auto stop_wallet_workloads = [&](bool run_failed) {
+    mcp_application.SetWorkloadService(nullptr);
+    std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
+    {
+      std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
+      wallet_workloads->shutting_down = true;
+      records.reserve(wallet_workloads->records.size());
+      for (const auto& [id, record] : wallet_workloads->records) {
+        static_cast<void>(id);
+        records.push_back(record);
+      }
+    }
+    for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (IsTerminalLiveWalletWorkloadState(record->state)) {
+        continue;
+      }
+      record->state = LiveWalletWorkloadState::kStopping;
+      record->request = run_failed ? LiveWalletWorkloadRequest::kRunFailure
+                                   : LiveWalletWorkloadRequest::kShutdown;
+      record->epoch_stop_source.request_stop();
+      record->changed.notify_all();
+    }
+    for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
+      if (record->worker.joinable()) {
+        record->worker.join();
+      }
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (!IsTerminalLiveWalletWorkloadState(record->state)) {
+        record->state = run_failed ? LiveWalletWorkloadState::kFailed
+                                   : LiveWalletWorkloadState::kCancelled;
+        record->terminal_outcome = run_failed ? "failed" : "cancelled";
+        if (run_failed && !record->failure) {
+          record->failure = "run failed while wallet workload was active";
+        }
+        record->changed.notify_all();
+      }
+    }
+    while (installed_workload_service &&
+           installed_workload_service.use_count() > 1U) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    installed_workload_service.reset();
+  };
+  const auto stop_transaction_observer = [&] {
+    if (transaction_observer) {
+      transaction_observer->request_stop();
+      if (transaction_observer->joinable()) {
+        transaction_observer->join();
+      }
+      transaction_observer.reset();
     }
   };
   const auto stop_command_processor = [&]() {
@@ -16071,6 +16666,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    cleanup_step("wallet workload shutdown",
+                 [&] { stop_wallet_workloads(true); });
+    cleanup_step("transaction observer shutdown", stop_transaction_observer);
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
     cleanup_step("block production shutdown", stop_block_production);
@@ -16127,6 +16725,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    cleanup_step("wallet workload shutdown",
+                 [&] { stop_wallet_workloads(false); });
+    cleanup_step("transaction observer shutdown", stop_transaction_observer);
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
     cleanup_step("block production shutdown", stop_block_production);
@@ -16162,6 +16763,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    cleanup_step("wallet workload shutdown",
+                 [&] { stop_wallet_workloads(false); });
+    cleanup_step("transaction observer shutdown", stop_transaction_observer);
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
     cleanup_step("block production shutdown", stop_block_production);
@@ -16311,8 +16915,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               RequireNodeRunning(miner, process_guard,
                                  "scheduled block production");
             }
-            const std::vector<std::string> hashes = driver.GenerateBlocks(
-                miner.config, 1U, chain_spec.default_reward_address,
+            const std::vector<std::string> hashes = GenerateBlocksSerialized(
+                block_generation_mutex, driver, miner.config, 1U,
+                chain_spec.default_reward_address,
                 block_production_rpc_stop_source.get_token());
             RecordGeneratedBlocks(driver, miner, hashes,
                                   block_production_rpc_stop_source.get_token());
@@ -16597,6 +17202,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   TrackedTransaction{
                       .txid = txid,
                       .submission_kind = "operator_wallet_send",
+                      .workload_id = {},
                       .workload_index = 0U,
                       .workload_count = 0U,
                       .transaction_index = command.sequence,
@@ -17095,9 +17701,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               RequireNodeRunning(node, "operator block generation");
               const std::uint64_t start_height =
                   driver.ReadMetrics(node.config, command_stop_token).height;
-              const std::vector<std::string> hashes = driver.GenerateBlocks(
-                  node.config, *command.block_count,
-                  chain_spec.default_reward_address, command_stop_token);
+              const std::vector<std::string> hashes = GenerateBlocksSerialized(
+                  block_generation_mutex, driver, node.config,
+                  *command.block_count, chain_spec.default_reward_address,
+                  command_stop_token);
               RecordGeneratedBlocks(driver, node, hashes, command_stop_token);
               if (start_height >
                   std::numeric_limits<std::uint64_t>::max() - hashes.size()) {
@@ -17613,6 +18220,735 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                           simulation_registry, stop_token);
     wallets_initialized.store(true, std::memory_order_release);
 
+    const auto require_workload_record =
+        [wallet_workloads](std::string_view workload_id) {
+          std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
+          const auto found =
+              wallet_workloads->records.find(std::string(workload_id));
+          if (found == wallet_workloads->records.end()) {
+            throw McpOperationFailure(
+                "workload_not_found",
+                "wallet workload instance is not registered: " +
+                    std::string(workload_id),
+                false);
+          }
+          return found->second;
+        };
+    const auto launch_wallet_workload =
+        [&](WalletTransactionsWorkload workload,
+            std::optional<std::string> requested_id)
+        -> std::shared_ptr<LiveWalletWorkloadRecord> {
+      auto record = std::make_shared<LiveWalletWorkloadRecord>();
+      record->workload = std::move(workload);
+      record->claimed_wallets = ClaimedWalletsForWorkload(
+          record->workload, simulation_registry.wallets().size());
+      {
+        std::lock_guard<std::mutex> registry_lock(wallet_workloads->mutex);
+        if (wallet_workloads->shutting_down) {
+          throw McpOperationFailure(
+              "run_not_active",
+              "the run is stopping and cannot start another workload", false);
+        }
+        if (wallet_workloads->records.size() >= kMaximumScenarioActionCount) {
+          throw McpOperationFailure(
+              "workload_capacity_exceeded",
+              "wallet workload retained-instance capacity is exhausted", false);
+        }
+        std::size_t active_count = 0U;
+        for (const auto& [existing_id, existing] : wallet_workloads->records) {
+          static_cast<void>(existing_id);
+          std::lock_guard<std::mutex> existing_lock(existing->mutex);
+          if (IsTerminalLiveWalletWorkloadState(existing->state)) {
+            continue;
+          }
+          ++active_count;
+          if (WalletClaimsOverlap(record->claimed_wallets,
+                                  existing->claimed_wallets)) {
+            throw McpOperationFailure(
+                "wallet_admission_conflict",
+                "wallet workload sender admission overlaps active workload " +
+                    existing->id,
+                true);
+          }
+        }
+        if (active_count >= kMaximumWalletTransactionLoadConcurrency) {
+          throw McpOperationFailure(
+              "workload_capacity_exceeded",
+              "active wallet workload capacity is exhausted", true);
+        }
+        if (requested_id) {
+          ValidateMcpIdentifier(*requested_id, "workload_id");
+          if (wallet_workloads->records.contains(*requested_id)) {
+            throw McpOperationFailure(
+                "workload_id_conflict",
+                "wallet workload_id is already retained: " + *requested_id,
+                false);
+          }
+          record->id = *requested_id;
+        } else {
+          do {
+            if (wallet_workloads->next_id ==
+                std::numeric_limits<std::uint64_t>::max()) {
+              throw McpOperationFailure(
+                  "workload_id_exhausted",
+                  "wallet workload identity sequence is exhausted", false);
+            }
+            record->id = "wallet-workload-" +
+                         std::to_string(wallet_workloads->next_id++);
+          } while (wallet_workloads->records.contains(record->id));
+        }
+        record->ordinal =
+            static_cast<std::uint32_t>(wallet_workloads->records.size() + 1U);
+        wallet_workloads->records.emplace(record->id, record);
+      }
+
+      try {
+        record->worker = std::thread([&, record] {
+          const auto set_terminal =
+              [&](LiveWalletWorkloadState state, std::string outcome,
+                  std::optional<std::string> failure = std::nullopt) {
+                {
+                  std::lock_guard<std::mutex> lock(record->mutex);
+                  record->state = state;
+                  record->terminal_outcome = std::move(outcome);
+                  record->failure = std::move(failure);
+                  record->changed.notify_all();
+                }
+                try {
+                  WriteLiveWalletWorkloadState(events_path, options, *record);
+                } catch (const std::exception& error) {
+                  BBP_LOG(error)
+                      << "failed to publish terminal wallet workload "
+                      << record->id << ": " << error.what();
+                }
+              };
+          const auto cancel_outstanding_tracking = [&] {
+            const std::size_t cancelled =
+                transaction_tracker.CancelWorkload(record->id);
+            std::lock_guard<std::mutex> lock(record->mutex);
+            CheckedWalletWorkloadAdd(static_cast<std::uint64_t>(cancelled),
+                                     &record->cancelled_tracking,
+                                     "cancelled tracking");
+          };
+          try {
+            while (true) {
+              WalletTransactionsWorkload epoch_workload;
+              std::stop_token epoch_stop_token;
+              {
+                std::unique_lock<std::mutex> lock(record->mutex);
+                while (record->request == LiveWalletWorkloadRequest::kPause) {
+                  record->state = LiveWalletWorkloadState::kPaused;
+                  record->changed.notify_all();
+                  lock.unlock();
+                  WriteLiveWalletWorkloadState(events_path, options, *record);
+                  lock.lock();
+                  if (!record->changed.wait(lock, stop_token, [&] {
+                        return record->request !=
+                               LiveWalletWorkloadRequest::kPause;
+                      })) {
+                    record->request = LiveWalletWorkloadRequest::kShutdown;
+                    break;
+                  }
+                }
+                if (record->request == LiveWalletWorkloadRequest::kStopCancel) {
+                  lock.unlock();
+                  cancel_outstanding_tracking();
+                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                  return;
+                }
+                if (record->request == LiveWalletWorkloadRequest::kStopSettle) {
+                  lock.unlock();
+                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                  return;
+                }
+                if (record->request == LiveWalletWorkloadRequest::kShutdown) {
+                  lock.unlock();
+                  cancel_outstanding_tracking();
+                  set_terminal(LiveWalletWorkloadState::kCancelled,
+                               "cancelled");
+                  return;
+                }
+                if (record->request == LiveWalletWorkloadRequest::kRunFailure) {
+                  lock.unlock();
+                  cancel_outstanding_tracking();
+                  set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                               "run failed while wallet workload was active");
+                  return;
+                }
+                if (record->request ==
+                    LiveWalletWorkloadRequest::kReconfigure) {
+                  if (!record->pending_workload) {
+                    throw std::logic_error(
+                        "wallet workload reconfigure has no configuration");
+                  }
+                  record->workload = std::move(*record->pending_workload);
+                  record->pending_workload.reset();
+                  if (record->configuration_revision ==
+                      std::numeric_limits<std::uint64_t>::max()) {
+                    throw std::runtime_error(
+                        "wallet workload configuration revision exceeds "
+                        "uint64");
+                  }
+                  ++record->configuration_revision;
+                  record->request = LiveWalletWorkloadRequest::kNone;
+                  record->state = LiveWalletWorkloadState::kStarting;
+                  record->changed.notify_all();
+                  lock.unlock();
+                  WriteLiveWalletWorkloadState(events_path, options, *record);
+                  lock.lock();
+                }
+                record->epoch_stop_source = std::stop_source();
+                epoch_stop_token = record->epoch_stop_source.get_token();
+                epoch_workload = record->workload;
+              }
+
+              CombinedStopToken execution_stop(stop_token, epoch_stop_token);
+              WalletWorkloadExecutionContext execution{
+                  .accounting = record->accounting,
+                  .workload_id = record->id,
+                  .started_at = record->started_at,
+                  .next_transaction_index = record->next_transaction_index,
+                  .prepared_funding = &record->prepared_funding,
+                  .yield_requested =
+                      [record] {
+                        std::lock_guard<std::mutex> lock(record->mutex);
+                        return record->request !=
+                               LiveWalletWorkloadRequest::kNone;
+                      },
+                  .settle_requested =
+                      [record] {
+                        std::lock_guard<std::mutex> lock(record->mutex);
+                        return record->request ==
+                               LiveWalletWorkloadRequest::kStopSettle;
+                      },
+                  .record_planned =
+                      [record](std::uint64_t count) {
+                        std::lock_guard<std::mutex> lock(record->mutex);
+                        CheckedWalletWorkloadAdd(count, &record->planned,
+                                                 "planned");
+                      },
+                  .record_accepted =
+                      [record](std::uint64_t count) {
+                        std::lock_guard<std::mutex> lock(record->mutex);
+                        CheckedWalletWorkloadAdd(count, &record->accepted,
+                                                 "accepted");
+                      },
+                  .record_load_admission =
+                      [record, fee_reserve =
+                                   EffectiveWalletTransactionFeeReserveSatoshis(
+                                       epoch_workload)](
+                          std::span<const WalletTransactionPlanEntry> plans) {
+                        std::uint64_t reserved = 0U;
+                        for (const WalletTransactionPlanEntry& plan : plans) {
+                          if (plan.amount_satoshis >
+                              std::numeric_limits<std::uint64_t>::max() -
+                                  fee_reserve) {
+                            throw std::runtime_error(
+                                "wallet workload reservation amount exceeds "
+                                "uint64");
+                          }
+                          const std::uint64_t amount =
+                              plan.amount_satoshis + fee_reserve;
+                          if (reserved >
+                              std::numeric_limits<std::uint64_t>::max() -
+                                  amount) {
+                            throw std::runtime_error(
+                                "wallet workload admission reservation exceeds "
+                                "uint64");
+                          }
+                          reserved += amount;
+                        }
+                        std::lock_guard<std::mutex> lock(record->mutex);
+                        const std::uint64_t accepted =
+                            static_cast<std::uint64_t>(plans.size());
+                        if (record->accepted >
+                                std::numeric_limits<std::uint64_t>::max() -
+                                    accepted ||
+                            record->reserved_atomic_units >
+                                std::numeric_limits<std::uint64_t>::max() -
+                                    reserved) {
+                          throw std::runtime_error(
+                              "wallet workload admission accounting exceeds "
+                              "uint64");
+                        }
+                        record->accepted += accepted;
+                        record->reserved_atomic_units += reserved;
+                      },
+                  .record_released_atomic_units =
+                      [record](std::uint64_t amount) {
+                        std::lock_guard<std::mutex> lock(record->mutex);
+                        CheckedWalletWorkloadAdd(amount,
+                                                 &record->released_atomic_units,
+                                                 "released atomic units");
+                      },
+                  .execution_started =
+                      [&, record] {
+                        {
+                          std::lock_guard<std::mutex> lock(record->mutex);
+                          if (record->request ==
+                              LiveWalletWorkloadRequest::kNone) {
+                            record->state = LiveWalletWorkloadState::kRunning;
+                          }
+                          record->changed.notify_all();
+                        }
+                        WriteLiveWalletWorkloadState(events_path, options,
+                                                     *record);
+                      },
+              };
+              try {
+                RuntimeNodeSnapshot execution_nodes = node_inventory.Snapshot();
+                const WalletWorkloadExecutionResult result =
+                    ApplyWalletTransactionsWorkload(
+                        options, events_path, driver, block_generation_mutex,
+                        execution_nodes, simulation_registry,
+                        transaction_tracker, nullptr, epoch_workload,
+                        record->ordinal, 0U, execution_stop.get_token(),
+                        &execution);
+                bool stop_settled = false;
+                {
+                  std::lock_guard<std::mutex> lock(record->mutex);
+                  record->next_transaction_index =
+                      result.next_transaction_index;
+                  record->queue_maximum_size = std::max(
+                      record->queue_maximum_size, result.queue_maximum_size);
+                  if (record->request ==
+                      LiveWalletWorkloadRequest::kStopSettle) {
+                    stop_settled = true;
+                  }
+                  if (record->request == LiveWalletWorkloadRequest::kPause ||
+                      record->request ==
+                          LiveWalletWorkloadRequest::kReconfigure) {
+                    continue;
+                  }
+                }
+                if (stop_settled) {
+                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                  return;
+                }
+                if (result.end ==
+                    WalletWorkloadExecutionEnd::kRefreshBalances) {
+                  std::unique_lock<std::mutex> lock(record->mutex);
+                  record->changed.wait_for(
+                      lock, execution_stop.get_token(),
+                      std::chrono::milliseconds(100), [&] {
+                        return record->request !=
+                               LiveWalletWorkloadRequest::kNone;
+                      });
+                  continue;
+                }
+                const std::string outcome =
+                    epoch_workload.transaction_count != 0U ? "count_reached"
+                    : epoch_workload.duration              ? "duration_expired"
+                                                           : "failed";
+                if (outcome == "failed") {
+                  cancel_outstanding_tracking();
+                  set_terminal(
+                      LiveWalletWorkloadState::kFailed, "failed",
+                      "continuous wallet workload sender ended unexpectedly");
+                } else {
+                  set_terminal(LiveWalletWorkloadState::kCompleted, outcome);
+                  const auto elapsed =
+                      std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() -
+                          record->started_at);
+                  const TransactionLoadSnapshot snapshot =
+                      record->accounting->Snapshot(elapsed);
+                  WriteEvent(
+                      events_path, options.run_id, "sim",
+                      SimulationEventKind::kTransactionLoadCompleted,
+                      TransactionLoadCompletedDetail(
+                          record->ordinal, 0U, epoch_workload,
+                          ExplicitWalletTransactionAttemptLimit(epoch_workload),
+                          record->queue_maximum_size, snapshot));
+                }
+                return;
+              } catch (const SimulationCancelled&) {
+                LiveWalletWorkloadRequest request;
+                {
+                  std::lock_guard<std::mutex> lock(record->mutex);
+                  record->next_transaction_index =
+                      execution.next_transaction_index;
+                  request = record->request;
+                }
+                if (request == LiveWalletWorkloadRequest::kPause ||
+                    request == LiveWalletWorkloadRequest::kReconfigure) {
+                  continue;
+                }
+                if (request == LiveWalletWorkloadRequest::kStopCancel ||
+                    request == LiveWalletWorkloadRequest::kStopSettle) {
+                  if (request == LiveWalletWorkloadRequest::kStopCancel) {
+                    cancel_outstanding_tracking();
+                  }
+                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                  return;
+                }
+                if (request == LiveWalletWorkloadRequest::kRunFailure) {
+                  cancel_outstanding_tracking();
+                  set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                               "run failed while wallet workload was active");
+                  return;
+                }
+                if (request == LiveWalletWorkloadRequest::kShutdown ||
+                    stop_token.stop_requested()) {
+                  cancel_outstanding_tracking();
+                  set_terminal(LiveWalletWorkloadState::kCancelled,
+                               "cancelled");
+                  return;
+                }
+                cancel_outstanding_tracking();
+                set_terminal(
+                    LiveWalletWorkloadState::kFailed, "failed",
+                    "wallet workload execution was cancelled unexpectedly");
+                return;
+              }
+            }
+          } catch (const std::exception& error) {
+            cancel_outstanding_tracking();
+            set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                         error.what());
+          } catch (...) {
+            cancel_outstanding_tracking();
+            set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                         "unknown wallet workload failure");
+          }
+        });
+      } catch (...) {
+        std::lock_guard<std::mutex> registry_lock(wallet_workloads->mutex);
+        const auto found = wallet_workloads->records.find(record->id);
+        if (found != wallet_workloads->records.end() &&
+            found->second == record) {
+          wallet_workloads->records.erase(found);
+        }
+        throw;
+      }
+      return record;
+    };
+
+    auto workload_service = std::make_shared<McpLiveWorkloadService>();
+    workload_service->operation = [&, require_workload_record,
+                                   launch_wallet_workload](
+                                      McpOperationKind kind,
+                                      const boost::json::object& arguments,
+                                      std::stop_token operation_stop_token) {
+      const auto require_argument_string = [&](std::string_view field) {
+        const boost::json::value* value = arguments.if_contains(field);
+        if (value == nullptr || !value->is_string() ||
+            value->as_string().empty()) {
+          throw std::invalid_argument("workload operation requires string " +
+                                      std::string(field));
+        }
+        return std::string(value->as_string());
+      };
+      const auto operation_timeout = [&] {
+        std::uint64_t seconds = 30U;
+        if (const boost::json::value* value =
+                arguments.if_contains("timeout_sec")) {
+          if (value->is_uint64()) {
+            seconds = value->as_uint64();
+          } else if (value->is_int64() && value->as_int64() >= 0) {
+            seconds = static_cast<std::uint64_t>(value->as_int64());
+          } else {
+            throw std::invalid_argument(
+                "workload timeout_sec must be an unsigned integer");
+          }
+        }
+        if (seconds == 0U || seconds > 3600U) {
+          throw std::invalid_argument(
+              "workload timeout_sec must be in 1..3600");
+        }
+        return std::chrono::seconds(seconds);
+      };
+      if (kind == McpOperationKind::kStartWorkload) {
+        const boost::json::value* workload_value =
+            arguments.if_contains("workload");
+        if (workload_value == nullptr || !workload_value->is_object()) {
+          throw std::invalid_argument(
+              "workload.start requires a workload object");
+        }
+        std::optional<std::string> requested_id;
+        if (arguments.if_contains("workload_id") != nullptr) {
+          requested_id = require_argument_string("workload_id");
+        }
+        const WalletTransactionsWorkload workload =
+            ParseAndValidateWalletTransactionsWorkload(
+                workload_value->as_object(), options);
+        const std::shared_ptr<LiveWalletWorkloadRecord> record =
+            launch_wallet_workload(workload, std::move(requested_id));
+        std::unique_lock<std::mutex> lock(record->mutex);
+        if (!record->changed.wait(lock, operation_stop_token, [&] {
+              return record->state != LiveWalletWorkloadState::kStarting;
+            })) {
+          record->request = LiveWalletWorkloadRequest::kStopCancel;
+          record->epoch_stop_source.request_stop();
+          record->changed.notify_all();
+          throw McpOperationCancelled();
+        }
+        lock.unlock();
+        return LiveWalletWorkloadJson(*record);
+      }
+
+      const std::string workload_id = require_argument_string("workload_id");
+      const std::shared_ptr<LiveWalletWorkloadRecord> record =
+          require_workload_record(workload_id);
+      if (kind == McpOperationKind::kInspectWorkload) {
+        return LiveWalletWorkloadJson(*record);
+      }
+      if (kind == McpOperationKind::kReconfigureWorkload) {
+        const boost::json::value* workload_value =
+            arguments.if_contains("workload");
+        if (workload_value == nullptr || !workload_value->is_object()) {
+          throw std::invalid_argument(
+              "workload.reconfigure requires a workload object");
+        }
+        WalletTransactionsWorkload updated =
+            ParseAndValidateWalletTransactionsWorkload(
+                workload_value->as_object(), options);
+        const std::vector<std::uint32_t> updated_claims =
+            ClaimedWalletsForWorkload(updated,
+                                      simulation_registry.wallets().size());
+        {
+          std::lock_guard<std::mutex> registry_lock(wallet_workloads->mutex);
+          for (const auto& [other_id, other] : wallet_workloads->records) {
+            if (other_id == workload_id) {
+              continue;
+            }
+            std::lock_guard<std::mutex> other_lock(other->mutex);
+            if (!IsTerminalLiveWalletWorkloadState(other->state) &&
+                WalletClaimsOverlap(updated_claims, other->claimed_wallets)) {
+              throw McpOperationFailure(
+                  "wallet_admission_conflict",
+                  "reconfigured sender admission overlaps active "
+                  "workload " +
+                      other_id,
+                  true);
+            }
+          }
+          std::lock_guard<std::mutex> record_lock(record->mutex);
+          if (IsTerminalLiveWalletWorkloadState(record->state)) {
+            throw McpOperationFailure(
+                "workload_not_active",
+                "terminal wallet workload cannot be reconfigured", false);
+          }
+          if (record->state == LiveWalletWorkloadState::kStopping) {
+            throw McpOperationFailure(
+                "workload_transition_in_progress",
+                "wallet workload already has a lifecycle transition in "
+                "progress",
+                true);
+          }
+          if (updated.transaction_count != 0U &&
+              record->next_transaction_index > updated.transaction_count) {
+            throw McpOperationFailure(
+                "workload_limit_conflict",
+                "reconfigured maximum transaction count is below "
+                "lifetime progress",
+                false);
+          }
+          if (updated.strategy == WalletTransferStrategy::kEqualFanout &&
+              updated.transaction_count != 0U &&
+              (static_cast<std::uint64_t>(updated.transaction_count) -
+               record->next_transaction_index) %
+                      static_cast<std::uint64_t>(
+                          updated.receiver_wallets.size()) !=
+                  0U) {
+            throw McpOperationFailure(
+                "workload_limit_conflict",
+                "reconfigured equal_fanout maximum does not leave a "
+                "complete receiver batch",
+                false);
+          }
+          record->claimed_wallets = updated_claims;
+          if (record->state == LiveWalletWorkloadState::kPaused) {
+            record->workload = std::move(updated);
+            if (record->configuration_revision ==
+                std::numeric_limits<std::uint64_t>::max()) {
+              throw std::runtime_error(
+                  "wallet workload configuration revision exceeds "
+                  "uint64");
+            }
+            ++record->configuration_revision;
+            record->changed.notify_all();
+          } else {
+            const bool execution_started =
+                record->state != LiveWalletWorkloadState::kStarting;
+            record->pending_workload = std::move(updated);
+            record->request = LiveWalletWorkloadRequest::kReconfigure;
+            record->state = LiveWalletWorkloadState::kStopping;
+            if (execution_started) {
+              record->epoch_stop_source.request_stop();
+            }
+            record->changed.notify_all();
+          }
+        }
+        std::unique_lock<std::mutex> lock(record->mutex);
+        const std::uint64_t expected_revision = record->configuration_revision;
+        if (record->pending_workload &&
+            !record->changed.wait(lock, operation_stop_token, [&] {
+              return (record->configuration_revision > expected_revision &&
+                      record->state == LiveWalletWorkloadState::kRunning) ||
+                     IsTerminalLiveWalletWorkloadState(record->state);
+            })) {
+          throw McpOperationCancelled();
+        }
+        lock.unlock();
+        return LiveWalletWorkloadJson(*record);
+      }
+      if (kind == McpOperationKind::kResumeWorkload) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + operation_timeout();
+        {
+          std::lock_guard<std::mutex> lock(record->mutex);
+          if (record->state != LiveWalletWorkloadState::kPaused) {
+            throw McpOperationFailure(
+                "workload_not_paused",
+                "wallet workload is not paused: " + workload_id, false);
+          }
+          record->request = LiveWalletWorkloadRequest::kNone;
+          record->state = LiveWalletWorkloadState::kStarting;
+          record->changed.notify_all();
+        }
+        std::unique_lock<std::mutex> lock(record->mutex);
+        if (!record->changed.wait_until(
+                lock, operation_stop_token, deadline, [&] {
+                  return record->state == LiveWalletWorkloadState::kRunning ||
+                         IsTerminalLiveWalletWorkloadState(record->state);
+                })) {
+          if (operation_stop_token.stop_requested()) {
+            throw McpOperationCancelled();
+          }
+          throw McpOperationFailure(
+              "workload_operation_timeout",
+              "wallet workload did not resume before timeout", true);
+        }
+        lock.unlock();
+        return LiveWalletWorkloadJson(*record);
+      }
+      const auto deadline =
+          std::chrono::steady_clock::now() + operation_timeout();
+      {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (IsTerminalLiveWalletWorkloadState(record->state)) {
+          throw McpOperationFailure(
+              "workload_not_active",
+              "wallet workload is already terminal: " + workload_id, false);
+        }
+        if (record->state == LiveWalletWorkloadState::kStopping) {
+          throw McpOperationFailure(
+              "workload_transition_in_progress",
+              "wallet workload already has a lifecycle transition in "
+              "progress",
+              true);
+        }
+        if (kind == McpOperationKind::kPauseWorkload) {
+          const bool execution_started =
+              record->state != LiveWalletWorkloadState::kStarting;
+          record->request = LiveWalletWorkloadRequest::kPause;
+          record->state = LiveWalletWorkloadState::kStopping;
+          if (execution_started) {
+            record->epoch_stop_source.request_stop();
+          }
+        } else if (kind == McpOperationKind::kStopWorkload) {
+          const bool execution_started =
+              record->state != LiveWalletWorkloadState::kStarting;
+          std::string policy = "cancel";
+          if (const boost::json::value* value =
+                  arguments.if_contains("policy")) {
+            if (!value->is_string()) {
+              throw std::invalid_argument(
+                  "workload.stop policy must be a string");
+            }
+            policy = std::string(value->as_string());
+          }
+          if (policy != "cancel" && policy != "settle") {
+            throw std::invalid_argument(
+                "workload.stop policy must be cancel or settle");
+          }
+          record->request = policy == "settle"
+                                ? LiveWalletWorkloadRequest::kStopSettle
+                                : LiveWalletWorkloadRequest::kStopCancel;
+          record->state = LiveWalletWorkloadState::kStopping;
+          if (policy == "cancel" || !execution_started) {
+            record->epoch_stop_source.request_stop();
+          }
+        } else {
+          throw std::logic_error("unknown wallet workload operation");
+        }
+        record->changed.notify_all();
+      }
+      std::unique_lock<std::mutex> lock(record->mutex);
+      const auto reached_target = [&] {
+        return kind == McpOperationKind::kPauseWorkload
+                   ? record->state == LiveWalletWorkloadState::kPaused ||
+                         IsTerminalLiveWalletWorkloadState(record->state)
+                   : IsTerminalLiveWalletWorkloadState(record->state);
+      };
+      if (!record->changed.wait_until(lock, operation_stop_token, deadline,
+                                      reached_target)) {
+        if (operation_stop_token.stop_requested()) {
+          throw McpOperationCancelled();
+        }
+        throw McpOperationFailure(
+            "workload_operation_timeout",
+            "wallet workload did not reach the requested state before "
+            "timeout",
+            true);
+      }
+      lock.unlock();
+      return LiveWalletWorkloadJson(*record);
+    };
+    workload_service->read = [wallet_workloads](
+                                 bool history,
+                                 std::stop_token read_stop_token) {
+      boost::json::array result;
+      std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
+      {
+        std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
+        records.reserve(wallet_workloads->records.size());
+        for (const auto& [id, record] : wallet_workloads->records) {
+          static_cast<void>(id);
+          records.push_back(record);
+        }
+      }
+      for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
+        if (read_stop_token.stop_requested()) {
+          throw McpOperationCancelled();
+        }
+        {
+          std::lock_guard<std::mutex> lock(record->mutex);
+          if (history != IsTerminalLiveWalletWorkloadState(record->state)) {
+            continue;
+          }
+        }
+        result.emplace_back(LiveWalletWorkloadJson(*record));
+      }
+      return boost::json::value(std::move(result));
+    };
+    mcp_application.SetWorkloadService(workload_service);
+    installed_workload_service = std::move(workload_service);
+    transaction_observer.emplace([&](std::stop_token observer_stop_token) {
+      CombinedStopToken observer_stop(stop_token, observer_stop_token);
+      const std::stop_token operation_stop_token = observer_stop.get_token();
+      std::condition_variable_any wakeup;
+      std::mutex wakeup_mutex;
+      while (!operation_stop_token.stop_requested()) {
+        try {
+          const RuntimeNodeSnapshot observer_nodes = node_inventory.Snapshot();
+          transaction_tracker.ObserveAll(options, events_path, driver,
+                                         observer_nodes, operation_stop_token);
+        } catch (const SimulationCancelled&) {
+          return;
+        } catch (const std::exception& error) {
+          BBP_LOG(warning) << "transaction confirmation observation failed: "
+                           << error.what();
+        } catch (...) {
+          BBP_LOG(warning) << "transaction confirmation observation failed";
+        }
+        std::unique_lock<std::mutex> lock(wakeup_mutex);
+        wakeup.wait_for(lock, operation_stop_token,
+                        std::chrono::milliseconds(50), [] { return false; });
+      }
+    });
+
     ThrowIfStopRequested(stop_token);
     if (peer_connectivity_controller) {
       peer_connectivity_controller->Start();
@@ -17771,9 +19107,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             RequireNodeRunning(generator, "block generation workload");
             start_height =
                 driver.ReadMetrics(generator.config, stop_token).height;
-            hashes = driver.GenerateBlocks(generator.config, workload.count,
-                                           chain_spec.default_reward_address,
-                                           stop_token);
+            hashes = GenerateBlocksSerialized(
+                block_generation_mutex, driver, generator.config,
+                workload.count, chain_spec.default_reward_address, stop_token);
             RecordGeneratedBlocks(driver, generator, hashes, stop_token);
             const uint64_t target_height =
                 start_height + static_cast<uint64_t>(hashes.size());
@@ -17839,16 +19175,30 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           } else if (scenario_workload.kind ==
                      WorkloadKind::kSendRawTransaction) {
             ApplySendRawTransactionWorkload(
-                options, events_path, driver, nodes, transaction_tracker,
-                scenario_workload.send_raw_transaction, action_index,
-                action_count, stop_token);
+                options, events_path, driver, block_generation_mutex, nodes,
+                transaction_tracker, scenario_workload.send_raw_transaction,
+                action_index, action_count, stop_token);
           } else if (scenario_workload.kind ==
                      WorkloadKind::kWalletTransactions) {
-            ApplyWalletTransactionsWorkload(
-                options, events_path, driver, nodes, simulation_registry,
-                transaction_tracker, &pending_transaction_load_completions,
-                scenario_workload.wallet_transactions, action_index,
-                action_count, stop_token);
+            const std::shared_ptr<LiveWalletWorkloadRecord> workload_record =
+                launch_wallet_workload(scenario_workload.wallet_transactions,
+                                       std::nullopt);
+            if (ExplicitWalletTransactionAttemptLimit(
+                    scenario_workload.wallet_transactions)) {
+              std::unique_lock<std::mutex> workload_lock(
+                  workload_record->mutex);
+              if (!workload_record->changed.wait(
+                      workload_lock, stop_token, [&] {
+                        return IsTerminalLiveWalletWorkloadState(
+                            workload_record->state);
+                      })) {
+                throw SimulationCancelled();
+              }
+              if (workload_record->state == LiveWalletWorkloadState::kFailed) {
+                throw std::runtime_error(workload_record->failure.value_or(
+                    "wallet workload failed without a diagnostic"));
+              }
+            }
           } else if (scenario_workload.kind == WorkloadKind::kRestartNode) {
             auto mutation_lock =
                 AcquireNodeMutationLock(node_mutation_mutex, stop_token);
@@ -18016,6 +19366,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    stop_wallet_workloads(false);
+    stop_transaction_observer();
     stop_command_processor();
     stop_peer_connectivity();
     stop_block_production();
@@ -18851,9 +20203,9 @@ int RunRetainedTuiWithMcp(const Options& cli_options,
 }  // namespace
 
 #ifdef BBP_ENABLE_TEST_HOOKS
-bool RuntimeNodeSupportDestructionAllowedForTest(
-    bool daemon_absence_verified, bool exact_cgroup_acquired,
-    bool exact_cgroup_empty) {
+bool RuntimeNodeSupportDestructionAllowedForTest(bool daemon_absence_verified,
+                                                 bool exact_cgroup_acquired,
+                                                 bool exact_cgroup_empty) {
   return RuntimeNodeSupportDestructionAllowed(
       daemon_absence_verified, exact_cgroup_acquired, exact_cgroup_empty);
 }
@@ -18867,6 +20219,28 @@ boost::json::object ResolveScenario(const boost::json::object& scenario) {
   const Options options = ParseAndValidateScenario(scenario);
   return BuildResolvedScenarioDocument(options,
                                        ChainDriverSpecFor(options.chain));
+}
+
+WalletTransactionsWorkload ParseAndValidateWalletTransactionsWorkload(
+    const boost::json::object& workload, const Options& options) {
+  boost::json::array workloads;
+  workloads.emplace_back(workload);
+  Options validation_options = options;
+  validation_options.workloads.clear();
+  validation_options.scheduled_events.clear();
+  validation_options.wallet_backed_workload_requested = false;
+  boost::program_options::variables_map variables;
+  ApplyScenarioWorkloads(workloads, variables, validation_options);
+  if (validation_options.workloads.size() != 1U ||
+      validation_options.workloads.front().kind !=
+          WorkloadKind::kWalletTransactions) {
+    throw std::runtime_error(
+        "workload operation requires a wallet_transactions workload");
+  }
+  const WalletTransactionsWorkload& parsed =
+      validation_options.workloads.front().wallet_transactions;
+  ValidateWalletTransactionsWorkload(parsed, validation_options);
+  return parsed;
 }
 
 SimulationNodeAddRequest ParseAndValidateSimulationNodeAddRequest(

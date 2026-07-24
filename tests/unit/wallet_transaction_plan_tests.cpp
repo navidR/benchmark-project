@@ -285,8 +285,7 @@ BOOST_AUTO_TEST_CASE(
   bbp::WalletTransactionsWorkload workload =
       FixedWorkload(bbp::WalletTransferStrategy::kRandomBruteforce, 20U);
   workload.random_seed = 0x12345678U;
-  workload.sender_wallets = {1U, 2U};
-  workload.receiver_wallets = {3U, 4U};
+  workload.retained_balance_basis_points = 8'000U;
   workload.amount = bbp::AmountDistribution{
       .kind = bbp::ValueDistributionKind::kUniform,
       .minimum_satoshis = 100U,
@@ -297,7 +296,7 @@ BOOST_AUTO_TEST_CASE(
 
   bbp::WalletTransactionLoadPlanner first(4U, workload);
   bbp::WalletTransactionLoadPlanner second(4U, workload);
-  std::vector<std::uint64_t> first_balances = {10'000U, 1'000U, 0U, 0U};
+  std::vector<std::uint64_t> first_balances = {10'000U, 8'000U, 6'000U, 4'000U};
   std::vector<std::uint64_t> second_balances = first_balances;
   std::size_t generated = 0U;
   while (true) {
@@ -309,22 +308,50 @@ BOOST_AUTO_TEST_CASE(
     if (!first_batch) {
       break;
     }
-    BOOST_REQUIRE_EQUAL(first_batch->size(), 1U);
-    const bbp::WalletTransactionPlanEntry& entry = first_batch->front();
-    BOOST_TEST(entry.sender_index < 2U);
-    BOOST_TEST(entry.receiver_index >= 2U);
-    BOOST_TEST(entry.receiver_index < 4U);
-    BOOST_TEST(entry.sender_index != entry.receiver_index);
-    BOOST_TEST(entry.amount_satoshis >= 100U);
-    BOOST_TEST(entry.amount_satoshis <= 1000U);
-    BOOST_TEST(entry.amount_satoshis <= before[entry.sender_index] / 5U);
-    BOOST_TEST(first_balances[entry.sender_index] ==
-               before[entry.sender_index] - entry.amount_satoshis - 50U);
-    ++generated;
+    BOOST_TEST(first_batch->size() <= 4U);
+    std::vector<bool> sent(4U, false);
+    for (const bbp::WalletTransactionPlanEntry& entry : *first_batch) {
+      BOOST_TEST(entry.sender_index < 4U);
+      BOOST_TEST(entry.receiver_index < 4U);
+      BOOST_TEST(entry.sender_index != entry.receiver_index);
+      BOOST_TEST(!sent.at(entry.sender_index));
+      sent.at(entry.sender_index) = true;
+      BOOST_TEST(entry.amount_satoshis >= 100U);
+      BOOST_TEST(entry.amount_satoshis <= 1000U);
+      const std::uint64_t retained =
+          (before[entry.sender_index] * 8U + 9U) / 10U;
+      BOOST_TEST(entry.amount_satoshis + 50U <=
+                 before[entry.sender_index] - retained);
+      BOOST_TEST(first_balances[entry.sender_index] ==
+                 before[entry.sender_index] - entry.amount_satoshis - 50U);
+      ++generated;
+    }
     BOOST_REQUIRE(generated < 100U);
   }
-  BOOST_TEST(generated > 1U);
-  BOOST_TEST(first.batch_size() == 1U);
+  BOOST_TEST(generated > 4U);
+  BOOST_TEST(first.batch_size() == 4U);
+
+  bbp::WalletTransactionLoadPlanner bounded(4U, workload);
+  std::vector<std::uint64_t> bounded_balances = {10'000U, 10'000U, 10'000U,
+                                                 10'000U};
+  const auto partial = bounded.NextBatch(&bounded_balances, 2U);
+  BOOST_REQUIRE(partial);
+  BOOST_REQUIRE_EQUAL(partial->size(), 2U);
+  BOOST_TEST(partial->at(0).sender_index == 0U);
+  BOOST_TEST(partial->at(1).sender_index == 1U);
+
+  bbp::WalletTransactionLoadPlanner later_first(4U, workload, 4U);
+  bbp::WalletTransactionLoadPlanner later_second(4U, workload, 4U);
+  std::vector<std::uint64_t> later_first_balances = {10'000U, 10'000U, 10'000U,
+                                                     10'000U};
+  std::vector<std::uint64_t> later_second_balances = later_first_balances;
+  const auto later_batch = later_first.NextBatch(&later_first_balances, 2U);
+  const auto repeated_later_batch =
+      later_second.NextBatch(&later_second_balances, 2U);
+  BOOST_REQUIRE(later_batch);
+  BOOST_CHECK(later_batch == repeated_later_batch);
+  BOOST_CHECK(later_first_balances == later_second_balances);
+  BOOST_CHECK(*later_batch != *partial);
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -374,19 +401,24 @@ BOOST_AUTO_TEST_CASE(
 BOOST_AUTO_TEST_CASE(wallet_transaction_load_planner_rejects_unsafe_inputs) {
   bbp::WalletTransactionsWorkload workload =
       FixedWorkload(bbp::WalletTransferStrategy::kRandomBruteforce, 1U);
+  workload.retained_balance_basis_points = 8'000U;
   workload.sender_wallets = {1U};
-  workload.receiver_wallets = {1U};
   workload.fee_satoshis = 1U;
   BOOST_CHECK_THROW(bbp::WalletTransactionLoadPlanner(2U, workload),
                     std::runtime_error);
 
-  workload.receiver_wallets = {2U};
+  workload.sender_wallets.clear();
   bbp::WalletTransactionLoadPlanner planner(2U, workload);
   std::vector<std::uint64_t> short_balances;
   BOOST_CHECK_THROW(planner.NextBatch(&short_balances), std::runtime_error);
   BOOST_CHECK_THROW(planner.NextBatch(nullptr), std::runtime_error);
+  std::vector<std::uint64_t> balances_for_zero_limit = {1'000U, 1'000U};
+  BOOST_CHECK_THROW(planner.NextBatch(&balances_for_zero_limit, 0U),
+                    std::runtime_error);
 
   workload.strategy = bbp::WalletTransferStrategy::kEqualFanout;
+  workload.retained_balance_basis_points.reset();
+  workload.sender_wallets = {1U};
   workload.receiver_wallets = {2U, 3U};
   workload.fee_satoshis = std::numeric_limits<std::uint64_t>::max();
   bbp::WalletTransactionLoadPlanner overflow(3U, workload);
@@ -413,4 +445,22 @@ BOOST_AUTO_TEST_CASE(wallet_transaction_duration_attempt_limit_is_bounded) {
               std::numeric_limits<std::chrono::milliseconds::rep>::max()),
           bbp::WalletTransactionRate::FromDouble(1000.0)),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    wallet_transaction_lifetime_limit_exists_only_when_explicit) {
+  bbp::WalletTransactionsWorkload workload =
+      FixedWorkload(bbp::WalletTransferStrategy::kRandomBruteforce, 0U);
+  workload.transaction_count = 0U;
+  workload.transaction_rate = bbp::WalletTransactionRate::FromDouble(2.0);
+  BOOST_TEST(!bbp::ExplicitWalletTransactionAttemptLimit(workload).has_value());
+
+  workload.transaction_count = 8U;
+  BOOST_REQUIRE(bbp::ExplicitWalletTransactionAttemptLimit(workload));
+  BOOST_TEST(*bbp::ExplicitWalletTransactionAttemptLimit(workload) == 8U);
+
+  workload.transaction_count = 0U;
+  workload.duration = std::chrono::milliseconds(1500);
+  BOOST_REQUIRE(bbp::ExplicitWalletTransactionAttemptLimit(workload));
+  BOOST_TEST(*bbp::ExplicitWalletTransactionAttemptLimit(workload) == 3U);
 }

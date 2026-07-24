@@ -49,7 +49,8 @@ constexpr std::array<McpNamedCapability, EnumCount(McpOperationKind::kCount)>
           "Fund, register, configure and activate a masternode"},
          {"masternode.remove", "Deactivate and remove a masternode role"},
          {"masternode.restart", "Restart and verify a masternode role"},
-         {"workload.start", "Start a bounded registered workload"},
+         {"workload.start", "Start a registered wallet workload instance"},
+         {"workload.inspect", "Inspect one live or retained workload instance"},
          {"workload.reconfigure",
           "Reconfigure a live workload at an accounting boundary"},
          {"workload.pause", "Pause a live workload"},
@@ -265,12 +266,10 @@ std::span<const std::string_view> McpScenarioMemberRegistry() {
 }
 
 boost::json::array BuildMcpResourceRegistry() {
-  std::array<McpInformationFamily,
-             EnumCount(McpInformationFamily::kCount)>
+  std::array<McpInformationFamily, EnumCount(McpInformationFamily::kCount)>
       information_families{};
   for (std::size_t index = 0U; index < information_families.size(); ++index) {
-    information_families[index] =
-        static_cast<McpInformationFamily>(index);
+    information_families[index] = static_cast<McpInformationFamily>(index);
   }
   return BuildMcpResourceRegistry(information_families);
 }
@@ -349,12 +348,10 @@ boost::json::object BuildMcpCapabilityDocument(
 
 boost::json::object BuildMcpCapabilityDocument(
     std::span<const McpOperationKind> operations) {
-  std::array<McpInformationFamily,
-             EnumCount(McpInformationFamily::kCount)>
+  std::array<McpInformationFamily, EnumCount(McpInformationFamily::kCount)>
       information_families{};
   for (std::size_t index = 0U; index < information_families.size(); ++index) {
-    information_families[index] =
-        static_cast<McpInformationFamily>(index);
+    information_families[index] = static_cast<McpInformationFamily>(index);
   }
   return BuildMcpCapabilityDocument(operations, information_families);
 }

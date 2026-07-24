@@ -21,6 +21,7 @@ constexpr std::size_t kMaximumTransactionObservationNodes = 16U;
 struct TrackedTransaction {
   std::string txid;
   std::string submission_kind;
+  std::string workload_id;
   std::uint32_t workload_index = 0U;
   std::uint32_t workload_count = 0U;
   std::uint64_t transaction_index = 0U;
@@ -48,6 +49,7 @@ struct TransactionObservationStoreStats {
   std::size_t recent_retired = 0U;
   std::uint64_t tracked = 0U;
   std::uint64_t retired = 0U;
+  std::uint64_t cancelled = 0U;
   std::uint64_t rejected = 0U;
   std::uint64_t visibility_transitions = 0U;
   std::uint64_t confirmation_transitions = 0U;
@@ -90,6 +92,7 @@ class TransactionObservationStore {
              const std::vector<std::string>& required_node_ids);
   void TrackSet(std::vector<TrackedTransaction> transactions,
                 const std::vector<std::string>& required_node_ids);
+  std::size_t CancelWorkload(std::string_view workload_id);
   [[nodiscard]] std::vector<TrackedTransaction> PendingTransactions() const;
   TransactionObservationTransition Record(std::string_view txid,
                                           std::string_view node_id,
@@ -119,6 +122,7 @@ class TransactionObservationStore {
   std::size_t maximum_retained_ = 0U;
   std::uint64_t tracked_ = 0U;
   std::uint64_t retired_ = 0U;
+  std::uint64_t cancelled_ = 0U;
   std::uint64_t rejected_ = 0U;
   std::uint64_t visibility_transitions_ = 0U;
   std::uint64_t confirmation_transitions_ = 0U;

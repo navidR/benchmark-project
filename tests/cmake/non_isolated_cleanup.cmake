@@ -1,31 +1,51 @@
 if(NOT DEFINED TEST_COMMAND OR NOT DEFINED CAPABILITY_HELPER OR
-   NOT DEFINED TEST_ROOT)
+   NOT DEFINED DAEMON_HELPER OR NOT DEFINED TEST_ROOT)
   message(FATAL_ERROR
-    "TEST_COMMAND, CAPABILITY_HELPER, and TEST_ROOT are required")
+    "TEST_COMMAND, CAPABILITY_HELPER, DAEMON_HELPER, and TEST_ROOT are required")
 endif()
 
-set(run_id "no-net-cap-cleanup")
-string(SHA256 resource_hash "${TEST_ROOT}")
-string(SUBSTRING "${resource_hash}" 0 32 resource_id)
-set(run_root "${TEST_ROOT}/${run_id}")
-set(node_root "${run_root}/nodes/firo-1")
-set(cgroup_root "/sys/fs/cgroup/bbp/${resource_id}")
-
 file(REMOVE_RECURSE "${TEST_ROOT}")
-file(MAKE_DIRECTORY "${node_root}")
-file(WRITE "${run_root}/.bbp-run"
-  "{\"version\":1,\"run_id\":\"${run_id}\",\"run_root\":\"${run_root}\",\"resource_id\":\"${resource_id}\"}\n"
+set(benchmark_root "${TEST_ROOT}/runs")
+set(bin_root "${TEST_ROOT}/bin")
+set(ready_daemon "${bin_root}/ready-firod")
+set(firo_qt "${bin_root}/firo-qt")
+file(MAKE_DIRECTORY "${benchmark_root}" "${bin_root}")
+configure_file("${DAEMON_HELPER}" "${ready_daemon}" COPYONLY)
+configure_file("${DAEMON_HELPER}" "${firo_qt}" COPYONLY)
+file(CHMOD "${ready_daemon}" "${firo_qt}"
+  PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+
+set(run_id "no-net-cap-cleanup")
+set(run_root "${benchmark_root}/${run_id}")
+set(node_root "${run_root}/nodes/firo-1")
+execute_process(
+  COMMAND "${TEST_COMMAND}"
+    --benchmark-root "${benchmark_root}"
+    --run-id "${run_id}"
+    --nodes 1
+    --node-binary "${ready_daemon}"
+    --no-isolate-network
+    --metrics-sample-count 1
+    --metrics-interval 50ms
+    --keep-cgroups
+    --no-tui
+  RESULT_VARIABLE prepare_result
+  OUTPUT_VARIABLE prepare_stdout
+  ERROR_VARIABLE prepare_stderr
 )
-file(WRITE "${run_root}/resolved-scenario.json"
-  "{\"chain\":\"firo\",\"nodes\":1,\"isolated_network\":false}\n"
-)
+if(NOT prepare_result EQUAL 0)
+  message(FATAL_ERROR
+    "could not prepare non-isolated retained run: ${prepare_stdout}${prepare_stderr}")
+endif()
+file(READ "${run_root}/.bbp-run" ownership)
+string(JSON resource_id GET "${ownership}" resource_id)
+set(cgroup_root "/sys/fs/cgroup/bbp/${resource_id}")
 file(WRITE "${node_root}/.bbp-rpc-cookie" "owned-secret\n")
 file(WRITE "${run_root}/sentinel" "run directory survives cleanup\n")
-file(MAKE_DIRECTORY "${cgroup_root}")
 
 execute_process(
   COMMAND "${CAPABILITY_HELPER}" "${TEST_COMMAND}"
-    --benchmark-root "${TEST_ROOT}"
+    --benchmark-root "${benchmark_root}"
     --cleanup-run "${run_id}"
   RESULT_VARIABLE result
   OUTPUT_VARIABLE stdout
@@ -35,7 +55,7 @@ set(output "${stdout}${stderr}")
 if(NOT result EQUAL 0)
   execute_process(
     COMMAND "${TEST_COMMAND}"
-      --benchmark-root "${TEST_ROOT}"
+      --benchmark-root "${benchmark_root}"
       --cleanup-run "${run_id}"
     OUTPUT_QUIET ERROR_QUIET
   )
@@ -56,23 +76,35 @@ if(NOT EXISTS "${run_root}/sentinel")
 endif()
 
 set(isolated_run_id "isolated-net-cleanup")
-string(SHA256 isolated_resource_hash "${TEST_ROOT}-isolated")
-string(SUBSTRING "${isolated_resource_hash}" 0 32 isolated_resource_id)
-set(isolated_run_root "${TEST_ROOT}/${isolated_run_id}")
+set(isolated_run_root "${benchmark_root}/${isolated_run_id}")
 set(isolated_node_root "${isolated_run_root}/nodes/firo-1")
+execute_process(
+  COMMAND "${TEST_COMMAND}"
+    --benchmark-root "${benchmark_root}"
+    --run-id "${isolated_run_id}"
+    --nodes 1
+    --node-binary "${ready_daemon}"
+    --isolate-network
+    --metrics-sample-count 1
+    --metrics-interval 50ms
+    --keep-cgroups
+    --no-tui
+  RESULT_VARIABLE isolated_prepare_result
+  OUTPUT_VARIABLE isolated_prepare_stdout
+  ERROR_VARIABLE isolated_prepare_stderr
+)
+if(NOT isolated_prepare_result EQUAL 0)
+  message(FATAL_ERROR
+    "could not prepare isolated retained run: ${isolated_prepare_stdout}${isolated_prepare_stderr}")
+endif()
+file(READ "${isolated_run_root}/.bbp-run" isolated_ownership)
+string(JSON isolated_resource_id GET "${isolated_ownership}" resource_id)
 set(isolated_cgroup_root
   "/sys/fs/cgroup/bbp/${isolated_resource_id}")
-file(MAKE_DIRECTORY "${isolated_node_root}" "${isolated_cgroup_root}")
-file(WRITE "${isolated_run_root}/.bbp-run"
-  "{\"version\":1,\"run_id\":\"${isolated_run_id}\",\"run_root\":\"${isolated_run_root}\",\"resource_id\":\"${isolated_resource_id}\"}\n"
-)
-file(WRITE "${isolated_run_root}/resolved-scenario.json"
-  "{\"chain\":\"firo\",\"nodes\":1,\"isolated_network\":true}\n"
-)
 file(WRITE "${isolated_node_root}/.bbp-rpc-cookie" "owned-secret\n")
 execute_process(
   COMMAND "${CAPABILITY_HELPER}" "${TEST_COMMAND}"
-    --benchmark-root "${TEST_ROOT}"
+    --benchmark-root "${benchmark_root}"
     --cleanup-run "${isolated_run_id}"
   RESULT_VARIABLE isolated_result
   OUTPUT_VARIABLE isolated_stdout
@@ -91,7 +123,7 @@ if(NOT EXISTS "${isolated_cgroup_root}" OR
 endif()
 execute_process(
   COMMAND "${TEST_COMMAND}"
-    --benchmark-root "${TEST_ROOT}"
+    --benchmark-root "${benchmark_root}"
     --cleanup-run "${isolated_run_id}"
   RESULT_VARIABLE isolated_cleanup_result
   OUTPUT_VARIABLE isolated_cleanup_stdout

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <future>
@@ -41,8 +42,12 @@ bbp::WalletTransactionsWorkload LoadWorkload(
   workload.fee_satoshis = 10U;
   workload.fee_reserve_satoshis = 10U;
   workload.random_seed = 17U;
-  workload.sender_wallets = {1U};
-  workload.receiver_wallets = std::move(receivers);
+  if (strategy == bbp::WalletTransferStrategy::kRandomBruteforce) {
+    workload.retained_balance_basis_points = 8'000U;
+  } else {
+    workload.sender_wallets = {1U};
+    workload.receiver_wallets = std::move(receivers);
+  }
   return workload;
 }
 
@@ -171,6 +176,54 @@ BOOST_AUTO_TEST_CASE(transaction_load_queue_admits_batches_atomically) {
   BOOST_TEST(!queue.TryPushBatch({Task(5U), Task(6U), Task(7U), Task(8U)}));
   BOOST_TEST(queue.size() == 0U);
   BOOST_TEST(queue.maximum_size() == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_queue_runs_admission_accounting_before_visibility) {
+  bbp::BoundedWalletTransactionQueue queue(1U);
+  std::atomic<bool> accounting_published = false;
+  std::future<bool> worker = std::async(std::launch::async, [&] {
+    const auto task = queue.Pop();
+    return task.has_value() &&
+           accounting_published.load(std::memory_order_acquire);
+  });
+  BOOST_TEST(queue.TryPushBatch({Task(1U)}, [&] {
+    accounting_published.store(true, std::memory_order_release);
+  }));
+  BOOST_CHECK(worker.wait_for(1s) == std::future_status::ready);
+  BOOST_TEST(worker.get());
+
+  bbp::BoundedWalletTransactionQueue rejected(1U);
+  BOOST_TEST(rejected.TryPush(Task(1U)));
+  bool rejected_callback_ran = false;
+  BOOST_TEST(!rejected.TryPushBatch({Task(2U)},
+                                    [&] { rejected_callback_ran = true; }));
+  BOOST_TEST(!rejected_callback_ran);
+
+  bbp::BoundedWalletTransactionQueue failed(1U);
+  BOOST_CHECK_THROW(
+      failed.TryPushBatch(
+          {Task(1U)},
+          [] { throw std::runtime_error("accounting publication failed"); }),
+      std::runtime_error);
+  BOOST_TEST(failed.size() == 0U);
+  BOOST_TEST(failed.maximum_size() == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_load_queue_settle_drops_pending_without_cancelling_active) {
+  bbp::BoundedWalletTransactionQueue queue(3U);
+  BOOST_REQUIRE(queue.TryPushBatch({Task(1U), Task(2U), Task(3U)}));
+  const auto active = queue.Pop();
+  BOOST_REQUIRE(active);
+  BOOST_TEST(active->transaction_index == 1U);
+  const auto dropped = queue.DropPendingAndClose();
+  BOOST_REQUIRE_EQUAL(dropped.size(), 2U);
+  BOOST_TEST(dropped.at(0).transaction_index == 2U);
+  BOOST_TEST(dropped.at(1).transaction_index == 3U);
+  BOOST_TEST(queue.closed());
+  BOOST_TEST(!queue.cancelled());
+  BOOST_TEST(!queue.Pop());
 }
 
 BOOST_AUTO_TEST_CASE(transaction_load_queue_stop_wakes_waiting_consumer) {
@@ -561,9 +614,13 @@ BOOST_AUTO_TEST_CASE(
   bbp::TransactionLoadConfirmation confirmation(
       accounting, {{"tx-a", "node-a"}, {"tx-b", "node-a"}});
 
-  confirmation.RecordObservation("tx-a", "node-a", true);
-  confirmation.RecordObservation("tx-b", "node-a", true);
-  confirmation.RecordPropagated(false);
+  BOOST_TEST(!confirmation.RecordObservation("tx-a", "node-a", true));
+  const std::optional<bbp::TransactionLoadSnapshot> completed =
+      confirmation.RecordObservation("tx-b", "node-a", true);
+  BOOST_REQUIRE(completed);
+  BOOST_TEST(completed->propagated == 1U);
+  BOOST_TEST(completed->confirmed == 1U);
+  BOOST_CHECK_THROW(confirmation.RecordPropagated(false), std::runtime_error);
 
   const bbp::TransactionLoadSnapshot snapshot = accounting->Snapshot(2s);
   BOOST_TEST(snapshot.propagated == 1U);

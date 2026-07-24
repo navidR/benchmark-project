@@ -60,6 +60,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "raw_transaction_submitted";
     case SimulationEventKind::kWalletTransactionSubmitted:
       return "wallet_transaction_submitted";
+    case SimulationEventKind::kWalletWorkloadState:
+      return "wallet_workload_state";
     case SimulationEventKind::kTransactionLoadAttempt:
       return "transaction_load_attempt";
     case SimulationEventKind::kTransactionLoadProgress:
@@ -220,6 +222,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
     return SimulationEventKind::kRawTransactionSubmitted;
   if (name == "wallet_transaction_submitted")
     return SimulationEventKind::kWalletTransactionSubmitted;
+  if (name == "wallet_workload_state")
+    return SimulationEventKind::kWalletWorkloadState;
   if (name == "transaction_load_attempt")
     return SimulationEventKind::kTransactionLoadAttempt;
   if (name == "transaction_load_progress")

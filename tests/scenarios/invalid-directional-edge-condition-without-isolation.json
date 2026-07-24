@@ -1,4 +1,5 @@
 {
+  "isolated_network": false,
   "firod": "/tmp/not-used-by-probe",
   "output_dir": "runs",
   "run_id": "invalid-edge-condition-no-isolation",

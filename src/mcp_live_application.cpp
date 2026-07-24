@@ -64,6 +64,15 @@ constexpr std::array kOwnedRunOperations = {
     McpOperationKind::kQueryEvidence, McpOperationKind::kQueryLogs,
     McpOperationKind::kFollowLogs, McpOperationKind::kReadArtifact};
 
+constexpr bool IsWalletWorkloadOperation(McpOperationKind kind) {
+  return kind == McpOperationKind::kStartWorkload ||
+         kind == McpOperationKind::kInspectWorkload ||
+         kind == McpOperationKind::kReconfigureWorkload ||
+         kind == McpOperationKind::kPauseWorkload ||
+         kind == McpOperationKind::kResumeWorkload ||
+         kind == McpOperationKind::kStopWorkload;
+}
+
 class CombinedStopToken {
   struct ForwardStop {
     std::stop_source* source;
@@ -592,7 +601,15 @@ void McpLiveApplication::EndRequest() {
 
 std::vector<McpOperationKind> McpLiveApplication::SupportedOperations() const {
   if (!config_.retained_run) {
-    return {kLiveOperations.begin(), kLiveOperations.end()};
+    std::vector<McpOperationKind> operations{kLiveOperations.begin(),
+                                             kLiveOperations.end()};
+    operations.insert(
+        operations.end(),
+        {McpOperationKind::kStartWorkload, McpOperationKind::kInspectWorkload,
+         McpOperationKind::kReconfigureWorkload,
+         McpOperationKind::kPauseWorkload, McpOperationKind::kResumeWorkload,
+         McpOperationKind::kStopWorkload});
+    return operations;
   }
   std::vector<McpOperationKind> operations{kRetainedOperations.begin(),
                                            kRetainedOperations.end()};
@@ -660,7 +677,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kQueryEvidence &&
       kind != McpOperationKind::kQueryLogs &&
       kind != McpOperationKind::kFollowLogs &&
-      kind != McpOperationKind::kReadArtifact) {
+      kind != McpOperationKind::kReadArtifact &&
+      !IsWalletWorkloadOperation(kind)) {
     return {};
   }
   RequireRun(arguments);
@@ -674,6 +692,29 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       throw McpOperationFailure("run_not_ready",
                                 "the managed run is still starting", true);
     }
+  }
+
+  if (IsWalletWorkloadOperation(kind)) {
+    const std::shared_ptr<McpLiveWorkloadService> workload_service =
+        WorkloadService();
+    if (!workload_service) {
+      throw McpOperationFailure(
+          "workload_service_unavailable",
+          "the simulator workload lifecycle service is unavailable", true);
+    }
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, workload_service, kind,
+                     arguments](McpOperationContext& context) {
+          CombinedStopToken cancellation(context.stop_token(),
+                                         run_stop_source_.get_token());
+          boost::json::object result = workload_service->operation(
+              kind, arguments, cancellation.token());
+          result["result_family"] = "workload";
+          result["run_id"] = config_.run_id;
+          return McpTypedResult{.family = McpResultFamily::kWorkload,
+                                .value = std::move(result)};
+        }};
   }
 
   if (kind == McpOperationKind::kStopRun) {
@@ -902,8 +943,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     const boost::json::object& command_request =
         RequireObject(arguments, "command");
     try {
-      command =
-          ParseAndValidateSimulationCommand(command_request, validation_options);
+      command = ParseAndValidateSimulationCommand(command_request,
+                                                  validation_options);
     } catch (const std::runtime_error& error) {
       const boost::json::value* command_kind =
           command_request.if_contains("kind");
@@ -984,10 +1025,10 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                : kSimulationCommandCancellationReconciliation;
         const SimulationCommandOutcome outcome = [&] {
           try {
-            return WaitForCommand(
-                sequence, stop_token, operation_control, cancellation_deadline,
-                terminal_deadline, reconciliation_bound,
-                node_add_operation ? &context : nullptr);
+            return WaitForCommand(sequence, stop_token, operation_control,
+                                  cancellation_deadline, terminal_deadline,
+                                  reconciliation_bound,
+                                  node_add_operation ? &context : nullptr);
           } catch (...) {
             DetachPendingCommand(sequence);
             throw;
@@ -1085,13 +1126,12 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                  : std::nullopt;
           const bool node_operation =
               typed_node_operation || node_add_operation;
-          const std::string code = capacity_failure ? "node_capacity_exceeded"
-                                   : resource_failure
-                                       ? "node_resource_unavailable"
-                                   : node_add_operation ? "node_add_failed"
-                                   : typed_node_operation
-                                       ? "node_operation_failed"
-                                       : "simulation_command_failed";
+          const std::string code =
+              capacity_failure       ? "node_capacity_exceeded"
+              : resource_failure     ? "node_resource_unavailable"
+              : node_add_operation   ? "node_add_failed"
+              : typed_node_operation ? "node_operation_failed"
+                                     : "simulation_command_failed";
           boost::json::array diagnostics;
           if (capacity_failure) {
             diagnostics =
@@ -1313,11 +1353,26 @@ boost::json::value McpLiveApplication::ReadResource(
                      ? ParseChainKind(config_.retained_run->chain)
                      : config_.options->chain)
                  .max_nodes},
-            {"available_node_capacity",
-             config_.retained_run ? 0U
-             : node_count <= node_capacity
-                 ? node_capacity - node_count
-                 : 0U}}});
+            {"available_node_capacity", config_.retained_run ? 0U
+                                        : node_count <= node_capacity
+                                            ? node_capacity - node_count
+                                            : 0U}}});
+  }
+
+  if (!config_.retained_run &&
+      (family == McpInformationFamily::kWorkloads ||
+       family == McpInformationFamily::kWorkloadHistory)) {
+    const std::shared_ptr<McpLiveWorkloadService> workload_service =
+        WorkloadService();
+    if (!workload_service) {
+      throw McpOperationFailure(
+          "workload_service_unavailable",
+          "the simulator workload lifecycle service is unavailable", true);
+    }
+    return ResourceEnvelope(
+        family, config_.run_id,
+        workload_service->read(family == McpInformationFamily::kWorkloadHistory,
+                               stop_token));
   }
 
   boost::json::object report = ReportSnapshot(stop_token);
@@ -1366,7 +1421,8 @@ boost::json::value McpLiveApplication::ReadResource(
     case McpInformationFamily::kWorkloads:
     case McpInformationFamily::kWorkloadHistory:
       data = SelectReportFields(
-          report, {"workloads", "scheduled_events_started",
+          report, {"workloads", "wallet_workload_instances",
+                   "wallet_workload_history", "scheduled_events_started",
                    "scheduled_events_completed", "scheduled_events_failed"});
       break;
     case McpInformationFamily::kProcesses:
@@ -1486,8 +1542,7 @@ std::uint64_t McpLiveApplication::SubmitCommand(SimulationCommand command) {
   return sequence;
 }
 
-void McpLiveApplication::DetachPendingCommand(
-    std::uint64_t sequence) noexcept {
+void McpLiveApplication::DetachPendingCommand(std::uint64_t sequence) noexcept {
   try {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto pending = pending_commands_.find(sequence);
@@ -1654,8 +1709,7 @@ void McpLiveApplication::RecordCommandOutcome(
       if (phase_mismatch) {
         mark_outcome_unconfirmed(
             "node-add outcome does not match its authoritative commit phase");
-      } else if (outcome.state ==
-                 SimulationCommandOutcomeState::kSucceeded) {
+      } else if (outcome.state == SimulationCommandOutcomeState::kSucceeded) {
         const std::optional<std::string> validation_error =
             NodeAddOutcomeError(command, outcome);
         const std::optional<std::uint64_t> initial_generation =
@@ -1667,8 +1721,7 @@ void McpLiveApplication::RecordCommandOutcome(
         } else if (!initial_generation ||
                    *initial_generation ==
                        std::numeric_limits<std::uint64_t>::max() ||
-                   *initial_generation + 1U !=
-                       *outcome.inventory_generation) {
+                   *initial_generation + 1U != *outcome.inventory_generation) {
           mark_outcome_unconfirmed(
               "successful node-add outcome reused or skipped its "
               "authoritative inventory generation");
@@ -1690,8 +1743,7 @@ void McpLiveApplication::RecordCommandOutcome(
               !std::equal(initial_node_ids->begin(), initial_node_ids->end(),
                           inventory.node_ids.begin()) ||
               !std::equal(
-                  outcome.added_node_ids.begin(),
-                  outcome.added_node_ids.end(),
+                  outcome.added_node_ids.begin(), outcome.added_node_ids.end(),
                   inventory.node_ids.begin() +
                       static_cast<std::vector<std::string>::difference_type>(
                           initial_node_ids->size()));
@@ -1707,16 +1759,14 @@ void McpLiveApplication::RecordCommandOutcome(
         }
       }
     } catch (const std::exception& error) {
-      mark_outcome_unconfirmed(
-          "node-add outcome reconciliation failed: " +
-          std::string(error.what()));
+      mark_outcome_unconfirmed("node-add outcome reconciliation failed: " +
+                               std::string(error.what()));
     } catch (...) {
       mark_outcome_unconfirmed(
           "node-add outcome reconciliation failed with an unknown exception");
     }
   }
-  std::optional<SimulationCommandOutcome> published_outcome =
-      validated_outcome;
+  std::optional<SimulationCommandOutcome> published_outcome = validated_outcome;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto pending = pending_commands_.find(command.sequence);
@@ -1876,6 +1926,29 @@ std::uint32_t McpLiveApplication::current_node_count() const {
   return NodeCount();
 }
 
+void McpLiveApplication::SetWorkloadService(
+    std::shared_ptr<McpLiveWorkloadService> service) {
+  if (config_.retained_run) {
+    throw std::logic_error(
+        "retained MCP application cannot install a workload service");
+  }
+  if (service && (!service->operation || !service->read)) {
+    throw std::invalid_argument(
+        "MCP workload service requires operation and read callbacks");
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (shutdown_) {
+    throw std::runtime_error("MCP live application is shutting down");
+  }
+  workload_service_ = std::move(service);
+}
+
+std::shared_ptr<McpLiveWorkloadService> McpLiveApplication::WorkloadService()
+    const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return workload_service_;
+}
+
 McpLiveNodeInventorySnapshot McpLiveApplication::LiveNodeInventory() const {
   if (config_.retained_run || !config_.node_inventory_snapshot) {
     throw std::logic_error("authoritative live node inventory is unavailable");
@@ -1898,8 +1971,8 @@ McpLiveNodeInventorySnapshot McpLiveApplication::LiveNodeInventory() const {
   return snapshot;
 }
 
-std::unique_lock<std::timed_mutex>
-McpLiveApplication::AcquirePublicationLock(std::stop_token stop_token) const {
+std::unique_lock<std::timed_mutex> McpLiveApplication::AcquirePublicationLock(
+    std::stop_token stop_token) const {
   if (!config_.publication_mutex) {
     return {};
   }
@@ -2042,6 +2115,7 @@ void McpLiveApplication::Shutdown() {
   run_stop_source_.request_stop();
   std::unique_lock<std::mutex> lock(mutex_);
   requests_drained_.wait(lock, [this] { return active_requests_ == 0U; });
+  workload_service_.reset();
 }
 
 }  // namespace bbp
