@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pty.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -154,6 +155,19 @@ class PtyProcess {
     }
   }
 
+  void Resize(unsigned short rows, unsigned short cols) const {
+    struct winsize size{};
+    size.ws_row = rows;
+    size.ws_col = cols;
+    if (ioctl(master_fd_, TIOCSWINSZ, &size) != 0) {
+      throw std::system_error(errno, std::generic_category(), "resize PTY");
+    }
+    if (kill(pid_, SIGWINCH) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "signal PTY resize");
+    }
+  }
+
   bool Running() const {
     return pid_ > 0 && (kill(pid_, 0) == 0 || errno == EPERM);
   }
@@ -272,6 +286,20 @@ class OwnedRunCopy {
     stream << event << '\n';
     if (!stream) {
       throw std::runtime_error("could not flush PTY test event");
+    }
+  }
+
+  void WriteSimulatorLog(const std::vector<std::string>& records) const {
+    std::ofstream stream(run_root_ / "simulator.log",
+                         std::ios::binary | std::ios::trunc);
+    if (!stream) {
+      throw std::runtime_error("could not create PTY simulator log");
+    }
+    for (const std::string& record : records) {
+      stream << record << '\n';
+    }
+    if (!stream) {
+      throw std::runtime_error("could not flush PTY simulator log");
     }
   }
 
@@ -1193,6 +1221,64 @@ std::string ActiveOperatorConnectionCommand(
          "'-listenonion=0' '-torsetup=0' '-upnp=0'";
 }
 
+void CheckSimulatorLogWrapping(const std::filesystem::path& command,
+                               const std::filesystem::path& source_run) {
+  OwnedRunCopy run(source_run, "simulator-log-wrap");
+  OwnedTemporaryDirectory home("simulator-log-wrap-home");
+  std::filesystem::create_directory(home.root() / "home");
+  const std::string generated_command =
+      "[2026-07-25 11:20:00.000000] [info] manual Firo GUI command: "
+      "'/home/navidr/work/firo/build/src/qt/firo-qt' '-regtest' "
+      "'-datadir=" +
+      (run.run_root() / "operator" / "firo-qt").string() +
+      "' '-connect=127.0.0.1:18168' '-dns=0' '-dnsseed=0' "
+      "'-forcednsseed=0' '-maxconnections=1' '-listen=0' '-discover=0' "
+      "'-listenonion=0' '-torsetup=0' '-upnp=0' LOG_WRAP_COMMAND_END";
+  run.WriteSimulatorLog({"[2026-07-25 11:19:59.000000] [info] simulator ready",
+                         generated_command});
+
+  PtyProcess process(command,
+                     {"--run", run.run_root().string(), "--refresh-ms", "50"},
+                     24, 80, home.root() / "home");
+  std::string rendered =
+      process.ReadUntil("LOG_WRAP_COMMAND_END", 5s, "80x24 simulator-log tail");
+  RequireContains(rendered, "Simulator Logs [",
+                  "80x24 simulator-log pane title");
+
+  process.Write(std::string(96U, '['));
+  rendered += process.ReadUntil("manual Firo GUI command:", 5s,
+                                "80x24 simulator-log upward scroll");
+  for (const std::string_view expected :
+       {"manual Firo GUI command:", "firo/build/src/qt/firo-qt", "'-regtest'",
+        "'-datadir=", "operator/firo-qt'", "'-connect=127.0.0.1:18168'",
+        "'-dnsseed=0'", "'-forcednsseed=0'", "'-maxconnections=1'",
+        "'-listen=0'", "'-discover=0'", "'-listenonion=0'", "'-torsetup=0'",
+        "'-upnp=0'", "LOG_WRAP_COMMAND_END"}) {
+    RequireContains(rendered, expected, "80x24 scrolled Firo-Qt command");
+  }
+
+  process.Resize(30, 120);
+  std::string resized = process.ReadUntil(
+      "manual Firo GUI command:", 5s, "120x30 resized simulator-log anchor");
+  resized += process.ReadFor(200ms);
+  RequireContains(resized, "Blockchain Benchmark Project TUI",
+                  "120x30 resized title");
+  RequireContains(resized, "Simulator Logs [",
+                  "120x30 resized simulator-log pane title");
+  RequireContains(resized, "Logs [/] row, PgUp/PgDn page, Home/End.",
+                  "120x30 resized simulator-log footer");
+
+  process.Write(std::string(96U, ']'));
+  resized += process.ReadFor(2s);
+  RequireContains(resized, "LOG_WRAP_COMMAND_END",
+                  "120x30 simulator-log downward scroll");
+  RequireContains(resized, "'-maxconnections=1'",
+                  "120x30 reflowed Firo-Qt command");
+  RequireContains(resized, "'-upnp=0'", "120x30 reflowed Firo-Qt command");
+  process.Write("q");
+  RequireExitZero(&process, "simulator-log wrapping TUI");
+}
+
 std::filesystem::path CopyActiveDaemonFixtures(
     const std::filesystem::path& helper_binary,
     const std::filesystem::path& directory) {
@@ -1426,6 +1512,18 @@ int main(int argc, char** argv) {
       return 0;
     } catch (const std::exception& error) {
       std::cerr << "empty control-plane regression failed: " << error.what()
+                << '\n';
+      return 1;
+    }
+  }
+  if (argc == 4 && std::string_view(argv[1]) == "--simulator-log-wrap") {
+    try {
+      CheckSimulatorLogWrapping(argv[2], argv[3]);
+      std::cout << "simulator-log visual-row wrapping, scrolling, and resize "
+                   "checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "simulator-log wrapping regression failed: " << error.what()
                 << '\n';
       return 1;
     }

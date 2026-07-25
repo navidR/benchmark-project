@@ -38,6 +38,7 @@
 #include "bbp/run_report.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulator/workload_kind.h"
+#include "bbp/simulator_log_pane.h"
 #include "bbp/topology_partition_resolver.h"
 #include "bbp/tui_command_admission.h"
 #include "bbp/tui_command_parser.h"
@@ -73,6 +74,7 @@ struct TuiState {
   TuiView view = TuiView::kNodes;
   NodeFilePane node_file_pane;
   NodeLogPane node_log_pane;
+  SimulatorLogPane simulator_log_pane;
   PeerListPane peer_list_pane;
   NetworkRulePane network_rule_pane;
   std::string command_status;
@@ -95,6 +97,7 @@ void ResetRunUiState(TuiState* state) {
   state->selected_topology_group = 0U;
   state->node_file_pane.Close();
   state->node_log_pane.Close();
+  state->simulator_log_pane = SimulatorLogPane{};
   state->peer_list_pane.Close();
   state->network_rule_pane.Close();
   state->command_status.clear();
@@ -1121,29 +1124,47 @@ int LogPaneRows(int rows) {
 }
 
 void DrawLogPane(int top, int rows, int cols,
-                 const std::vector<std::string>& log_lines) {
+                 const std::vector<std::string>& log_lines,
+                 SimulatorLogPane* log_pane) {
   if (top <= 0 || cols <= 0 || rows - top < 4) {
     return;
   }
   DrawHorizontalLine(top);
-  AddText(top + 1, 0, cols, "Simulator Logs", A_BOLD);
   const int first_line = top + 2;
   const int last_line = rows - 3;
   const int capacity = last_line - first_line + 1;
-  if (capacity <= 0) {
+  constexpr std::string_view kFirstRowPrefix = "> ";
+  constexpr std::string_view kContinuationPrefix = "| ";
+  const int content_width = cols - static_cast<int>(kFirstRowPrefix.size());
+  if (capacity <= 0 || content_width <= 0 || log_pane == nullptr) {
     return;
   }
-  if (log_lines.empty()) {
+  log_pane->Refresh(log_lines, static_cast<std::size_t>(content_width),
+                    static_cast<std::size_t>(capacity));
+  const std::vector<SimulatorLogVisualRow>& visual_rows = log_pane->Rows();
+  std::string title = "Simulator Logs";
+  if (!visual_rows.empty()) {
+    title += " [" + std::to_string(log_pane->FirstVisibleRow() + 1U) + "-" +
+             std::to_string(log_pane->LastVisibleRow()) + "/" +
+             std::to_string(visual_rows.size()) + " visual rows]";
+  }
+  AddText(top + 1, 0, cols, title, A_BOLD);
+  if (visual_rows.empty()) {
     AddText(first_line, 0, cols, "No log output.", COLOR_PAIR(kColorMuted));
     return;
   }
-  const std::size_t line_count = static_cast<std::size_t>(capacity);
-  const std::size_t first_log =
-      log_lines.size() > line_count ? log_lines.size() - line_count : 0U;
-  const std::size_t visible_lines = log_lines.size() - first_log;
-  int y = last_line - static_cast<int>(visible_lines) + 1;
-  for (std::size_t i = first_log; i < log_lines.size() && y <= last_line; ++i) {
-    AddText(y, 0, cols, log_lines[i]);
+
+  const std::size_t first = log_pane->FirstVisibleRow();
+  const std::size_t last = log_pane->LastVisibleRow();
+  const std::size_t visible_rows = last - first;
+  int y = last_line - static_cast<int>(visible_rows) + 1;
+  for (std::size_t index = first; index < last && y <= last_line; ++index) {
+    const SimulatorLogVisualRow& row = visual_rows[index];
+    const std::string_view prefix =
+        row.starts_record ? kFirstRowPrefix : kContinuationPrefix;
+    AddText(y, 0, static_cast<int>(prefix.size()), prefix,
+            row.starts_record ? A_BOLD : COLOR_PAIR(kColorMuted));
+    AddText(y, static_cast<int>(prefix.size()), content_width, row.text);
     ++y;
   }
 }
@@ -2137,7 +2158,8 @@ void DrawFrameBody(const std::filesystem::path& run_root,
                    const PeerListPane& peer_list_pane,
                    const NetworkRulePane& network_rule_pane,
                    const NodeFilePane& node_file_pane,
-                   std::string_view command_status) {
+                   std::string_view command_status,
+                   SimulatorLogPane* simulator_log_pane) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -2157,7 +2179,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
     AddText(5, 0, cols, "error: " + std::string(error),
             COLOR_PAIR(kColorWarning) | A_BOLD);
     if (log_rows != 0) {
-      DrawLogPane(log_top, rows, cols, log_lines);
+      DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane);
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
@@ -2285,7 +2307,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
                                      : "No node metric histories in report.";
     AddText(13, 0, cols, empty_text, COLOR_PAIR(kColorMuted));
     if (log_rows != 0) {
-      DrawLogPane(log_top, rows, cols, log_lines);
+      DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane);
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
@@ -2475,7 +2497,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   }
 
   if (log_rows != 0) {
-    DrawLogPane(log_top, rows, cols, log_lines);
+    DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane);
   }
   DrawNodeLogPane(content_bottom, cols, node_log_pane);
   DrawPeerListPane(content_bottom, cols, peer_list_pane);
@@ -2502,8 +2524,8 @@ void DrawFrameBody(const std::filesystem::path& run_root,
         "u reloads; b closes.";
   } else {
     footer +=
-        "Tab/n/w/g/h view. Arrows select. b files. p peers. a rules. c "
-        "command. e export. "
+        "Logs [/] row, PgUp/PgDn page, Home/End. Arrows select. Tab/n/w/g/h "
+        "view. b files. p peers. a rules. c command. e export. "
         "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. Esc "
         "asks; q exits.";
   }
@@ -2524,11 +2546,12 @@ void DrawSummary(
     const std::filesystem::path& firo_qt_launcher_path,
     std::string_view firo_qt_launcher_command,
     const std::optional<PendingConfirmation>& pending_confirmation,
-    const TuiExitConfirmation& exit_confirmation) {
+    const TuiExitConfirmation& exit_confirmation,
+    SimulatorLogPane* simulator_log_pane) {
   DrawFrameBody(run_root, report, error, log_lines, view, selected_node,
                 selected_wallet, selected_topology_group, node_log_pane,
                 peer_list_pane, network_rule_pane, node_file_pane,
-                command_status);
+                command_status, simulator_log_pane);
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -2957,6 +2980,32 @@ bool HandleFiroQtLauncherDialogInput(int ch, TuiState* state) {
   return ch != ERR;
 }
 
+bool HandleSimulatorLogInput(int ch, TuiState* state) {
+  if (state->view == TuiView::kMetrics || state->node_log_pane.IsOpen() ||
+      state->peer_list_pane.IsOpen() || state->network_rule_pane.IsOpen() ||
+      state->node_file_pane.IsOpen()) {
+    return false;
+  }
+  const std::size_t page_rows =
+      std::max<std::size_t>(state->simulator_log_pane.VisibleRowCount(), 1U);
+  if (ch == '[') {
+    state->simulator_log_pane.ScrollUp(1U);
+  } else if (ch == ']') {
+    state->simulator_log_pane.ScrollDown(1U);
+  } else if (ch == KEY_PPAGE) {
+    state->simulator_log_pane.ScrollUp(page_rows);
+  } else if (ch == KEY_NPAGE) {
+    state->simulator_log_pane.ScrollDown(page_rows);
+  } else if (ch == KEY_HOME) {
+    state->simulator_log_pane.ScrollHome();
+  } else if (ch == KEY_END) {
+    state->simulator_log_pane.ScrollEnd();
+  } else {
+    return false;
+  }
+  return true;
+}
+
 bool HandleInput(int ch, const std::filesystem::path& run_root,
                  const boost::json::object& report,
                  SimulationCommandQueue* command_queue, TuiState* state) {
@@ -2991,6 +3040,10 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
     state->command_palette_open = true;
     state->command_input.clear();
     state->command_input_error.clear();
+    return true;
+  }
+
+  if (HandleSimulatorLogInput(ch, state)) {
     return true;
   }
 
@@ -3383,7 +3436,7 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
                   state.firo_qt_launcher ? state.firo_qt_launcher->path()
                                          : std::filesystem::path{},
                   state.firo_qt_launcher_command, state.pending_confirmation,
-                  state.exit_confirmation);
+                  state.exit_confirmation, &state.simulator_log_pane);
     } else {
       DrawEmptySummary(state.exit_confirmation);
     }
@@ -3402,6 +3455,9 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
         break;
       }
       const int ch = getch();
+      if (ch == KEY_RESIZE) {
+        break;
+      }
       const bool palette_was_open = state.command_palette_open;
       SimulationCommandQueue* const command_queue =
           snapshot->run_root.empty() ? nullptr : snapshot->command_queue.get();

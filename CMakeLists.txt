@@ -284,6 +284,7 @@ add_executable(bbp
   src/simulation_time_scale.cpp
   src/signal_stop_monitor.cpp
   src/simulator_app.cpp
+  src/simulator_log_pane.cpp
   src/tui.cpp
   src/tui_command_admission.cpp
   src/tui_command_parser.cpp
@@ -421,6 +422,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_command_tests.cpp
     tests/unit/simulation_event_kind_tests.cpp
     tests/unit/simulation_registry_tests.cpp
+    tests/unit/simulator_log_pane_tests.cpp
     tests/unit/simulation_policy_tests.cpp
     tests/unit/simulation_time_scale_tests.cpp
     tests/unit/signal_stop_monitor_tests.cpp
@@ -507,6 +509,7 @@ if(BUILD_TESTING)
     src/simulation_policy.cpp
     src/simulation_time_scale.cpp
     src/signal_stop_monitor.cpp
+    src/simulator_log_pane.cpp
     src/tui_command_parser.cpp
     src/tui_command_admission.cpp
     src/tui_exit_confirmation.cpp
@@ -1847,6 +1850,12 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
       $<TARGET_FILE:bbp>
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-live-load"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+  )
+  add_test(NAME bbp-tui-simulator-log-wrap
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --simulator-log-wrap
+      $<TARGET_FILE:bbp>
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
   )
   add_test(NAME bbp-empty-control-plane-lifecycle
