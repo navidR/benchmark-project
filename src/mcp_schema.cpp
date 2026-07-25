@@ -241,10 +241,12 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "generate_blocks" || field == "isolated_network") {
     return TypeSchema("boolean");
   }
+  if (field == "bandwidth_kbps") {
+    return IntegerSchema();
+  }
   if (field == "probability" || field == "difficulty" ||
       field == "time_scale" || field == "transaction_rate" ||
-      field == "bandwidth_mbps" || field == "loss_percent" ||
-      field == "retained_balance_percentage") {
+      field == "loss_percent" || field == "retained_balance_percentage") {
     return NumberSchema();
   }
   if (field == "amount" || field == "fee" || field == "funding_threshold" ||

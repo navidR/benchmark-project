@@ -839,7 +839,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
       "\"read_bytes_per_sec\":1048576}],"
       "\"pids_current\":2,\"oom_kill\":0,"
       "\"network_rx_bytes\":100,\"network_tx_bytes\":200,"
-      "\"network_condition\":{\"bandwidth_mbps\":20,"
+      "\"network_condition\":{\"bandwidth_kbps\":20,"
       "\"delay_ms\":80,\"jitter_ms\":10,"
       "\"loss_basis_points\":11,\"duplicate_basis_points\":12,"
       "\"corrupt_basis_points\":13,\"reorder_basis_points\":14,"
@@ -1194,7 +1194,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_events_and_last_metrics) {
   BOOST_TEST(JsonInteger(last_metrics, "network_tx_bytes") == 200U);
   const boost::json::object& network_condition =
       last_metrics.at("network_condition").as_object();
-  BOOST_TEST(JsonInteger(network_condition, "bandwidth_mbps") == 20U);
+  BOOST_TEST(JsonInteger(network_condition, "bandwidth_kbps") == 20U);
   BOOST_TEST(JsonInteger(network_condition, "delay_ms") == 80U);
   BOOST_TEST(JsonInteger(network_condition, "jitter_ms") == 10U);
   BOOST_TEST(JsonInteger(network_condition, "loss_basis_points") == 11U);
@@ -1342,7 +1342,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_network_partition_events) {
   bbp::AppendLine(dir / "events.jsonl",
                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
                   "\"event\":\"network_condition_updated\","
-                  "\"detail\":\"{\\\"bandwidth_mbps\\\":20,"
+                  "\"detail\":\"{\\\"bandwidth_kbps\\\":20,"
                   "\\\"operator_command_sequence\\\":7}\"}");
   bbp::AppendLine(dir / "events.jsonl",
                   "{\"run_id\":\"r1\",\"node_id\":\"firo-1\","
@@ -1418,7 +1418,7 @@ BOOST_AUTO_TEST_CASE(
   boost::json::object condition;
   condition["from"] = 1U;
   condition["to"] = 2U;
-  condition["bandwidth_mbps"] = 9U;
+  condition["bandwidth_kbps"] = 9U;
   condition["delay_ms"] = 40U;
   condition["jitter_ms"] = 3U;
   condition["loss_basis_points"] = 5U;
@@ -1509,7 +1509,7 @@ BOOST_AUTO_TEST_CASE(run_report_reduces_successful_topology_edge_updates) {
                   "\"event\":\"run_started\"}");
   boost::json::object conditioned = initial_first;
   boost::json::object condition;
-  condition["bandwidth_mbps"] = 12U;
+  condition["bandwidth_kbps"] = 12U;
   condition["delay_ms"] = 35U;
   conditioned["condition"] = condition;
   boost::json::object condition_detail;
@@ -2080,7 +2080,7 @@ BOOST_AUTO_TEST_CASE(run_report_builds_topology_groups_and_node_exports) {
   const std::filesystem::path dir = MakeTestDir("run-report-topology-groups");
   bbp::WriteText(
       dir / "resolved-scenario.json",
-      R"({"run_id":"r1","chain":"firo","nodes":3,"topology":{"type":"partitioned_groups","groups":[[1,2],[3]]},"topology_initial_edges":[{"from":1,"to":2,"band":1,"active":true,"condition":{"bandwidth_mbps":5,"delay_ms":10}},{"from":2,"to":1,"band":1,"active":true,"condition":null}],"node_configs":[{"index":1,"id":"firo-1","chain":"firo","role":"miner"},{"index":2,"id":"firo-2","chain":"firo","role":"base"},{"index":3,"id":"firo-3","chain":"firo","role":"wallet"}]})"
+      R"({"run_id":"r1","chain":"firo","nodes":3,"topology":{"type":"partitioned_groups","groups":[[1,2],[3]]},"topology_initial_edges":[{"from":1,"to":2,"band":1,"active":true,"condition":{"bandwidth_kbps":5,"delay_ms":10}},{"from":2,"to":1,"band":1,"active":true,"condition":null}],"node_configs":[{"index":1,"id":"firo-1","chain":"firo","role":"miner"},{"index":2,"id":"firo-2","chain":"firo","role":"base"},{"index":3,"id":"firo-3","chain":"firo","role":"wallet"}]})"
       "\n");
   for (const std::string_view node_id : {"firo-1", "firo-2", "firo-3"}) {
     bbp::AppendLine(dir / "events.jsonl",
@@ -2101,7 +2101,7 @@ BOOST_AUTO_TEST_CASE(run_report_builds_topology_groups_and_node_exports) {
       R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":1000,"network_rx_bytes":100,"network_tx_bytes":200})");
   bbp::AppendLine(
       dir / "metrics.jsonl",
-      R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":2000,"network_rx_bytes":300,"network_tx_bytes":600,"network_condition":{"bandwidth_mbps":0,"delay_ms":80},"network_active_block_rules":[{"handle":77,"dst_address":"10.0.0.2","dst_port":18168}],"perf_counter_target_kind":"group","perf_counter_target_id":"topology-1","perf_counters_available":true,"perf_counter_names":["cycles"],"perf_counters":[{"name":"cycles","raw_value":18446744073709551610,"scaled_value":18446744073709551613,"time_enabled_ns":18446744073709551614,"time_running_ns":100,"multiplexed":true,"scaled":true,"scaled_overflow":false}]})");
+      R"({"run_id":"r1","node_id":"firo-1","timestamp_ms":2000,"network_rx_bytes":300,"network_tx_bytes":600,"network_condition":{"bandwidth_kbps":0,"delay_ms":80},"network_active_block_rules":[{"handle":77,"dst_address":"10.0.0.2","dst_port":18168}],"perf_counter_target_kind":"group","perf_counter_target_id":"topology-1","perf_counters_available":true,"perf_counter_names":["cycles"],"perf_counters":[{"name":"cycles","raw_value":18446744073709551610,"scaled_value":18446744073709551613,"time_enabled_ns":18446744073709551614,"time_running_ns":100,"multiplexed":true,"scaled":true,"scaled_overflow":false}]})");
   bbp::AppendLine(
       dir / "metrics.jsonl",
       R"({"run_id":"r1","node_id":"firo-2","timestamp_ms":1000,"network_rx_bytes":50,"network_tx_bytes":100})");

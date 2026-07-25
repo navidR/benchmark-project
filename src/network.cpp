@@ -420,7 +420,7 @@ bool HasNetemCondition(const NetworkCondition& condition) {
 }
 
 bool HasBandwidthCondition(const NetworkCondition& condition) {
-  return condition.bandwidth_mbps != 0U;
+  return condition.bandwidth_kbps != 0U;
 }
 
 in_addr ParseIpv4Address(const std::string& address,
@@ -504,9 +504,14 @@ std::uint32_t NetemProbability(std::uint32_t basis_points) {
 }
 
 std::uint64_t TbfRateBytesPerSecond(const NetworkCondition& condition) {
-  constexpr std::uint64_t kBytesPerMegabit = 1000000ULL / 8ULL;
-  return static_cast<std::uint64_t>(condition.bandwidth_mbps) *
-         kBytesPerMegabit;
+  constexpr std::uint64_t kBytesPerDecimalKilobyte = 1000ULL;
+  const std::uint64_t bandwidth_kbps = condition.bandwidth_kbps;
+  if (bandwidth_kbps >
+      std::numeric_limits<std::uint64_t>::max() / kBytesPerDecimalKilobyte) {
+    throw std::overflow_error(
+        "TBF bandwidth conversion exceeds uint64 bytes per second");
+  }
+  return bandwidth_kbps * kBytesPerDecimalKilobyte;
 }
 
 std::string Ipv4ToString(const void* payload) {
@@ -3425,7 +3430,7 @@ void ReplaceTbfQdisc(const std::string& if_name, std::uint32_t parent,
                      std::uint32_t handle, const NetworkCondition& condition) {
   RequireInterfaceName(if_name);
   ValidateNetworkCondition(condition);
-  if (condition.bandwidth_mbps == 0U) {
+  if (condition.bandwidth_kbps == 0U) {
     throw std::runtime_error("TBF bandwidth must be greater than zero");
   }
   const unsigned int if_index = if_nametoindex(if_name.c_str());
@@ -4120,7 +4125,7 @@ NetworkConditionProbe ProbeCombinedNetworkCondition() {
   NetworkConditionProbe probe;
   probe.host_name = ProbeName('h');
   probe.peer_name = ProbeName('p');
-  probe.condition.bandwidth_mbps = 20;
+  probe.condition.bandwidth_kbps = 20;
   probe.condition.delay_ms = 40;
   probe.condition.jitter_ms = 5;
   probe.condition.loss_basis_points = 10;
@@ -4200,7 +4205,7 @@ BandwidthLimitProbe ProbeBandwidthLimit() {
   BandwidthLimitProbe probe;
   probe.host_name = ProbeName('h');
   probe.peer_name = ProbeName('p');
-  probe.condition.bandwidth_mbps = 20;
+  probe.condition.bandwidth_kbps = 20;
 
   pid_t helper_pid = -1;
   UniqueFd namespace_fd = StartNetworkNamespaceHelper(&helper_pid);
@@ -4414,7 +4419,7 @@ DirectionalNetworkPolicyProbe ProbeDirectionalNetworkPolicies() {
   DirectionalNetworkPolicy combined_policy;
   combined_policy.band = 2;
   combined_policy.destination_address = "198.51.100.11";
-  combined_policy.condition.bandwidth_mbps = 20;
+  combined_policy.condition.bandwidth_kbps = 20;
   combined_policy.condition.delay_ms = 15;
   combined_policy.condition.limit_packets = 512;
   probe.policies = {delay_policy, combined_policy};

@@ -87,7 +87,7 @@ BOOST_AUTO_TEST_CASE(directional_network_policies_keep_canonical_edge_bands) {
   bbp::NetworkCondition delayed;
   delayed.delay_ms = 25U;
   bbp::NetworkCondition limited;
-  limited.bandwidth_mbps = 8U;
+  limited.bandwidth_kbps = 8U;
 
   bbp::PeerTopologyConfig topology;
   topology.kind = bbp::PeerTopologyKind::kCustomEdgeList;

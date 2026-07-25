@@ -30,7 +30,7 @@
       "action": "set_edge_condition",
       "from": 1,
       "to": 2,
-      "bandwidth_mbps": 20,
+      "bandwidth_kbps": 20,
       "delay_ms": 25,
       "jitter_ms": 2
     },

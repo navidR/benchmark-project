@@ -181,7 +181,8 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --network-delay-ms 5'
 ```
 
-Isolated Firo node with a bandwidth limit:
+Isolated Firo node with a bandwidth limit. Bandwidth values are unsigned
+decimal kilobytes per second (`1` = 1,000 bytes/s); `0` means unlimited:
 
 ```bash
 docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
@@ -200,7 +201,7 @@ docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
      --metrics-interval 250ms \
      --ready-timeout-sec 45 \
      --isolate-network \
-     --network-bandwidth-mbps 20'
+     --network-bandwidth-kbps 2500'
 ```
 
 Per-node isolated network conditions use repeatable JSON objects:
@@ -218,7 +219,7 @@ Per-node isolated network conditions use repeatable JSON objects:
   --metrics-sample-count 4 \
   --metrics-interval 250ms \
   --isolate-network \
-  --node-network-condition-json '{"node":2,"bandwidth_mbps":20}'
+  --node-network-condition-json '{"node":2,"bandwidth_kbps":2500}'
 ```
 
 Runtime network updates use the same JSON shape and are applied after nodes are
@@ -237,7 +238,7 @@ running, while scheduled block production and metrics collection continue:
   --metrics-sample-count 4 \
   --metrics-interval 250ms \
   --isolate-network \
-  --runtime-node-network-condition-json '{"node":2,"bandwidth_mbps":10}'
+  --runtime-node-network-condition-json '{"node":2,"bandwidth_kbps":1250}'
 ```
 
 Runtime block/unblock rules match a destination IPv4 address and TCP port on a
@@ -679,7 +680,7 @@ directed `resolved_edges` array is written to `resolved-scenario.json`.
 `average_degree`; `scale_free_graph` accepts `seed` plus either
 `attachment_count` or `average_degree`. A custom edge has `from`, `to`,
 `bidirectional`, and `active` fields. It may also define the flattened typed
-condition fields `bandwidth_mbps`, `delay_ms`, `jitter_ms`,
+condition fields `bandwidth_kbps`, `delay_ms`, `jitter_ms`,
 `loss_basis_points`, `duplicate_basis_points`, `corrupt_basis_points`,
 `reorder_basis_points`, and `limit_packets`. The compatibility field
 `latency_ms` maps to `delay_ms`; when both are present, their values must match.
@@ -731,7 +732,7 @@ both the configured active state and configured condition.
       "action": "set_edge_condition",
       "from": 1,
       "to": 2,
-      "bandwidth_mbps": 10,
+      "bandwidth_kbps": 1250,
       "delay_ms": 40
     },
     {

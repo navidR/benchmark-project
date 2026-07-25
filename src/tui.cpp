@@ -1448,7 +1448,7 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   AddText(top + 13, left + 2, popup_cols - 4,
           "resource-limit io-weight <weight>  pids-max <count>");
   AddText(top + 14, left + 2, popup_cols - 4,
-          "network-condition <mbps> <delay> <jitter> <loss> <dup> <corrupt> "
+          "network-condition <kB/s> <delay> <jitter> <loss> <dup> <corrupt> "
           "<reorder> [limit]");
   AddText(top + 15, left + 2, popup_cols - 4,
           "block|unblock <dst-ip> <port> [src-ip|*] [src-port]");
@@ -1829,7 +1829,7 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
     return;
   }
   AddDetailPair(y, 0, left_width, "condition bw / delay / loss",
-                NetworkConditionText(metric_object, "bandwidth_mbps", "M") +
+                NetworkConditionText(metric_object, "bandwidth_kbps", "kB/s") +
                     " / " +
                     NetworkConditionText(metric_object, "delay_ms", "ms") +
                     " / " + NetworkLossText(metric_object));
@@ -2226,7 +2226,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
       AddText(11, 150, 8, "Drops", A_BOLD);
       AddText(11, 158, 8, "Delay", A_BOLD);
       AddText(11, 166, 8, "Loss", A_BOLD);
-      AddText(11, 174, 10, "Bandwidth", A_BOLD);
+      AddText(11, 174, 10, "BW kB/s", A_BOLD);
       AddText(11, 184, std::max(0, cols - 184), "Last error", A_BOLD);
     } else {
       AddText(11, 0, 10, "Node [n]", A_BOLD);
@@ -2382,7 +2382,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
                 attributes);
         AddText(y, 166, 8, NetworkLossText(metric_object), attributes);
         AddText(y, 174, 10,
-                NetworkConditionText(metric_object, "bandwidth_mbps", "M"),
+                NetworkConditionText(metric_object, "bandwidth_kbps", "kB/s"),
                 attributes);
         AddText(y, 184, std::max(0, cols - 184),
                 JsonMetricText(*node, "last_error"), attributes);

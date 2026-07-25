@@ -152,7 +152,7 @@ struct TcFilterStatsSummary {
 };
 
 struct NetworkCondition {
-  std::uint32_t bandwidth_mbps = 0;
+  std::uint32_t bandwidth_kbps = 0;
   std::uint32_t delay_ms = 0;
   std::uint32_t jitter_ms = 0;
   std::uint32_t loss_basis_points = 0;
@@ -543,10 +543,9 @@ void UpdateDirectionalNetworkPoliciesInNamespace(
     const std::vector<DirectionalNetworkPolicy>& previous,
     const std::vector<DirectionalNetworkPolicy>& desired,
     std::stop_token stop_token = {});
-void SetupNodeVethNetwork(
-    int netns_fd, const NodeVethConfig& config,
-    std::optional<NodeVethIdentity>* acquired_identity,
-    std::stop_token stop_token = {});
+void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
+                          std::optional<NodeVethIdentity>* acquired_identity,
+                          std::stop_token stop_token = {});
 void DeleteNodeVethNetwork(const NodeVethConfig& config,
                            std::stop_token stop_token = {});
 void DeleteNodeVethNetwork(const NodeVethConfig& config,
@@ -556,8 +555,8 @@ void DeleteNodeVethNetwork(const NodeVethConfig& config,
 std::optional<int> ResolveNodeVethDeletionIndexForTest(
     const NodeVethConfig& config, const NodeVethIdentity& acquired_identity,
     const std::vector<LinkInfo>& links);
-void RequireIntentOnlyNodeVethAbsentForTest(
-    const NodeVethConfig& config, const std::vector<LinkInfo>& links);
+void RequireIntentOnlyNodeVethAbsentForTest(const NodeVethConfig& config,
+                                            const std::vector<LinkInfo>& links);
 #endif
 VethProbe ProbeVethPair();
 AddressProbe ProbeIpv4AddressAssignment();

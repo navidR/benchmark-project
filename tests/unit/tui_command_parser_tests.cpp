@@ -316,7 +316,7 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_network_commands) {
   BOOST_CHECK(condition.kind ==
               bbp::SimulationCommandKind::kSetNetworkCondition);
   BOOST_REQUIRE(condition.network_condition);
-  BOOST_TEST(condition.network_condition->bandwidth_mbps == 20U);
+  BOOST_TEST(condition.network_condition->bandwidth_kbps == 20U);
   BOOST_TEST(condition.network_condition->delay_ms == 80U);
   BOOST_TEST(condition.network_condition->jitter_ms == 10U);
   BOOST_TEST(condition.network_condition->loss_basis_points == 11U);
@@ -379,6 +379,12 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_network_commands) {
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_network_commands) {
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1.5 0 0 0 0 0 0", 0U),
+      std::exception);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("network-condition 1kB/s 0 0 0 0 0 0", 0U),
+      std::exception);
   BOOST_CHECK_THROW(
       bbp::TuiCommandParser::Parse("network-condition 1 4294968 0 0 0 0 0", 0U),
       std::runtime_error);

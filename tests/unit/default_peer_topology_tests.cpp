@@ -158,7 +158,7 @@ BOOST_AUTO_TEST_CASE(peer_topology_latency_matrix_preserves_direction) {
 
 BOOST_AUTO_TEST_CASE(peer_topology_custom_edges_preserve_typed_conditions) {
   bbp::NetworkCondition condition;
-  condition.bandwidth_mbps = 7U;
+  condition.bandwidth_kbps = 7U;
   condition.delay_ms = 23U;
   condition.jitter_ms = 4U;
   condition.loss_basis_points = 5U;
@@ -257,7 +257,7 @@ BOOST_AUTO_TEST_CASE(peer_topology_partitioned_groups_isolate_groups) {
 
 BOOST_AUTO_TEST_CASE(peer_topology_region_graph_uses_region_gateways) {
   bbp::NetworkCondition regional;
-  regional.bandwidth_mbps = 12U;
+  regional.bandwidth_kbps = 12U;
   regional.delay_ms = 40U;
   regional.jitter_ms = 3U;
   regional.loss_basis_points = 5U;

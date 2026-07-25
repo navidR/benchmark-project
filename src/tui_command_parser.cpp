@@ -483,12 +483,12 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
     if (tokens[0] == "network-condition") {
       if (tokens.size() != 8U && tokens.size() != 9U) {
         throw std::runtime_error(
-            "usage: network-condition <bandwidth-mbps> <delay-ms> "
+            "usage: network-condition <bandwidth-kbps> <delay-ms> "
             "<jitter-ms> <loss-bps> <duplicate-bps> <corrupt-bps> "
             "<reorder-bps> [limit-packets]");
       }
       NetworkCondition condition;
-      condition.bandwidth_mbps = boost::lexical_cast<std::uint32_t>(tokens[1]);
+      condition.bandwidth_kbps = boost::lexical_cast<std::uint32_t>(tokens[1]);
       condition.delay_ms = boost::lexical_cast<std::uint32_t>(tokens[2]);
       condition.jitter_ms = boost::lexical_cast<std::uint32_t>(tokens[3]);
       condition.loss_basis_points =

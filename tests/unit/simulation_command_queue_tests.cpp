@@ -335,7 +335,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_node_add_request) {
           },
       .network =
           bbp::NetworkCondition{
-              .bandwidth_mbps = 100U,
+              .bandwidth_kbps = 100U,
               .delay_ms = 5U,
           },
       .ready_timeout_sec = 11U,
@@ -623,7 +623,7 @@ BOOST_AUTO_TEST_CASE(
     simulation_command_queue_preserves_typed_network_condition) {
   bbp::SimulationCommandQueue queue;
   const bbp::NetworkCondition condition{
-      .bandwidth_mbps = 20U,
+      .bandwidth_kbps = 20U,
       .delay_ms = 80U,
       .jitter_ms = 10U,
       .loss_basis_points = 11U,

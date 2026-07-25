@@ -119,12 +119,12 @@ std::span<const std::string_view> ScenarioObjectFields(
       Fields("node", "all_peers", "min_peer_count", "max_peer_count");
   static constexpr auto kTopologyEdge =
       Fields("from", "to", "bidirectional", "active", "latency_ms",
-             "bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+             "bandwidth_kbps", "delay_ms", "jitter_ms", "loss_basis_points",
              "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
              "reorder_basis_points", "limit_packets");
   static constexpr auto kTopologyRegionEdge =
       Fields("from_region", "to_region", "bidirectional", "active",
-             "latency_ms", "bandwidth_mbps", "delay_ms", "jitter_ms",
+             "latency_ms", "bandwidth_kbps", "delay_ms", "jitter_ms",
              "loss_basis_points", "loss_percent", "duplicate_basis_points",
              "corrupt_basis_points", "reorder_basis_points", "limit_packets");
   static constexpr auto kDistribution = Fields("distribution", "min", "max");
@@ -142,11 +142,11 @@ std::span<const std::string_view> ScenarioObjectFields(
       Fields("node", "memory_high_bytes", "memory_max_bytes", "cpu_quota_us",
              "cpu_period_us", "cpu_weight", "io_weight", "io_max", "pids_max");
   static constexpr auto kNetworkCondition =
-      Fields("bandwidth_mbps", "delay_ms", "jitter_ms", "loss_basis_points",
+      Fields("bandwidth_kbps", "delay_ms", "jitter_ms", "loss_basis_points",
              "loss_percent", "duplicate_basis_points", "corrupt_basis_points",
              "reorder_basis_points", "limit_packets");
   static constexpr auto kNodeNetworkCondition =
-      Fields("node", "bandwidth_mbps", "delay_ms", "jitter_ms",
+      Fields("node", "bandwidth_kbps", "delay_ms", "jitter_ms",
              "loss_basis_points", "loss_percent", "duplicate_basis_points",
              "corrupt_basis_points", "reorder_basis_points", "limit_packets");
   static constexpr auto kNetworkBlockRule = Fields(
@@ -321,7 +321,7 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
              "memory_max_bytes", "cpu_quota_us", "cpu_period_us", "cpu_weight",
              "io_weight", "io_max", "pids_max");
   static constexpr auto kCondition =
-      Fields("node", "nodes", "bandwidth_mbps", "delay_ms", "jitter_ms",
+      Fields("node", "nodes", "bandwidth_kbps", "delay_ms", "jitter_ms",
              "loss_basis_points", "loss_percent", "duplicate_basis_points",
              "corrupt_basis_points", "reorder_basis_points", "limit_packets");
   static constexpr auto kFlow =
@@ -329,7 +329,7 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
              "dst_port", "handle");
   static constexpr auto kPartition = Fields("group_a", "group_b");
   static constexpr auto kEdge =
-      Fields("from", "to", "timeout_sec", "latency_ms", "bandwidth_mbps",
+      Fields("from", "to", "timeout_sec", "latency_ms", "bandwidth_kbps",
              "delay_ms", "jitter_ms", "loss_basis_points", "loss_percent",
              "duplicate_basis_points", "corrupt_basis_points",
              "reorder_basis_points", "limit_packets");

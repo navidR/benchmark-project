@@ -779,7 +779,7 @@ bool PositiveNumericField(const boost::json::object& object,
 
 bool IsDegradedCondition(const boost::json::object& condition) {
   constexpr std::string_view kFields[] = {
-      "bandwidth_mbps",
+      "bandwidth_kbps",
       "delay_ms",
       "jitter_ms",
       "loss_basis_points",

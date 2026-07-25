@@ -934,6 +934,26 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/valid-network-control-workloads.json"
       --probe-capabilities
   )
+  add_test(NAME bbp-valid-network-bandwidth-kbps
+    COMMAND bbp
+      --network-bandwidth-kbps 1
+      --probe-capabilities
+  )
+  add_argument_failure_test(
+    bbp-invalid-network-bandwidth-fraction
+    "--network-bandwidth-kbps|1.5|--probe-capabilities"
+    "option '--network-bandwidth-kbps' is invalid"
+  )
+  add_argument_failure_test(
+    bbp-invalid-network-bandwidth-unit-string
+    "--network-bandwidth-kbps|1kB/s|--probe-capabilities"
+    "option '--network-bandwidth-kbps' is invalid"
+  )
+  add_argument_failure_test(
+    bbp-invalid-removed-network-bandwidth-mbps
+    "--network-bandwidth-mbps|1|--probe-capabilities"
+    "unrecognised option '--network-bandwidth-mbps'"
+  )
   add_test(NAME bbp-valid-cgroup-resource-controls
     COMMAND bbp
       --scenario-json

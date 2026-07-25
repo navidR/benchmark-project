@@ -16,7 +16,7 @@
         "active": true,
         "latency_ms": 25,
         "delay_ms": 25,
-        "bandwidth_mbps": 8,
+        "bandwidth_kbps": 8,
         "jitter_ms": 3,
         "loss_basis_points": 4,
         "duplicate_basis_points": 5,

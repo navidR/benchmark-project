@@ -7,7 +7,7 @@
     {
       "type": "set_network_condition",
       "node": 1,
-      "bandwidth_mbps": 20,
+      "bandwidth_kbps": 20,
       "delay_ms": 80,
       "jitter_ms": 10,
       "loss_basis_points": 11,

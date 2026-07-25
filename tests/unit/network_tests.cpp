@@ -810,9 +810,30 @@ BOOST_AUTO_TEST_CASE(rtnetlink_lists_qdiscs_with_libmnl) {
   BOOST_REQUIRE(parsed_qdisc != qdiscs.end());
 }
 
+BOOST_AUTO_TEST_CASE(tbf_bandwidth_uses_decimal_kilobytes_per_second) {
+  bbp::NetworkCondition unlimited;
+  unlimited.bandwidth_kbps = 0U;
+  BOOST_CHECK_NO_THROW(bbp::ValidateNetworkCondition(unlimited));
+
+  const auto matches_rate = [](std::uint32_t bandwidth_kbps,
+                               std::uint64_t expected_bytes_per_second,
+                               std::uint32_t expected_limit_bytes) {
+    bbp::NetworkCondition condition;
+    condition.bandwidth_kbps = bandwidth_kbps;
+    bbp::QdiscInfo tbf;
+    tbf.kind = bbp::QdiscKind::kTbf;
+    tbf.has_tbf_options = true;
+    tbf.tbf_rate_bytes_per_sec = expected_bytes_per_second;
+    tbf.tbf_limit_bytes = expected_limit_bytes;
+    BOOST_TEST(bbp::QdiscMatchesNetworkCondition(tbf, condition));
+  };
+  matches_rate(1U, 1000U, 65536U);
+  matches_rate(1000U, 1000000U, 100000U);
+}
+
 BOOST_AUTO_TEST_CASE(qdisc_summary_matches_combined_tbf_netem_condition) {
   bbp::NetworkCondition condition;
-  condition.bandwidth_mbps = 20;
+  condition.bandwidth_kbps = 20;
   condition.delay_ms = 40;
   condition.jitter_ms = 5;
   condition.loss_basis_points = 10;
@@ -828,8 +849,8 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_matches_combined_tbf_netem_condition) {
   tbf.handle = TC_H_MAKE(1U << 16, 0U);
   tbf.parent = TC_H_ROOT;
   tbf.has_tbf_options = true;
-  tbf.tbf_rate_bytes_per_sec = 2500000;
-  tbf.tbf_limit_bytes = 250000;
+  tbf.tbf_rate_bytes_per_sec = 20000;
+  tbf.tbf_limit_bytes = 65536;
 
   bbp::QdiscInfo netem;
   netem.if_name = "veth0";
@@ -854,14 +875,14 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_matches_combined_tbf_netem_condition) {
   BOOST_CHECK(summary.kind == bbp::QdiscKind::kTbfNetem);
   BOOST_TEST(summary.has_tbf_options);
   BOOST_TEST(summary.has_netem_options);
-  BOOST_TEST(summary.tbf_rate_bytes_per_sec == 2500000U);
+  BOOST_TEST(summary.tbf_rate_bytes_per_sec == 20000U);
   BOOST_TEST(summary.netem_latency_us == 40000U);
   BOOST_TEST(bbp::QdiscMatchesNetworkCondition(summary, condition));
 }
 
 BOOST_AUTO_TEST_CASE(qdisc_summary_rejects_missing_child_netem) {
   bbp::NetworkCondition condition;
-  condition.bandwidth_mbps = 20;
+  condition.bandwidth_kbps = 20;
   condition.delay_ms = 40;
 
   bbp::QdiscInfo tbf;
@@ -871,8 +892,8 @@ BOOST_AUTO_TEST_CASE(qdisc_summary_rejects_missing_child_netem) {
   tbf.handle = TC_H_MAKE(1U << 16, 0U);
   tbf.parent = TC_H_ROOT;
   tbf.has_tbf_options = true;
-  tbf.tbf_rate_bytes_per_sec = 2500000;
-  tbf.tbf_limit_bytes = 250000;
+  tbf.tbf_rate_bytes_per_sec = 20000;
+  tbf.tbf_limit_bytes = 65536;
 
   bbp::QdiscInfo summary;
   BOOST_TEST(
@@ -1208,7 +1229,7 @@ BOOST_AUTO_TEST_CASE(
   bbp::DirectionalNetworkPolicy policy;
   policy.band = 1;
   policy.destination_address = "198.51.100.7";
-  policy.condition.bandwidth_mbps = 10;
+  policy.condition.bandwidth_kbps = 10;
   policy.condition.delay_ms = 2;
 
   bbp::QdiscInfo root;
@@ -1227,8 +1248,8 @@ BOOST_AUTO_TEST_CASE(
   tbf.handle = tbf_handle;
   tbf.parent = class_id;
   tbf.has_tbf_options = true;
-  tbf.tbf_rate_bytes_per_sec = 1250000U;
-  tbf.tbf_limit_bytes = 125000U;
+  tbf.tbf_rate_bytes_per_sec = 10000U;
+  tbf.tbf_limit_bytes = 65536U;
   tbf.has_stats = true;
   tbf.bytes = 100U;
   tbf.packets = 10U;

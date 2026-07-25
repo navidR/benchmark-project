@@ -10,8 +10,8 @@
     "large": {"memory_max": "2GiB", "pids_max": 512}
   },
   "network_profiles": {
-    "normal": {"bandwidth_mbps": 50, "delay_ms": 10},
-    "degraded": {"bandwidth_mbps": 5, "delay_ms": 100}
+    "normal": {"bandwidth_kbps": 50, "delay_ms": 10},
+    "degraded": {"bandwidth_kbps": 5, "delay_ms": 100}
   },
   "isolated_network": true,
   "block_production": {"enabled": false},

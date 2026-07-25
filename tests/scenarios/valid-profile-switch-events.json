@@ -4,9 +4,9 @@
     "large": {"memory_max": "2GiB", "cpu_weight": 200, "pids_max": 512}
   },
   "network_profiles": {
-    "normal": {"bandwidth_mbps": 50, "delay_ms": 20, "jitter_ms": 2},
+    "normal": {"bandwidth_kbps": 50, "delay_ms": 20, "jitter_ms": 2},
     "degraded": {
-      "bandwidth_mbps": 5,
+      "bandwidth_kbps": 5,
       "delay_ms": 200,
       "jitter_ms": 50,
       "loss_percent": 1.25

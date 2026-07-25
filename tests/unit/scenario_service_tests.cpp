@@ -1,9 +1,11 @@
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
+#include <cstdint>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 
 #include "bbp/drivers/chain_driver_registry.h"
@@ -115,6 +117,36 @@ BOOST_AUTO_TEST_CASE(scenario_service_preserves_explicit_network_opt_out) {
   const Options options = ParseAndValidateScenario(scenario);
   BOOST_TEST(!options.isolate_network);
   BOOST_TEST(!ResolveScenario(scenario).at("isolated_network").as_bool());
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_service_uses_decimal_kilobytes_per_second_for_bandwidth) {
+  for (const std::uint32_t bandwidth_kbps : {0U, 1U, 1000U}) {
+    boost::json::object scenario = MinimalScenario();
+    scenario["network"] = boost::json::object{
+        {"default_condition",
+         boost::json::object{{"bandwidth_kbps", bandwidth_kbps}}}};
+    const Options options = ParseAndValidateScenario(scenario);
+    BOOST_TEST(options.network_condition_requested);
+    BOOST_TEST(options.network_condition.bandwidth_kbps == bandwidth_kbps);
+    const boost::json::object resolved = ResolveScenario(scenario);
+    BOOST_TEST(resolved.at("default_network_condition")
+                   .as_object()
+                   .at("bandwidth_kbps")
+                   .as_uint64() == bandwidth_kbps);
+  }
+
+  const auto rejects_bandwidth = [](boost::json::value value,
+                                    std::string_view field) {
+    boost::json::object scenario = MinimalScenario();
+    scenario["network"] = boost::json::object{
+        {"default_condition",
+         boost::json::object{{std::string(field), std::move(value)}}}};
+    BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+  };
+  rejects_bandwidth(1U, "bandwidth_mbps");
+  rejects_bandwidth(1.5, "bandwidth_kbps");
+  rejects_bandwidth("1kB/s", "bandwidth_kbps");
 }
 
 BOOST_AUTO_TEST_CASE(scenario_service_allows_explicit_empty_active_run) {

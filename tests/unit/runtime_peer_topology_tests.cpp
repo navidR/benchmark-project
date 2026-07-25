@@ -8,7 +8,7 @@ BOOST_AUTO_TEST_CASE(runtime_peer_topology_preserves_bands_across_edge_state) {
   bbp::NetworkCondition delayed;
   delayed.delay_ms = 25U;
   bbp::NetworkCondition limited;
-  limited.bandwidth_mbps = 8U;
+  limited.bandwidth_kbps = 8U;
 
   bbp::PeerTopologyConfig config;
   config.kind = bbp::PeerTopologyKind::kCustomEdgeList;
@@ -110,7 +110,7 @@ BOOST_AUTO_TEST_CASE(runtime_peer_topology_allows_only_explicit_default_empty) {
 BOOST_AUTO_TEST_CASE(
     runtime_peer_topology_preserves_inactive_conditioned_region_edges) {
   bbp::NetworkCondition condition;
-  condition.bandwidth_mbps = 9U;
+  condition.bandwidth_kbps = 9U;
   condition.delay_ms = 45U;
 
   bbp::PeerTopologyConfig config;

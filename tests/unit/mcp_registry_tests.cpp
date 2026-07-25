@@ -356,6 +356,20 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_object_schemas_match_every_descriptor) {
   RequireClosedSchemaTree(scenario);
 }
 
+BOOST_AUTO_TEST_CASE(mcp_bandwidth_schema_uses_unsigned_decimal_kilobytes) {
+  const boost::json::object condition =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNetworkCondition);
+  const boost::json::object& properties =
+      condition.at("properties").as_object();
+  BOOST_TEST(!properties.contains("bandwidth_mbps"));
+  const boost::json::object& bandwidth =
+      properties.at("bandwidth_kbps").as_object();
+  BOOST_TEST(bandwidth.at("type").as_string() == "integer");
+  BOOST_TEST(bandwidth.at("minimum").as_uint64() == 0U);
+  BOOST_TEST(bandwidth.at("maximum").as_uint64() ==
+             std::numeric_limits<std::uint32_t>::max());
+}
+
 BOOST_AUTO_TEST_CASE(mcp_topology_workload_and_command_schemas_are_exhaustive) {
   const boost::json::object scenario = BuildMcpScenarioSchema();
   const boost::json::object& scenario_properties =

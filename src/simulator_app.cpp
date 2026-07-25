@@ -875,8 +875,8 @@ boost::json::value ParseYamlDocument(std::string input,
 NetworkCondition ParseNetworkConditionObject(
     const boost::json::object& object) {
   NetworkCondition condition;
-  condition.bandwidth_mbps = JsonOptionalUint32Field(object, "bandwidth_mbps",
-                                                     condition.bandwidth_mbps);
+  condition.bandwidth_kbps = JsonOptionalUint32Field(object, "bandwidth_kbps",
+                                                     condition.bandwidth_kbps);
   condition.delay_ms =
       JsonOptionalUint32Field(object, "delay_ms", condition.delay_ms);
   condition.jitter_ms =
@@ -4575,9 +4575,9 @@ void ApplyScenarioJson(const boost::json::object& scenario,
           "scenario network.default_condition");
       const NetworkCondition scenario_condition =
           ParseNetworkConditionObject(default_condition->as_object());
-      if (!OptionProvided(vm, "network-bandwidth-mbps")) {
-        options.network_condition.bandwidth_mbps =
-            scenario_condition.bandwidth_mbps;
+      if (!OptionProvided(vm, "network-bandwidth-kbps")) {
+        options.network_condition.bandwidth_kbps =
+            scenario_condition.bandwidth_kbps;
       }
       if (!OptionProvided(vm, "network-delay-ms")) {
         options.network_condition.delay_ms = scenario_condition.delay_ms;
@@ -5315,10 +5315,10 @@ Options ParseOptions(int argc, char** argv,
       "explicitly run each chain node in its own network namespace and veth "
       "link")("no-isolate-network", po::bool_switch(&no_isolate_network),
               "explicitly use loopback-only node networking")(
-      "network-bandwidth-mbps",
-      po::value<uint32_t>(&options.network_condition.bandwidth_mbps),
-      "TBF bandwidth limit in megabits per second for each isolated node "
-      "host-side veth")(
+      "network-bandwidth-kbps",
+      po::value<uint32_t>(&options.network_condition.bandwidth_kbps),
+      "TBF bandwidth limit in decimal kilobytes per second for each isolated "
+      "node host-side veth; 0 means unlimited")(
       "network-delay-ms",
       po::value<uint32_t>(&options.network_condition.delay_ms),
       "netem delay applied to each isolated node host-side veth")(
@@ -5624,7 +5624,7 @@ Options ParseOptions(int argc, char** argv,
   }
   options.network_condition_requested =
       options.network_condition_requested ||
-      vm.count("network-bandwidth-mbps") != 0U ||
+      vm.count("network-bandwidth-kbps") != 0U ||
       vm.count("network-delay-ms") != 0U ||
       vm.count("network-jitter-ms") != 0U ||
       vm.count("network-loss-bps") != 0U ||
@@ -6109,7 +6109,7 @@ boost::json::array TcFiltersJson(const std::vector<TcFilterInfo>& filters) {
 
 void AddNetworkConditionJsonFields(const NetworkCondition& condition,
                                    boost::json::object* object) {
-  (*object)["bandwidth_mbps"] = condition.bandwidth_mbps;
+  (*object)["bandwidth_kbps"] = condition.bandwidth_kbps;
   (*object)["delay_ms"] = condition.delay_ms;
   (*object)["jitter_ms"] = condition.jitter_ms;
   (*object)["loss_basis_points"] = condition.loss_basis_points;

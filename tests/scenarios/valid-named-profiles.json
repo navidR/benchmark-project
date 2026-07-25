@@ -16,13 +16,13 @@
   },
   "network_profiles": {
     "normal": {
-      "bandwidth_mbps": 50,
+      "bandwidth_kbps": 50,
       "delay_ms": 20,
       "jitter_ms": 2,
       "loss_percent": 0.0
     },
     "degraded": {
-      "bandwidth_mbps": 5,
+      "bandwidth_kbps": 5,
       "delay_ms": 200,
       "jitter_ms": 50,
       "loss_percent": 1.25
