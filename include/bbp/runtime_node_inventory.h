@@ -164,6 +164,31 @@ class RuntimeNodeInventory {
     bool committed_ = false;
   };
 
+  class PreparedReplacement {
+   public:
+    PreparedReplacement(PreparedReplacement&&) noexcept = default;
+    PreparedReplacement& operator=(PreparedReplacement&&) noexcept = default;
+
+    PreparedReplacement(const PreparedReplacement&) = delete;
+    PreparedReplacement& operator=(const PreparedReplacement&) = delete;
+
+    [[nodiscard]] RuntimeNodeSnapshot Commit() noexcept;
+
+   private:
+    friend class RuntimeNodeInventory;
+
+    PreparedReplacement(
+        RuntimeNodeInventory* owner, std::unique_lock<std::mutex> lock,
+        std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation)
+        : owner_(owner),
+          lock_(std::move(lock)),
+          generation_(std::move(generation)) {}
+
+    RuntimeNodeInventory* owner_ = nullptr;
+    std::unique_lock<std::mutex> lock_;
+    std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation_;
+  };
+
   explicit RuntimeNodeInventory(std::uint32_t capacity);
 
   RuntimeNodeInventory(const RuntimeNodeInventory&) = delete;
@@ -188,6 +213,10 @@ class RuntimeNodeInventory {
   PreparedRemoval PrepareRemoval(
       std::uint64_t expected_generation,
       const std::vector<std::string>& removed_node_ids,
+      const std::vector<ChainNodeConfig>& published_configs);
+  PreparedReplacement PrepareReplacement(
+      std::uint64_t expected_generation, std::string_view node_id,
+      const RuntimeNodeInsertion& replacement,
       const std::vector<ChainNodeConfig>& published_configs);
 
  private:

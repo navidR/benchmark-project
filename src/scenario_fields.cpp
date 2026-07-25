@@ -413,6 +413,7 @@ std::span<const std::string_view> ScenarioCommandFields(
   static constexpr auto kPerf = Fields("perf_target", "perf_counters");
   static constexpr auto kWallet = Fields("wallet_send");
   static constexpr auto kNodeAdd = Fields("node_add");
+  static constexpr auto kNodeReplace = Fields("node_replace");
   static constexpr auto kNodeRemove = Fields("node_remove");
   switch (kind) {
     case SimulationCommandKind::kIncreaseLogVerbosity:
@@ -457,6 +458,8 @@ std::span<const std::string_view> ScenarioCommandFields(
       return kWallet;
     case SimulationCommandKind::kAddNodes:
       return kNodeAdd;
+    case SimulationCommandKind::kReplaceNode:
+      return kNodeReplace;
     case SimulationCommandKind::kRemoveNodes:
       return kNodeRemove;
     case SimulationCommandKind::kCount:

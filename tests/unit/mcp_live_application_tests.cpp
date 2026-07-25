@@ -173,6 +173,19 @@ SimulationCommandOutcome NodeRemoveOutcome(std::vector<std::string> node_ids,
       .final_node_count = final_node_count};
 }
 
+SimulationCommandOutcome NodeReplaceOutcome(std::uint64_t inventory_generation,
+                                            std::uint32_t final_node_count) {
+  return SimulationCommandOutcome{
+      .state = SimulationCommandOutcomeState::kSucceeded,
+      .cancellation_cause = SimulationCommandCancellationCause::kNone,
+      .error = std::nullopt,
+      .node_lifecycle = "running",
+      .added_node_ids = {},
+      .removed_node_ids = {},
+      .inventory_generation = inventory_generation,
+      .final_node_count = final_node_count};
+}
+
 void MarkNodeAddCommitted(const SimulationCommand& command,
                           std::uint64_t initial_generation,
                           std::vector<std::string> initial_node_ids) {
@@ -941,6 +954,177 @@ BOOST_AUTO_TEST_CASE(
                  .at("code")
                  .as_string() == "node_outcome_unconfirmed");
   BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) >= 3U);
+
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_node_replace_has_direct_generic_progress_failure_and_inventory_parity) {
+  LiveApplicationDirectory temporary;
+  boost::json::object scenario = LiveScenario();
+  scenario["nodes"] = 2U;
+  scenario["node_capacity"] = 2U;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::mutex inventory_mutex;
+  McpLiveNodeInventorySnapshot inventory = InitialInventory(*options);
+  std::atomic_uint32_t run_stop_requests = 0U;
+  const auto publish_inventory = [&](std::uint64_t generation,
+                                     std::vector<std::string> node_ids) {
+    std::lock_guard<std::mutex> lock(inventory_mutex);
+    inventory.generation = generation;
+    inventory.node_ids = std::move(node_ids);
+  };
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [&] {
+            std::lock_guard<std::mutex> lock(inventory_mutex);
+            return inventory;
+          },
+      .publication_mutex = {},
+      .request_run_stop = [&] { ++run_stop_requests; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object replacement{
+      {"chain", "firo"},
+      {"count", 1U},
+      {"node_ids", boost::json::array{"firo-2"}},
+      {"binary", "/bin/true"},
+      {"ready_timeout_sec", 11U},
+      {"sync_timeout_sec", 13U}};
+  const boost::json::object direct_submitted =
+      Invoke(&dispatcher, "node.replace",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-2"},
+                                 {"replacement", replacement}});
+  const SimulationCommand direct_command = WaitForQueuedCommand(queue.get());
+  BOOST_CHECK(direct_command.kind == SimulationCommandKind::kReplaceNode);
+  BOOST_TEST(direct_command.node_id == "firo-2");
+  BOOST_REQUIRE(direct_command.node_replace);
+  BOOST_TEST(direct_command.node_replace->count == 1U);
+  BOOST_REQUIRE(direct_command.operation_control);
+  for (std::uint64_t phase = 1U; phase <= kSimulationNodeAddProgressTotal;
+       ++phase) {
+    BOOST_TEST(direct_command.operation_control->ReportProgress(phase));
+  }
+  publish_inventory(2U, {"firo-1", "firo-2"});
+  MarkNodeAddCommitted(direct_command, 1U, {"firo-1", "firo-2"});
+  application.RecordCommandOutcome(direct_command, NodeReplaceOutcome(2U, 2U));
+  const boost::json::object direct_terminal =
+      WaitForTerminal(&dispatcher, direct_submitted);
+  BOOST_TEST(direct_terminal.at("state").as_string() == "succeeded");
+  BOOST_TEST(direct_terminal.at("progress_total").as_uint64() ==
+             kSimulationNodeAddProgressTotal);
+  BOOST_TEST(direct_terminal.at("progress_completed").as_uint64() ==
+             kSimulationNodeAddProgressTotal);
+  const boost::json::object& direct_result =
+      direct_terminal.at("terminal_result").as_object();
+  BOOST_TEST(direct_result.at("result_family").as_string() == "mutation");
+  BOOST_TEST(direct_result.at("action").as_string() == "node.replace");
+  BOOST_TEST(direct_result.at("state").as_string() == "running");
+  BOOST_TEST(direct_result.at("added_node_ids").as_array().empty());
+  BOOST_TEST(direct_result.at("removed_node_ids").as_array().empty());
+  BOOST_TEST(
+      direct_result.at("affected_node_ids").as_array().front().as_string() ==
+      "firo-2");
+  BOOST_TEST(direct_result.at("inventory_generation").as_uint64() == 2U);
+  BOOST_TEST(direct_result.at("final_node_count").as_uint64() == 2U);
+
+  const boost::json::object generic_submitted = Invoke(
+      &dispatcher, "simulation.command",
+      boost::json::object{
+          {"run_id", "live-application"},
+          {"command", boost::json::object{{"kind", "replace_node"},
+                                          {"node", "firo-2"},
+                                          {"node_replace", replacement}}}});
+  const SimulationCommand generic_command = WaitForQueuedCommand(queue.get());
+  BOOST_CHECK(generic_command.kind == SimulationCommandKind::kReplaceNode);
+  publish_inventory(3U, {"firo-1", "firo-2"});
+  MarkNodeAddCommitted(generic_command, 2U, {"firo-1", "firo-2"});
+  BOOST_TEST(generic_command.operation_control->ReportProgress(
+      kSimulationNodeAddProgressTotal));
+  application.RecordCommandOutcome(generic_command, NodeReplaceOutcome(3U, 2U));
+  const boost::json::object generic_terminal =
+      WaitForTerminal(&dispatcher, generic_submitted);
+  BOOST_TEST(generic_terminal.at("state").as_string() == "succeeded");
+  const boost::json::object& generic_result =
+      generic_terminal.at("terminal_result").as_object();
+  BOOST_TEST(generic_result.at("result_family").as_string() ==
+             "runtime_command");
+  BOOST_TEST(generic_result.at("action").as_string() == "node.replace");
+  BOOST_TEST(
+      generic_result.at("affected_node_ids").as_array().front().as_string() ==
+      "firo-2");
+  BOOST_TEST(generic_result.at("inventory_generation").as_uint64() == 3U);
+  BOOST_TEST(generic_result.at("final_node_count").as_uint64() == 2U);
+
+  const boost::json::object failed_submitted =
+      Invoke(&dispatcher, "node.replace",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-2"},
+                                 {"replacement", replacement}});
+  const SimulationCommand failed_command = WaitForQueuedCommand(queue.get());
+  application.RecordCommandOutcome(
+      failed_command, CommandOutcome(SimulationCommandOutcomeState::kFailed,
+                                     "candidate readiness failed", "running"));
+  const boost::json::object failed_terminal =
+      WaitForTerminal(&dispatcher, failed_submitted);
+  BOOST_TEST(failed_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(
+      failed_terminal.at("terminal_error").as_object().at("code").as_string() ==
+      "node_replace_failed");
+
+  const boost::json::object cancelled_submitted =
+      Invoke(&dispatcher, "node.replace",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-2"},
+                                 {"replacement", replacement}});
+  const SimulationCommand cancelled_command = WaitForQueuedCommand(queue.get());
+  BOOST_REQUIRE(cancelled_command.operation_control);
+  BOOST_TEST(cancelled_command.operation_control->RequestCancellation(
+      SimulationCommandCancellationCause::kClientCancel));
+  application.RecordCommandOutcome(
+      cancelled_command,
+      CommandOutcome(SimulationCommandOutcomeState::kCancelled, std::nullopt,
+                     "running",
+                     SimulationCommandCancellationCause::kClientCancel));
+  const boost::json::object cancelled_terminal =
+      WaitForTerminal(&dispatcher, cancelled_submitted);
+  BOOST_TEST(cancelled_terminal.at("state").as_string() == "cancelled");
+  BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) == 0U);
+
+  const boost::json::object unconfirmed_submitted =
+      Invoke(&dispatcher, "node.replace",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_id", "firo-2"},
+                                 {"replacement", replacement}});
+  const SimulationCommand unconfirmed_command =
+      WaitForQueuedCommand(queue.get());
+  MarkNodeAddCommitted(unconfirmed_command, 3U, {"firo-1", "firo-2"});
+  publish_inventory(4U, {"replacement", "firo-2"});
+  application.RecordCommandOutcome(unconfirmed_command,
+                                   NodeReplaceOutcome(4U, 2U));
+  const boost::json::object unconfirmed_terminal =
+      WaitForTerminal(&dispatcher, unconfirmed_submitted);
+  BOOST_TEST(unconfirmed_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(unconfirmed_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "node_outcome_unconfirmed");
+  BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) >= 1U);
 
   dispatcher.Shutdown();
   application.Shutdown();

@@ -1,8 +1,10 @@
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <boost/test/unit_test.hpp>
 #include <cerrno>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 #ifdef __linux__
@@ -39,15 +41,18 @@ class ManifestTestRoot {
   bbp::RunOwnership ownership_;
 };
 
-bbp::RuntimeNodeResourceEntry Entry(std::string id, std::uint32_t slot,
-                                    bbp::RuntimeNodeResourceState state =
-                                        bbp::RuntimeNodeResourceState::kLive) {
+bbp::RuntimeNodeResourceEntry Entry(
+    std::string id, std::uint32_t slot,
+    bbp::RuntimeNodeResourceState state = bbp::RuntimeNodeResourceState::kLive,
+    std::optional<std::string> root_name = std::nullopt) {
+  const std::string root =
+      root_name ? *root_name : "firo-" + std::to_string(slot + 1U);
   return bbp::RuntimeNodeResourceEntry{
       .node_id = std::move(id),
       .slot = slot,
       .chain = bbp::ChainKind::kFiro,
-      .data_dir = std::filesystem::path("nodes") /
-                  ("firo-" + std::to_string(slot + 1U)) / "data",
+      .data_dir = std::filesystem::path("nodes") / root / "data",
+      .root_name = std::move(root_name),
       .state = state,
   };
 }
@@ -77,6 +82,166 @@ BOOST_AUTO_TEST_CASE(
   const auto loaded = bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
   BOOST_REQUIRE(loaded);
   BOOST_CHECK(*loaded == manifest);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_manifest_round_trips_replacement_phases_and_root_name) {
+  ManifestTestRoot root;
+  for (const bbp::RuntimeNodeResourceState state :
+       {bbp::RuntimeNodeResourceState::kPendingReplace,
+        bbp::RuntimeNodeResourceState::kPendingReplaceExchanged,
+        bbp::RuntimeNodeResourceState::kPendingReplaceCommitted,
+        bbp::RuntimeNodeResourceState::kPendingReplaceUncertain}) {
+    bbp::RuntimeNodeResourceManifest manifest{
+        .ownership = root.ownership(),
+        .isolated_network = true,
+        .nodes = {Entry("firo-1", 0U),
+                  Entry("firo-1", 0U, state, "replace-0-1")},
+    };
+    bbp::WriteRuntimeNodeResourceManifest(manifest);
+    const auto loaded =
+        bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
+    BOOST_REQUIRE(loaded);
+    BOOST_CHECK(*loaded == manifest);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_replacement_clone_and_exchange_preserve_both_owned_roots) {
+  ManifestTestRoot root;
+  const bbp::RuntimeNodeResourceEntry live = Entry("firo-1", 0U);
+  const bbp::RuntimeNodeResourceEntry staging =
+      Entry("firo-1", 0U, bbp::RuntimeNodeResourceState::kPendingReplace,
+            "replace-0-1");
+  bbp::PrepareRuntimeNodeRoot(root.ownership(), live);
+  const std::filesystem::path live_root = root.path() / "nodes" / live.node_id;
+  std::filesystem::create_directories(live_root / "data" / "nested");
+  bbp::WriteText(live_root / "data" / "nested" / "sentinel", "old\n");
+  std::filesystem::create_symlink(
+      "sentinel", live_root / "data" / "nested" / "sentinel-link");
+
+  bbp::CloneRuntimeNodeRootForReplacement(root.ownership(), live, staging);
+  const std::filesystem::path staging_root =
+      root.path() / "nodes" / *staging.root_name;
+  BOOST_TEST(bbp::ReadText(staging_root / "data" / "nested" / "sentinel") ==
+             "old\n");
+  BOOST_TEST(std::filesystem::read_symlink(staging_root / "data" / "nested" /
+                                           "sentinel-link") ==
+             std::filesystem::path("sentinel"));
+  bbp::WriteText(staging_root / "data" / "nested" / "sentinel", "new\n");
+
+  bbp::RuntimeNodeRootOrientation unknown_orientation =
+      bbp::RuntimeNodeRootOrientation::kUnknown;
+  BOOST_CHECK_THROW(bbp::ExchangeRuntimeNodeRootsForReplacement(
+                        root.ownership(), live, staging, &unknown_orientation),
+                    std::runtime_error);
+  BOOST_TEST(bbp::ReadText(live_root / "data" / "nested" / "sentinel") ==
+             "old\n");
+  BOOST_TEST(bbp::ReadText(staging_root / "data" / "nested" / "sentinel") ==
+             "new\n");
+
+  bbp::RuntimeNodeRootOrientation orientation =
+      bbp::RuntimeNodeRootOrientation::kOriginal;
+  BOOST_CHECK_THROW(bbp::ExchangeRuntimeNodeRootsForReplacement(
+                        root.ownership(), staging, live, &orientation),
+                    std::runtime_error);
+  bbp::ExchangeRuntimeNodeRootsForReplacement(root.ownership(), live, staging,
+                                              &orientation);
+  BOOST_CHECK(orientation == bbp::RuntimeNodeRootOrientation::kExchanged);
+  BOOST_TEST(bbp::ReadText(live_root / "data" / "nested" / "sentinel") ==
+             "new\n");
+  BOOST_TEST(bbp::ReadText(staging_root / "data" / "nested" / "sentinel") ==
+             "old\n");
+  bbp::VerifyRuntimeNodeRootOwnership(root.ownership(), live);
+  bbp::VerifyRuntimeNodeRootOwnership(root.ownership(), staging);
+  bbp::RuntimeNodeResourceEntry uncertain = staging;
+  uncertain.state = bbp::RuntimeNodeResourceState::kPendingReplaceUncertain;
+  BOOST_CHECK_THROW(bbp::RemoveRuntimeNodeRoot(root.ownership(), uncertain),
+                    std::runtime_error);
+
+  bbp::ExchangeRuntimeNodeRootsForReplacement(root.ownership(), live, staging,
+                                              &orientation);
+  BOOST_CHECK(orientation == bbp::RuntimeNodeRootOrientation::kOriginal);
+  BOOST_TEST(bbp::ReadText(live_root / "data" / "nested" / "sentinel") ==
+             "old\n");
+  bbp::RemoveRuntimeNodeRoot(root.ownership(), staging);
+  bbp::RemoveRuntimeNodeRoot(root.ownership(), live);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_replacement_clone_reports_partial_root_acquisition) {
+  ManifestTestRoot root;
+  const bbp::RuntimeNodeResourceEntry live = Entry("firo-1", 0U);
+  const bbp::RuntimeNodeResourceEntry staging =
+      Entry("firo-1", 0U, bbp::RuntimeNodeResourceState::kPendingReplace,
+            "replace-0-1");
+  bbp::PrepareRuntimeNodeRoot(root.ownership(), live);
+  const std::filesystem::path live_root = root.path() / "nodes" / live.node_id;
+  std::filesystem::create_directories(live_root / "data");
+  BOOST_REQUIRE_EQUAL(mkfifo((live_root / "data" / "unsupported-fifo").c_str(),
+                             S_IRUSR | S_IWUSR),
+                      0);
+
+  bool staging_acquired = false;
+  BOOST_CHECK_THROW(
+      bbp::CloneRuntimeNodeRootForReplacement(
+          root.ownership(), live, staging, std::nullopt, {}, &staging_acquired),
+      std::runtime_error);
+  BOOST_TEST(staging_acquired);
+  BOOST_TEST(bbp::RuntimeNodeRootEntryExists(root.ownership(), staging));
+  bbp::RemoveRuntimeNodeRoot(root.ownership(), staging);
+  bbp::RemoveRuntimeNodeRoot(root.ownership(), live);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_manifest_rejects_orphan_cross_paired_and_multiple_replacements) {
+  ManifestTestRoot root;
+  const bbp::RuntimeNodeResourceEntry replacement =
+      Entry("firo-1", 0U, bbp::RuntimeNodeResourceState::kPendingReplace,
+            "replace-0-1");
+  bbp::RuntimeNodeResourceManifest manifest{
+      .ownership = root.ownership(),
+      .isolated_network = true,
+      .nodes = {replacement},
+  };
+  BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
+                    std::runtime_error);
+
+  manifest.nodes = {
+      Entry("firo-1", 0U),
+      Entry("firo-2", 1U),
+      Entry("firo-1", 1U, bbp::RuntimeNodeResourceState::kPendingReplace,
+            "replace-cross"),
+  };
+  BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
+                    std::runtime_error);
+
+  bbp::RuntimeNodeResourceEntry wrong_chain = replacement;
+  wrong_chain.chain = bbp::ChainKind::kBitcoin;
+  manifest.nodes = {Entry("firo-1", 0U), wrong_chain};
+  BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
+                    std::runtime_error);
+
+  manifest.nodes = {
+      Entry("firo-1", 0U),
+      Entry("firo-2", 1U),
+      replacement,
+      Entry("firo-2", 1U, bbp::RuntimeNodeResourceState::kPendingReplace,
+            "replace-1-1"),
+  };
+  BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
+                    std::runtime_error);
+
+  manifest.nodes = {
+      Entry("firo-1", 0U),
+      Entry("firo-1", 1U, bbp::RuntimeNodeResourceState::kPendingAdd)};
+  BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
+                    std::runtime_error);
+  manifest.nodes = {
+      Entry("firo-1", 0U),
+      Entry("firo-2", 0U, bbp::RuntimeNodeResourceState::kPendingAdd)};
+  BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(

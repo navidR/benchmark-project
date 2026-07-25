@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -316,6 +317,77 @@ RuntimePeerTopologyEdge& RuntimePeerTopology::MutableEdge(std::uint32_t from,
     throw std::runtime_error("runtime topology edge does not exist");
   }
   return *edge;
+}
+
+std::vector<RuntimeNodeReplacementPeerEdge>
+ResolveRuntimeNodeReplacementPeerEdges(
+    const RuntimePeerTopology& topology,
+    const std::vector<std::string>& node_ids,
+    const std::map<std::string, std::vector<std::string>>& allowed_peers,
+    std::uint32_t target_index) {
+  if (target_index >= node_ids.size()) {
+    throw std::out_of_range(
+        "runtime node replacement target index is out of range");
+  }
+  std::map<std::string, std::uint32_t, std::less<>> indexes;
+  for (std::uint32_t index = 0U; index < node_ids.size(); ++index) {
+    if (node_ids[index].empty() ||
+        !indexes.emplace(node_ids[index], index).second) {
+      throw std::runtime_error(
+          "runtime node replacement peer plan has an empty or duplicate node "
+          "id");
+    }
+  }
+  if (allowed_peers.size() != node_ids.size()) {
+    throw std::runtime_error(
+        "runtime node replacement peer plan requires an exact allowed-peer "
+        "map");
+  }
+
+  std::set<std::pair<std::uint32_t, std::uint32_t>> topology_edges;
+  for (const RuntimePeerTopologyEdge& edge : topology.edges()) {
+    if (edge.from >= node_ids.size() || edge.to >= node_ids.size() ||
+        edge.from == edge.to) {
+      throw std::runtime_error(
+          "runtime node replacement topology edge is invalid");
+    }
+    if (edge.active) {
+      topology_edges.emplace(edge.from, edge.to);
+    }
+  }
+
+  std::set<std::pair<std::uint32_t, std::uint32_t>> allowed_edges;
+  for (std::uint32_t from = 0U; from < node_ids.size(); ++from) {
+    const auto allowed = allowed_peers.find(node_ids[from]);
+    if (allowed == allowed_peers.end()) {
+      throw std::runtime_error(
+          "runtime node replacement peer plan is missing allowed peers for " +
+          node_ids[from]);
+    }
+    std::set<std::uint32_t> unique;
+    for (const std::string& peer_id : allowed->second) {
+      const auto peer = indexes.find(peer_id);
+      if (peer == indexes.end() || peer->second == from ||
+          !unique.insert(peer->second).second) {
+        throw std::runtime_error(
+            "runtime node replacement peer plan contains an unknown, self, "
+            "or duplicate allowed peer");
+      }
+      allowed_edges.emplace(from, peer->second);
+    }
+  }
+  if (allowed_edges != topology_edges) {
+    throw std::runtime_error(
+        "runtime node replacement topology and allowed-peer map disagree");
+  }
+
+  std::vector<RuntimeNodeReplacementPeerEdge> result;
+  for (const auto& [from, to] : topology_edges) {
+    if (from == target_index || to == target_index) {
+      result.push_back(RuntimeNodeReplacementPeerEdge{.from = from, .to = to});
+    }
+  }
+  return result;
 }
 
 }  // namespace bbp

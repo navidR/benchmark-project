@@ -433,6 +433,81 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_validates_node_add_request) {
   BOOST_TEST(!queue.TryPop());
 }
 
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_preserves_and_validates_node_replacement) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationNodeReplaceRequest request{
+      .chain = bbp::ChainKind::kFiro,
+      .count = 1U,
+      .node_ids = {"firo-2"},
+      .binary = "/opt/firo/bin/firod",
+      .resources =
+          bbp::ResourceLimitPatch{
+              .memory_high_bytes = 1024U,
+              .memory_max_bytes = 2048U,
+              .cpu_quota_present = true,
+              .cpu_quota_us = 50000U,
+              .cpu_period_us = 100000U,
+              .cpu_weight = 100U,
+              .io_weight = 100U,
+              .io_limits_present = true,
+              .io_limits = {},
+              .pids_max = 64U,
+          },
+      .network = bbp::NetworkCondition{.bandwidth_kbps = 250U, .delay_ms = 7U},
+      .ready_timeout_sec = 41U,
+      .sync_timeout_sec = 43U,
+  };
+
+  const std::uint64_t sequence = queue.PushReplaceNode("firo-2", request);
+  const std::optional<bbp::SimulationCommand> command = queue.TryPop();
+  BOOST_REQUIRE(command);
+  BOOST_TEST(command->sequence == sequence);
+  BOOST_CHECK(command->kind == bbp::SimulationCommandKind::kReplaceNode);
+  BOOST_TEST(command->node_id == "firo-2");
+  BOOST_TEST(command->confirmed);
+  BOOST_REQUIRE(command->operation_control);
+  BOOST_REQUIRE(command->node_replace);
+  BOOST_CHECK(command->node_replace->chain == bbp::ChainKind::kFiro);
+  BOOST_TEST(command->node_replace->count == 1U);
+  BOOST_TEST(
+      command->node_replace->node_ids == std::vector<std::string>({"firo-2"}),
+      boost::test_tools::per_element());
+  BOOST_TEST(*command->node_replace->binary == "/opt/firo/bin/firod");
+  BOOST_REQUIRE(command->node_replace->resources->memory_max_bytes);
+  BOOST_TEST(*command->node_replace->resources->memory_max_bytes == 2048U);
+  BOOST_TEST(command->node_replace->network->delay_ms == 7U);
+  BOOST_TEST(command->node_replace->ready_timeout_sec == 41U);
+  BOOST_TEST(command->node_replace->sync_timeout_sec == 43U);
+
+  const auto rejected = [&](bbp::SimulationNodeReplaceRequest invalid) {
+    BOOST_CHECK_THROW(queue.PushReplaceNode("firo-2", std::move(invalid)),
+                      std::runtime_error);
+  };
+  bbp::SimulationNodeReplaceRequest invalid = request;
+  invalid.count = 2U;
+  rejected(invalid);
+  invalid = request;
+  invalid.node_ids = {"firo-3"};
+  rejected(invalid);
+  invalid.binary = "";
+  rejected(invalid);
+  invalid = request;
+  invalid.ready_timeout_sec = 0U;
+  rejected(invalid);
+  invalid = request;
+  invalid.sync_timeout_sec = bbp::kSimulationNodeAddMaximumTimeoutSeconds + 1U;
+  rejected(invalid);
+
+  bbp::SimulationCommand unconfirmed;
+  unconfirmed.kind = bbp::SimulationCommandKind::kReplaceNode;
+  unconfirmed.node_id = "firo-2";
+  unconfirmed.node_replace = request;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(std::move(unconfirmed)),
+                    std::runtime_error);
+  BOOST_TEST(!queue.TryPop());
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_node_remove_request) {
   bbp::SimulationCommandQueue queue;
   const bbp::SimulationNodeRemoveRequest request{

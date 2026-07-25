@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,8 +25,8 @@ struct NodeRuntime {
   ChainNodeConfig config;
   std::vector<std::string> process_start_connect_peers;
   bool uses_physical_start_connect_peers = false;
-  std::optional<Cgroup> cgroup;
-  std::optional<NetworkNamespace> network_namespace;
+  std::shared_ptr<Cgroup> cgroup;
+  std::shared_ptr<NetworkNamespace> network_namespace;
   std::optional<NodeVethConfig> network;
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
@@ -90,6 +91,18 @@ struct NodeRuntime {
     return std::atomic_ref<std::uint64_t>(restart_count_)
                .fetch_add(1U, std::memory_order_relaxed) +
            1U;
+  }
+
+  void CopyAccountingForReplacementFrom(NodeRuntime& source) {
+    std::atomic_ref<std::uint64_t>(generated_block_count_)
+        .store(source.GeneratedBlockCount(), std::memory_order_relaxed);
+    std::atomic_ref<std::uint64_t>(mined_transaction_count_)
+        .store(source.MinedTransactionCount(), std::memory_order_relaxed);
+    std::atomic_ref<bool>(mined_transaction_count_complete_)
+        .store(source.MinedTransactionCountComplete(),
+               std::memory_order_relaxed);
+    std::atomic_ref<std::uint64_t>(restart_count_)
+        .store(source.RestartCount(), std::memory_order_relaxed);
   }
 
   NodeRuntimeLifecycle Lifecycle() const {

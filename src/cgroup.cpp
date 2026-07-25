@@ -51,6 +51,11 @@ constexpr std::uint64_t kCgroupScopeStateVersion = 2U;
 std::mutex prepared_runs_mutex;
 std::set<std::string> prepared_runs;
 
+#ifdef BBP_ENABLE_TEST_HOOKS
+std::function<void()> cgroup_create_after_directory_hook;
+std::function<void()> cgroup_create_shared_allocation_hook;
+#endif
+
 struct CgroupPaths {
   std::filesystem::path root;
   std::filesystem::path simulator;
@@ -198,7 +203,7 @@ CgroupPathIdentity DirectoryIdentity(const std::filesystem::path& path,
                              " for ownership identity failed: " +
                              path.string() + ": " + std::strerror(errno));
   }
-  struct stat status {};
+  struct stat status{};
   if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
     const int error = errno;
     close(fd);
@@ -358,7 +363,7 @@ std::string ReadOwnedScopeState(const std::filesystem::path& path) {
     throw std::runtime_error("open cgroup scope state failed for " +
                              path.string() + ": " + std::strerror(errno));
   }
-  struct stat status {};
+  struct stat status{};
   if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) ||
       status.st_uid != geteuid() || (status.st_mode & 0077U) != 0U) {
     close(fd);
@@ -1072,7 +1077,7 @@ std::string ControllerList(const std::set<std::string>& controllers) {
 }
 
 void RequireNativeCgroupRoot(const std::filesystem::path& root) {
-  struct statfs filesystem_status {};
+  struct statfs filesystem_status{};
   if (statfs(root.c_str(), &filesystem_status) != 0) {
     throw std::runtime_error("inspect native cgroup root failed at " +
                              root.string() + ": " + std::strerror(errno));
@@ -1404,7 +1409,7 @@ void RemoveRunCgroup(const CgroupScopeConfig& config, const std::string& run_id,
 }
 
 bool ScopeStateExists(const CgroupScopeConfig& config) {
-  struct stat status {};
+  struct stat status{};
   if (lstat(config.state_file.c_str(), &status) == 0) {
     return true;
   }
@@ -1559,7 +1564,7 @@ void RemoveScopeStateFile(const CgroupScopeConfig& config) {
                              config.state_file.string() + ": " +
                              std::strerror(errno));
   }
-  struct stat status {};
+  struct stat status{};
   if (lstat(config.state_file.c_str(), &status) == 0 || errno != ENOENT) {
     throw std::runtime_error(
         "cgroup scope state absence read-back failed for " +
@@ -1675,9 +1680,8 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
   const CgroupPaths requested_paths = CgroupPathsForScope(config, run_id);
   const bool scope_state_exists = ScopeStateExists(config);
   if (!scope_state_exists && std::filesystem::exists(requested_paths.run)) {
-    throw std::runtime_error(
-        "refusing to adopt pre-existing run cgroup: " +
-        requested_paths.run.string());
+    throw std::runtime_error("refusing to adopt pre-existing run cgroup: " +
+                             requested_paths.run.string());
   }
   std::optional<CgroupScopeState> state;
   bool run_created = false;
@@ -1889,7 +1893,7 @@ Cgroup::Cgroup(std::filesystem::path path)
     throw std::runtime_error("open cgroup identity failed for " +
                              path_.string() + ": " + std::strerror(error));
   }
-  struct stat status {};
+  struct stat status{};
   if (fstat(fd_, &status) != 0 || !S_ISDIR(status.st_mode)) {
     const int error = errno == 0 ? ENOTDIR : errno;
     Close();
@@ -1954,7 +1958,7 @@ void Cgroup::RequireBoundIdentity() const {
            static_cast<std::uint64_t>(status.st_dev) == device_ &&
            static_cast<std::uint64_t>(status.st_ino) == inode_;
   };
-  struct stat opened {};
+  struct stat opened{};
   if (fstat(fd_, &opened) != 0) {
     throw std::runtime_error("inspect acquired cgroup fd failed for " +
                              path_.string() + ": " + std::strerror(errno));
@@ -1963,24 +1967,24 @@ void Cgroup::RequireBoundIdentity() const {
     throw std::runtime_error("acquired cgroup fd identity changed for " +
                              path_.string());
   }
-  struct stat parent_entry {};
-  if (fstatat(parent_fd_, name_.c_str(), &parent_entry,
-              AT_SYMLINK_NOFOLLOW) != 0) {
+  struct stat parent_entry{};
+  if (fstatat(parent_fd_, name_.c_str(), &parent_entry, AT_SYMLINK_NOFOLLOW) !=
+      0) {
     throw std::runtime_error("acquired cgroup path disappeared for " +
                              path_.string() + ": " + std::strerror(errno));
   }
   if (!exact_identity(parent_entry)) {
-    throw std::runtime_error(
-        "refusing replaced cgroup directory identity: " + path_.string());
+    throw std::runtime_error("refusing replaced cgroup directory identity: " +
+                             path_.string());
   }
-  struct stat path_entry {};
+  struct stat path_entry{};
   if (fstatat(AT_FDCWD, path_.c_str(), &path_entry, AT_SYMLINK_NOFOLLOW) != 0) {
     throw std::runtime_error("acquired cgroup pathname disappeared for " +
                              path_.string() + ": " + std::strerror(errno));
   }
   if (!exact_identity(path_entry)) {
-    throw std::runtime_error(
-        "refusing replaced cgroup pathname identity: " + path_.string());
+    throw std::runtime_error("refusing replaced cgroup pathname identity: " +
+                             path_.string());
   }
 }
 
@@ -2041,8 +2045,50 @@ Cgroup Cgroup::Create(const std::string& run_id, const std::string& node_id) {
   EnableControllers(paths.run);
   const std::filesystem::path node_root = paths.run / node_id;
   CreateCgroupDirectoryExclusive(node_root, "node");
+  try {
+#ifdef BBP_ENABLE_TEST_HOOKS
+    if (cgroup_create_after_directory_hook) {
+      cgroup_create_after_directory_hook();
+    }
+#endif
+    return Cgroup(node_root);
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    const std::string failure_text = CurrentExceptionText();
+    if (rmdir(node_root.c_str()) != 0) {
+      throw std::runtime_error(
+          failure_text +
+          "; failed to clean acquired cgroup after construction failure: " +
+          std::strerror(errno));
+    }
+    std::rethrow_exception(failure);
+  }
+}
 
-  return Cgroup(node_root);
+std::shared_ptr<Cgroup> Cgroup::CreateShared(const std::string& run_id,
+                                             const std::string& node_id) {
+  Cgroup acquired = Create(run_id, node_id);
+  try {
+#ifdef BBP_ENABLE_TEST_HOOKS
+    if (cgroup_create_shared_allocation_hook) {
+      cgroup_create_shared_allocation_hook();
+    }
+#endif
+    return std::make_shared<Cgroup>(std::move(acquired));
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    const std::string failure_text = CurrentExceptionText();
+    try {
+      acquired.Remove(std::chrono::steady_clock::now() +
+                      std::chrono::seconds(10));
+    } catch (...) {
+      throw std::runtime_error(
+          failure_text +
+          "; failed to clean acquired cgroup after shared ownership failure: " +
+          CurrentExceptionText());
+    }
+    std::rethrow_exception(failure);
+  }
 }
 
 void Cgroup::RemoveRun(const std::string& run_id) {
@@ -2364,9 +2410,8 @@ bool Cgroup::Frozen() const {
 
 bool Cgroup::Empty() const {
   const std::filesystem::path bound = access_path();
-  const bool empty =
-      CgroupProcsEmpty(bound) &&
-      ParseKeyValue(bound / "cgroup.events", "populated") == 0U;
+  const bool empty = CgroupProcsEmpty(bound) &&
+                     ParseKeyValue(bound / "cgroup.events", "populated") == 0U;
   RequireBoundIdentity();
   return empty;
 }
@@ -2399,11 +2444,11 @@ void Cgroup::Remove(std::chrono::steady_clock::time_point deadline,
                              path_.string());
   }
   if (removed_) {
-    struct stat replacement {};
-    if (fstatat(parent_fd_, name_.c_str(), &replacement,
-                AT_SYMLINK_NOFOLLOW) == 0) {
-      throw std::runtime_error(
-          "refusing replacement at removed cgroup path: " + path_.string());
+    struct stat replacement{};
+    if (fstatat(parent_fd_, name_.c_str(), &replacement, AT_SYMLINK_NOFOLLOW) ==
+        0) {
+      throw std::runtime_error("refusing replacement at removed cgroup path: " +
+                               path_.string());
     }
     if (errno != ENOENT) {
       throw std::runtime_error("inspect removed cgroup path failed for " +
@@ -2423,15 +2468,26 @@ void Cgroup::Remove(std::chrono::steady_clock::time_point deadline,
                              ": " + std::strerror(errno));
   }
   removed_ = true;
-  struct stat remaining {};
-  if (fstatat(parent_fd_, name_.c_str(), &remaining, AT_SYMLINK_NOFOLLOW) == 0) {
-    throw std::runtime_error(
-        "replacement appeared at removed cgroup path: " + path_.string());
+  struct stat remaining{};
+  if (fstatat(parent_fd_, name_.c_str(), &remaining, AT_SYMLINK_NOFOLLOW) ==
+      0) {
+    throw std::runtime_error("replacement appeared at removed cgroup path: " +
+                             path_.string());
   }
   if (errno != ENOENT) {
     throw std::runtime_error("verify removed cgroup path failed for " +
                              path_.string() + ": " + std::strerror(errno));
   }
 }
+
+#ifdef BBP_ENABLE_TEST_HOOKS
+void SetCgroupCreateAfterDirectoryHookForTest(std::function<void()> hook) {
+  cgroup_create_after_directory_hook = std::move(hook);
+}
+
+void SetCgroupCreateSharedAllocationHookForTest(std::function<void()> hook) {
+  cgroup_create_shared_allocation_hook = std::move(hook);
+}
+#endif
 
 }  // namespace bbp

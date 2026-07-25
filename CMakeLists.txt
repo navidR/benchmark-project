@@ -350,7 +350,13 @@ if(BUILD_TESTING)
   add_executable(bbp-tui-pty-helper
     tests/helpers/tui_pty_helper.cpp
   )
-  target_link_libraries(bbp-tui-pty-helper PRIVATE util)
+  target_link_libraries(bbp-tui-pty-helper PRIVATE
+    Boost::asio
+    Boost::beast
+    Boost::json
+    Boost::system
+    util
+  )
   target_compile_options(bbp-tui-pty-helper PRIVATE
     -Wall
     -Wextra
@@ -1851,6 +1857,14 @@ if(BUILD_TESTING)
       $<TARGET_FILE:bbp>
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-live-load"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+  )
+  add_test(NAME bbp-node-replace-default-timeout-production
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --slow-node-replace
+      $<TARGET_FILE:bbp>
+  )
+  set_tests_properties(bbp-node-replace-default-timeout-production
+    PROPERTIES TIMEOUT 150
   )
   add_test(NAME bbp-tui-simulator-log-wrap
     COMMAND $<TARGET_FILE:bbp-tui-pty-helper>

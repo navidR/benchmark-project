@@ -9,6 +9,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <boost/asio/ip/address_v4.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -18,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -29,6 +37,13 @@
 namespace {
 
 using namespace std::chrono_literals;
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+using tcp = asio::ip::tcp;
+
+inline constexpr auto kSlowNodeReplacementPhaseDelay =
+    std::chrono::milliseconds(17750);
 
 class PtyProcess {
  public:
@@ -360,6 +375,155 @@ std::string WaitForFileOccurrences(const std::filesystem::path& path,
                            " occurrence count for " + std::string(expected));
 }
 
+http::response<http::string_body> McpExchange(
+    std::uint16_t port, std::string_view token, std::string body,
+    std::string_view session_id = {}, std::string_view protocol_version = {}) {
+  asio::io_context io_context;
+  beast::tcp_stream stream(io_context);
+  stream.connect(tcp::endpoint(asio::ip::address_v4::loopback(), port));
+  http::request<http::string_body> request{http::verb::post, "/mcp", 11};
+  request.set(http::field::host, "127.0.0.1:" + std::to_string(port));
+  request.set(http::field::origin, "http://127.0.0.1:" + std::to_string(port));
+  request.set(http::field::content_type, "application/json");
+  request.set(http::field::accept, "application/json, text/event-stream");
+  request.set(http::field::authorization, "Bearer " + std::string(token));
+  request.set(http::field::connection, "close");
+  if (!session_id.empty()) {
+    request.set("Mcp-Session-Id", session_id);
+    request.set("MCP-Protocol-Version", protocol_version);
+  }
+  request.body() = std::move(body);
+  request.prepare_payload();
+  http::write(stream, request);
+  beast::flat_buffer buffer;
+  http::response<http::string_body> response;
+  http::read(stream, buffer, response);
+  return response;
+}
+
+boost::json::object McpStructuredContent(
+    const http::response<http::string_body>& response,
+    std::string_view context) {
+  if (response.result() != http::status::ok) {
+    throw std::runtime_error(std::string(context) + " returned HTTP " +
+                             std::to_string(response.result_int()) + ": " +
+                             response.body());
+  }
+  const boost::json::value decoded = boost::json::parse(response.body());
+  if (!decoded.is_object()) {
+    throw std::runtime_error(std::string(context) +
+                             " returned a non-object JSON-RPC response");
+  }
+  const boost::json::value* result = decoded.as_object().if_contains("result");
+  if (result == nullptr || !result->is_object()) {
+    throw std::runtime_error(std::string(context) +
+                             " returned no JSON-RPC result");
+  }
+  const boost::json::value* structured =
+      result->as_object().if_contains("structuredContent");
+  if (structured == nullptr || !structured->is_object()) {
+    throw std::runtime_error(std::string(context) +
+                             " returned no structured content");
+  }
+  return structured->as_object();
+}
+
+boost::json::object McpToolCall(std::uint16_t port, std::string_view token,
+                                std::string_view session_id,
+                                std::string_view protocol_version,
+                                std::uint64_t request_id, std::string_view name,
+                                boost::json::object arguments) {
+  boost::json::object result = McpStructuredContent(
+      McpExchange(port, token,
+                  boost::json::serialize(boost::json::object{
+                      {"jsonrpc", "2.0"},
+                      {"id", request_id},
+                      {"method", "tools/call"},
+                      {"params", boost::json::object{{"name", name},
+                                                     {"arguments",
+                                                      std::move(arguments)}}}}),
+                  session_id, protocol_version),
+      name);
+  if (const boost::json::value* error = result.if_contains("isError");
+      error != nullptr && error->is_bool() && error->as_bool()) {
+    throw std::runtime_error(
+        std::string(name) +
+        " returned an MCP tool error: " + boost::json::serialize(result));
+  }
+  return result;
+}
+
+struct McpTestSession {
+  std::uint16_t port = 0U;
+  std::string token;
+  std::string protocol_version;
+  std::string session_id;
+};
+
+McpTestSession ConnectMcpTestSession(
+    const std::filesystem::path& publication_directory) {
+  const boost::json::value client = boost::json::parse(WaitForFileText(
+      publication_directory / "client.json", "\"endpoint\"", 5s));
+  if (!client.is_object()) {
+    throw std::runtime_error("MCP client publication is not an object");
+  }
+  const boost::json::object& object = client.as_object();
+  const std::string endpoint(object.at("endpoint").as_string());
+  constexpr std::string_view kEndpointPrefix = "http://127.0.0.1:";
+  constexpr std::string_view kEndpointSuffix = "/mcp";
+  if (!endpoint.starts_with(kEndpointPrefix) ||
+      !endpoint.ends_with(kEndpointSuffix)) {
+    throw std::runtime_error("MCP client endpoint is not loopback HTTP");
+  }
+  const std::string port_text = endpoint.substr(
+      kEndpointPrefix.size(),
+      endpoint.size() - kEndpointPrefix.size() - kEndpointSuffix.size());
+  const unsigned long parsed_port = std::stoul(port_text);
+  if (parsed_port == 0U || parsed_port > 65535U) {
+    throw std::runtime_error("MCP client endpoint port is invalid");
+  }
+  McpTestSession session{
+      .port = static_cast<std::uint16_t>(parsed_port),
+      .token = ReadFile(publication_directory / "token"),
+      .protocol_version =
+          std::string(object.at("protocol_version").as_string()),
+      .session_id = {},
+  };
+  if (!session.token.empty() && session.token.back() == '\n') {
+    session.token.pop_back();
+  }
+  const http::response<http::string_body> initialized = McpExchange(
+      session.port, session.token,
+      boost::json::serialize(boost::json::object{
+          {"jsonrpc", "2.0"},
+          {"id", 1U},
+          {"method", "initialize"},
+          {"params",
+           boost::json::object{
+               {"protocolVersion", session.protocol_version},
+               {"capabilities", boost::json::object{}},
+               {"clientInfo",
+                boost::json::object{{"name", "bbp-pty-node-replace-test"},
+                                    {"version", "1"}}}}}}));
+  if (initialized.result() != http::status::ok ||
+      initialized.find("Mcp-Session-Id") == initialized.end()) {
+    throw std::runtime_error("MCP initialization failed: " +
+                             initialized.body());
+  }
+  session.session_id = initialized.at("Mcp-Session-Id");
+  const http::response<http::string_body> notification =
+      McpExchange(session.port, session.token,
+                  boost::json::serialize(boost::json::object{
+                      {"jsonrpc", "2.0"},
+                      {"method", "notifications/initialized"},
+                      {"params", boost::json::object{}}}),
+                  session.session_id, session.protocol_version);
+  if (notification.result() != http::status::accepted) {
+    throw std::runtime_error("MCP initialized notification failed");
+  }
+  return session;
+}
+
 void RequireContains(std::string_view text, std::string_view expected,
                      std::string_view context) {
   if (text.find(expected) == std::string_view::npos) {
@@ -395,6 +559,18 @@ std::string DaemonArgumentValue(int argc, char** argv,
   }
   throw std::runtime_error("ready daemon missing argument " +
                            std::string(prefix));
+}
+
+std::vector<std::string> DaemonArgumentValues(int argc, char** argv,
+                                              std::string_view prefix) {
+  std::vector<std::string> values;
+  for (int index = 1; index < argc; ++index) {
+    const std::string_view argument(argv[index]);
+    if (argument.starts_with(prefix)) {
+      values.emplace_back(argument.substr(prefix.size()));
+    }
+  }
+  return values;
 }
 
 void SendAll(int descriptor, std::string_view text) {
@@ -467,12 +643,101 @@ std::string RpcMethod(std::string_view request) {
   return std::string(request.substr(begin, end - begin));
 }
 
-std::string RpcResult(std::string_view method) {
+std::string RpcFirstStringParameter(std::string_view request,
+                                    std::string_view method) {
+  const std::size_t body_begin = request.find("\r\n\r\n");
+  if (body_begin == std::string_view::npos) {
+    throw std::runtime_error("ready daemon RPC has no body");
+  }
+  const boost::json::value decoded =
+      boost::json::parse(request.substr(body_begin + 4U));
+  const boost::json::value* parameters =
+      decoded.as_object().if_contains("params");
+  if (parameters == nullptr || !parameters->is_array() ||
+      parameters->as_array().empty() ||
+      !parameters->as_array().front().is_string()) {
+    throw std::runtime_error("ready daemon " + std::string(method) +
+                             " RPC has no string target");
+  }
+  return std::string(parameters->as_array().front().as_string());
+}
+
+void WriteReadyDaemonPeerState(const std::filesystem::path& path,
+                               const std::set<std::string>& peers) {
+  std::ofstream stream(path);
+  if (!stream) {
+    throw std::runtime_error("could not record ready-daemon peer state");
+  }
+  for (const std::string& peer : peers) {
+    stream << peer << '\n';
+  }
+}
+
+void AppendReadyDaemonRpcAudit(const std::filesystem::path& path,
+                               std::string_view method, std::string_view target,
+                               std::string_view phase) {
+  std::ofstream stream(path, std::ios::app);
+  if (!stream) {
+    throw std::runtime_error("could not append ready-daemon RPC audit");
+  }
+  stream << method << ' ' << target << ' ' << phase << '\n';
+  if (!stream) {
+    throw std::runtime_error("could not flush ready-daemon RPC audit");
+  }
+}
+
+void AppendReadyDaemonTimingAudit(const std::filesystem::path& run_root,
+                                  std::string_view node_root_name,
+                                  std::string_view phase) {
+  std::ofstream stream(run_root / "bbp-test-slow-node-replace-audit",
+                       std::ios::app);
+  if (!stream) {
+    throw std::runtime_error("could not append slow ready-daemon timing audit");
+  }
+  stream << node_root_name << ' ' << phase << '\n';
+  if (!stream) {
+    throw std::runtime_error("could not flush slow ready-daemon timing audit");
+  }
+}
+
+std::string RpcResult(std::string_view method, std::string_view request,
+                      std::set<std::string>* peers,
+                      const std::filesystem::path& peer_state_path,
+                      bool slow_replacement,
+                      std::optional<std::chrono::steady_clock::time_point>*
+                          slow_synchronization_started,
+                      bool* slow_synchronization_completed) {
+  const std::filesystem::path node_root =
+      peer_state_path.parent_path().parent_path();
+  const std::filesystem::path run_root = node_root.parent_path().parent_path();
+  const std::filesystem::path directed_peer_drop_control =
+      run_root / "bbp-test-drop-directed-peer-on-target-stop";
+  const std::filesystem::path directed_peer_drop_trigger =
+      run_root / "bbp-test-directed-peer-target-stopped";
   if (method == "getblockchaininfo") {
+    if (slow_replacement) {
+      const auto now = std::chrono::steady_clock::now();
+      if (!*slow_synchronization_started) {
+        *slow_synchronization_started = now;
+        AppendReadyDaemonTimingAudit(run_root, node_root.filename().string(),
+                                     "synchronization-delay-started");
+      } else if (now < **slow_synchronization_started +
+                           kSlowNodeReplacementPhaseDelay) {
+        return R"({"blocks":0,"headers":0,"bestblockhash":"00","initialblockdownload":true,"verificationprogress":0.5,"difficulty":1.0,"mediantime":0,"chainwork":"00"})";
+      } else if (!*slow_synchronization_completed) {
+        AppendReadyDaemonTimingAudit(run_root, node_root.filename().string(),
+                                     "synchronization-delay-completed");
+        *slow_synchronization_completed = true;
+      }
+    }
     return R"({"blocks":0,"headers":0,"bestblockhash":"00","initialblockdownload":false,"verificationprogress":1.0,"difficulty":1.0,"mediantime":0,"chainwork":"00"})";
   }
   if (method == "getnetworkinfo") {
-    return R"({"version":1,"protocolversion":1,"subversion":"/bbp-test/","connections":0})";
+    return boost::json::serialize(
+        boost::json::object{{"version", 1U},
+                            {"protocolversion", 1U},
+                            {"subversion", "/bbp-test/"},
+                            {"connections", peers->size()}});
   }
   if (method == "getmempoolinfo") {
     return R"({"size":0,"bytes":0})";
@@ -484,9 +749,66 @@ std::string RpcResult(std::string_view method) {
     return "0";
   }
   if (method == "getpeerinfo") {
+    const std::filesystem::path directed_peer_drop_consumed =
+        peer_state_path.parent_path() / "bbp-test-directed-peer-drop-consumed";
+    if (node_root.filename() != "firo-1" &&
+        std::filesystem::exists(directed_peer_drop_trigger) &&
+        !std::filesystem::exists(directed_peer_drop_consumed)) {
+      peers->clear();
+      WriteReadyDaemonPeerState(peer_state_path, *peers);
+      std::ofstream consumed(directed_peer_drop_consumed);
+      if (!consumed) {
+        throw std::runtime_error(
+            "could not record directed peer-drop consumption");
+      }
+      consumed << "target peer dropped\n";
+    }
+    boost::json::array result;
+    for (const std::string& peer : *peers) {
+      result.emplace_back(boost::json::object{
+          {"addr", peer},
+          {"bytesrecv_per_msg", boost::json::object{{"verack", 1U}}}});
+    }
+    return boost::json::serialize(result);
+  }
+  if (method == "listbanned") {
     return "[]";
   }
+  if (method == "setban") {
+    return "null";
+  }
+  if (method == "addnode") {
+    const std::string target = RpcFirstStringParameter(request, method);
+    const std::filesystem::path staged_events =
+        run_root / ".runtime-node-replace-events.pending";
+    std::string_view phase = "outside-replace";
+    if (std::filesystem::exists(staged_events)) {
+      phase = ReadFile(staged_events).find("\"event\":\"height_reached\"") ==
+                      std::string::npos
+                  ? "before-height"
+                  : "after-height";
+    }
+    AppendReadyDaemonRpcAudit(
+        peer_state_path.parent_path() / "bbp-test-rpc-audit", method, target,
+        phase);
+    peers->insert(target);
+    WriteReadyDaemonPeerState(peer_state_path, *peers);
+    return "null";
+  }
+  if (method == "disconnectnode") {
+    peers->erase(RpcFirstStringParameter(request, method));
+    WriteReadyDaemonPeerState(peer_state_path, *peers);
+    return "null";
+  }
   if (method == "stop") {
+    if (node_root.filename() == "firo-1" &&
+        std::filesystem::exists(directed_peer_drop_control)) {
+      std::ofstream trigger(directed_peer_drop_trigger);
+      if (!trigger) {
+        throw std::runtime_error("could not create directed peer-drop trigger");
+      }
+      trigger << "target stopped\n";
+    }
     return "null";
   }
   throw std::runtime_error("ready daemon received unsupported RPC method " +
@@ -494,6 +816,27 @@ std::string RpcResult(std::string_view method) {
 }
 
 int RunReadyFiroDaemon(int argc, char** argv) {
+  const std::filesystem::path data_directory =
+      DaemonArgumentValue(argc, argv, "-datadir=");
+  const std::filesystem::path node_root = data_directory.parent_path();
+  const std::filesystem::path run_root = node_root.parent_path().parent_path();
+  const bool slow_replacement =
+      std::filesystem::exists(run_root / "bbp-test-slow-node-replace");
+  if (node_root.filename().string().starts_with("bbpr-") &&
+      std::filesystem::exists(run_root / "bbp-test-stall-final-replacement")) {
+    std::ofstream marker(run_root / "nodes" / "firo-1" / "data" /
+                         "bbp-test-stall-readiness");
+    if (!marker) {
+      throw std::runtime_error(
+          "could not create final replacement readiness marker");
+    }
+    marker << "stall final replacement readiness\n";
+  }
+  if (std::filesystem::exists(data_directory / "bbp-test-stall-readiness")) {
+    for (;;) {
+      pause();
+    }
+  }
   const std::filesystem::path cookie =
       DaemonArgumentValue(argc, argv, "-rpccookiefile=");
   const std::string bind_address = DaemonArgumentValue(argc, argv, "-rpcbind=");
@@ -512,6 +855,13 @@ int RunReadyFiroDaemon(int argc, char** argv) {
   if (chmod(cookie.c_str(), 0600) != 0) {
     throw std::system_error(errno, std::generic_category(),
                             "protect ready-daemon RPC cookie");
+  }
+  if (slow_replacement) {
+    AppendReadyDaemonTimingAudit(run_root, node_root.filename().string(),
+                                 "readiness-delay-started");
+    std::this_thread::sleep_for(kSlowNodeReplacementPhaseDelay);
+    AppendReadyDaemonTimingAudit(run_root, node_root.filename().string(),
+                                 "readiness-delay-completed");
   }
 
   const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
@@ -544,6 +894,17 @@ int RunReadyFiroDaemon(int argc, char** argv) {
                             "bind ready-daemon listener");
   }
 
+  const std::vector<std::string> configured_peers =
+      DaemonArgumentValues(argc, argv, "-connect=");
+  std::set<std::string> peers(configured_peers.begin(), configured_peers.end());
+  const std::filesystem::path peer_state_path =
+      data_directory / "bbp-test-configured-peers";
+  if (!peers.empty()) {
+    WriteReadyDaemonPeerState(peer_state_path, peers);
+  }
+  std::optional<std::chrono::steady_clock::time_point>
+      slow_synchronization_started;
+  bool slow_synchronization_completed = false;
   bool stop = false;
   while (!stop) {
     int connection;
@@ -557,9 +918,14 @@ int RunReadyFiroDaemon(int argc, char** argv) {
                               "accept ready-daemon request");
     }
     try {
-      const std::string method = RpcMethod(ReadHttpRequest(connection));
-      const std::string body = "{\"result\":" + RpcResult(method) +
-                               ",\"error\":null,\"id\":\"bbp\"}";
+      const std::string request = ReadHttpRequest(connection);
+      const std::string method = RpcMethod(request);
+      const std::string body =
+          "{\"result\":" +
+          RpcResult(method, request, &peers, peer_state_path, slow_replacement,
+                    &slow_synchronization_started,
+                    &slow_synchronization_completed) +
+          ",\"error\":null,\"id\":\"bbp\"}";
       const std::string response =
           "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
           "Connection: close\r\nContent-Length: " +
@@ -999,6 +1365,266 @@ void CheckZeroToOnePublication(const std::filesystem::path& command,
   WaitForProcessExit(added_daemon_pid, 3s);
 }
 
+void CheckNodeReplacementPublication(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("node-replace");
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::filesystem::path ready_daemon = directory.root() / "ready-firod";
+  const std::filesystem::path firo_qt = directory.root() / "firo-qt";
+  std::filesystem::copy_file(helper_binary, ready_daemon);
+  std::filesystem::copy_file(helper_binary, firo_qt);
+  std::filesystem::permissions(ready_daemon,
+                               std::filesystem::perms::owner_read |
+                                   std::filesystem::perms::owner_write |
+                                   std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::replace);
+  std::filesystem::permissions(firo_qt,
+                               std::filesystem::perms::owner_read |
+                                   std::filesystem::perms::owner_write |
+                                   std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::replace);
+  const std::string run_id =
+      "replace-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  const std::filesystem::path node_root = run_root / "nodes" / "firo-1";
+  const std::filesystem::path sentinel = node_root / "data" / "sentinel";
+  const std::filesystem::path clone_failure =
+      node_root / "data" / "clone-failure.fifo";
+  const std::filesystem::path manifest_path =
+      run_root / "runtime-node-resources.json";
+  PtyProcess process(
+      command,
+      {"--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--nodes", "1", "--node-capacity", "1", "--node-binary",
+       ready_daemon.string(), "--no-isolate-network", "--no-mining",
+       "--refresh-ms", "50", "--metrics-interval", "50ms"},
+      30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "node replacement TUI"));
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"run_started\"", 5s));
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"process_started\"", 5s));
+  {
+    std::ofstream stream(sentinel);
+    if (!stream) {
+      throw std::runtime_error("could not create node-replacement sentinel");
+    }
+    stream << "preserve-root-and-data\n";
+  }
+  struct stat root_before{};
+  struct stat sentinel_before{};
+  if (stat(node_root.c_str(), &root_before) != 0 ||
+      stat(sentinel.c_str(), &sentinel_before) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "inspect node replacement identities");
+  }
+  const std::string manifest_before =
+      WaitForFileText(manifest_path, "\"state\":\"live\"", 5s);
+  if (mkfifo(clone_failure.c_str(), 0600) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "create node-replacement clone failure");
+  }
+
+  process.Write("c");
+  static_cast<void>(process.ReadUntil("add-nodes <chain> <count> [binary]", 3s,
+                                      "node replacement command palette"));
+  static_cast<void>(process.ReadFor(100ms));
+  process.Write("replace-node firo\n");
+  static_cast<void>(process.ReadUntil("Confirm destructive action", 3s,
+                                      "node replacement confirmation"));
+  process.Write("y");
+  const std::string failed_events = WaitForFileText(
+      events_path, "\"event\":\"operator_command_failed\"", 10s);
+  RequireNotContains(failed_events, "\"event\":\"run_cancelled\"",
+                     "recoverable node replacement clone failure");
+  if (ReadFile(manifest_path) != manifest_before) {
+    throw std::runtime_error(
+        "node replacement clone failure changed the live resource manifest");
+  }
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(run_root / "nodes")) {
+    if (entry.path().filename().string().starts_with("bbpr-")) {
+      throw std::runtime_error(
+          "node replacement clone failure retained a staging root");
+    }
+  }
+  struct stat root_after_failure{};
+  struct stat sentinel_after_failure{};
+  if (stat(node_root.c_str(), &root_after_failure) != 0 ||
+      stat(sentinel.c_str(), &sentinel_after_failure) != 0 ||
+      root_before.st_dev != root_after_failure.st_dev ||
+      root_before.st_ino != root_after_failure.st_ino ||
+      sentinel_before.st_dev != sentinel_after_failure.st_dev ||
+      sentinel_before.st_ino != sentinel_after_failure.st_ino) {
+    throw std::runtime_error(
+        "node replacement clone failure changed live filesystem identity");
+  }
+  static_cast<void>(
+      process.ReadUntil("Command error", 5s, "node replacement clone failure"));
+  process.Write("\n");
+  if (!std::filesystem::remove(clone_failure)) {
+    throw std::runtime_error(
+        "could not remove node-replacement clone failure fixture");
+  }
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  const std::filesystem::path stall_control =
+      run_root / "bbp-test-stall-final-replacement";
+  const std::filesystem::path stall_readiness =
+      node_root / "data" / "bbp-test-stall-readiness";
+  {
+    std::ofstream stream(stall_control);
+    if (!stream) {
+      throw std::runtime_error(
+          "could not create final replacement stall control");
+    }
+    stream << "stall final replacement only\n";
+  }
+  const boost::json::object submitted = McpToolCall(
+      mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, 2U,
+      "node.replace",
+      boost::json::object{
+          {"run_id", run_id},
+          {"node_id", "firo-1"},
+          {"replacement",
+           boost::json::object{{"chain", "firo"},
+                               {"count", 1U},
+                               {"node_ids", boost::json::array{"firo-1"}},
+                               {"ready_timeout_sec", 10U},
+                               {"sync_timeout_sec", 10U}}}});
+  const std::string operation_id(submitted.at("operation_id").as_string());
+  static_cast<void>(
+      WaitForFileText(run_root / ".runtime-node-replace-events.pending",
+                      "\\\"reason\\\":\\\"runtime_node_replace\\\"", 15s));
+  if (!std::filesystem::remove(stall_readiness) ||
+      !std::filesystem::remove(stall_control)) {
+    throw std::runtime_error(
+        "could not release final replacement readiness fixture");
+  }
+  const boost::json::object cancellation = McpToolCall(
+      mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, 3U,
+      "operation.cancel", boost::json::object{{"operation_id", operation_id}});
+  if (!cancellation.at("cancel_requested").as_bool()) {
+    throw std::runtime_error(
+        "MCP did not accept final replacement cancellation");
+  }
+  boost::json::object cancelled;
+  const auto cancellation_deadline = std::chrono::steady_clock::now() + 15s;
+  std::uint64_t request_id = 4U;
+  while (std::chrono::steady_clock::now() < cancellation_deadline) {
+    cancelled = McpToolCall(
+        mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+        "operation.get", boost::json::object{{"operation_id", operation_id}});
+    if (cancelled.at("state").as_string() == "cancelled") {
+      break;
+    }
+    if (cancelled.at("state").as_string() == "failed" ||
+        cancelled.at("state").as_string() == "succeeded") {
+      throw std::runtime_error(
+          "final replacement cancellation produced terminal state " +
+          std::string(cancelled.at("state").as_string()));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (cancelled.empty() || cancelled.at("state").as_string() != "cancelled") {
+    throw std::runtime_error(
+        "final replacement cancellation did not become terminal");
+  }
+  const std::string after_cancellation = ReadFile(events_path);
+  RequireNotContains(after_cancellation, "\"event\":\"run_cancelled\"",
+                     "cancelled node replacement");
+  if (ReadFile(manifest_path) != manifest_before ||
+      std::filesystem::exists(run_root /
+                              ".runtime-node-replace-events.pending")) {
+    throw std::runtime_error(
+        "cancelled node replacement did not restore its manifest/evidence");
+  }
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(run_root / "nodes")) {
+    if (entry.path().filename().string().starts_with("bbpr-")) {
+      throw std::runtime_error(
+          "cancelled node replacement retained a staging root");
+    }
+  }
+  struct stat root_after_cancellation{};
+  struct stat sentinel_after_cancellation{};
+  if (stat(node_root.c_str(), &root_after_cancellation) != 0 ||
+      stat(sentinel.c_str(), &sentinel_after_cancellation) != 0 ||
+      root_before.st_dev != root_after_cancellation.st_dev ||
+      root_before.st_ino != root_after_cancellation.st_ino ||
+      sentinel_before.st_dev != sentinel_after_cancellation.st_dev ||
+      sentinel_before.st_ino != sentinel_after_cancellation.st_ino ||
+      ReadFile(sentinel) != "preserve-root-and-data\n") {
+    throw std::runtime_error(
+        "cancelled node replacement changed preserved filesystem identity");
+  }
+
+  process.Write("c");
+  static_cast<void>(process.ReadUntil("add-nodes <chain> <count> [binary]", 3s,
+                                      "node replacement retry palette"));
+  static_cast<void>(process.ReadFor(100ms));
+  process.Write("replace-node firo\n");
+  static_cast<void>(process.ReadUntil("Confirm destructive action", 3s,
+                                      "node replacement retry confirmation"));
+  process.Write("y");
+  const std::string events = WaitForFileText(
+      events_path, "\"event\":\"operator_command_completed\"", 30s);
+  static_cast<void>(process.ReadUntil("Command #3 completed for firo-1.", 5s,
+                                      "node replacement completion"));
+  RequireContains(events, "\"event\":\"runtime_generation_published\"",
+                  "node replacement publication");
+  RequireContains(events, "\\\"generation\\\":2",
+                  "node replacement generation");
+  RequireContains(events, "\\\"node_count\\\":1", "node replacement count");
+  RequireContains(events, "\\\"replaced_node_id\\\":\\\"firo-1\\\"",
+                  "node replacement stable identity");
+  RequireContains(events, "\\\"topology_restore_request_sequence\\\":1",
+                  "node replacement topology restoration request");
+  RequireNotContains(events, "node_replace_outcome_unconfirmed",
+                     "node replacement outcome");
+  RequireContains(events,
+                  "\\\"reason\\\":\\\"runtime_node_replace_candidate\\\"",
+                  "node replacement candidate start");
+  RequireContains(events, "\\\"reason\\\":\\\"runtime_node_replace\\\"",
+                  "node replacement final start");
+
+  struct stat root_after{};
+  struct stat sentinel_after{};
+  if (stat(node_root.c_str(), &root_after) != 0 ||
+      stat(sentinel.c_str(), &sentinel_after) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "reinspect node replacement identities");
+  }
+  if (root_before.st_dev != root_after.st_dev ||
+      root_before.st_ino != root_after.st_ino ||
+      sentinel_before.st_dev != sentinel_after.st_dev ||
+      sentinel_before.st_ino != sentinel_after.st_ino ||
+      ReadFile(sentinel) != "preserve-root-and-data\n") {
+    throw std::runtime_error(
+        "compatible node replacement changed its live root or sentinel "
+        "identity");
+  }
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(run_root / "nodes")) {
+    if (entry.path().filename().string().starts_with("bbpr-")) {
+      throw std::runtime_error(
+          "successful node replacement retained a staging root");
+    }
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil("Confirm exit", 3s,
+                                      "node replacement confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "node replacement TUI exit");
+}
+
 void CheckRetainedMcpLifecycle(const std::filesystem::path& command,
                                const std::filesystem::path& run_root) {
   OwnedTemporaryDirectory directory("retained-mcp");
@@ -1298,6 +1924,358 @@ std::filesystem::path CopyActiveDaemonFixtures(
   return daemon;
 }
 
+void CheckSlowNodeReplacementDefaultTimeout(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("slow-node-replace");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "slow-replace-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  const std::filesystem::path node_root = run_root / "nodes" / "firo-1";
+  const std::filesystem::path sentinel = node_root / "data" / "sentinel";
+  const std::filesystem::path timing_audit =
+      run_root / "bbp-test-slow-node-replace-audit";
+
+  PtyProcess process(
+      command,
+      {"--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--nodes", "1", "--node-capacity", "1", "--node-binary", daemon.string(),
+       "--no-isolate-network", "--no-mining", "--refresh-ms", "50",
+       "--metrics-interval", "50ms"},
+      30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "slow node replacement TUI"));
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"rpc_ready\"", 30s));
+  {
+    std::ofstream stream(sentinel);
+    if (!stream) {
+      throw std::runtime_error(
+          "could not create slow node-replacement sentinel");
+    }
+    stream << "preserve-slow-replacement-root\n";
+  }
+  struct stat root_before{};
+  struct stat sentinel_before{};
+  if (stat(node_root.c_str(), &root_before) != 0 ||
+      stat(sentinel.c_str(), &sentinel_before) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "inspect slow node replacement identities");
+  }
+  {
+    std::ofstream stream(run_root / "bbp-test-slow-node-replace");
+    if (!stream) {
+      throw std::runtime_error(
+          "could not enable slow node-replacement fixture");
+    }
+    stream << "delay candidate and final readiness and synchronization\n";
+  }
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  const auto replacement_started = std::chrono::steady_clock::now();
+  const boost::json::object submitted = McpToolCall(
+      mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, 2U,
+      "node.replace",
+      boost::json::object{
+          {"run_id", run_id},
+          {"node_id", "firo-1"},
+          {"replacement",
+           boost::json::object{{"chain", "firo"},
+                               {"count", 1U},
+                               {"node_ids", boost::json::array{"firo-1"}},
+                               {"ready_timeout_sec", 20U},
+                               {"sync_timeout_sec", 20U}}}});
+  const std::string operation_id(submitted.at("operation_id").as_string());
+  boost::json::object terminal;
+  std::uint64_t request_id = 3U;
+  const auto terminal_wait_deadline = replacement_started + 135s;
+  while (std::chrono::steady_clock::now() < terminal_wait_deadline) {
+    terminal = McpToolCall(mcp.port, mcp.token, mcp.session_id,
+                           mcp.protocol_version, request_id++, "operation.get",
+                           boost::json::object{{"operation_id", operation_id}});
+    const std::string_view state = terminal.at("state").as_string();
+    if (state == "succeeded" || state == "failed" || state == "cancelled") {
+      break;
+    }
+    std::this_thread::sleep_for(100ms);
+  }
+  const auto replacement_elapsed =
+      std::chrono::steady_clock::now() - replacement_started;
+  if (terminal.empty() || terminal.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("slow node replacement did not succeed: " +
+                             (terminal.empty()
+                                  ? std::string("no terminal result")
+                                  : boost::json::serialize(terminal)));
+  }
+  constexpr auto kOldAggregateDefault = 70s;
+  constexpr auto kNewAggregateDefault = 130s;
+  if (replacement_elapsed <= kOldAggregateDefault) {
+    throw std::runtime_error(
+        "slow node replacement did not exceed the old 70-second default");
+  }
+  if (replacement_elapsed >= kNewAggregateDefault) {
+    throw std::runtime_error(
+        "slow node replacement exceeded the new 130-second default");
+  }
+
+  const boost::json::object& result =
+      terminal.at("terminal_result").as_object();
+  if (result.at("action").as_string() != "node.replace" ||
+      result.at("state").as_string() != "running" ||
+      result.at("inventory_generation").to_number<std::uint64_t>() != 2U ||
+      result.at("final_node_count").to_number<std::uint64_t>() != 1U ||
+      result.at("affected_node_ids").as_array().size() != 1U ||
+      result.at("affected_node_ids").as_array().front().as_string() !=
+          "firo-1") {
+    throw std::runtime_error(
+        "slow node replacement returned inconsistent inventory evidence");
+  }
+
+  const std::string timing = WaitForFileOccurrences(
+      timing_audit, "synchronization-delay-completed", 2U, 5s);
+  if (CountOccurrences(timing, "readiness-delay-started") != 2U ||
+      CountOccurrences(timing, "readiness-delay-completed") != 2U ||
+      CountOccurrences(timing, "synchronization-delay-started") != 2U ||
+      CountOccurrences(timing, "synchronization-delay-completed") != 2U) {
+    throw std::runtime_error(
+        "slow node replacement did not exercise exactly four delayed phases");
+  }
+  RequireContains(timing, "bbpr-", "slow replacement candidate timing audit");
+  RequireContains(timing, "firo-1", "slow replacement final timing audit");
+
+  const std::string events = ReadFile(events_path);
+  RequireContains(events, "\"event\":\"runtime_generation_published\"",
+                  "slow node replacement publication");
+  RequireNotContains(events, "node_replace_outcome_unconfirmed",
+                     "slow node replacement outcome");
+  RequireNotContains(events, "\"event\":\"run_cancelled\"",
+                     "slow node replacement run state");
+  RequireNotContains(events, "\"event\":\"run_failed\"",
+                     "slow node replacement run state");
+
+  struct stat root_after{};
+  struct stat sentinel_after{};
+  if (stat(node_root.c_str(), &root_after) != 0 ||
+      stat(sentinel.c_str(), &sentinel_after) != 0 ||
+      root_before.st_dev != root_after.st_dev ||
+      root_before.st_ino != root_after.st_ino ||
+      sentinel_before.st_dev != sentinel_after.st_dev ||
+      sentinel_before.st_ino != sentinel_after.st_ino ||
+      ReadFile(sentinel) != "preserve-slow-replacement-root\n") {
+    throw std::runtime_error(
+        "slow compatible replacement changed preserved filesystem identity");
+  }
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(run_root / "nodes")) {
+    if (entry.path().filename().string().starts_with("bbpr-")) {
+      throw std::runtime_error(
+          "slow successful replacement retained a staging root");
+    }
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s, "slow node replacement confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "slow node replacement TUI exit");
+  std::cout << "slow node replacement succeeded after "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   replacement_elapsed)
+                   .count()
+            << "ms across four delayed phases\n";
+}
+
+void CheckDirectedNodeReplacementPublication(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("directed-node-replace");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path scenario = directory.root() / "scenario.json";
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "directed-replace-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  {
+    std::ofstream stream(scenario);
+    if (!stream) {
+      throw std::runtime_error(
+          "could not create directed node-replacement scenario");
+    }
+    stream << boost::json::serialize(boost::json::object{
+                  {"chain", "firo"},
+                  {"chain_daemon", daemon.string()},
+                  {"nodes", 3U},
+                  {"node_capacity", 3U},
+                  {"isolated_network", false},
+                  {"topology",
+                   boost::json::object{
+                       {"node_count", 3U},
+                       {"type", "custom_edge_list"},
+                       {"edges",
+                        boost::json::array{
+                            boost::json::object{{"from", 2U},
+                                                {"to", 1U},
+                                                {"bidirectional", false},
+                                                {"active", true}},
+                            boost::json::object{{"from", 3U},
+                                                {"to", 1U},
+                                                {"bidirectional", false},
+                                                {"active", true}}}}}},
+                  {"block_production", boost::json::object{{"enabled", false}}},
+                  {"ready_timeout_sec", 10U},
+                  {"sync_timeout_sec", 10U},
+                  {"metrics_interval_ms", 50U},
+                  {"workloads", boost::json::array{}}})
+           << '\n';
+    if (!stream) {
+      throw std::runtime_error(
+          "could not write directed node-replacement scenario");
+    }
+  }
+
+  PtyProcess process(
+      command,
+      {"--scenario", scenario.string(), "--node-binary", daemon.string(),
+       "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--refresh-ms", "50"},
+      30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "directed node replacement TUI"));
+  static_cast<void>(WaitForFileOccurrences(
+      events_path, "\"event\":\"process_started\"", 3U, 10s));
+  const std::string node_two_configured_peers = WaitForFileText(
+      run_root / "nodes" / "firo-2" / "data" / "bbp-test-configured-peers",
+      "127.0.0.1:18168", 5s);
+  const std::string node_three_configured_peers = WaitForFileText(
+      run_root / "nodes" / "firo-3" / "data" / "bbp-test-configured-peers",
+      "127.0.0.1:18168", 5s);
+  RequireContains(node_two_configured_peers, "127.0.0.1:18168",
+                  "directed replacement source peer");
+  RequireContains(node_three_configured_peers, "127.0.0.1:18168",
+                  "directed replacement second source peer");
+  if (std::filesystem::exists(run_root / "nodes" / "firo-1" / "data" /
+                              "bbp-test-configured-peers")) {
+    throw std::runtime_error(
+        "directed replacement target received a reverse startup peer");
+  }
+  const std::filesystem::path source_rpc_audit =
+      run_root / "nodes" / "firo-2" / "data" / "bbp-test-rpc-audit";
+  const std::filesystem::path second_source_rpc_audit =
+      run_root / "nodes" / "firo-3" / "data" / "bbp-test-rpc-audit";
+  const std::filesystem::path target_rpc_audit =
+      run_root / "nodes" / "firo-1" / "data" / "bbp-test-rpc-audit";
+  const std::string source_rpc_audit_before =
+      std::filesystem::exists(source_rpc_audit) ? ReadFile(source_rpc_audit)
+                                                : std::string{};
+  const std::string second_source_rpc_audit_before =
+      std::filesystem::exists(second_source_rpc_audit)
+          ? ReadFile(second_source_rpc_audit)
+          : std::string{};
+  const std::string target_rpc_audit_before =
+      std::filesystem::exists(target_rpc_audit) ? ReadFile(target_rpc_audit)
+                                                : std::string{};
+  {
+    std::ofstream control(run_root /
+                          "bbp-test-drop-directed-peer-on-target-stop");
+    if (!control) {
+      throw std::runtime_error("could not create directed peer-drop control");
+    }
+    control << "drop the preserved incoming peer once\n";
+  }
+
+  static_cast<void>(process.ReadFor(200ms));
+  process.Write("c");
+  static_cast<void>(
+      process.ReadUntil("Enter submits. Tab completes. Esc closes.", 3s,
+                        "directed replacement palette"));
+  static_cast<void>(process.ReadFor(200ms));
+  process.Write("replace-node firo\n");
+  static_cast<void>(process.ReadUntil("Confirm destructive action", 3s,
+                                      "directed replacement confirmation"));
+  process.Write("y");
+  const std::string events = WaitForFileText(
+      events_path, "\"event\":\"operator_command_completed\"", 30s);
+  static_cast<void>(process.ReadUntil("Command #1 completed for firo-1.", 5s,
+                                      "directed replacement completion"));
+  RequireContains(
+      events,
+      "\\\"topology_current_edges\\\":[{\\\"from\\\":2,\\\"to\\\":1,"
+      "\\\"band\\\":1,\\\"active\\\":true",
+      "directed replacement published topology");
+  RequireContains(
+      events, "{\\\"from\\\":3,\\\"to\\\":1,\\\"band\\\":1,\\\"active\\\":true",
+      "directed replacement second published topology edge");
+  RequireNotContains(events, "\\\"from\\\":1,\\\"to\\\":2",
+                     "directed replacement published topology");
+  RequireNotContains(events, "\\\"from\\\":1,\\\"to\\\":3",
+                     "directed replacement published topology");
+  RequireContains(events, "\\\"topology_restore_request_sequence\\\":1",
+                  "directed replacement topology restoration request");
+  RequireNotContains(events, "\"event\":\"run_cancelled\"",
+                     "directed replacement run state");
+  constexpr std::string_view kSourceRestorationRpc =
+      "addnode 127.0.0.1:18168 before-height";
+  const std::string source_rpc_audit_after = WaitForFileOccurrences(
+      source_rpc_audit, kSourceRestorationRpc,
+      CountOccurrences(source_rpc_audit_before, kSourceRestorationRpc) + 1U,
+      5s);
+  if (!source_rpc_audit_after.starts_with(source_rpc_audit_before)) {
+    throw std::runtime_error(
+        "directed replacement rewrote its source RPC audit");
+  }
+  RequireContains(std::string_view(source_rpc_audit_after)
+                      .substr(source_rpc_audit_before.size()),
+                  kSourceRestorationRpc,
+                  "directed replacement source-oriented restoration RPC");
+  const std::string second_source_rpc_audit_after = WaitForFileOccurrences(
+      second_source_rpc_audit, kSourceRestorationRpc,
+      CountOccurrences(second_source_rpc_audit_before, kSourceRestorationRpc) +
+          1U,
+      5s);
+  if (!second_source_rpc_audit_after.starts_with(
+          second_source_rpc_audit_before)) {
+    throw std::runtime_error(
+        "directed replacement rewrote its second source RPC audit");
+  }
+  RequireContains(
+      std::string_view(second_source_rpc_audit_after)
+          .substr(second_source_rpc_audit_before.size()),
+      kSourceRestorationRpc,
+      "directed replacement second source-oriented restoration RPC");
+  const std::string target_rpc_audit_after =
+      std::filesystem::exists(target_rpc_audit) ? ReadFile(target_rpc_audit)
+                                                : std::string{};
+  if (!target_rpc_audit_after.starts_with(target_rpc_audit_before)) {
+    throw std::runtime_error(
+        "directed replacement rewrote its target RPC audit");
+  }
+  RequireNotContains(std::string_view(target_rpc_audit_after)
+                         .substr(target_rpc_audit_before.size()),
+                     "addnode 127.0.0.1:18169",
+                     "directed replacement reverse restoration RPC");
+  RequireNotContains(std::string_view(target_rpc_audit_after)
+                         .substr(target_rpc_audit_before.size()),
+                     "addnode 127.0.0.1:18170",
+                     "directed replacement second reverse restoration RPC");
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s, "directed replacement confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "directed replacement TUI exit");
+}
+
 void AppendMalformedEvent(const std::filesystem::path& events_path) {
   std::ofstream stream(events_path, std::ios::app);
   if (!stream) {
@@ -1538,6 +2516,17 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  if (argc == 3 && std::string_view(argv[1]) == "--slow-node-replace") {
+    try {
+      CheckSlowNodeReplacementDefaultTimeout(
+          argv[2], std::filesystem::canonical(argv[0]));
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "slow node replacement regression failed: " << error.what()
+                << '\n';
+      return 1;
+    }
+  }
   if (argc > 1 && argv[1][0] == '-') {
     return RunIdleDaemon();
   }
@@ -1555,6 +2544,10 @@ int main(int argc, char** argv) {
     CheckCommandErrorOnErrorFrame(command, complete_run);
     CheckActiveRunLifecycle(command, std::filesystem::canonical(argv[0]));
     CheckZeroToOnePublication(command, std::filesystem::canonical(argv[0]));
+    CheckNodeReplacementPublication(command,
+                                    std::filesystem::canonical(argv[0]));
+    CheckDirectedNodeReplacementPublication(
+        command, std::filesystem::canonical(argv[0]));
     std::cout << "canonical modal, shared error-frame overlays, and active "
                  "RunBenchmarkWithTui lifecycle checks passed\n";
     return 0;

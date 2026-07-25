@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/json/object.hpp>
+#include <string_view>
 
 #include "bbp/simulation_command.h"
 #include "bbp/simulator/options.h"
@@ -23,6 +24,9 @@ SimulationCommand ParseAndValidateSimulationCommand(
 // parsers. Capacity and live-inventory checks remain simulator-owned.
 SimulationNodeAddRequest ParseAndValidateSimulationNodeAddRequest(
     const boost::json::object& request, const Options& options);
+SimulationNodeReplaceRequest ParseAndValidateSimulationNodeReplaceRequest(
+    const boost::json::object& request, std::string_view node_id,
+    const Options& options);
 SimulationNodeRemoveRequest ParseAndValidateSimulationNodeRemoveRequest(
     const boost::json::object& request, const Options& options);
 

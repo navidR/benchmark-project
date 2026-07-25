@@ -44,6 +44,7 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kSetPerfCounters,
       bbp::SimulationCommandKind::kSendWalletTransaction,
       bbp::SimulationCommandKind::kAddNodes,
+      bbp::SimulationCommandKind::kReplaceNode,
       bbp::SimulationCommandKind::kRemoveNodes,
   };
 
@@ -55,6 +56,25 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
     BOOST_CHECK(*parsed == kind);
   }
   BOOST_TEST(!bbp::SimulationCommandKindFromName("unknown"));
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_node_replace_timeout_budgets_both_readiness_and_sync_cycles) {
+  bbp::SimulationNodeReplaceRequest request;
+  request.ready_timeout_sec = 30U;
+  request.sync_timeout_sec = 30U;
+  const std::chrono::seconds old_aggregate =
+      std::chrono::seconds(request.ready_timeout_sec) +
+      std::chrono::seconds(request.sync_timeout_sec) + std::chrono::seconds(30);
+  const std::chrono::seconds four_in_bound_delays =
+      std::chrono::seconds(request.ready_timeout_sec) * 2 +
+      std::chrono::seconds(request.sync_timeout_sec) * 2;
+
+  BOOST_TEST(four_in_bound_delays > old_aggregate);
+  BOOST_TEST(bbp::SimulationNodeReplaceDefaultExecutionTimeout(request) ==
+             std::chrono::seconds(180));
+  BOOST_TEST(bbp::kSimulationNodeReplaceCancellationReconciliation >
+             bbp::kSimulationNodeReplaceRollbackTimeout);
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
@@ -88,6 +108,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kSetPerfCounters));
   BOOST_TEST(!bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kAddNodes));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kReplaceNode));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kRemoveNodes));
 }

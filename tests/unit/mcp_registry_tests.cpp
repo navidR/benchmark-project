@@ -749,6 +749,65 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_node_replace_schema_preserves_one_identity_without_topology) {
+  const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
+  const boost::json::object& generic = VariantWithConst(
+      command_schema.at("oneOf").as_array(), "kind", "replace_node");
+  const boost::json::object& generic_replacement =
+      generic.at("properties").as_object().at("node_replace").as_object();
+  const boost::json::object direct =
+      BuildMcpOperationInputSchema(McpOperationKind::kReplaceNode);
+  const boost::json::object& direct_replacement =
+      direct.at("properties").as_object().at("replacement").as_object();
+
+  BOOST_TEST(generic_replacement == direct_replacement);
+  const boost::json::object& properties =
+      direct_replacement.at("properties").as_object();
+  BOOST_TEST(!properties.contains("topology"));
+  BOOST_TEST(properties.at("count").as_object().at("minimum").as_uint64() ==
+             1U);
+  BOOST_TEST(properties.at("count").as_object().at("maximum").as_uint64() ==
+             1U);
+  BOOST_TEST(properties.at("node_ids").as_object().at("minItems").as_uint64() ==
+             1U);
+  BOOST_TEST(properties.at("node_ids").as_object().at("maxItems").as_uint64() ==
+             1U);
+  BOOST_TEST(StringSet(ArrayField(direct_replacement, "required")) ==
+             std::set<std::string>({"chain", "count"}));
+
+  const boost::json::object output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kReplaceNode)
+          .at("oneOf")
+          .as_array()
+          .front()
+          .as_object();
+  const boost::json::object& output_properties =
+      output.at("properties").as_object();
+  BOOST_TEST(
+      output_properties.at("action").as_object().at("const").as_string() ==
+      "node.replace");
+  BOOST_TEST(
+      output_properties.at("state").as_object().at("const").as_string() ==
+      "running");
+  BOOST_TEST(output_properties.at("added_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(output_properties.at("removed_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(output_properties.at("affected_node_ids")
+                 .as_object()
+                 .at("minItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(output_properties.at("affected_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_node_remove_schema_is_shared_and_allows_empty_final_inventory) {
   const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
   const boost::json::object& generic = VariantWithConst(

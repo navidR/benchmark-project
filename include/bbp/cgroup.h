@@ -6,7 +6,9 @@
 #include <compare>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -86,6 +88,8 @@ class Cgroup {
   static void PrepareRun(const std::string& run_id);
   static void PrepareRun(const RunOwnership& ownership);
   static Cgroup Create(const std::string& run_id, const std::string& node_id);
+  static std::shared_ptr<Cgroup> CreateShared(const std::string& run_id,
+                                              const std::string& node_id);
   static void RemoveRun(const std::string& run_id);
   static void RemoveRun(const std::string& run_id,
                         std::chrono::steady_clock::time_point deadline,
@@ -154,6 +158,8 @@ void KillCgroupProcessesWithPidfdFallbackForTest(
     const std::filesystem::path& path,
     std::chrono::steady_clock::time_point deadline,
     std::stop_token stop_token = {});
+void SetCgroupCreateAfterDirectoryHookForTest(std::function<void()> hook);
+void SetCgroupCreateSharedAllocationHookForTest(std::function<void()> hook);
 #endif
 
 }  // namespace bbp

@@ -60,6 +60,7 @@ enum class SimulationCommandKind {
   kSetPerfCounters,
   kSendWalletTransaction,
   kAddNodes,
+  kReplaceNode,
   kRemoveNodes,
   kCount,
 };
@@ -319,6 +320,7 @@ struct SimulationCommand {
   std::vector<PerfCounterKind> perf_counter_kinds;
   std::optional<SimulationWalletSend> wallet_send;
   std::optional<SimulationNodeAddRequest> node_add;
+  std::optional<SimulationNodeReplaceRequest> node_replace = std::nullopt;
   std::optional<SimulationNodeRemoveRequest> node_remove;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;

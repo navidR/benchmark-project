@@ -117,7 +117,7 @@ class PeerConnectivityController {
   void UnregisterNode(std::string_view node_id,
                       std::stop_token stop_token = {});
   void SetPolicy(std::string_view node_id, PeerCountPolicy policy);
-  void RequestTopologyRestore(std::string_view changed_node_id);
+  std::uint64_t RequestTopologyRestore(std::string_view changed_node_id);
   void SetAllowedPeers(std::string_view node_id,
                        std::vector<std::string> peer_node_ids);
   void ValidateAllowedPeerUpdate(std::string_view node_id,

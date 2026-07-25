@@ -1456,8 +1456,8 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
           "peer-policy <minimum> <maximum>  add-nodes <chain> <count> "
           "[binary]");
   AddText(top + 7, left + 2, popup_cols - 4,
-          "freeze  thaw  stop-node  restart  kill");
-  AddText(top + 8, left + 2, popup_cols - 4, "generate-blocks <count>");
+          "replace-node <chain> [binary]  freeze  thaw  stop-node  restart");
+  AddText(top + 8, left + 2, popup_cols - 4, "kill  generate-blocks <count>");
   AddText(top + 9, left + 2, popup_cols - 4,
           "resource-profile <name>  network-profile <name>");
   AddText(top + 10, left + 2, popup_cols - 4,
@@ -2679,6 +2679,26 @@ bool QueueParsedNodeCommand(
       }
       node_id = "sim";
       target = "the simulation";
+    } else if (parsed.kind == SimulationCommandKind::kReplaceNode) {
+      if (!parsed.node_replace) {
+        throw std::runtime_error("node-replace payload is missing");
+      }
+      node_id = std::move(confirmed_target);
+      if (node_id.empty()) {
+        const boost::json::array* nodes = NodeSummaries(report);
+        const std::optional<std::size_t> selected_node =
+            SelectedNodeIndex(report, *state);
+        const boost::json::object* node = nodes == nullptr || !selected_node
+                                              ? nullptr
+                                              : NodeAt(*nodes, *selected_node);
+        if (node == nullptr) {
+          state->command_input_error = "No backing node is selected.";
+          state->command_status = state->command_input_error;
+          return false;
+        }
+        node_id = JsonString(*node, "node_id");
+      }
+      target = node_id;
     } else if (parsed.kind == SimulationCommandKind::kRemoveNodes) {
       if (!parsed.node_remove) {
         throw std::runtime_error("node-remove payload is missing");
@@ -2797,6 +2817,9 @@ bool QueueParsedNodeCommand(
             *parsed.block_production_policy);
       } else if (parsed.kind == SimulationCommandKind::kAddNodes) {
         sequence = command_queue->PushAddNodes(*parsed.node_add);
+      } else if (parsed.kind == SimulationCommandKind::kReplaceNode) {
+        sequence =
+            command_queue->PushReplaceNode(node_id, *parsed.node_replace);
       } else if (parsed.kind == SimulationCommandKind::kRemoveNodes) {
         sequence = command_queue->PushRemoveNodes(*parsed.node_remove);
       } else if (parsed.kind == SimulationCommandKind::kSetPerfCounters) {

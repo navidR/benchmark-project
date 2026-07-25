@@ -62,6 +62,8 @@ class SimulationCommandQueue {
                                SimulationWalletSend send,
                                bool confirmed = false);
   std::uint64_t PushAddNodes(SimulationNodeAddRequest request);
+  std::uint64_t PushReplaceNode(std::string node_id,
+                                SimulationNodeReplaceRequest request);
   std::uint64_t PushRemoveNodes(SimulationNodeRemoveRequest request);
   std::uint64_t PushRuntimeCommand(SimulationCommand command);
   std::uint64_t PushScenarioCommand(SimulationCommand command);

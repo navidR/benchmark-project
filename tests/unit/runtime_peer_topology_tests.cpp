@@ -191,3 +191,29 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(remapped.Edge(1U, 2U).active);
   BOOST_CHECK_THROW(remapped.Edge(0U, 2U), std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(
+    runtime_node_replacement_peer_plan_preserves_directed_orientation) {
+  bbp::PeerTopologyConfig config;
+  config.kind = bbp::PeerTopologyKind::kCustomEdgeList;
+  config.edges = {
+      {.from = 1U, .to = 0U, .bidirectional = false, .active = true}};
+  const bbp::RuntimePeerTopology topology(config, 2U);
+  const std::vector<std::string> node_ids{"node-a", "node-b"};
+  const std::map<std::string, std::vector<std::string>> allowed{
+      {"node-a", {}}, {"node-b", {"node-a"}}};
+
+  const std::vector<bbp::RuntimeNodeReplacementPeerEdge> replacing_a =
+      bbp::ResolveRuntimeNodeReplacementPeerEdges(topology, node_ids, allowed,
+                                                  0U);
+  BOOST_REQUIRE_EQUAL(replacing_a.size(), 1U);
+  BOOST_TEST(replacing_a.front().from == 1U);
+  BOOST_TEST(replacing_a.front().to == 0U);
+
+  auto reversed = allowed;
+  reversed["node-a"] = {"node-b"};
+  reversed["node-b"].clear();
+  BOOST_CHECK_THROW(bbp::ResolveRuntimeNodeReplacementPeerEdges(
+                        topology, node_ids, reversed, 0U),
+                    std::runtime_error);
+}

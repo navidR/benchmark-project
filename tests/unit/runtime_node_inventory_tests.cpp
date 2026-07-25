@@ -242,6 +242,96 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(unchanged[1U].config.id == "node-2");
 }
 
+BOOST_AUTO_TEST_CASE(
+    runtime_node_inventory_replacement_preserves_identity_slot_and_runtime) {
+  bbp::RuntimeNodeInventory inventory(2U);
+  std::vector<bbp::NodeRuntime> initial;
+  initial.push_back(RuntimeNode("node-1"));
+  initial.back().config.binary = "/old/node";
+  initial.push_back(RuntimeNode("node-2"));
+  inventory.Initialize(initial);
+
+  const bbp::RuntimeNodeSnapshot before = inventory.Snapshot();
+  bbp::NodeRuntime* const first = &before[0U];
+  bbp::NodeRuntime* const second = &before[1U];
+  const std::uint32_t first_slot = before.slot(0U);
+  const std::uint32_t second_slot = before.slot(1U);
+  std::vector<bbp::ChainNodeConfig> published_configs{before[0U].config,
+                                                      before[1U].config};
+  published_configs[0U].binary = "/new/node";
+  published_configs[0U].connect_peers = {"node-2:18444"};
+  auto replacement = std::make_shared<bbp::NodeRuntime>();
+  replacement->config = published_configs[0U];
+
+  auto prepared = inventory.PrepareReplacement(
+      before.generation(), "node-1",
+      bbp::RuntimeNodeInsertion{.slot = first_slot, .runtime = replacement},
+      published_configs);
+  BOOST_TEST(before.generation() == 1U);
+  BOOST_TEST(before[0U].config.binary == "/old/node");
+
+  const bbp::RuntimeNodeSnapshot after = prepared.Commit();
+
+  BOOST_TEST(after.generation() == before.generation() + 1U);
+  BOOST_REQUIRE_EQUAL(after.size(), before.size());
+  BOOST_TEST(&after[0U] == replacement.get());
+  BOOST_TEST(&after[0U] != first);
+  BOOST_TEST(&after[1U] == second);
+  BOOST_TEST(after.slot(0U) == first_slot);
+  BOOST_TEST(after.slot(1U) == second_slot);
+  BOOST_TEST(after[0U].config.id == "node-1");
+  BOOST_TEST(after[1U].config.id == "node-2");
+  BOOST_TEST(after[0U].config.binary == "/new/node");
+  BOOST_TEST(before[0U].config.binary == "/old/node");
+  BOOST_TEST(inventory.ConfigSnapshot().nodes()[0U].binary == "/new/node");
+  BOOST_TEST(inventory.capacity() == 2U);
+  BOOST_TEST(inventory.WasNodeIdUsed("node-1"));
+  BOOST_TEST(inventory.WasNodeIdUsed("node-2"));
+
+  {
+    auto abandoned = inventory.PrepareReplacement(
+        after.generation(), "node-1",
+        bbp::RuntimeNodeInsertion{.slot = first_slot, .runtime = replacement},
+        published_configs);
+  }
+  BOOST_TEST(inventory.Snapshot().generation() == after.generation());
+  BOOST_CHECK_THROW(
+      inventory.PrepareReplacement(
+          before.generation(), "node-1",
+          bbp::RuntimeNodeInsertion{.slot = first_slot, .runtime = replacement},
+          published_configs),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      inventory.PrepareReplacement(
+          after.generation(), "missing",
+          bbp::RuntimeNodeInsertion{.slot = first_slot, .runtime = replacement},
+          published_configs),
+      std::invalid_argument);
+  BOOST_CHECK_THROW(inventory.PrepareReplacement(
+                        after.generation(), "node-1",
+                        bbp::RuntimeNodeInsertion{.slot = second_slot,
+                                                  .runtime = replacement},
+                        published_configs),
+                    std::invalid_argument);
+  auto wrong_runtime = std::make_shared<bbp::NodeRuntime>();
+  wrong_runtime->config = published_configs[0U];
+  wrong_runtime->config.id = "replacement";
+  BOOST_CHECK_THROW(inventory.PrepareReplacement(
+                        after.generation(), "node-1",
+                        bbp::RuntimeNodeInsertion{.slot = first_slot,
+                                                  .runtime = wrong_runtime},
+                        published_configs),
+                    std::invalid_argument);
+  std::vector<bbp::ChainNodeConfig> changed_identity = published_configs;
+  changed_identity[0U].id = "replacement";
+  BOOST_CHECK_THROW(
+      inventory.PrepareReplacement(
+          after.generation(), "node-1",
+          bbp::RuntimeNodeInsertion{.slot = first_slot, .runtime = replacement},
+          changed_identity),
+      std::invalid_argument);
+}
+
 BOOST_AUTO_TEST_CASE(runtime_node_inventory_rejects_empty_append_runtime) {
   bbp::RuntimeNodeInventory inventory(2U);
   std::vector<bbp::NodeRuntime> initial;

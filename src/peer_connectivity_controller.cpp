@@ -569,13 +569,14 @@ void PeerConnectivityController::SetPolicy(std::string_view node_id,
   configuration_sequence_.fetch_add(1U, std::memory_order_release);
 }
 
-void PeerConnectivityController::RequestTopologyRestore(
+std::uint64_t PeerConnectivityController::RequestTopologyRestore(
     std::string_view changed_node_id) {
   std::lock_guard<std::mutex> lock(operation_mutex_);
   const std::string node_id = FindNodeUnlocked(changed_node_id).id;
   const std::uint64_t requested = NextTopologyRestoreSequence();
   std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
   topology_restore_requests_.at(node_id) = requested;
+  return requested;
 }
 
 void PeerConnectivityController::SetAllowedPeers(

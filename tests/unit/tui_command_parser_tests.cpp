@@ -24,6 +24,21 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_driver_commands) {
   BOOST_TEST(*add.node_add->binary == "/opt/monerod");
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("add-nodes firo 17", 0U),
                     std::runtime_error);
+  const bbp::ParsedTuiCommand replace_default =
+      bbp::TuiCommandParser::Parse("replace-node firo", 0U);
+  BOOST_CHECK(replace_default.kind == bbp::SimulationCommandKind::kReplaceNode);
+  BOOST_REQUIRE(replace_default.node_replace);
+  BOOST_CHECK(replace_default.node_replace->chain == bbp::ChainKind::kFiro);
+  BOOST_TEST(replace_default.node_replace->count == 1U);
+  BOOST_TEST(!replace_default.node_replace->binary);
+  const bbp::ParsedTuiCommand replace_binary =
+      bbp::TuiCommandParser::Parse("replace-node firo /opt/firod", 0U);
+  BOOST_REQUIRE(replace_binary.node_replace);
+  BOOST_REQUIRE(replace_binary.node_replace->binary);
+  BOOST_TEST(*replace_binary.node_replace->binary == "/opt/firod");
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("replace-node firo one two", 0U),
+      std::runtime_error);
   const bbp::ParsedTuiCommand remove =
       bbp::TuiCommandParser::Parse("remove-nodes firo-2 firo-4", 0U);
   BOOST_CHECK(remove.kind == bbp::SimulationCommandKind::kRemoveNodes);

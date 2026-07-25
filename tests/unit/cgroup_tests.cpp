@@ -73,6 +73,17 @@ class PreparedRunGuard {
   bool active_ = true;
 };
 
+class CgroupCreateHookGuard {
+ public:
+  CgroupCreateHookGuard() = default;
+  CgroupCreateHookGuard(const CgroupCreateHookGuard&) = delete;
+  CgroupCreateHookGuard& operator=(const CgroupCreateHookGuard&) = delete;
+  ~CgroupCreateHookGuard() {
+    bbp::SetCgroupCreateAfterDirectoryHookForTest({});
+    bbp::SetCgroupCreateSharedAllocationHookForTest({});
+  }
+};
+
 class ChildGuard {
  public:
   explicit ChildGuard(pid_t pid) : pid_(pid) {}
@@ -415,14 +426,12 @@ BOOST_AUTO_TEST_CASE(
                           rejects_replacement);
     BOOST_CHECK_EXCEPTION(cgroup.ReadMetrics(), std::runtime_error,
                           rejects_replacement);
-    BOOST_CHECK_EXCEPTION(
-        cgroup.KillAll(std::chrono::steady_clock::now() +
-                       std::chrono::seconds(1)),
-        std::runtime_error, rejects_replacement);
-    BOOST_CHECK_EXCEPTION(
-        cgroup.Remove(std::chrono::steady_clock::now() +
-                      std::chrono::seconds(1)),
-        std::runtime_error, rejects_replacement);
+    BOOST_CHECK_EXCEPTION(cgroup.KillAll(std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(1)),
+                          std::runtime_error, rejects_replacement);
+    BOOST_CHECK_EXCEPTION(cgroup.Remove(std::chrono::steady_clock::now() +
+                                        std::chrono::seconds(1)),
+                          std::runtime_error, rejects_replacement);
 
     BOOST_TEST(bbp::ReadText(acquired_path / "sentinel") == "foreign\n");
     BOOST_TEST(!std::filesystem::exists(acquired_path / "cgroup.procs"));
@@ -753,6 +762,38 @@ BOOST_AUTO_TEST_CASE(cgroup_recursively_kills_and_removes_nested_descendants) {
 
   // A completed removal remains harmless when a caller retries it.
   bbp::Cgroup::RemoveRun(run->run_id());
+}
+
+BOOST_AUTO_TEST_CASE(
+    cgroup_replacement_acquisition_is_strongly_exception_safe) {
+  std::unique_ptr<PreparedRunGuard> run =
+      PreparePrivilegedTestRun(UniqueRunId("replacement-acquire"));
+  if (!run) {
+    return;
+  }
+  CgroupCreateHookGuard hooks;
+  const std::filesystem::path staging_path =
+      RunCgroupPath(run->run_id()) / "replace-0";
+
+  bbp::SetCgroupCreateAfterDirectoryHookForTest(
+      [] { throw std::runtime_error("injected post-directory failure"); });
+  BOOST_CHECK_THROW(bbp::Cgroup::CreateShared(run->run_id(), "replace-0"),
+                    std::runtime_error);
+  bbp::SetCgroupCreateAfterDirectoryHookForTest({});
+  BOOST_TEST(!std::filesystem::exists(staging_path));
+
+  bbp::SetCgroupCreateSharedAllocationHookForTest(
+      [] { throw std::bad_alloc(); });
+  BOOST_CHECK_THROW(bbp::Cgroup::CreateShared(run->run_id(), "replace-0"),
+                    std::bad_alloc);
+  bbp::SetCgroupCreateSharedAllocationHookForTest({});
+  BOOST_TEST(!std::filesystem::exists(staging_path));
+
+  std::shared_ptr<bbp::Cgroup> reused =
+      bbp::Cgroup::CreateShared(run->run_id(), "replace-0");
+  BOOST_TEST(std::filesystem::is_directory(staging_path));
+  reused->Remove(std::chrono::steady_clock::now() + std::chrono::seconds(10));
+  BOOST_TEST(!std::filesystem::exists(staging_path));
 }
 
 BOOST_AUTO_TEST_CASE(cgroup_pidfd_fallback_kills_a_helper_and_its_descendant) {
@@ -1305,8 +1346,7 @@ BOOST_AUTO_TEST_CASE(
   }
 }
 
-BOOST_AUTO_TEST_CASE(
-    cgroup_scope_recovers_an_exact_bound_pending_created_run) {
+BOOST_AUTO_TEST_CASE(cgroup_scope_recovers_an_exact_bound_pending_created_run) {
   std::unique_ptr<PreparedRunGuard> delegated_parent =
       PreparePrivilegedTestRun(UniqueRunId("pending-parent"));
   if (!delegated_parent) {
@@ -1315,8 +1355,7 @@ BOOST_AUTO_TEST_CASE(
   const std::string suffix = UniqueRunId("scope-pending");
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
-  const std::filesystem::path state_file =
-      TestDirectory("scope-pending-state");
+  const std::filesystem::path state_file = TestDirectory("scope-pending-state");
   const std::filesystem::path ownership_roots =
       TestDirectory("scope-pending-roots");
   std::error_code error;
@@ -1361,10 +1400,10 @@ BOOST_AUTO_TEST_CASE(
     bbp::WriteText(state_file, boost::json::serialize(state) + "\n");
 
     bbp::PrepareCgroupRunInTestScope(config, second);
-    BOOST_TEST(!std::filesystem::exists(scope_root / "bbp" /
-                                        first.cgroup_name));
-    BOOST_TEST(std::filesystem::is_directory(scope_root / "bbp" /
-                                             second.cgroup_name));
+    BOOST_TEST(
+        !std::filesystem::exists(scope_root / "bbp" / first.cgroup_name));
+    BOOST_TEST(
+        std::filesystem::is_directory(scope_root / "bbp" / second.cgroup_name));
     bbp::RemoveCgroupRunInTestScope(config, second.cgroup_name);
     BOOST_TEST(!std::filesystem::exists(state_file));
     BOOST_TEST(!std::filesystem::exists(scope_root / "bbp"));

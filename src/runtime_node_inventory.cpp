@@ -336,6 +336,76 @@ bool RuntimeNodeInventory::PreparedRemoval::ReadersDrained() const noexcept {
   return committed_ && generation_.use_count() == 1U;
 }
 
+RuntimeNodeInventory::PreparedReplacement
+RuntimeNodeInventory::PrepareReplacement(
+    std::uint64_t expected_generation, std::string_view node_id,
+    const RuntimeNodeInsertion& replacement,
+    const std::vector<ChainNodeConfig>& published_configs) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (generation_->sequence != expected_generation) {
+    throw std::runtime_error(
+        "runtime node inventory changed before replacement publication");
+  }
+  if (node_id.empty()) {
+    throw std::invalid_argument("runtime node replacement requires a node id");
+  }
+  if (generation_->sequence == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("runtime node inventory generation overflow");
+  }
+  if (published_configs.size() != generation_->nodes.size()) {
+    throw std::invalid_argument(
+        "runtime node replacement published configs must match the current "
+        "generation");
+  }
+  if (!replacement.runtime) {
+    throw std::invalid_argument("runtime node replacement candidate is empty");
+  }
+  bool found = false;
+  std::vector<RuntimeNodeInsertion> next = generation_->nodes;
+  for (std::size_t index = 0U; index < published_configs.size(); ++index) {
+    const std::string& runtime_id =
+        generation_->nodes[index].runtime->config.id;
+    if (runtime_id == node_id) {
+      found = true;
+      if (replacement.slot != generation_->nodes[index].slot ||
+          replacement.runtime->config.id != runtime_id) {
+        throw std::invalid_argument(
+            "runtime node replacement must preserve its identity and slot");
+      }
+      next[index] = replacement;
+    }
+    if (published_configs[index].id != runtime_id ||
+        (runtime_id == node_id &&
+         published_configs[index].id != replacement.runtime->config.id)) {
+      throw std::invalid_argument(
+          "runtime node replacement config identity does not match its "
+          "runtime");
+    }
+  }
+  if (!found) {
+    throw std::invalid_argument(
+        "runtime node replacement references an unknown node id");
+  }
+  auto next_generation =
+      MakeGeneration(generation_->sequence + 1U, std::move(next), capacity_);
+  next_generation->configs = published_configs;
+  return PreparedReplacement(this, std::move(lock), std::move(next_generation));
+}
+
+RuntimeNodeSnapshot
+RuntimeNodeInventory::PreparedReplacement::Commit() noexcept {
+  if (owner_ == nullptr || !lock_.owns_lock() ||
+      lock_.mutex() != &owner_->mutex_ || !generation_) {
+    std::terminate();
+  }
+  owner_->generation_.swap(generation_);
+  RuntimeNodeSnapshot snapshot(owner_->generation_);
+  lock_.unlock();
+  owner_ = nullptr;
+  generation_.reset();
+  return snapshot;
+}
+
 std::shared_ptr<RuntimeNodeSnapshot::Generation>
 RuntimeNodeInventory::MakeGeneration(std::uint64_t generation,
                                      std::vector<RuntimeNodeInsertion> nodes,

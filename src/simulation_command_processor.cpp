@@ -27,6 +27,7 @@ SimulationCommandCancellationCause CancellationCause(
 
 bool NodeMutationCommitStarted(const SimulationCommand& command) {
   if ((command.kind != SimulationCommandKind::kAddNodes &&
+       command.kind != SimulationCommandKind::kReplaceNode &&
        command.kind != SimulationCommandKind::kRemoveNodes) ||
       !command.operation_control) {
     return false;
@@ -39,6 +40,7 @@ bool NodeMutationCommitStarted(const SimulationCommand& command) {
 
 bool NodeMutationCancellationWon(const SimulationCommand& command) {
   return (command.kind == SimulationCommandKind::kAddNodes ||
+          command.kind == SimulationCommandKind::kReplaceNode ||
           command.kind == SimulationCommandKind::kRemoveNodes) &&
          command.operation_control &&
          command.operation_control->CommitPhase() ==
@@ -108,6 +110,7 @@ void SimulationCommandProcessor::Stop() {
   std::vector<SimulationCommand> cancelled = queue_.Cancel();
   for (SimulationCommand& command : cancelled) {
     if ((command.kind == SimulationCommandKind::kAddNodes ||
+         command.kind == SimulationCommandKind::kReplaceNode ||
          command.kind == SimulationCommandKind::kRemoveNodes) &&
         command.operation_control) {
       static_cast<void>(command.operation_control->RequestCancellation(
@@ -146,6 +149,7 @@ void SimulationCommandProcessor::Run() {
           *command, SimulationCommandCancellationCause::kNone);
       outcome.error = std::nullopt;
       if ((command->kind == SimulationCommandKind::kAddNodes ||
+           command->kind == SimulationCommandKind::kReplaceNode ||
            command->kind == SimulationCommandKind::kRemoveNodes) &&
           (!command->operation_control ||
            command->operation_control->CommitPhase() !=

@@ -18,8 +18,9 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 31> kCommandNames = {
+constexpr std::array<std::string_view, 32> kCommandNames = {
     "add-nodes",
+    "replace-node",
     "remove-nodes",
     "block-production",
     "mining-difficulty",
@@ -163,6 +164,25 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       ParsedTuiCommand parsed;
       parsed.kind = SimulationCommandKind::kAddNodes;
       parsed.node_add = std::move(request);
+      return parsed;
+    }
+    if (tokens[0] == "replace-node") {
+      if (tokens.size() != 2U && tokens.size() != 3U) {
+        throw std::runtime_error(
+            "usage: replace-node <firo|bitcoin|monero> [binary]");
+      }
+      SimulationNodeReplaceRequest request;
+      request.chain = ParseChainKind(tokens[1]);
+      request.count = 1U;
+      if (tokens.size() == 3U) {
+        if (tokens[2].empty()) {
+          throw std::runtime_error("replace-node binary must not be empty");
+        }
+        request.binary = tokens[2];
+      }
+      ParsedTuiCommand parsed;
+      parsed.kind = SimulationCommandKind::kReplaceNode;
+      parsed.node_replace = std::move(request);
       return parsed;
     }
     if (tokens[0] == "remove-nodes") {

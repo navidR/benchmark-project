@@ -2,18 +2,24 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <linux/stat.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -32,10 +38,11 @@ constexpr std::string_view kManifestName = "runtime-node-resources.json";
 constexpr std::string_view kTemporaryManifestName =
     ".runtime-node-resources.json.tmp";
 constexpr std::string_view kNodeMarkerName = ".bbp-node";
-constexpr std::uint64_t kManifestVersion = 1U;
+constexpr std::uint64_t kManifestVersion = 2U;
 constexpr std::uint64_t kNodeMarkerVersion = 1U;
 constexpr std::size_t kMaximumManifestBytes = 1024U * 1024U;
-constexpr std::size_t kMaximumManifestNodes = 16U;
+constexpr std::size_t kMaximumRuntimeNodeSlots = 16U;
+constexpr std::size_t kMaximumManifestEntries = kMaximumRuntimeNodeSlots + 1U;
 constexpr std::size_t kMaximumTraversalDepth = 64U;
 constexpr std::size_t kMaximumTraversalEntries = 1000000U;
 
@@ -101,10 +108,30 @@ void RequireSafeNodeId(std::string_view node_id) {
   }
 }
 
+std::string_view EntryRootName(const RuntimeNodeResourceEntry& entry) {
+  return entry.root_name ? std::string_view(*entry.root_name)
+                         : std::string_view(entry.node_id);
+}
+
+bool IsReplacementState(RuntimeNodeResourceState state) {
+  return state == RuntimeNodeResourceState::kPendingReplace ||
+         state == RuntimeNodeResourceState::kPendingReplaceExchanged ||
+         state == RuntimeNodeResourceState::kPendingReplaceCommitted ||
+         state == RuntimeNodeResourceState::kPendingReplaceUncertain;
+}
+
 std::string_view StateName(RuntimeNodeResourceState state) {
   switch (state) {
     case RuntimeNodeResourceState::kPendingAdd:
       return "pending_add";
+    case RuntimeNodeResourceState::kPendingReplace:
+      return "pending_replace";
+    case RuntimeNodeResourceState::kPendingReplaceExchanged:
+      return "pending_replace_exchanged";
+    case RuntimeNodeResourceState::kPendingReplaceCommitted:
+      return "pending_replace_committed";
+    case RuntimeNodeResourceState::kPendingReplaceUncertain:
+      return "pending_replace_uncertain";
     case RuntimeNodeResourceState::kPendingRemove:
       return "pending_remove";
     case RuntimeNodeResourceState::kLive:
@@ -116,6 +143,18 @@ std::string_view StateName(RuntimeNodeResourceState state) {
 RuntimeNodeResourceState ParseState(std::string_view state) {
   if (state == "pending_add") {
     return RuntimeNodeResourceState::kPendingAdd;
+  }
+  if (state == "pending_replace") {
+    return RuntimeNodeResourceState::kPendingReplace;
+  }
+  if (state == "pending_replace_exchanged") {
+    return RuntimeNodeResourceState::kPendingReplaceExchanged;
+  }
+  if (state == "pending_replace_committed") {
+    return RuntimeNodeResourceState::kPendingReplaceCommitted;
+  }
+  if (state == "pending_replace_uncertain") {
+    return RuntimeNodeResourceState::kPendingReplaceUncertain;
   }
   if (state == "pending_remove") {
     return RuntimeNodeResourceState::kPendingRemove;
@@ -134,7 +173,7 @@ void RequireRelativeDataDirectory(const RuntimeNodeResourceEntry& entry) {
         "runtime resource data directory must be a normalized relative path");
   }
   const std::filesystem::path expected =
-      std::filesystem::path("nodes") / entry.node_id;
+      std::filesystem::path("nodes") / EntryRootName(entry);
   auto actual = entry.data_dir.begin();
   for (auto component = expected.begin(); component != expected.end();
        ++component, ++actual) {
@@ -157,8 +196,22 @@ void RequireRelativeDataDirectory(const RuntimeNodeResourceEntry& entry) {
 
 void RequireEntry(const RuntimeNodeResourceEntry& entry) {
   RequireSafeNodeId(entry.node_id);
+  RequireSafeNodeId(EntryRootName(entry));
+  if (entry.root_name && *entry.root_name == entry.node_id) {
+    throw std::runtime_error(
+        "runtime resource root_name must differ from node_id");
+  }
+  const bool replacement = IsReplacementState(entry.state);
+  if (replacement && !entry.root_name) {
+    throw std::runtime_error(
+        "pending replacement resource requires a distinct root_name");
+  }
+  if (!replacement && entry.root_name) {
+    throw std::runtime_error(
+        "only pending replacement resources may select root_name");
+  }
   RequireRelativeDataDirectory(entry);
-  if (entry.slot >= kMaximumManifestNodes) {
+  if (entry.slot >= kMaximumRuntimeNodeSlots) {
     throw std::runtime_error(
         "runtime resource slot exceeds the manifest bound");
   }
@@ -173,21 +226,48 @@ void RequireManifest(const RuntimeNodeResourceManifest& manifest) {
     throw std::runtime_error(
         "runtime resource manifest ownership no longer matches its run");
   }
-  if (manifest.nodes.size() > kMaximumManifestNodes) {
+  if (manifest.nodes.size() > kMaximumManifestEntries) {
     throw std::runtime_error(
         "runtime resource manifest node count is too large");
   }
-  std::set<std::string> node_ids;
-  std::set<std::uint32_t> slots;
+  std::set<std::string> root_names;
+  std::map<std::string, const RuntimeNodeResourceEntry*, std::less<>>
+      live_by_node_id;
+  std::map<std::uint32_t, const RuntimeNodeResourceEntry*> live_by_slot;
+  std::vector<const RuntimeNodeResourceEntry*> replacements;
   for (const RuntimeNodeResourceEntry& entry : manifest.nodes) {
     RequireEntry(entry);
-    if (!node_ids.insert(entry.node_id).second) {
+    if (!root_names.insert(std::string(EntryRootName(entry))).second) {
+      throw std::runtime_error(
+          "runtime resource manifest contains a duplicate root name");
+    }
+    if (IsReplacementState(entry.state)) {
+      replacements.push_back(&entry);
+      continue;
+    }
+    if (!live_by_node_id.emplace(entry.node_id, &entry).second) {
       throw std::runtime_error(
           "runtime resource manifest contains a duplicate node id");
     }
-    if (!slots.insert(entry.slot).second) {
+    if (!live_by_slot.emplace(entry.slot, &entry).second) {
       throw std::runtime_error(
           "runtime resource manifest contains a duplicate resource slot");
+    }
+  }
+  if (replacements.size() > 1U) {
+    throw std::runtime_error(
+        "runtime resource manifest contains multiple pending replacements");
+  }
+  for (const RuntimeNodeResourceEntry* replacement : replacements) {
+    const auto node = live_by_node_id.find(replacement->node_id);
+    const auto slot = live_by_slot.find(replacement->slot);
+    if (node == live_by_node_id.end() || slot == live_by_slot.end() ||
+        node->second != slot->second ||
+        node->second->state != RuntimeNodeResourceState::kLive ||
+        node->second->chain != replacement->chain) {
+      throw std::runtime_error(
+          "runtime resource manifest replacement has no exact live "
+          "counterpart");
     }
   }
 }
@@ -447,18 +527,19 @@ std::uint64_t MountIdAt(int parent, std::string_view name) {
   return status.stx_mnt_id;
 }
 
-UniqueFd OpenOwnedNodeRoot(int nodes, const RunOwnership& ownership,
-                           const RuntimeNodeResourceEntry& entry,
-                           struct stat* opened_status = nullptr) {
+UniqueFd OpenOwnedNodeRootNamed(int nodes, std::string_view root_name,
+                                const RunOwnership& ownership,
+                                const RuntimeNodeResourceEntry& entry,
+                                struct stat* opened_status = nullptr) {
+  const std::string name(root_name);
   struct stat before{};
-  if (fstatat(nodes, entry.node_id.c_str(), &before, AT_SYMLINK_NOFOLLOW) !=
-      0) {
+  if (fstatat(nodes, name.c_str(), &before, AT_SYMLINK_NOFOLLOW) != 0) {
     ThrowErrno("inspect runtime node root", errno);
   }
   if (!S_ISDIR(before.st_mode)) {
     throw std::runtime_error("runtime node root is not a directory");
   }
-  UniqueFd node(openat(nodes, entry.node_id.c_str(),
+  UniqueFd node(openat(nodes, name.c_str(),
                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
   if (!node.valid()) {
     ThrowErrno("open runtime node root", errno);
@@ -469,7 +550,7 @@ UniqueFd OpenOwnedNodeRoot(int nodes, const RunOwnership& ownership,
   }
   if (!SameIdentity(before, opened) || opened.st_uid != geteuid() ||
       MountId(node.get()) != MountId(nodes) ||
-      MountIdAt(nodes, entry.node_id) != MountId(node.get())) {
+      MountIdAt(nodes, name) != MountId(node.get())) {
     throw std::runtime_error(
         "runtime node root ownership, identity, or mount changed while it "
         "was opened");
@@ -479,6 +560,13 @@ UniqueFd OpenOwnedNodeRoot(int nodes, const RunOwnership& ownership,
     *opened_status = opened;
   }
   return node;
+}
+
+UniqueFd OpenOwnedNodeRoot(int nodes, const RunOwnership& ownership,
+                           const RuntimeNodeResourceEntry& entry,
+                           struct stat* opened_status = nullptr) {
+  return OpenOwnedNodeRootNamed(nodes, EntryRootName(entry), ownership, entry,
+                                opened_status);
 }
 
 void WriteNodeMarker(int node_directory, const RunOwnership& ownership,
@@ -611,6 +699,200 @@ void RemoveDirectoryContents(
   }
 }
 
+void RequireCloneTime(
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("runtime node root clone was cancelled");
+  }
+  if (absolute_deadline &&
+      std::chrono::steady_clock::now() >= *absolute_deadline) {
+    throw std::runtime_error("runtime node root clone deadline expired");
+  }
+}
+
+using CloneInode = std::pair<std::uint64_t, std::uint64_t>;
+
+void CloneDirectoryContents(
+    int source, int destination, int destination_root,
+    const std::filesystem::path& relative, std::size_t depth,
+    std::size_t* visited_entries,
+    std::map<CloneInode, std::filesystem::path>* hard_links,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  RequireCloneTime(absolute_deadline, stop_token);
+  if (depth > kMaximumTraversalDepth) {
+    throw std::runtime_error(
+        "runtime node root clone exceeded its directory-depth bound");
+  }
+  for (const std::string& name :
+       DirectoryNames(source, visited_entries, absolute_deadline, stop_token)) {
+    if (depth == 0U && name == kNodeMarkerName) {
+      continue;
+    }
+    RequireCloneTime(absolute_deadline, stop_token);
+    struct stat before{};
+    if (fstatat(source, name.c_str(), &before, AT_SYMLINK_NOFOLLOW) != 0) {
+      ThrowErrno("inspect runtime node clone source", errno);
+    }
+    if (before.st_uid != geteuid() ||
+        MountIdAt(source, name) != MountId(source)) {
+      throw std::runtime_error(
+          "runtime node clone source has unsafe ownership or mount identity");
+    }
+    const std::filesystem::path child_relative = relative / name;
+    if (S_ISDIR(before.st_mode)) {
+      const mode_t mode = static_cast<mode_t>(before.st_mode & 0777);
+      if (mkdirat(destination, name.c_str(), mode) != 0) {
+        ThrowErrno("create runtime node clone directory", errno);
+      }
+      UniqueFd source_child(
+          openat(source, name.c_str(),
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+      UniqueFd destination_child(
+          openat(destination, name.c_str(),
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+      if (!source_child.valid() || !destination_child.valid()) {
+        ThrowErrno("open runtime node clone directory", errno);
+      }
+      struct stat opened{};
+      if (fstat(source_child.get(), &opened) != 0) {
+        ThrowErrno("inspect runtime node clone directory", errno);
+      }
+      if (!SameIdentity(before, opened) ||
+          MountId(source_child.get()) != MountId(source)) {
+        throw std::runtime_error(
+            "runtime node clone directory identity changed");
+      }
+      CloneDirectoryContents(source_child.get(), destination_child.get(),
+                             destination_root, child_relative, depth + 1U,
+                             visited_entries, hard_links, absolute_deadline,
+                             stop_token);
+      if (fchmod(destination_child.get(), mode) != 0) {
+        ThrowErrno("set runtime node clone directory mode", errno);
+      }
+      const std::array<timespec, 2U> times{before.st_atim, before.st_mtim};
+      if (futimens(destination_child.get(), times.data()) != 0 ||
+          fsync(destination_child.get()) != 0) {
+        ThrowErrno("sync runtime node clone directory", errno);
+      }
+      continue;
+    }
+    if (S_ISREG(before.st_mode)) {
+      const CloneInode inode{static_cast<std::uint64_t>(before.st_dev),
+                             static_cast<std::uint64_t>(before.st_ino)};
+      const auto existing = hard_links->find(inode);
+      if (existing != hard_links->end()) {
+        if (linkat(destination_root, existing->second.c_str(), destination,
+                   name.c_str(), 0) != 0) {
+          ThrowErrno("create runtime node clone hard link", errno);
+        }
+        continue;
+      }
+      UniqueFd source_file(
+          openat(source, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+      if (!source_file.valid()) {
+        ThrowErrno("open runtime node clone source file", errno);
+      }
+      struct stat opened{};
+      if (fstat(source_file.get(), &opened) != 0) {
+        ThrowErrno("inspect runtime node clone source file", errno);
+      }
+      if (!SameIdentity(before, opened) || !S_ISREG(opened.st_mode) ||
+          opened.st_uid != geteuid() ||
+          MountId(source_file.get()) != MountId(source)) {
+        throw std::runtime_error(
+            "runtime node clone source file identity changed");
+      }
+      const mode_t mode = static_cast<mode_t>(before.st_mode & 0777);
+      UniqueFd destination_file(
+          openat(destination, name.c_str(),
+                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode));
+      if (!destination_file.valid()) {
+        ThrowErrno("create runtime node clone file", errno);
+      }
+      if (ioctl(destination_file.get(), FICLONE, source_file.get()) != 0) {
+        const int clone_error = errno;
+        if (clone_error != EOPNOTSUPP && clone_error != ENOTTY &&
+            clone_error != EXDEV && clone_error != EINVAL) {
+          ThrowErrno("reflink runtime node clone file", clone_error);
+        }
+        if (ftruncate(destination_file.get(), 0) != 0 ||
+            lseek(source_file.get(), 0, SEEK_SET) < 0) {
+          ThrowErrno("prepare runtime node clone file copy", errno);
+        }
+        std::array<char, 1024U * 1024U> buffer{};
+        while (true) {
+          RequireCloneTime(absolute_deadline, stop_token);
+          const ssize_t count =
+              read(source_file.get(), buffer.data(), buffer.size());
+          if (count < 0 && errno == EINTR) {
+            continue;
+          }
+          if (count < 0) {
+            ThrowErrno("read runtime node clone file", errno);
+          }
+          if (count == 0) {
+            break;
+          }
+          WriteAll(
+              destination_file.get(),
+              std::string_view(buffer.data(), static_cast<std::size_t>(count)),
+              "write runtime node clone file");
+        }
+      }
+      if (fchmod(destination_file.get(), mode) != 0) {
+        ThrowErrno("set runtime node clone file mode", errno);
+      }
+      const std::array<timespec, 2U> times{before.st_atim, before.st_mtim};
+      if (futimens(destination_file.get(), times.data()) != 0 ||
+          fsync(destination_file.get()) != 0) {
+        ThrowErrno("sync runtime node clone file", errno);
+      }
+      struct stat copied{};
+      if (fstat(destination_file.get(), &copied) != 0 ||
+          copied.st_size != before.st_size) {
+        throw std::runtime_error(
+            "runtime node clone file size verification failed");
+      }
+      hard_links->emplace(inode, child_relative);
+      continue;
+    }
+    if (S_ISLNK(before.st_mode)) {
+      if (before.st_size < 0 || before.st_size > 4096) {
+        throw std::runtime_error(
+            "runtime node clone symlink target exceeds its bound");
+      }
+      std::string target(static_cast<std::size_t>(before.st_size) + 1U, '\0');
+      const ssize_t count =
+          readlinkat(source, name.c_str(), target.data(), target.size());
+      if (count < 0) {
+        ThrowErrno("read runtime node clone symlink", errno);
+      }
+      if (static_cast<std::size_t>(count) >= target.size()) {
+        throw std::runtime_error(
+            "runtime node clone symlink changed while it was read");
+      }
+      target.resize(static_cast<std::size_t>(count));
+      struct stat after{};
+      if (fstatat(source, name.c_str(), &after, AT_SYMLINK_NOFOLLOW) != 0) {
+        ThrowErrno("reinspect runtime node clone symlink", errno);
+      }
+      if (!SameIdentity(before, after) || !S_ISLNK(after.st_mode) ||
+          after.st_uid != geteuid() ||
+          MountIdAt(source, name) != MountId(source)) {
+        throw std::runtime_error("runtime node clone symlink identity changed");
+      }
+      if (symlinkat(target.c_str(), destination, name.c_str()) != 0) {
+        ThrowErrno("create runtime node clone symlink", errno);
+      }
+      continue;
+    }
+    throw std::runtime_error(
+        "runtime node clone refuses unsupported filesystem entry type");
+  }
+}
+
 }  // namespace
 
 void WriteRuntimeNodeResourceManifest(
@@ -619,13 +901,17 @@ void WriteRuntimeNodeResourceManifest(
   boost::json::array nodes;
   nodes.reserve(manifest.nodes.size());
   for (const RuntimeNodeResourceEntry& entry : manifest.nodes) {
-    nodes.emplace_back(boost::json::object{
+    boost::json::object node{
         {"id", entry.node_id},
         {"slot", entry.slot},
         {"chain", std::string(ChainKindName(entry.chain))},
         {"data_dir", entry.data_dir.generic_string()},
         {"state", std::string(StateName(entry.state))},
-    });
+    };
+    if (entry.root_name) {
+      node["root_name"] = *entry.root_name;
+    }
+    nodes.emplace_back(std::move(node));
   }
   const std::string contents =
       boost::json::serialize(boost::json::object{
@@ -725,7 +1011,8 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
   RejectUnknownFields(
       object, {"version", "run_id", "resource_id", "isolated_network", "nodes"},
       "runtime resource manifest");
-  if (RequiredUnsigned(object, "version") != kManifestVersion ||
+  const std::uint64_t version = RequiredUnsigned(object, "version");
+  if ((version != 1U && version != kManifestVersion) ||
       RequiredString(object, "run_id") != ownership.run_id ||
       RequiredString(object, "resource_id") != ownership.resource_id) {
     throw std::runtime_error(
@@ -735,7 +1022,7 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
   const boost::json::value* node_values = object.if_contains("nodes");
   if (isolated == nullptr || !isolated->is_bool() || node_values == nullptr ||
       !node_values->is_array() ||
-      node_values->as_array().size() > kMaximumManifestNodes) {
+      node_values->as_array().size() > kMaximumManifestEntries) {
     throw std::runtime_error(
         "runtime resource manifest has invalid isolation or node fields");
   }
@@ -752,17 +1039,27 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
           "runtime resource manifest node entry is not an object");
     }
     const boost::json::object& node = value.as_object();
-    RejectUnknownFields(node, {"id", "slot", "chain", "data_dir", "state"},
-                        "runtime resource manifest node entry");
+    RejectUnknownFields(
+        node, {"id", "slot", "chain", "data_dir", "root_name", "state"},
+        "runtime resource manifest node entry");
     const std::uint64_t slot = RequiredUnsigned(node, "slot");
     if (slot > std::numeric_limits<std::uint32_t>::max()) {
       throw std::runtime_error("runtime resource manifest slot exceeds uint32");
+    }
+    std::optional<std::string> root_name;
+    if (const boost::json::value* root = node.if_contains("root_name")) {
+      if (!root->is_string()) {
+        throw std::runtime_error(
+            "runtime resource manifest root_name is not a string");
+      }
+      root_name = std::string(root->as_string());
     }
     manifest.nodes.push_back(RuntimeNodeResourceEntry{
         .node_id = RequiredString(node, "id"),
         .slot = static_cast<std::uint32_t>(slot),
         .chain = ParseChainKind(RequiredString(node, "chain")),
         .data_dir = RequiredString(node, "data_dir"),
+        .root_name = std::move(root_name),
         .state = ParseState(RequiredString(node, "state")),
     });
   }
@@ -785,6 +1082,12 @@ bool RuntimeNodeRootEntryExists(const RunOwnership& ownership,
   return true;
 }
 
+bool RuntimeNodeRootEntryExists(const RunOwnership& ownership,
+                                const RuntimeNodeResourceEntry& entry) {
+  RequireEntry(entry);
+  return RuntimeNodeRootEntryExists(ownership, EntryRootName(entry));
+}
+
 void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
                             const RuntimeNodeResourceEntry& entry,
                             bool* acquired) {
@@ -793,17 +1096,18 @@ void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
     *acquired = false;
   }
   UniqueFd nodes = OpenNodesDirectory(ownership);
-  if (mkdirat(nodes.get(), entry.node_id.c_str(), S_IRWXU) != 0) {
+  const std::string root_name(EntryRootName(entry));
+  if (mkdirat(nodes.get(), root_name.c_str(), S_IRWXU) != 0) {
     ThrowErrno("create runtime node root", errno);
   }
   if (acquired != nullptr) {
     *acquired = true;
   }
-  UniqueFd node(openat(nodes.get(), entry.node_id.c_str(),
+  UniqueFd node(openat(nodes.get(), root_name.c_str(),
                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
   if (!node.valid()) {
     const int error = errno;
-    if (unlinkat(nodes.get(), entry.node_id.c_str(), AT_REMOVEDIR) == 0 &&
+    if (unlinkat(nodes.get(), root_name.c_str(), AT_REMOVEDIR) == 0 &&
         acquired != nullptr) {
       *acquired = false;
     }
@@ -811,7 +1115,7 @@ void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
   }
   try {
     if (MountId(node.get()) != MountId(nodes.get()) ||
-        MountIdAt(nodes.get(), entry.node_id) != MountId(node.get())) {
+        MountIdAt(nodes.get(), root_name) != MountId(node.get())) {
       throw std::runtime_error(
           "created runtime node root crossed a mount boundary");
     }
@@ -823,7 +1127,7 @@ void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
         errno != ENOENT) {
       cleanup_error = std::error_code(errno, std::generic_category()).message();
     }
-    if (unlinkat(nodes.get(), entry.node_id.c_str(), AT_REMOVEDIR) == 0) {
+    if (unlinkat(nodes.get(), root_name.c_str(), AT_REMOVEDIR) == 0) {
       if (acquired != nullptr) {
         *acquired = false;
       }
@@ -869,8 +1173,9 @@ void CleanupRuntimeNodeRpcCredential(const RunOwnership& ownership,
   RequireEntry(entry);
   UniqueFd nodes = OpenNodesDirectory(ownership);
   struct stat present{};
-  if (fstatat(nodes.get(), entry.node_id.c_str(), &present,
-              AT_SYMLINK_NOFOLLOW) != 0) {
+  const std::string root_name(EntryRootName(entry));
+  if (fstatat(nodes.get(), root_name.c_str(), &present, AT_SYMLINK_NOFOLLOW) !=
+      0) {
     if (errno == ENOENT) {
       return;
     }
@@ -924,10 +1229,16 @@ void RemoveRuntimeNodeRoot(
     std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
     std::stop_token stop_token) {
   RequireEntry(entry);
+  if (entry.state == RuntimeNodeResourceState::kPendingReplaceUncertain) {
+    throw std::runtime_error(
+        "runtime node root removal refuses uncertain replacement "
+        "orientation");
+  }
   UniqueFd nodes = OpenNodesDirectory(ownership);
   struct stat present{};
-  if (fstatat(nodes.get(), entry.node_id.c_str(), &present,
-              AT_SYMLINK_NOFOLLOW) != 0) {
+  const std::string root_name(EntryRootName(entry));
+  if (fstatat(nodes.get(), root_name.c_str(), &present, AT_SYMLINK_NOFOLLOW) !=
+      0) {
     if (errno == ENOENT) {
       return;
     }
@@ -941,8 +1252,8 @@ void RemoveRuntimeNodeRoot(
                           absolute_deadline, stop_token);
   RequireNodeMarker(node.get(), ownership, entry);
   struct stat current{};
-  if (fstatat(nodes.get(), entry.node_id.c_str(), &current,
-              AT_SYMLINK_NOFOLLOW) != 0) {
+  if (fstatat(nodes.get(), root_name.c_str(), &current, AT_SYMLINK_NOFOLLOW) !=
+      0) {
     ThrowErrno("reinspect runtime node root before removal", errno);
   }
   if (!SameIdentity(opened, current)) {
@@ -953,7 +1264,7 @@ void RemoveRuntimeNodeRoot(
   if (unlinkat(node.get(), marker_name.c_str(), 0) != 0) {
     ThrowErrno("remove runtime node ownership marker", errno);
   }
-  if (unlinkat(nodes.get(), entry.node_id.c_str(), AT_REMOVEDIR) != 0) {
+  if (unlinkat(nodes.get(), root_name.c_str(), AT_REMOVEDIR) != 0) {
     const int remove_error = errno;
     try {
       WriteNodeMarker(node.get(), ownership, entry);
@@ -965,11 +1276,145 @@ void RemoveRuntimeNodeRoot(
     }
     ThrowErrno("remove runtime node root", remove_error);
   }
-  if (fstatat(nodes.get(), entry.node_id.c_str(), &current,
-              AT_SYMLINK_NOFOLLOW) == 0 ||
+  if (fstatat(nodes.get(), root_name.c_str(), &current, AT_SYMLINK_NOFOLLOW) ==
+          0 ||
       errno != ENOENT) {
     throw std::runtime_error(
         "runtime node root survived descriptor-anchored cleanup");
+  }
+}
+
+void CloneRuntimeNodeRootForReplacement(
+    const RunOwnership& ownership, const RuntimeNodeResourceEntry& source_entry,
+    const RuntimeNodeResourceEntry& staging_entry,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token, bool* acquired) {
+  if (acquired != nullptr) {
+    *acquired = false;
+  }
+  RequireEntry(source_entry);
+  RequireEntry(staging_entry);
+  if (source_entry.root_name ||
+      source_entry.state != RuntimeNodeResourceState::kLive ||
+      staging_entry.state != RuntimeNodeResourceState::kPendingReplace ||
+      !staging_entry.root_name ||
+      source_entry.node_id != staging_entry.node_id ||
+      source_entry.slot != staging_entry.slot ||
+      source_entry.chain != staging_entry.chain) {
+    throw std::runtime_error(
+        "runtime node replacement clone entries are incompatible");
+  }
+  RequireCloneTime(absolute_deadline, stop_token);
+  PrepareRuntimeNodeRoot(ownership, staging_entry, acquired);
+
+  UniqueFd nodes = OpenNodesDirectory(ownership);
+  UniqueFd source = OpenOwnedNodeRoot(nodes.get(), ownership, source_entry);
+  UniqueFd destination =
+      OpenOwnedNodeRoot(nodes.get(), ownership, staging_entry);
+  std::size_t visited_entries = 0U;
+  std::map<CloneInode, std::filesystem::path> hard_links;
+  CloneDirectoryContents(source.get(), destination.get(), destination.get(), {},
+                         0U, &visited_entries, &hard_links, absolute_deadline,
+                         stop_token);
+  if (fsync(destination.get()) != 0 || fsync(nodes.get()) != 0) {
+    ThrowErrno("sync runtime node replacement clone", errno);
+  }
+  VerifyRuntimeNodeRootOwnership(ownership, source_entry);
+  VerifyRuntimeNodeRootOwnership(ownership, staging_entry);
+}
+
+void ExchangeRuntimeNodeRootsForReplacement(
+    const RunOwnership& ownership, const RuntimeNodeResourceEntry& first_entry,
+    const RuntimeNodeResourceEntry& second_entry,
+    RuntimeNodeRootOrientation* orientation) {
+  if (orientation == nullptr) {
+    throw std::invalid_argument(
+        "runtime node replacement exchange requires orientation state");
+  }
+  if (*orientation == RuntimeNodeRootOrientation::kUnknown) {
+    throw std::runtime_error(
+        "runtime node replacement root orientation is unknown");
+  }
+  const RuntimeNodeRootOrientation prior_orientation = *orientation;
+  RequireEntry(first_entry);
+  RequireEntry(second_entry);
+  if (first_entry.root_name ||
+      first_entry.state != RuntimeNodeResourceState::kLive ||
+      !second_entry.root_name || !IsReplacementState(second_entry.state) ||
+      second_entry.state ==
+          RuntimeNodeResourceState::kPendingReplaceUncertain ||
+      EntryRootName(first_entry) == EntryRootName(second_entry) ||
+      first_entry.node_id != second_entry.node_id ||
+      first_entry.slot != second_entry.slot ||
+      first_entry.chain != second_entry.chain) {
+    throw std::runtime_error(
+        "runtime node replacement exchange entries are incompatible");
+  }
+  UniqueFd nodes = OpenNodesDirectory(ownership);
+  struct stat first_before{};
+  struct stat second_before{};
+  static_cast<void>(
+      OpenOwnedNodeRoot(nodes.get(), ownership, first_entry, &first_before));
+  static_cast<void>(
+      OpenOwnedNodeRoot(nodes.get(), ownership, second_entry, &second_before));
+  const std::string first_name(EntryRootName(first_entry));
+  const std::string second_name(EntryRootName(second_entry));
+  if (syscall(SYS_renameat2, nodes.get(), first_name.c_str(), nodes.get(),
+              second_name.c_str(), RENAME_EXCHANGE) != 0) {
+    ThrowErrno("exchange runtime node replacement roots", errno);
+  }
+  *orientation = prior_orientation == RuntimeNodeRootOrientation::kOriginal
+                     ? RuntimeNodeRootOrientation::kExchanged
+                     : RuntimeNodeRootOrientation::kOriginal;
+  const auto verify_exchange = [&](const struct stat& first_expected,
+                                   const struct stat& second_expected) {
+    struct stat first_after{};
+    struct stat second_after{};
+    static_cast<void>(OpenOwnedNodeRootNamed(nodes.get(), first_name, ownership,
+                                             first_entry, &first_after));
+    static_cast<void>(OpenOwnedNodeRootNamed(
+        nodes.get(), second_name, ownership, second_entry, &second_after));
+    if (!SameIdentity(first_after, first_expected) ||
+        !SameIdentity(second_after, second_expected)) {
+      throw std::runtime_error(
+          "runtime node replacement root exchange read-back failed");
+    }
+  };
+  try {
+    if (fsync(nodes.get()) != 0) {
+      ThrowErrno("sync runtime node replacement root exchange", errno);
+    }
+    verify_exchange(second_before, first_before);
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    std::string failure_text = "unknown exception";
+    try {
+      std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+      failure_text = error.what();
+    } catch (...) {
+    }
+    if (syscall(SYS_renameat2, nodes.get(), first_name.c_str(), nodes.get(),
+                second_name.c_str(), RENAME_EXCHANGE) != 0) {
+      *orientation = RuntimeNodeRootOrientation::kUnknown;
+      throw std::runtime_error(
+          "runtime node replacement root exchange verification failed: " +
+          failure_text + "; exchange rollback failed: " +
+          std::error_code(errno, std::generic_category()).message());
+    }
+    *orientation = prior_orientation;
+    try {
+      if (fsync(nodes.get()) != 0) {
+        ThrowErrno("sync runtime node replacement exchange rollback", errno);
+      }
+      verify_exchange(first_before, second_before);
+    } catch (...) {
+      *orientation = RuntimeNodeRootOrientation::kUnknown;
+      throw std::runtime_error(
+          "runtime node replacement root exchange verification failed: " +
+          failure_text + "; exchange rollback could not be verified");
+    }
+    std::rethrow_exception(failure);
   }
 }
 

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "bbp/default_peer_topology.h"
@@ -17,6 +19,13 @@ struct RuntimePeerTopologyEdge {
   std::optional<NetworkCondition> condition = std::nullopt;
 
   bool operator==(const RuntimePeerTopologyEdge&) const = default;
+};
+
+struct RuntimeNodeReplacementPeerEdge {
+  std::uint32_t from = 0;
+  std::uint32_t to = 0;
+
+  bool operator==(const RuntimeNodeReplacementPeerEdge&) const = default;
 };
 
 class RuntimePeerTopology {
@@ -54,5 +63,12 @@ class RuntimePeerTopology {
   std::vector<RuntimePeerTopologyEdge> baseline_edges_;
   std::vector<RuntimePeerTopologyEdge> edges_;
 };
+
+std::vector<RuntimeNodeReplacementPeerEdge>
+ResolveRuntimeNodeReplacementPeerEdges(
+    const RuntimePeerTopology& topology,
+    const std::vector<std::string>& node_ids,
+    const std::map<std::string, std::vector<std::string>>& allowed_peers,
+    std::uint32_t target_index);
 
 }  // namespace bbp

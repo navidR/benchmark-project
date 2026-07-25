@@ -304,6 +304,71 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    scenario_service_node_replace_preserves_target_and_ignores_capacity) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 2U;
+  scenario["node_capacity"] = 2U;
+  const Options options = ParseAndValidateScenario(scenario);
+  const boost::json::object replacement{
+      {"chain", "firo"},
+      {"count", 1U},
+      {"node_ids", boost::json::array{"firo-2"}},
+      {"binary", "/opt/firod"},
+      {"resources",
+       boost::json::object{{"memory_high_bytes", 1U * 1024U * 1024U},
+                           {"memory_max_bytes", 2U * 1024U * 1024U}}},
+      {"network", boost::json::object{{"delay_ms", 5U}}},
+      {"ready_timeout_sec", 41U},
+      {"sync_timeout_sec", 43U}};
+
+  const SimulationNodeReplaceRequest parsed =
+      ParseAndValidateSimulationNodeReplaceRequest(replacement, "firo-2",
+                                                   options);
+  BOOST_CHECK(parsed.chain == ChainKind::kFiro);
+  BOOST_TEST(parsed.count == 1U);
+  BOOST_TEST(parsed.node_ids == std::vector<std::string>({"firo-2"}),
+             boost::test_tools::per_element());
+  BOOST_REQUIRE(parsed.binary);
+  BOOST_TEST(*parsed.binary == "/opt/firod");
+  BOOST_REQUIRE(parsed.resources);
+  BOOST_REQUIRE(parsed.resources->memory_max_bytes);
+  BOOST_TEST(*parsed.resources->memory_max_bytes == 2U * 1024U * 1024U);
+  BOOST_REQUIRE(parsed.network);
+  BOOST_TEST(parsed.network->delay_ms == 5U);
+  BOOST_TEST(parsed.ready_timeout_sec == 41U);
+  BOOST_TEST(parsed.sync_timeout_sec == 43U);
+
+  const SimulationCommand command = ParseAndValidateSimulationCommand(
+      boost::json::object{{"kind", "replace_node"},
+                          {"node", "firo-2"},
+                          {"node_replace", replacement}},
+      options);
+  BOOST_CHECK(command.kind == SimulationCommandKind::kReplaceNode);
+  BOOST_TEST(command.node_id == "firo-2");
+  BOOST_REQUIRE(command.node_replace);
+
+  const auto rejects = [&](boost::json::object invalid,
+                           std::string_view target = "firo-2") {
+    BOOST_CHECK_THROW(
+        ParseAndValidateSimulationNodeReplaceRequest(invalid, target, options),
+        std::runtime_error);
+  };
+  boost::json::object invalid = replacement;
+  invalid["chain"] = "bitcoin";
+  rejects(invalid);
+  invalid = replacement;
+  invalid["count"] = 2U;
+  rejects(invalid);
+  invalid = replacement;
+  invalid["node_ids"] = boost::json::array{"firo-1"};
+  rejects(invalid);
+  invalid = replacement;
+  invalid["topology"] = boost::json::object{{"type", "ring"}};
+  rejects(invalid);
+  rejects(replacement, "firo-3");
+}
+
+BOOST_AUTO_TEST_CASE(
     scenario_service_node_remove_parser_enforces_active_batch_bounds) {
   boost::json::object scenario = MinimalScenario();
   scenario["nodes"] = 3U;

@@ -25,6 +25,7 @@ std::size_t SimulationCommandPayloadCount(const SimulationCommand& command) {
          static_cast<std::size_t>(!command.perf_counter_kinds.empty()) +
          static_cast<std::size_t>(command.wallet_send.has_value()) +
          static_cast<std::size_t>(command.node_add.has_value()) +
+         static_cast<std::size_t>(command.node_replace.has_value()) +
          static_cast<std::size_t>(command.node_remove.has_value());
 }
 
@@ -259,6 +260,47 @@ void ValidateNodeRemoveCommand(const SimulationCommand& command) {
   }
 }
 
+void ValidateNodeReplaceCommand(const SimulationCommand& command) {
+  RequirePayload(command, command.node_replace.has_value(), 1U);
+  const SimulationNodeReplaceRequest& request = *command.node_replace;
+  if (command.node_id.empty() || command.node_id == "sim") {
+    throw std::runtime_error(
+        "replace-node command must target one active node");
+  }
+  switch (request.chain) {
+    case ChainKind::kFiro:
+    case ChainKind::kBitcoin:
+    case ChainKind::kMonero:
+      break;
+    case ChainKind::kCount:
+    default:
+      throw std::runtime_error("replace-node command requires a valid chain");
+  }
+  if (request.count != 1U) {
+    throw std::runtime_error("replace-node count must equal one");
+  }
+  if (!request.node_ids.empty() &&
+      (request.node_ids.size() != 1U ||
+       request.node_ids.front() != command.node_id)) {
+    throw std::runtime_error(
+        "replace-node explicit node id must equal the selected node");
+  }
+  if (request.binary && request.binary->empty()) {
+    throw std::runtime_error("replace-node binary must not be empty");
+  }
+  if (request.network) {
+    ValidateNetworkCondition(*request.network);
+  }
+  if (request.ready_timeout_sec == 0U ||
+      request.ready_timeout_sec > kSimulationNodeAddMaximumTimeoutSeconds ||
+      request.sync_timeout_sec == 0U ||
+      request.sync_timeout_sec > kSimulationNodeAddMaximumTimeoutSeconds) {
+    throw std::runtime_error(
+        "replace-node timeout fields must be in 1.." +
+        std::to_string(kSimulationNodeAddMaximumTimeoutSeconds));
+  }
+}
+
 void ValidateSimulationCommand(const SimulationCommand& command) {
   if (command.sequence != 0U) {
     throw std::runtime_error(
@@ -355,6 +397,9 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
     case SimulationCommandKind::kAddNodes:
       ValidateNodeAddCommand(command);
       break;
+    case SimulationCommandKind::kReplaceNode:
+      ValidateNodeReplaceCommand(command);
+      break;
     case SimulationCommandKind::kRemoveNodes:
       ValidateNodeRemoveCommand(command);
       break;
@@ -406,6 +451,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kSetPerfCounters:
     case SimulationCommandKind::kSendWalletTransaction:
     case SimulationCommandKind::kAddNodes:
+    case SimulationCommandKind::kReplaceNode:
     case SimulationCommandKind::kRemoveNodes:
     case SimulationCommandKind::kCount:
       throw std::runtime_error(
@@ -922,6 +968,34 @@ std::uint64_t SimulationCommandQueue::PushAddNodes(
   });
 }
 
+std::uint64_t SimulationCommandQueue::PushReplaceNode(
+    std::string node_id, SimulationNodeReplaceRequest request) {
+  return PushCommand(SimulationCommand{
+      .sequence = 0U,
+      .kind = SimulationCommandKind::kReplaceNode,
+      .node_id = std::move(node_id),
+      .block_production_policy = std::nullopt,
+      .mining_difficulty = std::nullopt,
+      .peer_node_id = std::nullopt,
+      .peer_count_policy = std::nullopt,
+      .block_count = std::nullopt,
+      .profile = std::nullopt,
+      .resource_limit_patch = std::nullopt,
+      .network_condition = std::nullopt,
+      .network_flow = std::nullopt,
+      .partition = std::nullopt,
+      .perf_counter_target = std::nullopt,
+      .perf_counter_kinds = {},
+      .wallet_send = std::nullopt,
+      .node_add = std::nullopt,
+      .node_replace = std::move(request),
+      .node_remove = std::nullopt,
+      .confirmed = true,
+      .scheduled_event_sequence = std::nullopt,
+      .operation_control = nullptr,
+  });
+}
+
 std::uint64_t SimulationCommandQueue::PushRemoveNodes(
     SimulationNodeRemoveRequest request) {
   return PushCommand(SimulationCommand{
@@ -952,6 +1026,7 @@ std::uint64_t SimulationCommandQueue::PushRemoveNodes(
 std::uint64_t SimulationCommandQueue::PushCommand(SimulationCommand command) {
   ValidateSimulationCommand(command);
   if ((command.kind == SimulationCommandKind::kAddNodes ||
+       command.kind == SimulationCommandKind::kReplaceNode ||
        command.kind == SimulationCommandKind::kRemoveNodes) &&
       !command.operation_control) {
     command.operation_control = std::make_shared<SimulationCommandControl>();

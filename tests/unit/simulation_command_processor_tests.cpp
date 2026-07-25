@@ -37,6 +37,19 @@ bbp::SimulationNodeRemoveRequest NodeRemoveRequest(std::string node_id) {
   };
 }
 
+bbp::SimulationNodeReplaceRequest NodeReplaceRequest(std::string node_id) {
+  return bbp::SimulationNodeReplaceRequest{
+      .chain = bbp::ChainKind::kFiro,
+      .count = 1U,
+      .node_ids = {std::move(node_id)},
+      .binary = std::nullopt,
+      .resources = std::nullopt,
+      .network = std::nullopt,
+      .ready_timeout_sec = 30U,
+      .sync_timeout_sec = 30U,
+  };
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(simulation_command_processor_consumes_queued_commands) {
@@ -568,6 +581,46 @@ BOOST_AUTO_TEST_CASE(
         outcome.set_value(result);
       });
   queue.PushRemoveNodes(NodeRemoveRequest("uncommitted-remove"));
+
+  processor.Start();
+  const bbp::SimulationCommandOutcome result = outcome.get_future().get();
+  processor.Stop();
+
+  BOOST_REQUIRE(control);
+  BOOST_CHECK(control->CommitPhase() ==
+              bbp::SimulationCommandCommitPhase::kOpen);
+  BOOST_CHECK(result.state ==
+              bbp::SimulationCommandOutcomeState::kOutcomeUnconfirmed);
+  BOOST_REQUIRE(result.error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_processor_rejects_node_replace_success_without_commit) {
+  bbp::SimulationCommandQueue queue;
+  std::promise<bbp::SimulationCommandOutcome> outcome;
+  std::shared_ptr<bbp::SimulationCommandControl> control;
+  bbp::SimulationCommandProcessor processor(
+      queue,
+      [&](const bbp::SimulationCommand& command) {
+        control = command.operation_control;
+        return bbp::SimulationCommandOutcome{
+            .state = bbp::SimulationCommandOutcomeState::kSucceeded,
+            .cancellation_cause =
+                bbp::SimulationCommandCancellationCause::kNone,
+            .error = std::nullopt,
+            .node_lifecycle = "running",
+            .added_node_ids = {},
+            .removed_node_ids = {},
+            .inventory_generation = 2U,
+            .final_node_count = 1U,
+        };
+      },
+      [](const bbp::SimulationCommand&, std::string_view) {},
+      [&](const bbp::SimulationCommand&,
+          const bbp::SimulationCommandOutcome& result) {
+        outcome.set_value(result);
+      });
+  queue.PushReplaceNode("firo-1", NodeReplaceRequest("firo-1"));
 
   processor.Start();
   const bbp::SimulationCommandOutcome result = outcome.get_future().get();
