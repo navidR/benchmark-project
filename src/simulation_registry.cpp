@@ -45,6 +45,12 @@ void SimulationRegistry::AddWallet(WalletIdentity wallet) {
   }
   wallet.wallet_index = static_cast<uint32_t>(wallets_.size() + 1U);
   const uint32_t node_index = wallet.node - 1U;
+  if (!topology_.allow_miner_wallet_overlap &&
+      std::find(topology_.miner_nodes.begin(), topology_.miner_nodes.end(),
+                node_index) != topology_.miner_nodes.end()) {
+    throw std::runtime_error(
+        "wallet node overlaps a miner node without overlap permission");
+  }
   if (std::find(topology_.wallet_nodes.begin(), topology_.wallet_nodes.end(),
                 node_index) == topology_.wallet_nodes.end()) {
     topology_.wallet_nodes.push_back(node_index);

@@ -86,6 +86,18 @@ void ProbabilisticBlockScheduler::Stop() {
 ProbabilisticBlockScheduler::PreparedAdd
 ProbabilisticBlockScheduler::PrepareAddMiners(
     std::vector<std::string> node_ids) {
+  return PrepareAddMiners(std::move(node_ids), true);
+}
+
+ProbabilisticBlockScheduler::PreparedAdd
+ProbabilisticBlockScheduler::PrepareAddMinersInactive(
+    std::vector<std::string> node_ids) {
+  return PrepareAddMiners(std::move(node_ids), false);
+}
+
+ProbabilisticBlockScheduler::PreparedAdd
+ProbabilisticBlockScheduler::PrepareAddMiners(std::vector<std::string> node_ids,
+                                              bool initially_active) {
   if (node_ids.empty()) {
     throw std::invalid_argument(
         "block scheduler miner addition cannot be empty");
@@ -111,7 +123,7 @@ ProbabilisticBlockScheduler::PrepareAddMiners(
                                   node_id);
     }
     next_ids.push_back(std::move(node_id));
-    next_active.push_back(true);
+    next_active.push_back(initially_active);
     next_in_flight.push_back(false);
   }
   return PreparedAdd(this, std::move(lock), std::move(next_ids),

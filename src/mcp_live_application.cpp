@@ -48,6 +48,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kReplaceNode,
     McpOperationKind::kAddWallet,
     McpOperationKind::kRemoveWallet,
+    McpOperationKind::kAssignRole,
     McpOperationKind::kAddMiner,
     McpOperationKind::kRemoveMiner,
     McpOperationKind::kAddMasternode,
@@ -335,6 +336,402 @@ std::vector<std::string> OptionalStringArray(const boost::json::object& object,
     result.push_back(std::move(text));
   }
   return result;
+}
+
+struct RoleAssignmentPlan {
+  McpOperationKind service_kind = McpOperationKind::kCount;
+  std::string role;
+  std::vector<std::string> node_ids;
+  boost::json::object service_arguments;
+};
+
+RoleAssignmentPlan BuildRoleAssignmentPlan(
+    const boost::json::object& arguments) {
+  constexpr std::array<std::string_view, 6U> kAllowedFields = {
+      "run_id", "node_ids",          "roles",
+      "mode",   "funding_wallet_id", "timeout_sec"};
+  for (const auto& member : arguments) {
+    if (std::find(kAllowedFields.begin(), kAllowedFields.end(), member.key()) ==
+        kAllowedFields.end()) {
+      throw std::invalid_argument(
+          "unsupported MCP application argument for role.assign: " +
+          std::string(member.key()));
+    }
+  }
+
+  RoleAssignmentPlan plan;
+  plan.node_ids = OptionalStringArray(arguments, "node_ids", true);
+  if (plan.node_ids.size() > kSimulationNodeAddMaximumCount) {
+    throw std::invalid_argument("role.assign node_ids must contain 1..16 ids");
+  }
+  for (const std::string& node_id : plan.node_ids) {
+    if (!IsSafeNodeAddIdentifier(node_id)) {
+      throw std::invalid_argument(
+          "role.assign node_ids must contain safe identifiers");
+    }
+  }
+
+  std::vector<std::string> roles =
+      OptionalStringArray(arguments, "roles", true);
+  if (roles.size() != 1U) {
+    throw std::invalid_argument(
+        "role.assign roles must contain exactly one role");
+  }
+  plan.role = std::move(roles.front());
+
+  plan.service_arguments["run_id"] = RequireString(arguments, "run_id");
+  boost::json::array node_ids;
+  node_ids.reserve(plan.node_ids.size());
+  for (const std::string& node_id : plan.node_ids) {
+    node_ids.emplace_back(node_id);
+  }
+  plan.service_arguments["node_ids"] = std::move(node_ids);
+  plan.service_arguments["count"] = plan.node_ids.size();
+
+  if (const boost::json::value* timeout =
+          arguments.if_contains("timeout_sec")) {
+    const std::uint64_t seconds =
+        OptionalUnsigned(arguments, "timeout_sec", 0U);
+    if (seconds == 0U || seconds > kMaximumNodeOperationTimeoutSeconds) {
+      throw std::invalid_argument("role.assign timeout_sec must be in 1..3600");
+    }
+    plan.service_arguments["timeout_sec"] = *timeout;
+  }
+
+  const bool has_mode = arguments.if_contains("mode") != nullptr;
+  const bool has_funding_wallet =
+      arguments.if_contains("funding_wallet_id") != nullptr;
+  if (plan.role == "wallet") {
+    if (has_funding_wallet) {
+      throw std::invalid_argument(
+          "role.assign wallet does not accept funding_wallet_id");
+    }
+    const std::string mode = RequireString(arguments, "mode");
+    if (mode != "public" && mode != "private") {
+      throw std::invalid_argument(
+          "role.assign wallet mode must be public or private");
+    }
+    plan.service_kind = McpOperationKind::kAddWallet;
+    plan.service_arguments["mode"] = mode;
+    return plan;
+  }
+  if (plan.role == "miner") {
+    if (has_mode || has_funding_wallet) {
+      throw std::invalid_argument(
+          "role.assign miner does not accept mode or funding_wallet_id");
+    }
+    plan.service_kind = McpOperationKind::kAddMiner;
+    return plan;
+  }
+  if (plan.role == "masternode") {
+    if (has_mode) {
+      throw std::invalid_argument(
+          "role.assign masternode does not accept mode");
+    }
+    const std::string funding_wallet_id =
+        RequireString(arguments, "funding_wallet_id");
+    if (!IsSafeNodeAddIdentifier(funding_wallet_id)) {
+      throw std::invalid_argument(
+          "role.assign funding_wallet_id must be a safe identifier");
+    }
+    plan.service_kind = McpOperationKind::kAddMasternode;
+    plan.service_arguments["funding_wallet_id"] = funding_wallet_id;
+    return plan;
+  }
+  throw std::invalid_argument(
+      "role.assign role must be wallet, miner, or masternode");
+}
+
+const boost::json::array& RequireArrayMember(const boost::json::object& object,
+                                             std::string_view name) {
+  const boost::json::value& value = RequireMember(object, name);
+  if (!value.is_array()) {
+    throw std::logic_error("role.assign delegated result " + std::string(name) +
+                           " must be an array");
+  }
+  return value.as_array();
+}
+
+std::uint64_t RequireUnsignedResultMember(const boost::json::object& object,
+                                          std::string_view name,
+                                          bool require_positive = false) {
+  const boost::json::value& value = RequireMember(object, name);
+  std::uint64_t number = 0U;
+  if (value.is_uint64()) {
+    number = value.as_uint64();
+  } else if (value.is_int64() && value.as_int64() >= 0) {
+    number = static_cast<std::uint64_t>(value.as_int64());
+  } else {
+    throw std::logic_error("role.assign delegated result " + std::string(name) +
+                           " must be an unsigned integer");
+  }
+  if (require_positive && number == 0U) {
+    throw std::logic_error("role.assign delegated result " + std::string(name) +
+                           " must be positive");
+  }
+  return number;
+}
+
+std::uint64_t RequireUint32ResultMember(const boost::json::object& object,
+                                        std::string_view name,
+                                        bool require_positive = false) {
+  const std::uint64_t number =
+      RequireUnsignedResultMember(object, name, require_positive);
+  if (number > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::logic_error("role.assign delegated result " + std::string(name) +
+                           " exceeds uint32");
+  }
+  return number;
+}
+
+void RequireExactResultFields(const boost::json::object& object,
+                              std::span<const std::string_view> allowed_fields,
+                              std::string_view identity_kind) {
+  for (const auto& member : object) {
+    if (std::find(allowed_fields.begin(), allowed_fields.end(), member.key()) ==
+        allowed_fields.end()) {
+      throw std::logic_error(
+          "role.assign delegated " + std::string(identity_kind) +
+          " identity contains unsupported field " + std::string(member.key()));
+    }
+  }
+}
+
+std::string RequireResultStringMember(const boost::json::object& object,
+                                      std::string_view name,
+                                      bool allow_empty = false) {
+  const boost::json::value& value = RequireMember(object, name);
+  if (!value.is_string() || (!allow_empty && value.as_string().empty())) {
+    throw std::logic_error(
+        "role.assign delegated result " + std::string(name) +
+        " must be a string" +
+        (allow_empty ? std::string() : " with at least one character"));
+  }
+  if (value.as_string().size() > kMcpMaximumEvidenceTextBytes) {
+    throw std::logic_error("role.assign delegated result " + std::string(name) +
+                           " exceeds the text byte bound");
+  }
+  return std::string(value.as_string());
+}
+
+boost::json::object NormalizeRoleAssignmentWallet(
+    const boost::json::object& identity, std::string_view expected_node_id,
+    std::string_view expected_mode) {
+  constexpr std::array<std::string_view, 6U> kFields = {
+      "wallet_index", "node", "node_id", "mode", "address", "funding_address"};
+  RequireExactResultFields(identity, kFields, "wallet");
+  const std::string node_id = RequireResultStringMember(identity, "node_id");
+  const std::string mode = RequireResultStringMember(identity, "mode");
+  if (node_id != expected_node_id || mode != expected_mode) {
+    throw std::logic_error(
+        "role.assign wallet identity differs from its requested node or mode");
+  }
+  return boost::json::object{
+      {"wallet_index",
+       RequireUint32ResultMember(identity, "wallet_index", true)},
+      {"node", RequireUint32ResultMember(identity, "node", true)},
+      {"node_id", node_id},
+      {"mode", mode},
+      {"address", RequireResultStringMember(identity, "address")},
+      {"funding_address",
+       RequireResultStringMember(identity, "funding_address")}};
+}
+
+boost::json::object NormalizeRoleAssignmentMasternode(
+    const boost::json::object& identity, std::string_view expected_node_id,
+    std::string_view expected_funding_wallet_id) {
+  constexpr std::array<std::string_view, 14U> kFields = {
+      "node",
+      "node_id",
+      "funding_wallet_node_id",
+      "pro_tx_hash",
+      "service",
+      "collateral_address",
+      "owner_address",
+      "operator_public_key",
+      "voting_address",
+      "payout_address",
+      "collateral_hash",
+      "collateral_index",
+      "state",
+      "status"};
+  RequireExactResultFields(identity, kFields, "masternode");
+  const std::string node_id = RequireResultStringMember(identity, "node_id");
+  const std::string funding_wallet_node_id =
+      RequireResultStringMember(identity, "funding_wallet_node_id");
+  if (node_id != expected_node_id ||
+      funding_wallet_node_id != expected_funding_wallet_id) {
+    throw std::logic_error(
+        "role.assign masternode identity differs from its requested node or "
+        "funding wallet");
+  }
+  return boost::json::object{
+      {"node", RequireUint32ResultMember(identity, "node", true)},
+      {"node_id", node_id},
+      {"funding_wallet_node_id", funding_wallet_node_id},
+      {"pro_tx_hash", RequireResultStringMember(identity, "pro_tx_hash")},
+      {"service", RequireResultStringMember(identity, "service")},
+      {"collateral_address",
+       RequireResultStringMember(identity, "collateral_address")},
+      {"owner_address", RequireResultStringMember(identity, "owner_address")},
+      {"operator_public_key",
+       RequireResultStringMember(identity, "operator_public_key")},
+      {"voting_address", RequireResultStringMember(identity, "voting_address")},
+      {"payout_address", RequireResultStringMember(identity, "payout_address")},
+      {"collateral_hash",
+       RequireResultStringMember(identity, "collateral_hash", true)},
+      {"collateral_index",
+       RequireUnsignedResultMember(identity, "collateral_index")},
+      {"state", RequireResultStringMember(identity, "state")},
+      {"status", RequireResultStringMember(identity, "status", true)}};
+}
+
+boost::json::object NormalizeRoleAssignmentResult(
+    const RoleAssignmentPlan& plan, const boost::json::object& delegated) {
+  const std::string expected_action =
+      std::string(McpOperationKindName(plan.service_kind));
+  if (RequireString(delegated, "action") != expected_action ||
+      RequireString(delegated, "state") != "ready") {
+    throw std::logic_error(
+        "role.assign delegated service returned the wrong action or state");
+  }
+
+  const std::string_view node_ids_field =
+      plan.role == "wallet" ? "affected_node_ids" : "node_ids";
+  if (OptionalStringArray(delegated, node_ids_field, true) != plan.node_ids) {
+    throw std::logic_error(
+        "role.assign delegated service returned different node ids");
+  }
+
+  const std::string_view generation_field =
+      plan.role == "wallet" ? "wallet_generation" : "role_generation";
+  const std::uint64_t final_node_count =
+      RequireUint32ResultMember(delegated, "final_node_count", true);
+  if (final_node_count < plan.node_ids.size()) {
+    throw std::logic_error(
+        "role.assign delegated service returned an impossible final node "
+        "count");
+  }
+  boost::json::object normalized{
+      {"node_ids", RequireMember(plan.service_arguments, "node_ids")},
+      {"assigned_roles", boost::json::array{plan.role}},
+      {"removed_roles", boost::json::array{}},
+      {"action", "role.assign"},
+      {"state", "ready"},
+      {"created_node_ids", boost::json::array{}},
+      {"role_generation",
+       RequireUnsignedResultMember(delegated, generation_field, true)},
+      {"inventory_generation",
+       RequireUnsignedResultMember(delegated, "inventory_generation", true)},
+      {"final_node_count", final_node_count},
+  };
+
+  if (plan.role == "wallet") {
+    if (!RequireArrayMember(delegated, "added_node_ids").empty() ||
+        !RequireArrayMember(delegated, "removed_node_ids").empty()) {
+      throw std::logic_error(
+          "role.assign wallet service changed node identities");
+    }
+    const boost::json::array& wallets =
+        RequireArrayMember(delegated, "wallets");
+    if (wallets.size() != plan.node_ids.size()) {
+      throw std::logic_error(
+          "role.assign wallet service returned the wrong wallet count");
+    }
+    const std::string expected_mode =
+        RequireString(plan.service_arguments, "mode");
+    boost::json::array normalized_wallets;
+    normalized_wallets.reserve(wallets.size());
+    for (std::size_t index = 0U; index < wallets.size(); ++index) {
+      if (!wallets[index].is_object()) {
+        throw std::logic_error(
+            "role.assign wallet service returned a non-object identity");
+      }
+      normalized_wallets.push_back(NormalizeRoleAssignmentWallet(
+          wallets[index].as_object(), plan.node_ids[index], expected_mode));
+    }
+    const std::uint64_t final_wallet_count =
+        RequireUint32ResultMember(delegated, "final_wallet_count", true);
+    const std::uint64_t final_wallet_node_count =
+        RequireUint32ResultMember(delegated, "final_wallet_node_count", true);
+    if (final_wallet_node_count < plan.node_ids.size() ||
+        final_wallet_node_count > final_node_count ||
+        final_wallet_count < final_wallet_node_count) {
+      throw std::logic_error(
+          "role.assign wallet service returned impossible final identity or "
+          "role-node counts");
+    }
+    normalized["final_wallet_count"] = final_wallet_count;
+    normalized["final_wallet_node_count"] = final_wallet_node_count;
+    normalized["wallets"] = std::move(normalized_wallets);
+    return normalized;
+  }
+
+  const boost::json::array& assigned_roles =
+      RequireArrayMember(delegated, "assigned_roles");
+  if (assigned_roles.size() != 1U || !assigned_roles.front().is_string() ||
+      assigned_roles.front().as_string() != plan.role) {
+    throw std::logic_error(
+        "role.assign delegated service returned different assigned roles");
+  }
+  if (!RequireArrayMember(delegated, "removed_roles").empty() ||
+      !RequireArrayMember(delegated, "created_node_ids").empty()) {
+    throw std::logic_error(
+        "role.assign delegated service changed roles or node identities "
+        "outside its request");
+  }
+
+  if (plan.role == "miner") {
+    const std::uint64_t final_miner_count =
+        RequireUint32ResultMember(delegated, "final_miner_count");
+    if (final_miner_count < plan.node_ids.size() ||
+        final_miner_count > final_node_count) {
+      throw std::logic_error(
+          "role.assign miner service returned an impossible final count");
+    }
+    normalized["final_miner_count"] = final_miner_count;
+    return normalized;
+  }
+
+  const boost::json::array& masternodes =
+      RequireArrayMember(delegated, "masternodes");
+  if (masternodes.size() != plan.node_ids.size()) {
+    throw std::logic_error(
+        "role.assign masternode service returned the wrong identity count");
+  }
+  const std::string expected_funding_wallet_id =
+      RequireString(plan.service_arguments, "funding_wallet_id");
+  boost::json::array normalized_masternodes;
+  normalized_masternodes.reserve(masternodes.size());
+  for (std::size_t index = 0U; index < masternodes.size(); ++index) {
+    if (!masternodes[index].is_object()) {
+      throw std::logic_error(
+          "role.assign masternode service returned a non-object identity");
+    }
+    normalized_masternodes.push_back(NormalizeRoleAssignmentMasternode(
+        masternodes[index].as_object(), plan.node_ids[index],
+        expected_funding_wallet_id));
+  }
+  const std::uint64_t final_masternode_count =
+      RequireUint32ResultMember(delegated, "final_masternode_count");
+  if (final_masternode_count < plan.node_ids.size() ||
+      final_masternode_count > final_node_count) {
+    throw std::logic_error(
+        "role.assign masternode service returned an impossible final count");
+  }
+  normalized["final_masternode_count"] = final_masternode_count;
+  normalized["masternodes"] = std::move(normalized_masternodes);
+  return normalized;
+}
+
+std::string CurrentExceptionMessage(std::exception_ptr failure) {
+  try {
+    std::rethrow_exception(std::move(failure));
+  } catch (const std::exception& error) {
+    return error.what();
+  } catch (...) {
+    return "unknown non-standard exception";
+  }
 }
 
 std::vector<McpInformationFamily> RequireFamilies(
@@ -728,6 +1125,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kReplaceNode &&
       kind != McpOperationKind::kAddWallet &&
       kind != McpOperationKind::kRemoveWallet &&
+      kind != McpOperationKind::kAssignRole &&
       kind != McpOperationKind::kAddMiner &&
       kind != McpOperationKind::kRemoveMiner &&
       kind != McpOperationKind::kAddMasternode &&
@@ -776,8 +1174,14 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         }};
   }
 
+  const std::optional<RoleAssignmentPlan> role_assignment =
+      kind == McpOperationKind::kAssignRole
+          ? std::optional<RoleAssignmentPlan>(
+                BuildRoleAssignmentPlan(arguments))
+          : std::nullopt;
   if (kind == McpOperationKind::kAddWallet ||
       kind == McpOperationKind::kRemoveWallet ||
+      kind == McpOperationKind::kAssignRole ||
       kind == McpOperationKind::kAddMiner ||
       kind == McpOperationKind::kRemoveMiner ||
       kind == McpOperationKind::kAddMasternode ||
@@ -791,24 +1195,51 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     }
     return McpOperationPlan{
         .progress_total = 3U,
-        .executor = [this, role_service, kind,
-                     arguments](McpOperationContext& context) {
+        .executor = [this, role_service, kind, arguments,
+                     role_assignment](McpOperationContext& context) {
           CombinedStopToken cancellation(context.stop_token(),
                                          run_stop_source_.get_token());
           boost::json::object result;
           try {
-            result =
-                role_service->operation(kind, arguments, cancellation.token());
+            const McpOperationKind service_kind =
+                role_assignment ? role_assignment->service_kind : kind;
+            const boost::json::object& service_arguments =
+                role_assignment ? role_assignment->service_arguments
+                                : arguments;
+            result = role_service->operation(service_kind, service_arguments,
+                                             cancellation.token());
           } catch (const SimulationCancelled&) {
             throw McpOperationCancelled();
           }
+          if (role_assignment) {
+            try {
+              result = NormalizeRoleAssignmentResult(*role_assignment, result);
+              result["result_family"] = "role_mutation";
+              result["run_id"] = config_.run_id;
+            } catch (...) {
+              const std::string message =
+                  CurrentExceptionMessage(std::current_exception());
+              MarkRunStopping();
+              if (config_.request_run_stop) {
+                config_.request_run_stop();
+              }
+              throw McpOperationFailure(
+                  "role_assign_outcome_unconfirmed",
+                  "role.assign committed through its authoritative service "
+                  "but completion evidence could not be normalized: " +
+                      message,
+                  false);
+            }
+          }
           const McpResultFamily result_family =
-              kind == McpOperationKind::kAddWallet ||
-                      kind == McpOperationKind::kRemoveWallet
+              !role_assignment && (kind == McpOperationKind::kAddWallet ||
+                                   kind == McpOperationKind::kRemoveWallet)
                   ? McpResultFamily::kMutation
                   : McpResultFamily::kRoleMutation;
-          result["result_family"] = McpResultFamilyName(result_family);
-          result["run_id"] = config_.run_id;
+          if (!role_assignment) {
+            result["result_family"] = McpResultFamilyName(result_family);
+            result["run_id"] = config_.run_id;
+          }
           return McpTypedResult{.family = result_family,
                                 .value = std::move(result)};
         }};

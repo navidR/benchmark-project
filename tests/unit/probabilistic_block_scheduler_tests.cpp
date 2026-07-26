@@ -230,9 +230,15 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(scheduler.StopMiner("node-2"), std::runtime_error);
 
   scheduler.StopMiner("node-1");
-  auto prepared = scheduler.PrepareAddMiners({"node-2"});
+  auto prepared = scheduler.PrepareAddMinersInactive({"node-2"});
   prepared.Commit();
   scheduler.Start();
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    BOOST_TEST(
+        !produced.wait_for(lock, 20ms, [&miners] { return !miners.empty(); }));
+  }
+  scheduler.StartMiner("node-2");
   {
     std::unique_lock<std::mutex> lock(mutex);
     BOOST_REQUIRE(

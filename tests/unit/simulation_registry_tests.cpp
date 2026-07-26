@@ -73,6 +73,52 @@ BOOST_AUTO_TEST_CASE(simulation_registry_accepts_private_wallet_mode) {
              static_cast<int>(bbp::WalletPrivacyMode::kPrivate));
 }
 
+BOOST_AUTO_TEST_CASE(
+    simulation_registry_wallet_assignment_preserves_identity_multiplicity_and_overlap_policy) {
+  bbp::NodeRoleTopology topology;
+  topology.configured = true;
+  topology.node_count = 2U;
+  topology.miner_node_count = 1U;
+  topology.miner_nodes = {1U};
+  bbp::SimulationRegistry registry =
+      bbp::SimulationRegistry::FromTopology(topology, {});
+
+  registry.AddWallet(bbp::WalletIdentity{.node = 1U,
+                                         .node_id = "firo-1",
+                                         .address = "address-1",
+                                         .funding_address = "funding-1"});
+  registry.AddWallet(bbp::WalletIdentity{.node = 1U,
+                                         .node_id = "firo-1",
+                                         .address = "address-2",
+                                         .funding_address = "funding-2"});
+  BOOST_TEST(registry.topology().wallet_nodes == std::vector<std::uint32_t>{0U},
+             boost::test_tools::per_element());
+  BOOST_TEST(registry.topology().wallet_node_count == 1U);
+  BOOST_REQUIRE_EQUAL(registry.wallets().size(), 2U);
+  BOOST_TEST(registry.wallets()[0U].wallet_index == 1U);
+  BOOST_TEST(registry.wallets()[1U].wallet_index == 2U);
+
+  BOOST_CHECK_THROW(
+      registry.AddWallet(bbp::WalletIdentity{.node = 2U,
+                                             .node_id = "firo-2",
+                                             .address = "address-3",
+                                             .funding_address = "funding-3"}),
+      std::runtime_error);
+  BOOST_TEST(registry.wallets().size() == 2U);
+  BOOST_TEST(registry.topology().wallet_nodes == std::vector<std::uint32_t>{0U},
+             boost::test_tools::per_element());
+
+  topology.allow_miner_wallet_overlap = true;
+  bbp::SimulationRegistry overlap =
+      bbp::SimulationRegistry::FromTopology(topology, {});
+  overlap.AddWallet(bbp::WalletIdentity{.node = 2U,
+                                        .node_id = "firo-2",
+                                        .address = "address-3",
+                                        .funding_address = "funding-3"});
+  BOOST_TEST(overlap.topology().wallet_nodes == std::vector<std::uint32_t>{1U},
+             boost::test_tools::per_element());
+}
+
 BOOST_AUTO_TEST_CASE(wallet_initialization_names_round_trip) {
   const std::optional<bbp::WalletInitializationStrategy> strategy =
       bbp::WalletInitializationStrategyFromName(

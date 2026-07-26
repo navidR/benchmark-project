@@ -98,6 +98,7 @@ class ProbabilisticBlockScheduler {
   void Start();
   void Stop();
   PreparedAdd PrepareAddMiners(std::vector<std::string> node_ids);
+  PreparedAdd PrepareAddMinersInactive(std::vector<std::string> node_ids);
   PreparedRemove PrepareRemoveMiners(std::vector<std::string> node_ids,
                                      std::stop_token stop_token = {});
   void StartMiner(const std::string& node_id);
@@ -105,6 +106,8 @@ class ProbabilisticBlockScheduler {
   void UpdatePolicy(BlockProductionPolicy policy);
 
  private:
+  PreparedAdd PrepareAddMiners(std::vector<std::string> node_ids,
+                               bool initially_active);
   void Run();
 
   std::vector<std::string> miner_node_ids_;

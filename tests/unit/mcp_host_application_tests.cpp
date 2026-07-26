@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
@@ -99,9 +100,9 @@ BOOST_AUTO_TEST_CASE(
   for (const McpOperationKind operation :
        {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
         McpOperationKind::kRestartNode, McpOperationKind::kAddWallet,
-        McpOperationKind::kRemoveWallet, McpOperationKind::kAddMiner,
-        McpOperationKind::kRemoveMiner, McpOperationKind::kAddMasternode,
-        McpOperationKind::kRemoveMasternode,
+        McpOperationKind::kRemoveWallet, McpOperationKind::kAssignRole,
+        McpOperationKind::kAddMiner, McpOperationKind::kRemoveMiner,
+        McpOperationKind::kAddMasternode, McpOperationKind::kRemoveMasternode,
         McpOperationKind::kRestartMasternode, McpOperationKind::kStartWorkload,
         McpOperationKind::kInspectWorkload,
         McpOperationKind::kReconfigureWorkload,
@@ -144,6 +145,100 @@ BOOST_AUTO_TEST_CASE(
       application.ResourceReader()(McpInformationFamily::kCapabilities,
                                    "host-session", std::stop_token{}),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_assignment) {
+  const auto options = std::make_shared<Options>();
+  options->node_capacity = 1U;
+  const auto live_application =
+      std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
+          .run_id = "role-run",
+          .run_root = "/tmp/bbp-mcp-host-role-run",
+          .retained_run = {},
+          .options = options,
+          .command_queue = std::make_shared<SimulationCommandQueue>(),
+          .node_inventory_snapshot =
+              [] {
+                return McpLiveNodeInventorySnapshot{.generation = 1U,
+                                                    .node_ids = {"firo-1"}};
+              },
+          .publication_mutex = std::make_shared<std::timed_mutex>(),
+          .request_run_stop = [] {},
+          .run_started = {},
+          .run_stopping = {},
+          .run_stopped = {}});
+  bool delegated = false;
+  auto role_service = std::make_shared<McpLiveRoleService>();
+  role_service->operation = [&delegated](McpOperationKind kind,
+                                         const boost::json::object& arguments,
+                                         std::stop_token stop_token) {
+    BOOST_CHECK(kind == McpOperationKind::kAddMiner);
+    BOOST_TEST(arguments.at("run_id").as_string() == "role-run");
+    BOOST_TEST(arguments.at("node_ids").as_array() ==
+               boost::json::array{"firo-1"});
+    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
+    BOOST_TEST(arguments.if_contains("roles") == nullptr);
+    BOOST_TEST(arguments.at("timeout_sec").as_uint64() == 30U);
+    BOOST_TEST(!stop_token.stop_requested());
+    delegated = true;
+    return boost::json::object{
+        {"node_ids", boost::json::array{"firo-1"}},
+        {"assigned_roles", boost::json::array{"miner"}},
+        {"removed_roles", boost::json::array{}},
+        {"action", "miner.add"},
+        {"state", "ready"},
+        {"created_node_ids", boost::json::array{}},
+        {"role_generation", 2U},
+        {"final_miner_count", 1U},
+        {"inventory_generation", 1U},
+        {"final_node_count", 1U},
+    };
+  };
+  live_application->SetRoleService(role_service);
+  live_application->MarkRunStarted();
+
+  McpHostApplication application(McpHostApplication::Config{
+      .host_id = "editor-host",
+      .snapshot_run =
+          [live_application] {
+            return McpHostedRunSnapshot{.generation = 1U,
+                                        .run_id = "role-run",
+                                        .state = "active",
+                                        .chain = "firo",
+                                        .node_count = 1U,
+                                        .application = live_application};
+          },
+      .launch_run = [](const boost::json::object&,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .stop_run = [](std::string_view, std::chrono::seconds,
+                     std::stop_token) { return McpRunLifecycleResult{}; }});
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kAssignRole) != supported.end());
+
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("host-session", true, {});
+  const boost::json::object terminal = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "role.assign",
+             boost::json::object{{"run_id", "role-run"},
+                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"roles", boost::json::array{"miner"}},
+                                 {"timeout_sec", 30U}}));
+  BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+  BOOST_TEST(delegated);
+  const boost::json::object& result =
+      terminal.at("terminal_result").as_object();
+  BOOST_TEST(result.at("result_family").as_string() == "role_mutation");
+  BOOST_TEST(result.at("action").as_string() == "role.assign");
+  BOOST_TEST(result.at("assigned_roles").as_array() ==
+             boost::json::array{"miner"});
+
+  dispatcher.SessionHandler()("host-session", false, {});
+  application.Shutdown();
+  live_application->Shutdown();
 }
 
 BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {

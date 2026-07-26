@@ -160,6 +160,124 @@ const boost::json::object& LifecycleOperationConstraint(
   return operation_schema;
 }
 
+const boost::json::object& OperationStateSetConstraint(
+    const boost::json::object& operation_schema, std::string_view operation,
+    const std::set<std::string>& states) {
+  for (const boost::json::value& constraint :
+       operation_schema.at("allOf").as_array()) {
+    const boost::json::object& object = constraint.as_object();
+    const boost::json::value* condition = object.if_contains("if");
+    if (condition == nullptr) {
+      continue;
+    }
+    const boost::json::object& condition_properties =
+        condition->as_object().at("properties").as_object();
+    const boost::json::value* operation_property =
+        condition_properties.if_contains("operation");
+    const boost::json::value* state_property =
+        condition_properties.if_contains("state");
+    if (operation_property != nullptr && operation_property->is_object() &&
+        operation_property->as_object().if_contains("const") != nullptr &&
+        operation_property->as_object().at("const").as_string() == operation &&
+        state_property != nullptr && state_property->is_object()) {
+      const boost::json::value* state_enum =
+          state_property->as_object().if_contains("enum");
+      if (state_enum != nullptr && state_enum->is_array() &&
+          StringSet(state_enum->as_array()) == states) {
+        return object;
+      }
+    }
+  }
+  BOOST_FAIL("missing operation state-set constraint " << operation);
+  return operation_schema;
+}
+
+const boost::json::object& ArrayDiscriminatorConstraint(
+    const boost::json::object& schema, std::string_view discriminator,
+    std::string_view value) {
+  for (const boost::json::value& constraint : schema.at("allOf").as_array()) {
+    const boost::json::object& object = constraint.as_object();
+    const boost::json::value* condition = object.if_contains("if");
+    if (condition == nullptr) {
+      continue;
+    }
+    const boost::json::object& condition_properties =
+        condition->as_object().at("properties").as_object();
+    const boost::json::value* property =
+        condition_properties.if_contains(discriminator);
+    if (property == nullptr || !property->is_object()) {
+      continue;
+    }
+    const boost::json::value* constant =
+        property->as_object().if_contains("const");
+    if (constant != nullptr && constant->is_array() &&
+        constant->as_array().size() == 1U &&
+        constant->as_array().front().is_string() &&
+        constant->as_array().front().as_string() == value) {
+      return object;
+    }
+  }
+  BOOST_FAIL("missing array discriminator constraint " << discriminator << " "
+                                                       << value);
+  return schema;
+}
+
+const boost::json::object& StringDiscriminatorConstraint(
+    const boost::json::object& schema, std::string_view discriminator,
+    std::string_view value, std::string_view excluded_discriminator = {}) {
+  for (const boost::json::value& constraint : schema.at("allOf").as_array()) {
+    const boost::json::object& object = constraint.as_object();
+    const boost::json::value* condition = object.if_contains("if");
+    if (condition == nullptr) {
+      continue;
+    }
+    const boost::json::object& condition_properties =
+        condition->as_object().at("properties").as_object();
+    if (!excluded_discriminator.empty() &&
+        condition_properties.contains(excluded_discriminator)) {
+      continue;
+    }
+    const boost::json::value* property =
+        condition_properties.if_contains(discriminator);
+    if (property != nullptr && property->is_object() &&
+        property->as_object().if_contains("const") != nullptr &&
+        property->as_object().at("const").is_string() &&
+        property->as_object().at("const").as_string() == value) {
+      return object;
+    }
+  }
+  BOOST_FAIL("missing string discriminator constraint " << discriminator << " "
+                                                        << value);
+  return schema;
+}
+
+bool ContainsRequiredField(const boost::json::value& value,
+                           std::string_view field) {
+  if (value.is_array()) {
+    return std::any_of(value.as_array().begin(), value.as_array().end(),
+                       [field](const boost::json::value& child) {
+                         return ContainsRequiredField(child, field);
+                       });
+  }
+  if (!value.is_object()) {
+    return false;
+  }
+  const boost::json::object& object = value.as_object();
+  if (const boost::json::value* required = object.if_contains("required");
+      required != nullptr && required->is_array() &&
+      std::any_of(required->as_array().begin(), required->as_array().end(),
+                  [field](const boost::json::value& candidate) {
+                    return candidate.is_string() &&
+                           candidate.as_string() == field;
+                  })) {
+    return true;
+  }
+  return std::any_of(object.begin(), object.end(), [field](const auto& member) {
+    return member.key() != "required" &&
+           ContainsRequiredField(member.value(), field);
+  });
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(mcp_registry_mechanically_covers_typed_enums) {
@@ -498,6 +616,293 @@ BOOST_AUTO_TEST_CASE(mcp_scheduled_events_cover_every_registered_action) {
   }
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_role_assign_schema_discriminates_role_specific_requirements) {
+  const boost::json::object input =
+      BuildMcpOperationInputSchema(McpOperationKind::kAssignRole);
+  BOOST_TEST(input.at("additionalProperties").as_bool() == false);
+  BOOST_TEST(PropertySet(input) ==
+             std::set<std::string>({"funding_wallet_id", "mode", "node_ids",
+                                    "roles", "run_id", "timeout_sec"}));
+  BOOST_TEST(StringSet(ArrayField(input, "required")) ==
+             std::set<std::string>({"node_ids", "roles", "run_id"}));
+
+  const boost::json::object& input_properties =
+      input.at("properties").as_object();
+  const boost::json::object& node_ids =
+      input_properties.at("node_ids").as_object();
+  BOOST_TEST(node_ids.at("minItems").as_uint64() == 1U);
+  BOOST_TEST(node_ids.at("maxItems").as_uint64() == 16U);
+  BOOST_TEST(node_ids.at("uniqueItems").as_bool());
+  const boost::json::object& node_id = node_ids.at("items").as_object();
+  BOOST_TEST(node_id.at("type").as_string() == "string");
+  BOOST_TEST(node_id.at("minLength").as_uint64() == 1U);
+  BOOST_TEST(node_id.at("maxLength").as_uint64() == 32U);
+  BOOST_TEST(node_id.at("pattern").as_string() == "^[A-Za-z0-9_-]{1,32}$");
+  BOOST_TEST(input_properties.at("funding_wallet_id").as_object() == node_id);
+
+  const boost::json::object& roles = input_properties.at("roles").as_object();
+  BOOST_TEST(roles.at("minItems").as_uint64() == 1U);
+  BOOST_TEST(roles.at("maxItems").as_uint64() == 1U);
+  BOOST_TEST(roles.at("uniqueItems").as_bool());
+  BOOST_TEST(StringSet(roles.at("items").as_object().at("enum").as_array()) ==
+             std::set<std::string>({"masternode", "miner", "wallet"}));
+  BOOST_TEST(!StringSet(roles.at("items").as_object().at("enum").as_array())
+                  .contains("base"));
+  BOOST_TEST(
+      StringSet(
+          input_properties.at("mode").as_object().at("enum").as_array()) ==
+      std::set<std::string>({"private", "public"}));
+  const boost::json::object& timeout =
+      input_properties.at("timeout_sec").as_object();
+  BOOST_TEST(timeout.at("minimum").as_uint64() == 1U);
+  BOOST_TEST(timeout.at("maximum").as_uint64() == 3600U);
+
+  const boost::json::object& wallet_constraint =
+      ArrayDiscriminatorConstraint(input, "roles", "wallet");
+  const boost::json::object& wallet_then =
+      wallet_constraint.at("then").as_object();
+  BOOST_TEST(StringSet(ArrayField(wallet_then, "required")) ==
+             std::set<std::string>({"mode"}));
+  BOOST_TEST(ContainsRequiredField(wallet_then.at("not"), "funding_wallet_id"));
+
+  const boost::json::object& miner_constraint =
+      ArrayDiscriminatorConstraint(input, "roles", "miner");
+  const boost::json::object& miner_then =
+      miner_constraint.at("then").as_object();
+  BOOST_TEST(miner_then.if_contains("required") == nullptr);
+  BOOST_TEST(ContainsRequiredField(miner_then.at("not"), "mode"));
+  BOOST_TEST(ContainsRequiredField(miner_then.at("not"), "funding_wallet_id"));
+
+  const boost::json::object& masternode_constraint =
+      ArrayDiscriminatorConstraint(input, "roles", "masternode");
+  const boost::json::object& masternode_then =
+      masternode_constraint.at("then").as_object();
+  BOOST_TEST(StringSet(ArrayField(masternode_then, "required")) ==
+             std::set<std::string>({"funding_wallet_id"}));
+  BOOST_TEST(ContainsRequiredField(masternode_then.at("not"), "mode"));
+
+  const boost::json::object result =
+      BuildMcpResultSchema(McpResultFamily::kRoleMutation);
+  const boost::json::object& result_properties =
+      result.at("properties").as_object();
+  const std::set<std::string> result_required =
+      StringSet(ArrayField(result, "required"));
+  BOOST_TEST(result_required.contains("action"));
+  BOOST_TEST(result_required.contains("state"));
+  for (const std::string_view field :
+       {"action", "state", "created_node_ids", "role_generation",
+        "inventory_generation", "final_node_count", "final_wallet_count",
+        "final_wallet_node_count", "wallets", "final_miner_count",
+        "final_masternode_count", "masternodes"}) {
+    BOOST_TEST(result_properties.contains(field));
+  }
+
+  const boost::json::object& common_constraint = StringDiscriminatorConstraint(
+      result, "action", "role.assign", "assigned_roles");
+  BOOST_TEST(StringSet(ArrayField(common_constraint.at("then").as_object(),
+                                  "required")) ==
+             std::set<std::string>({"created_node_ids", "final_node_count",
+                                    "inventory_generation", "role_generation",
+                                    "state"}));
+  const boost::json::object& common_properties =
+      common_constraint.at("then").as_object().at("properties").as_object();
+  BOOST_TEST(
+      common_properties.at("state").as_object().at("const").as_string() ==
+      "ready");
+  BOOST_TEST(common_properties.at("assigned_roles")
+                 .as_object()
+                 .at("minItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(common_properties.at("assigned_roles")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(StringSet(common_properties.at("assigned_roles")
+                           .as_object()
+                           .at("items")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             std::set<std::string>({"masternode", "miner", "wallet"}));
+  BOOST_TEST(common_properties.at("removed_roles")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(common_properties.at("created_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+
+  const std::array role_requirements{
+      std::pair{"wallet",
+                std::set<std::string>({"final_wallet_count",
+                                       "final_wallet_node_count", "wallets"})},
+      std::pair{"miner", std::set<std::string>({"final_miner_count"})},
+      std::pair{"masternode", std::set<std::string>(
+                                  {"final_masternode_count", "masternodes"})},
+  };
+  for (const auto& [role, expected_required] : role_requirements) {
+    const boost::json::object& constraint =
+        ArrayDiscriminatorConstraint(result, "assigned_roles", role);
+    const boost::json::object& condition_properties =
+        constraint.at("if").as_object().at("properties").as_object();
+    BOOST_TEST(
+        condition_properties.at("action").as_object().at("const").as_string() ==
+        "role.assign");
+    BOOST_TEST(StringSet(ArrayField(constraint.at("then").as_object(),
+                                    "required")) == expected_required);
+    BOOST_REQUIRE(constraint.at("then").as_object().contains("not"));
+    const boost::json::value& forbidden =
+        constraint.at("then").as_object().at("not");
+    if (role == std::string_view("wallet")) {
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_miner_count"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_masternode_count"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "masternodes"));
+    } else if (role == std::string_view("miner")) {
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_wallet_count"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_wallet_node_count"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "wallets"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_masternode_count"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "masternodes"));
+    } else {
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_wallet_count"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_wallet_node_count"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "wallets"));
+      BOOST_TEST(ContainsRequiredField(forbidden, "final_miner_count"));
+    }
+  }
+
+  const boost::json::object output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kAssignRole);
+  const boost::json::array& output_choices = output.at("oneOf").as_array();
+  BOOST_REQUIRE_EQUAL(output_choices.size(), 3U);
+  const boost::json::object& direct_result = output_choices.front().as_object();
+  BOOST_TEST(direct_result != result);
+  const boost::json::object& direct_properties =
+      direct_result.at("properties").as_object();
+  BOOST_TEST(
+      direct_properties.at("action").as_object().at("const").as_string() ==
+      "role.assign");
+  BOOST_TEST(
+      direct_properties.at("state").as_object().at("const").as_string() ==
+      "ready");
+  BOOST_TEST(direct_properties.at("assigned_roles")
+                 .as_object()
+                 .at("minItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(direct_properties.at("assigned_roles")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(direct_properties.at("removed_roles")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(direct_properties.at("created_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(direct_properties.at("wallets")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("node_id")
+                 .as_object() == node_id);
+  const boost::json::object& direct_masternode_properties =
+      direct_properties.at("masternodes")
+          .as_object()
+          .at("items")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(direct_masternode_properties.at("node_id").as_object() == node_id);
+  BOOST_TEST(
+      direct_masternode_properties.at("funding_wallet_node_id").as_object() ==
+      node_id);
+  for (const auto& [role, expected_required] : role_requirements) {
+    const boost::json::object& direct_constraint =
+        ArrayDiscriminatorConstraint(direct_result, "assigned_roles", role);
+    BOOST_TEST(StringSet(ArrayField(direct_constraint.at("then").as_object(),
+                                    "required")) == expected_required);
+    BOOST_TEST(direct_constraint.at("then").as_object().contains("not"));
+  }
+
+  const boost::json::object operation_result =
+      BuildMcpResultSchema(McpResultFamily::kOperation);
+  const boost::json::object& nested_result =
+      LifecycleOperationConstraint(operation_result, "role.assign", "succeeded")
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object()
+          .at("terminal_result")
+          .as_object();
+  BOOST_TEST(nested_result.at("properties")
+                 .as_object()
+                 .at("result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "role_mutation");
+  BOOST_TEST(nested_result.at("properties")
+                 .as_object()
+                 .at("action")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "role.assign");
+
+  const boost::json::object& wrapper = output_choices[1U].as_object();
+  BOOST_TEST(StringSet(wrapper.at("properties")
+                           .as_object()
+                           .at("operation")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             std::set<std::string>({"role.assign"}));
+  BOOST_TEST(StringSet(wrapper.at("properties")
+                           .as_object()
+                           .at("terminal_result_family")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             std::set<std::string>({"error", "role_mutation"}));
+  const boost::json::object& wrapper_succeeded =
+      LifecycleOperationConstraint(wrapper, "role.assign", "succeeded")
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(wrapper_succeeded.at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "role_mutation");
+  const std::set<std::string> nonterminal_states{"cancelling", "queued",
+                                                 "running"};
+  const boost::json::object& wrapper_nonterminal =
+      OperationStateSetConstraint(wrapper, "role.assign", nonterminal_states)
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(wrapper_nonterminal.at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "role_mutation");
+  const std::set<std::string> failed_states{"cancelled", "failed"};
+  const boost::json::object& wrapper_failed =
+      OperationStateSetConstraint(wrapper, "role.assign", failed_states)
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(wrapper_failed.at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "error");
+}
+
 BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
   const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
   const boost::json::object& generic = VariantWithConst(
@@ -552,6 +957,14 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                  .as_object()
                  .at("maximum")
                  .as_uint64() == kSimulationNodeAddMaximumCount);
+  const boost::json::object& wallet_node_ids =
+      wallet_add.at("properties").as_object().at("node_ids").as_object();
+  BOOST_TEST(wallet_node_ids.at("maxItems").as_uint64() ==
+             kSimulationNodeAddMaximumCount);
+  BOOST_TEST(wallet_node_ids.at("uniqueItems").as_bool());
+  BOOST_TEST(
+      wallet_node_ids.at("items").as_object().at("maxLength").as_uint64() ==
+      32U);
   BOOST_TEST(
       StringSet(ArrayField(wallet_remove, "required")).contains("node_id"));
   BOOST_TEST(generic_request == scheduled_request);
@@ -695,7 +1108,8 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
       wallet_remove_output.at("properties").as_object();
   for (const std::string_view field :
        {"affected_node_ids", "action", "state", "wallets", "wallet_generation",
-        "final_wallet_count", "inventory_generation", "final_node_count"}) {
+        "final_wallet_count", "final_wallet_node_count", "inventory_generation",
+        "final_node_count"}) {
     BOOST_TEST(wallet_remove_output_properties.contains(field));
   }
   BOOST_REQUIRE(wallet_remove_output.contains("allOf"));
@@ -996,7 +1410,7 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
                  .contains("terminal_result"));
   BOOST_TEST(
       operation_schema.at("properties").as_object().contains("terminal_error"));
-  BOOST_TEST(operation_schema.at("allOf").as_array().size() == 9U);
+  BOOST_TEST(operation_schema.at("allOf").as_array().size() == 12U);
 
   const boost::json::object mutation_schema =
       BuildMcpResultSchema(McpResultFamily::kMutation);
@@ -1009,6 +1423,7 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
   BOOST_TEST(mutation_properties.contains("wallets"));
   BOOST_TEST(mutation_properties.contains("wallet_generation"));
   BOOST_TEST(mutation_properties.contains("final_wallet_count"));
+  BOOST_TEST(mutation_properties.contains("final_wallet_node_count"));
   const boost::json::object role_mutation_schema =
       BuildMcpResultSchema(McpResultFamily::kRoleMutation);
   const boost::json::object& role_mutation_properties =

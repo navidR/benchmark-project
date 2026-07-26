@@ -8873,30 +8873,45 @@ void ConfirmMasternodeTransactions(
   if (transactions.empty()) {
     return;
   }
+  bool requires_confirmation_blocks = false;
   for (const MasternodeTransactionConfirmation& transaction : transactions) {
     if (transaction.funding_wallet == nullptr ||
         transaction.transaction_id.empty()) {
       throw std::runtime_error(
           "masternode transaction confirmation is incomplete");
     }
+    bool funding_wallet_observed = false;
     for (NodeRuntime* node : nodes) {
       if (node == nullptr || !node->AllowsChainMetrics()) {
         continue;
       }
-      static_cast<void>(driver.WaitForMempoolTransaction(
-          node->config, transaction.transaction_id, timeout, stop_token));
+      const ChainTransactionObservation observation = driver.WaitForTransaction(
+          node->config, transaction.transaction_id, timeout, stop_token);
+      requires_confirmation_blocks =
+          requires_confirmation_blocks ||
+          observation.state != ChainTransactionState::kConfirmed ||
+          observation.confirmations == 0U;
+      if (node == transaction.funding_wallet) {
+        funding_wallet_observed = true;
+      }
+    }
+    if (!funding_wallet_observed) {
+      throw std::runtime_error(
+          "masternode transaction funding wallet is not active");
     }
   }
-  static_cast<void>(GenerateAndSynchronizeMasternodeBlocks(
-      driver, block_generation_mutex, miner, nodes, confirmation_blocks,
-      reward_address, timeout, stop_token));
+  if (requires_confirmation_blocks) {
+    static_cast<void>(GenerateAndSynchronizeMasternodeBlocks(
+        driver, block_generation_mutex, miner, nodes,
+        std::max<std::uint32_t>(1U, confirmation_blocks), reward_address,
+        timeout, stop_token));
+  }
   for (const MasternodeTransactionConfirmation& transaction : transactions) {
     const ChainTransactionObservation observation = driver.WaitForTransaction(
         transaction.funding_wallet->config, transaction.transaction_id, timeout,
         stop_token);
-    if (confirmation_blocks != 0U &&
-        (observation.state != ChainTransactionState::kConfirmed ||
-         observation.confirmations == 0U)) {
+    if (observation.state != ChainTransactionState::kConfirmed ||
+        observation.confirmations == 0U) {
       throw std::runtime_error(
           "masternode transaction did not reach confirmed state");
     }
@@ -15350,6 +15365,7 @@ struct RuntimeNodeAddResult {
   std::vector<WalletIdentity> added_wallets;
   std::optional<std::uint64_t> wallet_generation;
   std::optional<std::size_t> final_wallet_count;
+  std::optional<std::size_t> final_wallet_node_count;
   std::optional<std::uint64_t> role_generation;
   std::optional<std::size_t> final_miner_count;
   std::vector<MasternodeIdentity> added_masternodes;
@@ -16645,6 +16661,8 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     if (added_role == RuntimeNodeAdditionRole::kWallet) {
       result.wallet_generation = published_registry.generation();
       result.final_wallet_count = published_registry.wallets().size();
+      result.final_wallet_node_count =
+          published_registry.registry().topology().wallet_nodes.size();
     }
     RuntimeNodeResourceManifest live_manifest = pending_manifest;
     for (RuntimeNodeResourceEntry& entry : live_manifest.nodes) {
@@ -22059,6 +22077,14 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             };
 
         if (adding) {
+          SimulationCommandControl role_control;
+          role_control.absolute_deadline = deadline;
+          std::stop_callback cancel_role_publication(bounded_stop_token, [&] {
+            static_cast<void>(role_control.RequestCancellation(
+                deadline_expired.load(std::memory_order_acquire)
+                    ? SimulationCommandCancellationCause::kDeadline
+                    : SimulationCommandCancellationCause::kClientCancel));
+          });
           if (before_roles.registry().wallet_initialization().mode !=
               WalletPrivacyMode::kPublic) {
             throw McpOperationFailure(
@@ -22155,6 +22181,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               completion_stop_source.get_token();
           std::vector<ChainMasternodeRegistration> registrations;
           std::vector<MasternodeIdentity> added_masternodes;
+          std::vector<bool> scheduled_miner_was_active(selected_indexes.size(),
+                                                       false);
           registrations.reserve(selected_indexes.size());
           added_masternodes.reserve(selected_indexes.size());
           const auto rollback_registration = [&] {
@@ -22173,35 +22201,39 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 });
             const std::stop_token rollback_stop_token =
                 rollback_stop_source.get_token();
-            std::vector<MasternodeTransactionConfirmation> revocations;
-            revocations.reserve(registrations.size());
-            for (const ChainMasternodeRegistration& registration :
-                 registrations) {
-              revocations.push_back(MasternodeTransactionConfirmation{
-                  .funding_wallet = &funding_node,
-                  .transaction_id = driver.RevokeMasternode(
-                      funding_node.config, registration.pro_tx_hash,
-                      registration.operator_secret_key,
-                      funding_wallet.funding_address, rollback_stop_token),
-              });
-            }
-            ConfirmMasternodeTransactions(
-                driver, block_generation_mutex, miner,
-                funding_wallet.funding_address, active_nodes, revocations,
-                requirements.revocation_confirmation_blocks,
-                std::chrono::seconds(60), rollback_stop_token);
-            for (const std::size_t index : selected_indexes) {
-              NodeRuntime& node = current_nodes[index];
-              if (!node.config.masternode) {
-                continue;
+            const auto resume_scheduled_miners = [&] {
+              if (block_scheduler == nullptr) {
+                return;
               }
-              const bool resume_miner =
-                  block_scheduler != nullptr &&
-                  NodeListContains(before_topology.miner_nodes,
-                                   static_cast<std::uint32_t>(index)) &&
-                  block_scheduler->StopMiner(node.config.id);
-              node.config.masternode.reset();
-              try {
+              for (std::size_t offset = 0U; offset < selected_indexes.size();
+                   ++offset) {
+                if (!scheduled_miner_was_active[offset]) {
+                  continue;
+                }
+                NodeRuntime& node = current_nodes[selected_indexes[offset]];
+                if (!NodeProcessRunning(node)) {
+                  continue;
+                }
+                block_scheduler->StartMiner(node.config.id);
+                scheduled_miner_was_active[offset] = false;
+              }
+            };
+            try {
+              for (std::size_t offset = 0U; offset < selected_indexes.size();
+                   ++offset) {
+                const std::size_t index = selected_indexes[offset];
+                NodeRuntime& node = current_nodes[index];
+                if (!node.config.masternode) {
+                  continue;
+                }
+                const bool stopped_miner =
+                    block_scheduler != nullptr &&
+                    NodeListContains(before_topology.miner_nodes,
+                                     static_cast<std::uint32_t>(index)) &&
+                    block_scheduler->StopMiner(node.config.id);
+                scheduled_miner_was_active[offset] =
+                    scheduled_miner_was_active[offset] || stopped_miner;
+                node.config.masternode.reset();
                 if (!RestartNode(options, events_path, driver,
                                  *peer_connectivity_controller, node,
                                  lifecycle_epoch, rollback_stop_token,
@@ -22210,16 +22242,60 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                       "masternode rollback reached node stop_time: " +
                       node.config.id);
                 }
+              }
+
+              NodeRuntime& rollback_miner =
+                  current_nodes[running_miner_index()];
+              std::vector<MasternodeTransactionConfirmation>
+                  registration_transactions;
+              registration_transactions.reserve(registrations.size());
+              for (const ChainMasternodeRegistration& registration :
+                   registrations) {
+                registration_transactions.push_back(
+                    MasternodeTransactionConfirmation{
+                        .funding_wallet = &funding_node,
+                        .transaction_id = registration.pro_tx_hash,
+                    });
+              }
+              ConfirmMasternodeTransactions(
+                  driver, block_generation_mutex, rollback_miner,
+                  funding_wallet.funding_address, active_nodes,
+                  registration_transactions,
+                  requirements.registration_confirmation_blocks,
+                  std::chrono::seconds(60), rollback_stop_token);
+
+              std::vector<MasternodeTransactionConfirmation> revocations;
+              revocations.reserve(registrations.size());
+              for (const ChainMasternodeRegistration& registration :
+                   registrations) {
+                revocations.push_back(MasternodeTransactionConfirmation{
+                    .funding_wallet = &funding_node,
+                    .transaction_id = driver.RevokeMasternode(
+                        funding_node.config, registration.pro_tx_hash,
+                        registration.operator_secret_key,
+                        funding_wallet.funding_address, rollback_stop_token),
+                });
+              }
+              ConfirmMasternodeTransactions(
+                  driver, block_generation_mutex, rollback_miner,
+                  funding_wallet.funding_address, active_nodes, revocations,
+                  requirements.revocation_confirmation_blocks,
+                  std::chrono::seconds(60), rollback_stop_token);
+            } catch (...) {
+              const std::exception_ptr rollback_failure =
+                  std::current_exception();
+              try {
+                resume_scheduled_miners();
               } catch (...) {
-                if (resume_miner && NodeProcessRunning(node)) {
-                  block_scheduler->StartMiner(node.config.id);
-                }
-                throw;
+                throw std::runtime_error(
+                    "masternode rollback failed: " +
+                    ExceptionMessage(rollback_failure) +
+                    "; scheduled miner restoration failed: " +
+                    ExceptionMessage(std::current_exception()));
               }
-              if (resume_miner) {
-                block_scheduler->StartMiner(node.config.id);
-              }
+              std::rethrow_exception(rollback_failure);
             }
+            resume_scheduled_miners();
             const RuntimeWalletSnapshot restored =
                 runtime_wallet_registry.Snapshot();
             if (restored.generation() != before_roles.generation() ||
@@ -22269,6 +22345,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                   NodeListContains(before_topology.miner_nodes,
                                    static_cast<std::uint32_t>(index)) &&
                   block_scheduler->StopMiner(node.config.id);
+              scheduled_miner_was_active[offset] = resume_miner;
               node.config.masternode = ChainNodeConfig::MasternodeProcessConfig{
                   .operator_secret_key = registration.operator_secret_key,
                   .service = registration.service,
@@ -22331,6 +22408,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               throw McpOperationFailure("masternode_add_outcome_unconfirmed",
                                         ExceptionMessage(failure), false);
             }
+            if (role_control.CommitPhase() ==
+                SimulationCommandCommitPhase::kCancelled) {
+              throw SimulationCancelled();
+            }
             std::rethrow_exception(failure);
           }
 
@@ -22343,8 +22424,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                 runtime_wallet_registry.PrepareUpdate(
                     before_roles.generation(), {}, {}, added_masternodes,
                     static_cast<std::uint32_t>(current_nodes.size()));
-            ThrowIfStopRequested(bounded_stop_token);
+            if (!role_control.TryBeginCommit()) {
+              throw SimulationCancelled();
+            }
             published_roles = prepared_roles.Commit();
+            role_control.MarkCommitted();
           } catch (...) {
             const std::exception_ptr failure = std::current_exception();
             try {
@@ -22359,6 +22443,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                       "; rollback could not be verified: " +
                       ExceptionMessage(std::current_exception()),
                   false);
+            }
+            if (role_control.CommitPhase() ==
+                SimulationCommandCommitPhase::kCancelled) {
+              throw SimulationCancelled();
             }
             std::rethrow_exception(failure);
           }
@@ -22767,6 +22855,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               {"final_node_count", current_nodes.size()},
               {"wallet_generation", published.generation()},
               {"final_wallet_count", published.wallets().size()},
+              {"final_wallet_node_count",
+               published.registry().topology().wallet_nodes.size()},
           };
         } catch (...) {
           mcp_application.MarkRunStopping();
@@ -22935,7 +23025,6 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         }
         miner_node_ids.swap(next_miner_node_ids);
         role_control.MarkCommitted();
-        configured_miners_lock.unlock();
 
         try {
           WriteEvent(events_path, options.run_id, "sim",
@@ -23371,7 +23460,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             prepared_scheduler;
         if (block_scheduler != nullptr) {
           prepared_scheduler.emplace(
-              block_scheduler->PrepareAddMiners(selected_node_ids));
+              block_scheduler->PrepareAddMinersInactive(selected_node_ids));
         }
         if (!role_control.TryBeginCommit()) {
           throw SimulationCancelled();
@@ -23382,13 +23471,18 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         }
         miner_node_ids.swap(next_miner_node_ids);
         role_control.MarkCommitted();
-        configured_miners_lock.unlock();
 
         try {
           WriteEvent(events_path, options.run_id, "sim",
                      SimulationEventKind::kRuntimeRoleGenerationPublished,
                      boost::json::serialize(RuntimeRoleGenerationDetail(
                          published_roles, current_nodes)));
+          if (block_scheduler != nullptr) {
+            for (const std::string& node_id : selected_node_ids) {
+              block_scheduler->StartMiner(node_id);
+            }
+          }
+          configured_miners_lock.unlock();
           boost::json::array node_ids;
           node_ids.reserve(selected_node_ids.size());
           for (const std::string& node_id : selected_node_ids) {
@@ -23420,9 +23514,14 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
       if (kind != McpOperationKind::kAddWallet) {
         throw std::logic_error("unknown live role mutation operation");
       }
-      constexpr std::array<std::string_view, 7U> kAllowedFields = {
-          "run_id",     "node_id",     "count",
-          "mode",       "create_node", "readiness_confirmations",
+      constexpr std::array<std::string_view, 8U> kAllowedFields = {
+          "run_id",
+          "node_id",
+          "node_ids",
+          "count",
+          "mode",
+          "create_node",
+          "readiness_confirmations",
           "timeout_sec"};
       RejectUnsupportedFields(arguments, kAllowedFields, "wallet.add");
       const boost::json::value* create_node =
@@ -23467,9 +23566,42 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               "wallet.add with node_id requires count=1");
         }
       }
-      if (requested_node_id && create_node != nullptr) {
+      std::vector<std::string> requested_node_ids;
+      if (const boost::json::value* node_ids =
+              arguments.if_contains("node_ids")) {
+        if (!node_ids->is_array() || node_ids->as_array().empty() ||
+            node_ids->as_array().size() > kSimulationNodeAddMaximumCount) {
+          throw std::invalid_argument(
+              "wallet.add node_ids must contain 1..16 ids");
+        }
+        std::set<std::string> unique_node_ids;
+        requested_node_ids.reserve(node_ids->as_array().size());
+        for (const boost::json::value& node_id : node_ids->as_array()) {
+          if (!node_id.is_string()) {
+            throw std::invalid_argument(
+                "wallet.add node_ids must contain strings");
+          }
+          std::string id(node_id.as_string());
+          RequireSafeScenarioIdentifier(id, "wallet.add node_ids");
+          if (!unique_node_ids.insert(id).second) {
+            throw std::invalid_argument("wallet.add node_ids must be unique");
+          }
+          requested_node_ids.push_back(std::move(id));
+        }
+        if (requested_node_ids.size() != count) {
+          throw std::invalid_argument(
+              "wallet.add count must match node_ids size");
+        }
+      }
+      if (requested_node_id && !requested_node_ids.empty()) {
         throw std::invalid_argument(
-            "wallet.add node_id and create_node are mutually exclusive");
+            "wallet.add node_id and node_ids are mutually exclusive");
+      }
+      if ((requested_node_id || !requested_node_ids.empty()) &&
+          create_node != nullptr) {
+        throw std::invalid_argument(
+            "wallet.add explicit node ids and create_node are mutually "
+            "exclusive");
       }
 
       const auto deadline =
@@ -23606,6 +23738,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
 
         try {
           if (!added.wallet_generation || !added.final_wallet_count ||
+              !added.final_wallet_node_count ||
               added.added_wallets.size() != count ||
               added.added_node_ids.size() != count) {
             throw std::logic_error(
@@ -23638,6 +23771,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               {"final_node_count", added.final_node_count},
               {"wallet_generation", *added.wallet_generation},
               {"final_wallet_count", *added.final_wallet_count},
+              {"final_wallet_node_count", *added.final_wallet_node_count},
           };
         } catch (...) {
           mcp_application.MarkRunStopping();
@@ -23651,9 +23785,45 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         }
       }
 
+      SimulationCommandControl role_control;
+      role_control.absolute_deadline = deadline;
+      std::stop_callback cancel_role_publication(bounded_stop_token, [&] {
+        static_cast<void>(role_control.RequestCancellation(
+            deadline_expired.load(std::memory_order_acquire)
+                ? SimulationCommandCancellationCause::kDeadline
+                : SimulationCommandCancellationCause::kClientCancel));
+      });
+      const auto is_registered_wallet = [&](std::string_view node_id) {
+        return std::any_of(before_wallets.wallets().begin(),
+                           before_wallets.wallets().end(),
+                           [&](const WalletIdentity& wallet) {
+                             return wallet.node_id == node_id;
+                           });
+      };
+      const auto has_forbidden_miner_overlap = [&](std::size_t index) {
+        const NodeRoleTopology& topology = before_wallets.registry().topology();
+        return !topology.allow_miner_wallet_overlap &&
+               NodeListContains(topology.miner_nodes,
+                                static_cast<std::uint32_t>(index));
+      };
       std::vector<std::size_t> selected_indexes;
       selected_indexes.reserve(count);
-      if (requested_node_id) {
+      if (!requested_node_ids.empty()) {
+        for (const std::string& requested : requested_node_ids) {
+          const auto selected =
+              std::find_if(current_nodes.begin(), current_nodes.end(),
+                           [&](const NodeRuntime& node) {
+                             return node.config.id == requested;
+                           });
+          if (selected == current_nodes.end()) {
+            throw McpOperationFailure(
+                "node_not_found",
+                "wallet.add backing node is not active: " + requested, false);
+          }
+          selected_indexes.push_back(static_cast<std::size_t>(
+              std::distance(current_nodes.begin(), selected)));
+        }
+      } else if (requested_node_id) {
         const auto selected =
             std::find_if(current_nodes.begin(), current_nodes.end(),
                          [&](const NodeRuntime& node) {
@@ -23671,7 +23841,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         for (std::size_t index = 0U;
              index < current_nodes.size() && selected_indexes.size() < count;
              ++index) {
-          if (current_nodes[index].config.wallet_enabled) {
+          if (current_nodes[index].config.wallet_enabled &&
+              !has_forbidden_miner_overlap(index)) {
             selected_indexes.push_back(index);
           }
         }
@@ -23689,6 +23860,20 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         auto process_guard = run_process_state.Lock();
         for (const std::size_t index : selected_indexes) {
           NodeRuntime& node = current_nodes[index];
+          if (!requested_node_ids.empty() &&
+              is_registered_wallet(node.config.id)) {
+            throw McpOperationFailure(
+                "wallet_already_configured",
+                "wallet.add node is already a wallet: " + node.config.id,
+                false);
+          }
+          if (has_forbidden_miner_overlap(index)) {
+            throw McpOperationFailure(
+                "role_conflict",
+                "wallet.add cannot overlap the selected miner role: " +
+                    node.config.id,
+                false);
+          }
           if (!node.config.wallet_enabled) {
             throw McpOperationFailure(
                 "wallet_support_unavailable",
@@ -23745,7 +23930,11 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
           runtime_wallet_registry.PrepareAppend(
               before_wallets.generation(), added_wallets,
               static_cast<std::uint32_t>(current_nodes.size()));
+      if (!role_control.TryBeginCommit()) {
+        throw SimulationCancelled();
+      }
       const RuntimeWalletSnapshot published = prepared.Commit();
+      role_control.MarkCommitted();
       try {
         for (const WalletIdentity& wallet : added_wallets) {
           WriteEvent(events_path, options.run_id, wallet.node_id,
@@ -23782,6 +23971,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
             {"final_node_count", current_nodes.size()},
             {"wallet_generation", published.generation()},
             {"final_wallet_count", published.wallets().size()},
+            {"final_wallet_node_count",
+             published.registry().topology().wallet_nodes.size()},
         };
       } catch (...) {
         mcp_application.MarkRunStopping();
