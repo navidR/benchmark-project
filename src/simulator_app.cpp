@@ -15884,7 +15884,7 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
       }
     };
     if (!registered_masternodes.empty()) {
-      rollback_step("revoke registered masternodes", [&] {
+      rollback_step("confirm and revoke registered masternodes", [&] {
         if (masternode_context == nullptr ||
             masternode_context->block_generation_mutex == nullptr ||
             masternode_funding_wallet == nullptr || !masternode_miner_index) {
@@ -15904,6 +15904,23 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
             active_nodes.push_back(&*insertion.runtime);
           }
         }
+        std::vector<MasternodeTransactionConfirmation>
+            registration_transactions;
+        registration_transactions.reserve(registered_masternodes.size());
+        for (const ChainMasternodeRegistration& registration :
+             registered_masternodes) {
+          registration_transactions.push_back(MasternodeTransactionConfirmation{
+              .funding_wallet = &funding_node,
+              .transaction_id = registration.pro_tx_hash,
+          });
+        }
+        ConfirmMasternodeTransactions(
+            driver, *masternode_context->block_generation_mutex, miner,
+            masternode_funding_wallet->funding_address, active_nodes,
+            registration_transactions,
+            masternode_funding_requirements.registration_confirmation_blocks,
+            rollback_timeout, rollback_stop_token);
+
         std::vector<MasternodeTransactionConfirmation> revocations;
         revocations.reserve(registered_masternodes.size());
         for (const ChainMasternodeRegistration& registration :
