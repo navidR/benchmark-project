@@ -24,6 +24,7 @@
 #include "bbp/logging.h"
 #include "bbp/mcp_registry.h"
 #include "bbp/mcp_run_evidence.h"
+#include "bbp/operator_connection.h"
 #include "bbp/run_report.h"
 #include "bbp/scenario_service.h"
 #include "bbp/simulation_cancelled.h"
@@ -40,6 +41,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kStopRun,
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
+    McpOperationKind::kCreateFiroQtLauncher,
     McpOperationKind::kAddNode,
     McpOperationKind::kRemoveNode,
     McpOperationKind::kStopNode,
@@ -208,6 +210,18 @@ boost::json::array NodeCapacityDiagnostics(std::uint64_t requested,
 void ThrowIfCancelled(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
+  }
+}
+
+void CloseFiroQtLauncher(const std::shared_ptr<FiroQtLauncherService>& service,
+                         std::string_view run_id, std::string_view boundary) {
+  if (!service) {
+    return;
+  }
+  const FiroQtLauncherCleanupResult cleanup = service->CloseAndCleanup();
+  if (cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
+    BBP_LOG(warning) << "Firo-Qt launcher ownership changed before " << boundary
+                     << " cleanup for run " << run_id;
   }
 }
 
@@ -1208,6 +1222,7 @@ McpLiveApplication::McpLiveApplication(Config config)
           "MCP retained application requires persisted run metadata");
     }
     if (config_.options != nullptr || config_.command_queue != nullptr ||
+        config_.firo_qt_launcher_service != nullptr ||
         config_.node_inventory_snapshot || config_.request_run_stop ||
         config_.run_started || config_.run_stopping || config_.run_stopped ||
         config_.publish_evidence || config_.close_run_subscriptions) {
@@ -1238,7 +1253,17 @@ McpLiveApplication::McpLiveApplication(Config config)
   }
 }
 
-McpLiveApplication::~McpLiveApplication() { Shutdown(); }
+McpLiveApplication::~McpLiveApplication() {
+  try {
+    Shutdown();
+  } catch (const std::exception& error) {
+    BBP_LOG(error) << "MCP live application destructor cleanup failed for run "
+                   << config_.run_id << ": " << error.what();
+  } catch (...) {
+    BBP_LOG(error) << "MCP live application destructor cleanup failed for run "
+                   << config_.run_id << " with a non-standard exception";
+  }
+}
 
 McpLiveApplication::ActiveRequest::ActiveRequest(
     McpLiveApplication* application)
@@ -1319,6 +1344,9 @@ std::vector<McpOperationKind> McpLiveApplication::SupportedOperations() const {
   if (!config_.retained_run) {
     std::vector<McpOperationKind> operations{kLiveOperations.begin(),
                                              kLiveOperations.end()};
+    if (!config_.firo_qt_launcher_service) {
+      std::erase(operations, McpOperationKind::kCreateFiroQtLauncher);
+    }
     operations.insert(
         operations.end(),
         {McpOperationKind::kStartWorkload, McpOperationKind::kInspectWorkload,
@@ -1386,6 +1414,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
       kind != McpOperationKind::kInvokeRuntimeCommand &&
+      kind != McpOperationKind::kCreateFiroQtLauncher &&
       kind != McpOperationKind::kAddNode &&
       kind != McpOperationKind::kRemoveNode &&
       kind != McpOperationKind::kStopNode &&
@@ -1419,6 +1448,45 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       throw McpOperationFailure("run_not_ready",
                                 "the managed run is still starting", true);
     }
+  }
+
+  if (kind == McpOperationKind::kCreateFiroQtLauncher) {
+    const std::string node_id = RequireString(arguments, "node_id");
+    if (!IsSafeNodeAddIdentifier(node_id)) {
+      throw std::runtime_error(
+          "MCP Firo-Qt launcher node_id must be a 1..32 character safe node "
+          "identifier");
+    }
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, node_id](McpOperationContext& context) {
+          CombinedStopToken cancellation(context.stop_token(),
+                                         run_stop_source_.get_token());
+          const std::stop_token stop_token = cancellation.token();
+          ThrowIfCancelled(stop_token);
+          const boost::json::object report = ReportSnapshot(stop_token);
+          ThrowIfCancelled(stop_token);
+          FiroQtLauncherSnapshot launcher;
+          try {
+            launcher = config_.firo_qt_launcher_service->ReplaceFromReport(
+                report, node_id, stop_token);
+          } catch (const SimulationCancelled&) {
+            throw McpOperationCancelled();
+          }
+          return McpTypedResult{
+              .family = McpResultFamily::kMutation,
+              .value = boost::json::object{
+                  {"result_family", "mutation"},
+                  {"run_id", config_.run_id},
+                  {"added_node_ids", boost::json::array{}},
+                  {"removed_node_ids", boost::json::array{}},
+                  {"affected_node_ids", boost::json::array{node_id}},
+                  {"action", "local.firo_qt_launcher"},
+                  {"state", "ready"},
+                  {"unchanged", false},
+                  {"launcher_path", launcher.launcher_path.string()},
+                  {"operator_command", launcher.operator_command}}};
+        }};
   }
 
   if (IsWalletWorkloadOperation(kind)) {
@@ -1587,12 +1655,12 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                          request_stop_source_.get_token());
           const std::stop_token stop_token = cancellation.token();
           ThrowIfCancelled(stop_token);
-          std::unique_lock<std::timed_mutex> publication_lock =
-              AcquirePublicationLock(stop_token);
           boost::json::value report;
           if (node_ids.empty()) {
-            report = ReportSnapshot(stop_token, true);
+            report = ReportSnapshot(stop_token, include_artifacts);
           } else {
+            std::unique_lock<std::timed_mutex> publication_lock =
+                AcquirePublicationLock(stop_token);
             boost::json::array node_reports;
             node_reports.reserve(node_ids.size());
             for (const std::string& node_id : node_ids) {
@@ -1616,10 +1684,10 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             report =
                 boost::json::object{{"run_id", config_.run_id},
                                     {"node_reports", std::move(node_reports)}};
-          }
-          if (include_artifacts) {
-            report.as_object()["artifacts"] = BuildMcpRunArtifactInventory(
-                config_.run_id, config_.run_root, stop_token);
+            if (include_artifacts) {
+              report.as_object()["artifacts"] = BuildMcpRunArtifactInventory(
+                  config_.run_id, config_.run_root, stop_token);
+            }
           }
           ThrowIfCancelled(stop_token);
           return McpTypedResult{
@@ -2880,7 +2948,7 @@ void McpLiveApplication::RecordCommandOutcome(
 }
 
 boost::json::object McpLiveApplication::ReportSnapshot(
-    std::stop_token stop_token, bool publication_locked) {
+    std::stop_token stop_token, bool include_artifacts) {
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
   }
@@ -2894,10 +2962,8 @@ boost::json::object McpLiveApplication::ReportSnapshot(
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
   }
-  std::unique_lock<std::timed_mutex> publication_lock;
-  if (!publication_locked) {
-    publication_lock = AcquirePublicationLock(stop_token);
-  }
+  std::unique_lock<std::timed_mutex> publication_lock =
+      AcquirePublicationLock(stop_token);
   boost::json::object report;
   try {
     report = BuildRunReport(config_.run_root, stop_token);
@@ -2930,6 +2996,10 @@ boost::json::object McpLiveApplication::ReportSnapshot(
     std::lock_guard<std::mutex> state_lock(mutex_);
     config_.retained_run->state = std::string(state->as_string());
     config_.retained_run->node_count = *node_count;
+  }
+  if (include_artifacts) {
+    report["artifacts"] = BuildMcpRunArtifactInventory(
+        config_.run_id, config_.run_root, stop_token);
   }
   return report;
 }
@@ -3116,13 +3186,20 @@ void McpLiveApplication::MarkRunStopped() {
       return;
     }
     stop_requested_ = true;
-    if (!run_stopped_) {
-      run_stopped_ = true;
-      notify = true;
-    }
+    notify = !run_stopped_;
     command_outcome_ready_.notify_all();
   }
   run_stop_source_.request_stop();
+  if (notify) {
+    CloseFiroQtLauncher(config_.firo_qt_launcher_service, config_.run_id,
+                        "run-stop");
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (run_stopped_) {
+      notify = false;
+    } else {
+      run_stopped_ = true;
+    }
+  }
   if (notify && config_.run_stopped) {
     config_.run_stopped();
   }
@@ -3190,6 +3267,9 @@ void McpLiveApplication::Shutdown() {
   requests_drained_.wait(lock, [this] { return active_requests_ == 0U; });
   workload_service_.reset();
   role_service_.reset();
+  lock.unlock();
+  CloseFiroQtLauncher(config_.firo_qt_launcher_service, config_.run_id,
+                      "application-shutdown");
 }
 
 }  // namespace bbp

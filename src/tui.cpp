@@ -84,14 +84,26 @@ struct TuiState {
   bool command_palette_open = false;
   std::string command_input;
   std::string command_input_error;
-  std::optional<OwnedFiroQtLauncher> firo_qt_launcher;
+  std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
+  std::optional<OwnedFiroQtLauncher> standalone_firo_qt_launcher;
+  std::filesystem::path firo_qt_launcher_path;
   bool firo_qt_launcher_dialog_open = false;
   std::string firo_qt_launcher_command;
   std::optional<PendingConfirmation> pending_confirmation;
   TuiExitConfirmation exit_confirmation;
 };
 
+void ReleaseFiroQtLauncher(TuiState* state) {
+  if (state->standalone_firo_qt_launcher) {
+    static_cast<void>(state->standalone_firo_qt_launcher->Cleanup());
+    state->standalone_firo_qt_launcher.reset();
+  }
+  state->firo_qt_launcher_service.reset();
+  state->firo_qt_launcher_path.clear();
+}
+
 void ResetRunUiState(TuiState* state) {
+  ReleaseFiroQtLauncher(state);
   state->selected_node = 0U;
   state->selected_wallet = 0U;
   state->selected_topology_group = 0U;
@@ -107,17 +119,13 @@ void ResetRunUiState(TuiState* state) {
   state->command_palette_open = false;
   state->command_input.clear();
   state->command_input_error.clear();
-  state->firo_qt_launcher.reset();
   state->firo_qt_launcher_dialog_open = false;
   state->firo_qt_launcher_command.clear();
   state->pending_confirmation.reset();
 }
 
 int FinishTui(TuiState* state, int result) {
-  if (state->firo_qt_launcher) {
-    static_cast<void>(state->firo_qt_launcher->Cleanup());
-    state->firo_qt_launcher.reset();
-  }
+  ReleaseFiroQtLauncher(state);
   return result;
 }
 
@@ -2628,21 +2636,31 @@ bool QueueParsedNodeCommand(
       if (*parsed.local_action != TuiLocalAction::kCreateFiroQtLauncher) {
         throw std::runtime_error("unknown local TUI action");
       }
-      const std::string command = OperatorConnectionCommandFromReport(report);
-      if (command.empty()) {
-        throw std::runtime_error(
-            "the running benchmark has no Firo-Qt connection command");
+      if (state->firo_qt_launcher_service) {
+        const FiroQtLauncherSnapshot launcher =
+            state->firo_qt_launcher_service->ReplaceFromReport(report);
+        state->firo_qt_launcher_path = launcher.launcher_path;
+        state->firo_qt_launcher_command = launcher.operator_command;
+      } else {
+        const std::string command = OperatorConnectionCommandFromReport(report);
+        if (command.empty()) {
+          throw std::runtime_error(
+              "the running benchmark has no Firo-Qt connection command");
+        }
+        if (state->standalone_firo_qt_launcher) {
+          static_cast<void>(state->standalone_firo_qt_launcher->Cleanup());
+          state->standalone_firo_qt_launcher.reset();
+        }
+        state->standalone_firo_qt_launcher.emplace(
+            OwnedFiroQtLauncher::Create(command));
+        state->firo_qt_launcher_path =
+            state->standalone_firo_qt_launcher->path();
+        state->firo_qt_launcher_command = command;
       }
-      if (state->firo_qt_launcher) {
-        static_cast<void>(state->firo_qt_launcher->Cleanup());
-        state->firo_qt_launcher.reset();
-      }
-      state->firo_qt_launcher.emplace(OwnedFiroQtLauncher::Create(command));
-      state->firo_qt_launcher_command = command;
       state->firo_qt_launcher_dialog_open = true;
       state->command_input_error.clear();
       state->command_status = "Created native Firo-Qt launcher " +
-                              state->firo_qt_launcher->path().string() + ".";
+                              state->firo_qt_launcher_path.string() + ".";
       return true;
     } catch (const std::exception& error) {
       state->command_input_error = TuiCommandRejectionMessage(error.what());
@@ -3359,6 +3377,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       .generation = 0U,
       .run_root = run_root,
       .command_queue = std::move(shared_command_queue),
+      .firo_qt_launcher_service = {},
       .publication_mutex = {},
   };
   return RunTuiReport([snapshot]() { return snapshot; }, once, refresh_ms,
@@ -3385,6 +3404,7 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
     if (run_changed) {
       live_report.reset();
       ResetRunUiState(&state);
+      state.firo_qt_launcher_service = next_snapshot.firo_qt_launcher_service;
     }
     snapshot = std::move(next_snapshot);
     return run_changed;
@@ -3445,6 +3465,18 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
       }
       RefreshCommandResults(*report, &state);
     }
+    if (state.firo_qt_launcher_dialog_open && state.firo_qt_launcher_service) {
+      const std::optional<FiroQtLauncherSnapshot> launcher =
+          state.firo_qt_launcher_service->Snapshot();
+      if (launcher) {
+        state.firo_qt_launcher_path = launcher->launcher_path;
+        state.firo_qt_launcher_command = launcher->operator_command;
+      } else {
+        state.firo_qt_launcher_dialog_open = false;
+        state.firo_qt_launcher_path.clear();
+        state.firo_qt_launcher_command.clear();
+      }
+    }
     if (has_active_run) {
       const std::vector<std::string> log_lines =
           ReadRecentLogLines(RunLogPath(snapshot->run_root), 256U);
@@ -3456,10 +3488,9 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
                   state.command_error_open, state.command_error,
                   state.command_palette_open, state.command_input,
                   state.command_input_error, state.firo_qt_launcher_dialog_open,
-                  state.firo_qt_launcher ? state.firo_qt_launcher->path()
-                                         : std::filesystem::path{},
-                  state.firo_qt_launcher_command, state.pending_confirmation,
-                  state.exit_confirmation, &state.simulator_log_pane);
+                  state.firo_qt_launcher_path, state.firo_qt_launcher_command,
+                  state.pending_confirmation, state.exit_confirmation,
+                  &state.simulator_log_pane);
     } else {
       DrawEmptySummary(state.exit_confirmation);
     }

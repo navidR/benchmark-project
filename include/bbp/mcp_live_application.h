@@ -19,6 +19,7 @@
 
 namespace bbp {
 
+class FiroQtLauncherService;
 class SimulationCommandQueue;
 struct Options;
 
@@ -65,6 +66,7 @@ class McpLiveApplication {
     std::optional<RetainedRun> retained_run;
     std::shared_ptr<const Options> options;
     std::shared_ptr<SimulationCommandQueue> command_queue;
+    std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service = {};
     std::function<McpLiveNodeInventorySnapshot()> node_inventory_snapshot = {};
     std::shared_ptr<std::timed_mutex> publication_mutex;
     std::function<void()> request_run_stop;
@@ -144,7 +146,7 @@ class McpLiveApplication {
           kSimulationCommandCancellationReconciliation,
       McpOperationContext* progress_context = nullptr);
   boost::json::object ReportSnapshot(std::stop_token stop_token,
-                                     bool publication_locked = false);
+                                     bool include_artifacts = false);
   std::unique_lock<std::timed_mutex> AcquirePublicationLock(
       std::stop_token stop_token) const;
   std::string RunState(

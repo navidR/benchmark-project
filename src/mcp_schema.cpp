@@ -1385,7 +1385,8 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kCreateFiroQtLauncher:
       add_run();
-      add_node();
+      properties["node_id"] = NodeAddIdentifierSchema();
+      required.emplace_back("node_id");
       break;
     case McpOperationKind::kAddNode:
       add_run();
@@ -1842,6 +1843,29 @@ boost::json::object WalletRemoveMutationSchema() {
   return schema;
 }
 
+boost::json::object FiroQtLauncherMutationSchema() {
+  return AddDraft(ClosedObject(
+      boost::json::object{
+          {"result_family", ConstStringSchema("mutation")},
+          {"run_id", IdentifierSchema()},
+          {"added_node_ids",
+           ArraySchema(NodeAddIdentifierSchema(), 0U, 0U, true)},
+          {"removed_node_ids",
+           ArraySchema(NodeAddIdentifierSchema(), 0U, 0U, true)},
+          {"affected_node_ids",
+           ArraySchema(NodeAddIdentifierSchema(), 1U, 1U, true)},
+          {"action", ConstStringSchema("local.firo_qt_launcher")},
+          {"state", ConstStringSchema("ready")},
+          {"unchanged",
+           boost::json::object{{"type", "boolean"}, {"const", false}}},
+          {"launcher_path", StringSchema(1U)},
+          {"operator_command", StringSchema(1U)},
+      },
+      Required({"result_family", "run_id", "added_node_ids", "removed_node_ids",
+                "affected_node_ids", "action", "state", "unchanged",
+                "launcher_path", "operator_command"})));
+}
+
 boost::json::object TypedNodeLifecycleCancellationDiagnosticSchema(
     McpOperationKind operation) {
   boost::json::object schema = DiagnosticSchema();
@@ -1942,6 +1966,8 @@ boost::json::object BuildMcpResultSchema(
       properties["wallet_generation"] = IntegerSchema(1U);
       properties["final_wallet_count"] = Uint64Schema();
       properties["final_wallet_node_count"] = Uint64Schema();
+      properties["launcher_path"] = StringSchema(1U);
+      properties["operator_command"] = StringSchema(1U);
       require({"run_id", "added_node_ids", "removed_node_ids", "unchanged"});
       constraints.emplace_back(boost::json::object{
           {"if", boost::json::object{{"properties",
@@ -2372,6 +2398,56 @@ boost::json::object BuildMcpResultSchema(
                                  std::move(terminal_error_constraint)}}}}}});
         }
         if (std::find(selected_operations.begin(), selected_operations.end(),
+                      McpOperationKind::kCreateFiroQtLauncher) !=
+            selected_operations.end()) {
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation",
+                         ConstStringSchema("local.firo_qt_launcher")},
+                        {"state", ConstStringSchema("succeeded")}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{{"terminal_result_family",
+                                         ConstStringSchema("mutation")},
+                                        {"terminal_result",
+                                         FiroQtLauncherMutationSchema()}}}}}});
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation",
+                         ConstStringSchema("local.firo_qt_launcher")},
+                        {"state", StringEnumSchema(boost::json::array{
+                                      "queued", "running", "cancelling"})}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{{"terminal_result_family",
+                                         ConstStringSchema("mutation")}}}}}});
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation",
+                         ConstStringSchema("local.firo_qt_launcher")},
+                        {"state", StringEnumSchema(boost::json::array{
+                                      "failed", "cancelled"})}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{{"terminal_result_family",
+                                         ConstStringSchema("error")}}}}}});
+        }
+        if (std::find(selected_operations.begin(), selected_operations.end(),
                       McpOperationKind::kAssignRole) !=
             selected_operations.end()) {
           constraints.emplace_back(boost::json::object{
@@ -2589,14 +2665,17 @@ boost::json::object BuildMcpOperationOutputSchema(
   boost::json::array choices;
   const std::array<McpOperationKind, 1U> operation_only{operation};
   const std::span<const McpOperationKind> wrapper_operations =
-      operation == McpOperationKind::kAssignRole ||
+      operation == McpOperationKind::kCreateFiroQtLauncher ||
+              operation == McpOperationKind::kAssignRole ||
               operation == McpOperationKind::kRemoveRole ||
               operation == McpOperationKind::kRemoveWallet
           ? std::span<const McpOperationKind>(operation_only)
           : selected_operations;
   const McpResultFamily result_family = McpOperationResultFamily(operation);
   choices.emplace_back(
-      IsTypedNodeLifecycleOperation(operation)
+      operation == McpOperationKind::kCreateFiroQtLauncher
+          ? FiroQtLauncherMutationSchema()
+      : IsTypedNodeLifecycleOperation(operation)
           ? TypedNodeLifecycleMutationSchema(operation)
       : operation == McpOperationKind::kAddNode    ? NodeAddMutationSchema()
       : operation == McpOperationKind::kRemoveNode ? NodeRemoveMutationSchema()

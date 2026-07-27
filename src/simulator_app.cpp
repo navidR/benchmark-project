@@ -55,6 +55,7 @@
 #include "bbp/network.h"
 #include "bbp/network_allocation_lock.h"
 #include "bbp/node_log_collector.h"
+#include "bbp/operator_connection.h"
 #include "bbp/peer_connectivity_controller.h"
 #include "bbp/perf_counter.h"
 #include "bbp/periodic_metrics_collector.h"
@@ -19345,7 +19346,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
         WriteNodeLogTails(events_path, options, driver, current_nodes);
       });
     }
-    mcp_application.MarkRunStopped();
+    cleanup_step("MCP terminal launcher cleanup",
+                 [&] { mcp_application.MarkRunStopped(); });
   };
   const auto handle_run_cancellation = [&]() {
     mcp_application.MarkRunStopping();
@@ -24628,6 +24630,7 @@ struct EditorRunContext {
   std::shared_ptr<Options> options;
   std::optional<boost::json::object> source_scenario;
   std::shared_ptr<SimulationCommandQueue> command_queue;
+  std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
   std::shared_ptr<RuntimeNodeInventory> node_inventory;
   std::stop_source simulation_stop_source;
   std::shared_ptr<McpLiveApplication> mcp_application;
@@ -24652,6 +24655,7 @@ struct EditorRunSnapshot {
   std::uint32_t available_node_capacity = 0U;
   EditorRunState state = EditorRunState::kStarting;
   std::shared_ptr<SimulationCommandQueue> command_queue;
+  std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
   std::shared_ptr<McpLiveApplication> mcp_application;
 };
 
@@ -24812,6 +24816,14 @@ class EditorRunController {
           "run_stop_timeout",
           "managed run cleanup did not finish before the timeout", true);
     }
+    if (context->state == EditorRunState::kFailed) {
+      const std::string detail = context->failure
+                                     ? ExceptionMessage(context->failure)
+                                     : "unknown managed-run failure";
+      throw McpOperationFailure(
+          "run_stop_failed",
+          "managed run failed during bounded shutdown: " + detail, false);
+    }
     return SnapshotLocked(*context);
   }
 
@@ -24870,21 +24882,34 @@ class EditorRunController {
 
   void Shutdown() {
     std::shared_ptr<EditorRunContext> context;
+    std::lock_guard<std::mutex> transition_lock(transition_mutex_);
     {
-      std::lock_guard<std::mutex> transition_lock(transition_mutex_);
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (shutdown_) {
-          return;
-        }
-        shutdown_ = true;
-        context = std::move(active_);
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_ && !active_) {
+        return;
       }
-      if (context) {
-        RequestStop(context);
-      }
+      shutdown_ = true;
+      context = active_;
     }
-    JoinAndShutdown(context);
+    if (context) {
+      RequestStop(context);
+    }
+    bool application_shutdown_succeeded = false;
+    try {
+      JoinAndShutdown(context, true, &application_shutdown_succeeded);
+    } catch (...) {
+      if (application_shutdown_succeeded) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_ == context) {
+          active_.reset();
+        }
+      }
+      throw;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_ == context) {
+      active_.reset();
+    }
   }
 
  private:
@@ -24905,6 +24930,7 @@ class EditorRunController {
             node_count <= node_capacity ? node_capacity - node_count : 0U,
         .state = context.state,
         .command_queue = context.command_queue,
+        .firo_qt_launcher_service = context.firo_qt_launcher_service,
         .mcp_application = context.mcp_application};
   }
 
@@ -24933,15 +24959,47 @@ class EditorRunController {
     static_cast<void>(stopped.wait(lock, stop_token, [] { return false; }));
   }
 
-  static void JoinAndShutdown(
-      const std::shared_ptr<EditorRunContext>& context) {
+  static void JoinAndShutdown(const std::shared_ptr<EditorRunContext>& context,
+                              bool propagate_worker_failure = true,
+                              bool* application_shutdown_succeeded = nullptr) {
+    if (application_shutdown_succeeded != nullptr) {
+      *application_shutdown_succeeded = false;
+    }
     if (!context) {
+      if (application_shutdown_succeeded != nullptr) {
+        *application_shutdown_succeeded = true;
+      }
       return;
     }
     if (context->worker.joinable()) {
       context->worker.join();
     }
-    context->mcp_application->Shutdown();
+    std::exception_ptr worker_failure;
+    {
+      std::lock_guard<std::mutex> lock(context->mutex);
+      worker_failure = context->failure;
+    }
+    std::exception_ptr shutdown_failure;
+    try {
+      context->mcp_application->Shutdown();
+    } catch (...) {
+      shutdown_failure = std::current_exception();
+    }
+    if (!shutdown_failure && application_shutdown_succeeded != nullptr) {
+      *application_shutdown_succeeded = true;
+    }
+    if (propagate_worker_failure && worker_failure && shutdown_failure) {
+      throw std::runtime_error(
+          "managed run failed: " + ExceptionMessage(worker_failure) +
+          "; MCP application shutdown also failed: " +
+          ExceptionMessage(shutdown_failure));
+    }
+    if (propagate_worker_failure && worker_failure) {
+      std::rethrow_exception(worker_failure);
+    }
+    if (shutdown_failure) {
+      std::rethrow_exception(shutdown_failure);
+    }
   }
 
   void ReapTerminalRun() {
@@ -24957,9 +25015,13 @@ class EditorRunController {
           return;
         }
       }
-      context = std::move(active_);
+      context = active_;
     }
-    JoinAndShutdown(context);
+    JoinAndShutdown(context, false);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_ == context) {
+      active_.reset();
+    }
   }
 
   std::shared_ptr<EditorRunContext> Launch(
@@ -24993,6 +25055,51 @@ class EditorRunController {
     context->node_inventory =
         std::make_shared<RuntimeNodeInventory>(context->options->node_capacity);
     const std::weak_ptr<EditorRunContext> weak_context(context);
+    context->firo_qt_launcher_service = std::make_shared<FiroQtLauncherService>(
+        [weak_context](std::string_view node_id, std::stop_token stop_token) {
+          ThrowIfStopRequested(stop_token);
+          const std::shared_ptr<EditorRunContext> run = weak_context.lock();
+          if (!run || !run->node_inventory || !run->options) {
+            throw std::runtime_error(
+                "managed run Firo-Qt launcher authority is unavailable");
+          }
+
+          const RuntimeNodeSnapshot snapshot = run->node_inventory->Snapshot();
+          const auto selected =
+              std::find_if(snapshot.begin(), snapshot.end(),
+                           [node_id](const NodeRuntime& node) {
+                             return node.config.id == node_id;
+                           });
+          if (selected == snapshot.end()) {
+            throw std::runtime_error(
+                "Firo-Qt launcher references an unknown active node: " +
+                std::string(node_id));
+          }
+
+          ChainNodeConfig config;
+          {
+            auto process_guard = LockNodeProcessState(*selected);
+            RequireNodeRunning(*selected, process_guard, "Firo-Qt launcher");
+            config = selected->config;
+          }
+          ThrowIfStopRequested(stop_token);
+
+          std::unique_ptr<ChainDriver> driver =
+              CreateChainDriver(run->options->chain);
+          std::optional<OperatorConnectionCommand> command =
+              driver->BuildOperatorConnectionCommand(
+                  config, BenchmarkRunRoot(*run->options));
+          if (!command) {
+            throw std::runtime_error(
+                "the active chain has no Firo-Qt launcher command");
+          }
+          ThrowIfStopRequested(stop_token);
+          return FiroQtLauncherAuthority{
+              .inventory_generation = snapshot.generation(),
+              .node_id = config.id,
+              .command = std::move(*command),
+          };
+        });
     context->mcp_application =
         std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
             .run_id = context->options->run_id,
@@ -25000,6 +25107,7 @@ class EditorRunController {
             .retained_run = std::nullopt,
             .options = context->options,
             .command_queue = context->command_queue,
+            .firo_qt_launcher_service = context->firo_qt_launcher_service,
             .node_inventory_snapshot =
                 [weak_context] {
                   const std::shared_ptr<EditorRunContext> run =
@@ -25053,6 +25161,15 @@ class EditorRunController {
             .publish_evidence = std::move(publish_evidence),
             .close_run_subscriptions = std::move(close_run_subscriptions)});
     context->worker = std::jthread([context] {
+      const auto finalize_lifecycle = [&context]() -> std::exception_ptr {
+        try {
+          context->mcp_application->MarkRunStopping();
+          context->mcp_application->MarkRunStopped();
+          return {};
+        } catch (...) {
+          return std::current_exception();
+        }
+      };
       try {
         context->result = RunPreparedBenchmark(context);
         std::lock_guard<std::mutex> lock(context->mutex);
@@ -25061,16 +25178,24 @@ class EditorRunController {
         }
         context->state_changed.notify_all();
       } catch (const SimulationCancelled&) {
-        context->mcp_application->MarkRunStopping();
-        context->mcp_application->MarkRunStopped();
+        const std::exception_ptr cleanup_failure = finalize_lifecycle();
         std::lock_guard<std::mutex> lock(context->mutex);
-        context->result = 0;
-        context->state = EditorRunState::kStopped;
+        if (cleanup_failure) {
+          context->failure = cleanup_failure;
+          context->state = EditorRunState::kFailed;
+        } else {
+          context->result = 0;
+          context->state = EditorRunState::kStopped;
+        }
         context->state_changed.notify_all();
       } catch (...) {
-        const std::exception_ptr failure = std::current_exception();
-        context->mcp_application->MarkRunStopping();
-        context->mcp_application->MarkRunStopped();
+        std::exception_ptr failure = std::current_exception();
+        if (const std::exception_ptr cleanup_failure = finalize_lifecycle()) {
+          failure = std::make_exception_ptr(
+              std::runtime_error(ExceptionMessage(failure) +
+                                 "; terminal launcher cleanup also failed: " +
+                                 ExceptionMessage(cleanup_failure)));
+        }
         std::lock_guard<std::mutex> lock(context->mutex);
         context->failure = failure;
         context->state = EditorRunState::kFailed;
@@ -25123,6 +25248,7 @@ TuiRunSnapshot TuiSnapshot(const EditorRunController& controller) {
       .generation = snapshot->generation,
       .run_root = snapshot->run_root,
       .command_queue = snapshot->command_queue,
+      .firo_qt_launcher_service = snapshot->firo_qt_launcher_service,
       .publication_mutex = RuntimePublicationMutex(),
   };
 }

@@ -23,6 +23,7 @@
 #include "bbp/mcp_dispatcher.h"
 #include "bbp/mcp_live_application.h"
 #include "bbp/mcp_run_evidence.h"
+#include "bbp/operator_connection.h"
 #include "bbp/run_ownership.h"
 #include "bbp/scenario_service.h"
 #include "bbp/simulation_cancelled.h"
@@ -3431,6 +3432,172 @@ BOOST_AUTO_TEST_CASE(
       "masternode.restart",
       boost::json::object{{"node_ids", boost::json::array{"firo-cancel"}}});
   BOOST_TEST(cancelled.at("state").as_string() == "cancelled");
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_live_firo_qt_launcher_binds_report_replaces_and_cleans_up) {
+  LiveApplicationDirectory temporary;
+  boost::json::object scenario = LiveScenario();
+  scenario["nodes"] = 2U;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
+  WriteText(temporary.path() / "resolved-scenario.json",
+            boost::json::serialize(ResolveScenario(scenario)) + "\n");
+  AppendLine(
+      temporary.path() / "events.jsonl",
+      R"({"run_id":"live-application","node_id":"sim","event":"run_started"})");
+  OperatorConnectionCommand connection;
+  connection.executable = "/opt/firo/firo-qt";
+  connection.data_dir = "/tmp/bbp-operator/firo-qt";
+  connection.peer_address = "127.0.0.1";
+  connection.peer_port = 18444U;
+  connection.arguments = {
+      "-regtest",
+      "-datadir=" + connection.data_dir.string(),
+      "-connect=127.0.0.1:18444",
+      "-dns=0",
+      "-dnsseed=0",
+      "-forcednsseed=0",
+      "-maxconnections=1",
+      "-listen=0",
+      "-discover=0",
+      "-listenonion=0",
+      "-torsetup=0",
+      "-upnp=0",
+  };
+  const std::string operator_command = connection.ShellCommand();
+  boost::json::array arguments;
+  boost::json::array argv{connection.executable.string()};
+  for (const std::string& argument : connection.arguments) {
+    arguments.emplace_back(argument);
+    argv.emplace_back(argument);
+  }
+  const boost::json::object detail{
+      {"kind", "manual_firo_gui"},
+      {"manual_launch", true},
+      {"discovery_disabled", true},
+      {"wallet_enabled", true},
+      {"network", "regtest"},
+      {"executable", connection.executable.string()},
+      {"arguments", std::move(arguments)},
+      {"argv", std::move(argv)},
+      {"command", operator_command},
+      {"data_dir", connection.data_dir.string()},
+      {"peer_address", connection.peer_address},
+      {"peer_port", connection.peer_port},
+      {"peer_endpoint", "127.0.0.1:18444"},
+  };
+  AppendLine(temporary.path() / "events.jsonl",
+             boost::json::serialize(boost::json::object{
+                 {"run_id", "live-application"},
+                 {"node_id", "_firo"},
+                 {"event", "operator_connection_command"},
+                 {"timestamp", "2026-07-27T00:00:00Z"},
+                 {"detail", boost::json::serialize(detail)},
+             }));
+
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  auto launcher_service = std::make_shared<FiroQtLauncherService>(
+      [connection](std::string_view node_id, std::stop_token) {
+        if (node_id != "_firo") {
+          throw std::runtime_error(
+              "requested node has no authoritative Firo-Qt command");
+        }
+        return FiroQtLauncherAuthority{
+            .inventory_generation = 1U,
+            .node_id = "_firo",
+            .command = connection,
+        };
+      });
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .firo_qt_launcher_service = launcher_service,
+      .node_inventory_snapshot =
+          [] {
+            return McpLiveNodeInventorySnapshot{
+                .generation = 1U, .node_ids = {"_firo", "firo-2"}};
+          },
+      .publication_mutex = std::make_shared<std::timed_mutex>(),
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const boost::json::object mismatched = WaitForTerminal(
+      &dispatcher, Invoke(&dispatcher, "local.firo_qt_launcher",
+                          boost::json::object{{"run_id", "live-application"},
+                                              {"node_id", "firo-2"}}));
+  BOOST_TEST(mismatched.at("state").as_string() == "failed");
+  BOOST_TEST(!launcher_service->Snapshot().has_value());
+
+  const auto create_launcher = [&] {
+    return WaitForTerminal(
+        &dispatcher, Invoke(&dispatcher, "local.firo_qt_launcher",
+                            boost::json::object{{"run_id", "live-application"},
+                                                {"node_id", "_firo"}}));
+  };
+  const boost::json::object first_operation = create_launcher();
+  BOOST_TEST(first_operation.at("state").as_string() == "succeeded");
+  const boost::json::object& first =
+      first_operation.at("terminal_result").as_object();
+  BOOST_TEST(first.size() == 10U);
+  BOOST_TEST(first.at("result_family").as_string() == "mutation");
+  BOOST_TEST(first.at("run_id").as_string() == "live-application");
+  BOOST_TEST(first.at("added_node_ids").as_array().empty());
+  BOOST_TEST(first.at("removed_node_ids").as_array().empty());
+  const boost::json::array expected_affected{"_firo"};
+  BOOST_TEST(first.at("affected_node_ids").as_array() == expected_affected);
+  BOOST_TEST(first.at("action").as_string() == "local.firo_qt_launcher");
+  BOOST_TEST(first.at("state").as_string() == "ready");
+  BOOST_TEST(!first.at("unchanged").as_bool());
+  BOOST_TEST(first.at("operator_command").as_string() == operator_command);
+  const std::filesystem::path first_path(
+      std::string(first.at("launcher_path").as_string()));
+  BOOST_TEST(ReadText(first_path) ==
+             "#!/bin/bash\nexec " + operator_command + "\n");
+  const std::filesystem::perms permissions =
+      std::filesystem::status(first_path).permissions();
+  BOOST_CHECK((permissions & std::filesystem::perms::owner_all) ==
+              std::filesystem::perms::owner_all);
+  BOOST_CHECK((permissions & (std::filesystem::perms::group_all |
+                              std::filesystem::perms::others_all)) ==
+              std::filesystem::perms::none);
+  const boost::json::object second_operation = create_launcher();
+  BOOST_TEST(second_operation.at("state").as_string() == "succeeded");
+  const std::filesystem::path second_path(
+      std::string(second_operation.at("terminal_result")
+                      .as_object()
+                      .at("launcher_path")
+                      .as_string()));
+  BOOST_TEST(second_path != first_path);
+  BOOST_TEST(!std::filesystem::exists(first_path));
+  BOOST_TEST(std::filesystem::exists(second_path));
+
+  SetFiroQtLauncherCleanupTestHook(
+      [](FiroQtLauncherCleanupTestPhase phase, const std::filesystem::path&,
+         const std::optional<std::filesystem::path>&) {
+        if (phase ==
+            FiroQtLauncherCleanupTestPhase::kAfterPublicIdentityCheck) {
+          throw std::runtime_error("injected launcher cleanup failure");
+        }
+      });
+  BOOST_CHECK_THROW(application.MarkRunStopped(), std::runtime_error);
+  SetFiroQtLauncherCleanupTestHook({});
+  BOOST_TEST(std::filesystem::exists(second_path));
+  application.MarkRunStopped();
+  BOOST_TEST(!std::filesystem::exists(second_path));
+  BOOST_TEST(!launcher_service->Snapshot().has_value());
+
   dispatcher.Shutdown();
   application.Shutdown();
 }

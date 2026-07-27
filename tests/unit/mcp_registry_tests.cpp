@@ -1731,4 +1731,99 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
   }
 }
 
+BOOST_AUTO_TEST_CASE(mcp_firo_qt_launcher_schema_is_closed_and_wrapper_exact) {
+  const boost::json::object input =
+      BuildMcpOperationInputSchema(McpOperationKind::kCreateFiroQtLauncher);
+  const std::set<std::string> input_fields{"node_id", "run_id"};
+  BOOST_TEST(PropertySet(input) == input_fields);
+  BOOST_TEST(StringSet(input.at("required").as_array()) == input_fields);
+  BOOST_TEST(!input.at("additionalProperties").as_bool());
+  const boost::json::object& node_id =
+      input.at("properties").as_object().at("node_id").as_object();
+  BOOST_TEST(node_id.at("maxLength").as_uint64() == 32U);
+  BOOST_TEST(node_id.at("pattern").as_string() == "^[A-Za-z0-9_-]{1,32}$");
+
+  const boost::json::object output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kCreateFiroQtLauncher);
+  const boost::json::array& choices = output.at("oneOf").as_array();
+  BOOST_REQUIRE_EQUAL(choices.size(), 3U);
+  const boost::json::object& direct = choices.front().as_object();
+  const std::set<std::string> direct_fields{
+      "action",        "added_node_ids",   "affected_node_ids",
+      "launcher_path", "operator_command", "removed_node_ids",
+      "result_family", "run_id",           "state",
+      "unchanged",
+  };
+  BOOST_TEST(PropertySet(direct) == direct_fields);
+  BOOST_TEST(StringSet(direct.at("required").as_array()) == direct_fields);
+  BOOST_TEST(!direct.at("additionalProperties").as_bool());
+  const boost::json::object& properties = direct.at("properties").as_object();
+  BOOST_TEST(
+      properties.at("result_family").as_object().at("const").as_string() ==
+      "mutation");
+  BOOST_TEST(properties.at("action").as_object().at("const").as_string() ==
+             "local.firo_qt_launcher");
+  BOOST_TEST(properties.at("state").as_object().at("const").as_string() ==
+             "ready");
+  BOOST_TEST(!properties.at("unchanged").as_object().at("const").as_bool());
+  BOOST_TEST(
+      properties.at("added_node_ids").as_object().at("maxItems").as_uint64() ==
+      0U);
+  BOOST_TEST(properties.at("removed_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(properties.at("affected_node_ids")
+                 .as_object()
+                 .at("minItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(properties.at("affected_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 1U);
+
+  const boost::json::object& wrapper = choices[1U].as_object();
+  BOOST_TEST(StringSet(wrapper.at("properties")
+                           .as_object()
+                           .at("operation")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             std::set<std::string>({"local.firo_qt_launcher"}));
+  const boost::json::object& succeeded =
+      LifecycleOperationConstraint(wrapper, "local.firo_qt_launcher",
+                                   "succeeded")
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(succeeded.at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "mutation");
+  BOOST_TEST(succeeded.at("terminal_result").as_object() == direct);
+  BOOST_TEST(OperationStateSetConstraint(
+                 wrapper, "local.firo_qt_launcher",
+                 std::set<std::string>({"cancelling", "queued", "running"}))
+                 .at("then")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "mutation");
+  BOOST_TEST(OperationStateSetConstraint(
+                 wrapper, "local.firo_qt_launcher",
+                 std::set<std::string>({"cancelled", "failed"}))
+                 .at("then")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "error");
+}
+
 }  // namespace bbp

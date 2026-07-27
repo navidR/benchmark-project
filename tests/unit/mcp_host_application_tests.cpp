@@ -99,12 +99,12 @@ BOOST_AUTO_TEST_CASE(
   const std::vector<McpOperationKind> supported =
       application.SupportedOperations();
   for (const McpOperationKind operation :
-       {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
-        McpOperationKind::kRestartNode, McpOperationKind::kAddWallet,
-        McpOperationKind::kRemoveWallet, McpOperationKind::kAssignRole,
-        McpOperationKind::kRemoveRole, McpOperationKind::kAddMiner,
-        McpOperationKind::kRemoveMiner, McpOperationKind::kAddMasternode,
-        McpOperationKind::kRemoveMasternode,
+       {McpOperationKind::kCreateFiroQtLauncher, McpOperationKind::kStopNode,
+        McpOperationKind::kKillNode, McpOperationKind::kRestartNode,
+        McpOperationKind::kAddWallet, McpOperationKind::kRemoveWallet,
+        McpOperationKind::kAssignRole, McpOperationKind::kRemoveRole,
+        McpOperationKind::kAddMiner, McpOperationKind::kRemoveMiner,
+        McpOperationKind::kAddMasternode, McpOperationKind::kRemoveMasternode,
         McpOperationKind::kRestartMasternode, McpOperationKind::kStartWorkload,
         McpOperationKind::kInspectWorkload,
         McpOperationKind::kReconfigureWorkload,

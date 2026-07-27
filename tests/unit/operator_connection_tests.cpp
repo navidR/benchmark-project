@@ -2,16 +2,22 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
 #include <cerrno>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <sstream>
+#include <stop_token>
 #include <string>
+#include <vector>
 
 #include "bbp/operator_connection.h"
+#include "bbp/simulation_cancelled.h"
 
 namespace {
 
@@ -26,6 +32,33 @@ class ScopedFileRemoval {
 
  private:
   std::filesystem::path path_;
+};
+
+class ScopedLauncherCleanupHook {
+ public:
+  explicit ScopedLauncherCleanupHook(bbp::FiroQtLauncherCleanupTestHook hook) {
+    bbp::SetFiroQtLauncherCleanupTestHook(std::move(hook));
+  }
+  ~ScopedLauncherCleanupHook() { bbp::SetFiroQtLauncherCleanupTestHook({}); }
+
+  ScopedLauncherCleanupHook(const ScopedLauncherCleanupHook&) = delete;
+  ScopedLauncherCleanupHook& operator=(const ScopedLauncherCleanupHook&) =
+      delete;
+};
+
+class AtomicReleaseGuard {
+ public:
+  explicit AtomicReleaseGuard(std::atomic_bool* release) : release_(release) {}
+  ~AtomicReleaseGuard() {
+    release_->store(true, std::memory_order_release);
+    release_->notify_all();
+  }
+
+  AtomicReleaseGuard(const AtomicReleaseGuard&) = delete;
+  AtomicReleaseGuard& operator=(const AtomicReleaseGuard&) = delete;
+
+ private:
+  std::atomic_bool* release_;
 };
 
 std::string ReadFile(const std::filesystem::path& path) {
@@ -86,6 +119,86 @@ std::filesystem::path CreateMatchingForeignLauncher() {
     }
   }
   throw std::runtime_error("could not reserve a foreign launcher collision");
+}
+
+bbp::OperatorConnectionCommand LauncherConnection(std::uint16_t peer_port) {
+  bbp::OperatorConnectionCommand connection;
+  connection.executable = "/opt/firo/firo-qt";
+  connection.data_dir = "/tmp/bbp-operator/firo-qt";
+  connection.peer_address = "127.0.0.1";
+  connection.peer_port = peer_port;
+  const std::string peer_endpoint =
+      connection.peer_address + ":" + std::to_string(peer_port);
+  connection.arguments = {
+      "-regtest",
+      "-datadir=" + connection.data_dir.string(),
+      "-connect=" + peer_endpoint,
+      "-dns=0",
+      "-dnsseed=0",
+      "-forcednsseed=0",
+      "-maxconnections=1",
+      "-listen=0",
+      "-discover=0",
+      "-listenonion=0",
+      "-torsetup=0",
+      "-upnp=0",
+  };
+  return connection;
+}
+
+void SetLauncherConnection(boost::json::object* report,
+                           const bbp::OperatorConnectionCommand& connection) {
+  boost::json::array arguments;
+  boost::json::array argv{connection.executable.string()};
+  for (const std::string& argument : connection.arguments) {
+    arguments.emplace_back(argument);
+    argv.emplace_back(argument);
+  }
+  boost::json::object& command =
+      report->at("operator_connection_command").as_object();
+  command["executable"] = connection.executable.string();
+  command["arguments"] = std::move(arguments);
+  command["argv"] = std::move(argv);
+  command["command"] = connection.ShellCommand();
+  command["data_dir"] = connection.data_dir.string();
+  command["peer_address"] = connection.peer_address;
+  command["peer_port"] = connection.peer_port;
+  command["peer_endpoint"] =
+      connection.peer_address + ":" + std::to_string(connection.peer_port);
+}
+
+boost::json::object LauncherReport(std::string_view node_id,
+                                   std::uint16_t peer_port) {
+  const bbp::OperatorConnectionCommand connection =
+      LauncherConnection(peer_port);
+  boost::json::array arguments;
+  boost::json::array argv{connection.executable.string()};
+  for (const std::string& argument : connection.arguments) {
+    arguments.emplace_back(argument);
+    argv.emplace_back(argument);
+  }
+  const std::string peer_endpoint =
+      connection.peer_address + ":" + std::to_string(peer_port);
+  return boost::json::object{
+      {"chain", "firo"},
+      {"operator_connection_command",
+       boost::json::object{
+           {"node_id", node_id},
+           {"timestamp", "2026-07-27T00:00:00Z"},
+           {"kind", "manual_firo_gui"},
+           {"manual_launch", true},
+           {"discovery_disabled", true},
+           {"wallet_enabled", true},
+           {"network", "regtest"},
+           {"executable", connection.executable.string()},
+           {"arguments", std::move(arguments)},
+           {"argv", std::move(argv)},
+           {"command", connection.ShellCommand()},
+           {"data_dir", connection.data_dir.string()},
+           {"peer_address", connection.peer_address},
+           {"peer_port", connection.peer_port},
+           {"peer_endpoint", peer_endpoint},
+       }}};
 }
 
 }  // namespace
@@ -151,7 +264,7 @@ BOOST_AUTO_TEST_CASE(firo_qt_launcher_has_exact_content_mode_and_cleanup) {
   BOOST_TEST(ReadFile(launcher_path) == "#!/bin/bash\nexec " + command + "\n");
   BOOST_TEST(!std::filesystem::exists(execution_marker));
 
-  struct stat status {};
+  struct stat status{};
   BOOST_REQUIRE(lstat(launcher_path.c_str(), &status) == 0);
   BOOST_CHECK(S_ISREG(status.st_mode));
   BOOST_TEST((status.st_mode & 07777) == S_IRWXU);
@@ -178,6 +291,64 @@ BOOST_AUTO_TEST_CASE(firo_qt_launcher_preserves_replaced_foreign_identity) {
   BOOST_TEST(ReadFile(launcher_path) == "replacement owned by somebody else\n");
 }
 
+BOOST_AUTO_TEST_CASE(
+    firo_qt_launcher_atomic_cleanup_preserves_replacement_during_capture) {
+  bbp::OwnedFiroQtLauncher launcher =
+      bbp::OwnedFiroQtLauncher::Create("'/opt/firo/firo-qt' '-regtest'");
+  const std::filesystem::path launcher_path = launcher.path();
+  ScopedFileRemoval remove_replacement(launcher_path);
+  struct stat foreign_status{};
+  ScopedLauncherCleanupHook hook(
+      [&](bbp::FiroQtLauncherCleanupTestPhase phase,
+          const std::filesystem::path& public_path,
+          const std::optional<std::filesystem::path>&) {
+        if (phase !=
+            bbp::FiroQtLauncherCleanupTestPhase::kAfterPublicIdentityCheck) {
+          return;
+        }
+        BOOST_REQUIRE(std::filesystem::remove(public_path));
+        WriteNewFile(public_path, "foreign replacement during capture\n");
+        BOOST_REQUIRE(lstat(public_path.c_str(), &foreign_status) == 0);
+      });
+
+  BOOST_CHECK(launcher.Cleanup() ==
+              bbp::FiroQtLauncherCleanupResult::kOwnershipChanged);
+  struct stat restored_status{};
+  BOOST_REQUIRE(lstat(launcher_path.c_str(), &restored_status) == 0);
+  BOOST_TEST(restored_status.st_dev == foreign_status.st_dev);
+  BOOST_TEST(restored_status.st_ino == foreign_status.st_ino);
+  BOOST_TEST(ReadFile(launcher_path) == "foreign replacement during capture\n");
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_qt_launcher_atomic_cleanup_preserves_replacement_after_capture) {
+  bbp::OwnedFiroQtLauncher launcher =
+      bbp::OwnedFiroQtLauncher::Create("'/opt/firo/firo-qt' '-regtest'");
+  const std::filesystem::path launcher_path = launcher.path();
+  ScopedFileRemoval remove_replacement(launcher_path);
+  struct stat foreign_status{};
+  ScopedLauncherCleanupHook hook(
+      [&](bbp::FiroQtLauncherCleanupTestPhase phase,
+          const std::filesystem::path& public_path,
+          const std::optional<std::filesystem::path>& quarantine_path) {
+        if (phase != bbp::FiroQtLauncherCleanupTestPhase::kAfterAtomicCapture) {
+          return;
+        }
+        BOOST_REQUIRE(quarantine_path.has_value());
+        BOOST_TEST(!std::filesystem::exists(public_path));
+        BOOST_TEST(std::filesystem::exists(*quarantine_path));
+        WriteNewFile(public_path, "foreign replacement after capture\n");
+        BOOST_REQUIRE(lstat(public_path.c_str(), &foreign_status) == 0);
+      });
+
+  BOOST_CHECK(launcher.Cleanup() == bbp::FiroQtLauncherCleanupResult::kRemoved);
+  struct stat preserved_status{};
+  BOOST_REQUIRE(lstat(launcher_path.c_str(), &preserved_status) == 0);
+  BOOST_TEST(preserved_status.st_dev == foreign_status.st_dev);
+  BOOST_TEST(preserved_status.st_ino == foreign_status.st_ino);
+  BOOST_TEST(ReadFile(launcher_path) == "foreign replacement after capture\n");
+}
+
 BOOST_AUTO_TEST_CASE(firo_qt_launcher_destructor_removes_exact_owned_file) {
   std::filesystem::path launcher_path;
   {
@@ -186,8 +357,309 @@ BOOST_AUTO_TEST_CASE(firo_qt_launcher_destructor_removes_exact_owned_file) {
     launcher_path = launcher.path();
     BOOST_REQUIRE(std::filesystem::exists(launcher_path));
   }
-  struct stat status {};
+  struct stat status{};
   errno = 0;
   BOOST_TEST(lstat(launcher_path.c_str(), &status) == -1);
   BOOST_TEST(errno == ENOENT);
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_qt_launcher_service_binds_node_replaces_and_honors_cancellation) {
+  const std::string first_command = LauncherConnection(18444U).ShellCommand();
+  const std::string second_command = LauncherConnection(18445U).ShellCommand();
+  std::uint64_t inventory_generation = 1U;
+  bbp::OperatorConnectionCommand authoritative_connection =
+      LauncherConnection(18444U);
+  bbp::FiroQtLauncherService service([&](std::string_view, std::stop_token) {
+    return bbp::FiroQtLauncherAuthority{
+        .inventory_generation = inventory_generation,
+        .node_id = "firo-1",
+        .command = authoritative_connection,
+    };
+  });
+
+  BOOST_CHECK_THROW(
+      service.ReplaceFromReport(LauncherReport("firo-1", 18444U), "firo-2"),
+      std::runtime_error);
+  BOOST_CHECK_THROW(
+      service.ReplaceFromReport(LauncherReport("firo.1", 18444U), "firo.1"),
+      std::runtime_error);
+  boost::json::object unsafe_report = LauncherReport("firo-1", 18444U);
+  unsafe_report.at("operator_connection_command").as_object()["bearer_token"] =
+      "must-not-be-copied";
+  BOOST_CHECK_THROW(service.ReplaceFromReport(unsafe_report, "firo-1"),
+                    std::runtime_error);
+  boost::json::object oversized_report = LauncherReport("firo-1", 18444U);
+  bbp::OperatorConnectionCommand oversized_connection =
+      LauncherConnection(18444U);
+  oversized_connection.data_dir =
+      "/tmp/" + std::string(1024U * 1024U + 1U, 'x');
+  oversized_connection.arguments[1U] =
+      "-datadir=" + oversized_connection.data_dir.string();
+  SetLauncherConnection(&oversized_report, oversized_connection);
+  authoritative_connection = oversized_connection;
+  BOOST_CHECK_THROW(service.ReplaceFromReport(oversized_report, "firo-1"),
+                    std::runtime_error);
+  authoritative_connection = LauncherConnection(18444U);
+  boost::json::object foreign_data_report = LauncherReport("firo-1", 18444U);
+  bbp::OperatorConnectionCommand foreign_data_connection =
+      LauncherConnection(18444U);
+  foreign_data_connection.data_dir = "/tmp/foreign-operator/firo-qt";
+  foreign_data_connection.arguments[1U] =
+      "-datadir=" + foreign_data_connection.data_dir.string();
+  SetLauncherConnection(&foreign_data_report, foreign_data_connection);
+  BOOST_CHECK_THROW(service.ReplaceFromReport(foreign_data_report, "firo-1"),
+                    std::runtime_error);
+  boost::json::object foreign_executable_report =
+      LauncherReport("firo-1", 18444U);
+  bbp::OperatorConnectionCommand foreign_executable_connection =
+      LauncherConnection(18444U);
+  foreign_executable_connection.executable = "/tmp/foreign/firo-qt";
+  SetLauncherConnection(&foreign_executable_report,
+                        foreign_executable_connection);
+  BOOST_CHECK_THROW(
+      service.ReplaceFromReport(foreign_executable_report, "firo-1"),
+      std::runtime_error);
+  boost::json::object control_report = LauncherReport("firo-1", 18444U);
+  bbp::OperatorConnectionCommand control_connection =
+      LauncherConnection(18444U);
+  control_connection.data_dir = "/tmp/bad";
+  control_connection.data_dir += std::string(1U, '\x01');
+  control_connection.arguments[1U] =
+      "-datadir=" + control_connection.data_dir.string();
+  SetLauncherConnection(&control_report, control_connection);
+  authoritative_connection = control_connection;
+  BOOST_CHECK_THROW(service.ReplaceFromReport(control_report, "firo-1"),
+                    std::runtime_error);
+  authoritative_connection = LauncherConnection(18444U);
+  BOOST_TEST(!service.Snapshot().has_value());
+
+  const bbp::FiroQtLauncherSnapshot first =
+      service.ReplaceFromReport(LauncherReport("firo-1", 18444U), "firo-1");
+  BOOST_TEST(first.node_id == "firo-1");
+  BOOST_TEST(first.operator_command == first_command);
+  BOOST_TEST(std::filesystem::exists(first.launcher_path));
+
+  std::stop_source cancellation;
+  cancellation.request_stop();
+  BOOST_CHECK_THROW(
+      service.ReplaceFromReport(LauncherReport("firo-1", 18445U), "firo-1",
+                                cancellation.get_token()),
+      bbp::SimulationCancelled);
+  const std::optional<bbp::FiroQtLauncherSnapshot> after_cancellation =
+      service.Snapshot();
+  BOOST_REQUIRE(after_cancellation);
+  BOOST_TEST(after_cancellation->launcher_path == first.launcher_path);
+  BOOST_TEST(std::filesystem::exists(first.launcher_path));
+
+  ++inventory_generation;
+  authoritative_connection = LauncherConnection(18445U);
+  std::stop_source cleanup_cancellation;
+  std::vector<std::filesystem::path> cleanup_paths;
+  {
+    ScopedLauncherCleanupHook hook(
+        [&](bbp::FiroQtLauncherCleanupTestPhase phase,
+            const std::filesystem::path& public_path,
+            const std::optional<std::filesystem::path>&) {
+          if (phase !=
+              bbp::FiroQtLauncherCleanupTestPhase::kAfterPublicIdentityCheck) {
+            return;
+          }
+          cleanup_paths.push_back(public_path);
+          if (cleanup_paths.size() == 1U) {
+            cleanup_cancellation.request_stop();
+          }
+        });
+    BOOST_CHECK_THROW(
+        service.ReplaceFromReport(LauncherReport("firo-1", 18445U), "firo-1",
+                                  cleanup_cancellation.get_token()),
+        bbp::SimulationCancelled);
+  }
+  BOOST_REQUIRE(cleanup_paths.size() == 2U);
+  BOOST_TEST(!std::filesystem::exists(cleanup_paths[0U]));
+  BOOST_TEST(!std::filesystem::exists(cleanup_paths[1U]));
+  BOOST_TEST(!service.Snapshot().has_value());
+
+  const bbp::FiroQtLauncherSnapshot second =
+      service.ReplaceFromReport(LauncherReport("firo-1", 18445U), "firo-1");
+  BOOST_TEST(std::filesystem::exists(second.launcher_path));
+  BOOST_TEST(second.operator_command == second_command);
+  BOOST_CHECK(service.CloseAndCleanup() ==
+              bbp::FiroQtLauncherCleanupResult::kRemoved);
+  BOOST_TEST(!std::filesystem::exists(second.launcher_path));
+  BOOST_CHECK_THROW(
+      service.ReplaceFromReport(LauncherReport("firo-1", 18444U), "firo-1"),
+      std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_qt_launcher_service_clears_snapshot_after_quarantine_failure) {
+  std::uint64_t inventory_generation = 1U;
+  std::uint16_t authoritative_port = 18444U;
+  bbp::FiroQtLauncherService service([&](std::string_view, std::stop_token) {
+    return bbp::FiroQtLauncherAuthority{
+        .inventory_generation = inventory_generation,
+        .node_id = "firo-1",
+        .command = LauncherConnection(authoritative_port),
+    };
+  });
+  const bbp::FiroQtLauncherSnapshot first =
+      service.ReplaceFromReport(LauncherReport("firo-1", 18444U), "firo-1");
+  ++inventory_generation;
+  authoritative_port = 18445U;
+  std::optional<std::filesystem::path> quarantine_path;
+  bool injected = false;
+  {
+    ScopedLauncherCleanupHook hook(
+        [&](bbp::FiroQtLauncherCleanupTestPhase phase,
+            const std::filesystem::path&,
+            const std::optional<std::filesystem::path>& captured_path) {
+          if (phase !=
+                  bbp::FiroQtLauncherCleanupTestPhase::kAfterAtomicCapture ||
+              injected) {
+            return;
+          }
+          BOOST_REQUIRE(captured_path.has_value());
+          quarantine_path = captured_path;
+          injected = true;
+          throw std::runtime_error("injected post-capture cleanup failure");
+        });
+    BOOST_CHECK_THROW(
+        service.ReplaceFromReport(LauncherReport("firo-1", 18445U), "firo-1"),
+        std::runtime_error);
+  }
+
+  BOOST_TEST(injected);
+  BOOST_REQUIRE(quarantine_path.has_value());
+  BOOST_TEST(!std::filesystem::exists(first.launcher_path));
+  BOOST_TEST(std::filesystem::exists(*quarantine_path));
+  BOOST_TEST(!service.Snapshot().has_value());
+  BOOST_CHECK(service.CloseAndCleanup() ==
+              bbp::FiroQtLauncherCleanupResult::kRemoved);
+  BOOST_TEST(!std::filesystem::exists(*quarantine_path));
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_qt_launcher_service_close_attempts_pending_and_published_cleanup) {
+  std::uint64_t inventory_generation = 1U;
+  std::uint16_t authoritative_port = 18444U;
+  bbp::FiroQtLauncherService service([&](std::string_view, std::stop_token) {
+    return bbp::FiroQtLauncherAuthority{
+        .inventory_generation = inventory_generation,
+        .node_id = "firo-1",
+        .command = LauncherConnection(authoritative_port),
+    };
+  });
+  const bbp::FiroQtLauncherSnapshot first =
+      service.ReplaceFromReport(LauncherReport("firo-1", 18444U), "firo-1");
+  ++inventory_generation;
+  authoritative_port = 18445U;
+
+  std::vector<std::filesystem::path> failed_cleanup_paths;
+  {
+    ScopedLauncherCleanupHook hook(
+        [&](bbp::FiroQtLauncherCleanupTestPhase phase,
+            const std::filesystem::path& public_path,
+            const std::optional<std::filesystem::path>&) {
+          if (phase !=
+              bbp::FiroQtLauncherCleanupTestPhase::kAfterPublicIdentityCheck) {
+            return;
+          }
+          failed_cleanup_paths.push_back(public_path);
+          throw std::runtime_error("injected retained cleanup failure");
+        });
+    BOOST_CHECK_THROW(
+        service.ReplaceFromReport(LauncherReport("firo-1", 18445U), "firo-1"),
+        std::runtime_error);
+  }
+  BOOST_REQUIRE(failed_cleanup_paths.size() == 2U);
+  const std::filesystem::path candidate_path = failed_cleanup_paths[1U];
+  BOOST_TEST(failed_cleanup_paths[0U] == first.launcher_path);
+  BOOST_TEST(std::filesystem::exists(first.launcher_path));
+  BOOST_TEST(std::filesystem::exists(candidate_path));
+  BOOST_REQUIRE(service.Snapshot().has_value());
+
+  {
+    ScopedLauncherCleanupHook hook(
+        [&](bbp::FiroQtLauncherCleanupTestPhase phase,
+            const std::filesystem::path& public_path,
+            const std::optional<std::filesystem::path>&) {
+          if (phase == bbp::FiroQtLauncherCleanupTestPhase::
+                           kAfterPublicIdentityCheck &&
+              public_path == candidate_path) {
+            throw std::runtime_error("injected pending cleanup retry failure");
+          }
+        });
+    BOOST_CHECK_THROW(service.CloseAndCleanup(), std::runtime_error);
+  }
+  BOOST_TEST(!std::filesystem::exists(first.launcher_path));
+  BOOST_TEST(std::filesystem::exists(candidate_path));
+  BOOST_TEST(!service.Snapshot().has_value());
+  BOOST_CHECK(service.CloseAndCleanup() ==
+              bbp::FiroQtLauncherCleanupResult::kRemoved);
+  BOOST_TEST(!std::filesystem::exists(candidate_path));
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_qt_launcher_service_close_waits_while_snapshot_remains_prompt) {
+  using namespace std::chrono_literals;
+  std::uint64_t inventory_generation = 1U;
+  std::uint16_t authoritative_port = 18444U;
+  bbp::FiroQtLauncherService service([&](std::string_view, std::stop_token) {
+    return bbp::FiroQtLauncherAuthority{
+        .inventory_generation = inventory_generation,
+        .node_id = "firo-1",
+        .command = LauncherConnection(authoritative_port),
+    };
+  });
+  const bbp::FiroQtLauncherSnapshot first =
+      service.ReplaceFromReport(LauncherReport("firo-1", 18444U), "firo-1");
+  ++inventory_generation;
+  authoritative_port = 18445U;
+  std::promise<void> cleanup_entered;
+  std::future<void> cleanup_entered_future = cleanup_entered.get_future();
+  std::atomic_bool entered = false;
+  std::atomic_bool release = false;
+  ScopedLauncherCleanupHook hook(
+      [&](bbp::FiroQtLauncherCleanupTestPhase phase,
+          const std::filesystem::path&,
+          const std::optional<std::filesystem::path>&) {
+        if (phase !=
+            bbp::FiroQtLauncherCleanupTestPhase::kAfterPublicIdentityCheck) {
+          return;
+        }
+        if (!entered.exchange(true, std::memory_order_acq_rel)) {
+          cleanup_entered.set_value();
+        }
+        release.wait(false, std::memory_order_acquire);
+      });
+
+  std::future<bbp::FiroQtLauncherSnapshot> replacement =
+      std::async(std::launch::async, [&] {
+        return service.ReplaceFromReport(LauncherReport("firo-1", 18445U),
+                                         "firo-1");
+      });
+  AtomicReleaseGuard release_on_failure(&release);
+  BOOST_REQUIRE(cleanup_entered_future.wait_for(2s) ==
+                std::future_status::ready);
+
+  std::future<std::optional<bbp::FiroQtLauncherSnapshot>> snapshot =
+      std::async(std::launch::async, [&] { return service.Snapshot(); });
+  BOOST_REQUIRE(snapshot.wait_for(200ms) == std::future_status::ready);
+  const std::optional<bbp::FiroQtLauncherSnapshot> during_replacement =
+      snapshot.get();
+  BOOST_REQUIRE(during_replacement);
+  BOOST_TEST(during_replacement->launcher_path == first.launcher_path);
+
+  std::future<bbp::FiroQtLauncherCleanupResult> close =
+      std::async(std::launch::async, [&] { return service.CloseAndCleanup(); });
+  BOOST_CHECK(close.wait_for(100ms) == std::future_status::timeout);
+  release.store(true, std::memory_order_release);
+  release.notify_all();
+
+  const bbp::FiroQtLauncherSnapshot second = replacement.get();
+  BOOST_CHECK(close.get() == bbp::FiroQtLauncherCleanupResult::kRemoved);
+  BOOST_TEST(!std::filesystem::exists(first.launcher_path));
+  BOOST_TEST(!std::filesystem::exists(second.launcher_path));
+  BOOST_TEST(!service.Snapshot().has_value());
 }
