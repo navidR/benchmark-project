@@ -89,6 +89,7 @@ struct TuiState {
   std::filesystem::path firo_qt_launcher_path;
   bool firo_qt_launcher_dialog_open = false;
   std::string firo_qt_launcher_command;
+  bool mcp_connection_dialog_open = false;
   std::optional<PendingConfirmation> pending_confirmation;
   TuiExitConfirmation exit_confirmation;
 };
@@ -1578,12 +1579,70 @@ void DrawFiroQtLauncherDialog(int rows, int cols,
           COLOR_PAIR(kColorMuted));
 }
 
+void DrawMcpConnectionDialog(int rows, int cols,
+                             const TuiMcpConnectionInfo& connection) {
+  if (rows < 18 || cols < 48 || connection.endpoint.empty() ||
+      connection.token_file.empty() || connection.client_config_file.empty()) {
+    return;
+  }
+  const int popup_cols = std::min(cols - 4, 100);
+  const int content_width = popup_cols - 4;
+  const std::string token_file = connection.token_file.string();
+  const std::string client_config_file = connection.client_config_file.string();
+  const std::size_t desired_rows =
+      13U + WrappedLineCount(connection.endpoint, content_width) +
+      WrappedLineCount(token_file, content_width) +
+      WrappedLineCount(client_config_file, content_width);
+  if (desired_rows > static_cast<std::size_t>(rows - 2)) {
+    return;
+  }
+  const int popup_rows = static_cast<int>(desired_rows);
+  const int top = (rows - popup_rows) / 2;
+  const int left = (cols - popup_cols) / 2;
+  for (int row = 0; row < popup_rows; ++row) {
+    mvhline(top + row, left, ' ', popup_cols);
+  }
+  mvhline(top, left + 1, ACS_HLINE, popup_cols - 2);
+  mvhline(top + popup_rows - 1, left + 1, ACS_HLINE, popup_cols - 2);
+  mvvline(top + 1, left, ACS_VLINE, popup_rows - 2);
+  mvvline(top + 1, left + popup_cols - 1, ACS_VLINE, popup_rows - 2);
+  mvaddch(top, left, ACS_ULCORNER);
+  mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
+  mvaddch(top + popup_rows - 1, left, ACS_LLCORNER);
+  mvaddch(top + popup_rows - 1, left + popup_cols - 1, ACS_LRCORNER);
+
+  int y = top + 1;
+  AddText(y++, left + 2, content_width, "MCP connection",
+          A_BOLD | COLOR_PAIR(kColorTitle));
+  AddText(y++, left + 2, content_width,
+          "Connect Codex, OpenCode, or another MCP client to this BBP "
+          "process.");
+  AddText(y++, left + 2, content_width, "Endpoint:", A_BOLD);
+  DrawWrappedText(&y, left + 2, content_width, connection.endpoint);
+  AddText(y++, left + 2, content_width, "Authentication header:", A_BOLD);
+  AddText(y++, left + 2, content_width,
+          "Authorization: Bearer <contents of token file>");
+  AddText(y++, left + 2, content_width, "Private token file:", A_BOLD);
+  DrawWrappedText(&y, left + 2, content_width, token_file);
+  AddText(y++, left + 2, content_width,
+          "Private client configuration:", A_BOLD);
+  DrawWrappedText(&y, left + 2, content_width, client_config_file);
+  AddText(y++, left + 2, content_width, "Codex entry: codex_config_toml");
+  AddText(y++, left + 2, content_width, "OpenCode entry: opencode_config");
+  AddText(y++, left + 2, content_width,
+          "Credential values are not displayed in the terminal.",
+          COLOR_PAIR(kColorWarning));
+  AddText(y, left + 2, content_width, "Enter, Esc, or i dismisses this pane.",
+          COLOR_PAIR(kColorMuted));
+}
+
 void DrawModalEpilogue(
     int rows, int cols, bool command_error_open, std::string_view command_error,
     bool command_palette_open, std::string_view command_input,
     std::string_view command_input_error, bool firo_qt_launcher_dialog_open,
     const std::filesystem::path& firo_qt_launcher_path,
-    std::string_view firo_qt_launcher_command,
+    std::string_view firo_qt_launcher_command, bool mcp_connection_dialog_open,
+    const TuiMcpConnectionInfo& mcp_connection,
     const std::optional<PendingConfirmation>& pending_confirmation,
     const TuiExitConfirmation& exit_confirmation) {
   if (command_error_open) {
@@ -1598,6 +1657,9 @@ void DrawModalEpilogue(
   if (firo_qt_launcher_dialog_open) {
     DrawFiroQtLauncherDialog(rows, cols, firo_qt_launcher_path,
                              firo_qt_launcher_command);
+  }
+  if (mcp_connection_dialog_open) {
+    DrawMcpConnectionDialog(rows, cols, mcp_connection);
   }
   if (exit_confirmation.is_open()) {
     DrawExitConfirmationPopup(rows, cols);
@@ -2191,7 +2253,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
-            "Arrows select. l node log. Esc asks to exit; q exits.",
+            "MCP [i]. Arrows select. l node log. Esc asks to exit; q exits.",
             COLOR_PAIR(kColorMuted));
     return;
   }
@@ -2319,7 +2381,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
-            "Arrows select. l node log. Esc asks to exit; q exits.",
+            "MCP [i]. Arrows select. l node log. Esc asks to exit; q exits.",
             COLOR_PAIR(kColorMuted));
     return;
   }
@@ -2512,9 +2574,9 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   DrawNetworkRulePane(content_bottom, cols, network_rule_pane);
   DrawNodeFilePane(content_bottom, cols, node_file_pane);
   DrawHorizontalLine(rows - 2);
-  std::string footer;
+  std::string footer = "MCP [i]. ";
   if (!command_status.empty()) {
-    footer = std::string(command_status) + " | ";
+    footer += std::string(command_status) + " | ";
   }
   if (node_log_pane.IsOpen()) {
     footer +=
@@ -2552,7 +2614,8 @@ void DrawSummary(
     bool command_palette_open, std::string_view command_input,
     std::string_view command_input_error, bool firo_qt_launcher_dialog_open,
     const std::filesystem::path& firo_qt_launcher_path,
-    std::string_view firo_qt_launcher_command,
+    std::string_view firo_qt_launcher_command, bool mcp_connection_dialog_open,
+    const TuiMcpConnectionInfo& mcp_connection,
     const std::optional<PendingConfirmation>& pending_confirmation,
     const TuiExitConfirmation& exit_confirmation,
     SimulatorLogPane* simulator_log_pane) {
@@ -2566,12 +2629,14 @@ void DrawSummary(
   DrawModalEpilogue(rows, cols, command_error_open, command_error,
                     command_palette_open, command_input, command_input_error,
                     firo_qt_launcher_dialog_open, firo_qt_launcher_path,
-                    firo_qt_launcher_command, pending_confirmation,
-                    exit_confirmation);
+                    firo_qt_launcher_command, mcp_connection_dialog_open,
+                    mcp_connection, pending_confirmation, exit_confirmation);
   refresh();
 }
 
-void DrawEmptySummary(const TuiExitConfirmation& exit_confirmation) {
+void DrawEmptySummary(bool mcp_connection_dialog_open,
+                      const TuiMcpConnectionInfo& mcp_connection,
+                      const TuiExitConfirmation& exit_confirmation) {
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -2582,11 +2647,11 @@ void DrawEmptySummary(const TuiExitConfirmation& exit_confirmation) {
   AddText(3, 0, cols, "No active run.", A_BOLD);
   AddText(5, 0, cols, "Waiting for a benchmark run.", COLOR_PAIR(kColorMuted));
   DrawHorizontalLine(rows - 2);
-  AddText(rows - 1, 0, cols, "Esc asks to exit; q exits.",
+  AddText(rows - 1, 0, cols, "MCP [i]. Esc asks to exit; q exits.",
           COLOR_PAIR(kColorMuted));
   DrawModalEpilogue(rows, cols, false, "", false, "", "", false,
-                    std::filesystem::path{}, "", std::nullopt,
-                    exit_confirmation);
+                    std::filesystem::path{}, "", mcp_connection_dialog_open,
+                    mcp_connection, std::nullopt, exit_confirmation);
   refresh();
 }
 
@@ -3021,6 +3086,14 @@ bool HandleFiroQtLauncherDialogInput(int ch, TuiState* state) {
   return ch != ERR;
 }
 
+bool HandleMcpConnectionDialogInput(int ch, TuiState* state) {
+  if (ch == '\n' || ch == KEY_ENTER || ch == 27 || ch == 'i' || ch == 'I') {
+    state->mcp_connection_dialog_open = false;
+    return true;
+  }
+  return ch != ERR;
+}
+
 bool HandleSimulatorLogInput(int ch, TuiState* state) {
   if (state->view == TuiView::kMetrics || state->node_log_pane.IsOpen() ||
       state->peer_list_pane.IsOpen() || state->network_rule_pane.IsOpen() ||
@@ -3054,6 +3127,9 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
     return state->exit_confirmation.HandleInput(ch) !=
            TuiExitConfirmationResult::kIgnored;
   }
+  if (state->mcp_connection_dialog_open) {
+    return HandleMcpConnectionDialogInput(ch, state);
+  }
   if (state->firo_qt_launcher_dialog_open) {
     return HandleFiroQtLauncherDialogInput(ch, state);
   }
@@ -3074,6 +3150,11 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
 
   if (state->exit_confirmation.HandleInput(ch) !=
       TuiExitConfirmationResult::kIgnored) {
+    return true;
+  }
+
+  if (ch == 'i' || ch == 'I') {
+    state->mcp_connection_dialog_open = true;
     return true;
   }
 
@@ -3365,6 +3446,7 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
 
 int RunTuiReport(const std::filesystem::path& run_root, bool once,
                  std::uint32_t refresh_ms,
+                 const TuiMcpConnectionInfo& mcp_connection,
                  SimulationCommandQueue* command_queue,
                  std::stop_token stop_token) {
   std::shared_ptr<SimulationCommandQueue> shared_command_queue;
@@ -3381,11 +3463,13 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       .publication_mutex = {},
   };
   return RunTuiReport([snapshot]() { return snapshot; }, once, refresh_ms,
-                      stop_token);
+                      mcp_connection, stop_token);
 }
 
 int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
-                 std::uint32_t refresh_ms, std::stop_token stop_token) {
+                 std::uint32_t refresh_ms,
+                 const TuiMcpConnectionInfo& mcp_connection,
+                 std::stop_token stop_token) {
   if (!snapshot_provider) {
     throw std::invalid_argument("TUI run snapshot provider is empty");
   }
@@ -3489,10 +3573,12 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
                   state.command_palette_open, state.command_input,
                   state.command_input_error, state.firo_qt_launcher_dialog_open,
                   state.firo_qt_launcher_path, state.firo_qt_launcher_command,
+                  state.mcp_connection_dialog_open, mcp_connection,
                   state.pending_confirmation, state.exit_confirmation,
                   &state.simulator_log_pane);
     } else {
-      DrawEmptySummary(state.exit_confirmation);
+      DrawEmptySummary(state.mcp_connection_dialog_open, mcp_connection,
+                       state.exit_confirmation);
     }
     if (once) {
       return FinishTui(&state, error.empty() ? 0 : 1);

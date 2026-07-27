@@ -541,6 +541,55 @@ void RequireNotContains(std::string_view text, std::string_view unexpected,
   }
 }
 
+std::string McpEndpointFromClientConfig(std::string_view client_config,
+                                        std::string_view context) {
+  const boost::json::value decoded = boost::json::parse(client_config);
+  if (!decoded.is_object()) {
+    throw std::runtime_error(std::string(context) +
+                             " client configuration is not an object");
+  }
+  const boost::json::value* endpoint =
+      decoded.as_object().if_contains("endpoint");
+  if (endpoint == nullptr || !endpoint->is_string()) {
+    throw std::runtime_error(std::string(context) +
+                             " client configuration has no endpoint");
+  }
+  return std::string(endpoint->as_string());
+}
+
+std::string McpTokenValue(std::string token, std::string_view context) {
+  if (!token.empty() && token.back() == '\n') {
+    token.pop_back();
+  }
+  if (token.empty()) {
+    throw std::runtime_error(std::string(context) + " token is empty");
+  }
+  return token;
+}
+
+std::string OpenMcpConnectionPane(const PtyProcess& process,
+                                  std::string_view activation_key,
+                                  std::string_view endpoint,
+                                  const std::filesystem::path& token_path,
+                                  const std::filesystem::path& client_path,
+                                  std::string_view token,
+                                  std::string_view context) {
+  process.Write(activation_key);
+  const std::string output =
+      process.ReadUntil("Enter, Esc, or i dismisses this pane.", 3s, context);
+  RequireContains(output, "MCP connection", context);
+  RequireContains(output, endpoint, context);
+  RequireContains(output, "Authorization: Bearer <contents of token file>",
+                  context);
+  RequireContains(output, token_path.string(), context);
+  RequireContains(output, client_path.string(), context);
+  RequireContains(output, "Codex entry: codex_config_toml", context);
+  RequireContains(output, "OpenCode entry: opencode_config", context);
+  RequireContains(output, "Credential values are not displayed", context);
+  RequireNotContains(output, token, context);
+  return output;
+}
+
 void RequireExitZero(PtyProcess* process, std::string_view context) {
   const int result = process->Wait();
   if (result != 0) {
@@ -1233,6 +1282,10 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     initial +=
         process.ReadUntil("No active run.", 3s, "empty control-plane state");
   }
+  if (initial.find("MCP [i].") == std::string::npos) {
+    initial += process.ReadUntil("MCP [i].", 3s,
+                                 "empty control-plane connection shortcut");
+  }
   const std::string client =
       WaitForFileText(client_path, "\"codex_config_toml\"", 5s);
   const std::string token = ReadFile(token_path);
@@ -1252,6 +1305,10 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
                   "empty control-plane Codex configuration");
   RequireContains(client, "\"opencode_config\"",
                   "empty control-plane OpenCode configuration");
+  const std::string endpoint =
+      McpEndpointFromClientConfig(client, "empty control-plane MCP connection");
+  const std::string token_value =
+      McpTokenValue(token, "empty control-plane MCP connection");
 
   if (std::filesystem::exists(run_root) ||
       std::filesystem::exists(events_path)) {
@@ -1261,6 +1318,36 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   if (!process.Running()) {
     throw std::runtime_error("empty control plane exited without a request");
   }
+
+  static_cast<void>(OpenMcpConnectionPane(
+      process, "i", endpoint, token_path, client_path, token_value,
+      "empty control-plane MCP connection pane"));
+  const McpTestSession session = ConnectMcpTestSession(mcp_path);
+  if (session.session_id.empty()) {
+    throw std::runtime_error(
+        "MCP session did not initialize while the connection pane was open");
+  }
+  process.Resize(32, 120);
+  static_cast<void>(process.ReadUntil(
+      "MCP connection", 3s,
+      "empty control-plane MCP pane after initialized handshake"));
+  process.Write("\n");
+  static_cast<void>(process.ReadFor(250ms));
+
+  static_cast<void>(OpenMcpConnectionPane(
+      process, "I", endpoint, token_path, client_path, token_value,
+      "uppercase empty control-plane MCP connection pane"));
+  process.Write("\x1b");
+  static_cast<void>(process.ReadFor(250ms));
+  if (!process.Running()) {
+    throw std::runtime_error("Esc dismissal stopped the empty control plane");
+  }
+
+  static_cast<void>(OpenMcpConnectionPane(
+      process, "i", endpoint, token_path, client_path, token_value,
+      "repeat empty control-plane MCP connection pane"));
+  process.Write("I");
+  static_cast<void>(process.ReadFor(250ms));
 
   process.Write("c");
   static_cast<void>(process.ReadUntil("add-nodes <chain> <count> [binary]", 3s,
@@ -1637,10 +1724,15 @@ void CheckRetainedMcpLifecycle(const std::filesystem::path& command,
   PtyProcess process(command,
                      {"--run", run_root.string(), "--refresh-ms", "50"}, 30,
                      120, home_directory);
-  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
-                                      "retained MCP TUI"));
+  std::string initial = process.ReadUntil("Blockchain Benchmark Project TUI",
+                                          5s, "retained MCP TUI");
+  if (initial.find("MCP [i].") == std::string::npos) {
+    initial +=
+        process.ReadUntil("MCP [i].", 3s, "retained MCP connection shortcut");
+  }
   const std::string client =
       WaitForFileText(client_path, "\"codex_config_toml\"", 5s);
+  const std::string token = ReadFile(token_path);
   RequireContains(client, "\"run_id\":\"tui-fixture\"",
                   "retained MCP run identity");
   RequirePrivateMcpPath(mcp_path, S_IFDIR, 0700);
@@ -1648,6 +1740,19 @@ void CheckRetainedMcpLifecycle(const std::filesystem::path& command,
   RequirePrivateMcpPath(client_path, S_IFREG, 0600);
   if (!process.Running()) {
     throw std::runtime_error("retained TUI exited while MCP was published");
+  }
+
+  const std::string endpoint =
+      McpEndpointFromClientConfig(client, "retained MCP connection");
+  const std::string token_value =
+      McpTokenValue(token, "retained MCP connection");
+  static_cast<void>(OpenMcpConnectionPane(process, "i", endpoint, token_path,
+                                          client_path, token_value,
+                                          "retained MCP connection pane"));
+  process.Write("\x1b");
+  static_cast<void>(process.ReadFor(250ms));
+  if (!process.Running()) {
+    throw std::runtime_error("retained MCP pane dismissal exited the TUI");
   }
 
   process.Write("\x1b");

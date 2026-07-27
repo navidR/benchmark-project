@@ -25323,6 +25323,11 @@ int RunEditorApplication(Options options,
     BBP_LOG(info) << "MCP endpoint listening at " << publication.endpoint
                   << "; client_config="
                   << publication.client_config_file.string();
+    const TuiMcpConnectionInfo mcp_connection{
+        .endpoint = publication.endpoint,
+        .token_file = publication.token_file,
+        .client_config_file = publication.client_config_file,
+    };
 
     std::shared_ptr<EditorRunContext> initial_run;
     if (options.initial_run_requested) {
@@ -25339,7 +25344,7 @@ int RunEditorApplication(Options options,
     } else {
       SetConsoleLoggingEnabled(false);
       result = RunTuiReport([&] { return TuiSnapshot(run_controller); }, false,
-                            options.tui_refresh_ms,
+                            options.tui_refresh_ms, mcp_connection,
                             application_stop_source.get_token());
       SetConsoleLoggingEnabled(true);
     }
@@ -25459,9 +25464,15 @@ int RunRetainedTuiWithMcp(const Options& cli_options,
   int result = 1;
   try {
     mcp_endpoint.Start();
+    const McpEndpointPublication publication = mcp_endpoint.publication();
+    const TuiMcpConnectionInfo mcp_connection{
+        .endpoint = publication.endpoint,
+        .token_file = publication.token_file,
+        .client_config_file = publication.client_config_file,
+    };
     result =
         RunTuiReport(run_root, cli_options.tui_once, cli_options.tui_refresh_ms,
-                     nullptr, signal_monitor.GetToken());
+                     mcp_connection, nullptr, signal_monitor.GetToken());
   } catch (...) {
     application_failure = std::current_exception();
   }
