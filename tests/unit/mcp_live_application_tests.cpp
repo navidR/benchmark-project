@@ -2367,24 +2367,39 @@ BOOST_AUTO_TEST_CASE(
                           std::stop_token stop_token) {
     BOOST_CHECK(kind == McpOperationKind::kAddWallet ||
                 kind == McpOperationKind::kRemoveWallet);
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
     if (kind == McpOperationKind::kRemoveWallet) {
-      BOOST_TEST(arguments.at("node_id").as_string() == "firo-1");
+      boost::json::array node_ids;
+      if (const boost::json::value* plural =
+              arguments.if_contains("node_ids")) {
+        node_ids = plural->as_array();
+        BOOST_TEST(arguments.at("timeout_sec").as_uint64() == 30U);
+      } else {
+        node_ids.emplace_back(arguments.at("node_id"));
+      }
+      boost::json::array wallets;
+      for (std::size_t index = 0U; index < node_ids.size(); ++index) {
+        wallets.emplace_back(boost::json::object{
+            {"wallet_index", index + 1U},
+            {"node", index + 1U},
+            {"node_id", node_ids[index]},
+            {"mode", "public"},
+            {"address", "wallet-address-" + std::to_string(index + 1U)},
+            {"funding_address",
+             "wallet-address-" + std::to_string(index + 1U)}});
+      }
       return boost::json::object{
           {"added_node_ids", boost::json::array{}},
           {"removed_node_ids", boost::json::array{}},
-          {"affected_node_ids", boost::json::array{"firo-1"}},
+          {"affected_node_ids", node_ids},
           {"action", "wallet.remove"},
           {"state", "removed"},
           {"unchanged", false},
-          {"wallets", boost::json::array{boost::json::object{
-                          {"wallet_index", 1U},
-                          {"node", 1U},
-                          {"node_id", "firo-1"},
-                          {"mode", "public"},
-                          {"address", "wallet-address"},
-                          {"funding_address", "wallet-address"}}}},
+          {"wallets", std::move(wallets)},
           {"inventory_generation", 1U},
-          {"final_node_count", 1U},
+          {"final_node_count", node_ids.size()},
           {"wallet_generation", 3U},
           {"final_wallet_count", 0U},
           {"final_wallet_node_count", 0U},
@@ -2392,9 +2407,6 @@ BOOST_AUTO_TEST_CASE(
     }
     BOOST_TEST(arguments.at("count").as_uint64() == 1U);
     BOOST_TEST(arguments.at("mode").as_string() == "public");
-    if (stop_token.stop_requested()) {
-      throw McpOperationCancelled();
-    }
     const boost::json::value* node_id = arguments.if_contains("node_id");
     if (node_id != nullptr && node_id->as_string() == "firo-cancel") {
       throw SimulationCancelled();
@@ -2445,10 +2457,11 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(result.at("wallet_generation").as_uint64() == 2U);
   BOOST_TEST(result.at("wallets").as_array().size() == 1U);
 
-  const boost::json::object removed =
-      Invoke(&dispatcher, "wallet.remove",
-             boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "firo-1"}});
+  const boost::json::object removed = Invoke(
+      &dispatcher, "wallet.remove",
+      boost::json::object{{"run_id", "live-application"},
+                          {"node_ids", boost::json::array{"firo-1", "firo-2"}},
+                          {"timeout_sec", 30U}});
   const boost::json::object removed_terminal =
       WaitForTerminal(&dispatcher, removed);
   BOOST_TEST(removed_terminal.at("state").as_string() == "succeeded");
@@ -2457,7 +2470,17 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(removed_result.at("result_family").as_string() == "mutation");
   BOOST_TEST(removed_result.at("action").as_string() == "wallet.remove");
   BOOST_TEST(removed_result.at("state").as_string() == "removed");
+  const boost::json::array removed_wallet_nodes{"firo-1", "firo-2"};
+  BOOST_TEST(removed_result.at("affected_node_ids").as_array() ==
+             removed_wallet_nodes);
+  BOOST_TEST(removed_result.at("wallets").as_array().size() == 2U);
   BOOST_TEST(removed_result.at("final_wallet_count").as_uint64() == 0U);
+
+  const boost::json::object legacy_removed = WaitForTerminal(
+      &dispatcher, Invoke(&dispatcher, "wallet.remove",
+                          boost::json::object{{"run_id", "live-application"},
+                                              {"node_id", "firo-1"}}));
+  BOOST_TEST(legacy_removed.at("state").as_string() == "succeeded");
 
   const boost::json::object created = Invoke(
       &dispatcher, "wallet.add",
@@ -2828,6 +2851,318 @@ BOOST_AUTO_TEST_CASE(mcp_live_role_assign_rejects_delegated_schema_overflow) {
             {"final_wallet_node_count", 1U},
         };
       });
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_live_role_remove_delegates_one_typed_batch_and_normalizes_results) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  bool stop_requested = false;
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = std::make_shared<SimulationCommandQueue>(),
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [&stop_requested] { stop_requested = true; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kRemoveRole) != supported.end());
+
+  std::size_t service_calls = 0U;
+  auto service = std::make_shared<McpLiveRoleService>();
+  service->operation = [&service_calls](McpOperationKind kind,
+                                        const boost::json::object& arguments,
+                                        std::stop_token stop_token) {
+    ++service_calls;
+    BOOST_TEST(arguments.at("run_id").as_string() == "live-application");
+    BOOST_TEST(arguments.if_contains("roles") == nullptr);
+    BOOST_TEST(arguments.if_contains("count") == nullptr);
+    BOOST_TEST(arguments.at("timeout_sec").as_uint64() == 45U);
+    const boost::json::array& node_ids = arguments.at("node_ids").as_array();
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    if (node_ids.front().as_string() == "firo-cancel") {
+      throw SimulationCancelled();
+    }
+
+    if (kind == McpOperationKind::kRemoveWallet) {
+      boost::json::array wallets;
+      for (std::size_t index = 0U; index < node_ids.size(); ++index) {
+        wallets.emplace_back(boost::json::object{
+            {"wallet_index", index + 1U},
+            {"node", index + 1U},
+            {"node_id", node_ids[index]},
+            {"mode", index == 0U ? "public" : "private"},
+            {"address", "wallet-address-" + std::to_string(index + 1U)},
+            {"funding_address",
+             "funding-address-" + std::to_string(index + 1U)}});
+      }
+      return boost::json::object{
+          {"added_node_ids", boost::json::array{}},
+          {"removed_node_ids", boost::json::array{}},
+          {"affected_node_ids", node_ids},
+          {"action", "wallet.remove"},
+          {"state", "removed"},
+          {"unchanged", false},
+          {"wallets", std::move(wallets)},
+          {"inventory_generation", 4U},
+          {"final_node_count", 2U},
+          {"wallet_generation", 12U},
+          {"final_wallet_count", 0U},
+          {"final_wallet_node_count", 0U},
+      };
+    }
+    if (kind == McpOperationKind::kRemoveMiner) {
+      return boost::json::object{
+          {"node_ids", node_ids},
+          {"assigned_roles", boost::json::array{}},
+          {"removed_roles", boost::json::array{"miner"}},
+          {"action", "miner.remove"},
+          {"state", "removed"},
+          {"created_node_ids", boost::json::array{}},
+          {"role_generation", 13U},
+          {"final_miner_count", 0U},
+          {"inventory_generation", 4U},
+          {"final_node_count", 2U},
+      };
+    }
+    BOOST_REQUIRE(kind == McpOperationKind::kRemoveMasternode);
+    boost::json::array masternodes;
+    for (std::size_t index = 0U; index < node_ids.size(); ++index) {
+      boost::json::object identity{
+          {"node", index + 1U},
+          {"node_id", node_ids[index]},
+          {"funding_wallet_node_id", "firo-wallet"},
+          {"pro_tx_hash", "protx-" + std::to_string(index + 1U)},
+          {"service", "10.77.0.2:18168"},
+          {"collateral_address", "collateral"},
+          {"owner_address", "owner"},
+          {"operator_public_key", "operator-public"},
+          {"voting_address", "voting"},
+          {"payout_address", "payout"},
+          {"collateral_hash", "collateral-hash"},
+          {"collateral_index", index},
+          {"state", "REVOKED"},
+          {"status", "revoked"},
+      };
+      if (node_ids.front().as_string() == "firo-secret") {
+        identity["operator_secret_key"] = "delegated-secret";
+      }
+      masternodes.emplace_back(std::move(identity));
+    }
+    return boost::json::object{
+        {"node_ids", node_ids},
+        {"assigned_roles", boost::json::array{}},
+        {"removed_roles", boost::json::array{"masternode"}},
+        {"action", "masternode.remove"},
+        {"state", "removed"},
+        {"created_node_ids", boost::json::array{}},
+        {"role_generation", 14U},
+        {"final_masternode_count", 0U},
+        {"masternodes", std::move(masternodes)},
+        {"inventory_generation", 4U},
+        {"final_node_count", 2U},
+    };
+  };
+  application.SetRoleService(service);
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const auto remove = [&](boost::json::array node_ids, std::string_view role) {
+    return WaitForTerminal(
+        &dispatcher,
+        Invoke(&dispatcher, "role.remove",
+               boost::json::object{{"run_id", "live-application"},
+                                   {"node_ids", std::move(node_ids)},
+                                   {"roles", boost::json::array{role}},
+                                   {"timeout_sec", 45U}}));
+  };
+  const boost::json::array two_nodes{"_firo-1", "-firo-2"};
+
+  const boost::json::object wallet = remove(two_nodes, "wallet");
+  BOOST_TEST(wallet.at("state").as_string() == "succeeded");
+  const boost::json::object& wallet_result =
+      wallet.at("terminal_result").as_object();
+  BOOST_TEST(wallet_result.at("result_family").as_string() == "role_mutation");
+  BOOST_TEST(wallet_result.at("action").as_string() == "role.remove");
+  BOOST_TEST(wallet_result.at("state").as_string() == "removed");
+  BOOST_TEST(wallet_result.at("node_ids").as_array() == two_nodes);
+  BOOST_TEST(wallet_result.at("assigned_roles").as_array().empty());
+  BOOST_TEST(wallet_result.at("removed_roles").as_array() ==
+             boost::json::array{"wallet"});
+  BOOST_TEST(wallet_result.at("wallets").as_array().size() == 2U);
+  BOOST_TEST(wallet_result.at("final_wallet_count").as_uint64() == 0U);
+
+  const boost::json::object miner = remove(two_nodes, "miner");
+  const boost::json::object& miner_result =
+      miner.at("terminal_result").as_object();
+  BOOST_TEST(miner.at("state").as_string() == "succeeded");
+  BOOST_TEST(miner_result.at("action").as_string() == "role.remove");
+  BOOST_TEST(miner_result.at("removed_roles").as_array() ==
+             boost::json::array{"miner"});
+  BOOST_TEST(miner_result.at("final_miner_count").as_uint64() == 0U);
+  BOOST_TEST(miner_result.at("created_node_ids").as_array().empty());
+
+  const boost::json::object masternode = remove(two_nodes, "masternode");
+  const boost::json::object& masternode_result =
+      masternode.at("terminal_result").as_object();
+  BOOST_TEST(masternode.at("state").as_string() == "succeeded");
+  BOOST_TEST(masternode_result.at("action").as_string() == "role.remove");
+  BOOST_TEST(masternode_result.at("removed_roles").as_array() ==
+             boost::json::array{"masternode"});
+  BOOST_TEST(masternode_result.at("final_masternode_count").as_uint64() == 0U);
+  BOOST_TEST(masternode_result.at("masternodes").as_array().size() == 2U);
+  BOOST_TEST(
+      boost::json::serialize(masternode_result).find("operator_secret") ==
+      std::string::npos);
+
+  const boost::json::object cancelled =
+      remove(boost::json::array{"firo-cancel"}, "miner");
+  BOOST_TEST(cancelled.at("state").as_string() == "cancelled");
+  BOOST_TEST(service_calls == 4U);
+  BOOST_TEST(stop_requested == false);
+
+  BOOST_CHECK_THROW(
+      Invoke(&dispatcher, "role.remove",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"roles", boost::json::array{"base"}}}),
+      std::invalid_argument);
+  BOOST_CHECK_THROW(
+      Invoke(&dispatcher, "role.remove",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"node_ids", boost::json::array{"firo-1"}},
+                 {"roles", boost::json::array{"wallet", "miner"}}}),
+      std::invalid_argument);
+  BOOST_TEST(service_calls == 4U);
+
+  const boost::json::object secret_rejected =
+      remove(boost::json::array{"firo-secret"}, "masternode");
+  BOOST_TEST(secret_rejected.at("state").as_string() == "failed");
+  BOOST_TEST(
+      secret_rejected.at("terminal_error").as_object().at("code").as_string() ==
+      "role_remove_outcome_unconfirmed");
+  BOOST_TEST(boost::json::serialize(secret_rejected).find("delegated-secret") ==
+             std::string::npos);
+  BOOST_TEST(service_calls == 5U);
+  BOOST_TEST(stop_requested);
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_live_role_remove_rejects_impossible_delegated_evidence) {
+  using RoleOperation = decltype(McpLiveRoleService{}.operation);
+  const auto reject_delegated = [](std::string_view role,
+                                   RoleOperation operation) {
+    LiveApplicationDirectory temporary;
+    const auto options =
+        std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+    bool stop_requested = false;
+    McpLiveApplication application(McpLiveApplication::Config{
+        .run_id = "live-application",
+        .run_root = temporary.path(),
+        .retained_run = std::nullopt,
+        .options = options,
+        .command_queue = std::make_shared<SimulationCommandQueue>(),
+        .node_inventory_snapshot =
+            [options] { return InitialInventory(*options); },
+        .publication_mutex = {},
+        .request_run_stop = [&stop_requested] { stop_requested = true; },
+        .run_started = {},
+        .run_stopping = {},
+        .run_stopped = {},
+        .publish_evidence = {},
+        .close_run_subscriptions = {}});
+    auto service = std::make_shared<McpLiveRoleService>();
+    service->operation = std::move(operation);
+    application.SetRoleService(service);
+    application.MarkRunStarted();
+    McpDispatcher dispatcher({}, application.OperationFactory(),
+                             application.ResourceReader());
+    dispatcher.SessionHandler()("live-session", true, {});
+
+    const boost::json::object terminal = WaitForTerminal(
+        &dispatcher,
+        Invoke(&dispatcher, "role.remove",
+               boost::json::object{{"run_id", "live-application"},
+                                   {"node_ids", boost::json::array{"firo-1"}},
+                                   {"roles", boost::json::array{role}}}));
+    BOOST_TEST(terminal.at("state").as_string() == "failed");
+    BOOST_TEST(
+        terminal.at("terminal_error").as_object().at("code").as_string() ==
+        "role_remove_outcome_unconfirmed");
+    BOOST_TEST(stop_requested);
+    dispatcher.Shutdown();
+    application.Shutdown();
+  };
+
+  reject_delegated(
+      "miner", [](McpOperationKind kind, const boost::json::object& arguments,
+                  std::stop_token stop_token) {
+        BOOST_CHECK(kind == McpOperationKind::kRemoveMiner);
+        BOOST_TEST(!stop_token.stop_requested());
+        return boost::json::object{
+            {"node_ids", arguments.at("node_ids")},
+            {"assigned_roles", boost::json::array{}},
+            {"removed_roles", boost::json::array{"miner"}},
+            {"action", "miner.remove"},
+            {"state", "removed"},
+            {"created_node_ids", boost::json::array{}},
+            {"role_generation", 2U},
+            {"final_miner_count", 1U},
+            {"inventory_generation", 1U},
+            {"final_node_count", 1U},
+        };
+      });
+  reject_delegated("masternode", [](McpOperationKind kind,
+                                    const boost::json::object& arguments,
+                                    std::stop_token stop_token) {
+    BOOST_CHECK(kind == McpOperationKind::kRemoveMasternode);
+    BOOST_TEST(!stop_token.stop_requested());
+    return boost::json::object{
+        {"node_ids", arguments.at("node_ids")},
+        {"assigned_roles", boost::json::array{}},
+        {"removed_roles", boost::json::array{"masternode"}},
+        {"action", "masternode.remove"},
+        {"state", "removed"},
+        {"created_node_ids", boost::json::array{}},
+        {"role_generation", 2U},
+        {"final_masternode_count", 0U},
+        {"masternodes", boost::json::array{boost::json::object{
+                            {"node", 1U},
+                            {"node_id", "firo-1"},
+                            {"funding_wallet_node_id", "firo-wallet"},
+                            {"pro_tx_hash", "protx"},
+                            {"service", "10.77.0.2:18168"},
+                            {"collateral_address", "collateral"},
+                            {"owner_address", "owner"},
+                            {"operator_public_key", "operator-public"},
+                            {"voting_address", "voting"},
+                            {"payout_address", "payout"},
+                            {"collateral_hash", "collateral-hash"},
+                            {"collateral_index", 0U},
+                            {"state", "READY"},
+                            {"status", "enabled"}}}},
+        {"inventory_generation", 1U},
+        {"final_node_count", 1U},
+    };
+  });
 }
 
 BOOST_AUTO_TEST_CASE(

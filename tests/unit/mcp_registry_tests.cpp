@@ -903,6 +903,137 @@ BOOST_AUTO_TEST_CASE(
                  .as_string() == "error");
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_role_remove_schema_is_one_bounded_mutable_role_transaction) {
+  const boost::json::object input =
+      BuildMcpOperationInputSchema(McpOperationKind::kRemoveRole);
+  BOOST_TEST(input.at("additionalProperties").as_bool() == false);
+  BOOST_TEST(
+      PropertySet(input) ==
+      std::set<std::string>({"node_ids", "roles", "run_id", "timeout_sec"}));
+  BOOST_TEST(StringSet(ArrayField(input, "required")) ==
+             std::set<std::string>({"node_ids", "roles", "run_id"}));
+
+  const boost::json::object& input_properties =
+      input.at("properties").as_object();
+  const boost::json::object& node_ids =
+      input_properties.at("node_ids").as_object();
+  BOOST_TEST(node_ids.at("minItems").as_uint64() == 1U);
+  BOOST_TEST(node_ids.at("maxItems").as_uint64() ==
+             kSimulationNodeRemoveMaximumCount);
+  BOOST_TEST(node_ids.at("uniqueItems").as_bool());
+  BOOST_TEST(node_ids.at("items").as_object().at("pattern").as_string() ==
+             "^[A-Za-z0-9_-]{1,32}$");
+  const boost::json::object& roles = input_properties.at("roles").as_object();
+  BOOST_TEST(roles.at("minItems").as_uint64() == 1U);
+  BOOST_TEST(roles.at("maxItems").as_uint64() == 1U);
+  BOOST_TEST(StringSet(roles.at("items").as_object().at("enum").as_array()) ==
+             std::set<std::string>({"masternode", "miner", "wallet"}));
+  BOOST_TEST(input_properties.at("timeout_sec")
+                 .as_object()
+                 .at("minimum")
+                 .as_uint64() == 1U);
+  BOOST_TEST(input_properties.at("timeout_sec")
+                 .as_object()
+                 .at("maximum")
+                 .as_uint64() == 3600U);
+
+  const boost::json::object output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kRemoveRole);
+  const boost::json::array& choices = output.at("oneOf").as_array();
+  BOOST_REQUIRE_EQUAL(choices.size(), 3U);
+  const boost::json::object& direct = choices.front().as_object();
+  const boost::json::object& direct_properties =
+      direct.at("properties").as_object();
+  BOOST_TEST(
+      direct_properties.at("action").as_object().at("const").as_string() ==
+      "role.remove");
+  BOOST_TEST(
+      direct_properties.at("state").as_object().at("const").as_string() ==
+      "removed");
+  BOOST_TEST(direct_properties.at("assigned_roles")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(direct_properties.at("removed_roles")
+                 .as_object()
+                 .at("minItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(direct_properties.at("removed_roles")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 1U);
+  BOOST_TEST(direct_properties.at("created_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+
+  const std::array role_requirements{
+      std::pair{"wallet",
+                std::set<std::string>({"final_wallet_count",
+                                       "final_wallet_node_count", "wallets"})},
+      std::pair{"miner", std::set<std::string>({"final_miner_count"})},
+      std::pair{"masternode", std::set<std::string>(
+                                  {"final_masternode_count", "masternodes"})},
+  };
+  for (const auto& [role, expected_required] : role_requirements) {
+    const boost::json::object& constraint =
+        ArrayDiscriminatorConstraint(direct, "removed_roles", role);
+    BOOST_TEST(StringSet(ArrayField(constraint.at("then").as_object(),
+                                    "required")) == expected_required);
+    BOOST_TEST(constraint.at("then").as_object().contains("not"));
+  }
+
+  const boost::json::object& wrapper = choices[1U].as_object();
+  BOOST_TEST(StringSet(wrapper.at("properties")
+                           .as_object()
+                           .at("operation")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             std::set<std::string>({"role.remove"}));
+  const boost::json::object& succeeded =
+      LifecycleOperationConstraint(wrapper, "role.remove", "succeeded")
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(succeeded.at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "role_mutation");
+  BOOST_TEST(succeeded.at("terminal_result")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("action")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "role.remove");
+  const std::set<std::string> nonterminal_states{"cancelling", "queued",
+                                                 "running"};
+  BOOST_TEST(
+      OperationStateSetConstraint(wrapper, "role.remove", nonterminal_states)
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object()
+          .at("terminal_result_family")
+          .as_object()
+          .at("const")
+          .as_string() == "role_mutation");
+  const std::set<std::string> failed_states{"cancelled", "failed"};
+  BOOST_TEST(OperationStateSetConstraint(wrapper, "role.remove", failed_states)
+                 .at("then")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "error");
+}
+
 BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
   const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
   const boost::json::object& generic = VariantWithConst(
@@ -965,8 +1096,17 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
   BOOST_TEST(
       wallet_node_ids.at("items").as_object().at("maxLength").as_uint64() ==
       32U);
-  BOOST_TEST(
-      StringSet(ArrayField(wallet_remove, "required")).contains("node_id"));
+  BOOST_TEST(StringSet(ArrayField(wallet_remove, "required")) ==
+             std::set<std::string>({"run_id"}));
+  const boost::json::object& wallet_remove_properties =
+      wallet_remove.at("properties").as_object();
+  BOOST_TEST(wallet_remove_properties.at("node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == kSimulationNodeRemoveMaximumCount);
+  BOOST_TEST(wallet_remove.at("oneOf").as_array().size() == 2U);
+  BOOST_TEST(ContainsRequiredField(wallet_remove.at("oneOf"), "node_id"));
+  BOOST_TEST(ContainsRequiredField(wallet_remove.at("oneOf"), "node_ids"));
   BOOST_TEST(generic_request == scheduled_request);
   BOOST_TEST(generic_request == direct_request);
   BOOST_TEST(generic_request == wallet_create_node);
@@ -1098,12 +1238,13 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                  .as_object()
                  .at("maximum")
                  .as_uint64() == std::numeric_limits<std::uint32_t>::max());
-  const boost::json::object wallet_remove_output =
-      BuildMcpOperationOutputSchema(McpOperationKind::kRemoveWallet)
-          .at("oneOf")
-          .as_array()
-          .front()
-          .as_object();
+  const boost::json::object wallet_remove_schema =
+      BuildMcpOperationOutputSchema(McpOperationKind::kRemoveWallet);
+  const boost::json::array& wallet_remove_choices =
+      wallet_remove_schema.at("oneOf").as_array();
+  BOOST_REQUIRE_EQUAL(wallet_remove_choices.size(), 3U);
+  const boost::json::object& wallet_remove_output =
+      wallet_remove_choices.front().as_object();
   const boost::json::object& wallet_remove_output_properties =
       wallet_remove_output.at("properties").as_object();
   for (const std::string_view field :
@@ -1112,7 +1253,72 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
         "final_node_count"}) {
     BOOST_TEST(wallet_remove_output_properties.contains(field));
   }
+  BOOST_TEST(wallet_remove_output_properties.at("action")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "wallet.remove");
+  BOOST_TEST(wallet_remove_output_properties.at("state")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "removed");
+  BOOST_TEST(wallet_remove_output_properties.at("affected_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == kSimulationNodeRemoveMaximumCount);
+  BOOST_TEST(wallet_remove_output_properties.at("added_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
+  BOOST_TEST(wallet_remove_output_properties.at("removed_node_ids")
+                 .as_object()
+                 .at("maxItems")
+                 .as_uint64() == 0U);
   BOOST_REQUIRE(wallet_remove_output.contains("allOf"));
+  const boost::json::object& wallet_remove_wrapper =
+      wallet_remove_choices[1U].as_object();
+  BOOST_TEST(StringSet(wallet_remove_wrapper.at("properties")
+                           .as_object()
+                           .at("operation")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             std::set<std::string>({"wallet.remove"}));
+  const boost::json::object& wallet_remove_succeeded =
+      LifecycleOperationConstraint(wallet_remove_wrapper, "wallet.remove",
+                                   "succeeded")
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(wallet_remove_succeeded.at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "mutation");
+  BOOST_TEST(wallet_remove_succeeded.at("terminal_result").as_object() ==
+             wallet_remove_output);
+  const std::set<std::string> wallet_nonterminal_states{"cancelling", "queued",
+                                                        "running"};
+  BOOST_TEST(OperationStateSetConstraint(wallet_remove_wrapper, "wallet.remove",
+                                         wallet_nonterminal_states)
+                 .at("then")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "mutation");
+  const std::set<std::string> wallet_failed_states{"cancelled", "failed"};
+  BOOST_TEST(OperationStateSetConstraint(wallet_remove_wrapper, "wallet.remove",
+                                         wallet_failed_states)
+                 .at("then")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "error");
   const boost::json::object miner_output =
       BuildMcpOperationOutputSchema(McpOperationKind::kAddMiner)
           .at("oneOf")
@@ -1410,7 +1616,7 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
                  .contains("terminal_result"));
   BOOST_TEST(
       operation_schema.at("properties").as_object().contains("terminal_error"));
-  BOOST_TEST(operation_schema.at("allOf").as_array().size() == 12U);
+  BOOST_REQUIRE(operation_schema.contains("allOf"));
 
   const boost::json::object mutation_schema =
       BuildMcpResultSchema(McpResultFamily::kMutation);

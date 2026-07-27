@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -101,8 +102,9 @@ BOOST_AUTO_TEST_CASE(
        {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
         McpOperationKind::kRestartNode, McpOperationKind::kAddWallet,
         McpOperationKind::kRemoveWallet, McpOperationKind::kAssignRole,
-        McpOperationKind::kAddMiner, McpOperationKind::kRemoveMiner,
-        McpOperationKind::kAddMasternode, McpOperationKind::kRemoveMasternode,
+        McpOperationKind::kRemoveRole, McpOperationKind::kAddMiner,
+        McpOperationKind::kRemoveMiner, McpOperationKind::kAddMasternode,
+        McpOperationKind::kRemoveMasternode,
         McpOperationKind::kRestartMasternode, McpOperationKind::kStartWorkload,
         McpOperationKind::kInspectWorkload,
         McpOperationKind::kReconfigureWorkload,
@@ -147,7 +149,7 @@ BOOST_AUTO_TEST_CASE(
       std::runtime_error);
 }
 
-BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_assignment) {
+BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
   const auto options = std::make_shared<Options>();
   options->node_capacity = 1U;
   const auto live_application =
@@ -167,20 +169,36 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_assignment) {
           .run_started = {},
           .run_stopping = {},
           .run_stopped = {}});
-  bool delegated = false;
+  std::set<McpOperationKind> delegated;
   auto role_service = std::make_shared<McpLiveRoleService>();
   role_service->operation = [&delegated](McpOperationKind kind,
                                          const boost::json::object& arguments,
                                          std::stop_token stop_token) {
-    BOOST_CHECK(kind == McpOperationKind::kAddMiner);
+    BOOST_CHECK(kind == McpOperationKind::kAddMiner ||
+                kind == McpOperationKind::kRemoveMiner);
     BOOST_TEST(arguments.at("run_id").as_string() == "role-run");
     BOOST_TEST(arguments.at("node_ids").as_array() ==
                boost::json::array{"firo-1"});
-    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
     BOOST_TEST(arguments.if_contains("roles") == nullptr);
     BOOST_TEST(arguments.at("timeout_sec").as_uint64() == 30U);
     BOOST_TEST(!stop_token.stop_requested());
-    delegated = true;
+    delegated.insert(kind);
+    if (kind == McpOperationKind::kRemoveMiner) {
+      BOOST_TEST(arguments.if_contains("count") == nullptr);
+      return boost::json::object{
+          {"node_ids", boost::json::array{"firo-1"}},
+          {"assigned_roles", boost::json::array{}},
+          {"removed_roles", boost::json::array{"miner"}},
+          {"action", "miner.remove"},
+          {"state", "removed"},
+          {"created_node_ids", boost::json::array{}},
+          {"role_generation", 3U},
+          {"final_miner_count", 0U},
+          {"inventory_generation", 1U},
+          {"final_node_count", 1U},
+      };
+    }
+    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
     return boost::json::object{
         {"node_ids", boost::json::array{"firo-1"}},
         {"assigned_roles", boost::json::array{"miner"}},
@@ -216,6 +234,8 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_assignment) {
       application.SupportedOperations();
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kAssignRole) != supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kRemoveRole) != supported.end());
 
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
@@ -228,12 +248,28 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_assignment) {
                                  {"roles", boost::json::array{"miner"}},
                                  {"timeout_sec", 30U}}));
   BOOST_TEST(terminal.at("state").as_string() == "succeeded");
-  BOOST_TEST(delegated);
+  BOOST_CHECK(delegated.contains(McpOperationKind::kAddMiner));
   const boost::json::object& result =
       terminal.at("terminal_result").as_object();
   BOOST_TEST(result.at("result_family").as_string() == "role_mutation");
   BOOST_TEST(result.at("action").as_string() == "role.assign");
   BOOST_TEST(result.at("assigned_roles").as_array() ==
+             boost::json::array{"miner"});
+
+  const boost::json::object removed = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "role.remove",
+             boost::json::object{{"run_id", "role-run"},
+                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"roles", boost::json::array{"miner"}},
+                                 {"timeout_sec", 30U}}));
+  BOOST_TEST(removed.at("state").as_string() == "succeeded");
+  BOOST_CHECK(delegated.contains(McpOperationKind::kRemoveMiner));
+  const boost::json::object& removed_result =
+      removed.at("terminal_result").as_object();
+  BOOST_TEST(removed_result.at("result_family").as_string() == "role_mutation");
+  BOOST_TEST(removed_result.at("action").as_string() == "role.remove");
+  BOOST_TEST(removed_result.at("removed_roles").as_array() ==
              boost::json::array{"miner"});
 
   dispatcher.SessionHandler()("host-session", false, {});

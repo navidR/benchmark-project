@@ -49,6 +49,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kAddWallet,
     McpOperationKind::kRemoveWallet,
     McpOperationKind::kAssignRole,
+    McpOperationKind::kRemoveRole,
     McpOperationKind::kAddMiner,
     McpOperationKind::kRemoveMiner,
     McpOperationKind::kAddMasternode,
@@ -345,6 +346,13 @@ struct RoleAssignmentPlan {
   boost::json::object service_arguments;
 };
 
+struct RoleRemovalPlan {
+  McpOperationKind service_kind = McpOperationKind::kCount;
+  std::string role;
+  std::vector<std::string> node_ids;
+  boost::json::object service_arguments;
+};
+
 RoleAssignmentPlan BuildRoleAssignmentPlan(
     const boost::json::object& arguments) {
   constexpr std::array<std::string_view, 6U> kAllowedFields = {
@@ -442,19 +450,86 @@ RoleAssignmentPlan BuildRoleAssignmentPlan(
       "role.assign role must be wallet, miner, or masternode");
 }
 
-const boost::json::array& RequireArrayMember(const boost::json::object& object,
-                                             std::string_view name) {
+RoleRemovalPlan BuildRoleRemovalPlan(const boost::json::object& arguments) {
+  constexpr std::array<std::string_view, 4U> kAllowedFields = {
+      "run_id", "node_ids", "roles", "timeout_sec"};
+  for (const auto& member : arguments) {
+    if (std::find(kAllowedFields.begin(), kAllowedFields.end(), member.key()) ==
+        kAllowedFields.end()) {
+      throw std::invalid_argument(
+          "unsupported MCP application argument for role.remove: " +
+          std::string(member.key()));
+    }
+  }
+
+  RoleRemovalPlan plan;
+  plan.node_ids = OptionalStringArray(arguments, "node_ids", true);
+  if (plan.node_ids.size() > kSimulationNodeRemoveMaximumCount) {
+    throw std::invalid_argument("role.remove node_ids must contain 1..16 ids");
+  }
+  for (const std::string& node_id : plan.node_ids) {
+    if (!IsSafeNodeAddIdentifier(node_id)) {
+      throw std::invalid_argument(
+          "role.remove node_ids must contain safe identifiers");
+    }
+  }
+
+  std::vector<std::string> roles =
+      OptionalStringArray(arguments, "roles", true);
+  if (roles.size() != 1U) {
+    throw std::invalid_argument(
+        "role.remove roles must contain exactly one role");
+  }
+  plan.role = std::move(roles.front());
+
+  plan.service_arguments["run_id"] = RequireString(arguments, "run_id");
+  boost::json::array node_ids;
+  node_ids.reserve(plan.node_ids.size());
+  for (const std::string& node_id : plan.node_ids) {
+    node_ids.emplace_back(node_id);
+  }
+  plan.service_arguments["node_ids"] = std::move(node_ids);
+
+  if (const boost::json::value* timeout =
+          arguments.if_contains("timeout_sec")) {
+    const std::uint64_t seconds =
+        OptionalUnsigned(arguments, "timeout_sec", 0U);
+    if (seconds == 0U || seconds > kMaximumNodeOperationTimeoutSeconds) {
+      throw std::invalid_argument("role.remove timeout_sec must be in 1..3600");
+    }
+    plan.service_arguments["timeout_sec"] = *timeout;
+  }
+
+  if (plan.role == "wallet") {
+    plan.service_kind = McpOperationKind::kRemoveWallet;
+    return plan;
+  }
+  if (plan.role == "miner") {
+    plan.service_kind = McpOperationKind::kRemoveMiner;
+    return plan;
+  }
+  if (plan.role == "masternode") {
+    plan.service_kind = McpOperationKind::kRemoveMasternode;
+    return plan;
+  }
+  throw std::invalid_argument(
+      "role.remove role must be wallet, miner, or masternode");
+}
+
+const boost::json::array& RequireArrayMember(
+    const boost::json::object& object, std::string_view name,
+    std::string_view operation = "role.assign") {
   const boost::json::value& value = RequireMember(object, name);
   if (!value.is_array()) {
-    throw std::logic_error("role.assign delegated result " + std::string(name) +
-                           " must be an array");
+    throw std::logic_error(std::string(operation) + " delegated result " +
+                           std::string(name) + " must be an array");
   }
   return value.as_array();
 }
 
-std::uint64_t RequireUnsignedResultMember(const boost::json::object& object,
-                                          std::string_view name,
-                                          bool require_positive = false) {
+std::uint64_t RequireUnsignedResultMember(
+    const boost::json::object& object, std::string_view name,
+    bool require_positive = false, std::string_view operation = "role.assign") {
   const boost::json::value& value = RequireMember(object, name);
   std::uint64_t number = 0U;
   if (value.is_uint64()) {
@@ -462,84 +537,91 @@ std::uint64_t RequireUnsignedResultMember(const boost::json::object& object,
   } else if (value.is_int64() && value.as_int64() >= 0) {
     number = static_cast<std::uint64_t>(value.as_int64());
   } else {
-    throw std::logic_error("role.assign delegated result " + std::string(name) +
-                           " must be an unsigned integer");
+    throw std::logic_error(std::string(operation) + " delegated result " +
+                           std::string(name) + " must be an unsigned integer");
   }
   if (require_positive && number == 0U) {
-    throw std::logic_error("role.assign delegated result " + std::string(name) +
-                           " must be positive");
+    throw std::logic_error(std::string(operation) + " delegated result " +
+                           std::string(name) + " must be positive");
   }
   return number;
 }
 
-std::uint64_t RequireUint32ResultMember(const boost::json::object& object,
-                                        std::string_view name,
-                                        bool require_positive = false) {
+std::uint64_t RequireUint32ResultMember(
+    const boost::json::object& object, std::string_view name,
+    bool require_positive = false, std::string_view operation = "role.assign") {
   const std::uint64_t number =
-      RequireUnsignedResultMember(object, name, require_positive);
+      RequireUnsignedResultMember(object, name, require_positive, operation);
   if (number > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::logic_error("role.assign delegated result " + std::string(name) +
-                           " exceeds uint32");
+    throw std::logic_error(std::string(operation) + " delegated result " +
+                           std::string(name) + " exceeds uint32");
   }
   return number;
 }
 
 void RequireExactResultFields(const boost::json::object& object,
                               std::span<const std::string_view> allowed_fields,
-                              std::string_view identity_kind) {
+                              std::string_view identity_kind,
+                              std::string_view operation = "role.assign") {
   for (const auto& member : object) {
     if (std::find(allowed_fields.begin(), allowed_fields.end(), member.key()) ==
         allowed_fields.end()) {
       throw std::logic_error(
-          "role.assign delegated " + std::string(identity_kind) +
+          std::string(operation) + " delegated " + std::string(identity_kind) +
           " identity contains unsupported field " + std::string(member.key()));
     }
   }
 }
 
-std::string RequireResultStringMember(const boost::json::object& object,
-                                      std::string_view name,
-                                      bool allow_empty = false) {
+std::string RequireResultStringMember(
+    const boost::json::object& object, std::string_view name,
+    bool allow_empty = false, std::string_view operation = "role.assign") {
   const boost::json::value& value = RequireMember(object, name);
   if (!value.is_string() || (!allow_empty && value.as_string().empty())) {
     throw std::logic_error(
-        "role.assign delegated result " + std::string(name) +
+        std::string(operation) + " delegated result " + std::string(name) +
         " must be a string" +
         (allow_empty ? std::string() : " with at least one character"));
   }
   if (value.as_string().size() > kMcpMaximumEvidenceTextBytes) {
-    throw std::logic_error("role.assign delegated result " + std::string(name) +
-                           " exceeds the text byte bound");
+    throw std::logic_error(std::string(operation) + " delegated result " +
+                           std::string(name) + " exceeds the text byte bound");
   }
   return std::string(value.as_string());
 }
 
 boost::json::object NormalizeRoleAssignmentWallet(
     const boost::json::object& identity, std::string_view expected_node_id,
-    std::string_view expected_mode) {
+    std::string_view expected_mode,
+    std::string_view operation = "role.assign") {
   constexpr std::array<std::string_view, 6U> kFields = {
       "wallet_index", "node", "node_id", "mode", "address", "funding_address"};
-  RequireExactResultFields(identity, kFields, "wallet");
-  const std::string node_id = RequireResultStringMember(identity, "node_id");
-  const std::string mode = RequireResultStringMember(identity, "mode");
+  RequireExactResultFields(identity, kFields, "wallet", operation);
+  const std::string node_id =
+      RequireResultStringMember(identity, "node_id", false, operation);
+  const std::string mode =
+      RequireResultStringMember(identity, "mode", false, operation);
   if (node_id != expected_node_id || mode != expected_mode) {
     throw std::logic_error(
-        "role.assign wallet identity differs from its requested node or mode");
+        std::string(operation) +
+        " wallet identity differs from its requested node or mode");
   }
   return boost::json::object{
       {"wallet_index",
-       RequireUint32ResultMember(identity, "wallet_index", true)},
-      {"node", RequireUint32ResultMember(identity, "node", true)},
+       RequireUint32ResultMember(identity, "wallet_index", true, operation)},
+      {"node", RequireUint32ResultMember(identity, "node", true, operation)},
       {"node_id", node_id},
       {"mode", mode},
-      {"address", RequireResultStringMember(identity, "address")},
-      {"funding_address",
-       RequireResultStringMember(identity, "funding_address")}};
+      {"address",
+       RequireResultStringMember(identity, "address", false, operation)},
+      {"funding_address", RequireResultStringMember(identity, "funding_address",
+                                                    false, operation)}};
 }
 
 boost::json::object NormalizeRoleAssignmentMasternode(
     const boost::json::object& identity, std::string_view expected_node_id,
-    std::string_view expected_funding_wallet_id) {
+    std::string_view expected_funding_wallet_id,
+    std::string_view operation = "role.assign") {
   constexpr std::array<std::string_view, 14U> kFields = {
       "node",
       "node_id",
@@ -555,35 +637,45 @@ boost::json::object NormalizeRoleAssignmentMasternode(
       "collateral_index",
       "state",
       "status"};
-  RequireExactResultFields(identity, kFields, "masternode");
-  const std::string node_id = RequireResultStringMember(identity, "node_id");
-  const std::string funding_wallet_node_id =
-      RequireResultStringMember(identity, "funding_wallet_node_id");
+  RequireExactResultFields(identity, kFields, "masternode", operation);
+  const std::string node_id =
+      RequireResultStringMember(identity, "node_id", false, operation);
+  const std::string funding_wallet_node_id = RequireResultStringMember(
+      identity, "funding_wallet_node_id", false, operation);
   if (node_id != expected_node_id ||
       funding_wallet_node_id != expected_funding_wallet_id) {
     throw std::logic_error(
-        "role.assign masternode identity differs from its requested node or "
-        "funding wallet");
+        std::string(operation) +
+        " masternode identity differs from its requested node or funding "
+        "wallet");
   }
   return boost::json::object{
-      {"node", RequireUint32ResultMember(identity, "node", true)},
+      {"node", RequireUint32ResultMember(identity, "node", true, operation)},
       {"node_id", node_id},
       {"funding_wallet_node_id", funding_wallet_node_id},
-      {"pro_tx_hash", RequireResultStringMember(identity, "pro_tx_hash")},
-      {"service", RequireResultStringMember(identity, "service")},
+      {"pro_tx_hash",
+       RequireResultStringMember(identity, "pro_tx_hash", false, operation)},
+      {"service",
+       RequireResultStringMember(identity, "service", false, operation)},
       {"collateral_address",
-       RequireResultStringMember(identity, "collateral_address")},
-      {"owner_address", RequireResultStringMember(identity, "owner_address")},
+       RequireResultStringMember(identity, "collateral_address", false,
+                                 operation)},
+      {"owner_address",
+       RequireResultStringMember(identity, "owner_address", false, operation)},
       {"operator_public_key",
-       RequireResultStringMember(identity, "operator_public_key")},
-      {"voting_address", RequireResultStringMember(identity, "voting_address")},
-      {"payout_address", RequireResultStringMember(identity, "payout_address")},
+       RequireResultStringMember(identity, "operator_public_key", false,
+                                 operation)},
+      {"voting_address",
+       RequireResultStringMember(identity, "voting_address", false, operation)},
+      {"payout_address",
+       RequireResultStringMember(identity, "payout_address", false, operation)},
       {"collateral_hash",
-       RequireResultStringMember(identity, "collateral_hash", true)},
-      {"collateral_index",
-       RequireUnsignedResultMember(identity, "collateral_index")},
-      {"state", RequireResultStringMember(identity, "state")},
-      {"status", RequireResultStringMember(identity, "status", true)}};
+       RequireResultStringMember(identity, "collateral_hash", true, operation)},
+      {"collateral_index", RequireUnsignedResultMember(
+                               identity, "collateral_index", false, operation)},
+      {"state", RequireResultStringMember(identity, "state", false, operation)},
+      {"status",
+       RequireResultStringMember(identity, "status", true, operation)}};
 }
 
 boost::json::object NormalizeRoleAssignmentResult(
@@ -718,6 +810,183 @@ boost::json::object NormalizeRoleAssignmentResult(
       final_masternode_count > final_node_count) {
     throw std::logic_error(
         "role.assign masternode service returned an impossible final count");
+  }
+  normalized["final_masternode_count"] = final_masternode_count;
+  normalized["masternodes"] = std::move(normalized_masternodes);
+  return normalized;
+}
+
+boost::json::object NormalizeRoleRemovalResult(
+    const RoleRemovalPlan& plan, const boost::json::object& delegated) {
+  constexpr std::string_view kOperation = "role.remove";
+  const std::string expected_action =
+      std::string(McpOperationKindName(plan.service_kind));
+  if (RequireString(delegated, "action") != expected_action ||
+      RequireString(delegated, "state") != "removed") {
+    throw std::logic_error(
+        "role.remove delegated service returned the wrong action or state");
+  }
+
+  const std::string_view node_ids_field =
+      plan.role == "wallet" ? "affected_node_ids" : "node_ids";
+  if (OptionalStringArray(delegated, node_ids_field, true) != plan.node_ids) {
+    throw std::logic_error(
+        "role.remove delegated service returned different node ids");
+  }
+  if (plan.role == "wallet") {
+    if (!RequireArrayMember(delegated, "added_node_ids", kOperation).empty() ||
+        !RequireArrayMember(delegated, "removed_node_ids", kOperation)
+             .empty()) {
+      throw std::logic_error(
+          "role.remove wallet service changed node identities");
+    }
+    const boost::json::value& unchanged = RequireMember(delegated, "unchanged");
+    if (!unchanged.is_bool() || unchanged.as_bool()) {
+      throw std::logic_error(
+          "role.remove wallet service returned the wrong mutation state");
+    }
+  } else {
+    if (!RequireArrayMember(delegated, "assigned_roles", kOperation).empty() ||
+        !RequireArrayMember(delegated, "created_node_ids", kOperation)
+             .empty()) {
+      throw std::logic_error(
+          "role.remove delegated service assigned roles or changed node "
+          "identities");
+    }
+    const boost::json::array& removed_roles =
+        RequireArrayMember(delegated, "removed_roles", kOperation);
+    if (removed_roles.size() != 1U || !removed_roles.front().is_string() ||
+        removed_roles.front().as_string() != plan.role) {
+      throw std::logic_error(
+          "role.remove delegated service returned different removed roles");
+    }
+  }
+
+  const std::string_view generation_field =
+      plan.role == "wallet" ? "wallet_generation" : "role_generation";
+  const std::uint64_t final_node_count = RequireUint32ResultMember(
+      delegated, "final_node_count", true, kOperation);
+  if (final_node_count < plan.node_ids.size()) {
+    throw std::logic_error(
+        "role.remove delegated service returned an impossible final node "
+        "count");
+  }
+  const std::uint64_t maximum_remaining_role_nodes =
+      final_node_count - plan.node_ids.size();
+  boost::json::object normalized{
+      {"node_ids", RequireMember(plan.service_arguments, "node_ids")},
+      {"assigned_roles", boost::json::array{}},
+      {"removed_roles", boost::json::array{plan.role}},
+      {"action", "role.remove"},
+      {"state", "removed"},
+      {"created_node_ids", boost::json::array{}},
+      {"role_generation", RequireUnsignedResultMember(
+                              delegated, generation_field, true, kOperation)},
+      {"inventory_generation",
+       RequireUnsignedResultMember(delegated, "inventory_generation", true,
+                                   kOperation)},
+      {"final_node_count", final_node_count},
+  };
+
+  if (plan.role == "wallet") {
+    const boost::json::array& wallets =
+        RequireArrayMember(delegated, "wallets", kOperation);
+    if (wallets.empty() || wallets.size() > kMcpMaximumSelectionItems) {
+      throw std::logic_error(
+          "role.remove wallet service returned an invalid identity count");
+    }
+    const std::set<std::string> expected_node_ids(plan.node_ids.begin(),
+                                                  plan.node_ids.end());
+    std::set<std::string> observed_node_ids;
+    boost::json::array normalized_wallets;
+    normalized_wallets.reserve(wallets.size());
+    for (const boost::json::value& wallet : wallets) {
+      if (!wallet.is_object()) {
+        throw std::logic_error(
+            "role.remove wallet service returned a non-object identity");
+      }
+      const boost::json::object& identity = wallet.as_object();
+      const std::string node_id =
+          RequireResultStringMember(identity, "node_id", false, kOperation);
+      const std::string mode =
+          RequireResultStringMember(identity, "mode", false, kOperation);
+      if (!expected_node_ids.contains(node_id) ||
+          (mode != "public" && mode != "private")) {
+        throw std::logic_error(
+            "role.remove wallet identity differs from its requested nodes or "
+            "has an invalid mode");
+      }
+      observed_node_ids.insert(node_id);
+      normalized_wallets.push_back(
+          NormalizeRoleAssignmentWallet(identity, node_id, mode, kOperation));
+    }
+    if (observed_node_ids != expected_node_ids) {
+      throw std::logic_error(
+          "role.remove wallet service omitted a requested wallet identity");
+    }
+    const std::uint64_t final_wallet_count = RequireUint32ResultMember(
+        delegated, "final_wallet_count", false, kOperation);
+    const std::uint64_t final_wallet_node_count = RequireUint32ResultMember(
+        delegated, "final_wallet_node_count", false, kOperation);
+    if (final_wallet_node_count > maximum_remaining_role_nodes ||
+        final_wallet_count < final_wallet_node_count) {
+      throw std::logic_error(
+          "role.remove wallet service returned impossible final identity or "
+          "role-node counts");
+    }
+    normalized["final_wallet_count"] = final_wallet_count;
+    normalized["final_wallet_node_count"] = final_wallet_node_count;
+    normalized["wallets"] = std::move(normalized_wallets);
+    return normalized;
+  }
+
+  if (plan.role == "miner") {
+    const std::uint64_t final_miner_count = RequireUint32ResultMember(
+        delegated, "final_miner_count", false, kOperation);
+    if (final_miner_count > maximum_remaining_role_nodes) {
+      throw std::logic_error(
+          "role.remove miner service returned an impossible final count");
+    }
+    normalized["final_miner_count"] = final_miner_count;
+    return normalized;
+  }
+
+  const boost::json::array& masternodes =
+      RequireArrayMember(delegated, "masternodes", kOperation);
+  if (masternodes.size() != plan.node_ids.size()) {
+    throw std::logic_error(
+        "role.remove masternode service returned the wrong identity count");
+  }
+  boost::json::array normalized_masternodes;
+  normalized_masternodes.reserve(masternodes.size());
+  for (std::size_t index = 0U; index < masternodes.size(); ++index) {
+    if (!masternodes[index].is_object()) {
+      throw std::logic_error(
+          "role.remove masternode service returned a non-object identity");
+    }
+    const boost::json::object& identity = masternodes[index].as_object();
+    const std::string funding_wallet_node_id = RequireResultStringMember(
+        identity, "funding_wallet_node_id", false, kOperation);
+    if (!IsSafeNodeAddIdentifier(funding_wallet_node_id)) {
+      throw std::logic_error(
+          "role.remove masternode service returned an unsafe funding wallet "
+          "identity");
+    }
+    if (RequireResultStringMember(identity, "state", false, kOperation) !=
+            "REVOKED" ||
+        RequireResultStringMember(identity, "status", false, kOperation) !=
+            "revoked") {
+      throw std::logic_error(
+          "role.remove masternode service returned a non-revoked identity");
+    }
+    normalized_masternodes.push_back(NormalizeRoleAssignmentMasternode(
+        identity, plan.node_ids[index], funding_wallet_node_id, kOperation));
+  }
+  const std::uint64_t final_masternode_count = RequireUint32ResultMember(
+      delegated, "final_masternode_count", false, kOperation);
+  if (final_masternode_count > maximum_remaining_role_nodes) {
+    throw std::logic_error(
+        "role.remove masternode service returned an impossible final count");
   }
   normalized["final_masternode_count"] = final_masternode_count;
   normalized["masternodes"] = std::move(normalized_masternodes);
@@ -1126,6 +1395,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kAddWallet &&
       kind != McpOperationKind::kRemoveWallet &&
       kind != McpOperationKind::kAssignRole &&
+      kind != McpOperationKind::kRemoveRole &&
       kind != McpOperationKind::kAddMiner &&
       kind != McpOperationKind::kRemoveMiner &&
       kind != McpOperationKind::kAddMasternode &&
@@ -1179,9 +1449,14 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           ? std::optional<RoleAssignmentPlan>(
                 BuildRoleAssignmentPlan(arguments))
           : std::nullopt;
+  const std::optional<RoleRemovalPlan> role_removal =
+      kind == McpOperationKind::kRemoveRole
+          ? std::optional<RoleRemovalPlan>(BuildRoleRemovalPlan(arguments))
+          : std::nullopt;
   if (kind == McpOperationKind::kAddWallet ||
       kind == McpOperationKind::kRemoveWallet ||
       kind == McpOperationKind::kAssignRole ||
+      kind == McpOperationKind::kRemoveRole ||
       kind == McpOperationKind::kAddMiner ||
       kind == McpOperationKind::kRemoveMiner ||
       kind == McpOperationKind::kAddMasternode ||
@@ -1195,16 +1470,19 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     }
     return McpOperationPlan{
         .progress_total = 3U,
-        .executor = [this, role_service, kind, arguments,
-                     role_assignment](McpOperationContext& context) {
+        .executor = [this, role_service, kind, arguments, role_assignment,
+                     role_removal](McpOperationContext& context) {
           CombinedStopToken cancellation(context.stop_token(),
                                          run_stop_source_.get_token());
           boost::json::object result;
           try {
             const McpOperationKind service_kind =
-                role_assignment ? role_assignment->service_kind : kind;
+                role_assignment ? role_assignment->service_kind
+                : role_removal  ? role_removal->service_kind
+                                : kind;
             const boost::json::object& service_arguments =
                 role_assignment ? role_assignment->service_arguments
+                : role_removal  ? role_removal->service_arguments
                                 : arguments;
             result = role_service->operation(service_kind, service_arguments,
                                              cancellation.token());
@@ -1230,13 +1508,33 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                       message,
                   false);
             }
+          } else if (role_removal) {
+            try {
+              result = NormalizeRoleRemovalResult(*role_removal, result);
+              result["result_family"] = "role_mutation";
+              result["run_id"] = config_.run_id;
+            } catch (...) {
+              const std::string message =
+                  CurrentExceptionMessage(std::current_exception());
+              MarkRunStopping();
+              if (config_.request_run_stop) {
+                config_.request_run_stop();
+              }
+              throw McpOperationFailure(
+                  "role_remove_outcome_unconfirmed",
+                  "role.remove committed through its authoritative service "
+                  "but completion evidence could not be normalized: " +
+                      message,
+                  false);
+            }
           }
           const McpResultFamily result_family =
-              !role_assignment && (kind == McpOperationKind::kAddWallet ||
-                                   kind == McpOperationKind::kRemoveWallet)
+              !role_assignment && !role_removal &&
+                      (kind == McpOperationKind::kAddWallet ||
+                       kind == McpOperationKind::kRemoveWallet)
                   ? McpResultFamily::kMutation
                   : McpResultFamily::kRoleMutation;
-          if (!role_assignment) {
+          if (!role_assignment && !role_removal) {
             result["result_family"] = McpResultFamilyName(result_family);
             result["run_id"] = config_.run_id;
           }
