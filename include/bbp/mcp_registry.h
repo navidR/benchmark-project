@@ -4,6 +4,7 @@
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -40,7 +41,9 @@ enum class McpOperationKind {
   kReplayRun,
   kReportRun,
   kInvokeRuntimeCommand,
+#ifdef BBP_FIRO_GUI_LAUNCHER
   kCreateFiroQtLauncher,
+#endif
   kAddNode,
   kRemoveNode,
   kStopNode,
@@ -155,6 +158,8 @@ std::span<const McpNamedCapability> McpOperationRegistry();
 std::span<const McpNamedCapability> McpInformationFamilyRegistry();
 std::span<const McpNamedCapability> McpResultFamilyRegistry();
 std::span<const std::string_view> McpScenarioMemberRegistry();
+std::optional<boost::json::object> McpUnavailableBuildOperationResult(
+    std::string_view name);
 
 boost::json::object BuildMcpCapabilityDocument();
 boost::json::object BuildMcpCapabilityDocument(

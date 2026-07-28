@@ -21,14 +21,18 @@ enum class TuiPartitionTargetKind {
 };
 
 enum class TuiLocalAction {
+#ifdef BBP_FIRO_GUI_LAUNCHER
   kCreateFiroQtLauncher,
+#endif
   kCount,
 };
 
 constexpr std::string_view TuiLocalActionName(TuiLocalAction action) {
   switch (action) {
+#ifdef BBP_FIRO_GUI_LAUNCHER
     case TuiLocalAction::kCreateFiroQtLauncher:
       return "create_firo_qt_launcher";
+#endif
     case TuiLocalAction::kCount:
       break;
   }

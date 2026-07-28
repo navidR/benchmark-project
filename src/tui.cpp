@@ -84,27 +84,28 @@ struct TuiState {
   bool command_palette_open = false;
   std::string command_input;
   std::string command_input_error;
-  std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
-  std::optional<OwnedFiroQtLauncher> standalone_firo_qt_launcher;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  std::shared_ptr<OperatorConnectionLauncher> operator_connection_launcher;
   std::filesystem::path firo_qt_launcher_path;
   bool firo_qt_launcher_dialog_open = false;
   std::string firo_qt_launcher_command;
+#endif
   bool mcp_connection_dialog_open = false;
   std::optional<PendingConfirmation> pending_confirmation;
   TuiExitConfirmation exit_confirmation;
 };
 
-void ReleaseFiroQtLauncher(TuiState* state) {
-  if (state->standalone_firo_qt_launcher) {
-    static_cast<void>(state->standalone_firo_qt_launcher->Cleanup());
-    state->standalone_firo_qt_launcher.reset();
-  }
-  state->firo_qt_launcher_service.reset();
+#ifdef BBP_FIRO_GUI_LAUNCHER
+void ReleaseOperatorConnectionLauncher(TuiState* state) {
+  state->operator_connection_launcher.reset();
   state->firo_qt_launcher_path.clear();
 }
+#endif
 
 void ResetRunUiState(TuiState* state) {
-  ReleaseFiroQtLauncher(state);
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  ReleaseOperatorConnectionLauncher(state);
+#endif
   state->selected_node = 0U;
   state->selected_wallet = 0U;
   state->selected_topology_group = 0U;
@@ -120,13 +121,19 @@ void ResetRunUiState(TuiState* state) {
   state->command_palette_open = false;
   state->command_input.clear();
   state->command_input_error.clear();
+#ifdef BBP_FIRO_GUI_LAUNCHER
   state->firo_qt_launcher_dialog_open = false;
   state->firo_qt_launcher_command.clear();
+#endif
   state->pending_confirmation.reset();
 }
 
 int FinishTui(TuiState* state, int result) {
-  ReleaseFiroQtLauncher(state);
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  ReleaseOperatorConnectionLauncher(state);
+#else
+  static_cast<void>(state);
+#endif
   return result;
 }
 
@@ -1457,8 +1464,13 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
           "<value>");
   AddText(top + 3, left + 2, popup_cols - 4,
           "wallet-send <receiver-wallet> <amount> <fee> [timeout-sec]");
+#ifdef BBP_FIRO_GUI_LAUNCHER
   AddText(top + 4, left + 2, popup_cols - 4,
           "stop-mining  disconnect  reconnect  log-more  log-less  firo-qt");
+#else
+  AddText(top + 4, left + 2, popup_cols - 4,
+          "stop-mining  disconnect  reconnect  log-more  log-less");
+#endif
   AddText(top + 5, left + 2, popup_cols - 4,
           "connect-peer <node-id>  disconnect-peer <node-id>");
   AddText(top + 6, left + 2, popup_cols - 4,
@@ -1538,6 +1550,7 @@ void DrawWrappedText(int* y, int left, int width, std::string_view text,
   }
 }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
 void DrawFiroQtLauncherDialog(int rows, int cols,
                               const std::filesystem::path& launcher_path,
                               std::string_view command) {
@@ -1578,6 +1591,7 @@ void DrawFiroQtLauncherDialog(int rows, int cols,
           "Enter or Esc dismisses; BBP has not launched Firo-Qt.",
           COLOR_PAIR(kColorMuted));
 }
+#endif
 
 void DrawMcpConnectionDialog(int rows, int cols,
                              const TuiMcpConnectionInfo& connection) {
@@ -1639,10 +1653,13 @@ void DrawMcpConnectionDialog(int rows, int cols,
 void DrawModalEpilogue(
     int rows, int cols, bool command_error_open, std::string_view command_error,
     bool command_palette_open, std::string_view command_input,
-    std::string_view command_input_error, bool firo_qt_launcher_dialog_open,
+    std::string_view command_input_error,
+#ifdef BBP_FIRO_GUI_LAUNCHER
+    bool firo_qt_launcher_dialog_open,
     const std::filesystem::path& firo_qt_launcher_path,
-    std::string_view firo_qt_launcher_command, bool mcp_connection_dialog_open,
-    const TuiMcpConnectionInfo& mcp_connection,
+    std::string_view firo_qt_launcher_command,
+#endif
+    bool mcp_connection_dialog_open, const TuiMcpConnectionInfo& mcp_connection,
     const std::optional<PendingConfirmation>& pending_confirmation,
     const TuiExitConfirmation& exit_confirmation) {
   if (command_error_open) {
@@ -1654,10 +1671,12 @@ void DrawModalEpilogue(
   if (pending_confirmation) {
     DrawCommandConfirmationPopup(rows, cols, *pending_confirmation);
   }
+#ifdef BBP_FIRO_GUI_LAUNCHER
   if (firo_qt_launcher_dialog_open) {
     DrawFiroQtLauncherDialog(rows, cols, firo_qt_launcher_path,
                              firo_qt_launcher_command);
   }
+#endif
   if (mcp_connection_dialog_open) {
     DrawMcpConnectionDialog(rows, cols, mcp_connection);
   }
@@ -2612,10 +2631,13 @@ void DrawSummary(
     const NodeFilePane& node_file_pane, std::string_view command_status,
     bool command_error_open, std::string_view command_error,
     bool command_palette_open, std::string_view command_input,
-    std::string_view command_input_error, bool firo_qt_launcher_dialog_open,
+    std::string_view command_input_error,
+#ifdef BBP_FIRO_GUI_LAUNCHER
+    bool firo_qt_launcher_dialog_open,
     const std::filesystem::path& firo_qt_launcher_path,
-    std::string_view firo_qt_launcher_command, bool mcp_connection_dialog_open,
-    const TuiMcpConnectionInfo& mcp_connection,
+    std::string_view firo_qt_launcher_command,
+#endif
+    bool mcp_connection_dialog_open, const TuiMcpConnectionInfo& mcp_connection,
     const std::optional<PendingConfirmation>& pending_confirmation,
     const TuiExitConfirmation& exit_confirmation,
     SimulatorLogPane* simulator_log_pane) {
@@ -2628,9 +2650,12 @@ void DrawSummary(
   getmaxyx(stdscr, rows, cols);
   DrawModalEpilogue(rows, cols, command_error_open, command_error,
                     command_palette_open, command_input, command_input_error,
+#ifdef BBP_FIRO_GUI_LAUNCHER
                     firo_qt_launcher_dialog_open, firo_qt_launcher_path,
-                    firo_qt_launcher_command, mcp_connection_dialog_open,
-                    mcp_connection, pending_confirmation, exit_confirmation);
+                    firo_qt_launcher_command,
+#endif
+                    mcp_connection_dialog_open, mcp_connection,
+                    pending_confirmation, exit_confirmation);
   refresh();
 }
 
@@ -2649,9 +2674,12 @@ void DrawEmptySummary(bool mcp_connection_dialog_open,
   DrawHorizontalLine(rows - 2);
   AddText(rows - 1, 0, cols, "MCP [i]. Esc asks to exit; q exits.",
           COLOR_PAIR(kColorMuted));
-  DrawModalEpilogue(rows, cols, false, "", false, "", "", false,
-                    std::filesystem::path{}, "", mcp_connection_dialog_open,
-                    mcp_connection, std::nullopt, exit_confirmation);
+  DrawModalEpilogue(rows, cols, false, "", false, "", "",
+#ifdef BBP_FIRO_GUI_LAUNCHER
+                    false, std::filesystem::path{}, "",
+#endif
+                    mcp_connection_dialog_open, mcp_connection, std::nullopt,
+                    exit_confirmation);
   refresh();
 }
 
@@ -2690,6 +2718,7 @@ bool QueueParsedNodeCommand(
     bool confirmed = false, std::string confirmed_target = {},
     std::optional<SimulationPartition> confirmed_partition = std::nullopt,
     std::optional<SimulationWalletSend> confirmed_wallet_send = std::nullopt) {
+#ifdef BBP_FIRO_GUI_LAUNCHER
   if (parsed.local_action) {
     if (command_queue == nullptr) {
       state->command_input_error =
@@ -2701,27 +2730,14 @@ bool QueueParsedNodeCommand(
       if (*parsed.local_action != TuiLocalAction::kCreateFiroQtLauncher) {
         throw std::runtime_error("unknown local TUI action");
       }
-      if (state->firo_qt_launcher_service) {
-        const FiroQtLauncherSnapshot launcher =
-            state->firo_qt_launcher_service->ReplaceFromReport(report);
-        state->firo_qt_launcher_path = launcher.launcher_path;
-        state->firo_qt_launcher_command = launcher.operator_command;
-      } else {
-        const std::string command = OperatorConnectionCommandFromReport(report);
-        if (command.empty()) {
-          throw std::runtime_error(
-              "the running benchmark has no Firo-Qt connection command");
-        }
-        if (state->standalone_firo_qt_launcher) {
-          static_cast<void>(state->standalone_firo_qt_launcher->Cleanup());
-          state->standalone_firo_qt_launcher.reset();
-        }
-        state->standalone_firo_qt_launcher.emplace(
-            OwnedFiroQtLauncher::Create(command));
-        state->firo_qt_launcher_path =
-            state->standalone_firo_qt_launcher->path();
-        state->firo_qt_launcher_command = command;
+      if (!state->operator_connection_launcher) {
+        throw std::runtime_error(
+            "the active chain has no native operator launcher capability");
       }
+      const OperatorConnectionLauncherSnapshot launcher =
+          state->operator_connection_launcher->ReplaceFromReport(report);
+      state->firo_qt_launcher_path = launcher.launcher_path;
+      state->firo_qt_launcher_command = launcher.operator_command;
       state->firo_qt_launcher_dialog_open = true;
       state->command_input_error.clear();
       state->command_status = "Created native Firo-Qt launcher " +
@@ -2733,6 +2749,7 @@ bool QueueParsedNodeCommand(
       return false;
     }
   }
+#endif
   if (command_queue == nullptr) {
     state->command_input_error =
         "Live commands are unavailable in report mode.";
@@ -3076,6 +3093,7 @@ bool HandleCommandConfirmationInput(int ch, const boost::json::object& report,
   return ch != ERR;
 }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
 bool HandleFiroQtLauncherDialogInput(int ch, TuiState* state) {
   if (ch == '\n' || ch == KEY_ENTER || ch == 27) {
     state->firo_qt_launcher_dialog_open = false;
@@ -3085,6 +3103,7 @@ bool HandleFiroQtLauncherDialogInput(int ch, TuiState* state) {
   }
   return ch != ERR;
 }
+#endif
 
 bool HandleMcpConnectionDialogInput(int ch, TuiState* state) {
   if (ch == '\n' || ch == KEY_ENTER || ch == 27 || ch == 'i' || ch == 'I') {
@@ -3130,9 +3149,11 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
   if (state->mcp_connection_dialog_open) {
     return HandleMcpConnectionDialogInput(ch, state);
   }
+#ifdef BBP_FIRO_GUI_LAUNCHER
   if (state->firo_qt_launcher_dialog_open) {
     return HandleFiroQtLauncherDialogInput(ch, state);
   }
+#endif
   if (state->pending_confirmation) {
     return HandleCommandConfirmationInput(ch, report, command_queue, state);
   }
@@ -3459,7 +3480,9 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       .generation = 0U,
       .run_root = run_root,
       .command_queue = std::move(shared_command_queue),
-      .firo_qt_launcher_service = {},
+#ifdef BBP_FIRO_GUI_LAUNCHER
+      .operator_connection_launcher = {},
+#endif
       .publication_mutex = {},
       .read_lease = {},
   };
@@ -3489,7 +3512,10 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
     if (run_changed) {
       live_report.reset();
       ResetRunUiState(&state);
-      state.firo_qt_launcher_service = next_snapshot.firo_qt_launcher_service;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+      state.operator_connection_launcher =
+          next_snapshot.operator_connection_launcher;
+#endif
     }
     snapshot = std::move(next_snapshot);
     return run_changed;
@@ -3550,9 +3576,11 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
       }
       RefreshCommandResults(*report, &state);
     }
-    if (state.firo_qt_launcher_dialog_open && state.firo_qt_launcher_service) {
-      const std::optional<FiroQtLauncherSnapshot> launcher =
-          state.firo_qt_launcher_service->Snapshot();
+#ifdef BBP_FIRO_GUI_LAUNCHER
+    if (state.firo_qt_launcher_dialog_open &&
+        state.operator_connection_launcher) {
+      const std::optional<OperatorConnectionLauncherSnapshot> launcher =
+          state.operator_connection_launcher->Snapshot();
       if (launcher) {
         state.firo_qt_launcher_path = launcher->launcher_path;
         state.firo_qt_launcher_command = launcher->operator_command;
@@ -3562,6 +3590,7 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
         state.firo_qt_launcher_command.clear();
       }
     }
+#endif
     if (has_active_run) {
       const std::vector<std::string> log_lines =
           ReadRecentLogLines(RunLogPath(snapshot->run_root), 256U);
@@ -3572,8 +3601,11 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
                   state.node_file_pane, state.command_status,
                   state.command_error_open, state.command_error,
                   state.command_palette_open, state.command_input,
-                  state.command_input_error, state.firo_qt_launcher_dialog_open,
+                  state.command_input_error,
+#ifdef BBP_FIRO_GUI_LAUNCHER
+                  state.firo_qt_launcher_dialog_open,
                   state.firo_qt_launcher_path, state.firo_qt_launcher_command,
+#endif
                   state.mcp_connection_dialog_open, mcp_connection,
                   state.pending_confirmation, state.exit_confirmation,
                   &state.simulator_log_pane);

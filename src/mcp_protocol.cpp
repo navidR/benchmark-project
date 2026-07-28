@@ -1378,6 +1378,15 @@ struct McpProtocol::Impl {
       const std::string name = RequiredString(request.params, "name");
       const std::optional<McpOperationKind> operation = RegisteredTool(name);
       if (!operation) {
+        if (std::optional<boost::json::object> unavailable =
+                McpUnavailableBuildOperationResult(name)) {
+          const std::string content = boost::json::serialize(*unavailable);
+          return boost::json::object{
+              {"content", boost::json::array{boost::json::object{
+                              {"type", "text"}, {"text", std::move(content)}}}},
+              {"structuredContent", std::move(*unavailable)},
+              {"isError", true}};
+        }
         throw std::invalid_argument("unknown BBP tool");
       }
       if (!OperationAllowed(config, *operation)) {

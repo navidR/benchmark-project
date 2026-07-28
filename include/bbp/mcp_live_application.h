@@ -19,7 +19,9 @@
 
 namespace bbp {
 
-class FiroQtLauncherService;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+class OperatorConnectionLauncher;
+#endif
 class SimulationCommandQueue;
 struct Options;
 
@@ -66,7 +68,10 @@ class McpLiveApplication {
     std::optional<RetainedRun> retained_run;
     std::shared_ptr<const Options> options;
     std::shared_ptr<SimulationCommandQueue> command_queue;
-    std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service = {};
+#ifdef BBP_FIRO_GUI_LAUNCHER
+    std::shared_ptr<OperatorConnectionLauncher> operator_connection_launcher =
+        {};
+#endif
     std::function<McpLiveNodeInventorySnapshot()> node_inventory_snapshot = {};
     std::shared_ptr<std::timed_mutex> publication_mutex;
     std::function<void()> request_run_stop;

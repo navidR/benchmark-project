@@ -34,7 +34,9 @@ constexpr std::array<McpNamedCapability, EnumCount(McpOperationKind::kCount)>
          {"run.replay", "Replay a retained source scenario"},
          {"run.report", "Build an exact retained or live report"},
          {"simulation.command", "Invoke a registered runtime command"},
+#ifdef BBP_FIRO_GUI_LAUNCHER
          {"local.firo_qt_launcher", "Create the owned native Firo-Qt launcher"},
+#endif
          {"node.add", "Transactionally add and synchronize a base node"},
          {"node.remove", "Gracefully remove an owned node and its resources"},
          {"node.stop", "Gracefully stop a selected owned node"},
@@ -269,6 +271,31 @@ std::span<const std::string_view> McpScenarioMemberRegistry() {
   return kScenarioMemberViews;
 }
 
+std::optional<boost::json::object> McpUnavailableBuildOperationResult(
+    std::string_view name) {
+#ifndef BBP_FIRO_GUI_LAUNCHER
+  constexpr std::string_view kScope = "local";
+  constexpr std::string_view kFeature = "firo_qt_launcher";
+  const std::size_t separator = name.find('.');
+  if (separator != std::string_view::npos &&
+      name.find('.', separator + 1U) == std::string_view::npos &&
+      name.substr(0U, separator) == kScope &&
+      name.substr(separator + 1U) == kFeature) {
+    return boost::json::object{
+        {"result_family", "error"},
+        {"code", "unsupported_feature"},
+        {"message",
+         "native Firo-Qt launcher support is disabled at build time"},
+        {"retryable", false},
+        {"diagnostics", boost::json::array{}},
+    };
+  }
+#else
+  static_cast<void>(name);
+#endif
+  return std::nullopt;
+}
+
 boost::json::array BuildMcpResourceRegistry() {
   std::array<McpInformationFamily, EnumCount(McpInformationFamily::kCount)>
       information_families{};
@@ -321,6 +348,13 @@ boost::json::object BuildMcpCapabilityDocument(
       std::move(supported_protocol_versions);
   document["transport"] = "streamable_http";
   document["authentication"] = "bearer";
+  document["build_features"] = boost::json::object{
+#ifdef BBP_FIRO_GUI_LAUNCHER
+      {"firo_gui_launcher", true},
+#else
+      {"firo_gui_launcher", false},
+#endif
+  };
   document["chains"] = EnumNames(
       ChainKind::kCount, [](ChainKind kind) { return ChainKindName(kind); });
   document["workloads"] =

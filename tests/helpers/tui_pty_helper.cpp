@@ -997,6 +997,26 @@ int RunReadyFiroDaemon(int argc, char** argv) {
   return 0;
 }
 
+#ifndef BBP_FIRO_GUI_LAUNCHER
+std::set<std::filesystem::path> NativeLauncherPaths() {
+  std::set<std::filesystem::path> paths;
+  std::error_code error;
+  for (std::filesystem::directory_iterator entry("/tmp", error), end;
+       !error && entry != end; entry.increment(error)) {
+    const std::string name = entry->path().filename().string();
+    if (name.starts_with("bbp-firo-qt-") && name.ends_with(".sh")) {
+      paths.insert(entry->path());
+    }
+  }
+  if (error) {
+    throw std::runtime_error("could not inspect native launcher paths: " +
+                             error.message());
+  }
+  return paths;
+}
+#endif
+
+#ifdef BBP_FIRO_GUI_LAUNCHER
 std::filesystem::path LauncherPathFromOutput(std::string_view output) {
   constexpr std::string_view prefix = "/tmp/bbp-firo-qt-";
   constexpr std::size_t random_length = 6U;
@@ -1037,6 +1057,7 @@ std::pair<std::string, std::filesystem::path> ReadLauncherDialog(
   RequireContains(output, "BBP has not launched Firo-Qt", context);
   return {std::move(output), std::move(path)};
 }
+#endif
 
 void CheckCanonicalExitModal(const std::filesystem::path& command,
                              const std::filesystem::path& run_root) {
@@ -2678,11 +2699,14 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   if (!process.Running() || !ProcessExists(daemon_pid)) {
     throw std::runtime_error("active benchmark was not running before Esc");
   }
-  static_cast<void>(WaitForFileText(
-      events_path, "\"event\":\"operator_connection_command\"", 10s));
+  const std::string connection_events = WaitForFileText(
+      events_path, "\"event\":\"operator_connection_command\"", 10s);
 
   const std::string expected_qt_command = ActiveOperatorConnectionCommand(
       run_root, daemon.parent_path() / "firo-qt");
+  RequireContains(connection_events, expected_qt_command,
+                  "active generated Firo-Qt command evidence");
+#ifdef BBP_FIRO_GUI_LAUNCHER
   process.Write("c");
   static_cast<void>(
       process.ReadUntil("Live command", 3s, "active Firo-Qt palette"));
@@ -2742,6 +2766,27 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
     throw std::runtime_error(
         "Firo-Qt dialog dismissal stopped the active worker or ran Firo-Qt");
   }
+#else
+  const std::set<std::filesystem::path> launchers_before =
+      NativeLauncherPaths();
+  process.Write("c");
+  static_cast<void>(
+      process.ReadUntil("Live command", 3s, "active OFF launcher palette"));
+  process.Write("firo-qt\n");
+  const std::string unsupported =
+      process.ReadUntil("disabled at build", 3s, "active OFF launcher refusal");
+  RequireContains(unsupported,
+                  "unsupported_feature:", "active OFF launcher refusal");
+  process.Write("\x1b");
+  static_cast<void>(process.ReadFor(200ms));
+  if (NativeLauncherPaths() != launchers_before || !process.Running() ||
+      !ProcessExists(daemon_pid) ||
+      std::filesystem::exists(qt_execution_marker)) {
+    throw std::runtime_error(
+        "OFF Firo-Qt request created a launcher, executed it, or changed the "
+        "active run");
+  }
+#endif
 
   std::this_thread::sleep_for(200ms);
   static_cast<void>(process.ReadFor(100ms));
@@ -2785,6 +2830,7 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   RequireContains(finished_events, "\"event\":\"run_cancelled\"",
                   "active-run confirmed exit");
   WaitForProcessExit(daemon_pid, 3s);
+#ifdef BBP_FIRO_GUI_LAUNCHER
   struct stat launcher_status{};
   errno = 0;
   if (lstat(second_launcher.c_str(), &launcher_status) == 0 ||
@@ -2792,6 +2838,7 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
     throw std::runtime_error(
         "owned Firo-Qt launcher survived confirmed active-run cleanup");
   }
+#endif
   if (std::filesystem::exists(qt_execution_marker)) {
     throw std::runtime_error("BBP executed the generated Firo-Qt launcher");
   }

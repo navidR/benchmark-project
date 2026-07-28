@@ -45,6 +45,10 @@ class FiroDriver final : public ChainDriver {
   std::optional<OperatorConnectionCommand> BuildOperatorConnectionCommand(
       const FiroNodeConfig& config,
       const std::filesystem::path& run_root) const override;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  std::shared_ptr<OperatorConnectionLauncher> CreateOperatorConnectionLauncher(
+      OperatorConnectionLauncherAuthorityResolver resolver) const override;
+#endif
   std::optional<LogTailChunk> ReadLogTail(
       const FiroNodeConfig& config, ChainLogSource source,
       const LogTailCursor& cursor, std::uint64_t max_bytes) const override;

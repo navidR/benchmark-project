@@ -1298,7 +1298,9 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
       return McpResultFamily::kEvidencePage;
     case McpOperationKind::kInvokeRuntimeCommand:
       return McpResultFamily::kRuntimeCommand;
+#ifdef BBP_FIRO_GUI_LAUNCHER
     case McpOperationKind::kCreateFiroQtLauncher:
+#endif
     case McpOperationKind::kAddNode:
     case McpOperationKind::kRemoveNode:
     case McpOperationKind::kStopNode:
@@ -1393,11 +1395,13 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["command"] = BuildMcpSimulationCommandSchema();
       required.emplace_back("command");
       break;
+#ifdef BBP_FIRO_GUI_LAUNCHER
     case McpOperationKind::kCreateFiroQtLauncher:
       add_run();
       properties["node_id"] = NodeAddIdentifierSchema();
       required.emplace_back("node_id");
       break;
+#endif
     case McpOperationKind::kAddNode:
       add_run();
       properties["request"] = NodeMutationConfigSchema();
@@ -1853,6 +1857,7 @@ boost::json::object WalletRemoveMutationSchema() {
   return schema;
 }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
 boost::json::object FiroQtLauncherMutationSchema() {
   return AddDraft(ClosedObject(
       boost::json::object{
@@ -1875,6 +1880,7 @@ boost::json::object FiroQtLauncherMutationSchema() {
                 "affected_node_ids", "action", "state", "unchanged",
                 "launcher_path", "operator_command"})));
 }
+#endif
 
 boost::json::object TypedNodeLifecycleCancellationDiagnosticSchema(
     McpOperationKind operation) {
@@ -2407,6 +2413,7 @@ boost::json::object BuildMcpResultSchema(
                                 {"terminal_error",
                                  std::move(terminal_error_constraint)}}}}}});
         }
+#ifdef BBP_FIRO_GUI_LAUNCHER
         if (std::find(selected_operations.begin(), selected_operations.end(),
                       McpOperationKind::kCreateFiroQtLauncher) !=
             selected_operations.end()) {
@@ -2457,6 +2464,7 @@ boost::json::object BuildMcpResultSchema(
                     boost::json::object{{"terminal_result_family",
                                          ConstStringSchema("error")}}}}}});
         }
+#endif
         if (std::find(selected_operations.begin(), selected_operations.end(),
                       McpOperationKind::kAssignRole) !=
             selected_operations.end()) {
@@ -2680,31 +2688,43 @@ boost::json::object BuildMcpOperationOutputSchema(
     std::span<const McpOperationKind> selected_operations) {
   boost::json::array choices;
   const std::array<McpOperationKind, 1U> operation_only{operation};
-  const std::span<const McpOperationKind> wrapper_operations =
+  const bool has_dedicated_wrapper =
       operation == McpOperationKind::kCleanRun ||
-              operation == McpOperationKind::kCreateFiroQtLauncher ||
-              operation == McpOperationKind::kAssignRole ||
-              operation == McpOperationKind::kRemoveRole ||
-              operation == McpOperationKind::kRemoveWallet
-          ? std::span<const McpOperationKind>(operation_only)
-          : selected_operations;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+      operation == McpOperationKind::kCreateFiroQtLauncher ||
+#endif
+      operation == McpOperationKind::kAssignRole ||
+      operation == McpOperationKind::kRemoveRole ||
+      operation == McpOperationKind::kRemoveWallet;
+  const std::span<const McpOperationKind> wrapper_operations =
+      has_dedicated_wrapper ? std::span<const McpOperationKind>(operation_only)
+                            : selected_operations;
   const McpResultFamily result_family = McpOperationResultFamily(operation);
-  choices.emplace_back(
-      operation == McpOperationKind::kCreateFiroQtLauncher
-          ? FiroQtLauncherMutationSchema()
-      : IsTypedNodeLifecycleOperation(operation)
-          ? TypedNodeLifecycleMutationSchema(operation)
-      : operation == McpOperationKind::kAddNode    ? NodeAddMutationSchema()
-      : operation == McpOperationKind::kRemoveNode ? NodeRemoveMutationSchema()
-      : operation == McpOperationKind::kReplaceNode
-          ? NodeReplaceMutationSchema()
-      : operation == McpOperationKind::kRemoveWallet
-          ? WalletRemoveMutationSchema()
-      : operation == McpOperationKind::kAssignRole ? RoleAssignMutationSchema()
-      : operation == McpOperationKind::kRemoveRole ? RoleRemoveMutationSchema()
-      : result_family == McpResultFamily::kOperation
-          ? BuildMcpResultSchema(result_family, selected_operations)
-          : BuildMcpResultSchema(result_family));
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  if (operation == McpOperationKind::kCreateFiroQtLauncher) {
+    choices.emplace_back(FiroQtLauncherMutationSchema());
+  } else {
+#endif
+    choices.emplace_back(
+        IsTypedNodeLifecycleOperation(operation)
+            ? TypedNodeLifecycleMutationSchema(operation)
+        : operation == McpOperationKind::kAddNode ? NodeAddMutationSchema()
+        : operation == McpOperationKind::kRemoveNode
+            ? NodeRemoveMutationSchema()
+        : operation == McpOperationKind::kReplaceNode
+            ? NodeReplaceMutationSchema()
+        : operation == McpOperationKind::kRemoveWallet
+            ? WalletRemoveMutationSchema()
+        : operation == McpOperationKind::kAssignRole
+            ? RoleAssignMutationSchema()
+        : operation == McpOperationKind::kRemoveRole
+            ? RoleRemoveMutationSchema()
+        : result_family == McpResultFamily::kOperation
+            ? BuildMcpResultSchema(result_family, selected_operations)
+            : BuildMcpResultSchema(result_family));
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  }
+#endif
   if (result_family != McpResultFamily::kOperation) {
     // Long actions return their stable operation immediately; callers then
     // use operation.get/subscriptions for progress and the typed terminal

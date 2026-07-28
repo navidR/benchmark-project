@@ -24853,7 +24853,9 @@ struct EditorRunContext {
   std::shared_ptr<Options> options;
   std::optional<boost::json::object> source_scenario;
   std::shared_ptr<SimulationCommandQueue> command_queue;
-  std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  std::shared_ptr<OperatorConnectionLauncher> operator_connection_launcher;
+#endif
   std::shared_ptr<RuntimeNodeInventory> node_inventory;
   std::shared_ptr<EditorTuiReadLeaseState> tui_read_lease_state =
       std::make_shared<EditorTuiReadLeaseState>();
@@ -24881,7 +24883,9 @@ struct EditorRunSnapshot {
   std::uint32_t available_node_capacity = 0U;
   EditorRunState state = EditorRunState::kStarting;
   std::shared_ptr<SimulationCommandQueue> command_queue;
-  std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  std::shared_ptr<OperatorConnectionLauncher> operator_connection_launcher;
+#endif
   std::shared_ptr<McpLiveApplication> mcp_application;
   std::shared_ptr<void> tui_read_lease;
 };
@@ -25723,7 +25727,9 @@ class EditorRunController {
             node_count <= node_capacity ? node_capacity - node_count : 0U,
         .state = context.state,
         .command_queue = context.command_queue,
-        .firo_qt_launcher_service = context.firo_qt_launcher_service,
+#ifdef BBP_FIRO_GUI_LAUNCHER
+        .operator_connection_launcher = context.operator_connection_launcher,
+#endif
         .mcp_application = context.mcp_application,
         .tui_read_lease = acquire_tui_read_lease
                               ? std::make_shared<EditorTuiReadLease>(
@@ -26004,51 +26010,59 @@ class EditorRunController {
           };
     }
     const std::weak_ptr<EditorRunContext> weak_context(context);
-    context->firo_qt_launcher_service = std::make_shared<FiroQtLauncherService>(
-        [weak_context](std::string_view node_id, std::stop_token stop_token) {
-          ThrowIfStopRequested(stop_token);
-          const std::shared_ptr<EditorRunContext> run = weak_context.lock();
-          if (!run || !run->node_inventory || !run->options) {
-            throw std::runtime_error(
-                "managed run Firo-Qt launcher authority is unavailable");
-          }
+#ifdef BBP_FIRO_GUI_LAUNCHER
+    std::unique_ptr<ChainDriver> launcher_driver =
+        CreateChainDriver(context->options->chain);
+    context->operator_connection_launcher =
+        launcher_driver->CreateOperatorConnectionLauncher(
+            [weak_context](std::string_view node_id,
+                           std::stop_token stop_token) {
+              ThrowIfStopRequested(stop_token);
+              const std::shared_ptr<EditorRunContext> run = weak_context.lock();
+              if (!run || !run->node_inventory || !run->options) {
+                throw std::runtime_error(
+                    "managed run operator launcher authority is unavailable");
+              }
 
-          const RuntimeNodeSnapshot snapshot = run->node_inventory->Snapshot();
-          const auto selected =
-              std::find_if(snapshot.begin(), snapshot.end(),
-                           [node_id](const NodeRuntime& node) {
-                             return node.config.id == node_id;
-                           });
-          if (selected == snapshot.end()) {
-            throw std::runtime_error(
-                "Firo-Qt launcher references an unknown active node: " +
-                std::string(node_id));
-          }
+              const RuntimeNodeSnapshot snapshot =
+                  run->node_inventory->Snapshot();
+              const auto selected =
+                  std::find_if(snapshot.begin(), snapshot.end(),
+                               [node_id](const NodeRuntime& node) {
+                                 return node.config.id == node_id;
+                               });
+              if (selected == snapshot.end()) {
+                throw std::runtime_error(
+                    "operator launcher references an unknown active node: " +
+                    std::string(node_id));
+              }
 
-          ChainNodeConfig config;
-          {
-            auto process_guard = LockNodeProcessState(*selected);
-            RequireNodeRunning(*selected, process_guard, "Firo-Qt launcher");
-            config = selected->config;
-          }
-          ThrowIfStopRequested(stop_token);
+              ChainNodeConfig config;
+              {
+                auto process_guard = LockNodeProcessState(*selected);
+                RequireNodeRunning(*selected, process_guard,
+                                   "operator launcher");
+                config = selected->config;
+              }
+              ThrowIfStopRequested(stop_token);
 
-          std::unique_ptr<ChainDriver> driver =
-              CreateChainDriver(run->options->chain);
-          std::optional<OperatorConnectionCommand> command =
-              driver->BuildOperatorConnectionCommand(
-                  config, BenchmarkRunRoot(*run->options));
-          if (!command) {
-            throw std::runtime_error(
-                "the active chain has no Firo-Qt launcher command");
-          }
-          ThrowIfStopRequested(stop_token);
-          return FiroQtLauncherAuthority{
-              .inventory_generation = snapshot.generation(),
-              .node_id = config.id,
-              .command = std::move(*command),
-          };
-        });
+              std::unique_ptr<ChainDriver> driver =
+                  CreateChainDriver(run->options->chain);
+              std::optional<OperatorConnectionCommand> command =
+                  driver->BuildOperatorConnectionCommand(
+                      config, BenchmarkRunRoot(*run->options));
+              if (!command) {
+                throw std::runtime_error(
+                    "the active chain has no operator launcher command");
+              }
+              ThrowIfStopRequested(stop_token);
+              return OperatorConnectionLauncherAuthority{
+                  .inventory_generation = snapshot.generation(),
+                  .node_id = config.id,
+                  .command = std::move(*command),
+              };
+            });
+#endif
     context->mcp_application =
         std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
             .run_id = context->options->run_id,
@@ -26056,7 +26070,10 @@ class EditorRunController {
             .retained_run = std::nullopt,
             .options = context->options,
             .command_queue = context->command_queue,
-            .firo_qt_launcher_service = context->firo_qt_launcher_service,
+#ifdef BBP_FIRO_GUI_LAUNCHER
+            .operator_connection_launcher =
+                context->operator_connection_launcher,
+#endif
             .node_inventory_snapshot =
                 [weak_context] {
                   const std::shared_ptr<EditorRunContext> run =
@@ -26199,7 +26216,9 @@ TuiRunSnapshot TuiSnapshot(const EditorRunController& controller) {
       .generation = snapshot->generation,
       .run_root = snapshot->run_root,
       .command_queue = snapshot->command_queue,
-      .firo_qt_launcher_service = snapshot->firo_qt_launcher_service,
+#ifdef BBP_FIRO_GUI_LAUNCHER
+      .operator_connection_launcher = snapshot->operator_connection_launcher,
+#endif
       .publication_mutex = RuntimePublicationMutex(),
       .read_lease = snapshot->tui_read_lease,
   };

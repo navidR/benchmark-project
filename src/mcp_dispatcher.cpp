@@ -308,6 +308,10 @@ boost::json::value McpDispatcher::InvokeToolInSession(
   if (stop_token.stop_requested()) {
     throw std::runtime_error("MCP request was cancelled before dispatch");
   }
+  if (std::optional<boost::json::object> unavailable =
+          McpUnavailableBuildOperationResult(name)) {
+    return std::move(*unavailable);
+  }
   const McpOperationKind kind = RequireOperationKind(name);
   ValidateTopLevelArguments(kind, arguments);
 

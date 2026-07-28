@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(blockchain_benchmark_project LANGUAGES C CXX)
 
+option(FIRO_GUI_LAUNCHER "Build native Firo-Qt launcher support" OFF)
+
 # CMake 4 requires an explicit compatibility floor for libyaml's release
 # CMakeLists, which still declares compatibility with CMake 2.8.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
@@ -323,6 +325,10 @@ target_compile_options(bbp PRIVATE
   -Wconversion
   -Werror
 )
+if(FIRO_GUI_LAUNCHER)
+  target_sources(bbp PRIVATE src/drivers/firo_gui_launcher.cpp)
+  target_compile_definitions(bbp PRIVATE BBP_FIRO_GUI_LAUNCHER=1)
+endif()
 
 if(BUILD_TESTING)
   add_executable(bbp-process-tree-helper
@@ -364,6 +370,11 @@ if(BUILD_TESTING)
     -Wconversion
     -Werror
   )
+  if(FIRO_GUI_LAUNCHER)
+    target_compile_definitions(bbp-tui-pty-helper PRIVATE
+      BBP_FIRO_GUI_LAUNCHER=1
+    )
+  endif()
 
   add_executable(bbp-unit-tests
     tests/unit/application_instance_lock_tests.cpp
@@ -534,6 +545,12 @@ if(BUILD_TESTING)
     BBP_ENABLE_TEST_HOOKS=1
     BBP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   )
+  if(FIRO_GUI_LAUNCHER)
+    target_sources(bbp-unit-tests PRIVATE src/drivers/firo_gui_launcher.cpp)
+    target_compile_definitions(bbp-unit-tests PRIVATE
+      BBP_FIRO_GUI_LAUNCHER=1
+    )
+  endif()
   target_link_libraries(bbp-unit-tests PRIVATE
     Boost::asio
     Boost::beast

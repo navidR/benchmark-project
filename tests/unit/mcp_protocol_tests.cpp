@@ -444,6 +444,70 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_dispatches_registered_tools_and_resources) {
       kMcpProtocolVersion);
 }
 
+#ifndef BBP_FIRO_GUI_LAUNCHER
+BOOST_AUTO_TEST_CASE(
+    mcp_protocol_returns_typed_error_for_disabled_build_operation) {
+  std::size_t tool_calls = 0U;
+  McpProtocol protocol = MakeProtocol(&tool_calls);
+  const std::string session = Initialize(&protocol);
+  MarkInitialized(&protocol, session);
+  std::string unavailable_tool = "local";
+  unavailable_tool += '.';
+  unavailable_tool += "firo_qt_launcher";
+
+  boost::json::value parsed;
+  const auto tools_response = protocol.Handle(ProtocolRequest(
+      http::verb::post, RequestBody(2U, "tools/list"), session));
+  const boost::json::array& tools = ParsedBody(tools_response.body(), &parsed)
+                                        .at("result")
+                                        .as_object()
+                                        .at("tools")
+                                        .as_array();
+  for (const boost::json::value& tool : tools) {
+    BOOST_TEST(tool.as_object().at("name").as_string() != unavailable_tool);
+  }
+
+  const auto unavailable_response = protocol.Handle(ProtocolRequest(
+      http::verb::post,
+      RequestBody(3U, "tools/call",
+                  boost::json::object{{"name", unavailable_tool},
+                                      {"arguments", boost::json::object{}}}),
+      session));
+  BOOST_REQUIRE(unavailable_response.result() == http::status::ok);
+  const boost::json::object& result =
+      ParsedBody(unavailable_response.body(), &parsed).at("result").as_object();
+  BOOST_TEST(result.at("isError").as_bool());
+  const boost::json::object& structured =
+      result.at("structuredContent").as_object();
+  BOOST_REQUIRE_EQUAL(structured.size(), 5U);
+  BOOST_TEST(structured.at("result_family").as_string() == "error");
+  BOOST_TEST(structured.at("code").as_string() == "unsupported_feature");
+  BOOST_TEST(structured.at("message").as_string() ==
+             "native Firo-Qt launcher support is disabled at build time");
+  BOOST_TEST(!structured.at("retryable").as_bool());
+  BOOST_TEST(structured.at("diagnostics").as_array().empty());
+  const boost::json::object content = boost::json::parse(result.at("content")
+                                                             .as_array()
+                                                             .front()
+                                                             .as_object()
+                                                             .at("text")
+                                                             .as_string())
+                                          .as_object();
+  BOOST_TEST(content == structured);
+  BOOST_TEST(tool_calls == 0U);
+
+  const auto unknown_response = protocol.Handle(ProtocolRequest(
+      http::verb::post,
+      RequestBody(4U, "tools/call",
+                  boost::json::object{{"name", unavailable_tool + ".extra"}}),
+      session));
+  const boost::json::object& unknown =
+      ParsedBody(unknown_response.body(), &parsed);
+  BOOST_TEST(unknown.at("error").as_object().at("code").as_int64() == -32602);
+  BOOST_TEST(tool_calls == 0U);
+}
+#endif
+
 BOOST_AUTO_TEST_CASE(
     mcp_protocol_reports_resource_absence_separately_from_bad_params_and_faults) {
   const auto require_error = [](const auto& response, int expected_code,

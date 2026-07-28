@@ -78,6 +78,14 @@ ChainDriver::BuildOperatorConnectionCommand(
   return std::nullopt;
 }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
+std::shared_ptr<OperatorConnectionLauncher>
+ChainDriver::CreateOperatorConnectionLauncher(
+    OperatorConnectionLauncherAuthorityResolver) const {
+  return {};
+}
+#endif
+
 bool ChainDriver::SupportsWalletTransactionMode(ChainWalletMode) const {
   return false;
 }

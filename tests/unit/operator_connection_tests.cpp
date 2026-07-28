@@ -18,7 +18,11 @@
 
 #include "bbp/operator_connection.h"
 #include "bbp/simulation_cancelled.h"
+#ifdef BBP_FIRO_GUI_LAUNCHER
+#include "bbp/drivers/firo_gui_launcher.h"
+#endif
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
 namespace {
 
 class ScopedFileRemoval {
@@ -202,6 +206,7 @@ boost::json::object LauncherReport(std::string_view node_id,
 }
 
 }  // namespace
+#endif
 
 BOOST_AUTO_TEST_CASE(posix_shell_quote_handles_hostile_arguments) {
   BOOST_TEST(bbp::PosixShellQuote("") == "''");
@@ -240,6 +245,7 @@ BOOST_AUTO_TEST_CASE(operator_connection_is_recovered_from_run_report) {
              "'/opt/firo/firo-qt' '-regtest'");
 }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
 BOOST_AUTO_TEST_CASE(firo_qt_launcher_has_exact_content_mode_and_cleanup) {
   const std::filesystem::path foreign_path = CreateMatchingForeignLauncher();
   ScopedFileRemoval remove_foreign(foreign_path);
@@ -867,3 +873,5 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!std::filesystem::exists(*quarantine_path));
   BOOST_TEST(ReadFile(*displaced_owned_path) == launcher_content);
 }
+
+#endif

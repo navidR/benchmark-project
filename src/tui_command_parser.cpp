@@ -18,39 +18,48 @@
 namespace bbp {
 namespace {
 
-constexpr std::array<std::string_view, 32> kCommandNames = {
-    "add-nodes",
-    "replace-node",
-    "remove-nodes",
-    "block-production",
-    "mining-difficulty",
-    "stop-mining",
-    "disconnect",
-    "reconnect",
-    "connect-peer",
-    "disconnect-peer",
-    "peer-policy",
-    "log-more",
-    "log-less",
-    "freeze",
-    "thaw",
-    "stop-node",
-    "restart",
-    "kill",
-    "generate-blocks",
-    "resource-profile",
-    "resource-limit",
-    "network-profile",
-    "network-condition",
-    "block",
-    "unblock",
-    "clear-rule",
-    "partition",
-    "heal",
-    "export-node-report",
-    "perf-counters",
-    "wallet-send",
-    "firo-qt",
+constexpr std::array<std::string_view,
+#ifdef BBP_FIRO_GUI_LAUNCHER
+                     32U
+#else
+                     31U
+#endif
+                     >
+    kCommandNames = {
+        "add-nodes",
+        "replace-node",
+        "remove-nodes",
+        "block-production",
+        "mining-difficulty",
+        "stop-mining",
+        "disconnect",
+        "reconnect",
+        "connect-peer",
+        "disconnect-peer",
+        "peer-policy",
+        "log-more",
+        "log-less",
+        "freeze",
+        "thaw",
+        "stop-node",
+        "restart",
+        "kill",
+        "generate-blocks",
+        "resource-profile",
+        "resource-limit",
+        "network-profile",
+        "network-condition",
+        "block",
+        "unblock",
+        "clear-rule",
+        "partition",
+        "heal",
+        "export-node-report",
+        "perf-counters",
+        "wallet-send",
+#ifdef BBP_FIRO_GUI_LAUNCHER
+        "firo-qt",
+#endif
 };
 
 std::vector<std::string> Tokens(std::string_view input) {
@@ -205,10 +214,16 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       return parsed;
     }
     if (tokens[0] == "firo-qt") {
+#ifdef BBP_FIRO_GUI_LAUNCHER
       RequireArgumentCount(tokens, 1U, "firo-qt");
       ParsedTuiCommand parsed;
       parsed.local_action = TuiLocalAction::kCreateFiroQtLauncher;
       return parsed;
+#else
+      throw std::runtime_error(
+          "unsupported_feature: native Firo-Qt launcher support is disabled "
+          "at build time");
+#endif
     }
     if (tokens[0] == "resource-limit") {
       ResourceLimitPatch patch;

@@ -341,7 +341,14 @@ BOOST_AUTO_TEST_CASE(mcp_registry_covers_every_tui_command_and_local_action) {
   }
   const auto operations = NamedSet(ArrayField(document, "operations"));
   BOOST_TEST(operations.contains("simulation.command"));
+#ifdef BBP_FIRO_GUI_LAUNCHER
   BOOST_TEST(operations.contains("local.firo_qt_launcher"));
+#else
+  std::string unavailable_operation = "local";
+  unavailable_operation += '.';
+  unavailable_operation += "firo_qt_launcher";
+  BOOST_TEST(!operations.contains(unavailable_operation));
+#endif
   for (const std::string_view operation : {"node.add",
                                            "node.remove",
                                            "node.stop",
@@ -377,6 +384,14 @@ BOOST_AUTO_TEST_CASE(mcp_registry_exposes_every_information_family_and_bound) {
   const boost::json::object document = BuildMcpCapabilityDocument();
   BOOST_TEST(document.at("protocol_version").as_string() ==
              kMcpProtocolVersion);
+  const boost::json::object& build_features =
+      document.at("build_features").as_object();
+  BOOST_REQUIRE_EQUAL(build_features.size(), 1U);
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  BOOST_TEST(build_features.at("firo_gui_launcher").as_bool());
+#else
+  BOOST_TEST(!build_features.at("firo_gui_launcher").as_bool());
+#endif
   const boost::json::array& supported_versions =
       document.at("supported_protocol_versions").as_array();
   BOOST_REQUIRE_EQUAL(supported_versions.size(), 2U);
@@ -1731,6 +1746,7 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
   }
 }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
 BOOST_AUTO_TEST_CASE(mcp_firo_qt_launcher_schema_is_closed_and_wrapper_exact) {
   const boost::json::object input =
       BuildMcpOperationInputSchema(McpOperationKind::kCreateFiroQtLauncher);
@@ -1825,5 +1841,6 @@ BOOST_AUTO_TEST_CASE(mcp_firo_qt_launcher_schema_is_closed_and_wrapper_exact) {
                  .at("const")
                  .as_string() == "error");
 }
+#endif
 
 }  // namespace bbp

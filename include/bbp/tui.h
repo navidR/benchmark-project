@@ -10,7 +10,9 @@
 
 namespace bbp {
 
-class FiroQtLauncherService;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+class OperatorConnectionLauncher;
+#endif
 class SimulationCommandQueue;
 
 struct TuiMcpConnectionInfo {
@@ -23,7 +25,9 @@ struct TuiRunSnapshot {
   std::uint64_t generation = 0;
   std::filesystem::path run_root;
   std::shared_ptr<SimulationCommandQueue> command_queue;
-  std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service = {};
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  std::shared_ptr<OperatorConnectionLauncher> operator_connection_launcher = {};
+#endif
   std::shared_ptr<std::timed_mutex> publication_mutex;
   std::shared_ptr<void> read_lease;
 };

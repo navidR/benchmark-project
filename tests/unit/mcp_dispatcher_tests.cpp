@@ -52,6 +52,31 @@ boost::json::object WaitForTerminal(McpDispatcher* dispatcher,
 
 }  // namespace
 
+#ifndef BBP_FIRO_GUI_LAUNCHER
+BOOST_AUTO_TEST_CASE(
+    mcp_dispatcher_returns_typed_error_for_disabled_firo_gui_launcher) {
+  McpDispatcher dispatcher;
+  dispatcher.SessionHandler()("session-a", true, {});
+  std::string unavailable_tool = "local";
+  unavailable_tool += '.';
+  unavailable_tool += "firo_qt_launcher";
+
+  const boost::json::object result =
+      Invoke(&dispatcher, unavailable_tool, boost::json::object{});
+  BOOST_REQUIRE_EQUAL(result.size(), 5U);
+  BOOST_TEST(result.at("result_family").as_string() == "error");
+  BOOST_TEST(result.at("code").as_string() == "unsupported_feature");
+  BOOST_TEST(result.at("message").as_string() ==
+             "native Firo-Qt launcher support is disabled at build time");
+  BOOST_TEST(!result.at("retryable").as_bool());
+  BOOST_TEST(result.at("diagnostics").as_array().empty());
+  BOOST_CHECK_THROW(
+      Invoke(&dispatcher, unavailable_tool + ".extra", boost::json::object{}),
+      std::invalid_argument);
+  dispatcher.SessionHandler()("session-a", false, {});
+}
+#endif
+
 BOOST_AUTO_TEST_CASE(
     mcp_dispatcher_uses_production_scenario_validation_and_async_results) {
   McpDispatcher dispatcher;

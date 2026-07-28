@@ -20,6 +20,9 @@
 #include <vector>
 
 #include "bbp/drivers/chain_driver_registry.h"
+#ifdef BBP_FIRO_GUI_LAUNCHER
+#include "bbp/drivers/firo_gui_launcher.h"
+#endif
 #include "bbp/mcp_dispatcher.h"
 #include "bbp/mcp_live_application.h"
 #include "bbp/mcp_run_evidence.h"
@@ -3452,6 +3455,7 @@ BOOST_AUTO_TEST_CASE(
   application.Shutdown();
 }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
 BOOST_AUTO_TEST_CASE(
     mcp_live_firo_qt_launcher_binds_report_replaces_and_cleans_up) {
   LiveApplicationDirectory temporary;
@@ -3515,13 +3519,14 @@ BOOST_AUTO_TEST_CASE(
              }));
 
   auto queue = std::make_shared<SimulationCommandQueue>();
-  auto launcher_service = std::make_shared<FiroQtLauncherService>(
+  std::unique_ptr<ChainDriver> launcher_driver = CreateDefaultChainDriver();
+  auto launcher_service = launcher_driver->CreateOperatorConnectionLauncher(
       [connection](std::string_view node_id, std::stop_token) {
         if (node_id != "_firo") {
           throw std::runtime_error(
               "requested node has no authoritative Firo-Qt command");
         }
-        return FiroQtLauncherAuthority{
+        return OperatorConnectionLauncherAuthority{
             .inventory_generation = 1U,
             .node_id = "_firo",
             .command = connection,
@@ -3533,7 +3538,7 @@ BOOST_AUTO_TEST_CASE(
       .retained_run = std::nullopt,
       .options = options,
       .command_queue = queue,
-      .firo_qt_launcher_service = launcher_service,
+      .operator_connection_launcher = launcher_service,
       .node_inventory_snapshot =
           [] {
             return McpLiveNodeInventorySnapshot{
@@ -3622,19 +3627,20 @@ BOOST_AUTO_TEST_CASE(
       uncertainty_report.at("operator_connection_command").as_object();
   uncertainty_command["node_id"] = "_firo";
   uncertainty_command["timestamp"] = "2026-07-27T00:00:00Z";
-  auto uncertain_launcher_service = std::make_shared<FiroQtLauncherService>(
-      [connection](std::string_view node_id, std::stop_token) {
-        if (node_id != "_firo") {
-          throw std::runtime_error(
-              "requested node has no authoritative Firo-Qt command");
-        }
-        return FiroQtLauncherAuthority{
-            .inventory_generation = 1U,
-            .node_id = "_firo",
-            .command = connection,
-        };
-      });
-  const FiroQtLauncherSnapshot uncertain_launcher =
+  auto uncertain_launcher_service =
+      launcher_driver->CreateOperatorConnectionLauncher(
+          [connection](std::string_view node_id, std::stop_token) {
+            if (node_id != "_firo") {
+              throw std::runtime_error(
+                  "requested node has no authoritative Firo-Qt command");
+            }
+            return OperatorConnectionLauncherAuthority{
+                .inventory_generation = 1U,
+                .node_id = "_firo",
+                .command = connection,
+            };
+          });
+  const OperatorConnectionLauncherSnapshot uncertain_launcher =
       uncertain_launcher_service->ReplaceFromReport(uncertainty_report,
                                                     "_firo");
   BOOST_REQUIRE(std::filesystem::remove(uncertain_launcher.launcher_path));
@@ -3645,7 +3651,7 @@ BOOST_AUTO_TEST_CASE(
       .retained_run = std::nullopt,
       .options = options,
       .command_queue = std::make_shared<SimulationCommandQueue>(),
-      .firo_qt_launcher_service = uncertain_launcher_service,
+      .operator_connection_launcher = uncertain_launcher_service,
       .node_inventory_snapshot =
           [] {
             return McpLiveNodeInventorySnapshot{
@@ -3672,5 +3678,6 @@ BOOST_AUTO_TEST_CASE(
   dispatcher.Shutdown();
   application.Shutdown();
 }
+#endif
 
 }  // namespace bbp

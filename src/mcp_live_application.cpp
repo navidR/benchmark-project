@@ -41,7 +41,9 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kStopRun,
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
+#ifdef BBP_FIRO_GUI_LAUNCHER
     McpOperationKind::kCreateFiroQtLauncher,
+#endif
     McpOperationKind::kAddNode,
     McpOperationKind::kRemoveNode,
     McpOperationKind::kStopNode,
@@ -213,15 +215,17 @@ void ThrowIfCancelled(std::stop_token stop_token) {
   }
 }
 
-void CloseFiroQtLauncher(const std::shared_ptr<FiroQtLauncherService>& service,
-                         std::string_view run_id, std::string_view boundary,
-                         std::optional<std::chrono::steady_clock::time_point>
-                             deadline = std::nullopt,
-                         std::stop_token stop_token = {}) {
+#ifdef BBP_FIRO_GUI_LAUNCHER
+void CloseOperatorConnectionLauncher(
+    const std::shared_ptr<OperatorConnectionLauncher>& service,
+    std::string_view run_id, std::string_view boundary,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}) {
   if (!service) {
     return;
   }
-  FiroQtLauncherCleanupResult cleanup;
+  OperatorConnectionLauncherCleanupResult cleanup;
   try {
     cleanup = deadline ? service->CloseAndCleanup(*deadline, stop_token)
               : stop_token.stop_possible()
@@ -229,18 +233,19 @@ void CloseFiroQtLauncher(const std::shared_ptr<FiroQtLauncherService>& service,
                   : service->CloseAndCleanup();
   } catch (const SimulationCancelled&) {
     throw McpOperationCancelled();
-  } catch (const FiroQtLauncherCleanupUnverified& error) {
+  } catch (const OperatorConnectionLauncherCleanupUnverified& error) {
     throw McpOperationFailure(
         "run_cleanup_unverified",
-        "run cleanup refused unverified Firo-Qt launcher ownership: " +
+        "run cleanup refused unverified operator launcher ownership: " +
             std::string(error.what()),
         false);
   }
-  if (cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
-    BBP_LOG(warning) << "Firo-Qt launcher ownership changed before " << boundary
-                     << " cleanup for run " << run_id;
+  if (cleanup == OperatorConnectionLauncherCleanupResult::kOwnershipChanged) {
+    BBP_LOG(warning) << "operator launcher ownership changed before "
+                     << boundary << " cleanup for run " << run_id;
   }
 }
+#endif
 
 const boost::json::value& RequireMember(const boost::json::object& object,
                                         std::string_view name) {
@@ -1239,7 +1244,9 @@ McpLiveApplication::McpLiveApplication(Config config)
           "MCP retained application requires persisted run metadata");
     }
     if (config_.options != nullptr || config_.command_queue != nullptr ||
-        config_.firo_qt_launcher_service != nullptr ||
+#ifdef BBP_FIRO_GUI_LAUNCHER
+        config_.operator_connection_launcher != nullptr ||
+#endif
         config_.node_inventory_snapshot || config_.request_run_stop ||
         config_.run_started || config_.run_stopping || config_.run_stopped ||
         config_.publish_evidence || config_.close_run_subscriptions) {
@@ -1361,9 +1368,11 @@ std::vector<McpOperationKind> McpLiveApplication::SupportedOperations() const {
   if (!config_.retained_run) {
     std::vector<McpOperationKind> operations{kLiveOperations.begin(),
                                              kLiveOperations.end()};
-    if (!config_.firo_qt_launcher_service) {
+#ifdef BBP_FIRO_GUI_LAUNCHER
+    if (!config_.operator_connection_launcher) {
       std::erase(operations, McpOperationKind::kCreateFiroQtLauncher);
     }
+#endif
     operations.insert(
         operations.end(),
         {McpOperationKind::kStartWorkload, McpOperationKind::kInspectWorkload,
@@ -1431,7 +1440,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
       kind != McpOperationKind::kInvokeRuntimeCommand &&
+#ifdef BBP_FIRO_GUI_LAUNCHER
       kind != McpOperationKind::kCreateFiroQtLauncher &&
+#endif
       kind != McpOperationKind::kAddNode &&
       kind != McpOperationKind::kRemoveNode &&
       kind != McpOperationKind::kStopNode &&
@@ -1467,6 +1478,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     }
   }
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
   if (kind == McpOperationKind::kCreateFiroQtLauncher) {
     const std::string node_id = RequireString(arguments, "node_id");
     if (!IsSafeNodeAddIdentifier(node_id)) {
@@ -1483,9 +1495,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           ThrowIfCancelled(stop_token);
           const boost::json::object report = ReportSnapshot(stop_token);
           ThrowIfCancelled(stop_token);
-          FiroQtLauncherSnapshot launcher;
+          OperatorConnectionLauncherSnapshot launcher;
           try {
-            launcher = config_.firo_qt_launcher_service->ReplaceFromReport(
+            launcher = config_.operator_connection_launcher->ReplaceFromReport(
                 report, node_id, stop_token);
           } catch (const SimulationCancelled&) {
             throw McpOperationCancelled();
@@ -1505,6 +1517,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                   {"operator_command", launcher.operator_command}}};
         }};
   }
+#endif
 
   if (IsWalletWorkloadOperation(kind)) {
     const std::shared_ptr<McpLiveWorkloadService> workload_service =
@@ -3208,8 +3221,10 @@ void McpLiveApplication::MarkRunStopped() {
   }
   run_stop_source_.request_stop();
   if (notify) {
-    CloseFiroQtLauncher(config_.firo_qt_launcher_service, config_.run_id,
-                        "run-stop");
+#ifdef BBP_FIRO_GUI_LAUNCHER
+    CloseOperatorConnectionLauncher(config_.operator_connection_launcher,
+                                    config_.run_id, "run-stop");
+#endif
     std::lock_guard<std::mutex> lock(mutex_);
     if (run_stopped_) {
       notify = false;
@@ -3325,8 +3340,11 @@ void McpLiveApplication::ShutdownImpl(
   workload_service_.reset();
   role_service_.reset();
   lock.unlock();
-  CloseFiroQtLauncher(config_.firo_qt_launcher_service, config_.run_id,
-                      "application-shutdown", deadline, stop_token);
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  CloseOperatorConnectionLauncher(config_.operator_connection_launcher,
+                                  config_.run_id, "application-shutdown",
+                                  deadline, stop_token);
+#endif
 }
 
 }  // namespace bbp

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -232,6 +233,11 @@ class ChainDriver {
   virtual std::optional<OperatorConnectionCommand>
   BuildOperatorConnectionCommand(const ChainNodeConfig& config,
                                  const std::filesystem::path& run_root) const;
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  virtual std::shared_ptr<OperatorConnectionLauncher>
+  CreateOperatorConnectionLauncher(
+      OperatorConnectionLauncherAuthorityResolver resolver) const;
+#endif
   virtual std::optional<LogTailChunk> ReadLogTail(
       const ChainNodeConfig& config, ChainLogSource source,
       const LogTailCursor& cursor, std::uint64_t max_bytes) const = 0;

@@ -126,13 +126,26 @@ BOOST_AUTO_TEST_CASE(
       application.SupportedOperations();
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kCleanRun) != supported.end());
+#ifdef BBP_FIRO_GUI_LAUNCHER
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kCreateFiroQtLauncher) !=
+              supported.end());
+#else
+  std::string unavailable_operation = "local";
+  unavailable_operation += '.';
+  unavailable_operation += "firo_qt_launcher";
+  BOOST_CHECK(std::none_of(
+      supported.begin(), supported.end(), [&](McpOperationKind operation) {
+        return McpOperationKindName(operation) == unavailable_operation;
+      }));
+#endif
   for (const McpOperationKind operation :
-       {McpOperationKind::kCreateFiroQtLauncher, McpOperationKind::kStopNode,
-        McpOperationKind::kKillNode, McpOperationKind::kRestartNode,
-        McpOperationKind::kAddWallet, McpOperationKind::kRemoveWallet,
-        McpOperationKind::kAssignRole, McpOperationKind::kRemoveRole,
-        McpOperationKind::kAddMiner, McpOperationKind::kRemoveMiner,
-        McpOperationKind::kAddMasternode, McpOperationKind::kRemoveMasternode,
+       {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
+        McpOperationKind::kRestartNode, McpOperationKind::kAddWallet,
+        McpOperationKind::kRemoveWallet, McpOperationKind::kAssignRole,
+        McpOperationKind::kRemoveRole, McpOperationKind::kAddMiner,
+        McpOperationKind::kRemoveMiner, McpOperationKind::kAddMasternode,
+        McpOperationKind::kRemoveMasternode,
         McpOperationKind::kRestartMasternode, McpOperationKind::kStartWorkload,
         McpOperationKind::kInspectWorkload,
         McpOperationKind::kReconfigureWorkload,
