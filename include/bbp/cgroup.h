@@ -148,6 +148,11 @@ class Cgroup {
 };
 
 #ifdef BBP_ENABLE_TEST_HOOKS
+enum class CgroupRemovalTestPhase {
+  kAfterRunIdentityVerification,
+  kAfterDescendantIdentityVerification,
+};
+
 struct CgroupScopeTestConfig {
   std::filesystem::path root;
   std::string simulator_name;
@@ -173,6 +178,9 @@ void KillCgroupProcessesWithPidfdFallbackForTest(
     std::stop_token stop_token = {});
 void SetCgroupCreateAfterDirectoryHookForTest(std::function<void()> hook);
 void SetCgroupCreateSharedAllocationHookForTest(std::function<void()> hook);
+void SetCgroupRemovalIdentityHookForTest(
+    std::function<void(CgroupRemovalTestPhase, const std::filesystem::path&)>
+        hook);
 #endif
 
 }  // namespace bbp

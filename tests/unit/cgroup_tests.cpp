@@ -85,6 +85,14 @@ class CgroupCreateHookGuard {
   }
 };
 
+class CgroupRemovalHookGuard {
+ public:
+  CgroupRemovalHookGuard() = default;
+  CgroupRemovalHookGuard(const CgroupRemovalHookGuard&) = delete;
+  CgroupRemovalHookGuard& operator=(const CgroupRemovalHookGuard&) = delete;
+  ~CgroupRemovalHookGuard() { bbp::SetCgroupRemovalIdentityHookForTest({}); }
+};
+
 class ChildGuard {
  public:
   explicit ChildGuard(pid_t pid) : pid_(pid) {}
@@ -792,6 +800,118 @@ BOOST_AUTO_TEST_CASE(
     if (std::filesystem::exists(displaced_root) &&
         !std::filesystem::exists(run_root)) {
       std::filesystem::rename(displaced_root, run_root, ignored);
+    }
+    std::filesystem::remove_all(parent);
+    throw;
+  }
+  std::filesystem::remove_all(parent);
+}
+
+BOOST_AUTO_TEST_CASE(
+    stale_cgroup_cleanup_does_not_kill_a_post_verification_replacement) {
+  const std::string run_id = UniqueRunId("verify-swap");
+  const std::filesystem::path parent = TestDirectory("verified-replacement");
+  const std::filesystem::path run_root = parent / run_id;
+  std::filesystem::remove_all(parent);
+  std::filesystem::create_directories(run_root);
+  const bbp::RunOwnership ownership = bbp::CreateRunOwnership(run_id, run_root);
+  bbp::WriteRunOwnershipMarker(ownership);
+
+  try {
+    bbp::Cgroup::PrepareRun(ownership);
+  } catch (const std::exception& error) {
+    BOOST_TEST_MESSAGE(
+        "skipping privileged post-verification replacement test: "
+        << error.what());
+    std::filesystem::remove_all(parent);
+    return;
+  }
+
+  const std::filesystem::path cgroup_path =
+      RunCgroupPath(ownership.cgroup_name);
+  const pid_t pid = fork();
+  if (pid < 0) {
+    try {
+      bbp::Cgroup::RemoveRun(ownership.cgroup_name);
+    } catch (const std::exception&) {
+    }
+    std::filesystem::remove_all(parent);
+    BOOST_FAIL("fork failed for post-verification replacement test");
+    return;
+  }
+  if (pid == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+  ChildGuard child(pid);
+  CgroupRemovalHookGuard hook_guard;
+  bool replacement_installed = false;
+  bool child_waited = false;
+  try {
+    bbp::SetCgroupRemovalIdentityHookForTest(
+        [&](bbp::CgroupRemovalTestPhase phase,
+            const std::filesystem::path& verified_path) {
+          if (phase !=
+              bbp::CgroupRemovalTestPhase::kAfterRunIdentityVerification) {
+            return;
+          }
+          if (verified_path != cgroup_path) {
+            throw std::runtime_error(
+                "removal hook received an unexpected cgroup path");
+          }
+          if (!std::filesystem::remove(cgroup_path) ||
+              !std::filesystem::create_directory(cgroup_path)) {
+            throw std::runtime_error(
+                "could not install the replacement run cgroup");
+          }
+          bbp::WriteText(cgroup_path / "cgroup.procs", std::to_string(pid));
+          replacement_installed = true;
+        });
+
+    BOOST_CHECK_EXCEPTION(
+        bbp::Cgroup::RemoveStaleRun(ownership), bbp::CgroupOwnershipMismatch,
+        [](const bbp::CgroupOwnershipMismatch& error) {
+          return std::string(error.what())
+                     .find("refusing a replaced cgroup identity") !=
+                 std::string::npos;
+        });
+    bbp::SetCgroupRemovalIdentityHookForTest({});
+
+    BOOST_REQUIRE(replacement_installed);
+    BOOST_TEST(std::filesystem::is_directory(cgroup_path));
+    siginfo_t child_state{};
+    BOOST_REQUIRE(waitid(P_PID, static_cast<id_t>(pid), &child_state,
+                         WEXITED | WNOHANG | WNOWAIT) == 0);
+    BOOST_TEST(child_state.si_pid == 0);
+    const std::vector<std::string> replacement_pids =
+        bbp::SplitWhitespace(bbp::ReadText(cgroup_path / "cgroup.procs"));
+    const bool process_still_member =
+        std::find(replacement_pids.begin(), replacement_pids.end(),
+                  std::to_string(pid)) != replacement_pids.end();
+    BOOST_TEST(process_still_member);
+
+    BOOST_REQUIRE(kill(pid, SIGKILL) == 0);
+    const int status = child.Wait();
+    child_waited = true;
+    BOOST_REQUIRE(WIFSIGNALED(status));
+    BOOST_TEST(WTERMSIG(status) == SIGKILL);
+    BOOST_REQUIRE(std::filesystem::remove(cgroup_path));
+    bbp::Cgroup::RemoveRun(ownership.cgroup_name);
+  } catch (...) {
+    bbp::SetCgroupRemovalIdentityHookForTest({});
+    if (!child_waited) {
+      static_cast<void>(kill(pid, SIGKILL));
+      try {
+        static_cast<void>(child.Wait());
+      } catch (const std::exception&) {
+      }
+    }
+    std::error_code ignored;
+    std::filesystem::remove(cgroup_path, ignored);
+    try {
+      bbp::Cgroup::RemoveRun(ownership.cgroup_name);
+    } catch (const std::exception&) {
     }
     std::filesystem::remove_all(parent);
     throw;

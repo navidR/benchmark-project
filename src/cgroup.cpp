@@ -1,5 +1,6 @@
 #include "bbp/cgroup.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/magic.h>
 #include <signal.h>
@@ -54,6 +55,8 @@ std::set<std::string> prepared_runs;
 #ifdef BBP_ENABLE_TEST_HOOKS
 std::function<void()> cgroup_create_after_directory_hook;
 std::function<void()> cgroup_create_shared_allocation_hook;
+std::function<void(CgroupRemovalTestPhase, const std::filesystem::path&)>
+    cgroup_removal_identity_hook;
 #endif
 
 struct CgroupPaths {
@@ -148,6 +151,8 @@ class CgroupScopeLock {
   CgroupScopeLock& operator=(const CgroupScopeLock&) = delete;
 
   ~CgroupScopeLock() { Close(); }
+
+  int descriptor() const { return fd_; }
 
  private:
   void Open(const std::filesystem::path& root) {
@@ -843,9 +848,9 @@ CpuMaxValue ParseCpuMax(const std::filesystem::path& path) {
   return value;
 }
 
-uint64_t ParseKeyValue(const std::filesystem::path& path,
-                       std::string_view key) {
-  std::istringstream lines(ReadText(path));
+uint64_t ParseKeyValueText(std::string_view text, std::string_view key,
+                           std::string_view context) {
+  std::istringstream lines{std::string(text)};
   std::string line;
   std::optional<uint64_t> result;
   while (std::getline(lines, line)) {
@@ -855,18 +860,24 @@ uint64_t ParseKeyValue(const std::filesystem::path& path,
     }
     if (fields.size() != 2U) {
       throw std::runtime_error("invalid key/value cgroup line in " +
-                               path.string() + ": " + line);
+                               std::string(context) + ": " + line);
     }
-    const uint64_t value = ParseUint64(fields[1], path.string());
+    const uint64_t value = ParseUint64(fields[1], context);
     if (fields[0] == key) {
       if (result) {
-        throw std::runtime_error("duplicate cgroup key in " + path.string() +
-                                 ": " + std::string(key));
+        throw std::runtime_error("duplicate cgroup key in " +
+                                 std::string(context) + ": " +
+                                 std::string(key));
       }
       result = value;
     }
   }
   return result.value_or(0U);
+}
+
+uint64_t ParseKeyValue(const std::filesystem::path& path,
+                       std::string_view key) {
+  return ParseKeyValueText(ReadText(path), key, path.string());
 }
 
 std::optional<uint64_t> ParseAssignmentUint(std::string_view token,
@@ -1137,6 +1148,311 @@ void RequireNativeCgroupRoot(const std::filesystem::path& root) {
   }
 }
 
+bool SameCgroupIdentity(const struct stat& first, const struct stat& second) {
+  return first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+}
+
+std::uint64_t CgroupMountId(int descriptor) {
+  struct statx status{};
+  if (statx(descriptor, "", AT_EMPTY_PATH | AT_NO_AUTOMOUNT, STATX_MNT_ID,
+            &status) != 0) {
+    throw std::runtime_error("inspect acquired cgroup mount identity failed: " +
+                             std::string(std::strerror(errno)));
+  }
+  if ((status.stx_mask & STATX_MNT_ID) == 0U) {
+    throw std::runtime_error(
+        "kernel did not report an acquired cgroup mount identity");
+  }
+  return status.stx_mnt_id;
+}
+
+std::uint64_t CgroupMountIdAt(int parent, std::string_view name) {
+  const std::string filename(name);
+  struct statx status{};
+  if (statx(parent, filename.c_str(), AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+            STATX_MNT_ID, &status) != 0) {
+    throw std::runtime_error("inspect linked cgroup mount identity failed: " +
+                             std::string(std::strerror(errno)));
+  }
+  if ((status.stx_mask & STATX_MNT_ID) == 0U) {
+    throw std::runtime_error(
+        "kernel did not report a linked cgroup mount identity");
+  }
+  return status.stx_mnt_id;
+}
+
+class BoundCgroupDirectory {
+ public:
+  static std::optional<BoundCgroupDirectory> TryOpen(
+      int parent_descriptor, std::string name,
+      std::filesystem::path display_path,
+      std::optional<CgroupPathIdentity> expected_identity = std::nullopt) {
+    struct stat before{};
+    if (fstatat(parent_descriptor, name.c_str(), &before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno == ENOENT) {
+        return std::nullopt;
+      }
+      throw std::runtime_error("inspect cgroup before acquisition failed for " +
+                               display_path.string() + ": " +
+                               std::strerror(errno));
+    }
+    if (!S_ISDIR(before.st_mode)) {
+      throw CgroupOwnershipMismatch(
+          "refusing a non-directory cgroup cleanup target: " +
+          display_path.string());
+    }
+
+    BoundCgroupDirectory acquired(parent_descriptor, std::move(name),
+                                  std::move(display_path), before);
+    if (expected_identity &&
+        (static_cast<std::uint64_t>(acquired.identity_.st_dev) !=
+             expected_identity->device ||
+         static_cast<std::uint64_t>(acquired.identity_.st_ino) !=
+             expected_identity->inode)) {
+      throw CgroupOwnershipMismatch(
+          "refusing to remove a replaced run cgroup identity: " +
+          acquired.display_path_.string());
+    }
+    return acquired;
+  }
+
+  BoundCgroupDirectory(const BoundCgroupDirectory&) = delete;
+  BoundCgroupDirectory& operator=(const BoundCgroupDirectory&) = delete;
+
+  BoundCgroupDirectory(BoundCgroupDirectory&& other) noexcept {
+    *this = std::move(other);
+  }
+
+  BoundCgroupDirectory& operator=(BoundCgroupDirectory&& other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    Close();
+    parent_descriptor_ = other.parent_descriptor_;
+    descriptor_ = other.descriptor_;
+    name_ = std::move(other.name_);
+    display_path_ = std::move(other.display_path_);
+    identity_ = other.identity_;
+    mount_id_ = other.mount_id_;
+    removed_ = other.removed_;
+    other.parent_descriptor_ = -1;
+    other.descriptor_ = -1;
+    other.removed_ = true;
+    return *this;
+  }
+
+  ~BoundCgroupDirectory() { Close(); }
+
+  int parent_descriptor() const { return parent_descriptor_; }
+  int descriptor() const { return descriptor_; }
+  const std::string& name() const { return name_; }
+  const std::filesystem::path& display_path() const { return display_path_; }
+  const struct stat& identity() const { return identity_; }
+  std::uint64_t mount_id() const { return mount_id_; }
+
+  void RequireLinkedIdentity() const {
+    if (removed_) {
+      throw CgroupOwnershipMismatch("acquired cgroup was already removed: " +
+                                    display_path_.string());
+    }
+    struct stat opened{};
+    if (fstat(descriptor_, &opened) != 0) {
+      throw std::runtime_error("inspect acquired cgroup failed for " +
+                               display_path_.string() + ": " +
+                               std::strerror(errno));
+    }
+    if (!S_ISDIR(opened.st_mode) || !SameCgroupIdentity(opened, identity_) ||
+        opened.st_uid != identity_.st_uid || identity_.st_uid != geteuid()) {
+      throw CgroupOwnershipMismatch("acquired cgroup identity changed: " +
+                                    display_path_.string());
+    }
+    struct stat linked{};
+    if (fstatat(parent_descriptor_, name_.c_str(), &linked,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno == ENOENT) {
+        throw CgroupOwnershipMismatch("acquired cgroup path disappeared: " +
+                                      display_path_.string());
+      }
+      throw std::runtime_error("reinspect acquired cgroup failed for " +
+                               display_path_.string() + ": " +
+                               std::strerror(errno));
+    }
+    if (!S_ISDIR(linked.st_mode) || !SameCgroupIdentity(linked, identity_) ||
+        linked.st_uid != identity_.st_uid ||
+        CgroupMountId(descriptor_) != mount_id_ ||
+        CgroupMountIdAt(parent_descriptor_, name_) != mount_id_) {
+      throw CgroupOwnershipMismatch("refusing a replaced cgroup identity: " +
+                                    display_path_.string());
+    }
+  }
+
+  void MarkRemoved() { removed_ = true; }
+
+ private:
+  BoundCgroupDirectory(int parent_descriptor, std::string name,
+                       std::filesystem::path display_path,
+                       const struct stat& before)
+      : name_(std::move(name)),
+        display_path_(std::move(display_path)),
+        identity_(before) {
+    parent_descriptor_ = fcntl(parent_descriptor, F_DUPFD_CLOEXEC, 0);
+    if (parent_descriptor_ < 0) {
+      throw std::runtime_error("duplicate cgroup parent failed for " +
+                               display_path_.string() + ": " +
+                               std::strerror(errno));
+    }
+    descriptor_ = openat(parent_descriptor_, name_.c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor_ < 0) {
+      const int error = errno;
+      Close();
+      if (error == ENOENT) {
+        throw CgroupOwnershipMismatch(
+            "cgroup disappeared during acquisition: " + display_path_.string());
+      }
+      throw std::runtime_error("open acquired cgroup failed for " +
+                               display_path_.string() + ": " +
+                               std::strerror(error));
+    }
+    struct stat opened{};
+    if (fstat(descriptor_, &opened) != 0) {
+      const int error = errno;
+      Close();
+      throw std::runtime_error("inspect opened cgroup failed for " +
+                               display_path_.string() + ": " +
+                               std::strerror(error));
+    }
+    if (!S_ISDIR(opened.st_mode) || !SameCgroupIdentity(before, opened) ||
+        opened.st_uid != geteuid()) {
+      Close();
+      throw CgroupOwnershipMismatch(
+          "cgroup ownership or identity changed during acquisition: " +
+          display_path_.string());
+    }
+    try {
+      mount_id_ = CgroupMountId(descriptor_);
+      if (CgroupMountId(parent_descriptor_) != mount_id_ ||
+          CgroupMountIdAt(parent_descriptor_, name_) != mount_id_) {
+        throw CgroupOwnershipMismatch(
+            "cgroup cleanup refuses a mount boundary: " +
+            display_path_.string());
+      }
+    } catch (...) {
+      Close();
+      throw;
+    }
+    identity_ = opened;
+  }
+
+  void Close() noexcept {
+    if (descriptor_ >= 0) {
+      static_cast<void>(close(descriptor_));
+      descriptor_ = -1;
+    }
+    if (parent_descriptor_ >= 0) {
+      static_cast<void>(close(parent_descriptor_));
+      parent_descriptor_ = -1;
+    }
+  }
+
+  int parent_descriptor_ = -1;
+  int descriptor_ = -1;
+  std::string name_;
+  std::filesystem::path display_path_;
+  struct stat identity_{};
+  std::uint64_t mount_id_ = 0U;
+  bool removed_ = false;
+};
+
+std::string ReadCgroupFileAt(const BoundCgroupDirectory& cgroup,
+                             std::string_view file,
+                             std::chrono::steady_clock::time_point deadline,
+                             std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup file read");
+  const std::string filename(file);
+  const int descriptor = openat(cgroup.descriptor(), filename.c_str(),
+                                O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0) {
+    throw std::runtime_error("open cgroup file failed for " +
+                             (cgroup.display_path() / filename).string() +
+                             ": " + std::strerror(errno));
+  }
+  constexpr std::size_t kMaximumCgroupFileBytes = 1024U * 1024U;
+  std::string contents;
+  std::array<char, 4096U> buffer{};
+  try {
+    struct stat status{};
+    if (fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode)) {
+      throw std::runtime_error("cgroup control file is not regular: " +
+                               (cgroup.display_path() / filename).string());
+    }
+    if (CgroupMountId(descriptor) != cgroup.mount_id()) {
+      throw CgroupOwnershipMismatch(
+          "cgroup control file crosses a mount boundary: " +
+          (cgroup.display_path() / filename).string());
+    }
+    for (;;) {
+      RequireCgroupOperationActive(deadline, stop_token, "cgroup file read");
+      const ssize_t count = read(descriptor, buffer.data(), buffer.size());
+      if (count < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw std::runtime_error("read cgroup file failed for " +
+                                 (cgroup.display_path() / filename).string() +
+                                 ": " + std::strerror(errno));
+      }
+      if (count == 0) {
+        break;
+      }
+      const std::size_t received = static_cast<std::size_t>(count);
+      if (received > kMaximumCgroupFileBytes - contents.size()) {
+        throw std::runtime_error("cgroup file exceeds 1 MiB: " +
+                                 (cgroup.display_path() / filename).string());
+      }
+      contents.append(buffer.data(), received);
+    }
+  } catch (...) {
+    static_cast<void>(close(descriptor));
+    throw;
+  }
+  if (close(descriptor) != 0) {
+    throw std::runtime_error("close cgroup file failed for " +
+                             (cgroup.display_path() / filename).string() +
+                             ": " + std::strerror(errno));
+  }
+  return contents;
+}
+
+std::vector<pid_t> BoundCgroupPids(
+    const BoundCgroupDirectory& cgroup,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  std::vector<pid_t> pids;
+  for (const std::string& text : SplitWhitespace(
+           ReadCgroupFileAt(cgroup, "cgroup.procs", deadline, stop_token))) {
+    pid_t pid = 0;
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), pid);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        pid <= 0) {
+      throw std::runtime_error("cgroup.procs contains an invalid PID: " + text);
+    }
+    pids.push_back(pid);
+  }
+  return pids;
+}
+
+bool BoundCgroupPopulated(const BoundCgroupDirectory& cgroup,
+                          std::chrono::steady_clock::time_point deadline,
+                          std::stop_token stop_token) {
+  return ParseKeyValueText(
+             ReadCgroupFileAt(cgroup, "cgroup.events", deadline, stop_token),
+             "populated",
+             (cgroup.display_path() / "cgroup.events").string()) != 0U;
+}
+
 bool CgroupProcsEmpty(const std::filesystem::path& dir) {
   return SplitWhitespace(ReadText(dir / "cgroup.procs")).empty();
 }
@@ -1198,6 +1514,136 @@ void SignalPidfd(int descriptor, pid_t pid) {
 #endif
 }
 
+bool TryWriteBoundCgroupKill(const BoundCgroupDirectory& cgroup,
+                             std::chrono::steady_clock::time_point deadline,
+                             std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup process kill");
+  cgroup.RequireLinkedIdentity();
+  const int descriptor = openat(cgroup.descriptor(), "cgroup.kill",
+                                O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) {
+    if (errno == ENOENT) {
+      return false;
+    }
+    throw std::runtime_error("open cgroup.kill failed for " +
+                             cgroup.display_path().string() + ": " +
+                             std::strerror(errno));
+  }
+  try {
+    struct stat status{};
+    if (fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode)) {
+      throw std::runtime_error("cgroup.kill is not a regular control file: " +
+                               cgroup.display_path().string());
+    }
+    if (CgroupMountId(descriptor) != cgroup.mount_id()) {
+      throw CgroupOwnershipMismatch("cgroup.kill crosses a mount boundary: " +
+                                    cgroup.display_path().string());
+    }
+    std::string_view value = "1";
+    while (!value.empty()) {
+      RequireCgroupOperationActive(deadline, stop_token, "cgroup process kill");
+      const ssize_t count = write(descriptor, value.data(), value.size());
+      if (count < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw std::runtime_error("write cgroup.kill failed for " +
+                                 cgroup.display_path().string() + ": " +
+                                 std::strerror(errno));
+      }
+      if (count == 0) {
+        throw std::runtime_error("write cgroup.kill made no progress for " +
+                                 cgroup.display_path().string());
+      }
+      value.remove_prefix(static_cast<std::size_t>(count));
+    }
+  } catch (...) {
+    static_cast<void>(close(descriptor));
+    throw;
+  }
+  if (close(descriptor) != 0) {
+    throw std::runtime_error("close cgroup.kill failed for " +
+                             cgroup.display_path().string() + ": " +
+                             std::strerror(errno));
+  }
+  cgroup.RequireLinkedIdentity();
+  return true;
+}
+
+void WaitForBoundCgroupEmpty(const BoundCgroupDirectory& cgroup,
+                             std::chrono::steady_clock::time_point deadline,
+                             std::stop_token stop_token) {
+  for (;;) {
+    RequireCgroupOperationActive(deadline, stop_token, "cgroup process wait");
+    cgroup.RequireLinkedIdentity();
+    if (!BoundCgroupPopulated(cgroup, deadline, stop_token) &&
+        BoundCgroupPids(cgroup, deadline, stop_token).empty()) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::min(
+        std::chrono::milliseconds(20),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+  }
+}
+
+void KillBoundCgroupProcesses(const BoundCgroupDirectory& cgroup,
+                              std::chrono::steady_clock::time_point deadline,
+                              std::stop_token stop_token,
+                              bool force_pidfd_fallback = false) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup process kill");
+  if (!force_pidfd_fallback &&
+      TryWriteBoundCgroupKill(cgroup, deadline, stop_token)) {
+    WaitForBoundCgroupEmpty(cgroup, deadline, stop_token);
+    return;
+  }
+  for (;;) {
+    RequireCgroupOperationActive(deadline, stop_token, "cgroup process kill");
+    cgroup.RequireLinkedIdentity();
+    const std::vector<pid_t> pids =
+        BoundCgroupPids(cgroup, deadline, stop_token);
+    if (pids.empty()) {
+      if (BoundCgroupPopulated(cgroup, deadline, stop_token)) {
+        throw std::runtime_error(
+            "cgroup remained recursively populated without cgroup.kill: " +
+            cgroup.display_path().string());
+      }
+      return;
+    }
+    for (const pid_t pid : pids) {
+      RequireCgroupOperationActive(deadline, stop_token, "cgroup process kill");
+      const int pidfd = OpenPidfd(pid);
+      if (pidfd < 0) {
+        continue;
+      }
+      try {
+        const std::vector<pid_t> current =
+            BoundCgroupPids(cgroup, deadline, stop_token);
+        if (std::find(current.begin(), current.end(), pid) != current.end()) {
+          RequireCgroupOperationActive(deadline, stop_token,
+                                       "cgroup process kill");
+          SignalPidfd(pidfd, pid);
+        }
+      } catch (...) {
+        static_cast<void>(close(pidfd));
+        throw;
+      }
+      if (close(pidfd) != 0) {
+        throw std::runtime_error("close pidfd failed for cgroup process " +
+                                 std::to_string(pid) + ": " +
+                                 std::strerror(errno));
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < deadline) {
+      std::this_thread::sleep_for(std::min(
+          std::chrono::milliseconds(5),
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                now)));
+    }
+  }
+}
+
 void WaitForCgroupProcsEmpty(const std::filesystem::path& dir,
                              std::chrono::steady_clock::time_point deadline,
                              std::stop_token stop_token) {
@@ -1224,6 +1670,13 @@ void KillCgroupProcesses(const std::filesystem::path& dir,
                          std::chrono::steady_clock::time_point deadline,
                          std::stop_token stop_token,
                          bool force_pidfd_fallback = false) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("cgroup process kill cancelled: " + dir.string());
+  }
+  if (std::chrono::steady_clock::now() >= deadline) {
+    throw std::runtime_error("cgroup process kill deadline expired: " +
+                             dir.string());
+  }
   if (!force_pidfd_fallback && std::filesystem::exists(dir / "cgroup.kill")) {
     WriteCgroupFile(dir, "cgroup.kill", "1");
     WaitForCgroupProcsEmpty(dir, deadline, stop_token);
@@ -1365,56 +1818,6 @@ void CreateCgroupDirectoryExclusive(const std::filesystem::path& path,
   }
 }
 
-std::vector<std::filesystem::path> DescendantCgroupsDeepestFirst(
-    const std::filesystem::path& run_root,
-    std::chrono::steady_clock::time_point deadline,
-    std::stop_token stop_token) {
-  std::vector<std::filesystem::path> paths;
-  std::error_code ec;
-  std::filesystem::recursive_directory_iterator iterator(
-      run_root, std::filesystem::directory_options::none, ec);
-  const std::filesystem::recursive_directory_iterator end;
-  if (ec) {
-    throw std::runtime_error("list run cgroup failed for " + run_root.string() +
-                             ": " + ec.message());
-  }
-  while (iterator != end) {
-    if (stop_token.stop_requested()) {
-      throw std::runtime_error("cgroup traversal cancelled for " +
-                               run_root.string());
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      throw std::runtime_error("cgroup traversal deadline expired for " +
-                               run_root.string());
-    }
-    const bool is_directory = iterator->is_directory(ec);
-    if (ec) {
-      throw std::runtime_error("inspect run cgroup entry failed for " +
-                               iterator->path().string() + ": " + ec.message());
-    }
-    if (is_directory) {
-      paths.push_back(iterator->path());
-    }
-    iterator.increment(ec);
-    if (ec) {
-      throw std::runtime_error("list run cgroup failed for " +
-                               run_root.string() + ": " + ec.message());
-    }
-  }
-  const auto depth = [](const std::filesystem::path& path) {
-    return static_cast<std::size_t>(std::distance(path.begin(), path.end()));
-  };
-  std::sort(paths.begin(), paths.end(), [&](const auto& lhs, const auto& rhs) {
-    const std::size_t lhs_depth = depth(lhs);
-    const std::size_t rhs_depth = depth(rhs);
-    if (lhs_depth != rhs_depth) {
-      return lhs_depth > rhs_depth;
-    }
-    return lhs.generic_string() < rhs.generic_string();
-  });
-  return paths;
-}
-
 void RemoveCgroupDirectory(const std::filesystem::path& path,
                            std::string_view kind) {
   std::error_code ec;
@@ -1431,22 +1834,201 @@ void RemoveCgroupDirectory(const std::filesystem::path& path,
   }
 }
 
-void RemoveRunCgroup(const CgroupScopeConfig& config, const std::string& run_id,
+std::vector<std::string> BoundCgroupDirectoryNames(
+    const BoundCgroupDirectory& cgroup,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup traversal");
+  cgroup.RequireLinkedIdentity();
+  const int duplicate = fcntl(cgroup.descriptor(), F_DUPFD_CLOEXEC, 0);
+  if (duplicate < 0) {
+    throw std::runtime_error("duplicate cgroup directory failed for " +
+                             cgroup.display_path().string() + ": " +
+                             std::strerror(errno));
+  }
+  DIR* raw_directory = fdopendir(duplicate);
+  if (raw_directory == nullptr) {
+    const int error = errno;
+    static_cast<void>(close(duplicate));
+    throw std::runtime_error("open cgroup directory stream failed for " +
+                             cgroup.display_path().string() + ": " +
+                             std::strerror(error));
+  }
+  std::unique_ptr<DIR, int (*)(DIR*)> directory(raw_directory, closedir);
+  std::vector<std::string> names;
+  for (;;) {
+    RequireCgroupOperationActive(deadline, stop_token, "cgroup traversal");
+    errno = 0;
+    dirent* entry = readdir(directory.get());
+    if (entry == nullptr) {
+      if (errno != 0) {
+        throw std::runtime_error("read cgroup directory failed for " +
+                                 cgroup.display_path().string() + ": " +
+                                 std::strerror(errno));
+      }
+      break;
+    }
+    const std::string_view name(entry->d_name);
+    if (name == "." || name == "..") {
+      continue;
+    }
+    names.emplace_back(name);
+  }
+  std::sort(names.begin(), names.end());
+  cgroup.RequireLinkedIdentity();
+  return names;
+}
+
+void RemoveBoundCgroupDirectory(BoundCgroupDirectory* cgroup,
+                                std::chrono::steady_clock::time_point deadline,
+                                std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup removal");
+  cgroup->RequireLinkedIdentity();
+  if (BoundCgroupPopulated(*cgroup, deadline, stop_token) ||
+      !BoundCgroupPids(*cgroup, deadline, stop_token).empty()) {
+    throw std::runtime_error("refusing to remove a populated cgroup: " +
+                             cgroup->display_path().string());
+  }
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup removal");
+  cgroup->RequireLinkedIdentity();
+  struct stat linked{};
+  if (fstat(cgroup->descriptor(), &linked) != 0) {
+    throw std::runtime_error("inspect acquired cgroup before removal failed: " +
+                             cgroup->display_path().string() + ": " +
+                             std::strerror(errno));
+  }
+  if (!SameCgroupIdentity(linked, cgroup->identity())) {
+    throw CgroupOwnershipMismatch(
+        "acquired cgroup identity changed before removal: " +
+        cgroup->display_path().string());
+  }
+  if (unlinkat(cgroup->parent_descriptor(), cgroup->name().c_str(),
+               AT_REMOVEDIR) != 0) {
+    throw std::runtime_error("remove acquired cgroup failed for " +
+                             cgroup->display_path().string() + ": " +
+                             std::strerror(errno));
+  }
+  cgroup->MarkRemoved();
+  struct stat removed{};
+  if (fstat(cgroup->descriptor(), &removed) != 0) {
+    throw std::runtime_error("inspect removed cgroup identity failed for " +
+                             cgroup->display_path().string() + ": " +
+                             std::strerror(errno));
+  }
+  // Kernfs retains the pre-rmdir link count on an open cgroup descriptor,
+  // while conventional filesystems can report zero for an unlinked inode.
+  if (!S_ISDIR(removed.st_mode) ||
+      !SameCgroupIdentity(removed, cgroup->identity()) ||
+      (removed.st_nlink != 0U && removed.st_nlink != linked.st_nlink)) {
+    throw CgroupOwnershipMismatch(
+        "removed cgroup descriptor has an unexpected link count or identity: " +
+        cgroup->display_path().string());
+  }
+  struct stat remaining{};
+  if (fstatat(cgroup->parent_descriptor(), cgroup->name().c_str(), &remaining,
+              AT_SYMLINK_NOFOLLOW) == 0) {
+    throw CgroupOwnershipMismatch(
+        "a replacement appeared at a removed cgroup path: " +
+        cgroup->display_path().string());
+  }
+  if (errno != ENOENT) {
+    throw std::runtime_error("verify removed cgroup path failed for " +
+                             cgroup->display_path().string() + ": " +
+                             std::strerror(errno));
+  }
+}
+
+void RemoveBoundCgroupDescendants(
+    BoundCgroupDirectory* parent, std::size_t depth,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  constexpr std::size_t kMaximumCgroupDepth = 256U;
+  if (depth > kMaximumCgroupDepth) {
+    throw std::runtime_error(
+        "cgroup cleanup exceeded its directory-depth bound");
+  }
+  for (const std::string& name :
+       BoundCgroupDirectoryNames(*parent, deadline, stop_token)) {
+    RequireCgroupOperationActive(deadline, stop_token, "cgroup traversal");
+    struct stat status{};
+    if (fstatat(parent->descriptor(), name.c_str(), &status,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno == ENOENT) {
+        throw CgroupOwnershipMismatch(
+            "a cgroup descendant disappeared during traversal: " +
+            (parent->display_path() / name).string());
+      }
+      throw std::runtime_error("inspect cgroup descendant failed for " +
+                               (parent->display_path() / name).string() + ": " +
+                               std::strerror(errno));
+    }
+    if (!S_ISDIR(status.st_mode)) {
+      continue;
+    }
+    std::optional<BoundCgroupDirectory> child = BoundCgroupDirectory::TryOpen(
+        parent->descriptor(), name, parent->display_path() / name);
+    if (!child) {
+      throw CgroupOwnershipMismatch(
+          "a cgroup descendant disappeared during acquisition: " +
+          (parent->display_path() / name).string());
+    }
+#ifdef BBP_ENABLE_TEST_HOOKS
+    if (cgroup_removal_identity_hook) {
+      cgroup_removal_identity_hook(
+          CgroupRemovalTestPhase::kAfterDescendantIdentityVerification,
+          child->display_path());
+    }
+#endif
+    child->RequireLinkedIdentity();
+    RemoveBoundCgroupDescendants(&*child, depth + 1U, deadline, stop_token);
+    KillBoundCgroupProcesses(*child, deadline, stop_token);
+    RemoveBoundCgroupDirectory(&*child, deadline, stop_token);
+  }
+  parent->RequireLinkedIdentity();
+}
+
+std::optional<BoundCgroupDirectory> AcquireRunCgroup(
+    const CgroupScopeConfig& config, int scope_root_descriptor,
+    const std::string& run_id,
+    std::optional<CgroupPathIdentity> expected_identity) {
+  const CgroupPaths paths = CgroupPathsForScope(config, run_id);
+  std::optional<BoundCgroupDirectory> simulator = BoundCgroupDirectory::TryOpen(
+      scope_root_descriptor, config.simulator_name, paths.simulator);
+  if (!simulator) {
+    return std::nullopt;
+  }
+  return BoundCgroupDirectory::TryOpen(simulator->descriptor(), run_id,
+                                       paths.run, expected_identity);
+}
+
+void RemoveRunCgroup(BoundCgroupDirectory* run,
                      std::chrono::steady_clock::time_point deadline,
-                     std::stop_token stop_token,
-                     bool force_pidfd_fallback = false) {
-  const std::filesystem::path run_root =
-      CgroupPathsForScope(config, run_id).run;
-  if (!std::filesystem::exists(run_root)) {
-    return;
+                     std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "run cgroup removal");
+#ifdef BBP_ENABLE_TEST_HOOKS
+  if (cgroup_removal_identity_hook) {
+    cgroup_removal_identity_hook(
+        CgroupRemovalTestPhase::kAfterRunIdentityVerification,
+        run->display_path());
   }
-  for (const std::filesystem::path& path :
-       DescendantCgroupsDeepestFirst(run_root, deadline, stop_token)) {
-    KillCgroupProcesses(path, deadline, stop_token, force_pidfd_fallback);
-    RemoveCgroupDirectory(path, "descendant");
+#endif
+  run->RequireLinkedIdentity();
+  RemoveBoundCgroupDescendants(run, 0U, deadline, stop_token);
+  KillBoundCgroupProcesses(*run, deadline, stop_token);
+  RemoveBoundCgroupDirectory(run, deadline, stop_token);
+}
+
+void RemoveRunCgroup(const CgroupScopeConfig& config, int scope_root_descriptor,
+                     const std::string& run_id,
+                     std::optional<CgroupPathIdentity> expected_identity,
+                     std::chrono::steady_clock::time_point deadline,
+                     std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "run cgroup removal");
+  std::optional<BoundCgroupDirectory> run = AcquireRunCgroup(
+      config, scope_root_descriptor, run_id, expected_identity);
+  if (run) {
+    RemoveRunCgroup(&*run, deadline, stop_token);
   }
-  KillCgroupProcesses(run_root, deadline, stop_token, force_pidfd_fallback);
-  RemoveCgroupDirectory(run_root, "run");
 }
 
 bool ScopeStateExists(const CgroupScopeConfig& config) {
@@ -1680,6 +2262,7 @@ std::string CurrentExceptionText() {
 }
 
 void RecoverInterruptedCgroupPreparation(const CgroupScopeConfig& config,
+                                         int scope_root_descriptor,
                                          CgroupScopeState* state) {
   if (!state->pending_run) {
     return;
@@ -1699,7 +2282,8 @@ void RecoverInterruptedCgroupPreparation(const CgroupScopeConfig& config,
       throw std::runtime_error(
           "refusing recovery deletion for a replaced pending run resource");
     }
-    RemoveRunCgroup(config, *state->pending_run,
+    RemoveRunCgroup(config, scope_root_descriptor, *state->pending_run,
+                    binding->second.cgroup_identity,
                     std::chrono::steady_clock::now() + std::chrono::seconds(10),
                     {});
   }
@@ -1748,10 +2332,12 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
   bool run_created = false;
   bool attempted_run = false;
   bool scope_published = false;
+  std::optional<CgroupPathIdentity> created_run_identity;
   try {
     if (scope_state_exists) {
       state = LoadCgroupScopeState(config);
-      RecoverInterruptedCgroupPreparation(config, &*state);
+      RecoverInterruptedCgroupPreparation(config, scope_lock.descriptor(),
+                                          &*state);
       for (auto iterator = state->active_runs.begin();
            iterator != state->active_runs.end();) {
         if (!std::filesystem::exists(
@@ -1791,8 +2377,9 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
     const CgroupPaths paths = CgroupPathsForScope(config, run_id);
     CreateCgroupDirectoryExclusive(paths.run, "run");
     run_created = true;
+    created_run_identity = DirectoryIdentity(paths.run, "run cgroup");
     if (run_binding) {
-      run_binding->cgroup_identity = DirectoryIdentity(paths.run, "run cgroup");
+      run_binding->cgroup_identity = *created_run_identity;
       state->run_bindings.emplace(run_id, *run_binding);
     }
     state->pending_run_created = true;
@@ -1810,7 +2397,7 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
       if (state && (attempted_run || scope_published)) {
         if (run_created) {
           RemoveRunCgroup(
-              config, run_id,
+              config, scope_lock.descriptor(), run_id, created_run_identity,
               std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
         }
         if (attempted_run) {
@@ -1926,17 +2513,18 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
           "stale cgroup scope binding does not match exact run ownership");
     }
   }
-  const std::filesystem::path run_cgroup =
-      CgroupPathsForScope(config, run_id).run;
-  if (binding != state.run_bindings.end() &&
-      std::filesystem::exists(run_cgroup) &&
+  const std::optional<CgroupPathIdentity> expected_cgroup_identity =
+      binding == state.run_bindings.end()
+          ? std::nullopt
+          : std::optional<CgroupPathIdentity>(binding->second.cgroup_identity);
+  std::optional<BoundCgroupDirectory> run =
       verify_ownership("bound run cgroup identity could not be verified", [&] {
-        return DirectoryIdentity(run_cgroup, "run cgroup");
-      }) != binding->second.cgroup_identity) {
-    throw CgroupOwnershipMismatch(
-        "refusing to remove a replaced run cgroup identity: " + run_id);
+        return AcquireRunCgroup(config, scope_lock.descriptor(), run_id,
+                                expected_cgroup_identity);
+      });
+  if (run) {
+    RemoveRunCgroup(&*run, deadline, stop_token);
   }
-  RemoveRunCgroup(config, run_id, deadline, stop_token);
   if (state.pending_run == run_id) {
     state.pending_run.reset();
     state.pending_run_created = false;
@@ -2312,7 +2900,32 @@ void KillCgroupProcessesWithPidfdFallbackForTest(
     const std::filesystem::path& path,
     std::chrono::steady_clock::time_point deadline,
     std::stop_token stop_token) {
-  KillCgroupProcesses(path, deadline, stop_token, true);
+  const std::filesystem::path absolute =
+      std::filesystem::absolute(path).lexically_normal();
+  const std::filesystem::path parent = absolute.parent_path();
+  const int parent_descriptor =
+      open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (parent_descriptor < 0) {
+    throw std::runtime_error("open test cgroup parent failed for " +
+                             absolute.string() + ": " + std::strerror(errno));
+  }
+  std::optional<BoundCgroupDirectory> cgroup;
+  try {
+    cgroup = BoundCgroupDirectory::TryOpen(
+        parent_descriptor, absolute.filename().string(), absolute);
+  } catch (...) {
+    static_cast<void>(close(parent_descriptor));
+    throw;
+  }
+  if (close(parent_descriptor) != 0) {
+    throw std::runtime_error("close test cgroup parent failed for " +
+                             absolute.string() + ": " + std::strerror(errno));
+  }
+  if (!cgroup) {
+    throw std::runtime_error("test cgroup disappeared before acquisition: " +
+                             absolute.string());
+  }
+  KillBoundCgroupProcesses(*cgroup, deadline, stop_token, true);
 }
 #endif
 
@@ -2619,6 +3232,12 @@ void SetCgroupCreateAfterDirectoryHookForTest(std::function<void()> hook) {
 
 void SetCgroupCreateSharedAllocationHookForTest(std::function<void()> hook) {
   cgroup_create_shared_allocation_hook = std::move(hook);
+}
+
+void SetCgroupRemovalIdentityHookForTest(
+    std::function<void(CgroupRemovalTestPhase, const std::filesystem::path&)>
+        hook) {
+  cgroup_removal_identity_hook = std::move(hook);
 }
 #endif
 
