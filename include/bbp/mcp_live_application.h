@@ -104,6 +104,9 @@ class McpLiveApplication {
   void MarkRunStopping();
   void MarkRunStopped();
   void Shutdown();
+  void Shutdown(std::stop_token stop_token);
+  void Shutdown(std::chrono::steady_clock::time_point deadline,
+                std::stop_token stop_token);
 
  private:
   class ActiveRequest {
@@ -161,11 +164,14 @@ class McpLiveApplication {
       std::optional<std::string> node_id = std::nullopt,
       std::optional<boost::json::value> data = std::nullopt) const noexcept;
   void CloseRunSubscriptions() const noexcept;
+  void ShutdownImpl(
+      std::optional<std::chrono::steady_clock::time_point> deadline,
+      std::stop_token stop_token);
 
   Config config_;
   mutable std::mutex mutex_;
   std::condition_variable command_outcome_ready_;
-  std::condition_variable requests_drained_;
+  std::condition_variable_any requests_drained_;
   std::map<std::uint64_t, PendingCommand> pending_commands_;
   std::shared_ptr<McpLiveWorkloadService> workload_service_;
   std::shared_ptr<McpLiveRoleService> role_service_;

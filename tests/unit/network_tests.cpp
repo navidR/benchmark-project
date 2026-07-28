@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "bbp/network.h"
+#include "bbp/simulation_cancelled.h"
 
 namespace {
 
@@ -245,11 +246,8 @@ BOOST_AUTO_TEST_CASE(rtnetlink_dump_cancellation_has_bounded_latency) {
   std::stop_source stop_source;
   stop_source.request_stop();
   const auto started = std::chrono::steady_clock::now();
-  BOOST_CHECK_EXCEPTION(
-      bbp::ListNetworkLinks(stop_source.get_token()), std::runtime_error,
-      [](const std::runtime_error& error) {
-        return std::string(error.what()).find("cancelled") != std::string::npos;
-      });
+  BOOST_CHECK_THROW(bbp::ListNetworkLinks(stop_source.get_token()),
+                    bbp::SimulationCancelled);
   const auto elapsed = std::chrono::steady_clock::now() - started;
   BOOST_TEST(
       std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() <

@@ -44,6 +44,8 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/simulation_cancelled.h"
+
 namespace bbp {
 
 std::string_view QdiscKindName(QdiscKind kind) {
@@ -207,7 +209,7 @@ class MnlSocket {
     constexpr auto kCancellationPollInterval = std::chrono::milliseconds(25);
     while (true) {
       if (stop_token.stop_requested()) {
-        throw std::runtime_error("netlink receive cancelled");
+        throw SimulationCancelled();
       }
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) {
@@ -1213,6 +1215,8 @@ void ReceiveRtnetlinkDump(MnlSocket& socket, std::uint32_t sequence,
     try {
       received = socket.ReceiveUntil(buffer.data(), buffer.size(), deadline,
                                      stop_token);
+    } catch (const SimulationCancelled&) {
+      throw;
     } catch (const std::runtime_error& error) {
       if (received_partial_dump) {
         throw std::runtime_error(

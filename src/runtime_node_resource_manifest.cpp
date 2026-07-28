@@ -38,9 +38,17 @@ constexpr std::string_view kManifestName = "runtime-node-resources.json";
 constexpr std::string_view kTemporaryManifestName =
     ".runtime-node-resources.json.tmp";
 constexpr std::string_view kNodeMarkerName = ".bbp-node";
+constexpr std::string_view kRunCleanupTransactionName =
+    ".bbp-run-cleanup-transaction";
+constexpr std::string_view kRunCleanupReceiptPrefix =
+    ".bbp-run-cleanup-receipt-";
+constexpr std::string_view kRetiredRunCleanupReceiptPrefix =
+    ".bbp-retired-run-cleanup-receipt-";
 constexpr std::uint64_t kManifestVersion = 2U;
 constexpr std::uint64_t kNodeMarkerVersion = 1U;
+constexpr std::uint64_t kRunCleanupReceiptVersion = 1U;
 constexpr std::size_t kMaximumManifestBytes = 1024U * 1024U;
+constexpr std::size_t kMaximumRunCleanupReceiptBytes = 4096U;
 constexpr std::size_t kMaximumRuntimeNodeSlots = 16U;
 constexpr std::size_t kMaximumManifestEntries = kMaximumRuntimeNodeSlots + 1U;
 constexpr std::size_t kMaximumTraversalDepth = 64U;
@@ -276,7 +284,8 @@ bool SameIdentity(const struct stat& first, const struct stat& second);
 std::uint64_t MountId(int descriptor);
 std::uint64_t MountIdAt(int parent, std::string_view name);
 std::string ReadBoundedFileAt(int parent, std::string_view name,
-                              std::size_t maximum);
+                              std::size_t maximum,
+                              std::stop_token stop_token = {});
 std::uint64_t RequiredUnsigned(const boost::json::object& object,
                                std::string_view field);
 std::string RequiredString(const boost::json::object& object,
@@ -285,8 +294,32 @@ void RejectUnknownFields(const boost::json::object& object,
                          const std::set<std::string_view>& fields,
                          std::string_view description);
 
-UniqueFd OpenOwnedRunRoot(const RunOwnership& ownership) {
-  if (LoadRunOwnership(ownership.run_id, ownership.run_root) != ownership) {
+void RequireOpenedRunOwnership(int run_root, const RunOwnership& ownership,
+                               std::stop_token stop_token = {}) {
+  const boost::json::value marker = boost::json::parse(
+      ReadBoundedFileAt(run_root, kRunMarkerFile, 4096U, stop_token));
+  if (!marker.is_object()) {
+    throw std::runtime_error("opened run ownership marker is not an object");
+  }
+  const boost::json::object& object = marker.as_object();
+  RejectUnknownFields(object, {"version", "run_id", "run_root", "resource_id"},
+                      "opened run ownership marker");
+  if (RequiredUnsigned(object, "version") != 1U ||
+      RequiredString(object, "run_id") != ownership.run_id ||
+      std::filesystem::path(RequiredString(object, "run_root")) !=
+          ownership.run_root ||
+      RequiredString(object, "resource_id") != ownership.resource_id) {
+    throw std::runtime_error(
+        "opened run ownership marker does not match the requested run");
+  }
+}
+
+UniqueFd OpenOwnedRunRoot(
+    const RunOwnership& ownership,
+    std::optional<OwnedRunRootIdentity> expected_root = std::nullopt,
+    std::stop_token stop_token = {}) {
+  if (LoadRunOwnership(ownership.run_id, ownership.run_root, stop_token) !=
+      ownership) {
     throw std::runtime_error("run ownership changed before resource access");
   }
   UniqueFd run_root(open(ownership.run_root.c_str(),
@@ -302,6 +335,13 @@ UniqueFd OpenOwnedRunRoot(const RunOwnership& ownership) {
     throw std::runtime_error(
         "owned run root is not an effective-user-owned directory");
   }
+  if (expected_root && (static_cast<std::uintmax_t>(opened_status.st_dev) !=
+                            expected_root->device ||
+                        static_cast<std::uintmax_t>(opened_status.st_ino) !=
+                            expected_root->inode)) {
+    throw OwnedRunRootIdentityMismatch(
+        "owned run root does not match the expected directory identity");
+  }
   struct stat path_status{};
   if (fstatat(AT_FDCWD, ownership.run_root.c_str(), &path_status,
               AT_SYMLINK_NOFOLLOW) != 0) {
@@ -311,30 +351,19 @@ UniqueFd OpenOwnedRunRoot(const RunOwnership& ownership) {
     throw std::runtime_error(
         "owned run root identity changed while it was opened");
   }
-  if (LoadRunOwnership(ownership.run_id, ownership.run_root) != ownership) {
+  if (LoadRunOwnership(ownership.run_id, ownership.run_root, stop_token) !=
+      ownership) {
     throw std::runtime_error("run ownership changed during resource access");
   }
-  const boost::json::value marker = boost::json::parse(
-      ReadBoundedFileAt(run_root.get(), kRunMarkerFile, 4096U));
-  if (!marker.is_object()) {
-    throw std::runtime_error("opened run ownership marker is not an object");
-  }
-  const boost::json::object& object = marker.as_object();
-  RejectUnknownFields(object, {"version", "run_id", "run_root", "resource_id"},
-                      "opened run ownership marker");
-  if (RequiredUnsigned(object, "version") != 1U ||
-      RequiredString(object, "run_id") != ownership.run_id ||
-      std::filesystem::path(RequiredString(object, "run_root")) !=
-          ownership.run_root ||
-      RequiredString(object, "resource_id") != ownership.resource_id) {
-    throw std::runtime_error(
-        "opened run ownership marker does not match the requested run");
-  }
+  RequireOpenedRunOwnership(run_root.get(), ownership, stop_token);
   return run_root;
 }
 
-UniqueFd OpenNodesDirectory(const RunOwnership& ownership) {
-  UniqueFd run_root = OpenOwnedRunRoot(ownership);
+UniqueFd OpenNodesDirectory(
+    const RunOwnership& ownership,
+    std::optional<OwnedRunRootIdentity> expected_root = std::nullopt,
+    std::stop_token stop_token = {}) {
+  UniqueFd run_root = OpenOwnedRunRoot(ownership, expected_root, stop_token);
   UniqueFd nodes(openat(run_root.get(), "nodes",
                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
   if (!nodes.valid()) {
@@ -373,10 +402,13 @@ void WriteAll(int descriptor, std::string_view text,
 }
 
 std::string ReadBoundedFileAt(int parent, std::string_view name,
-                              std::size_t maximum) {
+                              std::size_t maximum, std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("runtime ownership file read was cancelled");
+  }
   const std::string filename(name);
-  UniqueFd file(
-      openat(parent, filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+  UniqueFd file(openat(parent, filename.c_str(),
+                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
   if (!file.valid()) {
     ThrowErrno("open runtime ownership file", errno);
   }
@@ -394,6 +426,9 @@ std::string ReadBoundedFileAt(int parent, std::string_view name,
   std::string contents(static_cast<std::size_t>(status.st_size), '\0');
   std::size_t offset = 0U;
   while (offset < contents.size()) {
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("runtime ownership file read was cancelled");
+    }
     const ssize_t count =
         read(file.get(), contents.data() + offset, contents.size() - offset);
     if (count < 0) {
@@ -410,6 +445,9 @@ std::string ReadBoundedFileAt(int parent, std::string_view name,
   }
   char extra = '\0';
   while (true) {
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("runtime ownership file read was cancelled");
+    }
     const ssize_t count = read(file.get(), &extra, 1U);
     if (count < 0 && errno == EINTR) {
       continue;
@@ -421,6 +459,9 @@ std::string ReadBoundedFileAt(int parent, std::string_view name,
       throw std::runtime_error("runtime ownership file grew while it was read");
     }
     break;
+  }
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("runtime ownership file read was cancelled");
   }
   return contents;
 }
@@ -630,6 +671,13 @@ std::vector<std::string> DirectoryNames(
     names.emplace_back(name);
   }
   std::sort(names.begin(), names.end());
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("runtime node cleanup was cancelled");
+  }
+  if (absolute_deadline &&
+      std::chrono::steady_clock::now() >= *absolute_deadline) {
+    throw std::runtime_error("runtime node cleanup deadline expired");
+  }
   return names;
 }
 
@@ -651,6 +699,13 @@ void RemoveDirectoryContents(
   }
   for (const std::string& name : DirectoryNames(
            directory, visited_entries, absolute_deadline, stop_token)) {
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("runtime node cleanup was cancelled");
+    }
+    if (absolute_deadline &&
+        std::chrono::steady_clock::now() >= *absolute_deadline) {
+      throw std::runtime_error("runtime node cleanup deadline expired");
+    }
     if (preserved_entry && name == *preserved_entry) {
       continue;
     }
@@ -685,6 +740,13 @@ void RemoveDirectoryContents(
     }
     RemoveDirectoryContents(child.get(), depth + 1U, visited_entries,
                             std::nullopt, absolute_deadline, stop_token);
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("runtime node cleanup was cancelled");
+    }
+    if (absolute_deadline &&
+        std::chrono::steady_clock::now() >= *absolute_deadline) {
+      throw std::runtime_error("runtime node cleanup deadline expired");
+    }
     struct stat current{};
     if (fstatat(directory, name.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0) {
       ThrowErrno("reinspect runtime node cleanup directory", errno);
@@ -893,10 +955,198 @@ void CloneDirectoryContents(
   }
 }
 
+void RequireRunCleanupActive(
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("runtime run cleanup was cancelled");
+  }
+  if (absolute_deadline &&
+      std::chrono::steady_clock::now() >= *absolute_deadline) {
+    throw std::runtime_error("runtime run cleanup deadline expired");
+  }
+}
+
+void RequireCleanupReceiptRoot(std::string_view run_id,
+                               const std::filesystem::path& run_root) {
+  RequireSafeNodeId(run_id);
+  if (!run_root.is_absolute() || run_root.lexically_normal() != run_root ||
+      run_root.parent_path().empty()) {
+    throw std::runtime_error(
+        "run cleanup receipt requires an exact normalized public run root");
+  }
+}
+
+void RequireCleanupReceiptResourceId(std::string_view resource_id) {
+  if (resource_id.size() != 32U ||
+      !std::all_of(resource_id.begin(), resource_id.end(), [](char value) {
+        return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+      })) {
+    throw std::runtime_error(
+        "run cleanup receipt resource id is not 32 lowercase hex digits");
+  }
+}
+
+std::string RunCleanupReceiptName(std::string_view run_id) {
+  RequireSafeNodeId(run_id);
+  return std::string(kRunCleanupReceiptPrefix) + std::string(run_id);
+}
+
+std::string RetiredRunCleanupReceiptName(std::string_view run_id) {
+  RequireSafeNodeId(run_id);
+  return std::string(kRetiredRunCleanupReceiptPrefix) + std::string(run_id);
+}
+
+boost::json::object RunCleanupReceiptJson(
+    const OwnedRunRootCleanupReceipt& receipt) {
+  return boost::json::object{
+      {"version", kRunCleanupReceiptVersion},
+      {"run_id", receipt.ownership.run_id},
+      {"run_root", receipt.ownership.run_root.string()},
+      {"resource_id", receipt.ownership.resource_id},
+      {"root_device", receipt.root_identity.device},
+      {"root_inode", receipt.root_identity.inode},
+  };
+}
+
+OwnedRunRootCleanupReceipt ParseRunCleanupReceipt(
+    std::string_view contents, std::string_view expected_run_id,
+    const std::filesystem::path& expected_run_root) {
+  const boost::json::value parsed = boost::json::parse(contents);
+  if (!parsed.is_object()) {
+    throw std::runtime_error("run cleanup receipt is not an object");
+  }
+  const boost::json::object& object = parsed.as_object();
+  RejectUnknownFields(object,
+                      {"version", "run_id", "run_root", "resource_id",
+                       "root_device", "root_inode"},
+                      "run cleanup receipt");
+  const std::string run_id = RequiredString(object, "run_id");
+  const std::filesystem::path run_root = RequiredString(object, "run_root");
+  const std::string resource_id = RequiredString(object, "resource_id");
+  const std::uint64_t root_device = RequiredUnsigned(object, "root_device");
+  const std::uint64_t root_inode = RequiredUnsigned(object, "root_inode");
+  if (RequiredUnsigned(object, "version") != kRunCleanupReceiptVersion ||
+      run_id != expected_run_id || run_root != expected_run_root ||
+      root_inode == 0U ||
+      root_device > std::numeric_limits<std::uintmax_t>::max() ||
+      root_inode > std::numeric_limits<std::uintmax_t>::max()) {
+    throw std::runtime_error(
+        "run cleanup receipt does not match the requested retained run");
+  }
+  RequireCleanupReceiptRoot(run_id, run_root);
+  RequireCleanupReceiptResourceId(resource_id);
+  return OwnedRunRootCleanupReceipt{
+      .ownership =
+          RunOwnership{
+              .run_id = run_id,
+              .run_root = run_root,
+              .resource_id = resource_id,
+              .cgroup_name = resource_id,
+              .interface_token = resource_id.substr(0U, 8U),
+          },
+      .root_identity =
+          OwnedRunRootIdentity{
+              .device = static_cast<std::uintmax_t>(root_device),
+              .inode = static_cast<std::uintmax_t>(root_inode),
+          },
+  };
+}
+
+UniqueFd OpenRunCleanupReceiptParent(const std::filesystem::path& run_root,
+                                     bool allow_absent = false) {
+  const std::filesystem::path parent_path = run_root.parent_path();
+  UniqueFd parent(open(parent_path.c_str(),
+                       O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+  if (!parent.valid()) {
+    if (allow_absent && errno == ENOENT) {
+      return parent;
+    }
+    ThrowErrno("open run cleanup receipt parent", errno);
+  }
+  struct stat status{};
+  if (fstat(parent.get(), &status) != 0) {
+    ThrowErrno("inspect run cleanup receipt parent", errno);
+  }
+  if (!S_ISDIR(status.st_mode)) {
+    throw std::runtime_error("run cleanup receipt parent is not a directory");
+  }
+  return parent;
+}
+
+std::optional<OwnedRunRootCleanupReceipt> TryReadRunCleanupReceiptAt(
+    int parent, std::string_view name, std::string_view expected_run_id,
+    const std::filesystem::path& expected_run_root,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  RequireRunCleanupActive(absolute_deadline, stop_token);
+  const std::string filename(name);
+  UniqueFd file(openat(parent, filename.c_str(),
+                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+  if (!file.valid()) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    ThrowErrno("open run cleanup receipt", errno);
+  }
+  struct stat opened{};
+  if (fstat(file.get(), &opened) != 0) {
+    ThrowErrno("inspect run cleanup receipt", errno);
+  }
+  if (!S_ISREG(opened.st_mode) || opened.st_uid != geteuid() ||
+      opened.st_size < 0 ||
+      static_cast<std::uint64_t>(opened.st_size) >
+          kMaximumRunCleanupReceiptBytes ||
+      (opened.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    throw std::runtime_error(
+        "run cleanup receipt is not a bounded owner-only regular file");
+  }
+  std::string contents(static_cast<std::size_t>(opened.st_size), '\0');
+  std::size_t offset = 0U;
+  while (offset < contents.size()) {
+    RequireRunCleanupActive(absolute_deadline, stop_token);
+    const ssize_t count =
+        pread(file.get(), contents.data() + offset, contents.size() - offset,
+              static_cast<off_t>(offset));
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      ThrowErrno("read run cleanup receipt", errno);
+    }
+    if (count == 0) {
+      throw std::runtime_error("run cleanup receipt changed while read");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  char extra = '\0';
+  ssize_t extra_count;
+  do {
+    RequireRunCleanupActive(absolute_deadline, stop_token);
+    extra_count = pread(file.get(), &extra, 1U, opened.st_size);
+  } while (extra_count < 0 && errno == EINTR);
+  if (extra_count < 0) {
+    ThrowErrno("verify run cleanup receipt length", errno);
+  }
+  if (extra_count != 0) {
+    throw std::runtime_error("run cleanup receipt grew while read");
+  }
+  struct stat linked{};
+  if (fstatat(parent, filename.c_str(), &linked, AT_SYMLINK_NOFOLLOW) != 0 ||
+      !SameIdentity(opened, linked)) {
+    throw OwnedRunRootIdentityMismatch(
+        "run cleanup receipt identity changed while it was read");
+  }
+  RequireRunCleanupActive(absolute_deadline, stop_token);
+  return ParseRunCleanupReceipt(contents, expected_run_id, expected_run_root);
+}
+
 }  // namespace
 
 void WriteRuntimeNodeResourceManifest(
-    const RuntimeNodeResourceManifest& manifest) {
+    const RuntimeNodeResourceManifest& manifest,
+    std::optional<OwnedRunRootIdentity> expected_root,
+    std::stop_token stop_token) {
   RequireManifest(manifest);
   boost::json::array nodes;
   nodes.reserve(manifest.nodes.size());
@@ -927,7 +1177,8 @@ void WriteRuntimeNodeResourceManifest(
         "runtime resource manifest exceeds its size bound");
   }
 
-  UniqueFd run_root = OpenOwnedRunRoot(manifest.ownership);
+  UniqueFd run_root =
+      OpenOwnedRunRoot(manifest.ownership, expected_root, stop_token);
   const std::string temporary(kTemporaryManifestName);
   const std::string published(kManifestName);
   if (unlinkat(run_root.get(), temporary.c_str(), 0) != 0 && errno != ENOENT) {
@@ -974,8 +1225,8 @@ void WriteRuntimeNodeResourceManifest(
       throw std::runtime_error(
           "runtime resource manifest publication read-back failed");
     }
-    if (ReadBoundedFileAt(run_root.get(), kManifestName,
-                          kMaximumManifestBytes) != contents) {
+    if (ReadBoundedFileAt(run_root.get(), kManifestName, kMaximumManifestBytes,
+                          stop_token) != contents) {
       throw std::runtime_error(
           "runtime resource manifest contents differ after publication");
     }
@@ -988,8 +1239,10 @@ void WriteRuntimeNodeResourceManifest(
 }
 
 std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
-    const RunOwnership& ownership) {
-  UniqueFd run_root = OpenOwnedRunRoot(ownership);
+    const RunOwnership& ownership,
+    std::optional<OwnedRunRootIdentity> expected_root,
+    std::stop_token stop_token) {
+  UniqueFd run_root = OpenOwnedRunRoot(ownership, expected_root, stop_token);
   struct stat status{};
   const std::string name(kManifestName);
   if (fstatat(run_root.get(), name.c_str(), &status, AT_SYMLINK_NOFOLLOW) !=
@@ -1002,8 +1255,8 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
   if (!S_ISREG(status.st_mode)) {
     throw std::runtime_error("runtime resource manifest is not a regular file");
   }
-  const boost::json::value parsed = boost::json::parse(
-      ReadBoundedFileAt(run_root.get(), kManifestName, kMaximumManifestBytes));
+  const boost::json::value parsed = boost::json::parse(ReadBoundedFileAt(
+      run_root.get(), kManifestName, kMaximumManifestBytes, stop_token));
   if (!parsed.is_object()) {
     throw std::runtime_error("runtime resource manifest is not an object");
   }
@@ -1067,10 +1320,12 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
   return manifest;
 }
 
-bool RuntimeNodeRootEntryExists(const RunOwnership& ownership,
-                                std::string_view node_id) {
+bool RuntimeNodeRootEntryExists(
+    const RunOwnership& ownership, std::string_view node_id,
+    std::optional<OwnedRunRootIdentity> expected_root,
+    std::stop_token stop_token) {
   RequireSafeNodeId(node_id);
-  UniqueFd nodes = OpenNodesDirectory(ownership);
+  UniqueFd nodes = OpenNodesDirectory(ownership, expected_root, stop_token);
   struct stat status{};
   const std::string name(node_id);
   if (fstatat(nodes.get(), name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -1082,10 +1337,13 @@ bool RuntimeNodeRootEntryExists(const RunOwnership& ownership,
   return true;
 }
 
-bool RuntimeNodeRootEntryExists(const RunOwnership& ownership,
-                                const RuntimeNodeResourceEntry& entry) {
+bool RuntimeNodeRootEntryExists(
+    const RunOwnership& ownership, const RuntimeNodeResourceEntry& entry,
+    std::optional<OwnedRunRootIdentity> expected_root,
+    std::stop_token stop_token) {
   RequireEntry(entry);
-  return RuntimeNodeRootEntryExists(ownership, EntryRootName(entry));
+  return RuntimeNodeRootEntryExists(ownership, EntryRootName(entry),
+                                    expected_root, stop_token);
 }
 
 void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
@@ -1147,10 +1405,12 @@ void PrepareRuntimeNodeRoot(const RunOwnership& ownership,
   }
 }
 
-void VerifyRuntimeNodeRootOwnership(const RunOwnership& ownership,
-                                    const RuntimeNodeResourceEntry& entry) {
+void VerifyRuntimeNodeRootOwnership(
+    const RunOwnership& ownership, const RuntimeNodeResourceEntry& entry,
+    std::optional<OwnedRunRootIdentity> expected_root,
+    std::stop_token stop_token) {
   RequireEntry(entry);
-  UniqueFd nodes = OpenNodesDirectory(ownership);
+  UniqueFd nodes = OpenNodesDirectory(ownership, expected_root, stop_token);
   static_cast<void>(OpenOwnedNodeRoot(nodes.get(), ownership, entry));
 }
 
@@ -1168,10 +1428,12 @@ void CleanupCookieAt(int node_directory) {
   }
 }
 
-void CleanupRuntimeNodeRpcCredential(const RunOwnership& ownership,
-                                     const RuntimeNodeResourceEntry& entry) {
+void CleanupRuntimeNodeRpcCredential(
+    const RunOwnership& ownership, const RuntimeNodeResourceEntry& entry,
+    std::optional<OwnedRunRootIdentity> expected_root,
+    std::stop_token stop_token) {
   RequireEntry(entry);
-  UniqueFd nodes = OpenNodesDirectory(ownership);
+  UniqueFd nodes = OpenNodesDirectory(ownership, expected_root, stop_token);
   struct stat present{};
   const std::string root_name(EntryRootName(entry));
   if (fstatat(nodes.get(), root_name.c_str(), &present, AT_SYMLINK_NOFOLLOW) !=
@@ -1189,11 +1451,12 @@ void CleanupRuntimeNodeRpcCredential(const RunOwnership& ownership,
   CleanupCookieAt(node.get());
 }
 
-void CleanupLegacyRuntimeNodeRpcCredential(const RunOwnership& ownership,
-                                           std::string_view node_id,
-                                           ChainKind chain) {
+void CleanupLegacyRuntimeNodeRpcCredential(
+    const RunOwnership& ownership, std::string_view node_id, ChainKind chain,
+    std::optional<OwnedRunRootIdentity> expected_root,
+    std::stop_token stop_token) {
   RequireSafeNodeId(node_id);
-  UniqueFd nodes = OpenNodesDirectory(ownership);
+  UniqueFd nodes = OpenNodesDirectory(ownership, expected_root, stop_token);
   struct stat before{};
   const std::string name(node_id);
   if (fstatat(nodes.get(), name.c_str(), &before, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -1227,14 +1490,15 @@ void CleanupLegacyRuntimeNodeRpcCredential(const RunOwnership& ownership,
 void RemoveRuntimeNodeRoot(
     const RunOwnership& ownership, const RuntimeNodeResourceEntry& entry,
     std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
-    std::stop_token stop_token) {
+    std::stop_token stop_token,
+    std::optional<OwnedRunRootIdentity> expected_root) {
   RequireEntry(entry);
   if (entry.state == RuntimeNodeResourceState::kPendingReplaceUncertain) {
     throw std::runtime_error(
         "runtime node root removal refuses uncertain replacement "
         "orientation");
   }
-  UniqueFd nodes = OpenNodesDirectory(ownership);
+  UniqueFd nodes = OpenNodesDirectory(ownership, expected_root, stop_token);
   struct stat present{};
   const std::string root_name(EntryRootName(entry));
   if (fstatat(nodes.get(), root_name.c_str(), &present, AT_SYMLINK_NOFOLLOW) !=
@@ -1250,6 +1514,13 @@ void RemoveRuntimeNodeRoot(
   std::size_t visited_entries = 0U;
   RemoveDirectoryContents(node.get(), 0U, &visited_entries, kNodeMarkerName,
                           absolute_deadline, stop_token);
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("runtime node cleanup was cancelled");
+  }
+  if (absolute_deadline &&
+      std::chrono::steady_clock::now() >= *absolute_deadline) {
+    throw std::runtime_error("runtime node cleanup deadline expired");
+  }
   RequireNodeMarker(node.get(), ownership, entry);
   struct stat current{};
   if (fstatat(nodes.get(), root_name.c_str(), &current, AT_SYMLINK_NOFOLLOW) !=
@@ -1260,6 +1531,15 @@ void RemoveRuntimeNodeRoot(
     throw std::runtime_error(
         "runtime node root identity changed during cleanup");
   }
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("runtime node cleanup was cancelled");
+  }
+  if (absolute_deadline &&
+      std::chrono::steady_clock::now() >= *absolute_deadline) {
+    throw std::runtime_error("runtime node cleanup deadline expired");
+  }
+  // Marker unlink is the cancellation commit point. Past it, finish removal or
+  // restore ownership instead of reporting cancellation after destructive work.
   const std::string marker_name(kNodeMarkerName);
   if (unlinkat(node.get(), marker_name.c_str(), 0) != 0) {
     ThrowErrno("remove runtime node ownership marker", errno);
@@ -1418,15 +1698,217 @@ void ExchangeRuntimeNodeRootsForReplacement(
   }
 }
 
+std::filesystem::path OwnedRunRootCleanupQuarantinePath(
+    const RunOwnership& ownership) {
+  return ownership.run_root.parent_path() /
+         (".bbp-run-cleanup-" + ownership.resource_id);
+}
+
+std::filesystem::path OwnedRunRootCleanupReceiptPath(
+    std::string_view run_id, const std::filesystem::path& run_root) {
+  RequireCleanupReceiptRoot(run_id, run_root);
+  return run_root.parent_path() / RunCleanupReceiptName(run_id);
+}
+
+std::optional<OwnedRunRootCleanupReceipt> TryLoadOwnedRunRootCleanupReceipt(
+    std::string_view run_id, const std::filesystem::path& run_root,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  RequireCleanupReceiptRoot(run_id, run_root);
+  UniqueFd parent = OpenRunCleanupReceiptParent(run_root, true);
+  if (!parent.valid()) {
+    return std::nullopt;
+  }
+  const std::optional<OwnedRunRootCleanupReceipt> published =
+      TryReadRunCleanupReceiptAt(parent.get(), RunCleanupReceiptName(run_id),
+                                 run_id, run_root, absolute_deadline,
+                                 stop_token);
+  const std::optional<OwnedRunRootCleanupReceipt> retired =
+      TryReadRunCleanupReceiptAt(parent.get(),
+                                 RetiredRunCleanupReceiptName(run_id), run_id,
+                                 run_root, absolute_deadline, stop_token);
+  if (published && retired) {
+    throw OwnedRunRootIdentityMismatch(
+        "both published and retired run cleanup receipts exist");
+  }
+  return published ? published : retired;
+}
+
+void WriteOwnedRunRootCleanupReceipt(
+    const RunOwnership& ownership, OwnedRunRootIdentity root_identity,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  RequireCleanupReceiptRoot(ownership.run_id, ownership.run_root);
+  RequireCleanupReceiptResourceId(ownership.resource_id);
+  if (ownership.cgroup_name != ownership.resource_id ||
+      ownership.interface_token != ownership.resource_id.substr(0U, 8U) ||
+      root_identity.inode == 0U) {
+    throw std::runtime_error("run cleanup receipt ownership is inconsistent");
+  }
+  const OwnedRunRootCleanupReceipt expected{
+      .ownership = ownership,
+      .root_identity = root_identity,
+  };
+  RequireRunCleanupActive(absolute_deadline, stop_token);
+  UniqueFd run_root = OpenOwnedRunRoot(ownership, root_identity, stop_token);
+  UniqueFd parent = OpenRunCleanupReceiptParent(ownership.run_root);
+  if (MountId(parent.get()) != MountId(run_root.get())) {
+    throw std::runtime_error(
+        "run cleanup receipt refuses an owned-root mount boundary");
+  }
+
+  const std::optional<OwnedRunRootCleanupReceipt> retired =
+      TryReadRunCleanupReceiptAt(
+          parent.get(), RetiredRunCleanupReceiptName(ownership.run_id),
+          ownership.run_id, ownership.run_root, absolute_deadline, stop_token);
+  if (retired) {
+    throw OwnedRunRootIdentityMismatch(
+        "a retired cleanup receipt prevents a new cleanup transaction");
+  }
+  const std::optional<OwnedRunRootCleanupReceipt> published =
+      TryReadRunCleanupReceiptAt(
+          parent.get(), RunCleanupReceiptName(ownership.run_id),
+          ownership.run_id, ownership.run_root, absolute_deadline, stop_token);
+  if (published) {
+    if (*published != expected) {
+      throw OwnedRunRootIdentityMismatch(
+          "published run cleanup receipt belongs to another run identity");
+    }
+    return;
+  }
+
+  const std::string contents =
+      boost::json::serialize(RunCleanupReceiptJson(expected)) + "\n";
+  if (contents.size() > kMaximumRunCleanupReceiptBytes) {
+    throw std::runtime_error("run cleanup receipt exceeds its size bound");
+  }
+  const std::string transaction_name(kRunCleanupTransactionName);
+  bool transaction_ready = false;
+  struct stat transaction_status{};
+  if (fstatat(run_root.get(), transaction_name.c_str(), &transaction_status,
+              AT_SYMLINK_NOFOLLOW) == 0) {
+    try {
+      transaction_ready = ReadBoundedFileAt(run_root.get(), transaction_name,
+                                            kMaximumRunCleanupReceiptBytes,
+                                            stop_token) == contents;
+    } catch (...) {
+      RequireRunCleanupActive(absolute_deadline, stop_token);
+    }
+    if (!transaction_ready &&
+        unlinkat(run_root.get(), transaction_name.c_str(), 0) != 0) {
+      ThrowErrno("remove incomplete in-root cleanup transaction", errno);
+    }
+  } else if (errno != ENOENT) {
+    ThrowErrno("inspect in-root cleanup transaction", errno);
+  }
+  if (!transaction_ready) {
+    UniqueFd transaction(
+        openat(run_root.get(), transaction_name.c_str(),
+               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+               S_IRUSR | S_IWUSR));
+    if (!transaction.valid()) {
+      ThrowErrno("create in-root cleanup transaction", errno);
+    }
+    WriteAll(transaction.get(), contents, "write in-root cleanup transaction");
+    if (fsync(transaction.get()) != 0 || fsync(run_root.get()) != 0) {
+      ThrowErrno("sync in-root cleanup transaction", errno);
+    }
+  }
+  RequireRunCleanupActive(absolute_deadline, stop_token);
+  const std::string receipt_name = RunCleanupReceiptName(ownership.run_id);
+  if (linkat(run_root.get(), transaction_name.c_str(), parent.get(),
+             receipt_name.c_str(), 0) != 0) {
+    const int link_error = errno;
+    if (link_error != EEXIST) {
+      ThrowErrno("publish durable run cleanup receipt", link_error);
+    }
+    const std::optional<OwnedRunRootCleanupReceipt> collision =
+        TryReadRunCleanupReceiptAt(parent.get(), receipt_name, ownership.run_id,
+                                   ownership.run_root, absolute_deadline,
+                                   stop_token);
+    if (!collision || *collision != expected) {
+      throw OwnedRunRootIdentityMismatch(
+          "durable run cleanup receipt publication collided");
+    }
+  }
+  if (fsync(parent.get()) != 0) {
+    ThrowErrno("sync durable run cleanup receipt publication", errno);
+  }
+  RequireRunCleanupActive(absolute_deadline, stop_token);
+}
+
+void RemoveOwnedRunRootCleanupReceipt(
+    const OwnedRunRootCleanupReceipt& receipt,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  RequireCleanupReceiptRoot(receipt.ownership.run_id,
+                            receipt.ownership.run_root);
+  RequireRunCleanupActive(absolute_deadline, stop_token);
+  UniqueFd parent = OpenRunCleanupReceiptParent(receipt.ownership.run_root);
+  const std::string published_name =
+      RunCleanupReceiptName(receipt.ownership.run_id);
+  const std::string retired_name =
+      RetiredRunCleanupReceiptName(receipt.ownership.run_id);
+  std::optional<OwnedRunRootCleanupReceipt> published =
+      TryReadRunCleanupReceiptAt(
+          parent.get(), published_name, receipt.ownership.run_id,
+          receipt.ownership.run_root, absolute_deadline, stop_token);
+  std::optional<OwnedRunRootCleanupReceipt> retired =
+      TryReadRunCleanupReceiptAt(
+          parent.get(), retired_name, receipt.ownership.run_id,
+          receipt.ownership.run_root, absolute_deadline, stop_token);
+  if (published && retired) {
+    throw OwnedRunRootIdentityMismatch(
+        "cleanup receipt retirement found two ownership anchors");
+  }
+  if (!published && !retired) {
+    return;
+  }
+  if ((published && *published != receipt) ||
+      (retired && *retired != receipt)) {
+    throw OwnedRunRootIdentityMismatch(
+        "cleanup receipt retirement found another run identity");
+  }
+  if (published) {
+    RequireRunCleanupActive(absolute_deadline, stop_token);
+    if (syscall(SYS_renameat2, parent.get(), published_name.c_str(),
+                parent.get(), retired_name.c_str(), RENAME_NOREPLACE) != 0) {
+      ThrowErrno("atomically retire run cleanup receipt", errno);
+    }
+    if (fsync(parent.get()) != 0) {
+      ThrowErrno("sync retired run cleanup receipt", errno);
+    }
+  }
+
+  // The stable-name rename is the retirement commit point. Finish removal so
+  // cancellation cannot leave launch reuse ambiguous.
+  const std::optional<OwnedRunRootCleanupReceipt> captured =
+      TryReadRunCleanupReceiptAt(parent.get(), retired_name,
+                                 receipt.ownership.run_id,
+                                 receipt.ownership.run_root, std::nullopt, {});
+  if (!captured || *captured != receipt) {
+    throw OwnedRunRootIdentityMismatch(
+        "retired run cleanup receipt identity changed before removal");
+  }
+  if (unlinkat(parent.get(), retired_name.c_str(), 0) != 0) {
+    ThrowErrno("remove retired run cleanup receipt", errno);
+  }
+  if (fsync(parent.get()) != 0) {
+    ThrowErrno("sync run cleanup receipt removal", errno);
+  }
+  struct stat absent{};
+  if (fstatat(parent.get(), retired_name.c_str(), &absent,
+              AT_SYMLINK_NOFOLLOW) == 0 ||
+      errno != ENOENT) {
+    throw std::runtime_error("retired run cleanup receipt survived removal");
+  }
+}
+
 void RemoveOwnedRunRoot(
     const RunOwnership& ownership,
     std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
-    std::stop_token stop_token) {
-  UniqueFd run_root = OpenOwnedRunRoot(ownership);
-  struct stat opened{};
-  if (fstat(run_root.get(), &opened) != 0) {
-    ThrowErrno("inspect owned run root before removal", errno);
-  }
+    std::stop_token stop_token,
+    std::optional<OwnedRunRootIdentity> expected_root) {
   const std::filesystem::path parent_path = ownership.run_root.parent_path();
   const std::string name = ownership.run_root.filename().string();
   if (parent_path.empty() || name.empty() || name == "." || name == "..") {
@@ -1441,56 +1923,346 @@ void RemoveOwnedRunRoot(
   if (fstat(parent.get(), &parent_status) != 0) {
     ThrowErrno("inspect owned run parent", errno);
   }
-  if (!S_ISDIR(parent_status.st_mode) ||
-      MountId(parent.get()) != MountId(run_root.get())) {
+  if (!S_ISDIR(parent_status.st_mode)) {
     throw std::runtime_error(
-        "owned run root removal refuses unsafe ownership or a mount boundary");
-  }
-  struct stat linked{};
-  if (fstatat(parent.get(), name.c_str(), &linked, AT_SYMLINK_NOFOLLOW) != 0) {
-    ThrowErrno("reinspect owned run root before removal", errno);
-  }
-  if (!SameIdentity(opened, linked)) {
-    throw std::runtime_error("owned run root identity changed before removal");
+        "owned run root removal refuses a non-directory parent");
   }
 
-  std::size_t visited_entries = 0U;
-  RemoveDirectoryContents(run_root.get(), 0U, &visited_entries, kRunMarkerFile,
-                          absolute_deadline, stop_token);
-  const std::string marker_contents =
-      ReadBoundedFileAt(run_root.get(), kRunMarkerFile, 4096U);
-  if (LoadRunOwnership(ownership.run_id, ownership.run_root) != ownership) {
-    throw std::runtime_error("run ownership changed before final root removal");
-  }
-  const std::string marker_name(kRunMarkerFile);
-  if (unlinkat(run_root.get(), marker_name.c_str(), 0) != 0) {
-    ThrowErrno("remove run ownership marker", errno);
-  }
-  if (fsync(run_root.get()) != 0) {
-    ThrowErrno("sync run root before final removal", errno);
-  }
-  if (unlinkat(parent.get(), name.c_str(), AT_REMOVEDIR) != 0) {
-    const int remove_error = errno;
-    UniqueFd marker(openat(run_root.get(), marker_name.c_str(),
-                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                           S_IRUSR | S_IWUSR));
-    if (!marker.valid()) {
+  RequireRunCleanupActive(absolute_deadline, stop_token);
+
+  // Callers without a durable identity keep the pre-existing in-place
+  // deletion contract. Moving such a root to a quarantine would make an
+  // abrupt interruption impossible to identify or resume on the next call.
+  if (!expected_root) {
+    UniqueFd run_root = OpenOwnedRunRoot(ownership, std::nullopt, stop_token);
+    struct stat opened{};
+    if (fstat(run_root.get(), &opened) != 0) {
+      ThrowErrno("inspect owned run root before removal", errno);
+    }
+    if (MountId(parent.get()) != MountId(run_root.get())) {
       throw std::runtime_error(
-          "remove owned run root failed: " +
-          std::error_code(remove_error, std::generic_category()).message() +
-          "; ownership marker restoration failed: " +
-          std::error_code(errno, std::generic_category()).message());
+          "owned run root removal refuses a mount boundary");
     }
-    WriteAll(marker.get(), marker_contents, "restore run ownership marker");
-    if (fsync(marker.get()) != 0 || fsync(run_root.get()) != 0) {
-      ThrowErrno("sync restored run ownership marker", errno);
+    const auto require_public_identity = [&] {
+      struct stat linked{};
+      if (fstatat(parent.get(), name.c_str(), &linked, AT_SYMLINK_NOFOLLOW) !=
+          0) {
+        ThrowErrno("reinspect owned run root before removal", errno);
+      }
+      if (!SameIdentity(opened, linked)) {
+        throw OwnedRunRootIdentityMismatch(
+            "owned run root identity changed before removal");
+      }
+    };
+    require_public_identity();
+
+    std::size_t visited_entries = 0U;
+    RemoveDirectoryContents(run_root.get(), 0U, &visited_entries,
+                            kRunMarkerFile, absolute_deadline, stop_token);
+    RequireRunCleanupActive(absolute_deadline, stop_token);
+    RequireOpenedRunOwnership(run_root.get(), ownership, stop_token);
+    const std::string marker_name(kRunMarkerFile);
+    const std::string marker_contents =
+        ReadBoundedFileAt(run_root.get(), marker_name, 4096U, stop_token);
+    struct stat marker_status{};
+    if (fstatat(run_root.get(), marker_name.c_str(), &marker_status,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      ThrowErrno("inspect run ownership marker before removal", errno);
     }
-    ThrowErrno("remove owned run root", remove_error);
+    if (!S_ISREG(marker_status.st_mode)) {
+      throw std::runtime_error(
+          "run ownership marker is not regular before removal");
+    }
+    RequireRunCleanupActive(absolute_deadline, stop_token);
+    require_public_identity();
+
+    if (unlinkat(run_root.get(), marker_name.c_str(), 0) != 0) {
+      ThrowErrno("remove run ownership marker", errno);
+    }
+    const auto restore_marker = [&] {
+      UniqueFd marker(
+          openat(run_root.get(), marker_name.c_str(),
+                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                 marker_status.st_mode & 07777));
+      if (!marker.valid()) {
+        ThrowErrno("restore run ownership marker", errno);
+      }
+      if (fchmod(marker.get(), marker_status.st_mode & 07777) != 0) {
+        ThrowErrno("restore run ownership marker mode", errno);
+      }
+      WriteAll(marker.get(), marker_contents, "restore run ownership marker");
+      if (fsync(marker.get()) != 0 || fsync(run_root.get()) != 0) {
+        ThrowErrno("sync restored run ownership marker", errno);
+      }
+    };
+
+    if (fsync(run_root.get()) != 0) {
+      const int sync_error = errno;
+      restore_marker();
+      ThrowErrno("sync run root before final removal", sync_error);
+    }
+    try {
+      require_public_identity();
+    } catch (...) {
+      const std::exception_ptr identity_failure = std::current_exception();
+      restore_marker();
+      std::rethrow_exception(identity_failure);
+    }
+    if (unlinkat(parent.get(), name.c_str(), AT_REMOVEDIR) != 0) {
+      const int remove_error = errno;
+      restore_marker();
+      ThrowErrno("remove owned run root", remove_error);
+    }
+    struct stat removed{};
+    if (fstat(run_root.get(), &removed) != 0) {
+      const int inspect_error = errno;
+      restore_marker();
+      ThrowErrno("inspect removed owned run root", inspect_error);
+    }
+    if (removed.st_nlink != 0) {
+      restore_marker();
+      throw OwnedRunRootIdentityMismatch(
+          "owned run root was displaced during final removal");
+    }
+    struct stat absent{};
+    if (fstatat(parent.get(), name.c_str(), &absent, AT_SYMLINK_NOFOLLOW) ==
+            0 ||
+        errno != ENOENT) {
+      throw std::runtime_error(
+          "owned run root survived descriptor-anchored removal");
+    }
+    return;
   }
-  if (fstatat(parent.get(), name.c_str(), &linked, AT_SYMLINK_NOFOLLOW) == 0 ||
-      errno != ENOENT) {
-    throw std::runtime_error(
-        "owned run root survived descriptor-anchored removal");
+
+  const std::string quarantine_name =
+      OwnedRunRootCleanupQuarantinePath(ownership).filename().string();
+  struct stat public_status{};
+  const bool public_exists = fstatat(parent.get(), name.c_str(), &public_status,
+                                     AT_SYMLINK_NOFOLLOW) == 0;
+  if (!public_exists && errno != ENOENT) {
+    ThrowErrno("inspect owned run root before atomic capture", errno);
+  }
+  struct stat quarantine_status{};
+  const bool quarantine_exists =
+      fstatat(parent.get(), quarantine_name.c_str(), &quarantine_status,
+              AT_SYMLINK_NOFOLLOW) == 0;
+  if (!quarantine_exists && errno != ENOENT) {
+    ThrowErrno("inspect owned run cleanup quarantine", errno);
+  }
+
+  bool restore_on_failure = false;
+  if (quarantine_exists) {
+    if (public_exists) {
+      throw OwnedRunRootIdentityMismatch(
+          "owned run cleanup quarantine collides with a public run root");
+    }
+  } else {
+    if (!public_exists) {
+      throw std::runtime_error(
+          "owned run root and cleanup quarantine are both absent");
+    }
+    if (syscall(SYS_renameat2, parent.get(), name.c_str(), parent.get(),
+                quarantine_name.c_str(), RENAME_NOREPLACE) != 0) {
+      const int capture_error = errno;
+      if (capture_error == ENOSYS || capture_error == EINVAL ||
+          capture_error == EOPNOTSUPP) {
+        throw std::runtime_error(
+            "identity-safe owned run cleanup is unsupported: " +
+            std::error_code(capture_error, std::generic_category()).message());
+      }
+      ThrowErrno("atomically capture owned run root", capture_error);
+    }
+    restore_on_failure = true;
+  }
+
+  std::optional<struct stat> captured_identity;
+  const auto restore_public_name = [&] {
+    if (!restore_on_failure) {
+      return;
+    }
+    if (captured_identity) {
+      struct stat linked{};
+      if (fstatat(parent.get(), quarantine_name.c_str(), &linked,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+          !SameIdentity(*captured_identity, linked)) {
+        throw OwnedRunRootIdentityMismatch(
+            "captured run root was displaced before restoration");
+      }
+    }
+    if (syscall(SYS_renameat2, parent.get(), quarantine_name.c_str(),
+                parent.get(), name.c_str(), RENAME_NOREPLACE) != 0) {
+      ThrowErrno("restore atomically captured owned run root", errno);
+    }
+    restore_on_failure = false;
+    if (fsync(parent.get()) != 0) {
+      ThrowErrno("sync already-restored owned run root name", errno);
+    }
+  };
+
+  try {
+    if (!quarantine_exists && fsync(parent.get()) != 0) {
+      ThrowErrno("sync atomically captured owned run root", errno);
+    }
+    UniqueFd run_root(openat(parent.get(), quarantine_name.c_str(),
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!run_root.valid()) {
+      ThrowErrno("open atomically captured owned run root", errno);
+    }
+    struct stat opened{};
+    if (fstat(run_root.get(), &opened) != 0) {
+      ThrowErrno("inspect atomically captured owned run root", errno);
+    }
+    captured_identity = opened;
+    struct stat linked{};
+    if (fstatat(parent.get(), quarantine_name.c_str(), &linked,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      ThrowErrno("reinspect atomically captured owned run root", errno);
+    }
+    if (!SameIdentity(opened, linked) || !S_ISDIR(opened.st_mode) ||
+        opened.st_uid != geteuid() ||
+        MountId(parent.get()) != MountId(run_root.get()) ||
+        MountIdAt(parent.get(), quarantine_name) != MountId(run_root.get())) {
+      throw std::runtime_error(
+          "atomically captured run root failed identity or mount checks");
+    }
+    if (static_cast<std::uintmax_t>(opened.st_dev) != expected_root->device ||
+        static_cast<std::uintmax_t>(opened.st_ino) != expected_root->inode) {
+      throw OwnedRunRootIdentityMismatch(
+          "atomically captured run root is not the expected directory");
+    }
+    const std::string marker_name(kRunMarkerFile);
+    struct stat marker_status{};
+    const bool marker_present =
+        fstatat(run_root.get(), marker_name.c_str(), &marker_status,
+                AT_SYMLINK_NOFOLLOW) == 0;
+    if (!marker_present && errno != ENOENT) {
+      ThrowErrno("inspect run ownership marker before removal", errno);
+    }
+
+    std::string marker_contents;
+    if (marker_present) {
+      RequireOpenedRunOwnership(run_root.get(), ownership, stop_token);
+      if (quarantine_exists) {
+        restore_on_failure = true;
+      }
+      RequireRunCleanupActive(absolute_deadline, stop_token);
+      std::size_t visited_entries = 0U;
+      RemoveDirectoryContents(run_root.get(), 0U, &visited_entries,
+                              kRunMarkerFile, absolute_deadline, stop_token);
+      RequireRunCleanupActive(absolute_deadline, stop_token);
+      RequireOpenedRunOwnership(run_root.get(), ownership, stop_token);
+      marker_contents =
+          ReadBoundedFileAt(run_root.get(), marker_name, 4096U, stop_token);
+      if (fstatat(run_root.get(), marker_name.c_str(), &marker_status,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+          !S_ISREG(marker_status.st_mode)) {
+        throw std::runtime_error(
+            "run ownership marker is not regular before removal");
+      }
+    } else {
+      const std::optional<OwnedRunRootCleanupReceipt> receipt =
+          TryLoadOwnedRunRootCleanupReceipt(ownership.run_id,
+                                            ownership.run_root,
+                                            absolute_deadline, stop_token);
+      if (!receipt || receipt->ownership != ownership ||
+          receipt->root_identity != *expected_root) {
+        throw OwnedRunRootIdentityMismatch(
+            "markerless run cleanup quarantine has no exact durable receipt");
+      }
+      std::size_t visited_entries = 0U;
+      if (!DirectoryNames(run_root.get(), &visited_entries, absolute_deadline,
+                          stop_token)
+               .empty()) {
+        throw OwnedRunRootIdentityMismatch(
+            "markerless run cleanup quarantine is not empty");
+      }
+    }
+
+    const auto require_quarantine_identity = [&] {
+      struct stat current{};
+      if (fstatat(parent.get(), quarantine_name.c_str(), &current,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+          !SameIdentity(opened, current)) {
+        throw OwnedRunRootIdentityMismatch(
+            "captured run root was displaced during cleanup");
+      }
+    };
+    RequireRunCleanupActive(absolute_deadline, stop_token);
+    require_quarantine_identity();
+
+    const auto restore_marker = [&] {
+      if (!marker_present) {
+        return;
+      }
+      UniqueFd marker(
+          openat(run_root.get(), marker_name.c_str(),
+                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                 marker_status.st_mode & 07777));
+      if (!marker.valid()) {
+        ThrowErrno("restore run ownership marker", errno);
+      }
+      if (fchmod(marker.get(), marker_status.st_mode & 07777) != 0) {
+        ThrowErrno("restore run ownership marker mode", errno);
+      }
+      WriteAll(marker.get(), marker_contents, "restore run ownership marker");
+      if (fsync(marker.get()) != 0 || fsync(run_root.get()) != 0) {
+        ThrowErrno("sync restored run ownership marker", errno);
+      }
+    };
+
+    if (marker_present &&
+        unlinkat(run_root.get(), marker_name.c_str(), 0) != 0) {
+      ThrowErrno("remove run ownership marker", errno);
+    }
+    if (fsync(run_root.get()) != 0) {
+      const int sync_error = errno;
+      restore_marker();
+      ThrowErrno("sync run root before final removal", sync_error);
+    }
+    try {
+      require_quarantine_identity();
+    } catch (...) {
+      const std::exception_ptr identity_failure = std::current_exception();
+      restore_marker();
+      std::rethrow_exception(identity_failure);
+    }
+    if (unlinkat(parent.get(), quarantine_name.c_str(), AT_REMOVEDIR) != 0) {
+      const int remove_error = errno;
+      restore_marker();
+      ThrowErrno("remove quarantined owned run root", remove_error);
+    }
+    struct stat removed{};
+    if (fstat(run_root.get(), &removed) != 0) {
+      const int inspect_error = errno;
+      restore_marker();
+      ThrowErrno("inspect removed quarantined owned run root", inspect_error);
+    }
+    if (removed.st_nlink != 0) {
+      restore_marker();
+      throw OwnedRunRootIdentityMismatch(
+          "captured run root was displaced during final removal");
+    }
+    restore_on_failure = false;
+    if (fsync(parent.get()) != 0) {
+      ThrowErrno("sync removed quarantined owned run root", errno);
+    }
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    try {
+      restore_public_name();
+    } catch (const std::exception& restore_error) {
+      std::string failure_text = "unknown owned run cleanup failure";
+      try {
+        std::rethrow_exception(failure);
+      } catch (const std::exception& error) {
+        failure_text = error.what();
+      } catch (...) {
+      }
+      throw std::runtime_error(
+          failure_text +
+          "; captured run root restoration failed: " + restore_error.what());
+    }
+    std::rethrow_exception(failure);
   }
 }
 

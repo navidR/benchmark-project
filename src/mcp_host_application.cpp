@@ -12,6 +12,7 @@
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/mcp_live_application.h"
 #include "bbp/mcp_registry.h"
+#include "bbp/util.h"
 
 namespace bbp {
 namespace {
@@ -21,6 +22,7 @@ constexpr std::array kHostOperations = {
     McpOperationKind::kResolveScenario,
     McpOperationKind::kLaunchRun,
     McpOperationKind::kStopRun,
+    McpOperationKind::kCleanRun,
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
     McpOperationKind::kCreateFiroQtLauncher,
@@ -86,6 +88,18 @@ std::string RequireString(const boost::json::object& object,
   return std::string(value.as_string());
 }
 
+std::string RequireRunId(const boost::json::object& object,
+                         std::string_view name) {
+  std::string run_id = RequireString(object, name);
+  try {
+    RequireSafeRunId(run_id);
+  } catch (const std::exception& error) {
+    throw std::invalid_argument("MCP host argument " + std::string(name) +
+                                " is not a safe run id: " + error.what());
+  }
+  return run_id;
+}
+
 std::uint64_t OptionalUnsigned(const boost::json::object& object,
                                std::string_view name, std::uint64_t fallback) {
   const boost::json::value* value = object.if_contains(name);
@@ -102,11 +116,52 @@ std::uint64_t OptionalUnsigned(const boost::json::object& object,
                               " must be an unsigned integer");
 }
 
+bool OptionalBoolean(const boost::json::object& object, std::string_view name,
+                     bool fallback) {
+  const boost::json::value* value = object.if_contains(name);
+  if (value == nullptr) {
+    return fallback;
+  }
+  if (!value->is_bool()) {
+    throw std::invalid_argument("MCP host argument " + std::string(name) +
+                                " must be a boolean");
+  }
+  return value->as_bool();
+}
+
 boost::json::object RunLifecycleJson(const McpRunLifecycleResult& result) {
   return boost::json::object{{"result_family", "run_lifecycle"},
                              {"run_id", result.run_id},
                              {"state", result.state},
                              {"node_count", result.node_count}};
+}
+
+boost::json::object RunCleanupJson(std::string_view requested_run_id,
+                                   const McpRunCleanupResult& result) {
+  if (result.run_id != requested_run_id) {
+    throw McpOperationFailure(
+        "invalid_result_shape",
+        "run.clean returned a result for a different run id", false);
+  }
+  if (!result.verified_owned || result.processes_remaining != 0U ||
+      result.network_resources_remaining != 0U ||
+      result.cgroups_remaining != 0U || result.credentials_remaining != 0U ||
+      !result.complete) {
+    throw McpOperationFailure(
+        "invalid_result_shape",
+        "run.clean did not return verified zero-residual complete cleanup",
+        false);
+  }
+  return boost::json::object{
+      {"result_family", "cleanup"},
+      {"run_id", result.run_id},
+      {"verified_owned", result.verified_owned},
+      {"processes_remaining", result.processes_remaining},
+      {"network_resources_remaining", result.network_resources_remaining},
+      {"cgroups_remaining", result.cgroups_remaining},
+      {"credentials_remaining", result.credentials_remaining},
+      {"complete", result.complete},
+  };
 }
 
 boost::json::object RunSnapshotJson(const McpHostedRunSnapshot& snapshot) {
@@ -160,7 +215,8 @@ McpHostApplication::McpHostApplication(Config config)
   if (config_.host_id.empty()) {
     throw std::invalid_argument("MCP host application requires a host id");
   }
-  if (!config_.snapshot_run || !config_.launch_run || !config_.stop_run) {
+  if (!config_.snapshot_run || !config_.launch_run || !config_.stop_run ||
+      !config_.clean_run) {
     throw std::invalid_argument(
         "MCP host application requires lifecycle callbacks");
   }
@@ -241,6 +297,34 @@ McpOperationPlan McpHostApplication::BuildOperation(
           return McpTypedResult{.family = McpResultFamily::kRunLifecycle,
                                 .value = RunLifecycleJson(config_.stop_run(
                                     run_id, timeout, context.stop_token()))};
+        }};
+  }
+
+  if (kind == McpOperationKind::kCleanRun) {
+    const std::string run_id = RequireRunId(arguments, "run_id");
+    const std::uint64_t timeout_seconds =
+        OptionalUnsigned(arguments, "timeout_sec", 30U);
+    if (timeout_seconds == 0U || timeout_seconds > 3600U ||
+        timeout_seconds >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::chrono::seconds::rep>::max())) {
+      throw std::invalid_argument(
+          "MCP run.clean timeout_sec must be in 1..3600");
+    }
+    const bool remove_retained_artifacts =
+        OptionalBoolean(arguments, "remove_retained_artifacts", false);
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, run_id,
+                     timeout = std::chrono::seconds(timeout_seconds),
+                     remove_retained_artifacts](McpOperationContext& context) {
+          context.ThrowIfCancelled();
+          return McpTypedResult{
+              .family = McpResultFamily::kCleanup,
+              .value = RunCleanupJson(
+                  run_id,
+                  config_.clean_run(run_id, timeout, remove_retained_artifacts,
+                                    context.stop_token()))};
         }};
   }
 

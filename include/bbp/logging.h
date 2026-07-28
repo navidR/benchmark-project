@@ -1,7 +1,10 @@
 #pragma once
 
 #include <boost/log/trivial.hpp>
+#include <chrono>
 #include <filesystem>
+#include <optional>
+#include <stop_token>
 
 #include "bbp/log_level.h"
 
@@ -11,6 +14,10 @@ void InitLogging();
 void SetMinimumLogLevel(LogLevel level);
 void SetConsoleLoggingEnabled(bool enabled);
 void AttachRunLogFile(const std::filesystem::path& run_root);
+void DetachRunLogFile(const std::filesystem::path& run_root,
+                      std::optional<std::chrono::steady_clock::time_point>
+                          deadline = std::nullopt,
+                      std::stop_token stop_token = {});
 
 }  // namespace bbp
 

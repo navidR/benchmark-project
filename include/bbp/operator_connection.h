@@ -1,11 +1,13 @@
 #pragma once
 
 #include <boost/json/object.hpp>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -17,6 +19,11 @@ enum class FiroQtLauncherCleanupResult {
   kRemoved,
   kAlreadyAbsent,
   kOwnershipChanged,
+};
+
+class FiroQtLauncherCleanupUnverified final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 class OwnedFiroQtLauncher {
@@ -33,10 +40,17 @@ class OwnedFiroQtLauncher {
   [[nodiscard]] const std::filesystem::path& path() const { return path_; }
   [[nodiscard]] bool active() const { return active_; }
   [[nodiscard]] FiroQtLauncherCleanupResult Cleanup();
+  [[nodiscard]] FiroQtLauncherCleanupResult Cleanup(std::stop_token stop_token);
+  [[nodiscard]] FiroQtLauncherCleanupResult Cleanup(
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {});
 
  private:
   OwnedFiroQtLauncher(std::filesystem::path path, std::uintmax_t device,
                       std::uintmax_t inode, int descriptor);
+  FiroQtLauncherCleanupResult CleanupImpl(
+      std::optional<std::chrono::steady_clock::time_point> deadline,
+      std::stop_token stop_token);
   void CleanupNoThrow() noexcept;
   void ResetOwnership() noexcept;
 
@@ -90,9 +104,18 @@ class FiroQtLauncherService {
       std::stop_token stop_token = {});
   [[nodiscard]] std::optional<FiroQtLauncherSnapshot> Snapshot() const;
   FiroQtLauncherCleanupResult CloseAndCleanup();
+  FiroQtLauncherCleanupResult CloseAndCleanup(std::stop_token stop_token);
+  FiroQtLauncherCleanupResult CloseAndCleanup(
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {});
 
  private:
-  std::unique_lock<std::timed_mutex> Acquire(std::stop_token stop_token) const;
+  std::unique_lock<std::timed_mutex> Acquire(
+      std::optional<std::chrono::steady_clock::time_point> deadline,
+      std::stop_token stop_token) const;
+  FiroQtLauncherCleanupResult CloseAndCleanupImpl(
+      std::optional<std::chrono::steady_clock::time_point> deadline,
+      std::stop_token stop_token);
   void ReconcileSnapshotAfterCleanupFailure();
   void CloseAndCleanupNoThrow() noexcept;
 
@@ -110,6 +133,7 @@ class FiroQtLauncherService {
 enum class FiroQtLauncherCleanupTestPhase {
   kAfterPublicIdentityCheck,
   kAfterAtomicCapture,
+  kBeforeQuarantineUnlink,
 };
 
 using FiroQtLauncherCleanupTestHook = std::function<void(

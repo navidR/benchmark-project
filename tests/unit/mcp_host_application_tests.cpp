@@ -53,6 +53,7 @@ BOOST_AUTO_TEST_CASE(
     mcp_host_application_routes_runs_without_replacing_the_host) {
   std::mutex run_mutex;
   std::optional<McpHostedRunSnapshot> current_run;
+  std::size_t cleanup_calls = 0U;
   McpHostApplication application(McpHostApplication::Config{
       .host_id = "editor-host",
       .snapshot_run =
@@ -82,6 +83,31 @@ BOOST_AUTO_TEST_CASE(
             current_run.reset();
             return McpRunLifecycleResult{
                 .run_id = "launched-run", .state = "stopped", .node_count = 3U};
+          },
+      .clean_run =
+          [&](std::string_view run_id, std::chrono::seconds timeout,
+              bool remove_retained_artifacts, std::stop_token stop_token) {
+            BOOST_TEST(!stop_token.stop_requested());
+            if (cleanup_calls == 0U) {
+              BOOST_TEST(run_id == "_retained-default");
+              BOOST_TEST(timeout == 30s);
+              BOOST_TEST(!remove_retained_artifacts);
+            } else {
+              BOOST_TEST(cleanup_calls == 1U);
+              BOOST_TEST(run_id == "retained-remove");
+              BOOST_TEST(timeout == 3600s);
+              BOOST_TEST(remove_retained_artifacts);
+            }
+            ++cleanup_calls;
+            return McpRunCleanupResult{
+                .run_id = std::string(run_id),
+                .verified_owned = true,
+                .processes_remaining = 0U,
+                .network_resources_remaining = 0U,
+                .cgroups_remaining = 0U,
+                .credentials_remaining = 0U,
+                .complete = true,
+            };
           }});
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
@@ -98,6 +124,8 @@ BOOST_AUTO_TEST_CASE(
              "bbp_process");
   const std::vector<McpOperationKind> supported =
       application.SupportedOperations();
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kCleanRun) != supported.end());
   for (const McpOperationKind operation :
        {McpOperationKind::kCreateFiroQtLauncher, McpOperationKind::kStopNode,
         McpOperationKind::kKillNode, McpOperationKind::kRestartNode,
@@ -124,6 +152,41 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(error.code() == "run_not_active");
   }
 
+  const boost::json::object default_cleanup = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "run.clean",
+             boost::json::object{{"run_id", "_retained-default"}}));
+  BOOST_TEST(default_cleanup.at("state").as_string() == "succeeded");
+  const boost::json::object& default_cleanup_result =
+      default_cleanup.at("terminal_result").as_object();
+  BOOST_TEST(default_cleanup_result.at("result_family").as_string() ==
+             "cleanup");
+  BOOST_TEST(default_cleanup_result.at("run_id").as_string() ==
+             "_retained-default");
+  BOOST_TEST(default_cleanup_result.at("verified_owned").as_bool());
+  BOOST_TEST(default_cleanup_result.at("processes_remaining").as_uint64() ==
+             0U);
+  BOOST_TEST(
+      default_cleanup_result.at("network_resources_remaining").as_uint64() ==
+      0U);
+  BOOST_TEST(default_cleanup_result.at("cgroups_remaining").as_uint64() == 0U);
+  BOOST_TEST(default_cleanup_result.at("credentials_remaining").as_uint64() ==
+             0U);
+  BOOST_TEST(default_cleanup_result.at("complete").as_bool());
+  BOOST_CHECK_THROW(Invoke(&dispatcher, "run.clean",
+                           boost::json::object{{"run_id", "retained.invalid"}}),
+                    std::invalid_argument);
+  BOOST_CHECK_THROW(
+      Invoke(&dispatcher, "run.clean",
+             boost::json::object{{"run_id", "retained-zero-timeout"},
+                                 {"timeout_sec", 0U}}),
+      std::invalid_argument);
+  BOOST_CHECK_THROW(
+      Invoke(&dispatcher, "run.clean",
+             boost::json::object{{"run_id", "retained-long-timeout"},
+                                 {"timeout_sec", 3601U}}),
+      std::invalid_argument);
+
   const boost::json::object launch = WaitForTerminal(
       &dispatcher,
       Invoke(
@@ -133,6 +196,20 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(launch.at("state").as_string() == "succeeded");
   BOOST_TEST(launch.at("terminal_result").as_object().at("state").as_string() ==
              "active");
+
+  const boost::json::object removing_cleanup = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "run.clean",
+             boost::json::object{{"run_id", "retained-remove"},
+                                 {"timeout_sec", 3600U},
+                                 {"remove_retained_artifacts", true}}));
+  BOOST_TEST(removing_cleanup.at("state").as_string() == "succeeded");
+  const boost::json::object& removing_cleanup_result =
+      removing_cleanup.at("terminal_result").as_object();
+  BOOST_TEST(removing_cleanup_result.at("run_id").as_string() ==
+             "retained-remove");
+  BOOST_TEST(removing_cleanup_result.at("complete").as_bool());
+  BOOST_TEST(cleanup_calls == 2U);
 
   const boost::json::object stop = WaitForTerminal(
       &dispatcher, Invoke(&dispatcher, "run.stop",
@@ -147,6 +224,69 @@ BOOST_AUTO_TEST_CASE(
       application.ResourceReader()(McpInformationFamily::kCapabilities,
                                    "host-session", std::stop_token{}),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_host_application_rejects_inexact_cleanup_callback_results) {
+  std::size_t cleanup_calls = 0U;
+  McpHostApplication application(McpHostApplication::Config{
+      .host_id = "editor-host",
+      .snapshot_run = [] { return std::optional<McpHostedRunSnapshot>{}; },
+      .launch_run = [](const boost::json::object&,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .stop_run = [](std::string_view, std::chrono::seconds,
+                     std::stop_token) { return McpRunLifecycleResult{}; },
+      .clean_run =
+          [&](std::string_view run_id, std::chrono::seconds, bool,
+              std::stop_token) {
+            McpRunCleanupResult result{
+                .run_id = std::string(run_id),
+                .verified_owned = true,
+                .processes_remaining = 0U,
+                .network_resources_remaining = 0U,
+                .cgroups_remaining = 0U,
+                .credentials_remaining = 0U,
+                .complete = true,
+            };
+            switch (cleanup_calls++) {
+              case 0U:
+                result.run_id = "different-run";
+                break;
+              case 1U:
+                result.verified_owned = false;
+                break;
+              case 2U:
+                result.processes_remaining = 1U;
+                break;
+              case 3U:
+                result.complete = false;
+                break;
+              default:
+                BOOST_FAIL("unexpected cleanup callback invocation");
+            }
+            return result;
+          }});
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("host-session", true, {});
+
+  for (const std::string_view run_id :
+       {"callback-id", "callback-ownership", "callback-residual",
+        "callback-incomplete"}) {
+    const boost::json::object terminal = WaitForTerminal(
+        &dispatcher, Invoke(&dispatcher, "run.clean",
+                            boost::json::object{{"run_id", run_id}}));
+    BOOST_TEST(terminal.at("state").as_string() == "failed");
+    BOOST_TEST(terminal.if_contains("terminal_result") == nullptr);
+    const boost::json::object& error =
+        terminal.at("terminal_error").as_object();
+    BOOST_TEST(error.at("code").as_string() == "invalid_result_shape");
+    BOOST_TEST(!error.at("retryable").as_bool());
+  }
+  BOOST_TEST(cleanup_calls == 4U);
+
+  dispatcher.SessionHandler()("host-session", false, {});
+  application.Shutdown();
 }
 
 BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
@@ -229,7 +369,9 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },
       .stop_run = [](std::string_view, std::chrono::seconds,
-                     std::stop_token) { return McpRunLifecycleResult{}; }});
+                     std::stop_token) { return McpRunLifecycleResult{}; },
+      .clean_run = [](std::string_view, std::chrono::seconds, bool,
+                      std::stop_token) { return McpRunCleanupResult{}; }});
   const std::vector<McpOperationKind> supported =
       application.SupportedOperations();
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
@@ -308,7 +450,9 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },
       .stop_run = [](std::string_view, std::chrono::seconds,
-                     std::stop_token) { return McpRunLifecycleResult{}; }});
+                     std::stop_token) { return McpRunLifecycleResult{}; },
+      .clean_run = [](std::string_view, std::chrono::seconds, bool,
+                      std::stop_token) { return McpRunCleanupResult{}; }});
   McpDispatcher dispatcher({}, application.OperationFactory(),
                            application.ResourceReader());
   dispatcher.SessionHandler()("host-session", true, {});

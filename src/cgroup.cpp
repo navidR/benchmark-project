@@ -357,25 +357,44 @@ void WriteAll(int fd, std::string_view text,
   }
 }
 
-std::string ReadOwnedScopeState(const std::filesystem::path& path) {
-  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+void RequireCgroupOperationActive(
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token, std::string_view operation) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error(std::string(operation) + " was cancelled");
+  }
+  if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+    throw std::runtime_error(std::string(operation) + " deadline expired");
+  }
+}
+
+std::string ReadOwnedScopeState(
+    const std::filesystem::path& path,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup scope state read");
+  const int fd =
+      open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
   if (fd < 0) {
     throw std::runtime_error("open cgroup scope state failed for " +
                              path.string() + ": " + std::strerror(errno));
-  }
-  struct stat status{};
-  if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) ||
-      status.st_uid != geteuid() || (status.st_mode & 0077U) != 0U) {
-    close(fd);
-    throw std::runtime_error(
-        "cgroup scope state must be an owner-only regular file: " +
-        path.string());
   }
   constexpr std::size_t kMaximumStateBytes = 64U * 1024U;
   std::string contents;
   std::array<char, 4096U> buffer{};
   try {
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup scope state read");
+    struct stat status{};
+    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_uid != geteuid() || (status.st_mode & 0077U) != 0U) {
+      throw std::runtime_error(
+          "cgroup scope state must be an owner-only regular file: " +
+          path.string());
+    }
     for (;;) {
+      RequireCgroupOperationActive(deadline, stop_token,
+                                   "cgroup scope state read");
       const ssize_t count = read(fd, buffer.data(), buffer.size());
       if (count < 0) {
         if (errno == EINTR) {
@@ -394,6 +413,8 @@ std::string ReadOwnedScopeState(const std::filesystem::path& path) {
       }
       contents.append(buffer.data(), received);
     }
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup scope state read");
   } catch (...) {
     close(fd);
     throw;
@@ -629,9 +650,14 @@ std::map<std::string, CgroupRunBinding> ScopeRunBindings(
   return bindings;
 }
 
-CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
-  const boost::json::value parsed =
-      boost::json::parse(ReadOwnedScopeState(config.state_file));
+CgroupScopeState LoadCgroupScopeState(
+    const CgroupScopeConfig& config,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}) {
+  const boost::json::value parsed = boost::json::parse(
+      ReadOwnedScopeState(config.state_file, deadline, stop_token));
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup scope state read");
   if (!parsed.is_object()) {
     throw std::runtime_error("cgroup scope state is not a JSON object");
   }
@@ -726,6 +752,7 @@ CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
     throw std::runtime_error(
         "cgroup scope state does not match the requested scope");
   }
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup scope state read");
   const std::set<std::string> desired = DesiredControllers(config.root);
   if (state.root_controllers_added !=
           SetDifference(desired, state.root_controllers_before) ||
@@ -733,6 +760,7 @@ CgroupScopeState LoadCgroupScopeState(const CgroupScopeConfig& config) {
           SetDifference(desired, state.simulator_controllers_before)) {
     throw std::runtime_error("cgroup scope root controller state is invalid");
   }
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup scope state read");
   return state;
 }
 
@@ -1284,8 +1312,12 @@ bool WaitForFrozenState(const Cgroup& cgroup, bool expected) {
 
 void MoveCgroupProcesses(const std::filesystem::path& source,
                          const std::filesystem::path& destination,
-                         std::string_view context) {
+                         std::string_view context,
+                         std::optional<std::chrono::steady_clock::time_point>
+                             deadline = std::nullopt,
+                         std::stop_token stop_token = {}) {
   for (int attempt = 0; attempt < 20; ++attempt) {
+    RequireCgroupOperationActive(deadline, stop_token, context);
     const std::vector<std::string> pids =
         SplitWhitespace(ReadText(source / "cgroup.procs"));
     if (pids.empty()) {
@@ -1301,7 +1333,16 @@ void MoveCgroupProcesses(const std::filesystem::path& source,
     if (CgroupProcsEmpty(source)) {
       return;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto now = std::chrono::steady_clock::now();
+    const auto delay =
+        deadline
+            ? std::min(std::chrono::milliseconds(20),
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           *deadline - now))
+            : std::chrono::milliseconds(20);
+    if (delay > std::chrono::milliseconds::zero()) {
+      std::this_thread::sleep_for(delay);
+    }
   }
 
   throw std::runtime_error(
@@ -1573,12 +1614,17 @@ void RemoveScopeStateFile(const CgroupScopeConfig& config) {
 }
 
 void RestoreCgroupScope(const CgroupScopeConfig& config,
-                        const CgroupScopeState& state) {
+                        const CgroupScopeState& state,
+                        std::optional<std::chrono::steady_clock::time_point>
+                            deadline = std::nullopt,
+                        std::stop_token stop_token = {}) {
   if (!state.active_runs.empty() || !state.run_bindings.empty() ||
       state.pending_run) {
     throw std::runtime_error(
         "refusing to restore cgroup scope while owned runs remain");
   }
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope restoration");
   const CgroupPaths paths = CgroupPathsForScope(config, "state-probe");
   const std::filesystem::path controller =
       paths.simulator / state.controller_name;
@@ -1588,16 +1634,27 @@ void RestoreCgroupScope(const CgroupScopeConfig& config,
     throw std::runtime_error("pre-existing simulator cgroup disappeared: " +
                              paths.simulator.string());
   }
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope restoration");
   SetControllers(paths.root, state.root_controllers_added, '-');
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope restoration");
   if (std::filesystem::exists(controller)) {
     MoveCgroupProcesses(controller, paths.root,
-                        "could not restore cgroup-root processes");
+                        "could not restore cgroup-root processes", deadline,
+                        stop_token);
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup scope restoration");
     RemoveCgroupDirectory(controller, "controller");
   }
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope restoration");
   if (!state.simulator_preexisting &&
       std::filesystem::exists(paths.simulator)) {
     RemoveCgroupDirectory(paths.simulator, "simulator");
   }
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope restoration");
   RequireControllersPreserved(paths.root, state.root_controllers_before,
                               state.root_controllers_added);
   if (state.simulator_preexisting) {
@@ -1605,6 +1662,10 @@ void RestoreCgroupScope(const CgroupScopeConfig& config,
                                 state.simulator_controllers_before,
                                 state.simulator_controllers_added);
   }
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope restoration");
+  // State-file unlink is the restoration commit point. Once it is absent, the
+  // scope is fully restored and cancellation belongs to the caller's next work.
   RemoveScopeStateFile(config);
 }
 
@@ -1785,38 +1846,83 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
   CgroupScopeLock scope_lock(config.root, deadline, stop_token);
   if (!ScopeStateExists(config)) {
     if (std::filesystem::exists(CgroupPathsForScope(config, run_id).run)) {
-      throw std::runtime_error(
+      throw CgroupOwnershipMismatch(
           "refusing to remove a run cgroup without scope ownership state: " +
           run_id);
     }
     return;
   }
-  CgroupScopeState state = LoadCgroupScopeState(config);
+  const auto verify_ownership = [&](std::string_view operation, auto&& action) {
+    try {
+      return action();
+    } catch (const CgroupOwnershipMismatch&) {
+      throw;
+    } catch (...) {
+      if (stop_token.stop_requested() ||
+          std::chrono::steady_clock::now() >= deadline) {
+        throw;
+      }
+      throw CgroupOwnershipMismatch(std::string(operation) + ": " +
+                                    CurrentExceptionText());
+    }
+  };
+  CgroupScopeState state = verify_ownership(
+      "cgroup scope ownership state could not be verified",
+      [&] { return LoadCgroupScopeState(config, deadline, stop_token); });
   if (!state.active_runs.contains(run_id) && state.pending_run != run_id) {
-    throw std::runtime_error(
-        "refusing to remove a run cgroup absent from scope ownership state: " +
-        run_id);
+    const std::filesystem::path run_cgroup =
+        CgroupPathsForScope(config, run_id).run;
+    if (std::filesystem::exists(run_cgroup) ||
+        state.run_bindings.contains(run_id)) {
+      throw CgroupOwnershipMismatch(
+          "refusing to remove a run cgroup absent from scope ownership "
+          "state: " +
+          run_id);
+    }
+    if (expected_ownership != nullptr) {
+      const RunOwnership loaded = verify_ownership(
+          "absent cgroup run ownership could not be verified", [&] {
+            return LoadRunOwnership(expected_ownership->run_id,
+                                    expected_ownership->run_root, stop_token);
+          });
+      if (loaded != *expected_ownership ||
+          expected_ownership->cgroup_name != run_id) {
+        throw CgroupOwnershipMismatch(
+            "stale cgroup ownership fields do not match the absent run");
+      }
+    }
+    if (state.active_runs.empty() && !state.pending_run) {
+      RestoreCgroupScope(config, state, deadline, stop_token);
+    }
+    return;
   }
   const auto binding = state.run_bindings.find(run_id);
   if (expected_ownership != nullptr) {
     if (binding == state.run_bindings.end()) {
-      throw std::runtime_error(
+      throw CgroupOwnershipMismatch(
           "refusing stale cgroup cleanup for an unbound legacy scope entry");
     }
-    const RunOwnership loaded = LoadRunOwnership(expected_ownership->run_id,
-                                                 expected_ownership->run_root);
+    const RunOwnership loaded = verify_ownership(
+        "bound cgroup run ownership could not be verified", [&] {
+          return LoadRunOwnership(expected_ownership->run_id,
+                                  expected_ownership->run_root, stop_token);
+        });
     const CgroupRunBinding expected{
         .run_id = expected_ownership->run_id,
         .run_root = expected_ownership->run_root,
         .resource_id = expected_ownership->resource_id,
-        .run_root_identity =
-            DirectoryIdentity(expected_ownership->run_root, "run root"),
+        .run_root_identity = verify_ownership(
+            "bound cgroup run root identity could not be verified",
+            [&] {
+              return DirectoryIdentity(expected_ownership->run_root,
+                                       "run root");
+            }),
         .cgroup_identity = binding->second.cgroup_identity,
     };
     if (loaded != *expected_ownership ||
         expected_ownership->cgroup_name != run_id ||
         binding->second != expected) {
-      throw std::runtime_error(
+      throw CgroupOwnershipMismatch(
           "stale cgroup scope binding does not match exact run ownership");
     }
   }
@@ -1824,9 +1930,10 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
       CgroupPathsForScope(config, run_id).run;
   if (binding != state.run_bindings.end() &&
       std::filesystem::exists(run_cgroup) &&
-      DirectoryIdentity(run_cgroup, "run cgroup") !=
-          binding->second.cgroup_identity) {
-    throw std::runtime_error(
+      verify_ownership("bound run cgroup identity could not be verified", [&] {
+        return DirectoryIdentity(run_cgroup, "run cgroup");
+      }) != binding->second.cgroup_identity) {
+    throw CgroupOwnershipMismatch(
         "refusing to remove a replaced run cgroup identity: " + run_id);
   }
   RemoveRunCgroup(config, run_id, deadline, stop_token);
@@ -1838,7 +1945,7 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
   state.run_bindings.erase(run_id);
   WriteCgroupScopeState(config.state_file, state);
   if (state.active_runs.empty() && !state.pending_run) {
-    RestoreCgroupScope(config, state);
+    RestoreCgroupScope(config, state, deadline, stop_token);
   }
 }
 
@@ -2114,14 +2221,31 @@ void Cgroup::RemoveRun(const std::string& run_id,
 }
 
 void Cgroup::RemoveStaleRun(const RunOwnership& ownership) {
-  const RunOwnership loaded =
-      LoadRunOwnership(ownership.run_id, ownership.run_root);
-  if (loaded != ownership) {
-    throw std::runtime_error("stale cgroup ownership fields do not match");
+  RemoveStaleRun(ownership,
+                 std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                 {});
+}
+
+void Cgroup::RemoveStaleRun(const RunOwnership& ownership,
+                            std::chrono::steady_clock::time_point deadline,
+                            std::stop_token stop_token) {
+  RunOwnership loaded;
+  try {
+    loaded = LoadRunOwnership(ownership.run_id, ownership.run_root, stop_token);
+  } catch (...) {
+    if (stop_token.stop_requested() ||
+        std::chrono::steady_clock::now() >= deadline) {
+      throw;
+    }
+    throw CgroupOwnershipMismatch(
+        "stale cgroup run ownership could not be verified: " +
+        CurrentExceptionText());
   }
-  RemoveRunInScope(
-      ProductionCgroupScopeConfig(), ownership.cgroup_name, &ownership,
-      std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+  if (loaded != ownership) {
+    throw CgroupOwnershipMismatch("stale cgroup ownership fields do not match");
+  }
+  RemoveRunInScope(ProductionCgroupScopeConfig(), ownership.cgroup_name,
+                   &ownership, deadline, stop_token);
   ForgetPreparedRun(ownership.cgroup_name);
 }
 
@@ -2152,6 +2276,15 @@ void PrepareCgroupRunInTestScope(const CgroupScopeTestConfig& config,
 
 void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
                                 const std::string& run_id) {
+  RemoveCgroupRunInTestScope(
+      config, run_id,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+}
+
+void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                const std::string& run_id,
+                                std::chrono::steady_clock::time_point deadline,
+                                std::stop_token stop_token) {
   RemoveRunInScope(
       CgroupScopeConfig{
           .root = config.root,
@@ -2159,8 +2292,7 @@ void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
           .state_file = config.state_file,
           .allow_root_process_move = config.allow_root_process_move,
       },
-      run_id, nullptr,
-      std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+      run_id, nullptr, deadline, stop_token);
 }
 
 void RemoveStaleCgroupRunInTestScope(const CgroupScopeTestConfig& config,

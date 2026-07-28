@@ -26,6 +26,7 @@ constexpr std::uint64_t kMarkerVersion = 1U;
 constexpr std::size_t kResourceByteCount = 16U;
 constexpr std::size_t kResourceHexCount = kResourceByteCount * 2U;
 constexpr std::size_t kInterfaceTokenHexCount = 8U;
+constexpr std::size_t kMaximumMarkerBytes = 4096U;
 
 std::filesystem::path CanonicalRunRoot(const std::filesystem::path& run_root) {
   std::error_code error;
@@ -167,6 +168,15 @@ RunOwnership CreateRunOwnership(std::string run_id,
 
 RunOwnership LoadRunOwnership(std::string run_id,
                               const std::filesystem::path& run_root) {
+  return LoadRunOwnership(std::move(run_id), run_root, {});
+}
+
+RunOwnership LoadRunOwnership(std::string run_id,
+                              const std::filesystem::path& run_root,
+                              std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("run ownership loading was cancelled");
+  }
   RequireSafeRunId(run_id);
   const std::filesystem::path canonical_root = CanonicalRunRoot(run_root);
   const std::filesystem::path marker_path =
@@ -182,7 +192,8 @@ RunOwnership LoadRunOwnership(std::string run_id,
 
   boost::json::value parsed;
   try {
-    parsed = boost::json::parse(ReadText(marker_path));
+    parsed = boost::json::parse(
+        ReadText(marker_path, kMaximumMarkerBytes, stop_token));
   } catch (const std::exception& parse_error) {
     throw std::runtime_error("invalid run ownership marker " +
                              marker_path.string() + ": " + parse_error.what());
@@ -216,8 +227,12 @@ RunOwnership LoadRunOwnership(std::string run_id,
       canonical_root) {
     throw std::runtime_error("run ownership marker root does not match");
   }
-  return BuildRunOwnership(std::move(run_id), canonical_root,
-                           RequiredString(marker, "resource_id"));
+  RunOwnership ownership = BuildRunOwnership(
+      std::move(run_id), canonical_root, RequiredString(marker, "resource_id"));
+  if (stop_token.stop_requested()) {
+    throw std::runtime_error("run ownership loading was cancelled");
+  }
+  return ownership;
 }
 
 void WriteRunOwnershipMarker(const RunOwnership& ownership) {

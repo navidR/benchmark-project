@@ -79,6 +79,13 @@ boost::json::object IdentifierSchema() {
                              {"pattern", "^[A-Za-z0-9][A-Za-z0-9_.-]*$"}};
 }
 
+boost::json::object RunIdentifierSchema() {
+  return boost::json::object{{"type", "string"},
+                             {"minLength", 1U},
+                             {"maxLength", 32U},
+                             {"pattern", "^[A-Za-z0-9_-]{1,32}$"}};
+}
+
 boost::json::object NodeAddIdentifierSchema() {
   return boost::json::object{{"type", "string"},
                              {"minLength", 1U},
@@ -1364,8 +1371,11 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kCleanRun:
       add_run();
-      add_timeout();
+      properties["run_id"] = RunIdentifierSchema();
+      properties["timeout_sec"] = IntegerSchema(1U, 3600U);
+      properties["timeout_sec"].as_object()["default"] = 30U;
       properties["remove_retained_artifacts"] = TypeSchema("boolean");
+      properties["remove_retained_artifacts"].as_object()["default"] = false;
       break;
     case McpOperationKind::kReplayRun:
       properties["source_run_id"] = IdentifierSchema();
@@ -2618,14 +2628,20 @@ boost::json::object BuildMcpResultSchema(
                "active"});
       break;
     case McpResultFamily::kCleanup:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["verified_owned"] = TypeSchema("boolean");
-      properties["processes_remaining"] = IntegerSchema();
-      properties["network_resources_remaining"] = IntegerSchema();
-      properties["cgroups_remaining"] = IntegerSchema();
-      properties["credentials_remaining"] = IntegerSchema();
+      properties["verified_owned"].as_object()["const"] = true;
+      properties["processes_remaining"] = Uint64Schema();
+      properties["processes_remaining"].as_object()["const"] = 0U;
+      properties["network_resources_remaining"] = Uint64Schema();
+      properties["network_resources_remaining"].as_object()["const"] = 0U;
+      properties["cgroups_remaining"] = Uint64Schema();
+      properties["cgroups_remaining"].as_object()["const"] = 0U;
+      properties["credentials_remaining"] = Uint64Schema();
+      properties["credentials_remaining"].as_object()["const"] = 0U;
       properties["complete"] = TypeSchema("boolean");
+      properties["complete"].as_object()["const"] = true;
       require({"run_id", "verified_owned", "processes_remaining",
                "network_resources_remaining", "cgroups_remaining",
                "credentials_remaining", "complete"});
@@ -2665,7 +2681,8 @@ boost::json::object BuildMcpOperationOutputSchema(
   boost::json::array choices;
   const std::array<McpOperationKind, 1U> operation_only{operation};
   const std::span<const McpOperationKind> wrapper_operations =
-      operation == McpOperationKind::kCreateFiroQtLauncher ||
+      operation == McpOperationKind::kCleanRun ||
+              operation == McpOperationKind::kCreateFiroQtLauncher ||
               operation == McpOperationKind::kAssignRole ||
               operation == McpOperationKind::kRemoveRole ||
               operation == McpOperationKind::kRemoveWallet

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <stop_token>
 #include <string>
 
 namespace bbp {
@@ -20,6 +21,9 @@ RunOwnership CreateRunOwnership(std::string run_id,
                                 const std::filesystem::path& run_root);
 RunOwnership LoadRunOwnership(std::string run_id,
                               const std::filesystem::path& run_root);
+RunOwnership LoadRunOwnership(std::string run_id,
+                              const std::filesystem::path& run_root,
+                              std::stop_token stop_token);
 void WriteRunOwnershipMarker(const RunOwnership& ownership);
 
 std::string RunInterfaceName(const RunOwnership& ownership,

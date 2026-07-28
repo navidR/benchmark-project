@@ -593,8 +593,13 @@ std::string OpenMcpConnectionPane(const PtyProcess& process,
 void RequireExitZero(PtyProcess* process, std::string_view context) {
   const int result = process->Wait();
   if (result != 0) {
+    const std::string output = process->ReadFor(200ms);
+    constexpr std::size_t kDiagnosticTail = 8192U;
+    const std::size_t diagnostic_begin =
+        output.size() > kDiagnosticTail ? output.size() - kDiagnosticTail : 0U;
     throw std::runtime_error(std::string(context) + " exited " +
-                             std::to_string(result));
+                             std::to_string(result) + "\nPTY output tail:\n" +
+                             output.substr(diagnostic_begin));
   }
 }
 
@@ -1332,6 +1337,229 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       "MCP connection", 3s,
       "empty control-plane MCP pane after initialized handshake"));
   process.Write("\n");
+  static_cast<void>(process.ReadFor(250ms));
+
+  std::uint64_t request_id = 2U;
+  const auto invoke_and_wait = [&](std::string_view operation,
+                                   boost::json::object arguments) {
+    const boost::json::object submitted =
+        McpToolCall(session.port, session.token, session.session_id,
+                    session.protocol_version, request_id++, operation,
+                    std::move(arguments));
+    const std::string operation_id(submitted.at("operation_id").as_string());
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      boost::json::object terminal =
+          McpToolCall(session.port, session.token, session.session_id,
+                      session.protocol_version, request_id++, "operation.get",
+                      boost::json::object{{"operation_id", operation_id}});
+      const std::string_view state = terminal.at("state").as_string();
+      if (state == "succeeded" || state == "failed" || state == "cancelled") {
+        return terminal;
+      }
+      std::this_thread::sleep_for(20ms);
+    }
+    throw std::runtime_error(std::string(operation) +
+                             " did not become terminal");
+  };
+  const auto launch_zero_node_run = [&](std::string_view launched_run_id) {
+    return invoke_and_wait(
+        "run.launch",
+        boost::json::object{
+            {"scenario", boost::json::object{{"run_id", launched_run_id},
+                                             {"nodes", 0U},
+                                             {"isolated_network", false}}}});
+  };
+  const auto stop_run = [&](std::string_view stopped_run_id) {
+    return invoke_and_wait(
+        "run.stop",
+        boost::json::object{{"run_id", stopped_run_id}, {"timeout_sec", 5U}});
+  };
+  const auto clean_run = [&](std::string_view cleaned_run_id) {
+    return invoke_and_wait(
+        "run.clean",
+        boost::json::object{{"run_id", cleaned_run_id}, {"timeout_sec", 5U}});
+  };
+  const auto remove_run = [&](std::string_view removed_run_id) {
+    return invoke_and_wait(
+        "run.clean", boost::json::object{{"run_id", removed_run_id},
+                                         {"timeout_sec", 5U},
+                                         {"remove_retained_artifacts", true}});
+  };
+
+  const std::filesystem::path other_benchmark_root =
+      directory.root() / "other-runs";
+  const boost::json::object mismatched_root = invoke_and_wait(
+      "run.launch",
+      boost::json::object{
+          {"scenario",
+           boost::json::object{{"run_id", "wrong-root"},
+                               {"output_dir", other_benchmark_root.string()},
+                               {"nodes", 0U},
+                               {"isolated_network", false}}}});
+  if (mismatched_root.at("state").as_string() != "failed" ||
+      mismatched_root.at("terminal_error").as_object().at("code").as_string() !=
+          "run_output_root_mismatch" ||
+      std::filesystem::exists(other_benchmark_root / "wrong-root")) {
+    throw std::runtime_error(
+        "run.launch did not reject a root outside the editor host");
+  }
+
+  const std::filesystem::path unowned_run_root =
+      benchmark_root / "unowned-cleanup";
+  if (!std::filesystem::create_directories(unowned_run_root)) {
+    throw std::runtime_error("could not create unowned cleanup fixture");
+  }
+  const boost::json::object unowned_cleanup = remove_run("unowned-cleanup");
+  const boost::json::object& unowned_error =
+      unowned_cleanup.at("terminal_error").as_object();
+  if (unowned_cleanup.at("state").as_string() != "failed" ||
+      unowned_error.at("code").as_string() != "run_cleanup_unverified" ||
+      unowned_error.at("retryable").as_bool() ||
+      !std::filesystem::is_directory(unowned_run_root)) {
+    throw std::runtime_error(
+        "run.clean did not preserve and type an unowned-root refusal");
+  }
+  if (!std::filesystem::remove(unowned_run_root)) {
+    throw std::runtime_error("could not remove unowned cleanup fixture");
+  }
+
+  const boost::json::object launched = launch_zero_node_run(run_id);
+  if (launched.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("MCP zero-node run launch failed: " +
+                             boost::json::serialize(launched));
+  }
+  if (launched.at("terminal_result").as_object().at("state").as_string() !=
+          "active" ||
+      !std::filesystem::exists(run_root / ".bbp-run")) {
+    throw std::runtime_error(
+        "MCP did not launch an owned zero-node run in the editor host");
+  }
+  const boost::json::object active_cleanup = remove_run(run_id);
+  if (active_cleanup.at("state").as_string() != "failed" ||
+      active_cleanup.at("terminal_error").as_object().at("code").as_string() !=
+          "run_cleanup_requires_stop" ||
+      !std::filesystem::exists(run_root / ".bbp-run")) {
+    throw std::runtime_error(
+        "run.clean did not preserve and reject the active managed run");
+  }
+  const boost::json::object other_cleanup = remove_run("other-retained-run");
+  if (other_cleanup.at("state").as_string() != "failed" ||
+      other_cleanup.at("terminal_error").as_object().at("code").as_string() !=
+          "run_cleanup_requires_stop" ||
+      !std::filesystem::exists(run_root / ".bbp-run")) {
+    throw std::runtime_error(
+        "run.clean admitted another retained run while one was active");
+  }
+  const std::string ownership_marker = ReadFile(run_root / ".bbp-run");
+  if (ownership_marker.empty()) {
+    throw std::runtime_error(
+        "active managed run had no readable ownership marker");
+  }
+  const boost::json::object stopped = stop_run(run_id);
+  if (stopped.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("MCP zero-node run stop failed: " +
+                             boost::json::serialize(stopped));
+  }
+  if (stopped.at("terminal_result").as_object().at("state").as_string() !=
+      "stopped") {
+    throw std::runtime_error("MCP returned a non-stopped run result");
+  }
+  const boost::json::object retained = clean_run(run_id);
+  if (retained.at("state").as_string() != "succeeded" ||
+      !retained.at("terminal_result").as_object().at("complete").as_bool() ||
+      ReadFile(run_root / ".bbp-run") != ownership_marker ||
+      !std::filesystem::exists(run_root / "resolved-scenario.json") ||
+      !std::filesystem::exists(events_path)) {
+    throw std::runtime_error(
+        "default run.clean did not preserve retained run artifacts");
+  }
+  {
+    std::ofstream damaged_report(run_root / "resolved-scenario.json",
+                                 std::ios::trunc);
+    damaged_report << "{damaged retained report\n";
+    if (!damaged_report) {
+      throw std::runtime_error(
+          "could not damage retained report for cleanup regression");
+    }
+  }
+  const boost::json::object cleaned = remove_run(run_id);
+  if (cleaned.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("MCP zero-node run cleanup failed: " +
+                             boost::json::serialize(cleaned));
+  }
+  const boost::json::object& cleanup_result =
+      cleaned.at("terminal_result").as_object();
+  if (cleanup_result.at("result_family").as_string() != "cleanup" ||
+      !cleanup_result.at("verified_owned").as_bool() ||
+      cleanup_result.at("processes_remaining").to_number<std::uint64_t>() !=
+          0U ||
+      cleanup_result.at("network_resources_remaining")
+              .to_number<std::uint64_t>() != 0U ||
+      cleanup_result.at("cgroups_remaining").to_number<std::uint64_t>() != 0U ||
+      cleanup_result.at("credentials_remaining").to_number<std::uint64_t>() !=
+          0U ||
+      !cleanup_result.at("complete").as_bool() ||
+      std::filesystem::exists(run_root)) {
+    throw std::runtime_error(
+        "run.clean did not return verified zero-residual cleanup");
+  }
+  const boost::json::object repeated_cleanup = remove_run(run_id);
+  if (repeated_cleanup.at("state").as_string() != "succeeded" ||
+      repeated_cleanup.at("terminal_result").as_object() != cleanup_result ||
+      std::filesystem::exists(run_root)) {
+    throw std::runtime_error(
+        "repeated run.clean did not return the verified idempotent result");
+  }
+
+  if (!std::filesystem::create_directory(run_root)) {
+    throw std::runtime_error(
+        "could not create replacement run root for identity-reuse check");
+  }
+  {
+    std::ofstream marker(run_root / ".bbp-run");
+    marker << ownership_marker;
+    if (!marker) {
+      throw std::runtime_error(
+          "could not create copied replacement ownership marker");
+    }
+  }
+  const boost::json::object replacement_cleanup = remove_run(run_id);
+  if (replacement_cleanup.at("state").as_string() != "failed" ||
+      replacement_cleanup.at("terminal_error")
+              .as_object()
+              .at("code")
+              .as_string() != "run_cleanup_identity_reused" ||
+      ReadFile(run_root / ".bbp-run") != ownership_marker) {
+    throw std::runtime_error(
+        "run.clean did not preserve and reject a replacement run root");
+  }
+  if (!std::filesystem::remove(run_root / ".bbp-run") ||
+      !std::filesystem::remove(run_root)) {
+    throw std::runtime_error(
+        "could not remove the preserved replacement run test fixture");
+  }
+
+  const boost::json::object relaunched = launch_zero_node_run(run_id);
+  if (relaunched.at("state").as_string() != "succeeded") {
+    throw std::runtime_error(
+        "editor host did not accept a cleaned run ID for reuse: " +
+        boost::json::serialize(relaunched));
+  }
+  const boost::json::object relaunched_stopped = stop_run(run_id);
+  if (relaunched_stopped.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("reused-ID editor run stop failed: " +
+                             boost::json::serialize(relaunched_stopped));
+  }
+  const boost::json::object relaunched_cleaned = remove_run(run_id);
+  if (relaunched_cleaned.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("reused-ID editor run cleanup failed: " +
+                             boost::json::serialize(relaunched_cleaned));
+  }
+  if (std::filesystem::exists(run_root)) {
+    throw std::runtime_error(
+        "reused-ID editor run did not stop and clean through the same host");
+  }
   static_cast<void>(process.ReadFor(250ms));
 
   static_cast<void>(OpenMcpConnectionPane(
@@ -2084,22 +2312,42 @@ void CheckSlowNodeReplacementDefaultTimeout(
 
   const McpTestSession mcp =
       ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  boost::json::object submitted;
+  std::uint64_t request_id = 2U;
+  const auto active_wait_deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < active_wait_deadline) {
+    submitted = McpToolCall(
+        mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+        "node.replace",
+        boost::json::object{
+            {"run_id", run_id},
+            {"node_id", "firo-1"},
+            {"replacement",
+             boost::json::object{{"chain", "firo"},
+                                 {"count", 1U},
+                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"ready_timeout_sec", 20U},
+                                 {"sync_timeout_sec", 20U}}}});
+    if (submitted.if_contains("operation_id") != nullptr) {
+      break;
+    }
+    const boost::json::value* code = submitted.if_contains("code");
+    const boost::json::value* retryable = submitted.if_contains("retryable");
+    if (code == nullptr || !code->is_string() ||
+        code->as_string() != "run_not_ready" || retryable == nullptr ||
+        !retryable->is_bool() || !retryable->as_bool()) {
+      throw std::runtime_error("slow node replacement was not admitted: " +
+                               boost::json::serialize(submitted));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (submitted.if_contains("operation_id") == nullptr) {
+    throw std::runtime_error(
+        "slow node replacement was not admitted after the run became ready");
+  }
   const auto replacement_started = std::chrono::steady_clock::now();
-  const boost::json::object submitted = McpToolCall(
-      mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, 2U,
-      "node.replace",
-      boost::json::object{
-          {"run_id", run_id},
-          {"node_id", "firo-1"},
-          {"replacement",
-           boost::json::object{{"chain", "firo"},
-                               {"count", 1U},
-                               {"node_ids", boost::json::array{"firo-1"}},
-                               {"ready_timeout_sec", 20U},
-                               {"sync_timeout_sec", 20U}}}});
   const std::string operation_id(submitted.at("operation_id").as_string());
   boost::json::object terminal;
-  std::uint64_t request_id = 3U;
   const auto terminal_wait_deadline = replacement_started + 135s;
   while (std::chrono::steady_clock::now() < terminal_wait_deadline) {
     terminal = McpToolCall(mcp.port, mcp.token, mcp.session_id,

@@ -210,13 +210,19 @@ std::string ExceptionText(const std::exception_ptr& failure) {
 }
 
 FiroQtLauncherCleanupResult CleanupPendingCandidate(
-    std::optional<OwnedFiroQtLauncher>* pending_cleanup) {
+    std::optional<OwnedFiroQtLauncher>* pending_cleanup,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}) {
   if (pending_cleanup == nullptr || !*pending_cleanup) {
     return FiroQtLauncherCleanupResult::kAlreadyAbsent;
   }
   FiroQtLauncherCleanupResult cleanup;
   try {
-    cleanup = (*pending_cleanup)->Cleanup();
+    cleanup = deadline ? (*pending_cleanup)->Cleanup(*deadline, stop_token)
+              : stop_token.stop_possible()
+                  ? (*pending_cleanup)->Cleanup(stop_token)
+                  : (*pending_cleanup)->Cleanup();
   } catch (...) {
     if (!(*pending_cleanup)->active()) {
       pending_cleanup->reset();
@@ -410,6 +416,15 @@ void ThrowIfCancelled(std::stop_token stop_token) {
   }
 }
 
+void RequireLauncherCleanupActive(
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  ThrowIfCancelled(stop_token);
+  if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+    throw std::runtime_error("Firo-Qt launcher cleanup deadline expired");
+  }
+}
+
 bool SameOperatorConnectionCommand(const OperatorConnectionCommand& left,
                                    const OperatorConnectionCommand& right) {
   return left.executable == right.executable &&
@@ -556,9 +571,27 @@ OwnedFiroQtLauncher OwnedFiroQtLauncher::Create(
 }
 
 FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup() {
+  return CleanupImpl(std::nullopt, {});
+}
+
+FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup(
+    std::stop_token stop_token) {
+  return CleanupImpl(std::nullopt, stop_token);
+}
+
+FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup(
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  return CleanupImpl(deadline, stop_token);
+}
+
+FiroQtLauncherCleanupResult OwnedFiroQtLauncher::CleanupImpl(
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
   if (!active_) {
     return FiroQtLauncherCleanupResult::kAlreadyAbsent;
   }
+  RequireLauncherCleanupActive(deadline, stop_token);
 
   const std::filesystem::path parent = path_.parent_path();
   const std::string public_name = path_.filename().string();
@@ -572,13 +605,37 @@ FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup() {
     ThrowSystemError("open owned Firo-Qt launcher cleanup directory");
   }
   const ScopedDescriptor parent_guard(parent_descriptor);
+  RequireLauncherCleanupActive(deadline, stop_token);
+
+  const auto resolve_missing_public_launcher = [&](std::string_view operation) {
+    struct stat descriptor_status{};
+    if (fstat(descriptor_, &descriptor_status) != 0) {
+      const int descriptor_error = errno;
+      ResetOwnership();
+      throw std::system_error(descriptor_error, std::generic_category(),
+                              "inspect missing Firo-Qt launcher descriptor");
+    }
+    if (static_cast<std::uintmax_t>(descriptor_status.st_dev) != device_ ||
+        static_cast<std::uintmax_t>(descriptor_status.st_ino) != inode_) {
+      ResetOwnership();
+      throw std::runtime_error(
+          "missing Firo-Qt launcher descriptor identity changed");
+    }
+    if (descriptor_status.st_nlink == 0U) {
+      ResetOwnership();
+      return FiroQtLauncherCleanupResult::kAlreadyAbsent;
+    }
+    ResetOwnership();
+    throw std::runtime_error(std::string(operation) +
+                             " while the owned file remains linked");
+  };
 
   struct stat status{};
   if (fstatat(parent_guard.get(), public_name.c_str(), &status,
               AT_SYMLINK_NOFOLLOW) != 0) {
     if (errno == ENOENT) {
-      ResetOwnership();
-      return FiroQtLauncherCleanupResult::kAlreadyAbsent;
+      return resolve_missing_public_launcher(
+          "public Firo-Qt launcher disappeared before cleanup");
     }
     ThrowSystemError("inspect owned Firo-Qt launcher during cleanup");
   }
@@ -597,10 +654,13 @@ FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup() {
   }
 #endif
 
+  RequireLauncherCleanupActive(deadline, stop_token);
+
   std::filesystem::path public_path = path_;
   bool captured = false;
   for (std::size_t attempt = 0U; attempt < kFiroQtLauncherCleanupAttempts;
        ++attempt) {
+    RequireLauncherCleanupActive(deadline, stop_token);
     const std::string quarantine_name = RandomFiroQtLauncherCleanupName();
     std::filesystem::path quarantine_path = parent / quarantine_name;
     if (syscall(SYS_renameat2, parent_guard.get(), public_name.c_str(),
@@ -615,8 +675,8 @@ FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup() {
       continue;
     }
     if (error == ENOENT) {
-      ResetOwnership();
-      return FiroQtLauncherCleanupResult::kAlreadyAbsent;
+      return resolve_missing_public_launcher(
+          "public Firo-Qt launcher disappeared during atomic capture");
     }
     if (error == ENOSYS || error == EINVAL || error == EOPNOTSUPP) {
       throw std::runtime_error(
@@ -639,9 +699,38 @@ FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup() {
   }
 #endif
 
+  RequireLauncherCleanupActive(deadline, stop_token);
+
   const std::string quarantine_name = path_.filename().string();
   if (fstatat(parent_guard.get(), quarantine_name.c_str(), &status,
               AT_SYMLINK_NOFOLLOW) != 0) {
+    const int path_error = errno;
+    if (path_error == ENOENT) {
+      struct stat descriptor_status{};
+      if (fstat(descriptor_, &descriptor_status) != 0) {
+        const int descriptor_error = errno;
+        ResetOwnership();
+        throw std::system_error(
+            descriptor_error, std::generic_category(),
+            "inspect missing quarantined Firo-Qt launcher descriptor");
+      }
+      if (static_cast<std::uintmax_t>(descriptor_status.st_dev) != device_ ||
+          static_cast<std::uintmax_t>(descriptor_status.st_ino) != inode_) {
+        ResetOwnership();
+        throw std::runtime_error(
+            "missing quarantined Firo-Qt launcher descriptor identity "
+            "changed");
+      }
+      if (descriptor_status.st_nlink == 0U) {
+        ResetOwnership();
+        return FiroQtLauncherCleanupResult::kAlreadyAbsent;
+      }
+      ResetOwnership();
+      throw std::runtime_error(
+          "quarantined Firo-Qt launcher disappeared while the owned file "
+          "remains linked");
+    }
+    errno = path_error;
     ThrowSystemError("inspect quarantined Firo-Qt launcher during cleanup");
   }
   if (!S_ISREG(status.st_mode) ||
@@ -662,12 +751,53 @@ FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup() {
         std::error_code(error, std::generic_category()).message());
   }
 
+  RequireLauncherCleanupActive(deadline, stop_token);
+  // Quarantine unlink is the cancellation commit point. After exact identity
+  // revalidation, complete removal without reporting a late cancellation.
+#ifdef BBP_ENABLE_TEST_HOOKS
+  if (firo_qt_launcher_cleanup_test_hook) {
+    firo_qt_launcher_cleanup_test_hook(
+        FiroQtLauncherCleanupTestPhase::kBeforeQuarantineUnlink, public_path,
+        path_);
+  }
+#endif
+
+  const auto inspect_owned_descriptor = [&] {
+    struct stat descriptor_status{};
+    if (fstat(descriptor_, &descriptor_status) != 0) {
+      const int descriptor_error = errno;
+      ResetOwnership();
+      throw std::system_error(
+          descriptor_error, std::generic_category(),
+          "inspect quarantined Firo-Qt launcher descriptor after unlink");
+    }
+    if (static_cast<std::uintmax_t>(descriptor_status.st_dev) != device_ ||
+        static_cast<std::uintmax_t>(descriptor_status.st_ino) != inode_) {
+      ResetOwnership();
+      throw std::runtime_error(
+          "quarantined Firo-Qt launcher descriptor identity changed");
+    }
+    return descriptor_status;
+  };
   if (unlinkat(parent_guard.get(), quarantine_name.c_str(), 0) != 0) {
     if (errno == ENOENT) {
+      const struct stat descriptor_status = inspect_owned_descriptor();
+      if (descriptor_status.st_nlink != 0U) {
+        ResetOwnership();
+        throw std::runtime_error(
+            "quarantined Firo-Qt launcher disappeared during unlink while "
+            "the owned file remains linked");
+      }
       ResetOwnership();
       return FiroQtLauncherCleanupResult::kAlreadyAbsent;
     }
     ThrowSystemError("remove quarantined owned Firo-Qt launcher");
+  }
+  const struct stat descriptor_status = inspect_owned_descriptor();
+  if (descriptor_status.st_nlink != 0U) {
+    ResetOwnership();
+    throw std::runtime_error(
+        "removed Firo-Qt launcher remains linked under an unknown name");
   }
   ResetOwnership();
   return FiroQtLauncherCleanupResult::kRemoved;
@@ -702,12 +832,27 @@ FiroQtLauncherService::FiroQtLauncherService(
 FiroQtLauncherService::~FiroQtLauncherService() { CloseAndCleanupNoThrow(); }
 
 std::unique_lock<std::timed_mutex> FiroQtLauncherService::Acquire(
+    std::optional<std::chrono::steady_clock::time_point> deadline,
     std::stop_token stop_token) const {
   std::unique_lock<std::timed_mutex> lock(mutation_mutex_, std::defer_lock);
-  while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
+  constexpr auto kLockPollInterval = std::chrono::milliseconds(10);
+  while (!lock.try_lock_until(
+      deadline ? std::min(*deadline,
+                          std::chrono::steady_clock::now() + kLockPollInterval)
+               : std::chrono::steady_clock::now() + kLockPollInterval)) {
     ThrowIfCancelled(stop_token);
+    if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+      throw std::runtime_error(
+          "Firo-Qt launcher cleanup deadline expired while waiting for "
+          "exclusive access");
+    }
   }
   ThrowIfCancelled(stop_token);
+  if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+    throw std::runtime_error(
+        "Firo-Qt launcher cleanup deadline expired after acquiring "
+        "exclusive access");
+  }
   return lock;
 }
 
@@ -718,7 +863,7 @@ FiroQtLauncherSnapshot FiroQtLauncherService::ReplaceFromReport(
   const ParsedFiroQtLauncherCommand parsed =
       FiroQtLauncherCommandFromReport(report, required_node_id);
   ThrowIfCancelled(stop_token);
-  std::unique_lock<std::timed_mutex> lock = Acquire(stop_token);
+  std::unique_lock<std::timed_mutex> lock = Acquire(std::nullopt, stop_token);
   if (closed_) {
     throw std::runtime_error("the Firo-Qt launcher service is closed");
   }
@@ -728,7 +873,7 @@ FiroQtLauncherSnapshot FiroQtLauncherService::ReplaceFromReport(
         "pending Firo-Qt launcher ownership changed before replacement");
   }
   if (!unverified_cleanup_failure_.empty()) {
-    throw std::runtime_error(
+    throw FiroQtLauncherCleanupUnverified(
         "a previous Firo-Qt launcher cleanup could not be verified: " +
         unverified_cleanup_failure_);
   }
@@ -816,15 +961,52 @@ void FiroQtLauncherService::ReconcileSnapshotAfterCleanupFailure() {
 }
 
 FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanup() {
-  std::lock_guard<std::timed_mutex> lock(mutation_mutex_);
+  return CloseAndCleanupImpl(std::nullopt, {});
+}
+
+FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanup(
+    std::stop_token stop_token) {
+  return CloseAndCleanupImpl(std::nullopt, stop_token);
+}
+
+FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanup(
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  return CloseAndCleanupImpl(deadline, stop_token);
+}
+
+FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanupImpl(
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  std::unique_lock<std::timed_mutex> lock = Acquire(deadline, stop_token);
   closed_ = true;
+  const auto retain_cleanup_uncertainty = [&](std::string_view detail) {
+    if (!unverified_cleanup_failure_.empty()) {
+      unverified_cleanup_failure_ += "; ";
+    }
+    unverified_cleanup_failure_ += detail;
+  };
   FiroQtLauncherCleanupResult pending_cleanup =
       FiroQtLauncherCleanupResult::kAlreadyAbsent;
   std::exception_ptr pending_failure;
   try {
-    pending_cleanup = CleanupPendingCandidate(&pending_cleanup_);
+    pending_cleanup =
+        CleanupPendingCandidate(&pending_cleanup_, deadline, stop_token);
   } catch (...) {
     pending_failure = std::current_exception();
+    if (!pending_cleanup_) {
+      retain_cleanup_uncertainty(
+          "pending candidate cleanup lost its retryable ownership after: " +
+          ExceptionText(pending_failure));
+    }
+    if (stop_token.stop_requested() ||
+        (deadline && std::chrono::steady_clock::now() >= *deadline)) {
+      std::rethrow_exception(pending_failure);
+    }
+  }
+  if (pending_cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
+    retain_cleanup_uncertainty(
+        "pending candidate ownership changed before cleanup");
   }
 
   FiroQtLauncherCleanupResult launcher_cleanup =
@@ -832,21 +1014,38 @@ FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanup() {
   std::exception_ptr launcher_failure;
   if (launcher_) {
     try {
-      launcher_cleanup = launcher_->Cleanup();
+      launcher_cleanup = deadline ? launcher_->Cleanup(*deadline, stop_token)
+                         : stop_token.stop_possible()
+                             ? launcher_->Cleanup(stop_token)
+                             : launcher_->Cleanup();
       launcher_.reset();
       std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
       snapshot_.reset();
     } catch (...) {
       launcher_failure = std::current_exception();
       ReconcileSnapshotAfterCleanupFailure();
+      if (!launcher_) {
+        retain_cleanup_uncertainty(
+            "published launcher cleanup lost its retryable ownership after: " +
+            ExceptionText(launcher_failure));
+      }
+      if (stop_token.stop_requested() ||
+          (deadline && std::chrono::steady_clock::now() >= *deadline)) {
+        std::rethrow_exception(launcher_failure);
+      }
     }
   } else {
     std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
     snapshot_.reset();
   }
+  if (launcher_cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
+    retain_cleanup_uncertainty(
+        "published launcher ownership changed before cleanup");
+  }
 
   if (pending_failure || launcher_failure ||
       !unverified_cleanup_failure_.empty()) {
+    const bool ownership_unverified = !unverified_cleanup_failure_.empty();
     std::string message = "Firo-Qt launcher cleanup failed";
     if (pending_failure) {
       message += "; pending candidate: " + ExceptionText(pending_failure);
@@ -857,6 +1056,9 @@ FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanup() {
     if (!unverified_cleanup_failure_.empty()) {
       message +=
           "; unverified creation cleanup: " + unverified_cleanup_failure_;
+    }
+    if (ownership_unverified) {
+      throw FiroQtLauncherCleanupUnverified(message);
     }
     throw std::runtime_error(message);
   }

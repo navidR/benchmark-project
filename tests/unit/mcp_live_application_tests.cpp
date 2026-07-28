@@ -1650,12 +1650,28 @@ BOOST_AUTO_TEST_CASE(
     BOOST_FAIL("old-run request was not admitted");
   }
 
-  std::future<void> shutdown =
-      std::async(std::launch::async, [&] { application.Shutdown(); });
-  BOOST_CHECK(shutdown.wait_for(20ms) == std::future_status::timeout);
+  std::stop_source shutdown_cancellation;
+  std::future<void> cancelled_shutdown = std::async(std::launch::async, [&] {
+    application.Shutdown(shutdown_cancellation.get_token());
+  });
+  BOOST_CHECK(cancelled_shutdown.wait_for(20ms) == std::future_status::timeout);
+  shutdown_cancellation.request_stop();
+  const std::future_status cancelled_status =
+      cancelled_shutdown.wait_for(500ms);
+  if (cancelled_status != std::future_status::ready) {
+    release_request_promise.set_value();
+  }
+  BOOST_REQUIRE(cancelled_status == std::future_status::ready);
+  BOOST_CHECK_THROW(cancelled_shutdown.get(), McpOperationCancelled);
+
+  std::future<void> bounded_shutdown = std::async(std::launch::async, [&] {
+    application.Shutdown(std::chrono::steady_clock::now() + 20ms, {});
+  });
+  const std::future_status bounded_status = bounded_shutdown.wait_for(500ms);
   release_request_promise.set_value();
-  BOOST_REQUIRE(shutdown.wait_for(500ms) == std::future_status::ready);
-  shutdown.get();
+  BOOST_REQUIRE(bounded_status == std::future_status::ready);
+  BOOST_CHECK_THROW(bounded_shutdown.get(), std::runtime_error);
+  application.Shutdown(std::chrono::steady_clock::now() + 500ms, {});
 
   const boost::json::object terminal = WaitForTerminal(&dispatcher, submitted);
   BOOST_TEST(terminal.at("state").as_string() == "cancelled");
@@ -3597,6 +3613,61 @@ BOOST_AUTO_TEST_CASE(
   application.MarkRunStopped();
   BOOST_TEST(!std::filesystem::exists(second_path));
   BOOST_TEST(!launcher_service->Snapshot().has_value());
+
+  boost::json::object uncertainty_report{
+      {"chain", "firo"},
+      {"operator_connection_command", detail},
+  };
+  boost::json::object& uncertainty_command =
+      uncertainty_report.at("operator_connection_command").as_object();
+  uncertainty_command["node_id"] = "_firo";
+  uncertainty_command["timestamp"] = "2026-07-27T00:00:00Z";
+  auto uncertain_launcher_service = std::make_shared<FiroQtLauncherService>(
+      [connection](std::string_view node_id, std::stop_token) {
+        if (node_id != "_firo") {
+          throw std::runtime_error(
+              "requested node has no authoritative Firo-Qt command");
+        }
+        return FiroQtLauncherAuthority{
+            .inventory_generation = 1U,
+            .node_id = "_firo",
+            .command = connection,
+        };
+      });
+  const FiroQtLauncherSnapshot uncertain_launcher =
+      uncertain_launcher_service->ReplaceFromReport(uncertainty_report,
+                                                    "_firo");
+  BOOST_REQUIRE(std::filesystem::remove(uncertain_launcher.launcher_path));
+  WriteText(uncertain_launcher.launcher_path, "foreign launcher\n");
+  McpLiveApplication uncertain_application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = std::make_shared<SimulationCommandQueue>(),
+      .firo_qt_launcher_service = uncertain_launcher_service,
+      .node_inventory_snapshot =
+          [] {
+            return McpLiveNodeInventorySnapshot{
+                .generation = 1U, .node_ids = {"_firo", "firo-2"}};
+          },
+      .publication_mutex = std::make_shared<std::timed_mutex>(),
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  uncertain_application.MarkRunStarted();
+  try {
+    uncertain_application.MarkRunStopped();
+    BOOST_FAIL("unverified launcher cleanup unexpectedly succeeded");
+  } catch (const McpOperationFailure& error) {
+    BOOST_TEST(error.code() == "run_cleanup_unverified");
+    BOOST_TEST(!error.retryable());
+  }
+  BOOST_TEST(ReadText(uncertain_launcher.launcher_path) ==
+             "foreign launcher\n");
+  BOOST_TEST(std::filesystem::is_directory(temporary.path()));
+  BOOST_REQUIRE(std::filesystem::remove(uncertain_launcher.launcher_path));
 
   dispatcher.Shutdown();
   application.Shutdown();

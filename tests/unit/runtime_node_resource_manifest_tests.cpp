@@ -3,9 +3,12 @@
 
 #include <boost/test/unit_test.hpp>
 #include <cerrno>
+#include <chrono>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
+#include <thread>
 
 #ifdef __linux__
 #include <sys/mount.h>
@@ -13,24 +16,40 @@
 
 #include "bbp/runtime_node_resource_manifest.h"
 #include "bbp/simulator/constants.h"
+#include "bbp/simulator_app.h"
 #include "bbp/util.h"
 
 namespace {
 
 class ManifestTestRoot {
  public:
-  ManifestTestRoot()
+  explicit ManifestTestRoot(std::string run_id = "manifest-test")
       : path_(std::filesystem::temp_directory_path() /
-              ("bbp-runtime-manifest-" + std::to_string(getpid()))) {
+              ("bbp-runtime-manifest-" + run_id + "-" +
+               std::to_string(getpid()))),
+        run_id_(std::move(run_id)) {
     std::filesystem::remove_all(path_);
+    std::filesystem::remove(
+        bbp::OwnedRunRootCleanupReceiptPath(run_id_, path_));
+    std::filesystem::remove(path_.parent_path() /
+                            (".bbp-retired-run-cleanup-receipt-" + run_id_));
     std::filesystem::create_directories(path_ / "nodes");
-    ownership_ = bbp::CreateRunOwnership("manifest-test", path_);
+    ownership_ = bbp::CreateRunOwnership(run_id_, path_);
     bbp::WriteRunOwnershipMarker(ownership_);
   }
 
   ~ManifestTestRoot() {
     std::error_code ignored;
     std::filesystem::remove_all(path_, ignored);
+    std::filesystem::remove_all(
+        bbp::OwnedRunRootCleanupQuarantinePath(ownership_), ignored);
+    std::filesystem::remove(bbp::OwnedRunRootCleanupReceiptPath(
+                                ownership_.run_id, ownership_.run_root),
+                            ignored);
+    std::filesystem::remove(
+        ownership_.run_root.parent_path() /
+            (".bbp-retired-run-cleanup-receipt-" + ownership_.run_id),
+        ignored);
   }
 
   const std::filesystem::path& path() const { return path_; }
@@ -38,7 +57,59 @@ class ManifestTestRoot {
 
  private:
   std::filesystem::path path_;
+  std::string run_id_;
   bbp::RunOwnership ownership_;
+};
+
+class EditorCleanupTestRoot {
+ public:
+  explicit EditorCleanupTestRoot(std::string run_id)
+      : benchmark_root_(std::filesystem::temp_directory_path() /
+                        ("bbp-editor-cleanup-" + run_id + "-" +
+                         std::to_string(static_cast<long long>(getpid())))),
+        run_root_(benchmark_root_ / run_id) {
+    std::filesystem::remove_all(benchmark_root_);
+    std::filesystem::create_directories(run_root_ / "nodes");
+    ownership_ = bbp::CreateRunOwnership(std::move(run_id), run_root_);
+    bbp::WriteRunOwnershipMarker(ownership_);
+    bbp::WriteRuntimeNodeResourceManifest(bbp::RuntimeNodeResourceManifest{
+        .ownership = ownership_,
+        .isolated_network = false,
+        .nodes = {},
+    });
+  }
+
+  ~EditorCleanupTestRoot() {
+    std::error_code ignored;
+    std::filesystem::remove_all(benchmark_root_, ignored);
+  }
+
+  const std::filesystem::path& benchmark_root() const {
+    return benchmark_root_;
+  }
+  const std::filesystem::path& run_root() const { return run_root_; }
+  const bbp::RunOwnership& ownership() const { return ownership_; }
+
+ private:
+  std::filesystem::path benchmark_root_;
+  std::filesystem::path run_root_;
+  bbp::RunOwnership ownership_;
+};
+
+class ScopedRunCleanupRootRemovedHook {
+ public:
+  explicit ScopedRunCleanupRootRemovedHook(std::function<void()> hook) {
+    bbp::SetRunCleanupRootRemovedHookForTest(std::move(hook));
+  }
+
+  ~ScopedRunCleanupRootRemovedHook() {
+    bbp::SetRunCleanupRootRemovedHookForTest({});
+  }
+
+  ScopedRunCleanupRootRemovedHook(const ScopedRunCleanupRootRemovedHook&) =
+      delete;
+  ScopedRunCleanupRootRemovedHook& operator=(
+      const ScopedRunCleanupRootRemovedHook&) = delete;
 };
 
 bbp::RuntimeNodeResourceEntry Entry(
@@ -336,6 +407,238 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(std::filesystem::exists(outside / "sentinel"));
   }
   std::filesystem::remove_all(outside);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_owned_run_cleanup_refuses_a_same_path_copied_marker_replacement) {
+  ManifestTestRoot root;
+  const std::filesystem::path public_root = root.path();
+  const std::filesystem::path preserved_root =
+      public_root.parent_path() / (public_root.filename().string() + "-owned");
+  std::filesystem::remove_all(preserved_root);
+  bbp::WriteText(public_root / "owned-sentinel", "owned\n");
+  struct stat owned_status{};
+  BOOST_REQUIRE_EQUAL(stat(public_root.c_str(), &owned_status), 0);
+  const bbp::OwnedRunRootIdentity expected{
+      .device = static_cast<std::uintmax_t>(owned_status.st_dev),
+      .inode = static_cast<std::uintmax_t>(owned_status.st_ino),
+  };
+  const std::string copied_marker =
+      bbp::ReadText(public_root / std::string(bbp::kRunMarkerFile));
+
+  std::filesystem::rename(public_root, preserved_root);
+  std::filesystem::create_directory(public_root);
+  bbp::WriteText(public_root / std::string(bbp::kRunMarkerFile), copied_marker);
+  bbp::WriteText(public_root / "foreign-sentinel", "foreign\n");
+  BOOST_CHECK_THROW(
+      bbp::RemoveOwnedRunRoot(root.ownership(), std::nullopt, {}, expected),
+      bbp::OwnedRunRootIdentityMismatch);
+
+  const bool foreign_preserved =
+      std::filesystem::exists(public_root / "foreign-sentinel") &&
+      std::filesystem::exists(public_root / std::string(bbp::kRunMarkerFile));
+  const bool owned_preserved =
+      std::filesystem::exists(preserved_root / "owned-sentinel") &&
+      std::filesystem::exists(preserved_root /
+                              std::string(bbp::kRunMarkerFile));
+  const bool quarantine_absent = !std::filesystem::exists(
+      bbp::OwnedRunRootCleanupQuarantinePath(root.ownership()));
+  std::filesystem::remove_all(public_root);
+  std::filesystem::rename(preserved_root, public_root);
+
+  BOOST_TEST(foreign_preserved);
+  BOOST_TEST(owned_preserved);
+  BOOST_TEST(quarantine_absent);
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_owned_run_cleanup_receipt_recovers_a_quarantined_root) {
+  ManifestTestRoot root;
+  struct stat root_status{};
+  BOOST_REQUIRE_EQUAL(stat(root.path().c_str(), &root_status), 0);
+  const bbp::OwnedRunRootIdentity identity{
+      .device = static_cast<std::uintmax_t>(root_status.st_dev),
+      .inode = static_cast<std::uintmax_t>(root_status.st_ino),
+  };
+  const bbp::OwnedRunRootCleanupReceipt expected{
+      .ownership = root.ownership(),
+      .root_identity = identity,
+  };
+  bbp::WriteOwnedRunRootCleanupReceipt(root.ownership(), identity);
+  const auto published = bbp::TryLoadOwnedRunRootCleanupReceipt(
+      root.ownership().run_id, root.ownership().run_root);
+  BOOST_REQUIRE(published);
+  BOOST_CHECK(*published == expected);
+
+  const std::filesystem::path quarantine =
+      bbp::OwnedRunRootCleanupQuarantinePath(root.ownership());
+  std::filesystem::rename(root.path(), quarantine);
+  const auto recovered = bbp::TryLoadOwnedRunRootCleanupReceipt(
+      root.ownership().run_id, root.ownership().run_root);
+  BOOST_REQUIRE(recovered);
+  BOOST_CHECK(*recovered == expected);
+  bbp::RemoveOwnedRunRoot(recovered->ownership, std::nullopt, {},
+                          recovered->root_identity);
+  BOOST_TEST(!std::filesystem::exists(root.path()));
+  BOOST_TEST(!std::filesystem::exists(quarantine));
+
+  const auto tombstone = bbp::TryLoadOwnedRunRootCleanupReceipt(
+      root.ownership().run_id, root.ownership().run_root);
+  BOOST_REQUIRE(tombstone);
+  BOOST_CHECK(*tombstone == expected);
+  bbp::RemoveOwnedRunRootCleanupReceipt(*tombstone);
+  BOOST_TEST(!bbp::TryLoadOwnedRunRootCleanupReceipt(
+      root.ownership().run_id, root.ownership().run_root));
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_owned_run_cleanup_receipt_names_do_not_alias_other_run_ids) {
+  ManifestTestRoot first("receipt-a");
+  ManifestTestRoot second("retired-receipt-a");
+  const auto identity = [](const std::filesystem::path& path) {
+    struct stat status{};
+    if (stat(path.c_str(), &status) != 0) {
+      throw std::runtime_error("inspect cleanup receipt test root failed");
+    }
+    return bbp::OwnedRunRootIdentity{
+        .device = static_cast<std::uintmax_t>(status.st_dev),
+        .inode = static_cast<std::uintmax_t>(status.st_ino),
+    };
+  };
+  bbp::WriteOwnedRunRootCleanupReceipt(first.ownership(),
+                                       identity(first.path()));
+  bbp::WriteOwnedRunRootCleanupReceipt(second.ownership(),
+                                       identity(second.path()));
+
+  const auto first_receipt = bbp::TryLoadOwnedRunRootCleanupReceipt(
+      first.ownership().run_id, first.path());
+  BOOST_REQUIRE(first_receipt);
+  bbp::RemoveOwnedRunRootCleanupReceipt(*first_receipt);
+  BOOST_TEST(!bbp::TryLoadOwnedRunRootCleanupReceipt(first.ownership().run_id,
+                                                     first.path()));
+  BOOST_REQUIRE(bbp::TryLoadOwnedRunRootCleanupReceipt(
+      second.ownership().run_id, second.path()));
+}
+
+BOOST_AUTO_TEST_CASE(
+    runtime_owned_run_cleanup_receipt_finishes_an_empty_markerless_quarantine) {
+  ManifestTestRoot root("markerless-recovery");
+  struct stat root_status{};
+  BOOST_REQUIRE_EQUAL(stat(root.path().c_str(), &root_status), 0);
+  const bbp::OwnedRunRootIdentity identity{
+      .device = static_cast<std::uintmax_t>(root_status.st_dev),
+      .inode = static_cast<std::uintmax_t>(root_status.st_ino),
+  };
+  bbp::WriteOwnedRunRootCleanupReceipt(root.ownership(), identity);
+  const std::filesystem::path quarantine =
+      bbp::OwnedRunRootCleanupQuarantinePath(root.ownership());
+  std::filesystem::rename(root.path(), quarantine);
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(quarantine)) {
+    std::filesystem::remove_all(entry.path());
+  }
+
+  bbp::RemoveOwnedRunRoot(root.ownership(), std::nullopt, {}, identity);
+  BOOST_TEST(!std::filesystem::exists(root.path()));
+  BOOST_TEST(!std::filesystem::exists(quarantine));
+  const auto receipt = bbp::TryLoadOwnedRunRootCleanupReceipt(
+      root.ownership().run_id, root.ownership().run_root);
+  BOOST_REQUIRE(receipt);
+  bbp::RemoveOwnedRunRootCleanupReceipt(*receipt);
+}
+
+BOOST_AUTO_TEST_CASE(
+    editor_run_clean_resumes_an_exact_durable_quarantined_root) {
+  using namespace std::chrono_literals;
+  EditorCleanupTestRoot root("editor-recovery");
+  struct stat root_status{};
+  BOOST_REQUIRE_EQUAL(stat(root.run_root().c_str(), &root_status), 0);
+  const bbp::OwnedRunRootIdentity identity{
+      .device = static_cast<std::uintmax_t>(root_status.st_dev),
+      .inode = static_cast<std::uintmax_t>(root_status.st_ino),
+  };
+  bbp::WriteOwnedRunRootCleanupReceipt(root.ownership(), identity);
+  const std::filesystem::path quarantine =
+      bbp::OwnedRunRootCleanupQuarantinePath(root.ownership());
+  std::filesystem::rename(root.run_root(), quarantine);
+
+  const bbp::McpRunCleanupResult result = bbp::CleanEditorRetainedRunForTest(
+      root.benchmark_root(), root.ownership().run_id, 5s, true);
+
+  BOOST_TEST(result.run_id == root.ownership().run_id);
+  BOOST_TEST(result.verified_owned);
+  BOOST_TEST(result.complete);
+  BOOST_TEST(!std::filesystem::exists(root.run_root()));
+  BOOST_TEST(!std::filesystem::exists(quarantine));
+}
+
+BOOST_AUTO_TEST_CASE(
+    editor_run_clean_ignores_cancellation_after_artifact_removal_commit) {
+  using namespace std::chrono_literals;
+  EditorCleanupTestRoot root("editor-late-cancel");
+  std::stop_source cancellation;
+  ScopedRunCleanupRootRemovedHook hook([&] { cancellation.request_stop(); });
+
+  const bbp::McpRunCleanupResult result = bbp::CleanEditorRetainedRunForTest(
+      root.benchmark_root(), root.ownership().run_id, 5s, true,
+      cancellation.get_token());
+
+  BOOST_TEST(result.verified_owned);
+  BOOST_TEST(result.complete);
+  BOOST_TEST(!std::filesystem::exists(root.run_root()));
+  BOOST_TEST(!std::filesystem::exists(
+      bbp::OwnedRunRootCleanupQuarantinePath(root.ownership())));
+}
+
+BOOST_AUTO_TEST_CASE(
+    editor_run_clean_ignores_deadline_after_artifact_removal_commit) {
+  using namespace std::chrono_literals;
+  EditorCleanupTestRoot root("editor-late-deadline");
+  ScopedRunCleanupRootRemovedHook hook(
+      [] { std::this_thread::sleep_for(1100ms); });
+
+  const bbp::McpRunCleanupResult result = bbp::CleanEditorRetainedRunForTest(
+      root.benchmark_root(), root.ownership().run_id, 1s, true);
+
+  BOOST_TEST(result.verified_owned);
+  BOOST_TEST(result.complete);
+  BOOST_TEST(!std::filesystem::exists(root.run_root()));
+  BOOST_TEST(!std::filesystem::exists(
+      bbp::OwnedRunRootCleanupQuarantinePath(root.ownership())));
+}
+
+BOOST_AUTO_TEST_CASE(
+    editor_run_clean_preserves_unsafe_root_types_as_unverified) {
+  using namespace std::chrono_literals;
+  const auto is_unverified = [](const bbp::McpOperationFailure& error) {
+    return error.code() == "run_cleanup_unverified" && !error.retryable();
+  };
+
+  EditorCleanupTestRoot symlink_root("editor-unsafe-link");
+  std::filesystem::remove_all(symlink_root.run_root());
+  const std::filesystem::path symlink_target =
+      symlink_root.benchmark_root() / "foreign-target";
+  std::filesystem::create_directory(symlink_target);
+  bbp::WriteText(symlink_target / "sentinel", "preserved\n");
+  std::filesystem::create_directory_symlink(symlink_target,
+                                            symlink_root.run_root());
+  BOOST_CHECK_EXCEPTION(bbp::CleanEditorRetainedRunForTest(
+                            symlink_root.benchmark_root(),
+                            symlink_root.ownership().run_id, 5s, true),
+                        bbp::McpOperationFailure, is_unverified);
+  BOOST_TEST(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(symlink_root.run_root())));
+  BOOST_TEST(bbp::ReadText(symlink_target / "sentinel") == "preserved\n");
+
+  EditorCleanupTestRoot file_root("editor-unsafe-file");
+  std::filesystem::remove_all(file_root.run_root());
+  bbp::WriteText(file_root.run_root(), "foreign file\n");
+  BOOST_CHECK_EXCEPTION(
+      bbp::CleanEditorRetainedRunForTest(
+          file_root.benchmark_root(), file_root.ownership().run_id, 5s, true),
+      bbp::McpOperationFailure, is_unverified);
+  BOOST_TEST(std::filesystem::is_regular_file(file_root.run_root()));
+  BOOST_TEST(bbp::ReadText(file_root.run_root()) == "foreign file\n");
 }
 
 BOOST_AUTO_TEST_CASE(

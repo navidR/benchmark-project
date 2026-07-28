@@ -36,6 +36,16 @@ struct McpRunLifecycleResult {
   std::uint32_t node_count = 0U;
 };
 
+struct McpRunCleanupResult {
+  std::string run_id;
+  bool verified_owned = false;
+  std::uint64_t processes_remaining = 0U;
+  std::uint64_t network_resources_remaining = 0U;
+  std::uint64_t cgroups_remaining = 0U;
+  std::uint64_t credentials_remaining = 0U;
+  bool complete = false;
+};
+
 // Process-level MCP application. The callbacks reserve controller-owned work
 // before waiting; their stop token cancels only that wait, never the run.
 class McpHostApplication {
@@ -49,6 +59,9 @@ class McpHostApplication {
     std::function<McpRunLifecycleResult(std::string_view, std::chrono::seconds,
                                         std::stop_token)>
         stop_run;
+    std::function<McpRunCleanupResult(std::string_view, std::chrono::seconds,
+                                      bool, std::stop_token)>
+        clean_run;
   };
 
   explicit McpHostApplication(Config config);

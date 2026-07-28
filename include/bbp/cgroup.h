@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -83,6 +84,11 @@ struct CgroupFreezeProbe {
   bool frozen_after_thaw = false;
 };
 
+class CgroupOwnershipMismatch final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 class Cgroup {
  public:
   static void PrepareRun(const std::string& run_id);
@@ -95,6 +101,9 @@ class Cgroup {
                         std::chrono::steady_clock::time_point deadline,
                         std::stop_token stop_token = {});
   static void RemoveStaleRun(const RunOwnership& ownership);
+  static void RemoveStaleRun(const RunOwnership& ownership,
+                             std::chrono::steady_clock::time_point deadline,
+                             std::stop_token stop_token = {});
   static CgroupFreezeProbe ProbeFreezeThaw();
 
   explicit Cgroup(std::filesystem::path path);
@@ -152,6 +161,10 @@ void PrepareCgroupRunInTestScope(const CgroupScopeTestConfig& config,
                                  const RunOwnership& ownership);
 void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
                                 const std::string& run_id);
+void RemoveCgroupRunInTestScope(const CgroupScopeTestConfig& config,
+                                const std::string& run_id,
+                                std::chrono::steady_clock::time_point deadline,
+                                std::stop_token stop_token = {});
 void RemoveStaleCgroupRunInTestScope(const CgroupScopeTestConfig& config,
                                      const RunOwnership& ownership);
 void KillCgroupProcessesWithPidfdFallbackForTest(

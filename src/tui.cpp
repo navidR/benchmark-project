@@ -3461,6 +3461,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       .command_queue = std::move(shared_command_queue),
       .firo_qt_launcher_service = {},
       .publication_mutex = {},
+      .read_lease = {},
   };
   return RunTuiReport([snapshot]() { return snapshot; }, once, refresh_ms,
                       mcp_connection, stop_token);

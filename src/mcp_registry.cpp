@@ -28,7 +28,9 @@ constexpr std::array<McpNamedCapability, EnumCount(McpOperationKind::kCount)>
          {"scenario.resolve", "Resolve defaults into a canonical scenario"},
          {"run.launch", "Launch a validated scenario"},
          {"run.stop", "Stop an active managed run"},
-         {"run.clean", "Clean a verified owned run"},
+         {"run.clean",
+          "Clean a verified owned run; retained artifacts are preserved by "
+          "default"},
          {"run.replay", "Replay a retained source scenario"},
          {"run.report", "Build an exact retained or live report"},
          {"simulation.command", "Invoke a registered runtime command"},

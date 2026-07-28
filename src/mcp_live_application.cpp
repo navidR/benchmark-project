@@ -214,11 +214,28 @@ void ThrowIfCancelled(std::stop_token stop_token) {
 }
 
 void CloseFiroQtLauncher(const std::shared_ptr<FiroQtLauncherService>& service,
-                         std::string_view run_id, std::string_view boundary) {
+                         std::string_view run_id, std::string_view boundary,
+                         std::optional<std::chrono::steady_clock::time_point>
+                             deadline = std::nullopt,
+                         std::stop_token stop_token = {}) {
   if (!service) {
     return;
   }
-  const FiroQtLauncherCleanupResult cleanup = service->CloseAndCleanup();
+  FiroQtLauncherCleanupResult cleanup;
+  try {
+    cleanup = deadline ? service->CloseAndCleanup(*deadline, stop_token)
+              : stop_token.stop_possible()
+                  ? service->CloseAndCleanup(stop_token)
+                  : service->CloseAndCleanup();
+  } catch (const SimulationCancelled&) {
+    throw McpOperationCancelled();
+  } catch (const FiroQtLauncherCleanupUnverified& error) {
+    throw McpOperationFailure(
+        "run_cleanup_unverified",
+        "run cleanup refused unverified Firo-Qt launcher ownership: " +
+            std::string(error.what()),
+        false);
+  }
   if (cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
     BBP_LOG(warning) << "Firo-Qt launcher ownership changed before " << boundary
                      << " cleanup for run " << run_id;
@@ -3254,7 +3271,21 @@ void McpLiveApplication::CloseRunSubscriptions() const noexcept {
   }
 }
 
-void McpLiveApplication::Shutdown() {
+void McpLiveApplication::Shutdown() { ShutdownImpl(std::nullopt, {}); }
+
+void McpLiveApplication::Shutdown(std::stop_token stop_token) {
+  ShutdownImpl(std::nullopt, stop_token);
+}
+
+void McpLiveApplication::Shutdown(
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  ShutdownImpl(deadline, stop_token);
+}
+
+void McpLiveApplication::ShutdownImpl(
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     shutdown_ = true;
@@ -3264,12 +3295,38 @@ void McpLiveApplication::Shutdown() {
   request_stop_source_.request_stop();
   run_stop_source_.request_stop();
   std::unique_lock<std::mutex> lock(mutex_);
-  requests_drained_.wait(lock, [this] { return active_requests_ == 0U; });
+  const auto requests_drained = [this] { return active_requests_ == 0U; };
+  if (deadline) {
+    if (!requests_drained_.wait_until(lock, stop_token, *deadline,
+                                      requests_drained)) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      throw std::runtime_error(
+          "MCP live application requests did not drain before the deadline");
+    }
+  } else if (stop_token.stop_possible()) {
+    if (!requests_drained_.wait(lock, stop_token, requests_drained)) {
+      throw McpOperationCancelled();
+    }
+  } else {
+    requests_drained_.wait(lock, requests_drained);
+  }
+  if (stop_token.stop_requested()) {
+    throw McpOperationCancelled();
+  }
+  if (deadline) {
+    if (std::chrono::steady_clock::now() >= *deadline) {
+      throw std::runtime_error(
+          "MCP live application shutdown deadline expired after request "
+          "drainage");
+    }
+  }
   workload_service_.reset();
   role_service_.reset();
   lock.unlock();
   CloseFiroQtLauncher(config_.firo_qt_launcher_service, config_.run_id,
-                      "application-shutdown");
+                      "application-shutdown", deadline, stop_token);
 }
 
 }  // namespace bbp

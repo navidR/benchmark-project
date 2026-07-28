@@ -1,8 +1,10 @@
 #include "bbp/simulator_app.h"
 
+#include <fcntl.h>
 #include <linux/capability.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #include <yaml.h>
 
 #include <algorithm>
@@ -94,6 +96,9 @@ namespace {
 
 std::mutex node_network_state_mutex;
 std::timed_mutex runtime_publication_mutex;
+#ifdef BBP_ENABLE_TEST_HOOKS
+std::function<void()> run_cleanup_root_removed_test_hook;
+#endif
 
 std::shared_ptr<std::timed_mutex> RuntimePublicationMutex() {
   static const std::shared_ptr<std::timed_mutex> mutex(
@@ -10420,14 +10425,16 @@ void WriteScenarioFiles(const Options& options,
 }
 
 void LoadCleanupMetadata(const std::filesystem::path& run_root,
-                         Options* options) {
+                         Options* options, std::stop_token stop_token) {
+  constexpr std::size_t kMaximumResolvedScenarioBytes = 4U * 1024U * 1024U;
   const std::filesystem::path resolved_path =
       run_root / "resolved-scenario.json";
   if (!std::filesystem::exists(resolved_path)) {
     return;
   }
 
-  const boost::json::value value = boost::json::parse(ReadText(resolved_path));
+  const boost::json::value value = boost::json::parse(
+      ReadText(resolved_path, kMaximumResolvedScenarioBytes, stop_token));
   if (!value.is_object()) {
     throw std::runtime_error("resolved scenario is not a JSON object: " +
                              resolved_path.string());
@@ -10477,15 +10484,107 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
   }
 }
 
-void CleanupRun(Options options) {
+void RequireCleanupActive(
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline,
+    std::stop_token stop_token) {
+  if (stop_token.stop_requested()) {
+    throw SimulationCancelled();
+  }
+  if (absolute_deadline &&
+      std::chrono::steady_clock::now() >= *absolute_deadline) {
+    throw std::runtime_error("run cleanup deadline expired");
+  }
+}
+
+McpRunCleanupResult CleanupRun(
+    Options options,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}, bool remove_retained_artifacts = false,
+    const RunOwnership* expected_ownership = nullptr,
+    std::optional<OwnedRunRootIdentity> expected_root = std::nullopt,
+    bool* external_cleanup_complete = nullptr) {
+  McpRunCleanupResult result{
+      .run_id = options.run_id,
+      .verified_owned = true,
+      .processes_remaining = 0U,
+      .network_resources_remaining = 0U,
+      .cgroups_remaining = 0U,
+      .credentials_remaining = 0U,
+      .complete = true,
+  };
+  std::stop_source deadline_stop_source;
+  std::optional<std::jthread> deadline_timer;
+  if (absolute_deadline) {
+    deadline_timer.emplace(
+        [deadline = *absolute_deadline,
+         &deadline_stop_source](std::stop_token timer_stop_token) {
+          try {
+            WaitUntil(deadline, timer_stop_token);
+          } catch (const SimulationCancelled&) {
+            return;
+          }
+          if (!timer_stop_token.stop_requested()) {
+            deadline_stop_source.request_stop();
+          }
+        });
+  }
+  CombinedStopToken cleanup_stop_tokens(stop_token,
+                                        deadline_stop_source.get_token());
+  const std::stop_token cleanup_stop_token = cleanup_stop_tokens.get_token();
+  RequireCleanupActive(absolute_deadline, cleanup_stop_token);
+
   const auto run_root =
       std::filesystem::absolute(options.output_dir) / options.run_id;
-  options.run_ownership = LoadRunOwnership(options.run_id, run_root);
-  LoadCleanupMetadata(run_root, &options);
-  const std::optional<RuntimeNodeResourceManifest> manifest =
-      TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+  RunOwnership ownership;
+  try {
+    ownership = LoadRunOwnership(options.run_id, run_root, cleanup_stop_token);
+  } catch (const std::exception& error) {
+    if (cleanup_stop_token.stop_requested() ||
+        (absolute_deadline &&
+         std::chrono::steady_clock::now() >= *absolute_deadline)) {
+      throw;
+    }
+    if (expected_ownership != nullptr) {
+      throw McpOperationFailure("run_cleanup_unverified",
+                                "run cleanup could not reverify ownership: " +
+                                    std::string(error.what()),
+                                false);
+    }
+    throw;
+  }
+  if (expected_ownership != nullptr && ownership != *expected_ownership) {
+    throw McpOperationFailure(
+        "run_cleanup_identity_reused",
+        "run ownership changed after cleanup identity verification", false);
+  }
+  options.run_ownership = std::move(ownership);
+  RequireCleanupActive(absolute_deadline, cleanup_stop_token);
+  std::optional<RuntimeNodeResourceManifest> manifest;
+  try {
+    manifest = TryLoadRuntimeNodeResourceManifest(
+        RequireRunOwnership(options), expected_root, cleanup_stop_token);
+  } catch (const std::exception& error) {
+    if (cleanup_stop_token.stop_requested() ||
+        (absolute_deadline &&
+         std::chrono::steady_clock::now() >= *absolute_deadline)) {
+      throw;
+    }
+    if (expected_ownership != nullptr) {
+      throw McpOperationFailure(
+          "run_cleanup_unverified",
+          "run cleanup could not verify its resource manifest: " +
+              std::string(error.what()),
+          false);
+    }
+    throw;
+  }
+  RequireCleanupActive(absolute_deadline, cleanup_stop_token);
   if (manifest) {
     options.isolate_network = manifest->isolated_network;
+  } else {
+    LoadCleanupMetadata(run_root, &options, cleanup_stop_token);
+    RequireCleanupActive(absolute_deadline, cleanup_stop_token);
   }
 
   std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
@@ -10493,16 +10592,37 @@ void CleanupRun(Options options) {
       options.isolate_network &&
       (manifest ? !manifest->nodes.empty() : options.nodes != 0U);
   if (has_network_resources) {
-    RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
-    network_allocation_lock = std::make_unique<NetworkAllocationLock>();
+    try {
+      RequireEffectiveCapability(CAP_NET_ADMIN, "CAP_NET_ADMIN");
+    } catch (const std::exception& error) {
+      if (expected_ownership != nullptr) {
+        throw McpOperationFailure(
+            "run_cleanup_capability_unavailable",
+            "run cleanup cannot remove isolated network resources: " +
+                std::string(error.what()),
+            false);
+      }
+      throw;
+    }
+    RequireCleanupActive(absolute_deadline, cleanup_stop_token);
+    network_allocation_lock =
+        std::make_unique<NetworkAllocationLock>(cleanup_stop_token);
+    RequireCleanupActive(absolute_deadline, cleanup_stop_token);
   }
 
   std::exception_ptr first_failure;
   const auto cleanup_step = [&](std::string_view description, auto&& action) {
     try {
+      RequireCleanupActive(absolute_deadline, cleanup_stop_token);
       action();
+      RequireCleanupActive(absolute_deadline, cleanup_stop_token);
       return true;
     } catch (...) {
+      if (cleanup_stop_token.stop_requested() ||
+          (absolute_deadline &&
+           std::chrono::steady_clock::now() >= *absolute_deadline)) {
+        throw;
+      }
       if (!first_failure) {
         first_failure = std::current_exception();
       }
@@ -10522,29 +10642,56 @@ void CleanupRun(Options options) {
     std::exception_ptr ownership_failure;
     for (const RuntimeNodeResourceEntry& entry : manifest->nodes) {
       try {
+        RequireCleanupActive(absolute_deadline, cleanup_stop_token);
         const bool root_exists =
-            RuntimeNodeRootEntryExists(RequireRunOwnership(options), entry);
+            RuntimeNodeRootEntryExists(RequireRunOwnership(options), entry,
+                                       expected_root, cleanup_stop_token);
         if (root_exists) {
-          VerifyRuntimeNodeRootOwnership(RequireRunOwnership(options), entry);
+          VerifyRuntimeNodeRootOwnership(RequireRunOwnership(options), entry,
+                                         expected_root, cleanup_stop_token);
         } else if (entry.state == RuntimeNodeResourceState::kLive) {
           throw std::runtime_error(
               "live runtime resource manifest entry has no owned node root: " +
               entry.node_id);
         }
       } catch (...) {
+        if (cleanup_stop_token.stop_requested() ||
+            (absolute_deadline &&
+             std::chrono::steady_clock::now() >= *absolute_deadline)) {
+          throw;
+        }
         if (!ownership_failure) {
           ownership_failure = std::current_exception();
         }
       }
     }
     if (ownership_failure) {
+      if (expected_ownership != nullptr) {
+        std::string detail = "unknown ownership failure";
+        try {
+          std::rethrow_exception(ownership_failure);
+        } catch (const std::exception& error) {
+          detail = error.what();
+        } catch (...) {
+        }
+        throw McpOperationFailure(
+            "run_cleanup_unverified",
+            "run cleanup could not verify runtime node ownership: " + detail,
+            false);
+      }
       std::rethrow_exception(ownership_failure);
     }
   }
 
-  const bool cgroup_cleanup_verified = cleanup_step(
-      "owned run cgroup removal",
-      [&] { Cgroup::RemoveStaleRun(RequireRunOwnership(options)); });
+  const bool cgroup_cleanup_verified =
+      cleanup_step("owned run cgroup removal", [&] {
+        if (absolute_deadline) {
+          Cgroup::RemoveStaleRun(RequireRunOwnership(options),
+                                 *absolute_deadline, cleanup_stop_token);
+        } else {
+          Cgroup::RemoveStaleRun(RequireRunOwnership(options));
+        }
+      });
   std::vector<bool> network_cleanup_verified(
       manifest ? manifest->nodes.size() : options.nodes,
       !has_network_resources);
@@ -10560,9 +10707,9 @@ void CleanupRun(Options options) {
             RunInterfaceAlias(ownership, entry.slot, 'h');
         config.peer_ownership_alias =
             RunInterfaceAlias(ownership, entry.slot, 'p');
-        network_cleanup_verified[index] =
-            cleanup_step("owned node network removal",
-                         [&] { DeleteNodeVethNetwork(config); });
+        network_cleanup_verified[index] = cleanup_step(
+            "owned node network removal",
+            [&] { DeleteNodeVethNetwork(config, cleanup_stop_token); });
       }
     } else {
       for (uint32_t i = 0; i < options.nodes; ++i) {
@@ -10572,9 +10719,9 @@ void CleanupRun(Options options) {
         config.peer_name = RunInterfaceName(ownership, i, 'p');
         config.host_ownership_alias = RunInterfaceAlias(ownership, i, 'h');
         config.peer_ownership_alias = RunInterfaceAlias(ownership, i, 'p');
-        network_cleanup_verified[i] =
-            cleanup_step("owned node network removal",
-                         [&] { DeleteNodeVethNetwork(config); });
+        network_cleanup_verified[i] = cleanup_step(
+            "owned node network removal",
+            [&] { DeleteNodeVethNetwork(config, cleanup_stop_token); });
       }
     }
   }
@@ -10588,7 +10735,8 @@ void CleanupRun(Options options) {
       credential_cleanup_verified[index] =
           cleanup_step("owned node RPC credential removal", [&] {
             CleanupRuntimeNodeRpcCredential(RequireRunOwnership(options),
-                                            manifest->nodes[index]);
+                                            manifest->nodes[index],
+                                            expected_root, cleanup_stop_token);
           });
     }
     RuntimeNodeResourceManifest reconciled = *manifest;
@@ -10603,12 +10751,16 @@ void CleanupRun(Options options) {
         return false;
       }
       return cleanup_step("owned pending node root removal", [&] {
-        RemoveRuntimeNodeRoot(RequireRunOwnership(options), entry);
+        RemoveRuntimeNodeRoot(RequireRunOwnership(options), entry,
+                              absolute_deadline, cleanup_stop_token,
+                              expected_root);
       });
     });
     if (reconciled != *manifest) {
-      cleanup_step("runtime node resource manifest reconciliation",
-                   [&] { WriteRuntimeNodeResourceManifest(reconciled); });
+      cleanup_step("runtime node resource manifest reconciliation", [&] {
+        WriteRuntimeNodeResourceManifest(reconciled, expected_root,
+                                         cleanup_stop_token);
+      });
     }
   } else {
     const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
@@ -10625,20 +10777,45 @@ void CleanupRun(Options options) {
       }
       cleanup_step("legacy node RPC credential removal", [&] {
         const ChainNodeConfig config = MakeChainNodeConfig(chain_spec, request);
-        CleanupLegacyRuntimeNodeRpcCredential(RequireRunOwnership(options),
-                                              config.id, options.chain);
+        CleanupLegacyRuntimeNodeRpcCredential(
+            RequireRunOwnership(options), config.id, options.chain,
+            expected_root, cleanup_stop_token);
       });
     }
   }
   if (first_failure) {
     std::rethrow_exception(first_failure);
   }
-  BBP_LOG(info) << "cleanup_run=" << options.run_id << "\n"
-                << "nodes="
-                << (manifest ? manifest->nodes.size()
-                             : static_cast<std::size_t>(options.nodes))
-                << "\n"
-                << "run_dir=" << run_root;
+  if (external_cleanup_complete != nullptr) {
+    *external_cleanup_complete = true;
+  }
+  if (remove_retained_artifacts) {
+    if (!expected_root) {
+      throw std::logic_error(
+          "artifact-removing cleanup requires a verified root identity");
+    }
+    RequireCleanupActive(absolute_deadline, cleanup_stop_token);
+    DetachRunLogFile(run_root, absolute_deadline, cleanup_stop_token);
+    WriteOwnedRunRootCleanupReceipt(RequireRunOwnership(options),
+                                    *expected_root, absolute_deadline,
+                                    cleanup_stop_token);
+    RemoveOwnedRunRoot(RequireRunOwnership(options), absolute_deadline,
+                       cleanup_stop_token, expected_root);
+  } else {
+    RequireCleanupActive(absolute_deadline, cleanup_stop_token);
+  }
+  try {
+    BBP_LOG(info) << "cleanup_run=" << options.run_id << "\n"
+                  << "nodes="
+                  << (manifest ? manifest->nodes.size()
+                               : static_cast<std::size_t>(options.nodes))
+                  << "\n"
+                  << "run_dir=" << run_root;
+  } catch (...) {
+    // Logging cannot turn committed cleanup into an ownership-unverifiable
+    // failure after the retained root has been removed.
+  }
+  return result;
 }
 
 void StopNodeProcess(const Options& options,
@@ -19038,8 +19215,10 @@ void RemovePreparedRunRoot(const Options& options) {
         "refusing to remove a prepared run with changed ownership: " +
         expected.run_root.string());
   }
-  RemoveOwnedRunRoot(
-      expected, std::chrono::steady_clock::now() + std::chrono::seconds(30));
+  const auto cleanup_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  DetachRunLogFile(BenchmarkRunRoot(options), cleanup_deadline);
+  RemoveOwnedRunRoot(expected, cleanup_deadline);
   if (std::filesystem::exists(expected.run_root)) {
     throw std::runtime_error("prepared run directory survived cleanup: " +
                              expected.run_root.string());
@@ -24626,6 +24805,33 @@ bool IsTerminalEditorRunState(EditorRunState state) {
   return state == EditorRunState::kStopped || state == EditorRunState::kFailed;
 }
 
+struct EditorTuiReadLeaseState {
+  std::mutex mutex;
+  std::condition_variable_any drained;
+  std::size_t readers = 0U;
+};
+
+class EditorTuiReadLease {
+ public:
+  explicit EditorTuiReadLease(std::shared_ptr<EditorTuiReadLeaseState> state)
+      : state_(std::move(state)) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    ++state_->readers;
+  }
+
+  ~EditorTuiReadLease() {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    --state_->readers;
+    state_->drained.notify_all();
+  }
+
+  EditorTuiReadLease(const EditorTuiReadLease&) = delete;
+  EditorTuiReadLease& operator=(const EditorTuiReadLease&) = delete;
+
+ private:
+  std::shared_ptr<EditorTuiReadLeaseState> state_;
+};
+
 [[maybe_unused]] std::string_view EditorRunStateName(EditorRunState state) {
   switch (state) {
     case EditorRunState::kStarting:
@@ -24649,8 +24855,11 @@ struct EditorRunContext {
   std::shared_ptr<SimulationCommandQueue> command_queue;
   std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
   std::shared_ptr<RuntimeNodeInventory> node_inventory;
+  std::shared_ptr<EditorTuiReadLeaseState> tui_read_lease_state =
+      std::make_shared<EditorTuiReadLeaseState>();
   std::stop_source simulation_stop_source;
   std::shared_ptr<McpLiveApplication> mcp_application;
+  std::function<void(std::stop_token)> run_root_prepared;
   std::jthread worker;
   mutable std::mutex mutex;
   std::condition_variable_any state_changed;
@@ -24674,6 +24883,7 @@ struct EditorRunSnapshot {
   std::shared_ptr<SimulationCommandQueue> command_queue;
   std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service;
   std::shared_ptr<McpLiveApplication> mcp_application;
+  std::shared_ptr<void> tui_read_lease;
 };
 
 int RunPreparedBenchmark(const std::shared_ptr<EditorRunContext>& context) {
@@ -24687,6 +24897,9 @@ int RunPreparedBenchmark(const std::shared_ptr<EditorRunContext>& context) {
     ThrowIfStopRequested(setup_stop_token);
     PrepareManagedRunRoot(&options);
     run_prepared = true;
+    if (context->run_root_prepared) {
+      context->run_root_prepared(setup_stop_token);
+    }
     if (options.isolate_network) {
       network_allocation_lock =
           std::make_unique<NetworkAllocationLock>(setup_stop_token);
@@ -24744,7 +24957,7 @@ class EditorRunController {
   void SetEvidenceCallbacks(
       std::function<void(McpEvidenceRecord)> publish_evidence,
       std::function<void(std::string_view)> close_run_subscriptions) {
-    std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+    std::lock_guard<std::timed_mutex> transition_lock(transition_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_) {
       throw std::logic_error(
@@ -24755,12 +24968,37 @@ class EditorRunController {
   }
 
   std::shared_ptr<EditorRunContext> LaunchScenario(
-      const boost::json::object& scenario) {
-    return Launch(ParseAndValidateScenario(scenario), scenario);
+      const boost::json::object& scenario,
+      const std::filesystem::path& benchmark_root, std::stop_token stop_token) {
+    boost::json::object hosted_scenario = scenario;
+    const boost::json::value* simulation =
+        hosted_scenario.if_contains("simulation");
+    const bool has_nested_output =
+        simulation != nullptr && simulation->is_object() &&
+        simulation->as_object().if_contains("output_dir") != nullptr;
+    if (hosted_scenario.if_contains("output_dir") == nullptr &&
+        !has_nested_output) {
+      hosted_scenario["output_dir"] = benchmark_root.string();
+    }
+
+    Options options = ParseAndValidateScenario(hosted_scenario);
+    const std::filesystem::path requested_root =
+        std::filesystem::weakly_canonical(
+            std::filesystem::absolute(options.output_dir))
+            .lexically_normal();
+    const std::filesystem::path configured_root =
+        benchmark_root.lexically_normal();
+    if (requested_root != configured_root) {
+      throw McpOperationFailure(
+          "run_output_root_mismatch",
+          "managed runs must use the editor host benchmark root", false);
+    }
+    options.output_dir = configured_root;
+    return Launch(std::move(options), std::move(hosted_scenario), stop_token);
   }
 
   std::shared_ptr<EditorRunContext> LaunchOptions(Options options) {
-    return Launch(std::move(options), std::nullopt);
+    return Launch(std::move(options), std::nullopt, {});
   }
 
   EditorRunSnapshot WaitUntilActive(
@@ -24791,9 +25029,32 @@ class EditorRunController {
   EditorRunSnapshot StopRun(std::string_view run_id,
                             std::chrono::seconds timeout,
                             std::stop_token stop_token) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::shared_ptr<EditorRunContext> context;
     {
-      std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+      std::unique_lock<std::timed_mutex> transition_lock(transition_mutex_,
+                                                         std::defer_lock);
+      constexpr auto kTransitionPollInterval = std::chrono::milliseconds(25);
+      while (!transition_lock.try_lock_until(std::min(
+          deadline,
+          std::chrono::steady_clock::now() + kTransitionPollInterval))) {
+        if (stop_token.stop_requested()) {
+          throw McpOperationCancelled();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+          throw McpOperationFailure(
+              "run_stop_timeout",
+              "managed run stop could not start before the timeout", true);
+        }
+      }
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw McpOperationFailure(
+            "run_stop_timeout",
+            "managed run stop could not start before the timeout", true);
+      }
       {
         std::lock_guard<std::mutex> lock(mutex_);
         context = active_;
@@ -24821,7 +25082,6 @@ class EditorRunController {
     }
 
     std::unique_lock<std::mutex> lock(context->mutex);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
     const bool stopped = context->state_changed.wait_until(
         lock, stop_token, deadline,
         [&] { return IsTerminalEditorRunState(context->state); });
@@ -24844,7 +25104,415 @@ class EditorRunController {
     return SnapshotLocked(*context);
   }
 
-  std::optional<EditorRunSnapshot> CurrentRun(bool include_terminal) const {
+  McpRunCleanupResult CleanRun(const std::filesystem::path& benchmark_root,
+                               std::string_view run_id,
+                               std::chrono::seconds timeout,
+                               bool remove_retained_artifacts,
+                               std::stop_token stop_token) {
+    RequireSafeOutputDirectory(benchmark_root);
+    RequireSafeRunId(run_id);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::stop_source deadline_stop_source;
+    std::jthread deadline_timer(
+        [deadline, &deadline_stop_source](std::stop_token timer_stop_token) {
+          try {
+            WaitUntil(deadline, timer_stop_token);
+          } catch (const SimulationCancelled&) {
+            return;
+          }
+          if (!timer_stop_token.stop_requested()) {
+            deadline_stop_source.request_stop();
+          }
+        });
+    CombinedStopToken operation_stop_tokens(stop_token,
+                                            deadline_stop_source.get_token());
+    const std::stop_token operation_stop_token =
+        operation_stop_tokens.get_token();
+    std::unique_lock<std::timed_mutex> transition_lock(transition_mutex_,
+                                                       std::defer_lock);
+    constexpr auto kTransitionPollInterval = std::chrono::milliseconds(25);
+    while (!transition_lock.try_lock_until(
+        std::min(deadline,
+                 std::chrono::steady_clock::now() + kTransitionPollInterval))) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw McpOperationFailure(
+            "run_clean_timeout",
+            "run cleanup could not start before the timeout", true);
+      }
+    }
+
+    try {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw McpOperationFailure(
+            "run_clean_timeout",
+            "run cleanup could not start before the timeout", true);
+      }
+
+      std::shared_ptr<EditorRunContext> context;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_) {
+          throw McpOperationFailure(
+              "application_stopping",
+              "BBP is shutting down and cannot clean a retained run", false);
+        }
+        context = active_;
+      }
+      if (context) {
+        std::lock_guard<std::mutex> lock(context->mutex);
+        if (!IsTerminalEditorRunState(context->state)) {
+          throw McpOperationFailure(
+              "run_cleanup_requires_stop",
+              "run.clean requires the managed run to be stopped first", true);
+        }
+      }
+      if (context) {
+        ReapTerminalRun(deadline, operation_stop_token);
+      }
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw McpOperationFailure(
+            "run_clean_timeout",
+            "run cleanup could not start before the timeout", true);
+      }
+
+      const std::filesystem::path run_root =
+          CleanupRunRoot(benchmark_root, run_id);
+      const std::optional<OwnedRunRootCleanupReceipt> durable_receipt =
+          TryLoadOwnedRunRootCleanupReceipt(run_id, run_root, deadline,
+                                            operation_stop_token);
+      auto receipt = cleanup_receipts_.find(run_id);
+      if (receipt != cleanup_receipts_.end() &&
+          receipt->second.ownership.run_root != run_root) {
+        throw McpOperationFailure(
+            "run_cleanup_identity_reused",
+            "run cleanup receipt does not match the configured run root",
+            false);
+      }
+      if (durable_receipt) {
+        if (receipt != cleanup_receipts_.end() &&
+            (receipt->second.ownership != durable_receipt->ownership ||
+             receipt->second.root_identity != durable_receipt->root_identity)) {
+          throw McpOperationFailure(
+              "run_cleanup_identity_reused",
+              "durable and in-memory cleanup receipts disagree", false);
+        }
+        if (receipt == cleanup_receipts_.end()) {
+          const auto inserted = cleanup_receipts_.emplace(
+              std::string(run_id),
+              RunCleanupReceipt{
+                  .ownership = durable_receipt->ownership,
+                  .root_identity = durable_receipt->root_identity,
+                  .result = SuccessfulCleanupResult(run_id),
+                  .external_cleanup_complete = true,
+                  .complete = false,
+              });
+          if (!inserted.second) {
+            throw std::logic_error(
+                "durable cleanup receipt insertion lost serialization");
+          }
+          receipt = inserted.first;
+        }
+      }
+      bool durable_receipt_available = durable_receipt.has_value();
+      std::optional<OwnedRunRootIdentity> initial_identity;
+      try {
+        initial_identity =
+            InspectRunRootIdentity(run_root, deadline, operation_stop_token);
+      } catch (const std::exception& error) {
+        if (stop_token.stop_requested()) {
+          throw McpOperationCancelled();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+          throw McpOperationFailure(
+              "run_clean_timeout",
+              "run cleanup root verification exceeded the timeout", true);
+        }
+        throw McpOperationFailure(
+            "run_cleanup_unverified",
+            "run cleanup could not verify the retained root identity: " +
+                std::string(error.what()),
+            false);
+      }
+      if (durable_receipt_available && !initial_identity) {
+        const std::filesystem::path quarantine =
+            OwnedRunRootCleanupQuarantinePath(receipt->second.ownership);
+        if (!InspectRunRootIdentity(quarantine, deadline,
+                                    operation_stop_token)) {
+          receipt->second.complete = true;
+          return receipt->second.result;
+        }
+      }
+      if (receipt != cleanup_receipts_.end() && !receipt->second.complete &&
+          !remove_retained_artifacts) {
+        throw McpOperationFailure(
+            "run_cleanup_state_uncertain",
+            "an incomplete artifact-removal cleanup must be resumed with "
+            "remove_retained_artifacts enabled",
+            false);
+      }
+      const auto require_removed_artifacts_absent =
+          [&](const std::filesystem::path& quarantine,
+              std::string_view failure_detail) {
+            if (InspectRunRootIdentity(run_root) ||
+                InspectRunRootIdentity(quarantine)) {
+              throw McpOperationFailure("run_cleanup_identity_reused",
+                                        std::string(failure_detail), false);
+            }
+          };
+      const auto complete_prepared_artifact_removal = [&] {
+        const std::filesystem::path quarantine =
+            OwnedRunRootCleanupQuarantinePath(receipt->second.ownership);
+        const std::optional<OwnedRunRootIdentity> quarantined_identity =
+            InspectRunRootIdentity(quarantine, deadline, operation_stop_token);
+        if ((initial_identity &&
+             *initial_identity != receipt->second.root_identity) ||
+            (quarantined_identity &&
+             *quarantined_identity != receipt->second.root_identity)) {
+          throw McpOperationFailure(
+              "run_cleanup_identity_reused",
+              "an incomplete cleanup found a foreign public or quarantined "
+              "run root",
+              false);
+        }
+        if (initial_identity && quarantined_identity) {
+          throw McpOperationFailure(
+              "run_cleanup_identity_reused",
+              "an incomplete cleanup found both public and quarantined run "
+              "roots",
+              false);
+        }
+        if (!initial_identity && !quarantined_identity) {
+          if (!durable_receipt_available) {
+            throw McpOperationFailure(
+                "run_cleanup_state_uncertain",
+                "a prepared run cleanup lost its ownership root before "
+                "completion was verified",
+                false);
+          }
+          receipt->second.complete = true;
+          return receipt->second.result;
+        }
+        DetachRunLogFile(run_root, deadline, operation_stop_token);
+        if (!durable_receipt_available) {
+          WriteOwnedRunRootCleanupReceipt(receipt->second.ownership,
+                                          receipt->second.root_identity,
+                                          deadline, operation_stop_token);
+          durable_receipt_available = true;
+        }
+        RemoveOwnedRunRoot(receipt->second.ownership, deadline,
+                           operation_stop_token, receipt->second.root_identity);
+#ifdef BBP_ENABLE_TEST_HOOKS
+        if (run_cleanup_root_removed_test_hook) {
+          run_cleanup_root_removed_test_hook();
+        }
+#endif
+        require_removed_artifacts_absent(
+            quarantine,
+            "a public or quarantined root appeared while prepared cleanup "
+            "completed");
+        receipt->second.complete = true;
+        return receipt->second.result;
+      };
+      if (receipt != cleanup_receipts_.end() && !receipt->second.complete &&
+          receipt->second.external_cleanup_complete) {
+        return complete_prepared_artifact_removal();
+      }
+      if (receipt != cleanup_receipts_.end() && receipt->second.complete) {
+        const std::filesystem::path quarantine =
+            OwnedRunRootCleanupQuarantinePath(receipt->second.ownership);
+        if (initial_identity || InspectRunRootIdentity(quarantine, deadline,
+                                                       operation_stop_token)) {
+          throw McpOperationFailure(
+              "run_cleanup_identity_reused",
+              "a run root reappeared after its verified cleanup completed",
+              false);
+        }
+        return receipt->second.result;
+      }
+      if (!initial_identity) {
+        if (receipt == cleanup_receipts_.end()) {
+          throw McpOperationFailure(
+              "run_cleanup_unverified",
+              "run cleanup cannot verify ownership of an absent run root",
+              false);
+        }
+        throw McpOperationFailure(
+            "run_cleanup_state_uncertain",
+            "a prepared run cleanup lost its ownership root before "
+            "completion was verified",
+            false);
+      }
+
+      RunOwnership ownership;
+      try {
+        ownership = LoadRunOwnership(std::string(run_id), run_root,
+                                     operation_stop_token);
+      } catch (const std::exception& error) {
+        if (stop_token.stop_requested()) {
+          throw McpOperationCancelled();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+          throw McpOperationFailure(
+              "run_clean_timeout",
+              "run cleanup ownership verification exceeded the timeout", true);
+        }
+        throw McpOperationFailure("run_cleanup_unverified",
+                                  "run cleanup could not verify ownership: " +
+                                      std::string(error.what()),
+                                  false);
+      }
+      const std::optional<OwnedRunRootIdentity> confirmed_identity =
+          InspectRunRootIdentity(run_root, deadline, operation_stop_token);
+      if (!confirmed_identity || *confirmed_identity != *initial_identity ||
+          ownership.run_root != run_root) {
+        throw McpOperationFailure(
+            "run_cleanup_identity_reused",
+            "run identity changed while cleanup ownership was verified", false);
+      }
+      if (receipt != cleanup_receipts_.end() &&
+          (receipt->second.ownership != ownership ||
+           receipt->second.root_identity != *initial_identity)) {
+        throw McpOperationFailure(
+            "run_cleanup_identity_reused",
+            "run cleanup refuses a replaced or foreign run identity", false);
+      }
+      if (receipt == cleanup_receipts_.end() && remove_retained_artifacts) {
+        RunCleanupReceipt prepared{
+            .ownership = ownership,
+            .root_identity = *initial_identity,
+            .result = SuccessfulCleanupResult(run_id),
+            .external_cleanup_complete = false,
+            .complete = false,
+        };
+        const auto inserted =
+            cleanup_receipts_.emplace(std::string(run_id), std::move(prepared));
+        if (!inserted.second) {
+          throw std::logic_error(
+              "run cleanup receipt insertion lost controller serialization");
+        }
+        receipt = inserted.first;
+      }
+
+      Options cleanup_options;
+      cleanup_options.output_dir = run_root.parent_path();
+      cleanup_options.run_id = std::string(run_id);
+      const RunOwnership* expected_ownership =
+          receipt == cleanup_receipts_.end() ? &ownership
+                                             : &receipt->second.ownership;
+      McpRunCleanupResult result = CleanupRun(
+          std::move(cleanup_options), deadline, operation_stop_token,
+          remove_retained_artifacts, expected_ownership, *initial_identity,
+          receipt == cleanup_receipts_.end()
+              ? nullptr
+              : &receipt->second.external_cleanup_complete);
+      if (remove_retained_artifacts) {
+        if (receipt == cleanup_receipts_.end()) {
+          throw std::logic_error(
+              "artifact-removing cleanup completed without a receipt");
+        }
+#ifdef BBP_ENABLE_TEST_HOOKS
+        if (run_cleanup_root_removed_test_hook) {
+          run_cleanup_root_removed_test_hook();
+        }
+#endif
+        const std::filesystem::path quarantine =
+            OwnedRunRootCleanupQuarantinePath(receipt->second.ownership);
+        require_removed_artifacts_absent(
+            quarantine,
+            "a public or quarantined root appeared during verified cleanup");
+        receipt->second.complete = true;
+      } else {
+        const std::optional<OwnedRunRootIdentity> retained_identity =
+            InspectRunRootIdentity(run_root, deadline, operation_stop_token);
+        if (!retained_identity || *retained_identity != *initial_identity) {
+          throw McpOperationFailure(
+              "run_cleanup_identity_reused",
+              "retained run identity changed before ownership was rechecked",
+              false);
+        }
+        RunOwnership retained_ownership;
+        try {
+          retained_ownership = LoadRunOwnership(std::string(run_id), run_root,
+                                                operation_stop_token);
+        } catch (...) {
+          const std::string detail = ExceptionMessage(std::current_exception());
+          if (stop_token.stop_requested()) {
+            throw McpOperationCancelled();
+          }
+          if (std::chrono::steady_clock::now() >= deadline) {
+            throw McpOperationFailure(
+                "run_clean_timeout",
+                "retained run ownership recheck exceeded the timeout: " +
+                    detail,
+                true);
+          }
+          throw McpOperationFailure(
+              "run_cleanup_identity_reused",
+              "retained run ownership changed before cleanup completion: " +
+                  detail,
+              false);
+        }
+        const std::optional<OwnedRunRootIdentity> final_identity =
+            InspectRunRootIdentity(run_root, deadline, operation_stop_token);
+        if (!final_identity || *final_identity != *initial_identity ||
+            retained_ownership != ownership ||
+            InspectRunRootIdentity(OwnedRunRootCleanupQuarantinePath(ownership),
+                                   deadline, operation_stop_token)) {
+          throw McpOperationFailure(
+              "run_cleanup_identity_reused",
+              "retained run identity changed before cleanup completion", false);
+        }
+      }
+      return result;
+    } catch (const McpOperationCancelled&) {
+      if (stop_token.stop_requested()) {
+        throw;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw McpOperationFailure(
+            "run_clean_timeout",
+            "run cleanup did not finish before the timeout", true);
+      }
+      throw;
+    } catch (const McpOperationFailure&) {
+      throw;
+    } catch (const OwnedRunRootIdentityMismatch& error) {
+      throw McpOperationFailure(
+          "run_cleanup_identity_reused",
+          "run cleanup refused a replaced root: " + std::string(error.what()),
+          false);
+    } catch (const CgroupOwnershipMismatch& error) {
+      throw McpOperationFailure(
+          "run_cleanup_unverified",
+          "run cleanup refused unverified cgroup ownership: " +
+              std::string(error.what()),
+          false);
+    } catch (...) {
+      const std::string detail = ExceptionMessage(std::current_exception());
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw McpOperationFailure(
+            "run_clean_timeout",
+            "run cleanup did not finish before the timeout: " + detail, true);
+      }
+      throw McpOperationFailure("run_clean_failed",
+                                "run cleanup failed: " + detail, true);
+    }
+  }
+
+  std::optional<EditorRunSnapshot> CurrentRun(
+      bool include_terminal, bool acquire_tui_read_lease = false) const {
     std::shared_ptr<EditorRunContext> context;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -24857,7 +25525,7 @@ class EditorRunController {
     if (!include_terminal && IsTerminalEditorRunState(context->state)) {
       return std::nullopt;
     }
-    return SnapshotLocked(*context);
+    return SnapshotLocked(*context, acquire_tui_read_lease);
   }
 
   void RequestActiveRunStop() {
@@ -24899,7 +25567,8 @@ class EditorRunController {
 
   void Shutdown() {
     std::shared_ptr<EditorRunContext> context;
-    std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+    std::lock_guard<std::timed_mutex> transition_lock(transition_mutex_);
+    JoinRetiredWorkers();
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (shutdown_ && !active_) {
@@ -24930,7 +25599,114 @@ class EditorRunController {
   }
 
  private:
-  static EditorRunSnapshot SnapshotLocked(const EditorRunContext& context) {
+  struct RunCleanupReceipt {
+    RunOwnership ownership;
+    OwnedRunRootIdentity root_identity;
+    McpRunCleanupResult result;
+    bool external_cleanup_complete = false;
+    bool complete = false;
+  };
+
+  static std::filesystem::path CleanupRunRoot(
+      const std::filesystem::path& benchmark_root, std::string_view run_id) {
+    std::error_code error;
+    const std::filesystem::path absolute_root =
+        std::filesystem::absolute(benchmark_root, error);
+    if (error) {
+      throw std::runtime_error("resolve editor host benchmark root failed: " +
+                               error.message());
+    }
+    const std::filesystem::path canonical_root =
+        std::filesystem::weakly_canonical(absolute_root, error);
+    if (error) {
+      throw std::runtime_error(
+          "canonicalize editor host benchmark root failed: " + error.message());
+    }
+    return (canonical_root / run_id).lexically_normal();
+  }
+
+  static std::optional<OwnedRunRootIdentity> InspectRunRootIdentity(
+      const std::filesystem::path& run_root,
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt,
+      std::stop_token stop_token = {}) {
+    const auto require_active = [&] {
+      if (stop_token.stop_requested()) {
+        throw std::runtime_error("retained run root inspection was cancelled");
+      }
+      if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+        throw std::runtime_error(
+            "retained run root inspection deadline expired");
+      }
+    };
+    require_active();
+    const int descriptor =
+        open(run_root.c_str(),
+             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (descriptor < 0) {
+      const int open_error = errno;
+      require_active();
+      if (open_error == ENOENT) {
+        return std::nullopt;
+      }
+      throw std::runtime_error(
+          "open retained run root without following links failed: " +
+          std::error_code(open_error, std::generic_category()).message());
+    }
+
+    struct stat opened{};
+    const int inspect_result = fstat(descriptor, &opened);
+    const int inspect_error = inspect_result == 0 ? 0 : errno;
+    struct stat linked{};
+    const int link_result =
+        inspect_result == 0
+            ? fstatat(AT_FDCWD, run_root.c_str(), &linked, AT_SYMLINK_NOFOLLOW)
+            : -1;
+    const int link_error = link_result == 0 ? 0 : errno;
+    const int close_result = close(descriptor);
+    const int close_error = close_result == 0 ? 0 : errno;
+    require_active();
+    if (inspect_result != 0) {
+      throw std::runtime_error(
+          "inspect retained run root failed: " +
+          std::error_code(inspect_error, std::generic_category()).message());
+    }
+    if (link_result != 0) {
+      throw std::runtime_error(
+          "reinspect retained run root link failed: " +
+          std::error_code(link_error, std::generic_category()).message());
+    }
+    if (close_result != 0) {
+      throw std::runtime_error(
+          "close retained run root failed: " +
+          std::error_code(close_error, std::generic_category()).message());
+    }
+    if (!S_ISDIR(linked.st_mode) || opened.st_dev != linked.st_dev ||
+        opened.st_ino != linked.st_ino) {
+      throw std::runtime_error(
+          "retained run root identity changed during no-follow inspection");
+    }
+    require_active();
+    return OwnedRunRootIdentity{
+        .device = static_cast<std::uintmax_t>(opened.st_dev),
+        .inode = static_cast<std::uintmax_t>(opened.st_ino),
+    };
+  }
+
+  static McpRunCleanupResult SuccessfulCleanupResult(std::string_view run_id) {
+    return McpRunCleanupResult{
+        .run_id = std::string(run_id),
+        .verified_owned = true,
+        .processes_remaining = 0U,
+        .network_resources_remaining = 0U,
+        .cgroups_remaining = 0U,
+        .credentials_remaining = 0U,
+        .complete = true,
+    };
+  }
+
+  static EditorRunSnapshot SnapshotLocked(const EditorRunContext& context,
+                                          bool acquire_tui_read_lease = false) {
     const std::uint32_t node_count =
         context.mcp_application->current_node_count();
     const std::uint32_t node_capacity = context.options->node_capacity;
@@ -24948,7 +25724,11 @@ class EditorRunController {
         .state = context.state,
         .command_queue = context.command_queue,
         .firo_qt_launcher_service = context.firo_qt_launcher_service,
-        .mcp_application = context.mcp_application};
+        .mcp_application = context.mcp_application,
+        .tui_read_lease = acquire_tui_read_lease
+                              ? std::make_shared<EditorTuiReadLease>(
+                                    context.tui_read_lease_state)
+                              : std::shared_ptr<void>{}};
   }
 
   static void RequestStop(const std::shared_ptr<EditorRunContext>& context) {
@@ -24976,9 +25756,37 @@ class EditorRunController {
     static_cast<void>(stopped.wait(lock, stop_token, [] { return false; }));
   }
 
-  static void JoinAndShutdown(const std::shared_ptr<EditorRunContext>& context,
-                              bool propagate_worker_failure = true,
-                              bool* application_shutdown_succeeded = nullptr) {
+  static void WaitForTuiReadLeaseDrain(
+      const std::shared_ptr<EditorRunContext>& context,
+      std::optional<std::chrono::steady_clock::time_point> deadline,
+      std::stop_token stop_token) {
+    const std::shared_ptr<EditorTuiReadLeaseState> state =
+        context->tui_read_lease_state;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    const auto drained = [&] { return state->readers == 0U; };
+    if (!deadline) {
+      if (!state->drained.wait(lock, stop_token, drained)) {
+        throw McpOperationCancelled();
+      }
+      return;
+    }
+    if (!state->drained.wait_until(lock, stop_token, *deadline, drained)) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      throw std::runtime_error(
+          "TUI did not release the terminal run before the cleanup deadline");
+    }
+  }
+
+  static void JoinAndShutdown(
+      const std::shared_ptr<EditorRunContext>& context,
+      bool propagate_worker_failure = true,
+      bool* application_shutdown_succeeded = nullptr,
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt,
+      std::stop_token stop_token = {},
+      std::vector<std::jthread>* retired_workers = nullptr) {
     if (application_shutdown_succeeded != nullptr) {
       *application_shutdown_succeeded = false;
     }
@@ -24988,8 +25796,38 @@ class EditorRunController {
       }
       return;
     }
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+      throw std::runtime_error(
+          "managed run reaping did not start before the deadline");
+    }
     if (context->worker.joinable()) {
-      context->worker.join();
+      if (deadline || stop_token.stop_possible()) {
+        {
+          std::lock_guard<std::mutex> lock(context->mutex);
+          if (!IsTerminalEditorRunState(context->state)) {
+            throw std::logic_error(
+                "cancelable managed run reaping requires terminal state");
+          }
+        }
+        if (retired_workers == nullptr) {
+          throw std::logic_error(
+              "cancelable managed run reaping requires retired-worker "
+              "storage");
+        }
+        retired_workers->push_back(std::move(context->worker));
+      } else {
+        context->worker.join();
+      }
+    }
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+      throw std::runtime_error(
+          "managed run worker did not join before the deadline");
     }
     std::exception_ptr worker_failure;
     {
@@ -24998,7 +25836,13 @@ class EditorRunController {
     }
     std::exception_ptr shutdown_failure;
     try {
-      context->mcp_application->Shutdown();
+      if (deadline) {
+        context->mcp_application->Shutdown(*deadline, stop_token);
+      } else if (stop_token.stop_possible()) {
+        context->mcp_application->Shutdown(stop_token);
+      } else {
+        context->mcp_application->Shutdown();
+      }
     } catch (...) {
       shutdown_failure = std::current_exception();
     }
@@ -25019,7 +25863,18 @@ class EditorRunController {
     }
   }
 
-  void ReapTerminalRun() {
+  void JoinRetiredWorkers() {
+    for (std::jthread& worker : retired_workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    retired_workers_.clear();
+  }
+
+  void ReapTerminalRun(std::optional<std::chrono::steady_clock::time_point>
+                           deadline = std::nullopt,
+                       std::stop_token stop_token = {}) {
     std::shared_ptr<EditorRunContext> context;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -25034,7 +25889,10 @@ class EditorRunController {
       }
       context = active_;
     }
-    JoinAndShutdown(context, false);
+    WaitForTuiReadLeaseDrain(context, deadline, stop_token);
+    JoinAndShutdown(
+        context, false, nullptr, deadline, stop_token,
+        deadline || stop_token.stop_possible() ? &retired_workers_ : nullptr);
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_ == context) {
       active_.reset();
@@ -25042,10 +25900,21 @@ class EditorRunController {
   }
 
   std::shared_ptr<EditorRunContext> Launch(
-      Options options, std::optional<boost::json::object> source_scenario) {
+      Options options, std::optional<boost::json::object> source_scenario,
+      std::stop_token stop_token) {
     RequireSafeOutputDirectory(options.output_dir);
-    std::lock_guard<std::mutex> transition_lock(transition_mutex_);
-    ReapTerminalRun();
+    std::unique_lock<std::timed_mutex> transition_lock(transition_mutex_,
+                                                       std::defer_lock);
+    while (!transition_lock.try_lock_for(std::chrono::milliseconds(25))) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+    }
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    JoinRetiredWorkers();
+    ReapTerminalRun(std::nullopt, stop_token);
     std::function<void(McpEvidenceRecord)> publish_evidence;
     std::function<void(std::string_view)> close_run_subscriptions;
     {
@@ -25064,6 +25933,55 @@ class EditorRunController {
       close_run_subscriptions = close_run_subscriptions_;
     }
 
+    const std::filesystem::path cleanup_run_root =
+        CleanupRunRoot(options.output_dir, options.run_id);
+    const std::optional<OwnedRunRootCleanupReceipt> durable_receipt =
+        TryLoadOwnedRunRootCleanupReceipt(options.run_id, cleanup_run_root,
+                                          std::nullopt, stop_token);
+    auto receipt = cleanup_receipts_.find(options.run_id);
+    bool retire_in_memory_receipt = false;
+    if (durable_receipt) {
+      if (receipt != cleanup_receipts_.end() &&
+          (receipt->second.ownership != durable_receipt->ownership ||
+           receipt->second.root_identity != durable_receipt->root_identity)) {
+        throw McpOperationFailure(
+            "run_cleanup_identity_reused",
+            "durable cleanup receipt disagrees with controller state", false);
+      }
+      const std::filesystem::path quarantine =
+          OwnedRunRootCleanupQuarantinePath(durable_receipt->ownership);
+      if (InspectRunRootIdentity(cleanup_run_root, std::nullopt, stop_token) ||
+          InspectRunRootIdentity(quarantine, std::nullopt, stop_token)) {
+        throw McpOperationFailure(
+            "run_cleanup_state_uncertain",
+            "an incomplete durable cleanup prevents reuse of this run id",
+            false);
+      }
+      if (receipt != cleanup_receipts_.end()) {
+        retire_in_memory_receipt = true;
+      }
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+    } else if (receipt != cleanup_receipts_.end()) {
+      if (InspectRunRootIdentity(cleanup_run_root, std::nullopt, stop_token) ||
+          InspectRunRootIdentity(
+              OwnedRunRootCleanupQuarantinePath(receipt->second.ownership),
+              std::nullopt, stop_token)) {
+        throw McpOperationFailure(
+            "run_cleanup_identity_reused",
+            "a retained run identity must not be replaced by run.launch",
+            false);
+      }
+      if (!receipt->second.complete) {
+        throw McpOperationFailure(
+            "run_cleanup_state_uncertain",
+            "an incomplete cleanup receipt prevents reuse of this run id",
+            false);
+      }
+      retire_in_memory_receipt = true;
+    }
+
     auto context = std::make_shared<EditorRunContext>();
     context->generation = next_generation_++;
     context->options = std::make_shared<Options>(std::move(options));
@@ -25071,6 +25989,20 @@ class EditorRunController {
     context->command_queue = std::make_shared<SimulationCommandQueue>();
     context->node_inventory =
         std::make_shared<RuntimeNodeInventory>(context->options->node_capacity);
+    if (durable_receipt || retire_in_memory_receipt) {
+      const std::string reused_run_id = context->options->run_id;
+      context->run_root_prepared =
+          [this, durable_receipt, retire_in_memory_receipt,
+           reused_run_id](std::stop_token preparation_stop_token) {
+            if (durable_receipt) {
+              RemoveOwnedRunRootCleanupReceipt(*durable_receipt, std::nullopt,
+                                               preparation_stop_token);
+            }
+            if (retire_in_memory_receipt) {
+              cleanup_receipts_.erase(reused_run_id);
+            }
+          };
+    }
     const std::weak_ptr<EditorRunContext> weak_context(context);
     context->firo_qt_launcher_service = std::make_shared<FiroQtLauncherService>(
         [weak_context](std::string_view node_id, std::stop_token stop_token) {
@@ -25226,8 +26158,10 @@ class EditorRunController {
     return context;
   }
 
-  mutable std::mutex transition_mutex_;
+  mutable std::timed_mutex transition_mutex_;
   mutable std::mutex mutex_;
+  std::vector<std::jthread> retired_workers_;
+  std::map<std::string, RunCleanupReceipt, std::less<>> cleanup_receipts_;
   std::shared_ptr<EditorRunContext> active_;
   std::function<void(McpEvidenceRecord)> publish_evidence_;
   std::function<void(std::string_view)> close_run_subscriptions_;
@@ -25257,7 +26191,7 @@ std::optional<McpHostedRunSnapshot> McpSnapshot(
 
 TuiRunSnapshot TuiSnapshot(const EditorRunController& controller) {
   const std::optional<EditorRunSnapshot> snapshot =
-      controller.CurrentRun(false);
+      controller.CurrentRun(false, true);
   if (!snapshot || snapshot->state == EditorRunState::kStarting) {
     return {};
   }
@@ -25267,6 +26201,7 @@ TuiRunSnapshot TuiSnapshot(const EditorRunController& controller) {
       .command_queue = snapshot->command_queue,
       .firo_qt_launcher_service = snapshot->firo_qt_launcher_service,
       .publication_mutex = RuntimePublicationMutex(),
+      .read_lease = snapshot->tui_read_lease,
   };
 }
 
@@ -25281,6 +26216,11 @@ int RunEditorApplication(Options options,
                          const std::filesystem::path& state_directory) {
   SignalStopMonitor signal_monitor;
   std::stop_source application_stop_source;
+  EnsureDirectory(options.output_dir);
+  const std::filesystem::path benchmark_root =
+      std::filesystem::canonical(options.output_dir);
+  RequireSafeOutputDirectory(benchmark_root);
+  options.output_dir = benchmark_root;
   EditorRunController run_controller;
   McpHostApplication host_application(McpHostApplication::Config{
       .host_id = options.run_id,
@@ -25288,7 +26228,8 @@ int RunEditorApplication(Options options,
       .launch_run =
           [&](const boost::json::object& scenario, std::stop_token stop_token) {
             const std::shared_ptr<EditorRunContext> run =
-                run_controller.LaunchScenario(scenario);
+                run_controller.LaunchScenario(scenario, benchmark_root,
+                                              stop_token);
             const EditorRunSnapshot snapshot =
                 run_controller.WaitUntilActive(run, stop_token);
             return McpRunLifecycleResult{
@@ -25307,6 +26248,14 @@ int RunEditorApplication(Options options,
                 .state = std::string(EditorRunStateName(snapshot.state)),
                 .node_count = snapshot.node_count,
             };
+          },
+      .clean_run =
+          [&, benchmark_root](
+              std::string_view run_id, std::chrono::seconds timeout,
+              bool remove_retained_artifacts, std::stop_token stop_token) {
+            return run_controller.CleanRun(benchmark_root, run_id, timeout,
+                                           remove_retained_artifacts,
+                                           stop_token);
           },
   });
   McpEndpoint mcp_endpoint(
@@ -25537,6 +26486,19 @@ bool RuntimeNodeSupportDestructionAllowedForTest(
   return RuntimeNodeSupportDestructionAllowed(
       daemon_absence_verified, exact_cgroup_acquired, exact_cgroup_empty,
       allow_partial_preparation);
+}
+
+void SetRunCleanupRootRemovedHookForTest(std::function<void()> hook) {
+  run_cleanup_root_removed_test_hook = std::move(hook);
+}
+
+McpRunCleanupResult CleanEditorRetainedRunForTest(
+    const std::filesystem::path& benchmark_root, std::string_view run_id,
+    std::chrono::seconds timeout, bool remove_retained_artifacts,
+    std::stop_token stop_token) {
+  EditorRunController controller;
+  return controller.CleanRun(benchmark_root, run_id, timeout,
+                             remove_retained_artifacts, stop_token);
 }
 #endif
 

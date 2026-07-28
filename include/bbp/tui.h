@@ -25,6 +25,7 @@ struct TuiRunSnapshot {
   std::shared_ptr<SimulationCommandQueue> command_queue;
   std::shared_ptr<FiroQtLauncherService> firo_qt_launcher_service = {};
   std::shared_ptr<std::timed_mutex> publication_mutex;
+  std::shared_ptr<void> read_lease;
 };
 
 using TuiRunSnapshotProvider = std::function<TuiRunSnapshot()>;

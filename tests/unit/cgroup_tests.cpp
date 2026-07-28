@@ -1,5 +1,6 @@
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -385,6 +386,73 @@ BOOST_AUTO_TEST_CASE(block_device_ids_are_strict_and_bounded) {
                     std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(
+    cgroup_scope_cleanup_rejects_fifo_state_without_exceeding_deadline) {
+  const std::filesystem::path root = TestDirectory("fifo-state-root");
+  const std::filesystem::path state_file = TestDirectory("fifo-state");
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  error.clear();
+  std::filesystem::remove(state_file, error);
+  error.clear();
+  BOOST_REQUIRE(std::filesystem::create_directory(root, error));
+  BOOST_REQUIRE(!error);
+  BOOST_REQUIRE(mkfifo(state_file.c_str(), 0600) == 0);
+
+  const pid_t child = fork();
+  BOOST_REQUIRE(child >= 0);
+  if (child == 0) {
+    try {
+      bbp::RemoveCgroupRunInTestScope(
+          bbp::CgroupScopeTestConfig{
+              .root = root,
+              .simulator_name = "bbp",
+              .state_file = state_file,
+          },
+          "fifo-state-run",
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(250));
+      _exit(20);
+    } catch (const std::runtime_error& failure) {
+      _exit(std::string(failure.what()).find("owner-only regular file") !=
+                    std::string::npos
+                ? 0
+                : 21);
+    } catch (...) {
+      _exit(22);
+    }
+  }
+
+  int status = 0;
+  pid_t waited = 0;
+  const auto wait_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (std::chrono::steady_clock::now() < wait_deadline) {
+    waited = waitpid(child, &status, WNOHANG);
+    if (waited == child) {
+      break;
+    }
+    if (waited < 0 && errno != EINTR) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (waited != child) {
+    kill(child, SIGKILL);
+    do {
+      waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+  }
+
+  std::filesystem::remove(state_file, error);
+  error.clear();
+  std::filesystem::remove(root, error);
+  BOOST_REQUIRE(waited == child);
+  BOOST_REQUIRE_MESSAGE(
+      WIFEXITED(status),
+      "cgroup cleanup blocked on a FIFO state file past its deadline");
+  BOOST_TEST(WEXITSTATUS(status) == 0);
+}
+
 BOOST_AUTO_TEST_CASE(cgroup_metrics_reject_io_total_overflow) {
   const std::filesystem::path dir = TestDirectory("overflow");
   WriteMetricFixture(dir,
@@ -578,6 +646,10 @@ BOOST_AUTO_TEST_CASE(stale_cleanup_is_scoped_to_one_same_id_run_instance) {
     BOOST_TEST(!std::filesystem::exists(RunCgroupPath(second.cgroup_name)));
     BOOST_TEST(kill(pid, 0) == 0);
 
+    bbp::Cgroup::RemoveStaleRun(second);
+    BOOST_TEST(std::filesystem::is_directory(RunCgroupPath(first.cgroup_name)));
+    BOOST_TEST(kill(pid, 0) == 0);
+
     bbp::Cgroup::RemoveRun(first.cgroup_name);
     const int status = child.Wait();
     BOOST_REQUIRE(WIFSIGNALED(status));
@@ -637,8 +709,8 @@ BOOST_AUTO_TEST_CASE(
     node.AttachPid(pid);
 
     BOOST_CHECK_EXCEPTION(
-        bbp::Cgroup::RemoveStaleRun(collision), std::runtime_error,
-        [](const std::runtime_error& error) {
+        bbp::Cgroup::RemoveStaleRun(collision), bbp::CgroupOwnershipMismatch,
+        [](const bbp::CgroupOwnershipMismatch& error) {
           return std::string(error.what())
                      .find("binding does not match exact run ownership") !=
                  std::string::npos;
@@ -686,8 +758,8 @@ BOOST_AUTO_TEST_CASE(
     std::filesystem::create_directory(run_root);
     bbp::WriteRunOwnershipMarker(ownership);
     BOOST_CHECK_EXCEPTION(
-        bbp::Cgroup::RemoveStaleRun(ownership), std::runtime_error,
-        [](const std::runtime_error& error) {
+        bbp::Cgroup::RemoveStaleRun(ownership), bbp::CgroupOwnershipMismatch,
+        [](const bbp::CgroupOwnershipMismatch& error) {
           return std::string(error.what())
                      .find("binding does not match exact run ownership") !=
                  std::string::npos;
@@ -702,8 +774,8 @@ BOOST_AUTO_TEST_CASE(
     BOOST_REQUIRE(std::filesystem::remove(cgroup_path));
     BOOST_REQUIRE(std::filesystem::create_directory(cgroup_path));
     BOOST_CHECK_EXCEPTION(
-        bbp::Cgroup::RemoveStaleRun(ownership), std::runtime_error,
-        [](const std::runtime_error& error) {
+        bbp::Cgroup::RemoveStaleRun(ownership), bbp::CgroupOwnershipMismatch,
+        [](const bbp::CgroupOwnershipMismatch& error) {
           return std::string(error.what())
                      .find("replaced run cgroup identity") != std::string::npos;
         });
@@ -1218,6 +1290,8 @@ BOOST_AUTO_TEST_CASE(
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
   const std::filesystem::path state_file = TestDirectory("scope-state");
+  const std::filesystem::path restore_blocker =
+      scope_root / "bbp" / "restore-blocker";
   std::error_code error;
   std::filesystem::remove(state_file, error);
   error.clear();
@@ -1303,6 +1377,13 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(bbp::ReadText("/proc/" + std::to_string(pid) + "/cgroup")
                    .find(".bbp-controller-v1-") != std::string::npos);
 
+    BOOST_REQUIRE(std::filesystem::create_directory(restore_blocker));
+    BOOST_CHECK_THROW(bbp::RemoveCgroupRunInTestScope(config, second),
+                      std::runtime_error);
+    BOOST_TEST(std::filesystem::exists(state_file));
+    BOOST_TEST(!std::filesystem::exists(scope_root / "bbp" / second));
+    BOOST_REQUIRE(std::filesystem::remove(restore_blocker));
+
     bbp::RemoveCgroupRunInTestScope(config, second);
     BOOST_TEST(!std::filesystem::exists(state_file));
     BOOST_TEST(!std::filesystem::exists(scope_root / "bbp"));
@@ -1322,6 +1403,8 @@ BOOST_AUTO_TEST_CASE(
     BOOST_REQUIRE(std::filesystem::remove(scope_root, error));
     BOOST_REQUIRE(!error);
   } catch (...) {
+    std::filesystem::remove(restore_blocker, error);
+    error.clear();
     try {
       bbp::RemoveCgroupRunInTestScope(
           bbp::CgroupScopeTestConfig{
