@@ -47,7 +47,7 @@ constexpr std::string_view kSimulatorRootName = "bbp";
 constexpr std::string_view kCgroupScopeStateFile =
     "/tmp/blockchain-benchmark-project-cgroup-scope-v1.json";
 constexpr std::string_view kOwnedControllerPrefix = ".bbp-controller-v1-";
-constexpr std::uint64_t kCgroupScopeStateVersion = 2U;
+constexpr std::uint64_t kCgroupScopeStateVersion = 3U;
 
 std::mutex prepared_runs_mutex;
 std::set<std::string> prepared_runs;
@@ -79,6 +79,13 @@ struct CgroupPathIdentity {
   bool operator==(const CgroupPathIdentity&) const = default;
 };
 
+struct CgroupDirectoryIdentity {
+  CgroupPathIdentity path;
+  std::uint64_t mount_id = 0U;
+
+  bool operator==(const CgroupDirectoryIdentity&) const = default;
+};
+
 struct CgroupRunBinding {
   std::string run_id;
   std::filesystem::path run_root;
@@ -94,6 +101,11 @@ struct CgroupScopeState {
   std::string simulator_name;
   std::string controller_name;
   bool simulator_preexisting = false;
+  bool controller_expected = false;
+  bool restoration_ready = false;
+  std::optional<CgroupDirectoryIdentity> root_identity;
+  std::optional<CgroupDirectoryIdentity> simulator_identity;
+  std::optional<CgroupDirectoryIdentity> controller_identity;
   std::set<std::string> root_controllers_before;
   std::set<std::string> simulator_controllers_before;
   std::set<std::string> root_controllers_added;
@@ -102,6 +114,7 @@ struct CgroupScopeState {
   std::map<std::string, CgroupRunBinding> run_bindings;
   std::optional<std::string> pending_run;
   bool pending_run_created = false;
+  bool legacy_scope_identities = false;
 };
 
 class CgroupScopeLock {
@@ -261,19 +274,6 @@ std::set<std::string> ControllerSet(const std::filesystem::path& path) {
   return std::set<std::string>(values.begin(), values.end());
 }
 
-std::set<std::string> DesiredControllers(
-    const std::filesystem::path& directory) {
-  const std::set<std::string> available =
-      ControllerSet(directory / "cgroup.controllers");
-  std::set<std::string> desired;
-  for (std::string_view controller : {"cpu", "io", "memory", "pids"}) {
-    if (available.contains(std::string(controller))) {
-      desired.emplace(controller);
-    }
-  }
-  return desired;
-}
-
 std::set<std::string> SetDifference(const std::set<std::string>& values,
                                     const std::set<std::string>& excluded) {
   std::set<std::string> difference;
@@ -294,25 +294,6 @@ std::string ControllerRequest(const std::set<std::string>& controllers,
     request += controller;
   }
   return request;
-}
-
-void SetControllers(const std::filesystem::path& directory,
-                    const std::set<std::string>& controllers, char operation) {
-  if (controllers.empty()) {
-    return;
-  }
-  WriteText(directory / "cgroup.subtree_control",
-            ControllerRequest(controllers, operation));
-  const std::set<std::string> after =
-      ControllerSet(directory / "cgroup.subtree_control");
-  for (const std::string& controller : controllers) {
-    const bool expected = operation == '+';
-    if (after.contains(controller) != expected) {
-      throw std::runtime_error("cgroup controller " + controller +
-                               " read-back verification failed at " +
-                               directory.string());
-    }
-  }
 }
 
 std::string RandomScopeToken() {
@@ -439,6 +420,18 @@ boost::json::array StringSetJson(const std::set<std::string>& values) {
   return result;
 }
 
+boost::json::value ScopeDirectoryIdentityJson(
+    const std::optional<CgroupDirectoryIdentity>& identity) {
+  if (!identity) {
+    return nullptr;
+  }
+  return boost::json::object{
+      {"device", identity->path.device},
+      {"inode", identity->path.inode},
+      {"mount_id", identity->mount_id},
+  };
+}
+
 boost::json::object RunBindingsJson(
     const std::map<std::string, CgroupRunBinding>& bindings) {
   boost::json::object result;
@@ -463,6 +456,13 @@ std::string SerializeCgroupScopeState(const CgroupScopeState& state) {
   object["simulator_name"] = state.simulator_name;
   object["controller_name"] = state.controller_name;
   object["simulator_preexisting"] = state.simulator_preexisting;
+  object["controller_expected"] = state.controller_expected;
+  object["restoration_ready"] = state.restoration_ready;
+  object["root_identity"] = ScopeDirectoryIdentityJson(state.root_identity);
+  object["simulator_identity"] =
+      ScopeDirectoryIdentityJson(state.simulator_identity);
+  object["controller_identity"] =
+      ScopeDirectoryIdentityJson(state.controller_identity);
   object["root_controllers_before"] =
       StringSetJson(state.root_controllers_before);
   object["simulator_controllers_before"] =
@@ -480,6 +480,34 @@ std::string SerializeCgroupScopeState(const CgroupScopeState& state) {
   }
   object["pending_run_created"] = state.pending_run_created;
   return boost::json::serialize(object) + "\n";
+}
+
+void SyncCgroupScopeStateDirectory(const std::filesystem::path& path,
+                                   std::string_view operation) {
+  const std::filesystem::path parent = path.parent_path().empty()
+                                           ? std::filesystem::path(".")
+                                           : path.parent_path();
+  const int descriptor =
+      open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (descriptor < 0) {
+    throw std::runtime_error("open cgroup scope state directory failed after " +
+                             std::string(operation) + " for " + path.string() +
+                             ": " + std::strerror(errno));
+  }
+  if (fsync(descriptor) != 0) {
+    const int error = errno;
+    static_cast<void>(close(descriptor));
+    throw std::runtime_error(
+        "fsync cgroup scope state directory failed after " +
+        std::string(operation) + " for " + path.string() + ": " +
+        std::strerror(error));
+  }
+  if (close(descriptor) != 0) {
+    throw std::runtime_error(
+        "close cgroup scope state directory failed after " +
+        std::string(operation) + " for " + path.string() + ": " +
+        std::strerror(errno));
+  }
 }
 
 void WriteCgroupScopeState(const std::filesystem::path& path,
@@ -518,6 +546,7 @@ void WriteCgroupScopeState(const std::filesystem::path& path,
     throw std::runtime_error("publish cgroup scope state failed for " +
                              path.string() + ": " + std::strerror(error));
   }
+  SyncCgroupScopeStateDirectory(path, "publish");
 }
 
 const boost::json::value& RequiredScopeField(const boost::json::object& object,
@@ -551,6 +580,42 @@ std::uint64_t ScopeUint64(const boost::json::object& object,
   }
   throw std::runtime_error("cgroup scope state field is not uint64: " +
                            std::string(field));
+}
+
+std::optional<CgroupDirectoryIdentity> ScopeDirectoryIdentity(
+    const boost::json::object& object, std::string_view field) {
+  const boost::json::value& value = RequiredScopeField(object, field);
+  if (value.is_null()) {
+    return std::nullopt;
+  }
+  if (!value.is_object()) {
+    throw std::runtime_error(
+        "cgroup scope directory identity is not an object: " +
+        std::string(field));
+  }
+  const boost::json::object& identity = value.as_object();
+  const std::set<std::string_view> supported = {"device", "inode", "mount_id"};
+  for (const auto& member : identity) {
+    if (!supported.contains(member.key())) {
+      throw std::runtime_error(
+          "cgroup scope directory identity has unsupported field: " +
+          std::string(field));
+    }
+  }
+  CgroupDirectoryIdentity result{
+      .path =
+          CgroupPathIdentity{
+              .device = ScopeUint64(identity, "device"),
+              .inode = ScopeUint64(identity, "inode"),
+          },
+      .mount_id = ScopeUint64(identity, "mount_id"),
+  };
+  if (result.path.inode == 0U || result.mount_id == 0U) {
+    throw std::runtime_error(
+        "cgroup scope directory identity contains a zero identity: " +
+        std::string(field));
+  }
+  return result;
 }
 
 enum class ScopeSetKind { kRunIds, kControllers, kManagedControllers };
@@ -667,7 +732,17 @@ CgroupScopeState LoadCgroupScopeState(
     throw std::runtime_error("cgroup scope state is not a JSON object");
   }
   const boost::json::object& object = parsed.as_object();
-  const std::set<std::string_view> supported = {
+  const boost::json::value& version = RequiredScopeField(object, "version");
+  const std::uint64_t version_number =
+      version.is_uint64() ? version.as_uint64()
+      : version.is_int64() && version.as_int64() >= 0
+          ? static_cast<std::uint64_t>(version.as_int64())
+          : 0U;
+  if (version_number != 1U && version_number != 2U &&
+      version_number != kCgroupScopeStateVersion) {
+    throw std::runtime_error("cgroup scope state version is unsupported");
+  }
+  std::set<std::string_view> supported = {
       "version",
       "root",
       "simulator_name",
@@ -682,21 +757,19 @@ CgroupScopeState LoadCgroupScopeState(
       "pending_run",
       "pending_run_created",
   };
+  if (version_number == kCgroupScopeStateVersion) {
+    supported.insert("controller_expected");
+    supported.insert("restoration_ready");
+    supported.insert("root_identity");
+    supported.insert("simulator_identity");
+    supported.insert("controller_identity");
+  }
   for (const auto& member : object) {
     const std::string_view key(member.key().data(), member.key().size());
     if (!supported.contains(key)) {
       throw std::runtime_error("cgroup scope state has unsupported field: " +
                                std::string(key));
     }
-  }
-  const boost::json::value& version = RequiredScopeField(object, "version");
-  const std::uint64_t version_number =
-      version.is_uint64() ? version.as_uint64()
-      : version.is_int64() && version.as_int64() >= 0
-          ? static_cast<std::uint64_t>(version.as_int64())
-          : 0U;
-  if (version_number != 1U && version_number != kCgroupScopeStateVersion) {
-    throw std::runtime_error("cgroup scope state version is unsupported");
   }
   const boost::json::value& preexisting =
       RequiredScopeField(object, "simulator_preexisting");
@@ -709,6 +782,29 @@ CgroupScopeState LoadCgroupScopeState(
   state.simulator_name = ScopeString(object, "simulator_name");
   state.controller_name = ScopeString(object, "controller_name");
   state.simulator_preexisting = preexisting.as_bool();
+  if (version_number == kCgroupScopeStateVersion) {
+    const boost::json::value& controller_expected =
+        RequiredScopeField(object, "controller_expected");
+    const boost::json::value& restoration_ready =
+        RequiredScopeField(object, "restoration_ready");
+    if (!controller_expected.is_bool()) {
+      throw std::runtime_error(
+          "cgroup scope controller_expected is not Boolean");
+    }
+    if (!restoration_ready.is_bool()) {
+      throw std::runtime_error("cgroup scope restoration_ready is not Boolean");
+    }
+    state.controller_expected = controller_expected.as_bool();
+    state.restoration_ready = restoration_ready.as_bool();
+    state.root_identity = ScopeDirectoryIdentity(object, "root_identity");
+    state.simulator_identity =
+        ScopeDirectoryIdentity(object, "simulator_identity");
+    state.controller_identity =
+        ScopeDirectoryIdentity(object, "controller_identity");
+  } else {
+    state.controller_expected = config.allow_root_process_move;
+    state.legacy_scope_identities = true;
+  }
   state.root_controllers_before = ScopeStringSet(
       object, "root_controllers_before", ScopeSetKind::kControllers);
   state.simulator_controllers_before = ScopeStringSet(
@@ -757,13 +853,77 @@ CgroupScopeState LoadCgroupScopeState(
     throw std::runtime_error(
         "cgroup scope state does not match the requested scope");
   }
-  RequireCgroupOperationActive(deadline, stop_token, "cgroup scope state read");
-  const std::set<std::string> desired = DesiredControllers(config.root);
-  if (state.root_controllers_added !=
-          SetDifference(desired, state.root_controllers_before) ||
-      state.simulator_controllers_added !=
-          SetDifference(desired, state.simulator_controllers_before)) {
-    throw std::runtime_error("cgroup scope root controller state is invalid");
+  const auto controllers_overlap = [](const std::set<std::string>& before,
+                                      const std::set<std::string>& added) {
+    return std::any_of(added.begin(), added.end(),
+                       [&](const std::string& controller) {
+                         return before.contains(controller);
+                       });
+  };
+  if (controllers_overlap(state.root_controllers_before,
+                          state.root_controllers_added) ||
+      controllers_overlap(state.simulator_controllers_before,
+                          state.simulator_controllers_added) ||
+      (!state.simulator_preexisting &&
+       !state.simulator_controllers_before.empty())) {
+    throw std::runtime_error("cgroup scope controller state is inconsistent");
+  }
+  if (!state.legacy_scope_identities) {
+    if (!state.root_identity) {
+      throw std::runtime_error(
+          "cgroup scope state is missing its root identity");
+    }
+    if (state.simulator_preexisting && !state.simulator_identity) {
+      throw std::runtime_error(
+          "cgroup scope state is missing its pre-existing simulator identity");
+    }
+    if (state.controller_identity && !state.controller_expected) {
+      throw std::runtime_error(
+          "cgroup scope state has an unexpected controller identity");
+    }
+    if (state.controller_identity && !state.simulator_identity) {
+      throw std::runtime_error(
+          "cgroup scope controller identity has no simulator identity");
+    }
+    if (!state.controller_expected && !state.root_controllers_added.empty()) {
+      throw std::runtime_error(
+          "cgroup scope without a controller cannot own root controllers");
+    }
+    const bool scope_in_use =
+        !state.active_runs.empty() || state.pending_run.has_value();
+    if (scope_in_use && !state.simulator_identity) {
+      throw std::runtime_error(
+          "cgroup scope in use is missing its simulator identity");
+    }
+    if (scope_in_use && state.controller_expected &&
+        !state.controller_identity) {
+      throw std::runtime_error(
+          "cgroup scope in use is missing its controller identity");
+    }
+    if (state.restoration_ready &&
+        (!state.active_runs.empty() || !state.run_bindings.empty() ||
+         state.pending_run || state.pending_run_created)) {
+      throw std::runtime_error(
+          "restoration-ready cgroup scope still contains an owned run");
+    }
+    if (state.simulator_identity &&
+        (state.simulator_identity->path.device !=
+             state.root_identity->path.device ||
+         state.simulator_identity->mount_id != state.root_identity->mount_id ||
+         state.simulator_identity->path == state.root_identity->path)) {
+      throw std::runtime_error(
+          "cgroup scope simulator identity is outside its root identity");
+    }
+    if (state.controller_identity &&
+        (state.controller_identity->path.device !=
+             state.simulator_identity->path.device ||
+         state.controller_identity->mount_id !=
+             state.simulator_identity->mount_id ||
+         state.controller_identity->path == state.simulator_identity->path ||
+         state.controller_identity->path == state.root_identity->path)) {
+      throw std::runtime_error(
+          "cgroup scope controller identity is outside its simulator identity");
+    }
   }
   RequireCgroupOperationActive(deadline, stop_token, "cgroup scope state read");
   return state;
@@ -1186,7 +1346,9 @@ class BoundCgroupDirectory {
   static std::optional<BoundCgroupDirectory> TryOpen(
       int parent_descriptor, std::string name,
       std::filesystem::path display_path,
-      std::optional<CgroupPathIdentity> expected_identity = std::nullopt) {
+      std::optional<CgroupPathIdentity> expected_identity = std::nullopt,
+      std::optional<std::uint64_t> expected_mount_id = std::nullopt,
+      bool require_parent_mount = true) {
     struct stat before{};
     if (fstatat(parent_descriptor, name.c_str(), &before,
                 AT_SYMLINK_NOFOLLOW) != 0) {
@@ -1204,14 +1366,22 @@ class BoundCgroupDirectory {
     }
 
     BoundCgroupDirectory acquired(parent_descriptor, std::move(name),
-                                  std::move(display_path), before);
+                                  std::move(display_path), before,
+                                  require_parent_mount);
     if (expected_identity &&
         (static_cast<std::uint64_t>(acquired.identity_.st_dev) !=
              expected_identity->device ||
          static_cast<std::uint64_t>(acquired.identity_.st_ino) !=
              expected_identity->inode)) {
       throw CgroupOwnershipMismatch(
-          "refusing to remove a replaced run cgroup identity: " +
+          (expected_mount_id
+               ? "refusing a replaced scope cgroup identity: "
+               : "refusing to remove a replaced run cgroup identity: ") +
+          acquired.display_path_.string());
+    }
+    if (expected_mount_id && acquired.mount_id_ != *expected_mount_id) {
+      throw CgroupOwnershipMismatch(
+          "refusing a replaced cgroup mount identity: " +
           acquired.display_path_.string());
     }
     return acquired;
@@ -1250,6 +1420,16 @@ class BoundCgroupDirectory {
   const std::filesystem::path& display_path() const { return display_path_; }
   const struct stat& identity() const { return identity_; }
   std::uint64_t mount_id() const { return mount_id_; }
+  CgroupDirectoryIdentity directory_identity() const {
+    return CgroupDirectoryIdentity{
+        .path =
+            CgroupPathIdentity{
+                .device = static_cast<std::uint64_t>(identity_.st_dev),
+                .inode = static_cast<std::uint64_t>(identity_.st_ino),
+            },
+        .mount_id = mount_id_,
+    };
+  }
 
   void RequireLinkedIdentity() const {
     if (removed_) {
@@ -1292,7 +1472,7 @@ class BoundCgroupDirectory {
  private:
   BoundCgroupDirectory(int parent_descriptor, std::string name,
                        std::filesystem::path display_path,
-                       const struct stat& before)
+                       const struct stat& before, bool require_parent_mount)
       : name_(std::move(name)),
         display_path_(std::move(display_path)),
         identity_(before) {
@@ -1332,7 +1512,8 @@ class BoundCgroupDirectory {
     }
     try {
       mount_id_ = CgroupMountId(descriptor_);
-      if (CgroupMountId(parent_descriptor_) != mount_id_ ||
+      if ((require_parent_mount &&
+           CgroupMountId(parent_descriptor_) != mount_id_) ||
           CgroupMountIdAt(parent_descriptor_, name_) != mount_id_) {
         throw CgroupOwnershipMismatch(
             "cgroup cleanup refuses a mount boundary: " +
@@ -1365,33 +1546,149 @@ class BoundCgroupDirectory {
   bool removed_ = false;
 };
 
-std::string ReadCgroupFileAt(const BoundCgroupDirectory& cgroup,
-                             std::string_view file,
-                             std::chrono::steady_clock::time_point deadline,
-                             std::stop_token stop_token) {
+BoundCgroupDirectory AcquireBoundScopeRoot(
+    const CgroupScopeConfig& config, const CgroupScopeLock& scope_lock,
+    const std::optional<CgroupDirectoryIdentity>& expected_identity) {
+  if (!config.root.is_absolute() ||
+      config.root.lexically_normal() != config.root ||
+      config.root.filename().empty()) {
+    throw std::runtime_error(
+        "cgroup scope root is not a normalized directory: " +
+        config.root.string());
+  }
+  const std::filesystem::path parent_path = config.root.parent_path();
+  const int parent_descriptor = open(
+      parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (parent_descriptor < 0) {
+    throw std::runtime_error("open cgroup scope root parent failed for " +
+                             parent_path.string() + ": " +
+                             std::strerror(errno));
+  }
+
+  std::optional<BoundCgroupDirectory> root;
+  try {
+    root = BoundCgroupDirectory::TryOpen(
+        parent_descriptor, config.root.filename().string(), config.root,
+        expected_identity
+            ? std::optional<CgroupPathIdentity>(expected_identity->path)
+            : std::nullopt,
+        expected_identity
+            ? std::optional<std::uint64_t>(expected_identity->mount_id)
+            : std::nullopt,
+        false);
+  } catch (...) {
+    static_cast<void>(close(parent_descriptor));
+    throw;
+  }
+  if (close(parent_descriptor) != 0) {
+    throw std::runtime_error("close cgroup scope root parent failed for " +
+                             parent_path.string() + ": " +
+                             std::strerror(errno));
+  }
+  if (!root) {
+    throw CgroupOwnershipMismatch("cgroup scope root disappeared: " +
+                                  config.root.string());
+  }
+
+  struct stat locked{};
+  if (fstat(scope_lock.descriptor(), &locked) != 0) {
+    throw std::runtime_error("inspect locked cgroup scope root failed for " +
+                             config.root.string() + ": " +
+                             std::strerror(errno));
+  }
+  if (!SameCgroupIdentity(locked, root->identity()) ||
+      CgroupMountId(scope_lock.descriptor()) != root->mount_id()) {
+    throw CgroupOwnershipMismatch(
+        "locked cgroup scope root was replaced during acquisition: " +
+        config.root.string());
+  }
+  root->RequireLinkedIdentity();
+  return std::move(*root);
+}
+
+void RequireAbsentCgroupChild(const BoundCgroupDirectory& parent,
+                              std::string_view name,
+                              const std::filesystem::path& display_path) {
+  parent.RequireLinkedIdentity();
+  const std::string child_name(name);
+  struct stat status{};
+  if (fstatat(parent.descriptor(), child_name.c_str(), &status,
+              AT_SYMLINK_NOFOLLOW) == 0) {
+    throw CgroupOwnershipMismatch(
+        "a replacement appeared at an absent cgroup path: " +
+        display_path.string());
+  }
+  if (errno != ENOENT) {
+    throw std::runtime_error("inspect absent cgroup path failed for " +
+                             display_path.string() + ": " +
+                             std::strerror(errno));
+  }
+  parent.RequireLinkedIdentity();
+}
+
+struct BoundCgroupScope {
+  BoundCgroupDirectory root;
+  std::optional<BoundCgroupDirectory> simulator;
+  std::optional<BoundCgroupDirectory> controller;
+};
+
+int OpenBoundCgroupFile(
+    const BoundCgroupDirectory& cgroup, std::string_view file, int access_mode,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup file open");
+  if (file.empty() || file == "." || file == ".." ||
+      file.find('/') != std::string_view::npos) {
+    throw std::runtime_error("invalid cgroup control filename: " +
+                             std::string(file));
+  }
+  cgroup.RequireLinkedIdentity();
+  const std::string filename(file);
+  const std::filesystem::path path = cgroup.display_path() / filename;
+  const int descriptor =
+      openat(cgroup.descriptor(), filename.c_str(),
+             access_mode | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0) {
+    const int error = errno;
+    cgroup.RequireLinkedIdentity();
+    throw std::runtime_error("open cgroup file failed for " + path.string() +
+                             ": " + std::strerror(error));
+  }
+  try {
+    struct stat status{};
+    if (fstat(descriptor, &status) != 0) {
+      throw std::runtime_error("inspect cgroup control file failed for " +
+                               path.string() + ": " + std::strerror(errno));
+    }
+    if (!S_ISREG(status.st_mode)) {
+      throw std::runtime_error("cgroup control file is not regular: " +
+                               path.string());
+    }
+    if (CgroupMountId(descriptor) != cgroup.mount_id()) {
+      throw CgroupOwnershipMismatch(
+          "cgroup control file crosses a mount boundary: " + path.string());
+    }
+    cgroup.RequireLinkedIdentity();
+  } catch (...) {
+    static_cast<void>(close(descriptor));
+    throw;
+  }
+  return descriptor;
+}
+
+std::string ReadCgroupFileAt(
+    const BoundCgroupDirectory& cgroup, std::string_view file,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
   RequireCgroupOperationActive(deadline, stop_token, "cgroup file read");
   const std::string filename(file);
-  const int descriptor = openat(cgroup.descriptor(), filename.c_str(),
-                                O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0) {
-    throw std::runtime_error("open cgroup file failed for " +
-                             (cgroup.display_path() / filename).string() +
-                             ": " + std::strerror(errno));
-  }
+  const std::filesystem::path path = cgroup.display_path() / filename;
+  const int descriptor =
+      OpenBoundCgroupFile(cgroup, file, O_RDONLY, deadline, stop_token);
   constexpr std::size_t kMaximumCgroupFileBytes = 1024U * 1024U;
   std::string contents;
   std::array<char, 4096U> buffer{};
   try {
-    struct stat status{};
-    if (fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode)) {
-      throw std::runtime_error("cgroup control file is not regular: " +
-                               (cgroup.display_path() / filename).string());
-    }
-    if (CgroupMountId(descriptor) != cgroup.mount_id()) {
-      throw CgroupOwnershipMismatch(
-          "cgroup control file crosses a mount boundary: " +
-          (cgroup.display_path() / filename).string());
-    }
     for (;;) {
       RequireCgroupOperationActive(deadline, stop_token, "cgroup file read");
       const ssize_t count = read(descriptor, buffer.data(), buffer.size());
@@ -1400,34 +1697,117 @@ std::string ReadCgroupFileAt(const BoundCgroupDirectory& cgroup,
           continue;
         }
         throw std::runtime_error("read cgroup file failed for " +
-                                 (cgroup.display_path() / filename).string() +
-                                 ": " + std::strerror(errno));
+                                 path.string() + ": " + std::strerror(errno));
       }
       if (count == 0) {
         break;
       }
       const std::size_t received = static_cast<std::size_t>(count);
       if (received > kMaximumCgroupFileBytes - contents.size()) {
-        throw std::runtime_error("cgroup file exceeds 1 MiB: " +
-                                 (cgroup.display_path() / filename).string());
+        throw std::runtime_error("cgroup file exceeds 1 MiB: " + path.string());
       }
       contents.append(buffer.data(), received);
     }
+    cgroup.RequireLinkedIdentity();
   } catch (...) {
     static_cast<void>(close(descriptor));
     throw;
   }
   if (close(descriptor) != 0) {
-    throw std::runtime_error("close cgroup file failed for " +
-                             (cgroup.display_path() / filename).string() +
+    throw std::runtime_error("close cgroup file failed for " + path.string() +
                              ": " + std::strerror(errno));
   }
+  cgroup.RequireLinkedIdentity();
   return contents;
+}
+
+class CgroupFileWriteError final : public std::runtime_error {
+ public:
+  CgroupFileWriteError(const std::filesystem::path& path, int error)
+      : std::runtime_error("write cgroup file failed for " + path.string() +
+                           ": " + std::strerror(error)),
+        error_(error) {}
+
+  int error() const { return error_; }
+
+ private:
+  int error_;
+};
+
+void WriteCgroupFileAt(
+    const BoundCgroupDirectory& cgroup, std::string_view file,
+    std::string_view value,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token, "cgroup file write");
+  const std::filesystem::path path = cgroup.display_path() / std::string(file);
+  const int descriptor =
+      OpenBoundCgroupFile(cgroup, file, O_WRONLY, deadline, stop_token);
+  try {
+    ssize_t count = -1;
+    do {
+      RequireCgroupOperationActive(deadline, stop_token, "cgroup file write");
+      count = write(descriptor, value.data(), value.size());
+    } while (count < 0 && errno == EINTR);
+    if (count < 0) {
+      throw CgroupFileWriteError(path, errno);
+    }
+    if (static_cast<std::size_t>(count) != value.size()) {
+      throw std::runtime_error("short write to cgroup file " + path.string());
+    }
+    cgroup.RequireLinkedIdentity();
+  } catch (...) {
+    static_cast<void>(close(descriptor));
+    throw;
+  }
+  if (close(descriptor) != 0) {
+    throw std::runtime_error("close cgroup file failed for " + path.string() +
+                             ": " + std::strerror(errno));
+  }
+  cgroup.RequireLinkedIdentity();
+}
+
+std::set<std::string> ControllerSetAt(
+    const BoundCgroupDirectory& cgroup,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  const std::vector<std::string> values = SplitWhitespace(
+      ReadCgroupFileAt(cgroup, "cgroup.subtree_control", deadline, stop_token));
+  return std::set<std::string>(values.begin(), values.end());
+}
+
+void SetControllersAt(
+    const BoundCgroupDirectory& cgroup,
+    const std::set<std::string>& controllers, char operation,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup controller update");
+  cgroup.RequireLinkedIdentity();
+  if (controllers.empty()) {
+    return;
+  }
+  if (operation != '+' && operation != '-') {
+    throw std::runtime_error("invalid cgroup controller operation");
+  }
+  WriteCgroupFileAt(cgroup, "cgroup.subtree_control",
+                    ControllerRequest(controllers, operation), deadline,
+                    stop_token);
+  const std::set<std::string> after =
+      ControllerSetAt(cgroup, deadline, stop_token);
+  for (const std::string& controller : controllers) {
+    const bool expected = operation == '+';
+    if (after.contains(controller) != expected) {
+      throw std::runtime_error("cgroup controller " + controller +
+                               " read-back verification failed at " +
+                               cgroup.display_path().string());
+    }
+  }
 }
 
 std::vector<pid_t> BoundCgroupPids(
     const BoundCgroupDirectory& cgroup,
-    std::chrono::steady_clock::time_point deadline,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
     std::stop_token stop_token) {
   std::vector<pid_t> pids;
   for (const std::string& text : SplitWhitespace(
@@ -1442,6 +1822,59 @@ std::vector<pid_t> BoundCgroupPids(
     pids.push_back(pid);
   }
   return pids;
+}
+
+void MoveCgroupProcesses(
+    const BoundCgroupDirectory& source, const BoundCgroupDirectory& destination,
+    std::string_view context,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    RequireCgroupOperationActive(deadline, stop_token, context);
+    source.RequireLinkedIdentity();
+    destination.RequireLinkedIdentity();
+    const std::vector<pid_t> pids =
+        BoundCgroupPids(source, deadline, stop_token);
+    if (pids.empty()) {
+      source.RequireLinkedIdentity();
+      destination.RequireLinkedIdentity();
+      return;
+    }
+    for (const pid_t pid : pids) {
+      RequireCgroupOperationActive(deadline, stop_token, context);
+      try {
+        WriteCgroupFileAt(destination, "cgroup.procs", std::to_string(pid),
+                          deadline, stop_token);
+      } catch (const CgroupFileWriteError& error) {
+        if (error.error() != ESRCH) {
+          throw;
+        }
+        source.RequireLinkedIdentity();
+        destination.RequireLinkedIdentity();
+      }
+    }
+    source.RequireLinkedIdentity();
+    destination.RequireLinkedIdentity();
+    const bool source_empty =
+        BoundCgroupPids(source, deadline, stop_token).empty();
+    destination.RequireLinkedIdentity();
+    if (source_empty) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto delay =
+        deadline
+            ? std::min(std::chrono::milliseconds(20),
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           *deadline - now))
+            : std::chrono::milliseconds(20);
+    if (delay > std::chrono::milliseconds::zero()) {
+      std::this_thread::sleep_for(delay);
+    }
+  }
+  throw std::runtime_error(
+      std::string(context) +
+      "; source cgroup still has processes: " + source.display_path().string());
 }
 
 bool BoundCgroupPopulated(const BoundCgroupDirectory& cgroup,
@@ -1763,46 +2196,6 @@ bool WaitForFrozenState(const Cgroup& cgroup, bool expected) {
   return false;
 }
 
-void MoveCgroupProcesses(const std::filesystem::path& source,
-                         const std::filesystem::path& destination,
-                         std::string_view context,
-                         std::optional<std::chrono::steady_clock::time_point>
-                             deadline = std::nullopt,
-                         std::stop_token stop_token = {}) {
-  for (int attempt = 0; attempt < 20; ++attempt) {
-    RequireCgroupOperationActive(deadline, stop_token, context);
-    const std::vector<std::string> pids =
-        SplitWhitespace(ReadText(source / "cgroup.procs"));
-    if (pids.empty()) {
-      return;
-    }
-    for (const std::string& pid : pids) {
-      try {
-        WriteText(destination / "cgroup.procs", pid);
-      } catch (const std::exception&) {
-        // A PID can exit between reading cgroup.procs and writing it.
-      }
-    }
-    if (CgroupProcsEmpty(source)) {
-      return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const auto delay =
-        deadline
-            ? std::min(std::chrono::milliseconds(20),
-                       std::chrono::duration_cast<std::chrono::milliseconds>(
-                           *deadline - now))
-            : std::chrono::milliseconds(20);
-    if (delay > std::chrono::milliseconds::zero()) {
-      std::this_thread::sleep_for(delay);
-    }
-  }
-
-  throw std::runtime_error(
-      std::string(context) +
-      "; source cgroup still has processes: " + source.string());
-}
-
 void CreateCgroupDirectoryExclusive(const std::filesystem::path& path,
                                     std::string_view kind) {
   std::error_code ec;
@@ -1815,22 +2208,6 @@ void CreateCgroupDirectoryExclusive(const std::filesystem::path& path,
   if (!created) {
     throw std::runtime_error("refusing to adopt pre-existing " +
                              std::string(kind) + " cgroup: " + path.string());
-  }
-}
-
-void RemoveCgroupDirectory(const std::filesystem::path& path,
-                           std::string_view kind) {
-  std::error_code ec;
-  const bool removed = std::filesystem::remove(path, ec);
-  if (ec) {
-    throw std::runtime_error("remove " + std::string(kind) +
-                             " cgroup failed for " + path.string() + ": " +
-                             ec.message());
-  }
-  if (!removed) {
-    throw std::runtime_error(
-        std::string(kind) +
-        " cgroup disappeared during removal: " + path.string());
   }
 }
 
@@ -1902,6 +2279,8 @@ void RemoveBoundCgroupDirectory(BoundCgroupDirectory* cgroup,
         "acquired cgroup identity changed before removal: " +
         cgroup->display_path().string());
   }
+  // Linux has no compare-identity form of rmdir/unlinkat. The final linked
+  // identity validation and this unlinkat therefore cannot be one atomic step.
   if (unlinkat(cgroup->parent_descriptor(), cgroup->name().c_str(),
                AT_REMOVEDIR) != 0) {
     throw std::runtime_error("remove acquired cgroup failed for " +
@@ -1988,17 +2367,11 @@ void RemoveBoundCgroupDescendants(
 }
 
 std::optional<BoundCgroupDirectory> AcquireRunCgroup(
-    const CgroupScopeConfig& config, int scope_root_descriptor,
-    const std::string& run_id,
+    const BoundCgroupDirectory& simulator, const std::string& run_id,
     std::optional<CgroupPathIdentity> expected_identity) {
-  const CgroupPaths paths = CgroupPathsForScope(config, run_id);
-  std::optional<BoundCgroupDirectory> simulator = BoundCgroupDirectory::TryOpen(
-      scope_root_descriptor, config.simulator_name, paths.simulator);
-  if (!simulator) {
-    return std::nullopt;
-  }
-  return BoundCgroupDirectory::TryOpen(simulator->descriptor(), run_id,
-                                       paths.run, expected_identity);
+  return BoundCgroupDirectory::TryOpen(simulator.descriptor(), run_id,
+                                       simulator.display_path() / run_id,
+                                       expected_identity);
 }
 
 void RemoveRunCgroup(BoundCgroupDirectory* run,
@@ -2016,19 +2389,6 @@ void RemoveRunCgroup(BoundCgroupDirectory* run,
   RemoveBoundCgroupDescendants(run, 0U, deadline, stop_token);
   KillBoundCgroupProcesses(*run, deadline, stop_token);
   RemoveBoundCgroupDirectory(run, deadline, stop_token);
-}
-
-void RemoveRunCgroup(const CgroupScopeConfig& config, int scope_root_descriptor,
-                     const std::string& run_id,
-                     std::optional<CgroupPathIdentity> expected_identity,
-                     std::chrono::steady_clock::time_point deadline,
-                     std::stop_token stop_token) {
-  RequireCgroupOperationActive(deadline, stop_token, "run cgroup removal");
-  std::optional<BoundCgroupDirectory> run = AcquireRunCgroup(
-      config, scope_root_descriptor, run_id, expected_identity);
-  if (run) {
-    RemoveRunCgroup(&*run, deadline, stop_token);
-  }
 }
 
 bool ScopeStateExists(const CgroupScopeConfig& config) {
@@ -2054,131 +2414,416 @@ bool IsResourceCgroupName(std::string_view name) {
   });
 }
 
-void RecordExistingResourceCgroups(const std::filesystem::path& simulator,
-                                   CgroupScopeState* state) {
-  if (!std::filesystem::exists(simulator)) {
-    return;
-  }
-  std::error_code error;
-  std::filesystem::directory_iterator iterator(simulator, error);
-  const std::filesystem::directory_iterator end;
-  if (error) {
-    throw std::runtime_error("list simulator cgroups failed for " +
-                             simulator.string() + ": " + error.message());
-  }
-  while (iterator != end) {
-    const std::string name = iterator->path().filename().string();
-    if (IsResourceCgroupName(name) && iterator->is_directory(error)) {
-      state->active_runs.insert(name);
-    }
-    if (error) {
-      throw std::runtime_error("inspect simulator cgroup failed for " +
-                               iterator->path().string() + ": " +
-                               error.message());
-    }
-    iterator.increment(error);
-    if (error) {
-      throw std::runtime_error("list simulator cgroups failed for " +
-                               simulator.string() + ": " + error.message());
-    }
+void RequireScopeChildName(std::string_view name, std::string_view kind) {
+  if (name.empty() || name == "." || name == ".." ||
+      name.find('/') != std::string_view::npos) {
+    throw std::runtime_error("invalid " + std::string(kind) +
+                             " cgroup name: " + std::string(name));
   }
 }
 
-CgroupScopeState NewCgroupScopeState(const CgroupScopeConfig& config) {
-  const CgroupPaths paths = CgroupPathsForScope(config, "state-probe");
-  std::error_code error;
-  const std::filesystem::file_status simulator_status =
-      std::filesystem::symlink_status(paths.simulator, error);
-  const bool simulator_missing =
-      error == std::errc::no_such_file_or_directory ||
-      (!error &&
-       simulator_status.type() == std::filesystem::file_type::not_found);
-  if (error && error != std::errc::no_such_file_or_directory) {
-    throw std::runtime_error("inspect simulator cgroup failed for " +
-                             paths.simulator.string() + ": " + error.message());
-  }
-  const bool simulator_preexisting = !simulator_missing;
-  if (simulator_preexisting &&
-      !std::filesystem::is_directory(simulator_status)) {
-    throw std::runtime_error("simulator cgroup path is not a real directory: " +
-                             paths.simulator.string());
-  }
-
-  RequireControllersAvailable(paths.root, {"cpu", "io", "memory", "pids"});
-  const std::set<std::string> desired = DesiredControllers(paths.root);
-  CgroupScopeState state{
-      .root = paths.root,
-      .simulator_name = config.simulator_name,
-      .controller_name =
-          std::string(kOwnedControllerPrefix) + RandomScopeToken(),
-      .simulator_preexisting = simulator_preexisting,
-      .root_controllers_before =
-          ControllerSet(paths.root / "cgroup.subtree_control"),
-      .simulator_controllers_before =
-          simulator_preexisting
-              ? ControllerSet(paths.simulator / "cgroup.subtree_control")
-              : std::set<std::string>{},
-      .root_controllers_added = {},
-      .simulator_controllers_added = {},
-      .active_runs = {},
-      .run_bindings = {},
-      .pending_run = std::nullopt,
-      .pending_run_created = false,
-  };
-  state.root_controllers_added =
-      SetDifference(desired, state.root_controllers_before);
-  state.simulator_controllers_added =
-      SetDifference(desired, state.simulator_controllers_before);
-  RecordExistingResourceCgroups(paths.simulator, &state);
-  return state;
+std::optional<BoundCgroupDirectory> AcquireBoundScopeChild(
+    const BoundCgroupDirectory& parent, const std::string& name,
+    const std::filesystem::path& display_path,
+    const std::optional<CgroupDirectoryIdentity>& expected_identity) {
+  RequireScopeChildName(name, "scope");
+  return BoundCgroupDirectory::TryOpen(
+      parent.descriptor(), name, display_path,
+      expected_identity
+          ? std::optional<CgroupPathIdentity>(expected_identity->path)
+          : std::nullopt,
+      expected_identity
+          ? std::optional<std::uint64_t>(expected_identity->mount_id)
+          : std::nullopt);
 }
 
-void StartCgroupScope(const CgroupScopeConfig& config,
-                      const CgroupScopeState& state) {
-  const CgroupPaths paths = CgroupPathsForScope(config, "state-probe");
-  if (!config.allow_root_process_move &&
-      !state.root_controllers_added.empty()) {
+void CreateCgroupDirectoryExclusiveAt(const BoundCgroupDirectory& parent,
+                                      const std::string& name,
+                                      std::string_view kind) {
+  RequireScopeChildName(name, kind);
+  parent.RequireLinkedIdentity();
+  if (mkdirat(parent.descriptor(), name.c_str(), 0777) != 0) {
+    if (errno == EEXIST) {
+      throw std::runtime_error(
+          "refusing to adopt pre-existing " + std::string(kind) +
+          " cgroup: " + (parent.display_path() / name).string());
+    }
     throw std::runtime_error(
-        "native cgroup root unexpectedly requires controller mutation at " +
-        paths.root.string() + ": " +
-        ControllerList(state.root_controllers_added));
+        "create " + std::string(kind) + " cgroup failed for " +
+        (parent.display_path() / name).string() + ": " + std::strerror(errno));
   }
-  if (!state.simulator_preexisting) {
-    CreateCgroupDirectoryExclusive(paths.simulator, "simulator");
-  }
-  if (config.allow_root_process_move) {
-    const std::filesystem::path controller =
-        paths.simulator / state.controller_name;
-    CreateCgroupDirectoryExclusive(controller, "controller");
-    if (!CgroupProcsEmpty(paths.root)) {
-      MoveCgroupProcesses(paths.root, controller,
-                          "could not delegate cgroup root");
-    }
-    SetControllers(paths.root, state.root_controllers_added, '+');
-  }
-  RequireControllersAvailable(paths.simulator, {"cpu", "io", "memory", "pids"});
-  SetControllers(paths.simulator, state.simulator_controllers_added, '+');
+  parent.RequireLinkedIdentity();
 }
 
-void RequireControllersPreserved(const std::filesystem::path& directory,
-                                 const std::set<std::string>& before,
-                                 const std::set<std::string>& added) {
+std::set<std::string> ControllerFileSetAt(
+    const BoundCgroupDirectory& cgroup, std::string_view file,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}) {
+  const std::vector<std::string> values =
+      SplitWhitespace(ReadCgroupFileAt(cgroup, file, deadline, stop_token));
+  return std::set<std::string>(values.begin(), values.end());
+}
+
+std::set<std::string> DesiredControllersAt(
+    const BoundCgroupDirectory& cgroup,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}) {
+  const std::set<std::string> available =
+      ControllerFileSetAt(cgroup, "cgroup.controllers", deadline, stop_token);
+  std::set<std::string> desired;
+  for (std::string_view controller : {"cpu", "io", "memory", "pids"}) {
+    if (available.contains(std::string(controller))) {
+      desired.emplace(controller);
+    }
+  }
+  return desired;
+}
+
+void RequireControllersAvailableAt(
+    const BoundCgroupDirectory& cgroup,
+    std::initializer_list<std::string_view> required_controllers,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}) {
+  const std::set<std::string> available =
+      ControllerFileSetAt(cgroup, "cgroup.controllers", deadline, stop_token);
+  for (const std::string_view required : required_controllers) {
+    if (!available.contains(std::string(required))) {
+      throw std::runtime_error("required cgroup controller unavailable at " +
+                               cgroup.display_path().string() + ": " +
+                               std::string(required));
+    }
+  }
+}
+
+void EnableControllersAt(const BoundCgroupDirectory& cgroup,
+                         std::optional<std::chrono::steady_clock::time_point>
+                             deadline = std::nullopt,
+                         std::stop_token stop_token = {}) {
+  SetControllersAt(cgroup, DesiredControllersAt(cgroup, deadline, stop_token),
+                   '+', deadline, stop_token);
+}
+
+void RequireControllersPreservedAt(
+    const BoundCgroupDirectory& cgroup, const std::set<std::string>& before,
+    const std::set<std::string>& added,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
   const std::set<std::string> after =
-      ControllerSet(directory / "cgroup.subtree_control");
+      ControllerSetAt(cgroup, deadline, stop_token);
   for (const std::string& controller : before) {
     if (!after.contains(controller)) {
       throw std::runtime_error(
           "pre-existing cgroup controller disappeared at " +
-          directory.string() + ": " + controller);
+          cgroup.display_path().string() + ": " + controller);
     }
   }
   for (const std::string& controller : added) {
     if (after.contains(controller)) {
       throw std::runtime_error(
           "BBP-added cgroup controller survived cleanup at " +
-          directory.string() + ": " + controller);
+          cgroup.display_path().string() + ": " + controller);
     }
   }
+}
+
+void ValidateScopeControllerPlan(
+    const CgroupScopeState& state, const BoundCgroupDirectory& root,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  const std::set<std::string> desired =
+      DesiredControllersAt(root, deadline, stop_token);
+  if (state.root_controllers_added !=
+          SetDifference(desired, state.root_controllers_before) ||
+      state.simulator_controllers_added !=
+          SetDifference(desired, state.simulator_controllers_before)) {
+    throw std::runtime_error("cgroup scope root controller state is invalid");
+  }
+}
+
+void RequireBoundScopeHierarchy(const CgroupScopeConfig& config,
+                                const CgroupScopeState& state,
+                                const BoundCgroupScope& scope) {
+  scope.root.RequireLinkedIdentity();
+  if (!state.root_identity ||
+      scope.root.directory_identity() != *state.root_identity) {
+    throw CgroupOwnershipMismatch(
+        "cgroup scope root identity no longer matches durable state");
+  }
+  const std::filesystem::path simulator_path =
+      config.root / config.simulator_name;
+  if (scope.simulator) {
+    scope.simulator->RequireLinkedIdentity();
+    if (!state.simulator_identity ||
+        scope.simulator->directory_identity() != *state.simulator_identity) {
+      throw CgroupOwnershipMismatch(
+          "cgroup scope simulator identity no longer matches durable state");
+    }
+  } else {
+    RequireAbsentCgroupChild(scope.root, config.simulator_name, simulator_path);
+  }
+
+  if (!state.controller_expected) {
+    if (scope.controller || state.controller_identity) {
+      throw CgroupOwnershipMismatch(
+          "cgroup scope has an unexpected owned controller identity");
+    }
+    return;
+  }
+  if (!scope.simulator) {
+    return;
+  }
+  const std::filesystem::path controller_path =
+      simulator_path / state.controller_name;
+  if (scope.controller) {
+    scope.controller->RequireLinkedIdentity();
+    if (!state.controller_identity ||
+        scope.controller->directory_identity() != *state.controller_identity) {
+      throw CgroupOwnershipMismatch(
+          "cgroup scope controller identity no longer matches durable state");
+    }
+  } else {
+    RequireAbsentCgroupChild(*scope.simulator, state.controller_name,
+                             controller_path);
+  }
+}
+
+BoundCgroupScope BindNewCgroupScope(const CgroupScopeConfig& config,
+                                    const CgroupScopeLock& scope_lock) {
+  RequireScopeChildName(config.simulator_name, "simulator");
+  BoundCgroupDirectory root =
+      AcquireBoundScopeRoot(config, scope_lock, std::nullopt);
+  std::optional<BoundCgroupDirectory> simulator =
+      AcquireBoundScopeChild(root, config.simulator_name,
+                             config.root / config.simulator_name, std::nullopt);
+  return BoundCgroupScope{
+      .root = std::move(root),
+      .simulator = std::move(simulator),
+      .controller = std::nullopt,
+  };
+}
+
+BoundCgroupScope BindCgroupScope(
+    const CgroupScopeConfig& config, const CgroupScopeLock& scope_lock,
+    CgroupScopeState* state,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt,
+    std::stop_token stop_token = {}) {
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope identity binding");
+  RequireScopeChildName(config.simulator_name, "simulator");
+  const bool legacy = state->legacy_scope_identities;
+  if (legacy && state->active_runs.empty() && !state->pending_run) {
+    throw CgroupOwnershipMismatch(
+        "refusing identity-less legacy cgroup scope restoration");
+  }
+  BoundCgroupDirectory root = AcquireBoundScopeRoot(
+      config, scope_lock, legacy ? std::nullopt : state->root_identity);
+  std::optional<BoundCgroupDirectory> simulator = AcquireBoundScopeChild(
+      root, config.simulator_name, config.root / config.simulator_name,
+      legacy ? std::nullopt : state->simulator_identity);
+  const bool scope_in_use =
+      !state->active_runs.empty() || state->pending_run.has_value();
+  if (!legacy && !state->simulator_identity && simulator) {
+    throw CgroupOwnershipMismatch(
+        "refusing to adopt an identity-less simulator cgroup");
+  }
+  if (!simulator &&
+      (legacy || state->simulator_preexisting || scope_in_use ||
+       (state->simulator_identity && !state->restoration_ready))) {
+    throw CgroupOwnershipMismatch(
+        "expected cgroup scope simulator identity disappeared");
+  }
+
+  std::optional<BoundCgroupDirectory> controller;
+  if (legacy && simulator) {
+    controller = AcquireBoundScopeChild(
+        *simulator, state->controller_name,
+        simulator->display_path() / state->controller_name, std::nullopt);
+    if (!controller && !state->root_controllers_added.empty()) {
+      throw CgroupOwnershipMismatch(
+          "legacy cgroup scope cannot prove its historical controller mode");
+    }
+    state->controller_expected = controller.has_value();
+  } else if (state->controller_expected && simulator) {
+    controller = AcquireBoundScopeChild(
+        *simulator, state->controller_name,
+        simulator->display_path() / state->controller_name,
+        legacy ? std::nullopt : state->controller_identity);
+    if (!legacy && !state->controller_identity && controller) {
+      throw CgroupOwnershipMismatch(
+          "refusing to adopt an identity-less scope controller cgroup");
+    }
+    if (!controller &&
+        (legacy || scope_in_use ||
+         (state->controller_identity && !state->restoration_ready))) {
+      throw CgroupOwnershipMismatch(
+          "expected cgroup scope controller identity disappeared");
+    }
+  }
+
+  BoundCgroupScope scope{
+      .root = std::move(root),
+      .simulator = std::move(simulator),
+      .controller = std::move(controller),
+  };
+  ValidateScopeControllerPlan(*state, scope.root, deadline, stop_token);
+  if (legacy) {
+    if (!scope.simulator || (state->controller_expected && !scope.controller)) {
+      throw CgroupOwnershipMismatch(
+          "legacy cgroup scope hierarchy is incomplete");
+    }
+    std::set<std::string> expected_runs = state->active_runs;
+    if (state->pending_run_created) {
+      expected_runs.insert(*state->pending_run);
+    }
+    for (const std::string& run_id : expected_runs) {
+      const auto binding = state->run_bindings.find(run_id);
+      const std::optional<CgroupPathIdentity> expected_identity =
+          binding == state->run_bindings.end()
+              ? std::nullopt
+              : std::optional<CgroupPathIdentity>(
+                    binding->second.cgroup_identity);
+      if (!AcquireRunCgroup(*scope.simulator, run_id, expected_identity)) {
+        throw CgroupOwnershipMismatch(
+            "legacy cgroup scope run disappeared before identity migration: " +
+            run_id);
+      }
+    }
+    state->root_identity = scope.root.directory_identity();
+    state->simulator_identity = scope.simulator->directory_identity();
+    state->controller_identity =
+        scope.controller ? std::optional<CgroupDirectoryIdentity>(
+                               scope.controller->directory_identity())
+                         : std::nullopt;
+    state->restoration_ready = false;
+    state->legacy_scope_identities = false;
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup scope identity migration");
+    WriteCgroupScopeState(config.state_file, *state);
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup scope identity migration");
+  }
+  RequireBoundScopeHierarchy(config, *state, scope);
+  return scope;
+}
+
+void RecordExistingResourceCgroups(const BoundCgroupDirectory& simulator,
+                                   CgroupScopeState* state) {
+  for (const std::string& name : BoundCgroupDirectoryNames(
+           simulator, std::chrono::steady_clock::time_point::max(), {})) {
+    if (!IsResourceCgroupName(name)) {
+      continue;
+    }
+    struct stat status{};
+    if (fstatat(simulator.descriptor(), name.c_str(), &status,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno == ENOENT) {
+        throw CgroupOwnershipMismatch(
+            "resource cgroup disappeared while recording scope state: " +
+            (simulator.display_path() / name).string());
+      }
+      throw std::runtime_error("inspect simulator resource cgroup failed for " +
+                               (simulator.display_path() / name).string() +
+                               ": " + std::strerror(errno));
+    }
+    if (S_ISDIR(status.st_mode)) {
+      state->active_runs.insert(name);
+    }
+  }
+  simulator.RequireLinkedIdentity();
+}
+
+CgroupScopeState NewCgroupScopeState(const CgroupScopeConfig& config,
+                                     const BoundCgroupScope& scope) {
+  RequireControllersAvailableAt(scope.root, {"cpu", "io", "memory", "pids"});
+  const std::set<std::string> desired = DesiredControllersAt(scope.root);
+  CgroupScopeState state{
+      .root = config.root,
+      .simulator_name = config.simulator_name,
+      .controller_name =
+          std::string(kOwnedControllerPrefix) + RandomScopeToken(),
+      .simulator_preexisting = scope.simulator.has_value(),
+      .controller_expected = config.allow_root_process_move,
+      .restoration_ready = false,
+      .root_identity = scope.root.directory_identity(),
+      .simulator_identity = scope.simulator
+                                ? std::optional<CgroupDirectoryIdentity>(
+                                      scope.simulator->directory_identity())
+                                : std::nullopt,
+      .controller_identity = std::nullopt,
+      .root_controllers_before = ControllerSetAt(scope.root, std::nullopt, {}),
+      .simulator_controllers_before =
+          scope.simulator ? ControllerSetAt(*scope.simulator, std::nullopt, {})
+                          : std::set<std::string>{},
+      .root_controllers_added = {},
+      .simulator_controllers_added = {},
+      .active_runs = {},
+      .run_bindings = {},
+      .pending_run = std::nullopt,
+      .pending_run_created = false,
+      .legacy_scope_identities = false,
+  };
+  state.root_controllers_added =
+      SetDifference(desired, state.root_controllers_before);
+  state.simulator_controllers_added =
+      SetDifference(desired, state.simulator_controllers_before);
+  if (!config.allow_root_process_move &&
+      !state.root_controllers_added.empty()) {
+    throw std::runtime_error(
+        "native cgroup root unexpectedly requires controller mutation at " +
+        config.root.string() + ": " +
+        ControllerList(state.root_controllers_added));
+  }
+  if (scope.simulator) {
+    RecordExistingResourceCgroups(*scope.simulator, &state);
+  }
+  return state;
+}
+
+void StartCgroupScope(const CgroupScopeConfig& config, CgroupScopeState* state,
+                      BoundCgroupScope* scope) {
+  RequireBoundScopeHierarchy(config, *state, *scope);
+  if (!scope->simulator) {
+    CreateCgroupDirectoryExclusiveAt(scope->root, config.simulator_name,
+                                     "simulator");
+    scope->simulator = AcquireBoundScopeChild(
+        scope->root, config.simulator_name, config.root / config.simulator_name,
+        std::nullopt);
+    if (!scope->simulator) {
+      throw CgroupOwnershipMismatch(
+          "new simulator cgroup disappeared during acquisition");
+    }
+    state->simulator_identity = scope->simulator->directory_identity();
+    WriteCgroupScopeState(config.state_file, *state);
+    RequireBoundScopeHierarchy(config, *state, *scope);
+  }
+  if (state->controller_expected) {
+    CreateCgroupDirectoryExclusiveAt(*scope->simulator, state->controller_name,
+                                     "controller");
+    scope->controller = AcquireBoundScopeChild(
+        *scope->simulator, state->controller_name,
+        scope->simulator->display_path() / state->controller_name,
+        std::nullopt);
+    if (!scope->controller) {
+      throw CgroupOwnershipMismatch(
+          "new scope controller disappeared during acquisition");
+    }
+    state->controller_identity = scope->controller->directory_identity();
+    WriteCgroupScopeState(config.state_file, *state);
+    RequireBoundScopeHierarchy(config, *state, *scope);
+    MoveCgroupProcesses(scope->root, *scope->controller,
+                        "could not delegate cgroup root", std::nullopt, {});
+    SetControllersAt(scope->root, state->root_controllers_added, '+',
+                     std::nullopt, {});
+  }
+  RequireControllersAvailableAt(*scope->simulator,
+                                {"cpu", "io", "memory", "pids"});
+  SetControllersAt(*scope->simulator, state->simulator_controllers_added, '+',
+                   std::nullopt, {});
+  RequireBoundScopeHierarchy(config, *state, *scope);
 }
 
 void RemoveScopeStateFile(const CgroupScopeConfig& config) {
@@ -2193,59 +2838,168 @@ void RemoveScopeStateFile(const CgroupScopeConfig& config) {
         "cgroup scope state absence read-back failed for " +
         config.state_file.string());
   }
+  SyncCgroupScopeStateDirectory(config.state_file, "removal");
+}
+
+void RequireNoCgroupDirectoryChildren(
+    const BoundCgroupDirectory& cgroup,
+    const std::optional<std::string>& allowed_child,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  for (const std::string& name :
+       BoundCgroupDirectoryNames(cgroup, deadline, stop_token)) {
+    struct stat status{};
+    if (fstatat(cgroup.descriptor(), name.c_str(), &status,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno == ENOENT) {
+        throw CgroupOwnershipMismatch(
+            "cgroup child disappeared during emptiness verification: " +
+            (cgroup.display_path() / name).string());
+      }
+      throw std::runtime_error("inspect cgroup child failed for " +
+                               (cgroup.display_path() / name).string() + ": " +
+                               std::strerror(errno));
+    }
+    if (S_ISDIR(status.st_mode) && (!allowed_child || name != *allowed_child)) {
+      throw std::runtime_error(
+          "refusing to restore a cgroup scope with an unexpected child: " +
+          (cgroup.display_path() / name).string());
+    }
+  }
+  cgroup.RequireLinkedIdentity();
 }
 
 void RestoreCgroupScope(const CgroupScopeConfig& config,
-                        const CgroupScopeState& state,
+                        CgroupScopeState* state, BoundCgroupScope* scope,
                         std::optional<std::chrono::steady_clock::time_point>
                             deadline = std::nullopt,
                         std::stop_token stop_token = {}) {
-  if (!state.active_runs.empty() || !state.run_bindings.empty() ||
-      state.pending_run) {
+  if (!state->active_runs.empty() || !state->run_bindings.empty() ||
+      state->pending_run) {
     throw std::runtime_error(
         "refusing to restore cgroup scope while owned runs remain");
   }
-  RequireCgroupOperationActive(deadline, stop_token,
-                               "cgroup scope restoration");
-  const CgroupPaths paths = CgroupPathsForScope(config, "state-probe");
-  const std::filesystem::path controller =
-      paths.simulator / state.controller_name;
-  if (std::filesystem::exists(paths.simulator)) {
-    SetControllers(paths.simulator, state.simulator_controllers_added, '-');
-  } else if (state.simulator_preexisting) {
-    throw std::runtime_error("pre-existing simulator cgroup disappeared: " +
-                             paths.simulator.string());
+  if (state->legacy_scope_identities) {
+    throw CgroupOwnershipMismatch(
+        "refusing to restore a cgroup scope without durable identities");
   }
   RequireCgroupOperationActive(deadline, stop_token,
                                "cgroup scope restoration");
-  SetControllers(paths.root, state.root_controllers_added, '-');
-  RequireCgroupOperationActive(deadline, stop_token,
-                               "cgroup scope restoration");
-  if (std::filesystem::exists(controller)) {
-    MoveCgroupProcesses(controller, paths.root,
-                        "could not restore cgroup-root processes", deadline,
-                        stop_token);
+  const std::filesystem::path controller =
+      config.root / config.simulator_name / state->controller_name;
+  RequireBoundScopeHierarchy(config, *state, *scope);
+#ifdef BBP_ENABLE_TEST_HOOKS
+  if (cgroup_removal_identity_hook) {
+    cgroup_removal_identity_hook(
+        CgroupRemovalTestPhase::kAfterScopeHierarchyIdentityVerification,
+        controller);
+  }
+#endif
+  RequireBoundScopeHierarchy(config, *state, *scope);
+
+  const std::chrono::steady_clock::time_point bound_deadline =
+      deadline.value_or(std::chrono::steady_clock::time_point::max());
+  const auto remove_scope_directory = [&](BoundCgroupDirectory* directory) {
+    try {
+      RemoveBoundCgroupDirectory(directory, bound_deadline, stop_token);
+    } catch (...) {
+      const std::exception_ptr removal_failure = std::current_exception();
+      try {
+        RequireBoundScopeHierarchy(config, *state, *scope);
+      } catch (const CgroupOwnershipMismatch&) {
+        throw;
+      } catch (...) {
+      }
+      std::rethrow_exception(removal_failure);
+    }
+  };
+  if (!state->restoration_ready) {
+    if (scope->simulator) {
+      SetControllersAt(*scope->simulator, state->simulator_controllers_added,
+                       '-', deadline, stop_token);
+    }
     RequireCgroupOperationActive(deadline, stop_token,
                                  "cgroup scope restoration");
-    RemoveCgroupDirectory(controller, "controller");
+    SetControllersAt(scope->root, state->root_controllers_added, '-', deadline,
+                     stop_token);
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup scope restoration");
+    if (scope->controller) {
+      MoveCgroupProcesses(*scope->controller, scope->root,
+                          "could not restore cgroup-root processes", deadline,
+                          stop_token);
+      if (!BoundCgroupPids(*scope->controller, deadline, stop_token).empty() ||
+          BoundCgroupPopulated(*scope->controller, bound_deadline,
+                               stop_token)) {
+        throw std::runtime_error(
+            "scope controller remained populated after process restoration: " +
+            scope->controller->display_path().string());
+      }
+      RequireNoCgroupDirectoryChildren(*scope->controller, std::nullopt,
+                                       bound_deadline, stop_token);
+    }
+    RequireControllersPreservedAt(scope->root, state->root_controllers_before,
+                                  state->root_controllers_added, deadline,
+                                  stop_token);
+    if (scope->simulator) {
+      RequireControllersPreservedAt(
+          *scope->simulator, state->simulator_controllers_before,
+          state->simulator_controllers_added, deadline, stop_token);
+      if (!state->simulator_preexisting) {
+        if (!BoundCgroupPids(*scope->simulator, deadline, stop_token).empty() ||
+            BoundCgroupPopulated(*scope->simulator, bound_deadline,
+                                 stop_token)) {
+          throw std::runtime_error(
+              "owned simulator cgroup remained populated during restoration: " +
+              scope->simulator->display_path().string());
+        }
+        RequireNoCgroupDirectoryChildren(
+            *scope->simulator,
+            scope->controller
+                ? std::optional<std::string>(state->controller_name)
+                : std::nullopt,
+            bound_deadline, stop_token);
+      }
+    }
+    RequireBoundScopeHierarchy(config, *state, *scope);
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup restoration-ready checkpoint");
+    state->restoration_ready = true;
+    WriteCgroupScopeState(config.state_file, *state);
+    RequireCgroupOperationActive(deadline, stop_token,
+                                 "cgroup restoration-ready checkpoint");
+    RequireBoundScopeHierarchy(config, *state, *scope);
+  }
+
+  RequireCgroupOperationActive(deadline, stop_token,
+                               "cgroup scope restoration");
+  if (scope->controller) {
+    remove_scope_directory(&*scope->controller);
+    scope->controller.reset();
+    RequireBoundScopeHierarchy(config, *state, *scope);
   }
   RequireCgroupOperationActive(deadline, stop_token,
                                "cgroup scope restoration");
-  if (!state.simulator_preexisting &&
-      std::filesystem::exists(paths.simulator)) {
-    RemoveCgroupDirectory(paths.simulator, "simulator");
+  if (!state->simulator_preexisting && scope->simulator) {
+    remove_scope_directory(&*scope->simulator);
+    scope->simulator.reset();
+  }
+  RequireBoundScopeHierarchy(config, *state, *scope);
+  RequireControllersPreservedAt(scope->root, state->root_controllers_before,
+                                state->root_controllers_added, deadline,
+                                stop_token);
+  if (state->simulator_preexisting) {
+    if (!scope->simulator) {
+      throw CgroupOwnershipMismatch(
+          "pre-existing simulator disappeared during scope restoration");
+    }
+    RequireControllersPreservedAt(
+        *scope->simulator, state->simulator_controllers_before,
+        state->simulator_controllers_added, deadline, stop_token);
   }
   RequireCgroupOperationActive(deadline, stop_token,
                                "cgroup scope restoration");
-  RequireControllersPreserved(paths.root, state.root_controllers_before,
-                              state.root_controllers_added);
-  if (state.simulator_preexisting) {
-    RequireControllersPreserved(paths.simulator,
-                                state.simulator_controllers_before,
-                                state.simulator_controllers_added);
-  }
-  RequireCgroupOperationActive(deadline, stop_token,
-                               "cgroup scope restoration");
+  RequireBoundScopeHierarchy(config, *state, *scope);
   // State-file unlink is the restoration commit point. Once it is absent, the
   // scope is fully restored and cancellation belongs to the caller's next work.
   RemoveScopeStateFile(config);
@@ -2262,7 +3016,7 @@ std::string CurrentExceptionText() {
 }
 
 void RecoverInterruptedCgroupPreparation(const CgroupScopeConfig& config,
-                                         int scope_root_descriptor,
+                                         BoundCgroupScope* scope,
                                          CgroupScopeState* state) {
   if (!state->pending_run) {
     return;
@@ -2273,19 +3027,24 @@ void RecoverInterruptedCgroupPreparation(const CgroupScopeConfig& config,
       throw std::runtime_error(
           "refusing recovery deletion for an unbound pending run cgroup");
     }
-    const std::filesystem::path run_cgroup =
-        CgroupPathsForScope(config, *state->pending_run).run;
     if (DirectoryIdentity(binding->second.run_root, "run root") !=
-            binding->second.run_root_identity ||
-        DirectoryIdentity(run_cgroup, "run cgroup") !=
-            binding->second.cgroup_identity) {
+        binding->second.run_root_identity) {
       throw std::runtime_error(
           "refusing recovery deletion for a replaced pending run resource");
     }
-    RemoveRunCgroup(config, scope_root_descriptor, *state->pending_run,
-                    binding->second.cgroup_identity,
-                    std::chrono::steady_clock::now() + std::chrono::seconds(10),
-                    {});
+    if (!scope->simulator) {
+      throw CgroupOwnershipMismatch(
+          "pending run simulator identity disappeared before recovery");
+    }
+    std::optional<BoundCgroupDirectory> run =
+        AcquireRunCgroup(*scope->simulator, *state->pending_run,
+                         binding->second.cgroup_identity);
+    if (!run) {
+      throw CgroupOwnershipMismatch(
+          "pending run cgroup disappeared before recovery");
+    }
+    RemoveRunCgroup(
+        &*run, std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
   }
   state->run_bindings.erase(*state->pending_run);
   state->pending_run.reset();
@@ -2314,34 +3073,33 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
         .cgroup_identity = {},
     };
   }
-  if (!std::filesystem::exists(config.root / "cgroup.controllers")) {
-    throw std::runtime_error("cgroup v2 is not mounted at " +
-                             config.root.string());
-  }
   CgroupScopeLock scope_lock(config.root);
   if (!config.allow_root_process_move) {
     RequireNativeCgroupRoot(config.root);
   }
-  const CgroupPaths requested_paths = CgroupPathsForScope(config, run_id);
   const bool scope_state_exists = ScopeStateExists(config);
-  if (!scope_state_exists && std::filesystem::exists(requested_paths.run)) {
-    throw std::runtime_error("refusing to adopt pre-existing run cgroup: " +
-                             requested_paths.run.string());
-  }
   std::optional<CgroupScopeState> state;
-  bool run_created = false;
+  std::optional<BoundCgroupScope> scope;
+  std::optional<BoundCgroupDirectory> created_run;
   bool attempted_run = false;
   bool scope_published = false;
   std::optional<CgroupPathIdentity> created_run_identity;
   try {
     if (scope_state_exists) {
       state = LoadCgroupScopeState(config);
-      RecoverInterruptedCgroupPreparation(config, scope_lock.descriptor(),
-                                          &*state);
+      scope.emplace(BindCgroupScope(config, scope_lock, &*state));
+      RecoverInterruptedCgroupPreparation(config, &*scope, &*state);
       for (auto iterator = state->active_runs.begin();
            iterator != state->active_runs.end();) {
-        if (!std::filesystem::exists(
-                CgroupPathsForScope(config, *iterator).run)) {
+        const auto binding = state->run_bindings.find(*iterator);
+        const std::optional<CgroupPathIdentity> expected_identity =
+            binding == state->run_bindings.end()
+                ? std::nullopt
+                : std::optional<CgroupPathIdentity>(
+                      binding->second.cgroup_identity);
+        std::optional<BoundCgroupDirectory> existing =
+            AcquireRunCgroup(*scope->simulator, *iterator, expected_identity);
+        if (!existing) {
           state->run_bindings.erase(*iterator);
           iterator = state->active_runs.erase(iterator);
         } else {
@@ -2350,12 +3108,14 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
       }
       if (state->active_runs.empty()) {
         WriteCgroupScopeState(config.state_file, *state);
-        RestoreCgroupScope(config, *state);
+        RestoreCgroupScope(config, &*state, &*scope);
         state.reset();
+        scope.reset();
       }
     }
     if (!state) {
-      state = NewCgroupScopeState(config);
+      scope.emplace(BindNewCgroupScope(config, scope_lock));
+      state = NewCgroupScopeState(config, *scope);
       if (state->active_runs.contains(run_id)) {
         throw std::runtime_error(
             "refusing to adopt pre-existing run cgroup: " +
@@ -2363,7 +3123,7 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
       }
       WriteCgroupScopeState(config.state_file, *state);
       scope_published = true;
-      StartCgroupScope(config, *state);
+      StartCgroupScope(config, &*state, &*scope);
     }
     if (state->active_runs.contains(run_id)) {
       throw std::runtime_error(
@@ -2374,18 +3134,26 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
     state->pending_run_created = false;
     WriteCgroupScopeState(config.state_file, *state);
 
-    const CgroupPaths paths = CgroupPathsForScope(config, run_id);
-    CreateCgroupDirectoryExclusive(paths.run, "run");
-    run_created = true;
-    created_run_identity = DirectoryIdentity(paths.run, "run cgroup");
+    if (!scope->simulator) {
+      throw CgroupOwnershipMismatch(
+          "simulator cgroup disappeared before run creation");
+    }
+    CreateCgroupDirectoryExclusiveAt(*scope->simulator, run_id, "run");
+    created_run = AcquireRunCgroup(*scope->simulator, run_id, std::nullopt);
+    if (!created_run) {
+      throw CgroupOwnershipMismatch(
+          "new run cgroup disappeared during acquisition");
+    }
+    created_run_identity = created_run->directory_identity().path;
     if (run_binding) {
       run_binding->cgroup_identity = *created_run_identity;
       state->run_bindings.emplace(run_id, *run_binding);
     }
     state->pending_run_created = true;
     WriteCgroupScopeState(config.state_file, *state);
-    RequireControllersAvailable(paths.run, {"cpu", "io", "memory", "pids"});
-    EnableControllers(paths.run);
+    RequireControllersAvailableAt(*created_run,
+                                  {"cpu", "io", "memory", "pids"});
+    EnableControllersAt(*created_run);
     state->active_runs.insert(run_id);
     state->pending_run.reset();
     state->pending_run_created = false;
@@ -2394,11 +3162,12 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
     const std::string original = CurrentExceptionText();
     std::optional<std::string> rollback_error;
     try {
-      if (state && (attempted_run || scope_published)) {
-        if (run_created) {
+      if (state && scope && (attempted_run || scope_published)) {
+        if (created_run) {
           RemoveRunCgroup(
-              config, scope_lock.descriptor(), run_id, created_run_identity,
+              &*created_run,
               std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+          created_run.reset();
         }
         if (attempted_run) {
           state->active_runs.erase(run_id);
@@ -2410,7 +3179,7 @@ void PrepareRunInScope(const CgroupScopeConfig& config,
         }
         WriteCgroupScopeState(config.state_file, *state);
         if (state->active_runs.empty()) {
-          RestoreCgroupScope(config, *state);
+          RestoreCgroupScope(config, &*state, &*scope);
         }
       }
     } catch (...) {
@@ -2456,11 +3225,20 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
   CgroupScopeState state = verify_ownership(
       "cgroup scope ownership state could not be verified",
       [&] { return LoadCgroupScopeState(config, deadline, stop_token); });
+  BoundCgroupScope scope = verify_ownership(
+      "cgroup scope hierarchy identity could not be verified", [&] {
+        return BindCgroupScope(config, scope_lock, &state, deadline,
+                               stop_token);
+      });
   if (!state.active_runs.contains(run_id) && state.pending_run != run_id) {
-    const std::filesystem::path run_cgroup =
-        CgroupPathsForScope(config, run_id).run;
-    if (std::filesystem::exists(run_cgroup) ||
-        state.run_bindings.contains(run_id)) {
+    std::optional<BoundCgroupDirectory> unexpected_run;
+    if (scope.simulator) {
+      unexpected_run =
+          verify_ownership("absent run cgroup path could not be verified", [&] {
+            return AcquireRunCgroup(*scope.simulator, run_id, std::nullopt);
+          });
+    }
+    if (unexpected_run || state.run_bindings.contains(run_id)) {
       throw CgroupOwnershipMismatch(
           "refusing to remove a run cgroup absent from scope ownership "
           "state: " +
@@ -2479,7 +3257,7 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
       }
     }
     if (state.active_runs.empty() && !state.pending_run) {
-      RestoreCgroupScope(config, state, deadline, stop_token);
+      RestoreCgroupScope(config, &state, &scope, deadline, stop_token);
     }
     return;
   }
@@ -2519,7 +3297,11 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
           : std::optional<CgroupPathIdentity>(binding->second.cgroup_identity);
   std::optional<BoundCgroupDirectory> run =
       verify_ownership("bound run cgroup identity could not be verified", [&] {
-        return AcquireRunCgroup(config, scope_lock.descriptor(), run_id,
+        if (!scope.simulator) {
+          throw CgroupOwnershipMismatch(
+              "run cgroup simulator identity disappeared");
+        }
+        return AcquireRunCgroup(*scope.simulator, run_id,
                                 expected_cgroup_identity);
       });
   if (run) {
@@ -2533,7 +3315,7 @@ void RemoveRunInScope(const CgroupScopeConfig& config,
   state.run_bindings.erase(run_id);
   WriteCgroupScopeState(config.state_file, state);
   if (state.active_runs.empty() && !state.pending_run) {
-    RestoreCgroupScope(config, state, deadline, stop_token);
+    RestoreCgroupScope(config, &state, &scope, deadline, stop_token);
   }
 }
 

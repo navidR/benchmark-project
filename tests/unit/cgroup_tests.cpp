@@ -1400,6 +1400,132 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    cgroup_scope_cleanup_refuses_a_post_run_controller_replacement) {
+  std::unique_ptr<PreparedRunGuard> delegated_parent =
+      PreparePrivilegedTestRun(UniqueRunId("swap-parent"));
+  if (!delegated_parent) {
+    return;
+  }
+  const std::string suffix = UniqueRunId("scope-replacement");
+  const std::filesystem::path scope_root =
+      std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
+  const std::filesystem::path simulator = scope_root / "bbp";
+  const std::filesystem::path state_file = TestDirectory(suffix + "-state");
+  const std::string run_id = "scope-replacement-run";
+  std::error_code error;
+  std::filesystem::remove(state_file, error);
+  error.clear();
+  if (!std::filesystem::create_directory(scope_root, error)) {
+    BOOST_TEST_MESSAGE(
+        "skipping real cgroup scope replacement test: " << error.message());
+    return;
+  }
+
+  const bbp::CgroupScopeTestConfig config{
+      .root = scope_root,
+      .simulator_name = "bbp",
+      .state_file = state_file,
+  };
+  try {
+    bbp::PrepareCgroupRunInTestScope(config, run_id);
+  } catch (const std::exception& failure) {
+    BOOST_TEST_MESSAGE(
+        "skipping real cgroup scope replacement test: " << failure.what());
+    std::filesystem::remove(state_file, error);
+    error.clear();
+    std::filesystem::remove(scope_root, error);
+    return;
+  }
+
+  CgroupRemovalHookGuard hook_guard;
+  std::filesystem::path replacement_controller;
+  struct stat replacement_identity{};
+  bool replacement_installed = false;
+  const std::string root_controllers_before =
+      bbp::ReadText(scope_root / "cgroup.subtree_control");
+  const std::string simulator_controllers_before =
+      bbp::ReadText(simulator / "cgroup.subtree_control");
+  const auto remove_test_hierarchy = [&] {
+    bbp::SetCgroupRemovalIdentityHookForTest({});
+    if (replacement_controller.empty()) {
+      try {
+        bbp::RemoveCgroupRunInTestScope(config, run_id);
+      } catch (const std::exception&) {
+      }
+    }
+    std::error_code ignored;
+    if (!replacement_controller.empty()) {
+      std::filesystem::remove(replacement_controller, ignored);
+      ignored.clear();
+    }
+    std::filesystem::remove(simulator / run_id, ignored);
+    ignored.clear();
+    std::filesystem::remove(simulator, ignored);
+    ignored.clear();
+    std::filesystem::remove(scope_root, ignored);
+    ignored.clear();
+    std::filesystem::remove(state_file, ignored);
+  };
+
+  try {
+    bbp::SetCgroupRemovalIdentityHookForTest(
+        [&](bbp::CgroupRemovalTestPhase phase,
+            const std::filesystem::path& verified_path) {
+          if (phase != bbp::CgroupRemovalTestPhase::
+                           kAfterScopeHierarchyIdentityVerification) {
+            return;
+          }
+          if (verified_path.parent_path() != simulator ||
+              std::filesystem::exists(simulator / run_id)) {
+            throw std::runtime_error(
+                "scope restoration hook ran at an unexpected boundary");
+          }
+          if (!bbp::SplitWhitespace(
+                   bbp::ReadText(verified_path / "cgroup.procs"))
+                   .empty()) {
+            throw std::runtime_error(
+                "scope restoration replacement controller is populated");
+          }
+          replacement_controller = verified_path;
+          if (!std::filesystem::remove(replacement_controller) ||
+              !std::filesystem::create_directory(replacement_controller)) {
+            throw std::runtime_error(
+                "could not install the replacement scope controller");
+          }
+          if (stat(replacement_controller.c_str(), &replacement_identity) !=
+              0) {
+            throw std::runtime_error(
+                "could not record the replacement scope controller identity");
+          }
+          replacement_installed = true;
+        });
+
+    BOOST_CHECK_THROW(bbp::RemoveCgroupRunInTestScope(config, run_id),
+                      bbp::CgroupOwnershipMismatch);
+    bbp::SetCgroupRemovalIdentityHookForTest({});
+
+    BOOST_REQUIRE(replacement_installed);
+    struct stat retained_identity{};
+    BOOST_REQUIRE(stat(replacement_controller.c_str(), &retained_identity) ==
+                  0);
+    BOOST_TEST(retained_identity.st_dev == replacement_identity.st_dev);
+    BOOST_TEST(retained_identity.st_ino == replacement_identity.st_ino);
+    BOOST_TEST(std::filesystem::exists(state_file));
+    BOOST_TEST(bbp::ReadText(scope_root / "cgroup.subtree_control") ==
+               root_controllers_before);
+    BOOST_TEST(bbp::ReadText(simulator / "cgroup.subtree_control") ==
+               simulator_controllers_before);
+
+    remove_test_hierarchy();
+    BOOST_TEST(!std::filesystem::exists(scope_root));
+    BOOST_TEST(!std::filesystem::exists(state_file));
+  } catch (...) {
+    remove_test_hierarchy();
+    throw;
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
     cgroup_scope_restores_processes_and_controller_state_once) {
   std::unique_ptr<PreparedRunGuard> delegated_parent =
       PreparePrivilegedTestRun(UniqueRunId("scope-parent"));

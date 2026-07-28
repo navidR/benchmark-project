@@ -151,6 +151,7 @@ class Cgroup {
 enum class CgroupRemovalTestPhase {
   kAfterRunIdentityVerification,
   kAfterDescendantIdentityVerification,
+  kAfterScopeHierarchyIdentityVerification,
 };
 
 struct CgroupScopeTestConfig {
