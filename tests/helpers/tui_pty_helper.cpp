@@ -1018,20 +1018,33 @@ std::set<std::filesystem::path> NativeLauncherPaths() {
 
 #ifdef BBP_FIRO_GUI_LAUNCHER
 std::filesystem::path LauncherPathFromOutput(std::string_view output) {
-  constexpr std::string_view prefix = "/tmp/bbp-firo-qt-";
-  constexpr std::size_t random_length = 6U;
-  constexpr std::string_view suffix = ".sh";
+  constexpr std::string_view prefix = "/proc/";
+  constexpr std::string_view descriptor_component = "/fd/";
   const std::size_t begin = output.find(prefix);
   if (begin == std::string_view::npos) {
     return {};
   }
-  const std::size_t length = prefix.size() + random_length + suffix.size();
-  if (begin + length > output.size() ||
-      output.substr(begin + prefix.size() + random_length, suffix.size()) !=
-          suffix) {
+  const std::size_t pid_begin = begin + prefix.size();
+  const std::size_t pid_end = output.find(descriptor_component, pid_begin);
+  const std::string_view pid =
+      pid_end == std::string_view::npos
+          ? std::string_view{}
+          : output.substr(pid_begin, pid_end - pid_begin);
+  if (pid_end == std::string_view::npos || pid_end == pid_begin ||
+      !std::all_of(pid.begin(), pid.end(),
+                   [](char value) { return value >= '0' && value <= '9'; })) {
     return {};
   }
-  return std::string(output.substr(begin, length));
+  const std::size_t descriptor_begin = pid_end + descriptor_component.size();
+  std::size_t descriptor_end = descriptor_begin;
+  while (descriptor_end < output.size() && output[descriptor_end] >= '0' &&
+         output[descriptor_end] <= '9') {
+    ++descriptor_end;
+  }
+  if (descriptor_end == descriptor_begin) {
+    return {};
+  }
+  return std::string(output.substr(begin, descriptor_end - begin));
 }
 
 std::pair<std::string, std::filesystem::path> ReadLauncherDialog(

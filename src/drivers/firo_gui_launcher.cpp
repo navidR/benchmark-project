@@ -2,8 +2,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <linux/fs.h>
-#include <sys/random.h>
+#include <linux/memfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -13,7 +12,6 @@
 #include <boost/json/value.hpp>
 #include <cerrno>
 #include <chrono>
-#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -28,11 +26,23 @@
 namespace bbp {
 namespace {
 
-constexpr std::string_view kFiroQtLauncherTemplate =
-    "/tmp/bbp-firo-qt-XXXXXX.sh";
+constexpr std::string_view kFiroQtLauncherDescriptorName =
+    "bbp-firo-qt-launcher";
 constexpr std::size_t kMaximumFiroQtLauncherCommandBytes = 1024U * 1024U;
-constexpr std::size_t kFiroQtLauncherCleanupRandomBytes = 16U;
-constexpr std::size_t kFiroQtLauncherCleanupAttempts = 8U;
+constexpr int kRequiredFiroQtLauncherSeals =
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+#ifdef MFD_EXEC
+constexpr unsigned int kFiroQtLauncherMemfdExecFlag = MFD_EXEC;
+#else
+// Linux UAPI value since 6.3. An older running kernel rejects it with EINVAL.
+constexpr unsigned int kFiroQtLauncherMemfdExecFlag = 0x0010U;
+#endif
+#ifdef F_SEAL_EXEC
+constexpr int kFiroQtLauncherExecSeal = F_SEAL_EXEC;
+#else
+// Linux UAPI value since 6.3. An older running kernel rejects it with EINVAL.
+constexpr int kFiroQtLauncherExecSeal = 0x0020;
+#endif
 
 #ifdef BBP_ENABLE_TEST_HOOKS
 FiroQtLauncherCleanupTestHook firo_qt_launcher_cleanup_test_hook;
@@ -51,48 +61,13 @@ class ScopedDescriptor {
   ScopedDescriptor& operator=(const ScopedDescriptor&) = delete;
 
   [[nodiscard]] int get() const { return descriptor_; }
+  [[nodiscard]] int release() { return std::exchange(descriptor_, -1); }
 
  private:
   int descriptor_ = -1;
 };
 
-class FiroQtLauncherCleanupFailure final : public std::exception {
- public:
-  [[nodiscard]] const char* what() const noexcept override {
-    return "Firo-Qt launcher creation cleanup could not be verified";
-  }
-};
-
 [[noreturn]] void ThrowSystemError(std::string_view operation);
-
-std::string RandomFiroQtLauncherCleanupName() {
-  std::array<unsigned char, kFiroQtLauncherCleanupRandomBytes> bytes{};
-  std::size_t offset = 0U;
-  while (offset < bytes.size()) {
-    const ssize_t count =
-        getrandom(bytes.data() + offset, bytes.size() - offset, 0U);
-    if (count < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      ThrowSystemError("generate Firo-Qt launcher cleanup identity");
-    }
-    if (count == 0) {
-      throw std::runtime_error(
-          "generate Firo-Qt launcher cleanup identity made no progress");
-    }
-    offset += static_cast<std::size_t>(count);
-  }
-
-  constexpr char kHex[] = "0123456789abcdef";
-  std::string name = ".bbp-firo-qt-cleanup-";
-  name.reserve(name.size() + bytes.size() * 2U);
-  for (const unsigned char byte : bytes) {
-    name.push_back(kHex[byte >> 4U]);
-    name.push_back(kHex[byte & 0x0fU]);
-  }
-  return name;
-}
 
 std::string RequiredLauncherString(const boost::json::object& object,
                                    std::string_view field) {
@@ -338,6 +313,41 @@ void WriteAll(int descriptor, std::string_view content) {
   }
 }
 
+bool DescriptorHasExactContent(int descriptor, std::string_view expected) {
+  std::array<char, 4096U> buffer{};
+  std::size_t offset = 0U;
+  while (offset < expected.size()) {
+    const std::size_t requested =
+        std::min(buffer.size(), expected.size() - offset);
+    const ssize_t count = read(descriptor, buffer.data(), requested);
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      ThrowSystemError("read sealed Firo-Qt launcher");
+    }
+    if (count == 0) {
+      return false;
+    }
+    const std::size_t bytes = static_cast<std::size_t>(count);
+    if (!std::equal(buffer.data(), buffer.data() + bytes,
+                    expected.data() + offset)) {
+      return false;
+    }
+    offset += bytes;
+  }
+
+  char extra = '\0';
+  ssize_t count = 0;
+  do {
+    count = read(descriptor, &extra, 1U);
+  } while (count < 0 && errno == EINTR);
+  if (count < 0) {
+    ThrowSystemError("read sealed Firo-Qt launcher end");
+  }
+  return count == 0;
+}
+
 ParsedFiroQtLauncherCommand FiroQtLauncherCommandFromReport(
     const boost::json::object& report,
     std::optional<std::string_view> required_node_id) {
@@ -530,12 +540,13 @@ FiroQtLauncherAuthority ResolveLauncherAuthority(
 
 OwnedFiroQtLauncher::OwnedFiroQtLauncher(std::filesystem::path path,
                                          std::uintmax_t device,
-                                         std::uintmax_t inode,
-                                         int descriptor) noexcept
+                                         std::uintmax_t inode, int descriptor,
+                                         int seals) noexcept
     : path_(std::move(path)),
       device_(device),
       inode_(inode),
       descriptor_(descriptor),
+      seals_(seals),
       active_(true) {}
 
 OwnedFiroQtLauncher::OwnedFiroQtLauncher(OwnedFiroQtLauncher&& other) noexcept
@@ -543,9 +554,11 @@ OwnedFiroQtLauncher::OwnedFiroQtLauncher(OwnedFiroQtLauncher&& other) noexcept
       device_(other.device_),
       inode_(other.inode_),
       descriptor_(std::exchange(other.descriptor_, -1)),
+      seals_(other.seals_),
       active_(std::exchange(other.active_, false)) {
   other.device_ = 0U;
   other.inode_ = 0U;
+  other.seals_ = 0;
   other.path_.clear();
 }
 
@@ -559,9 +572,11 @@ OwnedFiroQtLauncher& OwnedFiroQtLauncher::operator=(
   device_ = other.device_;
   inode_ = other.inode_;
   descriptor_ = std::exchange(other.descriptor_, -1);
+  seals_ = other.seals_;
   active_ = std::exchange(other.active_, false);
   other.device_ = 0U;
   other.inode_ = 0U;
+  other.seals_ = 0;
   other.path_.clear();
   return *this;
 }
@@ -577,70 +592,109 @@ OwnedFiroQtLauncher OwnedFiroQtLauncher::Create(
     throw std::invalid_argument("Firo-Qt shell command contains NUL");
   }
 
-  std::vector<char> path_template(kFiroQtLauncherTemplate.begin(),
-                                  kFiroQtLauncherTemplate.end());
-  path_template.push_back('\0');
-  int descriptor = mkostemps(path_template.data(), 3, O_CLOEXEC);
-  if (descriptor < 0) {
-    ThrowSystemError("create Firo-Qt launcher");
+  constexpr unsigned int kMemfdFlags =
+      MFD_CLOEXEC | MFD_ALLOW_SEALING | kFiroQtLauncherMemfdExecFlag;
+  int writable_descriptor = static_cast<int>(syscall(
+      SYS_memfd_create, kFiroQtLauncherDescriptorName.data(), kMemfdFlags));
+  if (writable_descriptor < 0 && errno == EINVAL) {
+    // MFD_EXEC was added after memfd_create. Kernels predating it create
+    // executable memfds by default.
+    writable_descriptor = static_cast<int>(
+        syscall(SYS_memfd_create, kFiroQtLauncherDescriptorName.data(),
+                MFD_CLOEXEC | MFD_ALLOW_SEALING));
   }
-  struct stat created_status{};
-  int inspect_result = 0;
+  if (writable_descriptor < 0) {
+    ThrowSystemError("create anonymous Firo-Qt launcher");
+  }
+  ScopedDescriptor writable(writable_descriptor);
+
+  int descriptor_flags = 0;
   do {
-    inspect_result = fstat(descriptor, &created_status);
-  } while (inspect_result != 0 && errno == EINTR);
-  if (inspect_result != 0) {
-    static_cast<void>(close(descriptor));
-    throw FiroQtLauncherCleanupFailure();
+    descriptor_flags = fcntl(writable.get(), F_GETFD);
+  } while (descriptor_flags < 0 && errno == EINTR);
+  if (descriptor_flags < 0) {
+    ThrowSystemError("protect anonymous Firo-Qt launcher descriptor");
   }
-  std::filesystem::path path;
-  try {
-    path = std::filesystem::path(path_template.data());
-  } catch (...) {
-    static_cast<void>(close(descriptor));
-    throw FiroQtLauncherCleanupFailure();
+  if ((descriptor_flags & FD_CLOEXEC) == 0) {
+    throw std::runtime_error(
+        "anonymous Firo-Qt launcher descriptor is not close-on-exec");
+  }
+  const std::string content =
+      "#!/bin/bash\nexec " + std::string(shell_command) + "\n";
+  WriteAll(writable.get(), content);
+  int sync_result = 0;
+  do {
+    sync_result = fsync(writable.get());
+  } while (sync_result != 0 && errno == EINTR);
+  if (sync_result != 0) {
+    ThrowSystemError("sync anonymous Firo-Qt launcher");
+  }
+  if (fchmod(writable.get(), S_IRWXU) != 0) {
+    ThrowSystemError("set anonymous Firo-Qt launcher permissions");
+  }
+
+  int requested_seals = kRequiredFiroQtLauncherSeals | kFiroQtLauncherExecSeal;
+  if (fcntl(writable.get(), F_ADD_SEALS, requested_seals) != 0) {
+    if (errno != EINVAL ||
+        fcntl(writable.get(), F_ADD_SEALS, kRequiredFiroQtLauncherSeals) != 0) {
+      ThrowSystemError("seal anonymous Firo-Qt launcher");
+    }
+    requested_seals = kRequiredFiroQtLauncherSeals;
+  }
+  const std::string local_descriptor_path =
+      "/proc/self/fd/" + std::to_string(writable.get());
+  const int read_only_descriptor =
+      open(local_descriptor_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (read_only_descriptor < 0) {
+    ThrowSystemError("reopen anonymous Firo-Qt launcher read-only");
+  }
+  ScopedDescriptor read_only(read_only_descriptor);
+
+  struct stat created_status{};
+  if (fstat(read_only.get(), &created_status) != 0) {
+    ThrowSystemError("inspect anonymous Firo-Qt launcher");
+  }
+  int applied_seals = 0;
+  do {
+    applied_seals = fcntl(read_only.get(), F_GET_SEALS);
+  } while (applied_seals < 0 && errno == EINTR);
+  if (applied_seals < 0) {
+    ThrowSystemError("inspect anonymous Firo-Qt launcher seals");
+  }
+  if (!S_ISREG(created_status.st_mode) ||
+      (created_status.st_mode & 07777) != S_IRWXU ||
+      (applied_seals & requested_seals) != requested_seals ||
+      !DescriptorHasExactContent(read_only.get(), content)) {
+    throw std::runtime_error(
+        "anonymous Firo-Qt launcher identity, mode, seals, or content are "
+        "invalid");
+  }
+  const int read_only_flags = fcntl(read_only.get(), F_GETFL);
+  const int read_only_descriptor_flags = fcntl(read_only.get(), F_GETFD);
+  if (read_only_flags < 0 || (read_only_flags & O_ACCMODE) != O_RDONLY ||
+      read_only_descriptor_flags < 0 ||
+      (read_only_descriptor_flags & FD_CLOEXEC) == 0) {
+    throw std::runtime_error(
+        "anonymous Firo-Qt launcher read descriptor is not protected");
+  }
+
+  std::filesystem::path path = std::filesystem::path("/proc") /
+                               std::to_string(getpid()) / "fd" /
+                               std::to_string(read_only.get());
+  struct stat published_status{};
+  if (stat(path.c_str(), &published_status) != 0 ||
+      published_status.st_dev != created_status.st_dev ||
+      published_status.st_ino != created_status.st_ino) {
+    throw std::runtime_error(
+        "anonymous Firo-Qt launcher proc descriptor is unavailable");
   }
 
   OwnedFiroQtLauncher launcher(
       std::move(path), static_cast<std::uintmax_t>(created_status.st_dev),
-      static_cast<std::uintmax_t>(created_status.st_ino), descriptor);
-  descriptor = -1;
-
-  try {
-    const int descriptor_flags = fcntl(launcher.descriptor_, F_GETFD);
-    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0) {
-      ThrowSystemError("protect Firo-Qt launcher descriptor");
-    }
-    const std::string content =
-        "#!/bin/bash\nexec " + std::string(shell_command) + "\n";
-    WriteAll(launcher.descriptor_, content);
-    if (fsync(launcher.descriptor_) != 0) {
-      ThrowSystemError("sync Firo-Qt launcher");
-    }
-    if (fchmod(launcher.descriptor_, S_IRWXU) != 0) {
-      ThrowSystemError("set Firo-Qt launcher permissions");
-    }
-    struct stat status{};
-    if (fstat(launcher.descriptor_, &status) != 0) {
-      ThrowSystemError("inspect Firo-Qt launcher");
-    }
-    if (!S_ISREG(status.st_mode) || (status.st_mode & 07777) != S_IRWXU) {
-      throw std::runtime_error(
-          "Firo-Qt launcher is not a regular mode-0700 file");
-    }
-    return launcher;
-  } catch (...) {
-    const std::exception_ptr creation_error = std::current_exception();
-    try {
-      if (launcher.Cleanup() ==
-          FiroQtLauncherCleanupResult::kOwnershipChanged) {
-        throw FiroQtLauncherCleanupFailure();
-      }
-    } catch (...) {
-      throw FiroQtLauncherCleanupFailure();
-    }
-    std::rethrow_exception(creation_error);
-  }
+      static_cast<std::uintmax_t>(created_status.st_ino), read_only.get(),
+      applied_seals);
+  static_cast<void>(read_only.release());
+  return launcher;
 }
 
 FiroQtLauncherCleanupResult OwnedFiroQtLauncher::Cleanup() {
@@ -666,212 +720,67 @@ FiroQtLauncherCleanupResult OwnedFiroQtLauncher::CleanupImpl(
   }
   RequireLauncherCleanupActive(deadline, stop_token);
 
-  const std::filesystem::path parent = path_.parent_path();
-  const std::string public_name = path_.filename().string();
-  if (parent.empty() || public_name.empty()) {
-    throw std::runtime_error(
-        "owned Firo-Qt launcher has no cleanup parent or filename");
-  }
-  const int parent_descriptor =
-      open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  if (parent_descriptor < 0) {
-    ThrowSystemError("open owned Firo-Qt launcher cleanup directory");
-  }
-  const ScopedDescriptor parent_guard(parent_descriptor);
-  RequireLauncherCleanupActive(deadline, stop_token);
-
-  const auto resolve_missing_public_launcher = [&](std::string_view operation) {
+  const auto inspect_descriptor = [&] {
     struct stat descriptor_status{};
-    if (fstat(descriptor_, &descriptor_status) != 0) {
+    int inspect_result = 0;
+    do {
+      inspect_result = fstat(descriptor_, &descriptor_status);
+    } while (inspect_result != 0 && errno == EINTR);
+    if (inspect_result != 0) {
       const int descriptor_error = errno;
+      descriptor_ = -1;
       ResetOwnership();
       throw std::system_error(descriptor_error, std::generic_category(),
-                              "inspect missing Firo-Qt launcher descriptor");
+                              "inspect anonymous Firo-Qt launcher descriptor");
     }
-    if (static_cast<std::uintmax_t>(descriptor_status.st_dev) != device_ ||
+    if (!S_ISREG(descriptor_status.st_mode) ||
+        static_cast<std::uintmax_t>(descriptor_status.st_dev) != device_ ||
         static_cast<std::uintmax_t>(descriptor_status.st_ino) != inode_) {
+      descriptor_ = -1;
       ResetOwnership();
-      throw std::runtime_error(
-          "missing Firo-Qt launcher descriptor identity changed");
+      return false;
     }
-    if (descriptor_status.st_nlink == 0U) {
+    int current_seals = 0;
+    do {
+      current_seals = fcntl(descriptor_, F_GET_SEALS);
+    } while (current_seals < 0 && errno == EINTR);
+    if (current_seals < 0) {
+      const int seal_error = errno;
+      descriptor_ = -1;
       ResetOwnership();
-      return FiroQtLauncherCleanupResult::kAlreadyAbsent;
+      throw std::system_error(seal_error, std::generic_category(),
+                              "inspect anonymous Firo-Qt launcher seals");
     }
-    ResetOwnership();
-    throw std::runtime_error(std::string(operation) +
-                             " while the owned file remains linked");
+    if (current_seals != seals_ ||
+        (current_seals & kRequiredFiroQtLauncherSeals) !=
+            kRequiredFiroQtLauncherSeals) {
+      descriptor_ = -1;
+      ResetOwnership();
+      return false;
+    }
+    return true;
   };
-
-  struct stat status{};
-  if (fstatat(parent_guard.get(), public_name.c_str(), &status,
-              AT_SYMLINK_NOFOLLOW) != 0) {
-    if (errno == ENOENT) {
-      return resolve_missing_public_launcher(
-          "public Firo-Qt launcher disappeared before cleanup");
-    }
-    ThrowSystemError("inspect owned Firo-Qt launcher during cleanup");
-  }
-  if (!S_ISREG(status.st_mode) ||
-      static_cast<std::uintmax_t>(status.st_dev) != device_ ||
-      static_cast<std::uintmax_t>(status.st_ino) != inode_) {
-    ResetOwnership();
+  if (!inspect_descriptor()) {
     return FiroQtLauncherCleanupResult::kOwnershipChanged;
   }
 
 #ifdef BBP_ENABLE_TEST_HOOKS
   if (firo_qt_launcher_cleanup_test_hook) {
     firo_qt_launcher_cleanup_test_hook(
-        FiroQtLauncherCleanupTestPhase::kAfterPublicIdentityCheck, path_,
+        FiroQtLauncherCleanupTestPhase::kBeforeDescriptorRelease, path_,
         std::nullopt);
   }
 #endif
 
   RequireLauncherCleanupActive(deadline, stop_token);
-
-  std::filesystem::path public_path = path_;
-  bool captured = false;
-  for (std::size_t attempt = 0U; attempt < kFiroQtLauncherCleanupAttempts;
-       ++attempt) {
-    RequireLauncherCleanupActive(deadline, stop_token);
-    const std::string quarantine_name = RandomFiroQtLauncherCleanupName();
-    std::filesystem::path quarantine_path = parent / quarantine_name;
-    if (syscall(SYS_renameat2, parent_guard.get(), public_name.c_str(),
-                parent_guard.get(), quarantine_name.c_str(),
-                RENAME_NOREPLACE) == 0) {
-      path_.swap(quarantine_path);
-      captured = true;
-      break;
-    }
-    const int error = errno;
-    if (error == EEXIST) {
-      continue;
-    }
-    if (error == ENOENT) {
-      return resolve_missing_public_launcher(
-          "public Firo-Qt launcher disappeared during atomic capture");
-    }
-    if (error == ENOSYS || error == EINVAL || error == EOPNOTSUPP) {
-      throw std::runtime_error(
-          "identity-safe Firo-Qt launcher cleanup is unsupported: " +
-          std::error_code(error, std::generic_category()).message());
-    }
-    throw std::system_error(error, std::generic_category(),
-                            "atomically capture owned Firo-Qt launcher");
-  }
-  if (!captured) {
-    throw std::runtime_error(
-        "could not reserve a Firo-Qt launcher cleanup quarantine");
+  if (!inspect_descriptor()) {
+    return FiroQtLauncherCleanupResult::kOwnershipChanged;
   }
 
-#ifdef BBP_ENABLE_TEST_HOOKS
-  if (firo_qt_launcher_cleanup_test_hook) {
-    firo_qt_launcher_cleanup_test_hook(
-        FiroQtLauncherCleanupTestPhase::kAfterAtomicCapture, public_path,
-        path_);
-  }
-#endif
-
-  RequireLauncherCleanupActive(deadline, stop_token);
-
-  const std::string quarantine_name = path_.filename().string();
-  if (fstatat(parent_guard.get(), quarantine_name.c_str(), &status,
-              AT_SYMLINK_NOFOLLOW) != 0) {
-    const int path_error = errno;
-    if (path_error == ENOENT) {
-      struct stat descriptor_status{};
-      if (fstat(descriptor_, &descriptor_status) != 0) {
-        const int descriptor_error = errno;
-        ResetOwnership();
-        throw std::system_error(
-            descriptor_error, std::generic_category(),
-            "inspect missing quarantined Firo-Qt launcher descriptor");
-      }
-      if (static_cast<std::uintmax_t>(descriptor_status.st_dev) != device_ ||
-          static_cast<std::uintmax_t>(descriptor_status.st_ino) != inode_) {
-        ResetOwnership();
-        throw std::runtime_error(
-            "missing quarantined Firo-Qt launcher descriptor identity "
-            "changed");
-      }
-      if (descriptor_status.st_nlink == 0U) {
-        ResetOwnership();
-        return FiroQtLauncherCleanupResult::kAlreadyAbsent;
-      }
-      ResetOwnership();
-      throw std::runtime_error(
-          "quarantined Firo-Qt launcher disappeared while the owned file "
-          "remains linked");
-    }
-    errno = path_error;
-    ThrowSystemError("inspect quarantined Firo-Qt launcher during cleanup");
-  }
-  if (!S_ISREG(status.st_mode) ||
-      static_cast<std::uintmax_t>(status.st_dev) != device_ ||
-      static_cast<std::uintmax_t>(status.st_ino) != inode_) {
-    if (syscall(SYS_renameat2, parent_guard.get(), quarantine_name.c_str(),
-                parent_guard.get(), public_name.c_str(),
-                RENAME_NOREPLACE) == 0) {
-      ResetOwnership();
-      return FiroQtLauncherCleanupResult::kOwnershipChanged;
-    }
-    const int error = errno;
-    const std::filesystem::path preserved_foreign = path_;
-    ResetOwnership();
-    throw std::runtime_error(
-        "could not restore a foreign Firo-Qt launcher from " +
-        preserved_foreign.string() + ": " +
-        std::error_code(error, std::generic_category()).message());
-  }
-
-  RequireLauncherCleanupActive(deadline, stop_token);
-  // Quarantine unlink is the cancellation commit point. After exact identity
-  // revalidation, complete removal without reporting a late cancellation.
-#ifdef BBP_ENABLE_TEST_HOOKS
-  if (firo_qt_launcher_cleanup_test_hook) {
-    firo_qt_launcher_cleanup_test_hook(
-        FiroQtLauncherCleanupTestPhase::kBeforeQuarantineUnlink, public_path,
-        path_);
-  }
-#endif
-
-  const auto inspect_owned_descriptor = [&] {
-    struct stat descriptor_status{};
-    if (fstat(descriptor_, &descriptor_status) != 0) {
-      const int descriptor_error = errno;
-      ResetOwnership();
-      throw std::system_error(
-          descriptor_error, std::generic_category(),
-          "inspect quarantined Firo-Qt launcher descriptor after unlink");
-    }
-    if (static_cast<std::uintmax_t>(descriptor_status.st_dev) != device_ ||
-        static_cast<std::uintmax_t>(descriptor_status.st_ino) != inode_) {
-      ResetOwnership();
-      throw std::runtime_error(
-          "quarantined Firo-Qt launcher descriptor identity changed");
-    }
-    return descriptor_status;
-  };
-  if (unlinkat(parent_guard.get(), quarantine_name.c_str(), 0) != 0) {
-    if (errno == ENOENT) {
-      const struct stat descriptor_status = inspect_owned_descriptor();
-      if (descriptor_status.st_nlink != 0U) {
-        ResetOwnership();
-        throw std::runtime_error(
-            "quarantined Firo-Qt launcher disappeared during unlink while "
-            "the owned file remains linked");
-      }
-      ResetOwnership();
-      return FiroQtLauncherCleanupResult::kAlreadyAbsent;
-    }
-    ThrowSystemError("remove quarantined owned Firo-Qt launcher");
-  }
-  const struct stat descriptor_status = inspect_owned_descriptor();
-  if (descriptor_status.st_nlink != 0U) {
-    ResetOwnership();
-    throw std::runtime_error(
-        "removed Firo-Qt launcher remains linked under an unknown name");
-  }
+  // A memfd has no directory entry. Releasing BBP's exact descriptor removes
+  // its procfs publication without selecting or deleting a mutable pathname.
+  // Other processes may retain descriptors they opened while it was active;
+  // cleanup does not claim to revoke those already-open references.
   ResetOwnership();
   return FiroQtLauncherCleanupResult::kRemoved;
 }
@@ -891,6 +800,7 @@ void OwnedFiroQtLauncher::ResetOwnership() noexcept {
   device_ = 0U;
   inode_ = 0U;
   descriptor_ = -1;
+  seals_ = 0;
   active_ = false;
 }
 
@@ -973,17 +883,7 @@ FiroQtLauncherSnapshot FiroQtLauncherService::ReplaceFromReport(
   const FiroQtLauncherAuthority authority =
       ResolveLauncherAuthority(authority_resolver_, parsed, stop_token);
   const std::string operator_command = authority.command.ShellCommand();
-  OwnedFiroQtLauncher candidate = [&] {
-    try {
-      return OwnedFiroQtLauncher::Create(operator_command);
-    } catch (const FiroQtLauncherCleanupFailure& error) {
-      RetainFiroQtLauncherCleanupUncertainty(
-          &cleanup_unverified_, &unverified_cleanup_failure_, error.what());
-      throw FiroQtLauncherCleanupUnverified(
-          "Firo-Qt launcher creation cleanup could not be verified: " +
-          unverified_cleanup_failure_);
-    }
-  }();
+  OwnedFiroQtLauncher candidate = OwnedFiroQtLauncher::Create(operator_command);
   FiroQtLauncherSnapshot publication;
   try {
     publication = FiroQtLauncherSnapshot{

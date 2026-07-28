@@ -44,7 +44,7 @@ class OwnedFiroQtLauncher {
 
  private:
   OwnedFiroQtLauncher(std::filesystem::path path, std::uintmax_t device,
-                      std::uintmax_t inode, int descriptor) noexcept;
+                      std::uintmax_t inode, int descriptor, int seals) noexcept;
   FiroQtLauncherCleanupResult CleanupImpl(
       std::optional<std::chrono::steady_clock::time_point> deadline,
       std::stop_token stop_token);
@@ -55,6 +55,7 @@ class OwnedFiroQtLauncher {
   std::uintmax_t device_ = 0U;
   std::uintmax_t inode_ = 0U;
   int descriptor_ = -1;
+  int seals_ = 0;
   bool active_ = false;
 };
 
@@ -105,9 +106,7 @@ class FiroQtLauncherService final : public OperatorConnectionLauncher {
 
 #ifdef BBP_ENABLE_TEST_HOOKS
 enum class FiroQtLauncherCleanupTestPhase {
-  kAfterPublicIdentityCheck,
-  kAfterAtomicCapture,
-  kBeforeQuarantineUnlink,
+  kBeforeDescriptorRelease,
 };
 
 using FiroQtLauncherCleanupTestHook = std::function<void(

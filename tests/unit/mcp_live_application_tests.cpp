@@ -68,6 +68,21 @@ class AtomicReleaseGuard {
   std::atomic_bool* release_;
 };
 
+#ifdef BBP_FIRO_GUI_LAUNCHER
+class ScopedFiroQtLauncherCleanupHook {
+ public:
+  explicit ScopedFiroQtLauncherCleanupHook(FiroQtLauncherCleanupTestHook hook) {
+    SetFiroQtLauncherCleanupTestHook(std::move(hook));
+  }
+  ~ScopedFiroQtLauncherCleanupHook() { SetFiroQtLauncherCleanupTestHook({}); }
+
+  ScopedFiroQtLauncherCleanupHook(const ScopedFiroQtLauncherCleanupHook&) =
+      delete;
+  ScopedFiroQtLauncherCleanupHook& operator=(
+      const ScopedFiroQtLauncherCleanupHook&) = delete;
+};
+#endif
+
 boost::json::object LiveScenario() {
   return boost::json::object{
       {"chain", "firo"},
@@ -3604,16 +3619,17 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!std::filesystem::exists(first_path));
   BOOST_TEST(std::filesystem::exists(second_path));
 
-  SetFiroQtLauncherCleanupTestHook(
-      [](FiroQtLauncherCleanupTestPhase phase, const std::filesystem::path&,
-         const std::optional<std::filesystem::path>&) {
-        if (phase ==
-            FiroQtLauncherCleanupTestPhase::kAfterPublicIdentityCheck) {
-          throw std::runtime_error("injected launcher cleanup failure");
-        }
-      });
-  BOOST_CHECK_THROW(application.MarkRunStopped(), std::runtime_error);
-  SetFiroQtLauncherCleanupTestHook({});
+  {
+    ScopedFiroQtLauncherCleanupHook cleanup_hook(
+        [](FiroQtLauncherCleanupTestPhase phase, const std::filesystem::path&,
+           const std::optional<std::filesystem::path>&) {
+          if (phase ==
+              FiroQtLauncherCleanupTestPhase::kBeforeDescriptorRelease) {
+            throw std::runtime_error("injected launcher cleanup failure");
+          }
+        });
+    BOOST_CHECK_THROW(application.MarkRunStopped(), std::runtime_error);
+  }
   BOOST_TEST(std::filesystem::exists(second_path));
   application.MarkRunStopped();
   BOOST_TEST(!std::filesystem::exists(second_path));
@@ -3643,8 +3659,6 @@ BOOST_AUTO_TEST_CASE(
   const OperatorConnectionLauncherSnapshot uncertain_launcher =
       uncertain_launcher_service->ReplaceFromReport(uncertainty_report,
                                                     "_firo");
-  BOOST_REQUIRE(std::filesystem::remove(uncertain_launcher.launcher_path));
-  WriteText(uncertain_launcher.launcher_path, "foreign launcher\n");
   McpLiveApplication uncertain_application(McpLiveApplication::Config{
       .run_id = "live-application",
       .run_root = temporary.path(),
@@ -3663,17 +3677,33 @@ BOOST_AUTO_TEST_CASE(
       .run_stopping = {},
       .run_stopped = {}});
   uncertain_application.MarkRunStarted();
-  try {
-    uncertain_application.MarkRunStopped();
-    BOOST_FAIL("unverified launcher cleanup unexpectedly succeeded");
-  } catch (const McpOperationFailure& error) {
-    BOOST_TEST(error.code() == "run_cleanup_unverified");
-    BOOST_TEST(!error.retryable());
+  bool descriptor_closed = false;
+  {
+    ScopedFiroQtLauncherCleanupHook cleanup_hook(
+        [&](FiroQtLauncherCleanupTestPhase phase,
+            const std::filesystem::path& descriptor_path,
+            const std::optional<std::filesystem::path>&) {
+          if (phase !=
+                  FiroQtLauncherCleanupTestPhase::kBeforeDescriptorRelease ||
+              descriptor_path != uncertain_launcher.launcher_path ||
+              descriptor_closed) {
+            return;
+          }
+          const int descriptor = std::stoi(descriptor_path.filename().string());
+          BOOST_REQUIRE(close(descriptor) == 0);
+          descriptor_closed = true;
+        });
+    try {
+      uncertain_application.MarkRunStopped();
+      BOOST_FAIL("unverified launcher cleanup unexpectedly succeeded");
+    } catch (const McpOperationFailure& error) {
+      BOOST_TEST(error.code() == "run_cleanup_unverified");
+      BOOST_TEST(!error.retryable());
+    }
   }
-  BOOST_TEST(ReadText(uncertain_launcher.launcher_path) ==
-             "foreign launcher\n");
+  BOOST_TEST(descriptor_closed);
+  BOOST_TEST(!std::filesystem::exists(uncertain_launcher.launcher_path));
   BOOST_TEST(std::filesystem::is_directory(temporary.path()));
-  BOOST_REQUIRE(std::filesystem::remove(uncertain_launcher.launcher_path));
 
   dispatcher.Shutdown();
   application.Shutdown();
