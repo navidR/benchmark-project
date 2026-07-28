@@ -44,7 +44,7 @@ class OwnedFiroQtLauncher {
 
  private:
   OwnedFiroQtLauncher(std::filesystem::path path, std::uintmax_t device,
-                      std::uintmax_t inode, int descriptor);
+                      std::uintmax_t inode, int descriptor) noexcept;
   FiroQtLauncherCleanupResult CleanupImpl(
       std::optional<std::chrono::steady_clock::time_point> deadline,
       std::stop_token stop_token);
@@ -97,6 +97,7 @@ class FiroQtLauncherService final : public OperatorConnectionLauncher {
   std::optional<OwnedFiroQtLauncher> pending_cleanup_;
   std::optional<OwnedFiroQtLauncher> launcher_;
   std::optional<FiroQtLauncherSnapshot> snapshot_;
+  bool cleanup_unverified_ = false;
   std::string unverified_cleanup_failure_;
   FiroQtLauncherAuthorityResolver authority_resolver_;
   bool closed_ = false;

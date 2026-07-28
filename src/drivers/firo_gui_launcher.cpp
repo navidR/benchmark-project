@@ -56,9 +56,11 @@ class ScopedDescriptor {
   int descriptor_ = -1;
 };
 
-class FiroQtLauncherCleanupFailure : public std::runtime_error {
+class FiroQtLauncherCleanupFailure final : public std::exception {
  public:
-  using std::runtime_error::runtime_error;
+  [[nodiscard]] const char* what() const noexcept override {
+    return "Firo-Qt launcher creation cleanup could not be verified";
+  }
 };
 
 [[noreturn]] void ThrowSystemError(std::string_view operation);
@@ -179,34 +181,94 @@ std::string ExceptionText(const std::exception_ptr& failure) {
   }
 }
 
+void RetainFiroQtLauncherCleanupUncertainty(bool* cleanup_unverified,
+                                            std::string* retained,
+                                            std::string_view detail) noexcept {
+  if (cleanup_unverified == nullptr || retained == nullptr) {
+    return;
+  }
+  *cleanup_unverified = true;
+  if (detail.empty()) {
+    detail = "unspecified Firo-Qt launcher cleanup uncertainty";
+  }
+  try {
+    if (!retained->empty()) {
+      *retained += "; ";
+    }
+    retained->append(detail);
+  } catch (...) {
+  }
+}
+
 [[noreturn]] void RethrowAfterCandidateCleanup(
     OwnedFiroQtLauncher* candidate, const std::exception_ptr& failure,
-    std::optional<OwnedFiroQtLauncher>* pending_cleanup) {
+    std::optional<OwnedFiroQtLauncher>* pending_cleanup,
+    bool* cleanup_unverified, std::string* unverified_cleanup_failure) {
+  const auto cleanup_is_unverified = [&] {
+    return cleanup_unverified != nullptr && *cleanup_unverified;
+  };
+  const auto retain_candidate_after_failure = [&] {
+    if (candidate->active()) {
+      if (pending_cleanup != nullptr && !pending_cleanup->has_value()) {
+        pending_cleanup->emplace(std::move(*candidate));
+        return;
+      }
+      RetainFiroQtLauncherCleanupUncertainty(
+          cleanup_unverified, unverified_cleanup_failure,
+          "candidate cleanup could not retain its retryable ownership");
+      return;
+    }
+    RetainFiroQtLauncherCleanupUncertainty(
+        cleanup_unverified, unverified_cleanup_failure,
+        "candidate cleanup lost its retryable ownership after an exception");
+  };
   if (candidate == nullptr || !candidate->active()) {
+    if (cleanup_is_unverified()) {
+      throw FiroQtLauncherCleanupUnverified(
+          "Firo-Qt launcher replacement failed: " + ExceptionText(failure) +
+          "; cleanup could not be verified: " + *unverified_cleanup_failure);
+    }
     std::rethrow_exception(failure);
   }
-  std::string cleanup_failure;
+  FiroQtLauncherCleanupResult cleanup;
   try {
-    if (candidate->Cleanup() ==
-        FiroQtLauncherCleanupResult::kOwnershipChanged) {
-      cleanup_failure = "candidate launcher ownership changed";
-    }
+    cleanup = candidate->Cleanup();
   } catch (const std::exception& error) {
-    cleanup_failure = error.what();
+    retain_candidate_after_failure();
+    const std::string_view cleanup_failure =
+        *error.what() == '\0' ? "cleanup threw without diagnostics"
+                              : error.what();
+    const std::string message =
+        "Firo-Qt launcher replacement failed: " + ExceptionText(failure) +
+        "; verified candidate cleanup also failed: " +
+        std::string(cleanup_failure);
+    if (cleanup_is_unverified()) {
+      throw FiroQtLauncherCleanupUnverified(
+          message +
+          "; cleanup could not be verified: " + *unverified_cleanup_failure);
+    }
+    throw std::runtime_error(message);
   } catch (...) {
-    cleanup_failure = "non-standard candidate cleanup exception";
-  }
-  if (!cleanup_failure.empty()) {
-    if (candidate->active()) {
-      if (pending_cleanup == nullptr || pending_cleanup->has_value()) {
-        throw std::logic_error(
-            "Firo-Qt launcher candidate cleanup tracking is unavailable");
-      }
-      pending_cleanup->emplace(std::move(*candidate));
+    retain_candidate_after_failure();
+    if (cleanup_is_unverified()) {
+      throw FiroQtLauncherCleanupUnverified(
+          "Firo-Qt launcher replacement and candidate cleanup failed; cleanup "
+          "could not be verified: " +
+          *unverified_cleanup_failure);
     }
     throw std::runtime_error(
+        "Firo-Qt launcher replacement failed and candidate cleanup threw a "
+        "non-standard exception");
+  }
+  if (cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
+    RetainFiroQtLauncherCleanupUncertainty(
+        cleanup_unverified, unverified_cleanup_failure,
+        "candidate launcher ownership changed");
+  }
+  if (cleanup_is_unverified()) {
+    throw FiroQtLauncherCleanupUnverified(
         "Firo-Qt launcher replacement failed: " + ExceptionText(failure) +
-        "; verified candidate cleanup also failed: " + cleanup_failure);
+        "; cleanup could not be verified: " + *unverified_cleanup_failure);
   }
   std::rethrow_exception(failure);
 }
@@ -468,7 +530,8 @@ FiroQtLauncherAuthority ResolveLauncherAuthority(
 
 OwnedFiroQtLauncher::OwnedFiroQtLauncher(std::filesystem::path path,
                                          std::uintmax_t device,
-                                         std::uintmax_t inode, int descriptor)
+                                         std::uintmax_t inode,
+                                         int descriptor) noexcept
     : path_(std::move(path)),
       device_(device),
       inode_(inode),
@@ -521,17 +584,25 @@ OwnedFiroQtLauncher OwnedFiroQtLauncher::Create(
   if (descriptor < 0) {
     ThrowSystemError("create Firo-Qt launcher");
   }
-  const std::filesystem::path path(path_template.data());
   struct stat created_status{};
-  if (fstat(descriptor, &created_status) != 0) {
-    const int error = errno;
+  int inspect_result = 0;
+  do {
+    inspect_result = fstat(descriptor, &created_status);
+  } while (inspect_result != 0 && errno == EINTR);
+  if (inspect_result != 0) {
     static_cast<void>(close(descriptor));
-    throw std::system_error(error, std::generic_category(),
-                            "inspect created Firo-Qt launcher");
+    throw FiroQtLauncherCleanupFailure();
+  }
+  std::filesystem::path path;
+  try {
+    path = std::filesystem::path(path_template.data());
+  } catch (...) {
+    static_cast<void>(close(descriptor));
+    throw FiroQtLauncherCleanupFailure();
   }
 
   OwnedFiroQtLauncher launcher(
-      path, static_cast<std::uintmax_t>(created_status.st_dev),
+      std::move(path), static_cast<std::uintmax_t>(created_status.st_dev),
       static_cast<std::uintmax_t>(created_status.st_ino), descriptor);
   descriptor = -1;
 
@@ -561,12 +632,12 @@ OwnedFiroQtLauncher OwnedFiroQtLauncher::Create(
   } catch (...) {
     const std::exception_ptr creation_error = std::current_exception();
     try {
-      static_cast<void>(launcher.Cleanup());
-    } catch (const std::exception& cleanup_error) {
-      throw FiroQtLauncherCleanupFailure(
-          "Firo-Qt launcher creation failed and verified cleanup also "
-          "failed: " +
-          std::string(cleanup_error.what()));
+      if (launcher.Cleanup() ==
+          FiroQtLauncherCleanupResult::kOwnershipChanged) {
+        throw FiroQtLauncherCleanupFailure();
+      }
+    } catch (...) {
+      throw FiroQtLauncherCleanupFailure();
     }
     std::rethrow_exception(creation_error);
   }
@@ -869,12 +940,32 @@ FiroQtLauncherSnapshot FiroQtLauncherService::ReplaceFromReport(
   if (closed_) {
     throw std::runtime_error("the Firo-Qt launcher service is closed");
   }
-  if (CleanupPendingCandidate(&pending_cleanup_) ==
-      FiroQtLauncherCleanupResult::kOwnershipChanged) {
-    throw std::runtime_error(
-        "pending Firo-Qt launcher ownership changed before replacement");
+  FiroQtLauncherCleanupResult pending_cleanup =
+      FiroQtLauncherCleanupResult::kAlreadyAbsent;
+  try {
+    pending_cleanup = CleanupPendingCandidate(&pending_cleanup_);
+  } catch (...) {
+    const std::exception_ptr cleanup_failure = std::current_exception();
+    if (!pending_cleanup_) {
+      RetainFiroQtLauncherCleanupUncertainty(
+          &cleanup_unverified_, &unverified_cleanup_failure_,
+          "pending candidate cleanup lost its retryable ownership after an "
+          "exception");
+      throw FiroQtLauncherCleanupUnverified(
+          "pending Firo-Qt launcher cleanup could not be verified: " +
+          unverified_cleanup_failure_);
+    }
+    std::rethrow_exception(cleanup_failure);
   }
-  if (!unverified_cleanup_failure_.empty()) {
+  if (pending_cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
+    RetainFiroQtLauncherCleanupUncertainty(
+        &cleanup_unverified_, &unverified_cleanup_failure_,
+        "pending candidate ownership changed before replacement");
+    throw FiroQtLauncherCleanupUnverified(
+        "pending Firo-Qt launcher cleanup could not be verified: " +
+        unverified_cleanup_failure_);
+  }
+  if (cleanup_unverified_) {
     throw FiroQtLauncherCleanupUnverified(
         "a previous Firo-Qt launcher cleanup could not be verified: " +
         unverified_cleanup_failure_);
@@ -886,8 +977,11 @@ FiroQtLauncherSnapshot FiroQtLauncherService::ReplaceFromReport(
     try {
       return OwnedFiroQtLauncher::Create(operator_command);
     } catch (const FiroQtLauncherCleanupFailure& error) {
-      unverified_cleanup_failure_ = error.what();
-      throw;
+      RetainFiroQtLauncherCleanupUncertainty(
+          &cleanup_unverified_, &unverified_cleanup_failure_, error.what());
+      throw FiroQtLauncherCleanupUnverified(
+          "Firo-Qt launcher creation cleanup could not be verified: " +
+          unverified_cleanup_failure_);
     }
   }();
   FiroQtLauncherSnapshot publication;
@@ -907,13 +1001,29 @@ FiroQtLauncherSnapshot FiroQtLauncherService::ReplaceFromReport(
     }
 
     if (launcher_) {
-      const FiroQtLauncherCleanupResult cleanup = launcher_->Cleanup();
+      FiroQtLauncherCleanupResult cleanup;
+      try {
+        cleanup = launcher_->Cleanup();
+      } catch (...) {
+        const std::exception_ptr cleanup_failure = std::current_exception();
+        if (!launcher_->active()) {
+          RetainFiroQtLauncherCleanupUncertainty(
+              &cleanup_unverified_, &unverified_cleanup_failure_,
+              "published launcher cleanup lost its retryable ownership "
+              "after an exception");
+        }
+        std::rethrow_exception(cleanup_failure);
+      }
       if (cleanup == FiroQtLauncherCleanupResult::kOwnershipChanged) {
+        RetainFiroQtLauncherCleanupUncertainty(
+            &cleanup_unverified_, &unverified_cleanup_failure_,
+            "previous Firo-Qt launcher ownership changed before replacement");
         launcher_.reset();
         std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
         snapshot_.reset();
-        throw std::runtime_error(
-            "previous Firo-Qt launcher ownership changed before replacement");
+        throw FiroQtLauncherCleanupUnverified(
+            "previous Firo-Qt launcher cleanup could not be verified: " +
+            unverified_cleanup_failure_);
       }
       launcher_.reset();
     }
@@ -933,7 +1043,8 @@ FiroQtLauncherSnapshot FiroQtLauncherService::ReplaceFromReport(
   } catch (...) {
     ReconcileSnapshotAfterCleanupFailure();
     RethrowAfterCandidateCleanup(&candidate, std::current_exception(),
-                                 &pending_cleanup_);
+                                 &pending_cleanup_, &cleanup_unverified_,
+                                 &unverified_cleanup_failure_);
   }
   return publication;
 }
@@ -983,10 +1094,8 @@ FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanupImpl(
   std::unique_lock<std::timed_mutex> lock = Acquire(deadline, stop_token);
   closed_ = true;
   const auto retain_cleanup_uncertainty = [&](std::string_view detail) {
-    if (!unverified_cleanup_failure_.empty()) {
-      unverified_cleanup_failure_ += "; ";
-    }
-    unverified_cleanup_failure_ += detail;
+    RetainFiroQtLauncherCleanupUncertainty(
+        &cleanup_unverified_, &unverified_cleanup_failure_, detail);
   };
   FiroQtLauncherCleanupResult pending_cleanup =
       FiroQtLauncherCleanupResult::kAlreadyAbsent;
@@ -998,8 +1107,8 @@ FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanupImpl(
     pending_failure = std::current_exception();
     if (!pending_cleanup_) {
       retain_cleanup_uncertainty(
-          "pending candidate cleanup lost its retryable ownership after: " +
-          ExceptionText(pending_failure));
+          "pending candidate cleanup lost its retryable ownership after an "
+          "exception");
     }
     if (stop_token.stop_requested() ||
         (deadline && std::chrono::steady_clock::now() >= *deadline)) {
@@ -1028,8 +1137,8 @@ FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanupImpl(
       ReconcileSnapshotAfterCleanupFailure();
       if (!launcher_) {
         retain_cleanup_uncertainty(
-            "published launcher cleanup lost its retryable ownership after: " +
-            ExceptionText(launcher_failure));
+            "published launcher cleanup lost its retryable ownership after an "
+            "exception");
       }
       if (stop_token.stop_requested() ||
           (deadline && std::chrono::steady_clock::now() >= *deadline)) {
@@ -1045,9 +1154,8 @@ FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanupImpl(
         "published launcher ownership changed before cleanup");
   }
 
-  if (pending_failure || launcher_failure ||
-      !unverified_cleanup_failure_.empty()) {
-    const bool ownership_unverified = !unverified_cleanup_failure_.empty();
+  if (pending_failure || launcher_failure || cleanup_unverified_) {
+    const bool ownership_unverified = cleanup_unverified_;
     std::string message = "Firo-Qt launcher cleanup failed";
     if (pending_failure) {
       message += "; pending candidate: " + ExceptionText(pending_failure);
@@ -1055,9 +1163,11 @@ FiroQtLauncherCleanupResult FiroQtLauncherService::CloseAndCleanupImpl(
     if (launcher_failure) {
       message += "; published launcher: " + ExceptionText(launcher_failure);
     }
-    if (!unverified_cleanup_failure_.empty()) {
-      message +=
-          "; unverified creation cleanup: " + unverified_cleanup_failure_;
+    if (cleanup_unverified_) {
+      message += "; unverified launcher cleanup";
+      if (!unverified_cleanup_failure_.empty()) {
+        message += ": " + unverified_cleanup_failure_;
+      }
     }
     if (ownership_unverified) {
       throw FiroQtLauncherCleanupUnverified(message);
