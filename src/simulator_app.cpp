@@ -25247,12 +25247,17 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         if (arguments.if_contains("workload_id") != nullptr) {
           requested_id = require_argument_string("workload_id");
         }
-        const Options validation_options = runtime_wallet_validation_options();
-        const WalletTransactionsWorkload workload =
-            ParseAndValidateWalletTransactionsWorkload(
-                workload_value->as_object(), validation_options);
-        const std::shared_ptr<LiveWalletWorkloadRecord> record =
-            launch_wallet_workload(workload, std::move(requested_id));
+        std::shared_ptr<LiveWalletWorkloadRecord> record;
+        {
+          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
+                                                       operation_stop_token);
+          const Options validation_options =
+              runtime_wallet_validation_options();
+          const WalletTransactionsWorkload workload =
+              ParseAndValidateWalletTransactionsWorkload(
+                  workload_value->as_object(), validation_options);
+          record = launch_wallet_workload(workload, std::move(requested_id));
+        }
         std::unique_lock<std::mutex> lock(record->mutex);
         if (!record->changed.wait(lock, operation_stop_token, [&] {
               return record->state != LiveWalletWorkloadState::kStarting;
@@ -28035,9 +28040,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                      " failed: " + *outcome);
           }
         } else {
-          const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
           const ScenarioWorkload& scenario_workload =
               std::get<ScenarioWorkload>(runtime_action.action);
+          const RuntimeNodeSnapshot nodes =
+              scenario_workload.kind == WorkloadKind::kWalletTransactions
+                  ? RuntimeNodeSnapshot{}
+                  : node_inventory.Snapshot();
           if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
             const BlockGenerationWorkload& workload =
                 scenario_workload.block_generation;
@@ -28117,9 +28125,13 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 action_index, action_count, stop_token);
           } else if (scenario_workload.kind ==
                      WorkloadKind::kWalletTransactions) {
-            const std::shared_ptr<LiveWalletWorkloadRecord> workload_record =
-                launch_wallet_workload(scenario_workload.wallet_transactions,
-                                       std::nullopt);
+            std::shared_ptr<LiveWalletWorkloadRecord> workload_record;
+            {
+              auto mutation_lock =
+                  AcquireNodeMutationLock(node_mutation_mutex, stop_token);
+              workload_record = launch_wallet_workload(
+                  scenario_workload.wallet_transactions, std::nullopt);
+            }
             if (ExplicitWalletTransactionAttemptLimit(
                     scenario_workload.wallet_transactions)) {
               std::unique_lock<std::mutex> workload_lock(

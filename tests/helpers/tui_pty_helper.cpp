@@ -862,6 +862,64 @@ void AppendBlockGenerationAudit(const std::filesystem::path& run_root,
   }
 }
 
+std::filesystem::path SharedReadyDaemonHeightPath(
+    const std::filesystem::path& run_root) {
+  return run_root / "bbp-test-shared-height";
+}
+
+void SynchronizeReadyDaemonHeight(const std::filesystem::path& run_root,
+                                  std::uint64_t* height) {
+  if (!std::filesystem::exists(run_root / "bbp-test-shared-height-enabled")) {
+    return;
+  }
+  const std::string shared = ReadFile(SharedReadyDaemonHeightPath(run_root));
+  if (!shared.empty()) {
+    const auto shared_height = static_cast<std::uint64_t>(std::stoull(shared));
+    *height = std::max(*height, shared_height);
+  }
+}
+
+void PublishReadyDaemonHeight(const std::filesystem::path& run_root,
+                              std::uint64_t height) {
+  if (!std::filesystem::exists(run_root / "bbp-test-shared-height-enabled")) {
+    return;
+  }
+  std::ofstream stream(SharedReadyDaemonHeightPath(run_root));
+  if (!stream) {
+    throw std::runtime_error("could not publish shared ready-daemon height");
+  }
+  stream << height << '\n';
+  if (!stream) {
+    throw std::runtime_error("could not flush shared ready-daemon height");
+  }
+}
+
+void WaitForNodeMutationAdmissionRelease(const std::filesystem::path& run_root,
+                                         std::string_view node_root_name) {
+  if (!node_root_name.starts_with("bbpr-") ||
+      !std::filesystem::exists(run_root /
+                               "bbp-test-node-mutation-admission-gate")) {
+    return;
+  }
+  {
+    std::ofstream held(run_root / "bbp-test-node-mutation-admission-held");
+    if (!held) {
+      throw std::runtime_error("could not record held node-mutation admission");
+    }
+    held << node_root_name << '\n';
+  }
+  const std::filesystem::path release =
+      run_root / "bbp-test-node-mutation-admission-release";
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (!std::filesystem::exists(release) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  if (!std::filesystem::remove(release)) {
+    throw std::runtime_error("node-mutation admission gate was not released");
+  }
+}
+
 std::filesystem::path BlockGenerationReleasePath(
     const std::filesystem::path& run_root, std::uint64_t start_height) {
   return run_root /
@@ -907,6 +965,7 @@ std::string RpcResult(std::string_view method, std::string_view request,
   const std::filesystem::path directed_peer_drop_trigger =
       run_root / "bbp-test-directed-peer-target-stopped";
   if (method == "getblockchaininfo") {
+    SynchronizeReadyDaemonHeight(run_root, height);
     if (slow_replacement) {
       const auto now = std::chrono::steady_clock::now();
       if (!*slow_synchronization_started) {
@@ -951,7 +1010,24 @@ std::string RpcResult(std::string_view method, std::string_view request,
   if (method == "getnetworkhashps") {
     return "0";
   }
+  if (method == "getnewaddress") {
+    return boost::json::serialize(node_root.filename().string() +
+                                  "-wallet-address");
+  }
+  if (method == "getbalance") {
+    return "100.00000000";
+  }
+  if (method == "getwalletinfo") {
+    return R"({"balance":100.00000000,"unconfirmed_balance":0.00000000,"immature_balance":0.00000000,"txcount":0})";
+  }
+  if (method == "listtransactions") {
+    return "[]";
+  }
+  if (method == "settxfee") {
+    return "true";
+  }
   if (method == "generatetoaddress") {
+    SynchronizeReadyDaemonHeight(run_root, height);
     const std::size_t body_begin = request.find("\r\n\r\n");
     if (body_begin == std::string_view::npos) {
       throw std::runtime_error("ready daemon generation RPC has no body");
@@ -980,6 +1056,7 @@ std::string RpcResult(std::string_view method, std::string_view request,
       ++*height;
       hashes.emplace_back("block-" + std::to_string(*height));
     }
+    PublishReadyDaemonHeight(run_root, *height);
     if (std::filesystem::exists(run_root / "bbp-test-slow-block-generation")) {
       AppendBlockGenerationAudit(run_root, "generation-completed", *height);
     }
@@ -1074,6 +1151,7 @@ int RunReadyFiroDaemon(int argc, char** argv) {
       pause();
     }
   }
+  WaitForNodeMutationAdmissionRelease(run_root, node_root.filename().string());
   const std::filesystem::path cookie =
       DaemonArgumentValue(argc, argv, "-rpccookiefile=");
   const std::string bind_address = DaemonArgumentValue(argc, argv, "-rpcbind=");
@@ -2967,6 +3045,238 @@ void CheckSlowNodeReplacementDefaultTimeout(
             << "ms across four delayed phases\n";
 }
 
+void CheckWalletWorkloadNodeMutationAdmission(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("wallet-node-mutation-admission");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path scenario = directory.root() / "scenario.json";
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "wallet-admission-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  {
+    std::ofstream stream(scenario);
+    if (!stream) {
+      throw std::runtime_error("could not create wallet-admission scenario");
+    }
+    stream << boost::json::serialize(boost::json::object{
+                  {"chain", "firo"},
+                  {"chain_daemon", daemon.string()},
+                  {"nodes", 3U},
+                  {"node_capacity", 3U},
+                  {"isolated_network", false},
+                  {"topology",
+                   boost::json::object{
+                       {"node_count", 3U},
+                       {"wallet_node_count", 2U},
+                       {"miner_node_count", 1U},
+                       {"wallet_nodes", boost::json::array{1U, 2U}},
+                       {"miner_nodes", boost::json::array{3U}},
+                       {"wallet_initialization",
+                        boost::json::object{{"strategy", "driver_rpc"},
+                                            {"mode", "public"}}}}},
+                  {"block_production", boost::json::object{{"enabled", false}}},
+                  {"ready_timeout_sec", 10U},
+                  {"sync_timeout_sec", 10U},
+                  {"metrics_interval_ms", 50U},
+                  {"workloads", boost::json::array{}}})
+           << '\n';
+    if (!stream) {
+      throw std::runtime_error("could not write wallet-admission scenario");
+    }
+  }
+
+  PtyProcess process(
+      command,
+      {"--scenario", scenario.string(), "--node-binary", daemon.string(),
+       "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--refresh-ms", "50"},
+      30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "wallet-admission TUI"));
+  static_cast<void>(WaitForFileOccurrences(
+      events_path, "\"event\":\"wallet_address_created\"", 2U, 10s));
+
+  const auto write_control = [](const std::filesystem::path& path,
+                                std::string_view contents) {
+    std::ofstream stream(path);
+    if (!stream) {
+      throw std::runtime_error("could not create " + path.string());
+    }
+    stream << contents;
+    if (!stream) {
+      throw std::runtime_error("could not flush " + path.string());
+    }
+  };
+  write_control(run_root / "bbp-test-shared-height", "0\n");
+  write_control(run_root / "bbp-test-shared-height-enabled",
+                "share fake daemon height\n");
+  write_control(run_root / "bbp-test-node-mutation-admission-gate",
+                "hold replacement admission\n");
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  boost::json::object replacement_submitted;
+  const auto replacement_admission_deadline =
+      std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < replacement_admission_deadline) {
+    replacement_submitted = SubmitMcpOperation(
+        mcp, &request_id, "node.replace",
+        boost::json::object{
+            {"run_id", run_id},
+            {"node_id", "firo-1"},
+            {"replacement",
+             boost::json::object{{"chain", "firo"},
+                                 {"count", 1U},
+                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"ready_timeout_sec", 15U},
+                                 {"sync_timeout_sec", 15U}}}});
+    if (replacement_submitted.if_contains("operation_id") != nullptr) {
+      break;
+    }
+    const boost::json::value* code = replacement_submitted.if_contains("code");
+    const boost::json::value* retryable =
+        replacement_submitted.if_contains("retryable");
+    if (code == nullptr || !code->is_string() ||
+        code->as_string() != "run_not_ready" || retryable == nullptr ||
+        !retryable->is_bool() || !retryable->as_bool()) {
+      throw std::runtime_error(
+          "wallet-admission replacement was not admitted: " +
+          boost::json::serialize(replacement_submitted));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (replacement_submitted.if_contains("operation_id") == nullptr) {
+    throw std::runtime_error(
+        "wallet-admission replacement was not admitted after run readiness");
+  }
+  static_cast<void>(WaitForFileText(
+      run_root / "bbp-test-node-mutation-admission-held", "bbpr-", 10s));
+
+  const boost::json::object workload_submitted = SubmitMcpOperation(
+      mcp, &request_id, "workload.start",
+      boost::json::object{
+          {"run_id", run_id},
+          {"workload_id", "wallet-admission-race"},
+          {"workload", boost::json::object{{"type", "wallet_transactions"},
+                                           {"funding_strategy", "round_robin"},
+                                           {"strategy", "round_robin"},
+                                           {"funding_blocks_per_wallet", 101U},
+                                           {"readiness_confirmations", 101U},
+                                           {"transaction_count", 1U},
+                                           {"amount", "1.00000000"},
+                                           {"fee", "0.00001000"},
+                                           {"funding_threshold", "1.00001000"},
+                                           {"timeout_sec", 10U}}}});
+  const boost::json::value* workload_operation_value =
+      workload_submitted.if_contains("operation_id");
+  if (workload_operation_value == nullptr ||
+      !workload_operation_value->is_string()) {
+    throw std::runtime_error("wallet start returned no operation identity: " +
+                             boost::json::serialize(workload_submitted));
+  }
+  const std::string workload_operation_id(
+      workload_operation_value->as_string());
+  boost::json::object workload_operation;
+  const auto running_deadline = std::chrono::steady_clock::now() + 3s;
+  while (std::chrono::steady_clock::now() < running_deadline) {
+    workload_operation = McpToolCall(
+        mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+        "operation.get",
+        boost::json::object{{"operation_id", workload_operation_id}});
+    const std::string_view state = workload_operation.at("state").as_string();
+    if (state == "running") {
+      break;
+    }
+    if (state == "succeeded" || state == "failed" || state == "cancelled") {
+      throw std::runtime_error(
+          "wallet start crossed held node-mutation admission: " +
+          boost::json::serialize(workload_operation));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (workload_operation.empty() ||
+      workload_operation.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "wallet start did not reach its running operation boundary");
+  }
+
+  const auto cancellation_started = std::chrono::steady_clock::now();
+  const boost::json::object cancellation =
+      McpToolCall(mcp.port, mcp.token, mcp.session_id, mcp.protocol_version,
+                  request_id++, "operation.cancel",
+                  boost::json::object{{"operation_id", workload_operation_id}});
+  if (!cancellation.at("cancel_requested").as_bool()) {
+    throw std::runtime_error(
+        "wallet start cancellation was not accepted at mutation admission");
+  }
+  const auto cancellation_deadline = cancellation_started + 2s;
+  while (std::chrono::steady_clock::now() < cancellation_deadline) {
+    workload_operation = McpToolCall(
+        mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+        "operation.get",
+        boost::json::object{{"operation_id", workload_operation_id}});
+    const std::string_view state = workload_operation.at("state").as_string();
+    if (state == "cancelled") {
+      break;
+    }
+    if (state == "succeeded" || state == "failed") {
+      throw std::runtime_error(
+          "cancelled wallet start crossed held node-mutation admission: " +
+          boost::json::serialize(workload_operation));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (workload_operation.at("state").as_string() != "cancelled" ||
+      std::chrono::steady_clock::now() >= cancellation_deadline) {
+    throw std::runtime_error(
+        "wallet start cancellation was not bounded at mutation admission");
+  }
+  if (!ReadMcpResourceData(mcp, &request_id, "bbp:///workloads",
+                           "wallet admission current workloads")
+           .as_array()
+           .empty() ||
+      !ReadMcpResourceData(mcp, &request_id, "bbp:///workload_history",
+                           "wallet admission workload history")
+           .as_array()
+           .empty()) {
+    throw std::runtime_error(
+        "cancelled wallet start published across held node mutation");
+  }
+  RequireNotContains(ReadFile(events_path), "wallet-admission-race",
+                     "held node-mutation workload evidence");
+
+  write_control(run_root / "bbp-test-node-mutation-admission-release",
+                "release replacement admission\n");
+  const boost::json::object replacement =
+      WaitForMcpOperation(mcp, &request_id, replacement_submitted, 20s,
+                          "wallet-admission node replacement");
+  if (replacement.at("action").as_string() != "node.replace" ||
+      replacement.at("state").as_string() != "running" ||
+      replacement.at("inventory_generation").to_number<std::uint64_t>() != 2U ||
+      replacement.at("final_node_count").to_number<std::uint64_t>() != 3U) {
+    throw std::runtime_error(
+        "wallet-admission replacement returned inconsistent evidence");
+  }
+  const std::string events = ReadFile(events_path);
+  RequireContains(events, "\"event\":\"runtime_generation_published\"",
+                  "wallet-admission replacement publication");
+  RequireNotContains(events, "\"event\":\"run_failed\"",
+                     "wallet-admission replacement run state");
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil("Confirm exit", 3s,
+                                      "wallet-admission confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "wallet-admission TUI exit");
+}
+
 void CheckDirectedNodeReplacementPublication(
     const std::filesystem::path& command,
     const std::filesystem::path& helper_binary) {
@@ -3718,6 +4028,20 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
       std::cerr << "slow node replacement regression failed: " << error.what()
                 << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 && std::string_view(argv[1]) ==
+                       "--wallet-workload-node-mutation-admission") {
+    try {
+      CheckWalletWorkloadNodeMutationAdmission(
+          argv[2], std::filesystem::canonical(argv[0]));
+      std::cout << "wallet workload node-mutation admission checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "wallet workload node-mutation admission regression "
+                   "failed: "
+                << error.what() << '\n';
       return 1;
     }
   }
