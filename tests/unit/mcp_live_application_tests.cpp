@@ -1717,6 +1717,40 @@ BOOST_AUTO_TEST_CASE(
   AppendLine(
       temporary.path() / "events.jsonl",
       R"({"run_id":"live-application","node_id":"sim","event":"run_failed","detail":"expected retained failure"})");
+  const boost::json::object retained_block_workload{
+      {"workload_id", "block-generation-workload-1"},
+      {"state", "cancelled"},
+      {"terminal_outcome", "cancelled"},
+      {"configuration_revision", 1U},
+      {"configuration", boost::json::object{{"type", "block_generation"},
+                                            {"node", 1U},
+                                            {"count", 10U},
+                                            {"sync_timeout_sec", 30U}}},
+      {"accounting",
+       boost::json::object{{"target", 10U},
+                           {"attempted", 1U},
+                           {"generated", 1U},
+                           {"completed_boundaries", 0U},
+                           {"failed", 0U},
+                           {"cancelled", 1U},
+                           {"remaining", 10U},
+                           {"outstanding", 0U},
+                           {"in_flight", 0U},
+                           {"generation_outcome_unconfirmed", false}}},
+      {"last_result", boost::json::object{{"generator_node", 1U},
+                                          {"generator_node_id", "firo-1"},
+                                          {"start_height", 0U},
+                                          {"target_height", 1U},
+                                          {"block_hash", "block-1"},
+                                          {"reward_address", "reward-address"},
+                                          {"synchronized", false}}},
+      {"failure", nullptr}};
+  AppendLine(temporary.path() / "events.jsonl",
+             boost::json::serialize(boost::json::object{
+                 {"run_id", "live-application"},
+                 {"node_id", "block-generation-workload-1"},
+                 {"event", "workload_state"},
+                 {"detail", boost::json::serialize(retained_block_workload)}}));
 
   McpLiveApplication application(McpLiveApplication::Config{
       .run_id = "live-application",
@@ -1769,6 +1803,23 @@ BOOST_AUTO_TEST_CASE(
                  .as_object()
                  .at("state")
                  .as_string() == "failed");
+
+  const boost::json::object retained_workloads =
+      application
+          .ResourceReader()(McpInformationFamily::kWorkloadHistory,
+                            "retained-session", std::stop_token{})
+          .as_object()
+          .at("data")
+          .as_object();
+  BOOST_TEST(retained_workloads.at("workload_instances").as_array().empty());
+  BOOST_REQUIRE_EQUAL(
+      retained_workloads.at("workload_history").as_array().size(), 1U);
+  BOOST_TEST(retained_workloads.at("workload_history")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("workload_id")
+                 .as_string() == "block-generation-workload-1");
 
   const boost::json::object capabilities =
       application

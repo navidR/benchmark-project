@@ -2612,6 +2612,60 @@ BOOST_AUTO_TEST_CASE(
                  .as_object()
                  .at("workload_id")
                  .as_string() == "wallet-workload-1");
+
+  boost::json::object block_running{
+      {"workload_id", "block-generation-workload-1"},
+      {"state", "running"},
+      {"terminal_outcome", "none"},
+      {"configuration_revision", 1U},
+      {"configuration", boost::json::object{{"type", "block_generation"},
+                                            {"node", 1U},
+                                            {"count", 2U},
+                                            {"sync_timeout_sec", 30U}}},
+      {"accounting",
+       boost::json::object{{"target", 2U},
+                           {"attempted", 1U},
+                           {"generated", 1U},
+                           {"completed_boundaries", 1U},
+                           {"failed", 0U},
+                           {"cancelled", 0U},
+                           {"remaining", 1U},
+                           {"outstanding", 0U},
+                           {"in_flight", 0U},
+                           {"generation_outcome_unconfirmed", false}}},
+      {"last_result", boost::json::object{{"generator_node", 1U},
+                                          {"generator_node_id", "firo-1"},
+                                          {"start_height", 0U},
+                                          {"target_height", 1U},
+                                          {"block_hash", "block-1"},
+                                          {"reward_address", "reward-address"},
+                                          {"synchronized", true}}},
+      {"failure", nullptr}};
+  AppendDetailEvent(dir, "workload_state", block_running,
+                    "block-generation-workload-1");
+  report = bbp::BuildRunReport(dir);
+  BOOST_REQUIRE_EQUAL(report.at("workload_instances").as_array().size(), 1U);
+  BOOST_REQUIRE_EQUAL(report.at("workload_history").as_array().size(), 1U);
+
+  boost::json::object block_cancelled = block_running;
+  block_cancelled["state"] = "cancelled";
+  block_cancelled["terminal_outcome"] = "cancelled";
+  AppendDetailEvent(dir, "workload_state", block_cancelled,
+                    "block-generation-workload-1");
+  report = bbp::BuildRunReport(dir);
+  BOOST_TEST(report.at("workload_instances").as_array().empty());
+  BOOST_REQUIRE_EQUAL(report.at("workload_history").as_array().size(), 2U);
+  const auto retained_block =
+      std::find_if(report.at("workload_history").as_array().begin(),
+                   report.at("workload_history").as_array().end(),
+                   [](const boost::json::value& value) {
+                     return value.as_object().at("workload_id").as_string() ==
+                            "block-generation-workload-1";
+                   });
+  BOOST_REQUIRE(retained_block !=
+                report.at("workload_history").as_array().end());
+  BOOST_TEST(retained_block->as_object().at("state").as_string() ==
+             "cancelled");
   std::filesystem::remove_all(dir);
 }
 

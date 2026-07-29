@@ -460,6 +460,99 @@ struct McpTestSession {
   std::string session_id;
 };
 
+boost::json::object WaitForMcpOperation(
+    const McpTestSession& session, std::uint64_t* request_id,
+    const boost::json::object& submitted,
+    std::chrono::steady_clock::duration timeout, std::string_view context) {
+  const boost::json::value* operation_id =
+      submitted.if_contains("operation_id");
+  if (operation_id == nullptr || !operation_id->is_string()) {
+    throw std::runtime_error(
+        std::string(context) +
+        " returned no operation_id: " + boost::json::serialize(submitted));
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  boost::json::object operation;
+  while (std::chrono::steady_clock::now() < deadline) {
+    operation =
+        McpToolCall(session.port, session.token, session.session_id,
+                    session.protocol_version, (*request_id)++, "operation.get",
+                    boost::json::object{{"operation_id", *operation_id}});
+    const std::string_view state = operation.at("state").as_string();
+    if (state == "succeeded") {
+      const boost::json::value* terminal =
+          operation.if_contains("terminal_result");
+      if (terminal == nullptr || !terminal->is_object()) {
+        throw std::runtime_error(std::string(context) +
+                                 " succeeded without a terminal result");
+      }
+      return terminal->as_object();
+    }
+    if (state == "failed" || state == "cancelled") {
+      throw std::runtime_error(std::string(context) + " ended in state " +
+                               std::string(state) + ": " +
+                               boost::json::serialize(operation));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  throw std::runtime_error(std::string(context) +
+                           " did not finish before its test deadline");
+}
+
+boost::json::object SubmitMcpOperation(const McpTestSession& session,
+                                       std::uint64_t* request_id,
+                                       std::string_view tool,
+                                       boost::json::object arguments) {
+  return McpToolCall(session.port, session.token, session.session_id,
+                     session.protocol_version, (*request_id)++, tool,
+                     std::move(arguments));
+}
+
+boost::json::object InvokeMcpOperation(
+    const McpTestSession& session, std::uint64_t* request_id,
+    std::string_view tool, boost::json::object arguments,
+    std::chrono::steady_clock::duration timeout, std::string_view context) {
+  const boost::json::object submitted =
+      SubmitMcpOperation(session, request_id, tool, std::move(arguments));
+  return WaitForMcpOperation(session, request_id, submitted, timeout, context);
+}
+
+boost::json::value ReadMcpResourceData(const McpTestSession& session,
+                                       std::uint64_t* request_id,
+                                       std::string_view uri,
+                                       std::string_view context) {
+  const http::response<http::string_body> response =
+      McpExchange(session.port, session.token,
+                  boost::json::serialize(boost::json::object{
+                      {"jsonrpc", "2.0"},
+                      {"id", (*request_id)++},
+                      {"method", "resources/read"},
+                      {"params", boost::json::object{{"uri", uri}}}}),
+                  session.session_id, session.protocol_version);
+  if (response.result() != http::status::ok) {
+    throw std::runtime_error(std::string(context) + " returned HTTP " +
+                             std::to_string(response.result_int()) + ": " +
+                             response.body());
+  }
+  const boost::json::object decoded =
+      boost::json::parse(response.body()).as_object();
+  const boost::json::array& contents =
+      decoded.at("result").as_object().at("contents").as_array();
+  if (contents.size() != 1U || !contents.front().is_object()) {
+    throw std::runtime_error(std::string(context) +
+                             " returned invalid resource contents");
+  }
+  const boost::json::object& content = contents.front().as_object();
+  if (content.at("uri").as_string() != uri ||
+      content.at("mimeType").as_string() != "application/json") {
+    throw std::runtime_error(std::string(context) +
+                             " returned incorrect resource metadata");
+  }
+  const boost::json::object envelope =
+      boost::json::parse(content.at("text").as_string()).as_object();
+  return envelope.at("data");
+}
+
 McpTestSession ConnectMcpTestSession(
     const std::filesystem::path& publication_directory) {
   const boost::json::value client = boost::json::parse(WaitForFileText(
@@ -754,10 +847,55 @@ void AppendReadyDaemonTimingAudit(const std::filesystem::path& run_root,
   }
 }
 
+void AppendBlockGenerationAudit(const std::filesystem::path& run_root,
+                                std::string_view phase, std::uint64_t height) {
+  std::ofstream stream(run_root / "bbp-test-block-generation-audit",
+                       std::ios::app);
+  if (!stream) {
+    throw std::runtime_error(
+        "could not append ready-daemon block-generation audit");
+  }
+  stream << phase << ' ' << height << '\n';
+  if (!stream) {
+    throw std::runtime_error(
+        "could not flush ready-daemon block-generation audit");
+  }
+}
+
+std::filesystem::path BlockGenerationReleasePath(
+    const std::filesystem::path& run_root, std::uint64_t start_height) {
+  return run_root /
+         ("bbp-test-block-generation-release-" + std::to_string(start_height));
+}
+
+void WaitForBlockGenerationRelease(const std::filesystem::path& run_root,
+                                   std::uint64_t start_height) {
+  const std::filesystem::path release =
+      BlockGenerationReleasePath(run_root, start_height);
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (!std::filesystem::exists(release) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  if (!std::filesystem::remove(release)) {
+    throw std::runtime_error(
+        "ready daemon block-generation gate was not released");
+  }
+}
+
+void ReleaseBlockGeneration(const std::filesystem::path& run_root,
+                            std::uint64_t start_height) {
+  std::ofstream stream(BlockGenerationReleasePath(run_root, start_height));
+  if (!stream) {
+    throw std::runtime_error("could not release block-generation fixture");
+  }
+  stream << "release acknowledged generation\n";
+}
+
 std::string RpcResult(std::string_view method, std::string_view request,
                       std::set<std::string>* peers,
                       const std::filesystem::path& peer_state_path,
-                      bool slow_replacement,
+                      std::uint64_t* height, bool slow_replacement,
                       std::optional<std::chrono::steady_clock::time_point>*
                           slow_synchronization_started,
                       bool* slow_synchronization_completed) {
@@ -784,7 +922,15 @@ std::string RpcResult(std::string_view method, std::string_view request,
         *slow_synchronization_completed = true;
       }
     }
-    return R"({"blocks":0,"headers":0,"bestblockhash":"00","initialblockdownload":false,"verificationprogress":1.0,"difficulty":1.0,"mediantime":0,"chainwork":"00"})";
+    return boost::json::serialize(boost::json::object{
+        {"blocks", *height},
+        {"headers", *height},
+        {"bestblockhash", "block-" + std::to_string(*height)},
+        {"initialblockdownload", false},
+        {"verificationprogress", 1.0},
+        {"difficulty", 1.0},
+        {"mediantime", 0U},
+        {"chainwork", "00"}});
   }
   if (method == "getnetworkinfo") {
     return boost::json::serialize(
@@ -799,8 +945,45 @@ std::string RpcResult(std::string_view method, std::string_view request,
   if (method == "getblockheader") {
     return R"({"time":0})";
   }
+  if (method == "getblock") {
+    return R"({"tx":["coinbase"]})";
+  }
   if (method == "getnetworkhashps") {
     return "0";
+  }
+  if (method == "generatetoaddress") {
+    const std::size_t body_begin = request.find("\r\n\r\n");
+    if (body_begin == std::string_view::npos) {
+      throw std::runtime_error("ready daemon generation RPC has no body");
+    }
+    const boost::json::value decoded =
+        boost::json::parse(request.substr(body_begin + 4U));
+    const boost::json::array& parameters =
+        decoded.as_object().at("params").as_array();
+    if (parameters.size() < 2U ||
+        (!parameters.front().is_uint64() && !parameters.front().is_int64())) {
+      throw std::runtime_error(
+          "ready daemon generation RPC has invalid parameters");
+    }
+    const std::uint64_t count = parameters.front().to_number<std::uint64_t>();
+    if (std::filesystem::exists(run_root / "bbp-test-slow-block-generation")) {
+      AppendBlockGenerationAudit(run_root, "generation-started", *height);
+      if (std::filesystem::exists(run_root /
+                                  "bbp-test-block-generation-gate")) {
+        WaitForBlockGenerationRelease(run_root, *height);
+      } else {
+        std::this_thread::sleep_for(150ms);
+      }
+    }
+    boost::json::array hashes;
+    for (std::uint64_t index = 0U; index < count; ++index) {
+      ++*height;
+      hashes.emplace_back("block-" + std::to_string(*height));
+    }
+    if (std::filesystem::exists(run_root / "bbp-test-slow-block-generation")) {
+      AppendBlockGenerationAudit(run_root, "generation-completed", *height);
+    }
+    return boost::json::serialize(hashes);
   }
   if (method == "getpeerinfo") {
     const std::filesystem::path directed_peer_drop_consumed =
@@ -959,6 +1142,7 @@ int RunReadyFiroDaemon(int argc, char** argv) {
   std::optional<std::chrono::steady_clock::time_point>
       slow_synchronization_started;
   bool slow_synchronization_completed = false;
+  std::uint64_t height = 0U;
   bool stop = false;
   while (!stop) {
     int connection;
@@ -976,8 +1160,8 @@ int RunReadyFiroDaemon(int argc, char** argv) {
       const std::string method = RpcMethod(request);
       const std::string body =
           "{\"result\":" +
-          RpcResult(method, request, &peers, peer_state_path, slow_replacement,
-                    &slow_synchronization_started,
+          RpcResult(method, request, &peers, peer_state_path, &height,
+                    slow_replacement, &slow_synchronization_started,
                     &slow_synchronization_completed) +
           ",\"error\":null,\"id\":\"bbp\"}";
       const std::string response =
@@ -2978,6 +3162,287 @@ void AppendMalformedEvent(const std::filesystem::path& events_path) {
   }
 }
 
+void CheckBlockGenerationWorkloadLifecycle(
+    std::string_view run_id, const std::filesystem::path& run_root,
+    const std::filesystem::path& home_directory) {
+  {
+    std::ofstream marker(run_root / "bbp-test-slow-block-generation");
+    if (!marker) {
+      throw std::runtime_error(
+          "could not enable slow block-generation fixture");
+    }
+    marker << "delay each acknowledged block boundary\n";
+  }
+  {
+    std::ofstream gate(run_root / "bbp-test-block-generation-gate");
+    if (!gate) {
+      throw std::runtime_error(
+          "could not enable deterministic block-generation gate");
+    }
+    gate << "wait for lifecycle request admission before mutation return\n";
+  }
+  const std::filesystem::path audit_path =
+      run_root / "bbp-test-block-generation-audit";
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  const auto configuration = [](std::uint32_t count,
+                                std::uint32_t sync_timeout_sec) {
+    return boost::json::object{{"type", "block_generation"},
+                               {"node", 1U},
+                               {"count", count},
+                               {"sync_timeout_sec", sync_timeout_sec}};
+  };
+  const auto arguments = [&](std::string_view workload_id,
+                             boost::json::object extra = {}) {
+    extra["run_id"] = run_id;
+    extra["workload_id"] = workload_id;
+    return extra;
+  };
+  const auto accounting =
+      [](const boost::json::object& result) -> const boost::json::object& {
+    return result.at("accounting").as_object();
+  };
+  const auto require_workload =
+      [](const boost::json::array& records,
+         std::string_view workload_id) -> const boost::json::object& {
+    for (const boost::json::value& value : records) {
+      const boost::json::object& record = value.as_object();
+      if (record.at("workload_id").as_string() == workload_id) {
+        return record;
+      }
+    }
+    throw std::runtime_error("MCP workload resource omitted " +
+                             std::string(workload_id));
+  };
+  const auto wait_for_state = [&](std::string_view workload_id,
+                                  std::string_view expected,
+                                  std::string_view context) {
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    std::string state;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const boost::json::object inspected =
+          InvokeMcpOperation(mcp, &request_id, "workload.inspect",
+                             arguments(workload_id), 2s, context);
+      state = std::string(inspected.at("state").as_string());
+      if (state == expected) {
+        return;
+      }
+      if (state == "stopped" || state == "completed" || state == "cancelled" ||
+          state == "failed") {
+        break;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    throw std::runtime_error(std::string(context) + " did not reach " +
+                             std::string(expected) + "; last state was " +
+                             state);
+  };
+
+  const boost::json::object started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("block-lifecycle",
+                boost::json::object{{"workload", configuration(4U, 2U)}}),
+      3s, "block-generation workload start");
+  if (started.at("configuration").as_object().at("type").as_string() !=
+          "block_generation" ||
+      started.at("workload_id").as_string() != "block-lifecycle") {
+    throw std::runtime_error(
+        "block-generation start returned the wrong typed identity");
+  }
+  static_cast<void>(
+      WaitForFileOccurrences(audit_path, "generation-started", 1U, 3s));
+  const boost::json::object pause_submitted = SubmitMcpOperation(
+      mcp, &request_id, "workload.pause",
+      arguments("block-lifecycle", boost::json::object{{"timeout_sec", 2U}}));
+  wait_for_state("block-lifecycle", "stopping",
+                 "block-generation pause admission");
+  ReleaseBlockGeneration(run_root, 0U);
+  const boost::json::object paused = WaitForMcpOperation(
+      mcp, &request_id, pause_submitted, 3s, "block-generation workload pause");
+  if (paused.at("state").as_string() != "paused" ||
+      accounting(paused).at("generated").to_number<std::uint64_t>() != 1U ||
+      accounting(paused)
+              .at("completed_boundaries")
+              .to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "block-generation pause did not finish at one synchronized boundary");
+  }
+  const boost::json::object paused_again = InvokeMcpOperation(
+      mcp, &request_id, "workload.pause",
+      arguments("block-lifecycle", boost::json::object{{"timeout_sec", 2U}}),
+      3s, "already-paused block-generation workload pause");
+  if (paused_again.at("state").as_string() != "paused") {
+    throw std::runtime_error(
+        "repeated block-generation pause changed the paused lifecycle");
+  }
+  const boost::json::array current =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workloads",
+                          "active block-generation workloads")
+          .as_array();
+  if (current.size() != 1U ||
+      require_workload(current, "block-lifecycle").at("state").as_string() !=
+          "paused") {
+    throw std::runtime_error(
+        "paused block-generation workload was not retained as current");
+  }
+
+  const boost::json::object reconfigured = InvokeMcpOperation(
+      mcp, &request_id, "workload.reconfigure",
+      arguments("block-lifecycle",
+                boost::json::object{{"workload", configuration(2U, 3U)}}),
+      3s, "block-generation workload reconfiguration");
+  if (reconfigured.at("workload_id").as_string() != "block-lifecycle" ||
+      reconfigured.at("configuration_revision").to_number<std::uint64_t>() !=
+          2U ||
+      reconfigured.at("configuration")
+              .as_object()
+              .at("sync_timeout_sec")
+              .to_number<std::uint64_t>() != 3U ||
+      accounting(reconfigured)
+              .at("completed_boundaries")
+              .to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "block-generation reconfiguration lost identity or lifetime progress");
+  }
+  static_cast<void>(InvokeMcpOperation(
+      mcp, &request_id, "workload.resume",
+      arguments("block-lifecycle", boost::json::object{{"timeout_sec", 2U}}),
+      3s, "block-generation workload resume"));
+  static_cast<void>(
+      WaitForFileOccurrences(audit_path, "generation-started", 2U, 3s));
+  ReleaseBlockGeneration(run_root, 1U);
+  boost::json::object completed;
+  const auto completed_deadline = std::chrono::steady_clock::now() + 3s;
+  while (std::chrono::steady_clock::now() < completed_deadline) {
+    completed = InvokeMcpOperation(
+        mcp, &request_id, "workload.inspect", arguments("block-lifecycle"), 2s,
+        "completed block-generation workload inspection");
+    if (completed.at("state").as_string() == "completed") {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (completed.empty() || completed.at("state").as_string() != "completed" ||
+      completed.at("terminal_outcome").as_string() != "count_reached" ||
+      accounting(completed).at("generated").to_number<std::uint64_t>() != 2U ||
+      accounting(completed)
+              .at("completed_boundaries")
+              .to_number<std::uint64_t>() != 2U ||
+      accounting(completed).at("outstanding").to_number<std::uint64_t>() !=
+          0U ||
+      !completed.at("last_result").as_object().at("synchronized").as_bool()) {
+    throw std::runtime_error(
+        "block-generation reconfigured workload did not complete exactly");
+  }
+  if (!ReadMcpResourceData(mcp, &request_id, "bbp:///workloads",
+                           "completed block-generation current resource")
+           .as_array()
+           .empty()) {
+    throw std::runtime_error(
+        "completed block-generation workload remained in current resources");
+  }
+  const boost::json::array completed_history =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workload_history",
+                          "completed block-generation history")
+          .as_array();
+  if (completed_history.size() != 1U ||
+      require_workload(completed_history, "block-lifecycle")
+              .at("state")
+              .as_string() != "completed") {
+    throw std::runtime_error(
+        "completed block-generation workload was not retained in history");
+  }
+
+  static_cast<void>(InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("block-stop",
+                boost::json::object{{"workload", configuration(100U, 2U)}}),
+      3s, "cancellable block-generation workload start"));
+  static_cast<void>(
+      WaitForFileOccurrences(audit_path, "generation-started", 3U, 3s));
+  const auto stop_started = std::chrono::steady_clock::now();
+  const boost::json::object stop_submitted = SubmitMcpOperation(
+      mcp, &request_id, "workload.stop",
+      arguments("block-stop", boost::json::object{{"policy", "cancel"},
+                                                  {"timeout_sec", 2U}}));
+  wait_for_state("block-stop", "stopping", "block-generation Stop admission");
+  ReleaseBlockGeneration(run_root, 2U);
+  const boost::json::object stopped = WaitForMcpOperation(
+      mcp, &request_id, stop_submitted, 3s, "block-generation workload Stop");
+  if (std::chrono::steady_clock::now() - stop_started >= 2s ||
+      stopped.at("state").as_string() != "stopped" ||
+      stopped.at("terminal_outcome").as_string() != "stopped" ||
+      accounting(stopped).at("attempted").to_number<std::uint64_t>() != 1U ||
+      accounting(stopped).at("generated").to_number<std::uint64_t>() != 1U ||
+      accounting(stopped)
+              .at("completed_boundaries")
+              .to_number<std::uint64_t>() != 0U ||
+      accounting(stopped).at("cancelled").to_number<std::uint64_t>() != 1U ||
+      accounting(stopped).at("outstanding").to_number<std::uint64_t>() != 0U ||
+      accounting(stopped).at("generation_outcome_unconfirmed").as_bool()) {
+    throw std::runtime_error(
+        "block-generation cancel Stop was not bounded and truthful");
+  }
+  const boost::json::array stopped_history =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workload_history",
+                          "stopped block-generation history")
+          .as_array();
+  if (stopped_history.size() != 2U ||
+      require_workload(stopped_history, "block-stop").at("state").as_string() !=
+          "stopped") {
+    throw std::runtime_error(
+        "stopped block-generation workload was not retained in history");
+  }
+  const boost::json::object zero_count = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("block-zero",
+                boost::json::object{{"workload", configuration(0U, 2U)}}),
+      3s, "zero-count block-generation workload start");
+  if (zero_count.at("state").as_string() != "completed" ||
+      zero_count.at("terminal_outcome").as_string() != "count_reached" ||
+      accounting(zero_count).at("target").to_number<std::uint64_t>() != 0U ||
+      accounting(zero_count).at("attempted").to_number<std::uint64_t>() != 0U ||
+      accounting(zero_count).at("generated").to_number<std::uint64_t>() != 0U ||
+      accounting(zero_count)
+              .at("completed_boundaries")
+              .to_number<std::uint64_t>() != 0U ||
+      !zero_count.at("last_result").is_null()) {
+    throw std::runtime_error(
+        "zero-count block-generation workload did not complete without a "
+        "mutation");
+  }
+  if (!std::filesystem::remove(run_root / "bbp-test-block-generation-gate")) {
+    throw std::runtime_error(
+        "could not disable deterministic block-generation gate");
+  }
+}
+
+void StartBlockGenerationWorkloadForRunShutdown(
+    std::string_view run_id, const std::filesystem::path& run_root,
+    const std::filesystem::path& home_directory) {
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  const boost::json::object started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      boost::json::object{
+          {"run_id", run_id},
+          {"workload_id", "block-shutdown"},
+          {"workload", boost::json::object{{"type", "block_generation"},
+                                           {"node", 1U},
+                                           {"count", 100U},
+                                           {"sync_timeout_sec", 2U}}}},
+      3s, "run-shutdown block-generation workload start");
+  if (started.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "run-shutdown block-generation workload did not start");
+  }
+  static_cast<void>(
+      WaitForFileOccurrences(run_root / "bbp-test-block-generation-audit",
+                             "generation-started", 4U, 3s));
+}
+
 void CheckActiveRunLifecycle(const std::filesystem::path& command,
                              const std::filesystem::path& helper_binary) {
   OwnedTemporaryDirectory directory("active");
@@ -2985,6 +3450,8 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
       CopyActiveDaemonFixtures(helper_binary, directory.root());
   const std::filesystem::path scenario = directory.root() / "scenario.json";
   const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
   const std::string run_id = "tui-active-" + std::to_string(getpid());
   const std::filesystem::path run_root = benchmark_root / run_id;
   const std::filesystem::path events_path = run_root / "events.jsonl";
@@ -3003,7 +3470,7 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
       {"--scenario", scenario.string(), "--node-binary", daemon.string(),
        "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
        "--refresh-ms", "50"},
-      30, 100);
+      30, 100, home_directory);
   if (unsetenv("BBP_TUI_FIRO_QT_EXECUTION_MARKER") != 0) {
     throw std::system_error(errno, std::generic_category(),
                             "clear Firo-Qt execution marker");
@@ -3018,11 +3485,14 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   }
   const std::string connection_events = WaitForFileText(
       events_path, "\"event\":\"operator_connection_command\"", 10s);
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"rpc_ready\"", 30s));
 
   const std::string expected_qt_command = ActiveOperatorConnectionCommand(
       run_root, daemon.parent_path() / "firo-qt");
   RequireContains(connection_events, expected_qt_command,
                   "active generated Firo-Qt command evidence");
+  CheckBlockGenerationWorkloadLifecycle(run_id, run_root, home_directory);
 #ifdef BBP_FIRO_GUI_LAUNCHER
   process.Write("c");
   static_cast<void>(
@@ -3137,6 +3607,7 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
     throw std::runtime_error("Esc,n stopped the active worker or its daemon");
   }
 
+  StartBlockGenerationWorkloadForRunShutdown(run_id, run_root, home_directory);
   process.Write("\x1b");
   static_cast<void>(
       process.ReadUntil("Confirm exit", 3s, "active-run confirmed exit modal"));
@@ -3146,6 +3617,12 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
       WaitForFileText(events_path, "\"event\":\"run_finished\"", 3s);
   RequireContains(finished_events, "\"event\":\"run_cancelled\"",
                   "active-run confirmed exit");
+  RequireContains(finished_events, "\"event\":\"workload_state\"",
+                  "active-run block workload shutdown");
+  RequireContains(finished_events, "\\\"workload_id\\\":\\\"block-shutdown\\\"",
+                  "active-run block workload shutdown identity");
+  RequireContains(finished_events, "\\\"state\\\":\\\"cancelled\\\"",
+                  "active-run block workload shutdown state");
   WaitForProcessExit(daemon_pid, 3s);
 #ifdef BBP_FIRO_GUI_LAUNCHER
   struct stat launcher_status{};

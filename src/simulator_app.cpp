@@ -7864,7 +7864,8 @@ std::string GeneratedBlocksDetail(
     uint32_t workload_index, uint32_t workload_count, uint32_t generator_node,
     uint64_t start_height, uint64_t target_height,
     const std::vector<std::string>& hashes, const std::string& reward_address,
-    std::optional<std::uint64_t> operator_command_sequence = std::nullopt) {
+    std::optional<std::uint64_t> operator_command_sequence = std::nullopt,
+    std::optional<std::string_view> workload_id = std::nullopt) {
   boost::json::array hash_array;
   for (const std::string& hash : hashes) {
     hash_array.emplace_back(hash);
@@ -7880,6 +7881,9 @@ std::string GeneratedBlocksDetail(
   detail["hashes"] = std::move(hash_array);
   if (operator_command_sequence) {
     detail["operator_command_sequence"] = *operator_command_sequence;
+  }
+  if (workload_id) {
+    detail["workload_id"] = *workload_id;
   }
   return boost::json::serialize(detail);
 }
@@ -8810,17 +8814,144 @@ void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
   node.AddMinedTransactions(mined_transaction_count);
 }
 
-std::vector<std::string> GenerateBlocksSerialized(
-    std::timed_mutex& block_generation_mutex, const ChainDriver& driver,
-    const ChainNodeConfig& node, std::uint32_t count,
-    const std::string& reward_address, std::stop_token stop_token) {
+std::unique_lock<std::timed_mutex> AcquireBlockGenerationLock(
+    std::timed_mutex& block_generation_mutex, std::stop_token stop_token) {
   std::unique_lock<std::timed_mutex> generation_lock(block_generation_mutex,
                                                      std::defer_lock);
   while (!generation_lock.try_lock_for(std::chrono::milliseconds(25))) {
     ThrowIfStopRequested(stop_token);
   }
   ThrowIfStopRequested(stop_token);
+  return generation_lock;
+}
+
+std::vector<std::string> GenerateBlocksSerialized(
+    std::timed_mutex& block_generation_mutex, const ChainDriver& driver,
+    const ChainNodeConfig& node, std::uint32_t count,
+    const std::string& reward_address, std::stop_token stop_token) {
+  std::unique_lock<std::timed_mutex> generation_lock =
+      AcquireBlockGenerationLock(block_generation_mutex, stop_token);
   return driver.GenerateBlocks(node, count, reward_address, stop_token);
+}
+
+NodeRuntime& RequireRuntimeNodeNumber(const RuntimeNodeSnapshot& nodes,
+                                      std::uint32_t node,
+                                      std::string_view context) {
+  if (node == 0U || node > nodes.size()) {
+    throw std::runtime_error(std::string(context) +
+                             " references an inactive node number " +
+                             std::to_string(node));
+  }
+  return nodes[node - 1U];
+}
+
+struct GeneratedBlockWorkloadBoundary {
+  std::uint32_t generator_node = 0U;
+  std::string generator_node_id;
+  std::uint64_t start_height = 0U;
+  std::uint64_t target_height = 0U;
+  std::vector<std::string> hashes;
+  std::string reward_address;
+};
+
+class BlockGenerationOutcomeUnconfirmed final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+GeneratedBlockWorkloadBoundary GenerateBlockWorkloadBoundary(
+    const ChainDriver& driver, std::timed_mutex& block_generation_mutex,
+    const RuntimeNodeSnapshot& nodes, const BlockGenerationWorkload& workload,
+    const std::string& reward_address, std::stop_token mutation_stop_token,
+    std::stop_token boundary_stop_token,
+    const std::function<void()>& authorize_mutation = {}) {
+  if (workload.count == 0U) {
+    throw std::logic_error(
+        "block-generation boundary requires a positive count");
+  }
+  NodeRuntime& generator = RequireRuntimeNodeNumber(
+      nodes, workload.node, "block generation workload");
+  std::unique_lock<std::timed_mutex> generation_lock =
+      AcquireBlockGenerationLock(block_generation_mutex, boundary_stop_token);
+  RequireNodeRunning(generator, "block generation workload");
+  const std::uint64_t start_height =
+      driver.ReadMetrics(generator.config, boundary_stop_token).height;
+  ThrowIfStopRequested(boundary_stop_token);
+  std::vector<std::string> hashes;
+  if (authorize_mutation) {
+    authorize_mutation();
+  }
+  try {
+    hashes = driver.GenerateBlocks(generator.config, workload.count,
+                                   reward_address, mutation_stop_token);
+  } catch (const SimulationCancelled&) {
+    if (!mutation_stop_token.stop_requested()) {
+      throw BlockGenerationOutcomeUnconfirmed(
+          "block generation RPC cancelled after mutation admission with an "
+          "unconfirmed outcome");
+    }
+    throw;
+  } catch (const std::exception& error) {
+    throw BlockGenerationOutcomeUnconfirmed(
+        "block generation RPC outcome is unconfirmed: " +
+        std::string(error.what()));
+  } catch (...) {
+    throw BlockGenerationOutcomeUnconfirmed(
+        "block generation RPC outcome is unconfirmed after an unknown "
+        "failure");
+  }
+  if (hashes.size() != workload.count ||
+      start_height >
+          std::numeric_limits<std::uint64_t>::max() - hashes.size()) {
+    throw BlockGenerationOutcomeUnconfirmed(
+        "block generation workload returned an invalid block count or height");
+  }
+
+  const std::uint64_t target_height = start_height + hashes.size();
+  return GeneratedBlockWorkloadBoundary{
+      .generator_node = workload.node,
+      .generator_node_id = generator.config.id,
+      .start_height = start_height,
+      .target_height = target_height,
+      .hashes = std::move(hashes),
+      .reward_address = reward_address,
+  };
+}
+
+void RecordAndPublishGeneratedBlockWorkloadBoundary(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, const RuntimeNodeSnapshot& nodes,
+    const GeneratedBlockWorkloadBoundary& boundary,
+    std::uint32_t workload_index, std::uint32_t workload_count,
+    std::stop_token reconciliation_stop_token,
+    std::optional<std::string_view> workload_id = std::nullopt) {
+  NodeRuntime& generator = RequireRuntimeNodeNumber(
+      nodes, boundary.generator_node, "block generation workload");
+  RecordGeneratedBlocks(driver, generator, boundary.hashes,
+                        reconciliation_stop_token);
+  WriteEvent(events_path, options.run_id, generator.config.id,
+             SimulationEventKind::kGeneratedBlocks,
+             GeneratedBlocksDetail(
+                 workload_index, workload_count, boundary.generator_node,
+                 boundary.start_height, boundary.target_height, boundary.hashes,
+                 boundary.reward_address, std::nullopt, workload_id));
+}
+
+void SynchronizeBlockWorkloadBoundary(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, const RuntimeNodeSnapshot& nodes,
+    const GeneratedBlockWorkloadBoundary& boundary,
+    std::uint32_t sync_timeout_sec, std::stop_token stop_token) {
+  for (NodeRuntime& node : nodes) {
+    if (!node.AllowsChainMetrics()) {
+      continue;
+    }
+    driver.WaitForHeight(node.config, boundary.target_height,
+                         std::chrono::seconds(sync_timeout_sec), stop_token);
+    WriteEvent(events_path, options.run_id, node.config.id,
+               SimulationEventKind::kHeightReached,
+               std::to_string(boundary.target_height));
+  }
 }
 
 using RuntimeNodePointers = std::vector<NodeRuntime*>;
@@ -12802,7 +12933,7 @@ void ApplySendRawTransactionWorkload(
       std::chrono::seconds(workload.timeout_sec), stop_token);
 }
 
-enum class LiveWalletWorkloadState {
+enum class LiveWorkloadState {
   kStarting,
   kRunning,
   kPaused,
@@ -12813,7 +12944,7 @@ enum class LiveWalletWorkloadState {
   kFailed,
 };
 
-enum class LiveWalletWorkloadRequest {
+enum class LiveWorkloadRequest {
   kNone,
   kPause,
   kReconfigure,
@@ -12823,33 +12954,44 @@ enum class LiveWalletWorkloadRequest {
   kRunFailure,
 };
 
-std::string_view LiveWalletWorkloadStateName(LiveWalletWorkloadState state) {
+using LiveWalletWorkloadState = LiveWorkloadState;
+using LiveWalletWorkloadRequest = LiveWorkloadRequest;
+
+std::string_view LiveWorkloadStateName(LiveWorkloadState state) {
   switch (state) {
-    case LiveWalletWorkloadState::kStarting:
+    case LiveWorkloadState::kStarting:
       return "starting";
-    case LiveWalletWorkloadState::kRunning:
+    case LiveWorkloadState::kRunning:
       return "running";
-    case LiveWalletWorkloadState::kPaused:
+    case LiveWorkloadState::kPaused:
       return "paused";
-    case LiveWalletWorkloadState::kStopping:
+    case LiveWorkloadState::kStopping:
       return "stopping";
-    case LiveWalletWorkloadState::kStopped:
+    case LiveWorkloadState::kStopped:
       return "stopped";
-    case LiveWalletWorkloadState::kCompleted:
+    case LiveWorkloadState::kCompleted:
       return "completed";
-    case LiveWalletWorkloadState::kCancelled:
+    case LiveWorkloadState::kCancelled:
       return "cancelled";
-    case LiveWalletWorkloadState::kFailed:
+    case LiveWorkloadState::kFailed:
       return "failed";
   }
-  throw std::logic_error("unknown live wallet workload state");
+  throw std::logic_error("unknown live workload state");
+}
+
+std::string_view LiveWalletWorkloadStateName(LiveWalletWorkloadState state) {
+  return LiveWorkloadStateName(state);
+}
+
+bool IsTerminalLiveWorkloadState(LiveWorkloadState state) {
+  return state == LiveWorkloadState::kStopped ||
+         state == LiveWorkloadState::kCompleted ||
+         state == LiveWorkloadState::kCancelled ||
+         state == LiveWorkloadState::kFailed;
 }
 
 bool IsTerminalLiveWalletWorkloadState(LiveWalletWorkloadState state) {
-  return state == LiveWalletWorkloadState::kStopped ||
-         state == LiveWalletWorkloadState::kCompleted ||
-         state == LiveWalletWorkloadState::kCancelled ||
-         state == LiveWalletWorkloadState::kFailed;
+  return IsTerminalLiveWorkloadState(state);
 }
 
 struct LiveWalletWorkloadRecord {
@@ -12888,6 +13030,180 @@ struct LiveWalletWorkloadRegistry {
   std::uint64_t next_id = 1U;
   bool shutting_down = false;
 };
+
+struct LiveBlockGenerationBoundaryResult {
+  std::uint32_t generator_node = 0U;
+  std::string generator_node_id;
+  std::uint64_t start_height = 0U;
+  std::uint64_t target_height = 0U;
+  std::string block_hash;
+  std::string reward_address;
+  bool synchronized = false;
+};
+
+struct LiveBlockGenerationWorkloadRecord {
+  mutable std::mutex mutex;
+  std::condition_variable_any changed;
+  std::string id;
+  std::uint32_t ordinal = 0U;
+  BlockGenerationWorkload workload;
+  std::optional<BlockGenerationWorkload> pending_workload;
+  LiveWorkloadState state = LiveWorkloadState::kStarting;
+  LiveWorkloadRequest request = LiveWorkloadRequest::kNone;
+  std::string terminal_outcome = "none";
+  std::optional<std::string> failure;
+  std::uint64_t configuration_revision = 1U;
+  std::uint64_t attempted = 0U;
+  std::uint64_t generated = 0U;
+  std::uint64_t completed_boundaries = 0U;
+  std::uint64_t failed = 0U;
+  std::uint64_t cancelled = 0U;
+  bool generation_outcome_unconfirmed = false;
+  bool boundary_mutation_admitted = false;
+  std::optional<LiveBlockGenerationBoundaryResult> last_result;
+  std::chrono::steady_clock::time_point started_at =
+      std::chrono::steady_clock::now();
+  std::stop_source boundary_stop_source;
+  std::thread worker;
+};
+
+struct LiveBlockGenerationWorkloadRegistry {
+  mutable std::mutex mutex;
+  std::map<std::string, std::shared_ptr<LiveBlockGenerationWorkloadRecord>>
+      records;
+  std::uint64_t next_id = 1U;
+  bool shutting_down = false;
+};
+
+BlockGenerationWorkload ParseAndValidateLiveBlockGenerationWorkload(
+    const boost::json::object& workload, const Options& options,
+    const RuntimeNodeSnapshot& nodes) {
+  if (nodes.empty()) {
+    throw McpOperationFailure(
+        "workload_node_unavailable",
+        "block generation requires at least one active node", true);
+  }
+  boost::json::array workloads;
+  workloads.emplace_back(workload);
+  Options validation_options = options;
+  validation_options.workloads.clear();
+  validation_options.scheduled_events.clear();
+  if (validation_options.generate_node == 0U) {
+    validation_options.generate_node = 1U;
+  }
+  boost::program_options::variables_map variables;
+  ApplyScenarioWorkloads(workloads, variables, validation_options);
+  if (validation_options.workloads.size() != 1U ||
+      validation_options.workloads.front().kind !=
+          WorkloadKind::kBlockGeneration) {
+    throw std::runtime_error(
+        "workload operation requires a block_generation workload");
+  }
+  const BlockGenerationWorkload parsed =
+      validation_options.workloads.front().block_generation;
+  static_cast<void>(RequireRuntimeNodeNumber(nodes, parsed.node,
+                                             "block generation workload"));
+  if (parsed.sync_timeout_sec == 0U || parsed.sync_timeout_sec > 3600U) {
+    throw std::runtime_error(
+        "block generation sync_timeout_sec must be in 1..3600");
+  }
+  return parsed;
+}
+
+boost::json::object LiveBlockGenerationWorkloadJson(
+    const LiveBlockGenerationWorkloadRecord& record) {
+  std::lock_guard<std::mutex> lock(record.mutex);
+  if (record.completed_boundaries >
+          std::numeric_limits<std::uint64_t>::max() - record.failed ||
+      record.completed_boundaries + record.failed >
+          std::numeric_limits<std::uint64_t>::max() - record.cancelled) {
+    throw std::runtime_error(
+        "block generation workload final accounting exceeds uint64");
+  }
+  const std::uint64_t finalized =
+      record.completed_boundaries + record.failed + record.cancelled;
+  if (finalized > record.attempted || record.generated > record.attempted) {
+    throw std::runtime_error(
+        "block generation workload accounting is inconsistent");
+  }
+  const std::uint64_t target = record.workload.count;
+  const std::uint64_t remaining = target > record.completed_boundaries
+                                      ? target - record.completed_boundaries
+                                      : 0U;
+  const std::uint64_t outstanding = record.attempted - finalized;
+  boost::json::object accounting{
+      {"target", target},
+      {"attempted", record.attempted},
+      {"generated", record.generated},
+      {"completed_boundaries", record.completed_boundaries},
+      {"failed", record.failed},
+      {"cancelled", record.cancelled},
+      {"remaining", remaining},
+      {"outstanding", outstanding},
+      {"in_flight", outstanding},
+      {"generation_outcome_unconfirmed", record.generation_outcome_unconfirmed},
+  };
+  boost::json::object result{
+      {"workload_id", record.id},
+      {"state", LiveWorkloadStateName(record.state)},
+      {"terminal_outcome", record.terminal_outcome},
+      {"configuration_revision", record.configuration_revision},
+      {"configuration", BlockGenerationWorkloadJson(record.workload)},
+      {"accounting", std::move(accounting)},
+  };
+  if (record.last_result) {
+    result["last_result"] = boost::json::object{
+        {"generator_node", record.last_result->generator_node},
+        {"generator_node_id", record.last_result->generator_node_id},
+        {"start_height", record.last_result->start_height},
+        {"target_height", record.last_result->target_height},
+        {"block_hash", record.last_result->block_hash},
+        {"reward_address", record.last_result->reward_address},
+        {"synchronized", record.last_result->synchronized},
+    };
+  } else {
+    result["last_result"] = nullptr;
+  }
+  result["failure"] = record.failure ? boost::json::value(*record.failure)
+                                     : boost::json::value(nullptr);
+  return result;
+}
+
+void WriteLiveBlockGenerationWorkloadState(
+    const std::filesystem::path& events_path, const Options& options,
+    const LiveBlockGenerationWorkloadRecord& record) {
+  WriteEvent(events_path, options.run_id, record.id,
+             SimulationEventKind::kWorkloadState,
+             boost::json::serialize(LiveBlockGenerationWorkloadJson(record)));
+}
+
+void RequireNoActiveBlockGenerationWorkloads(
+    const std::shared_ptr<LiveBlockGenerationWorkloadRegistry>& registry,
+    std::string_view operation) {
+  if (!registry) {
+    throw std::logic_error(std::string(operation) +
+                           " block workload service is missing");
+  }
+  std::vector<std::shared_ptr<LiveBlockGenerationWorkloadRecord>> records;
+  {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    records.reserve(registry->records.size());
+    for (const auto& [id, record] : registry->records) {
+      static_cast<void>(id);
+      records.push_back(record);
+    }
+  }
+  for (const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record :
+       records) {
+    std::lock_guard<std::mutex> lock(record->mutex);
+    if (!IsTerminalLiveWorkloadState(record->state)) {
+      throw std::runtime_error(
+          std::string(operation) +
+          " is unavailable while block generation workload " + record->id +
+          " is " + std::string(LiveWorkloadStateName(record->state)));
+    }
+  }
+}
 
 std::vector<std::uint32_t> ClaimedWalletsForWorkload(
     const WalletTransactionsWorkload& workload, std::size_t wallet_count) {
@@ -17024,6 +17340,8 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     const RuntimePeerTopology& runtime_topology,
     const PeerTopologyConfig& live_topology_config,
     const std::shared_ptr<LiveWalletWorkloadRegistry>& wallet_workloads,
+    const std::shared_ptr<LiveBlockGenerationWorkloadRegistry>&
+        block_generation_workloads,
     const TransactionObservationTracker& transaction_tracker,
     RunProcessState& run_process_state,
     std::chrono::steady_clock::time_point lifecycle_epoch,
@@ -17104,6 +17422,8 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
       }
     }
   }
+  RequireNoActiveBlockGenerationWorkloads(block_generation_workloads,
+                                          "node-replace");
   if (transaction_tracker.HasPending()) {
     throw std::runtime_error(
         "node-replace is unavailable while transaction observations are "
@@ -18033,6 +18353,8 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
     std::unique_ptr<RuntimePeerTopology>* runtime_topology,
     PeerTopologyConfig* live_topology_config,
     const std::shared_ptr<LiveWalletWorkloadRegistry>& wallet_workloads,
+    const std::shared_ptr<LiveBlockGenerationWorkloadRegistry>&
+        block_generation_workloads,
     const TransactionObservationTracker& transaction_tracker,
     const SimulationNodeRemoveRequest& request,
     SimulationCommandControl* operation_control, std::stop_token stop_token) {
@@ -18146,6 +18468,8 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
       }
     }
   }
+  RequireNoActiveBlockGenerationWorkloads(block_generation_workloads,
+                                          "node-remove");
   if (transaction_tracker.HasPending()) {
     throw std::runtime_error(
         "node-remove is unavailable while transaction observations are "
@@ -21866,6 +22190,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   std::vector<PendingTransactionLoadCompletion>
       pending_transaction_load_completions;
   auto wallet_workloads = std::make_shared<LiveWalletWorkloadRegistry>();
+  auto block_generation_workloads =
+      std::make_shared<LiveBlockGenerationWorkloadRegistry>();
   auto live_instrumentation = std::make_shared<LiveInstrumentationRegistry>();
   std::shared_ptr<McpLiveWorkloadService> installed_workload_service;
   std::shared_ptr<McpLiveInstrumentationService>
@@ -21934,16 +22260,24 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       lifecycle_supervisor.reset();
     }
   };
-  const auto stop_wallet_workloads = [&](bool run_failed) {
-    mcp_application.SetWorkloadService(nullptr);
+  const auto request_workload_shutdown = [&](bool run_failed) {
     std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
+    std::vector<std::shared_ptr<LiveBlockGenerationWorkloadRecord>>
+        block_records;
     {
-      std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
+      std::scoped_lock lock(wallet_workloads->mutex,
+                            block_generation_workloads->mutex);
       wallet_workloads->shutting_down = true;
+      block_generation_workloads->shutting_down = true;
       records.reserve(wallet_workloads->records.size());
       for (const auto& [id, record] : wallet_workloads->records) {
         static_cast<void>(id);
         records.push_back(record);
+      }
+      block_records.reserve(block_generation_workloads->records.size());
+      for (const auto& [id, record] : block_generation_workloads->records) {
+        static_cast<void>(id);
+        block_records.push_back(record);
       }
     }
     for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
@@ -21957,6 +22291,23 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       record->epoch_stop_source.request_stop();
       record->changed.notify_all();
     }
+    for (const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record :
+         block_records) {
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (IsTerminalLiveWorkloadState(record->state)) {
+        continue;
+      }
+      record->state = LiveWorkloadState::kStopping;
+      record->request = run_failed ? LiveWorkloadRequest::kRunFailure
+                                   : LiveWorkloadRequest::kShutdown;
+      record->boundary_stop_source.request_stop();
+      record->changed.notify_all();
+    }
+    return std::make_pair(std::move(records), std::move(block_records));
+  };
+  const auto stop_wallet_workloads = [&](bool run_failed) {
+    mcp_application.SetWorkloadService(nullptr);
+    auto [records, block_records] = request_workload_shutdown(run_failed);
     for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
       if (record->worker.joinable()) {
         record->worker.join();
@@ -21968,6 +22319,23 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         record->terminal_outcome = run_failed ? "failed" : "cancelled";
         if (run_failed && !record->failure) {
           record->failure = "run failed while wallet workload was active";
+        }
+        record->changed.notify_all();
+      }
+    }
+    for (const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record :
+         block_records) {
+      if (record->worker.joinable()) {
+        record->worker.join();
+      }
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (!IsTerminalLiveWorkloadState(record->state)) {
+        record->state = run_failed ? LiveWorkloadState::kFailed
+                                   : LiveWorkloadState::kCancelled;
+        record->terminal_outcome = run_failed ? "failed" : "cancelled";
+        if (run_failed && !record->failure) {
+          record->failure =
+              "run failed while block generation workload was active";
         }
         record->changed.notify_all();
       }
@@ -22612,10 +22980,10 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                         options, run_root, events_path, driver, node_inventory,
                         runtime_wallet_registry, *peer_connectivity_controller,
                         *runtime_topology, live_topology_config,
-                        wallet_workloads, transaction_tracker,
-                        run_process_state, lifecycle_epoch, command.node_id,
-                        *command.node_replace, resume_native_miner,
-                        chain_spec.default_reward_address,
+                        wallet_workloads, block_generation_workloads,
+                        transaction_tracker, run_process_state, lifecycle_epoch,
+                        command.node_id, *command.node_replace,
+                        resume_native_miner, chain_spec.default_reward_address,
                         command.operation_control.get(), command_stop_token);
                 command_outcome.inventory_generation =
                     replaced.inventory_generation;
@@ -22663,8 +23031,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                   options, events_path, driver, node_inventory,
                   runtime_wallet_registry, *peer_connectivity_controller,
                   &runtime_topology, &live_topology_config, wallet_workloads,
-                  transaction_tracker, *command.node_remove,
-                  command.operation_control.get(), command_stop_token);
+                  block_generation_workloads, transaction_tracker,
+                  *command.node_remove, command.operation_control.get(),
+                  command_stop_token);
               command_outcome.removed_node_ids =
                   std::move(removed.removed_node_ids);
               command_outcome.inventory_generation =
@@ -23706,6 +24075,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           }
         }
         mcp_application.MarkRunStopping();
+        static_cast<void>(request_workload_shutdown(true));
         simulation_stop_source.request_stop();
       }
     });
@@ -23806,20 +24176,19 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       return validation;
     };
 
-    const auto require_workload_record =
-        [wallet_workloads](std::string_view workload_id) {
-          std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
-          const auto found =
-              wallet_workloads->records.find(std::string(workload_id));
-          if (found == wallet_workloads->records.end()) {
-            throw McpOperationFailure(
-                "workload_not_found",
-                "wallet workload instance is not registered: " +
-                    std::string(workload_id),
-                false);
-          }
-          return found->second;
-        };
+    const auto require_workload_record = [wallet_workloads](
+                                             std::string_view workload_id) {
+      std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
+      const auto found =
+          wallet_workloads->records.find(std::string(workload_id));
+      if (found == wallet_workloads->records.end()) {
+        throw McpOperationFailure(
+            "workload_not_found",
+            "workload instance is not registered: " + std::string(workload_id),
+            false);
+      }
+      return found->second;
+    };
     const auto launch_wallet_workload =
         [&](WalletTransactionsWorkload workload,
             std::optional<std::string> requested_id)
@@ -23827,8 +24196,10 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       auto record = std::make_shared<LiveWalletWorkloadRecord>();
       record->workload = std::move(workload);
       {
-        std::lock_guard<std::mutex> registry_lock(wallet_workloads->mutex);
-        if (wallet_workloads->shutting_down) {
+        std::scoped_lock registry_lock(wallet_workloads->mutex,
+                                       block_generation_workloads->mutex);
+        if (wallet_workloads->shutting_down ||
+            block_generation_workloads->shutting_down) {
           throw McpOperationFailure(
               "run_not_active",
               "the run is stopping and cannot start another workload", false);
@@ -23841,10 +24212,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         ValidateWalletTransactionsWorkload(record->workload, validation);
         record->claimed_wallets = ClaimedWalletsForWorkload(
             record->workload, record->wallet_snapshot.wallets().size());
-        if (wallet_workloads->records.size() >= kMaximumScenarioActionCount) {
+        if (wallet_workloads->records.size() +
+                block_generation_workloads->records.size() >=
+            kMaximumScenarioActionCount) {
           throw McpOperationFailure(
               "workload_capacity_exceeded",
-              "wallet workload retained-instance capacity is exhausted", false);
+              "workload retained-instance capacity is exhausted", false);
         }
         std::size_t active_count = 0U;
         for (const auto& [existing_id, existing] : wallet_workloads->records) {
@@ -23870,11 +24243,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         }
         if (requested_id) {
           ValidateMcpIdentifier(*requested_id, "workload_id");
-          if (wallet_workloads->records.contains(*requested_id)) {
+          if (wallet_workloads->records.contains(*requested_id) ||
+              block_generation_workloads->records.contains(*requested_id)) {
             throw McpOperationFailure(
                 "workload_id_conflict",
-                "wallet workload_id is already retained: " + *requested_id,
-                false);
+                "workload_id is already retained: " + *requested_id, false);
           }
           record->id = *requested_id;
         } else {
@@ -23887,341 +24260,930 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             }
             record->id = "wallet-workload-" +
                          std::to_string(wallet_workloads->next_id++);
-          } while (wallet_workloads->records.contains(record->id));
+          } while (wallet_workloads->records.contains(record->id) ||
+                   block_generation_workloads->records.contains(record->id));
         }
-        record->ordinal =
-            static_cast<std::uint32_t>(wallet_workloads->records.size() + 1U);
+        record->ordinal = static_cast<std::uint32_t>(
+            wallet_workloads->records.size() +
+            block_generation_workloads->records.size() + 1U);
         wallet_workloads->records.emplace(record->id, record);
-      }
 
-      try {
-        record->worker = std::thread([&, record] {
-          const auto set_terminal =
-              [&](LiveWalletWorkloadState state, std::string outcome,
-                  std::optional<std::string> failure = std::nullopt) {
+        try {
+          record->worker = std::thread([&, record] {
+            const auto set_terminal =
+                [&](LiveWalletWorkloadState state, std::string outcome,
+                    std::optional<std::string> failure = std::nullopt) {
+                  {
+                    std::lock_guard<std::mutex> lock(record->mutex);
+                    record->state = state;
+                    record->terminal_outcome = std::move(outcome);
+                    record->failure = std::move(failure);
+                    record->changed.notify_all();
+                  }
+                  try {
+                    WriteLiveWalletWorkloadState(events_path, options, *record);
+                  } catch (const std::exception& error) {
+                    BBP_LOG(error)
+                        << "failed to publish terminal wallet workload "
+                        << record->id << ": " << error.what();
+                  }
+                };
+            const auto cancel_outstanding_tracking = [&] {
+              const std::size_t cancelled =
+                  transaction_tracker.CancelWorkload(record->id);
+              std::lock_guard<std::mutex> lock(record->mutex);
+              CheckedWalletWorkloadAdd(static_cast<std::uint64_t>(cancelled),
+                                       &record->cancelled_tracking,
+                                       "cancelled tracking");
+            };
+            try {
+              while (true) {
+                WalletTransactionsWorkload epoch_workload;
+                RuntimeWalletSnapshot epoch_wallets;
+                std::stop_token epoch_stop_token;
                 {
-                  std::lock_guard<std::mutex> lock(record->mutex);
-                  record->state = state;
-                  record->terminal_outcome = std::move(outcome);
-                  record->failure = std::move(failure);
-                  record->changed.notify_all();
-                }
-                try {
-                  WriteLiveWalletWorkloadState(events_path, options, *record);
-                } catch (const std::exception& error) {
-                  BBP_LOG(error)
-                      << "failed to publish terminal wallet workload "
-                      << record->id << ": " << error.what();
-                }
-              };
-          const auto cancel_outstanding_tracking = [&] {
-            const std::size_t cancelled =
-                transaction_tracker.CancelWorkload(record->id);
-            std::lock_guard<std::mutex> lock(record->mutex);
-            CheckedWalletWorkloadAdd(static_cast<std::uint64_t>(cancelled),
-                                     &record->cancelled_tracking,
-                                     "cancelled tracking");
-          };
-          try {
-            while (true) {
-              WalletTransactionsWorkload epoch_workload;
-              RuntimeWalletSnapshot epoch_wallets;
-              std::stop_token epoch_stop_token;
-              {
-                std::unique_lock<std::mutex> lock(record->mutex);
-                while (record->request == LiveWalletWorkloadRequest::kPause) {
-                  record->state = LiveWalletWorkloadState::kPaused;
-                  record->changed.notify_all();
-                  lock.unlock();
-                  WriteLiveWalletWorkloadState(events_path, options, *record);
-                  lock.lock();
-                  if (!record->changed.wait(lock, stop_token, [&] {
-                        return record->request !=
-                               LiveWalletWorkloadRequest::kPause;
-                      })) {
-                    record->request = LiveWalletWorkloadRequest::kShutdown;
-                    break;
+                  std::unique_lock<std::mutex> lock(record->mutex);
+                  while (record->request == LiveWalletWorkloadRequest::kPause) {
+                    record->state = LiveWalletWorkloadState::kPaused;
+                    record->changed.notify_all();
+                    lock.unlock();
+                    WriteLiveWalletWorkloadState(events_path, options, *record);
+                    lock.lock();
+                    if (!record->changed.wait(lock, stop_token, [&] {
+                          return record->request !=
+                                 LiveWalletWorkloadRequest::kPause;
+                        })) {
+                      record->request = LiveWalletWorkloadRequest::kShutdown;
+                      break;
+                    }
                   }
-                }
-                if (record->request == LiveWalletWorkloadRequest::kStopCancel) {
-                  lock.unlock();
-                  cancel_outstanding_tracking();
-                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
-                  return;
-                }
-                if (record->request == LiveWalletWorkloadRequest::kStopSettle) {
-                  lock.unlock();
-                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
-                  return;
-                }
-                if (record->request == LiveWalletWorkloadRequest::kShutdown) {
-                  lock.unlock();
-                  cancel_outstanding_tracking();
-                  set_terminal(LiveWalletWorkloadState::kCancelled,
-                               "cancelled");
-                  return;
-                }
-                if (record->request == LiveWalletWorkloadRequest::kRunFailure) {
-                  lock.unlock();
-                  cancel_outstanding_tracking();
-                  set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                               "run failed while wallet workload was active");
-                  return;
-                }
-                if (record->request ==
-                    LiveWalletWorkloadRequest::kReconfigure) {
-                  if (!record->pending_workload) {
-                    throw std::logic_error(
-                        "wallet workload reconfigure has no configuration");
+                  if (record->request ==
+                      LiveWalletWorkloadRequest::kStopCancel) {
+                    lock.unlock();
+                    cancel_outstanding_tracking();
+                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                    return;
                   }
-                  record->workload = std::move(*record->pending_workload);
-                  record->pending_workload.reset();
-                  if (record->configuration_revision ==
-                      std::numeric_limits<std::uint64_t>::max()) {
-                    throw std::runtime_error(
-                        "wallet workload configuration revision exceeds "
-                        "uint64");
-                  }
-                  ++record->configuration_revision;
-                  record->request = LiveWalletWorkloadRequest::kNone;
-                  record->state = LiveWalletWorkloadState::kStarting;
-                  record->changed.notify_all();
-                  lock.unlock();
-                  WriteLiveWalletWorkloadState(events_path, options, *record);
-                  lock.lock();
-                }
-                record->epoch_stop_source = std::stop_source();
-                epoch_stop_token = record->epoch_stop_source.get_token();
-                epoch_workload = record->workload;
-                epoch_wallets = record->wallet_snapshot;
-              }
-
-              CombinedStopToken execution_stop(stop_token, epoch_stop_token);
-              WalletWorkloadExecutionContext execution{
-                  .accounting = record->accounting,
-                  .workload_id = record->id,
-                  .started_at = record->started_at,
-                  .next_transaction_index = record->next_transaction_index,
-                  .prepared_funding = &record->prepared_funding,
-                  .yield_requested =
-                      [record] {
-                        std::lock_guard<std::mutex> lock(record->mutex);
-                        return record->request !=
-                               LiveWalletWorkloadRequest::kNone;
-                      },
-                  .settle_requested =
-                      [record] {
-                        std::lock_guard<std::mutex> lock(record->mutex);
-                        return record->request ==
-                               LiveWalletWorkloadRequest::kStopSettle;
-                      },
-                  .record_planned =
-                      [record](std::uint64_t count) {
-                        std::lock_guard<std::mutex> lock(record->mutex);
-                        CheckedWalletWorkloadAdd(count, &record->planned,
-                                                 "planned");
-                      },
-                  .record_accepted =
-                      [record](std::uint64_t count) {
-                        std::lock_guard<std::mutex> lock(record->mutex);
-                        CheckedWalletWorkloadAdd(count, &record->accepted,
-                                                 "accepted");
-                      },
-                  .record_load_admission =
-                      [record, fee_reserve =
-                                   EffectiveWalletTransactionFeeReserveSatoshis(
-                                       epoch_workload)](
-                          std::span<const WalletTransactionPlanEntry> plans) {
-                        std::uint64_t reserved = 0U;
-                        for (const WalletTransactionPlanEntry& plan : plans) {
-                          if (plan.amount_satoshis >
-                              std::numeric_limits<std::uint64_t>::max() -
-                                  fee_reserve) {
-                            throw std::runtime_error(
-                                "wallet workload reservation amount exceeds "
-                                "uint64");
-                          }
-                          const std::uint64_t amount =
-                              plan.amount_satoshis + fee_reserve;
-                          if (reserved >
-                              std::numeric_limits<std::uint64_t>::max() -
-                                  amount) {
-                            throw std::runtime_error(
-                                "wallet workload admission reservation exceeds "
-                                "uint64");
-                          }
-                          reserved += amount;
-                        }
-                        std::lock_guard<std::mutex> lock(record->mutex);
-                        const std::uint64_t accepted =
-                            static_cast<std::uint64_t>(plans.size());
-                        if (record->accepted >
-                                std::numeric_limits<std::uint64_t>::max() -
-                                    accepted ||
-                            record->reserved_atomic_units >
-                                std::numeric_limits<std::uint64_t>::max() -
-                                    reserved) {
-                          throw std::runtime_error(
-                              "wallet workload admission accounting exceeds "
-                              "uint64");
-                        }
-                        record->accepted += accepted;
-                        record->reserved_atomic_units += reserved;
-                      },
-                  .record_released_atomic_units =
-                      [record](std::uint64_t amount) {
-                        std::lock_guard<std::mutex> lock(record->mutex);
-                        CheckedWalletWorkloadAdd(amount,
-                                                 &record->released_atomic_units,
-                                                 "released atomic units");
-                      },
-                  .execution_started =
-                      [&, record] {
-                        {
-                          std::lock_guard<std::mutex> lock(record->mutex);
-                          if (record->request ==
-                              LiveWalletWorkloadRequest::kNone) {
-                            record->state = LiveWalletWorkloadState::kRunning;
-                          }
-                          record->changed.notify_all();
-                        }
-                        WriteLiveWalletWorkloadState(events_path, options,
-                                                     *record);
-                      },
-              };
-              try {
-                RuntimeNodeSnapshot execution_nodes = node_inventory.Snapshot();
-                const WalletWorkloadExecutionResult result =
-                    ApplyWalletTransactionsWorkload(
-                        options, events_path, driver, block_generation_mutex,
-                        execution_nodes, epoch_wallets.registry(),
-                        transaction_tracker, nullptr, epoch_workload,
-                        record->ordinal, 0U, execution_stop.get_token(),
-                        &execution);
-                bool stop_settled = false;
-                {
-                  std::lock_guard<std::mutex> lock(record->mutex);
-                  record->next_transaction_index =
-                      result.next_transaction_index;
-                  record->queue_maximum_size = std::max(
-                      record->queue_maximum_size, result.queue_maximum_size);
                   if (record->request ==
                       LiveWalletWorkloadRequest::kStopSettle) {
-                    stop_settled = true;
+                    lock.unlock();
+                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                    return;
                   }
-                  if (record->request == LiveWalletWorkloadRequest::kPause ||
-                      record->request ==
-                          LiveWalletWorkloadRequest::kReconfigure) {
+                  if (record->request == LiveWalletWorkloadRequest::kShutdown) {
+                    lock.unlock();
+                    cancel_outstanding_tracking();
+                    set_terminal(LiveWalletWorkloadState::kCancelled,
+                                 "cancelled");
+                    return;
+                  }
+                  if (record->request ==
+                      LiveWalletWorkloadRequest::kRunFailure) {
+                    lock.unlock();
+                    cancel_outstanding_tracking();
+                    set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                                 "run failed while wallet workload was active");
+                    return;
+                  }
+                  if (record->request ==
+                      LiveWalletWorkloadRequest::kReconfigure) {
+                    if (!record->pending_workload) {
+                      throw std::logic_error(
+                          "wallet workload reconfigure has no configuration");
+                    }
+                    record->workload = std::move(*record->pending_workload);
+                    record->pending_workload.reset();
+                    if (record->configuration_revision ==
+                        std::numeric_limits<std::uint64_t>::max()) {
+                      throw std::runtime_error(
+                          "wallet workload configuration revision exceeds "
+                          "uint64");
+                    }
+                    ++record->configuration_revision;
+                    record->request = LiveWalletWorkloadRequest::kNone;
+                    record->state = LiveWalletWorkloadState::kStarting;
+                    record->changed.notify_all();
+                    lock.unlock();
+                    WriteLiveWalletWorkloadState(events_path, options, *record);
+                    lock.lock();
+                  }
+                  record->epoch_stop_source = std::stop_source();
+                  epoch_stop_token = record->epoch_stop_source.get_token();
+                  epoch_workload = record->workload;
+                  epoch_wallets = record->wallet_snapshot;
+                }
+
+                CombinedStopToken execution_stop(stop_token, epoch_stop_token);
+                WalletWorkloadExecutionContext execution{
+                    .accounting = record->accounting,
+                    .workload_id = record->id,
+                    .started_at = record->started_at,
+                    .next_transaction_index = record->next_transaction_index,
+                    .prepared_funding = &record->prepared_funding,
+                    .yield_requested =
+                        [record] {
+                          std::lock_guard<std::mutex> lock(record->mutex);
+                          return record->request !=
+                                 LiveWalletWorkloadRequest::kNone;
+                        },
+                    .settle_requested =
+                        [record] {
+                          std::lock_guard<std::mutex> lock(record->mutex);
+                          return record->request ==
+                                 LiveWalletWorkloadRequest::kStopSettle;
+                        },
+                    .record_planned =
+                        [record](std::uint64_t count) {
+                          std::lock_guard<std::mutex> lock(record->mutex);
+                          CheckedWalletWorkloadAdd(count, &record->planned,
+                                                   "planned");
+                        },
+                    .record_accepted =
+                        [record](std::uint64_t count) {
+                          std::lock_guard<std::mutex> lock(record->mutex);
+                          CheckedWalletWorkloadAdd(count, &record->accepted,
+                                                   "accepted");
+                        },
+                    .record_load_admission =
+                        [record,
+                         fee_reserve =
+                             EffectiveWalletTransactionFeeReserveSatoshis(
+                                 epoch_workload)](
+                            std::span<const WalletTransactionPlanEntry> plans) {
+                          std::uint64_t reserved = 0U;
+                          for (const WalletTransactionPlanEntry& plan : plans) {
+                            if (plan.amount_satoshis >
+                                std::numeric_limits<std::uint64_t>::max() -
+                                    fee_reserve) {
+                              throw std::runtime_error(
+                                  "wallet workload reservation amount exceeds "
+                                  "uint64");
+                            }
+                            const std::uint64_t amount =
+                                plan.amount_satoshis + fee_reserve;
+                            if (reserved >
+                                std::numeric_limits<std::uint64_t>::max() -
+                                    amount) {
+                              throw std::runtime_error(
+                                  "wallet workload admission reservation "
+                                  "exceeds "
+                                  "uint64");
+                            }
+                            reserved += amount;
+                          }
+                          std::lock_guard<std::mutex> lock(record->mutex);
+                          const std::uint64_t accepted =
+                              static_cast<std::uint64_t>(plans.size());
+                          if (record->accepted >
+                                  std::numeric_limits<std::uint64_t>::max() -
+                                      accepted ||
+                              record->reserved_atomic_units >
+                                  std::numeric_limits<std::uint64_t>::max() -
+                                      reserved) {
+                            throw std::runtime_error(
+                                "wallet workload admission accounting exceeds "
+                                "uint64");
+                          }
+                          record->accepted += accepted;
+                          record->reserved_atomic_units += reserved;
+                        },
+                    .record_released_atomic_units =
+                        [record](std::uint64_t amount) {
+                          std::lock_guard<std::mutex> lock(record->mutex);
+                          CheckedWalletWorkloadAdd(
+                              amount, &record->released_atomic_units,
+                              "released atomic units");
+                        },
+                    .execution_started =
+                        [&, record] {
+                          {
+                            std::lock_guard<std::mutex> lock(record->mutex);
+                            if (record->request ==
+                                LiveWalletWorkloadRequest::kNone) {
+                              record->state = LiveWalletWorkloadState::kRunning;
+                            }
+                            record->changed.notify_all();
+                          }
+                          WriteLiveWalletWorkloadState(events_path, options,
+                                                       *record);
+                        },
+                };
+                try {
+                  RuntimeNodeSnapshot execution_nodes =
+                      node_inventory.Snapshot();
+                  const WalletWorkloadExecutionResult result =
+                      ApplyWalletTransactionsWorkload(
+                          options, events_path, driver, block_generation_mutex,
+                          execution_nodes, epoch_wallets.registry(),
+                          transaction_tracker, nullptr, epoch_workload,
+                          record->ordinal, 0U, execution_stop.get_token(),
+                          &execution);
+                  bool stop_settled = false;
+                  {
+                    std::lock_guard<std::mutex> lock(record->mutex);
+                    record->next_transaction_index =
+                        result.next_transaction_index;
+                    record->queue_maximum_size = std::max(
+                        record->queue_maximum_size, result.queue_maximum_size);
+                    if (record->request ==
+                        LiveWalletWorkloadRequest::kStopSettle) {
+                      stop_settled = true;
+                    }
+                    if (record->request == LiveWalletWorkloadRequest::kPause ||
+                        record->request ==
+                            LiveWalletWorkloadRequest::kReconfigure) {
+                      continue;
+                    }
+                  }
+                  if (stop_settled) {
+                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                    return;
+                  }
+                  if (result.end ==
+                      WalletWorkloadExecutionEnd::kRefreshBalances) {
+                    std::unique_lock<std::mutex> lock(record->mutex);
+                    record->changed.wait_for(
+                        lock, execution_stop.get_token(),
+                        std::chrono::milliseconds(100), [&] {
+                          return record->request !=
+                                 LiveWalletWorkloadRequest::kNone;
+                        });
                     continue;
                   }
-                }
-                if (stop_settled) {
-                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                  const std::string outcome =
+                      epoch_workload.transaction_count != 0U ? "count_reached"
+                      : epoch_workload.duration ? "duration_expired"
+                                                : "failed";
+                  if (outcome == "failed") {
+                    cancel_outstanding_tracking();
+                    set_terminal(
+                        LiveWalletWorkloadState::kFailed, "failed",
+                        "continuous wallet workload sender ended unexpectedly");
+                  } else {
+                    set_terminal(LiveWalletWorkloadState::kCompleted, outcome);
+                    const auto elapsed =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() -
+                            record->started_at);
+                    const TransactionLoadSnapshot snapshot =
+                        record->accounting->Snapshot(elapsed);
+                    WriteEvent(events_path, options.run_id, "sim",
+                               SimulationEventKind::kTransactionLoadCompleted,
+                               TransactionLoadCompletedDetail(
+                                   record->ordinal, 0U, epoch_workload,
+                                   ExplicitWalletTransactionAttemptLimit(
+                                       epoch_workload),
+                                   record->queue_maximum_size, snapshot));
+                  }
                   return;
-                }
-                if (result.end ==
-                    WalletWorkloadExecutionEnd::kRefreshBalances) {
-                  std::unique_lock<std::mutex> lock(record->mutex);
-                  record->changed.wait_for(
-                      lock, execution_stop.get_token(),
-                      std::chrono::milliseconds(100), [&] {
-                        return record->request !=
-                               LiveWalletWorkloadRequest::kNone;
-                      });
-                  continue;
-                }
-                const std::string outcome =
-                    epoch_workload.transaction_count != 0U ? "count_reached"
-                    : epoch_workload.duration              ? "duration_expired"
-                                                           : "failed";
-                if (outcome == "failed") {
+                } catch (const SimulationCancelled&) {
+                  LiveWalletWorkloadRequest request;
+                  {
+                    std::lock_guard<std::mutex> lock(record->mutex);
+                    record->next_transaction_index =
+                        execution.next_transaction_index;
+                    request = record->request;
+                  }
+                  if (request == LiveWalletWorkloadRequest::kPause ||
+                      request == LiveWalletWorkloadRequest::kReconfigure) {
+                    continue;
+                  }
+                  if (request == LiveWalletWorkloadRequest::kStopCancel ||
+                      request == LiveWalletWorkloadRequest::kStopSettle) {
+                    if (request == LiveWalletWorkloadRequest::kStopCancel) {
+                      cancel_outstanding_tracking();
+                    }
+                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                    return;
+                  }
+                  if (request == LiveWalletWorkloadRequest::kRunFailure) {
+                    cancel_outstanding_tracking();
+                    set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                                 "run failed while wallet workload was active");
+                    return;
+                  }
+                  if (request == LiveWalletWorkloadRequest::kShutdown ||
+                      stop_token.stop_requested()) {
+                    cancel_outstanding_tracking();
+                    set_terminal(LiveWalletWorkloadState::kCancelled,
+                                 "cancelled");
+                    return;
+                  }
                   cancel_outstanding_tracking();
                   set_terminal(
                       LiveWalletWorkloadState::kFailed, "failed",
-                      "continuous wallet workload sender ended unexpectedly");
-                } else {
-                  set_terminal(LiveWalletWorkloadState::kCompleted, outcome);
-                  const auto elapsed =
-                      std::chrono::duration_cast<std::chrono::microseconds>(
-                          std::chrono::steady_clock::now() -
-                          record->started_at);
-                  const TransactionLoadSnapshot snapshot =
-                      record->accounting->Snapshot(elapsed);
-                  WriteEvent(
-                      events_path, options.run_id, "sim",
-                      SimulationEventKind::kTransactionLoadCompleted,
-                      TransactionLoadCompletedDetail(
-                          record->ordinal, 0U, epoch_workload,
-                          ExplicitWalletTransactionAttemptLimit(epoch_workload),
-                          record->queue_maximum_size, snapshot));
-                }
-                return;
-              } catch (const SimulationCancelled&) {
-                LiveWalletWorkloadRequest request;
-                {
-                  std::lock_guard<std::mutex> lock(record->mutex);
-                  record->next_transaction_index =
-                      execution.next_transaction_index;
-                  request = record->request;
-                }
-                if (request == LiveWalletWorkloadRequest::kPause ||
-                    request == LiveWalletWorkloadRequest::kReconfigure) {
-                  continue;
-                }
-                if (request == LiveWalletWorkloadRequest::kStopCancel ||
-                    request == LiveWalletWorkloadRequest::kStopSettle) {
-                  if (request == LiveWalletWorkloadRequest::kStopCancel) {
-                    cancel_outstanding_tracking();
-                  }
-                  set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
+                      "wallet workload execution was cancelled unexpectedly");
                   return;
                 }
-                if (request == LiveWalletWorkloadRequest::kRunFailure) {
-                  cancel_outstanding_tracking();
-                  set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                               "run failed while wallet workload was active");
-                  return;
-                }
-                if (request == LiveWalletWorkloadRequest::kShutdown ||
-                    stop_token.stop_requested()) {
-                  cancel_outstanding_tracking();
-                  set_terminal(LiveWalletWorkloadState::kCancelled,
-                               "cancelled");
-                  return;
-                }
-                cancel_outstanding_tracking();
-                set_terminal(
-                    LiveWalletWorkloadState::kFailed, "failed",
-                    "wallet workload execution was cancelled unexpectedly");
-                return;
               }
+            } catch (const std::exception& error) {
+              cancel_outstanding_tracking();
+              set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                           error.what());
+            } catch (...) {
+              cancel_outstanding_tracking();
+              set_terminal(LiveWalletWorkloadState::kFailed, "failed",
+                           "unknown wallet workload failure");
             }
-          } catch (const std::exception& error) {
-            cancel_outstanding_tracking();
-            set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                         error.what());
-          } catch (...) {
-            cancel_outstanding_tracking();
-            set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                         "unknown wallet workload failure");
+          });
+        } catch (...) {
+          const auto found = wallet_workloads->records.find(record->id);
+          if (found != wallet_workloads->records.end() &&
+              found->second == record) {
+            wallet_workloads->records.erase(found);
           }
-        });
-      } catch (...) {
-        std::lock_guard<std::mutex> registry_lock(wallet_workloads->mutex);
-        const auto found = wallet_workloads->records.find(record->id);
-        if (found != wallet_workloads->records.end() &&
-            found->second == record) {
-          wallet_workloads->records.erase(found);
+          throw;
         }
-        throw;
       }
       return record;
     };
 
+    const auto find_block_generation_workload_record =
+        [block_generation_workloads](std::string_view workload_id) {
+          std::lock_guard<std::mutex> lock(block_generation_workloads->mutex);
+          const auto found = block_generation_workloads->records.find(
+              std::string(workload_id));
+          return found == block_generation_workloads->records.end()
+                     ? std::shared_ptr<LiveBlockGenerationWorkloadRecord>{}
+                     : found->second;
+        };
+    const auto launch_block_generation_workload =
+        [&](BlockGenerationWorkload workload,
+            std::optional<std::string> requested_id)
+        -> std::shared_ptr<LiveBlockGenerationWorkloadRecord> {
+      auto record = std::make_shared<LiveBlockGenerationWorkloadRecord>();
+      record->workload = workload;
+      {
+        std::scoped_lock registry_lock(wallet_workloads->mutex,
+                                       block_generation_workloads->mutex);
+        if (wallet_workloads->shutting_down ||
+            block_generation_workloads->shutting_down) {
+          throw McpOperationFailure(
+              "run_not_active",
+              "the run is stopping and cannot start another workload", false);
+        }
+        if (wallet_workloads->records.size() +
+                block_generation_workloads->records.size() >=
+            kMaximumScenarioActionCount) {
+          throw McpOperationFailure(
+              "workload_capacity_exceeded",
+              "workload retained-instance capacity is exhausted", false);
+        }
+        for (const auto& [id, existing] : block_generation_workloads->records) {
+          static_cast<void>(id);
+          std::lock_guard<std::mutex> existing_lock(existing->mutex);
+          if (!IsTerminalLiveWorkloadState(existing->state)) {
+            throw McpOperationFailure(
+                "workload_capacity_exceeded",
+                "another block generation workload is already active", true);
+          }
+        }
+        if (requested_id) {
+          ValidateMcpIdentifier(*requested_id, "workload_id");
+          if (wallet_workloads->records.contains(*requested_id) ||
+              block_generation_workloads->records.contains(*requested_id)) {
+            throw McpOperationFailure(
+                "workload_id_conflict",
+                "workload_id is already retained: " + *requested_id, false);
+          }
+          record->id = *requested_id;
+        } else {
+          do {
+            if (block_generation_workloads->next_id ==
+                std::numeric_limits<std::uint64_t>::max()) {
+              throw McpOperationFailure(
+                  "workload_id_exhausted",
+                  "block generation workload identity sequence is exhausted",
+                  false);
+            }
+            record->id = "block-generation-workload-" +
+                         std::to_string(block_generation_workloads->next_id++);
+          } while (wallet_workloads->records.contains(record->id) ||
+                   block_generation_workloads->records.contains(record->id));
+        }
+        record->ordinal = static_cast<std::uint32_t>(
+            wallet_workloads->records.size() +
+            block_generation_workloads->records.size() + 1U);
+        block_generation_workloads->records.emplace(record->id, record);
+
+        try {
+          record->worker = std::thread([&, record] {
+            const auto set_terminal =
+                [&](LiveWorkloadState state, std::string outcome,
+                    std::optional<std::string> failure = std::nullopt) {
+                  {
+                    std::lock_guard<std::mutex> lock(record->mutex);
+                    record->state = state;
+                    record->terminal_outcome = std::move(outcome);
+                    record->failure = std::move(failure);
+                    record->changed.notify_all();
+                  }
+                  try {
+                    WriteLiveBlockGenerationWorkloadState(events_path, options,
+                                                          *record);
+                  } catch (const std::exception& error) {
+                    BBP_LOG(error)
+                        << "failed to publish terminal block generation "
+                           "workload "
+                        << record->id << ": " << error.what();
+                  }
+                };
+            const auto finalize_outstanding_attempt = [&](bool cancelled) {
+              std::lock_guard<std::mutex> lock(record->mutex);
+              const std::uint64_t finalized = record->completed_boundaries +
+                                              record->failed +
+                                              record->cancelled;
+              if (record->attempted > finalized) {
+                if (cancelled) {
+                  ++record->cancelled;
+                } else {
+                  ++record->failed;
+                }
+              }
+            };
+            try {
+              while (true) {
+                BlockGenerationWorkload boundary_workload;
+                std::stop_token boundary_stop_token;
+                bool publish_running = false;
+                {
+                  std::unique_lock<std::mutex> lock(record->mutex);
+                  record->boundary_mutation_admitted = false;
+                  while (record->request == LiveWorkloadRequest::kPause) {
+                    record->state = LiveWorkloadState::kPaused;
+                    record->changed.notify_all();
+                    lock.unlock();
+                    WriteLiveBlockGenerationWorkloadState(events_path, options,
+                                                          *record);
+                    lock.lock();
+                    if (!record->changed.wait(lock, stop_token, [&] {
+                          return record->request != LiveWorkloadRequest::kPause;
+                        })) {
+                      record->request = LiveWorkloadRequest::kShutdown;
+                      record->boundary_stop_source.request_stop();
+                      break;
+                    }
+                  }
+                  if (record->request == LiveWorkloadRequest::kStopCancel ||
+                      record->request == LiveWorkloadRequest::kStopSettle) {
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kStopped, "stopped");
+                    return;
+                  }
+                  if (record->request == LiveWorkloadRequest::kShutdown) {
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kCancelled, "cancelled");
+                    return;
+                  }
+                  if (record->request == LiveWorkloadRequest::kRunFailure) {
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kFailed, "failed",
+                                 "run failed while block generation workload "
+                                 "was active");
+                    return;
+                  }
+                  if (record->request == LiveWorkloadRequest::kReconfigure) {
+                    if (!record->pending_workload) {
+                      throw std::logic_error(
+                          "block generation workload reconfigure has no "
+                          "configuration");
+                    }
+                    if (record->configuration_revision ==
+                        std::numeric_limits<std::uint64_t>::max()) {
+                      throw std::runtime_error(
+                          "block generation workload configuration revision "
+                          "exceeds uint64");
+                    }
+                    record->workload = *record->pending_workload;
+                    record->pending_workload.reset();
+                    ++record->configuration_revision;
+                    record->request = LiveWorkloadRequest::kNone;
+                    record->state = LiveWorkloadState::kStarting;
+                    record->changed.notify_all();
+                    lock.unlock();
+                    WriteLiveBlockGenerationWorkloadState(events_path, options,
+                                                          *record);
+                    lock.lock();
+                  }
+                  if (record->completed_boundaries >= record->workload.count) {
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kCompleted,
+                                 "count_reached");
+                    return;
+                  }
+                  if (stop_token.stop_requested()) {
+                    record->request = LiveWorkloadRequest::kShutdown;
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kCancelled, "cancelled");
+                    return;
+                  }
+                  record->boundary_stop_source = std::stop_source();
+                  boundary_stop_token =
+                      record->boundary_stop_source.get_token();
+                  boundary_workload = record->workload;
+                  boundary_workload.count = 1U;
+                  if (record->state != LiveWorkloadState::kRunning) {
+                    record->state = LiveWorkloadState::kRunning;
+                    publish_running = true;
+                  }
+                  if (record->attempted ==
+                      std::numeric_limits<std::uint64_t>::max()) {
+                    throw std::runtime_error(
+                        "block generation workload attempt count exceeds "
+                        "uint64");
+                  }
+                  ++record->attempted;
+                  record->changed.notify_all();
+                }
+                if (publish_running) {
+                  WriteLiveBlockGenerationWorkloadState(events_path, options,
+                                                        *record);
+                }
+
+                auto mutation_lock = AcquireNodeMutationLock(
+                    node_mutation_mutex, boundary_stop_token);
+                RuntimeNodeSnapshot execution_nodes = node_inventory.Snapshot();
+                const auto authorize_mutation = [&, record] {
+                  std::lock_guard<std::mutex> lock(record->mutex);
+                  if (boundary_stop_token.stop_requested() ||
+                      stop_token.stop_requested() ||
+                      record->request == LiveWorkloadRequest::kStopCancel ||
+                      record->request == LiveWorkloadRequest::kShutdown ||
+                      record->request == LiveWorkloadRequest::kRunFailure) {
+                    throw SimulationCancelled();
+                  }
+                  if (record->boundary_mutation_admitted) {
+                    throw std::logic_error(
+                        "block generation workload admitted one mutation "
+                        "twice");
+                  }
+                  record->boundary_mutation_admitted = true;
+                  record->changed.notify_all();
+                };
+                const GeneratedBlockWorkloadBoundary boundary =
+                    GenerateBlockWorkloadBoundary(
+                        driver, block_generation_mutex, execution_nodes,
+                        boundary_workload, chain_spec.default_reward_address,
+                        std::stop_token{}, boundary_stop_token,
+                        authorize_mutation);
+                if (boundary.hashes.size() != 1U) {
+                  throw std::logic_error(
+                      "single block generation boundary returned an invalid "
+                      "hash count");
+                }
+                {
+                  std::lock_guard<std::mutex> lock(record->mutex);
+                  ++record->generated;
+                  record->last_result = LiveBlockGenerationBoundaryResult{
+                      .generator_node = boundary.generator_node,
+                      .generator_node_id = boundary.generator_node_id,
+                      .start_height = boundary.start_height,
+                      .target_height = boundary.target_height,
+                      .block_hash = boundary.hashes.front(),
+                      .reward_address = boundary.reward_address,
+                      .synchronized = false,
+                  };
+                  record->changed.notify_all();
+                }
+                RecordAndPublishGeneratedBlockWorkloadBoundary(
+                    options, events_path, driver, execution_nodes, boundary,
+                    record->ordinal, 0U, std::stop_token{}, record->id);
+                SynchronizeBlockWorkloadBoundary(
+                    options, events_path, driver, execution_nodes, boundary,
+                    boundary_workload.sync_timeout_sec, boundary_stop_token);
+                {
+                  std::lock_guard<std::mutex> lock(record->mutex);
+                  ++record->completed_boundaries;
+                  if (!record->last_result || record->last_result->block_hash !=
+                                                  boundary.hashes.front()) {
+                    throw std::logic_error(
+                        "block generation workload lost its boundary result");
+                  }
+                  record->last_result->synchronized = true;
+                  record->changed.notify_all();
+                }
+              }
+            } catch (const SimulationCancelled&) {
+              LiveWorkloadRequest request;
+              {
+                std::lock_guard<std::mutex> lock(record->mutex);
+                request = record->request;
+              }
+              if (request == LiveWorkloadRequest::kRunFailure) {
+                finalize_outstanding_attempt(false);
+                set_terminal(
+                    LiveWorkloadState::kFailed, "failed",
+                    "run failed while block generation workload was active");
+              } else if (request == LiveWorkloadRequest::kStopCancel ||
+                         request == LiveWorkloadRequest::kStopSettle) {
+                finalize_outstanding_attempt(true);
+                set_terminal(LiveWorkloadState::kStopped, "stopped");
+              } else if (request == LiveWorkloadRequest::kShutdown ||
+                         stop_token.stop_requested()) {
+                finalize_outstanding_attempt(true);
+                set_terminal(LiveWorkloadState::kCancelled, "cancelled");
+              } else {
+                finalize_outstanding_attempt(false);
+                set_terminal(
+                    LiveWorkloadState::kFailed, "failed",
+                    "block generation workload execution was cancelled "
+                    "unexpectedly");
+              }
+            } catch (const BlockGenerationOutcomeUnconfirmed& error) {
+              {
+                std::lock_guard<std::mutex> lock(record->mutex);
+                record->generation_outcome_unconfirmed = true;
+              }
+              finalize_outstanding_attempt(false);
+              set_terminal(LiveWorkloadState::kFailed, "failed", error.what());
+            } catch (const std::exception& error) {
+              finalize_outstanding_attempt(false);
+              set_terminal(LiveWorkloadState::kFailed, "failed", error.what());
+            } catch (...) {
+              finalize_outstanding_attempt(false);
+              set_terminal(LiveWorkloadState::kFailed, "failed",
+                           "unknown block generation workload failure");
+            }
+          });
+        } catch (...) {
+          const auto found =
+              block_generation_workloads->records.find(record->id);
+          if (found != block_generation_workloads->records.end() &&
+              found->second == record) {
+            block_generation_workloads->records.erase(found);
+          }
+          throw;
+        }
+      }
+      return record;
+    };
+
+    const auto block_generation_operation =
+        [&, find_block_generation_workload_record,
+         launch_block_generation_workload](
+            McpOperationKind kind, const boost::json::object& arguments,
+            std::stop_token operation_stop_token) {
+          const auto require_argument_string = [&](std::string_view field) {
+            const boost::json::value* value = arguments.if_contains(field);
+            if (value == nullptr || !value->is_string() ||
+                value->as_string().empty()) {
+              throw std::invalid_argument(
+                  "workload operation requires string " + std::string(field));
+            }
+            return std::string(value->as_string());
+          };
+          const auto operation_timeout = [&] {
+            std::uint64_t seconds = 30U;
+            if (const boost::json::value* value =
+                    arguments.if_contains("timeout_sec")) {
+              if (value->is_uint64()) {
+                seconds = value->as_uint64();
+              } else if (value->is_int64() && value->as_int64() >= 0) {
+                seconds = static_cast<std::uint64_t>(value->as_int64());
+              } else {
+                throw std::invalid_argument(
+                    "workload timeout_sec must be an unsigned integer");
+              }
+            }
+            if (seconds == 0U || seconds > 3600U) {
+              throw std::invalid_argument(
+                  "workload timeout_sec must be in 1..3600");
+            }
+            return std::chrono::seconds(seconds);
+          };
+          if (kind == McpOperationKind::kStartWorkload) {
+            const boost::json::value* workload_value =
+                arguments.if_contains("workload");
+            if (workload_value == nullptr || !workload_value->is_object()) {
+              throw std::invalid_argument(
+                  "workload.start requires a workload object");
+            }
+            std::optional<std::string> requested_id;
+            if (arguments.if_contains("workload_id") != nullptr) {
+              requested_id = require_argument_string("workload_id");
+            }
+            std::shared_ptr<LiveBlockGenerationWorkloadRecord> record;
+            {
+              auto mutation_lock = AcquireNodeMutationLock(
+                  node_mutation_mutex, operation_stop_token);
+              const RuntimeNodeSnapshot current_nodes =
+                  node_inventory.Snapshot();
+              const BlockGenerationWorkload workload =
+                  ParseAndValidateLiveBlockGenerationWorkload(
+                      workload_value->as_object(), options, current_nodes);
+              record = launch_block_generation_workload(
+                  workload, std::move(requested_id));
+            }
+            std::unique_lock<std::mutex> lock(record->mutex);
+            if (!record->changed.wait(lock, operation_stop_token, [&] {
+                  return record->state != LiveWorkloadState::kStarting;
+                })) {
+              record->request = LiveWorkloadRequest::kStopCancel;
+              record->boundary_stop_source.request_stop();
+              record->changed.notify_all();
+              throw McpOperationCancelled();
+            }
+            lock.unlock();
+            return LiveBlockGenerationWorkloadJson(*record);
+          }
+
+          const std::string workload_id =
+              require_argument_string("workload_id");
+          const std::shared_ptr<LiveBlockGenerationWorkloadRecord> record =
+              find_block_generation_workload_record(workload_id);
+          if (!record) {
+            throw McpOperationFailure(
+                "workload_not_found",
+                "block generation workload instance is not registered: " +
+                    workload_id,
+                false);
+          }
+          if (kind == McpOperationKind::kInspectWorkload) {
+            return LiveBlockGenerationWorkloadJson(*record);
+          }
+          if (kind == McpOperationKind::kReconfigureWorkload) {
+            const boost::json::value* workload_value =
+                arguments.if_contains("workload");
+            if (workload_value == nullptr || !workload_value->is_object()) {
+              throw std::invalid_argument(
+                  "workload.reconfigure requires a workload object");
+            }
+            const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
+            const BlockGenerationWorkload updated =
+                ParseAndValidateLiveBlockGenerationWorkload(
+                    workload_value->as_object(), options, current_nodes);
+            bool publish_paused_revision = false;
+            std::uint64_t expected_revision = 0U;
+            {
+              std::lock_guard<std::mutex> lock(record->mutex);
+              if (IsTerminalLiveWorkloadState(record->state)) {
+                throw McpOperationFailure(
+                    "workload_not_active",
+                    "terminal block generation workload cannot be "
+                    "reconfigured",
+                    false);
+              }
+              if (record->state == LiveWorkloadState::kStopping) {
+                throw McpOperationFailure(
+                    "workload_transition_in_progress",
+                    "block generation workload already has a lifecycle "
+                    "transition in progress",
+                    true);
+              }
+              if (updated.count < record->attempted) {
+                throw McpOperationFailure(
+                    "workload_limit_conflict",
+                    "reconfigured block count is below lifetime progress",
+                    false);
+              }
+              if (record->configuration_revision ==
+                  std::numeric_limits<std::uint64_t>::max()) {
+                throw std::runtime_error(
+                    "block generation workload configuration revision exceeds "
+                    "uint64");
+              }
+              expected_revision = record->configuration_revision;
+              if (record->state == LiveWorkloadState::kPaused) {
+                record->workload = updated;
+                ++record->configuration_revision;
+                publish_paused_revision = true;
+              } else {
+                record->pending_workload = updated;
+                record->request = LiveWorkloadRequest::kReconfigure;
+                record->state = LiveWorkloadState::kStopping;
+              }
+              record->changed.notify_all();
+            }
+            if (publish_paused_revision) {
+              WriteLiveBlockGenerationWorkloadState(events_path, options,
+                                                    *record);
+            } else {
+              std::unique_lock<std::mutex> lock(record->mutex);
+              if (!record->changed.wait(lock, operation_stop_token, [&] {
+                    return (record->configuration_revision >
+                                expected_revision &&
+                            record->state == LiveWorkloadState::kRunning) ||
+                           IsTerminalLiveWorkloadState(record->state);
+                  })) {
+                throw McpOperationCancelled();
+              }
+            }
+            return LiveBlockGenerationWorkloadJson(*record);
+          }
+          if (kind == McpOperationKind::kResumeWorkload) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + operation_timeout();
+            {
+              std::lock_guard<std::mutex> lock(record->mutex);
+              if (record->state != LiveWorkloadState::kPaused) {
+                throw McpOperationFailure(
+                    "workload_not_paused",
+                    "block generation workload is not paused: " + workload_id,
+                    false);
+              }
+              record->request = LiveWorkloadRequest::kNone;
+              record->state = LiveWorkloadState::kStarting;
+              record->changed.notify_all();
+            }
+            std::unique_lock<std::mutex> lock(record->mutex);
+            if (!record->changed.wait_until(
+                    lock, operation_stop_token, deadline, [&] {
+                      return record->state == LiveWorkloadState::kRunning ||
+                             IsTerminalLiveWorkloadState(record->state);
+                    })) {
+              if (operation_stop_token.stop_requested()) {
+                throw McpOperationCancelled();
+              }
+              throw McpOperationFailure(
+                  "workload_operation_timeout",
+                  "block generation workload did not resume before timeout",
+                  true);
+            }
+            lock.unlock();
+            return LiveBlockGenerationWorkloadJson(*record);
+          }
+          const auto deadline =
+              std::chrono::steady_clock::now() + operation_timeout();
+          bool already_paused = false;
+          {
+            std::lock_guard<std::mutex> lock(record->mutex);
+            if (IsTerminalLiveWorkloadState(record->state)) {
+              throw McpOperationFailure(
+                  "workload_not_active",
+                  "block generation workload is already terminal: " +
+                      workload_id,
+                  false);
+            }
+            if (kind == McpOperationKind::kPauseWorkload &&
+                record->state == LiveWorkloadState::kPaused) {
+              already_paused = true;
+            } else if (record->state == LiveWorkloadState::kStopping) {
+              throw McpOperationFailure(
+                  "workload_transition_in_progress",
+                  "block generation workload already has a lifecycle "
+                  "transition in progress",
+                  true);
+            } else if (kind == McpOperationKind::kPauseWorkload) {
+              record->request = LiveWorkloadRequest::kPause;
+              record->state = LiveWorkloadState::kStopping;
+            } else if (kind == McpOperationKind::kStopWorkload) {
+              std::string policy = "cancel";
+              if (const boost::json::value* value =
+                      arguments.if_contains("policy")) {
+                if (!value->is_string()) {
+                  throw std::invalid_argument(
+                      "workload.stop policy must be a string");
+                }
+                policy = std::string(value->as_string());
+              }
+              if (policy != "cancel" && policy != "settle") {
+                throw std::invalid_argument(
+                    "workload.stop policy must be cancel or settle");
+              }
+              record->request = policy == "settle"
+                                    ? LiveWorkloadRequest::kStopSettle
+                                    : LiveWorkloadRequest::kStopCancel;
+              record->state = LiveWorkloadState::kStopping;
+              if (policy == "cancel") {
+                record->boundary_stop_source.request_stop();
+              }
+            } else {
+              throw std::logic_error(
+                  "unknown block generation workload operation");
+            }
+            record->changed.notify_all();
+          }
+          if (already_paused) {
+            return LiveBlockGenerationWorkloadJson(*record);
+          }
+          std::unique_lock<std::mutex> lock(record->mutex);
+          const auto reached_target = [&] {
+            return kind == McpOperationKind::kPauseWorkload
+                       ? record->state == LiveWorkloadState::kPaused ||
+                             IsTerminalLiveWorkloadState(record->state)
+                       : IsTerminalLiveWorkloadState(record->state);
+          };
+          if (!record->changed.wait_until(lock, operation_stop_token, deadline,
+                                          reached_target)) {
+            if (operation_stop_token.stop_requested()) {
+              throw McpOperationCancelled();
+            }
+            throw McpOperationFailure(
+                "workload_operation_timeout",
+                "block generation workload did not reach the requested state "
+                "before timeout",
+                true);
+          }
+          lock.unlock();
+          return LiveBlockGenerationWorkloadJson(*record);
+        };
+
     auto workload_service = std::make_shared<McpLiveWorkloadService>();
     workload_service->operation = [&, require_workload_record,
                                    launch_wallet_workload,
-                                   runtime_wallet_validation_options](
+                                   runtime_wallet_validation_options,
+                                   find_block_generation_workload_record,
+                                   block_generation_operation](
                                       McpOperationKind kind,
                                       const boost::json::object& arguments,
                                       std::stop_token operation_stop_token) {
@@ -24253,6 +25215,27 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         }
         return std::chrono::seconds(seconds);
       };
+      if (kind == McpOperationKind::kStartWorkload) {
+        const boost::json::value* workload_value =
+            arguments.if_contains("workload");
+        if (workload_value != nullptr && workload_value->is_object()) {
+          const boost::json::value* type =
+              workload_value->as_object().if_contains("type");
+          if (type != nullptr && type->is_string() &&
+              type->as_string() == "block_generation") {
+            return block_generation_operation(kind, arguments,
+                                              operation_stop_token);
+          }
+        }
+      } else {
+        const boost::json::value* workload_id =
+            arguments.if_contains("workload_id");
+        if (workload_id != nullptr && workload_id->is_string() &&
+            find_block_generation_workload_record(workload_id->as_string())) {
+          return block_generation_operation(kind, arguments,
+                                            operation_stop_token);
+        }
+      }
       if (kind == McpOperationKind::kStartWorkload) {
         const boost::json::value* workload_value =
             arguments.if_contains("workload");
@@ -24501,30 +25484,47 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       lock.unlock();
       return LiveWalletWorkloadJson(*record);
     };
-    workload_service->read = [wallet_workloads](
+    workload_service->read = [wallet_workloads, block_generation_workloads](
                                  bool history,
                                  std::stop_token read_stop_token) {
       boost::json::array result;
       std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
+      std::vector<std::shared_ptr<LiveBlockGenerationWorkloadRecord>>
+          block_records;
       {
-        std::lock_guard<std::mutex> lock(wallet_workloads->mutex);
+        std::scoped_lock lock(wallet_workloads->mutex,
+                              block_generation_workloads->mutex);
         records.reserve(wallet_workloads->records.size());
         for (const auto& [id, record] : wallet_workloads->records) {
           static_cast<void>(id);
           records.push_back(record);
         }
+        block_records.reserve(block_generation_workloads->records.size());
+        for (const auto& [id, record] : block_generation_workloads->records) {
+          static_cast<void>(id);
+          block_records.push_back(record);
+        }
       }
+      const auto append_if_selected = [&](boost::json::object snapshot) {
+        const std::string_view state = snapshot.at("state").as_string();
+        const bool terminal = state == "stopped" || state == "completed" ||
+                              state == "cancelled" || state == "failed";
+        if (history == terminal) {
+          result.emplace_back(std::move(snapshot));
+        }
+      };
       for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
         if (read_stop_token.stop_requested()) {
           throw McpOperationCancelled();
         }
-        {
-          std::lock_guard<std::mutex> lock(record->mutex);
-          if (history != IsTerminalLiveWalletWorkloadState(record->state)) {
-            continue;
-          }
+        append_if_selected(LiveWalletWorkloadJson(*record));
+      }
+      for (const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record :
+           block_records) {
+        if (read_stop_token.stop_requested()) {
+          throw McpOperationCancelled();
         }
-        result.emplace_back(LiveWalletWorkloadJson(*record));
+        append_if_selected(LiveBlockGenerationWorkloadJson(*record));
       }
       return boost::json::value(std::move(result));
     };
@@ -27053,37 +28053,22 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               }
               continue;
             }
-            NodeRuntime& generator = nodes[workload.node - 1U];
-            uint64_t start_height = 0U;
-            std::vector<std::string> hashes;
-            RequireNodeRunning(generator, "block generation workload");
-            start_height =
-                driver.ReadMetrics(generator.config, stop_token).height;
-            hashes = GenerateBlocksSerialized(
-                block_generation_mutex, driver, generator.config,
-                workload.count, chain_spec.default_reward_address, stop_token);
-            RecordGeneratedBlocks(driver, generator, hashes, stop_token);
-            const uint64_t target_height =
-                start_height + static_cast<uint64_t>(hashes.size());
-            WriteEvent(
-                events_path, options.run_id, generator.config.id,
-                SimulationEventKind::kGeneratedBlocks,
-                GeneratedBlocksDetail(action_index, action_count, workload.node,
-                                      start_height, target_height, hashes,
-                                      chain_spec.default_reward_address));
-            for (auto& node : nodes) {
-              if (!node.AllowsChainMetrics()) {
-                continue;
-              }
-              driver.WaitForHeight(
-                  node.config, target_height,
-                  std::chrono::seconds(workload.sync_timeout_sec), stop_token);
-              WriteEvent(events_path, options.run_id, node.config.id,
-                         SimulationEventKind::kHeightReached,
-                         std::to_string(target_height));
-            }
-            transaction_tracker.ObserveAll(options, events_path, driver, nodes,
-                                           stop_token);
+            auto mutation_lock =
+                AcquireNodeMutationLock(node_mutation_mutex, stop_token);
+            const RuntimeNodeSnapshot generation_nodes =
+                node_inventory.Snapshot();
+            const GeneratedBlockWorkloadBoundary boundary =
+                GenerateBlockWorkloadBoundary(
+                    driver, block_generation_mutex, generation_nodes, workload,
+                    chain_spec.default_reward_address, stop_token, stop_token);
+            RecordAndPublishGeneratedBlockWorkloadBoundary(
+                options, events_path, driver, generation_nodes, boundary,
+                action_index, action_count, stop_token);
+            SynchronizeBlockWorkloadBoundary(
+                options, events_path, driver, generation_nodes, boundary,
+                workload.sync_timeout_sec, stop_token);
+            transaction_tracker.ObserveAll(options, events_path, driver,
+                                           generation_nodes, stop_token);
           } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
             const WaitUntilHeightWorkload& workload =
                 scenario_workload.wait_until_height;
@@ -27171,8 +28156,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 RestartNodeWorkloadDetail(action_index, action_count,
                                           workload.node, node.RestartCount()));
           } else if (scenario_workload.kind == WorkloadKind::kFreezeNode) {
+            auto mutation_lock =
+                AcquireNodeMutationLock(node_mutation_mutex, stop_token);
             const FreezeNodeWorkload& workload = scenario_workload.freeze_node;
-            NodeRuntime& node = nodes[workload.node - 1U];
+            const RuntimeNodeSnapshot freeze_nodes = node_inventory.Snapshot();
+            NodeRuntime& node = RequireRuntimeNodeNumber(
+                freeze_nodes, workload.node, "freeze_node workload");
             RequireNodeRunning(node, "freeze_node workload");
             FreezeNodeForDuration(options, events_path, node,
                                   workload.duration_ms, stop_token);

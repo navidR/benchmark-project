@@ -80,7 +80,7 @@ constexpr std::array kOwnedRunOperations = {
     McpOperationKind::kQueryEvidence, McpOperationKind::kQueryLogs,
     McpOperationKind::kFollowLogs, McpOperationKind::kReadArtifact};
 
-constexpr bool IsWalletWorkloadOperation(McpOperationKind kind) {
+constexpr bool IsWorkloadOperation(McpOperationKind kind) {
   return kind == McpOperationKind::kStartWorkload ||
          kind == McpOperationKind::kInspectWorkload ||
          kind == McpOperationKind::kReconfigureWorkload ||
@@ -1481,8 +1481,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kQueryEvidence &&
       kind != McpOperationKind::kQueryLogs &&
       kind != McpOperationKind::kFollowLogs &&
-      kind != McpOperationKind::kReadArtifact &&
-      !IsWalletWorkloadOperation(kind) && !IsInstrumentationOperation(kind)) {
+      kind != McpOperationKind::kReadArtifact && !IsWorkloadOperation(kind) &&
+      !IsInstrumentationOperation(kind)) {
     return {};
   }
   RequireRun(arguments);
@@ -1539,7 +1539,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   }
 #endif
 
-  if (IsWalletWorkloadOperation(kind)) {
+  if (IsWorkloadOperation(kind)) {
     const std::shared_ptr<McpLiveWorkloadService> workload_service =
         WorkloadService();
     if (!workload_service) {
@@ -1553,8 +1553,13 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                      arguments](McpOperationContext& context) {
           CombinedStopToken cancellation(context.stop_token(),
                                          run_stop_source_.get_token());
-          boost::json::object result = workload_service->operation(
-              kind, arguments, cancellation.token());
+          boost::json::object result;
+          try {
+            result = workload_service->operation(kind, arguments,
+                                                 cancellation.token());
+          } catch (const SimulationCancelled&) {
+            throw McpOperationCancelled();
+          }
           result["result_family"] = "workload";
           result["run_id"] = config_.run_id;
           return McpTypedResult{.family = McpResultFamily::kWorkload,
@@ -2611,9 +2616,10 @@ boost::json::value McpLiveApplication::ReadResource(
     case McpInformationFamily::kWorkloads:
     case McpInformationFamily::kWorkloadHistory:
       data = SelectReportFields(
-          report, {"workloads", "wallet_workload_instances",
-                   "wallet_workload_history", "scheduled_events_started",
-                   "scheduled_events_completed", "scheduled_events_failed"});
+          report, {"workloads", "workload_instances", "workload_history",
+                   "wallet_workload_instances", "wallet_workload_history",
+                   "scheduled_events_started", "scheduled_events_completed",
+                   "scheduled_events_failed"});
       break;
     case McpInformationFamily::kProcesses:
     case McpInformationFamily::kNamespaces:

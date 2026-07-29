@@ -35,6 +35,7 @@ enum class SimulationEventKind {
   kRawTransactionSubmitted,
   kWalletTransactionSubmitted,
   kWalletWorkloadState,
+  kWorkloadState,
   kTransactionLoadAttempt,
   kTransactionLoadProgress,
   kTransactionLoadCompleted,

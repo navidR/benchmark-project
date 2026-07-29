@@ -55,7 +55,7 @@ constexpr std::array<McpNamedCapability, EnumCount(McpOperationKind::kCount)>
           "Fund, register, configure and activate a masternode"},
          {"masternode.remove", "Deactivate and remove a masternode role"},
          {"masternode.restart", "Restart and verify a masternode role"},
-         {"workload.start", "Start a registered wallet workload instance"},
+         {"workload.start", "Start a registered workload instance"},
          {"workload.inspect", "Inspect one live or retained workload instance"},
          {"workload.reconfigure",
           "Reconfigure a live workload at an accounting boundary"},

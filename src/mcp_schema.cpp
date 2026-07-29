@@ -941,6 +941,7 @@ boost::json::object ExactAccountingSchema() {
         "reserved_atomic_units", "released_atomic_units"}) {
     properties[field] = Uint64Schema();
   }
+  properties["cancelled_tracking"] = Uint64Schema();
   return ClosedObject(
       std::move(properties),
       Required({"planned", "accepted", "attempted", "submitted", "propagated",
@@ -948,6 +949,36 @@ boost::json::object ExactAccountingSchema() {
                 "dropped", "failed", "retried", "cancelled", "outstanding",
                 "in_flight", "reserved_atomic_units",
                 "released_atomic_units"}));
+}
+
+boost::json::object BlockGenerationAccountingSchema() {
+  boost::json::object properties;
+  for (const std::string_view field :
+       {"target", "attempted", "generated", "completed_boundaries", "failed",
+        "cancelled", "remaining", "outstanding", "in_flight"}) {
+    properties[field] = Uint64Schema();
+  }
+  properties["generation_outcome_unconfirmed"] = TypeSchema("boolean");
+  return ClosedObject(
+      std::move(properties),
+      Required({"target", "attempted", "generated", "completed_boundaries",
+                "failed", "cancelled", "remaining", "outstanding", "in_flight",
+                "generation_outcome_unconfirmed"}));
+}
+
+boost::json::object BlockGenerationBoundaryResultSchema() {
+  boost::json::object properties;
+  properties["generator_node"] = Uint64Schema();
+  properties["generator_node_id"] = IdentifierSchema();
+  properties["start_height"] = Uint64Schema();
+  properties["target_height"] = Uint64Schema();
+  properties["block_hash"] = StringSchema(1U);
+  properties["reward_address"] = StringSchema(1U);
+  properties["synchronized"] = TypeSchema("boolean");
+  return ClosedObject(std::move(properties),
+                      Required({"generator_node", "generator_node_id",
+                                "start_height", "target_height", "block_hash",
+                                "reward_address", "synchronized"}));
 }
 
 boost::json::object AddDraft(boost::json::object schema) {
@@ -2248,9 +2279,59 @@ boost::json::object BuildMcpResultSchema(
                              "duration_expired", "cancelled", "failed"});
       properties["configuration_revision"] = Uint64Schema();
       properties["configuration"] = BuildMcpWorkloadSchema();
-      properties["accounting"] = ExactAccountingSchema();
+      properties["accounting"] =
+          OneOf({ExactAccountingSchema(), BlockGenerationAccountingSchema()});
+      properties["last_result"] =
+          Nullable(BlockGenerationBoundaryResultSchema());
+      properties["failure"] = Nullable(StringSchema(1U));
+      properties["queue_maximum_depth"] = Uint64Schema();
       require({"run_id", "workload_id", "state", "terminal_outcome",
                "configuration_revision", "configuration", "accounting"});
+      constraints.emplace_back(boost::json::object{
+          {"if",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"configuration",
+                     boost::json::object{
+                         {"properties",
+                          boost::json::object{
+                              {"type", ConstStringSchema("block_generation")}}},
+                         {"required", Required({"type"})}}}}},
+               {"required", Required({"configuration"})}}},
+          {"then", boost::json::object{
+                       {"properties",
+                        boost::json::object{
+                            {"accounting", BlockGenerationAccountingSchema()},
+                            {"last_result",
+                             Nullable(BlockGenerationBoundaryResultSchema())}}},
+                       {"required", Required({"last_result", "failure"})},
+                       {"not", boost::json::object{{
+                                   "required",
+                                   Required({"queue_maximum_depth"}),
+                               }}}}}});
+      constraints.emplace_back(boost::json::object{
+          {"if",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"configuration",
+                     boost::json::object{
+                         {"properties",
+                          boost::json::object{
+                              {"type",
+                               ConstStringSchema("wallet_transactions")}}},
+                         {"required", Required({"type"})}}}}},
+               {"required", Required({"configuration"})}}},
+          {"then",
+           boost::json::object{
+               {"properties",
+                boost::json::object{{"accounting", ExactAccountingSchema()}}},
+               {"required", Required({"failure", "queue_maximum_depth"})},
+               {"not", boost::json::object{{
+                           "required",
+                           Required({"last_result"}),
+                       }}}}}});
       break;
     case McpResultFamily::kInstrumentation:
       properties["run_id"] = IdentifierSchema();
