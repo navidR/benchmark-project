@@ -1893,6 +1893,15 @@ if(BUILD_TESTING)
     bbp-wallet-workload-node-mutation-admission-production
     PROPERTIES TIMEOUT 60
   )
+  add_test(NAME bbp-scenario-restart-node-snapshot-admission-production
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --scenario-restart-node-snapshot-admission
+      $<TARGET_FILE:bbp>
+  )
+  set_tests_properties(
+    bbp-scenario-restart-node-snapshot-admission-production
+    PROPERTIES TIMEOUT 60
+  )
   add_test(NAME bbp-tui-simulator-log-wrap
     COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
       --simulator-log-wrap

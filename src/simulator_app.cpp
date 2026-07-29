@@ -3629,6 +3629,9 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       }
       RestartNodeWorkload restart;
       restart.node = JsonOptionalUint32Field(workload, "node", restart.node);
+      if (restart.node != 0U && restart.node <= options.nodes) {
+        restart.node_id = ScenarioNodeId(options, restart.node - 1U);
+      }
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kRestartNode;
       scenario_workload.restart_node = restart;
@@ -28043,7 +28046,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           const ScenarioWorkload& scenario_workload =
               std::get<ScenarioWorkload>(runtime_action.action);
           const RuntimeNodeSnapshot nodes =
-              scenario_workload.kind == WorkloadKind::kWalletTransactions
+              scenario_workload.kind == WorkloadKind::kWalletTransactions ||
+                      scenario_workload.kind == WorkloadKind::kRestartNode
                   ? RuntimeNodeSnapshot{}
                   : node_inventory.Snapshot();
           if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
@@ -28153,7 +28157,18 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 AcquireNodeMutationLock(node_mutation_mutex, stop_token);
             const RestartNodeWorkload& workload =
                 scenario_workload.restart_node;
-            NodeRuntime& node = nodes[workload.node - 1U];
+            const RuntimeNodeSnapshot restart_nodes = node_inventory.Snapshot();
+            const auto selected =
+                std::find_if(restart_nodes.begin(), restart_nodes.end(),
+                             [&](const NodeRuntime& candidate) {
+                               return candidate.config.id == workload.node_id;
+                             });
+            if (selected == restart_nodes.end()) {
+              throw std::runtime_error(
+                  "restart_node workload references an inactive node id: " +
+                  workload.node_id);
+            }
+            NodeRuntime& node = *selected;
             if (!RestartNode(options, events_path, driver,
                              *peer_connectivity_controller, node,
                              lifecycle_epoch, stop_token)) {

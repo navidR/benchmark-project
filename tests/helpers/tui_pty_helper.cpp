@@ -3277,6 +3277,199 @@ void CheckWalletWorkloadNodeMutationAdmission(
   RequireExitZero(&process, "wallet-admission TUI exit");
 }
 
+void CheckScenarioRestartNodeSnapshotAdmission(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("restart-snapshot-admission");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path scenario = directory.root() / "scenario.json";
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "restart-admission-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  {
+    std::ofstream stream(scenario);
+    if (!stream) {
+      throw std::runtime_error("could not create restart-admission scenario");
+    }
+    stream
+        << boost::json::serialize(boost::json::object{
+               {"chain", "firo"},
+               {"chain_daemon", daemon.string()},
+               {"nodes", 1U},
+               {"node_capacity", 1U},
+               {"isolated_network", false},
+               {"block_production", boost::json::object{{"enabled", false}}},
+               {"ready_timeout_sec", 10U},
+               {"sync_timeout_sec", 10U},
+               {"metrics_interval_ms", 50U},
+               {"workloads", boost::json::array{}},
+               {"events",
+                boost::json::array{boost::json::object{
+                    {"at", "5s"}, {"action", "restart_node"}, {"node", 1U}}}}})
+        << '\n';
+    if (!stream) {
+      throw std::runtime_error("could not write restart-admission scenario");
+    }
+  }
+
+  PtyProcess process(
+      command,
+      {"--scenario", scenario.string(), "--node-binary", daemon.string(),
+       "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--refresh-ms", "50"},
+      30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "restart-admission TUI"));
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"process_started\"", 5s));
+  {
+    std::ofstream stream(run_root / "bbp-test-node-mutation-admission-gate");
+    if (!stream) {
+      throw std::runtime_error(
+          "could not create restart-admission replacement gate");
+    }
+    stream << "hold replacement before scenario restart\n";
+  }
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  boost::json::object replacement_submitted;
+  const auto replacement_admission_deadline =
+      std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < replacement_admission_deadline) {
+    replacement_submitted = SubmitMcpOperation(
+        mcp, &request_id, "node.replace",
+        boost::json::object{
+            {"run_id", run_id},
+            {"node_id", "firo-1"},
+            {"timeout_sec", 30U},
+            {"replacement",
+             boost::json::object{{"chain", "firo"},
+                                 {"count", 1U},
+                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"ready_timeout_sec", 10U},
+                                 {"sync_timeout_sec", 10U}}}});
+    if (replacement_submitted.if_contains("operation_id") != nullptr) {
+      break;
+    }
+    const boost::json::value* code = replacement_submitted.if_contains("code");
+    const boost::json::value* retryable =
+        replacement_submitted.if_contains("retryable");
+    if (code == nullptr || !code->is_string() ||
+        code->as_string() != "run_not_ready" || retryable == nullptr ||
+        !retryable->is_bool() || !retryable->as_bool()) {
+      throw std::runtime_error(
+          "restart-admission replacement was not admitted: " +
+          boost::json::serialize(replacement_submitted));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (replacement_submitted.if_contains("operation_id") == nullptr) {
+    throw std::runtime_error(
+        "restart-admission replacement was not admitted after run readiness");
+  }
+  static_cast<void>(WaitForFileText(
+      run_root / "bbp-test-node-mutation-admission-held", "bbpr-", 10s));
+  const std::string scheduled_started =
+      WaitForFileText(events_path, "\"event\":\"scheduled_event_started\"", 8s);
+  RequireContains(scheduled_started, "\\\"action\\\":\\\"restart_node\\\"",
+                  "restart-admission scheduled action");
+  RequireNotContains(scheduled_started, "\"event\":\"node_restarted\"",
+                     "restart before replacement admission release");
+  RequireNotContains(scheduled_started,
+                     "\"event\":\"scheduled_event_completed\"",
+                     "restart completion before replacement admission release");
+
+  {
+    std::ofstream stream(run_root / "bbp-test-node-mutation-admission-release");
+    if (!stream) {
+      throw std::runtime_error(
+          "could not release restart-admission replacement gate");
+    }
+    stream << "release replacement before scenario restart\n";
+  }
+  const boost::json::object replacement =
+      WaitForMcpOperation(mcp, &request_id, replacement_submitted, 20s,
+                          "restart-admission node replacement");
+  if (replacement.at("action").as_string() != "node.replace" ||
+      replacement.at("state").as_string() != "running" ||
+      replacement.at("inventory_generation").to_number<std::uint64_t>() != 2U ||
+      replacement.at("final_node_count").to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "restart-admission replacement returned inconsistent evidence");
+  }
+  static_cast<void>(WaitForFileText(
+      events_path, "\"event\":\"scheduled_event_completed\"", 15s));
+
+  boost::json::value current_nodes;
+  bool current_runtime_restarted = false;
+  const auto current_restart_deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < current_restart_deadline) {
+    current_nodes = ReadMcpResourceData(mcp, &request_id, "bbp:///nodes",
+                                        "restart-admission current nodes");
+    if (current_nodes.is_object()) {
+      const boost::json::value* summaries =
+          current_nodes.as_object().if_contains("nodes_summary");
+      if (summaries != nullptr && summaries->is_array() &&
+          summaries->as_array().size() == 1U &&
+          summaries->as_array().front().is_object()) {
+        const boost::json::object& summary =
+            summaries->as_array().front().as_object();
+        const boost::json::value* metrics = summary.if_contains("last_metrics");
+        if (summary.at("node_id").as_string() == "firo-1" &&
+            metrics != nullptr && metrics->is_object()) {
+          const boost::json::value* restart_count =
+              metrics->as_object().if_contains("restart_count");
+          current_runtime_restarted =
+              restart_count != nullptr && restart_count->is_number() &&
+              restart_count->to_number<std::uint64_t>() == 2U;
+        }
+      }
+    }
+    if (current_runtime_restarted) {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (!current_runtime_restarted) {
+    throw std::runtime_error(
+        "scenario restart did not mutate the current replacement runtime: " +
+        boost::json::serialize(current_nodes));
+  }
+
+  const std::string events = ReadFile(events_path);
+  const std::size_t started =
+      events.find("\"event\":\"scheduled_event_started\"");
+  const std::size_t published =
+      events.find("\"event\":\"runtime_generation_published\"");
+  const std::size_t restarted = events.find("\"event\":\"node_restarted\"");
+  const std::size_t completed =
+      events.find("\"event\":\"scheduled_event_completed\"");
+  if (started == std::string::npos || published == std::string::npos ||
+      restarted == std::string::npos || completed == std::string::npos ||
+      !(started < published && published < restarted &&
+        restarted < completed)) {
+    throw std::runtime_error(
+        "restart-admission evidence was not causally ordered");
+  }
+  RequireNotContains(events, "\"event\":\"scheduled_event_failed\"",
+                     "restart-admission scheduled result");
+  RequireNotContains(events, "\"event\":\"run_failed\"",
+                     "restart-admission run state");
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s, "restart-admission confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "restart-admission TUI exit");
+}
+
 void CheckDirectedNodeReplacementPublication(
     const std::filesystem::path& command,
     const std::filesystem::path& helper_binary) {
@@ -4040,6 +4233,20 @@ int main(int argc, char** argv) {
       return 0;
     } catch (const std::exception& error) {
       std::cerr << "wallet workload node-mutation admission regression "
+                   "failed: "
+                << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 && std::string_view(argv[1]) ==
+                       "--scenario-restart-node-snapshot-admission") {
+    try {
+      CheckScenarioRestartNodeSnapshotAdmission(
+          argv[2], std::filesystem::canonical(argv[0]));
+      std::cout << "scenario restart-node snapshot admission checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "scenario restart-node snapshot admission regression "
                    "failed: "
                 << error.what() << '\n';
       return 1;
