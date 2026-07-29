@@ -91,6 +91,7 @@
 #include "bbp/simulator/node_runtime.h"
 #include "bbp/simulator/options.h"
 #include "bbp/simulator/process_control_config.h"
+#include "bbp/simulator/scenario_workload_admission.h"
 #include "bbp/simulator/transaction_load.h"
 #include "bbp/simulator/transaction_observation_store.h"
 #include "bbp/simulator/wallet_transaction_plan.h"
@@ -28045,11 +28046,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         } else {
           const ScenarioWorkload& scenario_workload =
               std::get<ScenarioWorkload>(runtime_action.action);
-          const RuntimeNodeSnapshot nodes =
-              scenario_workload.kind == WorkloadKind::kWalletTransactions ||
-                      scenario_workload.kind == WorkloadKind::kRestartNode
-                  ? RuntimeNodeSnapshot{}
-                  : node_inventory.Snapshot();
+          const RuntimeNodeSnapshot nodes = SnapshotScenarioDispatchNodes(
+              node_inventory, scenario_workload.kind);
           if (scenario_workload.kind == WorkloadKind::kBlockGeneration) {
             const BlockGenerationWorkload& workload =
                 scenario_workload.block_generation;
