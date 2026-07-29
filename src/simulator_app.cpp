@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -9206,6 +9207,8 @@ std::string CheckpointWorkloadDetail(std::uint32_t workload_index,
 using NodeMetricsFailureHandler =
     std::function<void(const NodeRuntime&, std::string_view)>;
 using MetricsStopRequested = std::function<bool()>;
+using NodeMetricsRecordHandler =
+    std::function<void(const NodeRuntime&, std::string_view)>;
 
 std::uint32_t WriteMetricsSnapshot(
     const std::filesystem::path& metrics_path, const Options& options,
@@ -9213,7 +9216,9 @@ std::uint32_t WriteMetricsSnapshot(
     const NodeMetricsFailureHandler& node_failure_handler = {},
     const MetricsStopRequested& stop_requested = {},
     std::stop_token stop_token = {},
-    const NodeRoleTopology* runtime_topology = nullptr) {
+    const NodeRoleTopology* runtime_topology = nullptr,
+    const std::set<std::string>* selected_node_ids = nullptr,
+    const NodeMetricsRecordHandler& record_handler = {}) {
   std::uint32_t sample_count = 0U;
   struct NetworkMetricsState {
     std::optional<NodeVethConfig> network;
@@ -9224,19 +9229,30 @@ std::uint32_t WriteMetricsSnapshot(
   std::vector<NetworkMetricsState> network_states(nodes.size());
   {
     std::lock_guard<std::mutex> lock(node_network_state_mutex);
-    const bool has_isolated_node = std::any_of(
-        nodes.begin(), nodes.end(),
-        [](const NodeRuntime& node) { return node.network.has_value(); });
+    const bool has_isolated_node =
+        std::any_of(nodes.begin(), nodes.end(), [&](const NodeRuntime& node) {
+          return (selected_node_ids == nullptr ||
+                  selected_node_ids->contains(node.config.id)) &&
+                 node.network.has_value();
+        });
     if (has_isolated_node) {
       qdiscs = ListQdiscs(stop_token);
     }
     for (std::size_t index = 0; index < nodes.size(); ++index) {
+      if (selected_node_ids != nullptr &&
+          !selected_node_ids->contains(nodes[index].config.id)) {
+        continue;
+      }
       network_states[index].network = nodes[index].network;
       network_states[index].profile = nodes[index].network_profile;
     }
   }
   for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
     NodeRuntime& node = nodes[node_index];
+    if (selected_node_ids != nullptr &&
+        !selected_node_ids->contains(node.config.id)) {
+      continue;
+    }
     if (stop_requested && stop_requested()) {
       return sample_count;
     }
@@ -9388,16 +9404,18 @@ std::uint32_t WriteMetricsSnapshot(
         filter_metrics = &filters;
       }
     }
-    AppendLine(
-        metrics_path,
-        MetricsJson(
-            options.run_id, node.config.id, runtime, chain,
-            node.GeneratedBlockCount(), node.MinedTransactionCount(),
-            node.MinedTransactionCountComplete(), node.RestartCount(),
-            resource_profile, network_states[node_index].profile,
-            network && network->apply_condition ? &network->condition : nullptr,
-            &cg, link, qdisc, network ? &qdisc_tree : nullptr, filter_metrics,
-            directional_stats ? &*directional_stats : nullptr));
+    const std::string record = MetricsJson(
+        options.run_id, node.config.id, runtime, chain,
+        node.GeneratedBlockCount(), node.MinedTransactionCount(),
+        node.MinedTransactionCountComplete(), node.RestartCount(),
+        resource_profile, network_states[node_index].profile,
+        network && network->apply_condition ? &network->condition : nullptr,
+        &cg, link, qdisc, network ? &qdisc_tree : nullptr, filter_metrics,
+        directional_stats ? &*directional_stats : nullptr);
+    AppendLine(metrics_path, record);
+    if (record_handler) {
+      record_handler(node, record);
+    }
     ++sample_count;
   }
   return sample_count;
@@ -15569,7 +15587,6 @@ bool SimulationCommandRequiresNodeMutationLock(SimulationCommandKind kind) {
     case SimulationCommandKind::kSetBlockProductionPolicy:
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kExportNodeReport:
-    case SimulationCommandKind::kSetPerfCounters:
       return false;
     case SimulationCommandKind::kCount:
       return false;
@@ -18736,13 +18753,35 @@ bool IsCanonicalWalletPerfTargetId(std::string_view id) {
   return error == std::errc() && end == id.data() + id.size() && value > 0U;
 }
 
+struct NodePerfCounterConfiguration {
+  std::string node_id;
+  std::vector<PerfCounterKind> kinds;
+  PerfCounterTargetKind target_kind = PerfCounterTargetKind::kNode;
+  std::string target_id;
+};
+
+struct NodePerfCounterAssignment {
+  NodeRuntime* node = nullptr;
+  NodePerfCounterConfiguration configuration;
+  bool require_running = true;
+  bool require_attachment = true;
+};
+
+struct NodePerfCounterTransactionBackend {
+  std::function<bool(const NodeRuntime&)> is_running;
+  std::function<void(NodeRuntime&, const RunProcessState::Guard&,
+                     bool require_attachment)>
+      attach;
+  std::function<void(NodeRuntime&, const RunProcessState::Guard&)> reset;
+};
+
 struct NodePerfCounterSnapshot {
-  explicit NodePerfCounterSnapshot(NodeRuntime& runtime,
-                                   const PerfCounterTarget& target,
-                                   const std::vector<PerfCounterKind>& kinds)
+  explicit NodePerfCounterSnapshot(
+      NodeRuntime& runtime, const NodePerfCounterConfiguration& configuration)
       : node(&runtime),
-        configuration_kinds(kinds),
-        configuration_id(target.id) {}
+        configuration_kinds(configuration.kinds),
+        configuration_kind(configuration.target_kind),
+        configuration_id(configuration.target_id) {}
 
   NodeRuntime* node;
   std::vector<PerfCounterKind> configuration_kinds;
@@ -18760,52 +18799,46 @@ struct NodePerfCounterSnapshot {
   bool replacement_started = false;
 };
 
-void BeginNodePerfCounterReplacement(NodePerfCounterSnapshot& snapshot,
-                                     PerfCounterTargetKind target_kind,
-                                     const RunProcessState::Guard&) {
+NodePerfCounterConfiguration SnapshotPerfCounterConfiguration(
+    const NodePerfCounterSnapshot& snapshot) {
+  return NodePerfCounterConfiguration{
+      .node_id = snapshot.node->config.id,
+      .kinds = snapshot.configuration_kinds,
+      .target_kind = snapshot.configuration_kind,
+      .target_id = snapshot.configuration_id,
+  };
+}
+
+void SwapNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot,
+                                 const RunProcessState::Guard&) {
   NodeRuntime& node = *snapshot.node;
-  snapshot.configuration_kind = node.perf_counter_target_kind;
   node.perf_counter_kinds.swap(snapshot.configuration_kinds);
   node.perf_counter_target_id.swap(snapshot.configuration_id);
-  node.perf_counter_target_kind = target_kind;
-  if (node.process_perf_counters) {
-    snapshot.process_counters.emplace(std::move(*node.process_perf_counters));
-    node.process_perf_counters.reset();
-  }
-  if (node.cgroup_perf_counters) {
-    snapshot.cgroup_counters.emplace(std::move(*node.cgroup_perf_counters));
-    node.cgroup_perf_counters.reset();
-  }
-  snapshot.target_pid = node.perf_counter_target_pid;
-  snapshot.attached_pid = node.perf_counter_attached_pid;
-  snapshot.process_generation = node.perf_counter_process_generation;
-  snapshot.cgroup_path = std::move(node.perf_counter_cgroup_path);
-  snapshot.cpus = std::move(node.perf_counter_cpus);
-  snapshot.error_kind = node.perf_counter_error_kind;
-  snapshot.error = std::move(node.perf_counter_error);
+  std::swap(node.perf_counter_target_kind, snapshot.configuration_kind);
+  node.process_perf_counters.swap(snapshot.process_counters);
+  node.cgroup_perf_counters.swap(snapshot.cgroup_counters);
+  std::swap(node.perf_counter_target_pid, snapshot.target_pid);
+  std::swap(node.perf_counter_attached_pid, snapshot.attached_pid);
+  std::swap(node.perf_counter_process_generation, snapshot.process_generation);
+  node.perf_counter_cgroup_path.swap(snapshot.cgroup_path);
+  node.perf_counter_cpus.swap(snapshot.cpus);
+  node.perf_counter_error_kind.swap(snapshot.error_kind);
+  node.perf_counter_error.swap(snapshot.error);
+}
+
+void BeginNodePerfCounterReplacement(NodePerfCounterSnapshot& snapshot,
+                                     const RunProcessState::Guard& guard) {
+  SwapNodePerfCounterSnapshot(snapshot, guard);
   snapshot.replacement_started = true;
 }
 
 void RestoreNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot,
-                                    const RunProcessState::Guard&) {
+                                    const RunProcessState::Guard& guard) {
   if (!snapshot.replacement_started) {
     return;
   }
-  NodeRuntime& node = *snapshot.node;
-  node.process_perf_counters.reset();
-  node.cgroup_perf_counters.reset();
-  node.perf_counter_kinds.swap(snapshot.configuration_kinds);
-  node.perf_counter_target_kind = snapshot.configuration_kind;
-  node.perf_counter_target_id.swap(snapshot.configuration_id);
-  node.process_perf_counters = std::move(snapshot.process_counters);
-  node.cgroup_perf_counters = std::move(snapshot.cgroup_counters);
-  node.perf_counter_target_pid = snapshot.target_pid;
-  node.perf_counter_attached_pid = snapshot.attached_pid;
-  node.perf_counter_process_generation = snapshot.process_generation;
-  node.perf_counter_cgroup_path = std::move(snapshot.cgroup_path);
-  node.perf_counter_cpus = std::move(snapshot.cpus);
-  node.perf_counter_error_kind = snapshot.error_kind;
-  node.perf_counter_error = std::move(snapshot.error);
+  SwapNodePerfCounterSnapshot(snapshot, guard);
+  snapshot.replacement_started = false;
 }
 
 void RequireNodePerfCounterAttachment(const NodeRuntime& node,
@@ -18838,8 +18871,100 @@ void RequireNodePerfCounterAttachment(const NodeRuntime& node,
   }
 }
 
-void ApplyPerfCounterCommand(const SimulationCommand& command, auto& nodes,
-                             const RunProcessState::Guard& process_guard) {
+std::vector<NodePerfCounterSnapshot> ReplaceNodePerfCountersTransactional(
+    std::span<const NodePerfCounterAssignment> assignments,
+    const RunProcessState::Guard& process_guard,
+    std::stop_token stop_token = {},
+    const NodePerfCounterTransactionBackend* backend = nullptr) {
+  if (assignments.empty()) {
+    throw std::invalid_argument(
+        "perf counter transaction requires at least one node");
+  }
+  if (backend != nullptr &&
+      (!backend->is_running || !backend->attach || !backend->reset)) {
+    throw std::invalid_argument(
+        "perf counter transaction backend is incomplete");
+  }
+  std::set<std::string> unique_nodes;
+  for (const NodePerfCounterAssignment& assignment : assignments) {
+    if (assignment.node == nullptr ||
+        assignment.configuration.node_id != assignment.node->config.id ||
+        assignment.configuration.target_id.empty() ||
+        assignment.configuration.kinds.empty() ||
+        !unique_nodes.insert(assignment.configuration.node_id).second) {
+      throw std::invalid_argument(
+          "perf counter transaction contains an invalid or duplicate node");
+    }
+    const std::set<PerfCounterKind> unique_kinds(
+        assignment.configuration.kinds.begin(),
+        assignment.configuration.kinds.end());
+    if (unique_kinds.size() != assignment.configuration.kinds.size()) {
+      throw std::invalid_argument(
+          "perf counter transaction contains duplicate counters");
+    }
+    const bool running = backend != nullptr
+                             ? backend->is_running(*assignment.node)
+                             : assignment.node->process.running();
+    if (assignment.require_running && !running) {
+      throw std::runtime_error("perf counter target node is not running: " +
+                               assignment.configuration.node_id);
+    }
+    if ((assignment.configuration.target_kind ==
+             PerfCounterTargetKind::kGroup ||
+         assignment.configuration.target_kind ==
+             PerfCounterTargetKind::kCgroup) &&
+        !assignment.node->cgroup) {
+      throw std::runtime_error(
+          "perf counter target node has no owned cgroup: " +
+          assignment.configuration.node_id);
+    }
+  }
+  ThrowIfStopRequested(stop_token);
+
+  std::vector<NodePerfCounterSnapshot> snapshots;
+  snapshots.reserve(assignments.size());
+  try {
+    for (const NodePerfCounterAssignment& assignment : assignments) {
+      ThrowIfStopRequested(stop_token);
+      snapshots.emplace_back(*assignment.node, assignment.configuration);
+      NodePerfCounterSnapshot& snapshot = snapshots.back();
+      BeginNodePerfCounterReplacement(snapshot, process_guard);
+      const bool running = backend != nullptr
+                               ? backend->is_running(*assignment.node)
+                               : assignment.node->process.running();
+      if (running) {
+        if (backend != nullptr) {
+          backend->attach(*assignment.node, process_guard,
+                          assignment.require_attachment);
+        } else {
+          AttachNodePerfCounters(*assignment.node, process_guard);
+          if (assignment.require_attachment) {
+            RequireNodePerfCounterAttachment(*assignment.node, process_guard);
+          }
+        }
+      } else {
+        if (backend != nullptr) {
+          backend->reset(*assignment.node, process_guard);
+        } else {
+          ResetNodePerfCounters(*assignment.node, process_guard);
+        }
+      }
+    }
+    ThrowIfStopRequested(stop_token);
+  } catch (...) {
+    for (auto snapshot = snapshots.rbegin(); snapshot != snapshots.rend();
+         ++snapshot) {
+      RestoreNodePerfCounterSnapshot(*snapshot, process_guard);
+    }
+    throw;
+  }
+  return snapshots;
+}
+
+void ApplyPerfCounterCommand(
+    const SimulationCommand& command, auto& nodes,
+    const RunProcessState::Guard& process_guard,
+    const NodePerfCounterTransactionBackend* backend = nullptr) {
   if (!command.perf_counter_target) {
     throw std::runtime_error("perf counter command requires a typed target");
   }
@@ -18897,7 +19022,9 @@ void ApplyPerfCounterCommand(const SimulationCommand& command, auto& nodes,
       throw std::runtime_error("perf counter target references unknown node: " +
                                node_id);
     }
-    if (!node->process.running()) {
+    const bool running = backend != nullptr ? backend->is_running(*node)
+                                            : node->process.running();
+    if (!running) {
       throw std::runtime_error("perf counter target node is not running: " +
                                node_id);
     }
@@ -18910,25 +19037,1631 @@ void ApplyPerfCounterCommand(const SimulationCommand& command, auto& nodes,
     target_nodes.push_back(&*node);
   }
 
-  std::vector<NodePerfCounterSnapshot> snapshots;
-  snapshots.reserve(target_nodes.size());
+  std::vector<NodePerfCounterAssignment> assignments;
+  assignments.reserve(target_nodes.size());
   for (NodeRuntime* node : target_nodes) {
-    snapshots.emplace_back(*node, target, command.perf_counter_kinds);
+    assignments.push_back(NodePerfCounterAssignment{
+        .node = node,
+        .configuration =
+            NodePerfCounterConfiguration{
+                .node_id = node->config.id,
+                .kinds = command.perf_counter_kinds,
+                .target_kind = target.kind,
+                .target_id = target.id,
+            },
+        .require_running = true,
+        .require_attachment = true,
+    });
   }
+  static_cast<void>(ReplaceNodePerfCountersTransactional(
+      assignments, process_guard, {}, backend));
+}
 
+constexpr std::size_t kMaximumRetainedInstrumentationMeasurements = 1024U;
+
+enum class LiveInstrumentationState {
+  kRunning,
+  kSucceeded,
+  kCancelled,
+  kFailed,
+};
+
+std::string_view LiveInstrumentationStateName(LiveInstrumentationState state) {
+  switch (state) {
+    case LiveInstrumentationState::kRunning:
+      return "running";
+    case LiveInstrumentationState::kSucceeded:
+      return "succeeded";
+    case LiveInstrumentationState::kCancelled:
+      return "cancelled";
+    case LiveInstrumentationState::kFailed:
+      return "failed";
+  }
+  throw std::logic_error("unknown live instrumentation state");
+}
+
+bool IsTerminalLiveInstrumentationState(LiveInstrumentationState state) {
+  return state != LiveInstrumentationState::kRunning;
+}
+
+struct LiveInstrumentationMeasurement {
+  std::uint64_t sample = 0U;
+  std::string record;
+};
+
+struct LiveInstrumentationRecord {
+  mutable std::mutex mutex;
+  mutable std::mutex worker_lifecycle_mutex;
+  std::condition_variable_any changed;
+  std::timed_mutex sampling_boundary;
+  std::string id;
+  std::vector<PerfCounterTarget> targets;
+  std::vector<PerfCounterKind> counters;
+  std::map<std::string, NodePerfCounterConfiguration, std::less<>>
+      baseline_configurations;
+  std::chrono::milliseconds sample_interval{1};
+  std::optional<std::chrono::milliseconds> window;
+  std::chrono::steady_clock::time_point started_at =
+      std::chrono::steady_clock::now();
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+  std::uint64_t started_at_ms = 0U;
+  std::optional<std::uint64_t> completed_at_ms;
+  LiveInstrumentationState state = LiveInstrumentationState::kRunning;
+  std::optional<std::string> failure;
+  std::uint64_t configuration_revision = 1U;
+  std::uint64_t sample_count = 0U;
+  std::deque<LiveInstrumentationMeasurement> measurements;
+  bool measurements_truncated = false;
+  std::uint64_t dropped_measurement_count = 0U;
+  std::jthread worker;
+};
+
+void RequestStopLiveInstrumentationWorker(
+    const std::shared_ptr<LiveInstrumentationRecord>& record) {
+  std::lock_guard<std::mutex> lock(record->worker_lifecycle_mutex);
+  record->worker.request_stop();
+}
+
+void JoinLiveInstrumentationWorker(
+    const std::shared_ptr<LiveInstrumentationRecord>& record) {
+  std::lock_guard<std::mutex> lock(record->worker_lifecycle_mutex);
+  if (record->worker.joinable()) {
+    record->worker.join();
+  }
+}
+
+struct LiveInstrumentationRegistry {
+  mutable std::mutex mutex;
+  std::map<std::string, std::shared_ptr<LiveInstrumentationRecord>, std::less<>>
+      records;
+  std::string active_id;
+  std::uint64_t next_id = 1U;
+  bool shutting_down = false;
+};
+
+boost::json::object LiveInstrumentationTargetJson(
+    const PerfCounterTarget& target) {
+  boost::json::array node_ids;
+  node_ids.reserve(target.node_ids.size());
+  for (const std::string& node_id : target.node_ids) {
+    node_ids.emplace_back(node_id);
+  }
+  return boost::json::object{
+      {"kind", PerfCounterTargetKindName(target.kind)},
+      {"id", target.id},
+      {"node_ids", std::move(node_ids)},
+  };
+}
+
+boost::json::array LiveInstrumentationTargetsJson(
+    const std::vector<PerfCounterTarget>& targets) {
+  boost::json::array result;
+  result.reserve(targets.size());
+  for (const PerfCounterTarget& target : targets) {
+    result.emplace_back(LiveInstrumentationTargetJson(target));
+  }
+  return result;
+}
+
+boost::json::object LiveInstrumentationResultJson(
+    const LiveInstrumentationRecord& record) {
+  std::lock_guard<std::mutex> lock(record.mutex);
+  return boost::json::object{
+      {"instrumentation_id", record.id},
+      {"state", LiveInstrumentationStateName(record.state)},
+      {"sample_count", record.sample_count},
+      {"targets", LiveInstrumentationTargetsJson(record.targets)},
+  };
+}
+
+boost::json::object LiveInstrumentationResourceJson(
+    const LiveInstrumentationRecord& record, bool include_measurements) {
+  std::lock_guard<std::mutex> lock(record.mutex);
+  boost::json::object result{
+      {"instrumentation_id", record.id},
+      {"state", LiveInstrumentationStateName(record.state)},
+      {"sample_count", record.sample_count},
+      {"targets", LiveInstrumentationTargetsJson(record.targets)},
+      {"counters", PerfCounterNamesJson(record.counters)},
+      {"sample_interval_ms", record.sample_interval.count()},
+      {"started_at_ms", record.started_at_ms},
+      {"configuration_revision", record.configuration_revision},
+      {"retained_measurement_count", record.measurements.size()},
+      {"measurements_truncated", record.measurements_truncated},
+      {"dropped_measurement_count", record.dropped_measurement_count},
+  };
+  if (record.window) {
+    result["window_ms"] = record.window->count();
+  } else {
+    result["window_ms"] = nullptr;
+  }
+  if (record.completed_at_ms) {
+    result["completed_at_ms"] = *record.completed_at_ms;
+  } else {
+    result["completed_at_ms"] = nullptr;
+  }
+  if (record.failure) {
+    result["failure"] = *record.failure;
+  } else {
+    result["failure"] = nullptr;
+  }
+  if (include_measurements) {
+    boost::json::array measurements;
+    measurements.reserve(record.measurements.size());
+    for (const LiveInstrumentationMeasurement& measurement :
+         record.measurements) {
+      measurements.emplace_back(boost::json::object{
+          {"sample", measurement.sample},
+          {"record", boost::json::parse(measurement.record)},
+      });
+    }
+    result["measurement_records"] = std::move(measurements);
+  }
+  return result;
+}
+
+std::vector<PerfCounterTarget> ParseLiveInstrumentationTargets(
+    const boost::json::object& arguments) {
+  const boost::json::value* value = arguments.if_contains("targets");
+  if (value == nullptr || !value->is_array() || value->as_array().empty() ||
+      value->as_array().size() > kMcpMaximumSelectionItems) {
+    throw std::invalid_argument(
+        "instrumentation targets must be a non-empty bounded array");
+  }
+  std::vector<PerfCounterTarget> targets;
+  targets.reserve(value->as_array().size());
+  std::set<std::string> target_ids;
+  std::set<std::string> resolved_node_ids;
+  constexpr std::array<std::string_view, 3U> kTargetFields = {"kind", "id",
+                                                              "node_ids"};
+  for (const boost::json::value& entry : value->as_array()) {
+    if (!entry.is_object()) {
+      throw std::invalid_argument(
+          "instrumentation target entries must be objects");
+    }
+    const boost::json::object& object = entry.as_object();
+    RejectUnsupportedFields(object, kTargetFields, "instrumentation target");
+    const boost::json::value* kind_value = object.if_contains("kind");
+    const boost::json::value* id_value = object.if_contains("id");
+    const boost::json::value* node_ids_value = object.if_contains("node_ids");
+    if (kind_value == nullptr || !kind_value->is_string() ||
+        id_value == nullptr || !id_value->is_string() ||
+        id_value->as_string().empty() || node_ids_value == nullptr ||
+        !node_ids_value->is_array() || node_ids_value->as_array().empty() ||
+        node_ids_value->as_array().size() > kMcpMaximumSelectionItems) {
+      throw std::invalid_argument(
+          "instrumentation target requires kind, id, and node_ids");
+    }
+    const std::optional<PerfCounterTargetKind> kind =
+        PerfCounterTargetKindFromName(kind_value->as_string());
+    if (!kind) {
+      throw std::invalid_argument("instrumentation target kind is unsupported");
+    }
+    PerfCounterTarget target;
+    target.kind = *kind;
+    target.id = std::string(id_value->as_string());
+    ValidateMcpIdentifier(target.id, "instrumentation target id");
+    if (!target_ids.insert(target.id).second) {
+      throw std::invalid_argument(
+          "instrumentation targets contain a duplicate id");
+    }
+    std::set<std::string> target_nodes;
+    target.node_ids.reserve(node_ids_value->as_array().size());
+    for (const boost::json::value& node_id_value : node_ids_value->as_array()) {
+      if (!node_id_value.is_string() || node_id_value.as_string().empty()) {
+        throw std::invalid_argument(
+            "instrumentation target node_ids must contain identifiers");
+      }
+      std::string node_id(node_id_value.as_string());
+      ValidateMcpIdentifier(node_id, "instrumentation target node id");
+      if (!target_nodes.insert(node_id).second) {
+        throw std::invalid_argument(
+            "instrumentation target contains a duplicate node id");
+      }
+      if (!resolved_node_ids.insert(node_id).second) {
+        throw std::invalid_argument(
+            "instrumentation targets resolve the same node more than once");
+      }
+      target.node_ids.push_back(std::move(node_id));
+    }
+    if (target.kind != PerfCounterTargetKind::kGroup &&
+        target.node_ids.size() != 1U) {
+      throw std::invalid_argument(
+          "non-group instrumentation target must resolve one node");
+    }
+    if ((target.kind == PerfCounterTargetKind::kNode ||
+         target.kind == PerfCounterTargetKind::kCgroup) &&
+        target.id != target.node_ids.front()) {
+      throw std::invalid_argument(
+          "node and cgroup instrumentation target ids must equal their node");
+    }
+    if (target.kind == PerfCounterTargetKind::kWallet &&
+        !IsCanonicalWalletPerfTargetId(target.id)) {
+      throw std::invalid_argument(
+          "wallet instrumentation target id must be "
+          "wallet-<positive-index>");
+    }
+    targets.push_back(std::move(target));
+  }
+  return targets;
+}
+
+std::vector<PerfCounterKind> ParseLiveInstrumentationCounters(
+    const boost::json::object& arguments) {
+  const boost::json::value* value = arguments.if_contains("counters");
+  if (value == nullptr || !value->is_array() || value->as_array().empty() ||
+      value->as_array().size() > DefaultPerfCounterKinds().size()) {
+    throw std::invalid_argument(
+        "instrumentation counters must be a non-empty bounded array");
+  }
+  std::vector<PerfCounterKind> counters;
+  counters.reserve(value->as_array().size());
+  std::set<PerfCounterKind> unique;
+  for (const boost::json::value& counter : value->as_array()) {
+    if (!counter.is_string()) {
+      throw std::invalid_argument(
+          "instrumentation counters must contain strings");
+    }
+    const std::optional<PerfCounterKind> kind =
+        PerfCounterKindFromName(counter.as_string());
+    if (!kind) {
+      throw std::invalid_argument("instrumentation counter is unsupported: " +
+                                  std::string(counter.as_string()));
+    }
+    if (!unique.insert(*kind).second) {
+      throw std::invalid_argument(
+          "instrumentation counters contain a duplicate");
+    }
+    counters.push_back(*kind);
+  }
+  return counters;
+}
+
+std::optional<std::chrono::milliseconds> OptionalLiveInstrumentationDuration(
+    const boost::json::object& arguments, std::string_view field) {
+  const boost::json::value* value = arguments.if_contains(field);
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (!value->is_string()) {
+    throw std::invalid_argument("instrumentation " + std::string(field) +
+                                " must be a duration string");
+  }
   try {
-    for (NodePerfCounterSnapshot& snapshot : snapshots) {
-      BeginNodePerfCounterReplacement(snapshot, target.kind, process_guard);
-      AttachNodePerfCounters(*snapshot.node, process_guard);
-      RequireNodePerfCounterAttachment(*snapshot.node, process_guard);
+    return PositiveDuration::Parse(value->as_string()).value();
+  } catch (const std::exception& error) {
+    throw std::invalid_argument("instrumentation " + std::string(field) +
+                                " is invalid: " + error.what());
+  }
+}
+
+std::map<std::string, NodePerfCounterConfiguration, std::less<>>
+LiveInstrumentationConfigurations(
+    const std::vector<PerfCounterTarget>& targets,
+    const std::vector<PerfCounterKind>& counters) {
+  std::map<std::string, NodePerfCounterConfiguration, std::less<>>
+      configurations;
+  for (const PerfCounterTarget& target : targets) {
+    for (const std::string& node_id : target.node_ids) {
+      const bool inserted = configurations
+                                .emplace(node_id,
+                                         NodePerfCounterConfiguration{
+                                             .node_id = node_id,
+                                             .kinds = counters,
+                                             .target_kind = target.kind,
+                                             .target_id = target.id,
+                                         })
+                                .second;
+      if (!inserted) {
+        throw std::invalid_argument(
+            "instrumentation targets resolve the same node more than once");
+      }
+    }
+  }
+  return configurations;
+}
+
+std::vector<NodePerfCounterAssignment> ResolvePerfCounterAssignments(
+    const std::map<std::string, NodePerfCounterConfiguration, std::less<>>&
+        configurations,
+    RuntimeNodeSnapshot& nodes, bool require_running, bool require_attachment) {
+  std::vector<NodePerfCounterAssignment> assignments;
+  assignments.reserve(configurations.size());
+  for (const auto& [node_id, configuration] : configurations) {
+    assignments.push_back(NodePerfCounterAssignment{
+        .node = &FindNodeRuntimeById(nodes, node_id),
+        .configuration = configuration,
+        .require_running = require_running,
+        .require_attachment = require_attachment,
+    });
+  }
+  return assignments;
+}
+
+void AppendLiveInstrumentationRound(
+    LiveInstrumentationRecord& record,
+    std::vector<std::string> measurement_records) {
+  std::lock_guard<std::mutex> lock(record.mutex);
+  if (record.state != LiveInstrumentationState::kRunning) {
+    return;
+  }
+  if (record.sample_count == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("instrumentation sample count exceeds uint64");
+  }
+  const std::uint64_t sample = record.sample_count + 1U;
+  std::size_t appended = 0U;
+  try {
+    for (std::string& measurement_record : measurement_records) {
+      record.measurements.push_back(LiveInstrumentationMeasurement{
+          .sample = sample,
+          .record = std::move(measurement_record),
+      });
+      ++appended;
     }
   } catch (...) {
-    for (NodePerfCounterSnapshot& snapshot : snapshots) {
-      RestoreNodePerfCounterSnapshot(snapshot, process_guard);
+    while (appended > 0U) {
+      record.measurements.pop_back();
+      --appended;
     }
     throw;
   }
+  const std::size_t dropped =
+      record.measurements.size() > kMaximumRetainedInstrumentationMeasurements
+          ? record.measurements.size() -
+                kMaximumRetainedInstrumentationMeasurements
+          : 0U;
+  for (std::size_t index = 0U; index < dropped; ++index) {
+    record.measurements.pop_front();
+  }
+  if (dropped != 0U) {
+    record.measurements_truncated = true;
+    const std::uint64_t remaining = std::numeric_limits<std::uint64_t>::max() -
+                                    record.dropped_measurement_count;
+    record.dropped_measurement_count +=
+        std::min<std::uint64_t>(remaining, dropped);
+  }
+  record.sample_count = sample;
+  record.changed.notify_all();
 }
+
+std::unique_lock<std::timed_mutex> AcquireInstrumentationTimedLock(
+    std::timed_mutex& mutex,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token, std::string_view component) {
+  std::unique_lock<std::timed_mutex> lock(mutex, std::defer_lock);
+  while (true) {
+    ThrowIfStopRequested(stop_token);
+    const auto now = std::chrono::steady_clock::now();
+    if (deadline && now >= *deadline) {
+      throw McpOperationFailure(
+          "instrumentation_operation_timeout",
+          "instrumentation timed out waiting for " + std::string(component),
+          true);
+    }
+    const auto attempt_deadline =
+        deadline ? std::min(*deadline, now + std::chrono::milliseconds(20))
+                 : now + std::chrono::milliseconds(20);
+    if (lock.try_lock_until(attempt_deadline)) {
+      ThrowIfStopRequested(stop_token);
+      return lock;
+    }
+  }
+}
+
+bool LiveInstrumentationCommandConflicts(
+    const LiveInstrumentationRegistry& registry,
+    const SimulationCommand& command) {
+  std::shared_ptr<LiveInstrumentationRecord> active;
+  {
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    if (registry.active_id.empty()) {
+      return false;
+    }
+    const auto found = registry.records.find(registry.active_id);
+    if (found == registry.records.end()) {
+      throw std::logic_error("active instrumentation record is not retained");
+    }
+    active = found->second;
+  }
+  const std::vector<std::string>* affected_nodes = nullptr;
+  if (command.kind == SimulationCommandKind::kSetPerfCounters) {
+    if (!command.perf_counter_target) {
+      return false;
+    }
+    affected_nodes = &command.perf_counter_target->node_ids;
+  } else if (command.kind == SimulationCommandKind::kRemoveNodes &&
+             command.node_remove) {
+    affected_nodes = &command.node_remove->node_ids;
+  } else {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(active->mutex);
+  return std::any_of(affected_nodes->begin(), affected_nodes->end(),
+                     [&](const std::string& node_id) {
+                       return active->baseline_configurations.contains(node_id);
+                     });
+}
+
+void RequireNoLiveInstrumentationCommandConflict(
+    const LiveInstrumentationRegistry& registry,
+    const SimulationCommand& command) {
+  if (LiveInstrumentationCommandConflicts(registry, command)) {
+    throw std::runtime_error(
+        "simulation command conflicts with the active instrumentation window");
+  }
+}
+
+std::string RequireLiveInstrumentationId(const boost::json::object& arguments) {
+  const boost::json::value* value = arguments.if_contains("instrumentation_id");
+  if (value == nullptr || !value->is_string() || value->as_string().empty()) {
+    throw std::invalid_argument(
+        "instrumentation_id must be a non-empty identifier");
+  }
+  std::string id(value->as_string());
+  ValidateMcpIdentifier(id, "instrumentation_id");
+  return id;
+}
+
+void ValidateLiveInstrumentationMappings(
+    const std::vector<PerfCounterTarget>& targets, RuntimeNodeSnapshot& nodes,
+    const RuntimeWalletSnapshot& wallets, const Options& options) {
+  std::map<std::string, std::set<std::string>, std::less<>>
+      authoritative_groups;
+  std::set<std::string> all_nodes;
+  std::map<std::string, std::set<std::string>, std::less<>> role_nodes;
+  std::vector<std::string> node_ids;
+  node_ids.reserve(nodes.size());
+  for (std::size_t index = 0U; index < nodes.size(); ++index) {
+    const std::string& node_id = nodes[index].config.id;
+    node_ids.push_back(node_id);
+    all_nodes.insert(node_id);
+    role_nodes["role-" + NodeRoleName(options,
+                                      static_cast<std::uint32_t>(index),
+                                      &wallets.registry().topology())]
+        .insert(node_id);
+  }
+  if (!all_nodes.empty()) {
+    authoritative_groups.emplace("all", std::move(all_nodes));
+  }
+  const auto append_index_groups =
+      [&](const std::vector<std::vector<std::uint32_t>>& groups,
+          std::string_view prefix) {
+        for (std::size_t index = 0U; index < groups.size(); ++index) {
+          std::set<std::string> members;
+          for (const std::uint32_t node_index : groups[index]) {
+            if (node_index >= node_ids.size()) {
+              throw std::logic_error(
+                  "active topology group references an unknown node");
+            }
+            members.insert(node_ids[node_index]);
+          }
+          if (!members.empty()) {
+            authoritative_groups.emplace(
+                std::string(prefix) + std::to_string(index + 1U),
+                std::move(members));
+          }
+        }
+      };
+  const PeerTopologyConfig& topology =
+      wallets.registry().topology().peer_topology;
+  append_index_groups(topology.groups, "topology-");
+  append_index_groups(topology.regions, "region-");
+  authoritative_groups.insert(std::make_move_iterator(role_nodes.begin()),
+                              std::make_move_iterator(role_nodes.end()));
+
+  for (const PerfCounterTarget& target : targets) {
+    for (const std::string& node_id : target.node_ids) {
+      static_cast<void>(FindNodeRuntimeById(nodes, node_id));
+    }
+    if (target.kind == PerfCounterTargetKind::kGroup) {
+      const auto group = authoritative_groups.find(target.id);
+      const std::set<std::string> requested_members(target.node_ids.begin(),
+                                                    target.node_ids.end());
+      if (group == authoritative_groups.end() ||
+          group->second != requested_members) {
+        throw std::invalid_argument(
+            "group instrumentation target does not match the active "
+            "topology");
+      }
+      continue;
+    }
+    if (target.kind != PerfCounterTargetKind::kWallet) {
+      continue;
+    }
+    constexpr std::string_view kWalletPrefix = "wallet-";
+    std::string_view index_text(target.id);
+    index_text.remove_prefix(kWalletPrefix.size());
+    std::uint32_t wallet_index = 0U;
+    const auto [end, error] = std::from_chars(
+        index_text.data(), index_text.data() + index_text.size(), wallet_index);
+    if (error != std::errc() || end != index_text.data() + index_text.size() ||
+        wallet_index == 0U) {
+      throw std::invalid_argument(
+          "wallet instrumentation target id is invalid");
+    }
+    const auto wallet =
+        std::find_if(wallets.wallets().begin(), wallets.wallets().end(),
+                     [wallet_index](const WalletIdentity& candidate) {
+                       return candidate.wallet_index == wallet_index;
+                     });
+    if (wallet == wallets.wallets().end() ||
+        wallet->node_id != target.node_ids.front()) {
+      throw std::invalid_argument(
+          "wallet instrumentation target does not match the active wallet "
+          "registry");
+    }
+  }
+}
+
+void ValidateLiveInstrumentationDuration(std::chrono::milliseconds duration,
+                                         std::string_view field) {
+  try {
+    static_cast<void>(
+        SteadyDeadline(std::chrono::steady_clock::now(), duration));
+  } catch (const std::exception& error) {
+    throw std::invalid_argument(
+        "instrumentation " + std::string(field) +
+        " exceeds the monotonic clock range: " + error.what());
+  }
+}
+
+void RollBackNodePerfCounterSnapshots(
+    std::vector<NodePerfCounterSnapshot>& snapshots,
+    RunProcessState& run_process_state) {
+  auto process_guard = run_process_state.Lock();
+  for (auto snapshot = snapshots.rbegin(); snapshot != snapshots.rend();
+       ++snapshot) {
+    RestoreNodePerfCounterSnapshot(*snapshot, process_guard);
+  }
+}
+
+using LiveInstrumentationMeasurementCollector =
+    std::function<std::vector<std::string>(const std::set<std::string>&,
+                                           std::stop_token)>;
+
+class LiveInstrumentationController {
+ public:
+  LiveInstrumentationController(
+      const Options& options, std::filesystem::path metrics_path,
+      std::filesystem::path events_path, ChainDriver& driver,
+      RuntimeNodeInventory& node_inventory,
+      RuntimeWalletRegistry& wallet_registry,
+      RunProcessState& run_process_state, std::timed_mutex& node_mutation_mutex,
+      std::shared_ptr<LiveInstrumentationRegistry> registry,
+      std::optional<NodePerfCounterTransactionBackend> transaction_backend =
+          std::nullopt,
+      LiveInstrumentationMeasurementCollector measurement_collector = {})
+      : options_(options),
+        metrics_path_(std::move(metrics_path)),
+        events_path_(std::move(events_path)),
+        driver_(driver),
+        node_inventory_(node_inventory),
+        wallet_registry_(wallet_registry),
+        run_process_state_(run_process_state),
+        node_mutation_mutex_(node_mutation_mutex),
+        registry_(std::move(registry)),
+        transaction_backend_(std::move(transaction_backend)),
+        measurement_collector_(std::move(measurement_collector)) {
+    if (!registry_) {
+      throw std::invalid_argument(
+          "live instrumentation registry must not be null");
+    }
+    if (transaction_backend_ &&
+        (!transaction_backend_->is_running || !transaction_backend_->attach ||
+         !transaction_backend_->reset)) {
+      throw std::invalid_argument(
+          "live instrumentation transaction backend is incomplete");
+    }
+  }
+
+  std::shared_ptr<McpLiveInstrumentationService> MakeService() {
+    auto service = std::make_shared<McpLiveInstrumentationService>();
+    service->operation = [this](McpOperationKind kind,
+                                const boost::json::object& arguments,
+                                std::stop_token stop_token) {
+      return Operate(kind, arguments, stop_token);
+    };
+    service->read = [this](McpInformationFamily family,
+                           std::stop_token stop_token) {
+      return Read(family, stop_token);
+    };
+    return service;
+  }
+
+  void Shutdown(bool run_failed) {
+    std::shared_ptr<LiveInstrumentationRecord> active;
+    std::vector<std::shared_ptr<LiveInstrumentationRecord>> records;
+    {
+      std::lock_guard<std::mutex> lock(registry_->mutex);
+      registry_->shutting_down = true;
+      records.reserve(registry_->records.size());
+      for (const auto& [id, record] : registry_->records) {
+        static_cast<void>(id);
+        records.push_back(record);
+      }
+      if (!registry_->active_id.empty()) {
+        const auto found = registry_->records.find(registry_->active_id);
+        if (found == registry_->records.end()) {
+          throw std::logic_error(
+              "active instrumentation record is not retained");
+        }
+        active = found->second;
+      }
+    }
+    if (active) {
+      RequestStopLiveInstrumentationWorker(active);
+      active->changed.notify_all();
+    }
+
+    std::exception_ptr restoration_failure;
+    if (active) {
+      try {
+        auto mutation_lock = AcquireInstrumentationTimedLock(
+            node_mutation_mutex_, std::nullopt, {}, "node mutation boundary");
+        auto sampling_lock = AcquireInstrumentationTimedLock(
+            active->sampling_boundary, std::nullopt, {}, "sampling boundary");
+        if (IsActiveRecord(active)) {
+          const LiveInstrumentationState terminal_state =
+              run_failed ? LiveInstrumentationState::kFailed
+                         : LiveInstrumentationState::kCancelled;
+          try {
+            RestoreBaseline(*active, {});
+            MarkRestored(active, terminal_state,
+                         run_failed
+                             ? std::optional<std::string>(
+                                   "run failed while instrumentation was "
+                                   "active")
+                             : std::nullopt);
+          } catch (const std::exception& error) {
+            MarkRestorationFailed(
+                active,
+                "instrumentation shutdown could not restore the "
+                "pre-window configuration: " +
+                    std::string(error.what()));
+            restoration_failure = std::current_exception();
+          } catch (...) {
+            MarkRestorationFailed(
+                active,
+                "instrumentation shutdown could not restore the "
+                "pre-window configuration");
+            restoration_failure = std::current_exception();
+          }
+        }
+      } catch (...) {
+        restoration_failure = std::current_exception();
+      }
+    }
+
+    for (const std::shared_ptr<LiveInstrumentationRecord>& record : records) {
+      RequestStopLiveInstrumentationWorker(record);
+      record->changed.notify_all();
+    }
+    for (const std::shared_ptr<LiveInstrumentationRecord>& record : records) {
+      JoinLiveInstrumentationWorker(record);
+    }
+    if (restoration_failure) {
+      std::rethrow_exception(restoration_failure);
+    }
+  }
+
+#ifdef BBP_ENABLE_TEST_HOOKS
+  void ApplyPerfMutationForTest(std::string_view node_id,
+                                PerfCounterKind counter) {
+    SimulationCommand command;
+    command.kind = SimulationCommandKind::kSetPerfCounters;
+    command.node_id = node_id;
+    command.perf_counter_target = PerfCounterTarget{
+        .kind = PerfCounterTargetKind::kNode,
+        .id = std::string(node_id),
+        .node_ids = {std::string(node_id)},
+    };
+    command.perf_counter_kinds = {counter};
+
+    auto mutation_lock = AcquireInstrumentationTimedLock(
+        node_mutation_mutex_, std::nullopt, {}, "node mutation boundary");
+    RequireNoLiveInstrumentationCommandConflict(*registry_, command);
+    RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
+    auto process_guard = run_process_state_.Lock();
+    ApplyPerfCounterCommand(
+        command, nodes, process_guard,
+        transaction_backend_ ? &*transaction_backend_ : nullptr);
+  }
+
+  void SampleNowForTest() {
+    auto mutation_lock = AcquireInstrumentationTimedLock(
+        node_mutation_mutex_, std::nullopt, {}, "node mutation boundary");
+    const std::shared_ptr<LiveInstrumentationRecord> record =
+        CurrentActiveRecordForTest();
+    auto sampling_lock = AcquireInstrumentationTimedLock(
+        record->sampling_boundary, std::nullopt, {}, "sampling boundary");
+    RequireSameActiveRecord(record);
+    CaptureRound(*record, {});
+  }
+
+  void ExpireNowForTest() {
+    std::shared_ptr<LiveInstrumentationRecord> record;
+    {
+      auto mutation_lock = AcquireInstrumentationTimedLock(
+          node_mutation_mutex_, std::nullopt, {}, "node mutation boundary");
+      record = CurrentActiveRecordForTest();
+      auto sampling_lock = AcquireInstrumentationTimedLock(
+          record->sampling_boundary, std::nullopt, {}, "sampling boundary");
+      RequireSameActiveRecord(record);
+      std::lock_guard<std::mutex> record_lock(record->mutex);
+      record->deadline = std::chrono::steady_clock::now();
+      record->changed.notify_all();
+    }
+    {
+      std::unique_lock<std::mutex> record_lock(record->mutex);
+      if (!record->changed.wait_for(
+              record_lock, std::chrono::seconds(5), [&record] {
+                return IsTerminalLiveInstrumentationState(record->state);
+              })) {
+        throw std::runtime_error(
+            "instrumentation worker did not process forced expiry");
+      }
+    }
+    JoinLiveInstrumentationWorker(record);
+  }
+#endif
+
+ private:
+  boost::json::object Operate(McpOperationKind kind,
+                              const boost::json::object& arguments,
+                              std::stop_token stop_token) {
+    switch (kind) {
+      case McpOperationKind::kStartInstrumentation:
+        return Start(arguments, stop_token);
+      case McpOperationKind::kReconfigureInstrumentation:
+        return Reconfigure(arguments, stop_token);
+      case McpOperationKind::kStopInstrumentation:
+        return Stop(arguments, stop_token);
+      default:
+        throw std::logic_error("unknown live instrumentation operation");
+    }
+  }
+
+  boost::json::object Start(const boost::json::object& arguments,
+                            std::stop_token stop_token) {
+    constexpr std::array<std::string_view, 6U> kAllowedFields = {
+        "run_id",   "instrumentation_id", "targets",
+        "counters", "sample_interval",    "window"};
+    RejectUnsupportedFields(arguments, kAllowedFields, "instrumentation.start");
+    std::vector<PerfCounterTarget> targets =
+        ParseLiveInstrumentationTargets(arguments);
+    std::vector<PerfCounterKind> counters =
+        ParseLiveInstrumentationCounters(arguments);
+    const std::chrono::milliseconds sample_interval =
+        OptionalLiveInstrumentationDuration(arguments, "sample_interval")
+            .value_or(options_.metrics_interval);
+    const std::optional<std::chrono::milliseconds> window =
+        OptionalLiveInstrumentationDuration(arguments, "window");
+    ValidateLiveInstrumentationDuration(sample_interval, "sample_interval");
+    if (window) {
+      ValidateLiveInstrumentationDuration(*window, "window");
+    }
+    std::optional<std::string> requested_id;
+    if (arguments.if_contains("instrumentation_id") != nullptr) {
+      requested_id = RequireLiveInstrumentationId(arguments);
+    }
+
+    auto mutation_lock =
+        AcquireInstrumentationTimedLock(node_mutation_mutex_, std::nullopt,
+                                        stop_token, "node mutation boundary");
+    ThrowIfStopRequested(stop_token);
+
+    auto record = std::make_shared<LiveInstrumentationRecord>();
+    {
+      std::lock_guard<std::mutex> lock(registry_->mutex);
+      RequireOperationalRegistry();
+      if (!registry_->active_id.empty()) {
+        throw McpOperationFailure(
+            "instrumentation_already_active",
+            "only one instrumentation window may be active per run", true);
+      }
+      if (registry_->records.size() >= kMaximumScenarioActionCount) {
+        throw McpOperationFailure(
+            "instrumentation_history_capacity",
+            "instrumentation history reached its bounded run capacity", false);
+      }
+      if (requested_id) {
+        if (registry_->records.contains(*requested_id)) {
+          throw McpOperationFailure(
+              "instrumentation_id_conflict",
+              "instrumentation_id is already retained: " + *requested_id,
+              false);
+        }
+        record->id = *requested_id;
+      } else {
+        while (true) {
+          if (registry_->next_id == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error(
+                "instrumentation identity sequence exceeds uint64");
+          }
+          const std::string candidate =
+              "instrumentation-" + std::to_string(registry_->next_id++);
+          if (!registry_->records.contains(candidate)) {
+            record->id = candidate;
+            break;
+          }
+        }
+      }
+    }
+
+    RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
+    const RuntimeWalletSnapshot wallets = wallet_registry_.Snapshot();
+    ValidateLiveInstrumentationMappings(targets, nodes, wallets, options_);
+    const auto configurations =
+        LiveInstrumentationConfigurations(targets, counters);
+    std::vector<NodePerfCounterAssignment> assignments =
+        ResolvePerfCounterAssignments(configurations, nodes, true, true);
+
+    std::vector<NodePerfCounterSnapshot> snapshots;
+    bool published = false;
+    try {
+      {
+        auto process_guard = run_process_state_.Lock();
+        snapshots = ReplaceNodePerfCountersTransactional(
+            assignments, process_guard, stop_token,
+            transaction_backend_ ? &*transaction_backend_ : nullptr);
+      }
+      for (const NodePerfCounterSnapshot& snapshot : snapshots) {
+        record->baseline_configurations.emplace(
+            snapshot.node->config.id,
+            SnapshotPerfCounterConfiguration(snapshot));
+      }
+      record->targets = targets;
+      record->counters = counters;
+      record->sample_interval = sample_interval;
+      record->window = window;
+      CaptureRound(*record, stop_token);
+      ThrowIfStopRequested(stop_token);
+
+      const auto committed_at = std::chrono::steady_clock::now();
+      record->started_at = committed_at;
+      record->started_at_ms = NowUnixMillis();
+      if (window) {
+        record->deadline = SteadyDeadline(committed_at, *window);
+      }
+      boost::json::object result = LiveInstrumentationResultJson(*record);
+
+      {
+        std::unique_lock<std::mutex> worker_lock(
+            record->worker_lifecycle_mutex);
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        RequireOperationalRegistry();
+        if (!registry_->active_id.empty() ||
+            registry_->records.contains(record->id)) {
+          throw McpOperationFailure(
+              "instrumentation_admission_conflict",
+              "instrumentation admission changed before publication", true);
+        }
+        const auto [inserted_record, inserted] =
+            registry_->records.emplace(record->id, record);
+        if (!inserted) {
+          throw std::logic_error(
+              "instrumentation publication lost its identity reservation");
+        }
+        try {
+          registry_->active_id = record->id;
+          record->worker =
+              std::jthread([this, record](std::stop_token worker_stop_token) {
+                RunWorker(record, worker_stop_token);
+              });
+          published = true;
+        } catch (...) {
+          registry_->active_id.clear();
+          registry_->records.erase(inserted_record);
+          throw;
+        }
+      }
+      return result;
+    } catch (...) {
+      RequestStopLiveInstrumentationWorker(record);
+      record->changed.notify_all();
+      JoinLiveInstrumentationWorker(record);
+      if (published) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->active_id == record->id) {
+          registry_->active_id.clear();
+        }
+        registry_->records.erase(record->id);
+      }
+      RollBackNodePerfCounterSnapshots(snapshots, run_process_state_);
+      throw;
+    }
+  }
+
+  boost::json::object Reconfigure(const boost::json::object& arguments,
+                                  std::stop_token stop_token) {
+    constexpr std::array<std::string_view, 5U> kAllowedFields = {
+        "run_id", "instrumentation_id", "targets", "counters",
+        "sample_interval"};
+    RejectUnsupportedFields(arguments, kAllowedFields,
+                            "instrumentation.reconfigure");
+    const std::string instrumentation_id =
+        RequireLiveInstrumentationId(arguments);
+    std::vector<PerfCounterTarget> targets =
+        ParseLiveInstrumentationTargets(arguments);
+    std::vector<PerfCounterKind> counters =
+        ParseLiveInstrumentationCounters(arguments);
+    const std::optional<std::chrono::milliseconds> requested_interval =
+        OptionalLiveInstrumentationDuration(arguments, "sample_interval");
+    if (requested_interval) {
+      ValidateLiveInstrumentationDuration(*requested_interval,
+                                          "sample_interval");
+    }
+
+    auto mutation_lock =
+        AcquireInstrumentationTimedLock(node_mutation_mutex_, std::nullopt,
+                                        stop_token, "node mutation boundary");
+    const std::shared_ptr<LiveInstrumentationRecord> record =
+        RequireActiveRecord(instrumentation_id);
+    auto sampling_lock =
+        AcquireInstrumentationTimedLock(record->sampling_boundary, std::nullopt,
+                                        stop_token, "sampling boundary");
+    RequireSameActiveRecord(record);
+    ThrowIfStopRequested(stop_token);
+    const auto expire_at_boundary = [&] {
+      RequestStopLiveInstrumentationWorker(record);
+      record->changed.notify_all();
+      CompleteAtSamplingBoundary(record, LiveInstrumentationState::kSucceeded,
+                                 std::nullopt);
+      std::optional<std::string> restoration_failure;
+      {
+        std::lock_guard<std::mutex> record_lock(record->mutex);
+        if (record->state == LiveInstrumentationState::kFailed) {
+          restoration_failure = record->failure.value_or(
+              "instrumentation expiry could not restore the pre-window "
+              "configuration");
+        }
+      }
+      sampling_lock.unlock();
+      mutation_lock.unlock();
+      JoinLiveInstrumentationWorker(record);
+      if (restoration_failure) {
+        throw McpOperationFailure("instrumentation_restoration_failed",
+                                  *restoration_failure, true);
+      }
+      throw McpOperationFailure(
+          "instrumentation_not_active",
+          "instrumentation window expired before reconfiguration", false);
+    };
+
+    std::vector<PerfCounterTarget> prior_targets;
+    std::vector<PerfCounterKind> prior_counters;
+    std::map<std::string, NodePerfCounterConfiguration, std::less<>>
+        prior_baseline;
+    std::chrono::milliseconds sample_interval;
+    std::uint64_t next_revision = 0U;
+    std::uint64_t sample_count = 0U;
+    bool deadline_reached = false;
+    {
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (record->state != LiveInstrumentationState::kRunning) {
+        throw McpOperationFailure(
+            "instrumentation_not_active",
+            "terminal instrumentation cannot be reconfigured: " +
+                instrumentation_id,
+            false);
+      }
+      deadline_reached = record->deadline &&
+                         std::chrono::steady_clock::now() >= *record->deadline;
+      if (deadline_reached) {
+        record->changed.notify_all();
+      } else {
+        if (record->configuration_revision ==
+            std::numeric_limits<std::uint64_t>::max()) {
+          throw std::overflow_error(
+              "instrumentation configuration revision exceeds uint64");
+        }
+        prior_targets = record->targets;
+        prior_counters = record->counters;
+        prior_baseline = record->baseline_configurations;
+        sample_interval = requested_interval.value_or(record->sample_interval);
+        next_revision = record->configuration_revision + 1U;
+        sample_count = record->sample_count;
+      }
+    }
+    if (deadline_reached) {
+      expire_at_boundary();
+    }
+    boost::json::object result{
+        {"instrumentation_id", record->id},
+        {"state",
+         LiveInstrumentationStateName(LiveInstrumentationState::kRunning)},
+        {"sample_count", sample_count},
+        {"targets", LiveInstrumentationTargetsJson(targets)},
+    };
+
+    RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
+    const RuntimeWalletSnapshot wallets = wallet_registry_.Snapshot();
+    ValidateLiveInstrumentationMappings(targets, nodes, wallets, options_);
+    const auto prior_configurations =
+        LiveInstrumentationConfigurations(prior_targets, prior_counters);
+    const auto next_configurations =
+        LiveInstrumentationConfigurations(targets, counters);
+
+    std::vector<NodePerfCounterAssignment> assignments;
+    assignments.reserve(prior_configurations.size() +
+                        next_configurations.size());
+    for (const auto& [node_id, configuration] : next_configurations) {
+      assignments.push_back(NodePerfCounterAssignment{
+          .node = &FindNodeRuntimeById(nodes, node_id),
+          .configuration = configuration,
+          .require_running = true,
+          .require_attachment = true,
+      });
+    }
+    for (const auto& [node_id, configuration] : prior_configurations) {
+      static_cast<void>(configuration);
+      if (next_configurations.contains(node_id)) {
+        continue;
+      }
+      const auto baseline = prior_baseline.find(node_id);
+      if (baseline == prior_baseline.end()) {
+        throw std::logic_error(
+            "instrumentation baseline is missing an active node");
+      }
+      assignments.push_back(NodePerfCounterAssignment{
+          .node = &FindNodeRuntimeById(nodes, node_id),
+          .configuration = baseline->second,
+          .require_running = false,
+          .require_attachment = true,
+      });
+    }
+
+    std::vector<NodePerfCounterSnapshot> snapshots;
+    try {
+      {
+        auto process_guard = run_process_state_.Lock();
+        snapshots = ReplaceNodePerfCountersTransactional(
+            assignments, process_guard, stop_token,
+            transaction_backend_ ? &*transaction_backend_ : nullptr);
+      }
+      std::map<std::string, NodePerfCounterConfiguration, std::less<>>
+          next_baseline = prior_baseline;
+      for (const auto& [node_id, configuration] : prior_configurations) {
+        static_cast<void>(configuration);
+        if (!next_configurations.contains(node_id)) {
+          next_baseline.erase(node_id);
+        }
+      }
+      for (const NodePerfCounterSnapshot& snapshot : snapshots) {
+        const std::string& node_id = snapshot.node->config.id;
+        if (!prior_configurations.contains(node_id)) {
+          next_baseline.emplace(node_id,
+                                SnapshotPerfCounterConfiguration(snapshot));
+        }
+      }
+      ThrowIfStopRequested(stop_token);
+      {
+        std::lock_guard<std::mutex> registry_lock(registry_->mutex);
+        RequireOperationalRegistry();
+        if (registry_->active_id != record->id) {
+          throw McpOperationFailure(
+              "instrumentation_admission_conflict",
+              "instrumentation admission changed during reconfiguration", true);
+        }
+      }
+      {
+        std::lock_guard<std::mutex> record_lock(record->mutex);
+        if (record->state != LiveInstrumentationState::kRunning) {
+          throw McpOperationFailure(
+              "instrumentation_not_active",
+              "instrumentation became terminal during reconfiguration", true);
+        }
+        deadline_reached =
+            record->deadline &&
+            std::chrono::steady_clock::now() >= *record->deadline;
+        if (!deadline_reached) {
+          record->targets = std::move(targets);
+          record->counters = std::move(counters);
+          record->baseline_configurations = std::move(next_baseline);
+          record->sample_interval = sample_interval;
+          record->configuration_revision = next_revision;
+          record->changed.notify_all();
+        }
+      }
+      if (deadline_reached) {
+        RollBackNodePerfCounterSnapshots(snapshots, run_process_state_);
+        snapshots.clear();
+        expire_at_boundary();
+      }
+    } catch (...) {
+      RollBackNodePerfCounterSnapshots(snapshots, run_process_state_);
+      throw;
+    }
+    return result;
+  }
+
+  boost::json::object Stop(const boost::json::object& arguments,
+                           std::stop_token stop_token) {
+    constexpr std::array<std::string_view, 3U> kAllowedFields = {
+        "run_id", "instrumentation_id", "timeout_sec"};
+    RejectUnsupportedFields(arguments, kAllowedFields, "instrumentation.stop");
+    const std::string instrumentation_id =
+        RequireLiveInstrumentationId(arguments);
+    const std::uint32_t timeout_sec =
+        JsonOptionalUint32Field(arguments, "timeout_sec", 60U);
+    if (timeout_sec == 0U || timeout_sec > 3600U) {
+      throw std::invalid_argument(
+          "instrumentation.stop timeout_sec must be in 1..3600");
+    }
+    const auto deadline =
+        SteadyDeadline(std::chrono::steady_clock::now(),
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::seconds(timeout_sec)));
+
+    std::shared_ptr<LiveInstrumentationRecord> record;
+    boost::json::object result;
+    {
+      auto mutation_lock = AcquireInstrumentationTimedLock(
+          node_mutation_mutex_, deadline, stop_token, "node mutation boundary");
+      record = RequireActiveRecord(instrumentation_id);
+      auto sampling_lock = AcquireInstrumentationTimedLock(
+          record->sampling_boundary, deadline, stop_token, "sampling boundary");
+      RequireSameActiveRecord(record);
+      ThrowIfStopRequested(stop_token);
+
+      LiveInstrumentationState terminal_state;
+      {
+        std::lock_guard<std::mutex> record_lock(record->mutex);
+        terminal_state = record->state == LiveInstrumentationState::kFailed
+                             ? LiveInstrumentationState::kFailed
+                             : LiveInstrumentationState::kSucceeded;
+      }
+      RequestStopLiveInstrumentationWorker(record);
+      record->changed.notify_all();
+      try {
+        RestoreBaseline(*record, {});
+        MarkRestored(record, terminal_state, std::nullopt);
+      } catch (const std::exception& error) {
+        MarkRestorationFailed(
+            record,
+            "instrumentation.stop could not restore the pre-window "
+            "configuration: " +
+                std::string(error.what()));
+      } catch (...) {
+        MarkRestorationFailed(
+            record,
+            "instrumentation.stop could not restore the pre-window "
+            "configuration");
+      }
+      result = LiveInstrumentationResultJson(*record);
+    }
+    JoinLiveInstrumentationWorker(record);
+    return result;
+  }
+
+  boost::json::value Read(McpInformationFamily family,
+                          std::stop_token stop_token) const {
+    ThrowIfStopRequested(stop_token);
+    std::string active_id;
+    std::vector<std::shared_ptr<LiveInstrumentationRecord>> records;
+    {
+      std::lock_guard<std::mutex> lock(registry_->mutex);
+      active_id = registry_->active_id;
+      records.reserve(registry_->records.size());
+      for (const auto& [id, record] : registry_->records) {
+        static_cast<void>(id);
+        records.push_back(record);
+      }
+    }
+    if (family == McpInformationFamily::kInstrumentation) {
+      boost::json::array result;
+      if (!active_id.empty()) {
+        const auto active = std::find_if(records.begin(), records.end(),
+                                         [&active_id](const auto& record) {
+                                           return record->id == active_id;
+                                         });
+        if (active == records.end()) {
+          throw std::logic_error(
+              "active instrumentation record is not retained");
+        }
+        result.emplace_back(LiveInstrumentationResourceJson(**active, false));
+      }
+      return result;
+    }
+    if (family == McpInformationFamily::kMeasurements) {
+      if (active_id.empty()) {
+        return boost::json::object{
+            {"instrumentation_id", nullptr},
+            {"sample_count", 0U},
+            {"retained_measurement_count", 0U},
+            {"measurements_truncated", false},
+            {"dropped_measurement_count", 0U},
+            {"measurement_records", boost::json::array{}},
+        };
+      }
+      const auto active = std::find_if(
+          records.begin(), records.end(),
+          [&active_id](const auto& record) { return record->id == active_id; });
+      if (active == records.end()) {
+        throw std::logic_error("active instrumentation record is not retained");
+      }
+      return LiveInstrumentationResourceJson(**active, true);
+    }
+    if (family == McpInformationFamily::kMeasurementHistory) {
+      boost::json::array result;
+      for (const std::shared_ptr<LiveInstrumentationRecord>& record : records) {
+        ThrowIfStopRequested(stop_token);
+        if (record->id == active_id) {
+          continue;
+        }
+        {
+          std::lock_guard<std::mutex> lock(record->mutex);
+          if (!IsTerminalLiveInstrumentationState(record->state)) {
+            continue;
+          }
+        }
+        result.emplace_back(LiveInstrumentationResourceJson(*record, true));
+      }
+      return result;
+    }
+    throw std::logic_error("unknown live instrumentation resource");
+  }
+
+  void RequireOperationalRegistry() const {
+    if (registry_->shutting_down) {
+      throw McpOperationFailure(
+          "instrumentation_service_stopping",
+          "instrumentation service is stopping with its run", true);
+    }
+  }
+
+  std::shared_ptr<LiveInstrumentationRecord> RequireActiveRecord(
+      std::string_view instrumentation_id) const {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    RequireOperationalRegistry();
+    if (registry_->active_id != instrumentation_id) {
+      throw McpOperationFailure("instrumentation_not_active",
+                                "instrumentation is not the active window: " +
+                                    std::string(instrumentation_id),
+                                false);
+    }
+    const auto found = registry_->records.find(registry_->active_id);
+    if (found == registry_->records.end()) {
+      throw std::logic_error("active instrumentation record is not retained");
+    }
+    return found->second;
+  }
+
+  void RequireSameActiveRecord(
+      const std::shared_ptr<LiveInstrumentationRecord>& record) const {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    RequireOperationalRegistry();
+    const auto found = registry_->records.find(record->id);
+    if (registry_->active_id != record->id ||
+        found == registry_->records.end() || found->second != record) {
+      throw McpOperationFailure(
+          "instrumentation_admission_conflict",
+          "instrumentation admission changed at the sampling boundary", true);
+    }
+  }
+
+  bool IsActiveRecord(
+      const std::shared_ptr<LiveInstrumentationRecord>& record) const {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    const auto found = registry_->records.find(record->id);
+    return registry_->active_id == record->id &&
+           found != registry_->records.end() && found->second == record;
+  }
+
+#ifdef BBP_ENABLE_TEST_HOOKS
+  std::shared_ptr<LiveInstrumentationRecord> CurrentActiveRecordForTest()
+      const {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    if (registry_->active_id.empty()) {
+      throw std::logic_error("no active instrumentation record");
+    }
+    const auto found = registry_->records.find(registry_->active_id);
+    if (found == registry_->records.end()) {
+      throw std::logic_error("active instrumentation record is not retained");
+    }
+    return found->second;
+  }
+#endif
+
+  std::set<std::string> SelectedNodeIds(
+      const LiveInstrumentationRecord& record) const {
+    std::lock_guard<std::mutex> lock(record.mutex);
+    std::set<std::string> selected;
+    for (const PerfCounterTarget& target : record.targets) {
+      selected.insert(target.node_ids.begin(), target.node_ids.end());
+    }
+    return selected;
+  }
+
+  void CaptureRound(LiveInstrumentationRecord& record,
+                    std::stop_token stop_token) {
+    const std::set<std::string> selected = SelectedNodeIds(record);
+    if (measurement_collector_) {
+      std::vector<std::string> measurements =
+          measurement_collector_(selected, stop_token);
+      ThrowIfStopRequested(stop_token);
+      AppendLiveInstrumentationRound(record, std::move(measurements));
+      return;
+    }
+    RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
+    const RuntimeWalletSnapshot wallets = wallet_registry_.Snapshot();
+    std::vector<std::string> measurements;
+    WriteMetricsSnapshot(
+        metrics_path_, options_, driver_, nodes, run_process_state_,
+        [&](const NodeRuntime& node, std::string_view error) {
+          boost::json::object detail;
+          {
+            std::lock_guard<std::mutex> lock(record.mutex);
+            detail["instrumentation_id"] = record.id;
+            detail["sample"] = record.sample_count + 1U;
+          }
+          detail["error"] = error;
+          WriteEvent(events_path_, options_.run_id, node.config.id,
+                     SimulationEventKind::kMetricsNodeUnavailable,
+                     boost::json::serialize(detail));
+          BBP_LOG(warning) << "instrumentation metrics skipped "
+                           << node.config.id << ": " << error;
+        },
+        {}, stop_token, &wallets.registry().topology(), &selected,
+        [&](const NodeRuntime&, std::string_view measurement) {
+          measurements.emplace_back(measurement);
+        });
+    ThrowIfStopRequested(stop_token);
+    AppendLiveInstrumentationRound(record, std::move(measurements));
+  }
+
+  void RestoreBaseline(LiveInstrumentationRecord& record,
+                       std::stop_token stop_token) {
+    std::map<std::string, NodePerfCounterConfiguration, std::less<>> baseline;
+    {
+      std::lock_guard<std::mutex> lock(record.mutex);
+      baseline = record.baseline_configurations;
+    }
+    RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
+    std::vector<NodePerfCounterAssignment> assignments =
+        ResolvePerfCounterAssignments(baseline, nodes, false, true);
+    auto process_guard = run_process_state_.Lock();
+    static_cast<void>(ReplaceNodePerfCountersTransactional(
+        assignments, process_guard, stop_token,
+        transaction_backend_ ? &*transaction_backend_ : nullptr));
+  }
+
+  void MarkRestored(const std::shared_ptr<LiveInstrumentationRecord>& record,
+                    LiveInstrumentationState state,
+                    std::optional<std::string> failure) {
+    std::lock_guard<std::mutex> registry_lock(registry_->mutex);
+    const auto found = registry_->records.find(record->id);
+    if (registry_->active_id != record->id ||
+        found == registry_->records.end() || found->second != record) {
+      throw std::logic_error(
+          "restored instrumentation record is no longer active");
+    }
+    std::lock_guard<std::mutex> record_lock(record->mutex);
+    if (record->state == LiveInstrumentationState::kFailed) {
+      state = LiveInstrumentationState::kFailed;
+    }
+    record->state = state;
+    if (failure) {
+      record->failure = std::move(failure);
+    }
+    record->completed_at_ms = NowUnixMillis();
+    registry_->active_id.clear();
+    record->changed.notify_all();
+  }
+
+  void MarkRestorationFailed(
+      const std::shared_ptr<LiveInstrumentationRecord>& record,
+      std::string failure) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(record->mutex);
+      record->state = LiveInstrumentationState::kFailed;
+      record->completed_at_ms.reset();
+      if (record->failure) {
+        *record->failure += "; " + failure;
+      } else {
+        record->failure = std::move(failure);
+      }
+      record->changed.notify_all();
+    } catch (...) {
+    }
+  }
+
+  void CompleteAtSamplingBoundary(
+      const std::shared_ptr<LiveInstrumentationRecord>& record,
+      LiveInstrumentationState state,
+      std::optional<std::string> failure) noexcept {
+    try {
+      RestoreBaseline(*record, {});
+      MarkRestored(record, state, failure);
+    } catch (const std::exception& error) {
+      std::string detail =
+          failure.value_or("instrumentation completion failed");
+      detail += "; pre-window configuration restoration failed: " +
+                std::string(error.what());
+      MarkRestorationFailed(record, std::move(detail));
+    } catch (...) {
+      std::string detail =
+          failure.value_or("instrumentation completion failed");
+      detail += "; pre-window configuration restoration failed";
+      MarkRestorationFailed(record, std::move(detail));
+    }
+  }
+
+  void CompleteFromWorker(
+      const std::shared_ptr<LiveInstrumentationRecord>& record,
+      LiveInstrumentationState state, std::optional<std::string> failure,
+      std::stop_token worker_stop_token) noexcept {
+    try {
+      auto mutation_lock = AcquireInstrumentationTimedLock(
+          node_mutation_mutex_, std::nullopt, worker_stop_token,
+          "node mutation boundary");
+      auto sampling_lock = AcquireInstrumentationTimedLock(
+          record->sampling_boundary, std::nullopt, worker_stop_token,
+          "sampling boundary");
+      if (!IsActiveRecord(record)) {
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (record->state != LiveInstrumentationState::kRunning) {
+          return;
+        }
+      }
+      CompleteAtSamplingBoundary(record, state, std::move(failure));
+    } catch (const SimulationCancelled&) {
+    } catch (const std::exception& error) {
+      if (!worker_stop_token.stop_requested()) {
+        MarkRestorationFailed(
+            record,
+            "instrumentation worker could not enter its restoration "
+            "boundary: " +
+                std::string(error.what()));
+      }
+    } catch (...) {
+      if (!worker_stop_token.stop_requested()) {
+        MarkRestorationFailed(
+            record,
+            "instrumentation worker could not enter its restoration boundary");
+      }
+    }
+  }
+
+  void RunWorker(const std::shared_ptr<LiveInstrumentationRecord>& record,
+                 std::stop_token worker_stop_token) noexcept {
+    try {
+      std::uint64_t revision;
+      std::chrono::steady_clock::time_point next_sample;
+      {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        revision = record->configuration_revision;
+        next_sample =
+            SteadyDeadline(record->started_at, record->sample_interval);
+      }
+      while (!worker_stop_token.stop_requested()) {
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        {
+          std::unique_lock<std::mutex> lock(record->mutex);
+          if (record->state != LiveInstrumentationState::kRunning) {
+            return;
+          }
+          deadline = record->deadline;
+          const auto wake_at =
+              deadline ? std::min(next_sample, *deadline) : next_sample;
+          static_cast<void>(
+              record->changed.wait_until(lock, worker_stop_token, wake_at, [&] {
+                return record->state != LiveInstrumentationState::kRunning ||
+                       record->configuration_revision != revision ||
+                       record->deadline != deadline;
+              }));
+          if (worker_stop_token.stop_requested() ||
+              record->state != LiveInstrumentationState::kRunning) {
+            return;
+          }
+          if (record->configuration_revision != revision) {
+            revision = record->configuration_revision;
+            next_sample = SteadyDeadline(std::chrono::steady_clock::now(),
+                                         record->sample_interval);
+            continue;
+          }
+        }
+
+        auto mutation_lock = AcquireInstrumentationTimedLock(
+            node_mutation_mutex_, std::nullopt, worker_stop_token,
+            "node mutation boundary");
+        auto sampling_lock = AcquireInstrumentationTimedLock(
+            record->sampling_boundary, std::nullopt, worker_stop_token,
+            "sampling boundary");
+        bool expired = false;
+        {
+          std::lock_guard<std::mutex> lock(record->mutex);
+          if (record->state != LiveInstrumentationState::kRunning) {
+            return;
+          }
+          if (record->configuration_revision != revision) {
+            revision = record->configuration_revision;
+            next_sample = SteadyDeadline(std::chrono::steady_clock::now(),
+                                         record->sample_interval);
+            continue;
+          }
+          expired = record->deadline &&
+                    std::chrono::steady_clock::now() >= *record->deadline;
+        }
+        if (expired) {
+          CompleteAtSamplingBoundary(
+              record, LiveInstrumentationState::kSucceeded, std::nullopt);
+          return;
+        }
+        try {
+          CaptureRound(*record, worker_stop_token);
+        } catch (const SimulationCancelled&) {
+          if (worker_stop_token.stop_requested()) {
+            return;
+          }
+          throw;
+        } catch (const std::exception& error) {
+          CompleteAtSamplingBoundary(
+              record, LiveInstrumentationState::kFailed,
+              "instrumentation sampling failed: " + std::string(error.what()));
+          return;
+        } catch (...) {
+          CompleteAtSamplingBoundary(record, LiveInstrumentationState::kFailed,
+                                     "instrumentation sampling failed");
+          return;
+        }
+        {
+          std::lock_guard<std::mutex> lock(record->mutex);
+          next_sample = SteadyDeadline(std::chrono::steady_clock::now(),
+                                       record->sample_interval);
+        }
+      }
+    } catch (const SimulationCancelled&) {
+    } catch (const std::exception& error) {
+      if (!worker_stop_token.stop_requested()) {
+        CompleteFromWorker(
+            record, LiveInstrumentationState::kFailed,
+            "instrumentation worker failed: " + std::string(error.what()),
+            worker_stop_token);
+      }
+    } catch (...) {
+      if (!worker_stop_token.stop_requested()) {
+        CompleteFromWorker(record, LiveInstrumentationState::kFailed,
+                           "instrumentation worker failed", worker_stop_token);
+      }
+    }
+  }
+
+  const Options& options_;
+  std::filesystem::path metrics_path_;
+  std::filesystem::path events_path_;
+  ChainDriver& driver_;
+  RuntimeNodeInventory& node_inventory_;
+  RuntimeWalletRegistry& wallet_registry_;
+  RunProcessState& run_process_state_;
+  std::timed_mutex& node_mutation_mutex_;
+  std::shared_ptr<LiveInstrumentationRegistry> registry_;
+  std::optional<NodePerfCounterTransactionBackend> transaction_backend_;
+  LiveInstrumentationMeasurementCollector measurement_collector_;
+};
 
 std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
     const Options& options, const auto& nodes) {
@@ -19760,7 +21493,10 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
   std::vector<PendingTransactionLoadCompletion>
       pending_transaction_load_completions;
   auto wallet_workloads = std::make_shared<LiveWalletWorkloadRegistry>();
+  auto live_instrumentation = std::make_shared<LiveInstrumentationRegistry>();
   std::shared_ptr<McpLiveWorkloadService> installed_workload_service;
+  std::shared_ptr<McpLiveInstrumentationService>
+      installed_instrumentation_service;
   std::shared_ptr<McpLiveRoleService> installed_role_service;
   std::mutex lifecycle_failure_mutex;
   std::timed_mutex node_mutation_mutex;
@@ -19778,6 +21514,28 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
   std::stop_callback cancel_metrics_rpc(stop_token, [&metrics_rpc_stop_source] {
     metrics_rpc_stop_source.request_stop();
   });
+  auto instrumentation_controller =
+      std::make_unique<LiveInstrumentationController>(
+          options, metrics_path, events_path, driver, node_inventory,
+          runtime_wallet_registry, run_process_state, node_mutation_mutex,
+          live_instrumentation);
+  const auto stop_instrumentation = [&](bool run_failed) {
+    mcp_application.SetInstrumentationService(nullptr);
+    std::exception_ptr shutdown_failure;
+    try {
+      instrumentation_controller->Shutdown(run_failed);
+    } catch (...) {
+      shutdown_failure = std::current_exception();
+    }
+    while (installed_instrumentation_service &&
+           installed_instrumentation_service.use_count() > 1U) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    installed_instrumentation_service.reset();
+    if (shutdown_failure) {
+      std::rethrow_exception(shutdown_failure);
+    }
+  };
   const auto stop_role_mutations = [&] {
     mcp_application.SetRoleService(nullptr);
     while (installed_role_service && installed_role_service.use_count() > 1U) {
@@ -19934,6 +21692,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    cleanup_step("instrumentation shutdown",
+                 [&] { stop_instrumentation(true); });
     cleanup_step("role mutation shutdown", stop_role_mutations);
     cleanup_step("wallet workload shutdown",
                  [&] { stop_wallet_workloads(true); });
@@ -19995,6 +21755,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    cleanup_step("instrumentation shutdown",
+                 [&] { stop_instrumentation(false); });
     cleanup_step("role mutation shutdown", stop_role_mutations);
     cleanup_step("wallet workload shutdown",
                  [&] { stop_wallet_workloads(false); });
@@ -20034,6 +21796,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    cleanup_step("instrumentation shutdown",
+                 [&] { stop_instrumentation(false); });
     cleanup_step("role mutation shutdown", stop_role_mutations);
     cleanup_step("wallet workload shutdown",
                  [&] { stop_wallet_workloads(false); });
@@ -20343,6 +22107,8 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
               mutation_lock.emplace(AcquireNodeMutationLock(
                   node_mutation_mutex, command_stop_token));
             }
+            RequireNoLiveInstrumentationCommandConflict(*live_instrumentation,
+                                                        command);
             WriteEvent(events_path, options.run_id, command.node_id,
                        SimulationEventKind::kOperatorCommandStarted,
                        SimulationCommandDetail(command));
@@ -21652,6 +23418,9 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
                           simulation_registry, stop_token);
     runtime_wallet_registry.Initialize(std::move(simulation_registry));
     wallets_initialized.store(true, std::memory_order_release);
+    auto instrumentation_service = instrumentation_controller->MakeService();
+    mcp_application.SetInstrumentationService(instrumentation_service);
+    installed_instrumentation_service = std::move(instrumentation_service);
     const auto runtime_wallet_validation_options = [&] {
       Options validation = options;
       const RuntimeWalletSnapshot wallet_snapshot =
@@ -25179,6 +26948,7 @@ int RunBenchmarkHeadless(Options options, SimulationCommandQueue& command_queue,
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    stop_instrumentation(false);
     stop_role_mutations();
     stop_wallet_workloads(false);
     stop_transaction_observer();
@@ -27126,6 +28896,275 @@ int RunRetainedTuiWithMcp(const Options& cli_options,
 }  // namespace
 
 #ifdef BBP_ENABLE_TEST_HOOKS
+class LiveInstrumentationHarnessForTest::Impl {
+ public:
+  Impl(std::vector<std::string> node_ids,
+       std::chrono::milliseconds default_sample_interval)
+      : node_inventory_(CheckedNodeCapacity(node_ids.size())) {
+    if (node_ids.empty()) {
+      throw std::invalid_argument(
+          "instrumentation test harness requires at least one node");
+    }
+    ValidateLiveInstrumentationDuration(default_sample_interval,
+                                        "sample_interval");
+    options_.run_id = "instrumentation-test";
+    options_.nodes = static_cast<std::uint32_t>(node_ids.size());
+    options_.metrics_interval = default_sample_interval;
+    options_.topology.configured = true;
+    options_.topology.node_count = options_.nodes;
+    options_.topology.peer_topology.kind = PeerTopologyKind::kFullMesh;
+
+    std::vector<NodeRuntime> nodes;
+    nodes.reserve(node_ids.size());
+    const std::vector<PerfCounterKind>& available = DefaultPerfCounterKinds();
+    for (std::size_t index = 0U; index < node_ids.size(); ++index) {
+      ValidateMcpIdentifier(node_ids[index], "test node id");
+      if (!running_.emplace(node_ids[index], true).second) {
+        throw std::invalid_argument(
+            "instrumentation test node ids must be unique");
+      }
+      NodeRuntime node;
+      node.config.id = std::move(node_ids[index]);
+      node.run_process_state = &run_process_state_;
+      node.perf_counter_kinds = {available[index % available.size()]};
+      node.perf_counter_target_kind = PerfCounterTargetKind::kNode;
+      node.perf_counter_target_id = node.config.id;
+      node.perf_counter_target_pid = static_cast<pid_t>(100U + index);
+      node.perf_counter_attached_pid = node.perf_counter_target_pid;
+      node.perf_counter_process_generation = 10U + index;
+      nodes.push_back(std::move(node));
+    }
+    node_inventory_.Initialize(nodes);
+    wallet_registry_.Initialize(SimulationRegistry::FromTopology(
+        options_.topology, options_.wallet_initialization));
+    driver_ = CreateChainDriver(options_.chain);
+
+    NodePerfCounterTransactionBackend backend;
+    backend.is_running = [this](const NodeRuntime& node) {
+      const auto found = running_.find(node.config.id);
+      if (found == running_.end()) {
+        throw std::logic_error(
+            "instrumentation test backend found an unknown node");
+      }
+      return found->second;
+    };
+    backend.attach = [this](NodeRuntime& node,
+                            const RunProcessState::Guard& guard,
+                            bool require_attachment) {
+      static_cast<void>(require_attachment);
+      if (attachment_attempts_ == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error(
+            "instrumentation test attachment sequence exceeds uint64");
+      }
+      ++attachment_attempts_;
+      if (failed_attachment_attempt_ &&
+          attachment_attempts_ == *failed_attachment_attempt_) {
+        throw std::runtime_error("injected instrumentation attachment failure");
+      }
+      ResetNodePerfCounters(node, guard);
+      node.perf_counter_process_generation = attachment_attempts_;
+      if (node.perf_counter_target_kind == PerfCounterTargetKind::kNode ||
+          node.perf_counter_target_kind == PerfCounterTargetKind::kWallet) {
+        node.perf_counter_target_pid =
+            static_cast<pid_t>(1000U + attachment_attempts_);
+        node.perf_counter_attached_pid = node.perf_counter_target_pid;
+      } else {
+        node.perf_counter_cgroup_path =
+            "/instrumentation-test/" + node.config.id;
+        node.perf_counter_cpus = {0};
+      }
+    };
+    backend.reset = [](NodeRuntime& node, const RunProcessState::Guard& guard) {
+      ResetNodePerfCounters(node, guard);
+    };
+    LiveInstrumentationMeasurementCollector collector =
+        [this](const std::set<std::string>& selected,
+               std::stop_token stop_token) {
+          ThrowIfStopRequested(stop_token);
+          if (fail_next_sample_) {
+            fail_next_sample_ = false;
+            throw std::runtime_error(
+                "injected instrumentation sampling failure");
+          }
+          if (sample_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error(
+                "instrumentation test sample sequence exceeds uint64");
+          }
+          ++sample_sequence_;
+          std::vector<std::string> records;
+          records.reserve(selected.size());
+          for (const std::string& node_id : selected) {
+            records.push_back(boost::json::serialize(boost::json::object{
+                {"node_id", node_id},
+                {"test_sample", sample_sequence_},
+            }));
+          }
+          return records;
+        };
+    controller_ = std::make_unique<LiveInstrumentationController>(
+        options_, std::filesystem::path{}, std::filesystem::path{}, *driver_,
+        node_inventory_, wallet_registry_, run_process_state_,
+        node_mutation_mutex_, registry_, std::move(backend),
+        std::move(collector));
+    service_ = controller_->MakeService();
+  }
+
+  ~Impl() {
+    try {
+      Shutdown(false);
+    } catch (...) {
+    }
+    service_.reset();
+    controller_.reset();
+  }
+
+  std::shared_ptr<McpLiveInstrumentationService> service() const {
+    return service_;
+  }
+
+  LiveInstrumentationNodeStateForTest NodeState(std::string_view node_id) {
+    std::lock_guard<std::timed_mutex> mutation_lock(node_mutation_mutex_);
+    RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
+    NodeRuntime& node = FindNodeRuntimeById(nodes, std::string(node_id));
+    auto process_guard = run_process_state_.Lock();
+    static_cast<void>(process_guard);
+    return LiveInstrumentationNodeStateForTest{
+        .counters = node.perf_counter_kinds,
+        .target_kind = node.perf_counter_target_kind,
+        .target_id = node.perf_counter_target_id,
+        .target_pid = node.perf_counter_target_pid,
+        .attached_pid = node.perf_counter_attached_pid,
+        .process_generation = node.perf_counter_process_generation,
+        .cgroup_path = node.perf_counter_cgroup_path.string(),
+        .cpus = node.perf_counter_cpus,
+        .error_kind = node.perf_counter_error_kind,
+        .error = node.perf_counter_error,
+    };
+  }
+
+  void SetNodeRunning(std::string_view node_id, bool running) {
+    std::lock_guard<std::timed_mutex> lock(node_mutation_mutex_);
+    const auto found = running_.find(std::string(node_id));
+    if (found == running_.end()) {
+      throw std::invalid_argument(
+          "instrumentation test backend found an unknown node");
+    }
+    found->second = running;
+  }
+
+  void FailAttachmentOnAttempt(std::optional<std::size_t> attempt) {
+    std::lock_guard<std::timed_mutex> lock(node_mutation_mutex_);
+    if (attempt && *attempt > std::numeric_limits<std::uint64_t>::max()) {
+      throw std::invalid_argument(
+          "instrumentation test attachment attempt exceeds uint64");
+    }
+    failed_attachment_attempt_ =
+        attempt ? std::optional<std::uint64_t>(*attempt) : std::nullopt;
+  }
+
+  void FailNextSample() {
+    std::lock_guard<std::timed_mutex> lock(node_mutation_mutex_);
+    fail_next_sample_ = true;
+  }
+
+  std::uint64_t attachment_attempts() const {
+    std::lock_guard<std::timed_mutex> lock(node_mutation_mutex_);
+    return attachment_attempts_;
+  }
+
+  void ApplyPerfMutation(std::string_view node_id, PerfCounterKind counter) {
+    controller_->ApplyPerfMutationForTest(node_id, counter);
+  }
+
+  void SampleNow() { controller_->SampleNowForTest(); }
+
+  void ExpireNow() { controller_->ExpireNowForTest(); }
+
+  void Shutdown(bool run_failed) {
+    if (shutdown_) {
+      return;
+    }
+    controller_->Shutdown(run_failed);
+    shutdown_ = true;
+  }
+
+ private:
+  static std::uint32_t CheckedNodeCapacity(std::size_t count) {
+    if (count == 0U || count > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::invalid_argument(
+          "instrumentation test node count is out of range");
+    }
+    return static_cast<std::uint32_t>(count);
+  }
+
+  Options options_;
+  std::unique_ptr<ChainDriver> driver_;
+  RuntimeNodeInventory node_inventory_;
+  RuntimeWalletRegistry wallet_registry_;
+  RunProcessState run_process_state_;
+  mutable std::timed_mutex node_mutation_mutex_;
+  std::shared_ptr<LiveInstrumentationRegistry> registry_ =
+      std::make_shared<LiveInstrumentationRegistry>();
+  std::map<std::string, bool, std::less<>> running_;
+  std::optional<std::uint64_t> failed_attachment_attempt_;
+  std::uint64_t attachment_attempts_ = 0U;
+  std::uint64_t sample_sequence_ = 0U;
+  bool fail_next_sample_ = false;
+  bool shutdown_ = false;
+  std::unique_ptr<LiveInstrumentationController> controller_;
+  std::shared_ptr<McpLiveInstrumentationService> service_;
+};
+
+LiveInstrumentationHarnessForTest::LiveInstrumentationHarnessForTest(
+    std::vector<std::string> node_ids,
+    std::chrono::milliseconds default_sample_interval)
+    : impl_(std::make_unique<Impl>(std::move(node_ids),
+                                   default_sample_interval)) {}
+
+LiveInstrumentationHarnessForTest::~LiveInstrumentationHarnessForTest() =
+    default;
+
+std::shared_ptr<McpLiveInstrumentationService>
+LiveInstrumentationHarnessForTest::service() const {
+  return impl_->service();
+}
+
+LiveInstrumentationNodeStateForTest
+LiveInstrumentationHarnessForTest::NodeState(std::string_view node_id) const {
+  return impl_->NodeState(node_id);
+}
+
+void LiveInstrumentationHarnessForTest::SetNodeRunning(std::string_view node_id,
+                                                       bool running) {
+  impl_->SetNodeRunning(node_id, running);
+}
+
+void LiveInstrumentationHarnessForTest::FailAttachmentOnAttempt(
+    std::optional<std::size_t> attempt) {
+  impl_->FailAttachmentOnAttempt(attempt);
+}
+
+void LiveInstrumentationHarnessForTest::FailNextSample() {
+  impl_->FailNextSample();
+}
+
+std::uint64_t LiveInstrumentationHarnessForTest::attachment_attempts() const {
+  return impl_->attachment_attempts();
+}
+
+void LiveInstrumentationHarnessForTest::ApplyPerfMutation(
+    std::string_view node_id, PerfCounterKind counter) {
+  impl_->ApplyPerfMutation(node_id, counter);
+}
+
+void LiveInstrumentationHarnessForTest::SampleNow() { impl_->SampleNow(); }
+
+void LiveInstrumentationHarnessForTest::ExpireNow() { impl_->ExpireNow(); }
+
+void LiveInstrumentationHarnessForTest::Shutdown(bool run_failed) {
+  impl_->Shutdown(run_failed);
+}
+
 bool RuntimeNodeSupportDestructionAllowedForTest(
     bool daemon_absence_verified, bool exact_cgroup_acquired,
     bool exact_cgroup_empty, bool allow_partial_preparation) {

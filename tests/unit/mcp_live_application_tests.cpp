@@ -2369,6 +2369,195 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_live_instrumentation_operations_route_one_stable_lifecycle) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+  const std::vector<McpOperationKind> advertised =
+      application.SupportedOperations();
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStartInstrumentation,
+        McpOperationKind::kReconfigureInstrumentation,
+        McpOperationKind::kStopInstrumentation}) {
+    BOOST_CHECK(std::find(advertised.begin(), advertised.end(), operation) !=
+                advertised.end());
+  }
+  application.MarkRunStarted();
+
+  const boost::json::array targets{
+      boost::json::object{{"kind", "node"},
+                          {"id", "firo-1"},
+                          {"node_ids", boost::json::array{"firo-1"}}}};
+  try {
+    static_cast<void>(application.OperationFactory()(
+        McpOperationKind::kStartInstrumentation,
+        boost::json::object{{"run_id", "live-application"},
+                            {"instrumentation_id", "instrumentation-1"},
+                            {"targets", targets},
+                            {"counters", boost::json::array{"cycles"}}},
+        "live-session"));
+    BOOST_FAIL("instrumentation operation started without a service");
+  } catch (const McpOperationFailure& failure) {
+    BOOST_TEST(failure.code() == "instrumentation_service_unavailable");
+    BOOST_TEST(failure.retryable());
+  }
+
+  std::mutex state_mutex;
+  std::string state = "running";
+  std::uint64_t sample_count = 1U;
+  const auto snapshot = [&] {
+    return boost::json::object{{"instrumentation_id", "instrumentation-1"},
+                               {"state", state},
+                               {"sample_count", sample_count},
+                               {"targets", targets}};
+  };
+  std::vector<McpInformationFamily> reads;
+  auto service = std::make_shared<McpLiveInstrumentationService>();
+  service->operation = [&](McpOperationKind kind,
+                           const boost::json::object& arguments,
+                           std::stop_token stop_token) {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    std::lock_guard<std::mutex> lock(state_mutex);
+    BOOST_TEST(arguments.at("instrumentation_id").as_string() ==
+               "instrumentation-1");
+    switch (kind) {
+      case McpOperationKind::kStartInstrumentation:
+        break;
+      case McpOperationKind::kReconfigureInstrumentation:
+        break;
+      case McpOperationKind::kStopInstrumentation:
+        state = "succeeded";
+        break;
+      default:
+        throw std::logic_error("unexpected instrumentation operation");
+    }
+    return snapshot();
+  };
+  service->read = [&](McpInformationFamily family,
+                      std::stop_token stop_token) -> boost::json::value {
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    std::lock_guard<std::mutex> lock(state_mutex);
+    reads.push_back(family);
+    if (family == McpInformationFamily::kMeasurements) {
+      return boost::json::object{{"instrumentation_id", "instrumentation-1"},
+                                 {"sample_count", sample_count}};
+    }
+    const bool history = family == McpInformationFamily::kMeasurementHistory;
+    const bool terminal = state == "succeeded";
+    if (history != terminal) {
+      return boost::json::array{};
+    }
+    return boost::json::array{snapshot()};
+  };
+  application.SetInstrumentationService(service);
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  const auto invoke_instrumentation = [&](std::string_view tool,
+                                          boost::json::object arguments) {
+    arguments["run_id"] = "live-application";
+    const boost::json::object submitted =
+        Invoke(&dispatcher, tool, std::move(arguments));
+    const boost::json::object terminal =
+        WaitForTerminal(&dispatcher, submitted);
+    BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+    return terminal.at("terminal_result").as_object();
+  };
+  const boost::json::object started = invoke_instrumentation(
+      "instrumentation.start",
+      boost::json::object{{"instrumentation_id", "instrumentation-1"},
+                          {"targets", targets},
+                          {"counters", boost::json::array{"cycles"}},
+                          {"sample_interval", "1s"},
+                          {"window", "10s"}});
+  BOOST_TEST(started.at("result_family").as_string() == "instrumentation");
+  BOOST_TEST(started.at("run_id").as_string() == "live-application");
+  BOOST_TEST(started.at("instrumentation_id").as_string() ==
+             "instrumentation-1");
+  BOOST_TEST(started.at("sample_count").as_uint64() == 1U);
+
+  const boost::json::object reconfigured = invoke_instrumentation(
+      "instrumentation.reconfigure",
+      boost::json::object{{"instrumentation_id", "instrumentation-1"},
+                          {"targets", targets},
+                          {"counters", boost::json::array{"instructions"}},
+                          {"sample_interval", "2s"}});
+  BOOST_TEST(reconfigured.at("instrumentation_id").as_string() ==
+             "instrumentation-1");
+  BOOST_TEST(reconfigured.at("sample_count").as_uint64() == 1U);
+
+  const boost::json::object active =
+      application
+          .ResourceReader()(McpInformationFamily::kInstrumentation,
+                            "live-session", {})
+          .as_object();
+  BOOST_REQUIRE_EQUAL(active.at("data").as_array().size(), 1U);
+  BOOST_TEST(active.at("data")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("instrumentation_id")
+                 .as_string() == "instrumentation-1");
+  const boost::json::object measurements =
+      application
+          .ResourceReader()(McpInformationFamily::kMeasurements, "live-session",
+                            {})
+          .as_object();
+  BOOST_TEST(
+      measurements.at("data").as_object().at("sample_count").as_uint64() == 1U);
+
+  const boost::json::object stopped = invoke_instrumentation(
+      "instrumentation.stop",
+      boost::json::object{{"instrumentation_id", "instrumentation-1"},
+                          {"timeout_sec", 1U}});
+  BOOST_TEST(stopped.at("instrumentation_id").as_string() ==
+             "instrumentation-1");
+  BOOST_TEST(stopped.at("state").as_string() == "succeeded");
+  BOOST_TEST(stopped.at("sample_count").as_uint64() == 1U);
+
+  const boost::json::object history =
+      application
+          .ResourceReader()(McpInformationFamily::kMeasurementHistory,
+                            "live-session", {})
+          .as_object();
+  BOOST_REQUIRE_EQUAL(history.at("data").as_array().size(), 1U);
+  BOOST_TEST(history.at("data")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("instrumentation_id")
+                 .as_string() == "instrumentation-1");
+  BOOST_REQUIRE_EQUAL(reads.size(), 3U);
+  BOOST_TEST(McpInformationFamilyName(reads[0]) == "instrumentation");
+  BOOST_TEST(McpInformationFamilyName(reads[1]) == "measurements");
+  BOOST_TEST(McpInformationFamilyName(reads[2]) == "measurement_history");
+
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_live_wallet_lifecycle_routes_authoritative_role_mutation_service) {
   LiveApplicationDirectory temporary;
   const auto options =

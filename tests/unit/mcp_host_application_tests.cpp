@@ -487,6 +487,106 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
   live_application->Shutdown();
 }
 
+BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_instrumentation) {
+  const auto options = std::make_shared<Options>();
+  options->node_capacity = 1U;
+  const auto live_application =
+      std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
+          .run_id = "instrumentation-run",
+          .run_root = "/tmp/bbp-mcp-host-instrumentation-run",
+          .retained_run = {},
+          .options = options,
+          .command_queue = std::make_shared<SimulationCommandQueue>(),
+          .node_inventory_snapshot =
+              [] {
+                return McpLiveNodeInventorySnapshot{.generation = 1U,
+                                                    .node_ids = {"firo-1"}};
+              },
+          .publication_mutex = std::make_shared<std::timed_mutex>(),
+          .request_run_stop = [] {},
+          .run_started = {},
+          .run_stopping = {},
+          .run_stopped = {}});
+  std::size_t delegated = 0U;
+  auto instrumentation_service =
+      std::make_shared<McpLiveInstrumentationService>();
+  instrumentation_service->operation =
+      [&delegated](McpOperationKind kind, const boost::json::object& arguments,
+                   std::stop_token stop_token) {
+        BOOST_CHECK(kind == McpOperationKind::kStartInstrumentation);
+        BOOST_TEST(arguments.at("run_id").as_string() == "instrumentation-run");
+        BOOST_TEST(!stop_token.stop_requested());
+        ++delegated;
+        return boost::json::object{
+            {"instrumentation_id", "instrumentation-1"},
+            {"state", "running"},
+            {"sample_count", 0U},
+            {"targets", arguments.at("targets")},
+        };
+      };
+  instrumentation_service->read = [](McpInformationFamily,
+                                     std::stop_token) -> boost::json::value {
+    return boost::json::array{};
+  };
+  live_application->SetInstrumentationService(instrumentation_service);
+  live_application->MarkRunStarted();
+
+  McpHostApplication application(McpHostApplication::Config{
+      .host_id = "editor-host",
+      .snapshot_run =
+          [live_application] {
+            return McpHostedRunSnapshot{.generation = 1U,
+                                        .run_id = "instrumentation-run",
+                                        .state = "active",
+                                        .chain = "firo",
+                                        .node_count = 1U,
+                                        .application = live_application};
+          },
+      .launch_run = [](const boost::json::object&,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .replay_run = [](std::string_view, std::optional<std::string>,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .stop_run = [](std::string_view, std::chrono::seconds,
+                     std::stop_token) { return McpRunLifecycleResult{}; },
+      .clean_run = [](std::string_view, std::chrono::seconds, bool,
+                      std::stop_token) { return McpRunCleanupResult{}; }});
+  const std::vector<McpOperationKind> supported =
+      application.SupportedOperations();
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStartInstrumentation,
+        McpOperationKind::kReconfigureInstrumentation,
+        McpOperationKind::kStopInstrumentation}) {
+    BOOST_CHECK(std::find(supported.begin(), supported.end(), operation) !=
+                supported.end());
+  }
+
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("host-session", true, {});
+  const boost::json::array targets{
+      boost::json::object{{"kind", "node"},
+                          {"id", "firo-1"},
+                          {"node_ids", boost::json::array{"firo-1"}}}};
+  const boost::json::object terminal = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "instrumentation.start",
+             boost::json::object{{"run_id", "instrumentation-run"},
+                                 {"targets", targets},
+                                 {"counters", boost::json::array{"cycles"}}}));
+  BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+  BOOST_TEST(delegated == 1U);
+  const boost::json::object& result =
+      terminal.at("terminal_result").as_object();
+  BOOST_TEST(result.at("result_family").as_string() == "instrumentation");
+  BOOST_TEST(result.at("run_id").as_string() == "instrumentation-run");
+  BOOST_TEST(result.at("instrumentation_id").as_string() ==
+             "instrumentation-1");
+
+  dispatcher.SessionHandler()("host-session", false, {});
+  application.Shutdown();
+  live_application->Shutdown();
+}
+
 BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
   std::string run_state = "starting";
   const auto live_application =

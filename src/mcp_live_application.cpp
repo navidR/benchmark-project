@@ -89,6 +89,12 @@ constexpr bool IsWalletWorkloadOperation(McpOperationKind kind) {
          kind == McpOperationKind::kStopWorkload;
 }
 
+constexpr bool IsInstrumentationOperation(McpOperationKind kind) {
+  return kind == McpOperationKind::kStartInstrumentation ||
+         kind == McpOperationKind::kReconfigureInstrumentation ||
+         kind == McpOperationKind::kStopInstrumentation;
+}
+
 class CombinedStopToken {
   struct ForwardStop {
     std::stop_source* source;
@@ -1378,7 +1384,10 @@ std::vector<McpOperationKind> McpLiveApplication::SupportedOperations() const {
         {McpOperationKind::kStartWorkload, McpOperationKind::kInspectWorkload,
          McpOperationKind::kReconfigureWorkload,
          McpOperationKind::kPauseWorkload, McpOperationKind::kResumeWorkload,
-         McpOperationKind::kStopWorkload});
+         McpOperationKind::kStopWorkload,
+         McpOperationKind::kStartInstrumentation,
+         McpOperationKind::kReconfigureInstrumentation,
+         McpOperationKind::kStopInstrumentation});
     return operations;
   }
   std::vector<McpOperationKind> operations{kRetainedOperations.begin(),
@@ -1462,7 +1471,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kQueryLogs &&
       kind != McpOperationKind::kFollowLogs &&
       kind != McpOperationKind::kReadArtifact &&
-      !IsWalletWorkloadOperation(kind)) {
+      !IsWalletWorkloadOperation(kind) && !IsInstrumentationOperation(kind)) {
     return {};
   }
   RequireRun(arguments);
@@ -1538,6 +1547,30 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           result["result_family"] = "workload";
           result["run_id"] = config_.run_id;
           return McpTypedResult{.family = McpResultFamily::kWorkload,
+                                .value = std::move(result)};
+        }};
+  }
+
+  if (IsInstrumentationOperation(kind)) {
+    const std::shared_ptr<McpLiveInstrumentationService>
+        instrumentation_service = InstrumentationService();
+    if (!instrumentation_service) {
+      throw McpOperationFailure(
+          "instrumentation_service_unavailable",
+          "the simulator instrumentation lifecycle service is unavailable",
+          true);
+    }
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, instrumentation_service, kind,
+                     arguments](McpOperationContext& context) {
+          CombinedStopToken cancellation(context.stop_token(),
+                                         run_stop_source_.get_token());
+          boost::json::object result = instrumentation_service->operation(
+              kind, arguments, cancellation.token());
+          result["result_family"] = "instrumentation";
+          result["run_id"] = config_.run_id;
+          return McpTypedResult{.family = McpResultFamily::kInstrumentation,
                                 .value = std::move(result)};
         }};
   }
@@ -2471,6 +2504,22 @@ boost::json::value McpLiveApplication::ReadResource(
                                stop_token));
   }
 
+  if (!config_.retained_run &&
+      (family == McpInformationFamily::kInstrumentation ||
+       family == McpInformationFamily::kMeasurements ||
+       family == McpInformationFamily::kMeasurementHistory)) {
+    const std::shared_ptr<McpLiveInstrumentationService>
+        instrumentation_service = InstrumentationService();
+    if (!instrumentation_service) {
+      throw McpOperationFailure(
+          "instrumentation_service_unavailable",
+          "the simulator instrumentation lifecycle service is unavailable",
+          true);
+    }
+    return ResourceEnvelope(family, config_.run_id,
+                            instrumentation_service->read(family, stop_token));
+  }
+
   boost::json::object report = ReportSnapshot(stop_token);
   boost::json::value data;
   switch (family) {
@@ -3100,6 +3149,29 @@ std::shared_ptr<McpLiveWorkloadService> McpLiveApplication::WorkloadService()
   return workload_service_;
 }
 
+void McpLiveApplication::SetInstrumentationService(
+    std::shared_ptr<McpLiveInstrumentationService> service) {
+  if (config_.retained_run) {
+    throw std::logic_error(
+        "retained MCP application cannot install an instrumentation service");
+  }
+  if (service && (!service->operation || !service->read)) {
+    throw std::invalid_argument(
+        "MCP instrumentation service requires operation and read callbacks");
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (shutdown_) {
+    throw std::runtime_error("MCP live application is shutting down");
+  }
+  instrumentation_service_ = std::move(service);
+}
+
+std::shared_ptr<McpLiveInstrumentationService>
+McpLiveApplication::InstrumentationService() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return instrumentation_service_;
+}
+
 void McpLiveApplication::SetRoleService(
     std::shared_ptr<McpLiveRoleService> service) {
   if (config_.retained_run) {
@@ -3338,6 +3410,7 @@ void McpLiveApplication::ShutdownImpl(
     }
   }
   workload_service_.reset();
+  instrumentation_service_.reset();
   role_service_.reset();
   lock.unlock();
 #ifdef BBP_FIRO_GUI_LAUNCHER

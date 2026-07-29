@@ -40,6 +40,16 @@ struct McpLiveWorkloadService {
   std::function<boost::json::value(bool history, std::stop_token)> read;
 };
 
+// Simulator-owned instrumentation lifecycle service. MCP supplies typed
+// arguments and cancellation; the service owns measurement windows, stable
+// identities, sampling, evidence, and teardown shared with run reporting.
+struct McpLiveInstrumentationService {
+  std::function<boost::json::object(
+      McpOperationKind, const boost::json::object&, std::stop_token)>
+      operation;
+  std::function<boost::json::value(McpInformationFamily, std::stop_token)> read;
+};
+
 // Simulator-owned role mutation service. MCP supplies typed arguments and
 // cancellation; the simulator owns driver calls, transactional publication,
 // evidence, and shared runtime state.
@@ -98,6 +108,8 @@ class McpLiveApplication {
   bool read_only() const;
   std::uint32_t current_node_count() const;
   void SetWorkloadService(std::shared_ptr<McpLiveWorkloadService> service);
+  void SetInstrumentationService(
+      std::shared_ptr<McpLiveInstrumentationService> service);
   void SetRoleService(std::shared_ptr<McpLiveRoleService> service);
 
   // Called exactly once by SimulationCommandProcessor. Successful node
@@ -163,6 +175,7 @@ class McpLiveApplication {
   std::uint32_t NodeCount() const;
   McpLiveNodeInventorySnapshot LiveNodeInventory() const;
   std::shared_ptr<McpLiveWorkloadService> WorkloadService() const;
+  std::shared_ptr<McpLiveInstrumentationService> InstrumentationService() const;
   std::shared_ptr<McpLiveRoleService> RoleService() const;
   void PublishEvidence(
       McpInformationFamily family, std::string kind, std::string message,
@@ -179,6 +192,7 @@ class McpLiveApplication {
   std::condition_variable_any requests_drained_;
   std::map<std::uint64_t, PendingCommand> pending_commands_;
   std::shared_ptr<McpLiveWorkloadService> workload_service_;
+  std::shared_ptr<McpLiveInstrumentationService> instrumentation_service_;
   std::shared_ptr<McpLiveRoleService> role_service_;
   std::stop_source request_stop_source_;
   std::stop_source run_stop_source_;

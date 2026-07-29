@@ -1568,7 +1568,7 @@ boost::json::object BuildMcpOperationInputSchema(
       add_run();
       properties["instrumentation_id"] = IdentifierSchema();
       required.emplace_back("instrumentation_id");
-      add_timeout();
+      properties["timeout_sec"] = IntegerSchema(1U, 3600U);
       break;
     case McpOperationKind::kQueryEvidence:
       add_run();

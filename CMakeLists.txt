@@ -393,6 +393,7 @@ if(BUILD_TESTING)
     tests/unit/log_tail_tests.cpp
     tests/unit/log_level_tests.cpp
     tests/unit/logging_tests.cpp
+    tests/unit/live_instrumentation_tests.cpp
     tests/unit/mcp_dispatcher_tests.cpp
     tests/unit/mcp_endpoint_tests.cpp
     tests/unit/mcp_host_application_tests.cpp
