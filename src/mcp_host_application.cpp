@@ -5,6 +5,7 @@
 #include <boost/json/array.hpp>
 #include <boost/json/value.hpp>
 #include <limits>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -182,6 +183,48 @@ boost::json::object RunSnapshotJson(const McpHostedRunSnapshot& snapshot) {
       {"available_node_capacity", snapshot.available_node_capacity}};
 }
 
+boost::json::object RetainedRunSnapshotJson(
+    const McpRetainedRunSnapshot& snapshot) {
+  return boost::json::object{
+      {"run_id", snapshot.run_id},
+      {"state", snapshot.state},
+      {"chain", snapshot.chain},
+      {"node_count", snapshot.node_count},
+      {"node_capacity", snapshot.node_capacity},
+      {"chain_node_maximum", snapshot.chain_node_maximum},
+      {"available_node_capacity", 0U}};
+}
+
+void ValidateRetainedRunSnapshot(const McpRetainedRunSnapshot& snapshot) {
+  try {
+    RequireSafeRunId(snapshot.run_id);
+    if (snapshot.state != "finished" && snapshot.state != "failed" &&
+        snapshot.state != "cancelled" && snapshot.state != "incomplete") {
+      throw std::runtime_error("retained run state is not terminal");
+    }
+    const ChainKind chain = ParseChainKind(snapshot.chain);
+    if (snapshot.chain_node_maximum != ChainDriverSpecFor(chain).max_nodes ||
+        snapshot.node_capacity > snapshot.chain_node_maximum ||
+        snapshot.node_count > snapshot.node_capacity) {
+      throw std::runtime_error("retained run node bounds are inconsistent");
+    }
+  } catch (const std::exception& error) {
+    throw McpOperationFailure(
+        "invalid_result_shape",
+        "retained run discovery returned invalid metadata for " +
+            snapshot.run_id + ": " + error.what(),
+        false);
+  }
+}
+
+bool SameHostedRunMembership(const std::optional<McpHostedRunSnapshot>& left,
+                             const std::optional<McpHostedRunSnapshot>& right) {
+  if (!left || !right) {
+    return !left && !right;
+  }
+  return left->generation == right->generation && left->run_id == right->run_id;
+}
+
 boost::json::object ResourceEnvelope(std::string_view host_id,
                                      const McpHostedRunSnapshot* run,
                                      McpInformationFamily family,
@@ -221,8 +264,9 @@ McpHostApplication::McpHostApplication(Config config)
   if (config_.host_id.empty()) {
     throw std::invalid_argument("MCP host application requires a host id");
   }
-  if (!config_.snapshot_run || !config_.launch_run || !config_.replay_run ||
-      !config_.stop_run || !config_.clean_run) {
+  if (!config_.snapshot_run || !config_.snapshot_run_membership_revision ||
+      !config_.snapshot_retained_runs || !config_.launch_run ||
+      !config_.replay_run || !config_.stop_run || !config_.clean_run) {
     throw std::invalid_argument(
         "MCP host application requires lifecycle callbacks");
   }
@@ -388,7 +432,17 @@ boost::json::value McpHostApplication::ReadResource(
   if (stop_token.stop_requested()) {
     throw McpOperationCancelled();
   }
-  const std::optional<McpHostedRunSnapshot> run = config_.snapshot_run();
+  const bool reading_run_registry =
+      family == McpInformationFamily::kRunRegistry;
+  const std::uint64_t initial_membership_revision =
+      reading_run_registry ? config_.snapshot_run_membership_revision() : 0U;
+  std::optional<McpHostedRunSnapshot> run = config_.snapshot_run();
+  if (reading_run_registry && config_.snapshot_run_membership_revision() !=
+                                  initial_membership_revision) {
+    throw McpOperationFailure(
+        "retained_run_registry_changed",
+        "active run membership changed before retained run discovery", true);
+  }
   const std::vector<McpOperationKind> operations = SupportedOperations();
   const std::vector<McpInformationFamily> information_families =
       SupportedInformationFamilies();
@@ -405,6 +459,9 @@ boost::json::value McpHostApplication::ReadResource(
       chain_limits[ChainKindName(chain)] = ChainDriverSpecFor(chain).max_nodes;
     }
     capabilities["chain_node_maximums"] = std::move(chain_limits);
+    boost::json::object& limits = capabilities.at("limits").as_object();
+    limits["run_registry_entries"] = kMcpHostMaximumRunRegistryEntries;
+    limits["run_registry_legacy_bytes"] = kMcpHostMaximumLegacyRegistryBytes;
     capabilities["current_run"] =
         run ? boost::json::value(RunSnapshotJson(*run))
             : boost::json::value(nullptr);
@@ -417,9 +474,68 @@ boost::json::value McpHostApplication::ReadResource(
         BuildSchemaDocument(operations, information_families));
   }
   if (family == McpInformationFamily::kRunRegistry) {
+    std::vector<McpRetainedRunSnapshot> retained;
+    std::exception_ptr discovery_failure;
+    try {
+      retained = config_.snapshot_retained_runs(
+          run ? std::string_view(run->run_id) : std::string_view(), stop_token);
+    } catch (const McpOperationCancelled&) {
+      throw;
+    } catch (...) {
+      discovery_failure = std::current_exception();
+    }
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    std::optional<McpHostedRunSnapshot> refreshed_run = config_.snapshot_run();
+    const std::uint64_t final_membership_revision =
+        config_.snapshot_run_membership_revision();
+    if (initial_membership_revision != final_membership_revision ||
+        !SameHostedRunMembership(run, refreshed_run)) {
+      throw McpOperationFailure(
+          "retained_run_registry_changed",
+          "active run membership changed during retained run discovery", true);
+    }
+    run = std::move(refreshed_run);
+    if (discovery_failure) {
+      std::rethrow_exception(discovery_failure);
+    }
+
     boost::json::array runs;
+    std::set<std::string, std::less<>> run_ids;
     if (run) {
       runs.emplace_back(RunSnapshotJson(*run));
+      run_ids.insert(run->run_id);
+    }
+    std::sort(retained.begin(), retained.end(),
+              [](const McpRetainedRunSnapshot& left,
+                 const McpRetainedRunSnapshot& right) {
+                return left.run_id < right.run_id;
+              });
+    for (const McpRetainedRunSnapshot& snapshot : retained) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      ValidateRetainedRunSnapshot(snapshot);
+      if (run_ids.contains(snapshot.run_id)) {
+        if (run && snapshot.run_id == run->run_id) {
+          continue;
+        }
+        throw McpOperationFailure(
+            "invalid_result_shape",
+            "retained run discovery returned a duplicate run id: " +
+                snapshot.run_id,
+            false);
+      }
+      if (runs.size() >= kMcpHostMaximumRunRegistryEntries) {
+        throw McpOperationFailure(
+            "retained_run_registry_limit_exceeded",
+            "retained run discovery exceeds the advertised registry entry "
+            "limit",
+            false);
+      }
+      run_ids.insert(snapshot.run_id);
+      runs.emplace_back(RetainedRunSnapshotJson(snapshot));
     }
     return ResourceEnvelope(config_.host_id, run ? &*run : nullptr, family,
                             std::move(runs));

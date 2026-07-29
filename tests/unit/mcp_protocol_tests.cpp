@@ -594,13 +594,22 @@ BOOST_AUTO_TEST_CASE(
       });
   const std::string unavailable_session = Initialize(&unavailable);
   MarkInitialized(&unavailable, unavailable_session);
-  require_error(
-      unavailable.Handle(ProtocolRequest(
-          http::verb::post,
-          RequestBody(6U, "resources/read",
-                      boost::json::object{{"uri", "bbp:///logs"}}),
-          unavailable_session)),
-      -32002, "bbp:///logs");
+  const auto unavailable_response = unavailable.Handle(
+      ProtocolRequest(http::verb::post,
+                      RequestBody(6U, "resources/read",
+                                  boost::json::object{{"uri", "bbp:///logs"}}),
+                      unavailable_session));
+  require_error(unavailable_response, -32002, "bbp:///logs");
+  const boost::json::object unavailable_data =
+      boost::json::parse(unavailable_response.body())
+          .as_object()
+          .at("error")
+          .as_object()
+          .at("data")
+          .as_object();
+  BOOST_TEST(unavailable_data.at("code").as_string() == "run_not_active");
+  BOOST_TEST(unavailable_data.at("retryable").as_bool());
+  BOOST_TEST(unavailable_data.at("diagnostics").as_array().empty());
 }
 
 BOOST_AUTO_TEST_CASE(

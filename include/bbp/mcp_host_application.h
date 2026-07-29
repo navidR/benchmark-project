@@ -2,6 +2,7 @@
 
 #include <boost/json/object.hpp>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -30,6 +31,19 @@ struct McpHostedRunSnapshot {
   std::shared_ptr<McpLiveApplication> application;
 };
 
+struct McpRetainedRunSnapshot {
+  std::string run_id;
+  std::string state;
+  std::string chain;
+  std::uint32_t node_count = 0U;
+  std::uint32_t node_capacity = 0U;
+  std::uint32_t chain_node_maximum = 0U;
+};
+
+inline constexpr std::size_t kMcpHostMaximumRunRegistryEntries = 256U;
+inline constexpr std::size_t kMcpHostMaximumLegacyRegistryBytes =
+    64U * 1024U * 1024U;
+
 struct McpRunLifecycleResult {
   std::string run_id;
   std::string state;
@@ -53,6 +67,10 @@ class McpHostApplication {
   struct Config {
     std::string host_id;
     std::function<std::optional<McpHostedRunSnapshot>()> snapshot_run;
+    std::function<std::uint64_t()> snapshot_run_membership_revision;
+    std::function<std::vector<McpRetainedRunSnapshot>(std::string_view,
+                                                      std::stop_token)>
+        snapshot_retained_runs;
     std::function<McpRunLifecycleResult(const boost::json::object&,
                                         std::stop_token)>
         launch_run;

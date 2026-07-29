@@ -62,6 +62,11 @@ BOOST_AUTO_TEST_CASE(
             std::lock_guard<std::mutex> lock(run_mutex);
             return current_run;
           },
+      .snapshot_run_membership_revision = [] { return 0U; },
+      .snapshot_retained_runs =
+          [](std::string_view, std::stop_token) {
+            return std::vector<McpRetainedRunSnapshot>{};
+          },
       .launch_run =
           [&](const boost::json::object& scenario, std::stop_token) {
             BOOST_TEST(scenario.at("run_id").as_string() == "launched-run");
@@ -291,11 +296,172 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_host_application_run_registry_merges_live_and_retained_runs) {
+  McpHostApplication application(McpHostApplication::Config{
+      .host_id = "registry-host",
+      .snapshot_run =
+          [] {
+            return McpHostedRunSnapshot{
+                .generation = 42U,
+                .run_id = "live-run",
+                .state = "active",
+                .chain = "firo",
+                .node_count = 3U,
+                .node_capacity = 8U,
+                .chain_node_maximum = 16U,
+                .available_node_capacity = 5U,
+                .application = {},
+            };
+          },
+      .snapshot_run_membership_revision = [] { return 0U; },
+      .snapshot_retained_runs =
+          [](std::string_view active_run_id, std::stop_token stop_token) {
+            BOOST_TEST(active_run_id == "live-run");
+            BOOST_TEST(!stop_token.stop_requested());
+            return std::vector<McpRetainedRunSnapshot>{
+                McpRetainedRunSnapshot{
+                    .run_id = "z-retained",
+                    .state = "cancelled",
+                    .chain = "monero",
+                    .node_count = 2U,
+                    .node_capacity = 4U,
+                    .chain_node_maximum = 16U,
+                },
+                McpRetainedRunSnapshot{
+                    .run_id = "live-run",
+                    .state = "finished",
+                    .chain = "firo",
+                    .node_count = 3U,
+                    .node_capacity = 3U,
+                    .chain_node_maximum = 16U,
+                },
+                McpRetainedRunSnapshot{
+                    .run_id = "a-retained",
+                    .state = "failed",
+                    .chain = "bitcoin",
+                    .node_count = 1U,
+                    .node_capacity = 2U,
+                    .chain_node_maximum = 16U,
+                },
+            };
+          },
+      .launch_run = [](const boost::json::object&,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .replay_run = [](std::string_view, std::optional<std::string>,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .stop_run = [](std::string_view, std::chrono::seconds,
+                     std::stop_token) { return McpRunLifecycleResult{}; },
+      .clean_run = [](std::string_view, std::chrono::seconds, bool,
+                      std::stop_token) { return McpRunCleanupResult{}; }});
+
+  const boost::json::object registry =
+      application
+          .ResourceReader()(McpInformationFamily::kRunRegistry,
+                            "registry-session", std::stop_token{})
+          .as_object();
+  BOOST_TEST(registry.at("run_id").as_string() == "live-run");
+  const boost::json::array& runs = registry.at("data").as_array();
+  BOOST_REQUIRE_EQUAL(runs.size(), 3U);
+
+  const boost::json::object& active = runs[0].as_object();
+  BOOST_TEST(active.at("run_id").as_string() == "live-run");
+  BOOST_TEST(active.at("state").as_string() == "active");
+  BOOST_TEST(active.at("generation").as_uint64() == 42U);
+  BOOST_TEST(active.at("available_node_capacity").as_uint64() == 5U);
+
+  const boost::json::object& first_retained = runs[1].as_object();
+  BOOST_TEST(first_retained.at("run_id").as_string() == "a-retained");
+  BOOST_TEST(first_retained.at("state").as_string() == "failed");
+  BOOST_TEST(first_retained.at("chain").as_string() == "bitcoin");
+  BOOST_TEST(first_retained.at("node_count").as_uint64() == 1U);
+  BOOST_TEST(first_retained.at("node_capacity").as_uint64() == 2U);
+  BOOST_TEST(first_retained.at("chain_node_maximum").as_uint64() == 16U);
+  BOOST_TEST(first_retained.at("available_node_capacity").as_uint64() == 0U);
+  BOOST_TEST(first_retained.if_contains("generation") == nullptr);
+
+  const boost::json::object& second_retained = runs[2].as_object();
+  BOOST_TEST(second_retained.at("run_id").as_string() == "z-retained");
+  BOOST_TEST(second_retained.at("state").as_string() == "cancelled");
+  BOOST_TEST(second_retained.at("chain").as_string() == "monero");
+  BOOST_TEST(second_retained.at("node_count").as_uint64() == 2U);
+  BOOST_TEST(second_retained.at("node_capacity").as_uint64() == 4U);
+  BOOST_TEST(second_retained.at("chain_node_maximum").as_uint64() == 16U);
+  BOOST_TEST(second_retained.at("available_node_capacity").as_uint64() == 0U);
+  BOOST_TEST(second_retained.if_contains("generation") == nullptr);
+
+  application.Shutdown();
+
+  std::uint64_t membership_revision = 0U;
+  std::size_t discovery_calls = 0U;
+  McpHostApplication transitioning_application(McpHostApplication::Config{
+      .host_id = "transitioning-registry-host",
+      .snapshot_run = [] { return std::optional<McpHostedRunSnapshot>{}; },
+      .snapshot_run_membership_revision = [&] { return membership_revision; },
+      .snapshot_retained_runs =
+          [&](std::string_view active_run_id, std::stop_token) {
+            ++discovery_calls;
+            if (discovery_calls == 1U) {
+              BOOST_TEST(active_run_id.empty());
+              membership_revision += 2U;
+              throw McpOperationFailure("retained_run_registry_invalid",
+                                        "a fast run changed during discovery",
+                                        false);
+            }
+            BOOST_TEST(active_run_id.empty());
+            return std::vector<McpRetainedRunSnapshot>{
+                McpRetainedRunSnapshot{
+                    .run_id = "older-run",
+                    .state = "finished",
+                    .chain = "bitcoin",
+                    .node_count = 0U,
+                    .node_capacity = 1U,
+                    .chain_node_maximum = 16U,
+                },
+            };
+          },
+      .launch_run = [](const boost::json::object&,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .replay_run = [](std::string_view, std::optional<std::string>,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .stop_run = [](std::string_view, std::chrono::seconds,
+                     std::stop_token) { return McpRunLifecycleResult{}; },
+      .clean_run = [](std::string_view, std::chrono::seconds, bool,
+                      std::stop_token) { return McpRunCleanupResult{}; }});
+
+  try {
+    static_cast<void>(transitioning_application.ResourceReader()(
+        McpInformationFamily::kRunRegistry, "transitioning-registry-session",
+        std::stop_token{}));
+    BOOST_FAIL("a changing active-run membership must not return a registry");
+  } catch (const McpOperationFailure& failure) {
+    BOOST_TEST(failure.code() == "retained_run_registry_changed");
+    BOOST_TEST(failure.retryable());
+  }
+
+  const boost::json::value transitioned_registry =
+      transitioning_application.ResourceReader()(
+          McpInformationFamily::kRunRegistry, "transitioning-registry-session",
+          std::stop_token{});
+  const boost::json::array& transitioned_runs =
+      transitioned_registry.as_object().at("data").as_array();
+  BOOST_REQUIRE_EQUAL(transitioned_runs.size(), 1U);
+  BOOST_TEST(transitioned_runs[0].as_object().at("run_id").as_string() ==
+             "older-run");
+
+  transitioning_application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_host_application_rejects_inexact_cleanup_callback_results) {
   std::size_t cleanup_calls = 0U;
   McpHostApplication application(McpHostApplication::Config{
       .host_id = "editor-host",
       .snapshot_run = [] { return std::optional<McpHostedRunSnapshot>{}; },
+      .snapshot_run_membership_revision = [] { return 0U; },
+      .snapshot_retained_runs =
+          [](std::string_view, std::stop_token) {
+            return std::vector<McpRetainedRunSnapshot>{};
+          },
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },
       .replay_run = [](std::string_view, std::optional<std::string>,
@@ -432,6 +598,11 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
                                         .node_count = 1U,
                                         .application = live_application};
           },
+      .snapshot_run_membership_revision = [] { return 0U; },
+      .snapshot_retained_runs =
+          [](std::string_view, std::stop_token) {
+            return std::vector<McpRetainedRunSnapshot>{};
+          },
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },
       .replay_run = [](std::string_view, std::optional<std::string>,
@@ -542,6 +713,11 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_instrumentation) {
                                         .node_count = 1U,
                                         .application = live_application};
           },
+      .snapshot_run_membership_revision = [] { return 0U; },
+      .snapshot_retained_runs =
+          [](std::string_view, std::stop_token) {
+            return std::vector<McpRetainedRunSnapshot>{};
+          },
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },
       .replay_run = [](std::string_view, std::optional<std::string>,
@@ -614,6 +790,11 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
                                         .chain = "firo",
                                         .node_count = 1U,
                                         .application = current_application};
+          },
+      .snapshot_run_membership_revision = [] { return 0U; },
+      .snapshot_retained_runs =
+          [](std::string_view, std::stop_token) {
+            return std::vector<McpRetainedRunSnapshot>{};
           },
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },

@@ -123,13 +123,28 @@ struct JsonRpcRequest {
 
 class McpResourceUnavailable : public std::runtime_error {
  public:
-  McpResourceUnavailable(std::string uri, std::string message)
-      : std::runtime_error(std::move(message)), uri_(std::move(uri)) {}
+  McpResourceUnavailable(std::string uri, std::string message,
+                         std::string code = "resource_unavailable",
+                         bool retryable = false,
+                         boost::json::array diagnostics = {})
+      : std::runtime_error(std::move(message)),
+        uri_(std::move(uri)),
+        code_(std::move(code)),
+        retryable_(retryable),
+        diagnostics_(std::move(diagnostics)) {}
 
   const std::string& uri() const noexcept { return uri_; }
+  const std::string& code() const noexcept { return code_; }
+  bool retryable() const noexcept { return retryable_; }
+  const boost::json::array& diagnostics() const noexcept {
+    return diagnostics_;
+  }
 
  private:
   std::string uri_;
+  std::string code_;
+  bool retryable_ = false;
+  boost::json::array diagnostics_;
 };
 
 class McpResourceHandlerFailure : public std::runtime_error {
@@ -1361,7 +1376,9 @@ struct McpProtocol::Impl {
       try {
         value = ReadResource(uri, session_id, stop_token);
       } catch (const McpOperationFailure& failure) {
-        throw McpResourceUnavailable(uri, failure.what());
+        throw McpResourceUnavailable(uri, failure.what(), failure.code(),
+                                     failure.retryable(),
+                                     failure.diagnostics());
       } catch (const std::exception& error) {
         throw McpResourceHandlerFailure(error.what());
       } catch (...) {
@@ -1684,9 +1701,13 @@ struct McpProtocol::Impl {
     } catch (const McpResourceUnavailable& unavailable) {
       return JsonResponse(
           http_request,
-          JsonRpcError(request->id, -32002, "Resource not found",
-                       boost::json::object{{"uri", unavailable.uri()},
-                                           {"reason", unavailable.what()}}));
+          JsonRpcError(
+              request->id, -32002, "Resource unavailable",
+              boost::json::object{{"uri", unavailable.uri()},
+                                  {"code", unavailable.code()},
+                                  {"reason", unavailable.what()},
+                                  {"retryable", unavailable.retryable()},
+                                  {"diagnostics", unavailable.diagnostics()}}));
     } catch (const std::invalid_argument& error) {
       return JsonResponse(
           http_request,

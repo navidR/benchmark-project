@@ -1374,6 +1374,67 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   static_cast<void>(process.ReadFor(250ms));
 
   std::uint64_t request_id = 2U;
+  const auto read_run_registry =
+      [&](std::string_view context) -> boost::json::array {
+    const http::response<http::string_body> response = McpExchange(
+        session.port, session.token,
+        boost::json::serialize(boost::json::object{
+            {"jsonrpc", "2.0"},
+            {"id", request_id++},
+            {"method", "resources/read"},
+            {"params", boost::json::object{{"uri", "bbp:///run_registry"}}}}),
+        session.session_id, session.protocol_version);
+    if (response.result() != http::status::ok) {
+      throw std::runtime_error(std::string(context) + " returned HTTP " +
+                               std::to_string(response.result_int()) + ": " +
+                               response.body());
+    }
+    const boost::json::value decoded = boost::json::parse(response.body());
+    if (!decoded.is_object()) {
+      throw std::runtime_error(std::string(context) +
+                               " returned a non-object JSON-RPC response");
+    }
+    const boost::json::array& contents =
+        decoded.as_object().at("result").as_object().at("contents").as_array();
+    if (contents.size() != 1U || !contents.front().is_object()) {
+      throw std::runtime_error(std::string(context) +
+                               " returned an invalid resource content array");
+    }
+    const boost::json::object& content = contents.front().as_object();
+    if (content.at("uri").as_string() != "bbp:///run_registry" ||
+        content.at("mimeType").as_string() != "application/json") {
+      throw std::runtime_error(std::string(context) +
+                               " returned the wrong resource metadata");
+    }
+    const boost::json::value registry =
+        boost::json::parse(content.at("text").as_string());
+    if (!registry.is_object() ||
+        registry.as_object().at("family").as_string() != "run_registry" ||
+        !registry.as_object().at("data").is_array()) {
+      throw std::runtime_error(std::string(context) +
+                               " returned an invalid run registry envelope");
+    }
+    return registry.as_object().at("data").as_array();
+  };
+  const auto require_single_cancelled_retained =
+      [](const boost::json::array& registry, std::string_view expected_run_id,
+         std::string_view context) {
+        if (registry.size() != 1U || !registry.front().is_object()) {
+          throw std::runtime_error(std::string(context) +
+                                   " did not contain exactly one run");
+        }
+        const boost::json::object& entry = registry.front().as_object();
+        if (entry.at("run_id").as_string() != expected_run_id ||
+            entry.at("state").as_string() != "cancelled" ||
+            entry.if_contains("generation") != nullptr) {
+          throw std::runtime_error(std::string(context) +
+                                   " did not contain the cancelled retained "
+                                   "source run");
+        }
+      };
+  if (!read_run_registry("initial run registry").empty()) {
+    throw std::runtime_error("initial run registry was not empty");
+  }
   const auto invoke_and_wait = [&](std::string_view operation,
                                    boost::json::object arguments) {
     const boost::json::object submitted =
@@ -1505,6 +1566,66 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       "stopped") {
     throw std::runtime_error("MCP returned a non-stopped run result");
   }
+  require_single_cancelled_retained(
+      read_run_registry("stopped source run registry"), run_id,
+      "stopped source run registry");
+  const std::filesystem::path registry_summary =
+      run_root / "run-registry-summary.json";
+  const std::filesystem::path saved_registry_summary =
+      run_root / ".run-registry-summary.test-backup";
+  std::filesystem::rename(registry_summary, saved_registry_summary);
+  require_single_cancelled_retained(
+      read_run_registry("legacy stopped source run registry"), run_id,
+      "legacy stopped source run registry");
+
+  const std::string saved_events = ReadFile(events_path);
+  {
+    std::ofstream events(events_path, std::ios::app);
+    events << boost::json::serialize(boost::json::object{
+                  {"run_id", run_id},
+                  {"event", "runtime_generation_published"},
+                  {"detail", boost::json::serialize(
+                                 boost::json::object{{"node_count", 0U}})}})
+           << '\n';
+    if (!events) {
+      throw std::runtime_error(
+          "could not append malformed legacy generation fixture");
+    }
+  }
+  const http::response<http::string_body> malformed_legacy_response =
+      McpExchange(
+          session.port, session.token,
+          boost::json::serialize(boost::json::object{
+              {"jsonrpc", "2.0"},
+              {"id", request_id++},
+              {"method", "resources/read"},
+              {"params", boost::json::object{{"uri", "bbp:///run_registry"}}}}),
+          session.session_id, session.protocol_version);
+  const boost::json::object malformed_legacy_error =
+      boost::json::parse(malformed_legacy_response.body())
+          .as_object()
+          .at("error")
+          .as_object();
+  const boost::json::object& malformed_legacy_data =
+      malformed_legacy_error.at("data").as_object();
+  if (malformed_legacy_response.result() != http::status::ok ||
+      malformed_legacy_error.at("code").as_int64() != -32002 ||
+      malformed_legacy_data.at("code").as_string() !=
+          "retained_run_registry_invalid" ||
+      malformed_legacy_data.at("retryable").as_bool()) {
+    throw std::runtime_error(
+        "malformed owned legacy metadata did not return its typed registry "
+        "failure");
+  }
+  {
+    std::ofstream events(events_path, std::ios::trunc);
+    events << saved_events;
+    if (!events) {
+      throw std::runtime_error(
+          "could not restore the legacy generation fixture");
+    }
+  }
+  std::filesystem::rename(saved_registry_summary, registry_summary);
 
   const std::string replay_collision_id = "replay-collision";
   const std::filesystem::path replay_collision_root =
@@ -1553,6 +1674,9 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error(
         "run.replay adopted or changed an existing destination collision");
   }
+  require_single_cancelled_retained(
+      read_run_registry("foreign replay collision registry"), run_id,
+      "foreign replay collision registry");
   if (!std::filesystem::remove(replay_collision_sentinel) ||
       !std::filesystem::remove(replay_collision_root)) {
     throw std::runtime_error(
@@ -1590,6 +1714,25 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error(
         "replayed run did not retain its destination source identity");
   }
+  {
+    const boost::json::array registry =
+        read_run_registry("active replay run registry");
+    if (registry.size() != 2U || !registry[0].is_object() ||
+        !registry[1].is_object()) {
+      throw std::runtime_error(
+          "active replay run registry did not contain exactly two runs");
+    }
+    const boost::json::object& active = registry[0].as_object();
+    const boost::json::object& source = registry[1].as_object();
+    if (active.at("run_id").as_string() != replay_run_id ||
+        active.at("state").as_string() != "active" ||
+        source.at("run_id").as_string() != run_id ||
+        source.at("state").as_string() != "cancelled") {
+      throw std::runtime_error(
+          "active replay run registry did not publish the active run first "
+          "and retained source exactly once");
+    }
+  }
 
   const std::string blocked_replay_id = "blocked-replay";
   const boost::json::object blocked_replay = invoke_and_wait(
@@ -1607,6 +1750,29 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error("replayed editor run stop failed: " +
                              boost::json::serialize(replay_stopped));
   }
+  {
+    const boost::json::array registry =
+        read_run_registry("stopped replay run registry");
+    std::vector<std::string> expected_run_ids{run_id, replay_run_id};
+    std::sort(expected_run_ids.begin(), expected_run_ids.end());
+    if (registry.size() != expected_run_ids.size()) {
+      throw std::runtime_error(
+          "stopped replay run registry did not contain two retained runs");
+    }
+    for (std::size_t index = 0U; index < expected_run_ids.size(); ++index) {
+      if (!registry[index].is_object()) {
+        throw std::runtime_error(
+            "stopped replay run registry contained a non-object entry");
+      }
+      const boost::json::object& entry = registry[index].as_object();
+      if (entry.at("run_id").as_string() != expected_run_ids[index] ||
+          entry.at("state").as_string() != "cancelled" ||
+          entry.if_contains("generation") != nullptr) {
+        throw std::runtime_error(
+            "stopped replay run registry was not ordered by run ID");
+      }
+    }
+  }
   const boost::json::object replay_cleaned = remove_run(replay_run_id);
   if (replay_cleaned.at("state").as_string() != "succeeded" ||
       std::filesystem::exists(replay_root) ||
@@ -1615,6 +1781,9 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error(
         "replayed run cleanup changed its retained source run");
   }
+  require_single_cancelled_retained(
+      read_run_registry("replay artifact removal registry"), run_id,
+      "replay artifact removal registry");
 
   const boost::json::object retained = clean_run(run_id);
   if (retained.at("state").as_string() != "succeeded" ||
@@ -1655,6 +1824,10 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error(
         "run.clean did not return verified zero-residual cleanup");
   }
+  if (!read_run_registry("source artifact removal registry").empty()) {
+    throw std::runtime_error(
+        "source artifact removal left a retained registry entry");
+  }
   const boost::json::object repeated_cleanup = remove_run(run_id);
   if (repeated_cleanup.at("state").as_string() != "succeeded" ||
       repeated_cleanup.at("terminal_result").as_object() != cleanup_result ||
@@ -1674,6 +1847,10 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       throw std::runtime_error(
           "could not create copied replacement ownership marker");
     }
+  }
+  if (!read_run_registry("copied replacement marker registry").empty()) {
+    throw std::runtime_error(
+        "copied replacement ownership marker was exposed as a retained run");
   }
   const boost::json::object replacement_cleanup = remove_run(run_id);
   if (replacement_cleanup.at("state").as_string() != "failed" ||
@@ -1829,6 +2006,16 @@ void CheckZeroToOnePublication(const std::filesystem::path& command,
   active_process.Write("y");
   RequireExitZero(&active_process, "active zero-node TUI exit");
   WaitForProcessExit(added_daemon_pid, 3s);
+  const boost::json::value shutdown_summary = boost::json::parse(
+      ReadFile(active_run_root / "run-registry-summary.json"));
+  if (!shutdown_summary.is_object() ||
+      shutdown_summary.as_object().at("state").as_string() != "cancelled" ||
+      shutdown_summary.as_object()
+              .at("node_count")
+              .to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "active TUI shutdown did not retain its cancelled final inventory");
+  }
 }
 
 void CheckNodeReplacementPublication(
