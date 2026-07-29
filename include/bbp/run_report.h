@@ -15,6 +15,8 @@
 namespace bbp {
 
 constexpr std::size_t kMaximumRunReportSummaryRecords = 256U;
+constexpr std::size_t kMaximumRetainedInstrumentationConfigurationRevisions =
+    256U;
 constexpr std::string_view kRetainedInstrumentationHistoryFileName =
     "instrumentation-history.json";
 

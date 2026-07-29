@@ -19047,7 +19047,7 @@ void ApplyPerfCounterCommand(
 constexpr std::size_t kMaximumRetainedInstrumentationMeasurements = 1024U;
 constexpr std::size_t kMaximumRetainedInstrumentationMeasurementBytes =
     kMcpMaximumRetainedResultBytes;
-constexpr std::size_t kRetainedInstrumentationMeasurementJsonOverhead = 64U;
+constexpr std::size_t kRetainedInstrumentationMeasurementJsonOverhead = 128U;
 
 enum class LiveInstrumentationState {
   kRunning,
@@ -19076,8 +19076,19 @@ bool IsTerminalLiveInstrumentationState(LiveInstrumentationState state) {
 
 struct LiveInstrumentationMeasurement {
   std::uint64_t sample = 0U;
+  std::uint64_t configuration_revision = 0U;
   std::string record;
 };
+
+struct LiveInstrumentationConfiguration {
+  std::uint64_t configuration_revision = 0U;
+  std::vector<PerfCounterTarget> targets;
+  std::vector<PerfCounterKind> counters;
+  std::chrono::milliseconds sample_interval{1};
+};
+
+static_assert(
+    std::is_nothrow_move_constructible_v<LiveInstrumentationConfiguration>);
 
 struct LiveInstrumentationRecord {
   mutable std::mutex mutex;
@@ -19099,6 +19110,7 @@ struct LiveInstrumentationRecord {
   LiveInstrumentationState state = LiveInstrumentationState::kRunning;
   std::optional<std::string> failure;
   std::uint64_t configuration_revision = 1U;
+  std::vector<LiveInstrumentationConfiguration> configuration_history;
   std::uint64_t sample_count = 0U;
   std::deque<LiveInstrumentationMeasurement> measurements;
   std::size_t measurement_storage_bytes = 0U;
@@ -19127,6 +19139,7 @@ struct LiveInstrumentationRegistry {
       records;
   std::string active_id;
   std::uint64_t next_id = 1U;
+  std::size_t retained_configuration_revisions = 0U;
   bool shutting_down = false;
 };
 
@@ -19154,6 +19167,52 @@ boost::json::array LiveInstrumentationTargetsJson(
   return result;
 }
 
+boost::json::object LiveInstrumentationConfigurationJson(
+    const LiveInstrumentationConfiguration& configuration) {
+  return boost::json::object{
+      {"configuration_revision", configuration.configuration_revision},
+      {"targets", LiveInstrumentationTargetsJson(configuration.targets)},
+      {"counters", PerfCounterNamesJson(configuration.counters)},
+      {"sample_interval_ms", configuration.sample_interval.count()},
+  };
+}
+
+void RequireLiveInstrumentationConfigurationHistoryConsistent(
+    const LiveInstrumentationRecord& record) {
+  if (record.configuration_history.empty() ||
+      record.configuration_history.size() >
+          kMaximumRetainedInstrumentationConfigurationRevisions ||
+      record.configuration_history.size() != record.configuration_revision) {
+    throw std::logic_error(
+        "instrumentation configuration history is inconsistent");
+  }
+  for (std::size_t index = 0U; index < record.configuration_history.size();
+       ++index) {
+    if (record.configuration_history[index].configuration_revision !=
+        index + 1U) {
+      throw std::logic_error(
+          "instrumentation configuration history revision is inconsistent");
+    }
+  }
+  const LiveInstrumentationConfiguration& current =
+      record.configuration_history.back();
+  if (current.configuration_revision != record.configuration_revision ||
+      current.targets != record.targets ||
+      current.counters != record.counters ||
+      current.sample_interval != record.sample_interval) {
+    throw std::logic_error(
+        "instrumentation current configuration does not match its history");
+  }
+}
+
+[[noreturn]] void ThrowLiveInstrumentationConfigurationHistoryCapacity() {
+  throw McpOperationFailure(
+      "instrumentation_configuration_history_capacity",
+      "instrumentation configuration history reached its bounded run "
+      "capacity",
+      false);
+}
+
 boost::json::object LiveInstrumentationResultJson(
     const LiveInstrumentationRecord& record) {
   std::lock_guard<std::mutex> lock(record.mutex);
@@ -19168,6 +19227,14 @@ boost::json::object LiveInstrumentationResultJson(
 boost::json::object LiveInstrumentationResourceJson(
     const LiveInstrumentationRecord& record, bool include_measurements) {
   std::lock_guard<std::mutex> lock(record.mutex);
+  RequireLiveInstrumentationConfigurationHistoryConsistent(record);
+  boost::json::array configuration_history;
+  configuration_history.reserve(record.configuration_history.size());
+  for (const LiveInstrumentationConfiguration& configuration :
+       record.configuration_history) {
+    configuration_history.emplace_back(
+        LiveInstrumentationConfigurationJson(configuration));
+  }
   boost::json::object result{
       {"instrumentation_id", record.id},
       {"state", LiveInstrumentationStateName(record.state)},
@@ -19177,6 +19244,7 @@ boost::json::object LiveInstrumentationResourceJson(
       {"sample_interval_ms", record.sample_interval.count()},
       {"started_at_ms", record.started_at_ms},
       {"configuration_revision", record.configuration_revision},
+      {"configuration_history", std::move(configuration_history)},
       {"retained_measurement_count", record.measurements.size()},
       {"measurements_truncated", record.measurements_truncated},
       {"dropped_measurement_count", record.dropped_measurement_count},
@@ -19203,6 +19271,7 @@ boost::json::object LiveInstrumentationResourceJson(
          record.measurements) {
       measurements.emplace_back(boost::json::object{
           {"sample", measurement.sample},
+          {"configuration_revision", measurement.configuration_revision},
           {"record", boost::json::parse(measurement.record)},
       });
     }
@@ -19431,12 +19500,15 @@ void AppendLiveInstrumentationRound(
   if (record.sample_count == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("instrumentation sample count exceeds uint64");
   }
+  RequireLiveInstrumentationConfigurationHistoryConsistent(record);
   const std::uint64_t sample = record.sample_count + 1U;
+  const std::uint64_t configuration_revision = record.configuration_revision;
   std::size_t appended = 0U;
   try {
     for (std::string& measurement_record : measurement_records) {
       record.measurements.push_back(LiveInstrumentationMeasurement{
           .sample = sample,
+          .configuration_revision = configuration_revision,
           .record = std::move(measurement_record),
       });
       ++appended;
@@ -19969,6 +20041,10 @@ class LiveInstrumentationController {
             "instrumentation_already_active",
             "only one instrumentation window may be active per run", true);
       }
+      if (registry_->retained_configuration_revisions >=
+          kMaximumRetainedInstrumentationConfigurationRevisions) {
+        ThrowLiveInstrumentationConfigurationHistoryCapacity();
+      }
       if (registry_->records.size() >= kMaximumScenarioActionCount) {
         throw McpOperationFailure(
             "instrumentation_history_capacity",
@@ -19997,6 +20073,19 @@ class LiveInstrumentationController {
         }
       }
     }
+    record->targets = std::move(targets);
+    record->counters = std::move(counters);
+    record->sample_interval = sample_interval;
+    record->window = window;
+    record->configuration_history.reserve(
+        kMaximumRetainedInstrumentationConfigurationRevisions);
+    record->configuration_history.push_back(LiveInstrumentationConfiguration{
+        .configuration_revision = record->configuration_revision,
+        .targets = record->targets,
+        .counters = record->counters,
+        .sample_interval = record->sample_interval,
+    });
+    RequireLiveInstrumentationConfigurationHistoryConsistent(*record);
 
     const bool persistence_may_be_active = !metrics_path_.empty();
     std::unique_lock<std::timed_mutex> mutation_lock;
@@ -20019,9 +20108,10 @@ class LiveInstrumentationController {
       }
       RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
       const RuntimeWalletSnapshot wallets = wallet_registry_.Snapshot();
-      ValidateLiveInstrumentationMappings(targets, nodes, wallets, options_);
+      ValidateLiveInstrumentationMappings(record->targets, nodes, wallets,
+                                          options_);
       const auto configurations =
-          LiveInstrumentationConfigurations(targets, counters);
+          LiveInstrumentationConfigurations(record->targets, record->counters);
       std::vector<NodePerfCounterAssignment> assignments =
           ResolvePerfCounterAssignments(configurations, nodes, true, true);
       {
@@ -20035,10 +20125,6 @@ class LiveInstrumentationController {
             snapshot.node->config.id,
             SnapshotPerfCounterConfiguration(snapshot));
       }
-      record->targets = targets;
-      record->counters = counters;
-      record->sample_interval = sample_interval;
-      record->window = window;
       CaptureRound(*record, stop_token);
       ThrowIfStopRequested(stop_token);
 
@@ -20061,6 +20147,10 @@ class LiveInstrumentationController {
               "instrumentation_admission_conflict",
               "instrumentation admission changed before publication", true);
         }
+        if (registry_->retained_configuration_revisions >=
+            kMaximumRetainedInstrumentationConfigurationRevisions) {
+          ThrowLiveInstrumentationConfigurationHistoryCapacity();
+        }
         const auto [inserted_record, inserted] =
             registry_->records.emplace(record->id, record);
         if (!inserted) {
@@ -20073,6 +20163,7 @@ class LiveInstrumentationController {
               std::jthread([this, record](std::stop_token worker_stop_token) {
                 RunWorker(record, worker_stop_token);
               });
+          ++registry_->retained_configuration_revisions;
           published = true;
         } catch (...) {
           registry_->active_id.clear();
@@ -20175,7 +20266,16 @@ class LiveInstrumentationController {
     std::uint64_t sample_count = 0U;
     bool deadline_reached = false;
     {
-      std::lock_guard<std::mutex> lock(record->mutex);
+      std::lock_guard<std::mutex> registry_lock(registry_->mutex);
+      RequireOperationalRegistry();
+      const auto active = registry_->records.find(record->id);
+      if (registry_->active_id != record->id ||
+          active == registry_->records.end() || active->second != record) {
+        throw McpOperationFailure(
+            "instrumentation_admission_conflict",
+            "instrumentation admission changed before reconfiguration", true);
+      }
+      std::lock_guard<std::mutex> record_lock(record->mutex);
       if (record->state != LiveInstrumentationState::kRunning) {
         throw McpOperationFailure(
             "instrumentation_not_active",
@@ -20188,6 +20288,13 @@ class LiveInstrumentationController {
       if (deadline_reached) {
         record->changed.notify_all();
       } else {
+        RequireLiveInstrumentationConfigurationHistoryConsistent(*record);
+        if (registry_->retained_configuration_revisions >=
+                kMaximumRetainedInstrumentationConfigurationRevisions ||
+            record->configuration_history.size() >=
+                kMaximumRetainedInstrumentationConfigurationRevisions) {
+          ThrowLiveInstrumentationConfigurationHistoryCapacity();
+        }
         if (record->configuration_revision ==
             std::numeric_limits<std::uint64_t>::max()) {
           throw std::overflow_error(
@@ -20199,6 +20306,8 @@ class LiveInstrumentationController {
         sample_interval = requested_interval.value_or(record->sample_interval);
         next_revision = record->configuration_revision + 1U;
         sample_count = record->sample_count;
+        record->configuration_history.reserve(
+            kMaximumRetainedInstrumentationConfigurationRevisions);
       }
     }
     if (deadline_reached) {
@@ -20210,6 +20319,12 @@ class LiveInstrumentationController {
          LiveInstrumentationStateName(LiveInstrumentationState::kRunning)},
         {"sample_count", sample_count},
         {"targets", LiveInstrumentationTargetsJson(targets)},
+    };
+    LiveInstrumentationConfiguration next_configuration{
+        .configuration_revision = next_revision,
+        .targets = targets,
+        .counters = counters,
+        .sample_interval = sample_interval,
     };
 
     RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
@@ -20276,13 +20391,13 @@ class LiveInstrumentationController {
       {
         std::lock_guard<std::mutex> registry_lock(registry_->mutex);
         RequireOperationalRegistry();
-        if (registry_->active_id != record->id) {
+        const auto active = registry_->records.find(record->id);
+        if (registry_->active_id != record->id ||
+            active == registry_->records.end() || active->second != record) {
           throw McpOperationFailure(
               "instrumentation_admission_conflict",
               "instrumentation admission changed during reconfiguration", true);
         }
-      }
-      {
         std::lock_guard<std::mutex> record_lock(record->mutex);
         if (record->state != LiveInstrumentationState::kRunning) {
           throw McpOperationFailure(
@@ -20293,11 +20408,27 @@ class LiveInstrumentationController {
             record->deadline &&
             std::chrono::steady_clock::now() >= *record->deadline;
         if (!deadline_reached) {
-          record->targets = std::move(targets);
-          record->counters = std::move(counters);
-          record->baseline_configurations = std::move(next_baseline);
+          RequireLiveInstrumentationConfigurationHistoryConsistent(*record);
+          if (registry_->retained_configuration_revisions >=
+                  kMaximumRetainedInstrumentationConfigurationRevisions ||
+              record->configuration_history.size() >=
+                  kMaximumRetainedInstrumentationConfigurationRevisions) {
+            ThrowLiveInstrumentationConfigurationHistoryCapacity();
+          }
+          if (record->configuration_history.capacity() <
+              kMaximumRetainedInstrumentationConfigurationRevisions) {
+            throw std::logic_error(
+                "instrumentation configuration history lost its reserved "
+                "capacity");
+          }
+          record->configuration_history.push_back(
+              std::move(next_configuration));
+          record->targets.swap(targets);
+          record->counters.swap(counters);
+          record->baseline_configurations.swap(next_baseline);
           record->sample_interval = sample_interval;
           record->configuration_revision = next_revision;
+          ++registry_->retained_configuration_revisions;
           record->changed.notify_all();
         }
       }

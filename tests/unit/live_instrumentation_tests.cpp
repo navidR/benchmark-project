@@ -134,8 +134,10 @@ const boost::json::object& FindInstrumentationHistoryRecord(
 
 BOOST_AUTO_TEST_CASE(
     live_instrumentation_reconfigures_at_a_boundary_and_restores_baselines) {
-  bbp::LiveInstrumentationHarnessForTest harness({"node-1", "node-2"},
-                                                 std::chrono::hours(7));
+  InstrumentationRunDirectory directory;
+  const std::filesystem::path run_root = directory.path() / "reconfigured";
+  bbp::LiveInstrumentationHarnessForTest harness(
+      {"node-1", "node-2"}, std::chrono::hours(7), run_root);
   const auto service = harness.service();
   const bbp::LiveInstrumentationNodeStateForTest node_1_baseline =
       harness.NodeState("node-1");
@@ -177,6 +179,24 @@ BOOST_AUTO_TEST_CASE(
              std::chrono::hours(7).count() * 60 * 60 * 1000);
   BOOST_TEST(active_before.at("window_ms").as_int64() ==
              std::chrono::hours(24).count() * 60 * 60 * 1000);
+  const boost::json::array& initial_configurations =
+      active_before.at("configuration_history").as_array();
+  BOOST_REQUIRE_EQUAL(initial_configurations.size(), 1U);
+  const boost::json::object& initial_configuration =
+      initial_configurations.front().as_object();
+  BOOST_TEST(initial_configuration.at("configuration_revision").as_uint64() ==
+             1U);
+  BOOST_TEST(initial_configuration.at("targets")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("id")
+                 .as_string() == "node-1");
+  BOOST_TEST(
+      initial_configuration.at("counters").as_array().front().as_string() ==
+      "instructions");
+  BOOST_TEST(initial_configuration.at("sample_interval_ms").as_int64() ==
+             std::chrono::hours(7).count() * 60 * 60 * 1000);
 
   const std::uint64_t attempts_before_reconfigure =
       harness.attachment_attempts();
@@ -232,6 +252,26 @@ BOOST_AUTO_TEST_CASE(
              active_before.at("window_ms").as_int64());
   BOOST_TEST(active_after.at("sample_interval_ms").as_int64() ==
              std::chrono::hours(12).count() * 60 * 60 * 1000);
+  BOOST_TEST(active_after.at("configuration_revision").as_uint64() == 2U);
+  const boost::json::array& configurations =
+      active_after.at("configuration_history").as_array();
+  BOOST_REQUIRE_EQUAL(configurations.size(), 2U);
+  BOOST_CHECK(configurations.front() == initial_configuration);
+  const boost::json::object& reconfigured_mapping =
+      configurations.back().as_object();
+  BOOST_TEST(reconfigured_mapping.at("configuration_revision").as_uint64() ==
+             2U);
+  BOOST_TEST(reconfigured_mapping.at("targets")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("id")
+                 .as_string() == "node-2");
+  BOOST_TEST(
+      reconfigured_mapping.at("counters").as_array().front().as_string() ==
+      "cache-references");
+  BOOST_TEST(reconfigured_mapping.at("sample_interval_ms").as_int64() ==
+             std::chrono::hours(12).count() * 60 * 60 * 1000);
 
   harness.SampleNow();
   const boost::json::object measurements =
@@ -240,6 +280,14 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::array& measurement_records =
       measurements.at("measurement_records").as_array();
   BOOST_REQUIRE_EQUAL(measurement_records.size(), 2U);
+  BOOST_TEST(measurement_records[0]
+                 .as_object()
+                 .at("configuration_revision")
+                 .as_uint64() == 1U);
+  BOOST_TEST(measurement_records[1]
+                 .as_object()
+                 .at("configuration_revision")
+                 .as_uint64() == 2U);
   BOOST_TEST(measurement_records[1]
                  .as_object()
                  .at("record")
@@ -273,6 +321,92 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(retained.at("started_at_ms").as_uint64() == committed_start);
   BOOST_TEST(retained.at("sample_count").as_uint64() == 2U);
   BOOST_REQUIRE_EQUAL(retained.at("measurement_records").as_array().size(), 2U);
+  BOOST_CHECK(retained.at("configuration_history") ==
+              active_after.at("configuration_history"));
+  BOOST_CHECK(retained.at("measurement_records") ==
+              measurements.at("measurement_records"));
+
+  const boost::json::array persisted =
+      bbp::ReadRetainedInstrumentationHistory(run_root, "instrumentation-test");
+  BOOST_REQUIRE_EQUAL(persisted.size(), 1U);
+  const boost::json::object& persisted_record = persisted.front().as_object();
+  BOOST_CHECK(persisted_record.at("configuration_history") ==
+              retained.at("configuration_history"));
+  BOOST_TEST(persisted_record.at("measurement_records")
+                 .as_array()[0]
+                 .as_object()
+                 .at("configuration_revision")
+                 .as_uint64() == 1U);
+  BOOST_TEST(persisted_record.at("measurement_records")
+                 .as_array()[1]
+                 .as_object()
+                 .at("configuration_revision")
+                 .as_uint64() == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    live_instrumentation_bounds_configuration_history_before_mutation) {
+  bbp::LiveInstrumentationHarnessForTest harness({"node-1"});
+  const auto service = harness.service();
+  const boost::json::object started =
+      Invoke(service, bbp::McpOperationKind::kStartInstrumentation,
+             StartArguments(boost::json::array{Target("node-1")},
+                            bbp::PerfCounterKind::kInstructions));
+  const std::string instrumentation_id(
+      started.at("instrumentation_id").as_string());
+  const boost::json::object reconfiguration{
+      {"run_id", "instrumentation-test"},
+      {"instrumentation_id", instrumentation_id},
+      {"targets", boost::json::array{Target("node-1")}},
+      {"counters", Counters(bbp::PerfCounterKind::kInstructions)},
+  };
+  for (std::size_t revision = 1U;
+       revision < bbp::kMaximumRetainedInstrumentationConfigurationRevisions;
+       ++revision) {
+    static_cast<void>(Invoke(service,
+                             bbp::McpOperationKind::kReconfigureInstrumentation,
+                             reconfiguration));
+  }
+
+  const boost::json::object at_capacity =
+      service->read(bbp::McpInformationFamily::kInstrumentation, {})
+          .as_array()
+          .front()
+          .as_object();
+  BOOST_TEST(at_capacity.at("configuration_history").as_array().size() ==
+             bbp::kMaximumRetainedInstrumentationConfigurationRevisions);
+  const std::uint64_t attempts_at_capacity = harness.attachment_attempts();
+  BOOST_CHECK_EXCEPTION(
+      Invoke(service, bbp::McpOperationKind::kReconfigureInstrumentation,
+             reconfiguration),
+      bbp::McpOperationFailure, [](const bbp::McpOperationFailure& failure) {
+        return failure.code() ==
+                   "instrumentation_configuration_history_capacity" &&
+               !failure.retryable();
+      });
+  BOOST_TEST(harness.attachment_attempts() == attempts_at_capacity);
+  BOOST_CHECK(service->read(bbp::McpInformationFamily::kInstrumentation, {})
+                  .as_array()
+                  .front()
+                  .as_object() == at_capacity);
+
+  static_cast<void>(Invoke(service, bbp::McpOperationKind::kStopInstrumentation,
+                           boost::json::object{
+                               {"run_id", "instrumentation-test"},
+                               {"instrumentation_id", instrumentation_id},
+                               {"timeout_sec", 1},
+                           }));
+  const std::uint64_t attempts_after_stop = harness.attachment_attempts();
+  BOOST_CHECK_EXCEPTION(
+      Invoke(service, bbp::McpOperationKind::kStartInstrumentation,
+             StartArguments(boost::json::array{Target("node-1")},
+                            bbp::PerfCounterKind::kCycles)),
+      bbp::McpOperationFailure, [](const bbp::McpOperationFailure& failure) {
+        return failure.code() ==
+                   "instrumentation_configuration_history_capacity" &&
+               !failure.retryable();
+      });
+  BOOST_TEST(harness.attachment_attempts() == attempts_after_stop);
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -655,6 +789,7 @@ BOOST_AUTO_TEST_CASE(
   for (std::size_t index = 0U; index < 1024U; ++index) {
     measurements.emplace_back(boost::json::object{
         {"sample", static_cast<std::uint64_t>(index + 1U)},
+        {"configuration_revision", 1U},
         {"record",
          boost::json::object{
              {"node_id", "node-1"},
@@ -672,6 +807,13 @@ BOOST_AUTO_TEST_CASE(
           {"sample_interval_ms", 1000U},
           {"started_at_ms", 1U},
           {"configuration_revision", 1U},
+          {"configuration_history",
+           boost::json::array{boost::json::object{
+               {"configuration_revision", 1U},
+               {"targets", boost::json::array{Target("node-1")}},
+               {"counters", boost::json::array{"instructions"}},
+               {"sample_interval_ms", 1000U},
+           }}},
           {"retained_measurement_count", measurements.size()},
           {"measurements_truncated", false},
           {"dropped_measurement_count", 0U},
@@ -713,6 +855,49 @@ BOOST_AUTO_TEST_CASE(
                  .as_uint64() == 1024U);
 
   bbp::WriteRetainedInstrumentationHistory(run_root, "instrumentation-test",
+                                           bounded);
+  const std::filesystem::path history_path =
+      run_root / bbp::kRetainedInstrumentationHistoryFileName;
+  boost::json::object legacy_document =
+      boost::json::parse(bbp::ReadText(history_path)).as_object();
+  legacy_document["version"] = 1U;
+  boost::json::object& legacy_record =
+      legacy_document.at("records").as_array().front().as_object();
+  legacy_record.erase("configuration_history");
+  for (boost::json::value& measurement :
+       legacy_record.at("measurement_records").as_array()) {
+    measurement.as_object().erase("configuration_revision");
+  }
+  bbp::WriteText(history_path, boost::json::serialize(legacy_document));
+  const boost::json::array upgraded_legacy =
+      bbp::ReadRetainedInstrumentationHistory(run_root, "instrumentation-test");
+  BOOST_REQUIRE_EQUAL(upgraded_legacy.size(), 1U);
+  BOOST_REQUIRE_EQUAL(upgraded_legacy.front()
+                          .as_object()
+                          .at("configuration_history")
+                          .as_array()
+                          .size(),
+                      1U);
+  BOOST_TEST(upgraded_legacy.front()
+                 .as_object()
+                 .at("measurement_records")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("configuration_revision")
+                 .as_uint64() == 1U);
+
+  legacy_record["configuration_revision"] = 2U;
+  bbp::WriteText(history_path, boost::json::serialize(legacy_document));
+  try {
+    static_cast<void>(ReadRetainedInstrumentationResource(
+        run_root, bbp::McpInformationFamily::kMeasurementHistory));
+    BOOST_FAIL("unattributable version-one instrumentation was accepted");
+  } catch (const bbp::McpOperationFailure& failure) {
+    BOOST_TEST(failure.code() == "retained_instrumentation_invalid");
+  }
+
+  bbp::WriteRetainedInstrumentationHistory(run_root, "instrumentation-test",
                                            bounded, "incomplete-window");
   try {
     static_cast<void>(ReadRetainedInstrumentationResource(
@@ -724,8 +909,6 @@ BOOST_AUTO_TEST_CASE(
 
   bbp::WriteRetainedInstrumentationHistory(run_root, "instrumentation-test",
                                            bounded);
-  const std::filesystem::path history_path =
-      run_root / bbp::kRetainedInstrumentationHistoryFileName;
   const auto reject_semantic_corruption = [&](const auto& mutate) {
     bbp::WriteRetainedInstrumentationHistory(run_root, "instrumentation-test",
                                              bounded);
@@ -761,8 +944,20 @@ BOOST_AUTO_TEST_CASE(
     record["completed_at_ms"] = nullptr;
     record["failure"] = "synthetic failure";
   });
+  reject_semantic_corruption([](boost::json::object& record) {
+    record.at("measurement_records")
+        .as_array()
+        .front()
+        .as_object()["configuration_revision"] = 2U;
+  });
+  reject_semantic_corruption([](boost::json::object& record) {
+    record.at("configuration_history")
+        .as_array()
+        .front()
+        .as_object()["configuration_revision"] = 2U;
+  });
   bbp::WriteText(run_root / bbp::kRetainedInstrumentationHistoryFileName,
-                 R"({"format":"bbp.instrumentation_history","version":2})");
+                 R"({"format":"bbp.instrumentation_history","version":3})");
   try {
     static_cast<void>(ReadRetainedInstrumentationResource(
         run_root, bbp::McpInformationFamily::kMeasurementHistory));
