@@ -426,6 +426,21 @@ std::optional<PerfCounterTargetKind> PerfCounterTargetKindFromName(
   return std::nullopt;
 }
 
+bool IsCanonicalWalletPerfTargetId(std::string_view id) {
+  constexpr std::string_view kPrefix = "wallet-";
+  if (!id.starts_with(kPrefix)) {
+    return false;
+  }
+  id.remove_prefix(kPrefix.size());
+  if (id.empty() || (id.size() > 1U && id.front() == '0')) {
+    return false;
+  }
+  std::uint32_t value = 0U;
+  const auto [end, error] =
+      std::from_chars(id.data(), id.data() + id.size(), value);
+  return error == std::errc() && end == id.data() + id.size() && value > 0U;
+}
+
 std::string_view PerfCounterErrorKindName(PerfCounterErrorKind kind) {
   switch (kind) {
     case PerfCounterErrorKind::kInvalidArgument:

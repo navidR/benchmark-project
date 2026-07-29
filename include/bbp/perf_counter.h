@@ -39,6 +39,7 @@ enum class PerfCounterTargetKind {
 std::string_view PerfCounterTargetKindName(PerfCounterTargetKind kind);
 std::optional<PerfCounterTargetKind> PerfCounterTargetKindFromName(
     std::string_view name);
+bool IsCanonicalWalletPerfTargetId(std::string_view id);
 
 struct PerfCounterTarget {
   PerfCounterTargetKind kind = PerfCounterTargetKind::kNode;

@@ -1,11 +1,13 @@
 #pragma once
 
+#include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -13,6 +15,8 @@
 namespace bbp {
 
 constexpr std::size_t kMaximumRunReportSummaryRecords = 256U;
+constexpr std::string_view kRetainedInstrumentationHistoryFileName =
+    "instrumentation-history.json";
 
 struct RunReportRefreshStats {
   std::uint64_t event_records = 0;
@@ -51,5 +55,12 @@ std::string BuildNodeReportJson(const std::filesystem::path& run_root,
                                 std::string_view node_id,
                                 std::uint64_t operator_command_sequence,
                                 std::stop_token stop_token = {});
+void WriteRetainedInstrumentationHistory(
+    const std::filesystem::path& run_root, std::string_view run_id,
+    const boost::json::array& records,
+    std::optional<std::string_view> active_instrumentation_id = std::nullopt);
+boost::json::array ReadRetainedInstrumentationHistory(
+    const std::filesystem::path& run_root, std::string_view run_id,
+    std::stop_token stop_token = {});
 
 }  // namespace bbp

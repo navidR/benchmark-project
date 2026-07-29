@@ -1129,6 +1129,17 @@ boost::json::object ResourceEnvelope(McpInformationFamily family,
   };
 }
 
+boost::json::object EmptyInstrumentationMeasurements() {
+  return boost::json::object{
+      {"instrumentation_id", nullptr},
+      {"sample_count", 0U},
+      {"retained_measurement_count", 0U},
+      {"measurements_truncated", false},
+      {"dropped_measurement_count", 0U},
+      {"measurement_records", boost::json::array{}},
+  };
+}
+
 boost::json::object BuildSchemaDocument(
     std::span<const McpOperationKind> selected_operations,
     std::span<const McpInformationFamily> selected_information_families) {
@@ -2518,6 +2529,35 @@ boost::json::value McpLiveApplication::ReadResource(
     }
     return ResourceEnvelope(family, config_.run_id,
                             instrumentation_service->read(family, stop_token));
+  }
+
+  if (config_.retained_run &&
+      (family == McpInformationFamily::kInstrumentation ||
+       family == McpInformationFamily::kMeasurements ||
+       family == McpInformationFamily::kMeasurementHistory)) {
+    boost::json::array history;
+    try {
+      history = ReadRetainedInstrumentationHistory(config_.run_root,
+                                                   config_.run_id, stop_token);
+    } catch (const std::exception& error) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      throw McpOperationFailure(
+          "retained_instrumentation_invalid",
+          "retained instrumentation history is invalid: " +
+              std::string(error.what()),
+          false);
+    }
+    boost::json::value data;
+    if (family == McpInformationFamily::kMeasurementHistory) {
+      data = std::move(history);
+    } else if (family == McpInformationFamily::kMeasurements) {
+      data = EmptyInstrumentationMeasurements();
+    } else {
+      data = boost::json::array{};
+    }
+    return ResourceEnvelope(family, config_.run_id, std::move(data));
   }
 
   boost::json::object report = ReportSnapshot(stop_token);

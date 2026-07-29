@@ -18738,21 +18738,6 @@ NodeRuntime& FindNodeRuntimeById(auto& nodes, const std::string& node_id) {
   return *node;
 }
 
-bool IsCanonicalWalletPerfTargetId(std::string_view id) {
-  constexpr std::string_view kPrefix = "wallet-";
-  if (!id.starts_with(kPrefix)) {
-    return false;
-  }
-  id.remove_prefix(kPrefix.size());
-  if (id.empty() || (id.size() > 1U && id.front() == '0')) {
-    return false;
-  }
-  std::uint64_t value = 0U;
-  const auto [end, error] =
-      std::from_chars(id.data(), id.data() + id.size(), value);
-  return error == std::errc() && end == id.data() + id.size() && value > 0U;
-}
-
 struct NodePerfCounterConfiguration {
   std::string node_id;
   std::vector<PerfCounterKind> kinds;
@@ -19058,6 +19043,9 @@ void ApplyPerfCounterCommand(
 }
 
 constexpr std::size_t kMaximumRetainedInstrumentationMeasurements = 1024U;
+constexpr std::size_t kMaximumRetainedInstrumentationMeasurementBytes =
+    kMcpMaximumRetainedResultBytes;
+constexpr std::size_t kRetainedInstrumentationMeasurementJsonOverhead = 64U;
 
 enum class LiveInstrumentationState {
   kRunning,
@@ -19111,6 +19099,7 @@ struct LiveInstrumentationRecord {
   std::uint64_t configuration_revision = 1U;
   std::uint64_t sample_count = 0U;
   std::deque<LiveInstrumentationMeasurement> measurements;
+  std::size_t measurement_storage_bytes = 0U;
   bool measurements_truncated = false;
   std::uint64_t dropped_measurement_count = 0U;
   std::jthread worker;
@@ -19398,6 +19387,38 @@ std::vector<NodePerfCounterAssignment> ResolvePerfCounterAssignments(
   return assignments;
 }
 
+void BoundLiveInstrumentationRecordMeasurements(
+    LiveInstrumentationRecord& record, std::size_t maximum_bytes) {
+  std::size_t retained = 0U;
+  std::size_t retained_bytes = 0U;
+  for (auto measurement = record.measurements.rbegin();
+       measurement != record.measurements.rend() &&
+       retained < kMaximumRetainedInstrumentationMeasurements;
+       ++measurement) {
+    const std::size_t remaining = maximum_bytes - retained_bytes;
+    if (remaining < kRetainedInstrumentationMeasurementJsonOverhead ||
+        measurement->record.size() >
+            remaining - kRetainedInstrumentationMeasurementJsonOverhead) {
+      break;
+    }
+    retained_bytes += measurement->record.size() +
+                      kRetainedInstrumentationMeasurementJsonOverhead;
+    ++retained;
+  }
+  const std::size_t dropped = record.measurements.size() - retained;
+  for (std::size_t index = 0U; index < dropped; ++index) {
+    record.measurements.pop_front();
+  }
+  record.measurement_storage_bytes = retained_bytes;
+  if (dropped != 0U) {
+    record.measurements_truncated = true;
+    const std::uint64_t remaining = std::numeric_limits<std::uint64_t>::max() -
+                                    record.dropped_measurement_count;
+    record.dropped_measurement_count +=
+        std::min<std::uint64_t>(remaining, dropped);
+  }
+}
+
 void AppendLiveInstrumentationRound(
     LiveInstrumentationRecord& record,
     std::vector<std::string> measurement_records) {
@@ -19425,23 +19446,44 @@ void AppendLiveInstrumentationRound(
     }
     throw;
   }
-  const std::size_t dropped =
-      record.measurements.size() > kMaximumRetainedInstrumentationMeasurements
-          ? record.measurements.size() -
-                kMaximumRetainedInstrumentationMeasurements
-          : 0U;
-  for (std::size_t index = 0U; index < dropped; ++index) {
-    record.measurements.pop_front();
-  }
-  if (dropped != 0U) {
-    record.measurements_truncated = true;
-    const std::uint64_t remaining = std::numeric_limits<std::uint64_t>::max() -
-                                    record.dropped_measurement_count;
-    record.dropped_measurement_count +=
-        std::min<std::uint64_t>(remaining, dropped);
-  }
+  BoundLiveInstrumentationRecordMeasurements(
+      record, kMaximumRetainedInstrumentationMeasurementBytes);
   record.sample_count = sample;
   record.changed.notify_all();
+}
+
+void BoundLiveInstrumentationPersistenceMeasurements(
+    const std::vector<std::shared_ptr<LiveInstrumentationRecord>>& records) {
+  struct Candidate {
+    std::shared_ptr<LiveInstrumentationRecord> record;
+    std::uint64_t started_at_ms;
+    std::size_t order;
+  };
+  std::vector<Candidate> terminal;
+  terminal.reserve(records.size());
+  for (std::size_t index = 0U; index < records.size(); ++index) {
+    std::lock_guard<std::mutex> lock(records[index]->mutex);
+    if (IsTerminalLiveInstrumentationState(records[index]->state)) {
+      terminal.push_back(Candidate{
+          .record = records[index],
+          .started_at_ms = records[index]->started_at_ms,
+          .order = index,
+      });
+    }
+  }
+  std::sort(terminal.begin(), terminal.end(),
+            [](const Candidate& left, const Candidate& right) {
+              return left.started_at_ms > right.started_at_ms ||
+                     (left.started_at_ms == right.started_at_ms &&
+                      left.order > right.order);
+            });
+
+  std::size_t remaining = kMaximumRetainedInstrumentationMeasurementBytes;
+  for (const Candidate& candidate : terminal) {
+    std::lock_guard<std::mutex> lock(candidate.record->mutex);
+    BoundLiveInstrumentationRecordMeasurements(*candidate.record, remaining);
+    remaining -= candidate.record->measurement_storage_bytes;
+  }
 }
 
 std::unique_lock<std::timed_mutex> AcquireInstrumentationTimedLock(
@@ -19713,6 +19755,8 @@ class LiveInstrumentationController {
       active->changed.notify_all();
     }
 
+    auto lifecycle_lock = AcquireInstrumentationTimedLock(
+        lifecycle_mutex_, std::nullopt, {}, "instrumentation lifecycle");
     std::exception_ptr restoration_failure;
     if (active) {
       try {
@@ -19747,7 +19791,18 @@ class LiveInstrumentationController {
             restoration_failure = std::current_exception();
           }
         }
+      } catch (const std::exception& error) {
+        MarkRestorationFailed(
+            active,
+            "instrumentation shutdown could not enter its restoration "
+            "boundary: " +
+                std::string(error.what()));
+        restoration_failure = std::current_exception();
       } catch (...) {
+        MarkRestorationFailed(
+            active,
+            "instrumentation shutdown could not enter its restoration "
+            "boundary");
         restoration_failure = std::current_exception();
       }
     }
@@ -19759,8 +19814,23 @@ class LiveInstrumentationController {
     for (const std::shared_ptr<LiveInstrumentationRecord>& record : records) {
       JoinLiveInstrumentationWorker(record);
     }
+    std::exception_ptr persistence_failure;
+    if (!metrics_path_.empty()) {
+      try {
+        const std::optional<std::string> active_id =
+            ActiveInstrumentationIdForPersistence();
+        PersistRetainedStateLocked(
+            active_id ? std::optional<std::string_view>(*active_id)
+                      : std::nullopt);
+      } catch (...) {
+        persistence_failure = std::current_exception();
+      }
+    }
     if (restoration_failure) {
       std::rethrow_exception(restoration_failure);
+    }
+    if (persistence_failure) {
+      std::rethrow_exception(persistence_failure);
     }
   }
 
@@ -19823,6 +19893,24 @@ class LiveInstrumentationController {
     }
     JoinLiveInstrumentationWorker(record);
   }
+
+  void SetExpiredWithoutWorkerWakeForTest() {
+    auto lifecycle_lock = AcquireInstrumentationTimedLock(
+        lifecycle_mutex_, std::nullopt, {}, "instrumentation lifecycle");
+    auto mutation_lock = AcquireInstrumentationTimedLock(
+        node_mutation_mutex_, std::nullopt, {}, "node mutation boundary");
+    const std::shared_ptr<LiveInstrumentationRecord> record =
+        CurrentActiveRecordForTest();
+    auto sampling_lock = AcquireInstrumentationTimedLock(
+        record->sampling_boundary, std::nullopt, {}, "sampling boundary");
+    RequireSameActiveRecord(record);
+    std::lock_guard<std::mutex> record_lock(record->mutex);
+    if (record->state != LiveInstrumentationState::kRunning) {
+      throw std::logic_error(
+          "cannot expire terminal instrumentation for a test");
+    }
+    record->deadline = std::chrono::steady_clock::now();
+  }
 #endif
 
  private:
@@ -19865,9 +19953,9 @@ class LiveInstrumentationController {
       requested_id = RequireLiveInstrumentationId(arguments);
     }
 
-    auto mutation_lock =
-        AcquireInstrumentationTimedLock(node_mutation_mutex_, std::nullopt,
-                                        stop_token, "node mutation boundary");
+    auto lifecycle_lock = AcquireInstrumentationTimedLock(
+        lifecycle_mutex_, std::nullopt, stop_token,
+        "instrumentation lifecycle");
     ThrowIfStopRequested(stop_token);
 
     auto record = std::make_shared<LiveInstrumentationRecord>();
@@ -19908,17 +19996,32 @@ class LiveInstrumentationController {
       }
     }
 
-    RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
-    const RuntimeWalletSnapshot wallets = wallet_registry_.Snapshot();
-    ValidateLiveInstrumentationMappings(targets, nodes, wallets, options_);
-    const auto configurations =
-        LiveInstrumentationConfigurations(targets, counters);
-    std::vector<NodePerfCounterAssignment> assignments =
-        ResolvePerfCounterAssignments(configurations, nodes, true, true);
-
+    const bool persistence_may_be_active = !metrics_path_.empty();
+    std::unique_lock<std::timed_mutex> mutation_lock;
     std::vector<NodePerfCounterSnapshot> snapshots;
     bool published = false;
     try {
+      PersistRetainedStateLocked(record->id);
+      mutation_lock =
+          AcquireInstrumentationTimedLock(node_mutation_mutex_, std::nullopt,
+                                          stop_token, "node mutation boundary");
+      {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        RequireOperationalRegistry();
+        if (!registry_->active_id.empty() ||
+            registry_->records.contains(record->id)) {
+          throw McpOperationFailure(
+              "instrumentation_admission_conflict",
+              "instrumentation admission changed before mutation", true);
+        }
+      }
+      RuntimeNodeSnapshot nodes = node_inventory_.Snapshot();
+      const RuntimeWalletSnapshot wallets = wallet_registry_.Snapshot();
+      ValidateLiveInstrumentationMappings(targets, nodes, wallets, options_);
+      const auto configurations =
+          LiveInstrumentationConfigurations(targets, counters);
+      std::vector<NodePerfCounterAssignment> assignments =
+          ResolvePerfCounterAssignments(configurations, nodes, true, true);
       {
         auto process_guard = run_process_state_.Lock();
         snapshots = ReplaceNodePerfCountersTransactional(
@@ -19988,6 +20091,15 @@ class LiveInstrumentationController {
         registry_->records.erase(record->id);
       }
       RollBackNodePerfCounterSnapshots(snapshots, run_process_state_);
+      if (mutation_lock.owns_lock()) {
+        mutation_lock.unlock();
+      }
+      if (persistence_may_be_active) {
+        try {
+          PersistRetainedStateLocked(std::nullopt);
+        } catch (...) {
+        }
+      }
       throw;
     }
   }
@@ -20012,6 +20124,9 @@ class LiveInstrumentationController {
                                           "sample_interval");
     }
 
+    auto lifecycle_lock = AcquireInstrumentationTimedLock(
+        lifecycle_mutex_, std::nullopt, stop_token,
+        "instrumentation lifecycle");
     auto mutation_lock =
         AcquireInstrumentationTimedLock(node_mutation_mutex_, std::nullopt,
                                         stop_token, "node mutation boundary");
@@ -20039,6 +20154,7 @@ class LiveInstrumentationController {
       sampling_lock.unlock();
       mutation_lock.unlock();
       JoinLiveInstrumentationWorker(record);
+      PersistTerminalStateLocked(record);
       if (restoration_failure) {
         throw McpOperationFailure("instrumentation_restoration_failed",
                                   *restoration_failure, true);
@@ -20213,8 +20329,9 @@ class LiveInstrumentationController {
                        std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::seconds(timeout_sec)));
 
+    auto lifecycle_lock = AcquireInstrumentationTimedLock(
+        lifecycle_mutex_, deadline, stop_token, "instrumentation lifecycle");
     std::shared_ptr<LiveInstrumentationRecord> record;
-    boost::json::object result;
     {
       auto mutation_lock = AcquireInstrumentationTimedLock(
           node_mutation_mutex_, deadline, stop_token, "node mutation boundary");
@@ -20248,10 +20365,10 @@ class LiveInstrumentationController {
             "instrumentation.stop could not restore the pre-window "
             "configuration");
       }
-      result = LiveInstrumentationResultJson(*record);
     }
     JoinLiveInstrumentationWorker(record);
-    return result;
+    PersistTerminalStateLocked(record);
+    return LiveInstrumentationResultJson(*record);
   }
 
   boost::json::value Read(McpInformationFamily family,
@@ -20446,6 +20563,37 @@ class LiveInstrumentationController {
         transaction_backend_ ? &*transaction_backend_ : nullptr));
   }
 
+  void PersistRetainedStateLocked(
+      std::optional<std::string_view> active_instrumentation_id) {
+    if (metrics_path_.empty()) {
+      return;
+    }
+    std::vector<std::shared_ptr<LiveInstrumentationRecord>> records;
+    {
+      std::lock_guard<std::mutex> registry_lock(registry_->mutex);
+      records.reserve(registry_->records.size());
+      for (const auto& [id, record] : registry_->records) {
+        static_cast<void>(id);
+        records.push_back(record);
+      }
+    }
+    BoundLiveInstrumentationPersistenceMeasurements(records);
+    boost::json::array history;
+    history.reserve(records.size());
+    for (const std::shared_ptr<LiveInstrumentationRecord>& record : records) {
+      {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (!IsTerminalLiveInstrumentationState(record->state)) {
+          continue;
+        }
+      }
+      history.emplace_back(LiveInstrumentationResourceJson(*record, true));
+    }
+    WriteRetainedInstrumentationHistory(metrics_path_.parent_path(),
+                                        options_.run_id, history,
+                                        active_instrumentation_id);
+  }
+
   void MarkRestored(const std::shared_ptr<LiveInstrumentationRecord>& record,
                     LiveInstrumentationState state,
                     std::optional<std::string> failure) {
@@ -20486,6 +20634,66 @@ class LiveInstrumentationController {
     }
   }
 
+  void MarkPersistenceFailed(
+      const std::shared_ptr<LiveInstrumentationRecord>& record,
+      std::string failure) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(record->mutex);
+      record->state = LiveInstrumentationState::kFailed;
+      if (record->failure) {
+        *record->failure += "; retained history persistence failed: " + failure;
+      } else {
+        record->failure =
+            "retained history persistence failed: " + std::move(failure);
+      }
+      record->changed.notify_all();
+    } catch (...) {
+    }
+  }
+
+  std::optional<std::string> ActiveInstrumentationIdForPersistence() const {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    if (registry_->active_id.empty()) {
+      return std::nullopt;
+    }
+    return registry_->active_id;
+  }
+
+  void PersistTerminalStateLocked(
+      const std::shared_ptr<LiveInstrumentationRecord>& record) noexcept {
+    const std::optional<std::string> active_id =
+        ActiveInstrumentationIdForPersistence();
+    const auto persist = [&] {
+      PersistRetainedStateLocked(
+          active_id ? std::optional<std::string_view>(*active_id)
+                    : std::nullopt);
+    };
+    try {
+      persist();
+      return;
+    } catch (const std::exception& error) {
+      MarkPersistenceFailed(record, error.what());
+    } catch (...) {
+      MarkPersistenceFailed(record, "unknown persistence failure");
+    }
+    try {
+      persist();
+    } catch (...) {
+    }
+  }
+
+  void CheckpointFailedTerminalState(
+      const std::shared_ptr<LiveInstrumentationRecord>& record,
+      std::stop_token stop_token) noexcept {
+    try {
+      auto lifecycle_lock = AcquireInstrumentationTimedLock(
+          lifecycle_mutex_, std::nullopt, stop_token,
+          "instrumentation lifecycle");
+      PersistTerminalStateLocked(record);
+    } catch (...) {
+    }
+  }
+
   void CompleteAtSamplingBoundary(
       const std::shared_ptr<LiveInstrumentationRecord>& record,
       LiveInstrumentationState state,
@@ -20512,6 +20720,9 @@ class LiveInstrumentationController {
       LiveInstrumentationState state, std::optional<std::string> failure,
       std::stop_token worker_stop_token) noexcept {
     try {
+      auto lifecycle_lock = AcquireInstrumentationTimedLock(
+          lifecycle_mutex_, std::nullopt, worker_stop_token,
+          "instrumentation lifecycle");
       auto mutation_lock = AcquireInstrumentationTimedLock(
           node_mutation_mutex_, std::nullopt, worker_stop_token,
           "node mutation boundary");
@@ -20528,6 +20739,9 @@ class LiveInstrumentationController {
         }
       }
       CompleteAtSamplingBoundary(record, state, std::move(failure));
+      sampling_lock.unlock();
+      mutation_lock.unlock();
+      PersistTerminalStateLocked(record);
     } catch (const SimulationCancelled&) {
     } catch (const std::exception& error) {
       if (!worker_stop_token.stop_requested()) {
@@ -20536,12 +20750,14 @@ class LiveInstrumentationController {
             "instrumentation worker could not enter its restoration "
             "boundary: " +
                 std::string(error.what()));
+        CheckpointFailedTerminalState(record, worker_stop_token);
       }
     } catch (...) {
       if (!worker_stop_token.stop_requested()) {
         MarkRestorationFailed(
             record,
             "instrumentation worker could not enter its restoration boundary");
+        CheckpointFailedTerminalState(record, worker_stop_token);
       }
     }
   }
@@ -20585,6 +20801,9 @@ class LiveInstrumentationController {
           }
         }
 
+        auto lifecycle_lock = AcquireInstrumentationTimedLock(
+            lifecycle_mutex_, std::nullopt, worker_stop_token,
+            "instrumentation lifecycle");
         auto mutation_lock = AcquireInstrumentationTimedLock(
             node_mutation_mutex_, std::nullopt, worker_stop_token,
             "node mutation boundary");
@@ -20609,6 +20828,9 @@ class LiveInstrumentationController {
         if (expired) {
           CompleteAtSamplingBoundary(
               record, LiveInstrumentationState::kSucceeded, std::nullopt);
+          sampling_lock.unlock();
+          mutation_lock.unlock();
+          PersistTerminalStateLocked(record);
           return;
         }
         try {
@@ -20622,10 +20844,16 @@ class LiveInstrumentationController {
           CompleteAtSamplingBoundary(
               record, LiveInstrumentationState::kFailed,
               "instrumentation sampling failed: " + std::string(error.what()));
+          sampling_lock.unlock();
+          mutation_lock.unlock();
+          PersistTerminalStateLocked(record);
           return;
         } catch (...) {
           CompleteAtSamplingBoundary(record, LiveInstrumentationState::kFailed,
                                      "instrumentation sampling failed");
+          sampling_lock.unlock();
+          mutation_lock.unlock();
+          PersistTerminalStateLocked(record);
           return;
         }
         {
@@ -20659,6 +20887,7 @@ class LiveInstrumentationController {
   RunProcessState& run_process_state_;
   std::timed_mutex& node_mutation_mutex_;
   std::shared_ptr<LiveInstrumentationRegistry> registry_;
+  std::timed_mutex lifecycle_mutex_;
   std::optional<NodePerfCounterTransactionBackend> transaction_backend_;
   LiveInstrumentationMeasurementCollector measurement_collector_;
 };
@@ -28899,7 +29128,8 @@ int RunRetainedTuiWithMcp(const Options& cli_options,
 class LiveInstrumentationHarnessForTest::Impl {
  public:
   Impl(std::vector<std::string> node_ids,
-       std::chrono::milliseconds default_sample_interval)
+       std::chrono::milliseconds default_sample_interval,
+       std::filesystem::path run_root)
       : node_inventory_(CheckedNodeCapacity(node_ids.size())) {
     if (node_ids.empty()) {
       throw std::invalid_argument(
@@ -29001,8 +29231,15 @@ class LiveInstrumentationHarnessForTest::Impl {
           }
           return records;
         };
+    std::filesystem::path metrics_path;
+    std::filesystem::path events_path;
+    if (!run_root.empty()) {
+      EnsureDirectory(run_root);
+      metrics_path = run_root / "metrics.jsonl";
+      events_path = run_root / "events.jsonl";
+    }
     controller_ = std::make_unique<LiveInstrumentationController>(
-        options_, std::filesystem::path{}, std::filesystem::path{}, *driver_,
+        options_, std::move(metrics_path), std::move(events_path), *driver_,
         node_inventory_, wallet_registry_, run_process_state_,
         node_mutation_mutex_, registry_, std::move(backend),
         std::move(collector));
@@ -29080,6 +29317,10 @@ class LiveInstrumentationHarnessForTest::Impl {
 
   void ExpireNow() { controller_->ExpireNowForTest(); }
 
+  void SetExpiredWithoutWorkerWake() {
+    controller_->SetExpiredWithoutWorkerWakeForTest();
+  }
+
   void Shutdown(bool run_failed) {
     if (shutdown_) {
       return;
@@ -29117,9 +29358,10 @@ class LiveInstrumentationHarnessForTest::Impl {
 
 LiveInstrumentationHarnessForTest::LiveInstrumentationHarnessForTest(
     std::vector<std::string> node_ids,
-    std::chrono::milliseconds default_sample_interval)
-    : impl_(std::make_unique<Impl>(std::move(node_ids),
-                                   default_sample_interval)) {}
+    std::chrono::milliseconds default_sample_interval,
+    std::filesystem::path run_root)
+    : impl_(std::make_unique<Impl>(std::move(node_ids), default_sample_interval,
+                                   std::move(run_root))) {}
 
 LiveInstrumentationHarnessForTest::~LiveInstrumentationHarnessForTest() =
     default;
@@ -29160,6 +29402,10 @@ void LiveInstrumentationHarnessForTest::ApplyPerfMutation(
 void LiveInstrumentationHarnessForTest::SampleNow() { impl_->SampleNow(); }
 
 void LiveInstrumentationHarnessForTest::ExpireNow() { impl_->ExpireNow(); }
+
+void LiveInstrumentationHarnessForTest::SetExpiredWithoutWorkerWake() {
+  impl_->SetExpiredWithoutWorkerWake();
+}
 
 void LiveInstrumentationHarnessForTest::Shutdown(bool run_failed) {
   impl_->Shutdown(run_failed);

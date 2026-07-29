@@ -1,6 +1,8 @@
 #include "bbp/run_report.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <boost/json/array.hpp>
@@ -9,6 +11,7 @@
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -25,7 +28,10 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/mcp_operation_service.h"
+#include "bbp/mcp_registry.h"
 #include "bbp/operator_command_status.h"
+#include "bbp/perf_counter.h"
 #include "bbp/simulation_command.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulation_registry.h"
@@ -58,6 +64,601 @@ constexpr std::size_t kMaximumTransactionLoadAttemptSummaries =
     kMaximumRunReportSummaryRecords;
 constexpr std::size_t kMaximumTransactionLoadCompletionSummaries =
     kMaximumRunReportSummaryRecords;
+constexpr std::size_t kMaximumRetainedInstrumentationMeasurementRecords = 1024U;
+constexpr std::uint64_t kRetainedInstrumentationHistoryVersion = 1U;
+constexpr std::string_view kRetainedInstrumentationHistoryFormat =
+    "bbp.instrumentation_history";
+
+void ThrowIfReportCancelled(std::stop_token stop_token);
+
+const boost::json::value& RequireInstrumentationHistoryField(
+    const boost::json::object& object, std::string_view field,
+    std::string_view context) {
+  const boost::json::value* value = object.if_contains(field);
+  if (value == nullptr) {
+    throw std::runtime_error("retained instrumentation " +
+                             std::string(context) +
+                             " is missing field: " + std::string(field));
+  }
+  return *value;
+}
+
+void RequireInstrumentationHistoryFields(
+    const boost::json::object& object,
+    std::initializer_list<std::string_view> fields, std::string_view context) {
+  if (object.size() != fields.size()) {
+    throw std::runtime_error("retained instrumentation " +
+                             std::string(context) +
+                             " has an unexpected field count");
+  }
+  for (const auto& entry : object) {
+    if (std::find(fields.begin(), fields.end(), entry.key()) == fields.end()) {
+      throw std::runtime_error(
+          "retained instrumentation " + std::string(context) +
+          " has an unsupported field: " + std::string(entry.key()));
+    }
+  }
+}
+
+std::uint64_t RequireInstrumentationHistoryUint(
+    const boost::json::object& object, std::string_view field,
+    std::string_view context) {
+  const boost::json::value& value =
+      RequireInstrumentationHistoryField(object, field, context);
+  if (value.is_uint64()) {
+    return value.as_uint64();
+  }
+  if (value.is_int64() && value.as_int64() >= 0) {
+    return static_cast<std::uint64_t>(value.as_int64());
+  }
+  throw std::runtime_error(
+      "retained instrumentation " + std::string(context) +
+      " field must be a non-negative integer: " + std::string(field));
+}
+
+void RequireInstrumentationHistoryNullableUint(
+    const boost::json::object& object, std::string_view field,
+    std::string_view context) {
+  const boost::json::value& value =
+      RequireInstrumentationHistoryField(object, field, context);
+  if (!value.is_null()) {
+    static_cast<void>(
+        RequireInstrumentationHistoryUint(object, field, context));
+  }
+}
+
+std::string_view RequireInstrumentationHistoryString(
+    const boost::json::object& object, std::string_view field,
+    std::string_view context) {
+  const boost::json::value& value =
+      RequireInstrumentationHistoryField(object, field, context);
+  if (!value.is_string() || value.as_string().empty()) {
+    throw std::runtime_error(
+        "retained instrumentation " + std::string(context) +
+        " field must be a non-empty string: " + std::string(field));
+  }
+  return value.as_string();
+}
+
+void ValidateRetainedInstrumentationTarget(const boost::json::value& value,
+                                           std::stop_token stop_token) {
+  ThrowIfReportCancelled(stop_token);
+  if (!value.is_object()) {
+    throw std::runtime_error(
+        "retained instrumentation target must be an object");
+  }
+  const boost::json::object& target = value.as_object();
+  RequireInstrumentationHistoryFields(target, {"kind", "id", "node_ids"},
+                                      "target");
+  const std::optional<PerfCounterTargetKind> kind =
+      PerfCounterTargetKindFromName(
+          RequireInstrumentationHistoryString(target, "kind", "target"));
+  if (!kind) {
+    throw std::runtime_error(
+        "retained instrumentation target has an unknown kind");
+  }
+  const std::string_view target_id =
+      RequireInstrumentationHistoryString(target, "id", "target");
+  ValidateMcpIdentifier(target_id, "retained instrumentation target id");
+  const boost::json::value& node_ids_value =
+      RequireInstrumentationHistoryField(target, "node_ids", "target");
+  if (!node_ids_value.is_array() || node_ids_value.as_array().empty() ||
+      node_ids_value.as_array().size() > kMcpMaximumSelectionItems) {
+    throw std::runtime_error(
+        "retained instrumentation target node_ids is not a bounded array");
+  }
+  std::set<std::string, std::less<>> unique_node_ids;
+  for (const boost::json::value& node_id : node_ids_value.as_array()) {
+    ThrowIfReportCancelled(stop_token);
+    if (!node_id.is_string() || node_id.as_string().empty()) {
+      throw std::runtime_error(
+          "retained instrumentation target node_id must be a non-empty "
+          "string");
+    }
+    ValidateMcpIdentifier(node_id.as_string(),
+                          "retained instrumentation target node_id");
+    if (!unique_node_ids.emplace(node_id.as_string()).second) {
+      throw std::runtime_error(
+          "retained instrumentation target contains a duplicate node_id");
+    }
+  }
+  if (*kind != PerfCounterTargetKind::kGroup &&
+      node_ids_value.as_array().size() != 1U) {
+    throw std::runtime_error(
+        "retained instrumentation non-group target must resolve one node");
+  }
+  if ((*kind == PerfCounterTargetKind::kNode ||
+       *kind == PerfCounterTargetKind::kCgroup) &&
+      target_id != node_ids_value.as_array().front().as_string()) {
+    throw std::runtime_error(
+        "retained instrumentation node target id does not match its node");
+  }
+  if (*kind == PerfCounterTargetKind::kWallet &&
+      !IsCanonicalWalletPerfTargetId(target_id)) {
+    throw std::runtime_error(
+        "retained instrumentation wallet target id is not canonical");
+  }
+}
+
+void ValidateRetainedInstrumentationRecord(
+    const boost::json::value& value, std::stop_token stop_token,
+    std::optional<std::string_view> active_instrumentation_id) {
+  ThrowIfReportCancelled(stop_token);
+  if (!value.is_object()) {
+    throw std::runtime_error(
+        "retained instrumentation history record must be an object");
+  }
+  const boost::json::object& record = value.as_object();
+  RequireInstrumentationHistoryFields(
+      record,
+      {"instrumentation_id", "state", "sample_count", "targets", "counters",
+       "sample_interval_ms", "started_at_ms", "configuration_revision",
+       "retained_measurement_count", "measurements_truncated",
+       "dropped_measurement_count", "window_ms", "completed_at_ms", "failure",
+       "measurement_records"},
+      "history record");
+  const std::string_view instrumentation_id =
+      RequireInstrumentationHistoryString(record, "instrumentation_id",
+                                          "history record");
+  ValidateMcpIdentifier(instrumentation_id,
+                        "retained instrumentation instrumentation_id");
+  const std::string_view state =
+      RequireInstrumentationHistoryString(record, "state", "history record");
+  if (state != "succeeded" && state != "cancelled" && state != "failed") {
+    throw std::runtime_error(
+        "retained instrumentation history record is not terminal");
+  }
+  const std::uint64_t sample_count = RequireInstrumentationHistoryUint(
+      record, "sample_count", "history record");
+  if (sample_count == 0U) {
+    throw std::runtime_error(
+        "retained instrumentation sample_count must be positive");
+  }
+  const boost::json::value& targets =
+      RequireInstrumentationHistoryField(record, "targets", "history record");
+  if (!targets.is_array() || targets.as_array().empty() ||
+      targets.as_array().size() > kMcpMaximumSelectionItems) {
+    throw std::runtime_error(
+        "retained instrumentation targets is not a bounded array");
+  }
+  std::set<std::string, std::less<>> target_ids;
+  std::set<std::string, std::less<>> resolved_node_ids;
+  for (const boost::json::value& target : targets.as_array()) {
+    ValidateRetainedInstrumentationTarget(target, stop_token);
+    const boost::json::object& object = target.as_object();
+    if (!target_ids.emplace(object.at("id").as_string()).second) {
+      throw std::runtime_error(
+          "retained instrumentation targets contain a duplicate id");
+    }
+    for (const boost::json::value& node_id : object.at("node_ids").as_array()) {
+      if (!resolved_node_ids.emplace(node_id.as_string()).second) {
+        throw std::runtime_error(
+            "retained instrumentation targets resolve a node more than once");
+      }
+    }
+  }
+  const boost::json::value& counters =
+      RequireInstrumentationHistoryField(record, "counters", "history record");
+  if (!counters.is_array() || counters.as_array().empty() ||
+      counters.as_array().size() > DefaultPerfCounterKinds().size()) {
+    throw std::runtime_error(
+        "retained instrumentation counters is not a bounded array");
+  }
+  std::set<PerfCounterKind> unique_counters;
+  for (const boost::json::value& counter : counters.as_array()) {
+    ThrowIfReportCancelled(stop_token);
+    if (!counter.is_string()) {
+      throw std::runtime_error(
+          "retained instrumentation counter must be a string");
+    }
+    const std::optional<PerfCounterKind> kind =
+        PerfCounterKindFromName(counter.as_string());
+    if (!kind) {
+      throw std::runtime_error(
+          "retained instrumentation counter is unsupported");
+    }
+    if (!unique_counters.insert(*kind).second) {
+      throw std::runtime_error(
+          "retained instrumentation counters contain a duplicate");
+    }
+  }
+  // This is the stable range a live producer can admit from the clock epoch.
+  // Remaining capacity from "now" shrinks and would invalidate old records.
+  const auto remaining = std::chrono::steady_clock::time_point::max() -
+                         std::chrono::steady_clock::time_point{};
+  const auto maximum_duration_count =
+      std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+  const std::uint64_t maximum_duration =
+      maximum_duration_count > 0
+          ? static_cast<std::uint64_t>(maximum_duration_count)
+          : 0U;
+  const std::uint64_t sample_interval = RequireInstrumentationHistoryUint(
+      record, "sample_interval_ms", "history record");
+  if (sample_interval == 0U || sample_interval > maximum_duration) {
+    throw std::runtime_error(
+        "retained instrumentation sample_interval_ms is outside the "
+        "milliseconds range");
+  }
+  static_cast<void>(RequireInstrumentationHistoryUint(record, "started_at_ms",
+                                                      "history record"));
+  if (RequireInstrumentationHistoryUint(record, "configuration_revision",
+                                        "history record") == 0U) {
+    throw std::runtime_error(
+        "retained instrumentation configuration revision must be positive");
+  }
+  const boost::json::value& window =
+      RequireInstrumentationHistoryField(record, "window_ms", "history record");
+  RequireInstrumentationHistoryNullableUint(record, "window_ms",
+                                            "history record");
+  if (!window.is_null()) {
+    const std::uint64_t window_ms = RequireInstrumentationHistoryUint(
+        record, "window_ms", "history record");
+    if (window_ms == 0U || window_ms > maximum_duration) {
+      throw std::runtime_error(
+          "retained instrumentation window_ms is outside the milliseconds "
+          "range");
+    }
+  }
+  const boost::json::value& completed = RequireInstrumentationHistoryField(
+      record, "completed_at_ms", "history record");
+  RequireInstrumentationHistoryNullableUint(record, "completed_at_ms",
+                                            "history record");
+  const boost::json::value& failure =
+      RequireInstrumentationHistoryField(record, "failure", "history record");
+  if (state == "failed") {
+    if (!failure.is_string() || failure.as_string().empty()) {
+      throw std::runtime_error(
+          "failed retained instrumentation requires a failure");
+    }
+  } else if (!failure.is_null()) {
+    throw std::runtime_error(
+        "non-failed retained instrumentation must not contain a failure");
+  }
+  const bool active_record = active_instrumentation_id &&
+                             instrumentation_id == *active_instrumentation_id;
+  if (completed.is_null() && !(active_record && state == "failed")) {
+    throw std::runtime_error(
+        "completed retained instrumentation requires a completion timestamp");
+  }
+  if (active_record && (state != "failed" || !completed.is_null())) {
+    throw std::runtime_error(
+        "active retained instrumentation history record must describe an "
+        "unrestored failure");
+  }
+  const boost::json::value& truncated = RequireInstrumentationHistoryField(
+      record, "measurements_truncated", "history record");
+  if (!truncated.is_bool()) {
+    throw std::runtime_error(
+        "retained instrumentation measurements_truncated must be boolean");
+  }
+  const std::uint64_t dropped = RequireInstrumentationHistoryUint(
+      record, "dropped_measurement_count", "history record");
+  if (truncated.as_bool() != (dropped != 0U)) {
+    throw std::runtime_error(
+        "retained instrumentation truncation metadata is inconsistent");
+  }
+  const boost::json::value& measurements = RequireInstrumentationHistoryField(
+      record, "measurement_records", "history record");
+  if (!measurements.is_array() ||
+      measurements.as_array().size() >
+          kMaximumRetainedInstrumentationMeasurementRecords) {
+    throw std::runtime_error(
+        "retained instrumentation measurements is not a bounded array");
+  }
+  if (RequireInstrumentationHistoryUint(record, "retained_measurement_count",
+                                        "history record") !=
+      measurements.as_array().size()) {
+    throw std::runtime_error(
+        "retained instrumentation measurement count is inconsistent");
+  }
+  std::uint64_t previous_sample = 0U;
+  for (const boost::json::value& measurement : measurements.as_array()) {
+    ThrowIfReportCancelled(stop_token);
+    if (!measurement.is_object()) {
+      throw std::runtime_error(
+          "retained instrumentation measurement must be an object");
+    }
+    const boost::json::object& object = measurement.as_object();
+    RequireInstrumentationHistoryFields(object, {"sample", "record"},
+                                        "measurement");
+    const std::uint64_t sample =
+        RequireInstrumentationHistoryUint(object, "sample", "measurement");
+    if (sample == 0U || sample > sample_count) {
+      throw std::runtime_error(
+          "retained instrumentation measurement sample is out of range");
+    }
+    if (sample < previous_sample) {
+      throw std::runtime_error(
+          "retained instrumentation measurements are out of order");
+    }
+    previous_sample = sample;
+    if (!RequireInstrumentationHistoryField(object, "record", "measurement")
+             .is_object()) {
+      throw std::runtime_error(
+          "retained instrumentation measurement record must be an object");
+    }
+  }
+}
+
+void ValidateRetainedInstrumentationRecords(
+    const boost::json::array& records, std::stop_token stop_token = {},
+    std::optional<std::string_view> active_instrumentation_id = std::nullopt) {
+  if (records.size() > kMaximumRunReportSummaryRecords) {
+    throw std::runtime_error(
+        "retained instrumentation history exceeds its record bound");
+  }
+  std::set<std::string, std::less<>> ids;
+  for (const boost::json::value& record : records) {
+    ThrowIfReportCancelled(stop_token);
+    ValidateRetainedInstrumentationRecord(record, stop_token,
+                                          active_instrumentation_id);
+    const std::string id(
+        record.as_object().at("instrumentation_id").as_string());
+    if (!ids.insert(id).second) {
+      throw std::runtime_error(
+          "retained instrumentation history contains a duplicate identity");
+    }
+  }
+}
+
+void NormalizeRetainedInstrumentationUnsignedFields(
+    boost::json::array& records) {
+  for (boost::json::value& value : records) {
+    boost::json::object& record = value.as_object();
+    for (const std::string_view field :
+         {"sample_count", "started_at_ms", "configuration_revision",
+          "retained_measurement_count", "dropped_measurement_count"}) {
+      record[field] =
+          RequireInstrumentationHistoryUint(record, field, "history record");
+    }
+    if (!record.at("completed_at_ms").is_null()) {
+      record["completed_at_ms"] = RequireInstrumentationHistoryUint(
+          record, "completed_at_ms", "history record");
+    }
+    for (boost::json::value& measurement :
+         record.at("measurement_records").as_array()) {
+      boost::json::object& object = measurement.as_object();
+      object["sample"] =
+          RequireInstrumentationHistoryUint(object, "sample", "measurement");
+    }
+  }
+}
+
+std::uint64_t SaturatingInstrumentationCountAdd(std::uint64_t left,
+                                                std::uint64_t right) {
+  if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return left + right;
+}
+
+boost::json::object RetainedInstrumentationDocument(
+    std::string_view run_id, const boost::json::array& records,
+    std::optional<std::string_view> active_instrumentation_id) {
+  boost::json::object document{
+      {"format", kRetainedInstrumentationHistoryFormat},
+      {"version", kRetainedInstrumentationHistoryVersion},
+      {"run_id", run_id},
+      {"records", records},
+  };
+  if (active_instrumentation_id) {
+    document["active_instrumentation_id"] = *active_instrumentation_id;
+  } else {
+    document["active_instrumentation_id"] = nullptr;
+  }
+  return document;
+}
+
+boost::json::array BoundRetainedInstrumentationRecords(
+    std::string_view run_id, const boost::json::array& records,
+    std::optional<std::string_view> active_instrumentation_id) {
+  ValidateRetainedInstrumentationRecords(records, {},
+                                         active_instrumentation_id);
+  boost::json::array bounded = records;
+  std::vector<boost::json::array> original_measurements;
+  original_measurements.reserve(bounded.size());
+  for (boost::json::value& value : bounded) {
+    boost::json::object& record = value.as_object();
+    original_measurements.push_back(
+        std::move(record.at("measurement_records").as_array()));
+    record["measurement_records"] = boost::json::array{};
+    const std::uint64_t dropped = SaturatingInstrumentationCountAdd(
+        RequireInstrumentationHistoryUint(record, "dropped_measurement_count",
+                                          "history record"),
+        original_measurements.back().size());
+    record["retained_measurement_count"] = std::uint64_t{0U};
+    record["dropped_measurement_count"] = dropped;
+    record["measurements_truncated"] = dropped != 0U;
+  }
+
+  const std::size_t base_size =
+      boost::json::serialize(RetainedInstrumentationDocument(
+                                 run_id, bounded, active_instrumentation_id))
+          .size();
+  if (base_size >= kMcpMaximumRetainedResultBytes) {
+    throw std::runtime_error(
+        "retained instrumentation metadata exceeds its byte bound");
+  }
+  constexpr std::size_t kSerializationSafetyMargin = 64U * 1024U;
+  std::size_t remaining =
+      base_size + kSerializationSafetyMargin >= kMcpMaximumRetainedResultBytes
+          ? 0U
+          : kMcpMaximumRetainedResultBytes - base_size -
+                kSerializationSafetyMargin;
+
+  std::vector<std::size_t> newest_first(bounded.size());
+  for (std::size_t index = 0U; index < newest_first.size(); ++index) {
+    newest_first[index] = index;
+  }
+  std::sort(
+      newest_first.begin(), newest_first.end(),
+      [&bounded](std::size_t left, std::size_t right) {
+        const std::uint64_t left_started =
+            bounded[left].as_object().at("started_at_ms").is_uint64()
+                ? bounded[left].as_object().at("started_at_ms").as_uint64()
+                : static_cast<std::uint64_t>(
+                      bounded[left].as_object().at("started_at_ms").as_int64());
+        const std::uint64_t right_started =
+            bounded[right].as_object().at("started_at_ms").is_uint64()
+                ? bounded[right].as_object().at("started_at_ms").as_uint64()
+                : static_cast<std::uint64_t>(bounded[right]
+                                                 .as_object()
+                                                 .at("started_at_ms")
+                                                 .as_int64());
+        return left_started > right_started ||
+               (left_started == right_started && left > right);
+      });
+
+  for (const std::size_t index : newest_first) {
+    boost::json::array retained_reverse;
+    const boost::json::array& original = original_measurements[index];
+    for (auto measurement = original.rbegin(); measurement != original.rend();
+         ++measurement) {
+      const std::size_t serialized_size =
+          boost::json::serialize(*measurement).size() + 1U;
+      if (serialized_size > remaining) {
+        break;
+      }
+      retained_reverse.push_back(*measurement);
+      remaining -= serialized_size;
+    }
+    std::reverse(retained_reverse.begin(), retained_reverse.end());
+    boost::json::object& record = bounded[index].as_object();
+    const std::uint64_t original_dropped = RequireInstrumentationHistoryUint(
+        records[index].as_object(), "dropped_measurement_count",
+        "history record");
+    const std::uint64_t additionally_dropped =
+        original.size() - retained_reverse.size();
+    const std::uint64_t dropped = SaturatingInstrumentationCountAdd(
+        original_dropped, additionally_dropped);
+    record["retained_measurement_count"] =
+        static_cast<std::uint64_t>(retained_reverse.size());
+    record["dropped_measurement_count"] = dropped;
+    record["measurements_truncated"] = dropped != 0U;
+    record["measurement_records"] = std::move(retained_reverse);
+  }
+
+  ValidateRetainedInstrumentationRecords(bounded, {},
+                                         active_instrumentation_id);
+  const std::size_t final_size =
+      boost::json::serialize(RetainedInstrumentationDocument(
+                                 run_id, bounded, active_instrumentation_id))
+          .size();
+  if (final_size >= kMcpMaximumRetainedResultBytes) {
+    throw std::runtime_error(
+        "retained instrumentation history exceeds its byte bound");
+  }
+  return bounded;
+}
+
+[[noreturn]] void ThrowRetainedInstrumentationIo(std::string_view action,
+                                                 int error) {
+  throw std::runtime_error(
+      std::string(action) + ": " +
+      std::error_code(error, std::generic_category()).message());
+}
+
+void WriteRetainedInstrumentationDocument(const std::filesystem::path& run_root,
+                                          std::string_view contents) {
+  constexpr std::string_view kTemporaryName =
+      ".instrumentation-history.json.tmp";
+  const int directory_fd =
+      open(run_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (directory_fd < 0) {
+    ThrowRetainedInstrumentationIo(
+        "open retained instrumentation run directory failed", errno);
+  }
+  int output_fd = -1;
+  bool published = false;
+  try {
+    const std::string temporary_name(kTemporaryName);
+    if (unlinkat(directory_fd, temporary_name.c_str(), 0) != 0 &&
+        errno != ENOENT) {
+      ThrowRetainedInstrumentationIo(
+          "remove stale retained instrumentation temporary file failed", errno);
+    }
+    output_fd =
+        openat(directory_fd, temporary_name.c_str(),
+               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (output_fd < 0) {
+      ThrowRetainedInstrumentationIo(
+          "create retained instrumentation temporary file failed", errno);
+    }
+    std::size_t offset = 0U;
+    while (offset < contents.size()) {
+      const ssize_t written =
+          write(output_fd, contents.data() + offset, contents.size() - offset);
+      if (written < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        ThrowRetainedInstrumentationIo(
+            "write retained instrumentation history failed", errno);
+      }
+      if (written == 0) {
+        ThrowRetainedInstrumentationIo(
+            "write retained instrumentation history made no progress", EIO);
+      }
+      offset += static_cast<std::size_t>(written);
+    }
+    if (fsync(output_fd) != 0) {
+      ThrowRetainedInstrumentationIo(
+          "sync retained instrumentation history failed", errno);
+    }
+    if (close(output_fd) != 0) {
+      const int close_error = errno;
+      output_fd = -1;
+      ThrowRetainedInstrumentationIo(
+          "close retained instrumentation history failed", close_error);
+    }
+    output_fd = -1;
+    const std::string output_name(kRetainedInstrumentationHistoryFileName);
+    if (renameat(directory_fd, temporary_name.c_str(), directory_fd,
+                 output_name.c_str()) != 0) {
+      ThrowRetainedInstrumentationIo(
+          "publish retained instrumentation history failed", errno);
+    }
+    published = true;
+    if (fsync(directory_fd) != 0) {
+      ThrowRetainedInstrumentationIo(
+          "sync retained instrumentation run directory failed", errno);
+    }
+  } catch (...) {
+    if (output_fd >= 0) {
+      static_cast<void>(close(output_fd));
+    }
+    if (!published) {
+      const std::string temporary_name(kTemporaryName);
+      static_cast<void>(unlinkat(directory_fd, temporary_name.c_str(), 0));
+    }
+    static_cast<void>(close(directory_fd));
+    throw;
+  }
+  if (close(directory_fd) != 0) {
+    ThrowRetainedInstrumentationIo(
+        "close retained instrumentation run directory failed", errno);
+  }
+}
 
 void ThrowIfReportCancelled(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
@@ -3226,6 +3827,107 @@ std::string BuildNodeReportJson(const std::filesystem::path& run_root,
   report["node"] = *selected_node;
   ThrowIfReportCancelled(stop_token);
   return boost::json::serialize(report);
+}
+
+void WriteRetainedInstrumentationHistory(
+    const std::filesystem::path& run_root, std::string_view run_id,
+    const boost::json::array& records,
+    std::optional<std::string_view> active_instrumentation_id) {
+  RequireSafeRunId(run_id);
+  if (active_instrumentation_id) {
+    ValidateMcpIdentifier(*active_instrumentation_id,
+                          "active retained instrumentation id");
+  }
+  const boost::json::array bounded = BoundRetainedInstrumentationRecords(
+      run_id, records, active_instrumentation_id);
+  std::string contents = boost::json::serialize(RetainedInstrumentationDocument(
+      run_id, bounded, active_instrumentation_id));
+  if (contents.size() >= kMcpMaximumRetainedResultBytes) {
+    throw std::logic_error(
+        "bounded retained instrumentation history exceeded its byte limit");
+  }
+  contents.push_back('\n');
+  WriteRetainedInstrumentationDocument(run_root, contents);
+}
+
+boost::json::array ReadRetainedInstrumentationHistory(
+    const std::filesystem::path& run_root, std::string_view run_id,
+    std::stop_token stop_token) {
+  RequireSafeRunId(run_id);
+  ThrowIfReportCancelled(stop_token);
+  const std::filesystem::path path =
+      run_root / kRetainedInstrumentationHistoryFileName;
+  std::error_code error;
+  const std::filesystem::file_status status =
+      std::filesystem::symlink_status(path, error);
+  if ((!error && status.type() == std::filesystem::file_type::not_found) ||
+      error == std::errc::no_such_file_or_directory) {
+    return {};
+  }
+  if (error) {
+    throw std::runtime_error(
+        "inspect retained instrumentation history failed: " + error.message());
+  }
+
+  const std::string contents =
+      ReadText(path, kMcpMaximumRetainedResultBytes, stop_token);
+  ThrowIfReportCancelled(stop_token);
+  boost::json::value parsed;
+  try {
+    parsed = boost::json::parse(contents);
+  } catch (const std::exception& parse_error) {
+    throw std::runtime_error("parse retained instrumentation history failed: " +
+                             std::string(parse_error.what()));
+  }
+  if (!parsed.is_object()) {
+    throw std::runtime_error(
+        "retained instrumentation history root must be an object");
+  }
+  const boost::json::object& document = parsed.as_object();
+  RequireInstrumentationHistoryFields(
+      document,
+      {"format", "version", "run_id", "records", "active_instrumentation_id"},
+      "document");
+  if (RequireInstrumentationHistoryString(document, "format", "document") !=
+      kRetainedInstrumentationHistoryFormat) {
+    throw std::runtime_error(
+        "retained instrumentation history format is unsupported");
+  }
+  if (RequireInstrumentationHistoryUint(document, "version", "document") !=
+      kRetainedInstrumentationHistoryVersion) {
+    throw std::runtime_error(
+        "retained instrumentation history version is unsupported");
+  }
+  if (RequireInstrumentationHistoryString(document, "run_id", "document") !=
+      run_id) {
+    throw std::runtime_error(
+        "retained instrumentation history run_id does not match the run");
+  }
+  const boost::json::value& active = RequireInstrumentationHistoryField(
+      document, "active_instrumentation_id", "document");
+  if (!active.is_null()) {
+    if (!active.is_string() || active.as_string().empty()) {
+      throw std::runtime_error(
+          "retained instrumentation active identity is malformed");
+    }
+    ValidateMcpIdentifier(active.as_string(),
+                          "retained instrumentation active identity");
+    throw std::runtime_error(
+        "retained run ended with an incomplete active instrumentation "
+        "window: " +
+        std::string(active.as_string()));
+  }
+  const boost::json::value& records_value =
+      RequireInstrumentationHistoryField(document, "records", "document");
+  if (!records_value.is_array()) {
+    throw std::runtime_error(
+        "retained instrumentation history records must be an array");
+  }
+  boost::json::array records = records_value.as_array();
+  ValidateRetainedInstrumentationRecords(records, stop_token);
+  NormalizeRetainedInstrumentationUnsignedFields(records);
+  ThrowIfReportCancelled(stop_token);
+  return records;
 }
 
 }  // namespace bbp

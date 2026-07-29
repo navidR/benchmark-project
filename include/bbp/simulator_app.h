@@ -56,7 +56,8 @@ class LiveInstrumentationHarnessForTest {
   explicit LiveInstrumentationHarnessForTest(
       std::vector<std::string> node_ids,
       std::chrono::milliseconds default_sample_interval =
-          std::chrono::hours(24));
+          std::chrono::hours(24),
+      std::filesystem::path run_root = {});
   ~LiveInstrumentationHarnessForTest();
 
   LiveInstrumentationHarnessForTest(const LiveInstrumentationHarnessForTest&) =
@@ -73,6 +74,7 @@ class LiveInstrumentationHarnessForTest {
   void ApplyPerfMutation(std::string_view node_id, PerfCounterKind counter);
   void SampleNow();
   void ExpireNow();
+  void SetExpiredWithoutWorkerWake();
   void Shutdown(bool run_failed = false);
 
  private:
