@@ -17,14 +17,30 @@ struct RunOwnership {
   bool operator==(const RunOwnership&) const = default;
 };
 
+struct RunOwnershipMarkerIdentity {
+  std::uintmax_t device = 0U;
+  std::uintmax_t inode = 0U;
+
+  bool operator==(const RunOwnershipMarkerIdentity&) const = default;
+};
+
 RunOwnership CreateRunOwnership(std::string run_id,
                                 const std::filesystem::path& run_root);
+RunOwnership CreateRunOwnershipAt(std::string run_id,
+                                  const std::filesystem::path& run_root,
+                                  int run_root_fd);
 RunOwnership LoadRunOwnership(std::string run_id,
                               const std::filesystem::path& run_root);
 RunOwnership LoadRunOwnership(std::string run_id,
                               const std::filesystem::path& run_root,
                               std::stop_token stop_token);
+RunOwnership LoadRunOwnershipAt(std::string run_id,
+                                const std::filesystem::path& run_root,
+                                int run_root_fd,
+                                std::stop_token stop_token = {});
 void WriteRunOwnershipMarker(const RunOwnership& ownership);
+RunOwnershipMarkerIdentity WriteRunOwnershipMarkerAt(
+    const RunOwnership& ownership, int run_root_fd);
 
 std::string RunInterfaceName(const RunOwnership& ownership,
                              std::uint32_t node_index, char suffix);

@@ -14,6 +14,7 @@ void InitLogging();
 void SetMinimumLogLevel(LogLevel level);
 void SetConsoleLoggingEnabled(bool enabled);
 void AttachRunLogFile(const std::filesystem::path& run_root);
+void AttachRunLogFileAt(const std::filesystem::path& run_root, int run_root_fd);
 void DetachRunLogFile(const std::filesystem::path& run_root,
                       std::optional<std::chrono::steady_clock::time_point>
                           deadline = std::nullopt,

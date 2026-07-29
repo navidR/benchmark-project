@@ -21,6 +21,7 @@ constexpr std::array kHostOperations = {
     McpOperationKind::kValidateScenario,
     McpOperationKind::kResolveScenario,
     McpOperationKind::kLaunchRun,
+    McpOperationKind::kReplayRun,
     McpOperationKind::kStopRun,
     McpOperationKind::kCleanRun,
     McpOperationKind::kReportRun,
@@ -217,8 +218,8 @@ McpHostApplication::McpHostApplication(Config config)
   if (config_.host_id.empty()) {
     throw std::invalid_argument("MCP host application requires a host id");
   }
-  if (!config_.snapshot_run || !config_.launch_run || !config_.stop_run ||
-      !config_.clean_run) {
+  if (!config_.snapshot_run || !config_.launch_run || !config_.replay_run ||
+      !config_.stop_run || !config_.clean_run) {
     throw std::invalid_argument(
         "MCP host application requires lifecycle callbacks");
   }
@@ -276,6 +277,29 @@ McpOperationPlan McpHostApplication::BuildOperation(
           return McpTypedResult{.family = McpResultFamily::kRunLifecycle,
                                 .value = RunLifecycleJson(config_.launch_run(
                                     scenario, context.stop_token()))};
+        }};
+  }
+
+  if (kind == McpOperationKind::kReplayRun) {
+    const std::string source_run_id = RequireRunId(arguments, "source_run_id");
+    std::optional<std::string> run_id;
+    if (arguments.if_contains("run_id") != nullptr) {
+      run_id = RequireRunId(arguments, "run_id");
+      if (*run_id == source_run_id) {
+        throw std::invalid_argument(
+            "MCP run.replay destination run_id must differ from "
+            "source_run_id");
+      }
+    }
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, source_run_id,
+                     run_id = std::move(run_id)](McpOperationContext& context) {
+          context.ThrowIfCancelled();
+          return McpTypedResult{
+              .family = McpResultFamily::kRunLifecycle,
+              .value = RunLifecycleJson(config_.replay_run(
+                  source_run_id, run_id, context.stop_token()))};
         }};
   }
 

@@ -2,7 +2,10 @@
 
 #include <fcntl.h>
 #include <linux/capability.h>
+#include <linux/fs.h>
+#include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <yaml.h>
@@ -38,6 +41,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -127,6 +131,37 @@ class CombinedStopToken {
   std::stop_source source_;
   std::stop_callback<StopForwarder> first_callback_;
   std::stop_callback<StopForwarder> second_callback_;
+};
+
+class UniqueFileDescriptor {
+ public:
+  explicit UniqueFileDescriptor(int descriptor = -1)
+      : descriptor_(descriptor) {}
+  ~UniqueFileDescriptor() {
+    if (descriptor_ >= 0) {
+      static_cast<void>(close(descriptor_));
+    }
+  }
+
+  UniqueFileDescriptor(const UniqueFileDescriptor&) = delete;
+  UniqueFileDescriptor& operator=(const UniqueFileDescriptor&) = delete;
+  UniqueFileDescriptor(UniqueFileDescriptor&& other) noexcept
+      : descriptor_(std::exchange(other.descriptor_, -1)) {}
+  UniqueFileDescriptor& operator=(UniqueFileDescriptor&& other) noexcept {
+    if (this != &other) {
+      if (descriptor_ >= 0) {
+        static_cast<void>(close(descriptor_));
+      }
+      descriptor_ = std::exchange(other.descriptor_, -1);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] int get() const { return descriptor_; }
+  [[nodiscard]] bool valid() const { return descriptor_ >= 0; }
+
+ private:
+  int descriptor_ = -1;
 };
 
 std::unique_ptr<boost::asio::ip::tcp::acceptor> ReserveTcpEndpoint(
@@ -10416,12 +10451,19 @@ boost::json::object BuildResolvedScenarioDocument(
 
 void WriteScenarioFiles(const Options& options,
                         const std::filesystem::path& run_root,
-                        const ChainDriverSpec& chain_spec) {
+                        const ChainDriverSpec& chain_spec,
+                        int reserved_run_root_fd = -1) {
   const boost::json::object resolved =
       BuildResolvedScenarioDocument(options, chain_spec);
-  WriteText(run_root / "resolved-scenario.json",
-            boost::json::serialize(resolved) + "\n");
-  WriteText(run_root / "scenario.yaml", YamlFromJson(resolved));
+  const std::string resolved_text = boost::json::serialize(resolved) + "\n";
+  const std::string yaml_text = YamlFromJson(resolved);
+  if (reserved_run_root_fd >= 0) {
+    CreateTextAt(reserved_run_root_fd, "resolved-scenario.json", resolved_text);
+    CreateTextAt(reserved_run_root_fd, "scenario.yaml", yaml_text);
+  } else {
+    WriteText(run_root / "resolved-scenario.json", resolved_text);
+    WriteText(run_root / "scenario.yaml", yaml_text);
+  }
 }
 
 void LoadCleanupMetadata(const std::filesystem::path& run_root,
@@ -19165,8 +19207,405 @@ std::string SimulationCommandDetail(
   return boost::json::serialize(detail);
 }
 
-void PrepareManagedRunRoot(Options* options) {
+class ReservedManagedRunRoot {
+ public:
+  ReservedManagedRunRoot(std::filesystem::path&& run_root, std::string&& run_id,
+                         std::string&& staging_name,
+                         UniqueFileDescriptor&& parent_fd,
+                         OwnedRunRootIdentity root_identity) noexcept
+      : run_root_(std::move(run_root)),
+        run_id_(std::move(run_id)),
+        staging_name_(std::move(staging_name)),
+        parent_fd_(std::move(parent_fd)),
+        root_identity_(root_identity) {}
+
+  ReservedManagedRunRoot(ReservedManagedRunRoot&& other) noexcept
+      : run_root_(std::move(other.run_root_)),
+        run_id_(std::move(other.run_id_)),
+        staging_name_(std::move(other.staging_name_)),
+        parent_fd_(std::move(other.parent_fd_)),
+        run_root_fd_(std::move(other.run_root_fd_)),
+        root_identity_(other.root_identity_),
+        ownership_(std::move(other.ownership_)),
+        marker_identity_(other.marker_identity_),
+        published_(other.published_),
+        adopted_(other.adopted_.load(std::memory_order_acquire)) {
+    other.disarmed_ = true;
+  }
+
+  ~ReservedManagedRunRoot() {
+    if (disarmed_ || adopted_.load(std::memory_order_acquire) ||
+        !parent_fd_.valid()) {
+      return;
+    }
+    struct stat linked{};
+    const std::string& linked_name = published_ ? run_id_ : staging_name_;
+    if (fstatat(parent_fd_.get(), linked_name.c_str(), &linked,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISDIR(linked.st_mode) || linked.st_uid != geteuid() ||
+        static_cast<std::uintmax_t>(linked.st_dev) != root_identity_.device ||
+        static_cast<std::uintmax_t>(linked.st_ino) != root_identity_.inode) {
+      return;
+    }
+    if (run_root_fd_.valid()) {
+      struct stat opened{};
+      if (fstat(run_root_fd_.get(), &opened) != 0 || !S_ISDIR(opened.st_mode) ||
+          opened.st_dev != linked.st_dev || opened.st_ino != linked.st_ino) {
+        return;
+      }
+    }
+    if (marker_identity_) {
+      const std::string marker_name(kRunMarkerFile);
+      struct stat linked_marker{};
+      if (fstatat(run_root_fd_.get(), marker_name.c_str(), &linked_marker,
+                  AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno != ENOENT) {
+          return;
+        }
+      } else if (!S_ISREG(linked_marker.st_mode) ||
+                 static_cast<std::uintmax_t>(linked_marker.st_dev) !=
+                     marker_identity_->device ||
+                 static_cast<std::uintmax_t>(linked_marker.st_ino) !=
+                     marker_identity_->inode ||
+                 unlinkat(run_root_fd_.get(), marker_name.c_str(), 0) != 0) {
+        return;
+      }
+    }
+    if (fstatat(parent_fd_.get(), linked_name.c_str(), &linked,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISDIR(linked.st_mode) ||
+        static_cast<std::uintmax_t>(linked.st_dev) != root_identity_.device ||
+        static_cast<std::uintmax_t>(linked.st_ino) != root_identity_.inode) {
+      return;
+    }
+    static_cast<void>(
+        unlinkat(parent_fd_.get(), linked_name.c_str(), AT_REMOVEDIR));
+  }
+
+  ReservedManagedRunRoot(const ReservedManagedRunRoot&) = delete;
+  ReservedManagedRunRoot& operator=(const ReservedManagedRunRoot&) = delete;
+  ReservedManagedRunRoot& operator=(ReservedManagedRunRoot&&) = delete;
+
+  void BindOpenedRoot(UniqueFileDescriptor run_root_fd) {
+    if (run_root_fd_.valid() || !run_root_fd.valid()) {
+      throw std::logic_error(
+          "replay reservation root descriptor binding is invalid");
+    }
+    struct stat opened{};
+    if (fstat(run_root_fd.get(), &opened) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "inspect opened replay reservation");
+    }
+    if (!S_ISDIR(opened.st_mode) || opened.st_uid != geteuid() ||
+        static_cast<std::uintmax_t>(opened.st_dev) != root_identity_.device ||
+        static_cast<std::uintmax_t>(opened.st_ino) != root_identity_.inode) {
+      throw std::runtime_error(
+          "opened replay reservation is not the directory BBP created");
+    }
+    run_root_fd_ = std::move(run_root_fd);
+  }
+
+  void Publish() {
+    if (published_ || !run_root_fd_.valid()) {
+      throw std::logic_error("replay run root was published more than once");
+    }
+    if (syscall(SYS_renameat2, parent_fd_.get(), staging_name_.c_str(),
+                parent_fd_.get(), run_id_.c_str(), RENAME_NOREPLACE) != 0) {
+      const int publish_error = errno;
+      if (publish_error == EEXIST) {
+        throw McpOperationFailure(
+            "run_replay_destination_exists",
+            "the replay destination run directory already exists", true);
+      }
+      throw std::system_error(publish_error, std::generic_category(),
+                              "publish reserved replay destination");
+    }
+    published_ = true;
+  }
+
+  void SetOwnership(RunOwnership ownership) {
+    ownership_ = std::move(ownership);
+  }
+
+  void MarkMarkerCreated(RunOwnershipMarkerIdentity marker) {
+    marker_identity_ = OwnedRunRootIdentity{
+        .device = marker.device,
+        .inode = marker.inode,
+    };
+  }
+
+  [[nodiscard]] const RunOwnership& ownership() const {
+    if (!ownership_) {
+      throw std::logic_error("reserved run root has no ownership identity");
+    }
+    return *ownership_;
+  }
+
+  [[nodiscard]] int parent_descriptor() const { return parent_fd_.get(); }
+  [[nodiscard]] int descriptor() const {
+    if (!run_root_fd_.valid()) {
+      throw std::logic_error("replay reservation root is not open");
+    }
+    return run_root_fd_.get();
+  }
+  [[nodiscard]] const std::string& staging_name() const {
+    return staging_name_;
+  }
+  [[nodiscard]] OwnedRunRootIdentity root_identity() const {
+    return root_identity_;
+  }
+
+  void Adopt() { adopted_.store(true, std::memory_order_release); }
+
+ private:
+  std::filesystem::path run_root_;
+  std::string run_id_;
+  std::string staging_name_;
+  UniqueFileDescriptor parent_fd_;
+  UniqueFileDescriptor run_root_fd_;
+  OwnedRunRootIdentity root_identity_;
+  std::optional<RunOwnership> ownership_;
+  std::optional<OwnedRunRootIdentity> marker_identity_;
+  bool published_ = false;
+  std::atomic<bool> adopted_{false};
+  bool disarmed_ = false;
+};
+
+std::string MakeReplayReservationName() {
+  std::array<unsigned char, 16U> random_bytes{};
+  std::size_t offset = 0U;
+  while (offset < random_bytes.size()) {
+    const ssize_t count = getrandom(random_bytes.data() + offset,
+                                    random_bytes.size() - offset, 0U);
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::system_error(errno, std::generic_category(),
+                              "generate replay reservation name");
+    }
+    if (count == 0) {
+      throw std::runtime_error(
+          "replay reservation randomness made no progress");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string name = ".bbp-replay-reservation-";
+  name.reserve(name.size() + random_bytes.size() * 2U);
+  for (const unsigned char byte : random_bytes) {
+    name.push_back(kHex[byte >> 4U]);
+    name.push_back(kHex[byte & 0x0fU]);
+  }
+  return name;
+}
+
+std::shared_ptr<ReservedManagedRunRoot> ReserveManagedReplayRunRoot(
+    const Options& options) {
+  const std::filesystem::path run_root =
+      BenchmarkRunRoot(options).lexically_normal();
+  const std::filesystem::path benchmark_root = run_root.parent_path();
+  try {
+    UniqueFileDescriptor parent_fd(
+        open(benchmark_root.c_str(),
+             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    if (!parent_fd.valid()) {
+      throw std::system_error(errno, std::generic_category(),
+                              "open replay benchmark root");
+    }
+    struct stat opened_parent{};
+    struct stat linked_parent{};
+    if (fstat(parent_fd.get(), &opened_parent) != 0 ||
+        fstatat(AT_FDCWD, benchmark_root.c_str(), &linked_parent,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "inspect replay benchmark root");
+    }
+    if (!S_ISDIR(opened_parent.st_mode) || !S_ISDIR(linked_parent.st_mode) ||
+        opened_parent.st_dev != linked_parent.st_dev ||
+        opened_parent.st_ino != linked_parent.st_ino) {
+      throw std::runtime_error(
+          "replay benchmark root changed during destination reservation");
+    }
+    UniqueFileDescriptor descriptor_reserve(
+        fcntl(parent_fd.get(), F_DUPFD_CLOEXEC, 0));
+    if (!descriptor_reserve.valid()) {
+      throw std::system_error(errno, std::generic_category(),
+                              "reserve replay directory descriptor capacity");
+    }
+    std::filesystem::path reserved_run_root = run_root;
+    std::string reserved_run_id = options.run_id;
+
+    std::string staging_name;
+    constexpr std::size_t kMaximumStagingNameAttempts = 32U;
+    for (std::size_t attempt = 0U; attempt < kMaximumStagingNameAttempts;
+         ++attempt) {
+      staging_name = MakeReplayReservationName();
+      if (mkdirat(parent_fd.get(), staging_name.c_str(), 0700) == 0) {
+        break;
+      }
+      const int create_error = errno;
+      if (create_error != EEXIST) {
+        throw std::system_error(create_error, std::generic_category(),
+                                "create private replay reservation");
+      }
+      staging_name.clear();
+    }
+    if (staging_name.empty()) {
+      throw std::runtime_error(
+          "could not allocate a private replay reservation name");
+    }
+
+    struct stat created_root{};
+    if (fstatat(parent_fd.get(), staging_name.c_str(), &created_root,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      const int inspect_error = errno;
+      throw std::system_error(inspect_error, std::generic_category(),
+                              "inspect created replay reservation");
+    }
+    ReservedManagedRunRoot reservation(
+        std::move(reserved_run_root), std::move(reserved_run_id),
+        std::move(staging_name), std::move(parent_fd),
+        OwnedRunRootIdentity{
+            .device = static_cast<std::uintmax_t>(created_root.st_dev),
+            .inode = static_cast<std::uintmax_t>(created_root.st_ino),
+        });
+
+    descriptor_reserve = UniqueFileDescriptor();
+    int opened_descriptor = -1;
+    do {
+      opened_descriptor = openat(
+          reservation.parent_descriptor(), reservation.staging_name().c_str(),
+          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    } while (opened_descriptor < 0 && errno == EINTR);
+    UniqueFileDescriptor run_root_fd(opened_descriptor);
+    if (!run_root_fd.valid()) {
+      throw std::system_error(errno, std::generic_category(),
+                              "open private replay reservation");
+    }
+    reservation.BindOpenedRoot(std::move(run_root_fd));
+
+    struct stat linked_root{};
+    struct stat final_linked_parent{};
+    if (fstatat(reservation.parent_descriptor(),
+                reservation.staging_name().c_str(), &linked_root,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(AT_FDCWD, benchmark_root.c_str(), &final_linked_parent,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "verify private replay reservation");
+    }
+    if (!S_ISDIR(created_root.st_mode) || !S_ISDIR(linked_root.st_mode) ||
+        created_root.st_uid != geteuid() ||
+        created_root.st_dev != linked_root.st_dev ||
+        created_root.st_ino != linked_root.st_ino ||
+        created_root.st_dev != opened_parent.st_dev ||
+        opened_parent.st_dev != final_linked_parent.st_dev ||
+        opened_parent.st_ino != final_linked_parent.st_ino) {
+      throw std::runtime_error(
+          "private replay reservation failed identity verification");
+    }
+
+    reservation.Publish();
+    struct stat published_root{};
+    struct stat published_path{};
+    struct stat published_parent{};
+    if (fstatat(reservation.parent_descriptor(), options.run_id.c_str(),
+                &published_root, AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(AT_FDCWD, run_root.c_str(), &published_path,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(AT_FDCWD, benchmark_root.c_str(), &published_parent,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "verify published replay destination");
+    }
+    if (!S_ISDIR(published_root.st_mode) || !S_ISDIR(published_path.st_mode) ||
+        published_root.st_dev != created_root.st_dev ||
+        published_root.st_ino != created_root.st_ino ||
+        published_path.st_dev != created_root.st_dev ||
+        published_path.st_ino != created_root.st_ino ||
+        published_parent.st_dev != opened_parent.st_dev ||
+        published_parent.st_ino != opened_parent.st_ino) {
+      throw std::runtime_error(
+          "published replay destination failed identity verification");
+    }
+
+    const RunOwnership ownership = CreateRunOwnershipAt(
+        options.run_id, run_root, reservation.descriptor());
+    reservation.SetOwnership(ownership);
+    reservation.MarkMarkerCreated(
+        WriteRunOwnershipMarkerAt(ownership, reservation.descriptor()));
+    if (LoadRunOwnershipAt(options.run_id, run_root,
+                           reservation.descriptor()) != ownership) {
+      throw std::runtime_error(
+          "reserved replay destination ownership did not read back");
+    }
+    return std::make_shared<ReservedManagedRunRoot>(std::move(reservation));
+  } catch (const McpOperationFailure&) {
+    throw;
+  } catch (...) {
+    throw McpOperationFailure("run_replay_destination_unavailable",
+                              "the replay destination could not be reserved: " +
+                                  ExceptionMessage(std::current_exception()),
+                              true);
+  }
+}
+
+void CreateReservedRunDirectoryAt(int run_root_fd, std::string_view name) {
+  const std::string name_text(name);
+  if (mkdirat(run_root_fd, name_text.c_str(), 0777) != 0) {
+    throw std::runtime_error(
+        "create reserved run directory failed for " + name_text + ": " +
+        std::error_code(errno, std::generic_category()).message());
+  }
+  UniqueFileDescriptor child(
+      openat(run_root_fd, name_text.c_str(),
+             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+  if (!child.valid()) {
+    throw std::runtime_error(
+        "open reserved run directory failed for " + name_text + ": " +
+        std::error_code(errno, std::generic_category()).message());
+  }
+  struct stat opened{};
+  struct stat linked{};
+  if (fstat(child.get(), &opened) != 0 ||
+      fstatat(run_root_fd, name_text.c_str(), &linked, AT_SYMLINK_NOFOLLOW) !=
+          0 ||
+      !S_ISDIR(opened.st_mode) || !S_ISDIR(linked.st_mode) ||
+      opened.st_uid != geteuid() || opened.st_dev != linked.st_dev ||
+      opened.st_ino != linked.st_ino) {
+    throw std::runtime_error(
+        "reserved run directory identity could not be verified: " + name_text);
+  }
+}
+
+void PrepareManagedRunRoot(
+    Options* options,
+    const std::shared_ptr<ReservedManagedRunRoot>& reservation = {}) {
   const std::filesystem::path run_root = BenchmarkRunRoot(*options);
+  if (reservation) {
+    const RunOwnership& ownership = reservation->ownership();
+    if (ownership.run_id != options->run_id ||
+        ownership.run_root != run_root.lexically_normal()) {
+      throw std::runtime_error(
+          "reserved replay destination does not match the prepared run");
+    }
+    options->run_ownership = ownership;
+    if (LoadRunOwnershipAt(options->run_id, ownership.run_root,
+                           reservation->descriptor()) != ownership) {
+      throw std::runtime_error(
+          "reserved replay destination ownership changed before preparation");
+    }
+    AttachRunLogFileAt(run_root, reservation->descriptor());
+    BBP_LOG(info) << "starting run " << options->run_id;
+    CreateReservedRunDirectoryAt(reservation->descriptor(), "nodes");
+    if (LoadRunOwnershipAt(options->run_id, ownership.run_root,
+                           reservation->descriptor()) != ownership) {
+      throw std::runtime_error(
+          "reserved replay destination identity changed during preparation");
+    }
+    return;
+  }
   if (std::filesystem::exists(run_root)) {
     if (!options->replace_run) {
       throw std::runtime_error(
@@ -19206,10 +19645,14 @@ void PrepareManagedRunRoot(Options* options) {
   EnsureDirectory(run_root / "nodes");
 }
 
-void RemovePreparedRunRoot(const Options& options) {
+void RemovePreparedRunRoot(
+    const Options& options,
+    const std::shared_ptr<ReservedManagedRunRoot>& reservation = {}) {
   const RunOwnership& expected = RequireRunOwnership(options);
   const RunOwnership loaded =
-      LoadRunOwnership(options.run_id, expected.run_root);
+      reservation ? LoadRunOwnershipAt(options.run_id, expected.run_root,
+                                       reservation->descriptor())
+                  : LoadRunOwnership(options.run_id, expected.run_root);
   if (loaded != expected) {
     throw std::runtime_error(
         "refusing to remove a prepared run with changed ownership: " +
@@ -19218,7 +19661,10 @@ void RemovePreparedRunRoot(const Options& options) {
   const auto cleanup_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(30);
   DetachRunLogFile(BenchmarkRunRoot(options), cleanup_deadline);
-  RemoveOwnedRunRoot(expected, cleanup_deadline);
+  RemoveOwnedRunRoot(expected, cleanup_deadline, {},
+                     reservation ? std::optional<OwnedRunRootIdentity>(
+                                       reservation->root_identity())
+                                 : std::nullopt);
   if (std::filesystem::exists(expected.run_root)) {
     throw std::runtime_error("prepared run directory survived cleanup: " +
                              expected.run_root.string());
@@ -24861,6 +25307,7 @@ struct EditorRunContext {
       std::make_shared<EditorTuiReadLeaseState>();
   std::stop_source simulation_stop_source;
   std::shared_ptr<McpLiveApplication> mcp_application;
+  std::shared_ptr<ReservedManagedRunRoot> reserved_run_root;
   std::function<void(std::stop_token)> run_root_prepared;
   std::jthread worker;
   mutable std::mutex mutex;
@@ -24899,8 +25346,21 @@ int RunPreparedBenchmark(const std::shared_ptr<EditorRunContext>& context) {
   bool run_prepared = false;
   try {
     ThrowIfStopRequested(setup_stop_token);
-    PrepareManagedRunRoot(&options);
-    run_prepared = true;
+    if (context->reserved_run_root) {
+      const RunOwnership& ownership = context->reserved_run_root->ownership();
+      if (ownership.run_id != options.run_id ||
+          ownership.run_root != run_root.lexically_normal()) {
+        throw std::runtime_error(
+            "reserved replay destination does not match the launched run");
+      }
+      options.run_ownership = ownership;
+      context->reserved_run_root->Adopt();
+      run_prepared = true;
+      PrepareManagedRunRoot(&options, context->reserved_run_root);
+    } else {
+      PrepareManagedRunRoot(&options);
+      run_prepared = true;
+    }
     if (context->run_root_prepared) {
       context->run_root_prepared(setup_stop_token);
     }
@@ -24913,19 +25373,34 @@ int RunPreparedBenchmark(const std::shared_ptr<EditorRunContext>& context) {
           ListIpv4Routes(setup_stop_token));
     }
     ThrowIfStopRequested(setup_stop_token);
-    WriteScenarioFiles(options, run_root, ChainDriverSpecFor(options.chain));
+    WriteScenarioFiles(options, run_root, ChainDriverSpecFor(options.chain),
+                       context->reserved_run_root
+                           ? context->reserved_run_root->descriptor()
+                           : -1);
     if (context->source_scenario) {
       boost::json::object source = *context->source_scenario;
       source["run_id"] = options.run_id;
-      WriteText(run_root / "source-scenario.json",
-                boost::json::serialize(source) + "\n");
+      const std::string source_text = boost::json::serialize(source) + "\n";
+      if (context->reserved_run_root) {
+        CreateTextAt(context->reserved_run_root->descriptor(),
+                     "source-scenario.json", source_text);
+      } else {
+        WriteText(run_root / "source-scenario.json", source_text);
+      }
+    }
+    if (context->reserved_run_root &&
+        LoadRunOwnershipAt(options.run_id, run_root.lexically_normal(),
+                           context->reserved_run_root->descriptor()) !=
+            RequireRunOwnership(options)) {
+      throw std::runtime_error(
+          "reserved replay destination identity changed during publication");
     }
     ThrowIfStopRequested(setup_stop_token);
   } catch (...) {
     const std::exception_ptr setup_failure = std::current_exception();
     if (run_prepared) {
       try {
-        RemovePreparedRunRoot(options);
+        RemovePreparedRunRoot(options, context->reserved_run_root);
       } catch (...) {
         throw std::runtime_error(
             "run setup failed: " + ExceptionMessage(setup_failure) +
@@ -24975,30 +25450,114 @@ class EditorRunController {
       const boost::json::object& scenario,
       const std::filesystem::path& benchmark_root, std::stop_token stop_token) {
     boost::json::object hosted_scenario = scenario;
-    const boost::json::value* simulation =
-        hosted_scenario.if_contains("simulation");
-    const bool has_nested_output =
-        simulation != nullptr && simulation->is_object() &&
-        simulation->as_object().if_contains("output_dir") != nullptr;
-    if (hosted_scenario.if_contains("output_dir") == nullptr &&
-        !has_nested_output) {
-      hosted_scenario["output_dir"] = benchmark_root.string();
+    Options options = PrepareHostedScenario(&hosted_scenario, benchmark_root);
+    return Launch(std::move(options), std::move(hosted_scenario), stop_token);
+  }
+
+  std::shared_ptr<EditorRunContext> ReplayScenario(
+      std::string_view source_run_id,
+      std::optional<std::string> destination_run_id,
+      const std::filesystem::path& benchmark_root, std::stop_token stop_token) {
+    RequireSafeRunId(source_run_id);
+    if (destination_run_id) {
+      RequireSafeRunId(*destination_run_id);
+      if (*destination_run_id == source_run_id) {
+        throw std::invalid_argument(
+            "replay destination run id must differ from its source");
+      }
+    }
+    std::unique_lock<std::timed_mutex> transition_lock =
+        AcquireTransitionLock(stop_token);
+    if (CurrentRun(false)) {
+      throw McpOperationFailure(
+          "run_already_active",
+          "a managed run is already starting, active, or stopping", true);
     }
 
-    Options options = ParseAndValidateScenario(hosted_scenario);
-    const std::filesystem::path requested_root =
-        std::filesystem::weakly_canonical(
-            std::filesystem::absolute(options.output_dir))
-            .lexically_normal();
-    const std::filesystem::path configured_root =
-        benchmark_root.lexically_normal();
-    if (requested_root != configured_root) {
+    constexpr std::size_t kMaximumSourceScenarioBytes = 4U * 1024U * 1024U;
+    const std::filesystem::path source_root =
+        CleanupRunRoot(benchmark_root, source_run_id);
+    boost::json::object source_scenario;
+    try {
+      UniqueFileDescriptor source_root_fd(
+          open(source_root.c_str(),
+               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+      if (!source_root_fd.valid()) {
+        throw std::system_error(errno, std::generic_category(),
+                                "open retained replay source root");
+      }
+      const RunOwnership initial_ownership =
+          LoadRunOwnershipAt(std::string(source_run_id), source_root,
+                             source_root_fd.get(), stop_token);
+
+      const boost::json::value parsed = boost::json::parse(
+          ReadTextAt(source_root_fd.get(), "source-scenario.json",
+                     kMaximumSourceScenarioBytes, stop_token));
+      if (!parsed.is_object()) {
+        throw std::runtime_error(
+            "the retained source scenario is not an object");
+      }
+      source_scenario = parsed.as_object();
+      const boost::json::value* embedded_run_id =
+          source_scenario.if_contains("run_id");
+      if (embedded_run_id == nullptr || !embedded_run_id->is_string() ||
+          embedded_run_id->as_string() != source_run_id) {
+        throw std::runtime_error(
+            "the retained source scenario has an inconsistent run id");
+      }
+
+      const RunOwnership final_ownership =
+          LoadRunOwnershipAt(std::string(source_run_id), source_root,
+                             source_root_fd.get(), stop_token);
+      if (final_ownership != initial_ownership) {
+        throw std::runtime_error(
+            "the retained source identity changed while it was read");
+      }
+    } catch (const McpOperationFailure&) {
+      throw;
+    } catch (...) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
       throw McpOperationFailure(
-          "run_output_root_mismatch",
-          "managed runs must use the editor host benchmark root", false);
+          "run_replay_source_unavailable",
+          "the retained replay source could not be verified: " +
+              ExceptionMessage(std::current_exception()),
+          false);
     }
-    options.output_dir = configured_root;
-    return Launch(std::move(options), std::move(hosted_scenario), stop_token);
+
+    const auto launch_destination = [&](std::string_view destination) {
+      boost::json::object replay_scenario = source_scenario;
+      replay_scenario["run_id"] = destination;
+      Options options = PrepareHostedScenario(&replay_scenario, benchmark_root);
+      return LaunchLocked(std::move(options), std::move(replay_scenario),
+                          stop_token, true);
+    };
+    if (destination_run_id) {
+      return launch_destination(*destination_run_id);
+    }
+
+    constexpr std::size_t kMaximumGeneratedRunIdAttempts = 32U;
+    for (std::size_t attempt = 0U; attempt < kMaximumGeneratedRunIdAttempts;
+         ++attempt) {
+      if (stop_token.stop_requested()) {
+        throw McpOperationCancelled();
+      }
+      const std::string candidate = MakeRunId();
+      if (candidate == source_run_id) {
+        continue;
+      }
+      try {
+        return launch_destination(candidate);
+      } catch (const McpOperationFailure& failure) {
+        if (failure.code() != "run_replay_destination_exists") {
+          throw;
+        }
+      }
+    }
+    throw McpOperationFailure("run_replay_id_unavailable",
+                              "BBP could not allocate a fresh replay run id",
+                              true);
   }
 
   std::shared_ptr<EditorRunContext> LaunchOptions(Options options) {
@@ -25611,6 +26170,35 @@ class EditorRunController {
     bool complete = false;
   };
 
+  static Options PrepareHostedScenario(
+      boost::json::object* hosted_scenario,
+      const std::filesystem::path& benchmark_root) {
+    const boost::json::value* simulation =
+        hosted_scenario->if_contains("simulation");
+    const bool has_nested_output =
+        simulation != nullptr && simulation->is_object() &&
+        simulation->as_object().if_contains("output_dir") != nullptr;
+    if (hosted_scenario->if_contains("output_dir") == nullptr &&
+        !has_nested_output) {
+      (*hosted_scenario)["output_dir"] = benchmark_root.string();
+    }
+
+    Options options = ParseAndValidateScenario(*hosted_scenario);
+    const std::filesystem::path requested_root =
+        std::filesystem::weakly_canonical(
+            std::filesystem::absolute(options.output_dir))
+            .lexically_normal();
+    const std::filesystem::path configured_root =
+        benchmark_root.lexically_normal();
+    if (requested_root != configured_root) {
+      throw McpOperationFailure(
+          "run_output_root_mismatch",
+          "managed runs must use the editor host benchmark root", false);
+    }
+    options.output_dir = configured_root;
+    return options;
+  }
+
   static std::filesystem::path CleanupRunRoot(
       const std::filesystem::path& benchmark_root, std::string_view run_id) {
     std::error_code error;
@@ -25905,10 +26493,8 @@ class EditorRunController {
     }
   }
 
-  std::shared_ptr<EditorRunContext> Launch(
-      Options options, std::optional<boost::json::object> source_scenario,
+  std::unique_lock<std::timed_mutex> AcquireTransitionLock(
       std::stop_token stop_token) {
-    RequireSafeOutputDirectory(options.output_dir);
     std::unique_lock<std::timed_mutex> transition_lock(transition_mutex_,
                                                        std::defer_lock);
     while (!transition_lock.try_lock_for(std::chrono::milliseconds(25))) {
@@ -25916,6 +26502,25 @@ class EditorRunController {
         throw McpOperationCancelled();
       }
     }
+    if (stop_token.stop_requested()) {
+      throw McpOperationCancelled();
+    }
+    return transition_lock;
+  }
+
+  std::shared_ptr<EditorRunContext> Launch(
+      Options options, std::optional<boost::json::object> source_scenario,
+      std::stop_token stop_token) {
+    std::unique_lock<std::timed_mutex> transition_lock =
+        AcquireTransitionLock(stop_token);
+    return LaunchLocked(std::move(options), std::move(source_scenario),
+                        stop_token);
+  }
+
+  std::shared_ptr<EditorRunContext> LaunchLocked(
+      Options options, std::optional<boost::json::object> source_scenario,
+      std::stop_token stop_token, bool reserve_replay_destination = false) {
+    RequireSafeOutputDirectory(options.output_dir);
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
@@ -25988,6 +26593,11 @@ class EditorRunController {
       retire_in_memory_receipt = true;
     }
 
+    std::shared_ptr<ReservedManagedRunRoot> reserved_run_root;
+    if (reserve_replay_destination) {
+      reserved_run_root = ReserveManagedReplayRunRoot(options);
+    }
+
     auto context = std::make_shared<EditorRunContext>();
     context->generation = next_generation_++;
     context->options = std::make_shared<Options>(std::move(options));
@@ -25995,6 +26605,7 @@ class EditorRunController {
     context->command_queue = std::make_shared<SimulationCommandQueue>();
     context->node_inventory =
         std::make_shared<RuntimeNodeInventory>(context->options->node_capacity);
+    context->reserved_run_root = std::move(reserved_run_root);
     if (durable_receipt || retire_in_memory_receipt) {
       const std::string reused_run_id = context->options->run_id;
       context->run_root_prepared =
@@ -26249,6 +26860,22 @@ int RunEditorApplication(Options options,
             const std::shared_ptr<EditorRunContext> run =
                 run_controller.LaunchScenario(scenario, benchmark_root,
                                               stop_token);
+            const EditorRunSnapshot snapshot =
+                run_controller.WaitUntilActive(run, stop_token);
+            return McpRunLifecycleResult{
+                .run_id = snapshot.run_id,
+                .state = std::string(EditorRunStateName(snapshot.state)),
+                .node_count = snapshot.node_count,
+            };
+          },
+      .replay_run =
+          [&](std::string_view source_run_id,
+              std::optional<std::string> destination_run_id,
+              std::stop_token stop_token) {
+            const std::shared_ptr<EditorRunContext> run =
+                run_controller.ReplayScenario(source_run_id,
+                                              std::move(destination_run_id),
+                                              benchmark_root, stop_token);
             const EditorRunSnapshot snapshot =
                 run_controller.WaitUntilActive(run, stop_token);
             return McpRunLifecycleResult{

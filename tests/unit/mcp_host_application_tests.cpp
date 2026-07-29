@@ -54,6 +54,7 @@ BOOST_AUTO_TEST_CASE(
   std::mutex run_mutex;
   std::optional<McpHostedRunSnapshot> current_run;
   std::size_t cleanup_calls = 0U;
+  std::size_t replay_calls = 0U;
   McpHostApplication application(McpHostApplication::Config{
       .host_id = "editor-host",
       .snapshot_run =
@@ -73,6 +74,22 @@ BOOST_AUTO_TEST_CASE(
                                                .application = {}};
             return McpRunLifecycleResult{
                 .run_id = "launched-run", .state = "active", .node_count = 3U};
+          },
+      .replay_run =
+          [&](std::string_view source_run_id, std::optional<std::string> run_id,
+              std::stop_token stop_token) {
+            BOOST_TEST(source_run_id == "retained-source");
+            BOOST_TEST(!stop_token.stop_requested());
+            if (replay_calls++ == 0U) {
+              BOOST_REQUIRE(run_id.has_value());
+              BOOST_TEST(*run_id == "replayed-run");
+              return McpRunLifecycleResult{
+                  .run_id = *run_id, .state = "active", .node_count = 2U};
+            }
+            BOOST_TEST(!run_id.has_value());
+            return McpRunLifecycleResult{.run_id = "generated-replay",
+                                         .state = "active",
+                                         .node_count = 2U};
           },
       .stop_run =
           [&](std::string_view run_id, std::chrono::seconds timeout,
@@ -126,6 +143,8 @@ BOOST_AUTO_TEST_CASE(
       application.SupportedOperations();
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kCleanRun) != supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kReplayRun) != supported.end());
 #ifdef BBP_FIRO_GUI_LAUNCHER
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kCreateFiroQtLauncher) !=
@@ -200,6 +219,38 @@ BOOST_AUTO_TEST_CASE(
                                  {"timeout_sec", 3601U}}),
       std::invalid_argument);
 
+  const boost::json::object explicit_replay = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "run.replay",
+             boost::json::object{{"source_run_id", "retained-source"},
+                                 {"run_id", "replayed-run"}}));
+  BOOST_TEST(explicit_replay.at("state").as_string() == "succeeded");
+  const boost::json::object& explicit_replay_result =
+      explicit_replay.at("terminal_result").as_object();
+  BOOST_TEST(explicit_replay_result.at("result_family").as_string() ==
+             "run_lifecycle");
+  BOOST_TEST(explicit_replay_result.at("run_id").as_string() == "replayed-run");
+  BOOST_TEST(explicit_replay_result.at("node_count").as_uint64() == 2U);
+
+  const boost::json::object generated_replay = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "run.replay",
+             boost::json::object{{"source_run_id", "retained-source"}}));
+  BOOST_TEST(generated_replay.at("state").as_string() == "succeeded");
+  BOOST_TEST(generated_replay.at("terminal_result")
+                 .as_object()
+                 .at("run_id")
+                 .as_string() == "generated-replay");
+  BOOST_TEST(replay_calls == 2U);
+  BOOST_CHECK_THROW(
+      Invoke(&dispatcher, "run.replay",
+             boost::json::object{{"source_run_id", "retained.invalid"}}),
+      std::invalid_argument);
+  BOOST_CHECK_THROW(Invoke(&dispatcher, "run.replay",
+                           boost::json::object{{"source_run_id", "same-run"},
+                                               {"run_id", "same-run"}}),
+                    std::invalid_argument);
+
   const boost::json::object launch = WaitForTerminal(
       &dispatcher,
       Invoke(
@@ -246,6 +297,8 @@ BOOST_AUTO_TEST_CASE(
       .host_id = "editor-host",
       .snapshot_run = [] { return std::optional<McpHostedRunSnapshot>{}; },
       .launch_run = [](const boost::json::object&,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .replay_run = [](std::string_view, std::optional<std::string>,
                        std::stop_token) { return McpRunLifecycleResult{}; },
       .stop_run = [](std::string_view, std::chrono::seconds,
                      std::stop_token) { return McpRunLifecycleResult{}; },
@@ -381,6 +434,8 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
           },
       .launch_run = [](const boost::json::object&,
                        std::stop_token) { return McpRunLifecycleResult{}; },
+      .replay_run = [](std::string_view, std::optional<std::string>,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
       .stop_run = [](std::string_view, std::chrono::seconds,
                      std::stop_token) { return McpRunLifecycleResult{}; },
       .clean_run = [](std::string_view, std::chrono::seconds, bool,
@@ -461,6 +516,8 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
                                         .application = current_application};
           },
       .launch_run = [](const boost::json::object&,
+                       std::stop_token) { return McpRunLifecycleResult{}; },
+      .replay_run = [](std::string_view, std::optional<std::string>,
                        std::stop_token) { return McpRunLifecycleResult{}; },
       .stop_run = [](std::string_view, std::chrono::seconds,
                      std::stop_token) { return McpRunLifecycleResult{}; },

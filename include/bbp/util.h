@@ -16,6 +16,10 @@ namespace bbp {
 std::string ReadText(const std::filesystem::path& path);
 std::string ReadText(const std::filesystem::path& path,
                      std::size_t maximum_bytes, std::stop_token stop_token);
+std::string ReadTextAt(int directory_fd, std::string_view name,
+                       std::size_t maximum_bytes, std::stop_token stop_token);
+void CreateTextAt(int directory_fd, std::string_view name,
+                  std::string_view text);
 void WriteText(const std::filesystem::path& path, std::string_view text);
 void AppendLine(const std::filesystem::path& path, std::string_view text);
 void EnsureDirectory(const std::filesystem::path& path);

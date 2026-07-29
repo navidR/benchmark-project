@@ -44,6 +44,9 @@ void WriteFdAll(int fd, std::string_view text,
       }
       throw IoError(path, "write");
     }
+    if (n == 0) {
+      throw std::runtime_error("write made no progress for " + path.string());
+    }
     data += n;
     remaining -= static_cast<size_t>(n);
   }
@@ -121,6 +124,178 @@ std::string ReadText(const std::filesystem::path& path,
     throw IoError(path, "close");
   }
   return text;
+}
+
+std::string ReadTextAt(int directory_fd, std::string_view name,
+                       std::size_t maximum_bytes, std::stop_token stop_token) {
+  if (directory_fd < 0) {
+    throw std::invalid_argument(
+        "bounded descriptor-relative text read requires a directory");
+  }
+  if (name.empty() || name == "." || name == ".." ||
+      name.find('/') != std::string_view::npos) {
+    throw std::invalid_argument(
+        "bounded descriptor-relative text read requires a simple name");
+  }
+  if (maximum_bytes == 0U) {
+    throw std::invalid_argument("maximum text read size must be positive");
+  }
+  const std::filesystem::path display_path{std::string(name)};
+  const std::string name_text(name);
+  const int fd = openat(directory_fd, name_text.c_str(),
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0) {
+    throw IoError(display_path, "openat");
+  }
+
+  std::string text;
+  try {
+    struct stat initial{};
+    if (fstat(fd, &initial) != 0) {
+      throw IoError(display_path, "inspect opened");
+    }
+    if (!S_ISREG(initial.st_mode) || initial.st_size < 0) {
+      throw std::runtime_error(
+          "descriptor-relative text input is not a regular file: " +
+          display_path.string());
+    }
+    const std::uintmax_t initial_size =
+        static_cast<std::uintmax_t>(initial.st_size);
+    if (initial_size > maximum_bytes) {
+      throw std::runtime_error("text input exceeds byte limit: " +
+                               display_path.string());
+    }
+    text.reserve(static_cast<std::size_t>(initial_size));
+    std::array<char, 64U * 1024U> buffer{};
+    while (true) {
+      if (stop_token.stop_requested()) {
+        throw std::runtime_error("text read was cancelled");
+      }
+      const ssize_t count = read(fd, buffer.data(), buffer.size());
+      if (count == 0) {
+        break;
+      }
+      if (count < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw IoError(display_path, "read");
+      }
+      const std::size_t chunk_size = static_cast<std::size_t>(count);
+      if (chunk_size > maximum_bytes - text.size()) {
+        throw std::runtime_error("text input exceeds byte limit: " +
+                                 display_path.string());
+      }
+      text.append(buffer.data(), chunk_size);
+    }
+    if (stop_token.stop_requested()) {
+      throw std::runtime_error("text read was cancelled");
+    }
+
+    struct stat final_status{};
+    if (fstat(fd, &final_status) != 0) {
+      throw IoError(display_path, "reinspect opened");
+    }
+    struct stat linked{};
+    if (fstatat(directory_fd, name_text.c_str(), &linked,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      throw IoError(display_path, "reinspect linked");
+    }
+    const bool stable_metadata =
+        initial.st_dev == final_status.st_dev &&
+        initial.st_ino == final_status.st_ino &&
+        initial.st_mode == final_status.st_mode &&
+        initial.st_uid == final_status.st_uid &&
+        initial.st_gid == final_status.st_gid &&
+        initial.st_size == final_status.st_size &&
+        initial.st_mtim.tv_sec == final_status.st_mtim.tv_sec &&
+        initial.st_mtim.tv_nsec == final_status.st_mtim.tv_nsec &&
+        initial.st_ctim.tv_sec == final_status.st_ctim.tv_sec &&
+        initial.st_ctim.tv_nsec == final_status.st_ctim.tv_nsec;
+    const bool stable_path = S_ISREG(linked.st_mode) &&
+                             final_status.st_dev == linked.st_dev &&
+                             final_status.st_ino == linked.st_ino;
+    if (!stable_metadata || !stable_path ||
+        text.size() != static_cast<std::size_t>(initial_size)) {
+      throw std::runtime_error(
+          "descriptor-relative text input changed while it was read: " +
+          display_path.string());
+    }
+  } catch (...) {
+    static_cast<void>(close(fd));
+    throw;
+  }
+  if (close(fd) != 0) {
+    throw IoError(display_path, "close");
+  }
+  return text;
+}
+
+void CreateTextAt(int directory_fd, std::string_view name,
+                  std::string_view text) {
+  if (directory_fd < 0) {
+    throw std::invalid_argument(
+        "descriptor-relative text creation requires a directory");
+  }
+  if (name.empty() || name == "." || name == ".." ||
+      name.find('/') != std::string_view::npos) {
+    throw std::invalid_argument(
+        "descriptor-relative text creation requires a simple name");
+  }
+  const std::filesystem::path display_path{std::string(name)};
+  const std::string name_text(name);
+  const int fd =
+      openat(directory_fd, name_text.c_str(),
+             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+  if (fd < 0) {
+    throw IoError(display_path, "create at");
+  }
+  struct stat opened{};
+  if (fstat(fd, &opened) != 0) {
+    const int inspect_error = errno;
+    static_cast<void>(close(fd));
+    errno = inspect_error;
+    throw IoError(display_path, "inspect created at");
+  }
+  if (!S_ISREG(opened.st_mode) || opened.st_uid != geteuid()) {
+    static_cast<void>(close(fd));
+    throw std::runtime_error(
+        "descriptor-relative text output is not an owned regular file: " +
+        display_path.string());
+  }
+  // The descriptor-bound root owner performs rollback. A failed creator must
+  // not unlink a name that another process may have replaced.
+  try {
+    WriteFdAll(fd, text, display_path);
+    struct stat final_status{};
+    if (fstat(fd, &final_status) != 0) {
+      throw IoError(display_path, "reinspect created at");
+    }
+    struct stat linked{};
+    if (fstatat(directory_fd, name_text.c_str(), &linked,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      throw IoError(display_path, "reinspect linked at");
+    }
+    if (!S_ISREG(final_status.st_mode) || !S_ISREG(linked.st_mode) ||
+        final_status.st_dev != opened.st_dev ||
+        final_status.st_ino != opened.st_ino ||
+        final_status.st_uid != opened.st_uid ||
+        linked.st_dev != opened.st_dev || linked.st_ino != opened.st_ino ||
+        final_status.st_size < 0 ||
+        static_cast<std::uintmax_t>(final_status.st_size) != text.size()) {
+      throw std::runtime_error(
+          "descriptor-relative text output changed during creation: " +
+          display_path.string());
+    }
+  } catch (...) {
+    static_cast<void>(close(fd));
+    throw;
+  }
+  if (close(fd) != 0) {
+    const int close_error = errno;
+    errno = close_error;
+    throw IoError(display_path, "close");
+  }
 }
 
 void WriteText(const std::filesystem::path& path, std::string_view text) {

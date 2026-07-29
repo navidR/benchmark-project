@@ -56,6 +56,9 @@ class McpHostApplication {
     std::function<McpRunLifecycleResult(const boost::json::object&,
                                         std::stop_token)>
         launch_run;
+    std::function<McpRunLifecycleResult(
+        std::string_view, std::optional<std::string>, std::stop_token)>
+        replay_run;
     std::function<McpRunLifecycleResult(std::string_view, std::chrono::seconds,
                                         std::stop_token)>
         stop_run;

@@ -1380,8 +1380,8 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["remove_retained_artifacts"].as_object()["default"] = false;
       break;
     case McpOperationKind::kReplayRun:
-      properties["source_run_id"] = IdentifierSchema();
-      properties["run_id"] = IdentifierSchema();
+      properties["source_run_id"] = RunIdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       required.emplace_back("source_run_id");
       break;
     case McpOperationKind::kReportRun:

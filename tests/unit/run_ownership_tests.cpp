@@ -1,3 +1,6 @@
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <boost/test/unit_test.hpp>
@@ -71,6 +74,38 @@ BOOST_AUTO_TEST_CASE(run_ownership_rejects_a_marker_copied_to_another_root) {
         return std::string(error.what()).find("root does not match") !=
                std::string::npos;
       });
+}
+
+BOOST_AUTO_TEST_CASE(
+    run_ownership_descriptor_loader_binds_the_opened_root_identity) {
+  ScopedDirectory parent(TestRoot("descriptor-bound"));
+  const std::filesystem::path first_root = parent.path() / "first";
+  const std::filesystem::path second_root = parent.path() / "second";
+  std::filesystem::create_directory(first_root);
+  std::filesystem::create_directory(second_root);
+  const bbp::RunOwnership first_owner =
+      bbp::CreateRunOwnership("bound-run", first_root);
+  const bbp::RunOwnership second_owner =
+      bbp::CreateRunOwnership("bound-run", second_root);
+  bbp::WriteRunOwnershipMarker(first_owner);
+  bbp::WriteRunOwnershipMarker(second_owner);
+  bbp::WriteText(first_root / "source-scenario.json", "first");
+  bbp::WriteText(second_root / "source-scenario.json", "second");
+
+  const int first_fd =
+      open(first_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  BOOST_REQUIRE(first_fd >= 0);
+  BOOST_REQUIRE(syscall(SYS_renameat2, AT_FDCWD, first_root.c_str(), AT_FDCWD,
+                        second_root.c_str(), RENAME_EXCHANGE) == 0);
+  BOOST_TEST(bbp::ReadTextAt(first_fd, "source-scenario.json", 16U, {}) ==
+             "first");
+  BOOST_CHECK_THROW(bbp::LoadRunOwnershipAt("bound-run", first_root, first_fd),
+                    std::runtime_error);
+  BOOST_REQUIRE(syscall(SYS_renameat2, AT_FDCWD, first_root.c_str(), AT_FDCWD,
+                        second_root.c_str(), RENAME_EXCHANGE) == 0);
+  BOOST_CHECK(bbp::LoadRunOwnershipAt("bound-run", first_root, first_fd) ==
+              first_owner);
+  BOOST_TEST(close(first_fd) == 0);
 }
 
 BOOST_AUTO_TEST_CASE(run_ownership_rejects_legacy_or_malformed_markers) {

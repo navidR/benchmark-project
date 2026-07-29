@@ -1490,6 +1490,12 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error(
         "active managed run had no readable ownership marker");
   }
+  const std::string source_scenario =
+      ReadFile(run_root / "source-scenario.json");
+  if (source_scenario.empty()) {
+    throw std::runtime_error(
+        "active managed run had no retained source scenario");
+  }
   const boost::json::object stopped = stop_run(run_id);
   if (stopped.at("state").as_string() != "succeeded") {
     throw std::runtime_error("MCP zero-node run stop failed: " +
@@ -1499,6 +1505,117 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       "stopped") {
     throw std::runtime_error("MCP returned a non-stopped run result");
   }
+
+  const std::string replay_collision_id = "replay-collision";
+  const std::filesystem::path replay_collision_root =
+      benchmark_root / replay_collision_id;
+  const std::filesystem::path replay_collision_sentinel =
+      replay_collision_root / "sentinel";
+  if (!std::filesystem::create_directory(replay_collision_root)) {
+    throw std::runtime_error(
+        "could not create replay destination collision fixture");
+  }
+  {
+    std::ofstream sentinel(replay_collision_sentinel);
+    sentinel << "foreign replay destination\n";
+    if (!sentinel) {
+      throw std::runtime_error(
+          "could not write replay destination collision sentinel");
+    }
+  }
+  struct stat collision_before{};
+  if (lstat(replay_collision_root.c_str(), &collision_before) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "inspect replay destination collision fixture");
+  }
+  const boost::json::object replay_collision = invoke_and_wait(
+      "run.replay", boost::json::object{{"source_run_id", std::string(run_id)},
+                                        {"run_id", replay_collision_id}});
+  struct stat collision_after{};
+  if (lstat(replay_collision_root.c_str(), &collision_after) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "reinspect replay destination collision fixture");
+  }
+  if (replay_collision.at("state").as_string() != "failed" ||
+      replay_collision.at("terminal_error")
+              .as_object()
+              .at("code")
+              .as_string() != "run_replay_destination_exists" ||
+      collision_before.st_dev != collision_after.st_dev ||
+      collision_before.st_ino != collision_after.st_ino ||
+      ReadFile(replay_collision_sentinel) != "foreign replay destination\n" ||
+      std::filesystem::exists(replay_collision_root / ".bbp-run") ||
+      std::filesystem::exists(replay_collision_root /
+                              "resolved-scenario.json") ||
+      std::filesystem::exists(replay_collision_root / "source-scenario.json") ||
+      ReadFile(run_root / ".bbp-run") != ownership_marker ||
+      ReadFile(run_root / "source-scenario.json") != source_scenario) {
+    throw std::runtime_error(
+        "run.replay adopted or changed an existing destination collision");
+  }
+  if (!std::filesystem::remove(replay_collision_sentinel) ||
+      !std::filesystem::remove(replay_collision_root)) {
+    throw std::runtime_error(
+        "could not remove replay destination collision fixture");
+  }
+
+  const boost::json::object replayed = invoke_and_wait(
+      "run.replay",
+      boost::json::object{{"source_run_id", std::string(run_id)}});
+  if (replayed.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("MCP zero-node run replay failed: " +
+                             boost::json::serialize(replayed));
+  }
+  const boost::json::object& replay_result =
+      replayed.at("terminal_result").as_object();
+  const std::string replay_run_id(replay_result.at("run_id").as_string());
+  const std::filesystem::path replay_root = benchmark_root / replay_run_id;
+  if (replay_result.at("result_family").as_string() != "run_lifecycle" ||
+      replay_result.at("state").as_string() != "active" ||
+      replay_result.at("node_count").to_number<std::uint64_t>() != 0U ||
+      replay_run_id == run_id || replay_run_id.empty() ||
+      replay_run_id.size() > 32U ||
+      !std::filesystem::exists(replay_root / ".bbp-run") ||
+      ReadFile(replay_root / "simulator.log")
+              .find("starting run " + replay_run_id) == std::string::npos ||
+      ReadFile(run_root / ".bbp-run") != ownership_marker ||
+      ReadFile(run_root / "source-scenario.json") != source_scenario) {
+    throw std::runtime_error(
+        "run.replay did not preserve its source and publish a distinct run");
+  }
+  const boost::json::value replay_source =
+      boost::json::parse(ReadFile(replay_root / "source-scenario.json"));
+  if (!replay_source.is_object() ||
+      replay_source.as_object().at("run_id").as_string() != replay_run_id) {
+    throw std::runtime_error(
+        "replayed run did not retain its destination source identity");
+  }
+
+  const std::string blocked_replay_id = "blocked-replay";
+  const boost::json::object blocked_replay = invoke_and_wait(
+      "run.replay", boost::json::object{{"source_run_id", std::string(run_id)},
+                                        {"run_id", blocked_replay_id}});
+  if (blocked_replay.at("state").as_string() != "failed" ||
+      blocked_replay.at("terminal_error").as_object().at("code").as_string() !=
+          "run_already_active" ||
+      std::filesystem::exists(benchmark_root / blocked_replay_id)) {
+    throw std::runtime_error(
+        "run.replay did not reject a second active managed run");
+  }
+  const boost::json::object replay_stopped = stop_run(replay_run_id);
+  if (replay_stopped.at("state").as_string() != "succeeded") {
+    throw std::runtime_error("replayed editor run stop failed: " +
+                             boost::json::serialize(replay_stopped));
+  }
+  const boost::json::object replay_cleaned = remove_run(replay_run_id);
+  if (replay_cleaned.at("state").as_string() != "succeeded" ||
+      std::filesystem::exists(replay_root) ||
+      ReadFile(run_root / ".bbp-run") != ownership_marker ||
+      ReadFile(run_root / "source-scenario.json") != source_scenario) {
+    throw std::runtime_error(
+        "replayed run cleanup changed its retained source run");
+  }
+
   const boost::json::object retained = clean_run(run_id);
   if (retained.at("state").as_string() != "succeeded" ||
       !retained.at("terminal_result").as_object().at("complete").as_bool() ||
