@@ -1489,7 +1489,7 @@ boost::json::object BuildMcpOperationInputSchema(
     required.emplace_back("node_id");
   };
   const auto add_timeout = [&] {
-    properties["timeout_sec"] = IntegerSchema(1U);
+    properties["timeout_sec"] = IntegerSchema(1U, 3600U);
   };
   switch (operation) {
     case McpOperationKind::kValidateScenario:

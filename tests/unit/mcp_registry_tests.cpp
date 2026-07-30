@@ -1071,6 +1071,46 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_direct_operation_timeout_schemas_match_parser_maximum) {
+  constexpr std::array operations{
+      McpOperationKind::kCleanRun,         McpOperationKind::kStopRun,
+      McpOperationKind::kStopNode,         McpOperationKind::kKillNode,
+      McpOperationKind::kRestartNode,      McpOperationKind::kReplaceNode,
+      McpOperationKind::kAddWallet,        McpOperationKind::kAddMiner,
+      McpOperationKind::kRemoveMiner,      McpOperationKind::kAddMasternode,
+      McpOperationKind::kRemoveMasternode, McpOperationKind::kRestartMasternode,
+      McpOperationKind::kPauseWorkload,    McpOperationKind::kResumeWorkload,
+      McpOperationKind::kStopWorkload,
+  };
+  const boost::json::array tools = BuildMcpToolRegistry(operations);
+  const boost::json::object& reference =
+      ObjectWithStringField(tools, "name", "run.clean")
+          .at("inputSchema")
+          .as_object()
+          .at("properties")
+          .as_object()
+          .at("timeout_sec")
+          .as_object();
+  for (std::size_t index = 1U; index < operations.size(); ++index) {
+    const boost::json::object& timeout =
+        ObjectWithStringField(tools, "name",
+                              McpOperationKindName(operations[index]))
+            .at("inputSchema")
+            .as_object()
+            .at("properties")
+            .as_object()
+            .at("timeout_sec")
+            .as_object();
+    BOOST_TEST(timeout.at("type").as_string() ==
+               reference.at("type").as_string());
+    BOOST_TEST(timeout.at("minimum").as_uint64() ==
+               reference.at("minimum").as_uint64());
+    BOOST_TEST(timeout.at("maximum").as_uint64() ==
+               reference.at("maximum").as_uint64());
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_non_block_timeout_schemas_match_positive_uint32_production_input) {
   RequirePositiveWorkloadTimeouts(BuildMcpWorkloadSchema(), "type");
 
