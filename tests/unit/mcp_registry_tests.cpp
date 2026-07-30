@@ -130,6 +130,36 @@ const boost::json::object& VariantWithConst(const boost::json::array& variants,
   return variants.front().as_object();
 }
 
+const boost::json::object& SchemaWithType(
+    const boost::json::array& alternatives, std::string_view type) {
+  for (const boost::json::value& alternative : alternatives) {
+    BOOST_REQUIRE(alternative.is_object());
+    const boost::json::object& schema = alternative.as_object();
+    const boost::json::value* candidate = schema.if_contains("type");
+    if (candidate != nullptr && candidate->is_string() &&
+        candidate->as_string() == type) {
+      return schema;
+    }
+  }
+  BOOST_FAIL("missing schema type " << type);
+  return alternatives.front().as_object();
+}
+
+const boost::json::object& LatencyMatrixCellSchema(
+    const boost::json::object& topology_schema) {
+  const boost::json::object& matrix =
+      VariantWithConst(topology_schema.at("oneOf").as_array(), "type",
+                       PeerTopologyKindName(PeerTopologyKind::kLatencyMatrix));
+  return matrix.at("properties")
+      .as_object()
+      .at("latency_matrix_ms")
+      .as_object()
+      .at("items")
+      .as_object()
+      .at("items")
+      .as_object();
+}
+
 void RequirePositiveUint32Timeout(const boost::json::object& properties) {
   const boost::json::object& timeout = properties.at("timeout_sec").as_object();
   BOOST_TEST(timeout.at("type").as_string() == "integer");
@@ -747,6 +777,43 @@ BOOST_AUTO_TEST_CASE(mcp_network_condition_value_schemas_match_production) {
       BuildMcpScenarioObjectSchema(ScenarioObjectKind::kTopologyEdge);
   RequireIntegerRange(edge.at("properties").as_object(), "latency_ms", 0U,
                       4294967U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_latency_matrix_cell_schemas_match_scalar_delay_contract) {
+  const boost::json::object topology_edge =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kTopologyEdge);
+  const boost::json::object& scalar_latency =
+      topology_edge.at("properties").as_object().at("latency_ms").as_object();
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::object& scenario_topology =
+      scenario.at("properties").as_object().at("topology").as_object();
+
+  const boost::json::object commands = BuildMcpSimulationCommandSchema();
+  const boost::json::object& add_nodes =
+      VariantWithConst(commands.at("oneOf").as_array(), "kind", "add_nodes");
+  const boost::json::object& node_add_topology = add_nodes.at("properties")
+                                                     .as_object()
+                                                     .at("node_add")
+                                                     .as_object()
+                                                     .at("properties")
+                                                     .as_object()
+                                                     .at("topology")
+                                                     .as_object();
+
+  for (const boost::json::object* topology :
+       {&scenario_topology, &node_add_topology}) {
+    const boost::json::object& cell = LatencyMatrixCellSchema(*topology);
+    const boost::json::array& alternatives = ArrayField(cell, "oneOf");
+    BOOST_REQUIRE_EQUAL(alternatives.size(), 2U);
+    const boost::json::object& integer =
+        SchemaWithType(alternatives, "integer");
+    for (const std::string_view keyword : {"type", "minimum", "maximum"}) {
+      BOOST_TEST(integer.at(keyword) == scalar_latency.at(keyword));
+    }
+    static_cast<void>(SchemaWithType(alternatives, "null"));
+  }
 }
 
 BOOST_AUTO_TEST_CASE(mcp_network_condition_loss_fields_are_mutually_exclusive) {

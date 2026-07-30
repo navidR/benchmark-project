@@ -208,6 +208,10 @@ boost::json::object Nullable(boost::json::object schema) {
   return OneOf({std::move(schema), TypeSchema("null")});
 }
 
+boost::json::object LatencyMatrixCellSchema() {
+  return Nullable(IntegerSchema(0U, kMaximumNetworkDelayMilliseconds));
+}
+
 boost::json::object NodeSelectorSchema() {
   return OneOf({IdentifierSchema(), IntegerSchema(1U)});
 }
@@ -320,7 +324,7 @@ boost::json::object GenericFieldSchema(std::string_view field) {
     return ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
   }
   if (field == "latency_matrix_ms") {
-    return ArraySchema(ArraySchema(Nullable(IntegerSchema()), 1U), 1U);
+    return ArraySchema(ArraySchema(LatencyMatrixCellSchema(), 1U), 1U);
   }
   if (field == "extra_args") {
     return ArraySchema(StringSchema(1U));
@@ -517,7 +521,7 @@ boost::json::object NodeAddTopologySchema() {
     }
     if (properties.contains("latency_matrix_ms")) {
       properties["latency_matrix_ms"] =
-          ArraySchema(ArraySchema(Nullable(IntegerSchema()), 1U,
+          ArraySchema(ArraySchema(LatencyMatrixCellSchema(), 1U,
                                   kSimulationNodeAddMaximumCount),
                       1U, kSimulationNodeAddMaximumCount);
     }
