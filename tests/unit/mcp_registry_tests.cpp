@@ -138,6 +138,22 @@ void RequirePositiveUint32Timeout(const boost::json::object& properties) {
              std::numeric_limits<std::uint32_t>::max());
 }
 
+void RequireIntegerRange(const boost::json::object& properties,
+                         std::string_view field, std::uint64_t minimum,
+                         std::uint64_t maximum) {
+  const boost::json::object& schema = properties.at(field).as_object();
+  BOOST_TEST(schema.at("type").as_string() == "integer");
+  BOOST_TEST(schema.at("minimum").as_uint64() == minimum);
+  BOOST_TEST(schema.at("maximum").as_uint64() == maximum);
+}
+
+void RequireNetworkLossConflict(const boost::json::object& schema) {
+  const boost::json::object& excluded = schema.at("not").as_object();
+  BOOST_TEST(excluded.size() == 1U);
+  const std::set<std::string> expected{"loss_basis_points", "loss_percent"};
+  BOOST_TEST(StringSet(ArrayField(excluded, "required")) == expected);
+}
+
 void RequirePositiveWorkloadTimeouts(const boost::json::object& schema,
                                      std::string_view discriminator) {
   constexpr std::array kKinds{
@@ -702,6 +718,67 @@ BOOST_AUTO_TEST_CASE(mcp_bandwidth_schema_uses_unsigned_decimal_kilobytes) {
   BOOST_TEST(bandwidth.at("minimum").as_uint64() == 0U);
   BOOST_TEST(bandwidth.at("maximum").as_uint64() ==
              std::numeric_limits<std::uint32_t>::max());
+}
+
+BOOST_AUTO_TEST_CASE(mcp_network_condition_value_schemas_match_production) {
+  const boost::json::object condition =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNetworkCondition);
+  const boost::json::object& properties =
+      condition.at("properties").as_object();
+  for (const std::string_view field : {"delay_ms", "jitter_ms"}) {
+    RequireIntegerRange(properties, field, 0U, 4294967U);
+  }
+  for (const std::string_view field :
+       {"loss_basis_points", "duplicate_basis_points", "corrupt_basis_points",
+        "reorder_basis_points"}) {
+    RequireIntegerRange(properties, field, 0U, 10000U);
+  }
+  RequireIntegerRange(properties, "limit_packets", 1U,
+                      std::numeric_limits<std::uint32_t>::max());
+
+  const boost::json::object& loss_percent =
+      properties.at("loss_percent").as_object();
+  BOOST_TEST(loss_percent.at("type").as_string() == "number");
+  BOOST_TEST(loss_percent.at("minimum").as_double() == 0.0);
+  BOOST_TEST(loss_percent.at("maximum").as_double() == 100.0);
+  BOOST_TEST(loss_percent.at("multipleOf").as_double() == 0.01);
+
+  const boost::json::object edge =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kTopologyEdge);
+  RequireIntegerRange(edge.at("properties").as_object(), "latency_ms", 0U,
+                      4294967U);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_network_condition_loss_fields_are_mutually_exclusive) {
+  for (const ScenarioObjectKind kind :
+       {ScenarioObjectKind::kNetworkCondition,
+        ScenarioObjectKind::kNodeNetworkCondition,
+        ScenarioObjectKind::kTopologyEdge,
+        ScenarioObjectKind::kTopologyRegionEdge}) {
+    RequireNetworkLossConflict(BuildMcpScenarioObjectSchema(kind));
+  }
+
+  const boost::json::object direct = BuildMcpWorkloadSchema();
+  for (const WorkloadKind kind :
+       {WorkloadKind::kSetNetworkCondition, WorkloadKind::kSetEdgeCondition}) {
+    RequireNetworkLossConflict(VariantWithConst(
+        direct.at("oneOf").as_array(), "type", WorkloadKindName(kind)));
+  }
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::array& scheduled = scenario.at("properties")
+                                            .as_object()
+                                            .at("events")
+                                            .as_object()
+                                            .at("items")
+                                            .as_object()
+                                            .at("oneOf")
+                                            .as_array();
+  for (const WorkloadKind kind :
+       {WorkloadKind::kSetNetworkCondition, WorkloadKind::kSetEdgeCondition}) {
+    RequireNetworkLossConflict(
+        VariantWithConst(scheduled, "action", WorkloadKindName(kind)));
+  }
 }
 
 BOOST_AUTO_TEST_CASE(mcp_topology_workload_and_command_schemas_are_exhaustive) {

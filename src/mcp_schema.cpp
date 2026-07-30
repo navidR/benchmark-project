@@ -35,6 +35,9 @@ constexpr std::string_view kJsonSchemaDraft =
 constexpr std::uint64_t kMaximumUint32 =
     std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint64_t kMaximumSafeCollection = 10000U;
+constexpr std::uint64_t kMaximumNetworkDelayMilliseconds =
+    kMaximumUint32 / 1000U;
+constexpr std::uint64_t kMaximumNetworkBasisPoints = 10000U;
 
 constexpr std::array kPerfCounterKinds{
     PerfCounterKind::kCycles,
@@ -113,6 +116,13 @@ boost::json::object NumberSchema(double minimum = 0.0) {
   return boost::json::object{{"type", "number"}, {"minimum", minimum}};
 }
 
+boost::json::object NetworkLossPercentSchema() {
+  return boost::json::object{{"type", "number"},
+                             {"minimum", 0.0},
+                             {"maximum", 100.0},
+                             {"multipleOf", 0.01}};
+}
+
 boost::json::object ConstStringSchema(std::string_view value) {
   return boost::json::object{{"type", "string"}, {"const", value}};
 }
@@ -153,11 +163,18 @@ boost::json::array Required(std::initializer_list<std::string_view> fields) {
 
 boost::json::object ClosedObject(boost::json::object properties,
                                  boost::json::array required = {}) {
+  const bool excludes_conflicting_loss_fields =
+      properties.contains("loss_basis_points") &&
+      properties.contains("loss_percent");
   boost::json::object schema{{"type", "object"},
                              {"properties", std::move(properties)},
                              {"additionalProperties", false}};
   if (!required.empty()) {
     schema["required"] = std::move(required);
+  }
+  if (excludes_conflicting_loss_fields) {
+    schema["not"] = boost::json::object{
+        {"required", Required({"loss_basis_points", "loss_percent"})}};
   }
   return schema;
 }
@@ -246,16 +263,29 @@ boost::json::object IoLimitSchema() {
 boost::json::object GenericFieldSchema(std::string_view field) {
   if (field == "enabled" || field == "native_mining" || field == "all_peers" ||
       field == "bidirectional" || field == "active" || field == "isolated" ||
-      field == "allow_miner_wallet_overlap" || field == "limit_packets" ||
-      field == "generate_blocks" || field == "isolated_network") {
+      field == "allow_miner_wallet_overlap" || field == "generate_blocks" ||
+      field == "isolated_network") {
     return TypeSchema("boolean");
   }
   if (field == "bandwidth_kbps") {
     return IntegerSchema();
   }
+  if (field == "latency_ms" || field == "delay_ms" || field == "jitter_ms") {
+    return IntegerSchema(0U, kMaximumNetworkDelayMilliseconds);
+  }
+  if (field == "loss_basis_points" || field == "duplicate_basis_points" ||
+      field == "corrupt_basis_points" || field == "reorder_basis_points") {
+    return IntegerSchema(0U, kMaximumNetworkBasisPoints);
+  }
+  if (field == "limit_packets") {
+    return IntegerSchema(1U);
+  }
+  if (field == "loss_percent") {
+    return NetworkLossPercentSchema();
+  }
   if (field == "probability" || field == "difficulty" ||
       field == "time_scale" || field == "transaction_rate" ||
-      field == "loss_percent" || field == "retained_balance_percentage") {
+      field == "retained_balance_percentage") {
     return NumberSchema();
   }
   if (field == "amount" || field == "fee" || field == "funding_threshold" ||
@@ -317,11 +347,8 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "dst_port" || field == "handle" || field == "duration_ms" ||
       field == "timeout_sec" || field == "sync_timeout_sec" ||
       field == "ready_timeout_sec" || field == "metrics_sample_count" ||
-      field == "metrics_interval_ms" || field == "latency_ms" ||
-      field == "delay_ms" || field == "jitter_ms" ||
-      field == "loss_basis_points" || field == "duplicate_basis_points" ||
-      field == "corrupt_basis_points" || field == "reorder_basis_points" ||
-      field == "min_peer_count" || field == "max_peer_count") {
+      field == "metrics_interval_ms" || field == "min_peer_count" ||
+      field == "max_peer_count") {
     return IntegerSchema();
   }
   if (field == "height" || field == "peer_count" || field == "period_ms" ||
