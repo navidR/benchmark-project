@@ -24,7 +24,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -623,6 +625,31 @@ void RequireContains(std::string_view text, std::string_view expected,
     throw std::runtime_error(std::string(context) +
                              " did not contain: " + std::string(expected));
   }
+}
+
+void RequireLineContainsAll(
+    std::string_view text,
+    std::initializer_list<std::string_view> expected_fragments,
+    std::string_view context) {
+  std::size_t line_start = 0U;
+  while (line_start <= text.size()) {
+    const std::size_t line_end = text.find('\n', line_start);
+    const std::string_view line = text.substr(
+        line_start, line_end == std::string_view::npos ? std::string_view::npos
+                                                       : line_end - line_start);
+    if (std::all_of(expected_fragments.begin(), expected_fragments.end(),
+                    [line](std::string_view fragment) {
+                      return line.find(fragment) != std::string_view::npos;
+                    })) {
+      return;
+    }
+    if (line_end == std::string_view::npos) {
+      break;
+    }
+    line_start = line_end + 1U;
+  }
+  throw std::runtime_error(std::string(context) +
+                           " did not contain one matching record");
 }
 
 void RequireNotContains(std::string_view text, std::string_view unexpected,
@@ -3921,12 +3948,299 @@ void CheckBlockGenerationWorkloadLifecycle(
   }
 }
 
-void StartBlockGenerationWorkloadForRunShutdown(
+std::uint64_t CheckWaitUntilHeightWorkloadLifecycle(
     std::string_view run_id, const std::filesystem::path& run_root,
     const std::filesystem::path& home_directory) {
+  const auto write_control = [](const std::filesystem::path& path,
+                                std::string_view contents) {
+    std::ofstream stream(path);
+    if (!stream) {
+      throw std::runtime_error("could not create " + path.string());
+    }
+    stream << contents;
+    if (!stream) {
+      throw std::runtime_error("could not flush " + path.string());
+    }
+  };
+  write_control(run_root / "bbp-test-shared-height", "0\n");
+  write_control(run_root / "bbp-test-shared-height-enabled",
+                "share fake daemon height\n");
+
   const McpTestSession mcp =
       ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
   std::uint64_t request_id = 2U;
+  const auto configuration = [](std::uint64_t height,
+                                std::uint32_t timeout_sec) {
+    return boost::json::object{{"type", "wait_until_height"},
+                               {"node", 1U},
+                               {"height", height},
+                               {"timeout_sec", timeout_sec}};
+  };
+  const auto arguments = [&](std::string_view workload_id,
+                             boost::json::object extra = {}) {
+    extra["run_id"] = run_id;
+    extra["workload_id"] = workload_id;
+    return extra;
+  };
+  const auto require_workload =
+      [](const boost::json::array& records,
+         std::string_view workload_id) -> const boost::json::object& {
+    for (const boost::json::value& value : records) {
+      const boost::json::object& record = value.as_object();
+      if (record.at("workload_id").as_string() == workload_id) {
+        return record;
+      }
+    }
+    throw std::runtime_error("MCP workload resource omitted " +
+                             std::string(workload_id));
+  };
+  const auto wait_for_terminal =
+      [&](std::string_view workload_id, std::string_view expected,
+          std::chrono::steady_clock::duration timeout,
+          std::string_view context) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        boost::json::object inspected;
+        while (std::chrono::steady_clock::now() < deadline) {
+          inspected = InvokeMcpOperation(mcp, &request_id, "workload.inspect",
+                                         arguments(workload_id), 2s, context);
+          const std::string_view state = inspected.at("state").as_string();
+          if (state == expected) {
+            return inspected;
+          }
+          if (state == "stopped" || state == "completed" ||
+              state == "cancelled" || state == "failed") {
+            break;
+          }
+          std::this_thread::sleep_for(20ms);
+        }
+        throw std::runtime_error(std::string(context) + " did not reach " +
+                                 std::string(expected) + ": " +
+                                 boost::json::serialize(inspected));
+      };
+
+  const boost::json::object baseline_started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("height-baseline",
+                boost::json::object{{"workload", configuration(0U, 3U)}}),
+      3s, "wait-until-height baseline observation");
+  if (baseline_started.at("state").as_string() != "running" &&
+      baseline_started.at("state").as_string() != "completed") {
+    throw std::runtime_error(
+        "wait-until-height baseline did not start authoritatively");
+  }
+  const boost::json::object baseline =
+      wait_for_terminal("height-baseline", "completed", 3s,
+                        "wait-until-height baseline observation");
+  if (baseline.at("state").as_string() != "completed" ||
+      baseline.at("terminal_outcome").as_string() != "height_reached" ||
+      !baseline.at("result").is_object()) {
+    throw std::runtime_error(
+        "wait-until-height baseline did not complete authoritatively");
+  }
+  const std::uint64_t baseline_height = baseline.at("result")
+                                            .as_object()
+                                            .at("observed_height")
+                                            .to_number<std::uint64_t>();
+  constexpr std::uint64_t kUnreachedHeightDelta = 10'000U;
+  if (baseline_height >
+      std::numeric_limits<std::uint64_t>::max() - kUnreachedHeightDelta) {
+    throw std::runtime_error(
+        "wait-until-height fixture has no safe target-height headroom");
+  }
+  const std::uint64_t initial_target_height = baseline_height + 1U;
+  const std::uint64_t completed_target_height = baseline_height + 2U;
+  const std::uint64_t unreached_target_height =
+      baseline_height + kUnreachedHeightDelta;
+
+  const boost::json::object started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("height-lifecycle",
+                boost::json::object{
+                    {"workload", configuration(initial_target_height, 3U)}}),
+      3s, "wait-until-height workload start");
+  if (started.at("state").as_string() != "running" ||
+      started.at("workload_id").as_string() != "height-lifecycle" ||
+      !started.at("result").is_null()) {
+    throw std::runtime_error(
+        "wait-until-height start returned the wrong current state");
+  }
+  const boost::json::array current =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workloads",
+                          "active wait-until-height workloads")
+          .as_array();
+  if (require_workload(current, "height-lifecycle").at("state").as_string() !=
+      "running") {
+    throw std::runtime_error(
+        "running wait-until-height workload was not retained as current");
+  }
+
+  const boost::json::object paused = InvokeMcpOperation(
+      mcp, &request_id, "workload.pause",
+      arguments("height-lifecycle", boost::json::object{{"timeout_sec", 2U}}),
+      3s, "wait-until-height workload pause");
+  if (paused.at("state").as_string() != "paused" ||
+      paused.at("configuration_revision").to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "wait-until-height workload did not pause at its polling boundary");
+  }
+  const boost::json::object reconfigured = InvokeMcpOperation(
+      mcp, &request_id, "workload.reconfigure",
+      arguments("height-lifecycle",
+                boost::json::object{
+                    {"workload", configuration(completed_target_height, 3U)}}),
+      3s, "wait-until-height workload reconfiguration");
+  if (reconfigured.at("state").as_string() != "paused" ||
+      reconfigured.at("configuration_revision").to_number<std::uint64_t>() !=
+          2U ||
+      reconfigured.at("configuration")
+              .as_object()
+              .at("height")
+              .to_number<std::uint64_t>() != completed_target_height) {
+    throw std::runtime_error(
+        "wait-until-height reconfiguration lost state, revision, or target");
+  }
+  const boost::json::object resumed = InvokeMcpOperation(
+      mcp, &request_id, "workload.resume",
+      arguments("height-lifecycle", boost::json::object{{"timeout_sec", 2U}}),
+      3s, "wait-until-height workload resume");
+  if (resumed.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "wait-until-height workload did not start a fresh resumed epoch");
+  }
+
+  write_control(run_root / "bbp-test-shared-height",
+                std::to_string(completed_target_height) + "\n");
+  const boost::json::object completed =
+      wait_for_terminal("height-lifecycle", "completed", 4s,
+                        "completed wait-until-height workload inspection");
+  const boost::json::object& result = completed.at("result").as_object();
+  if (completed.at("terminal_outcome").as_string() != "height_reached" ||
+      completed.at("configuration_revision").to_number<std::uint64_t>() != 2U ||
+      result.at("node").to_number<std::uint64_t>() != 1U ||
+      result.at("node_id").as_string() != "firo-active" ||
+      result.at("target_height").to_number<std::uint64_t>() !=
+          completed_target_height ||
+      result.at("observed_height").to_number<std::uint64_t>() <
+          completed_target_height) {
+    throw std::runtime_error(
+        "wait-until-height completion lacked authoritative height evidence: " +
+        boost::json::serialize(completed));
+  }
+  const boost::json::array history =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workload_history",
+                          "completed wait-until-height history")
+          .as_array();
+  if (require_workload(history, "height-lifecycle").at("state").as_string() !=
+      "completed") {
+    throw std::runtime_error(
+        "completed wait-until-height workload was not retained in history");
+  }
+  const boost::json::array completed_current =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workloads",
+                          "completed wait-until-height current resource")
+          .as_array();
+  for (const boost::json::value& value : completed_current) {
+    if (value.as_object().at("workload_id").as_string() == "height-lifecycle") {
+      throw std::runtime_error(
+          "completed wait-until-height workload remained current");
+    }
+  }
+  const std::string completed_events = ReadFile(run_root / "events.jsonl");
+  RequireLineContainsAll(completed_events,
+                         {"\"event\":\"height_wait_reached\"",
+                          "\\\"workload_id\\\":\\\"height-lifecycle\\\""},
+                         "wait-until-height completion event identity");
+
+  const boost::json::object cancel_started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("height-cancel",
+                boost::json::object{
+                    {"workload", configuration(unreached_target_height, 10U)}}),
+      3s, "cancellable wait-until-height workload start");
+  if (cancel_started.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "cancellable wait-until-height workload did not start");
+  }
+  const boost::json::object settle_submitted = SubmitMcpOperation(
+      mcp, &request_id, "workload.stop",
+      arguments("height-cancel", boost::json::object{{"policy", "settle"},
+                                                     {"timeout_sec", 5U}}));
+  boost::json::object settling;
+  const auto settling_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < settling_deadline) {
+    settling = InvokeMcpOperation(
+        mcp, &request_id, "workload.inspect", arguments("height-cancel"), 2s,
+        "settling wait-until-height workload inspection");
+    if (settling.at("state").as_string() == "stopping") {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (settling.at("state").as_string() != "stopping") {
+    throw std::runtime_error("wait-until-height settle Stop was not admitted");
+  }
+  const auto stop_started = std::chrono::steady_clock::now();
+  const boost::json::object stopped = InvokeMcpOperation(
+      mcp, &request_id, "workload.stop",
+      arguments("height-cancel",
+                boost::json::object{{"policy", "cancel"}, {"timeout_sec", 2U}}),
+      3s, "wait-until-height workload Stop");
+  if (std::chrono::steady_clock::now() - stop_started >= 2s ||
+      stopped.at("state").as_string() != "stopped" ||
+      stopped.at("terminal_outcome").as_string() != "stopped" ||
+      !stopped.at("result").is_null()) {
+    throw std::runtime_error(
+        "wait-until-height cancel Stop was not bounded and truthful");
+  }
+  const boost::json::object settled =
+      WaitForMcpOperation(mcp, &request_id, settle_submitted, 2s,
+                          "escalated wait-until-height settle Stop");
+  if (settled.at("state").as_string() != "stopped") {
+    throw std::runtime_error(
+        "escalated wait-until-height settle Stop did not observe cancellation");
+  }
+
+  const boost::json::object timeout_started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("height-timeout",
+                boost::json::object{
+                    {"workload", configuration(unreached_target_height, 1U)}}),
+      3s, "timed wait-until-height workload start");
+  if (timeout_started.at("state").as_string() != "running") {
+    throw std::runtime_error("timed wait-until-height workload did not start");
+  }
+  const boost::json::object failed =
+      wait_for_terminal("height-timeout", "failed", 4s,
+                        "timed wait-until-height workload inspection");
+  if (failed.at("terminal_outcome").as_string() != "failed" ||
+      failed.at("failure").is_null() || !failed.at("result").is_null()) {
+    throw std::runtime_error(
+        "wait-until-height timeout did not retain a truthful failure");
+  }
+  return unreached_target_height;
+}
+
+void StartBlockGenerationWorkloadForRunShutdown(
+    std::string_view run_id, const std::filesystem::path& run_root,
+    const std::filesystem::path& home_directory,
+    std::uint64_t height_wait_target) {
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  const boost::json::object height_wait = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      boost::json::object{
+          {"run_id", run_id},
+          {"workload_id", "height-shutdown"},
+          {"workload", boost::json::object{{"type", "wait_until_height"},
+                                           {"node", 1U},
+                                           {"height", height_wait_target},
+                                           {"timeout_sec", 30U}}}},
+      3s, "run-shutdown wait-until-height workload start");
+  if (height_wait.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "run-shutdown wait-until-height workload did not start");
+  }
   const boost::json::object started = InvokeMcpOperation(
       mcp, &request_id, "workload.start",
       boost::json::object{
@@ -3996,6 +4310,8 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   RequireContains(connection_events, expected_qt_command,
                   "active generated Firo-Qt command evidence");
   CheckBlockGenerationWorkloadLifecycle(run_id, run_root, home_directory);
+  const std::uint64_t height_wait_shutdown_target =
+      CheckWaitUntilHeightWorkloadLifecycle(run_id, run_root, home_directory);
 #ifdef BBP_FIRO_GUI_LAUNCHER
   process.Write("c");
   static_cast<void>(
@@ -4110,7 +4426,8 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
     throw std::runtime_error("Esc,n stopped the active worker or its daemon");
   }
 
-  StartBlockGenerationWorkloadForRunShutdown(run_id, run_root, home_directory);
+  StartBlockGenerationWorkloadForRunShutdown(run_id, run_root, home_directory,
+                                             height_wait_shutdown_target);
   process.Write("\x1b");
   static_cast<void>(
       process.ReadUntil("Confirm exit", 3s, "active-run confirmed exit modal"));
@@ -4126,6 +4443,11 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
                   "active-run block workload shutdown identity");
   RequireContains(finished_events, "\\\"state\\\":\\\"cancelled\\\"",
                   "active-run block workload shutdown state");
+  RequireLineContainsAll(finished_events,
+                         {"\"event\":\"workload_state\"",
+                          "\\\"workload_id\\\":\\\"height-shutdown\\\"",
+                          "\\\"state\\\":\\\"cancelled\\\""},
+                         "active-run height-wait workload shutdown state");
   WaitForProcessExit(daemon_pid, 3s);
 #ifdef BBP_FIRO_GUI_LAUNCHER
   struct stat launcher_status{};

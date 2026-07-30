@@ -2015,7 +2015,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     bbp-invalid-wait-height-plural-nodes
     tests/scenarios/invalid-wait-height-plural-nodes.json
-    "current MVP wait_until_height workload uses node, not nodes"
+    "scenario workload wait_until_height has unsupported field: nodes"
   )
   add_cli_failure_test(
     bbp-invalid-wait-peers-missing-peer-count

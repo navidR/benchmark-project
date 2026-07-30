@@ -553,6 +553,8 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
       require({"count"});
       break;
     case WorkloadKind::kWaitUntilHeight:
+      properties["node"] = IntegerSchema(1U);
+      properties["timeout_sec"] = IntegerSchema(1U);
       require({"height"});
       break;
     case WorkloadKind::kWaitForPeers:
@@ -980,6 +982,17 @@ boost::json::object BlockGenerationBoundaryResultSchema() {
                       Required({"generator_node", "generator_node_id",
                                 "start_height", "target_height", "block_hash",
                                 "reward_address", "synchronized"}));
+}
+
+boost::json::object WaitUntilHeightResultSchema() {
+  boost::json::object properties;
+  properties["node"] = IntegerSchema(1U);
+  properties["node_id"] = IdentifierSchema();
+  properties["target_height"] = Uint64Schema();
+  properties["observed_height"] = Uint64Schema();
+  return ClosedObject(
+      std::move(properties),
+      Required({"node", "node_id", "target_height", "observed_height"}));
 }
 
 boost::json::object AddDraft(boost::json::object schema) {
@@ -2275,19 +2288,20 @@ boost::json::object BuildMcpResultSchema(
       properties["workload_id"] = IdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["state"] = WorkloadStateSchema();
-      properties["terminal_outcome"] = StringEnumSchema(
-          boost::json::array{"none", "stopped", "count_reached",
-                             "duration_expired", "cancelled", "failed"});
+      properties["terminal_outcome"] = StringEnumSchema(boost::json::array{
+          "none", "stopped", "count_reached", "duration_expired",
+          "height_reached", "cancelled", "failed"});
       properties["configuration_revision"] = Uint64Schema();
       properties["configuration"] = BuildMcpWorkloadSchema();
       properties["accounting"] =
           OneOf({ExactAccountingSchema(), BlockGenerationAccountingSchema()});
       properties["last_result"] =
           Nullable(BlockGenerationBoundaryResultSchema());
+      properties["result"] = Nullable(WaitUntilHeightResultSchema());
       properties["failure"] = Nullable(StringSchema(1U));
       properties["queue_maximum_depth"] = Uint64Schema();
       require({"run_id", "workload_id", "state", "terminal_outcome",
-               "configuration_revision", "configuration", "accounting"});
+               "configuration_revision", "configuration"});
       constraints.emplace_back(boost::json::object{
           {"if",
            boost::json::object{
@@ -2300,17 +2314,25 @@ boost::json::object BuildMcpResultSchema(
                               {"type", ConstStringSchema("block_generation")}}},
                          {"required", Required({"type"})}}}}},
                {"required", Required({"configuration"})}}},
-          {"then", boost::json::object{
-                       {"properties",
-                        boost::json::object{
-                            {"accounting", BlockGenerationAccountingSchema()},
-                            {"last_result",
-                             Nullable(BlockGenerationBoundaryResultSchema())}}},
-                       {"required", Required({"last_result", "failure"})},
-                       {"not", boost::json::object{{
-                                   "required",
-                                   Required({"queue_maximum_depth"}),
-                               }}}}}});
+          {"then",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"accounting", BlockGenerationAccountingSchema()},
+                    {"last_result",
+                     Nullable(BlockGenerationBoundaryResultSchema())}}},
+               {"required", Required({"accounting", "last_result", "failure"})},
+               {"not",
+                boost::json::object{{
+                    "anyOf",
+                    boost::json::array{
+                        boost::json::object{{
+                            "required",
+                            Required({"queue_maximum_depth"}),
+                        }},
+                        boost::json::object{{"required", Required({"result"})}},
+                    },
+                }}}}}});
       constraints.emplace_back(boost::json::object{
           {"if",
            boost::json::object{
@@ -2328,11 +2350,83 @@ boost::json::object BuildMcpResultSchema(
            boost::json::object{
                {"properties",
                 boost::json::object{{"accounting", ExactAccountingSchema()}}},
-               {"required", Required({"failure", "queue_maximum_depth"})},
-               {"not", boost::json::object{{
-                           "required",
-                           Required({"last_result"}),
-                       }}}}}});
+               {"required",
+                Required({"accounting", "failure", "queue_maximum_depth"})},
+               {"not",
+                boost::json::object{{
+                    "anyOf",
+                    boost::json::array{
+                        boost::json::object{
+                            {"required", Required({"last_result"})}},
+                        boost::json::object{{"required", Required({"result"})}},
+                    },
+                }}}}}});
+      constraints.emplace_back(boost::json::object{
+          {"if",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"configuration",
+                     boost::json::object{
+                         {"properties",
+                          boost::json::object{
+                              {"type",
+                               ConstStringSchema("wait_until_height")}}},
+                         {"required", Required({"type"})}}}}},
+               {"required", Required({"configuration"})}}},
+          {"then",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"result", Nullable(WaitUntilHeightResultSchema())},
+                    {"terminal_outcome",
+                     StringEnumSchema(
+                         boost::json::array{"none", "stopped", "height_reached",
+                                            "cancelled", "failed"})}}},
+               {"required", Required({"result", "failure"})},
+               {"not",
+                boost::json::object{{
+                    "anyOf",
+                    boost::json::array{
+                        boost::json::object{
+                            {"required", Required({"accounting"})}},
+                        boost::json::object{
+                            {"required", Required({"last_result"})}},
+                        boost::json::object{
+                            {"required", Required({"queue_maximum_depth"})}},
+                    },
+                }}}}}});
+      {
+        boost::json::object non_wait_type;
+        non_wait_type["not"] = ConstStringSchema("wait_until_height");
+
+        boost::json::object non_wait_configuration;
+        non_wait_configuration["properties"] =
+            boost::json::object{{"type", std::move(non_wait_type)}};
+        non_wait_configuration["required"] = Required({"type"});
+
+        boost::json::object non_wait_condition;
+        non_wait_condition["properties"] = boost::json::object{
+            {"configuration", std::move(non_wait_configuration)}};
+        non_wait_condition["required"] = Required({"configuration"});
+
+        boost::json::object non_wait_properties;
+        non_wait_properties["accounting"] =
+            OneOf({ExactAccountingSchema(), BlockGenerationAccountingSchema()});
+        non_wait_properties["terminal_outcome"] = StringEnumSchema(
+            boost::json::array{"none", "stopped", "count_reached",
+                               "duration_expired", "cancelled", "failed"});
+
+        boost::json::object non_wait_result;
+        non_wait_result["properties"] = std::move(non_wait_properties);
+        non_wait_result["required"] = Required({"accounting"});
+        non_wait_result["not"] =
+            boost::json::object{{"required", Required({"result"})}};
+
+        constraints.emplace_back(
+            boost::json::object{{"if", std::move(non_wait_condition)},
+                                {"then", std::move(non_wait_result)}});
+      }
       break;
     case McpResultFamily::kInstrumentation:
       properties["run_id"] = IdentifierSchema();

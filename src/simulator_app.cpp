@@ -46,6 +46,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -7892,15 +7893,19 @@ std::string GeneratedBlocksDetail(
   return boost::json::serialize(detail);
 }
 
-std::string HeightWaitDetail(uint32_t workload_index, uint32_t workload_count,
-                             uint32_t node, uint64_t target_height,
-                             uint64_t observed_height) {
+std::string HeightWaitDetail(
+    uint32_t workload_index, uint32_t workload_count, uint32_t node,
+    uint64_t target_height, uint64_t observed_height,
+    std::optional<std::string_view> workload_id = std::nullopt) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
   detail["node"] = node;
   detail["target_height"] = target_height;
   detail["observed_height"] = observed_height;
+  if (workload_id) {
+    detail["workload_id"] = *workload_id;
+  }
   return boost::json::serialize(detail);
 }
 
@@ -13079,6 +13084,43 @@ struct LiveBlockGenerationWorkloadRegistry {
   bool shutting_down = false;
 };
 
+struct LiveWaitUntilHeightResult {
+  std::uint32_t node = 0U;
+  std::string node_id;
+  std::uint64_t target_height = 0U;
+  std::uint64_t observed_height = 0U;
+};
+
+struct LiveWaitUntilHeightWorkloadRecord {
+  mutable std::mutex mutex;
+  std::condition_variable_any changed;
+  std::string id;
+  std::uint32_t ordinal = 0U;
+  WaitUntilHeightWorkload workload;
+  std::optional<WaitUntilHeightWorkload> pending_workload;
+  LiveWorkloadState state = LiveWorkloadState::kStarting;
+  LiveWorkloadRequest request = LiveWorkloadRequest::kNone;
+  std::string terminal_outcome = "none";
+  std::optional<std::string> failure;
+  std::uint64_t configuration_revision = 1U;
+  std::optional<LiveWaitUntilHeightResult> result;
+  bool completion_pending = false;
+  std::chrono::steady_clock::time_point epoch_deadline{};
+  bool epoch_timed_out = false;
+  std::optional<std::chrono::steady_clock::time_point>
+      epoch_run_stop_requested_at;
+  std::stop_source epoch_stop_source;
+  std::thread worker;
+};
+
+struct LiveWaitUntilHeightWorkloadRegistry {
+  mutable std::mutex mutex;
+  std::map<std::string, std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>>
+      records;
+  std::uint64_t next_id = 1U;
+  bool shutting_down = false;
+};
+
 BlockGenerationWorkload ParseAndValidateLiveBlockGenerationWorkload(
     const boost::json::object& workload, const Options& options,
     const RuntimeNodeSnapshot& nodes) {
@@ -13110,6 +13152,38 @@ BlockGenerationWorkload ParseAndValidateLiveBlockGenerationWorkload(
   if (parsed.sync_timeout_sec == 0U || parsed.sync_timeout_sec > 3600U) {
     throw std::runtime_error(
         "block generation sync_timeout_sec must be in 1..3600");
+  }
+  return parsed;
+}
+
+WaitUntilHeightWorkload ParseAndValidateLiveWaitUntilHeightWorkload(
+    const boost::json::object& workload, const Options& options,
+    const RuntimeNodeSnapshot& nodes) {
+  if (nodes.empty()) {
+    throw McpOperationFailure(
+        "workload_node_unavailable",
+        "wait-until-height requires at least one active node", true);
+  }
+  boost::json::array workloads;
+  workloads.emplace_back(workload);
+  Options validation_options = options;
+  validation_options.workloads.clear();
+  validation_options.scheduled_events.clear();
+  boost::program_options::variables_map variables;
+  ApplyScenarioWorkloads(workloads, variables, validation_options);
+  if (validation_options.workloads.size() != 1U ||
+      validation_options.workloads.front().kind !=
+          WorkloadKind::kWaitUntilHeight) {
+    throw std::runtime_error(
+        "workload operation requires a wait_until_height workload");
+  }
+  const WaitUntilHeightWorkload parsed =
+      validation_options.workloads.front().wait_until_height;
+  static_cast<void>(RequireRuntimeNodeNumber(nodes, parsed.node,
+                                             "wait_until_height workload"));
+  if (parsed.timeout_sec == 0U) {
+    throw std::runtime_error(
+        "wait_until_height timeout_sec must be greater than zero");
   }
   return parsed;
 }
@@ -13173,12 +13247,45 @@ boost::json::object LiveBlockGenerationWorkloadJson(
   return result;
 }
 
+boost::json::object LiveWaitUntilHeightWorkloadJson(
+    const LiveWaitUntilHeightWorkloadRecord& record) {
+  std::lock_guard<std::mutex> lock(record.mutex);
+  boost::json::object result{
+      {"workload_id", record.id},
+      {"state", LiveWorkloadStateName(record.state)},
+      {"terminal_outcome", record.terminal_outcome},
+      {"configuration_revision", record.configuration_revision},
+      {"configuration", WaitUntilHeightWorkloadJson(record.workload)},
+  };
+  if (record.result) {
+    result["result"] = boost::json::object{
+        {"node", record.result->node},
+        {"node_id", record.result->node_id},
+        {"target_height", record.result->target_height},
+        {"observed_height", record.result->observed_height},
+    };
+  } else {
+    result["result"] = nullptr;
+  }
+  result["failure"] = record.failure ? boost::json::value(*record.failure)
+                                     : boost::json::value(nullptr);
+  return result;
+}
+
 void WriteLiveBlockGenerationWorkloadState(
     const std::filesystem::path& events_path, const Options& options,
     const LiveBlockGenerationWorkloadRecord& record) {
   WriteEvent(events_path, options.run_id, record.id,
              SimulationEventKind::kWorkloadState,
              boost::json::serialize(LiveBlockGenerationWorkloadJson(record)));
+}
+
+void WriteLiveWaitUntilHeightWorkloadState(
+    const std::filesystem::path& events_path, const Options& options,
+    const LiveWaitUntilHeightWorkloadRecord& record) {
+  WriteEvent(events_path, options.run_id, record.id,
+             SimulationEventKind::kWorkloadState,
+             boost::json::serialize(LiveWaitUntilHeightWorkloadJson(record)));
 }
 
 void RequireNoActiveBlockGenerationWorkloads(
@@ -13204,6 +13311,34 @@ void RequireNoActiveBlockGenerationWorkloads(
       throw std::runtime_error(
           std::string(operation) +
           " is unavailable while block generation workload " + record->id +
+          " is " + std::string(LiveWorkloadStateName(record->state)));
+    }
+  }
+}
+
+void RequireNoActiveWaitUntilHeightWorkloads(
+    const std::shared_ptr<LiveWaitUntilHeightWorkloadRegistry>& registry,
+    std::string_view operation) {
+  if (!registry) {
+    throw std::logic_error(std::string(operation) +
+                           " height-wait workload service is missing");
+  }
+  std::vector<std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>> records;
+  {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    records.reserve(registry->records.size());
+    for (const auto& [id, record] : registry->records) {
+      static_cast<void>(id);
+      records.push_back(record);
+    }
+  }
+  for (const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record :
+       records) {
+    std::lock_guard<std::mutex> lock(record->mutex);
+    if (!IsTerminalLiveWorkloadState(record->state)) {
+      throw std::runtime_error(
+          std::string(operation) +
+          " is unavailable while wait-until-height workload " + record->id +
           " is " + std::string(LiveWorkloadStateName(record->state)));
     }
   }
@@ -17346,6 +17481,8 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     const std::shared_ptr<LiveWalletWorkloadRegistry>& wallet_workloads,
     const std::shared_ptr<LiveBlockGenerationWorkloadRegistry>&
         block_generation_workloads,
+    const std::shared_ptr<LiveWaitUntilHeightWorkloadRegistry>&
+        wait_until_height_workloads,
     const TransactionObservationTracker& transaction_tracker,
     RunProcessState& run_process_state,
     std::chrono::steady_clock::time_point lifecycle_epoch,
@@ -17427,6 +17564,8 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     }
   }
   RequireNoActiveBlockGenerationWorkloads(block_generation_workloads,
+                                          "node-replace");
+  RequireNoActiveWaitUntilHeightWorkloads(wait_until_height_workloads,
                                           "node-replace");
   if (transaction_tracker.HasPending()) {
     throw std::runtime_error(
@@ -18359,6 +18498,8 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
     const std::shared_ptr<LiveWalletWorkloadRegistry>& wallet_workloads,
     const std::shared_ptr<LiveBlockGenerationWorkloadRegistry>&
         block_generation_workloads,
+    const std::shared_ptr<LiveWaitUntilHeightWorkloadRegistry>&
+        wait_until_height_workloads,
     const TransactionObservationTracker& transaction_tracker,
     const SimulationNodeRemoveRequest& request,
     SimulationCommandControl* operation_control, std::stop_token stop_token) {
@@ -18473,6 +18614,8 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
     }
   }
   RequireNoActiveBlockGenerationWorkloads(block_generation_workloads,
+                                          "node-remove");
+  RequireNoActiveWaitUntilHeightWorkloads(wait_until_height_workloads,
                                           "node-remove");
   if (transaction_tracker.HasPending()) {
     throw std::runtime_error(
@@ -22110,12 +22253,43 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     McpLiveApplication& mcp_application, RuntimeNodeInventory& node_inventory,
     std::stop_source& simulation_stop_source,
     std::stop_token external_stop_token = {}) {
+  using RunStopTick = std::chrono::steady_clock::duration::rep;
+  constexpr RunStopTick kRunStopNotObserved =
+      std::numeric_limits<RunStopTick>::max();
+  std::atomic<RunStopTick> run_stop_tick = kRunStopNotObserved;
+  const auto record_run_stop =
+      [&](std::chrono::steady_clock::time_point observed_at) {
+        const RunStopTick observed_tick =
+            observed_at.time_since_epoch().count();
+        RunStopTick current = run_stop_tick.load(std::memory_order_relaxed);
+        while (observed_tick < current &&
+               !run_stop_tick.compare_exchange_weak(
+                   current, observed_tick, std::memory_order_release,
+                   std::memory_order_relaxed)) {
+        }
+      };
+  const auto request_simulation_stop = [&] {
+    record_run_stop(std::chrono::steady_clock::now());
+    return simulation_stop_source.request_stop();
+  };
   std::stop_callback stop_simulation_on_external_request(
       external_stop_token, [&] {
         mcp_application.MarkRunStopping();
-        simulation_stop_source.request_stop();
+        request_simulation_stop();
       });
   const std::stop_token stop_token = simulation_stop_source.get_token();
+  std::stop_callback observe_run_stop(
+      stop_token, [&] { record_run_stop(std::chrono::steady_clock::now()); });
+  const auto observed_run_stop =
+      [&]() -> std::optional<std::chrono::steady_clock::time_point> {
+    const RunStopTick observed_tick =
+        run_stop_tick.load(std::memory_order_acquire);
+    if (observed_tick == kRunStopNotObserved) {
+      return std::nullopt;
+    }
+    return std::chrono::steady_clock::time_point{
+        std::chrono::steady_clock::duration{observed_tick}};
+  };
   SimulationCommandQueue* active_command_queue = &command_queue;
   std::mutex scheduled_command_outcome_mutex;
   std::condition_variable_any scheduled_command_outcome_ready;
@@ -22196,6 +22370,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   auto wallet_workloads = std::make_shared<LiveWalletWorkloadRegistry>();
   auto block_generation_workloads =
       std::make_shared<LiveBlockGenerationWorkloadRegistry>();
+  auto wait_until_height_workloads =
+      std::make_shared<LiveWaitUntilHeightWorkloadRegistry>();
   auto live_instrumentation = std::make_shared<LiveInstrumentationRegistry>();
   std::shared_ptr<McpLiveWorkloadService> installed_workload_service;
   std::shared_ptr<McpLiveInstrumentationService>
@@ -22265,14 +22441,20 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     }
   };
   const auto request_workload_shutdown = [&](bool run_failed) {
+    const std::chrono::steady_clock::time_point shutdown_requested_at =
+        observed_run_stop().value_or(std::chrono::steady_clock::now());
     std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
     std::vector<std::shared_ptr<LiveBlockGenerationWorkloadRecord>>
         block_records;
+    std::vector<std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>>
+        height_wait_records;
     {
       std::scoped_lock lock(wallet_workloads->mutex,
-                            block_generation_workloads->mutex);
+                            block_generation_workloads->mutex,
+                            wait_until_height_workloads->mutex);
       wallet_workloads->shutting_down = true;
       block_generation_workloads->shutting_down = true;
+      wait_until_height_workloads->shutting_down = true;
       records.reserve(wallet_workloads->records.size());
       for (const auto& [id, record] : wallet_workloads->records) {
         static_cast<void>(id);
@@ -22282,6 +22464,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       for (const auto& [id, record] : block_generation_workloads->records) {
         static_cast<void>(id);
         block_records.push_back(record);
+      }
+      height_wait_records.reserve(wait_until_height_workloads->records.size());
+      for (const auto& [id, record] : wait_until_height_workloads->records) {
+        static_cast<void>(id);
+        height_wait_records.push_back(record);
       }
     }
     for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
@@ -22307,11 +22494,38 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       record->boundary_stop_source.request_stop();
       record->changed.notify_all();
     }
-    return std::make_pair(std::move(records), std::move(block_records));
+    for (const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record :
+         height_wait_records) {
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (IsTerminalLiveWorkloadState(record->state) ||
+          record->completion_pending) {
+        continue;
+      }
+      if ((record->state == LiveWorkloadState::kRunning ||
+           (record->state == LiveWorkloadState::kStopping &&
+            record->request == LiveWorkloadRequest::kStopSettle)) &&
+          record->epoch_deadline != std::chrono::steady_clock::time_point{} &&
+          shutdown_requested_at >= record->epoch_deadline &&
+          (record->request == LiveWorkloadRequest::kNone ||
+           record->request == LiveWorkloadRequest::kStopSettle)) {
+        record->epoch_timed_out = true;
+        record->epoch_stop_source.request_stop();
+        record->changed.notify_all();
+        continue;
+      }
+      record->state = LiveWorkloadState::kStopping;
+      record->request = run_failed ? LiveWorkloadRequest::kRunFailure
+                                   : LiveWorkloadRequest::kShutdown;
+      record->epoch_stop_source.request_stop();
+      record->changed.notify_all();
+    }
+    return std::make_tuple(std::move(records), std::move(block_records),
+                           std::move(height_wait_records));
   };
   const auto stop_wallet_workloads = [&](bool run_failed) {
     mcp_application.SetWorkloadService(nullptr);
-    auto [records, block_records] = request_workload_shutdown(run_failed);
+    auto [records, block_records, height_wait_records] =
+        request_workload_shutdown(run_failed);
     for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
       if (record->worker.joinable()) {
         record->worker.join();
@@ -22323,6 +22537,23 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         record->terminal_outcome = run_failed ? "failed" : "cancelled";
         if (run_failed && !record->failure) {
           record->failure = "run failed while wallet workload was active";
+        }
+        record->changed.notify_all();
+      }
+    }
+    for (const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record :
+         height_wait_records) {
+      if (record->worker.joinable()) {
+        record->worker.join();
+      }
+      std::lock_guard<std::mutex> lock(record->mutex);
+      if (!IsTerminalLiveWorkloadState(record->state)) {
+        record->state = run_failed ? LiveWorkloadState::kFailed
+                                   : LiveWorkloadState::kCancelled;
+        record->terminal_outcome = run_failed ? "failed" : "cancelled";
+        if (run_failed && !record->failure) {
+          record->failure =
+              "run failed while wait-until-height workload was active";
         }
         record->changed.notify_all();
       }
@@ -22606,7 +22837,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         const auto duration_deadline = SteadyDeadline(epoch, wall_duration);
         duration_timer.emplace([duration_deadline, &simulation_duration_reached,
                                 &duration_stop_requested_at_ms,
-                                &mcp_application, &simulation_stop_source,
+                                &mcp_application, &request_simulation_stop,
                                 epoch](std::stop_token timer_stop_token) {
           try {
             WaitUntil(duration_deadline, timer_stop_token);
@@ -22618,7 +22849,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               std::memory_order_release);
           simulation_duration_reached.store(true, std::memory_order_release);
           mcp_application.MarkRunStopping();
-          simulation_stop_source.request_stop();
+          request_simulation_stop();
         });
       };
   BenchmarkTerminalOutcome terminal_outcome =
@@ -22985,9 +23216,10 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                         runtime_wallet_registry, *peer_connectivity_controller,
                         *runtime_topology, live_topology_config,
                         wallet_workloads, block_generation_workloads,
-                        transaction_tracker, run_process_state, lifecycle_epoch,
-                        command.node_id, *command.node_replace,
-                        resume_native_miner, chain_spec.default_reward_address,
+                        wait_until_height_workloads, transaction_tracker,
+                        run_process_state, lifecycle_epoch, command.node_id,
+                        *command.node_replace, resume_native_miner,
+                        chain_spec.default_reward_address,
                         command.operation_control.get(), command_stop_token);
                 command_outcome.inventory_generation =
                     replaced.inventory_generation;
@@ -22996,7 +23228,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 mining_intent.reset();
                 command.operation_control->outcome_unconfirmed.store(
                     true, std::memory_order_release);
-                simulation_stop_source.request_stop();
+                request_simulation_stop();
                 throw;
               } catch (...) {
                 const std::exception_ptr failure = std::current_exception();
@@ -23006,7 +23238,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 } catch (...) {
                   command.operation_control->outcome_unconfirmed.store(
                       true, std::memory_order_release);
-                  simulation_stop_source.request_stop();
+                  request_simulation_stop();
                   throw SimulationCommandOutcomeUnconfirmed(
                       "node-replace failed: " + ExceptionMessage(failure) +
                       "; scheduled mining restoration failed: " +
@@ -23020,7 +23252,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               } catch (...) {
                 command.operation_control->outcome_unconfirmed.store(
                     true, std::memory_order_release);
-                simulation_stop_source.request_stop();
+                request_simulation_stop();
                 throw SimulationCommandOutcomeUnconfirmed(
                     "node-replace committed but scheduled mining restoration "
                     "failed: " +
@@ -23035,9 +23267,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                   options, events_path, driver, node_inventory,
                   runtime_wallet_registry, *peer_connectivity_controller,
                   &runtime_topology, &live_topology_config, wallet_workloads,
-                  block_generation_workloads, transaction_tracker,
-                  *command.node_remove, command.operation_control.get(),
-                  command_stop_token);
+                  block_generation_workloads, wait_until_height_workloads,
+                  transaction_tracker, *command.node_remove,
+                  command.operation_control.get(), command_stop_token);
               command_outcome.removed_node_ids =
                   std::move(removed.removed_node_ids);
               command_outcome.inventory_generation =
@@ -23574,7 +23806,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 if (!command.operation_control &&
                     restart_control->outcome_unconfirmed.load(
                         std::memory_order_acquire)) {
-                  simulation_stop_source.request_stop();
+                  request_simulation_stop();
                   throw SimulationCommandOutcomeUnconfirmed(
                       ExceptionMessage(std::current_exception()));
                 }
@@ -23800,7 +24032,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                   command.operation_control->outcome_unconfirmed.store(
                       true, std::memory_order_release);
                 } else {
-                  simulation_stop_source.request_stop();
+                  request_simulation_stop();
                 }
                 throw;
               }
@@ -23851,7 +24083,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 command.operation_control->outcome_unconfirmed.store(
                     true, std::memory_order_release);
               }
-              simulation_stop_source.request_stop();
+              request_simulation_stop();
             }
             const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
             const auto node = std::find_if(
@@ -24080,7 +24312,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         }
         mcp_application.MarkRunStopping();
         static_cast<void>(request_workload_shutdown(true));
-        simulation_stop_source.request_stop();
+        request_simulation_stop();
       }
     });
     log_collector = std::make_unique<NodeLogCollector>(
@@ -24201,9 +24433,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       record->workload = std::move(workload);
       {
         std::scoped_lock registry_lock(wallet_workloads->mutex,
-                                       block_generation_workloads->mutex);
+                                       block_generation_workloads->mutex,
+                                       wait_until_height_workloads->mutex);
         if (wallet_workloads->shutting_down ||
-            block_generation_workloads->shutting_down) {
+            block_generation_workloads->shutting_down ||
+            wait_until_height_workloads->shutting_down) {
           throw McpOperationFailure(
               "run_not_active",
               "the run is stopping and cannot start another workload", false);
@@ -24217,7 +24451,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         record->claimed_wallets = ClaimedWalletsForWorkload(
             record->workload, record->wallet_snapshot.wallets().size());
         if (wallet_workloads->records.size() +
-                block_generation_workloads->records.size() >=
+                block_generation_workloads->records.size() +
+                wait_until_height_workloads->records.size() >=
             kMaximumScenarioActionCount) {
           throw McpOperationFailure(
               "workload_capacity_exceeded",
@@ -24248,7 +24483,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         if (requested_id) {
           ValidateMcpIdentifier(*requested_id, "workload_id");
           if (wallet_workloads->records.contains(*requested_id) ||
-              block_generation_workloads->records.contains(*requested_id)) {
+              block_generation_workloads->records.contains(*requested_id) ||
+              wait_until_height_workloads->records.contains(*requested_id)) {
             throw McpOperationFailure(
                 "workload_id_conflict",
                 "workload_id is already retained: " + *requested_id, false);
@@ -24265,11 +24501,13 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             record->id = "wallet-workload-" +
                          std::to_string(wallet_workloads->next_id++);
           } while (wallet_workloads->records.contains(record->id) ||
-                   block_generation_workloads->records.contains(record->id));
+                   block_generation_workloads->records.contains(record->id) ||
+                   wait_until_height_workloads->records.contains(record->id));
         }
         record->ordinal = static_cast<std::uint32_t>(
             wallet_workloads->records.size() +
-            block_generation_workloads->records.size() + 1U);
+            block_generation_workloads->records.size() +
+            wait_until_height_workloads->records.size() + 1U);
         wallet_workloads->records.emplace(record->id, record);
 
         try {
@@ -24619,15 +24857,18 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       record->workload = workload;
       {
         std::scoped_lock registry_lock(wallet_workloads->mutex,
-                                       block_generation_workloads->mutex);
+                                       block_generation_workloads->mutex,
+                                       wait_until_height_workloads->mutex);
         if (wallet_workloads->shutting_down ||
-            block_generation_workloads->shutting_down) {
+            block_generation_workloads->shutting_down ||
+            wait_until_height_workloads->shutting_down) {
           throw McpOperationFailure(
               "run_not_active",
               "the run is stopping and cannot start another workload", false);
         }
         if (wallet_workloads->records.size() +
-                block_generation_workloads->records.size() >=
+                block_generation_workloads->records.size() +
+                wait_until_height_workloads->records.size() >=
             kMaximumScenarioActionCount) {
           throw McpOperationFailure(
               "workload_capacity_exceeded",
@@ -24645,7 +24886,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         if (requested_id) {
           ValidateMcpIdentifier(*requested_id, "workload_id");
           if (wallet_workloads->records.contains(*requested_id) ||
-              block_generation_workloads->records.contains(*requested_id)) {
+              block_generation_workloads->records.contains(*requested_id) ||
+              wait_until_height_workloads->records.contains(*requested_id)) {
             throw McpOperationFailure(
                 "workload_id_conflict",
                 "workload_id is already retained: " + *requested_id, false);
@@ -24663,11 +24905,13 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             record->id = "block-generation-workload-" +
                          std::to_string(block_generation_workloads->next_id++);
           } while (wallet_workloads->records.contains(record->id) ||
-                   block_generation_workloads->records.contains(record->id));
+                   block_generation_workloads->records.contains(record->id) ||
+                   wait_until_height_workloads->records.contains(record->id));
         }
         record->ordinal = static_cast<std::uint32_t>(
             wallet_workloads->records.size() +
-            block_generation_workloads->records.size() + 1U);
+            block_generation_workloads->records.size() +
+            wait_until_height_workloads->records.size() + 1U);
         block_generation_workloads->records.emplace(record->id, record);
 
         try {
@@ -25182,12 +25426,727 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           return LiveBlockGenerationWorkloadJson(*record);
         };
 
+    const auto find_wait_until_height_workload_record =
+        [wait_until_height_workloads](std::string_view workload_id) {
+          std::lock_guard<std::mutex> lock(wait_until_height_workloads->mutex);
+          const auto found = wait_until_height_workloads->records.find(
+              std::string(workload_id));
+          return found == wait_until_height_workloads->records.end()
+                     ? std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>{}
+                     : found->second;
+        };
+    const auto launch_wait_until_height_workload =
+        [&](WaitUntilHeightWorkload workload,
+            std::optional<std::string> requested_id)
+        -> std::shared_ptr<LiveWaitUntilHeightWorkloadRecord> {
+      auto record = std::make_shared<LiveWaitUntilHeightWorkloadRecord>();
+      record->workload = workload;
+      {
+        std::scoped_lock registry_lock(wallet_workloads->mutex,
+                                       block_generation_workloads->mutex,
+                                       wait_until_height_workloads->mutex);
+        if (wallet_workloads->shutting_down ||
+            block_generation_workloads->shutting_down ||
+            wait_until_height_workloads->shutting_down) {
+          throw McpOperationFailure(
+              "run_not_active",
+              "the run is stopping and cannot start another workload", false);
+        }
+        if (wallet_workloads->records.size() +
+                block_generation_workloads->records.size() +
+                wait_until_height_workloads->records.size() >=
+            kMaximumScenarioActionCount) {
+          throw McpOperationFailure(
+              "workload_capacity_exceeded",
+              "workload retained-instance capacity is exhausted", false);
+        }
+        if (requested_id) {
+          ValidateMcpIdentifier(*requested_id, "workload_id");
+          if (wallet_workloads->records.contains(*requested_id) ||
+              block_generation_workloads->records.contains(*requested_id) ||
+              wait_until_height_workloads->records.contains(*requested_id)) {
+            throw McpOperationFailure(
+                "workload_id_conflict",
+                "workload_id is already retained: " + *requested_id, false);
+          }
+          record->id = *requested_id;
+        } else {
+          do {
+            if (wait_until_height_workloads->next_id ==
+                std::numeric_limits<std::uint64_t>::max()) {
+              throw McpOperationFailure(
+                  "workload_id_exhausted",
+                  "wait-until-height workload identity sequence is exhausted",
+                  false);
+            }
+            record->id = "wait-until-height-workload-" +
+                         std::to_string(wait_until_height_workloads->next_id++);
+          } while (wallet_workloads->records.contains(record->id) ||
+                   block_generation_workloads->records.contains(record->id) ||
+                   wait_until_height_workloads->records.contains(record->id));
+        }
+        record->ordinal = static_cast<std::uint32_t>(
+            wallet_workloads->records.size() +
+            block_generation_workloads->records.size() +
+            wait_until_height_workloads->records.size() + 1U);
+        wait_until_height_workloads->records.emplace(record->id, record);
+
+        try {
+          record->worker = std::thread([&, record] {
+            const auto set_terminal =
+                [&](LiveWorkloadState state, std::string outcome,
+                    std::optional<std::string> failure = std::nullopt) {
+                  {
+                    std::lock_guard<std::mutex> lock(record->mutex);
+                    record->state = state;
+                    record->terminal_outcome = std::move(outcome);
+                    record->failure = std::move(failure);
+                    record->completion_pending = false;
+                    record->changed.notify_all();
+                  }
+                  try {
+                    WriteLiveWaitUntilHeightWorkloadState(events_path, options,
+                                                          *record);
+                  } catch (const std::exception& error) {
+                    BBP_LOG(error)
+                        << "failed to publish terminal wait-until-height "
+                           "workload "
+                        << record->id << ": " << error.what();
+                  }
+                };
+            try {
+              while (true) {
+                WaitUntilHeightWorkload epoch_workload;
+                std::stop_source epoch_stop_source;
+                std::chrono::steady_clock::time_point deadline;
+                bool publish_running = false;
+                {
+                  std::unique_lock<std::mutex> lock(record->mutex);
+                  while (record->request == LiveWorkloadRequest::kPause) {
+                    record->state = LiveWorkloadState::kPaused;
+                    record->epoch_deadline =
+                        std::chrono::steady_clock::time_point{};
+                    record->epoch_timed_out = false;
+                    record->epoch_run_stop_requested_at.reset();
+                    record->changed.notify_all();
+                    lock.unlock();
+                    WriteLiveWaitUntilHeightWorkloadState(events_path, options,
+                                                          *record);
+                    lock.lock();
+                    if (!record->changed.wait(lock, stop_token, [&] {
+                          return record->request != LiveWorkloadRequest::kPause;
+                        })) {
+                      record->request = LiveWorkloadRequest::kShutdown;
+                      record->epoch_stop_source.request_stop();
+                      break;
+                    }
+                  }
+                  if (record->request == LiveWorkloadRequest::kStopCancel ||
+                      record->request == LiveWorkloadRequest::kStopSettle) {
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kStopped, "stopped");
+                    return;
+                  }
+                  if (record->request == LiveWorkloadRequest::kShutdown) {
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kCancelled, "cancelled");
+                    return;
+                  }
+                  if (record->request == LiveWorkloadRequest::kRunFailure) {
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kFailed, "failed",
+                                 "run failed while wait-until-height workload "
+                                 "was active");
+                    return;
+                  }
+                  if (record->request == LiveWorkloadRequest::kReconfigure) {
+                    if (!record->pending_workload) {
+                      throw std::logic_error(
+                          "wait-until-height workload reconfigure has no "
+                          "configuration");
+                    }
+                    if (record->configuration_revision ==
+                        std::numeric_limits<std::uint64_t>::max()) {
+                      throw std::runtime_error(
+                          "wait-until-height workload configuration revision "
+                          "exceeds uint64");
+                    }
+                    record->workload = *record->pending_workload;
+                    record->pending_workload.reset();
+                    ++record->configuration_revision;
+                    record->request = LiveWorkloadRequest::kNone;
+                    record->state = LiveWorkloadState::kStarting;
+                    record->epoch_deadline =
+                        std::chrono::steady_clock::time_point{};
+                    record->changed.notify_all();
+                    lock.unlock();
+                    WriteLiveWaitUntilHeightWorkloadState(events_path, options,
+                                                          *record);
+                    lock.lock();
+                    if (record->request != LiveWorkloadRequest::kNone) {
+                      continue;
+                    }
+                  }
+                  if (stop_token.stop_requested()) {
+                    record->request = LiveWorkloadRequest::kShutdown;
+                    lock.unlock();
+                    set_terminal(LiveWorkloadState::kCancelled, "cancelled");
+                    return;
+                  }
+                  record->epoch_stop_source = std::stop_source();
+                  epoch_stop_source = record->epoch_stop_source;
+                  epoch_workload = record->workload;
+                  deadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(epoch_workload.timeout_sec);
+                  record->epoch_deadline = deadline;
+                  record->epoch_timed_out = false;
+                  record->epoch_run_stop_requested_at.reset();
+                  if (record->state != LiveWorkloadState::kRunning) {
+                    record->state = LiveWorkloadState::kRunning;
+                    publish_running = true;
+                  }
+                  record->changed.notify_all();
+                }
+                if (publish_running) {
+                  WriteLiveWaitUntilHeightWorkloadState(events_path, options,
+                                                        *record);
+                }
+
+                const std::stop_token execution_stop_token =
+                    epoch_stop_source.get_token();
+                std::stop_callback stop_epoch_on_run_stop(
+                    stop_token, [&, epoch_stop_source] {
+                      const auto observed_at = std::chrono::steady_clock::now();
+                      record_run_stop(observed_at);
+                      const auto requested_at =
+                          observed_run_stop().value_or(observed_at);
+                      std::lock_guard<std::mutex> lock(record->mutex);
+                      if (record->completion_pending) {
+                        return;
+                      }
+                      record->epoch_run_stop_requested_at = requested_at;
+                      epoch_stop_source.request_stop();
+                      record->changed.notify_all();
+                    });
+                std::mutex deadline_mutex;
+                std::condition_variable_any deadline_changed;
+                std::jthread deadline_timer(
+                    [&, epoch_stop_source](std::stop_token timer_stop_token) {
+                      {
+                        std::unique_lock<std::mutex> lock(deadline_mutex);
+                        static_cast<void>(deadline_changed.wait_until(
+                            lock, timer_stop_token, deadline,
+                            [] { return false; }));
+                      }
+                      if (timer_stop_token.stop_requested()) {
+                        return;
+                      }
+                      std::lock_guard<std::mutex> lock(record->mutex);
+                      if (!timer_stop_token.stop_requested() &&
+                          (!record->epoch_run_stop_requested_at ||
+                           *record->epoch_run_stop_requested_at >= deadline) &&
+                          (record->request == LiveWorkloadRequest::kNone ||
+                           record->request ==
+                               LiveWorkloadRequest::kStopSettle)) {
+                        record->epoch_timed_out = true;
+                        epoch_stop_source.request_stop();
+                      }
+                    });
+                try {
+                  ChainNodeConfig target_config;
+                  {
+                    auto mutation_lock = AcquireNodeMutationLock(
+                        node_mutation_mutex, execution_stop_token);
+                    const RuntimeNodeSnapshot execution_nodes =
+                        node_inventory.Snapshot();
+                    NodeRuntime& node = RequireRuntimeNodeNumber(
+                        execution_nodes, epoch_workload.node,
+                        "wait_until_height workload");
+                    RequireNodeRunning(node, "wait_until_height workload");
+                    target_config = node.config;
+                  }
+                  while (true) {
+                    driver.WaitForHeight(
+                        target_config, epoch_workload.height,
+                        std::chrono::seconds(epoch_workload.timeout_sec),
+                        execution_stop_token);
+                    const std::uint64_t observed_height =
+                        driver.ReadMetrics(target_config, execution_stop_token)
+                            .height;
+                    std::optional<LiveWaitUntilHeightResult> completed_result;
+                    if (observed_height >= epoch_workload.height) {
+                      completed_result.emplace(LiveWaitUntilHeightResult{
+                          .node = epoch_workload.node,
+                          .node_id = target_config.id,
+                          .target_height = epoch_workload.height,
+                          .observed_height = observed_height,
+                      });
+                    }
+                    std::unique_lock<std::mutex> lock(record->mutex);
+                    if ((record->request != LiveWorkloadRequest::kNone &&
+                         record->request != LiveWorkloadRequest::kStopSettle)) {
+                      throw SimulationCancelled();
+                    }
+                    const auto require_open_epoch = [&] {
+                      if (record->epoch_run_stop_requested_at &&
+                          *record->epoch_run_stop_requested_at < deadline) {
+                        throw SimulationCancelled();
+                      }
+                      if (record->epoch_timed_out ||
+                          std::chrono::steady_clock::now() >= deadline) {
+                        record->epoch_timed_out = true;
+                        epoch_stop_source.request_stop();
+                        throw SimulationCancelled();
+                      }
+                      if (execution_stop_token.stop_requested()) {
+                        throw SimulationCancelled();
+                      }
+                    };
+                    require_open_epoch();
+                    if (observed_height < epoch_workload.height) {
+                      lock.unlock();
+                      continue;
+                    }
+                    deadline_timer.request_stop();
+                    require_open_epoch();
+                    const bool settle =
+                        record->request == LiveWorkloadRequest::kStopSettle;
+                    record->completion_pending = true;
+                    record->state = LiveWorkloadState::kStopping;
+                    record->changed.notify_all();
+                    lock.unlock();
+                    WriteEvent(events_path, options.run_id, target_config.id,
+                               SimulationEventKind::kHeightWaitReached,
+                               HeightWaitDetail(record->ordinal, 0U,
+                                                epoch_workload.node,
+                                                epoch_workload.height,
+                                                observed_height, record->id));
+                    lock.lock();
+                    record->result = std::move(*completed_result);
+                    record->completion_pending = false;
+                    if (settle) {
+                      record->state = LiveWorkloadState::kStopped;
+                      record->terminal_outcome = "stopped";
+                    } else {
+                      record->state = LiveWorkloadState::kCompleted;
+                      record->terminal_outcome = "height_reached";
+                    }
+                    record->changed.notify_all();
+                    lock.unlock();
+                    try {
+                      WriteLiveWaitUntilHeightWorkloadState(events_path,
+                                                            options, *record);
+                    } catch (const std::exception& error) {
+                      BBP_LOG(error)
+                          << "failed to publish completed wait-until-height "
+                             "workload "
+                          << record->id << ": " << error.what();
+                    }
+                    return;
+                  }
+                } catch (const SimulationCancelled&) {
+                  deadline_timer.request_stop();
+                  LiveWorkloadRequest request;
+                  bool timed_out = false;
+                  bool run_stop_admitted = false;
+                  {
+                    std::lock_guard<std::mutex> lock(record->mutex);
+                    request = record->request;
+                    run_stop_admitted =
+                        record->epoch_run_stop_requested_at &&
+                        *record->epoch_run_stop_requested_at < deadline;
+                    if (!run_stop_admitted &&
+                        (request == LiveWorkloadRequest::kNone ||
+                         request == LiveWorkloadRequest::kStopSettle) &&
+                        std::chrono::steady_clock::now() >= deadline) {
+                      record->epoch_timed_out = true;
+                      epoch_stop_source.request_stop();
+                    }
+                    timed_out = record->epoch_timed_out && !run_stop_admitted;
+                  }
+                  if (timed_out) {
+                    throw std::runtime_error(
+                        "wait_until_height workload timed out after " +
+                        std::to_string(epoch_workload.timeout_sec) +
+                        " seconds waiting for height " +
+                        std::to_string(epoch_workload.height));
+                  }
+                  if (!run_stop_admitted &&
+                      (request == LiveWorkloadRequest::kPause ||
+                       request == LiveWorkloadRequest::kReconfigure)) {
+                    continue;
+                  }
+                  throw;
+                }
+              }
+            } catch (const SimulationCancelled&) {
+              LiveWorkloadRequest request;
+              bool run_stop_admitted = false;
+              {
+                std::lock_guard<std::mutex> lock(record->mutex);
+                request = record->request;
+                run_stop_admitted = record->epoch_run_stop_requested_at &&
+                                    *record->epoch_run_stop_requested_at <
+                                        record->epoch_deadline;
+              }
+              if (request == LiveWorkloadRequest::kRunFailure) {
+                set_terminal(
+                    LiveWorkloadState::kFailed, "failed",
+                    "run failed while wait-until-height workload was active");
+              } else if (run_stop_admitted ||
+                         request == LiveWorkloadRequest::kShutdown ||
+                         stop_token.stop_requested()) {
+                set_terminal(LiveWorkloadState::kCancelled, "cancelled");
+              } else if (request == LiveWorkloadRequest::kStopCancel ||
+                         request == LiveWorkloadRequest::kStopSettle) {
+                set_terminal(LiveWorkloadState::kStopped, "stopped");
+              } else {
+                set_terminal(
+                    LiveWorkloadState::kFailed, "failed",
+                    "wait-until-height workload execution was cancelled "
+                    "unexpectedly");
+              }
+            } catch (const std::exception& error) {
+              set_terminal(LiveWorkloadState::kFailed, "failed", error.what());
+            } catch (...) {
+              set_terminal(LiveWorkloadState::kFailed, "failed",
+                           "unknown wait-until-height workload failure");
+            }
+          });
+        } catch (...) {
+          const auto found =
+              wait_until_height_workloads->records.find(record->id);
+          if (found != wait_until_height_workloads->records.end() &&
+              found->second == record) {
+            wait_until_height_workloads->records.erase(found);
+          }
+          throw;
+        }
+      }
+      return record;
+    };
+
+    const auto wait_until_height_operation =
+        [&, find_wait_until_height_workload_record,
+         launch_wait_until_height_workload](
+            McpOperationKind kind, const boost::json::object& arguments,
+            std::stop_token operation_stop_token) {
+          const auto require_argument_string = [&](std::string_view field) {
+            const boost::json::value* value = arguments.if_contains(field);
+            if (value == nullptr || !value->is_string() ||
+                value->as_string().empty()) {
+              throw std::invalid_argument(
+                  "workload operation requires string " + std::string(field));
+            }
+            return std::string(value->as_string());
+          };
+          const auto operation_timeout = [&] {
+            std::uint64_t seconds = 30U;
+            if (const boost::json::value* value =
+                    arguments.if_contains("timeout_sec")) {
+              if (value->is_uint64()) {
+                seconds = value->as_uint64();
+              } else if (value->is_int64() && value->as_int64() >= 0) {
+                seconds = static_cast<std::uint64_t>(value->as_int64());
+              } else {
+                throw std::invalid_argument(
+                    "workload timeout_sec must be an unsigned integer");
+              }
+            }
+            if (seconds == 0U || seconds > 3600U) {
+              throw std::invalid_argument(
+                  "workload timeout_sec must be in 1..3600");
+            }
+            return std::chrono::seconds(seconds);
+          };
+          const auto expire_epoch_if_due =
+              [&](LiveWaitUntilHeightWorkloadRecord& record) {
+                if (record.completion_pending ||
+                    IsTerminalLiveWorkloadState(record.state) ||
+                    (record.state != LiveWorkloadState::kRunning &&
+                     !(record.state == LiveWorkloadState::kStopping &&
+                       record.request == LiveWorkloadRequest::kStopSettle)) ||
+                    record.epoch_deadline ==
+                        std::chrono::steady_clock::time_point{} ||
+                    (record.epoch_run_stop_requested_at &&
+                     *record.epoch_run_stop_requested_at <
+                         record.epoch_deadline) ||
+                    std::chrono::steady_clock::now() < record.epoch_deadline ||
+                    (record.request != LiveWorkloadRequest::kNone &&
+                     record.request != LiveWorkloadRequest::kStopSettle)) {
+                  return record.epoch_timed_out;
+                }
+                record.epoch_timed_out = true;
+                record.epoch_stop_source.request_stop();
+                record.changed.notify_all();
+                return true;
+              };
+          if (kind == McpOperationKind::kStartWorkload) {
+            const boost::json::value* workload_value =
+                arguments.if_contains("workload");
+            if (workload_value == nullptr || !workload_value->is_object()) {
+              throw std::invalid_argument(
+                  "workload.start requires a workload object");
+            }
+            std::optional<std::string> requested_id;
+            if (arguments.if_contains("workload_id") != nullptr) {
+              requested_id = require_argument_string("workload_id");
+            }
+            std::shared_ptr<LiveWaitUntilHeightWorkloadRecord> record;
+            {
+              auto mutation_lock = AcquireNodeMutationLock(
+                  node_mutation_mutex, operation_stop_token);
+              const RuntimeNodeSnapshot current_nodes =
+                  node_inventory.Snapshot();
+              const WaitUntilHeightWorkload workload =
+                  ParseAndValidateLiveWaitUntilHeightWorkload(
+                      workload_value->as_object(), options, current_nodes);
+              record = launch_wait_until_height_workload(
+                  workload, std::move(requested_id));
+            }
+            std::unique_lock<std::mutex> lock(record->mutex);
+            if (!record->changed.wait(lock, operation_stop_token, [&] {
+                  return record->state != LiveWorkloadState::kStarting;
+                })) {
+              record->request = LiveWorkloadRequest::kStopCancel;
+              record->epoch_stop_source.request_stop();
+              record->changed.notify_all();
+              throw McpOperationCancelled();
+            }
+            lock.unlock();
+            return LiveWaitUntilHeightWorkloadJson(*record);
+          }
+
+          const std::string workload_id =
+              require_argument_string("workload_id");
+          const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord> record =
+              find_wait_until_height_workload_record(workload_id);
+          if (!record) {
+            throw McpOperationFailure(
+                "workload_not_found",
+                "wait-until-height workload instance is not registered: " +
+                    workload_id,
+                false);
+          }
+          if (kind == McpOperationKind::kInspectWorkload) {
+            return LiveWaitUntilHeightWorkloadJson(*record);
+          }
+          if (kind == McpOperationKind::kReconfigureWorkload) {
+            const boost::json::value* workload_value =
+                arguments.if_contains("workload");
+            if (workload_value == nullptr || !workload_value->is_object()) {
+              throw std::invalid_argument(
+                  "workload.reconfigure requires a workload object");
+            }
+            WaitUntilHeightWorkload updated;
+            {
+              auto mutation_lock = AcquireNodeMutationLock(
+                  node_mutation_mutex, operation_stop_token);
+              updated = ParseAndValidateLiveWaitUntilHeightWorkload(
+                  workload_value->as_object(), options,
+                  node_inventory.Snapshot());
+            }
+            bool publish_paused_revision = false;
+            std::uint64_t expected_revision = 0U;
+            {
+              std::lock_guard<std::mutex> lock(record->mutex);
+              if (IsTerminalLiveWorkloadState(record->state)) {
+                throw McpOperationFailure(
+                    "workload_not_active",
+                    "terminal wait-until-height workload cannot be "
+                    "reconfigured",
+                    false);
+              }
+              if (expire_epoch_if_due(*record)) {
+                throw McpOperationFailure(
+                    "workload_transition_in_progress",
+                    "wait-until-height workload epoch deadline has elapsed",
+                    true);
+              }
+              if (record->state == LiveWorkloadState::kStarting ||
+                  record->state == LiveWorkloadState::kStopping) {
+                throw McpOperationFailure(
+                    "workload_transition_in_progress",
+                    "wait-until-height workload already has a lifecycle "
+                    "transition in progress",
+                    true);
+              }
+              if (record->configuration_revision ==
+                  std::numeric_limits<std::uint64_t>::max()) {
+                throw std::runtime_error(
+                    "wait-until-height workload configuration revision exceeds "
+                    "uint64");
+              }
+              expected_revision = record->configuration_revision;
+              if (record->state == LiveWorkloadState::kPaused) {
+                record->workload = updated;
+                ++record->configuration_revision;
+                publish_paused_revision = true;
+              } else {
+                record->pending_workload = updated;
+                record->request = LiveWorkloadRequest::kReconfigure;
+                record->state = LiveWorkloadState::kStopping;
+                record->epoch_stop_source.request_stop();
+              }
+              record->changed.notify_all();
+            }
+            if (publish_paused_revision) {
+              WriteLiveWaitUntilHeightWorkloadState(events_path, options,
+                                                    *record);
+            } else {
+              std::unique_lock<std::mutex> lock(record->mutex);
+              if (!record->changed.wait(lock, operation_stop_token, [&] {
+                    return (record->configuration_revision >
+                                expected_revision &&
+                            record->state == LiveWorkloadState::kRunning) ||
+                           IsTerminalLiveWorkloadState(record->state);
+                  })) {
+                throw McpOperationCancelled();
+              }
+            }
+            return LiveWaitUntilHeightWorkloadJson(*record);
+          }
+          if (kind == McpOperationKind::kResumeWorkload) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + operation_timeout();
+            {
+              std::lock_guard<std::mutex> lock(record->mutex);
+              if (record->state != LiveWorkloadState::kPaused) {
+                throw McpOperationFailure(
+                    "workload_not_paused",
+                    "wait-until-height workload is not paused: " + workload_id,
+                    false);
+              }
+              record->request = LiveWorkloadRequest::kNone;
+              record->state = LiveWorkloadState::kStarting;
+              record->changed.notify_all();
+            }
+            std::unique_lock<std::mutex> lock(record->mutex);
+            if (!record->changed.wait_until(
+                    lock, operation_stop_token, deadline, [&] {
+                      return record->state == LiveWorkloadState::kRunning ||
+                             IsTerminalLiveWorkloadState(record->state);
+                    })) {
+              if (operation_stop_token.stop_requested()) {
+                throw McpOperationCancelled();
+              }
+              throw McpOperationFailure(
+                  "workload_operation_timeout",
+                  "wait-until-height workload did not resume before timeout",
+                  true);
+            }
+            lock.unlock();
+            return LiveWaitUntilHeightWorkloadJson(*record);
+          }
+          const auto deadline =
+              std::chrono::steady_clock::now() + operation_timeout();
+          std::optional<std::string> stop_policy;
+          if (kind == McpOperationKind::kStopWorkload) {
+            stop_policy = "cancel";
+            if (const boost::json::value* value =
+                    arguments.if_contains("policy")) {
+              if (!value->is_string()) {
+                throw std::invalid_argument(
+                    "workload.stop policy must be a string");
+              }
+              stop_policy = std::string(value->as_string());
+            }
+            if (*stop_policy != "cancel" && *stop_policy != "settle") {
+              throw std::invalid_argument(
+                  "workload.stop policy must be cancel or settle");
+            }
+          }
+          bool already_paused = false;
+          {
+            std::lock_guard<std::mutex> lock(record->mutex);
+            if (IsTerminalLiveWorkloadState(record->state)) {
+              throw McpOperationFailure(
+                  "workload_not_active",
+                  "wait-until-height workload is already terminal: " +
+                      workload_id,
+                  false);
+            }
+            if (expire_epoch_if_due(*record)) {
+              throw McpOperationFailure(
+                  "workload_transition_in_progress",
+                  "wait-until-height workload epoch deadline has elapsed",
+                  true);
+            }
+            if (record->state == LiveWorkloadState::kStarting) {
+              throw McpOperationFailure(
+                  "workload_transition_in_progress",
+                  "wait-until-height workload already has a lifecycle "
+                  "transition in progress",
+                  true);
+            }
+            if (kind == McpOperationKind::kPauseWorkload &&
+                record->state == LiveWorkloadState::kPaused) {
+              already_paused = true;
+            } else if (record->state == LiveWorkloadState::kStopping) {
+              if (kind == McpOperationKind::kStopWorkload &&
+                  stop_policy == "cancel" &&
+                  record->request == LiveWorkloadRequest::kStopSettle &&
+                  !record->completion_pending) {
+                record->request = LiveWorkloadRequest::kStopCancel;
+                record->epoch_stop_source.request_stop();
+              } else {
+                throw McpOperationFailure(
+                    "workload_transition_in_progress",
+                    "wait-until-height workload already has a lifecycle "
+                    "transition in progress",
+                    true);
+              }
+            } else if (kind == McpOperationKind::kPauseWorkload) {
+              record->request = LiveWorkloadRequest::kPause;
+              record->state = LiveWorkloadState::kStopping;
+              record->epoch_stop_source.request_stop();
+            } else if (kind == McpOperationKind::kStopWorkload) {
+              record->request = stop_policy == "settle"
+                                    ? LiveWorkloadRequest::kStopSettle
+                                    : LiveWorkloadRequest::kStopCancel;
+              record->state = LiveWorkloadState::kStopping;
+              if (stop_policy == "cancel") {
+                record->epoch_stop_source.request_stop();
+              }
+            } else {
+              throw std::logic_error(
+                  "unknown wait-until-height workload operation");
+            }
+            record->changed.notify_all();
+          }
+          if (already_paused) {
+            return LiveWaitUntilHeightWorkloadJson(*record);
+          }
+          std::unique_lock<std::mutex> lock(record->mutex);
+          const auto reached_target = [&] {
+            return kind == McpOperationKind::kPauseWorkload
+                       ? record->state == LiveWorkloadState::kPaused ||
+                             IsTerminalLiveWorkloadState(record->state)
+                       : IsTerminalLiveWorkloadState(record->state);
+          };
+          if (!record->changed.wait_until(lock, operation_stop_token, deadline,
+                                          reached_target)) {
+            if (operation_stop_token.stop_requested()) {
+              throw McpOperationCancelled();
+            }
+            throw McpOperationFailure(
+                "workload_operation_timeout",
+                "wait-until-height workload did not reach the requested state "
+                "before timeout",
+                true);
+          }
+          lock.unlock();
+          return LiveWaitUntilHeightWorkloadJson(*record);
+        };
+
     auto workload_service = std::make_shared<McpLiveWorkloadService>();
     workload_service->operation = [&, require_workload_record,
                                    launch_wallet_workload,
                                    runtime_wallet_validation_options,
                                    find_block_generation_workload_record,
-                                   block_generation_operation](
+                                   block_generation_operation,
+                                   find_wait_until_height_workload_record,
+                                   wait_until_height_operation](
                                       McpOperationKind kind,
                                       const boost::json::object& arguments,
                                       std::stop_token operation_stop_token) {
@@ -25225,19 +26184,30 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         if (workload_value != nullptr && workload_value->is_object()) {
           const boost::json::value* type =
               workload_value->as_object().if_contains("type");
-          if (type != nullptr && type->is_string() &&
-              type->as_string() == "block_generation") {
-            return block_generation_operation(kind, arguments,
-                                              operation_stop_token);
+          if (type != nullptr && type->is_string()) {
+            if (type->as_string() == "block_generation") {
+              return block_generation_operation(kind, arguments,
+                                                operation_stop_token);
+            }
+            if (type->as_string() == "wait_until_height") {
+              return wait_until_height_operation(kind, arguments,
+                                                 operation_stop_token);
+            }
           }
         }
       } else {
         const boost::json::value* workload_id =
             arguments.if_contains("workload_id");
-        if (workload_id != nullptr && workload_id->is_string() &&
-            find_block_generation_workload_record(workload_id->as_string())) {
-          return block_generation_operation(kind, arguments,
-                                            operation_stop_token);
+        if (workload_id != nullptr && workload_id->is_string()) {
+          if (find_block_generation_workload_record(workload_id->as_string())) {
+            return block_generation_operation(kind, arguments,
+                                              operation_stop_token);
+          }
+          if (find_wait_until_height_workload_record(
+                  workload_id->as_string())) {
+            return wait_until_height_operation(kind, arguments,
+                                               operation_stop_token);
+          }
         }
       }
       if (kind == McpOperationKind::kStartWorkload) {
@@ -25493,16 +26463,20 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       lock.unlock();
       return LiveWalletWorkloadJson(*record);
     };
-    workload_service->read = [wallet_workloads, block_generation_workloads](
+    workload_service->read = [wallet_workloads, block_generation_workloads,
+                              wait_until_height_workloads](
                                  bool history,
                                  std::stop_token read_stop_token) {
       boost::json::array result;
       std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
       std::vector<std::shared_ptr<LiveBlockGenerationWorkloadRecord>>
           block_records;
+      std::vector<std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>>
+          height_wait_records;
       {
         std::scoped_lock lock(wallet_workloads->mutex,
-                              block_generation_workloads->mutex);
+                              block_generation_workloads->mutex,
+                              wait_until_height_workloads->mutex);
         records.reserve(wallet_workloads->records.size());
         for (const auto& [id, record] : wallet_workloads->records) {
           static_cast<void>(id);
@@ -25512,6 +26486,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         for (const auto& [id, record] : block_generation_workloads->records) {
           static_cast<void>(id);
           block_records.push_back(record);
+        }
+        height_wait_records.reserve(
+            wait_until_height_workloads->records.size());
+        for (const auto& [id, record] : wait_until_height_workloads->records) {
+          static_cast<void>(id);
+          height_wait_records.push_back(record);
         }
       }
       const auto append_if_selected = [&](boost::json::object snapshot) {
@@ -25534,6 +26514,13 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           throw McpOperationCancelled();
         }
         append_if_selected(LiveBlockGenerationWorkloadJson(*record));
+      }
+      for (const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record :
+           height_wait_records) {
+        if (read_stop_token.stop_requested()) {
+          throw McpOperationCancelled();
+        }
+        append_if_selected(LiveWaitUntilHeightWorkloadJson(*record));
       }
       return boost::json::value(std::move(result));
     };
@@ -25750,7 +26737,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     {"recoverable", true}}});
           } catch (const SimulationCommandOutcomeUnconfirmed& error) {
             mcp_application.MarkRunStopping();
-            simulation_stop_source.request_stop();
+            request_simulation_stop();
             throw McpOperationFailure(
                 "masternode_add_outcome_unconfirmed",
                 "masternode.add create_nodes outcome is unconfirmed: " +
@@ -25797,7 +26784,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             };
           } catch (...) {
             mcp_application.MarkRunStopping();
-            simulation_stop_source.request_stop();
+            request_simulation_stop();
             throw McpOperationFailure(
                 "masternode_add_outcome_unconfirmed",
                 "masternode.add create_nodes published but completion "
@@ -26189,7 +27176,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 rollback_registration();
               } catch (...) {
                 mcp_application.MarkRunStopping();
-                simulation_stop_source.request_stop();
+                request_simulation_stop();
                 throw McpOperationFailure(
                     "masternode_add_outcome_unconfirmed",
                     "masternode.add failed after registration: " +
@@ -26201,7 +27188,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             }
             if (registration_outcome_unknown) {
               mcp_application.MarkRunStopping();
-              simulation_stop_source.request_stop();
+              request_simulation_stop();
               throw McpOperationFailure("masternode_add_outcome_unconfirmed",
                                         ExceptionMessage(failure), false);
             }
@@ -26232,7 +27219,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               rollback_registration();
             } catch (...) {
               mcp_application.MarkRunStopping();
-              simulation_stop_source.request_stop();
+              request_simulation_stop();
               throw McpOperationFailure(
                   "masternode_add_outcome_unconfirmed",
                   "masternode.add could not publish after registration: " +
@@ -26268,7 +27255,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             };
           } catch (...) {
             mcp_application.MarkRunStopping();
-            simulation_stop_source.request_stop();
+            request_simulation_stop();
             throw McpOperationFailure(
                 "masternode_add_outcome_unconfirmed",
                 "masternode.add published but completion evidence failed: " +
@@ -26428,7 +27415,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             const std::exception_ptr failure = std::current_exception();
             if (revocation_attempted) {
               mcp_application.MarkRunStopping();
-              simulation_stop_source.request_stop();
+              request_simulation_stop();
               throw McpOperationFailure(
                   "masternode_remove_outcome_unconfirmed",
                   "masternode.remove failed after revocation began: " +
@@ -26530,7 +27517,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           }
           const std::exception_ptr failure = std::current_exception();
           mcp_application.MarkRunStopping();
-          simulation_stop_source.request_stop();
+          request_simulation_stop();
           throw McpOperationFailure(
               "masternode_restart_outcome_unconfirmed",
               "masternode.restart failed after process mutation began: " +
@@ -26756,7 +27743,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           };
         } catch (...) {
           mcp_application.MarkRunStopping();
-          simulation_stop_source.request_stop();
+          request_simulation_stop();
           throw McpOperationFailure(
               "wallet_remove_outcome_unconfirmed",
               "wallet.remove published but completion evidence failed: " +
@@ -26947,7 +27934,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           };
         } catch (...) {
           mcp_application.MarkRunStopping();
-          simulation_stop_source.request_stop();
+          request_simulation_stop();
           throw McpOperationFailure(
               "miner_remove_outcome_unconfirmed",
               "miner.remove published but completion evidence failed: " +
@@ -27154,7 +28141,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     {"recoverable", true}}});
           } catch (const SimulationCommandOutcomeUnconfirmed& error) {
             mcp_application.MarkRunStopping();
-            simulation_stop_source.request_stop();
+            request_simulation_stop();
             throw McpOperationFailure(
                 "miner_add_outcome_unconfirmed",
                 "miner.add create_nodes outcome is unconfirmed: " +
@@ -27203,7 +28190,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             };
           } catch (...) {
             mcp_application.MarkRunStopping();
-            simulation_stop_source.request_stop();
+            request_simulation_stop();
             throw McpOperationFailure(
                 "miner_add_outcome_unconfirmed",
                 "miner.add create_nodes published but completion evidence "
@@ -27399,7 +28386,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           };
         } catch (...) {
           mcp_application.MarkRunStopping();
-          simulation_stop_source.request_stop();
+          request_simulation_stop();
           throw McpOperationFailure(
               "miner_add_outcome_unconfirmed",
               "miner.add published but completion evidence failed: " +
@@ -27614,7 +28601,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                   {"recoverable", true}}});
         } catch (const SimulationCommandOutcomeUnconfirmed& error) {
           mcp_application.MarkRunStopping();
-          simulation_stop_source.request_stop();
+          request_simulation_stop();
           throw McpOperationFailure(
               "wallet_add_outcome_unconfirmed",
               "wallet.add create_node outcome is unconfirmed: " +
@@ -27671,7 +28658,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           };
         } catch (...) {
           mcp_application.MarkRunStopping();
-          simulation_stop_source.request_stop();
+          request_simulation_stop();
           throw McpOperationFailure(
               "wallet_add_outcome_unconfirmed",
               "wallet.add create_node published but completion evidence "
@@ -27872,7 +28859,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         };
       } catch (...) {
         mcp_application.MarkRunStopping();
-        simulation_stop_source.request_stop();
+        request_simulation_stop();
         throw McpOperationFailure(
             "wallet_add_outcome_unconfirmed",
             "wallet.add published but completion evidence failed: " +

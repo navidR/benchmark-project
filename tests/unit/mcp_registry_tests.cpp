@@ -144,6 +144,23 @@ void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
   BOOST_TEST(node.at("minimum").as_uint64() == 1U);
 }
 
+void RequireSingleNodeHeightWaitSchema(const boost::json::object& schema,
+                                       std::string_view discriminator) {
+  const boost::json::object& height_wait =
+      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
+                       WorkloadKindName(WorkloadKind::kWaitUntilHeight));
+  const boost::json::object& properties =
+      height_wait.at("properties").as_object();
+  BOOST_TEST(properties.contains("node"));
+  BOOST_TEST(!properties.contains("nodes"));
+  const boost::json::object& node = properties.at("node").as_object();
+  BOOST_TEST(node.at("type").as_string() == "integer");
+  BOOST_TEST(node.at("minimum").as_uint64() == 1U);
+  const boost::json::object& timeout = properties.at("timeout_sec").as_object();
+  BOOST_TEST(timeout.at("type").as_string() == "integer");
+  BOOST_TEST(timeout.at("minimum").as_uint64() == 1U);
+}
+
 const boost::json::object& LifecycleOperationConstraint(
     const boost::json::object& operation_schema, std::string_view operation,
     std::string_view state) {
@@ -262,6 +279,38 @@ const boost::json::object& StringDiscriminatorConstraint(
   }
   BOOST_FAIL("missing string discriminator constraint " << discriminator << " "
                                                         << value);
+  return schema;
+}
+
+const boost::json::object& WorkloadTypeConstraint(
+    const boost::json::object& schema, std::string_view workload_type) {
+  for (const boost::json::value& constraint : schema.at("allOf").as_array()) {
+    const boost::json::object& object = constraint.as_object();
+    const boost::json::value* condition = object.if_contains("if");
+    if (condition == nullptr || !condition->is_object()) {
+      continue;
+    }
+    const boost::json::value* configuration = condition->as_object()
+                                                  .at("properties")
+                                                  .as_object()
+                                                  .if_contains("configuration");
+    if (configuration == nullptr || !configuration->is_object()) {
+      continue;
+    }
+    const boost::json::value* type = configuration->as_object()
+                                         .at("properties")
+                                         .as_object()
+                                         .if_contains("type");
+    if (type != nullptr && type->is_object()) {
+      const boost::json::value* constant =
+          type->as_object().if_contains("const");
+      if (constant != nullptr && constant->is_string() &&
+          constant->as_string() == workload_type) {
+        return object;
+      }
+    }
+  }
+  BOOST_FAIL("missing workload type constraint " << workload_type);
   return schema;
 }
 
@@ -650,6 +699,85 @@ BOOST_AUTO_TEST_CASE(
             .at("workload")
             .as_object(),
         "type");
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_height_wait_schemas_match_single_node_production_input) {
+  RequireSingleNodeHeightWaitSchema(BuildMcpWorkloadSchema(), "type");
+  const std::vector<std::string> scenario_members =
+      BuildScenarioMemberRegistry();
+  const bool has_node =
+      std::find(scenario_members.begin(), scenario_members.end(),
+                "workload.wait_until_height.node") != scenario_members.end();
+  const bool has_nodes =
+      std::find(scenario_members.begin(), scenario_members.end(),
+                "workload.wait_until_height.nodes") != scenario_members.end();
+  BOOST_TEST(has_node);
+  BOOST_TEST(!has_nodes);
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  RequireSingleNodeHeightWaitSchema(scenario.at("properties")
+                                        .as_object()
+                                        .at("workloads")
+                                        .as_object()
+                                        .at("items")
+                                        .as_object(),
+                                    "type");
+  RequireSingleNodeHeightWaitSchema(scenario.at("properties")
+                                        .as_object()
+                                        .at("events")
+                                        .as_object()
+                                        .at("items")
+                                        .as_object(),
+                                    "action");
+
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStartWorkload,
+        McpOperationKind::kReconfigureWorkload}) {
+    RequireSingleNodeHeightWaitSchema(BuildMcpOperationInputSchema(operation)
+                                          .at("properties")
+                                          .as_object()
+                                          .at("workload")
+                                          .as_object(),
+                                      "type");
+  }
+}
+
+BOOST_AUTO_TEST_CASE(mcp_height_wait_result_schema_matches_production_output) {
+  const boost::json::object schema =
+      BuildMcpResultSchema(McpResultFamily::kWorkload);
+  const boost::json::object& properties = schema.at("properties").as_object();
+  const boost::json::array& result_choices =
+      properties.at("result").as_object().at("oneOf").as_array();
+  BOOST_REQUIRE(result_choices.size() == 2U);
+  const boost::json::object& result = result_choices.front().as_object();
+  const std::set<std::string> result_fields{"node", "node_id",
+                                            "observed_height", "target_height"};
+  BOOST_TEST(PropertySet(result) == result_fields);
+  BOOST_TEST(StringSet(result.at("required").as_array()) ==
+             PropertySet(result));
+  BOOST_TEST(result.at("additionalProperties").as_bool() == false);
+  BOOST_TEST(result_choices.back().as_object().at("type").as_string() ==
+             "null");
+
+  const boost::json::object& constraint =
+      WorkloadTypeConstraint(schema, "wait_until_height");
+  const boost::json::object& then_schema = constraint.at("then").as_object();
+  const std::set<std::string> required_fields{"failure", "result"};
+  BOOST_TEST(StringSet(then_schema.at("required").as_array()) ==
+             required_fields);
+  const std::set<std::string> terminal_outcomes{
+      "cancelled", "failed", "height_reached", "none", "stopped"};
+  BOOST_TEST(StringSet(then_schema.at("properties")
+                           .as_object()
+                           .at("terminal_outcome")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) == terminal_outcomes);
+  for (const std::string_view forbidden :
+       {"accounting", "last_result", "queue_maximum_depth"}) {
+    BOOST_TEST(ContainsRequiredField(then_schema.at("not"), forbidden));
   }
 }
 
