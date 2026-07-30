@@ -31,6 +31,7 @@
 
 #include "bbp/mcp_operation_service.h"
 #include "bbp/run_ownership.h"
+#include "bbp/simulation_event_kind.h"
 
 namespace bbp {
 namespace {
@@ -393,8 +394,13 @@ bool EventMatches(McpInformationFamily family, std::string_view kind) {
              kind == "wallet_transaction_submitted" ||
              kind == "raw_transaction_submitted";
     case McpInformationFamily::kWorkloadHistory:
-      return kind.starts_with("scheduled_event_") ||
-             kind == "checkpoint_recorded";
+      return kind == SimulationEventKindName(
+                         SimulationEventKind::kWalletWorkloadState) ||
+             kind ==
+                 SimulationEventKindName(SimulationEventKind::kWorkloadState) ||
+             kind.starts_with("scheduled_event_") ||
+             kind == SimulationEventKindName(
+                         SimulationEventKind::kCheckpointRecorded);
     case McpInformationFamily::kProgress:
       return Contains(kind, "progress") || Contains(kind, "started") ||
              Contains(kind, "completed") || Contains(kind, "failed");

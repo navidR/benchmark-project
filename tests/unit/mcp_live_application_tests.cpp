@@ -32,6 +32,7 @@
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
 #include "bbp/simulation_command_queue.h"
+#include "bbp/simulation_event_kind.h"
 #include "bbp/util.h"
 
 namespace bbp {
@@ -2062,6 +2063,49 @@ BOOST_AUTO_TEST_CASE(
       WaitForTerminal(&dispatcher, cancellable_follow);
   BOOST_TEST(cancelled_terminal.at("state").as_string() == "cancelled");
   BOOST_CHECK(std::chrono::steady_clock::now() - cancellation_started < 500ms);
+
+  const auto append_workload_state = [&](SimulationEventKind kind,
+                                         std::string_view workload_id) {
+    AppendLine(temporary.path() / "events.jsonl",
+               boost::json::serialize(boost::json::object{
+                   {"run_id", "live-application"},
+                   {"node_id", workload_id},
+                   {"event", SimulationEventKindName(kind)},
+                   {"detail",
+                    boost::json::serialize(boost::json::object{
+                        {"workload_id", workload_id}, {"state", "failed"}})}}));
+  };
+  append_workload_state(SimulationEventKind::kWorkloadState,
+                        "block-generation-workload-1");
+  append_workload_state(SimulationEventKind::kWalletWorkloadState,
+                        "wallet-workload-1");
+  const boost::json::object history_terminal = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "evidence.query",
+             boost::json::object{
+                 {"run_id", "live-application"},
+                 {"families", boost::json::array{"workload_history"}}}));
+  BOOST_TEST(history_terminal.at("state").as_string() == "succeeded");
+  const boost::json::array& history_items =
+      history_terminal.at("terminal_result").as_object().at("items").as_array();
+  BOOST_REQUIRE_EQUAL(history_items.size(), 2U);
+  constexpr std::array expected_history{
+      std::pair{SimulationEventKind::kWorkloadState,
+                std::string_view("block-generation-workload-1")},
+      std::pair{SimulationEventKind::kWalletWorkloadState,
+                std::string_view("wallet-workload-1")}};
+  for (std::size_t index = 0U; index < expected_history.size(); ++index) {
+    const boost::json::object& item = history_items[index].as_object();
+    BOOST_TEST(item.at("family").as_string() == "workload_history");
+    BOOST_TEST(item.at("kind").as_string() ==
+               SimulationEventKindName(expected_history[index].first));
+    BOOST_TEST(item.at("data")
+                   .as_object()
+                   .at("detail")
+                   .as_object()
+                   .at("workload_id")
+                   .as_string() == expected_history[index].second);
+  }
 
   const boost::json::value inventory_value = application.ResourceReader()(
       McpInformationFamily::kArtifacts, "live-session", std::stop_token{});
