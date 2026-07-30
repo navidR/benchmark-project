@@ -222,7 +222,9 @@ void MarkNodeAddCommitted(const SimulationCommand& command,
 BOOST_AUTO_TEST_CASE(
     mcp_live_application_reads_real_report_and_waits_for_real_command_outcome) {
   LiveApplicationDirectory temporary;
-  const boost::json::object scenario = LiveScenario();
+  boost::json::object scenario = LiveScenario();
+  scenario["ready_timeout_sec"] = 11U;
+  scenario["sync_timeout_sec"] = 13U;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(scenario));
   WriteText(temporary.path() / "resolved-scenario.json",
@@ -230,6 +232,9 @@ BOOST_AUTO_TEST_CASE(
   AppendLine(
       temporary.path() / "events.jsonl",
       R"({"run_id":"live-application","node_id":"sim","event":"run_started"})");
+  AppendLine(
+      temporary.path() / "events.jsonl",
+      R"({"run_id":"live-application","node_id":"firo-1","event":"state","detail":"Running"})");
 
   auto queue = std::make_shared<SimulationCommandQueue>();
   std::atomic<bool> stop_requested = false;
@@ -297,11 +302,12 @@ BOOST_AUTO_TEST_CASE(
                  .at("data")
                  .as_object()
                  .at("event_count")
-                 .as_uint64() == 1U);
+                 .as_uint64() == 2U);
 
   const boost::json::object report_submitted =
       Invoke(&dispatcher, "run.report",
-             boost::json::object{{"run_id", "live-application"}});
+             boost::json::object{{"run_id", "live-application"},
+                                 {"node_ids", boost::json::array{"firo-1"}}});
   const boost::json::object report_terminal =
       WaitForTerminal(&dispatcher, report_submitted);
   BOOST_TEST(report_terminal.at("state").as_string() == "succeeded");
@@ -315,6 +321,22 @@ BOOST_AUTO_TEST_CASE(
                  .as_object()
                  .at("run_id")
                  .as_string() == "live-application");
+  const boost::json::object& node_report = report_terminal.at("terminal_result")
+                                               .as_object()
+                                               .at("items")
+                                               .as_array()
+                                               .front()
+                                               .as_object()
+                                               .at("data")
+                                               .as_object()
+                                               .at("node_reports")
+                                               .as_array()
+                                               .front()
+                                               .as_object();
+  BOOST_TEST(node_report.at("ready_timeout_sec").to_number<std::uint64_t>() ==
+             scenario.at("ready_timeout_sec").to_number<std::uint64_t>());
+  BOOST_TEST(node_report.at("sync_timeout_sec").to_number<std::uint64_t>() ==
+             scenario.at("sync_timeout_sec").to_number<std::uint64_t>());
 
   const boost::json::object command_arguments{
       {"run_id", "live-application"},

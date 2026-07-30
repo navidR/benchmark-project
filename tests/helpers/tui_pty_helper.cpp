@@ -1985,13 +1985,31 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error(std::string(operation) +
                              " did not become terminal");
   };
+  const boost::json::object zero_node_scenario{{"nodes", 0U},
+                                               {"isolated_network", false},
+                                               {"ready_timeout_sec", 11U},
+                                               {"sync_timeout_sec", 13U}};
+  const auto require_global_timeouts = [&](const boost::json::object& evidence,
+                                           std::string_view context) {
+    for (const std::string_view field :
+         {"ready_timeout_sec", "sync_timeout_sec"}) {
+      const boost::json::value* actual = evidence.if_contains(field);
+      const boost::json::value& expected =
+          zero_node_scenario.at(std::string(field));
+      if (actual == nullptr || (!actual->is_uint64() && !actual->is_int64()) ||
+          actual->to_number<std::uint64_t>() !=
+              expected.to_number<std::uint64_t>()) {
+        throw std::runtime_error(std::string(context) +
+                                 " did not preserve typed global " +
+                                 std::string(field));
+      }
+    }
+  };
   const auto launch_zero_node_run = [&](std::string_view launched_run_id) {
+    boost::json::object scenario = zero_node_scenario;
+    scenario["run_id"] = launched_run_id;
     return invoke_and_wait(
-        "run.launch",
-        boost::json::object{
-            {"scenario", boost::json::object{{"run_id", launched_run_id},
-                                             {"nodes", 0U},
-                                             {"isolated_network", false}}}});
+        "run.launch", boost::json::object{{"scenario", std::move(scenario)}});
   };
   const auto stop_run = [&](std::string_view stopped_run_id) {
     return invoke_and_wait(
@@ -2058,6 +2076,31 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
     throw std::runtime_error(
         "MCP did not launch an owned zero-node run in the editor host");
   }
+  const boost::json::value resolved_resource =
+      ReadMcpResourceData(session, &request_id, "bbp:///resolved_scenario",
+                          "active zero-node resolved-scenario resource");
+  const boost::json::value reports_resource =
+      ReadMcpResourceData(session, &request_id, "bbp:///reports",
+                          "active zero-node reports resource");
+  if (!resolved_resource.is_object() || !reports_resource.is_object()) {
+    throw std::runtime_error(
+        "active zero-node timeout evidence was not object-valued");
+  }
+  require_global_timeouts(resolved_resource.as_object(),
+                          "active zero-node resolved-scenario resource");
+  require_global_timeouts(reports_resource.as_object(),
+                          "active zero-node reports resource");
+  const std::string expected_global_timeout_summary =
+      "global ready/sync=" +
+      std::to_string(zero_node_scenario.at("ready_timeout_sec")
+                         .to_number<std::uint64_t>()) +
+      "s/" +
+      std::to_string(zero_node_scenario.at("sync_timeout_sec")
+                         .to_number<std::uint64_t>()) +
+      "s";
+  static_cast<void>(
+      process.ReadUntil(expected_global_timeout_summary, 5s,
+                        "active zero-node global timeout TUI summary"));
   const boost::json::object active_cleanup = remove_run(run_id);
   if (active_cleanup.at("state").as_string() != "failed" ||
       active_cleanup.at("terminal_error").as_object().at("code").as_string() !=
@@ -2237,11 +2280,18 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
   }
   const boost::json::value replay_source =
       boost::json::parse(ReadFile(replay_root / "source-scenario.json"));
+  const boost::json::value replay_resolved =
+      boost::json::parse(ReadFile(replay_root / "resolved-scenario.json"));
   if (!replay_source.is_object() ||
-      replay_source.as_object().at("run_id").as_string() != replay_run_id) {
+      replay_source.as_object().at("run_id").as_string() != replay_run_id ||
+      !replay_resolved.is_object()) {
     throw std::runtime_error(
         "replayed run did not retain its destination source identity");
   }
+  require_global_timeouts(replay_source.as_object(),
+                          "replayed source scenario");
+  require_global_timeouts(replay_resolved.as_object(),
+                          "replayed resolved scenario");
   {
     const boost::json::array registry =
         read_run_registry("active replay run registry");

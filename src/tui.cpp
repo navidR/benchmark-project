@@ -418,6 +418,16 @@ std::string NetworkLossText(const boost::json::object& metrics) {
   return output.str();
 }
 
+std::string GlobalTimeoutSummaryText(const boost::json::object& report) {
+  const auto seconds_text = [&](std::string_view field) {
+    const std::optional<std::uint64_t> seconds =
+        JsonUnsignedMetric(report, field);
+    return seconds ? std::to_string(*seconds) + "s" : std::string("-");
+  };
+  return "global ready/sync=" + seconds_text("ready_timeout_sec") + "/" +
+         seconds_text("sync_timeout_sec");
+}
+
 std::string WorkloadsSummaryText(const boost::json::object& report) {
   std::string lifecycle_suffix;
   const boost::json::value* live_instances =
@@ -2259,8 +2269,10 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   const int log_top = log_rows == 0 ? rows - 2 : rows - log_rows - 2;
   const int content_bottom = log_rows == 0 ? rows - 2 : log_top;
 
-  AddText(0, 0, cols, "Blockchain Benchmark Project TUI",
-          COLOR_PAIR(kColorTitle) | A_BOLD);
+  AddText(
+      0, 0, cols,
+      "Blockchain Benchmark Project TUI | " + GlobalTimeoutSummaryText(report),
+      COLOR_PAIR(kColorTitle) | A_BOLD);
   DrawHorizontalLine(1);
 
   if (!error.empty()) {

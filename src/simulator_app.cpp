@@ -9908,23 +9908,6 @@ std::optional<uint32_t> CommonBlockGenerationNode(
   return node;
 }
 
-std::optional<uint32_t> CommonBlockGenerationSyncTimeout(
-    const std::vector<ScenarioWorkload>& workloads) {
-  std::optional<uint32_t> sync_timeout_sec;
-  for (const ScenarioWorkload& workload : workloads) {
-    if (workload.kind != WorkloadKind::kBlockGeneration) {
-      continue;
-    }
-    if (!sync_timeout_sec) {
-      sync_timeout_sec = workload.block_generation.sync_timeout_sec;
-    } else if (*sync_timeout_sec !=
-               workload.block_generation.sync_timeout_sec) {
-      return std::nullopt;
-    }
-  }
-  return sync_timeout_sec;
-}
-
 boost::json::object BlockGenerationWorkloadJson(
     const BlockGenerationWorkload& workload) {
   boost::json::object object;
@@ -10413,12 +10396,8 @@ boost::json::object BuildResolvedScenarioDocument(
   } else {
     resolved["network_address_range"] = nullptr;
   }
-  if (const std::optional<uint32_t> sync_timeout_sec =
-          CommonBlockGenerationSyncTimeout(workloads)) {
-    resolved["sync_timeout_sec"] = *sync_timeout_sec;
-  } else {
-    resolved["sync_timeout_sec"] = nullptr;
-  }
+  resolved["ready_timeout_sec"] = options.ready_timeout_sec;
+  resolved["sync_timeout_sec"] = options.sync_timeout_sec;
   resolved["metrics_sample_count"] = options.metrics_sample_count;
   resolved["metrics_interval_ms"] = options.metrics_interval.count();
   resolved["keep_artifacts"] = options.keep_artifacts;

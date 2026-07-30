@@ -104,6 +104,10 @@ BOOST_AUTO_TEST_CASE(scenario_service_returns_production_resolved_document) {
   BOOST_TEST(resolved.at("nodes").as_uint64() == 1U);
   BOOST_TEST(resolved.at("isolated_network").as_bool());
   BOOST_TEST(resolved.at("chain_daemon").as_string() == "/bin/true");
+  BOOST_TEST(resolved.at("ready_timeout_sec").as_uint64() ==
+             options.ready_timeout_sec);
+  BOOST_TEST(resolved.at("sync_timeout_sec").as_uint64() ==
+             options.sync_timeout_sec);
   BOOST_TEST(resolved.at("node_configs")
                  .as_array()
                  .front()
@@ -184,6 +188,29 @@ BOOST_AUTO_TEST_CASE(
   boost::json::object nullable_global = MinimalScenario();
   nullable_global["sync_timeout_sec"] = nullptr;
   BOOST_TEST(ParseAndValidateScenario(nullable_global).sync_timeout_sec == 30U);
+
+  boost::json::object distinct = MinimalScenario();
+  distinct["ready_timeout_sec"] = 41U;
+  distinct["sync_timeout_sec"] = kBlockGenerationMaximumSyncTimeoutSeconds + 1U;
+  distinct["workloads"] =
+      boost::json::array{boost::json::object{{"type", "block_generation"},
+                                             {"node", 1U},
+                                             {"count", 1U},
+                                             {"sync_timeout_sec", 43U}}};
+  const Options distinct_options = ParseAndValidateScenario(distinct);
+  const boost::json::object resolved = ResolveScenario(distinct);
+  BOOST_TEST(resolved.at("ready_timeout_sec").as_uint64() ==
+             distinct_options.ready_timeout_sec);
+  BOOST_TEST(resolved.at("sync_timeout_sec").as_uint64() ==
+             distinct_options.sync_timeout_sec);
+  BOOST_TEST(
+      resolved.at("workloads")
+          .as_array()
+          .front()
+          .as_object()
+          .at("sync_timeout_sec")
+          .as_uint64() ==
+      distinct_options.workloads.front().block_generation.sync_timeout_sec);
 
   wider_global["workloads"] = boost::json::array{boost::json::object{
       {"type", "block_generation"}, {"node", 1U}, {"count", 1U}}};

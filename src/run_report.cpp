@@ -1437,6 +1437,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "generate_node", report);
   CopyField(scenario, "block_production", report);
   CopyField(scenario, "isolated_network", report);
+  CopyField(scenario, "ready_timeout_sec", report);
   CopyField(scenario, "sync_timeout_sec", report);
   CopyField(scenario, "topology", report);
   CopyField(scenario, "topology_initial_edges", report);
@@ -4030,6 +4031,8 @@ std::string BuildNodeReportJson(const std::filesystem::path& run_root,
       "run_root",
       "run_id",
       "chain",
+      "ready_timeout_sec",
+      "sync_timeout_sec",
       "status",
       "ok",
       "started_at",
