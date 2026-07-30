@@ -648,7 +648,19 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
     case WorkloadKind::kCount:
       throw std::logic_error("unknown workload kind");
   }
-  return ClosedObject(std::move(properties), std::move(required));
+  boost::json::object schema =
+      ClosedObject(std::move(properties), std::move(required));
+  if (kind == WorkloadKind::kSetEdgeCondition) {
+    boost::json::array alternatives;
+    for (const std::string_view field : ScenarioWorkloadFields(kind)) {
+      if (field != "from" && field != "to") {
+        alternatives.emplace_back(
+            boost::json::object{{"required", Required({field})}});
+      }
+    }
+    schema["anyOf"] = std::move(alternatives);
+  }
+  return schema;
 }
 
 boost::json::object CommandVariant(SimulationCommandKind kind,

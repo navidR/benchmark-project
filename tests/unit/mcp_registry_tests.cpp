@@ -172,6 +172,39 @@ void RequireNoSetEdgeConditionTimeout(const boost::json::object& schema,
   BOOST_TEST(!variant.at("properties").as_object().contains("timeout_sec"));
 }
 
+void RequireSetEdgeConditionField(const boost::json::object& schema,
+                                  std::string_view discriminator,
+                                  bool scheduled) {
+  const boost::json::object& variant =
+      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
+                       WorkloadKindName(WorkloadKind::kSetEdgeCondition));
+  std::set<std::string> required{std::string(discriminator), "from", "to"};
+  if (scheduled) {
+    required.emplace("at");
+  }
+  BOOST_TEST(StringSet(ArrayField(variant, "required")) == required);
+
+  std::set<std::string> condition_fields;
+  for (const boost::json::value& alternative : ArrayField(variant, "anyOf")) {
+    BOOST_REQUIRE(alternative.is_object());
+    const boost::json::object& constraint = alternative.as_object();
+    BOOST_TEST(constraint.size() == 1U);
+    const std::set<std::string> fields =
+        StringSet(ArrayField(constraint, "required"));
+    BOOST_REQUIRE(fields.size() == 1U);
+    BOOST_TEST(condition_fields.emplace(*fields.begin()).second);
+  }
+
+  std::set<std::string> expected =
+      FieldSet(ScenarioWorkloadFields(WorkloadKind::kSetEdgeCondition));
+  BOOST_TEST(expected.erase("from") == 1U);
+  BOOST_TEST(expected.erase("to") == 1U);
+  BOOST_TEST(!condition_fields.empty());
+  BOOST_TEST(condition_fields.contains("latency_ms"));
+  BOOST_TEST(condition_fields.contains("loss_percent"));
+  BOOST_TEST(condition_fields == expected);
+}
+
 void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
                                             std::string_view discriminator) {
   const boost::json::object& block_generation =
@@ -841,6 +874,19 @@ BOOST_AUTO_TEST_CASE(mcp_set_edge_condition_schemas_omit_unsupported_timeout) {
                                    "action");
   BOOST_TEST(!StringSet(scenario.at("x-bbp-members").as_array())
                   .contains("workload.set_edge_condition.timeout_sec"));
+}
+
+BOOST_AUTO_TEST_CASE(mcp_set_edge_condition_schemas_require_condition_field) {
+  RequireSetEdgeConditionField(BuildMcpWorkloadSchema(), "type", false);
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  RequireSetEdgeConditionField(scenario.at("properties")
+                                   .as_object()
+                                   .at("events")
+                                   .as_object()
+                                   .at("items")
+                                   .as_object(),
+                               "action", true);
 }
 
 BOOST_AUTO_TEST_CASE(
