@@ -4,6 +4,10 @@
 
 namespace bbp {
 
+inline constexpr std::uint32_t kBlockGenerationMinimumSyncTimeoutSeconds = 1U;
+inline constexpr std::uint32_t kBlockGenerationMaximumSyncTimeoutSeconds =
+    3600U;
+
 struct BlockGenerationWorkload {
   std::uint32_t node = 1;
   std::uint32_t count = 0;

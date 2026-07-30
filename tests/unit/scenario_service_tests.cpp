@@ -10,6 +10,7 @@
 
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/scenario_service.h"
+#include "bbp/simulator/block_generation_workload.h"
 #include "bbp/simulator/wallet_transaction_plan.h"
 
 namespace bbp {
@@ -117,6 +118,81 @@ BOOST_AUTO_TEST_CASE(scenario_service_preserves_explicit_network_opt_out) {
   const Options options = ParseAndValidateScenario(scenario);
   BOOST_TEST(!options.isolate_network);
   BOOST_TEST(!ResolveScenario(scenario).at("isolated_network").as_bool());
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_service_enforces_block_generation_sync_timeout_contract) {
+  boost::json::object direct = MinimalScenario();
+  direct["workloads"] = boost::json::array{boost::json::object{
+      {"type", "block_generation"},
+      {"node", 1U},
+      {"count", 1U},
+      {"sync_timeout_sec", kBlockGenerationMinimumSyncTimeoutSeconds}}};
+  const Options direct_options = ParseAndValidateScenario(direct);
+  BOOST_REQUIRE_EQUAL(direct_options.workloads.size(), 1U);
+  BOOST_TEST(
+      direct_options.workloads.front().block_generation.sync_timeout_sec ==
+      kBlockGenerationMinimumSyncTimeoutSeconds);
+
+  boost::json::object scheduled = MinimalScenario();
+  scheduled["events"] = boost::json::array{boost::json::object{
+      {"at", "1s"},
+      {"action", "block_generation"},
+      {"node", 1U},
+      {"count", 1U},
+      {"sync_timeout_sec", kBlockGenerationMaximumSyncTimeoutSeconds}}};
+  const Options scheduled_options = ParseAndValidateScenario(scheduled);
+  BOOST_REQUIRE_EQUAL(scheduled_options.scheduled_events.size(), 1U);
+  const ScenarioWorkload& scheduled_workload = std::get<ScenarioWorkload>(
+      scheduled_options.scheduled_events.front().action);
+  BOOST_TEST(scheduled_workload.block_generation.sync_timeout_sec ==
+             kBlockGenerationMaximumSyncTimeoutSeconds);
+
+  const auto rejects_timeout = [](bool use_scheduled_event,
+                                  std::uint32_t timeout) {
+    boost::json::object scenario = MinimalScenario();
+    boost::json::object action{
+        {"node", 1U}, {"count", 1U}, {"sync_timeout_sec", timeout}};
+    if (use_scheduled_event) {
+      action["at"] = "1s";
+      action["action"] = "block_generation";
+      scenario["events"] = boost::json::array{std::move(action)};
+    } else {
+      action["type"] = "block_generation";
+      scenario["workloads"] = boost::json::array{std::move(action)};
+    }
+    BOOST_CHECK_EXCEPTION(
+        ParseAndValidateScenario(scenario), std::runtime_error,
+        [](const std::runtime_error& error) {
+          return std::string(error.what()) ==
+                 "block_generation sync_timeout_sec must be in 1..3600";
+        });
+  };
+  rejects_timeout(false, 0U);
+  rejects_timeout(true, kBlockGenerationMaximumSyncTimeoutSeconds + 1U);
+
+  boost::json::object wider_global = MinimalScenario();
+  wider_global["sync_timeout_sec"] =
+      kBlockGenerationMaximumSyncTimeoutSeconds + 1U;
+  BOOST_TEST(ParseAndValidateScenario(wider_global).sync_timeout_sec ==
+             kBlockGenerationMaximumSyncTimeoutSeconds + 1U);
+
+  boost::json::object zero_global = MinimalScenario();
+  zero_global["sync_timeout_sec"] = 0U;
+  BOOST_TEST(ParseAndValidateScenario(zero_global).sync_timeout_sec == 0U);
+
+  boost::json::object nullable_global = MinimalScenario();
+  nullable_global["sync_timeout_sec"] = nullptr;
+  BOOST_TEST(ParseAndValidateScenario(nullable_global).sync_timeout_sec == 30U);
+
+  wider_global["workloads"] = boost::json::array{boost::json::object{
+      {"type", "block_generation"}, {"node", 1U}, {"count", 1U}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(wider_global), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "block_generation sync_timeout_sec must be in 1..3600";
+      });
 }
 
 BOOST_AUTO_TEST_CASE(

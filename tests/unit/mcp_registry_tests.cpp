@@ -142,6 +142,11 @@ void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
   const boost::json::object& node = properties.at("node").as_object();
   BOOST_TEST(node.at("type").as_string() == "integer");
   BOOST_TEST(node.at("minimum").as_uint64() == 1U);
+  const boost::json::object& sync_timeout =
+      properties.at("sync_timeout_sec").as_object();
+  BOOST_TEST(sync_timeout.at("type").as_string() == "integer");
+  BOOST_TEST(sync_timeout.at("minimum").as_uint64() == 1U);
+  BOOST_TEST(sync_timeout.at("maximum").as_uint64() == 3600U);
 }
 
 void RequireSingleNodeHeightWaitSchema(const boost::json::object& schema,
@@ -712,6 +717,30 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!has_nodes);
 
   const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::array& global_sync_timeout = scenario.at("properties")
+                                                      .as_object()
+                                                      .at("sync_timeout_sec")
+                                                      .as_object()
+                                                      .at("oneOf")
+                                                      .as_array();
+  BOOST_REQUIRE_EQUAL(global_sync_timeout.size(), 2U);
+  const auto integer = std::find_if(
+      global_sync_timeout.begin(), global_sync_timeout.end(),
+      [](const boost::json::value& choice) {
+        return choice.is_object() &&
+               choice.as_object().at("type").as_string() == "integer";
+      });
+  const auto null =
+      std::find_if(global_sync_timeout.begin(), global_sync_timeout.end(),
+                   [](const boost::json::value& choice) {
+                     return choice.is_object() &&
+                            choice.as_object().at("type").as_string() == "null";
+                   });
+  BOOST_REQUIRE(integer != global_sync_timeout.end());
+  BOOST_REQUIRE(null != global_sync_timeout.end());
+  BOOST_TEST(integer->as_object().at("minimum").as_uint64() == 0U);
+  BOOST_TEST(integer->as_object().at("maximum").as_uint64() ==
+             std::numeric_limits<std::uint32_t>::max());
   RequireSingleNodeBlockGenerationSchema(scenario.at("properties")
                                              .as_object()
                                              .at("workloads")

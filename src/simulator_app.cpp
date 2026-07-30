@@ -87,6 +87,7 @@
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulation_registry.h"
+#include "bbp/simulator/block_generation_workload.h"
 #include "bbp/simulator/constants.h"
 #include "bbp/simulator/legacy_cli_inputs.h"
 #include "bbp/simulator/node_runtime.h"
@@ -3551,6 +3552,15 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
               ? options.sync_timeout_sec
               : JsonOptionalUint32Field(workload, "sync_timeout_sec",
                                         options.sync_timeout_sec);
+      if (block_generation.sync_timeout_sec <
+              kBlockGenerationMinimumSyncTimeoutSeconds ||
+          block_generation.sync_timeout_sec >
+              kBlockGenerationMaximumSyncTimeoutSeconds) {
+        throw std::runtime_error(
+            "block_generation sync_timeout_sec must be in " +
+            std::to_string(kBlockGenerationMinimumSyncTimeoutSeconds) + ".." +
+            std::to_string(kBlockGenerationMaximumSyncTimeoutSeconds));
+      }
       ScenarioWorkload scenario_workload;
       scenario_workload.kind = WorkloadKind::kBlockGeneration;
       scenario_workload.block_generation = block_generation;
@@ -13259,10 +13269,6 @@ BlockGenerationWorkload ParseAndValidateLiveBlockGenerationWorkload(
       validation_options.workloads.front().block_generation;
   static_cast<void>(RequireRuntimeNodeNumber(nodes, parsed.node,
                                              "block generation workload"));
-  if (parsed.sync_timeout_sec == 0U || parsed.sync_timeout_sec > 3600U) {
-    throw std::runtime_error(
-        "block generation sync_timeout_sec must be in 1..3600");
-  }
   return parsed;
 }
 

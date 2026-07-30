@@ -21,6 +21,7 @@
 #include "bbp/simulation_command.h"
 #include "bbp/simulation_partition.h"
 #include "bbp/simulation_policy.h"
+#include "bbp/simulator/block_generation_workload.h"
 #include "bbp/simulator/wallet_funding_strategy.h"
 #include "bbp/simulator/wallet_transactions_workload.h"
 #include "bbp/simulator/wallet_transfer_strategy.h"
@@ -550,6 +551,9 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
   switch (kind) {
     case WorkloadKind::kBlockGeneration:
       properties["node"] = IntegerSchema(1U);
+      properties["sync_timeout_sec"] =
+          IntegerSchema(kBlockGenerationMinimumSyncTimeoutSeconds,
+                        kBlockGenerationMaximumSyncTimeoutSeconds);
       require({"count"});
       break;
     case WorkloadKind::kWaitUntilHeight:
@@ -1022,6 +1026,7 @@ boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind) {
   boost::json::array required;
   switch (kind) {
     case ScenarioObjectKind::kRoot:
+      properties["sync_timeout_sec"] = Nullable(IntegerSchema());
       break;
     case ScenarioObjectKind::kSimulation:
       break;
