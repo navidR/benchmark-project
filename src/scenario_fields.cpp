@@ -330,11 +330,7 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
       "from", "to", "latency_ms", "bandwidth_kbps", "delay_ms", "jitter_ms",
       "loss_basis_points", "loss_percent", "duplicate_basis_points",
       "corrupt_basis_points", "reorder_basis_points", "limit_packets");
-  static constexpr auto kEdge =
-      Fields("from", "to", "timeout_sec", "latency_ms", "bandwidth_kbps",
-             "delay_ms", "jitter_ms", "loss_basis_points", "loss_percent",
-             "duplicate_basis_points", "corrupt_basis_points",
-             "reorder_basis_points", "limit_packets");
+  static constexpr auto kEdge = Fields("from", "to", "timeout_sec");
   static constexpr auto kRawTransaction =
       Fields("nodes", "funding_node", "submit_node", "source_address",
              "source_private_key", "destination_address", "funding_blocks",

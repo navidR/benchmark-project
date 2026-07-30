@@ -1494,15 +1494,16 @@ PeerTopologyEdge ParsePeerTopologyEdge(const boost::json::object& object,
   return edge;
 }
 
+bool IsTopologyEdgeConditionField(std::string_view field) {
+  return field == "latency_ms" ||
+         ScenarioObjectFieldAllowed(ScenarioObjectKind::kNetworkCondition,
+                                    field);
+}
+
 bool HasTopologyEdgeConditionField(const boost::json::object& object) {
-  return object.if_contains("latency_ms") != nullptr ||
-         std::any_of(
-             ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition)
-                 .begin(),
-             ScenarioObjectFields(ScenarioObjectKind::kNetworkCondition).end(),
-             [&](std::string_view field) {
-               return object.if_contains(field) != nullptr;
-             });
+  return std::any_of(object.begin(), object.end(), [](const auto& member) {
+    return IsTopologyEdgeConditionField(member.key());
+  });
 }
 
 NetworkCondition ParseTopologyEdgeWorkloadCondition(
@@ -3051,12 +3052,17 @@ ProfileSwitchWorkload ParseProfileSwitchWorkload(
 
 void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
                                            WorkloadKind kind, bool scheduled) {
+  const bool state_edge_action = kind == WorkloadKind::kActivateEdge ||
+                                 kind == WorkloadKind::kDeactivateEdge ||
+                                 kind == WorkloadKind::kRestoreEdge;
   for (const auto& member : object) {
     const bool structural =
         scheduled ? member.key() == "at" || member.key() == "action"
                   : member.key() == "type";
-    const bool dedicated_rejection = kind == WorkloadKind::kSetEdgeCondition &&
-                                     member.key() == "timeout_sec";
+    const bool dedicated_rejection =
+        (kind == WorkloadKind::kSetEdgeCondition &&
+         member.key() == "timeout_sec") ||
+        (state_edge_action && IsTopologyEdgeConditionField(member.key()));
     if (!structural && !dedicated_rejection &&
         !ScenarioWorkloadFieldAllowed(kind, member.key())) {
       throw std::runtime_error(

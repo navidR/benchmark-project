@@ -205,6 +205,26 @@ void RequireSetEdgeConditionField(const boost::json::object& schema,
   BOOST_TEST(condition_fields == expected);
 }
 
+constexpr std::array kEdgeActionKinds{
+    WorkloadKind::kActivateEdge,
+    WorkloadKind::kDeactivateEdge,
+    WorkloadKind::kRestoreEdge,
+};
+
+void RequireEdgeActionFields(const boost::json::object& schema,
+                             std::string_view discriminator, bool scheduled) {
+  std::set<std::string> expected{std::string(discriminator), "from", "to",
+                                 "timeout_sec"};
+  if (scheduled) {
+    expected.emplace("at");
+  }
+  for (const WorkloadKind kind : kEdgeActionKinds) {
+    const boost::json::object& variant = VariantWithConst(
+        schema.at("oneOf").as_array(), discriminator, WorkloadKindName(kind));
+    BOOST_TEST(PropertySet(variant) == expected);
+  }
+}
+
 void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
                                             std::string_view discriminator) {
   const boost::json::object& block_generation =
@@ -887,6 +907,35 @@ BOOST_AUTO_TEST_CASE(mcp_set_edge_condition_schemas_require_condition_field) {
                                    .at("items")
                                    .as_object(),
                                "action", true);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_edge_action_schemas_omit_unsupported_condition_fields) {
+  RequireEdgeActionFields(BuildMcpWorkloadSchema(), "type", false);
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  RequireEdgeActionFields(scenario.at("properties")
+                              .as_object()
+                              .at("events")
+                              .as_object()
+                              .at("items")
+                              .as_object(),
+                          "action", true);
+
+  const std::set<std::string> members =
+      StringSet(scenario.at("x-bbp-members").as_array());
+  const std::set<std::string> expected{"type", "from", "to", "timeout_sec"};
+  for (const WorkloadKind kind : kEdgeActionKinds) {
+    const std::string prefix =
+        "workload." + std::string(WorkloadKindName(kind)) + ".";
+    std::set<std::string> action_members;
+    for (const std::string& member : members) {
+      if (member.starts_with(prefix)) {
+        action_members.emplace(member.substr(prefix.size()));
+      }
+    }
+    BOOST_TEST(action_members == expected);
+  }
 }
 
 BOOST_AUTO_TEST_CASE(
