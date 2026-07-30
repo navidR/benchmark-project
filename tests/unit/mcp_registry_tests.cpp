@@ -53,6 +53,21 @@ std::set<std::string> NamedSet(const boost::json::array& array) {
   return result;
 }
 
+const boost::json::object& ObjectWithStringField(
+    const boost::json::array& objects, std::string_view field,
+    std::string_view expected) {
+  for (const boost::json::value& value : objects) {
+    BOOST_REQUIRE(value.is_object());
+    const boost::json::value* candidate = value.as_object().if_contains(field);
+    if (candidate != nullptr && candidate->is_string() &&
+        candidate->as_string() == expected) {
+      return value.as_object();
+    }
+  }
+  BOOST_FAIL("missing object with " << field << " " << expected);
+  return objects.front().as_object();
+}
+
 std::set<std::string> PropertySet(const boost::json::object& schema) {
   const boost::json::value* properties = schema.if_contains("properties");
   BOOST_REQUIRE(properties != nullptr);
@@ -128,6 +143,21 @@ const boost::json::object& VariantWithConst(const boost::json::array& variants,
   }
   BOOST_FAIL("missing schema variant " << name);
   return variants.front().as_object();
+}
+
+std::set<std::string> VariantConstSet(const boost::json::object& schema,
+                                      std::string_view discriminator) {
+  std::set<std::string> result;
+  for (const boost::json::value& variant : ArrayField(schema, "oneOf")) {
+    BOOST_REQUIRE(variant.is_object());
+    const boost::json::object& properties =
+        variant.as_object().at("properties").as_object();
+    const boost::json::object& field = properties.at(discriminator).as_object();
+    const boost::json::value& constant = field.at("const");
+    BOOST_REQUIRE(constant.is_string());
+    BOOST_REQUIRE(result.emplace(constant.as_string()).second);
+  }
+  return result;
 }
 
 const boost::json::object& SchemaWithType(
@@ -1006,6 +1036,38 @@ BOOST_AUTO_TEST_CASE(
             .as_object(),
         "type");
   }
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_workload_lifecycle_schemas_advertise_only_dispatchable_kinds) {
+  const std::set<std::string> expected{
+      std::string(WorkloadKindName(WorkloadKind::kBlockGeneration)),
+      std::string(WorkloadKindName(WorkloadKind::kWaitUntilHeight)),
+      std::string(WorkloadKindName(WorkloadKind::kWaitForPeers)),
+      std::string(WorkloadKindName(WorkloadKind::kWalletTransactions)),
+  };
+  constexpr std::array operations{
+      McpOperationKind::kStartWorkload,
+      McpOperationKind::kReconfigureWorkload,
+  };
+  const boost::json::array tools = BuildMcpToolRegistry(operations);
+  for (const McpOperationKind operation : operations) {
+    const boost::json::object& tool =
+        ObjectWithStringField(tools, "name", McpOperationKindName(operation));
+    const boost::json::object& workload = tool.at("inputSchema")
+                                              .as_object()
+                                              .at("properties")
+                                              .as_object()
+                                              .at("workload")
+                                              .as_object();
+    BOOST_TEST(VariantConstSet(workload, "type") == expected);
+  }
+
+  const boost::json::object result =
+      BuildMcpResultSchema(McpResultFamily::kWorkload);
+  const boost::json::object& configuration =
+      result.at("properties").as_object().at("configuration").as_object();
+  BOOST_TEST(VariantConstSet(configuration, "type") == expected);
 }
 
 BOOST_AUTO_TEST_CASE(

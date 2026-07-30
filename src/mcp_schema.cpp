@@ -62,6 +62,12 @@ constexpr std::array kSimulationPartitionScopes{
     SimulationPartitionScope::kRegion,
     SimulationPartitionScope::kRole,
 };
+constexpr std::array kMcpLifecycleWorkloadKinds{
+    WorkloadKind::kBlockGeneration,
+    WorkloadKind::kWaitUntilHeight,
+    WorkloadKind::kWaitForPeers,
+    WorkloadKind::kWalletTransactions,
+};
 
 boost::json::object TypeSchema(std::string_view type) {
   return boost::json::object{{"type", type}};
@@ -1069,6 +1075,15 @@ boost::json::object AddDraft(boost::json::object schema) {
   return schema;
 }
 
+boost::json::object McpLifecycleWorkloadSchema() {
+  boost::json::array variants;
+  variants.reserve(kMcpLifecycleWorkloadKinds.size());
+  for (const WorkloadKind kind : kMcpLifecycleWorkloadKinds) {
+    variants.push_back(WorkloadVariant(kind, "type", false));
+  }
+  return AddDraft(boost::json::object{{"oneOf", std::move(variants)}});
+}
+
 }  // namespace
 
 boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind) {
@@ -1633,7 +1648,7 @@ boost::json::object BuildMcpOperationInputSchema(
     case McpOperationKind::kStartWorkload:
       add_run();
       properties["workload_id"] = IdentifierSchema();
-      properties["workload"] = BuildMcpWorkloadSchema();
+      properties["workload"] = McpLifecycleWorkloadSchema();
       required.emplace_back("workload");
       break;
     case McpOperationKind::kInspectWorkload:
@@ -1644,7 +1659,7 @@ boost::json::object BuildMcpOperationInputSchema(
     case McpOperationKind::kReconfigureWorkload:
       add_run();
       properties["workload_id"] = IdentifierSchema();
-      properties["workload"] = BuildMcpWorkloadSchema();
+      properties["workload"] = McpLifecycleWorkloadSchema();
       required.emplace_back("workload_id");
       required.emplace_back("workload");
       break;
@@ -2363,7 +2378,7 @@ boost::json::object BuildMcpResultSchema(
           "none", "stopped", "count_reached", "duration_expired",
           "height_reached", "peer_count_reached", "cancelled", "failed"});
       properties["configuration_revision"] = Uint64Schema();
-      properties["configuration"] = BuildMcpWorkloadSchema();
+      properties["configuration"] = McpLifecycleWorkloadSchema();
       properties["accounting"] =
           OneOf({ExactAccountingSchema(), BlockGenerationAccountingSchema()});
       properties["last_result"] =
