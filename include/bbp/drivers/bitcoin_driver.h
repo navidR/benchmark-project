@@ -20,9 +20,10 @@ class BitcoinDriver final : public ChainDriver {
   void WaitForHeight(const ChainNodeConfig& config, std::uint64_t height,
                      std::chrono::seconds timeout,
                      std::stop_token stop_token = {}) const override;
-  void WaitForPeerCount(const ChainNodeConfig& config, std::uint64_t peer_count,
-                        std::chrono::seconds timeout,
-                        std::stop_token stop_token = {}) const override;
+  std::uint64_t WaitForPeerCount(
+      const ChainNodeConfig& config, std::uint64_t peer_count,
+      std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const override;
   void WaitForPeerAddress(const ChainNodeConfig& config,
                           const std::string& address,
                           std::chrono::seconds timeout,

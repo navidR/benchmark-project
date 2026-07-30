@@ -2040,7 +2040,7 @@ if(BUILD_TESTING)
   add_cli_failure_test(
     bbp-invalid-wait-peers-plural-nodes
     tests/scenarios/invalid-wait-peers-plural-nodes.json
-    "current MVP wait_for_peers workload uses node, not nodes"
+    "scenario workload wait_for_peers has unsupported field: nodes"
   )
   add_cli_failure_test(
     bbp-invalid-connect-peer-peer

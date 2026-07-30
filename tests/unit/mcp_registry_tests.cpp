@@ -161,6 +161,27 @@ void RequireSingleNodeHeightWaitSchema(const boost::json::object& schema,
   BOOST_TEST(timeout.at("minimum").as_uint64() == 1U);
 }
 
+void RequireSingleNodePeerWaitSchema(const boost::json::object& schema,
+                                     std::string_view discriminator) {
+  const boost::json::object& peer_wait =
+      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
+                       WorkloadKindName(WorkloadKind::kWaitForPeers));
+  const boost::json::object& properties =
+      peer_wait.at("properties").as_object();
+  BOOST_TEST(properties.contains("node"));
+  BOOST_TEST(!properties.contains("nodes"));
+  const boost::json::object& node = properties.at("node").as_object();
+  BOOST_TEST(node.at("type").as_string() == "integer");
+  BOOST_TEST(node.at("minimum").as_uint64() == 1U);
+  const boost::json::object& peer_count =
+      properties.at("peer_count").as_object();
+  BOOST_TEST(peer_count.at("type").as_string() == "integer");
+  BOOST_TEST(peer_count.at("minimum").as_uint64() == 1U);
+  const boost::json::object& timeout = properties.at("timeout_sec").as_object();
+  BOOST_TEST(timeout.at("type").as_string() == "integer");
+  BOOST_TEST(timeout.at("minimum").as_uint64() == 1U);
+}
+
 const boost::json::object& LifecycleOperationConstraint(
     const boost::json::object& operation_schema, std::string_view operation,
     std::string_view state) {
@@ -312,6 +333,23 @@ const boost::json::object& WorkloadTypeConstraint(
   }
   BOOST_FAIL("missing workload type constraint " << workload_type);
   return schema;
+}
+
+const boost::json::object& ResultVariantWithField(
+    const boost::json::array& variants, std::string_view field) {
+  for (const boost::json::value& variant : variants) {
+    if (!variant.is_object()) {
+      continue;
+    }
+    const boost::json::value* properties =
+        variant.as_object().if_contains("properties");
+    if (properties != nullptr && properties->is_object() &&
+        properties->as_object().contains(field)) {
+      return variant.as_object();
+    }
+  }
+  BOOST_FAIL("missing result variant with field " << field);
+  return variants.front().as_object();
 }
 
 bool ContainsRequiredField(const boost::json::value& value,
@@ -750,8 +788,9 @@ BOOST_AUTO_TEST_CASE(mcp_height_wait_result_schema_matches_production_output) {
   const boost::json::object& properties = schema.at("properties").as_object();
   const boost::json::array& result_choices =
       properties.at("result").as_object().at("oneOf").as_array();
-  BOOST_REQUIRE(result_choices.size() == 2U);
-  const boost::json::object& result = result_choices.front().as_object();
+  BOOST_REQUIRE(result_choices.size() == 3U);
+  const boost::json::object& result =
+      ResultVariantWithField(result_choices, "target_height");
   const std::set<std::string> result_fields{"node", "node_id",
                                             "observed_height", "target_height"};
   BOOST_TEST(PropertySet(result) == result_fields);
@@ -769,6 +808,85 @@ BOOST_AUTO_TEST_CASE(mcp_height_wait_result_schema_matches_production_output) {
              required_fields);
   const std::set<std::string> terminal_outcomes{
       "cancelled", "failed", "height_reached", "none", "stopped"};
+  BOOST_TEST(StringSet(then_schema.at("properties")
+                           .as_object()
+                           .at("terminal_outcome")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) == terminal_outcomes);
+  for (const std::string_view forbidden :
+       {"accounting", "last_result", "queue_maximum_depth"}) {
+    BOOST_TEST(ContainsRequiredField(then_schema.at("not"), forbidden));
+  }
+}
+
+BOOST_AUTO_TEST_CASE(mcp_peer_wait_schemas_match_single_node_production_input) {
+  RequireSingleNodePeerWaitSchema(BuildMcpWorkloadSchema(), "type");
+  const std::vector<std::string> scenario_members =
+      BuildScenarioMemberRegistry();
+  const bool has_node =
+      std::find(scenario_members.begin(), scenario_members.end(),
+                "workload.wait_for_peers.node") != scenario_members.end();
+  const bool has_nodes =
+      std::find(scenario_members.begin(), scenario_members.end(),
+                "workload.wait_for_peers.nodes") != scenario_members.end();
+  BOOST_TEST(has_node);
+  BOOST_TEST(!has_nodes);
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  RequireSingleNodePeerWaitSchema(scenario.at("properties")
+                                      .as_object()
+                                      .at("workloads")
+                                      .as_object()
+                                      .at("items")
+                                      .as_object(),
+                                  "type");
+  RequireSingleNodePeerWaitSchema(scenario.at("properties")
+                                      .as_object()
+                                      .at("events")
+                                      .as_object()
+                                      .at("items")
+                                      .as_object(),
+                                  "action");
+
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStartWorkload,
+        McpOperationKind::kReconfigureWorkload}) {
+    RequireSingleNodePeerWaitSchema(BuildMcpOperationInputSchema(operation)
+                                        .at("properties")
+                                        .as_object()
+                                        .at("workload")
+                                        .as_object(),
+                                    "type");
+  }
+}
+
+BOOST_AUTO_TEST_CASE(mcp_peer_wait_result_schema_matches_production_output) {
+  const boost::json::object schema =
+      BuildMcpResultSchema(McpResultFamily::kWorkload);
+  const boost::json::object& properties = schema.at("properties").as_object();
+  const boost::json::array& result_choices =
+      properties.at("result").as_object().at("oneOf").as_array();
+  BOOST_REQUIRE(result_choices.size() == 3U);
+  const boost::json::object& result =
+      ResultVariantWithField(result_choices, "target_peer_count");
+  const std::set<std::string> result_fields{
+      "node", "node_id", "observed_peer_count", "target_peer_count"};
+  BOOST_TEST(PropertySet(result) == result_fields);
+  BOOST_TEST(StringSet(result.at("required").as_array()) ==
+             PropertySet(result));
+  BOOST_TEST(result.at("additionalProperties").as_bool() == false);
+  BOOST_TEST(result_choices.back().as_object().at("type").as_string() ==
+             "null");
+
+  const boost::json::object& constraint =
+      WorkloadTypeConstraint(schema, "wait_for_peers");
+  const boost::json::object& then_schema = constraint.at("then").as_object();
+  const std::set<std::string> required_fields{"failure", "result"};
+  BOOST_TEST(StringSet(then_schema.at("required").as_array()) ==
+             required_fields);
+  const std::set<std::string> terminal_outcomes{
+      "cancelled", "failed", "none", "peer_count_reached", "stopped"};
   BOOST_TEST(StringSet(then_schema.at("properties")
                            .as_object()
                            .at("terminal_outcome")

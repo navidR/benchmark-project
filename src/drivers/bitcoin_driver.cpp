@@ -114,12 +114,11 @@ void BitcoinDriver::WaitForHeight(const ChainNodeConfig& config,
   bitcoin_family_rpc_->WaitForHeight(config, height, timeout, stop_token);
 }
 
-void BitcoinDriver::WaitForPeerCount(const ChainNodeConfig& config,
-                                     std::uint64_t peer_count,
-                                     std::chrono::seconds timeout,
-                                     std::stop_token stop_token) const {
-  bitcoin_family_rpc_->WaitForPeerCount(config, peer_count, timeout,
-                                        stop_token);
+std::uint64_t BitcoinDriver::WaitForPeerCount(
+    const ChainNodeConfig& config, std::uint64_t peer_count,
+    std::chrono::seconds timeout, std::stop_token stop_token) const {
+  return bitcoin_family_rpc_->WaitForPeerCount(config, peer_count, timeout,
+                                               stop_token);
 }
 
 void BitcoinDriver::WaitForPeerAddress(const ChainNodeConfig& config,

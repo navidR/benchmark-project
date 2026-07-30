@@ -879,10 +879,10 @@ void FiroDriver::WaitForHeight(const FiroNodeConfig& config, uint64_t height,
       std::to_string(height) + (last_error.empty() ? "" : ": " + last_error));
 }
 
-void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
-                                  uint64_t peer_count,
-                                  std::chrono::seconds timeout,
-                                  std::stop_token stop_token) const {
+uint64_t FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
+                                      uint64_t peer_count,
+                                      std::chrono::seconds timeout,
+                                      std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   uint64_t last_peer_count = 0;
   std::string last_error;
@@ -892,7 +892,7 @@ void FiroDriver::WaitForPeerCount(const FiroNodeConfig& config,
       last_peer_count =
           HandshakeCompletePeerAddresses(config, stop_token).size();
       if (last_peer_count >= peer_count) {
-        return;
+        return last_peer_count;
       }
     } catch (const std::exception& e) {
       last_error = e.what();

@@ -747,6 +747,12 @@ std::vector<std::string> DaemonArgumentValues(int argc, char** argv,
   return values;
 }
 
+class ReadyDaemonClientDisconnected final : public std::runtime_error {
+ public:
+  ReadyDaemonClientDisconnected()
+      : std::runtime_error("ready-daemon client disconnected") {}
+};
+
 void SendAll(int descriptor, std::string_view text) {
   while (!text.empty()) {
     const ssize_t sent =
@@ -755,8 +761,14 @@ void SendAll(int descriptor, std::string_view text) {
       if (errno == EINTR) {
         continue;
       }
+      if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
+        throw ReadyDaemonClientDisconnected();
+      }
       throw std::system_error(errno, std::generic_category(),
                               "send ready-daemon response");
+    }
+    if (sent == 0) {
+      throw ReadyDaemonClientDisconnected();
     }
     text.remove_prefix(static_cast<std::size_t>(sent));
   }
@@ -773,11 +785,14 @@ std::string ReadHttpRequest(int descriptor) {
       if (errno == EINTR) {
         continue;
       }
+      if (errno == ECONNRESET || errno == ECONNABORTED) {
+        throw ReadyDaemonClientDisconnected();
+      }
       throw std::system_error(errno, std::generic_category(),
                               "read ready-daemon request");
     }
     if (received == 0) {
-      throw std::runtime_error("ready-daemon request ended early");
+      throw ReadyDaemonClientDisconnected();
     }
     request.append(buffer, static_cast<std::size_t>(received));
     if (request.size() > kMaximumRequestBytes) {
@@ -889,6 +904,31 @@ void AppendBlockGenerationAudit(const std::filesystem::path& run_root,
   }
 }
 
+struct ReadyDaemonPeerControl {
+  std::uint64_t connection_count = 0U;
+  std::uint64_t handshake_count = 0U;
+};
+
+void PublishReadyDaemonPeerControl(const std::filesystem::path& run_root,
+                                   std::uint64_t connection_count,
+                                   std::uint64_t handshake_count) {
+  const std::filesystem::path path = run_root / "bbp-test-shared-peer-counts";
+  std::filesystem::path pending_path = path;
+  pending_path += ".pending";
+  {
+    std::ofstream stream(pending_path);
+    if (!stream) {
+      throw std::runtime_error("could not create " + pending_path.string());
+    }
+    stream << connection_count << ' ' << handshake_count << '\n';
+    stream.close();
+    if (!stream) {
+      throw std::runtime_error("could not flush " + pending_path.string());
+    }
+  }
+  std::filesystem::rename(pending_path, path);
+}
+
 std::filesystem::path SharedReadyDaemonHeightPath(
     const std::filesystem::path& run_root) {
   return run_root / "bbp-test-shared-height";
@@ -919,6 +959,31 @@ void PublishReadyDaemonHeight(const std::filesystem::path& run_root,
   if (!stream) {
     throw std::runtime_error("could not flush shared ready-daemon height");
   }
+}
+
+std::optional<ReadyDaemonPeerControl> ReadReadyDaemonPeerControl(
+    const std::filesystem::path& run_root) {
+  const std::filesystem::path path = run_root / "bbp-test-shared-peer-counts";
+  if (!std::filesystem::exists(path)) {
+    return std::nullopt;
+  }
+  const std::string control = ReadFile(path);
+  const std::size_t separator = control.find(' ');
+  if (separator == std::string::npos) {
+    throw std::runtime_error(
+        "ready-daemon peer control must contain connection and handshake "
+        "counts");
+  }
+  ReadyDaemonPeerControl parsed;
+  parsed.connection_count =
+      static_cast<std::uint64_t>(std::stoull(control.substr(0U, separator)));
+  parsed.handshake_count =
+      static_cast<std::uint64_t>(std::stoull(control.substr(separator + 1U)));
+  if (parsed.handshake_count > parsed.connection_count ||
+      parsed.connection_count > 64U) {
+    throw std::runtime_error("ready-daemon peer control counts are invalid");
+  }
+  return parsed;
 }
 
 void WaitForNodeMutationAdmissionRelease(const std::filesystem::path& run_root,
@@ -1019,11 +1084,14 @@ std::string RpcResult(std::string_view method, std::string_view request,
         {"chainwork", "00"}});
   }
   if (method == "getnetworkinfo") {
-    return boost::json::serialize(
-        boost::json::object{{"version", 1U},
-                            {"protocolversion", 1U},
-                            {"subversion", "/bbp-test/"},
-                            {"connections", peers->size()}});
+    const std::optional<ReadyDaemonPeerControl> peer_control =
+        ReadReadyDaemonPeerControl(run_root);
+    return boost::json::serialize(boost::json::object{
+        {"version", 1U},
+        {"protocolversion", 1U},
+        {"subversion", "/bbp-test/"},
+        {"connections",
+         peer_control ? peer_control->connection_count : peers->size()}});
   }
   if (method == "getmempoolinfo") {
     return R"({"size":0,"bytes":0})";
@@ -1105,10 +1173,24 @@ std::string RpcResult(std::string_view method, std::string_view request,
       consumed << "target peer dropped\n";
     }
     boost::json::array result;
-    for (const std::string& peer : *peers) {
-      result.emplace_back(boost::json::object{
-          {"addr", peer},
-          {"bytesrecv_per_msg", boost::json::object{{"verack", 1U}}}});
+    if (const std::optional<ReadyDaemonPeerControl> peer_control =
+            ReadReadyDaemonPeerControl(run_root)) {
+      for (std::uint64_t index = 0U; index < peer_control->connection_count;
+           ++index) {
+        boost::json::object peer{
+            {"addr", "198.51.100." + std::to_string(index + 1U) + ":18168"}};
+        peer["bytesrecv_per_msg"] =
+            index < peer_control->handshake_count
+                ? boost::json::value(boost::json::object{{"verack", 1U}})
+                : boost::json::value(boost::json::object{});
+        result.emplace_back(std::move(peer));
+      }
+    } else {
+      for (const std::string& peer : *peers) {
+        result.emplace_back(boost::json::object{
+            {"addr", peer},
+            {"bytesrecv_per_msg", boost::json::object{{"verack", 1U}}}});
+      }
     }
     return boost::json::serialize(result);
   }
@@ -1275,6 +1357,9 @@ int RunReadyFiroDaemon(int argc, char** argv) {
           std::to_string(body.size()) + "\r\n\r\n" + body;
       SendAll(connection, response);
       stop = method == "stop";
+    } catch (const ReadyDaemonClientDisconnected&) {
+      static_cast<void>(close(connection));
+      continue;
     } catch (...) {
       static_cast<void>(close(connection));
       close_listener();
@@ -4220,6 +4305,231 @@ std::uint64_t CheckWaitUntilHeightWorkloadLifecycle(
   return unreached_target_height;
 }
 
+void CheckWaitForPeersWorkloadLifecycle(
+    std::string_view run_id, const std::filesystem::path& run_root,
+    const std::filesystem::path& home_directory) {
+  PublishReadyDaemonPeerControl(run_root, 3U, 0U);
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  const auto configuration = [](std::uint64_t peer_count,
+                                std::uint32_t timeout_sec) {
+    return boost::json::object{{"type", "wait_for_peers"},
+                               {"node", 1U},
+                               {"peer_count", peer_count},
+                               {"timeout_sec", timeout_sec}};
+  };
+  const auto arguments = [&](std::string_view workload_id,
+                             boost::json::object extra = {}) {
+    extra["run_id"] = run_id;
+    extra["workload_id"] = workload_id;
+    return extra;
+  };
+  const auto require_workload =
+      [](const boost::json::array& records,
+         std::string_view workload_id) -> const boost::json::object& {
+    for (const boost::json::value& value : records) {
+      const boost::json::object& record = value.as_object();
+      if (record.at("workload_id").as_string() == workload_id) {
+        return record;
+      }
+    }
+    throw std::runtime_error("MCP workload resource omitted " +
+                             std::string(workload_id));
+  };
+  const auto wait_for_terminal =
+      [&](std::string_view workload_id, std::string_view expected,
+          std::chrono::steady_clock::duration timeout,
+          std::string_view context) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        boost::json::object inspected;
+        while (std::chrono::steady_clock::now() < deadline) {
+          inspected = InvokeMcpOperation(mcp, &request_id, "workload.inspect",
+                                         arguments(workload_id), 2s, context);
+          const std::string_view state = inspected.at("state").as_string();
+          if (state == expected) {
+            return inspected;
+          }
+          if (state == "stopped" || state == "completed" ||
+              state == "cancelled" || state == "failed") {
+            break;
+          }
+          std::this_thread::sleep_for(20ms);
+        }
+        throw std::runtime_error(std::string(context) + " did not reach " +
+                                 std::string(expected) + ": " +
+                                 boost::json::serialize(inspected));
+      };
+
+  const boost::json::object started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("peer-lifecycle",
+                boost::json::object{{"workload", configuration(2U, 3U)}}),
+      3s, "wait-for-peers workload start");
+  if (started.at("state").as_string() != "running" ||
+      started.at("workload_id").as_string() != "peer-lifecycle" ||
+      !started.at("result").is_null()) {
+    throw std::runtime_error(
+        "wait-for-peers start returned the wrong current state");
+  }
+  const boost::json::array current =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workloads",
+                          "active wait-for-peers workloads")
+          .as_array();
+  if (require_workload(current, "peer-lifecycle").at("state").as_string() !=
+      "running") {
+    throw std::runtime_error(
+        "running wait-for-peers workload was not retained as current");
+  }
+
+  const boost::json::object paused = InvokeMcpOperation(
+      mcp, &request_id, "workload.pause",
+      arguments("peer-lifecycle", boost::json::object{{"timeout_sec", 2U}}), 3s,
+      "wait-for-peers workload pause");
+  if (paused.at("state").as_string() != "paused" ||
+      paused.at("configuration_revision").to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "wait-for-peers workload did not pause at its polling boundary");
+  }
+  const boost::json::object reconfigured = InvokeMcpOperation(
+      mcp, &request_id, "workload.reconfigure",
+      arguments("peer-lifecycle",
+                boost::json::object{{"workload", configuration(1U, 3U)}}),
+      3s, "wait-for-peers workload reconfiguration");
+  if (reconfigured.at("state").as_string() != "paused" ||
+      reconfigured.at("configuration_revision").to_number<std::uint64_t>() !=
+          2U ||
+      reconfigured.at("configuration")
+              .as_object()
+              .at("peer_count")
+              .to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "wait-for-peers reconfiguration lost state, revision, or target");
+  }
+  const boost::json::object resumed = InvokeMcpOperation(
+      mcp, &request_id, "workload.resume",
+      arguments("peer-lifecycle", boost::json::object{{"timeout_sec", 2U}}), 3s,
+      "wait-for-peers workload resume");
+  if (resumed.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "wait-for-peers workload did not start a fresh resumed epoch");
+  }
+  std::this_thread::sleep_for(200ms);
+  const boost::json::object pre_handshake = InvokeMcpOperation(
+      mcp, &request_id, "workload.inspect", arguments("peer-lifecycle"), 2s,
+      "pre-handshake wait-for-peers workload inspection");
+  if (pre_handshake.at("state").as_string() != "running" ||
+      !pre_handshake.at("result").is_null()) {
+    throw std::runtime_error(
+        "wait-for-peers treated total connections as completed handshakes");
+  }
+
+  PublishReadyDaemonPeerControl(run_root, 3U, 1U);
+  const boost::json::object completed =
+      wait_for_terminal("peer-lifecycle", "completed", 4s,
+                        "completed wait-for-peers workload inspection");
+  const boost::json::object& result = completed.at("result").as_object();
+  if (completed.at("terminal_outcome").as_string() != "peer_count_reached" ||
+      completed.at("configuration_revision").to_number<std::uint64_t>() != 2U ||
+      result.at("node").to_number<std::uint64_t>() != 1U ||
+      result.at("node_id").as_string() != "firo-active" ||
+      result.at("target_peer_count").to_number<std::uint64_t>() != 1U ||
+      result.at("observed_peer_count").to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "wait-for-peers completion lacked authoritative handshake evidence: " +
+        boost::json::serialize(completed));
+  }
+  const boost::json::array history =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workload_history",
+                          "completed wait-for-peers history")
+          .as_array();
+  if (require_workload(history, "peer-lifecycle").at("state").as_string() !=
+      "completed") {
+    throw std::runtime_error(
+        "completed wait-for-peers workload was not retained in history");
+  }
+  const boost::json::array completed_current =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///workloads",
+                          "completed wait-for-peers current resource")
+          .as_array();
+  for (const boost::json::value& value : completed_current) {
+    if (value.as_object().at("workload_id").as_string() == "peer-lifecycle") {
+      throw std::runtime_error(
+          "completed wait-for-peers workload remained current");
+    }
+  }
+  const std::string completed_events = ReadFile(run_root / "events.jsonl");
+  RequireLineContainsAll(completed_events,
+                         {"\"event\":\"peer_count_reached\"",
+                          "\\\"workload_id\\\":\\\"peer-lifecycle\\\""},
+                         "wait-for-peers completion event identity");
+
+  const boost::json::object cancel_started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("peer-cancel",
+                boost::json::object{{"workload", configuration(2U, 10U)}}),
+      3s, "cancellable wait-for-peers workload start");
+  if (cancel_started.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "cancellable wait-for-peers workload did not start");
+  }
+  const boost::json::object settle_submitted = SubmitMcpOperation(
+      mcp, &request_id, "workload.stop",
+      arguments("peer-cancel", boost::json::object{{"policy", "settle"},
+                                                   {"timeout_sec", 5U}}));
+  boost::json::object settling;
+  const auto settling_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < settling_deadline) {
+    settling = InvokeMcpOperation(
+        mcp, &request_id, "workload.inspect", arguments("peer-cancel"), 2s,
+        "settling wait-for-peers workload inspection");
+    if (settling.at("state").as_string() == "stopping") {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (settling.at("state").as_string() != "stopping") {
+    throw std::runtime_error("wait-for-peers settle Stop was not admitted");
+  }
+  const auto stop_started = std::chrono::steady_clock::now();
+  const boost::json::object stopped = InvokeMcpOperation(
+      mcp, &request_id, "workload.stop",
+      arguments("peer-cancel",
+                boost::json::object{{"policy", "cancel"}, {"timeout_sec", 2U}}),
+      3s, "wait-for-peers workload Stop");
+  if (std::chrono::steady_clock::now() - stop_started >= 2s ||
+      stopped.at("state").as_string() != "stopped" ||
+      stopped.at("terminal_outcome").as_string() != "stopped" ||
+      !stopped.at("result").is_null()) {
+    throw std::runtime_error(
+        "wait-for-peers cancel Stop was not bounded and truthful");
+  }
+  const boost::json::object settled =
+      WaitForMcpOperation(mcp, &request_id, settle_submitted, 2s,
+                          "escalated wait-for-peers settle Stop");
+  if (settled.at("state").as_string() != "stopped") {
+    throw std::runtime_error(
+        "escalated wait-for-peers settle Stop did not observe cancellation");
+  }
+
+  const boost::json::object timeout_started = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      arguments("peer-timeout",
+                boost::json::object{{"workload", configuration(2U, 1U)}}),
+      3s, "timed wait-for-peers workload start");
+  if (timeout_started.at("state").as_string() != "running") {
+    throw std::runtime_error("timed wait-for-peers workload did not start");
+  }
+  const boost::json::object failed = wait_for_terminal(
+      "peer-timeout", "failed", 4s, "timed wait-for-peers workload inspection");
+  if (failed.at("terminal_outcome").as_string() != "failed" ||
+      failed.at("failure").is_null() || !failed.at("result").is_null()) {
+    throw std::runtime_error(
+        "wait-for-peers timeout did not retain a truthful failure");
+  }
+}
+
 void StartBlockGenerationWorkloadForRunShutdown(
     std::string_view run_id, const std::filesystem::path& run_root,
     const std::filesystem::path& home_directory,
@@ -4240,6 +4550,20 @@ void StartBlockGenerationWorkloadForRunShutdown(
   if (height_wait.at("state").as_string() != "running") {
     throw std::runtime_error(
         "run-shutdown wait-until-height workload did not start");
+  }
+  const boost::json::object peer_wait = InvokeMcpOperation(
+      mcp, &request_id, "workload.start",
+      boost::json::object{
+          {"run_id", run_id},
+          {"workload_id", "peer-shutdown"},
+          {"workload", boost::json::object{{"type", "wait_for_peers"},
+                                           {"node", 1U},
+                                           {"peer_count", 2U},
+                                           {"timeout_sec", 30U}}}},
+      3s, "run-shutdown wait-for-peers workload start");
+  if (peer_wait.at("state").as_string() != "running") {
+    throw std::runtime_error(
+        "run-shutdown wait-for-peers workload did not start");
   }
   const boost::json::object started = InvokeMcpOperation(
       mcp, &request_id, "workload.start",
@@ -4312,6 +4636,7 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   CheckBlockGenerationWorkloadLifecycle(run_id, run_root, home_directory);
   const std::uint64_t height_wait_shutdown_target =
       CheckWaitUntilHeightWorkloadLifecycle(run_id, run_root, home_directory);
+  CheckWaitForPeersWorkloadLifecycle(run_id, run_root, home_directory);
 #ifdef BBP_FIRO_GUI_LAUNCHER
   process.Write("c");
   static_cast<void>(
@@ -4448,6 +4773,11 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
                           "\\\"workload_id\\\":\\\"height-shutdown\\\"",
                           "\\\"state\\\":\\\"cancelled\\\""},
                          "active-run height-wait workload shutdown state");
+  RequireLineContainsAll(finished_events,
+                         {"\"event\":\"workload_state\"",
+                          "\\\"workload_id\\\":\\\"peer-shutdown\\\"",
+                          "\\\"state\\\":\\\"cancelled\\\""},
+                         "active-run peer-wait workload shutdown state");
   WaitForProcessExit(daemon_pid, 3s);
 #ifdef BBP_FIRO_GUI_LAUNCHER
   struct stat launcher_status{};

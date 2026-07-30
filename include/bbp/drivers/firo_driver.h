@@ -58,9 +58,9 @@ class FiroDriver final : public ChainDriver {
   void WaitForHeight(const FiroNodeConfig& config, uint64_t height,
                      std::chrono::seconds timeout,
                      std::stop_token stop_token = {}) const override;
-  void WaitForPeerCount(const FiroNodeConfig& config, uint64_t peer_count,
-                        std::chrono::seconds timeout,
-                        std::stop_token stop_token = {}) const override;
+  uint64_t WaitForPeerCount(const FiroNodeConfig& config, uint64_t peer_count,
+                            std::chrono::seconds timeout,
+                            std::stop_token stop_token = {}) const override;
   void WaitForPeerAddress(const FiroNodeConfig& config,
                           const std::string& address,
                           std::chrono::seconds timeout,

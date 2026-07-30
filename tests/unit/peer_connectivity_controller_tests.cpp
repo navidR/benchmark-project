@@ -45,8 +45,11 @@ class TestChainDriver final : public bbp::ChainDriver {
                  std::stop_token) const override {}
   void WaitForHeight(const bbp::ChainNodeConfig&, std::uint64_t,
                      std::chrono::seconds, std::stop_token) const override {}
-  void WaitForPeerCount(const bbp::ChainNodeConfig&, std::uint64_t,
-                        std::chrono::seconds, std::stop_token) const override {}
+  std::uint64_t WaitForPeerCount(const bbp::ChainNodeConfig&,
+                                 std::uint64_t peer_count, std::chrono::seconds,
+                                 std::stop_token) const override {
+    return peer_count;
+  }
   void WaitForPeerAddress(const bbp::ChainNodeConfig& config,
                           const std::string& address, std::chrono::seconds,
                           std::stop_token stop_token) const override {

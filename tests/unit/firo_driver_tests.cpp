@@ -922,7 +922,8 @@ BOOST_AUTO_TEST_CASE(firo_peer_count_wait_requires_completed_handshakes) {
   config.rpc_password = "password";
   const bbp::FiroDriver driver(std::chrono::seconds(1));
 
-  driver.WaitForPeerCount(config, 1U, std::chrono::seconds(1));
+  BOOST_TEST(driver.WaitForPeerCount(config, 1U, std::chrono::seconds(1)) ==
+             1U);
   BOOST_REQUIRE_EQUAL(served.get().size(), 2U);
 }
 

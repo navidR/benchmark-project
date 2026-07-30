@@ -306,8 +306,7 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
   static constexpr auto kBlockGeneration =
       Fields("node", "count", "sync_timeout_sec");
   static constexpr auto kHeight = Fields("node", "height", "timeout_sec");
-  static constexpr auto kPeers =
-      Fields("node", "nodes", "peer_count", "timeout_sec");
+  static constexpr auto kPeers = Fields("node", "peer_count", "timeout_sec");
   static constexpr auto kPeer = Fields("node", "nodes", "peer", "timeout_sec");
   static constexpr auto kNode = Fields("node", "nodes");
   static constexpr auto kFreeze = Fields("node", "nodes", "duration_ms");

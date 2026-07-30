@@ -442,10 +442,10 @@ void MoneroDriver::WaitForHeight(const ChainNodeConfig& config,
       std::to_string(height) + (last_error.empty() ? "" : ": " + last_error));
 }
 
-void MoneroDriver::WaitForPeerCount(const ChainNodeConfig& config,
-                                    std::uint64_t peer_count,
-                                    std::chrono::seconds timeout,
-                                    std::stop_token stop_token) const {
+std::uint64_t MoneroDriver::WaitForPeerCount(const ChainNodeConfig& config,
+                                             std::uint64_t peer_count,
+                                             std::chrono::seconds timeout,
+                                             std::stop_token stop_token) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   std::uint64_t last_peer_count = 0U;
   std::string last_error;
@@ -455,7 +455,7 @@ void MoneroDriver::WaitForPeerCount(const ChainNodeConfig& config,
       last_peer_count =
           HandshakeCompletePeerAddresses(config, stop_token).size();
       if (last_peer_count >= peer_count) {
-        return;
+        return last_peer_count;
       }
     } catch (const std::exception& error) {
       last_error = error.what();

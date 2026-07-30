@@ -558,6 +558,9 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
       require({"height"});
       break;
     case WorkloadKind::kWaitForPeers:
+      properties["node"] = IntegerSchema(1U);
+      properties["peer_count"] = Uint64Schema(1U);
+      properties["timeout_sec"] = IntegerSchema(1U);
       require({"peer_count"});
       break;
     case WorkloadKind::kConnectPeer:
@@ -993,6 +996,17 @@ boost::json::object WaitUntilHeightResultSchema() {
   return ClosedObject(
       std::move(properties),
       Required({"node", "node_id", "target_height", "observed_height"}));
+}
+
+boost::json::object WaitForPeersResultSchema() {
+  boost::json::object properties;
+  properties["node"] = IntegerSchema(1U);
+  properties["node_id"] = IdentifierSchema();
+  properties["target_peer_count"] = Uint64Schema(1U);
+  properties["observed_peer_count"] = Uint64Schema(1U);
+  return ClosedObject(std::move(properties),
+                      Required({"node", "node_id", "target_peer_count",
+                                "observed_peer_count"}));
 }
 
 boost::json::object AddDraft(boost::json::object schema) {
@@ -2290,14 +2304,16 @@ boost::json::object BuildMcpResultSchema(
       properties["state"] = WorkloadStateSchema();
       properties["terminal_outcome"] = StringEnumSchema(boost::json::array{
           "none", "stopped", "count_reached", "duration_expired",
-          "height_reached", "cancelled", "failed"});
+          "height_reached", "peer_count_reached", "cancelled", "failed"});
       properties["configuration_revision"] = Uint64Schema();
       properties["configuration"] = BuildMcpWorkloadSchema();
       properties["accounting"] =
           OneOf({ExactAccountingSchema(), BlockGenerationAccountingSchema()});
       properties["last_result"] =
           Nullable(BlockGenerationBoundaryResultSchema());
-      properties["result"] = Nullable(WaitUntilHeightResultSchema());
+      properties["result"] =
+          OneOf({WaitUntilHeightResultSchema(), WaitForPeersResultSchema(),
+                 TypeSchema("null")});
       properties["failure"] = Nullable(StringSchema(1U));
       properties["queue_maximum_depth"] = Uint64Schema();
       require({"run_id", "workload_id", "state", "terminal_outcome",
@@ -2396,9 +2412,44 @@ boost::json::object BuildMcpResultSchema(
                             {"required", Required({"queue_maximum_depth"})}},
                     },
                 }}}}}});
+      constraints.emplace_back(boost::json::object{
+          {"if",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"configuration",
+                     boost::json::object{
+                         {"properties",
+                          boost::json::object{
+                              {"type", ConstStringSchema("wait_for_peers")}}},
+                         {"required", Required({"type"})}}}}},
+               {"required", Required({"configuration"})}}},
+          {"then",
+           boost::json::object{
+               {"properties",
+                boost::json::object{
+                    {"result", Nullable(WaitForPeersResultSchema())},
+                    {"terminal_outcome",
+                     StringEnumSchema(boost::json::array{
+                         "none", "stopped", "peer_count_reached", "cancelled",
+                         "failed"})}}},
+               {"required", Required({"result", "failure"})},
+               {"not",
+                boost::json::object{{
+                    "anyOf",
+                    boost::json::array{
+                        boost::json::object{
+                            {"required", Required({"accounting"})}},
+                        boost::json::object{
+                            {"required", Required({"last_result"})}},
+                        boost::json::object{
+                            {"required", Required({"queue_maximum_depth"})}},
+                    },
+                }}}}}});
       {
         boost::json::object non_wait_type;
-        non_wait_type["not"] = ConstStringSchema("wait_until_height");
+        non_wait_type["not"] = StringEnumSchema(
+            boost::json::array{"wait_until_height", "wait_for_peers"});
 
         boost::json::object non_wait_configuration;
         non_wait_configuration["properties"] =

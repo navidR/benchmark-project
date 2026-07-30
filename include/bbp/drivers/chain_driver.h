@@ -248,10 +248,10 @@ class ChainDriver {
   virtual void WaitForHeight(const ChainNodeConfig& config, uint64_t height,
                              std::chrono::seconds timeout,
                              std::stop_token stop_token = {}) const = 0;
-  virtual void WaitForPeerCount(const ChainNodeConfig& config,
-                                uint64_t peer_count,
-                                std::chrono::seconds timeout,
-                                std::stop_token stop_token = {}) const = 0;
+  virtual uint64_t WaitForPeerCount(const ChainNodeConfig& config,
+                                    uint64_t peer_count,
+                                    std::chrono::seconds timeout,
+                                    std::stop_token stop_token = {}) const = 0;
   virtual void WaitForPeerAddress(const ChainNodeConfig& config,
                                   const std::string& address,
                                   std::chrono::seconds timeout,
