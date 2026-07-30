@@ -1887,6 +1887,15 @@ if(BUILD_TESTING)
   set_tests_properties(bbp-node-replace-default-timeout-production
     PROPERTIES TIMEOUT 150
   )
+  add_test(NAME bbp-scenario-height-wait-readback-regression-production
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --scenario-height-wait-readback-regression
+      $<TARGET_FILE:bbp>
+  )
+  set_tests_properties(
+    bbp-scenario-height-wait-readback-regression-production
+    PROPERTIES TIMEOUT 30
+  )
   add_test(NAME bbp-wallet-workload-node-mutation-admission-production
     COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
       --wallet-workload-node-mutation-admission

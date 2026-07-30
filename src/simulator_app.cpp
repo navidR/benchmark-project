@@ -7909,6 +7909,19 @@ std::string HeightWaitDetail(
   return boost::json::serialize(detail);
 }
 
+std::optional<std::uint64_t> WaitForHeightReadback(
+    const ChainDriver& driver, const ChainNodeConfig& config,
+    std::uint64_t target_height, std::chrono::seconds timeout,
+    std::stop_token stop_token) {
+  driver.WaitForHeight(config, target_height, timeout, stop_token);
+  const std::uint64_t observed_height =
+      driver.ReadMetrics(config, stop_token).height;
+  if (observed_height < target_height) {
+    return std::nullopt;
+  }
+  return observed_height;
+}
+
 std::string PeerCountWaitDetail(
     uint32_t workload_index, uint32_t workload_count, uint32_t node,
     uint64_t target_peer_count, uint64_t observed_peer_count,
@@ -22392,25 +22405,30 @@ struct BenchmarkHeadlessResult {
       BenchmarkTerminalOutcome::kFinished;
 };
 
+using RunStopTick = std::chrono::steady_clock::duration::rep;
+constexpr RunStopTick kRunStopNotObserved =
+    std::numeric_limits<RunStopTick>::max();
+
+void RecordRunStop(std::atomic<RunStopTick>& run_stop_tick,
+                   std::chrono::steady_clock::time_point observed_at) {
+  const RunStopTick observed_tick = observed_at.time_since_epoch().count();
+  RunStopTick current = run_stop_tick.load(std::memory_order_relaxed);
+  while (observed_tick < current &&
+         !run_stop_tick.compare_exchange_weak(current, observed_tick,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+  }
+}
+
 BenchmarkHeadlessResult RunBenchmarkHeadless(
     Options options, SimulationCommandQueue& command_queue,
     McpLiveApplication& mcp_application, RuntimeNodeInventory& node_inventory,
     std::stop_source& simulation_stop_source,
+    std::atomic<RunStopTick>& run_stop_tick,
     std::stop_token external_stop_token = {}) {
-  using RunStopTick = std::chrono::steady_clock::duration::rep;
-  constexpr RunStopTick kRunStopNotObserved =
-      std::numeric_limits<RunStopTick>::max();
-  std::atomic<RunStopTick> run_stop_tick = kRunStopNotObserved;
   const auto record_run_stop =
       [&](std::chrono::steady_clock::time_point observed_at) {
-        const RunStopTick observed_tick =
-            observed_at.time_since_epoch().count();
-        RunStopTick current = run_stop_tick.load(std::memory_order_relaxed);
-        while (observed_tick < current &&
-               !run_stop_tick.compare_exchange_weak(
-                   current, observed_tick, std::memory_order_release,
-                   std::memory_order_relaxed)) {
-        }
+        RecordRunStop(run_stop_tick, observed_at);
       };
   const auto request_simulation_stop = [&] {
     record_run_stop(std::chrono::steady_clock::now());
@@ -25882,20 +25900,18 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     target_config = node.config;
                   }
                   while (true) {
-                    driver.WaitForHeight(
-                        target_config, epoch_workload.height,
-                        std::chrono::seconds(epoch_workload.timeout_sec),
-                        execution_stop_token);
-                    const std::uint64_t observed_height =
-                        driver.ReadMetrics(target_config, execution_stop_token)
-                            .height;
+                    const std::optional<std::uint64_t> observed_height =
+                        WaitForHeightReadback(
+                            driver, target_config, epoch_workload.height,
+                            std::chrono::seconds(epoch_workload.timeout_sec),
+                            execution_stop_token);
                     std::optional<LiveWaitUntilHeightResult> completed_result;
-                    if (observed_height >= epoch_workload.height) {
+                    if (observed_height) {
                       completed_result.emplace(LiveWaitUntilHeightResult{
                           .node = epoch_workload.node,
                           .node_id = target_config.id,
                           .target_height = epoch_workload.height,
-                          .observed_height = observed_height,
+                          .observed_height = *observed_height,
                       });
                     }
                     std::unique_lock<std::mutex> lock(record->mutex);
@@ -25919,7 +25935,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                       }
                     };
                     require_open_epoch();
-                    if (observed_height < epoch_workload.height) {
+                    if (!observed_height) {
                       lock.unlock();
                       continue;
                     }
@@ -25936,7 +25952,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                HeightWaitDetail(record->ordinal, 0U,
                                                 epoch_workload.node,
                                                 epoch_workload.height,
-                                                observed_height, record->id));
+                                                *observed_height, record->id));
                     lock.lock();
                     record->result = std::move(*completed_result);
                     record->completion_pending = false;
@@ -30018,16 +30034,75 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 scenario_workload.wait_until_height;
             NodeRuntime& node = nodes[workload.node - 1U];
             RequireNodeRunning(node, "wait_until_height workload");
-            driver.WaitForHeight(node.config, workload.height,
-                                 std::chrono::seconds(workload.timeout_sec),
-                                 stop_token);
-            const uint64_t observed_height =
-                driver.ReadMetrics(node.config, stop_token).height;
-            WriteEvent(
-                events_path, options.run_id, node.config.id,
-                SimulationEventKind::kHeightWaitReached,
-                HeightWaitDetail(action_index, action_count, workload.node,
-                                 workload.height, observed_height));
+            const auto timeout = std::chrono::seconds(workload.timeout_sec);
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            std::stop_source deadline_stop_source;
+            std::jthread deadline_timer([deadline, &deadline_stop_source](
+                                            std::stop_token timer_stop_token) {
+              try {
+                WaitUntil(deadline, timer_stop_token);
+              } catch (const SimulationCancelled&) {
+                return;
+              }
+              if (!timer_stop_token.stop_requested()) {
+                deadline_stop_source.request_stop();
+              }
+            });
+            CombinedStopToken execution_stop_tokens(
+                stop_token, deadline_stop_source.get_token());
+            const std::stop_token execution_stop_token =
+                execution_stop_tokens.get_token();
+            const auto timeout_failure = [&] {
+              return std::runtime_error(
+                  "wait_until_height workload timed out after " +
+                  std::to_string(workload.timeout_sec) +
+                  " seconds waiting for height " +
+                  std::to_string(workload.height));
+            };
+            const auto require_open_wait = [&] {
+              const std::optional<std::chrono::steady_clock::time_point>
+                  run_stop_requested_at = observed_run_stop();
+              if (run_stop_requested_at && *run_stop_requested_at < deadline) {
+                throw SimulationCancelled();
+              }
+              if (std::chrono::steady_clock::now() >= deadline) {
+                deadline_stop_source.request_stop();
+                throw timeout_failure();
+              }
+              ThrowIfStopRequested(stop_token);
+              ThrowIfStopRequested(execution_stop_token);
+            };
+            try {
+              while (true) {
+                const std::optional<std::uint64_t> observed_height =
+                    WaitForHeightReadback(driver, node.config, workload.height,
+                                          timeout, execution_stop_token);
+                require_open_wait();
+                if (!observed_height) {
+                  continue;
+                }
+                deadline_timer.request_stop();
+                require_open_wait();
+                WriteEvent(
+                    events_path, options.run_id, node.config.id,
+                    SimulationEventKind::kHeightWaitReached,
+                    HeightWaitDetail(action_index, action_count, workload.node,
+                                     workload.height, *observed_height));
+                break;
+              }
+            } catch (const SimulationCancelled&) {
+              deadline_timer.request_stop();
+              const std::optional<std::chrono::steady_clock::time_point>
+                  run_stop_requested_at = observed_run_stop();
+              if (run_stop_requested_at && *run_stop_requested_at < deadline) {
+                throw;
+              }
+              if (deadline_stop_source.stop_requested() ||
+                  std::chrono::steady_clock::now() >= deadline) {
+                throw timeout_failure();
+              }
+              throw;
+            }
           } else if (scenario_workload.kind == WorkloadKind::kWaitForPeers) {
             const WaitForPeersWorkload& workload =
                 scenario_workload.wait_for_peers;
@@ -31137,6 +31212,7 @@ struct EditorRunContext {
   std::shared_ptr<RuntimeNodeInventory> node_inventory;
   std::shared_ptr<EditorTuiReadLeaseState> tui_read_lease_state =
       std::make_shared<EditorTuiReadLeaseState>();
+  std::atomic<RunStopTick> run_stop_tick{kRunStopNotObserved};
   std::stop_source simulation_stop_source;
   std::shared_ptr<McpLiveApplication> mcp_application;
   std::shared_ptr<ReservedManagedRunRoot> reserved_run_root;
@@ -31252,7 +31328,8 @@ BenchmarkHeadlessResult RunPreparedBenchmark(
 
   return RunBenchmarkHeadless(
       options, *context->command_queue, *context->mcp_application,
-      *context->node_inventory, context->simulation_stop_source);
+      *context->node_inventory, context->simulation_stop_source,
+      context->run_stop_tick);
 }
 
 class EditorRunController {
@@ -32166,6 +32243,7 @@ class EditorRunController {
   }
 
   static void RequestStop(const std::shared_ptr<EditorRunContext>& context) {
+    RecordRunStop(context->run_stop_tick, std::chrono::steady_clock::now());
     context->simulation_stop_source.request_stop();
     context->command_queue->Close();
   }

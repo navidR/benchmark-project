@@ -46,6 +46,7 @@ using tcp = asio::ip::tcp;
 
 inline constexpr auto kSlowNodeReplacementPhaseDelay =
     std::chrono::milliseconds(17750);
+inline constexpr auto kHeightReadbackRegressionTargetDelay = 2s;
 
 class PtyProcess {
  public:
@@ -909,6 +910,71 @@ struct ReadyDaemonPeerControl {
   std::uint64_t handshake_count = 0U;
 };
 
+struct ReadyDaemonHeightReadbackRegression {
+  std::optional<std::chrono::steady_clock::time_point> activated_at;
+  bool target_reported = false;
+  bool readback_regressed = false;
+  std::uint64_t response_count = 0U;
+};
+
+void AppendHeightReadbackRegressionAudit(const std::filesystem::path& run_root,
+                                         std::string_view phase,
+                                         std::uint64_t response_count,
+                                         std::uint64_t height) {
+  std::ofstream stream(run_root / "bbp-test-height-readback-regression-audit",
+                       std::ios::app);
+  if (!stream) {
+    throw std::runtime_error(
+        "could not append ready-daemon height-readback regression audit");
+  }
+  stream << phase << " height=" << height << " response=" << response_count
+         << '\n';
+  if (!stream) {
+    throw std::runtime_error(
+        "could not flush ready-daemon height-readback regression audit");
+  }
+}
+
+std::optional<std::uint64_t> ScriptHeightReadbackRegression(
+    const std::filesystem::path& run_root,
+    ReadyDaemonHeightReadbackRegression* regression) {
+  if (!std::filesystem::exists(run_root.parent_path() /
+                               "bbp-test-height-readback-regression-enabled")) {
+    return std::nullopt;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (!regression->activated_at) {
+    const std::string events = ReadFile(run_root / "events.jsonl");
+    if (events.find("\"event\":\"height_wait_reached\"") == std::string::npos) {
+      return std::nullopt;
+    }
+    regression->activated_at = now;
+    AppendHeightReadbackRegressionAudit(run_root, "activated", 0U, 0U);
+  }
+
+  ++regression->response_count;
+  if (!regression->target_reported) {
+    std::this_thread::sleep_until(*regression->activated_at +
+                                  kHeightReadbackRegressionTargetDelay);
+    regression->target_reported = true;
+    AppendHeightReadbackRegressionAudit(run_root, "target",
+                                        regression->response_count, 1U);
+    return 1U;
+  }
+  if (regression->target_reported && !regression->readback_regressed) {
+    regression->readback_regressed = true;
+    AppendHeightReadbackRegressionAudit(run_root, "regressed-readback",
+                                        regression->response_count, 0U);
+    return 0U;
+  }
+  AppendHeightReadbackRegressionAudit(run_root,
+                                      regression->readback_regressed
+                                          ? "below-after-regression"
+                                          : "below-target",
+                                      regression->response_count, 0U);
+  return 0U;
+}
+
 void PublishReadyDaemonPeerControl(const std::filesystem::path& run_root,
                                    std::uint64_t connection_count,
                                    std::uint64_t handshake_count) {
@@ -1042,13 +1108,14 @@ void ReleaseBlockGeneration(const std::filesystem::path& run_root,
   stream << "release acknowledged generation\n";
 }
 
-std::string RpcResult(std::string_view method, std::string_view request,
-                      std::set<std::string>* peers,
-                      const std::filesystem::path& peer_state_path,
-                      std::uint64_t* height, bool slow_replacement,
-                      std::optional<std::chrono::steady_clock::time_point>*
-                          slow_synchronization_started,
-                      bool* slow_synchronization_completed) {
+std::string RpcResult(
+    std::string_view method, std::string_view request,
+    std::set<std::string>* peers, const std::filesystem::path& peer_state_path,
+    std::uint64_t* height, bool slow_replacement,
+    std::optional<std::chrono::steady_clock::time_point>*
+        slow_synchronization_started,
+    bool* slow_synchronization_completed,
+    ReadyDaemonHeightReadbackRegression* height_readback_regression) {
   const std::filesystem::path node_root =
       peer_state_path.parent_path().parent_path();
   const std::filesystem::path run_root = node_root.parent_path().parent_path();
@@ -1057,7 +1124,11 @@ std::string RpcResult(std::string_view method, std::string_view request,
   const std::filesystem::path directed_peer_drop_trigger =
       run_root / "bbp-test-directed-peer-target-stopped";
   if (method == "getblockchaininfo") {
-    SynchronizeReadyDaemonHeight(run_root, height);
+    const std::optional<std::uint64_t> scripted_height =
+        ScriptHeightReadbackRegression(run_root, height_readback_regression);
+    if (!scripted_height) {
+      SynchronizeReadyDaemonHeight(run_root, height);
+    }
     if (slow_replacement) {
       const auto now = std::chrono::steady_clock::now();
       if (!*slow_synchronization_started) {
@@ -1073,10 +1144,11 @@ std::string RpcResult(std::string_view method, std::string_view request,
         *slow_synchronization_completed = true;
       }
     }
+    const std::uint64_t reported_height = scripted_height.value_or(*height);
     return boost::json::serialize(boost::json::object{
-        {"blocks", *height},
-        {"headers", *height},
-        {"bestblockhash", "block-" + std::to_string(*height)},
+        {"blocks", reported_height},
+        {"headers", reported_height},
+        {"bestblockhash", "block-" + std::to_string(reported_height)},
         {"initialblockdownload", false},
         {"verificationprogress", 1.0},
         {"difficulty", 1.0},
@@ -1329,6 +1401,7 @@ int RunReadyFiroDaemon(int argc, char** argv) {
   std::optional<std::chrono::steady_clock::time_point>
       slow_synchronization_started;
   bool slow_synchronization_completed = false;
+  ReadyDaemonHeightReadbackRegression height_readback_regression;
   std::uint64_t height = 0U;
   bool stop = false;
   while (!stop) {
@@ -1349,7 +1422,8 @@ int RunReadyFiroDaemon(int argc, char** argv) {
           "{\"result\":" +
           RpcResult(method, request, &peers, peer_state_path, &height,
                     slow_replacement, &slow_synchronization_started,
-                    &slow_synchronization_completed) +
+                    &slow_synchronization_completed,
+                    &height_readback_regression) +
           ",\"error\":null,\"id\":\"bbp\"}";
       const std::string response =
           "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -2967,6 +3041,144 @@ std::filesystem::path CopyActiveDaemonFixtures(
   std::filesystem::permissions(qt, kOwnerExecutable,
                                std::filesystem::perm_options::replace);
   return daemon;
+}
+
+void CheckScenarioHeightWaitReadbackRegression(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("height-readback-regression");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path scenario = directory.root() / "scenario.json";
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directories(benchmark_root);
+  std::filesystem::create_directory(home_directory);
+  {
+    std::ofstream stream(benchmark_root /
+                         "bbp-test-height-readback-regression-enabled");
+    if (!stream) {
+      throw std::runtime_error(
+          "could not enable height-readback regression fixture");
+    }
+    stream << "script target then regressed height readback\n";
+  }
+
+  const std::string run_id =
+      "height-readback-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  const std::filesystem::path audit_path =
+      run_root / "bbp-test-height-readback-regression-audit";
+  {
+    std::ofstream stream(scenario);
+    if (!stream) {
+      throw std::runtime_error(
+          "could not create height-readback regression scenario");
+    }
+    stream << boost::json::serialize(boost::json::object{
+                  {"chain", "firo"},
+                  {"chain_daemon", daemon.string()},
+                  {"nodes", 1U},
+                  {"node_capacity", 1U},
+                  {"isolated_network", false},
+                  {"block_production", boost::json::object{{"enabled", false}}},
+                  {"ready_timeout_sec", 10U},
+                  {"sync_timeout_sec", 10U},
+                  {"metrics_sample_count", 0U},
+                  {"metrics_interval_ms", 10'000U},
+                  {"workloads",
+                   boost::json::array{
+                       boost::json::object{{"type", "wait_until_height"},
+                                           {"node", 1U},
+                                           {"height", 0U},
+                                           {"timeout_sec", 2U}},
+                       boost::json::object{{"type", "wait_until_height"},
+                                           {"node", 1U},
+                                           {"height", 1U},
+                                           {"timeout_sec", 5U}}}}})
+           << '\n';
+    if (!stream) {
+      throw std::runtime_error(
+          "could not write height-readback regression scenario");
+    }
+  }
+
+  PtyProcess process(
+      command,
+      {"--scenario", scenario.string(), "--node-binary", daemon.string(),
+       "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--no-tui", "--keep-artifacts"},
+      24, 100, home_directory);
+  const auto audit_deadline = std::chrono::steady_clock::now() + 10s;
+  std::string process_output;
+  std::string audit;
+  while (std::chrono::steady_clock::now() < audit_deadline) {
+    audit = ReadFile(audit_path);
+    if (audit.find("regressed-readback height=0") != std::string::npos) {
+      break;
+    }
+    process_output += process.ReadFor(50ms);
+  }
+  if (audit.find("regressed-readback height=0") == std::string::npos) {
+    throw std::runtime_error(
+        "height-readback regression fixture did not activate\nPTY output:\n" +
+        process_output + "\nevents:\n" + ReadFile(events_path) +
+        "\nresolved scenario:\n" +
+        ReadFile(run_root / "resolved-scenario.json"));
+  }
+  const auto regression_observed_at = std::chrono::steady_clock::now();
+  const auto earliest_original_deadline = regression_observed_at + 2s;
+  const auto original_deadline_bound = regression_observed_at + 4s;
+  std::string events;
+  while (std::chrono::steady_clock::now() < original_deadline_bound) {
+    events = ReadFile(events_path);
+    if (CountOccurrences(events, "\"event\":\"height_wait_reached\"") > 1U) {
+      throw std::runtime_error(
+          "scenario height wait published success from a regressed readback");
+    }
+    if (events.find("\"event\":\"run_failed\"") != std::string::npos) {
+      if (std::chrono::steady_clock::now() < earliest_original_deadline) {
+        throw std::runtime_error(
+            "scenario height wait failed before its original deadline after "
+            "a regressed readback");
+      }
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (events.find("\"event\":\"run_failed\"") == std::string::npos) {
+    throw std::runtime_error(
+        "scenario height wait reset or exceeded its original deadline after "
+        "a regressed readback");
+  }
+
+  const int result = process.Wait(5s);
+  if (result == 0) {
+    throw std::runtime_error(
+        "regressed scenario height wait exited successfully");
+  }
+  events = ReadFile(events_path);
+  if (CountOccurrences(events, "\"event\":\"height_wait_reached\"") != 1U) {
+    throw std::runtime_error(
+        "regressed scenario height wait retained the wrong success count");
+  }
+  RequireContains(events, "\"event\":\"run_failed\"",
+                  "regressed scenario height-wait terminal state");
+  RequireContains(
+      events,
+      "wait_until_height workload timed out after 5 seconds waiting for height "
+      "1",
+      "regressed scenario height-wait failure");
+  RequireNotContains(events, "\"event\":\"run_cancelled\"",
+                     "regressed scenario height-wait terminal state");
+  audit = ReadFile(audit_path);
+  RequireContains(audit, "target height=1",
+                  "scenario height-wait qualifying observation");
+  RequireContains(audit, "regressed-readback height=0",
+                  "scenario height-wait regressed readback");
+  RequireContains(audit, "below-after-regression height=0",
+                  "scenario height-wait retry");
 }
 
 void CheckSlowNodeReplacementDefaultTimeout(
@@ -4862,6 +5074,19 @@ int main(int argc, char** argv) {
       return 0;
     } catch (const std::exception& error) {
       std::cerr << "retained MCP regression failed: " << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 && std::string_view(argv[1]) ==
+                       "--scenario-height-wait-readback-regression") {
+    try {
+      CheckScenarioHeightWaitReadbackRegression(
+          argv[2], std::filesystem::canonical(argv[0]));
+      std::cout << "scenario height-wait readback regression checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "scenario height-wait readback regression failed: "
+                << error.what() << '\n';
       return 1;
     }
   }
