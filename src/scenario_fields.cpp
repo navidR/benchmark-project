@@ -326,6 +326,10 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
       Fields("node", "nodes", "src_address", "src_port", "dst_address",
              "dst_port", "handle");
   static constexpr auto kPartition = Fields("group_a", "group_b");
+  static constexpr auto kEdgeCondition = Fields(
+      "from", "to", "latency_ms", "bandwidth_kbps", "delay_ms", "jitter_ms",
+      "loss_basis_points", "loss_percent", "duplicate_basis_points",
+      "corrupt_basis_points", "reorder_basis_points", "limit_packets");
   static constexpr auto kEdge =
       Fields("from", "to", "timeout_sec", "latency_ms", "bandwidth_kbps",
              "delay_ms", "jitter_ms", "loss_basis_points", "loss_percent",
@@ -374,6 +378,7 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
     case WorkloadKind::kHealPartition:
       return kPartition;
     case WorkloadKind::kSetEdgeCondition:
+      return kEdgeCondition;
     case WorkloadKind::kActivateEdge:
     case WorkloadKind::kDeactivateEdge:
     case WorkloadKind::kRestoreEdge:

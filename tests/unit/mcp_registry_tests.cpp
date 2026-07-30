@@ -164,6 +164,14 @@ void RequirePositiveWalletSendTimeout(const boost::json::object& schema,
   RequirePositiveUint32Timeout(wallet_send.at("properties").as_object());
 }
 
+void RequireNoSetEdgeConditionTimeout(const boost::json::object& schema,
+                                      std::string_view discriminator) {
+  const boost::json::object& variant =
+      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
+                       WorkloadKindName(WorkloadKind::kSetEdgeCondition));
+  BOOST_TEST(!variant.at("properties").as_object().contains("timeout_sec"));
+}
+
 void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
                                             std::string_view discriminator) {
   const boost::json::object& block_generation =
@@ -818,6 +826,21 @@ BOOST_AUTO_TEST_CASE(
   RequirePositiveWalletSendTimeout(
       scenario_properties.at("events").as_object().at("items").as_object(),
       "action");
+}
+
+BOOST_AUTO_TEST_CASE(mcp_set_edge_condition_schemas_omit_unsupported_timeout) {
+  RequireNoSetEdgeConditionTimeout(BuildMcpWorkloadSchema(), "type");
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  RequireNoSetEdgeConditionTimeout(scenario.at("properties")
+                                       .as_object()
+                                       .at("events")
+                                       .as_object()
+                                       .at("items")
+                                       .as_object(),
+                                   "action");
+  BOOST_TEST(!StringSet(scenario.at("x-bbp-members").as_array())
+                  .contains("workload.set_edge_condition.timeout_sec"));
 }
 
 BOOST_AUTO_TEST_CASE(

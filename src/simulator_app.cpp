@@ -3055,7 +3055,10 @@ void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
     const bool structural =
         scheduled ? member.key() == "at" || member.key() == "action"
                   : member.key() == "type";
-    if (!structural && !ScenarioWorkloadFieldAllowed(kind, member.key())) {
+    const bool dedicated_rejection = kind == WorkloadKind::kSetEdgeCondition &&
+                                     member.key() == "timeout_sec";
+    if (!structural && !dedicated_rejection &&
+        !ScenarioWorkloadFieldAllowed(kind, member.key())) {
       throw std::runtime_error(
           std::string(scheduled ? "scenario scheduled action "
                                 : "scenario workload ") +
