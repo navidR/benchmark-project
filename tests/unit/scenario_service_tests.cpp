@@ -620,6 +620,38 @@ BOOST_AUTO_TEST_CASE(
       });
 }
 
+BOOST_AUTO_TEST_CASE(
+    scenario_service_freezes_height_wait_target_after_scheduled_compaction) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 2U;
+  scenario["node_capacity"] = 2U;
+  scenario["topology"] =
+      boost::json::object{{"node_count", 2U},
+                          {"wallet_node_count", 0U},
+                          {"miner_node_count", 0U},
+                          {"wallet_nodes", boost::json::array{}},
+                          {"miner_nodes", boost::json::array{}}};
+  scenario["events"] = boost::json::array{
+      boost::json::object{
+          {"at", "1s"},
+          {"action", "remove_nodes"},
+          {"node_remove",
+           boost::json::object{{"node_ids", boost::json::array{"firo-1"}}}}},
+      boost::json::object{{"at", "2s"},
+                          {"action", "wait_until_height"},
+                          {"node", 1U},
+                          {"height", 1U},
+                          {"timeout_sec", 3U}}};
+
+  const Options options = ParseAndValidateScenario(scenario);
+  BOOST_REQUIRE_EQUAL(options.scheduled_events.size(), 2U);
+  const ScenarioWorkload& wait =
+      std::get<ScenarioWorkload>(options.scheduled_events[1U].action);
+  BOOST_CHECK(wait.kind == WorkloadKind::kWaitUntilHeight);
+  BOOST_TEST(wait.wait_until_height.node == 1U);
+  BOOST_TEST(wait.wait_until_height.node_id == "firo-2");
+}
+
 BOOST_AUTO_TEST_CASE(scenario_service_rejects_scheduled_removal_of_role_node) {
   boost::json::object scenario = MinimalScenario();
   scenario["nodes"] = 3U;

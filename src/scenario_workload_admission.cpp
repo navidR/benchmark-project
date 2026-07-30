@@ -7,6 +7,7 @@ RuntimeNodeSnapshot SnapshotScenarioDispatchNodes(
   if (kind == WorkloadKind::kWalletTransactions ||
       kind == WorkloadKind::kRestartNode ||
       kind == WorkloadKind::kBlockGeneration ||
+      kind == WorkloadKind::kWaitUntilHeight ||
       kind == WorkloadKind::kFreezeNode) {
     return {};
   }

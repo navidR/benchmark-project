@@ -47,5 +47,5 @@ BOOST_AUTO_TEST_CASE(
       OldGenerationDrainsAfterDispatch(bbp::WorkloadKind::kBlockGeneration));
   BOOST_TEST(OldGenerationDrainsAfterDispatch(bbp::WorkloadKind::kFreezeNode));
   BOOST_TEST(
-      !OldGenerationDrainsAfterDispatch(bbp::WorkloadKind::kWaitUntilHeight));
+      OldGenerationDrainsAfterDispatch(bbp::WorkloadKind::kWaitUntilHeight));
 }

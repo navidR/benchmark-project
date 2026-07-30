@@ -34,6 +34,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -243,6 +244,43 @@ class OwnedTemporaryDirectory {
 
  private:
   std::filesystem::path root_;
+};
+
+class TestGateRelease {
+ public:
+  explicit TestGateRelease(std::filesystem::path path)
+      : path_(std::move(path)) {}
+
+  TestGateRelease(const TestGateRelease&) = delete;
+  TestGateRelease& operator=(const TestGateRelease&) = delete;
+
+  ~TestGateRelease() {
+    try {
+      Release();
+    } catch (...) {
+    }
+  }
+
+  void Release() {
+    if (!armed_) {
+      return;
+    }
+    std::ofstream stream(path_);
+    if (!stream) {
+      throw std::runtime_error("could not create " + path_.string());
+    }
+    stream << "release test gate\n";
+    if (!stream) {
+      throw std::runtime_error("could not flush " + path_.string());
+    }
+    armed_ = false;
+  }
+
+  void Disarm() noexcept { armed_ = false; }
+
+ private:
+  std::filesystem::path path_;
+  bool armed_ = true;
 };
 
 class TcpListener {
@@ -1078,6 +1116,47 @@ void WaitForNodeMutationAdmissionRelease(const std::filesystem::path& run_root,
   }
 }
 
+void WaitForScenarioHeightWaitAdmissionRelease(
+    const std::filesystem::path& run_root) {
+  const std::filesystem::path enabled =
+      run_root / "bbp-test-scenario-height-wait-admission-gate";
+  const std::filesystem::path held =
+      run_root / "bbp-test-scenario-height-wait-admission-held";
+  if (!std::filesystem::exists(enabled) || std::filesystem::exists(held)) {
+    return;
+  }
+  const std::string events = ReadFile(run_root / "events.jsonl");
+  if (events.find("\"event\":\"scheduled_event_started\"") ==
+          std::string::npos ||
+      events.find("\\\"action\\\":\\\"wait_until_height\\\"") ==
+          std::string::npos) {
+    return;
+  }
+  {
+    std::ofstream stream(held);
+    if (!stream) {
+      throw std::runtime_error(
+          "could not acknowledge scenario height-wait admission");
+    }
+    stream << "getblockchaininfo entered after scheduled wait admission\n";
+    if (!stream) {
+      throw std::runtime_error(
+          "could not flush scenario height-wait admission acknowledgement");
+    }
+  }
+  const std::filesystem::path release =
+      run_root / "bbp-test-scenario-height-wait-admission-release";
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  while (!std::filesystem::exists(release) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  if (!std::filesystem::remove(release)) {
+    throw std::runtime_error(
+        "scenario height-wait admission gate was not released");
+  }
+}
+
 std::filesystem::path BlockGenerationReleasePath(
     const std::filesystem::path& run_root, std::uint64_t start_height) {
   return run_root /
@@ -1124,6 +1203,7 @@ std::string RpcResult(
   const std::filesystem::path directed_peer_drop_trigger =
       run_root / "bbp-test-directed-peer-target-stopped";
   if (method == "getblockchaininfo") {
+    WaitForScenarioHeightWaitAdmissionRelease(run_root);
     const std::optional<std::uint64_t> scripted_height =
         ScriptHeightReadbackRegression(run_root, height_readback_regression);
     if (!scripted_height) {
@@ -3181,6 +3261,264 @@ void CheckScenarioHeightWaitReadbackRegression(
                   "scenario height-wait retry");
 }
 
+void CheckScenarioHeightWaitMutationAdmission(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("height-wait-mutation-admission");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path scenario = directory.root() / "scenario.json";
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "height-admission-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  const std::filesystem::path node_root = run_root / "nodes" / "firo-1";
+  {
+    std::ofstream stream(scenario);
+    if (!stream) {
+      throw std::runtime_error(
+          "could not create height-wait admission scenario");
+    }
+    stream << boost::json::serialize(boost::json::object{
+                  {"chain", "firo"},
+                  {"chain_daemon", daemon.string()},
+                  {"nodes", 1U},
+                  {"node_capacity", 1U},
+                  {"isolated_network", false},
+                  {"block_production", boost::json::object{{"enabled", false}}},
+                  {"ready_timeout_sec", 10U},
+                  {"sync_timeout_sec", 10U},
+                  {"metrics_sample_count", 0U},
+                  {"metrics_interval_ms", 10'000U},
+                  {"workloads", boost::json::array{}},
+                  {"events", boost::json::array{boost::json::object{
+                                 {"at", "5s"},
+                                 {"action", "wait_until_height"},
+                                 {"node", 1U},
+                                 {"height", 1U},
+                                 {"timeout_sec", 15U}}}}})
+           << '\n';
+    if (!stream) {
+      throw std::runtime_error(
+          "could not write height-wait admission scenario");
+    }
+  }
+
+  PtyProcess process(
+      command,
+      {"--scenario", scenario.string(), "--node-binary", daemon.string(),
+       "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--refresh-ms", "50"},
+      30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "height-wait admission TUI"));
+  const std::string startup_events =
+      WaitForFileText(events_path, "\"event\":\"process_started\"", 5s);
+  const pid_t initial_pid = ProcessStartedPid(startup_events);
+
+  const auto write_control = [](const std::filesystem::path& path,
+                                std::string_view contents) {
+    std::ofstream stream(path);
+    if (!stream) {
+      throw std::runtime_error("could not create " + path.string());
+    }
+    stream << contents;
+    if (!stream) {
+      throw std::runtime_error("could not flush " + path.string());
+    }
+  };
+  write_control(run_root / "bbp-test-shared-height", "0\n");
+  write_control(run_root / "bbp-test-shared-height-enabled",
+                "share fake daemon height\n");
+  write_control(run_root / "bbp-test-scenario-height-wait-admission-gate",
+                "hold the first admitted scenario height RPC\n");
+  TestGateRelease height_wait_gate(
+      run_root / "bbp-test-scenario-height-wait-admission-release");
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  static_cast<void>(WaitForFileText(
+      run_root / "bbp-test-scenario-height-wait-admission-held",
+      "getblockchaininfo entered after scheduled wait admission", 10s));
+  const std::string events_before_replacement = ReadFile(events_path);
+  RequireContains(events_before_replacement,
+                  "\"event\":\"scheduled_event_started\"",
+                  "height-wait admission scheduled boundary");
+  RequireContains(events_before_replacement,
+                  "\\\"action\\\":\\\"wait_until_height\\\"",
+                  "height-wait admission scheduled action");
+  RequireNotContains(events_before_replacement,
+                     "\"event\":\"height_wait_reached\"",
+                     "height-wait admission held RPC");
+  write_control(run_root / "bbp-test-node-mutation-admission-gate",
+                "fail if replacement reaches candidate readiness\n");
+  TestGateRelease candidate_gate(run_root /
+                                 "bbp-test-node-mutation-admission-release");
+  const std::filesystem::path clone_failure =
+      node_root / "data" / "height-wait-admission-clone-failure.fifo";
+  if (mkfifo(clone_failure.c_str(), 0600) != 0) {
+    throw std::system_error(
+        errno, std::generic_category(),
+        "create height-wait admission clone-failure sentinel");
+  }
+
+  const auto replacement_arguments = [&] {
+    return boost::json::object{
+        {"run_id", run_id},
+        {"node_id", "firo-1"},
+        {"timeout_sec", 20U},
+        {"replacement",
+         boost::json::object{{"chain", "firo"},
+                             {"count", 1U},
+                             {"node_ids", boost::json::array{"firo-1"}},
+                             {"ready_timeout_sec", 10U},
+                             {"sync_timeout_sec", 10U}}}};
+  };
+  const boost::json::object rejected_submission = SubmitMcpOperation(
+      mcp, &request_id, "node.replace", replacement_arguments());
+  const boost::json::value* rejected_operation_id =
+      rejected_submission.if_contains("operation_id");
+  if (rejected_operation_id == nullptr || !rejected_operation_id->is_string()) {
+    throw std::runtime_error(
+        "height-wait replacement rejection returned no operation identity");
+  }
+  boost::json::object rejected_operation;
+  const auto rejection_deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < rejection_deadline) {
+    if (std::filesystem::exists(run_root /
+                                "bbp-test-node-mutation-admission-held")) {
+      throw std::runtime_error(
+          "height-wait replacement reached candidate readiness before "
+          "admission rejection");
+    }
+    rejected_operation = McpToolCall(
+        mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+        "operation.get",
+        boost::json::object{{"operation_id", *rejected_operation_id}});
+    const std::string_view state = rejected_operation.at("state").as_string();
+    if (state == "failed") {
+      break;
+    }
+    if (state == "succeeded" || state == "cancelled") {
+      throw std::runtime_error(
+          "height-wait replacement crossed its admission lease: " +
+          boost::json::serialize(rejected_operation));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (rejected_operation.empty() ||
+      rejected_operation.at("state").as_string() != "failed") {
+    throw std::runtime_error(
+        "height-wait replacement was not rejected before its deadline");
+  }
+  const boost::json::object& rejection =
+      rejected_operation.at("terminal_error").as_object();
+  if (rejection.at("code").as_string() != "node_replace_failed") {
+    throw std::runtime_error(
+        "height-wait replacement returned the wrong typed failure: " +
+        boost::json::serialize(rejected_operation));
+  }
+  RequireContains(
+      boost::json::serialize(rejection),
+      "node-replace is unavailable while a scenario wait_until_height is "
+      "active for node firo-1",
+      "height-wait replacement admission failure");
+
+  const std::string rejected_events = ReadFile(events_path);
+  if (CountOccurrences(rejected_events,
+                       "\"event\":\"runtime_generation_published\"") !=
+          CountOccurrences(events_before_replacement,
+                           "\"event\":\"runtime_generation_published\"") ||
+      CountOccurrences(rejected_events, "\"event\":\"process_started\"") !=
+          CountOccurrences(events_before_replacement,
+                           "\"event\":\"process_started\"") ||
+      CountOccurrences(rejected_events, "\"event\":\"process_stopped\"") !=
+          CountOccurrences(events_before_replacement,
+                           "\"event\":\"process_stopped\"") ||
+      !ProcessExists(initial_pid)) {
+    throw std::runtime_error(
+        "rejected height-wait replacement mutated the live node generation");
+  }
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(run_root / "nodes")) {
+    if (entry.path().filename().string().starts_with("bbpr-")) {
+      throw std::runtime_error(
+          "rejected height-wait replacement staged a candidate root");
+    }
+  }
+  if (std::filesystem::exists(run_root /
+                              "bbp-test-node-mutation-admission-held")) {
+    throw std::runtime_error(
+        "rejected height-wait replacement entered candidate readiness");
+  }
+  if (!std::filesystem::remove(run_root /
+                               "bbp-test-node-mutation-admission-gate")) {
+    throw std::runtime_error(
+        "could not disable height-wait candidate admission gate");
+  }
+  candidate_gate.Disarm();
+  if (!std::filesystem::remove(clone_failure)) {
+    throw std::runtime_error(
+        "could not remove height-wait clone-failure sentinel");
+  }
+  static_cast<void>(process.ReadUntil(
+      "Command error", 3s, "height-wait replacement rejection modal"));
+  process.Write("\n");
+
+  write_control(run_root / "bbp-test-shared-height", "1\n");
+  height_wait_gate.Release();
+  const std::string completed_events = WaitForFileText(
+      events_path, "\"event\":\"scheduled_event_completed\"", 10s);
+  if (CountOccurrences(completed_events, "\"event\":\"height_wait_reached\"") !=
+      1U) {
+    throw std::runtime_error(
+        "admitted scenario height wait did not publish exactly one success");
+  }
+  RequireNotContains(completed_events, "\"event\":\"scheduled_event_failed\"",
+                     "admitted scenario height-wait result");
+  RequireNotContains(completed_events, "\"event\":\"run_failed\"",
+                     "admitted scenario height-wait run state");
+
+  const boost::json::object replacement = InvokeMcpOperation(
+      mcp, &request_id, "node.replace", replacement_arguments(), 20s,
+      "height-wait post-completion node replacement");
+  if (replacement.at("action").as_string() != "node.replace" ||
+      replacement.at("state").as_string() != "running" ||
+      replacement.at("inventory_generation").to_number<std::uint64_t>() != 2U ||
+      replacement.at("final_node_count").to_number<std::uint64_t>() != 1U) {
+    throw std::runtime_error(
+        "post-height-wait replacement returned inconsistent evidence");
+  }
+  const std::string final_events = ReadFile(events_path);
+  if (CountOccurrences(final_events,
+                       "\"event\":\"runtime_generation_published\"") !=
+      CountOccurrences(events_before_replacement,
+                       "\"event\":\"runtime_generation_published\"") +
+          1U) {
+    throw std::runtime_error(
+        "post-height-wait replacement did not publish exactly one generation");
+  }
+  RequireNotContains(final_events, "\"event\":\"run_failed\"",
+                     "post-height-wait replacement run state");
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(run_root / "nodes")) {
+    if (entry.path().filename().string().starts_with("bbpr-")) {
+      throw std::runtime_error(
+          "post-height-wait replacement retained a staging root");
+    }
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s, "height-wait admission confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "height-wait admission TUI exit");
+}
+
 void CheckSlowNodeReplacementDefaultTimeout(
     const std::filesystem::path& command,
     const std::filesystem::path& helper_binary) {
@@ -5086,6 +5424,20 @@ int main(int argc, char** argv) {
       return 0;
     } catch (const std::exception& error) {
       std::cerr << "scenario height-wait readback regression failed: "
+                << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 && std::string_view(argv[1]) ==
+                       "--scenario-height-wait-mutation-admission") {
+    try {
+      CheckScenarioHeightWaitMutationAdmission(
+          argv[2], std::filesystem::canonical(argv[0]));
+      std::cout << "scenario height-wait mutation-admission checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "scenario height-wait mutation-admission regression "
+                   "failed: "
                 << error.what() << '\n';
       return 1;
     }

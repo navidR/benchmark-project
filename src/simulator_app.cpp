@@ -3562,6 +3562,9 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       }
       WaitUntilHeightWorkload wait;
       wait.node = JsonOptionalUint32Field(workload, "node", wait.node);
+      if (wait.node != 0U && wait.node <= options.nodes) {
+        wait.node_id = ScenarioNodeId(options, wait.node - 1U);
+      }
       wait.height = JsonUint64Field(workload, "height");
       wait.timeout_sec =
           OptionProvided(vm, "sync-timeout-sec")
@@ -13133,9 +13136,63 @@ struct LiveWaitUntilHeightWorkloadRegistry {
   mutable std::mutex mutex;
   std::map<std::string, std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>>
       records;
+  std::map<std::string, std::size_t> scenario_admissions;
   std::uint64_t next_id = 1U;
   bool shutting_down = false;
 };
+
+class ScenarioHeightWaitAdmissionLease {
+ public:
+  ScenarioHeightWaitAdmissionLease(
+      std::shared_ptr<LiveWaitUntilHeightWorkloadRegistry> registry,
+      std::string node_id)
+      : registry_(std::move(registry)), node_id_(std::move(node_id)) {}
+
+  ScenarioHeightWaitAdmissionLease(const ScenarioHeightWaitAdmissionLease&) =
+      delete;
+  ScenarioHeightWaitAdmissionLease& operator=(
+      const ScenarioHeightWaitAdmissionLease&) = delete;
+  ScenarioHeightWaitAdmissionLease(
+      ScenarioHeightWaitAdmissionLease&&) noexcept = default;
+  ScenarioHeightWaitAdmissionLease& operator=(
+      ScenarioHeightWaitAdmissionLease&&) = delete;
+
+  ~ScenarioHeightWaitAdmissionLease() {
+    if (!registry_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    const auto found = registry_->scenario_admissions.find(node_id_);
+    if (found == registry_->scenario_admissions.end()) {
+      return;
+    }
+    if (found->second > 1U) {
+      --found->second;
+    } else {
+      registry_->scenario_admissions.erase(found);
+    }
+  }
+
+ private:
+  std::shared_ptr<LiveWaitUntilHeightWorkloadRegistry> registry_;
+  std::string node_id_;
+};
+
+ScenarioHeightWaitAdmissionLease AcquireScenarioHeightWaitAdmission(
+    const std::shared_ptr<LiveWaitUntilHeightWorkloadRegistry>& registry,
+    const std::string& node_id) {
+  if (!registry) {
+    throw std::logic_error("scenario height-wait workload service is missing");
+  }
+  std::string admitted_node_id = node_id;
+  std::lock_guard<std::mutex> lock(registry->mutex);
+  if (registry->shutting_down) {
+    throw SimulationCancelled();
+  }
+  ++registry->scenario_admissions[admitted_node_id];
+  return ScenarioHeightWaitAdmissionLease(registry,
+                                          std::move(admitted_node_id));
+}
 
 struct LiveWaitForPeersResult {
   std::uint32_t node = 0U;
@@ -13230,10 +13287,11 @@ WaitUntilHeightWorkload ParseAndValidateLiveWaitUntilHeightWorkload(
     throw std::runtime_error(
         "workload operation requires a wait_until_height workload");
   }
-  const WaitUntilHeightWorkload parsed =
+  WaitUntilHeightWorkload parsed =
       validation_options.workloads.front().wait_until_height;
-  static_cast<void>(RequireRuntimeNodeNumber(nodes, parsed.node,
-                                             "wait_until_height workload"));
+  parsed.node_id =
+      RequireRuntimeNodeNumber(nodes, parsed.node, "wait_until_height workload")
+          .config.id;
   if (parsed.timeout_sec == 0U) {
     throw std::runtime_error(
         "wait_until_height timeout_sec must be greater than zero");
@@ -13440,7 +13498,7 @@ void RequireNoActiveBlockGenerationWorkloads(
 
 void RequireNoActiveWaitUntilHeightWorkloads(
     const std::shared_ptr<LiveWaitUntilHeightWorkloadRegistry>& registry,
-    std::string_view operation) {
+    std::string_view operation, const std::set<std::string>& mutated_node_ids) {
   if (!registry) {
     throw std::logic_error(std::string(operation) +
                            " height-wait workload service is missing");
@@ -13448,6 +13506,15 @@ void RequireNoActiveWaitUntilHeightWorkloads(
   std::vector<std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>> records;
   {
     std::lock_guard<std::mutex> lock(registry->mutex);
+    for (const std::string& node_id : mutated_node_ids) {
+      if (registry->scenario_admissions.contains(node_id)) {
+        throw std::runtime_error(
+            std::string(operation) +
+            " is unavailable while a scenario wait_until_height is active "
+            "for node " +
+            node_id);
+      }
+    }
     records.reserve(registry->records.size());
     for (const auto& [id, record] : registry->records) {
       static_cast<void>(id);
@@ -17717,8 +17784,8 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
   }
   RequireNoActiveBlockGenerationWorkloads(block_generation_workloads,
                                           "node-replace");
-  RequireNoActiveWaitUntilHeightWorkloads(wait_until_height_workloads,
-                                          "node-replace");
+  RequireNoActiveWaitUntilHeightWorkloads(
+      wait_until_height_workloads, "node-replace", {std::string(node_id)});
   RequireNoActiveWaitForPeersWorkloads(wait_for_peers_workloads,
                                        "node-replace");
   if (transaction_tracker.HasPending()) {
@@ -18772,7 +18839,7 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
   RequireNoActiveBlockGenerationWorkloads(block_generation_workloads,
                                           "node-remove");
   RequireNoActiveWaitUntilHeightWorkloads(wait_until_height_workloads,
-                                          "node-remove");
+                                          "node-remove", requested_ids);
   RequireNoActiveWaitForPeersWorkloads(wait_for_peers_workloads, "node-remove");
   if (transaction_tracker.HasPending()) {
     throw std::runtime_error(
@@ -30032,8 +30099,6 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           } else if (scenario_workload.kind == WorkloadKind::kWaitUntilHeight) {
             const WaitUntilHeightWorkload& workload =
                 scenario_workload.wait_until_height;
-            NodeRuntime& node = nodes[workload.node - 1U];
-            RequireNodeRunning(node, "wait_until_height workload");
             const auto timeout = std::chrono::seconds(workload.timeout_sec);
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             std::stop_source deadline_stop_source;
@@ -30073,10 +30138,34 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               ThrowIfStopRequested(execution_stop_token);
             };
             try {
+              ChainNodeConfig target_config;
+              std::optional<ScenarioHeightWaitAdmissionLease> admission;
+              {
+                auto mutation_lock = AcquireNodeMutationLock(
+                    node_mutation_mutex, execution_stop_token);
+                const RuntimeNodeSnapshot height_nodes =
+                    node_inventory.Snapshot();
+                const auto selected = std::find_if(
+                    height_nodes.begin(), height_nodes.end(),
+                    [&](const NodeRuntime& candidate) {
+                      return candidate.config.id == workload.node_id;
+                    });
+                if (selected == height_nodes.end()) {
+                  throw std::runtime_error(
+                      "wait_until_height workload references an inactive node "
+                      "id: " +
+                      workload.node_id);
+                }
+                RequireNodeRunning(*selected, "wait_until_height workload");
+                target_config = selected->config;
+                admission.emplace(AcquireScenarioHeightWaitAdmission(
+                    wait_until_height_workloads, target_config.id));
+              }
               while (true) {
                 const std::optional<std::uint64_t> observed_height =
-                    WaitForHeightReadback(driver, node.config, workload.height,
-                                          timeout, execution_stop_token);
+                    WaitForHeightReadback(driver, target_config,
+                                          workload.height, timeout,
+                                          execution_stop_token);
                 require_open_wait();
                 if (!observed_height) {
                   continue;
@@ -30084,7 +30173,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 deadline_timer.request_stop();
                 require_open_wait();
                 WriteEvent(
-                    events_path, options.run_id, node.config.id,
+                    events_path, options.run_id, target_config.id,
                     SimulationEventKind::kHeightWaitReached,
                     HeightWaitDetail(action_index, action_count, workload.node,
                                      workload.height, *observed_height));
