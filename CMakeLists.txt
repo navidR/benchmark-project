@@ -713,6 +713,32 @@ if(BUILD_TESTING)
     "--isolate-network|--no-isolate-network|--probe-capabilities"
     "--isolate-network and --no-isolate-network are mutually exclusive"
   )
+  add_argument_failure_test(
+    bbp-invalid-ready-timeout-negative
+    "--ready-timeout-sec|-1|--help"
+    "--ready-timeout-sec must be an unsigned decimal integer"
+  )
+  add_argument_failure_test(
+    bbp-invalid-sync-timeout-negative
+    "--sync-timeout-sec=-0|--help"
+    "--sync-timeout-sec must be an unsigned decimal integer"
+  )
+  add_test(NAME bbp-valid-cli-timeout-uint32-max
+    COMMAND bbp
+      --ready-timeout-sec 4294967295
+      --sync-timeout-sec +4294967295
+      --help
+  )
+  add_argument_failure_test(
+    bbp-invalid-ready-timeout-overflow
+    "--ready-timeout-sec=4294967296|--help"
+    "--ready-timeout-sec must be an unsigned decimal integer"
+  )
+  add_argument_failure_test(
+    bbp-invalid-sync-timeout-overflow
+    "--sync-timeout-sec|4294967296|--help"
+    "--sync-timeout-sec must be an unsigned decimal integer"
+  )
   add_test(NAME bbp-valid-peer-churn-scenario
     COMMAND bbp
       --scenario-json

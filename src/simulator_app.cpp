@@ -757,6 +757,23 @@ bool OptionProvided(const boost::program_options::variables_map& vm,
   return iter != vm.end() && !iter->second.defaulted();
 }
 
+std::uint32_t ParseCliUint32Text(std::string_view text,
+                                 std::string_view option) {
+  if (!text.empty() && text.front() == '+') {
+    text.remove_prefix(1U);
+  }
+  std::uint32_t value = 0U;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value, 10);
+  if (text.empty() || error != std::errc{} ||
+      end != text.data() + text.size()) {
+    throw std::runtime_error(
+        std::string(option) + " must be an unsigned decimal integer in 0.." +
+        std::to_string(std::numeric_limits<std::uint32_t>::max()));
+  }
+  return value;
+}
+
 std::string YamlScalarText(const yaml_event_t& event) {
   return std::string(reinterpret_cast<const char*>(event.data.scalar.value),
                      event.data.scalar.length);
@@ -5229,6 +5246,8 @@ Options ParseOptions(int argc, char** argv,
   std::string cleanup_run_id;
   std::uint32_t wallet_node_count = 0U;
   std::string transaction_load_strategy;
+  std::string ready_timeout_text;
+  std::string sync_timeout_text;
 
   const std::string nodes_help =
       "chain regtest nodes, 1.." + std::to_string(default_chain_spec.max_nodes);
@@ -5343,9 +5362,9 @@ Options ParseOptions(int argc, char** argv,
       "reproducible global Bernoulli scheduler seed")(
       "mining-difficulty", po::value<double>(&mining_difficulty),
       "chain-specific mining difficulty requested for configured miners")(
-      "ready-timeout-sec", po::value<uint32_t>(&options.ready_timeout_sec),
+      "ready-timeout-sec", po::value<std::string>(&ready_timeout_text),
       "RPC startup timeout")("sync-timeout-sec",
-                             po::value<uint32_t>(&options.sync_timeout_sec),
+                             po::value<std::string>(&sync_timeout_text),
                              "block propagation timeout")(
       "metrics-sample-count",
       po::value<uint32_t>(&options.metrics_sample_count),
@@ -5513,6 +5532,14 @@ Options ParseOptions(int argc, char** argv,
   if (in_memory_scenario == nullptr) {
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
+  }
+  if (OptionProvided(vm, "ready-timeout-sec")) {
+    options.ready_timeout_sec =
+        ParseCliUint32Text(ready_timeout_text, "--ready-timeout-sec");
+  }
+  if (OptionProvided(vm, "sync-timeout-sec")) {
+    options.sync_timeout_sec =
+        ParseCliUint32Text(sync_timeout_text, "--sync-timeout-sec");
   }
 
   options.chain = ParseChainKind(chain_name);
