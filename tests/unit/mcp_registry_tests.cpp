@@ -130,6 +130,20 @@ const boost::json::object& VariantWithConst(const boost::json::array& variants,
   return variants.front().as_object();
 }
 
+void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
+                                            std::string_view discriminator) {
+  const boost::json::object& block_generation =
+      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
+                       WorkloadKindName(WorkloadKind::kBlockGeneration));
+  const boost::json::object& properties =
+      block_generation.at("properties").as_object();
+  BOOST_TEST(properties.contains("node"));
+  BOOST_TEST(!properties.contains("nodes"));
+  const boost::json::object& node = properties.at("node").as_object();
+  BOOST_TEST(node.at("type").as_string() == "integer");
+  BOOST_TEST(node.at("minimum").as_uint64() == 1U);
+}
+
 const boost::json::object& LifecycleOperationConstraint(
     const boost::json::object& operation_schema, std::string_view operation,
     std::string_view state) {
@@ -594,6 +608,49 @@ BOOST_AUTO_TEST_CASE(mcp_schema_builders_reject_enum_sentinels) {
       BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNodeProfile);
   BOOST_TEST(StringSet(node_profile.at("required").as_array()) ==
              std::set<std::string>{"profile"});
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_block_generation_schemas_match_single_node_production_input) {
+  RequireSingleNodeBlockGenerationSchema(BuildMcpWorkloadSchema(), "type");
+  const std::vector<std::string> scenario_members =
+      BuildScenarioMemberRegistry();
+  const bool has_node =
+      std::find(scenario_members.begin(), scenario_members.end(),
+                "workload.block_generation.node") != scenario_members.end();
+  const bool has_nodes =
+      std::find(scenario_members.begin(), scenario_members.end(),
+                "workload.block_generation.nodes") != scenario_members.end();
+  BOOST_TEST(has_node);
+  BOOST_TEST(!has_nodes);
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  RequireSingleNodeBlockGenerationSchema(scenario.at("properties")
+                                             .as_object()
+                                             .at("workloads")
+                                             .as_object()
+                                             .at("items")
+                                             .as_object(),
+                                         "type");
+  RequireSingleNodeBlockGenerationSchema(scenario.at("properties")
+                                             .as_object()
+                                             .at("events")
+                                             .as_object()
+                                             .at("items")
+                                             .as_object(),
+                                         "action");
+
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStartWorkload,
+        McpOperationKind::kReconfigureWorkload}) {
+    RequireSingleNodeBlockGenerationSchema(
+        BuildMcpOperationInputSchema(operation)
+            .at("properties")
+            .as_object()
+            .at("workload")
+            .as_object(),
+        "type");
+  }
 }
 
 BOOST_AUTO_TEST_CASE(mcp_scheduled_events_cover_every_registered_action) {

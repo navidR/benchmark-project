@@ -304,7 +304,7 @@ bool ScenarioTopologyFieldAllowed(PeerTopologyKind kind,
 
 std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
   static constexpr auto kBlockGeneration =
-      Fields("node", "nodes", "count", "sync_timeout_sec");
+      Fields("node", "count", "sync_timeout_sec");
   static constexpr auto kHeight =
       Fields("node", "nodes", "height", "timeout_sec");
   static constexpr auto kPeers =

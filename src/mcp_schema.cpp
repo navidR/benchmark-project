@@ -549,6 +549,7 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
   };
   switch (kind) {
     case WorkloadKind::kBlockGeneration:
+      properties["node"] = IntegerSchema(1U);
       require({"count"});
       break;
     case WorkloadKind::kWaitUntilHeight:
