@@ -130,6 +130,40 @@ const boost::json::object& VariantWithConst(const boost::json::array& variants,
   return variants.front().as_object();
 }
 
+void RequirePositiveUint32Timeout(const boost::json::object& properties) {
+  const boost::json::object& timeout = properties.at("timeout_sec").as_object();
+  BOOST_TEST(timeout.at("type").as_string() == "integer");
+  BOOST_TEST(timeout.at("minimum").as_uint64() == 1U);
+  BOOST_TEST(timeout.at("maximum").as_uint64() ==
+             std::numeric_limits<std::uint32_t>::max());
+}
+
+void RequirePositiveWorkloadTimeouts(const boost::json::object& schema,
+                                     std::string_view discriminator) {
+  constexpr std::array kKinds{
+      WorkloadKind::kConnectPeer,        WorkloadKind::kDisconnectPeer,
+      WorkloadKind::kActivateEdge,       WorkloadKind::kDeactivateEdge,
+      WorkloadKind::kRestoreEdge,        WorkloadKind::kSendRawTransaction,
+      WorkloadKind::kWalletTransactions,
+  };
+  const boost::json::array& variants = schema.at("oneOf").as_array();
+  for (const WorkloadKind kind : kKinds) {
+    const boost::json::object& variant =
+        VariantWithConst(variants, discriminator, WorkloadKindName(kind));
+    RequirePositiveUint32Timeout(variant.at("properties").as_object());
+  }
+}
+
+void RequirePositiveWalletSendTimeout(const boost::json::object& schema,
+                                      std::string_view discriminator) {
+  const boost::json::object& variant = VariantWithConst(
+      schema.at("oneOf").as_array(), discriminator,
+      SimulationCommandKindName(SimulationCommandKind::kSendWalletTransaction));
+  const boost::json::object& wallet_send =
+      variant.at("properties").as_object().at("wallet_send").as_object();
+  RequirePositiveUint32Timeout(wallet_send.at("properties").as_object());
+}
+
 void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
                                             std::string_view discriminator) {
   const boost::json::object& block_generation =
@@ -767,6 +801,23 @@ BOOST_AUTO_TEST_CASE(
             .as_object(),
         "type");
   }
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_non_block_timeout_schemas_match_positive_uint32_production_input) {
+  RequirePositiveWorkloadTimeouts(BuildMcpWorkloadSchema(), "type");
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::object& scenario_properties =
+      scenario.at("properties").as_object();
+  RequirePositiveWorkloadTimeouts(
+      scenario_properties.at("events").as_object().at("items").as_object(),
+      "action");
+
+  RequirePositiveWalletSendTimeout(BuildMcpSimulationCommandSchema(), "kind");
+  RequirePositiveWalletSendTimeout(
+      scenario_properties.at("events").as_object().at("items").as_object(),
+      "action");
 }
 
 BOOST_AUTO_TEST_CASE(

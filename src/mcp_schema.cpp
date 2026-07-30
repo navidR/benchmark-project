@@ -100,6 +100,8 @@ boost::json::object IntegerSchema(std::uint64_t minimum = 0U,
       {"type", "integer"}, {"minimum", minimum}, {"maximum", maximum}};
 }
 
+boost::json::object PositiveTimeoutSecondsSchema() { return IntegerSchema(1U); }
+
 boost::json::object Uint64Schema(std::uint64_t minimum = 0U) {
   return boost::json::object{
       {"type", "integer"},
@@ -569,6 +571,7 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
       break;
     case WorkloadKind::kConnectPeer:
     case WorkloadKind::kDisconnectPeer:
+      properties["timeout_sec"] = PositiveTimeoutSecondsSchema();
       require({"peer"});
       break;
     case WorkloadKind::kRestartNode:
@@ -600,16 +603,21 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
       require({"group_a", "group_b"});
       break;
     case WorkloadKind::kSetEdgeCondition:
+      require({"from", "to"});
+      break;
     case WorkloadKind::kActivateEdge:
     case WorkloadKind::kDeactivateEdge:
     case WorkloadKind::kRestoreEdge:
+      properties["timeout_sec"] = PositiveTimeoutSecondsSchema();
       require({"from", "to"});
       break;
     case WorkloadKind::kSendRawTransaction:
+      properties["timeout_sec"] = PositiveTimeoutSecondsSchema();
       require({"source_address", "source_private_key", "destination_address",
                "amount", "fee"});
       break;
     case WorkloadKind::kWalletTransactions:
+      properties["timeout_sec"] = PositiveTimeoutSecondsSchema();
       properties["funding_strategy"] =
           StringEnumSchema(boost::json::array{"round_robin", "random"});
       properties["strategy"] = StringEnumSchema(
@@ -1143,6 +1151,7 @@ boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind) {
     case ScenarioObjectKind::kWalletSend:
       properties["amount"] = Fixed8AmountSchema();
       properties["fee"] = Fixed8AmountSchema();
+      properties["timeout_sec"] = PositiveTimeoutSecondsSchema();
       required = Required({"sender_wallet_index", "receiver_wallet_index",
                            "amount", "fee", "timeout_sec"});
       break;
