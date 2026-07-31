@@ -111,7 +111,9 @@ void SimulationCommandProcessor::Stop() {
   for (SimulationCommand& command : cancelled) {
     if ((command.kind == SimulationCommandKind::kAddNodes ||
          command.kind == SimulationCommandKind::kReplaceNode ||
-         command.kind == SimulationCommandKind::kRemoveNodes) &&
+         command.kind == SimulationCommandKind::kRemoveNodes ||
+         command.kind == SimulationCommandKind::kAssignRole ||
+         command.kind == SimulationCommandKind::kRemoveRole) &&
         command.operation_control) {
       static_cast<void>(command.operation_control->RequestCancellation(
           SimulationCommandCancellationCause::kApplicationShutdown));

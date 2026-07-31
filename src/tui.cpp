@@ -1488,7 +1488,9 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
           "[binary]");
   AddText(top + 7, left + 2, popup_cols - 4,
           "replace-node <chain> [binary]  freeze  thaw  stop-node  restart");
-  AddText(top + 8, left + 2, popup_cols - 4, "kill  generate-blocks <count>");
+  AddText(top + 8, left + 2, popup_cols - 4,
+          "kill  generate-blocks <count>  assign-role <role>  remove-role "
+          "<role>");
   AddText(top + 9, left + 2, popup_cols - 4,
           "resource-profile <name>  network-profile <name>");
   AddText(top + 10, left + 2, popup_cols - 4,
@@ -2778,9 +2780,13 @@ bool QueueParsedNodeCommand(
         std::move(confirmed_partition);
     std::optional<SimulationWalletSend> wallet_send =
         std::move(confirmed_wallet_send);
+    std::optional<SimulationRoleMutationRequest> role_mutation;
     const bool partition_command =
         parsed.kind == SimulationCommandKind::kPartitionNodes ||
         parsed.kind == SimulationCommandKind::kHealPartition;
+    const bool role_mutation_command =
+        parsed.kind == SimulationCommandKind::kAssignRole ||
+        parsed.kind == SimulationCommandKind::kRemoveRole;
     if (parsed.kind == SimulationCommandKind::kSetBlockProductionPolicy) {
       if (!parsed.block_production_policy) {
         throw std::runtime_error("block production policy is missing");
@@ -2905,6 +2911,15 @@ bool QueueParsedNodeCommand(
       target = node_id;
     }
 
+    if (role_mutation_command) {
+      if (!parsed.role_mutation) {
+        throw std::runtime_error("role mutation payload is missing");
+      }
+      role_mutation = *parsed.role_mutation;
+      role_mutation->node_ids = {node_id};
+      ValidateSimulationRoleMutationRequest(parsed.kind, *role_mutation);
+    }
+
     if (SimulationCommandRequiresConfirmation(parsed.kind) && !confirmed) {
       state->pending_confirmation = PendingConfirmation{
           .command = parsed,
@@ -2946,6 +2961,12 @@ bool QueueParsedNodeCommand(
         }
         sequence =
             command_queue->PushWalletSend(node_id, *wallet_send, confirmed);
+      } else if (role_mutation_command) {
+        if (!role_mutation) {
+          throw std::runtime_error("role mutation payload is missing");
+        }
+        sequence = command_queue->PushRoleMutation(
+            parsed.kind, std::move(*role_mutation), confirmed);
       } else {
         if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
           if (!parsed.mining_difficulty) {

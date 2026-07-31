@@ -65,6 +65,9 @@ class SimulationCommandQueue {
   std::uint64_t PushReplaceNode(std::string node_id,
                                 SimulationNodeReplaceRequest request);
   std::uint64_t PushRemoveNodes(SimulationNodeRemoveRequest request);
+  std::uint64_t PushRoleMutation(SimulationCommandKind kind,
+                                 SimulationRoleMutationRequest request,
+                                 bool confirmed = false);
   std::uint64_t PushRuntimeCommand(SimulationCommand command);
   std::uint64_t PushScenarioCommand(SimulationCommand command);
   std::optional<SimulationCommand> TryPop();

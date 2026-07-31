@@ -412,6 +412,7 @@ std::span<const std::string_view> ScenarioCommandFields(
   static constexpr auto kNodeAdd = Fields("node_add");
   static constexpr auto kNodeReplace = Fields("node_replace");
   static constexpr auto kNodeRemove = Fields("node_remove");
+  static constexpr auto kRoleMutation = Fields("role_mutation");
   switch (kind) {
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:
@@ -459,6 +460,9 @@ std::span<const std::string_view> ScenarioCommandFields(
       return kNodeReplace;
     case SimulationCommandKind::kRemoveNodes:
       return kNodeRemove;
+    case SimulationCommandKind::kAssignRole:
+    case SimulationCommandKind::kRemoveRole:
+      return kRoleMutation;
     case SimulationCommandKind::kCount:
       break;
   }
@@ -474,7 +478,9 @@ bool ScenarioCommandFieldAllowed(SimulationCommandKind kind,
            kind != SimulationCommandKind::kHealPartition &&
            kind != SimulationCommandKind::kSetPerfCounters &&
            kind != SimulationCommandKind::kAddNodes &&
-           kind != SimulationCommandKind::kRemoveNodes;
+           kind != SimulationCommandKind::kRemoveNodes &&
+           kind != SimulationCommandKind::kAssignRole &&
+           kind != SimulationCommandKind::kRemoveRole;
   }
   return Contains(fields, field);
 }

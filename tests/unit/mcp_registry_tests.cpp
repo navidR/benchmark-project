@@ -92,6 +92,24 @@ std::set<std::string> FieldSet(
   return result;
 }
 
+boost::json::object WithoutSchemaEnvelope(
+    boost::json::object schema,
+    std::initializer_list<std::string_view> removed_fields) {
+  schema.erase("$schema");
+  boost::json::object& properties = schema.at("properties").as_object();
+  boost::json::array& required = schema.at("required").as_array();
+  for (const std::string_view field : removed_fields) {
+    properties.erase(field);
+    for (auto item = required.begin(); item != required.end(); ++item) {
+      if (item->is_string() && item->as_string() == field) {
+        required.erase(item);
+        break;
+      }
+    }
+  }
+  return schema;
+}
+
 void RequireClosedSchemaTree(const boost::json::value& value) {
   if (value.is_array()) {
     for (const boost::json::value& child : value.as_array()) {
@@ -1379,6 +1397,52 @@ BOOST_AUTO_TEST_CASE(mcp_scheduled_events_cover_every_registered_action) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_role_command_schemas_share_the_generic_single_role_contract) {
+  const boost::json::object command_schema = BuildMcpSimulationCommandSchema();
+  const boost::json::object scenario_schema = BuildMcpScenarioSchema();
+  const boost::json::array& scheduled_variants =
+      scenario_schema.at("properties")
+          .as_object()
+          .at("events")
+          .as_object()
+          .at("items")
+          .as_object()
+          .at("oneOf")
+          .as_array();
+  const std::array role_commands{
+      std::pair{SimulationCommandKind::kAssignRole,
+                McpOperationKind::kAssignRole},
+      std::pair{SimulationCommandKind::kRemoveRole,
+                McpOperationKind::kRemoveRole},
+  };
+  for (const auto& [kind, operation] : role_commands) {
+    const std::string_view name = SimulationCommandKindName(kind);
+    const boost::json::object& direct =
+        VariantWithConst(command_schema.at("oneOf").as_array(), "kind", name);
+    const boost::json::object& scheduled =
+        VariantWithConst(scheduled_variants, "action", name);
+    BOOST_TEST(PropertySet(direct) ==
+               std::set<std::string>({"kind", "role_mutation"}));
+    BOOST_TEST(StringSet(ArrayField(direct, "required")) ==
+               std::set<std::string>({"kind", "role_mutation"}));
+    BOOST_TEST(PropertySet(scheduled) ==
+               std::set<std::string>({"action", "at", "role_mutation"}));
+    BOOST_TEST(StringSet(ArrayField(scheduled, "required")) ==
+               std::set<std::string>({"action", "at", "role_mutation"}));
+    BOOST_TEST(!ScenarioCommandFieldAllowed(kind, "node"));
+
+    const boost::json::object& direct_request =
+        direct.at("properties").as_object().at("role_mutation").as_object();
+    const boost::json::object& scheduled_request =
+        scheduled.at("properties").as_object().at("role_mutation").as_object();
+    BOOST_TEST(direct_request == scheduled_request);
+    BOOST_TEST(direct_request ==
+               WithoutSchemaEnvelope(BuildMcpOperationInputSchema(operation),
+                                     {"run_id"}));
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_role_assign_schema_discriminates_role_specific_requirements) {
   const boost::json::object input =
       BuildMcpOperationInputSchema(McpOperationKind::kAssignRole);
@@ -1794,6 +1858,56 @@ BOOST_AUTO_TEST_CASE(
                  .as_object()
                  .at("const")
                  .as_string() == "error");
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_runtime_role_result_nests_the_normalized_mutation_contract) {
+  const boost::json::object runtime =
+      BuildMcpResultSchema(McpResultFamily::kRuntimeCommand);
+  const boost::json::object& properties = runtime.at("properties").as_object();
+  const boost::json::object& role_mutation =
+      properties.at("role_mutation").as_object();
+  const boost::json::array& variants = role_mutation.at("oneOf").as_array();
+  BOOST_REQUIRE_EQUAL(variants.size(), 2U);
+  BOOST_TEST(StringSet(properties.at("state").as_object().at("enum").as_array())
+                 .contains("succeeded"));
+  BOOST_TEST(
+      !StringSet(properties.at("state").as_object().at("enum").as_array())
+           .contains("ready"));
+  BOOST_TEST(
+      !StringSet(ArrayField(runtime, "required")).contains("role_mutation"));
+
+  const std::array role_operations{
+      std::pair{McpOperationKind::kAssignRole, "role.assign"},
+      std::pair{McpOperationKind::kRemoveRole, "role.remove"},
+  };
+  for (const auto& [operation, action] : role_operations) {
+    const boost::json::object& embedded =
+        VariantWithConst(variants, "action", action);
+    const boost::json::object direct = BuildMcpOperationOutputSchema(operation)
+                                           .at("oneOf")
+                                           .as_array()
+                                           .front()
+                                           .as_object();
+    BOOST_TEST(embedded ==
+               WithoutSchemaEnvelope(
+                   direct, {"result_family", "run_id", "operation_id"}));
+    const boost::json::object& constraint =
+        StringDiscriminatorConstraint(runtime, "action", action);
+    const boost::json::object& then_schema = constraint.at("then").as_object();
+    BOOST_TEST(StringSet(ArrayField(then_schema, "required")) ==
+               std::set<std::string>({"role_mutation"}));
+    BOOST_TEST(then_schema.at("properties")
+                   .as_object()
+                   .at("role_mutation")
+                   .as_object()
+                   .at("properties")
+                   .as_object()
+                   .at("action")
+                   .as_object()
+                   .at("const")
+                   .as_string() == action);
+  }
 }
 
 BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {

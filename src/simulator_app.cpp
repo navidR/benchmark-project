@@ -3288,6 +3288,74 @@ std::vector<PerfCounterKind> ParseScenarioPerfCounters(
   return counters;
 }
 
+SimulationRoleMutationRequest ParseScenarioRoleMutation(
+    const boost::json::object& object, SimulationCommandKind kind,
+    const Options& options) {
+  const boost::json::value* mutation = object.if_contains("role_mutation");
+  if (mutation == nullptr || !mutation->is_object()) {
+    throw std::runtime_error(
+        "scenario scheduled command role_mutation must be an object");
+  }
+  const boost::json::object& mutation_object = mutation->as_object();
+  constexpr std::array<std::string_view, 5U> kFields = {
+      "node_ids", "roles", "mode", "funding_wallet_id", "timeout_sec"};
+  RejectUnsupportedFields(mutation_object, kFields,
+                          "scenario scheduled command role_mutation");
+
+  SimulationRoleMutationRequest request;
+  const boost::json::value* node_ids = mutation_object.if_contains("node_ids");
+  if (node_ids == nullptr || !node_ids->is_array() ||
+      node_ids->as_array().empty()) {
+    throw std::runtime_error(
+        "scenario scheduled role_mutation node_ids must be a non-empty "
+        "array");
+  }
+  if (std::any_of(node_ids->as_array().begin(), node_ids->as_array().end(),
+                  [](const boost::json::value& node_id) {
+                    return !node_id.is_string();
+                  })) {
+    throw std::runtime_error(
+        "scenario scheduled role_mutation node_ids must contain strings");
+  }
+  request.node_ids =
+      ScenarioCommandNodeIds(mutation_object, "node_ids", options);
+  const boost::json::value* roles = mutation_object.if_contains("roles");
+  if (roles == nullptr || !roles->is_array() ||
+      roles->as_array().size() != 1U ||
+      !roles->as_array().front().is_string()) {
+    throw std::runtime_error(
+        "scenario scheduled role_mutation roles must contain exactly one "
+        "string");
+  }
+  const std::string role_name(roles->as_array().front().as_string());
+  const std::optional<SimulationRoleKind> role =
+      SimulationRoleKindFromName(role_name);
+  if (!role) {
+    throw std::runtime_error(
+        "scenario scheduled role_mutation role must be wallet, miner, or "
+        "masternode");
+  }
+  request.role = *role;
+
+  if (mutation_object.if_contains("mode") != nullptr) {
+    const std::string mode_name = JsonStringField(mutation_object, "mode");
+    request.mode = WalletPrivacyModeFromName(mode_name);
+    if (!request.mode) {
+      throw std::runtime_error(
+          "scenario scheduled role_mutation mode must be public or private");
+    }
+  }
+  if (mutation_object.if_contains("funding_wallet_id") != nullptr) {
+    request.funding_wallet_id =
+        JsonStringField(mutation_object, "funding_wallet_id");
+  }
+  if (mutation_object.if_contains("timeout_sec") != nullptr) {
+    request.timeout_sec = JsonUint32Field(mutation_object, "timeout_sec");
+  }
+  ValidateSimulationRoleMutationRequest(kind, request);
+  return request;
+}
+
 bool UsesScenarioCommandSchema(
     const boost::json::object& event,
     const std::optional<WorkloadKind>& workload_kind,
@@ -3321,7 +3389,9 @@ SimulationCommand ParseScheduledSimulationCommand(
       kind == SimulationCommandKind::kHealPartition ||
       kind == SimulationCommandKind::kSetPerfCounters ||
       kind == SimulationCommandKind::kAddNodes ||
-      kind == SimulationCommandKind::kRemoveNodes) {
+      kind == SimulationCommandKind::kRemoveNodes ||
+      kind == SimulationCommandKind::kAssignRole ||
+      kind == SimulationCommandKind::kRemoveRole) {
     command.node_id = "sim";
   } else {
     command.node_id = ScenarioCommandNodeId(object, "node", options);
@@ -3536,6 +3606,9 @@ SimulationCommand ParseScheduledSimulationCommand(
     }
     command.node_remove = ParseAndValidateSimulationNodeRemoveRequest(
         node_remove->as_object(), options);
+  } else if (kind == SimulationCommandKind::kAssignRole ||
+             kind == SimulationCommandKind::kRemoveRole) {
+    command.role_mutation = ParseScenarioRoleMutation(object, kind, options);
   }
   command.scheduled_event_sequence = 1U;
   SimulationCommandQueue validation_queue;
@@ -4078,6 +4151,10 @@ void ApplyScheduledScenarioEvents(
   for (const std::uint32_t node : options.topology.miner_nodes) {
     planned_miner_node_ids.insert(ScenarioNodeId(options, node));
   }
+  std::set<std::string> planned_masternode_node_ids;
+  for (const std::uint32_t node : options.topology.masternode_nodes) {
+    planned_masternode_node_ids.insert(ScenarioNodeId(options, node));
+  }
   for (const ScheduledInput& input : ordered_inputs) {
     const boost::json::object& event = events[input.source_index].as_object();
     const std::string action_name = JsonStringField(event, "action");
@@ -4138,6 +4215,75 @@ void ApplyScheduledScenarioEvents(
                                 reserved_ids.end());
         command.node_add->node_ids = std::move(reserved_ids);
         planned_node_count += command.node_add->count;
+      } else if (command.kind == SimulationCommandKind::kAssignRole ||
+                 command.kind == SimulationCommandKind::kRemoveRole) {
+        if (!command.role_mutation) {
+          throw std::logic_error(
+              "scheduled role mutation omitted its typed request");
+        }
+        const SimulationRoleMutationRequest& mutation = *command.role_mutation;
+        std::set<std::string>* planned_roles = nullptr;
+        switch (mutation.role) {
+          case SimulationRoleKind::kWallet:
+            planned_roles = &planned_wallet_node_ids;
+            break;
+          case SimulationRoleKind::kMiner:
+            planned_roles = &planned_miner_node_ids;
+            break;
+          case SimulationRoleKind::kMasternode:
+            planned_roles = &planned_masternode_node_ids;
+            break;
+          case SimulationRoleKind::kCount:
+            throw std::logic_error("scheduled role mutation has unknown role");
+        }
+        const std::string role_name(SimulationRoleKindName(mutation.role));
+        if (command.kind == SimulationCommandKind::kAssignRole) {
+          if (mutation.role == SimulationRoleKind::kWallet &&
+              (!mutation.mode ||
+               *mutation.mode != options.wallet_initialization.mode)) {
+            throw std::runtime_error(
+                "scheduled wallet assignment mode must match the active run "
+                "wallet mode");
+          }
+          if (mutation.role == SimulationRoleKind::kMasternode &&
+              (!mutation.funding_wallet_id ||
+               !planned_wallet_node_ids.contains(
+                   *mutation.funding_wallet_id))) {
+            throw std::runtime_error(
+                "scheduled masternode assignment requires a planned funding "
+                "wallet role");
+          }
+          for (const std::string& node_id : mutation.node_ids) {
+            if (mutation.role == SimulationRoleKind::kWallet &&
+                !options.topology.allow_miner_wallet_overlap &&
+                planned_miner_node_ids.contains(node_id)) {
+              throw std::runtime_error(
+                  "scheduled wallet assignment conflicts with planned miner "
+                  "role on " +
+                  node_id);
+            }
+            if (mutation.role == SimulationRoleKind::kMiner &&
+                !options.topology.allow_miner_wallet_overlap &&
+                planned_wallet_node_ids.contains(node_id)) {
+              throw std::runtime_error(
+                  "scheduled miner assignment conflicts with planned wallet "
+                  "role on " +
+                  node_id);
+            }
+            if (!planned_roles->insert(node_id).second) {
+              throw std::runtime_error("scheduled " + role_name +
+                                       " role is already assigned to " +
+                                       node_id);
+            }
+          }
+        } else {
+          for (const std::string& node_id : mutation.node_ids) {
+            if (planned_roles->erase(node_id) != 1U) {
+              throw std::runtime_error("scheduled " + role_name +
+                                       " role is not assigned to " + node_id);
+            }
+          }
+        }
       } else if (command.kind == SimulationCommandKind::kRemoveNodes) {
         for (const std::string& node_id : command.node_remove->node_ids) {
           if (planned_wallet_node_ids.contains(node_id)) {
@@ -4150,6 +4296,12 @@ void ApplyScheduledScenarioEvents(
             throw std::runtime_error(
                 "scheduled node.remove requires miner.remove before removing "
                 "miner node " +
+                node_id);
+          }
+          if (planned_masternode_node_ids.contains(node_id)) {
+            throw std::runtime_error(
+                "scheduled node.remove requires masternode.remove before "
+                "removing masternode node " +
                 node_id);
           }
           if (!planned_node_id_set.erase(node_id)) {
@@ -10217,7 +10369,9 @@ boost::json::object SimulationCommandScenarioJson(
   if (command.kind != SimulationCommandKind::kSetBlockProductionPolicy &&
       command.kind != SimulationCommandKind::kPartitionNodes &&
       command.kind != SimulationCommandKind::kHealPartition &&
-      command.kind != SimulationCommandKind::kSetPerfCounters) {
+      command.kind != SimulationCommandKind::kSetPerfCounters &&
+      command.kind != SimulationCommandKind::kAssignRole &&
+      command.kind != SimulationCommandKind::kRemoveRole) {
     object["node"] = command.node_id;
   }
   if (command.block_production_policy) {
@@ -10313,6 +10467,28 @@ boost::json::object SimulationCommandScenarioJson(
     send["fee"] = FormatFixed8Amount(command.wallet_send->fee_satoshis);
     send["timeout_sec"] = command.wallet_send->timeout_sec;
     object["wallet_send"] = std::move(send);
+  }
+  if (command.role_mutation) {
+    boost::json::object mutation;
+    boost::json::array node_ids;
+    node_ids.reserve(command.role_mutation->node_ids.size());
+    for (const std::string& node_id : command.role_mutation->node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    mutation["node_ids"] = std::move(node_ids);
+    mutation["roles"] = boost::json::array{
+        std::string(SimulationRoleKindName(command.role_mutation->role))};
+    if (command.role_mutation->mode) {
+      mutation["mode"] =
+          std::string(WalletPrivacyModeName(*command.role_mutation->mode));
+    }
+    if (command.role_mutation->funding_wallet_id) {
+      mutation["funding_wallet_id"] = *command.role_mutation->funding_wallet_id;
+    }
+    if (command.role_mutation->timeout_sec) {
+      mutation["timeout_sec"] = *command.role_mutation->timeout_sec;
+    }
+    object["role_mutation"] = std::move(mutation);
   }
   return object;
 }
@@ -16289,6 +16465,8 @@ bool SimulationCommandRequiresNodeMutationLock(SimulationCommandKind kind) {
     case SimulationCommandKind::kSetBlockProductionPolicy:
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kExportNodeReport:
+    case SimulationCommandKind::kAssignRole:
+    case SimulationCommandKind::kRemoveRole:
       return false;
     case SimulationCommandKind::kCount:
       return false;
@@ -21989,6 +22167,28 @@ std::string SimulationCommandDetail(
     remove["timeout_sec"] = command.node_remove->timeout_sec;
     detail["node_remove"] = std::move(remove);
   }
+  if (command.role_mutation) {
+    boost::json::object mutation;
+    boost::json::array node_ids;
+    node_ids.reserve(command.role_mutation->node_ids.size());
+    for (const std::string& node_id : command.role_mutation->node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    mutation["node_ids"] = std::move(node_ids);
+    mutation["roles"] = boost::json::array{
+        std::string(SimulationRoleKindName(command.role_mutation->role))};
+    if (command.role_mutation->mode) {
+      mutation["mode"] =
+          std::string(WalletPrivacyModeName(*command.role_mutation->mode));
+    }
+    if (command.role_mutation->funding_wallet_id) {
+      mutation["funding_wallet_id"] = *command.role_mutation->funding_wallet_id;
+    }
+    if (command.role_mutation->timeout_sec) {
+      mutation["timeout_sec"] = *command.role_mutation->timeout_sec;
+    }
+    detail["role_mutation_request"] = std::move(mutation);
+  }
   if (outcome != nullptr &&
       (command.kind == SimulationCommandKind::kAddNodes ||
        command.kind == SimulationCommandKind::kReplaceNode ||
@@ -22011,6 +22211,9 @@ std::string SimulationCommandDetail(
     if (outcome->final_node_count) {
       detail["final_node_count"] = *outcome->final_node_count;
     }
+  }
+  if (outcome != nullptr && outcome->role_mutation) {
+    detail["role_mutation"] = *outcome->role_mutation;
   }
   if (command.kind == SimulationCommandKind::kExportNodeReport) {
     detail["output_path"] = NodeReportRelativePath(command).generic_string();
@@ -22636,6 +22839,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   std::shared_ptr<McpLiveInstrumentationService>
       installed_instrumentation_service;
   std::shared_ptr<McpLiveRoleService> installed_role_service;
+  std::atomic<std::shared_ptr<McpLiveRoleService>> command_role_service;
   std::mutex lifecycle_failure_mutex;
   std::timed_mutex node_mutation_mutex;
   std::mutex configured_miner_node_ids_mutex;
@@ -22676,6 +22880,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   };
   const auto stop_role_mutations = [&] {
     mcp_application.SetRoleService(nullptr);
+    command_rpc_stop_source.request_stop();
+    command_role_service.store(nullptr, std::memory_order_release);
     while (installed_role_service && installed_role_service.use_count() > 1U) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -22910,12 +23116,15 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             "simulation stopped before command processor startup";
         if ((command.kind == SimulationCommandKind::kAddNodes ||
              command.kind == SimulationCommandKind::kReplaceNode ||
-             command.kind == SimulationCommandKind::kRemoveNodes) &&
+             command.kind == SimulationCommandKind::kRemoveNodes ||
+             command.kind == SimulationCommandKind::kAssignRole ||
+             command.kind == SimulationCommandKind::kRemoveRole) &&
             command.operation_control) {
           static_cast<void>(command.operation_control->RequestCancellation(
               SimulationCommandCancellationCause::kApplicationShutdown));
         }
-        record_scheduled_command_outcome(command, std::nullopt);
+        record_scheduled_command_outcome(
+            command, std::optional<std::string_view>(kCancellation));
         mcp_application.RecordCommandOutcome(
             command,
             SimulationCommandOutcome{
@@ -23373,7 +23582,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 command_rpc_stop_source.get_token(), [&] {
                   if ((command.kind == SimulationCommandKind::kAddNodes ||
                        command.kind == SimulationCommandKind::kReplaceNode ||
-                       command.kind == SimulationCommandKind::kRemoveNodes) &&
+                       command.kind == SimulationCommandKind::kRemoveNodes ||
+                       command.kind == SimulationCommandKind::kAssignRole ||
+                       command.kind == SimulationCommandKind::kRemoveRole) &&
                       command.operation_control) {
                     static_cast<void>(
                         command.operation_control->RequestCancellation(
@@ -23413,7 +23624,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     SimulationCommandKind::kSetBlockProductionPolicy &&
                 command.kind != SimulationCommandKind::kAddNodes &&
                 command.kind != SimulationCommandKind::kReplaceNode &&
-                command.kind != SimulationCommandKind::kRemoveNodes;
+                command.kind != SimulationCommandKind::kRemoveNodes &&
+                command.kind != SimulationCommandKind::kAssignRole &&
+                command.kind != SimulationCommandKind::kRemoveRole;
             const bool needs_direct_node =
                 needs_runtime_snapshot &&
                 command.kind != SimulationCommandKind::kSetPerfCounters &&
@@ -23586,6 +23799,41 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               command_outcome.inventory_generation =
                   removed.inventory_generation;
               command_outcome.final_node_count = removed.final_node_count;
+            } else if (command.kind == SimulationCommandKind::kAssignRole ||
+                       command.kind == SimulationCommandKind::kRemoveRole) {
+              if (!command.role_mutation) {
+                throw std::runtime_error("role mutation payload is missing");
+              }
+              if (!command.operation_control) {
+                throw std::runtime_error(
+                    "role mutation operation control is missing");
+              }
+              if (!command.operation_control->absolute_deadline) {
+                command.operation_control->absolute_deadline =
+                    std::chrono::steady_clock::now() +
+                    SimulationRoleMutationExecutionTimeout(
+                        command.kind, *command.role_mutation);
+              }
+              const std::shared_ptr<McpLiveRoleService> role_service =
+                  command_role_service.load(std::memory_order_acquire);
+              if (!role_service) {
+                throw std::runtime_error(
+                    "authoritative role mutation service is unavailable");
+              }
+              try {
+                command_outcome.role_mutation =
+                    ExecuteAndNormalizeSimulationRoleMutation(
+                        *role_service, options.run_id, command.kind,
+                        *command.role_mutation, command_stop_token);
+              } catch (const SimulationCancelled&) {
+                if (std::chrono::steady_clock::now() >=
+                    *command.operation_control->absolute_deadline) {
+                  static_cast<void>(
+                      command.operation_control->RequestCancellation(
+                          SimulationCommandCancellationCause::kDeadline));
+                }
+                throw;
+              }
             } else if (command.kind ==
                        SimulationCommandKind::kExportNodeReport) {
               ExportNodeReport(run_root, command);
@@ -24359,9 +24607,13 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                   (command.kind == SimulationCommandKind::kReplaceNode &&
                    command_outcome.inventory_generation.has_value()) ||
                   (command.kind == SimulationCommandKind::kRemoveNodes &&
-                   !command_outcome.removed_node_ids.empty())) {
+                   !command_outcome.removed_node_ids.empty()) ||
+                  ((command.kind == SimulationCommandKind::kAssignRole ||
+                    command.kind == SimulationCommandKind::kRemoveRole) &&
+                   command_outcome.role_mutation.has_value())) {
                 throw SimulationCommandOutcomeUnconfirmed(
-                    "node mutation published but completion evidence failed: " +
+                    "runtime mutation published but completion evidence "
+                    "failed: " +
                     std::string(error.what()));
               }
               throw;
@@ -24414,12 +24666,15 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                   });
               authoritative_outcome.node_lifecycle = std::move(lifecycle);
             }
+            std::optional<std::string> scheduled_error;
+            if (authoritative_outcome.state !=
+                SimulationCommandOutcomeState::kSucceeded) {
+              scheduled_error = authoritative_outcome.error.value_or(
+                  "scheduled command did not succeed");
+            }
             record_scheduled_command_outcome(
-                command, authoritative_outcome.state ==
-                                     SimulationCommandOutcomeState::kFailed &&
-                                 authoritative_outcome.error
-                             ? std::optional<std::string_view>(
-                                   *authoritative_outcome.error)
+                command, scheduled_error
+                             ? std::optional<std::string_view>(*scheduled_error)
                              : std::nullopt);
             mcp_application.RecordCommandOutcome(command,
                                                  authoritative_outcome);
@@ -29926,6 +30181,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       }
     };
     mcp_application.SetRoleService(role_service);
+    command_role_service.store(role_service, std::memory_order_release);
     installed_role_service = std::move(role_service);
 
     transaction_observer.emplace([&](std::stop_token observer_stop_token) {

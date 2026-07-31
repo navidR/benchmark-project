@@ -1246,6 +1246,83 @@ McpRunEvidenceQuery ParseEvidenceQuery(const boost::json::object& arguments,
 
 }  // namespace
 
+boost::json::object ExecuteAndNormalizeSimulationRoleMutation(
+    const McpLiveRoleService& service, std::string_view run_id,
+    SimulationCommandKind kind, const SimulationRoleMutationRequest& request,
+    std::stop_token stop_token) {
+  ValidateSimulationRoleMutationRequest(kind, request);
+  if (!service.operation) {
+    throw std::logic_error("role mutation service operation is unavailable");
+  }
+  if (run_id.empty()) {
+    throw std::invalid_argument("role mutation run id must not be empty");
+  }
+
+  boost::json::object arguments;
+  arguments["run_id"] = run_id;
+  boost::json::array node_ids;
+  node_ids.reserve(request.node_ids.size());
+  for (const std::string& node_id : request.node_ids) {
+    node_ids.emplace_back(node_id);
+  }
+  arguments["node_ids"] = std::move(node_ids);
+  arguments["roles"] =
+      boost::json::array{std::string(SimulationRoleKindName(request.role))};
+  if (request.mode) {
+    arguments["mode"] = std::string(WalletPrivacyModeName(*request.mode));
+  }
+  if (request.funding_wallet_id) {
+    arguments["funding_wallet_id"] = *request.funding_wallet_id;
+  }
+  if (request.timeout_sec) {
+    arguments["timeout_sec"] = *request.timeout_sec;
+  }
+
+  const auto invoke_service =
+      [&](McpOperationKind service_kind,
+          const boost::json::object& service_arguments) {
+        try {
+          return service.operation(service_kind, service_arguments, stop_token);
+        } catch (const McpOperationFailure& error) {
+          if (std::string_view(error.code()).find("outcome_unconfirmed") !=
+              std::string_view::npos) {
+            throw SimulationCommandOutcomeUnconfirmed(error.what());
+          }
+          throw;
+        }
+      };
+
+  if (kind == SimulationCommandKind::kAssignRole) {
+    const RoleAssignmentPlan plan = BuildRoleAssignmentPlan(arguments);
+    boost::json::object delegated =
+        invoke_service(plan.service_kind, plan.service_arguments);
+    try {
+      return NormalizeRoleAssignmentResult(plan, delegated);
+    } catch (const SimulationCommandOutcomeUnconfirmed&) {
+      throw;
+    } catch (...) {
+      throw SimulationCommandOutcomeUnconfirmed(
+          "role.assign committed through its authoritative service but "
+          "completion evidence could not be normalized: " +
+          CurrentExceptionMessage(std::current_exception()));
+    }
+  }
+
+  const RoleRemovalPlan plan = BuildRoleRemovalPlan(arguments);
+  boost::json::object delegated =
+      invoke_service(plan.service_kind, plan.service_arguments);
+  try {
+    return NormalizeRoleRemovalResult(plan, delegated);
+  } catch (const SimulationCommandOutcomeUnconfirmed&) {
+    throw;
+  } catch (...) {
+    throw SimulationCommandOutcomeUnconfirmed(
+        "role.remove committed through its authoritative service but "
+        "completion evidence could not be normalized: " +
+        CurrentExceptionMessage(std::current_exception()));
+  }
+}
+
 McpLiveApplication::McpLiveApplication(Config config)
     : config_(std::move(config)) {
   if (config_.run_id.empty()) {
@@ -1854,6 +1931,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   bool node_add_operation = direct_node_add_operation;
   bool node_replace_operation = direct_node_replace_operation;
   bool node_remove_operation = direct_node_remove_operation;
+  bool role_mutation_operation = false;
   std::optional<std::chrono::steady_clock::duration> command_timeout;
   SimulationCommand command;
   const auto node_capacity_failure_plan =
@@ -1983,11 +2061,17 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     node_replace_operation =
         command.kind == SimulationCommandKind::kReplaceNode;
     node_remove_operation = command.kind == SimulationCommandKind::kRemoveNodes;
+    role_mutation_operation =
+        command.kind == SimulationCommandKind::kAssignRole ||
+        command.kind == SimulationCommandKind::kRemoveRole;
     if (node_replace_operation) {
       command_timeout =
           SimulationNodeReplaceDefaultExecutionTimeout(*command.node_replace);
     } else if (node_remove_operation) {
       command_timeout = std::chrono::seconds(command.node_remove->timeout_sec);
+    } else if (role_mutation_operation && command.role_mutation->timeout_sec) {
+      command_timeout =
+          std::chrono::seconds(*command.role_mutation->timeout_sec);
     }
   }
   return McpOperationPlan{
@@ -1998,8 +2082,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       .executor = [this, command = std::move(command), command_timeout,
                    typed_node_operation, node_add_operation,
                    node_replace_operation, node_remove_operation,
-                   direct_node_add_operation, direct_node_replace_operation,
-                   direct_node_remove_operation](
+                   role_mutation_operation, direct_node_add_operation,
+                   direct_node_replace_operation, direct_node_remove_operation](
                       McpOperationContext& context) mutable {
         {
           std::lock_guard<std::mutex> lock(mutex_);
@@ -2038,6 +2122,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                 ? "node.replace"
             : command_kind == SimulationCommandKind::kRemoveNodes
                 ? "node.remove"
+            : command_kind == SimulationCommandKind::kAssignRole ? "role.assign"
+            : command_kind == SimulationCommandKind::kRemoveRole
+                ? "role.remove"
                 : std::string(SimulationCommandKindName(command_kind));
         const std::chrono::steady_clock::duration reconciliation_bound =
             node_replace_operation
@@ -2114,6 +2201,25 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           throw McpOperationCancelled();
         }
         if (outcome.state == SimulationCommandOutcomeState::kTimedOut) {
+          if (role_mutation_operation) {
+            const std::string timeout_message =
+                command_action +
+                " timed out before authoritative role-state reconciliation";
+            throw McpOperationFailure(
+                "role_operation_timeout",
+                "role mutation command #" + std::to_string(sequence) +
+                    " exceeded timeout_sec: " + timeout_message,
+                false,
+                boost::json::array{boost::json::object{
+                    {"code", "role_operation_timeout"},
+                    {"message", timeout_message},
+                    {"path", "command-" + std::to_string(sequence)},
+                    {"node_id", command_node_id},
+                    {"action", command_action},
+                    {"state", "indeterminate"},
+                    {"command_id", "command-" + std::to_string(sequence)},
+                    {"recoverable", false}}});
+          }
           const std::string timeout_message =
               command_kind == SimulationCommandKind::kRestartNode
                   ? "node.restart timed out during phase " +
@@ -2142,6 +2248,29 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         if (outcome.state ==
             SimulationCommandOutcomeState::kOutcomeUnconfirmed) {
           config_.request_run_stop();
+          if (role_mutation_operation) {
+            const std::string outcome_code =
+                command_kind == SimulationCommandKind::kAssignRole
+                    ? "role_assign_outcome_unconfirmed"
+                    : "role_remove_outcome_unconfirmed";
+            throw McpOperationFailure(
+                outcome_code,
+                command_action + " command #" + std::to_string(sequence) +
+                    " did not publish authoritative role state within its "
+                    "cancellation bound",
+                false,
+                boost::json::array{boost::json::object{
+                    {"code", outcome_code},
+                    {"message",
+                     "the selected role state is indeterminate; run stop was "
+                     "requested and blind retry is unsafe"},
+                    {"path", command_node_id},
+                    {"node_id", command_node_id},
+                    {"action", command_action},
+                    {"state", "indeterminate"},
+                    {"command_id", "command-" + std::to_string(sequence)},
+                    {"recoverable", false}}});
+          }
           const bool node_operation =
               typed_node_operation || node_add_operation ||
               node_replace_operation || node_remove_operation;
@@ -2384,6 +2513,26 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                   {"inventory_generation", *outcome.inventory_generation},
                   {"final_node_count", *outcome.final_node_count},
                   {"unchanged", false}}};
+        }
+        if (role_mutation_operation) {
+          if (!outcome.role_mutation) {
+            config_.request_run_stop();
+            throw McpOperationFailure(
+                "role_outcome_unconfirmed",
+                "successful role mutation omitted its normalized "
+                "authoritative result",
+                false);
+          }
+          return McpTypedResult{
+              .family = McpResultFamily::kRuntimeCommand,
+              .value = boost::json::object{
+                  {"result_family", "runtime_command"},
+                  {"run_id", config_.run_id},
+                  {"command_id", "command-" + std::to_string(sequence)},
+                  {"accepted", true},
+                  {"state", "succeeded"},
+                  {"action", command_action},
+                  {"role_mutation", *outcome.role_mutation}}};
         }
         return McpTypedResult{
             .family = McpResultFamily::kRuntimeCommand,
@@ -3002,6 +3151,14 @@ void McpLiveApplication::RecordCommandOutcome(
                                "unknown exception");
     }
   }
+  if ((command.kind == SimulationCommandKind::kAssignRole ||
+       command.kind == SimulationCommandKind::kRemoveRole) &&
+      outcome.state == SimulationCommandOutcomeState::kSucceeded &&
+      (!command.role_mutation || !outcome.role_mutation)) {
+    mark_outcome_unconfirmed(
+        "successful role mutation omitted its request or normalized "
+        "authoritative result");
+  }
   std::optional<SimulationCommandOutcome> published_outcome = validated_outcome;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -3063,6 +3220,9 @@ void McpLiveApplication::RecordCommandOutcome(
   }
   if (published_outcome->final_node_count) {
     data["final_node_count"] = *published_outcome->final_node_count;
+  }
+  if (published_outcome->role_mutation) {
+    data["role_mutation"] = *published_outcome->role_mutation;
   }
   PublishEvidence(McpInformationFamily::kEvents, "command_outcome",
                   "simulation command reached an authoritative outcome",

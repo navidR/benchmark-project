@@ -360,6 +360,138 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    scenario_service_preserves_scheduled_and_live_role_mutations) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 3U;
+  scenario["events"] = boost::json::array{
+      boost::json::object{
+          {"at", "1s"},
+          {"action", "assign_role"},
+          {"role_mutation",
+           boost::json::object{
+               {"node_ids", boost::json::array{"firo-2", "firo-1"}},
+               {"roles", boost::json::array{"wallet"}},
+               {"mode", "public"},
+               {"timeout_sec", 30U}}}},
+      boost::json::object{
+          {"at", "2s"},
+          {"action", "remove_role"},
+          {"role_mutation",
+           boost::json::object{
+               {"node_ids", boost::json::array{"firo-2", "firo-1"}},
+               {"roles", boost::json::array{"wallet"}},
+               {"timeout_sec", 20U}}}},
+      boost::json::object{
+          {"at", "3s"},
+          {"action", "remove_nodes"},
+          {"node_remove",
+           boost::json::object{
+               {"node_ids", boost::json::array{"firo-2", "firo-1"}}}}}};
+
+  const Options options = ParseAndValidateScenario(scenario);
+  BOOST_REQUIRE_EQUAL(options.scheduled_events.size(), 3U);
+  const SimulationCommand& assign =
+      std::get<SimulationCommand>(options.scheduled_events[0U].action);
+  BOOST_TEST(options.scheduled_events[0U].sequence == 1U);
+  BOOST_CHECK(assign.kind == SimulationCommandKind::kAssignRole);
+  BOOST_TEST(assign.node_id == "sim");
+  BOOST_REQUIRE(assign.role_mutation);
+  BOOST_TEST(assign.role_mutation->node_ids ==
+                 std::vector<std::string>({"firo-2", "firo-1"}),
+             boost::test_tools::per_element());
+  BOOST_CHECK(assign.role_mutation->role == SimulationRoleKind::kWallet);
+  BOOST_REQUIRE(assign.role_mutation->mode);
+  BOOST_CHECK(*assign.role_mutation->mode == WalletPrivacyMode::kPublic);
+  BOOST_REQUIRE(assign.role_mutation->timeout_sec);
+  BOOST_TEST(*assign.role_mutation->timeout_sec == 30U);
+
+  const SimulationCommand& remove =
+      std::get<SimulationCommand>(options.scheduled_events[1U].action);
+  BOOST_TEST(options.scheduled_events[1U].sequence == 2U);
+  BOOST_CHECK(remove.kind == SimulationCommandKind::kRemoveRole);
+  BOOST_REQUIRE(remove.role_mutation);
+  BOOST_TEST(remove.role_mutation->node_ids ==
+                 std::vector<std::string>({"firo-2", "firo-1"}),
+             boost::test_tools::per_element());
+  BOOST_CHECK(remove.role_mutation->role == SimulationRoleKind::kWallet);
+  BOOST_TEST(!remove.role_mutation->mode);
+  BOOST_TEST(!remove.role_mutation->funding_wallet_id);
+  BOOST_REQUIRE(remove.role_mutation->timeout_sec);
+  BOOST_TEST(*remove.role_mutation->timeout_sec == 20U);
+
+  const SimulationCommand& node_remove =
+      std::get<SimulationCommand>(options.scheduled_events[2U].action);
+  BOOST_CHECK(node_remove.kind == SimulationCommandKind::kRemoveNodes);
+  BOOST_REQUIRE(node_remove.node_remove);
+  BOOST_TEST(node_remove.node_remove->node_ids ==
+                 std::vector<std::string>({"firo-2", "firo-1"}),
+             boost::test_tools::per_element());
+
+  const boost::json::object live_request{
+      {"kind", "assign_role"},
+      {"role_mutation",
+       boost::json::object{{"node_ids", boost::json::array{"firo-3"}},
+                           {"roles", boost::json::array{"masternode"}},
+                           {"funding_wallet_id", "firo-1"},
+                           {"timeout_sec", 45U}}}};
+  const SimulationCommand live =
+      ParseAndValidateSimulationCommand(live_request, options);
+  BOOST_CHECK(live.kind == SimulationCommandKind::kAssignRole);
+  BOOST_REQUIRE(live.role_mutation);
+  BOOST_TEST(
+      live.role_mutation->node_ids == std::vector<std::string>({"firo-3"}),
+      boost::test_tools::per_element());
+  BOOST_CHECK(live.role_mutation->role == SimulationRoleKind::kMasternode);
+  BOOST_REQUIRE(live.role_mutation->funding_wallet_id);
+  BOOST_TEST(*live.role_mutation->funding_wallet_id == "firo-1");
+  BOOST_REQUIRE(live.role_mutation->timeout_sec);
+  BOOST_TEST(*live.role_mutation->timeout_sec == 45U);
+
+  const boost::json::object resolved = ResolveScenario(scenario);
+  const boost::json::array& resolved_events = resolved.at("events").as_array();
+  BOOST_REQUIRE_EQUAL(resolved_events.size(), 3U);
+  const boost::json::object& resolved_mutation =
+      resolved_events.front().as_object().at("role_mutation").as_object();
+  BOOST_TEST(resolved_mutation.at("node_ids").as_array() ==
+             boost::json::array({"firo-2", "firo-1"}));
+  BOOST_TEST(resolved_mutation.at("roles").as_array() ==
+             boost::json::array({"wallet"}));
+  BOOST_TEST(resolved_mutation.at("mode").as_string() == "public");
+
+  boost::json::object numeric_node_id = MinimalScenario();
+  numeric_node_id["events"] = boost::json::array{boost::json::object{
+      {"at", "1s"},
+      {"action", "assign_role"},
+      {"role_mutation",
+       boost::json::object{{"node_ids", boost::json::array{1U}},
+                           {"roles", boost::json::array{"wallet"}},
+                           {"mode", "public"}}}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(numeric_node_id), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scenario scheduled role_mutation node_ids must contain "
+               "strings";
+      });
+
+  boost::json::object mismatched_mode = MinimalScenario();
+  mismatched_mode["events"] = boost::json::array{boost::json::object{
+      {"at", "1s"},
+      {"action", "assign_role"},
+      {"role_mutation",
+       boost::json::object{{"node_ids", boost::json::array{"firo-1"}},
+                           {"roles", boost::json::array{"wallet"}},
+                           {"mode", "private"}}}}};
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateScenario(mismatched_mode), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "scheduled wallet assignment mode must match the active run "
+               "wallet mode";
+      });
+}
+
+BOOST_AUTO_TEST_CASE(
     scenario_service_node_add_parser_enforces_shared_public_bounds) {
   boost::json::object empty_scenario = MinimalScenario();
   empty_scenario["nodes"] = 0U;

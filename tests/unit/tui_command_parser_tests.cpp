@@ -149,6 +149,57 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_wallet_send_commands) {
   }
 }
 
+BOOST_AUTO_TEST_CASE(tui_command_parser_builds_role_mutation_commands) {
+  const bbp::ParsedTuiCommand public_wallet =
+      bbp::TuiCommandParser::Parse("assign-role wallet public", 0U);
+  BOOST_CHECK(public_wallet.kind == bbp::SimulationCommandKind::kAssignRole);
+  BOOST_REQUIRE(public_wallet.role_mutation);
+  BOOST_CHECK(public_wallet.role_mutation->role ==
+              bbp::SimulationRoleKind::kWallet);
+  BOOST_REQUIRE(public_wallet.role_mutation->mode);
+  BOOST_CHECK(*public_wallet.role_mutation->mode ==
+              bbp::WalletPrivacyMode::kPublic);
+  BOOST_TEST(public_wallet.role_mutation->node_ids.empty());
+  BOOST_TEST(!public_wallet.role_mutation->timeout_sec);
+
+  const bbp::ParsedTuiCommand private_wallet =
+      bbp::TuiCommandParser::Parse("assign-role wallet private 45", 0U);
+  BOOST_REQUIRE(private_wallet.role_mutation);
+  BOOST_REQUIRE(private_wallet.role_mutation->timeout_sec);
+  BOOST_TEST(*private_wallet.role_mutation->timeout_sec == 45U);
+
+  const bbp::ParsedTuiCommand miner =
+      bbp::TuiCommandParser::Parse("assign-role miner 60", 0U);
+  BOOST_REQUIRE(miner.role_mutation);
+  BOOST_CHECK(miner.role_mutation->role == bbp::SimulationRoleKind::kMiner);
+  BOOST_TEST(!miner.role_mutation->mode);
+  BOOST_REQUIRE(miner.role_mutation->timeout_sec);
+  BOOST_TEST(*miner.role_mutation->timeout_sec == 60U);
+
+  const bbp::ParsedTuiCommand masternode =
+      bbp::TuiCommandParser::Parse("assign-role masternode wallet-2 90", 0U);
+  BOOST_REQUIRE(masternode.role_mutation);
+  BOOST_CHECK(masternode.role_mutation->role ==
+              bbp::SimulationRoleKind::kMasternode);
+  BOOST_REQUIRE(masternode.role_mutation->funding_wallet_id);
+  BOOST_TEST(*masternode.role_mutation->funding_wallet_id == "wallet-2");
+  BOOST_REQUIRE(masternode.role_mutation->timeout_sec);
+  BOOST_TEST(*masternode.role_mutation->timeout_sec == 90U);
+
+  const bbp::ParsedTuiCommand remove =
+      bbp::TuiCommandParser::Parse("remove-role masternode 120", 0U);
+  BOOST_CHECK(remove.kind == bbp::SimulationCommandKind::kRemoveRole);
+  BOOST_REQUIRE(remove.role_mutation);
+  BOOST_CHECK(remove.role_mutation->role ==
+              bbp::SimulationRoleKind::kMasternode);
+  BOOST_REQUIRE(remove.role_mutation->timeout_sec);
+  BOOST_TEST(*remove.role_mutation->timeout_sec == 120U);
+
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("assign-role wallet watch-only", 0U),
+      std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(tui_command_parser_builds_perf_counter_commands) {
   const bbp::ParsedTuiCommand selected = bbp::TuiCommandParser::Parse(
       "perf-counters cycles,instructions,task-clock", 0U);
@@ -298,6 +349,8 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_resource_limits) {
 }
 
 BOOST_AUTO_TEST_CASE(tui_command_parser_completes_unique_command_prefix) {
+  BOOST_TEST(bbp::TuiCommandParser::Complete("assign-r") == "assign-role ");
+  BOOST_TEST(bbp::TuiCommandParser::Complete("remove-r") == "remove-role ");
   BOOST_TEST(bbp::TuiCommandParser::Complete("reco") == "reconnect ");
 #ifdef BBP_FIRO_GUI_LAUNCHER
   BOOST_TEST(bbp::TuiCommandParser::Complete("firo-q") == "firo-qt ");

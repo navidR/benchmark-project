@@ -20,15 +20,17 @@ namespace {
 
 constexpr std::array<std::string_view,
 #ifdef BBP_FIRO_GUI_LAUNCHER
-                     32U
+                     34U
 #else
-                     31U
+                     33U
 #endif
                      >
     kCommandNames = {
         "add-nodes",
         "replace-node",
         "remove-nodes",
+        "assign-role",
+        "remove-role",
         "block-production",
         "mining-difficulty",
         "stop-mining",
@@ -139,6 +141,21 @@ std::optional<std::uint64_t> ParsePositiveOrMaxToken(std::string_view text,
   return ParsePositiveToken(text, field);
 }
 
+std::optional<std::uint32_t> ParseRoleMutationTimeout(
+    const std::vector<std::string>& tokens, std::size_t index) {
+  if (tokens.size() <= index) {
+    return std::nullopt;
+  }
+  const std::uint64_t timeout =
+      ParsePositiveToken(tokens[index], "role mutation timeout");
+  if (timeout > kSimulationRoleMutationMaximumTimeoutSeconds) {
+    throw std::runtime_error(
+        "role mutation timeout must be in 1.." +
+        std::to_string(kSimulationRoleMutationMaximumTimeoutSeconds));
+  }
+  return static_cast<std::uint32_t>(timeout);
+}
+
 }  // namespace
 
 ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
@@ -211,6 +228,70 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       ParsedTuiCommand parsed;
       parsed.kind = SimulationCommandKind::kRemoveNodes;
       parsed.node_remove = std::move(request);
+      return parsed;
+    }
+    if (tokens[0] == "assign-role") {
+      if (tokens.size() < 2U) {
+        throw std::runtime_error(
+            "usage: assign-role <wallet|miner|masternode> <role-options>");
+      }
+
+      SimulationRoleMutationRequest request;
+      if (tokens[1] == "wallet") {
+        if (tokens.size() != 3U && tokens.size() != 4U) {
+          throw std::runtime_error(
+              "usage: assign-role wallet <public|private> [timeout-sec]");
+        }
+        const std::optional<WalletPrivacyMode> mode =
+            WalletPrivacyModeFromName(tokens[2]);
+        if (!mode) {
+          throw std::runtime_error(
+              "assign-role wallet mode must be public or private");
+        }
+        request.role = SimulationRoleKind::kWallet;
+        request.mode = *mode;
+        request.timeout_sec = ParseRoleMutationTimeout(tokens, 3U);
+      } else if (tokens[1] == "miner") {
+        if (tokens.size() != 2U && tokens.size() != 3U) {
+          throw std::runtime_error("usage: assign-role miner [timeout-sec]");
+        }
+        request.role = SimulationRoleKind::kMiner;
+        request.timeout_sec = ParseRoleMutationTimeout(tokens, 2U);
+      } else if (tokens[1] == "masternode") {
+        if (tokens.size() != 3U && tokens.size() != 4U) {
+          throw std::runtime_error(
+              "usage: assign-role masternode <funding-wallet-id> "
+              "[timeout-sec]");
+        }
+        request.role = SimulationRoleKind::kMasternode;
+        request.funding_wallet_id = tokens[2];
+        request.timeout_sec = ParseRoleMutationTimeout(tokens, 3U);
+      } else {
+        throw std::runtime_error("unknown assign-role role: " + tokens[1]);
+      }
+
+      ParsedTuiCommand parsed;
+      parsed.kind = SimulationCommandKind::kAssignRole;
+      parsed.role_mutation = std::move(request);
+      return parsed;
+    }
+    if (tokens[0] == "remove-role") {
+      if (tokens.size() != 2U && tokens.size() != 3U) {
+        throw std::runtime_error(
+            "usage: remove-role <wallet|miner|masternode> [timeout-sec]");
+      }
+      const std::optional<SimulationRoleKind> role =
+          SimulationRoleKindFromName(tokens[1]);
+      if (!role) {
+        throw std::runtime_error("unknown remove-role role: " + tokens[1]);
+      }
+
+      SimulationRoleMutationRequest request;
+      request.role = *role;
+      request.timeout_sec = ParseRoleMutationTimeout(tokens, 2U);
+      ParsedTuiCommand parsed;
+      parsed.kind = SimulationCommandKind::kRemoveRole;
+      parsed.role_mutation = std::move(request);
       return parsed;
     }
     if (tokens[0] == "firo-qt") {

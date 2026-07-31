@@ -26,7 +26,8 @@ std::size_t SimulationCommandPayloadCount(const SimulationCommand& command) {
          static_cast<std::size_t>(command.wallet_send.has_value()) +
          static_cast<std::size_t>(command.node_add.has_value()) +
          static_cast<std::size_t>(command.node_replace.has_value()) +
-         static_cast<std::size_t>(command.node_remove.has_value());
+         static_cast<std::size_t>(command.node_remove.has_value()) +
+         static_cast<std::size_t>(command.role_mutation.has_value());
 }
 
 void RequirePayload(const SimulationCommand& command, bool expected_present,
@@ -301,6 +302,14 @@ void ValidateNodeReplaceCommand(const SimulationCommand& command) {
   }
 }
 
+void ValidateRoleMutationCommand(const SimulationCommand& command) {
+  RequirePayload(command, command.role_mutation.has_value(), 1U);
+  if (command.node_id != "sim") {
+    throw std::runtime_error("role mutation command must target sim");
+  }
+  ValidateSimulationRoleMutationRequest(command.kind, *command.role_mutation);
+}
+
 void ValidateSimulationCommand(const SimulationCommand& command) {
   if (command.sequence != 0U) {
     throw std::runtime_error(
@@ -403,6 +412,10 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
     case SimulationCommandKind::kRemoveNodes:
       ValidateNodeRemoveCommand(command);
       break;
+    case SimulationCommandKind::kAssignRole:
+    case SimulationCommandKind::kRemoveRole:
+      ValidateRoleMutationCommand(command);
+      break;
     case SimulationCommandKind::kCount:
       throw std::runtime_error("unknown simulation command kind");
   }
@@ -453,6 +466,8 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kAddNodes:
     case SimulationCommandKind::kReplaceNode:
     case SimulationCommandKind::kRemoveNodes:
+    case SimulationCommandKind::kAssignRole:
+    case SimulationCommandKind::kRemoveRole:
     case SimulationCommandKind::kCount:
       throw std::runtime_error(
           "simulation command kind requires a typed payload method");
@@ -1023,11 +1038,25 @@ std::uint64_t SimulationCommandQueue::PushRemoveNodes(
   });
 }
 
+std::uint64_t SimulationCommandQueue::PushRoleMutation(
+    SimulationCommandKind kind, SimulationRoleMutationRequest request,
+    bool confirmed) {
+  ValidateSimulationRoleMutationRequest(kind, request);
+  SimulationCommand command;
+  command.kind = kind;
+  command.node_id = "sim";
+  command.role_mutation = std::move(request);
+  command.confirmed = confirmed;
+  return PushCommand(std::move(command));
+}
+
 std::uint64_t SimulationCommandQueue::PushCommand(SimulationCommand command) {
   ValidateSimulationCommand(command);
   if ((command.kind == SimulationCommandKind::kAddNodes ||
        command.kind == SimulationCommandKind::kReplaceNode ||
-       command.kind == SimulationCommandKind::kRemoveNodes) &&
+       command.kind == SimulationCommandKind::kRemoveNodes ||
+       command.kind == SimulationCommandKind::kAssignRole ||
+       command.kind == SimulationCommandKind::kRemoveRole) &&
       !command.operation_control) {
     command.operation_control = std::make_shared<SimulationCommandControl>();
   }

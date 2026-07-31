@@ -58,6 +58,7 @@ struct ParsedTuiCommand {
   std::optional<SimulationNodeAddRequest> node_add = std::nullopt;
   std::optional<SimulationNodeReplaceRequest> node_replace = std::nullopt;
   std::optional<SimulationNodeRemoveRequest> node_remove = std::nullopt;
+  std::optional<SimulationRoleMutationRequest> role_mutation = std::nullopt;
   std::optional<TuiLocalAction> local_action = std::nullopt;
 };
 

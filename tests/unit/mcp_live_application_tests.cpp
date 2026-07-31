@@ -538,6 +538,59 @@ BOOST_AUTO_TEST_CASE(
                  .as_string() == "node_operation_timeout");
   BOOST_CHECK(std::chrono::steady_clock::now() - timeout_started < 1500ms);
 
+  const boost::json::object assign_role_command{
+      {"kind", "assign_role"},
+      {"role_mutation",
+       boost::json::object{{"node_ids", boost::json::array{"firo-1"}},
+                           {"roles", boost::json::array{"wallet"}},
+                           {"mode", "public"},
+                           {"timeout_sec", 1U}}}};
+  const boost::json::object role_timeout_submitted =
+      Invoke(&dispatcher, "simulation.command",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"command", assign_role_command}});
+  const SimulationCommand timed_out_role_command =
+      WaitForQueuedCommand(queue.get());
+  BOOST_CHECK(timed_out_role_command.kind ==
+              SimulationCommandKind::kAssignRole);
+  application.RecordCommandOutcome(
+      timed_out_role_command,
+      CommandOutcome(SimulationCommandOutcomeState::kTimedOut,
+                     "role mutation deadline expired", std::nullopt,
+                     SimulationCommandCancellationCause::kDeadline));
+  const boost::json::object role_timeout_terminal =
+      WaitForTerminal(&dispatcher, role_timeout_submitted);
+  BOOST_TEST(role_timeout_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(role_timeout_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "role_operation_timeout");
+
+  const boost::json::object remove_role_command{
+      {"kind", "remove_role"},
+      {"role_mutation",
+       boost::json::object{{"node_ids", boost::json::array{"firo-1"}},
+                           {"roles", boost::json::array{"wallet"}}}}};
+  const boost::json::object role_unconfirmed_submitted =
+      Invoke(&dispatcher, "simulation.command",
+             boost::json::object{{"run_id", "live-application"},
+                                 {"command", remove_role_command}});
+  const SimulationCommand unconfirmed_role_command =
+      WaitForQueuedCommand(queue.get());
+  BOOST_CHECK(unconfirmed_role_command.kind ==
+              SimulationCommandKind::kRemoveRole);
+  application.RecordCommandOutcome(
+      unconfirmed_role_command,
+      CommandOutcome(SimulationCommandOutcomeState::kOutcomeUnconfirmed,
+                     "role removal publication was indeterminate"));
+  const boost::json::object role_unconfirmed_terminal =
+      WaitForTerminal(&dispatcher, role_unconfirmed_submitted);
+  BOOST_TEST(role_unconfirmed_terminal.at("state").as_string() == "failed");
+  BOOST_TEST(role_unconfirmed_terminal.at("terminal_error")
+                 .as_object()
+                 .at("code")
+                 .as_string() == "role_remove_outcome_unconfirmed");
+
   const boost::json::object stop_submitted =
       Invoke(&dispatcher, "run.stop",
              boost::json::object{{"run_id", "live-application"}});
@@ -2848,6 +2901,77 @@ BOOST_AUTO_TEST_CASE(
                                  {"mode", "public"}});
   BOOST_TEST(WaitForTerminal(&dispatcher, cancelled).at("state").as_string() ==
              "cancelled");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_role_mutation_adapter_delegates_and_normalizes_one_wallet) {
+  std::size_t service_calls = 0U;
+  McpLiveRoleService service;
+  service.operation = [&service_calls](McpOperationKind kind,
+                                       const boost::json::object& arguments,
+                                       std::stop_token stop_token) {
+    ++service_calls;
+    BOOST_CHECK(kind == McpOperationKind::kAddWallet);
+    BOOST_TEST(!stop_token.stop_requested());
+    const boost::json::object expected_arguments{
+        {"run_id", "live-application"},
+        {"node_ids", boost::json::array{"firo-2"}},
+        {"count", 1U},
+        {"timeout_sec", 41U},
+        {"mode", "private"}};
+    BOOST_TEST(arguments == expected_arguments);
+    return boost::json::object{
+        {"added_node_ids", boost::json::array{}},
+        {"removed_node_ids", boost::json::array{}},
+        {"affected_node_ids", boost::json::array{"firo-2"}},
+        {"action", "wallet.add"},
+        {"state", "ready"},
+        {"unchanged", false},
+        {"wallets", boost::json::array{boost::json::object{
+                        {"wallet_index", 1U},
+                        {"node", 2U},
+                        {"node_id", "firo-2"},
+                        {"mode", "private"},
+                        {"address", "wallet-address"},
+                        {"funding_address", "funding-address"}}}},
+        {"inventory_generation", 7U},
+        {"final_node_count", 2U},
+        {"wallet_generation", 5U},
+        {"final_wallet_count", 1U},
+        {"final_wallet_node_count", 1U}};
+  };
+
+  const boost::json::object normalized =
+      ExecuteAndNormalizeSimulationRoleMutation(
+          service, "live-application", SimulationCommandKind::kAssignRole,
+          SimulationRoleMutationRequest{.node_ids = {"firo-2"},
+                                        .role = SimulationRoleKind::kWallet,
+                                        .mode = WalletPrivacyMode::kPrivate,
+                                        .funding_wallet_id = std::nullopt,
+                                        .timeout_sec = 41U},
+          std::stop_token{});
+
+  BOOST_TEST(service_calls == 1U);
+  const boost::json::object expected_normalized{
+      {"node_ids", boost::json::array{"firo-2"}},
+      {"assigned_roles", boost::json::array{"wallet"}},
+      {"removed_roles", boost::json::array{}},
+      {"action", "role.assign"},
+      {"state", "ready"},
+      {"created_node_ids", boost::json::array{}},
+      {"role_generation", 5U},
+      {"inventory_generation", 7U},
+      {"final_node_count", 2U},
+      {"final_wallet_count", 1U},
+      {"final_wallet_node_count", 1U},
+      {"wallets", boost::json::array{boost::json::object{
+                      {"wallet_index", 1U},
+                      {"node", 2U},
+                      {"node_id", "firo-2"},
+                      {"mode", "private"},
+                      {"address", "wallet-address"},
+                      {"funding_address", "funding-address"}}}}};
+  BOOST_TEST(normalized == expected_normalized);
 }
 
 BOOST_AUTO_TEST_CASE(

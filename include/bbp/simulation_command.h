@@ -3,6 +3,7 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <boost/json/object.hpp>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -25,6 +26,7 @@
 #include "bbp/perf_counter.h"
 #include "bbp/simulation_node_add.h"
 #include "bbp/simulation_partition.h"
+#include "bbp/simulation_registry.h"
 #include "bbp/simulation_wallet_send.h"
 #include "bbp/simulator/node_runtime_lifecycle.h"
 #include "bbp/simulator/resource_limit_patch.h"
@@ -62,7 +64,27 @@ enum class SimulationCommandKind {
   kAddNodes,
   kReplaceNode,
   kRemoveNodes,
+  kAssignRole,
+  kRemoveRole,
   kCount,
+};
+
+enum class SimulationRoleKind {
+  kWallet,
+  kMiner,
+  kMasternode,
+  kCount,
+};
+
+inline constexpr std::uint32_t kSimulationRoleMutationMaximumTimeoutSeconds =
+    3600U;
+
+struct SimulationRoleMutationRequest {
+  std::vector<std::string> node_ids;
+  SimulationRoleKind role = SimulationRoleKind::kWallet;
+  std::optional<WalletPrivacyMode> mode = std::nullopt;
+  std::optional<std::string> funding_wallet_id = std::nullopt;
+  std::optional<std::uint32_t> timeout_sec = std::nullopt;
 };
 
 struct SimulationNetworkFlow {
@@ -269,6 +291,7 @@ struct SimulationCommandOutcome {
   std::vector<std::string> removed_node_ids;
   std::optional<std::uint64_t> inventory_generation;
   std::optional<std::uint32_t> final_node_count;
+  std::optional<boost::json::object> role_mutation = std::nullopt;
 };
 
 class SimulationCommandOutcomeUnconfirmed final : public std::runtime_error {
@@ -322,11 +345,19 @@ struct SimulationCommand {
   std::optional<SimulationNodeAddRequest> node_add;
   std::optional<SimulationNodeReplaceRequest> node_replace = std::nullopt;
   std::optional<SimulationNodeRemoveRequest> node_remove;
+  std::optional<SimulationRoleMutationRequest> role_mutation = std::nullopt;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;
   std::shared_ptr<SimulationCommandControl> operation_control;
 };
 
+std::string_view SimulationRoleKindName(SimulationRoleKind kind);
+std::optional<SimulationRoleKind> SimulationRoleKindFromName(
+    std::string_view name);
+void ValidateSimulationRoleMutationRequest(
+    SimulationCommandKind kind, const SimulationRoleMutationRequest& request);
+std::chrono::seconds SimulationRoleMutationExecutionTimeout(
+    SimulationCommandKind kind, const SimulationRoleMutationRequest& request);
 std::string_view SimulationCommandKindName(SimulationCommandKind kind);
 std::optional<SimulationCommandKind> SimulationCommandKindFromName(
     std::string_view name);

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <barrier>
+#include <boost/json/array.hpp>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
 #include <filesystem>
@@ -46,6 +47,8 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
       bbp::SimulationCommandKind::kAddNodes,
       bbp::SimulationCommandKind::kReplaceNode,
       bbp::SimulationCommandKind::kRemoveNodes,
+      bbp::SimulationCommandKind::kAssignRole,
+      bbp::SimulationCommandKind::kRemoveRole,
   };
 
   for (bbp::SimulationCommandKind kind : kKinds) {
@@ -56,6 +59,56 @@ BOOST_AUTO_TEST_CASE(simulation_command_kind_round_trips_names) {
     BOOST_CHECK(*parsed == kind);
   }
   BOOST_TEST(!bbp::SimulationCommandKindFromName("unknown"));
+}
+
+BOOST_AUTO_TEST_CASE(simulation_role_kind_round_trips_names) {
+  constexpr bbp::SimulationRoleKind kKinds[] = {
+      bbp::SimulationRoleKind::kWallet,
+      bbp::SimulationRoleKind::kMiner,
+      bbp::SimulationRoleKind::kMasternode,
+  };
+  for (const bbp::SimulationRoleKind kind : kKinds) {
+    const std::optional<bbp::SimulationRoleKind> parsed =
+        bbp::SimulationRoleKindFromName(bbp::SimulationRoleKindName(kind));
+    BOOST_REQUIRE(parsed);
+    BOOST_CHECK(*parsed == kind);
+  }
+  BOOST_TEST(!bbp::SimulationRoleKindFromName("base"));
+  BOOST_CHECK_THROW(
+      bbp::SimulationRoleKindName(bbp::SimulationRoleKind::kCount),
+      std::logic_error);
+}
+
+BOOST_AUTO_TEST_CASE(simulation_role_mutation_timeout_matches_role_services) {
+  const bbp::SimulationRoleMutationRequest wallet{
+      .node_ids = {"firo-1"},
+      .role = bbp::SimulationRoleKind::kWallet,
+      .mode = bbp::WalletPrivacyMode::kPublic,
+  };
+  const bbp::SimulationRoleMutationRequest masternode{
+      .node_ids = {"firo-2"},
+      .role = bbp::SimulationRoleKind::kMasternode,
+      .mode = std::nullopt,
+      .funding_wallet_id = "firo-1",
+  };
+  bbp::SimulationRoleMutationRequest explicit_timeout = wallet;
+  explicit_timeout.timeout_sec = 47U;
+
+  BOOST_TEST(bbp::SimulationRoleMutationExecutionTimeout(
+                 bbp::SimulationCommandKind::kAssignRole, wallet) ==
+             std::chrono::seconds(30));
+  BOOST_TEST(bbp::SimulationRoleMutationExecutionTimeout(
+                 bbp::SimulationCommandKind::kRemoveRole,
+                 bbp::SimulationRoleMutationRequest{
+                     .node_ids = {"firo-1"},
+                     .role = bbp::SimulationRoleKind::kWallet}) ==
+             std::chrono::seconds(30));
+  BOOST_TEST(bbp::SimulationRoleMutationExecutionTimeout(
+                 bbp::SimulationCommandKind::kAssignRole, masternode) ==
+             std::chrono::seconds(60));
+  BOOST_TEST(bbp::SimulationRoleMutationExecutionTimeout(
+                 bbp::SimulationCommandKind::kAssignRole, explicit_timeout) ==
+             std::chrono::seconds(47));
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -112,6 +165,10 @@ BOOST_AUTO_TEST_CASE(simulation_command_classifies_destructive_actions) {
       bbp::SimulationCommandKind::kReplaceNode));
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
       bbp::SimulationCommandKind::kRemoveNodes));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kAssignRole));
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(
+      bbp::SimulationCommandKind::kRemoveRole));
 }
 
 BOOST_AUTO_TEST_CASE(simulation_command_cancellation_is_optional_and_shared) {
@@ -235,6 +292,25 @@ BOOST_AUTO_TEST_CASE(simulation_command_outcome_carries_added_node_ids) {
   BOOST_REQUIRE_EQUAL(outcome.added_node_ids.size(), 2U);
   BOOST_TEST(outcome.added_node_ids[0] == "firo-2");
   BOOST_TEST(outcome.added_node_ids[1] == "firo-3");
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_outcome_carries_normalized_role_evidence) {
+  const boost::json::object normalized{
+      {"node_ids", boost::json::array{"firo-1"}},
+      {"assigned_roles", boost::json::array{"wallet"}},
+      {"removed_roles", boost::json::array{}},
+      {"action", "role.assign"},
+      {"state", "ready"},
+      {"role_generation", 7U},
+      {"final_wallet_count", 3U},
+      {"final_wallet_node_count", 1U},
+  };
+  bbp::SimulationCommandOutcome outcome;
+  outcome.state = bbp::SimulationCommandOutcomeState::kSucceeded;
+  outcome.role_mutation = normalized;
+  BOOST_REQUIRE(outcome.role_mutation);
+  BOOST_TEST(*outcome.role_mutation == normalized);
 }
 
 BOOST_AUTO_TEST_CASE(

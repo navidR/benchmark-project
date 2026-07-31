@@ -1,10 +1,141 @@
 #include "bbp/simulation_command.h"
 
 #include <algorithm>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
 namespace bbp {
+namespace {
+
+bool IsSafeRoleNodeIdentifier(std::string_view value) {
+  return !value.empty() && value.size() <= 32U &&
+         std::all_of(value.begin(), value.end(), [](char character) {
+           return (character >= 'a' && character <= 'z') ||
+                  (character >= 'A' && character <= 'Z') ||
+                  (character >= '0' && character <= '9') || character == '-' ||
+                  character == '_';
+         });
+}
+
+}  // namespace
+
+std::string_view SimulationRoleKindName(SimulationRoleKind kind) {
+  switch (kind) {
+    case SimulationRoleKind::kWallet:
+      return "wallet";
+    case SimulationRoleKind::kMiner:
+      return "miner";
+    case SimulationRoleKind::kMasternode:
+      return "masternode";
+    case SimulationRoleKind::kCount:
+      break;
+  }
+  throw std::logic_error("unknown simulation role kind");
+}
+
+std::optional<SimulationRoleKind> SimulationRoleKindFromName(
+    std::string_view name) {
+  if (name == "wallet") {
+    return SimulationRoleKind::kWallet;
+  }
+  if (name == "miner") {
+    return SimulationRoleKind::kMiner;
+  }
+  if (name == "masternode") {
+    return SimulationRoleKind::kMasternode;
+  }
+  return std::nullopt;
+}
+
+void ValidateSimulationRoleMutationRequest(
+    SimulationCommandKind kind, const SimulationRoleMutationRequest& request) {
+  if (kind != SimulationCommandKind::kAssignRole &&
+      kind != SimulationCommandKind::kRemoveRole) {
+    throw std::invalid_argument(
+        "role mutation request requires assign_role or remove_role");
+  }
+  const std::size_t maximum_count =
+      kind == SimulationCommandKind::kAssignRole
+          ? static_cast<std::size_t>(kSimulationNodeAddMaximumCount)
+          : static_cast<std::size_t>(kSimulationNodeRemoveMaximumCount);
+  if (request.node_ids.empty() || request.node_ids.size() > maximum_count) {
+    throw std::invalid_argument("role mutation node ids must contain 1.." +
+                                std::to_string(maximum_count) + " ids");
+  }
+  std::set<std::string> unique_node_ids;
+  for (const std::string& node_id : request.node_ids) {
+    if (!IsSafeRoleNodeIdentifier(node_id)) {
+      throw std::invalid_argument(
+          "role mutation node ids must contain safe identifiers");
+    }
+    if (!unique_node_ids.insert(node_id).second) {
+      throw std::invalid_argument(
+          "role mutation node ids must contain unique identifiers");
+    }
+  }
+  if (request.role == SimulationRoleKind::kCount) {
+    throw std::invalid_argument(
+        "role mutation role must be wallet, miner, or masternode");
+  }
+  if (request.timeout_sec &&
+      (*request.timeout_sec == 0U ||
+       *request.timeout_sec > kSimulationRoleMutationMaximumTimeoutSeconds)) {
+    throw std::invalid_argument(
+        "role mutation timeout must be in 1.." +
+        std::to_string(kSimulationRoleMutationMaximumTimeoutSeconds));
+  }
+
+  if (kind == SimulationCommandKind::kRemoveRole) {
+    if (request.mode || request.funding_wallet_id) {
+      throw std::invalid_argument(
+          "remove_role does not accept mode or funding_wallet_id");
+    }
+    return;
+  }
+
+  switch (request.role) {
+    case SimulationRoleKind::kWallet:
+      if (!request.mode) {
+        throw std::invalid_argument(
+            "assign_role wallet requires a privacy mode");
+      }
+      if (request.funding_wallet_id) {
+        throw std::invalid_argument(
+            "assign_role wallet does not accept funding_wallet_id");
+      }
+      return;
+    case SimulationRoleKind::kMiner:
+      if (request.mode || request.funding_wallet_id) {
+        throw std::invalid_argument(
+            "assign_role miner does not accept mode or funding_wallet_id");
+      }
+      return;
+    case SimulationRoleKind::kMasternode:
+      if (request.mode) {
+        throw std::invalid_argument(
+            "assign_role masternode does not accept mode");
+      }
+      if (!request.funding_wallet_id ||
+          !IsSafeRoleNodeIdentifier(*request.funding_wallet_id)) {
+        throw std::invalid_argument(
+            "assign_role masternode requires a safe funding_wallet_id");
+      }
+      return;
+    case SimulationRoleKind::kCount:
+      break;
+  }
+  throw std::logic_error("unknown simulation role kind");
+}
+
+std::chrono::seconds SimulationRoleMutationExecutionTimeout(
+    SimulationCommandKind kind, const SimulationRoleMutationRequest& request) {
+  ValidateSimulationRoleMutationRequest(kind, request);
+  const std::uint32_t default_timeout_sec =
+      request.role == SimulationRoleKind::kMasternode ? 60U : 30U;
+  return std::chrono::seconds(
+      request.timeout_sec.value_or(default_timeout_sec));
+}
 
 std::string_view SimulationNodeRestartPhaseName(
     SimulationNodeRestartPhase phase) {
@@ -171,6 +302,10 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "replace_node";
     case SimulationCommandKind::kRemoveNodes:
       return "remove_nodes";
+    case SimulationCommandKind::kAssignRole:
+      return "assign_role";
+    case SimulationCommandKind::kRemoveRole:
+      return "remove_role";
     case SimulationCommandKind::kCount:
       break;
   }
@@ -269,6 +404,12 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "remove_nodes") {
     return SimulationCommandKind::kRemoveNodes;
   }
+  if (name == "assign_role") {
+    return SimulationCommandKind::kAssignRole;
+  }
+  if (name == "remove_role") {
+    return SimulationCommandKind::kRemoveRole;
+  }
   return std::nullopt;
 }
 
@@ -289,6 +430,8 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kPartitionNodes:
     case SimulationCommandKind::kGenerateBlocks:
     case SimulationCommandKind::kSendWalletTransaction:
+    case SimulationCommandKind::kAssignRole:
+    case SimulationCommandKind::kRemoveRole:
       return true;
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:

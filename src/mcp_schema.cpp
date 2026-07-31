@@ -433,7 +433,8 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "resource_limits" || field == "network_condition" ||
       field == "network_flow" || field == "partition" ||
       field == "perf_target" || field == "wallet_send" || field == "node_add" ||
-      field == "node_replace" || field == "node_remove") {
+      field == "node_replace" || field == "node_remove" ||
+      field == "role_mutation") {
     return TypeSchema("object");
   }
   if (field == "chain_daemon" || field == "output_dir" ||
@@ -569,6 +570,76 @@ boost::json::object NodeAddTopologySchema() {
 boost::json::object NodeMutationConfigSchema();
 boost::json::object NodeReplacementConfigSchema();
 boost::json::object NodeRemoveConfigSchema();
+
+boost::json::object RoleMutationRequestSchema(bool assigning,
+                                              bool include_run_id) {
+  boost::json::object properties;
+  boost::json::array required;
+  if (include_run_id) {
+    properties["run_id"] = RunIdentifierSchema();
+    required.emplace_back("run_id");
+  }
+  properties["node_ids"] =
+      ArraySchema(NodeAddIdentifierSchema(), 1U,
+                  assigning ? kSimulationNodeAddMaximumCount
+                            : kSimulationNodeRemoveMaximumCount,
+                  true);
+  properties["roles"] = ArraySchema(
+      StringEnumSchema(boost::json::array{"wallet", "miner", "masternode"}), 1U,
+      1U, true);
+  properties["timeout_sec"] = IntegerSchema(1U, 3600U);
+  required.emplace_back("node_ids");
+  required.emplace_back("roles");
+  if (assigning) {
+    properties["mode"] =
+        StringEnumSchema(boost::json::array{"public", "private"});
+    properties["funding_wallet_id"] = NodeAddIdentifierSchema();
+  }
+
+  boost::json::object schema =
+      ClosedObject(std::move(properties), std::move(required));
+  if (!assigning) {
+    return schema;
+  }
+
+  const auto role_condition = [](std::string_view role) {
+    return boost::json::object{
+        {"properties",
+         boost::json::object{
+             {"roles",
+              boost::json::object{
+                  {"const", boost::json::array{std::string(role)}}}}}},
+        {"required", Required({"roles"})}};
+  };
+  schema["allOf"] = boost::json::array{
+      boost::json::object{
+          {"if", role_condition("wallet")},
+          {"then",
+           boost::json::object{
+               {"required", Required({"mode"})},
+               {"not",
+                boost::json::object{
+                    {"required", Required({"funding_wallet_id"})}}}}}},
+      boost::json::object{
+          {"if", role_condition("miner")},
+          {"then",
+           boost::json::object{
+               {"not",
+                boost::json::object{
+                    {"anyOf",
+                     boost::json::array{
+                         boost::json::object{{"required", Required({"mode"})}},
+                         boost::json::object{
+                             {"required",
+                              Required({"funding_wallet_id"})}}}}}}}}},
+      boost::json::object{
+          {"if", role_condition("masternode")},
+          {"then", boost::json::object{
+                       {"required", Required({"funding_wallet_id"})},
+                       {"not", boost::json::object{
+                                   {"required", Required({"mode"})}}}}}}};
+  return schema;
+}
 
 boost::json::object WorkloadVariant(WorkloadKind kind,
                                     std::string_view discriminator,
@@ -747,6 +818,10 @@ boost::json::object CommandVariant(SimulationCommandKind kind,
   }
   if (properties.contains("node_remove")) {
     properties["node_remove"] = NodeRemoveConfigSchema();
+  }
+  if (properties.contains("role_mutation")) {
+    properties["role_mutation"] = RoleMutationRequestSchema(
+        kind == SimulationCommandKind::kAssignRole, false);
   }
   for (const std::string_view field : ScenarioCommandFields(kind)) {
     required.emplace_back(field);
@@ -1582,31 +1657,9 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["timeout_sec"] = IntegerSchema(1U, 3600U);
       break;
     case McpOperationKind::kAssignRole:
-      add_run();
-      properties["node_ids"] = ArraySchema(
-          NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
-      properties["roles"] = ArraySchema(
-          StringEnumSchema(boost::json::array{"wallet", "miner", "masternode"}),
-          1U, 1U, true);
-      properties["mode"] =
-          StringEnumSchema(boost::json::array{"public", "private"});
-      properties["funding_wallet_id"] = NodeAddIdentifierSchema();
-      required.emplace_back("node_ids");
-      required.emplace_back("roles");
-      properties["timeout_sec"] = IntegerSchema(1U, 3600U);
-      break;
+      return AddDraft(RoleMutationRequestSchema(true, true));
     case McpOperationKind::kRemoveRole:
-      add_run();
-      properties["node_ids"] =
-          ArraySchema(NodeAddIdentifierSchema(), 1U,
-                      kSimulationNodeRemoveMaximumCount, true);
-      properties["roles"] = ArraySchema(
-          StringEnumSchema(boost::json::array{"wallet", "miner", "masternode"}),
-          1U, 1U, true);
-      required.emplace_back("node_ids");
-      required.emplace_back("roles");
-      properties["timeout_sec"] = IntegerSchema(1U, 3600U);
-      break;
+      return AddDraft(RoleMutationRequestSchema(false, true));
     case McpOperationKind::kAddMiner:
       add_run();
       properties["node_ids"] = ArraySchema(
@@ -1759,45 +1812,7 @@ boost::json::object BuildMcpOperationInputSchema(
   }
   boost::json::object schema =
       ClosedObject(std::move(properties), std::move(required));
-  if (operation == McpOperationKind::kAssignRole) {
-    const auto role_condition = [](std::string_view role) {
-      return boost::json::object{
-          {"properties",
-           boost::json::object{
-               {"roles",
-                boost::json::object{
-                    {"const", boost::json::array{std::string(role)}}}}}},
-          {"required", Required({"roles"})}};
-    };
-    schema["allOf"] = boost::json::array{
-        boost::json::object{
-            {"if", role_condition("wallet")},
-            {"then",
-             boost::json::object{
-                 {"required", Required({"mode"})},
-                 {"not",
-                  boost::json::object{
-                      {"required", Required({"funding_wallet_id"})}}}}}},
-        boost::json::object{
-            {"if", role_condition("miner")},
-            {"then",
-             boost::json::object{
-                 {"not",
-                  boost::json::object{
-                      {"anyOf",
-                       boost::json::array{
-                           boost::json::object{
-                               {"required", Required({"mode"})}},
-                           boost::json::object{
-                               {"required",
-                                Required({"funding_wallet_id"})}}}}}}}}},
-        boost::json::object{
-            {"if", role_condition("masternode")},
-            {"then", boost::json::object{
-                         {"required", Required({"funding_wallet_id"})},
-                         {"not", boost::json::object{
-                                     {"required", Required({"mode"})}}}}}}};
-  } else if (operation == McpOperationKind::kRemoveWallet) {
+  if (operation == McpOperationKind::kRemoveWallet) {
     schema["oneOf"] = boost::json::array{
         boost::json::object{
             {"required", Required({"node_id"})},
@@ -1956,6 +1971,33 @@ boost::json::object RoleRemoveMutationSchema() {
   return schema;
 }
 
+boost::json::object EmbeddedRoleMutationResultSchema(
+    boost::json::object schema) {
+  schema.erase("$schema");
+  boost::json::object& properties = schema.at("properties").as_object();
+  boost::json::array& required = schema.at("required").as_array();
+  for (const std::string_view field :
+       {"result_family", "run_id", "operation_id"}) {
+    properties.erase(field);
+    for (auto item = required.begin(); item != required.end(); ++item) {
+      if (item->is_string() && item->as_string() == field) {
+        required.erase(item);
+        break;
+      }
+    }
+  }
+  return schema;
+}
+
+boost::json::object RuntimeRoleMutationResultSchema() {
+  boost::json::array variants;
+  variants.emplace_back(
+      EmbeddedRoleMutationResultSchema(RoleAssignMutationSchema()));
+  variants.emplace_back(
+      EmbeddedRoleMutationResultSchema(RoleRemoveMutationSchema()));
+  return boost::json::object{{"oneOf", std::move(variants)}};
+}
+
 boost::json::object WalletRemoveMutationSchema() {
   boost::json::object schema = BuildMcpResultSchema(McpResultFamily::kMutation);
   boost::json::object& properties = schema.at("properties").as_object();
@@ -2066,6 +2108,7 @@ boost::json::object BuildMcpResultSchema(
           NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
       properties["inventory_generation"] = Uint64Schema();
       properties["final_node_count"] = IntegerSchema();
+      properties["role_mutation"] = RuntimeRoleMutationResultSchema();
       require({"run_id", "command_id", "accepted", "state"});
       constraints.emplace_back(boost::json::object{
           {"if",
@@ -2089,6 +2132,33 @@ boost::json::object BuildMcpResultSchema(
                {"required",
                 Required({"removed_node_ids", "affected_node_ids",
                           "inventory_generation", "final_node_count"})}}}});
+      for (const std::string_view action : {"role.assign", "role.remove"}) {
+        constraints.emplace_back(boost::json::object{
+            {"if",
+             boost::json::object{
+                 {"properties",
+                  boost::json::object{{"action", ConstStringSchema(action)}}},
+                 {"required", Required({"action"})}}},
+            {"then", boost::json::object{
+                         {"properties",
+                          boost::json::object{
+                              {"role_mutation",
+                               boost::json::object{
+                                   {"properties",
+                                    boost::json::object{
+                                        {"action", ConstStringSchema(action)}}},
+                                   {"required", Required({"action"})}}}}},
+                         {"required", Required({"role_mutation"})}}}});
+      }
+      constraints.emplace_back(boost::json::object{
+          {"if",
+           boost::json::object{{"required", Required({"role_mutation"})}}},
+          {"then", boost::json::object{
+                       {"properties",
+                        boost::json::object{
+                            {"action", StringEnumSchema(boost::json::array{
+                                           "role.assign", "role.remove"})}}},
+                       {"required", Required({"action"})}}}});
       break;
     case McpResultFamily::kMutation:
       properties["run_id"] = IdentifierSchema();

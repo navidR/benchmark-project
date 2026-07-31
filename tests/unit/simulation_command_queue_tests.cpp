@@ -585,6 +585,189 @@ BOOST_AUTO_TEST_CASE(simulation_command_queue_validates_node_remove_request) {
   BOOST_TEST(!queue.TryPop());
 }
 
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_preserves_typed_role_mutation_requests) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationRoleMutationRequest assign{
+      .node_ids = {"firo-2", "firo-4"},
+      .role = bbp::SimulationRoleKind::kWallet,
+      .mode = bbp::WalletPrivacyMode::kPrivate,
+      .funding_wallet_id = std::nullopt,
+      .timeout_sec = 47U,
+  };
+  const bbp::SimulationRoleMutationRequest remove{
+      .node_ids = {"firo-2", "firo-4"},
+      .role = bbp::SimulationRoleKind::kMiner,
+      .mode = std::nullopt,
+      .funding_wallet_id = std::nullopt,
+      .timeout_sec = std::nullopt,
+  };
+  const bbp::SimulationRoleMutationRequest masternode{
+      .node_ids = {"firo-6"},
+      .role = bbp::SimulationRoleKind::kMasternode,
+      .mode = std::nullopt,
+      .funding_wallet_id = "firo-funder",
+      .timeout_sec = 59U,
+  };
+
+  const std::uint64_t assign_sequence = queue.PushRoleMutation(
+      bbp::SimulationCommandKind::kAssignRole, assign, true);
+  const std::uint64_t masternode_sequence = queue.PushRoleMutation(
+      bbp::SimulationCommandKind::kAssignRole, masternode, true);
+  const std::uint64_t remove_sequence = queue.PushRoleMutation(
+      bbp::SimulationCommandKind::kRemoveRole, remove, true);
+  const std::optional<bbp::SimulationCommand> assigned = queue.TryPop();
+  const std::optional<bbp::SimulationCommand> masternode_assigned =
+      queue.TryPop();
+  const std::optional<bbp::SimulationCommand> removed = queue.TryPop();
+
+  BOOST_REQUIRE(assigned);
+  BOOST_TEST(assigned->sequence == assign_sequence);
+  BOOST_CHECK(assigned->kind == bbp::SimulationCommandKind::kAssignRole);
+  BOOST_TEST(assigned->node_id == "sim");
+  BOOST_TEST(assigned->confirmed);
+  BOOST_REQUIRE(assigned->operation_control);
+  BOOST_REQUIRE(assigned->role_mutation);
+  BOOST_TEST(assigned->role_mutation->node_ids == assign.node_ids,
+             boost::test_tools::per_element());
+  BOOST_CHECK(assigned->role_mutation->role ==
+              bbp::SimulationRoleKind::kWallet);
+  BOOST_REQUIRE(assigned->role_mutation->mode);
+  BOOST_CHECK(*assigned->role_mutation->mode ==
+              bbp::WalletPrivacyMode::kPrivate);
+  BOOST_REQUIRE(assigned->role_mutation->timeout_sec);
+  BOOST_TEST(*assigned->role_mutation->timeout_sec == 47U);
+
+  BOOST_REQUIRE(masternode_assigned);
+  BOOST_TEST(masternode_assigned->sequence == masternode_sequence);
+  BOOST_CHECK(masternode_assigned->kind ==
+              bbp::SimulationCommandKind::kAssignRole);
+  BOOST_REQUIRE(masternode_assigned->role_mutation);
+  BOOST_TEST(
+      masternode_assigned->role_mutation->node_ids == masternode.node_ids,
+      boost::test_tools::per_element());
+  BOOST_CHECK(masternode_assigned->role_mutation->role ==
+              bbp::SimulationRoleKind::kMasternode);
+  BOOST_REQUIRE(masternode_assigned->role_mutation->funding_wallet_id);
+  BOOST_TEST(*masternode_assigned->role_mutation->funding_wallet_id ==
+             "firo-funder");
+  BOOST_REQUIRE(masternode_assigned->role_mutation->timeout_sec);
+  BOOST_TEST(*masternode_assigned->role_mutation->timeout_sec == 59U);
+
+  BOOST_REQUIRE(removed);
+  BOOST_TEST(removed->sequence == remove_sequence);
+  BOOST_CHECK(removed->kind == bbp::SimulationCommandKind::kRemoveRole);
+  BOOST_REQUIRE(removed->role_mutation);
+  BOOST_TEST(removed->role_mutation->node_ids == remove.node_ids,
+             boost::test_tools::per_element());
+  BOOST_CHECK(removed->role_mutation->role == bbp::SimulationRoleKind::kMiner);
+  BOOST_TEST(!removed->role_mutation->mode);
+  BOOST_TEST(!removed->role_mutation->funding_wallet_id);
+  BOOST_TEST(!removed->role_mutation->timeout_sec);
+  BOOST_TEST(!queue.TryPop());
+}
+
+BOOST_AUTO_TEST_CASE(
+    simulation_command_queue_validates_typed_role_mutation_requests) {
+  bbp::SimulationCommandQueue queue;
+  const bbp::SimulationRoleMutationRequest wallet{
+      .node_ids = {"firo-1"},
+      .role = bbp::SimulationRoleKind::kWallet,
+      .mode = bbp::WalletPrivacyMode::kPublic,
+  };
+  const auto rejected = [&](bbp::SimulationCommandKind kind,
+                            bbp::SimulationRoleMutationRequest request,
+                            bool confirmed = true) {
+    BOOST_CHECK_THROW(
+        queue.PushRoleMutation(kind, std::move(request), confirmed),
+        std::exception);
+  };
+
+  rejected(bbp::SimulationCommandKind::kAssignRole, wallet, false);
+  rejected(bbp::SimulationCommandKind::kRestartNode, wallet);
+
+  bbp::SimulationRoleMutationRequest invalid = wallet;
+  invalid.node_ids.clear();
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid = wallet;
+  invalid.node_ids.reserve(17U);
+  invalid.node_ids.clear();
+  for (std::size_t index = 0U; index < 17U; ++index) {
+    invalid.node_ids.push_back("firo-" + std::to_string(index + 1U));
+  }
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid = wallet;
+  invalid.node_ids = {"firo-1", "firo-1"};
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid = wallet;
+  invalid.node_ids = {"firo/1"};
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid = wallet;
+  invalid.timeout_sec = 0U;
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid = wallet;
+  invalid.timeout_sec = bbp::kSimulationRoleMutationMaximumTimeoutSeconds + 1U;
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+
+  invalid = wallet;
+  invalid.mode.reset();
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid = wallet;
+  invalid.funding_wallet_id = "firo-funder";
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+
+  invalid = wallet;
+  invalid.role = bbp::SimulationRoleKind::kMiner;
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid.mode.reset();
+  invalid.funding_wallet_id = "firo-funder";
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+
+  invalid = wallet;
+  invalid.role = bbp::SimulationRoleKind::kMasternode;
+  invalid.mode.reset();
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid.funding_wallet_id = "firo/funder";
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  invalid.funding_wallet_id = "firo-funder";
+  invalid.mode = bbp::WalletPrivacyMode::kPrivate;
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+
+  invalid = wallet;
+  invalid.role = bbp::SimulationRoleKind::kCount;
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+
+  invalid = wallet;
+  rejected(bbp::SimulationCommandKind::kRemoveRole, invalid);
+  invalid.mode.reset();
+  invalid.funding_wallet_id = "firo-funder";
+  rejected(bbp::SimulationCommandKind::kRemoveRole, invalid);
+
+  const bbp::SimulationRoleMutationRequest masternode{
+      .node_ids = {"firo-1"},
+      .role = bbp::SimulationRoleKind::kMasternode,
+      .mode = std::nullopt,
+      .funding_wallet_id = "firo-funder",
+      .timeout_sec = std::nullopt,
+  };
+  BOOST_CHECK_NO_THROW(bbp::ValidateSimulationRoleMutationRequest(
+      bbp::SimulationCommandKind::kAssignRole, masternode));
+
+  bbp::SimulationCommand wrong_target;
+  wrong_target.kind = bbp::SimulationCommandKind::kAssignRole;
+  wrong_target.node_id = "firo-1";
+  wrong_target.role_mutation = wallet;
+  wrong_target.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(wrong_target), std::exception);
+
+  bbp::SimulationCommand missing_payload;
+  missing_payload.kind = bbp::SimulationCommandKind::kRemoveRole;
+  missing_payload.node_id = "sim";
+  missing_payload.confirmed = true;
+  BOOST_CHECK_THROW(queue.PushRuntimeCommand(missing_payload), std::exception);
+  BOOST_TEST(!queue.TryPop());
+}
+
 BOOST_AUTO_TEST_CASE(simulation_command_queue_preserves_typed_mining_payloads) {
   bbp::SimulationCommandQueue queue;
   queue.PushBlockProductionPolicy(

@@ -59,6 +59,14 @@ struct McpLiveRoleService {
       operation;
 };
 
+// Translates one shared simulation command into exactly one authoritative
+// role-service operation and returns the generic role.assign/role.remove
+// result after the same normalization and secret redaction used by MCP.
+boost::json::object ExecuteAndNormalizeSimulationRoleMutation(
+    const McpLiveRoleService& service, std::string_view run_id,
+    SimulationCommandKind kind, const SimulationRoleMutationRequest& request,
+    std::stop_token stop_token);
+
 // Lifetime bridge between the embedded MCP endpoint and one simulator run.
 // Config references remain valid until the endpoint has stopped all request
 // and operation workers. mutex_ owns admission, shutdown, and MCP command
