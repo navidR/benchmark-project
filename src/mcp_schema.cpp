@@ -676,8 +676,6 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
           ArraySchema(IntegerSchema(1U), 1U, kMaximumSafeCollection, true);
       properties["receiver_wallets"] =
           ArraySchema(IntegerSchema(1U), 1U, kMaximumSafeCollection, true);
-      properties["wallets"] =
-          ArraySchema(IntegerSchema(1U), 1U, kMaximumSafeCollection, true);
       require({"amount", "fee"});
       break;
     case WorkloadKind::kCheckpoint:

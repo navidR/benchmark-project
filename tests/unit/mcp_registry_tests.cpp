@@ -2263,6 +2263,70 @@ BOOST_AUTO_TEST_CASE(
       runtime_output.at("properties").as_object().contains("removed_node_ids"));
 }
 
+BOOST_AUTO_TEST_CASE(
+    mcp_wallet_workload_schemas_omit_rejected_wallet_material) {
+  constexpr std::array<std::string_view, 6U> rejected_fields{
+      "wallets", "private_key",    "source_private_key",
+      "address", "source_address", "destination_address",
+  };
+  const auto require_wallet_schema = [&](const boost::json::object& schema,
+                                         std::string_view discriminator) {
+    const boost::json::object& wallet =
+        VariantWithConst(schema.at("oneOf").as_array(), discriminator,
+                         WorkloadKindName(WorkloadKind::kWalletTransactions));
+    const boost::json::object& properties = wallet.at("properties").as_object();
+    for (const std::string_view field : rejected_fields) {
+      BOOST_TEST(!properties.contains(field));
+    }
+    for (const std::string_view field :
+         {"strategy", "amount", "fee", "sender_wallets"}) {
+      BOOST_TEST(properties.contains(field));
+    }
+  };
+
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::object& scenario_properties =
+      scenario.at("properties").as_object();
+  require_wallet_schema(
+      scenario_properties.at("workloads").as_object().at("items").as_object(),
+      "type");
+  require_wallet_schema(
+      scenario_properties.at("events").as_object().at("items").as_object(),
+      "action");
+
+  constexpr std::array operations{
+      McpOperationKind::kStartWorkload,
+      McpOperationKind::kReconfigureWorkload,
+  };
+  const boost::json::array tools = BuildMcpToolRegistry(operations);
+  for (const McpOperationKind operation : operations) {
+    require_wallet_schema(
+        ObjectWithStringField(tools, "name", McpOperationKindName(operation))
+            .at("inputSchema")
+            .as_object()
+            .at("properties")
+            .as_object()
+            .at("workload")
+            .as_object(),
+        "type");
+  }
+
+  require_wallet_schema(BuildMcpResultSchema(McpResultFamily::kWorkload)
+                            .at("properties")
+                            .as_object()
+                            .at("configuration")
+                            .as_object(),
+                        "type");
+
+  const std::set<std::string> members =
+      StringSet(scenario.at("x-bbp-members").as_array());
+  for (const std::string_view field : rejected_fields) {
+    BOOST_TEST(!members.contains("workload.wallet_transactions." +
+                                 std::string(field)));
+  }
+  BOOST_TEST(members.contains("workload.wallet_transactions.amount"));
+}
+
 BOOST_AUTO_TEST_CASE(mcp_wallet_and_perf_schemas_preserve_production_types) {
   const boost::json::object wallet_send =
       BuildMcpScenarioObjectSchema(ScenarioObjectKind::kWalletSend);

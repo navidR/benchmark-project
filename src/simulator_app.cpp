@@ -3050,6 +3050,12 @@ ProfileSwitchWorkload ParseProfileSwitchWorkload(
   return workload;
 }
 
+bool IsRejectedWalletMaterialField(std::string_view field) {
+  return field == "wallets" || field == "private_key" ||
+         field == "source_private_key" || field == "address" ||
+         field == "source_address" || field == "destination_address";
+}
+
 void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
                                            WorkloadKind kind, bool scheduled) {
   const bool state_edge_action = kind == WorkloadKind::kActivateEdge ||
@@ -3062,7 +3068,9 @@ void RejectUnsupportedScenarioActionFields(const boost::json::object& object,
     const bool dedicated_rejection =
         (kind == WorkloadKind::kSetEdgeCondition &&
          member.key() == "timeout_sec") ||
-        (state_edge_action && IsTopologyEdgeConditionField(member.key()));
+        (state_edge_action && IsTopologyEdgeConditionField(member.key())) ||
+        (kind == WorkloadKind::kWalletTransactions &&
+         IsRejectedWalletMaterialField(member.key()));
     if (!structural && !dedicated_rejection &&
         !ScenarioWorkloadFieldAllowed(kind, member.key())) {
       throw std::runtime_error(
@@ -3816,12 +3824,11 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       scenario_workload.send_raw_transaction = transaction;
       options.workloads.push_back(scenario_workload);
     } else if (*kind == WorkloadKind::kWalletTransactions) {
-      if (workload.if_contains("wallets") != nullptr ||
-          workload.if_contains("private_key") != nullptr ||
-          workload.if_contains("source_private_key") != nullptr ||
-          workload.if_contains("address") != nullptr ||
-          workload.if_contains("source_address") != nullptr ||
-          workload.if_contains("destination_address") != nullptr) {
+      const bool wallet_material_present =
+          std::any_of(workload.begin(), workload.end(), [](const auto& member) {
+            return IsRejectedWalletMaterialField(member.key());
+          });
+      if (wallet_material_present) {
         throw std::runtime_error(
             "scenario wallet_transactions workload must use "
             "topology.wallet_initialization instead of wallet keys or "

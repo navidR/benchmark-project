@@ -340,9 +340,7 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
       "readiness_confirmations", "transaction_count", "transaction_rate",
       "duration", "concurrency", "queue_capacity", "mode", "amount", "interval",
       "fee_policy", "fee", "funding_threshold", "retained_balance_percentage",
-      "seed", "sender_wallets", "receiver_wallets", "timeout_sec", "wallets",
-      "private_key", "source_private_key", "address", "source_address",
-      "destination_address");
+      "seed", "sender_wallets", "receiver_wallets", "timeout_sec");
   static constexpr auto kCheckpoint = Fields("name");
   switch (kind) {
     case WorkloadKind::kBlockGeneration:
