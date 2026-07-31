@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <optional>
 #include <string_view>
 
@@ -31,6 +33,58 @@ enum class WorkloadKind {
   kCheckpoint,
   kCount,
 };
+
+inline constexpr std::array kLifecycleWorkloadKinds{
+    WorkloadKind::kBlockGeneration,
+    WorkloadKind::kWaitUntilHeight,
+    WorkloadKind::kWaitForPeers,
+    WorkloadKind::kWalletTransactions,
+};
+
+inline constexpr std::array kOneShotWorkloadKinds{
+    WorkloadKind::kConnectPeer,          WorkloadKind::kDisconnectPeer,
+    WorkloadKind::kRestartNode,          WorkloadKind::kFreezeNode,
+    WorkloadKind::kUpdateResourceLimits, WorkloadKind::kSetResourceProfile,
+    WorkloadKind::kSetNetworkProfile,    WorkloadKind::kResourcePressure,
+    WorkloadKind::kSetNetworkCondition,  WorkloadKind::kBlockNetworkFlow,
+    WorkloadKind::kUnblockNetworkFlow,   WorkloadKind::kPartitionNodes,
+    WorkloadKind::kHealPartition,        WorkloadKind::kSetEdgeCondition,
+    WorkloadKind::kActivateEdge,         WorkloadKind::kDeactivateEdge,
+    WorkloadKind::kRestoreEdge,          WorkloadKind::kSendRawTransaction,
+    WorkloadKind::kCheckpoint,
+};
+
+constexpr bool IsLifecycleWorkloadKind(WorkloadKind kind) {
+  for (const WorkloadKind candidate : kLifecycleWorkloadKinds) {
+    if (candidate == kind) {
+      return true;
+    }
+  }
+  return false;
+}
+
+constexpr bool IsOneShotWorkloadKind(WorkloadKind kind) {
+  for (const WorkloadKind candidate : kOneShotWorkloadKinds) {
+    if (candidate == kind) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static_assert(kLifecycleWorkloadKinds.size() + kOneShotWorkloadKinds.size() ==
+              static_cast<std::size_t>(WorkloadKind::kCount));
+static_assert([] {
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(WorkloadKind::kCount); ++index) {
+    const auto kind = static_cast<WorkloadKind>(index);
+    if (IsLifecycleWorkloadKind(kind) == IsOneShotWorkloadKind(kind)) {
+      return false;
+    }
+  }
+  return !IsLifecycleWorkloadKind(WorkloadKind::kCount) &&
+         !IsOneShotWorkloadKind(WorkloadKind::kCount);
+}());
 
 constexpr std::string_view WorkloadKindName(WorkloadKind kind) {
   switch (kind) {

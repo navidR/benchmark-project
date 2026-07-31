@@ -1949,6 +1949,24 @@ if(BUILD_TESTING)
     bbp-scenario-restart-node-snapshot-admission-production
     PROPERTIES TIMEOUT 60
   )
+  add_test(NAME bbp-mcp-raw-transaction-cancellation-production
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --mcp-raw-transaction-cancellation
+      $<TARGET_FILE:bbp>
+  )
+  set_tests_properties(
+    bbp-mcp-raw-transaction-cancellation-production
+    PROPERTIES TIMEOUT 60
+  )
+  add_test(NAME bbp-scenario-raw-transaction-recovery-production
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --scenario-raw-transaction-recovery
+      $<TARGET_FILE:bbp>
+  )
+  set_tests_properties(
+    bbp-scenario-raw-transaction-recovery-production
+    PROPERTIES TIMEOUT 60
+  )
   add_test(NAME bbp-tui-simulator-log-wrap
     COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
       --simulator-log-wrap

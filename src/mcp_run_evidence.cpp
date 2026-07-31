@@ -768,6 +768,12 @@ bool SafeReadableArtifact(const ArtifactEntry& entry) {
       !TextArtifactSuffix(entry.components.back())) {
     return false;
   }
+  if (entry.components.size() == 1U &&
+      (entry.components.front() == "source-scenario.json" ||
+       entry.components.front() == "resolved-scenario.json" ||
+       entry.components.front() == "scenario.yaml")) {
+    return false;
+  }
   for (const std::string& component : entry.components) {
     if (SensitiveArtifactName(component)) {
       return false;

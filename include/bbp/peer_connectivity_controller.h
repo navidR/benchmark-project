@@ -125,10 +125,12 @@ class PeerConnectivityController {
   std::vector<std::string> AllowedPeersFor(std::string_view node_id);
   void ConnectPeer(std::string_view node_id, std::string_view peer_node_id,
                    std::chrono::seconds timeout,
-                   std::stop_token stop_token = {});
+                   std::stop_token stop_token = {},
+                   const std::function<void()>& authorize_mutation = {});
   void DisconnectPeer(std::string_view node_id, std::string_view peer_node_id,
                       std::chrono::seconds timeout,
-                      std::stop_token stop_token = {});
+                      std::stop_token stop_token = {},
+                      const std::function<void()>& authorize_mutation = {});
 
  private:
   const ChainNodeConfig& FindNodeUnlocked(std::string_view node_id) const;
@@ -143,10 +145,10 @@ class PeerConnectivityController {
   void RequireUnambiguousPeerIdentity(const std::vector<ChainNodeConfig>& nodes,
                                       const ChainNodeConfig& node,
                                       std::stop_token stop_token) const;
-  void SetPeerConnectionState(const ChainNodeConfig& node,
-                              const std::string& endpoint, bool connected,
-                              std::chrono::seconds timeout,
-                              std::stop_token stop_token) const;
+  bool SetPeerConnectionState(
+      const ChainNodeConfig& node, const std::string& endpoint, bool connected,
+      std::chrono::seconds timeout, std::stop_token stop_token,
+      const std::function<void()>& authorize_mutation = {}) const;
   std::unique_lock<std::mutex> LockRpc(std::stop_token stop_token);
   std::uint64_t NextTopologyRestoreSequence();
   void Run(std::stop_token stop_token);

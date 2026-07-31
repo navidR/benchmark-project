@@ -644,6 +644,106 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_scenario_resources_and_reports_redact_private_signing_material) {
+  LiveApplicationDirectory temporary;
+  constexpr std::string_view kPrivateKeySentinel =
+      "mcp-private-signing-material-sentinel";
+  boost::json::object scenario = LiveScenario();
+  scenario["workloads"] = boost::json::array{boost::json::object{
+      {"type", "send_raw_transaction"},
+      {"funding_node", 1U},
+      {"submit_node", 1U},
+      {"source_address", "source-address"},
+      {"source_private_key", kPrivateKeySentinel},
+      {"destination_address", "destination-address"},
+      {"funding_blocks", 101U},
+      {"amount", "1.00000000"},
+      {"fee", "0.01000000"},
+      {"timeout_sec", 30U},
+  }};
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
+  const RunOwnership ownership =
+      CreateRunOwnership("live-application", temporary.path());
+  WriteRunOwnershipMarker(ownership);
+  WriteText(temporary.path() / "source-scenario.json",
+            boost::json::serialize(scenario) + "\n");
+  WriteText(temporary.path() / "resolved-scenario.json",
+            boost::json::serialize(scenario) + "\n");
+  WriteText(temporary.path() / "scenario.yaml",
+            "source_private_key: mcp-private-signing-material-sentinel\n");
+
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+
+  const boost::json::value source_resource = application.ResourceReader()(
+      McpInformationFamily::kSourceScenario, "live-session", std::stop_token{});
+  const boost::json::value resolved_resource =
+      application.ResourceReader()(McpInformationFamily::kResolvedScenario,
+                                   "live-session", std::stop_token{});
+  const boost::json::value report_resource = application.ResourceReader()(
+      McpInformationFamily::kReports, "live-session", std::stop_token{});
+  for (const boost::json::value* resource :
+       {&source_resource, &resolved_resource, &report_resource}) {
+    const std::string serialized = boost::json::serialize(*resource);
+    BOOST_TEST(serialized.find(kPrivateKeySentinel) == std::string::npos);
+    BOOST_TEST(serialized.find("\"source_private_key\":\"<redacted>\"") !=
+               std::string::npos);
+  }
+
+  for (const std::string_view name :
+       {"source-scenario.json", "resolved-scenario.json", "scenario.yaml"}) {
+    BOOST_TEST(ReadText(temporary.path() / name).find(kPrivateKeySentinel) !=
+               std::string::npos);
+  }
+
+  const boost::json::value inventory_resource = application.ResourceReader()(
+      McpInformationFamily::kArtifacts, "live-session", std::stop_token{});
+  const boost::json::array& entries = inventory_resource.as_object()
+                                          .at("data")
+                                          .as_object()
+                                          .at("entries")
+                                          .as_array();
+  for (const std::string_view expected_path :
+       {"source-scenario.json", "resolved-scenario.json", "scenario.yaml"}) {
+    const boost::json::object* selected = nullptr;
+    for (const boost::json::value& entry : entries) {
+      if (entry.as_object().at("relative_path").as_string() == expected_path) {
+        selected = &entry.as_object();
+        break;
+      }
+    }
+    BOOST_REQUIRE(selected != nullptr);
+    BOOST_TEST(!selected->at("readable").as_bool());
+    BOOST_CHECK_EXCEPTION(
+        ReadMcpRunArtifact(
+            "live-application", temporary.path(),
+            std::string_view(selected->at("artifact_id").as_string()), 0U, 64U),
+        std::runtime_error, [](const std::runtime_error& error) {
+          return std::string(error.what())
+                     .find("not safe for public retrieval") !=
+                 std::string::npos;
+        });
+  }
+
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_node_add_reports_progress_exact_inventory_and_generic_parity) {
   LiveApplicationDirectory temporary;
   const auto options =
@@ -1849,6 +1949,8 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kStopRun) == supported.end());
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
+                        McpOperationKind::kInvokeWorkload) == supported.end());
+  BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kReadArtifact) == supported.end());
   BOOST_CHECK(std::find(supported.begin(), supported.end(),
                         McpOperationKind::kCreateSubscription) ==
@@ -2360,7 +2462,7 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
-    mcp_live_wallet_workload_operations_route_one_stable_lifecycle) {
+    mcp_live_workload_operations_separate_one_shot_and_retained_lifecycle) {
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -2385,7 +2487,8 @@ BOOST_AUTO_TEST_CASE(
   const std::vector<McpOperationKind> advertised_before_service =
       application.SupportedOperations();
   for (const McpOperationKind operation :
-       {McpOperationKind::kStartWorkload, McpOperationKind::kInspectWorkload,
+       {McpOperationKind::kInvokeWorkload, McpOperationKind::kStartWorkload,
+        McpOperationKind::kInspectWorkload,
         McpOperationKind::kReconfigureWorkload,
         McpOperationKind::kPauseWorkload, McpOperationKind::kResumeWorkload,
         McpOperationKind::kStopWorkload}) {
@@ -2401,6 +2504,8 @@ BOOST_AUTO_TEST_CASE(
   std::string terminal_outcome = "none";
   std::uint64_t revision = 1U;
   std::uint64_t submitted = 8U;
+  std::uint32_t service_calls = 0U;
+  std::string invoked_type;
   const boost::json::object configuration{{"type", "wallet_transactions"},
                                           {"strategy", "random_bruteforce"},
                                           {"retained_balance_percentage", 80.0},
@@ -2433,13 +2538,23 @@ BOOST_AUTO_TEST_CASE(
                                {"accounting", std::move(accounting)}};
   };
   auto service = std::make_shared<McpLiveWorkloadService>();
-  service->operation = [&](McpOperationKind kind, const boost::json::object&,
+  service->operation = [&](McpOperationKind kind,
+                           const boost::json::object& arguments,
                            std::stop_token stop_token) {
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
     std::lock_guard<std::mutex> lock(state_mutex);
+    ++service_calls;
     switch (kind) {
+      case McpOperationKind::kInvokeWorkload:
+        invoked_type = std::string(
+            arguments.at("workload").as_object().at("type").as_string());
+        return boost::json::object{{"result_family", "workload_invocation"},
+                                   {"run_id", "live-application"},
+                                   {"invocation_id", "invocation-1"},
+                                   {"action", invoked_type},
+                                   {"state", "completed"}};
       case McpOperationKind::kStartWorkload:
       case McpOperationKind::kInspectWorkload:
         break;
@@ -2486,10 +2601,47 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(terminal.at("state").as_string() == "succeeded");
     return terminal.at("terminal_result").as_object();
   };
+  const boost::json::object invoked = invoke_workload(
+      "workload.invoke",
+      boost::json::object{
+          {"workload", boost::json::object{{"type", "checkpoint"},
+                                           {"name", "mcp-checkpoint"}}}});
+  BOOST_TEST(invoked.at("result_family").as_string() == "workload_invocation");
+  BOOST_TEST(invoked.at("run_id").as_string() == "live-application");
+  BOOST_TEST(invoked.at("invocation_id").as_string() == "invocation-1");
+  BOOST_TEST(invoked.at("action").as_string() == "checkpoint");
+  BOOST_TEST(invoked.at("state").as_string() == "completed");
+  BOOST_TEST(!invoked.contains("workload_id"));
+  BOOST_TEST(!invoked.contains("configuration"));
+  {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    BOOST_TEST(invoked_type == "checkpoint");
+    BOOST_TEST(service_calls == 1U);
+  }
+  try {
+    static_cast<void>(Invoke(
+        &dispatcher, "workload.invoke",
+        boost::json::object{
+            {"run_id", "live-application"},
+            {"workload", boost::json::object{{"type", "block_generation"},
+                                             {"node", 1U},
+                                             {"count", 1U},
+                                             {"sync_timeout_sec", 30U}}}}));
+    BOOST_FAIL("workload.invoke admitted a retained lifecycle workload");
+  } catch (const McpOperationFailure& failure) {
+    BOOST_TEST(failure.code() == "workload_not_one_shot");
+    BOOST_TEST(!failure.retryable());
+  }
+  {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    BOOST_TEST(service_calls == 1U);
+  }
+
   const boost::json::object started =
       invoke_workload("workload.start",
                       boost::json::object{{"workload_id", "wallet-workload-1"},
                                           {"workload", configuration}});
+  BOOST_TEST(started.at("result_family").as_string() == "workload");
   BOOST_TEST(started.at("workload_id").as_string() == "wallet-workload-1");
   BOOST_TEST(
       started.at("accounting").as_object().at("outstanding").as_uint64() == 1U);

@@ -30,9 +30,12 @@ struct McpLiveNodeInventorySnapshot {
   std::vector<std::string> node_ids;
 };
 
-// Simulator-owned workload lifecycle service. MCP supplies typed arguments and
-// cancellation; the service owns validation, execution, stable identities,
-// state, and accounting shared with scenario/TUI reporting.
+// Simulator-owned workload service. MCP supplies typed arguments and
+// cancellation; the service owns validation and execution shared with the
+// scenario/TUI paths. Lifecycle operations additionally own retained workload
+// identity, state, and accounting; one-shot invocation owns only its terminal
+// invocation identity, returns its complete typed result, and remains
+// unregistered.
 struct McpLiveWorkloadService {
   std::function<boost::json::object(
       McpOperationKind, const boost::json::object&, std::stop_token)>

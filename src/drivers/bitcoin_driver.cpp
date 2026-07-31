@@ -208,7 +208,8 @@ ChainUtxo BitcoinDriver::FindSpendableOutput(const ChainNodeConfig&,
 ChainRawTransactionResult BitcoinDriver::SendRawTransaction(
     const ChainNodeConfig&, const ChainUtxo&, const std::string&,
     const std::string&, const std::string&, std::uint64_t, std::uint64_t,
-    std::chrono::seconds, std::stop_token stop_token) const {
+    std::chrono::seconds, std::stop_token stop_token,
+    const ChainRawTransactionBroadcastControl*) const {
   Unsupported(stop_token, "raw transaction submission");
 }
 

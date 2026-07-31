@@ -13,11 +13,13 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stop_token>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -33,7 +35,8 @@ std::vector<std::string> ServeRpcResponses(
     boost::asio::ip::tcp::acceptor& acceptor,
     const std::vector<std::string>& responses,
     std::vector<boost::json::value>* requests = nullptr,
-    const std::vector<unsigned>* response_statuses = nullptr) {
+    const std::vector<unsigned>* response_statuses = nullptr,
+    const std::function<void(std::string_view)>& request_observer = {}) {
   namespace beast = boost::beast;
   namespace http = beast::http;
   std::vector<std::string> methods;
@@ -46,6 +49,9 @@ std::vector<std::string> ServeRpcResponses(
     http::read(socket, buffer, request);
     const boost::json::value request_json = boost::json::parse(request.body());
     methods.emplace_back(request_json.as_object().at("method").as_string());
+    if (request_observer) {
+      request_observer(methods.back());
+    }
     if (requests != nullptr) {
       requests->push_back(request_json);
     }
@@ -2411,4 +2417,322 @@ BOOST_AUTO_TEST_CASE(firo_finds_spendable_output_with_boolean_getblock_mode) {
   BOOST_TEST(parameters[1].as_bool());
   BOOST_CHECK(!parameters[1].is_int64());
   BOOST_CHECK(!parameters[1].is_uint64());
+}
+
+BOOST_AUTO_TEST_CASE(firo_raw_transaction_broadcast_callbacks_bracket_rpc) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":"raw-hex","error":null,"id":"bbp"})",
+      R"({"result":{"complete":true,"hex":"signed-hex"},"error":null,"id":"bbp"})",
+      R"({"result":"broadcast-tx","error":null,"id":"bbp"})",
+      R"({"result":101,"error":null,"id":"bbp"})",
+      R"({"result":["broadcast-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"txid":"broadcast-tx"},"error":null,"id":"bbp"})"};
+  std::mutex events_mutex;
+  std::vector<std::string> events;
+  const auto record_event = [&](std::string event) {
+    const std::scoped_lock lock(events_mutex);
+    events.push_back(std::move(event));
+  };
+  const std::function<void(std::string_view)> observe_request =
+      [&](std::string_view method) {
+        record_event("rpc:" + std::string(method));
+      };
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr, nullptr,
+                                 observe_request);
+      });
+
+  bbp::FiroNodeConfig config;
+  config.id = "raw-broadcast-callback-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  const bbp::FiroUtxo utxo{
+      .txid = "funding-tx",
+      .vout = 1U,
+      .amount_satoshis = 200000000ULL,
+      .amount = "2.00000000",
+      .script_pub_key = "51",
+      .block_hash = "funding-block",
+      .confirmations = 101U,
+  };
+  std::string callback_txid;
+  std::uint64_t callback_mempool_size = 1U;
+  bool deterministic_rejection = false;
+  bbp::ChainRawTransactionBroadcastControl broadcast_control;
+  broadcast_control.before_broadcast = [&] {
+    record_event("before_broadcast");
+  };
+  broadcast_control.after_broadcast =
+      [&](const bbp::ChainRawTransactionResult& result) {
+        callback_txid = result.txid;
+        callback_mempool_size = result.mempool_size;
+        record_event("after_broadcast:" + result.txid);
+      };
+  broadcast_control.deterministic_rejection = [&] {
+    deterministic_rejection = true;
+    record_event("deterministic_rejection");
+  };
+
+  const bbp::FiroRawTransactionResult result = driver.SendRawTransaction(
+      config, utxo, "source-address", "source-private-key",
+      "destination-address", 100000000ULL, 1000ULL, std::chrono::seconds(1), {},
+      &broadcast_control);
+  const std::vector<std::string> methods = served.get();
+
+  const std::vector<std::string> expected_events = {
+      "rpc:createrawtransaction",
+      "rpc:signrawtransaction",
+      "before_broadcast",
+      "rpc:sendrawtransaction",
+      "after_broadcast:broadcast-tx",
+      "rpc:getblockcount",
+      "rpc:getrawmempool",
+      "rpc:getrawtransaction",
+  };
+  BOOST_TEST(events == expected_events, boost::test_tools::per_element());
+  BOOST_TEST(callback_txid == "broadcast-tx");
+  BOOST_TEST(callback_mempool_size == 0U);
+  BOOST_TEST(!deterministic_rejection);
+  BOOST_TEST(result.txid == "broadcast-tx");
+  BOOST_TEST(result.mempool_size == 1U);
+  BOOST_REQUIRE_EQUAL(methods.size(), expected_events.size() - 2U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_raw_transaction_deterministic_rejection_skips_acceptance_callback) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":"raw-hex","error":null,"id":"bbp"})",
+      R"({"result":{"complete":true,"hex":"signed-hex"},"error":null,"id":"bbp"})",
+      R"({"result":null,"error":{"code":-26,"message":"mandatory-script-verify-flag-failed"},"id":"bbp"})"};
+  const std::vector<unsigned> response_statuses = {200U, 200U, 500U};
+  std::mutex events_mutex;
+  std::vector<std::string> events;
+  const auto record_event = [&](std::string event) {
+    const std::scoped_lock lock(events_mutex);
+    events.push_back(std::move(event));
+  };
+  const std::function<void(std::string_view)> observe_request =
+      [&](std::string_view method) {
+        record_event("rpc:" + std::string(method));
+      };
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr,
+                                 &response_statuses, observe_request);
+      });
+
+  bbp::FiroNodeConfig config;
+  config.id = "raw-broadcast-rejection-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  const bbp::FiroUtxo utxo{
+      .txid = "funding-tx",
+      .vout = 1U,
+      .amount_satoshis = 200000000ULL,
+      .amount = "2.00000000",
+      .script_pub_key = "51",
+      .block_hash = "funding-block",
+      .confirmations = 101U,
+  };
+  bool after_broadcast = false;
+  bool deterministic_rejection = false;
+  bbp::ChainRawTransactionBroadcastControl broadcast_control;
+  broadcast_control.before_broadcast = [&] {
+    record_event("before_broadcast");
+  };
+  broadcast_control.after_broadcast =
+      [&](const bbp::ChainRawTransactionResult&) {
+        after_broadcast = true;
+        record_event("after_broadcast");
+      };
+  broadcast_control.deterministic_rejection = [&] {
+    deterministic_rejection = true;
+    record_event("deterministic_rejection");
+  };
+
+  BOOST_CHECK_THROW(driver.SendRawTransaction(
+                        config, utxo, "source-address", "source-private-key",
+                        "destination-address", 100000000ULL, 1000ULL,
+                        std::chrono::seconds(1), {}, &broadcast_control),
+                    std::runtime_error);
+  const std::vector<std::string> methods = served.get();
+
+  const std::vector<std::string> expected_events = {
+      "rpc:createrawtransaction", "rpc:signrawtransaction",  "before_broadcast",
+      "rpc:sendrawtransaction",   "deterministic_rejection",
+  };
+  BOOST_TEST(events == expected_events, boost::test_tools::per_element());
+  BOOST_TEST(!after_broadcast);
+  BOOST_TEST(deterministic_rejection);
+  BOOST_REQUIRE_EQUAL(methods.size(), 3U);
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_raw_transaction_already_in_chain_is_not_deterministic_rejection) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":"raw-hex","error":null,"id":"bbp"})",
+      R"({"result":{"complete":true,"hex":"signed-hex"},"error":null,"id":"bbp"})",
+      R"({"result":null,"error":{"code":-27,"message":"transaction already in block chain"},"id":"bbp"})"};
+  const std::vector<unsigned> response_statuses = {200U, 200U, 500U};
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr,
+                                 &response_statuses);
+      });
+
+  bbp::FiroNodeConfig config;
+  config.id = "raw-broadcast-already-in-chain-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  const bbp::FiroUtxo utxo{
+      .txid = "funding-tx",
+      .vout = 1U,
+      .amount_satoshis = 200000000ULL,
+      .amount = "2.00000000",
+      .script_pub_key = "51",
+      .block_hash = "funding-block",
+      .confirmations = 101U,
+  };
+  bool before_broadcast = false;
+  bool after_broadcast = false;
+  bool deterministic_rejection = false;
+  bbp::ChainRawTransactionBroadcastControl broadcast_control;
+  broadcast_control.before_broadcast = [&] { before_broadcast = true; };
+  broadcast_control.after_broadcast =
+      [&](const bbp::ChainRawTransactionResult&) { after_broadcast = true; };
+  broadcast_control.deterministic_rejection = [&] {
+    deterministic_rejection = true;
+  };
+
+  BOOST_CHECK_THROW(driver.SendRawTransaction(
+                        config, utxo, "source-address", "source-private-key",
+                        "destination-address", 100000000ULL, 1000ULL,
+                        std::chrono::seconds(1), {}, &broadcast_control),
+                    std::runtime_error);
+  const std::vector<std::string> methods = served.get();
+
+  const std::vector<std::string> expected_methods = {
+      "createrawtransaction",
+      "signrawtransaction",
+      "sendrawtransaction",
+  };
+  BOOST_TEST(methods == expected_methods, boost::test_tools::per_element());
+  BOOST_TEST(before_broadcast);
+  BOOST_TEST(!after_broadcast);
+  BOOST_TEST(!deterministic_rejection);
+}
+
+BOOST_AUTO_TEST_CASE(
+    firo_raw_transaction_rejects_empty_txid_before_acceptance_callback) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":"raw-hex","error":null,"id":"bbp"})",
+      R"({"result":{"complete":true,"hex":"signed-hex"},"error":null,"id":"bbp"})",
+      R"({"result":"","error":null,"id":"bbp"})"};
+  std::mutex events_mutex;
+  std::vector<std::string> events;
+  const auto record_event = [&](std::string event) {
+    const std::scoped_lock lock(events_mutex);
+    events.push_back(std::move(event));
+  };
+  const std::function<void(std::string_view)> observe_request =
+      [&](std::string_view method) {
+        record_event("rpc:" + std::string(method));
+      };
+  std::future<std::vector<std::string>> served =
+      std::async(std::launch::async, [&] {
+        return ServeRpcResponses(acceptor, responses, nullptr, nullptr,
+                                 observe_request);
+      });
+
+  bbp::FiroNodeConfig config;
+  config.id = "raw-broadcast-empty-txid-test";
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  const bbp::FiroUtxo utxo{
+      .txid = "funding-tx",
+      .vout = 1U,
+      .amount_satoshis = 200000000ULL,
+      .amount = "2.00000000",
+      .script_pub_key = "51",
+      .block_hash = "funding-block",
+      .confirmations = 101U,
+  };
+  bool after_broadcast = false;
+  bool deterministic_rejection = false;
+  bbp::ChainRawTransactionBroadcastControl broadcast_control;
+  broadcast_control.before_broadcast = [&] {
+    record_event("before_broadcast");
+  };
+  broadcast_control.after_broadcast =
+      [&](const bbp::ChainRawTransactionResult&) {
+        after_broadcast = true;
+        record_event("after_broadcast");
+      };
+  broadcast_control.deterministic_rejection = [&] {
+    deterministic_rejection = true;
+    record_event("deterministic_rejection");
+  };
+
+  BOOST_CHECK_EXCEPTION(
+      driver.SendRawTransaction(config, utxo, "source-address",
+                                "source-private-key", "destination-address",
+                                100000000ULL, 1000ULL, std::chrono::seconds(1),
+                                {}, &broadcast_control),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "Firo sendrawtransaction returned an empty txid";
+      });
+  const std::vector<std::string> methods = served.get();
+
+  const std::vector<std::string> expected_events = {
+      "rpc:createrawtransaction",
+      "rpc:signrawtransaction",
+      "before_broadcast",
+      "rpc:sendrawtransaction",
+  };
+  BOOST_TEST(events == expected_events, boost::test_tools::per_element());
+  BOOST_TEST(!after_broadcast);
+  BOOST_TEST(!deterministic_rejection);
+  BOOST_REQUIRE_EQUAL(methods.size(), 3U);
 }

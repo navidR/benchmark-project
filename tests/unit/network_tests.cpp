@@ -649,7 +649,7 @@ BOOST_AUTO_TEST_CASE(directional_netlink_reports_a_failed_rollback) {
           topology->namespace_fd(), topology->config().peer_name, {},
           {DelayPolicy()});
       BOOST_FAIL("injected rollback failure did not fail the update");
-    } catch (const std::runtime_error& error) {
+    } catch (const bbp::DirectionalNetworkPolicyOutcomeUnconfirmed& error) {
       failure = error.what();
     }
   }
@@ -662,6 +662,32 @@ BOOST_AUTO_TEST_CASE(directional_netlink_reports_a_failed_rollback) {
       bbp::ListQdiscsInNamespace(topology->namespace_fd());
   BOOST_TEST(HasQdiscHandle(after, topology->config().peer_name,
                             kDirectionalRootHandle));
+}
+
+BOOST_AUTO_TEST_CASE(
+    directional_netlink_preserves_cancellation_after_verified_rollback) {
+  std::optional<ScopedNamespaceVeth> topology;
+  try {
+    topology.emplace();
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged cancellation rollback test: " << error.what());
+      return;
+    }
+    throw;
+  }
+
+  std::stop_source stop_source;
+  stop_source.request_stop();
+  BOOST_CHECK_THROW(bbp::UpdateDirectionalNetworkPoliciesInNamespace(
+                        topology->namespace_fd(), topology->config().peer_name,
+                        {}, {DelayPolicy()}, stop_source.get_token()),
+                    bbp::SimulationCancelled);
+  const std::vector<bbp::QdiscInfo> after =
+      bbp::ListQdiscsInNamespace(topology->namespace_fd());
+  BOOST_TEST(!HasQdiscHandle(after, topology->config().peer_name,
+                             kDirectionalRootHandle));
 }
 
 BOOST_AUTO_TEST_CASE(main_thread_never_enters_a_node_network_namespace) {

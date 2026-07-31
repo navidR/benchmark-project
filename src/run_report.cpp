@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/json_secret_redaction.h"
 #include "bbp/mcp_operation_service.h"
 #include "bbp/mcp_registry.h"
 #include "bbp/operator_command_status.h"
@@ -1427,6 +1428,7 @@ void LoadResolvedScenario(const std::filesystem::path& path,
     throw std::runtime_error("resolved scenario is not a JSON object: " +
                              path.string());
   }
+  RedactPrivateSigningMaterial(&value);
   const boost::json::object& scenario = value.as_object();
   CopyField(scenario, "run_id", report);
   CopyField(scenario, "simulation", report);

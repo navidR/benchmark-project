@@ -166,7 +166,8 @@ class TestChainDriver final : public bbp::ChainDriver {
   bbp::ChainRawTransactionResult SendRawTransaction(
       const bbp::ChainNodeConfig&, const bbp::ChainUtxo&, const std::string&,
       const std::string&, const std::string&, std::uint64_t, std::uint64_t,
-      std::chrono::seconds, std::stop_token) const override {
+      std::chrono::seconds, std::stop_token,
+      const bbp::ChainRawTransactionBroadcastControl*) const override {
     return {};
   }
   bbp::ChainWalletTransactionResult SendWalletTransaction(
@@ -1118,6 +1119,30 @@ BOOST_AUTO_TEST_CASE(
   driver.ReleaseConnectedWait();
   mutation.join();
   controller.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(
+    peer_connectivity_controller_authorizes_before_physical_mutation) {
+  TestChainDriver driver;
+  bbp::PeerConnectivityController controller(
+      driver, TestNodes(), {}, FullAllowedPeers(), std::chrono::milliseconds(5),
+      [](std::string_view) { return true; },
+      [](std::string_view, std::string_view, bbp::PeerConnectivityAction,
+         const bbp::PeerCountPolicy&) {},
+      [](std::string_view, std::string_view) {});
+
+  std::uint32_t authorization_count = 0U;
+  BOOST_CHECK_THROW(
+      controller.ConnectPeer("node-1", "node-2", std::chrono::seconds(1), {},
+                             [&] {
+                               ++authorization_count;
+                               throw bbp::SimulationCancelled();
+                             }),
+      bbp::SimulationCancelled);
+
+  BOOST_TEST(authorization_count == 1U);
+  BOOST_TEST(!driver.IsConnected("node-1", "10.0.0.2:18001"));
+  BOOST_TEST(driver.DisconnectCallCount() == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(

@@ -86,12 +86,11 @@ McpOperationExecutor StatsReentrantStopExecutor(
     std::atomic<bool>* callback_completed) {
   return [service, callback_ready,
           callback_completed](McpOperationContext& context) {
-    std::stop_callback on_stop(context.stop_token(),
-                               [service, callback_completed] {
-                                 static_cast<void>(service->Stats());
-                                 callback_completed->store(
-                                     true, std::memory_order_release);
-                               });
+    std::stop_callback on_stop(
+        context.stop_token(), [service, callback_completed] {
+          static_cast<void>(service->Stats());
+          callback_completed->store(true, std::memory_order_release);
+        });
     callback_ready->store(true, std::memory_order_release);
     while (!context.stop_requested()) {
       std::this_thread::yield();
@@ -102,8 +101,7 @@ McpOperationExecutor StatsReentrantStopExecutor(
 }
 
 McpEvidenceRecord Evidence(McpInformationFamily family, std::string node_id,
-                           std::string message,
-                           std::string run_id = "run-a") {
+                           std::string message, std::string run_id = "run-a") {
   return McpEvidenceRecord{.run_id = std::move(run_id),
                            .family = family,
                            .sequence = 0U,
@@ -309,11 +307,15 @@ BOOST_AUTO_TEST_CASE(mcp_operation_failure_retains_typed_bounded_error) {
       "session-a", McpOperationKind::kValidateScenario, 2U,
       [](McpOperationContext& context) -> McpTypedResult {
         context.ReportProgress(1U);
-        throw McpOperationFailure(
-            "rpc_unavailable", "daemon RPC did not become ready", true,
-            boost::json::array{boost::json::object{
-                {"code", "rpc_timeout"},
-                {"message", "readiness deadline expired"}}});
+        throw McpOperationFailure("rpc_unavailable",
+                                  "daemon RPC did not become ready", true,
+                                  boost::json::array{boost::json::object{
+                                      {"code", "rpc_timeout"},
+                                      {"message", "readiness deadline expired"},
+                                      {"node_id", "firo-1"},
+                                      {"action", "restart_node"},
+                                      {"state", "indeterminate"},
+                                      {"phase", "replacement_ready"}}});
       });
   const McpOperationSnapshot terminal =
       WaitForTerminal(&service, "session-a", submitted.operation_id);
@@ -323,6 +325,9 @@ BOOST_AUTO_TEST_CASE(mcp_operation_failure_retains_typed_bounded_error) {
   BOOST_TEST(terminal.error->code == "rpc_unavailable");
   BOOST_TEST(terminal.error->retryable);
   BOOST_TEST(terminal.error->diagnostics.size() == 1U);
+  BOOST_TEST(
+      terminal.error->diagnostics.front().as_object().at("phase").as_string() ==
+      "replacement_ready");
   const boost::json::object snapshot_json = McpOperationSnapshotJson(terminal);
   BOOST_TEST(
       snapshot_json.at("terminal_error").as_object().at("code").as_string() ==
@@ -809,10 +814,10 @@ BOOST_AUTO_TEST_CASE(mcp_cancel_stop_callback_can_reenter_stats) {
   std::atomic<bool> callback_completed = false;
   McpOperationService service;
   service.RegisterSession("session-a");
-  const McpOperationSnapshot submitted = service.Submit(
-      "session-a", McpOperationKind::kValidateScenario, 1U,
-      StatsReentrantStopExecutor(&service, &callback_ready,
-                                 &callback_completed));
+  const McpOperationSnapshot submitted =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     StatsReentrantStopExecutor(&service, &callback_ready,
+                                                &callback_completed));
   const auto ready_deadline = std::chrono::steady_clock::now() + 2s;
   while (!callback_ready.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < ready_deadline) {
@@ -924,11 +929,12 @@ BOOST_AUTO_TEST_CASE(
   SetAtomicBoolOnExit release_terminal_delivery_on_exit{
       &release_terminal_delivery};
   service.RegisterSession("session-a");
-  const McpOperationSnapshot first = service.Submit(
-      "session-a", McpOperationKind::kValidateScenario, 1U,
-      [](McpOperationContext&) { return ValidationResult(); });
-  BOOST_CHECK(WaitForTerminal(&service, "session-a", first.operation_id).state ==
-              McpOperationState::kSucceeded);
+  const McpOperationSnapshot first =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) { return ValidationResult(); });
+  BOOST_CHECK(
+      WaitForTerminal(&service, "session-a", first.operation_id).state ==
+      McpOperationState::kSucceeded);
   BOOST_REQUIRE(terminal_delivery_started.load(std::memory_order_acquire));
   BOOST_CHECK_THROW(
       service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
@@ -944,8 +950,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(terminal_handler_returning.load(std::memory_order_acquire));
   std::optional<McpOperationSnapshot> replacement;
   const auto eviction_deadline = std::chrono::steady_clock::now() + 2s;
-  while (!replacement &&
-         std::chrono::steady_clock::now() < eviction_deadline) {
+  while (!replacement && std::chrono::steady_clock::now() < eviction_deadline) {
     try {
       replacement = service.Submit(
           "session-a", McpOperationKind::kValidateScenario, 1U,
@@ -955,8 +960,9 @@ BOOST_AUTO_TEST_CASE(
     }
   }
   BOOST_REQUIRE(static_cast<bool>(replacement));
-  BOOST_CHECK(WaitForTerminal(&service, "session-a", replacement->operation_id)
-                  .state == McpOperationState::kSucceeded);
+  BOOST_CHECK(
+      WaitForTerminal(&service, "session-a", replacement->operation_id).state ==
+      McpOperationState::kSucceeded);
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -1006,9 +1012,9 @@ BOOST_AUTO_TEST_CASE(
                              .node_ids = {},
                              .cursor = 0U});
 
-  const McpOperationSnapshot first = service.Submit(
-      "session-a", McpOperationKind::kValidateScenario, 1U,
-      [](McpOperationContext&) { return ValidationResult(); });
+  const McpOperationSnapshot first =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) { return ValidationResult(); });
   const auto delivery_deadline = std::chrono::steady_clock::now() + 2s;
   while (!first_terminal_delivery_started.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < delivery_deadline) {
@@ -1022,11 +1028,12 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(service.GetOperation("session-a", first.operation_id).state ==
               McpOperationState::kSucceeded);
 
-  const McpOperationSnapshot second = service.Submit(
-      "session-a", McpOperationKind::kValidateScenario, 1U,
-      [](McpOperationContext&) { return ValidationResult(); });
-  BOOST_CHECK(WaitForTerminal(&service, "session-a", second.operation_id).state ==
-              McpOperationState::kSucceeded);
+  const McpOperationSnapshot second =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) { return ValidationResult(); });
+  BOOST_CHECK(
+      WaitForTerminal(&service, "session-a", second.operation_id).state ==
+      McpOperationState::kSucceeded);
 
   // Two operation keys and one subscription key exhaust maximum_pending.
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "fill"));
@@ -1064,9 +1071,9 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(terminal_sequences[1] != terminal_sequences.front());
   }
 
-  const McpOperationSnapshot replacement = service.Submit(
-      "session-a", McpOperationKind::kValidateScenario, 1U,
-      [](McpOperationContext&) { return ValidationResult(); });
+  const McpOperationSnapshot replacement =
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) { return ValidationResult(); });
   BOOST_CHECK_THROW(service.GetOperation("session-a", first.operation_id),
                     std::runtime_error);
   BOOST_CHECK(service.GetOperation("session-a", second.operation_id).state ==
@@ -1106,9 +1113,9 @@ BOOST_AUTO_TEST_CASE(
       });
   service_pointer = &service;
   service.RegisterSession("session-a");
-  static_cast<void>(service.Submit(
-      "session-a", McpOperationKind::kValidateScenario, 1U,
-      [](McpOperationContext&) { return ValidationResult(); }));
+  static_cast<void>(
+      service.Submit("session-a", McpOperationKind::kValidateScenario, 1U,
+                     [](McpOperationContext&) { return ValidationResult(); }));
 
   const auto deadline = std::chrono::steady_clock::now() + 2s;
   while (!first_shutdown_returned.load(std::memory_order_acquire) &&
@@ -1147,8 +1154,7 @@ BOOST_AUTO_TEST_CASE(mcp_operation_callbacks_never_run_under_service_lock) {
           while (!release_terminal_delivery.load(std::memory_order_acquire)) {
             std::this_thread::yield();
           }
-        } else if (notification.method ==
-                   kMcpSubscriptionUpdatedNotification) {
+        } else if (notification.method == kMcpSubscriptionUpdatedNotification) {
           subscription_delivered.store(true, std::memory_order_release);
         }
       });
@@ -1187,8 +1193,7 @@ BOOST_AUTO_TEST_CASE(mcp_operation_callbacks_never_run_under_service_lock) {
   BOOST_TEST(!subscription_delivered.load(std::memory_order_acquire));
 
   release_terminal_delivery.store(true, std::memory_order_release);
-  const auto subscription_deadline =
-      std::chrono::steady_clock::now() + 2s;
+  const auto subscription_deadline = std::chrono::steady_clock::now() + 2s;
   while (!subscription_delivered.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < subscription_deadline) {
     std::this_thread::yield();
@@ -1242,8 +1247,8 @@ BOOST_AUTO_TEST_CASE(
   service.Publish(Evidence(McpInformationFamily::kEvents, "node-1", "wrong"));
   service.Publish(
       Evidence(McpInformationFamily::kMetrics, "node-2", "wrong-node"));
-  service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1",
-                           "wrong-run", "run-b"));
+  service.Publish(
+      Evidence(McpInformationFamily::kMetrics, "node-1", "wrong-run", "run-b"));
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "one"));
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "two"));
   service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1", "three"));

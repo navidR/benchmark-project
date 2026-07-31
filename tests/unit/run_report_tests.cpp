@@ -1642,6 +1642,8 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_peer_churn_events) {
 
 BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
   const std::filesystem::path dir = MakeTestDir("run-report-raw-tx");
+  constexpr std::string_view kPrivateKeySentinel =
+      "raw-transaction-private-key-sentinel";
   bbp::WriteText(
       dir / "resolved-scenario.json",
       "{\"run_id\":\"r1\",\"chain\":\"firo\",\"nodes\":1,"
@@ -1650,7 +1652,7 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
       "\"submit_node\":1,"
       "\"source_address\":\"TEDbE9M6woLAtvxKoFitLpFgeDHFicgTA2\","
       "\"source_private_key\":"
-      "\"cTpB4YiyKiBcPxnefsDpbnDxFDffjqJob8wGCEDXxgQ7zQoMXJdH\","
+      "\"raw-transaction-private-key-sentinel\","
       "\"destination_address\":\"TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh\","
       "\"funding_blocks\":101,\"amount\":\"39.99000000\","
       "\"fee\":\"0.01000000\",\"timeout_sec\":30}]}\n");
@@ -1681,8 +1683,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
                   "{\"run_id\":\"r1\",\"node_id\":\"sim\","
                   "\"event\":\"run_finished\"}");
 
-  const boost::json::value value =
-      boost::json::parse(bbp::BuildRunReportJson(dir));
+  const std::string report_json = bbp::BuildRunReportJson(dir);
+  BOOST_TEST(report_json.find(kPrivateKeySentinel) == std::string::npos);
+  const boost::json::value value = boost::json::parse(report_json);
   const boost::json::object& report = value.as_object();
 
   BOOST_TEST(report.at("ok").as_bool());
@@ -1690,6 +1693,9 @@ BOOST_AUTO_TEST_CASE(run_report_summarizes_raw_transaction_events) {
   BOOST_REQUIRE_EQUAL(workloads.size(), 1U);
   BOOST_TEST(workloads.front().as_object().at("type").as_string() ==
              "send_raw_transaction");
+  BOOST_TEST(
+      workloads.front().as_object().at("source_private_key").as_string() ==
+      "<redacted>");
   const boost::json::array& transactions =
       report.at("raw_transactions").as_array();
   BOOST_REQUIRE_EQUAL(transactions.size(), 1U);

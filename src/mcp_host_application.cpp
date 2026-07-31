@@ -45,6 +45,7 @@ constexpr std::array kHostOperations = {
     McpOperationKind::kAddMasternode,
     McpOperationKind::kRemoveMasternode,
     McpOperationKind::kRestartMasternode,
+    McpOperationKind::kInvokeWorkload,
     McpOperationKind::kStartWorkload,
     McpOperationKind::kInspectWorkload,
     McpOperationKind::kReconfigureWorkload,

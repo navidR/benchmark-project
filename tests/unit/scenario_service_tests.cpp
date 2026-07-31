@@ -11,6 +11,7 @@
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/scenario_service.h"
 #include "bbp/simulator/block_generation_workload.h"
+#include "bbp/simulator/constants.h"
 #include "bbp/simulator/wallet_transaction_plan.h"
 
 namespace bbp {
@@ -114,6 +115,35 @@ BOOST_AUTO_TEST_CASE(scenario_service_returns_production_resolved_document) {
                  .as_object()
                  .at("id")
                  .as_string() == "firo-1");
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_service_redacts_raw_signing_material_from_resolved_output) {
+  constexpr std::string_view private_key =
+      "private-signing-material-must-not-escape";
+  boost::json::object scenario = MinimalScenario();
+  scenario["workloads"] = boost::json::array{boost::json::object{
+      {"type", "send_raw_transaction"},
+      {"source_address", "source-address"},
+      {"source_private_key", private_key},
+      {"destination_address", "destination-address"},
+      {"funding_blocks", kDefaultCoinbaseSpendableConfirmations},
+      {"amount", "1.00000000"},
+      {"fee", "0.01000000"}}};
+
+  const Options options = ParseAndValidateScenario(scenario);
+  BOOST_REQUIRE_EQUAL(options.workloads.size(), 1U);
+  BOOST_TEST(
+      options.workloads.front().send_raw_transaction.source_private_key ==
+      private_key);
+
+  const boost::json::object resolved = ResolveScenario(scenario);
+  const boost::json::object& workload =
+      resolved.at("workloads").as_array().front().as_object();
+  BOOST_TEST(workload.at("source_private_key").as_string() == "<redacted>");
+  BOOST_TEST(workload.at("source_address").as_string() == "source-address");
+  BOOST_TEST(workload.at("destination_address").as_string() ==
+             "destination-address");
 }
 
 BOOST_AUTO_TEST_CASE(scenario_service_preserves_explicit_network_opt_out) {

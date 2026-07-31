@@ -1116,6 +1116,30 @@ void WaitForNodeMutationAdmissionRelease(const std::filesystem::path& run_root,
   }
 }
 
+void WaitForRestartReadinessRelease(const std::filesystem::path& run_root,
+                                    std::string_view node_root_name) {
+  if (!std::filesystem::exists(run_root / "bbp-test-restart-readiness-gate")) {
+    return;
+  }
+  {
+    std::ofstream held(run_root / "bbp-test-restart-readiness-held");
+    if (!held) {
+      throw std::runtime_error("could not record held restart readiness");
+    }
+    held << node_root_name << '\n';
+  }
+  const std::filesystem::path release =
+      run_root / "bbp-test-restart-readiness-release";
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (!std::filesystem::exists(release) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  if (!std::filesystem::remove(release)) {
+    throw std::runtime_error("restart readiness gate was not released");
+  }
+}
+
 void WaitForScenarioHeightWaitAdmissionRelease(
     const std::filesystem::path& run_root) {
   const std::filesystem::path enabled =
@@ -1253,6 +1277,25 @@ std::string RpcResult(
   }
   if (method == "getblock") {
     return R"({"tx":["coinbase"]})";
+  }
+  if (method == "gettxout") {
+    return R"({"value":40.00000000,"confirmations":101,"scriptPubKey":{"hex":"51","addresses":["raw-source-address"]}})";
+  }
+  if (method == "createrawtransaction") {
+    return R"("raw-transaction-hex")";
+  }
+  if (method == "signrawtransaction") {
+    return R"({"complete":true,"hex":"signed-raw-transaction-hex"})";
+  }
+  if (method == "sendrawtransaction") {
+    return R"("accepted-raw-transaction")";
+  }
+  if (method == "getblockcount") {
+    if (std::filesystem::exists(run_root /
+                                "bbp-test-fail-raw-transaction-observation")) {
+      return R"("invalid-height")";
+    }
+    return std::to_string(*height);
   }
   if (method == "getnetworkhashps") {
     return "0";
@@ -1413,6 +1456,7 @@ int RunReadyFiroDaemon(int argc, char** argv) {
     }
   }
   WaitForNodeMutationAdmissionRelease(run_root, node_root.filename().string());
+  WaitForRestartReadinessRelease(run_root, node_root.filename().string());
   const std::filesystem::path cookie =
       DaemonArgumentValue(argc, argv, "-rpccookiefile=");
   const std::string bind_address = DaemonArgumentValue(argc, argv, "-rpcbind=");
@@ -1678,23 +1722,30 @@ void CheckCommandErrorOnErrorFrame(const std::filesystem::path& command,
   RequireExitZero(&process, "command-error report-error frame");
 }
 
-pid_t ProcessStartedPid(std::string_view events) {
+pid_t LastProcessEventPid(std::string_view events,
+                          std::string_view event_name) {
+  const std::string event_marker =
+      "\"event\":\"" + std::string(event_name) + "\"";
   constexpr std::string_view marker = "\\\"pid\\\":";
-  const std::size_t process_event =
-      events.rfind("\"event\":\"process_started\"");
+  const std::size_t process_event = events.rfind(event_marker);
   const std::size_t pid_field = events.find(marker, process_event);
   if (process_event == std::string_view::npos ||
       pid_field == std::string_view::npos) {
-    throw std::runtime_error("process_started event did not contain a pid");
+    throw std::runtime_error(std::string(event_name) +
+                             " event did not contain a pid");
   }
   const std::size_t begin = pid_field + marker.size();
   const std::size_t end = events.find_first_not_of("0123456789", begin);
   const std::string text(events.substr(begin, end - begin));
   const long parsed = std::stol(text);
   if (parsed <= 0) {
-    throw std::runtime_error("process_started pid was not positive");
+    throw std::runtime_error(std::string(event_name) + " pid was not positive");
   }
   return static_cast<pid_t>(parsed);
+}
+
+pid_t ProcessStartedPid(std::string_view events) {
+  return LastProcessEventPid(events, "process_started");
 }
 
 bool ProcessExists(pid_t pid) { return kill(pid, 0) == 0 || errno == EPERM; }
@@ -2075,6 +2126,62 @@ void CheckEmptyControlPlane(const std::filesystem::path& command) {
       !std::filesystem::exists(run_root / ".bbp-run")) {
     throw std::runtime_error(
         "MCP did not launch an owned zero-node run in the editor host");
+  }
+  constexpr std::string_view kInvokedCheckpointName = "mcp-one-shot-checkpoint";
+  const boost::json::object checkpoint_result = InvokeMcpOperation(
+      session, &request_id, "workload.invoke",
+      boost::json::object{
+          {"run_id", run_id},
+          {"workload", boost::json::object{{"type", "checkpoint"},
+                                           {"name", kInvokedCheckpointName}}}},
+      10s, "zero-node checkpoint workload invocation");
+  const std::string invocation_id(
+      checkpoint_result.at("invocation_id").as_string());
+  const auto is_alphanumeric = [](char character) {
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9');
+  };
+  const bool safe_invocation_id =
+      !invocation_id.empty() && invocation_id.size() <= 128U &&
+      is_alphanumeric(invocation_id.front()) &&
+      std::all_of(invocation_id.begin(), invocation_id.end(),
+                  [&](char character) {
+                    return is_alphanumeric(character) || character == '_' ||
+                           character == '.' || character == '-';
+                  });
+  if (checkpoint_result.at("result_family").as_string() !=
+          "workload_invocation" ||
+      checkpoint_result.at("run_id").as_string() != run_id ||
+      !safe_invocation_id ||
+      checkpoint_result.at("action").as_string() != "checkpoint" ||
+      checkpoint_result.at("state").as_string() != "completed") {
+    throw std::runtime_error(
+        "MCP checkpoint invocation returned inconsistent completion "
+        "evidence: " +
+        boost::json::serialize(checkpoint_result));
+  }
+  const std::string checkpoint_events = ReadFile(events_path);
+  if (CountOccurrences(checkpoint_events,
+                       "\"event\":\"checkpoint_recorded\"") != 1U ||
+      checkpoint_events.find("\\\"name\\\":\\\"" +
+                             std::string(kInvokedCheckpointName) + "\\\"") ==
+          std::string::npos) {
+    throw std::runtime_error(
+        "MCP checkpoint invocation did not record exactly one named "
+        "checkpoint");
+  }
+  for (const auto& [uri, context] :
+       {std::pair{"bbp:///workloads",
+                  "checkpoint invocation current workloads"},
+        std::pair{"bbp:///workload_history",
+                  "checkpoint invocation workload history"}}) {
+    const boost::json::value data =
+        ReadMcpResourceData(session, &request_id, uri, context);
+    if (!data.is_array() || !data.as_array().empty()) {
+      throw std::runtime_error(std::string(context) +
+                               " retained a one-shot checkpoint");
+    }
   }
   const boost::json::value resolved_resource =
       ReadMcpResourceData(session, &request_id, "bbp:///resolved_scenario",
@@ -4182,6 +4289,461 @@ void CheckScenarioRestartNodeSnapshotAdmission(
   RequireExitZero(&process, "restart-admission TUI exit");
 }
 
+void CheckMcpRestartCancellationAfterAdmission(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("mcp-restart-cancellation");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "mcp-restart-cancel-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+
+  PtyProcess process(command,
+                     {"--benchmark-root",
+                      benchmark_root.string(),
+                      "--run-id",
+                      run_id,
+                      "--nodes",
+                      "1",
+                      "--node-capacity",
+                      "1",
+                      "--node-binary",
+                      daemon.string(),
+                      "--no-isolate-network",
+                      "--no-mining",
+                      "--ready-timeout-sec",
+                      "20",
+                      "--sync-timeout-sec",
+                      "20",
+                      "--refresh-ms",
+                      "50",
+                      "--metrics-interval",
+                      "50ms"},
+                     30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "MCP restart cancellation TUI"));
+  const std::string initial_events =
+      WaitForFileText(events_path, "\"event\":\"rpc_ready\"", 30s);
+  const pid_t original_pid = ProcessStartedPid(initial_events);
+  if (!ProcessExists(original_pid)) {
+    throw std::runtime_error(
+        "MCP restart cancellation fixture had no running original process");
+  }
+  {
+    std::ofstream gate(run_root / "bbp-test-restart-readiness-gate");
+    if (!gate) {
+      throw std::runtime_error("could not enable MCP restart readiness gate");
+    }
+    gate << "hold restarted daemon before RPC readiness\n";
+  }
+  TestGateRelease release_guard(run_root /
+                                "bbp-test-restart-readiness-release");
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  boost::json::object submitted;
+  const auto submission_deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < submission_deadline) {
+    submitted = SubmitMcpOperation(
+        mcp, &request_id, "workload.invoke",
+        boost::json::object{
+            {"run_id", run_id},
+            {"workload",
+             boost::json::object{{"type", "restart_node"}, {"node", 1U}}}});
+    if (submitted.if_contains("operation_id") != nullptr) {
+      break;
+    }
+    const boost::json::value* code = submitted.if_contains("code");
+    const boost::json::value* retryable = submitted.if_contains("retryable");
+    if (code == nullptr || !code->is_string() ||
+        code->as_string() != "run_not_ready" || retryable == nullptr ||
+        !retryable->is_bool() || !retryable->as_bool()) {
+      throw std::runtime_error("MCP restart workload was not admitted: " +
+                               boost::json::serialize(submitted));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  const boost::json::value* operation_id_value =
+      submitted.if_contains("operation_id");
+  if (operation_id_value == nullptr || !operation_id_value->is_string()) {
+    throw std::runtime_error(
+        "MCP restart workload was not admitted after run readiness");
+  }
+  const std::string operation_id(operation_id_value->as_string());
+
+  static_cast<void>(WaitForFileText(
+      run_root / "bbp-test-restart-readiness-held", "firo-1", 10s));
+  const auto original_exit_deadline = std::chrono::steady_clock::now() + 2s;
+  while (ProcessExists(original_pid) &&
+         std::chrono::steady_clock::now() < original_exit_deadline) {
+    std::this_thread::sleep_for(20ms);
+  }
+  const std::string admitted_events = ReadFile(events_path);
+  if (ProcessExists(original_pid) ||
+      CountOccurrences(admitted_events, "\"event\":\"process_started\"") !=
+          1U ||
+      CountOccurrences(admitted_events, "\"event\":\"process_restarted\"") !=
+          1U ||
+      CountOccurrences(admitted_events, "\"event\":\"node_restarted\"") != 0U) {
+    throw std::runtime_error(
+        "MCP restart readiness gate did not isolate post-exit admission");
+  }
+
+  const boost::json::object cancellation = McpToolCall(
+      mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+      "operation.cancel", boost::json::object{{"operation_id", operation_id}});
+  if (!cancellation.at("cancel_requested").as_bool()) {
+    throw std::runtime_error(
+        "MCP restart cancellation was not accepted after old-process exit");
+  }
+  release_guard.Release();
+
+  boost::json::object operation;
+  const auto completion_deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < completion_deadline) {
+    operation = McpToolCall(
+        mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+        "operation.get", boost::json::object{{"operation_id", operation_id}});
+    const std::string_view state = operation.at("state").as_string();
+    if (state == "succeeded" || state == "failed" || state == "cancelled") {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (operation.empty() || operation.at("state").as_string() != "succeeded" ||
+      !operation.at("cancel_requested").as_bool()) {
+    throw std::runtime_error(
+        "post-admission MCP restart cancellation did not settle as "
+        "succeeded: " +
+        (operation.empty() ? std::string("no terminal result")
+                           : boost::json::serialize(operation)));
+  }
+  const boost::json::object& result =
+      operation.at("terminal_result").as_object();
+  if (result.at("result_family").as_string() != "workload_invocation" ||
+      result.at("run_id").as_string() != run_id ||
+      result.at("invocation_id").as_string().empty() ||
+      result.at("action").as_string() != "restart_node" ||
+      result.at("state").as_string() != "completed") {
+    throw std::runtime_error(
+        "post-admission MCP restart returned inconsistent completion "
+        "evidence: " +
+        boost::json::serialize(operation));
+  }
+
+  const std::string completed_events = WaitForFileOccurrences(
+      events_path, "\"event\":\"node_restarted\"", 1U, 5s);
+  const pid_t replacement_pid =
+      LastProcessEventPid(completed_events, "process_restarted");
+  if (CountOccurrences(completed_events, "\"event\":\"node_restarted\"") !=
+          1U ||
+      CountOccurrences(completed_events, "\"event\":\"process_started\"") !=
+          1U ||
+      CountOccurrences(completed_events, "\"event\":\"process_restarted\"") !=
+          1U ||
+      replacement_pid == original_pid || !ProcessExists(replacement_pid)) {
+    throw std::runtime_error(
+        "post-admission MCP restart did not leave exactly one running "
+        "replacement");
+  }
+  RequireNotContains(completed_events, "\"event\":\"run_cancelled\"",
+                     "post-admission MCP restart run state");
+  RequireNotContains(completed_events, "\"event\":\"run_failed\"",
+                     "post-admission MCP restart run state");
+
+  boost::json::value current_nodes;
+  bool node_running = false;
+  const auto node_running_deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < node_running_deadline) {
+    current_nodes = ReadMcpResourceData(mcp, &request_id, "bbp:///nodes",
+                                        "post-admission MCP restart nodes");
+    if (current_nodes.is_object()) {
+      const boost::json::value* summaries =
+          current_nodes.as_object().if_contains("nodes_summary");
+      if (summaries != nullptr && summaries->is_array() &&
+          summaries->as_array().size() == 1U &&
+          summaries->as_array().front().is_object()) {
+        const boost::json::object& node =
+            summaries->as_array().front().as_object();
+        const boost::json::value* final_state = node.if_contains("final_state");
+        node_running = node.at("node_id").as_string() == "firo-1" &&
+                       final_state != nullptr && final_state->is_string() &&
+                       final_state->as_string() == "Running";
+      }
+    }
+    if (node_running) {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (!node_running) {
+    throw std::runtime_error(
+        "post-admission MCP restart did not publish a running node: " +
+        boost::json::serialize(current_nodes));
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s, "MCP restart cancellation confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "MCP restart cancellation TUI exit");
+}
+
+boost::json::object RawTransactionTestWorkload() {
+  return boost::json::object{
+      {"type", "send_raw_transaction"},
+      {"funding_node", 1U},
+      {"submit_node", 1U},
+      {"source_address", "raw-source-address"},
+      {"source_private_key", "raw-source-private-key"},
+      {"destination_address", "raw-destination-address"},
+      {"funding_blocks", 101U},
+      {"amount", "1.00000000"},
+      {"fee", "0.00001000"},
+      {"timeout_sec", 20U},
+  };
+}
+
+void CheckMcpRawTransactionCancellationAfterFundingAdmission(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("mcp-raw-transaction-cancellation");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "mcp-raw-cancel-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  const std::filesystem::path generation_audit =
+      run_root / "bbp-test-block-generation-audit";
+
+  PtyProcess process(command,
+                     {"--benchmark-root",
+                      benchmark_root.string(),
+                      "--run-id",
+                      run_id,
+                      "--nodes",
+                      "1",
+                      "--node-capacity",
+                      "1",
+                      "--node-binary",
+                      daemon.string(),
+                      "--no-isolate-network",
+                      "--no-mining",
+                      "--ready-timeout-sec",
+                      "20",
+                      "--sync-timeout-sec",
+                      "20",
+                      "--refresh-ms",
+                      "50",
+                      "--metrics-interval",
+                      "50ms"},
+                     30, 120, home_directory);
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                                      "MCP raw-transaction cancellation TUI"));
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"rpc_ready\"", 30s));
+  {
+    std::ofstream slow(run_root / "bbp-test-slow-block-generation");
+    std::ofstream gate(run_root / "bbp-test-block-generation-gate");
+    if (!slow || !gate) {
+      throw std::runtime_error(
+          "could not enable raw-transaction funding generation gate");
+    }
+    slow << "audit raw-transaction funding generation\n";
+    gate << "hold raw-transaction funding generation\n";
+  }
+  TestGateRelease generation_release(BlockGenerationReleasePath(run_root, 0U));
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  boost::json::object submitted;
+  const auto submission_deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < submission_deadline) {
+    submitted = SubmitMcpOperation(
+        mcp, &request_id, "workload.invoke",
+        boost::json::object{{"run_id", run_id},
+                            {"workload", RawTransactionTestWorkload()}});
+    if (submitted.if_contains("operation_id") != nullptr) {
+      break;
+    }
+    const boost::json::value* code = submitted.if_contains("code");
+    const boost::json::value* retryable = submitted.if_contains("retryable");
+    if (code == nullptr || !code->is_string() ||
+        code->as_string() != "run_not_ready" || retryable == nullptr ||
+        !retryable->is_bool() || !retryable->as_bool()) {
+      throw std::runtime_error(
+          "MCP raw-transaction workload was not admitted: " +
+          boost::json::serialize(submitted));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  const boost::json::value* operation_id_value =
+      submitted.if_contains("operation_id");
+  if (operation_id_value == nullptr || !operation_id_value->is_string()) {
+    throw std::runtime_error(
+        "MCP raw-transaction workload was not admitted after run readiness");
+  }
+  const std::string operation_id(operation_id_value->as_string());
+
+  static_cast<void>(
+      WaitForFileText(generation_audit, "generation-started 0", 10s));
+  const boost::json::object cancellation = McpToolCall(
+      mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+      "operation.cancel", boost::json::object{{"operation_id", operation_id}});
+  if (!cancellation.at("cancel_requested").as_bool()) {
+    throw std::runtime_error(
+        "MCP raw-transaction cancellation was not accepted after funding "
+        "admission");
+  }
+  generation_release.Release();
+
+  boost::json::object operation;
+  const auto completion_deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < completion_deadline) {
+    operation = McpToolCall(
+        mcp.port, mcp.token, mcp.session_id, mcp.protocol_version, request_id++,
+        "operation.get", boost::json::object{{"operation_id", operation_id}});
+    const std::string_view state = operation.at("state").as_string();
+    if (state == "succeeded" || state == "failed" || state == "cancelled") {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (operation.empty() || operation.at("state").as_string() != "failed" ||
+      !operation.at("cancel_requested").as_bool()) {
+    throw std::runtime_error(
+        "post-funding-admission raw-transaction cancellation did not return "
+        "a failed indeterminate outcome: " +
+        (operation.empty() ? std::string("no terminal result")
+                           : boost::json::serialize(operation)));
+  }
+  const boost::json::object& terminal_error =
+      operation.at("terminal_error").as_object();
+  if (terminal_error.at("code").as_string() !=
+          "workload_invocation_outcome_unconfirmed" ||
+      terminal_error.at("retryable").as_bool()) {
+    throw std::runtime_error(
+        "post-funding-admission raw-transaction cancellation returned the "
+        "wrong terminal error: " +
+        boost::json::serialize(operation));
+  }
+
+  static_cast<void>(
+      WaitForFileText(generation_audit, "generation-completed 101", 5s));
+  const std::string stopped_events =
+      WaitForFileText(events_path, "\"event\":\"run_cancelled\"", 20s);
+  RequireNotContains(stopped_events, "\"event\":\"raw_transaction_submitted\"",
+                     "cancelled raw-transaction funding boundary");
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s,
+      "MCP raw-transaction cancellation confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "MCP raw-transaction cancellation TUI exit");
+}
+
+void CheckScenarioRawTransactionAcceptedRecovery(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  OwnedTemporaryDirectory directory("scenario-raw-transaction-recovery");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path scenario = directory.root() / "scenario.json";
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id = "scenario-raw-recovery-" +
+                             std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  boost::json::object scheduled_transaction = RawTransactionTestWorkload();
+  scheduled_transaction.erase("type");
+  scheduled_transaction["at"] = "2s";
+  scheduled_transaction["action"] = "send_raw_transaction";
+  {
+    std::ofstream stream(scenario);
+    if (!stream) {
+      throw std::runtime_error(
+          "could not create raw-transaction recovery scenario");
+    }
+    stream << boost::json::serialize(boost::json::object{
+                  {"chain", "firo"},
+                  {"chain_daemon", daemon.string()},
+                  {"nodes", 1U},
+                  {"node_capacity", 1U},
+                  {"isolated_network", false},
+                  {"block_production", boost::json::object{{"enabled", false}}},
+                  {"ready_timeout_sec", 10U},
+                  {"sync_timeout_sec", 10U},
+                  {"metrics_sample_count", 0U},
+                  {"metrics_interval_ms", 10'000U},
+                  {"workloads", boost::json::array{}},
+                  {"events",
+                   boost::json::array{std::move(scheduled_transaction)}}})
+           << '\n';
+    if (!stream) {
+      throw std::runtime_error(
+          "could not write raw-transaction recovery scenario");
+    }
+  }
+
+  PtyProcess process(
+      command,
+      {"--scenario", scenario.string(), "--node-binary", daemon.string(),
+       "--benchmark-root", benchmark_root.string(), "--run-id", run_id,
+       "--no-tui", "--keep-artifacts"},
+      24, 100, home_directory);
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"rpc_ready\"", 5s));
+  {
+    std::ofstream failure(run_root /
+                          "bbp-test-fail-raw-transaction-observation");
+    if (!failure) {
+      throw std::runtime_error(
+          "could not enable raw-transaction observation failure");
+    }
+    failure << "fail the first post-broadcast getblockcount response\n";
+  }
+
+  const int result = process.Wait(20s);
+  if (result == 0) {
+    throw std::runtime_error(
+        "accepted raw-transaction observation failure exited successfully");
+  }
+  const std::string events = ReadFile(events_path);
+  if (CountOccurrences(events, "\"event\":\"raw_transaction_submitted\"") !=
+          1U ||
+      CountOccurrences(events, "\"event\":\"scheduled_event_failed\"") != 1U ||
+      CountOccurrences(events, "\"event\":\"run_failed\"") != 1U) {
+    throw std::runtime_error(
+        "accepted raw-transaction recovery retained inconsistent event "
+        "counts");
+  }
+  RequireLineContainsAll(events,
+                         {"\"event\":\"raw_transaction_submitted\"",
+                          "\\\"txid\\\":\\\"accepted-raw-transaction\\\"",
+                          "\\\"mempool_size\\\":null"},
+                         "accepted raw-transaction recovery event");
+  RequireContains(events, "getblockcount returned a non-uint64 height",
+                  "accepted raw-transaction post-broadcast failure");
+  RequireNotContains(events, "\"event\":\"scheduled_event_completed\"",
+                     "accepted raw-transaction scheduled outcome");
+  RequireNotContains(events, "\"event\":\"run_cancelled\"",
+                     "accepted raw-transaction run outcome");
+}
+
 void CheckDirectedNodeReplacementPublication(
     const std::filesystem::path& command,
     const std::filesystem::path& helper_binary) {
@@ -5492,6 +6054,36 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  if (argc == 3 &&
+      std::string_view(argv[1]) == "--mcp-raw-transaction-cancellation") {
+    try {
+      CheckMcpRawTransactionCancellationAfterFundingAdmission(
+          argv[2], std::filesystem::canonical(argv[0]));
+      std::cout << "MCP raw-transaction funding-admission cancellation "
+                   "checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "MCP raw-transaction funding-admission cancellation "
+                   "regression failed: "
+                << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 &&
+      std::string_view(argv[1]) == "--scenario-raw-transaction-recovery") {
+    try {
+      CheckScenarioRawTransactionAcceptedRecovery(
+          argv[2], std::filesystem::canonical(argv[0]));
+      std::cout << "scenario raw-transaction accepted-result recovery "
+                   "checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "scenario raw-transaction accepted-result recovery "
+                   "regression failed: "
+                << error.what() << '\n';
+      return 1;
+    }
+  }
   if (argc == 3 && std::string_view(argv[1]) == "--slow-node-replace") {
     try {
       CheckSlowNodeReplacementDefaultTimeout(
@@ -5521,6 +6113,8 @@ int main(int argc, char** argv) {
                        "--scenario-restart-node-snapshot-admission") {
     try {
       CheckScenarioRestartNodeSnapshotAdmission(
+          argv[2], std::filesystem::canonical(argv[0]));
+      CheckMcpRestartCancellationAfterAdmission(
           argv[2], std::filesystem::canonical(argv[0]));
       std::cout << "scenario restart-node snapshot admission checks passed\n";
       return 0;

@@ -17,6 +17,8 @@
 #include <thread>
 #include <utility>
 
+#include "bbp/simulation_command.h"
+
 namespace bbp {
 namespace {
 
@@ -161,8 +163,8 @@ void ValidateError(McpOperationError* error) {
       if (member.key() != "code" && member.key() != "message" &&
           member.key() != "path" && member.key() != "recoverable" &&
           member.key() != "node_id" && member.key() != "action" &&
-          member.key() != "state" && member.key() != "command_id" &&
-          member.key() != "requested_count" &&
+          member.key() != "state" && member.key() != "phase" &&
+          member.key() != "command_id" && member.key() != "requested_count" &&
           member.key() != "current_node_count" &&
           member.key() != "node_capacity" &&
           member.key() != "available_node_capacity" &&
@@ -216,6 +218,30 @@ void ValidateError(McpOperationError* error) {
         break;
       }
     }
+    const boost::json::value* phase = diagnostic.if_contains("phase");
+    if (phase != nullptr) {
+      if (!phase->is_string()) {
+        diagnostics_valid = false;
+        break;
+      }
+      constexpr std::array restart_phases{
+          SimulationNodeRestartPhase::kBeforeStop,
+          SimulationNodeRestartPhase::kStopRequested,
+          SimulationNodeRestartPhase::kOriginalExited,
+          SimulationNodeRestartPhase::kReplacementReady,
+          SimulationNodeRestartPhase::kCompleted,
+      };
+      const bool known_phase =
+          std::any_of(restart_phases.begin(), restart_phases.end(),
+                      [&](SimulationNodeRestartPhase candidate) {
+                        return phase->as_string() ==
+                               SimulationNodeRestartPhaseName(candidate);
+                      });
+      if (!known_phase) {
+        diagnostics_valid = false;
+        break;
+      }
+    }
     for (const std::string_view count :
          {"requested_count", "current_node_count", "node_capacity",
           "available_node_capacity"}) {
@@ -234,9 +260,8 @@ void ValidateError(McpOperationError* error) {
     if ((address != nullptr &&
          (!address->is_string() || address->as_string().empty() ||
           address->as_string().size() > kMcpMaximumEvidenceTextBytes)) ||
-        (port != nullptr &&
-         !(port->is_uint64() && port->as_uint64() > 0U &&
-           port->as_uint64() <= 65535U)) ||
+        (port != nullptr && !(port->is_uint64() && port->as_uint64() > 0U &&
+                              port->as_uint64() <= 65535U)) ||
         (mutation_started != nullptr && !mutation_started->is_bool())) {
       diagnostics_valid = false;
       break;

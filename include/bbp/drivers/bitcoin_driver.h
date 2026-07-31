@@ -80,7 +80,9 @@ class BitcoinDriver final : public ChainDriver {
       const std::string& source_address, const std::string& source_private_key,
       const std::string& destination_address, std::uint64_t amount_satoshis,
       std::uint64_t fee_satoshis, std::chrono::seconds timeout,
-      std::stop_token stop_token = {}) const override;
+      std::stop_token stop_token = {},
+      const ChainRawTransactionBroadcastControl* broadcast_control =
+          nullptr) const override;
   ChainWalletTransactionResult SendWalletTransaction(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       const std::string& destination_address, std::uint64_t amount_satoshis,

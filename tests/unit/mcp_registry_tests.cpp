@@ -659,6 +659,7 @@ BOOST_AUTO_TEST_CASE(mcp_registry_covers_every_tui_command_and_local_action) {
                                            "masternode.add",
                                            "masternode.remove",
                                            "masternode.restart",
+                                           "workload.invoke",
                                            "workload.start",
                                            "workload.reconfigure",
                                            "workload.pause",
@@ -710,6 +711,7 @@ BOOST_AUTO_TEST_CASE(mcp_registry_exposes_every_information_family_and_bound) {
   BOOST_TEST(results.contains("error"));
   BOOST_TEST(results.contains("cleanup"));
   BOOST_TEST(results.contains("workload"));
+  BOOST_TEST(results.contains("workload_invocation"));
 
   const boost::json::value* limits = document.if_contains("limits");
   BOOST_REQUIRE(limits != nullptr);
@@ -1086,6 +1088,158 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object& configuration =
       result.at("properties").as_object().at("configuration").as_object();
   BOOST_TEST(VariantConstSet(configuration, "type") == expected);
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_one_shot_workload_invocation_schema_is_the_exact_complement) {
+  constexpr std::array operations{McpOperationKind::kInvokeWorkload};
+  const boost::json::array tools = BuildMcpToolRegistry(operations);
+  BOOST_REQUIRE_EQUAL(tools.size(), 1U);
+  const boost::json::object& tool = tools.front().as_object();
+  BOOST_TEST(tool.at("name").as_string() == "workload.invoke");
+
+  const boost::json::object& input = tool.at("inputSchema").as_object();
+  const std::set<std::string> input_fields{"run_id", "workload"};
+  BOOST_TEST(PropertySet(input) == input_fields);
+  BOOST_TEST(StringSet(input.at("required").as_array()) == input_fields);
+  BOOST_TEST(input.at("additionalProperties").as_bool() == false);
+
+  std::set<std::string> expected_one_shot_names;
+  for (const WorkloadKind kind : kOneShotWorkloadKinds) {
+    BOOST_REQUIRE(
+        expected_one_shot_names.emplace(WorkloadKindName(kind)).second);
+  }
+  const boost::json::object& invocation_workload =
+      input.at("properties").as_object().at("workload").as_object();
+  BOOST_TEST(VariantConstSet(invocation_workload, "type") ==
+             expected_one_shot_names);
+
+  const boost::json::object authoritative = BuildMcpWorkloadSchema();
+  for (const WorkloadKind kind : kOneShotWorkloadKinds) {
+    const std::string_view name = WorkloadKindName(kind);
+    BOOST_TEST(
+        VariantWithConst(invocation_workload.at("oneOf").as_array(), "type",
+                         name) ==
+        VariantWithConst(authoritative.at("oneOf").as_array(), "type", name));
+  }
+
+  const boost::json::object& output = tool.at("outputSchema").as_object();
+  const boost::json::object& success =
+      output.at("oneOf").as_array().front().as_object();
+  BOOST_TEST(success.at("properties")
+                 .as_object()
+                 .at("result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "workload_invocation");
+
+  const boost::json::object full_host_output =
+      BuildMcpOperationOutputSchema(McpOperationKind::kInvokeWorkload);
+  const boost::json::object& full_host_wrapper =
+      full_host_output.at("oneOf").as_array().at(1U).as_object();
+  BOOST_TEST(StringSet(full_host_wrapper.at("properties")
+                           .as_object()
+                           .at("operation")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             std::set<std::string>{"workload.invoke"});
+  BOOST_TEST(StringSet(full_host_wrapper.at("properties")
+                           .as_object()
+                           .at("terminal_result_family")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) ==
+             (std::set<std::string>{"error", "workload_invocation"}));
+  const boost::json::object& succeeded_wrapper =
+      LifecycleOperationConstraint(full_host_wrapper, "workload.invoke",
+                                   "succeeded")
+          .at("then")
+          .as_object()
+          .at("properties")
+          .as_object();
+  BOOST_TEST(succeeded_wrapper.at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "workload_invocation");
+  BOOST_TEST(succeeded_wrapper.at("terminal_result")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "workload_invocation");
+  const std::set<std::string> nonterminal_states{"cancelling", "queued",
+                                                 "running"};
+  BOOST_TEST(OperationStateSetConstraint(full_host_wrapper, "workload.invoke",
+                                         nonterminal_states)
+                 .at("then")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "workload_invocation");
+  const std::set<std::string> failed_states{"cancelled", "failed"};
+  BOOST_TEST(OperationStateSetConstraint(full_host_wrapper, "workload.invoke",
+                                         failed_states)
+                 .at("then")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("terminal_result_family")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "error");
+
+  const boost::json::object error =
+      BuildMcpResultSchema(McpResultFamily::kError);
+  const boost::json::object& diagnostic = error.at("properties")
+                                              .as_object()
+                                              .at("diagnostics")
+                                              .as_object()
+                                              .at("items")
+                                              .as_object();
+  BOOST_TEST(
+      StringSet(diagnostic.at("properties")
+                    .as_object()
+                    .at("phase")
+                    .as_object()
+                    .at("enum")
+                    .as_array()) ==
+      (std::set<std::string>{"before_stop", "stop_requested", "original_exited",
+                             "replacement_ready", "completed"}));
+
+  const boost::json::object result =
+      BuildMcpResultSchema(McpResultFamily::kWorkloadInvocation);
+  const std::set<std::string> result_fields{"result_family", "run_id",
+                                            "invocation_id", "action", "state"};
+  BOOST_TEST(PropertySet(result) == result_fields);
+  BOOST_TEST(StringSet(result.at("required").as_array()) == result_fields);
+  BOOST_TEST(result.at("additionalProperties").as_bool() == false);
+  BOOST_TEST(StringSet(result.at("properties")
+                           .as_object()
+                           .at("action")
+                           .as_object()
+                           .at("enum")
+                           .as_array()) == expected_one_shot_names);
+  BOOST_TEST(result.at("properties")
+                 .as_object()
+                 .at("state")
+                 .as_object()
+                 .at("const")
+                 .as_string() == "completed");
+
+  const boost::json::object capabilities =
+      BuildMcpCapabilityDocument(operations);
+  BOOST_TEST(NamedSet(capabilities.at("operations").as_array()) ==
+             std::set<std::string>{"workload.invoke"});
+  const std::set<std::string> discovered_result_families{"error", "operation",
+                                                         "workload_invocation"};
+  BOOST_TEST(NamedSet(capabilities.at("result_families").as_array()) ==
+             discovered_result_families);
 }
 
 BOOST_AUTO_TEST_CASE(

@@ -1591,7 +1591,8 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
     const std::string& source_address, const std::string& source_private_key,
     const std::string& destination_address, uint64_t amount_satoshis,
     uint64_t fee_satoshis, std::chrono::seconds timeout,
-    std::stop_token stop_token) const {
+    std::stop_token stop_token,
+    const ChainRawTransactionBroadcastControl* broadcast_control) const {
   ThrowIfStopRequested(stop_token);
   if (utxo.amount_satoshis < amount_satoshis ||
       utxo.amount_satoshis - amount_satoshis < fee_satoshis) {
@@ -1651,12 +1652,27 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
   boost::json::array send_params;
   send_params.emplace_back(signed_hex);
   send_params.push_back(false);
-  const boost::json::value txid_value =
-      RpcCall(config, "sendrawtransaction", send_params, stop_token);
+  if (broadcast_control != nullptr && broadcast_control->before_broadcast) {
+    broadcast_control->before_broadcast();
+  }
+  boost::json::value txid_value;
+  try {
+    txid_value = RpcCall(config, "sendrawtransaction", send_params, stop_token);
+  } catch (const FiroRpcError& error) {
+    if (broadcast_control != nullptr &&
+        broadcast_control->deterministic_rejection &&
+        (error.code() == -6 || error.code() == -25 || error.code() == -26)) {
+      broadcast_control->deterministic_rejection();
+    }
+    throw;
+  }
   if (!txid_value.is_string()) {
     throw std::runtime_error("Firo sendrawtransaction returned non-string");
   }
   const std::string txid(txid_value.as_string());
+  if (txid.empty()) {
+    throw std::runtime_error("Firo sendrawtransaction returned an empty txid");
+  }
 
   FiroRawTransactionResult result;
   result.utxo = utxo;
@@ -1666,6 +1682,9 @@ FiroRawTransactionResult FiroDriver::SendRawTransaction(
   result.destination_amount = FormatFixed8Amount(amount_satoshis);
   result.change_amount = FormatFixed8Amount(change_satoshis);
   result.fee = FormatFixed8Amount(fee_satoshis);
+  if (broadcast_control != nullptr && broadcast_control->after_broadcast) {
+    broadcast_control->after_broadcast(result);
+  }
   result.mempool_size =
       WaitForMempoolTransaction(config, txid, timeout, stop_token);
   return result;

@@ -5,6 +5,7 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -15,7 +16,7 @@
 namespace bbp {
 namespace {
 
-constexpr auto kCancelledMutationRollbackBound = std::chrono::milliseconds(200);
+constexpr auto kMutationRollbackBound = std::chrono::milliseconds(200);
 
 std::string PeerEndpoint(const ChainNodeConfig& config) {
   return config.p2p_host + ":" + std::to_string(config.p2p_port);
@@ -602,10 +603,10 @@ std::vector<std::string> PeerConnectivityController::AllowedPeersFor(
   return AllowedPeersUnlocked(node_id);
 }
 
-void PeerConnectivityController::ConnectPeer(std::string_view node_id,
-                                             std::string_view peer_node_id,
-                                             std::chrono::seconds timeout,
-                                             std::stop_token stop_token) {
+void PeerConnectivityController::ConnectPeer(
+    std::string_view node_id, std::string_view peer_node_id,
+    std::chrono::seconds timeout, std::stop_token stop_token,
+    const std::function<void()>& authorize_mutation) {
   ChainNodeConfig node;
   ChainNodeConfig peer;
   std::vector<ChainNodeConfig> nodes;
@@ -644,36 +645,72 @@ void PeerConnectivityController::ConnectPeer(std::string_view node_id,
   }
   RequireUnambiguousPeerIdentity(nodes, node, stop_token);
   const std::string endpoint = PeerEndpoint(peer);
-  SetPeerConnectionState(node, endpoint, true, timeout, stop_token);
-  bool still_allowed = false;
-  {
-    std::lock_guard<std::mutex> lock(operation_mutex_);
-    const std::vector<std::string>& allowed = AllowedPeersUnlocked(node.id);
-    still_allowed =
-        std::find(allowed.begin(), allowed.end(), peer.id) != allowed.end();
-  }
-  if (!still_allowed) {
-    try {
-      SetPeerConnectionState(node, endpoint, false, timeout, stop_token);
-    } catch (...) {
-      throw PeerMutationOutcomeUnconfirmed(
-          "peer target was removed from the active logical edge during "
-          "connection and compensation failed: " +
-          ExceptionMessage(std::current_exception()));
+  const std::pair<std::string, std::string> restoration_key{node.id, peer.id};
+  std::stop_source bookkeeping_rollback_stop_source;
+  SetPeerConnectionState(node, endpoint, true, timeout, stop_token,
+                         authorize_mutation);
+  try {
+    bool still_allowed = false;
+    {
+      std::lock_guard<std::mutex> lock(operation_mutex_);
+      const auto allowed = allowed_peers_.find(node.id);
+      still_allowed = allowed != allowed_peers_.end() &&
+                      std::find(allowed->second.begin(), allowed->second.end(),
+                                peer.id) != allowed->second.end();
     }
-    throw std::runtime_error(
-        "peer target was removed from the active logical edge during "
-        "connection: " +
-        node.id + ": " + peer.id);
+    if (!still_allowed) {
+      throw std::runtime_error(
+          "peer target was removed from the active logical edge during "
+          "connection: " +
+          node.id + ": " + peer.id);
+    }
+    std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+    topology_restore_suppressions_.erase(restoration_key);
+  } catch (...) {
+    const std::exception_ptr original_error = std::current_exception();
+    std::optional<std::jthread> rollback_timer;
+    try {
+      rollback_timer.emplace([&bookkeeping_rollback_stop_source](
+                                 std::stop_token timer_stop_token) {
+        try {
+          std::condition_variable_any condition;
+          std::mutex mutex;
+          std::unique_lock<std::mutex> lock(mutex);
+          condition.wait_for(lock, timer_stop_token, kMutationRollbackBound,
+                             [] { return false; });
+        } catch (...) {
+          bookkeeping_rollback_stop_source.request_stop();
+          return;
+        }
+        if (!timer_stop_token.stop_requested()) {
+          bookkeeping_rollback_stop_source.request_stop();
+        }
+      });
+    } catch (...) {
+      RethrowPeerMutationFailure(original_error,
+                                 "connection bookkeeping rollback control",
+                                 std::current_exception());
+    }
+    try {
+      static_cast<void>(
+          SetPeerConnectionState(node, endpoint, false, timeout,
+                                 bookkeeping_rollback_stop_source.get_token()));
+    } catch (...) {
+      rollback_timer->request_stop();
+      rollback_timer->join();
+      RethrowPeerMutationFailure(original_error, "connection bookkeeping",
+                                 std::current_exception());
+    }
+    rollback_timer->request_stop();
+    rollback_timer->join();
+    std::rethrow_exception(original_error);
   }
-  std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
-  topology_restore_suppressions_.erase({node.id, peer.id});
 }
 
-void PeerConnectivityController::DisconnectPeer(std::string_view node_id,
-                                                std::string_view peer_node_id,
-                                                std::chrono::seconds timeout,
-                                                std::stop_token stop_token) {
+void PeerConnectivityController::DisconnectPeer(
+    std::string_view node_id, std::string_view peer_node_id,
+    std::chrono::seconds timeout, std::stop_token stop_token,
+    const std::function<void()>& authorize_mutation) {
   ChainNodeConfig node;
   ChainNodeConfig peer;
   std::vector<ChainNodeConfig> nodes;
@@ -706,17 +743,65 @@ void PeerConnectivityController::DisconnectPeer(std::string_view node_id,
   }
   RequireUnambiguousPeerIdentity(nodes, node, stop_token);
   const std::string endpoint = PeerEndpoint(peer);
-  SetPeerConnectionState(node, endpoint, false, timeout, stop_token);
-  const std::uint64_t sequence = NextTopologyRestoreSequence();
-  std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
-  topology_restore_suppressions_.insert_or_assign({node.id, peer.id}, sequence);
+  std::stop_source bookkeeping_rollback_stop_source;
+  const bool connected_before = SetPeerConnectionState(
+      node, endpoint, false, timeout, stop_token, authorize_mutation);
+  try {
+    const std::uint64_t sequence = NextTopologyRestoreSequence();
+    std::lock_guard<std::mutex> restoration_lock(restoration_mutex_);
+    topology_restore_suppressions_.insert_or_assign({node.id, peer.id},
+                                                    sequence);
+  } catch (...) {
+    const std::exception_ptr original_error = std::current_exception();
+    std::optional<std::jthread> rollback_timer;
+    try {
+      rollback_timer.emplace([&bookkeeping_rollback_stop_source](
+                                 std::stop_token timer_stop_token) {
+        try {
+          std::condition_variable_any condition;
+          std::mutex mutex;
+          std::unique_lock<std::mutex> lock(mutex);
+          condition.wait_for(lock, timer_stop_token, kMutationRollbackBound,
+                             [] { return false; });
+        } catch (...) {
+          bookkeeping_rollback_stop_source.request_stop();
+          return;
+        }
+        if (!timer_stop_token.stop_requested()) {
+          bookkeeping_rollback_stop_source.request_stop();
+        }
+      });
+    } catch (...) {
+      RethrowPeerMutationFailure(original_error,
+                                 "disconnection rollback control",
+                                 std::current_exception());
+    }
+    try {
+      static_cast<void>(
+          SetPeerConnectionState(node, endpoint, connected_before, timeout,
+                                 bookkeeping_rollback_stop_source.get_token()));
+    } catch (...) {
+      rollback_timer->request_stop();
+      rollback_timer->join();
+      RethrowPeerMutationFailure(original_error, "disconnection bookkeeping",
+                                 std::current_exception());
+    }
+    rollback_timer->request_stop();
+    rollback_timer->join();
+    std::rethrow_exception(original_error);
+  }
 }
 
-void PeerConnectivityController::SetPeerConnectionState(
+bool PeerConnectivityController::SetPeerConnectionState(
     const ChainNodeConfig& node, const std::string& endpoint, bool connected,
-    std::chrono::seconds timeout, std::stop_token stop_token) const {
+    std::chrono::seconds timeout, std::stop_token stop_token,
+    const std::function<void()>& authorize_mutation) const {
   const bool connected_before =
       !driver_.ConnectedPeerAddresses(node, {endpoint}, stop_token).empty();
+  std::stop_source rollback_stop_source;
+  if (authorize_mutation) {
+    authorize_mutation();
+  }
   try {
     if (connected) {
       driver_.ConnectPeer(node, endpoint, stop_token);
@@ -727,25 +812,32 @@ void PeerConnectivityController::SetPeerConnectionState(
     }
   } catch (...) {
     const std::exception_ptr original_error = std::current_exception();
-    const bool cancelled = stop_token.stop_requested();
-    std::stop_source rollback_stop_source;
     std::optional<std::jthread> rollback_timer;
-    if (cancelled) {
+    try {
       rollback_timer.emplace(
           [&rollback_stop_source](std::stop_token timer_stop_token) {
-            std::condition_variable_any condition;
-            std::mutex mutex;
-            std::unique_lock<std::mutex> lock(mutex);
-            const bool stopped = condition.wait_for(
-                lock, timer_stop_token, kCancelledMutationRollbackBound,
-                [] { return false; });
-            if (!stopped) {
+            try {
+              std::condition_variable_any condition;
+              std::mutex mutex;
+              std::unique_lock<std::mutex> lock(mutex);
+              condition.wait_for(lock, timer_stop_token, kMutationRollbackBound,
+                                 [] { return false; });
+            } catch (...) {
+              rollback_stop_source.request_stop();
+              return;
+            }
+            if (!timer_stop_token.stop_requested()) {
               rollback_stop_source.request_stop();
             }
           });
+    } catch (...) {
+      RethrowPeerMutationFailure(original_error,
+                                 connected ? "connection rollback control"
+                                           : "disconnection rollback control",
+                                 std::current_exception());
     }
     const std::stop_token rollback_stop_token =
-        cancelled ? rollback_stop_source.get_token() : std::stop_token{};
+        rollback_stop_source.get_token();
     try {
       if (connected_before) {
         driver_.ConnectPeer(node, endpoint, rollback_stop_token);
@@ -757,20 +849,17 @@ void PeerConnectivityController::SetPeerConnectionState(
                                          rollback_stop_token);
       }
     } catch (...) {
-      if (rollback_timer) {
-        rollback_timer->request_stop();
-        rollback_timer->join();
-      }
+      rollback_timer->request_stop();
+      rollback_timer->join();
       RethrowPeerMutationFailure(original_error,
                                  connected ? "connection" : "disconnection",
                                  std::current_exception());
     }
-    if (rollback_timer) {
-      rollback_timer->request_stop();
-      rollback_timer->join();
-    }
+    rollback_timer->request_stop();
+    rollback_timer->join();
     std::rethrow_exception(original_error);
   }
+  return connected_before;
 }
 
 const ChainNodeConfig& PeerConnectivityController::FindNodeUnlocked(

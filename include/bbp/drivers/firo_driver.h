@@ -136,7 +136,9 @@ class FiroDriver final : public ChainDriver {
       const std::string& source_address, const std::string& source_private_key,
       const std::string& destination_address, uint64_t amount_satoshis,
       uint64_t fee_satoshis, std::chrono::seconds timeout,
-      std::stop_token stop_token = {}) const override;
+      std::stop_token stop_token = {},
+      const ChainRawTransactionBroadcastControl* broadcast_control =
+          nullptr) const override;
   FiroWalletTransactionResult SendWalletTransaction(
       const FiroNodeConfig& config, WalletMode wallet_mode,
       const std::string& destination_address, uint64_t amount_satoshis,

@@ -21,6 +21,7 @@
 
 #include "bbp/chain_kind.h"
 #include "bbp/drivers/chain_driver_registry.h"
+#include "bbp/json_secret_redaction.h"
 #include "bbp/logging.h"
 #include "bbp/mcp_registry.h"
 #include "bbp/mcp_run_evidence.h"
@@ -30,6 +31,7 @@
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_queue.h"
 #include "bbp/simulator/options.h"
+#include "bbp/simulator/workload_kind.h"
 #include "bbp/util.h"
 
 namespace bbp {
@@ -81,7 +83,8 @@ constexpr std::array kOwnedRunOperations = {
     McpOperationKind::kFollowLogs, McpOperationKind::kReadArtifact};
 
 constexpr bool IsWorkloadOperation(McpOperationKind kind) {
-  return kind == McpOperationKind::kStartWorkload ||
+  return kind == McpOperationKind::kInvokeWorkload ||
+         kind == McpOperationKind::kStartWorkload ||
          kind == McpOperationKind::kInspectWorkload ||
          kind == McpOperationKind::kReconfigureWorkload ||
          kind == McpOperationKind::kPauseWorkload ||
@@ -1469,7 +1472,8 @@ std::vector<McpOperationKind> McpLiveApplication::SupportedOperations() const {
 #endif
     operations.insert(
         operations.end(),
-        {McpOperationKind::kStartWorkload, McpOperationKind::kInspectWorkload,
+        {McpOperationKind::kInvokeWorkload, McpOperationKind::kStartWorkload,
+         McpOperationKind::kInspectWorkload,
          McpOperationKind::kReconfigureWorkload,
          McpOperationKind::kPauseWorkload, McpOperationKind::kResumeWorkload,
          McpOperationKind::kStopWorkload,
@@ -1617,12 +1621,31 @@ McpOperationPlan McpLiveApplication::BuildOperation(
 #endif
 
   if (IsWorkloadOperation(kind)) {
+    if (kind == McpOperationKind::kInvokeWorkload) {
+      const boost::json::value* workload = arguments.if_contains("workload");
+      const boost::json::value* type =
+          workload != nullptr && workload->is_object()
+              ? workload->as_object().if_contains("type")
+              : nullptr;
+      if (type != nullptr && type->is_string()) {
+        const std::optional<WorkloadKind> workload_kind =
+            ParseWorkloadKind(type->as_string());
+        if (workload_kind && IsLifecycleWorkloadKind(*workload_kind)) {
+          throw McpOperationFailure(
+              "workload_not_one_shot",
+              "workload.invoke requires a finite one-shot workload; use "
+              "workload.start for " +
+                  std::string(WorkloadKindName(*workload_kind)),
+              false);
+        }
+      }
+    }
     const std::shared_ptr<McpLiveWorkloadService> workload_service =
         WorkloadService();
     if (!workload_service) {
-      throw McpOperationFailure(
-          "workload_service_unavailable",
-          "the simulator workload lifecycle service is unavailable", true);
+      throw McpOperationFailure("workload_service_unavailable",
+                                "the simulator workload service is unavailable",
+                                true);
     }
     return McpOperationPlan{
         .progress_total = 1U,
@@ -1637,9 +1660,15 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           } catch (const SimulationCancelled&) {
             throw McpOperationCancelled();
           }
-          result["result_family"] = "workload";
-          result["run_id"] = config_.run_id;
-          return McpTypedResult{.family = McpResultFamily::kWorkload,
+          const McpResultFamily result_family =
+              kind == McpOperationKind::kInvokeWorkload
+                  ? McpResultFamily::kWorkloadInvocation
+                  : McpResultFamily::kWorkload;
+          if (kind != McpOperationKind::kInvokeWorkload) {
+            result["result_family"] = McpResultFamilyName(result_family);
+            result["run_id"] = config_.run_id;
+          }
+          return McpTypedResult{.family = result_family,
                                 .value = std::move(result)};
         }};
   }
@@ -2609,6 +2638,7 @@ boost::json::value McpLiveApplication::ReadResource(
         config_.run_root / "resolved-scenario.json", stop_token);
     RequireDocumentRunIdentity(scenario.as_object(), config_.run_id,
                                "resolved scenario");
+    RedactPrivateSigningMaterial(&scenario);
     return ResourceEnvelope(family, config_.run_id, std::move(scenario));
   }
   if (family == McpInformationFamily::kSourceScenario) {
@@ -2618,6 +2648,7 @@ boost::json::value McpLiveApplication::ReadResource(
       boost::json::value scenario = ReadJsonObjectFile(source, stop_token);
       RequireDocumentRunIdentity(scenario.as_object(), config_.run_id,
                                  "source scenario");
+      RedactPrivateSigningMaterial(&scenario);
       return ResourceEnvelope(family, config_.run_id, std::move(scenario));
     }
     return ResourceEnvelope(

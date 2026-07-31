@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -13,6 +15,11 @@
 #include <vector>
 
 namespace bbp {
+
+class DirectionalNetworkPolicyOutcomeUnconfirmed : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 
 enum class QdiscKind {
   kUnknown,
@@ -542,7 +549,12 @@ void UpdateDirectionalNetworkPoliciesInNamespace(
     int netns_fd, const std::string& if_name,
     const std::vector<DirectionalNetworkPolicy>& previous,
     const std::vector<DirectionalNetworkPolicy>& desired,
-    std::stop_token stop_token = {});
+    std::stop_token stop_token = {},
+    std::optional<std::chrono::steady_clock::time_point> operation_deadline =
+        std::nullopt,
+    std::stop_token rollback_stop_token = {},
+    const std::function<std::chrono::steady_clock::time_point()>&
+        begin_rollback = {});
 void SetupNodeVethNetwork(int netns_fd, const NodeVethConfig& config,
                           std::optional<NodeVethIdentity>* acquired_identity,
                           std::stop_token stop_token = {});

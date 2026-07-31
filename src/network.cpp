@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <exception>
@@ -1002,6 +1003,7 @@ namespace {
 
 constexpr std::chrono::milliseconds kNetlinkAcknowledgementTimeout{5000};
 constexpr std::chrono::milliseconds kRtnetlinkDumpTimeout{5000};
+constexpr std::chrono::seconds kDirectionalPolicyRollbackTimeout{10};
 
 #ifdef BBP_ENABLE_TEST_HOOKS
 struct NetlinkFailurePlanState {
@@ -1152,6 +1154,16 @@ void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence,
                         std::optional<std::chrono::steady_clock::time_point>
                             absolute_deadline = std::nullopt,
                         const std::function<void()>& on_acknowledged = {}) {
+  const auto require_request_authorized = [&] {
+    if (stop_token.stop_requested()) {
+      throw SimulationCancelled();
+    }
+    if (absolute_deadline &&
+        std::chrono::steady_clock::now() >= *absolute_deadline) {
+      throw std::runtime_error("netlink request deadline exceeded");
+    }
+  };
+  require_request_authorized();
   if (acknowledged != nullptr) {
     *acknowledged = false;
   }
@@ -1162,6 +1174,7 @@ void SendNetlinkRequest(nlmsghdr* nlh, uint32_t sequence,
   MnlSocket socket(NETLINK_ROUTE);
   socket.Bind(0, MNL_SOCKET_AUTOPID);
   const unsigned int port_id = socket.PortId();
+  require_request_authorized();
   socket.Send(nlh, nlh->nlmsg_len);
 #ifdef BBP_ENABLE_TEST_HOOKS
   std::exception_ptr injected_after_send;
@@ -3372,8 +3385,10 @@ void ReplaceRootPfifoQdisc(const std::string& if_name,
 }
 
 void ReplaceNetemQdisc(const std::string& if_name, std::uint32_t parent,
-                       std::uint32_t handle,
-                       const NetworkCondition& condition) {
+                       std::uint32_t handle, const NetworkCondition& condition,
+                       std::stop_token stop_token = {},
+                       std::optional<std::chrono::steady_clock::time_point>
+                           absolute_deadline = std::nullopt) {
   RequireInterfaceName(if_name);
   ValidateNetworkCondition(condition);
   const unsigned int if_index = if_nametoindex(if_name.c_str());
@@ -3422,7 +3437,7 @@ void ReplaceNetemQdisc(const std::string& if_name, std::uint32_t parent,
   }
   mnl_attr_nest_end(nlh, netem_options);
 
-  SendNetlinkRequest(nlh, sequence);
+  SendNetlinkRequest(nlh, sequence, nullptr, stop_token, absolute_deadline);
 }
 
 void ReplaceRootNetemQdisc(const std::string& if_name,
@@ -3431,7 +3446,10 @@ void ReplaceRootNetemQdisc(const std::string& if_name,
 }
 
 void ReplaceTbfQdisc(const std::string& if_name, std::uint32_t parent,
-                     std::uint32_t handle, const NetworkCondition& condition) {
+                     std::uint32_t handle, const NetworkCondition& condition,
+                     std::stop_token stop_token = {},
+                     std::optional<std::chrono::steady_clock::time_point>
+                         absolute_deadline = std::nullopt) {
   RequireInterfaceName(if_name);
   ValidateNetworkCondition(condition);
   if (condition.bandwidth_kbps == 0U) {
@@ -3477,7 +3495,7 @@ void ReplaceTbfQdisc(const std::string& if_name, std::uint32_t parent,
   mnl_attr_put_u32(nlh, TCA_TBF_BURST, burst_bytes);
   mnl_attr_nest_end(nlh, tbf_options);
 
-  SendNetlinkRequest(nlh, sequence);
+  SendNetlinkRequest(nlh, sequence, nullptr, stop_token, absolute_deadline);
 }
 
 void ReplaceRootTbfQdisc(const std::string& if_name,
@@ -3485,7 +3503,9 @@ void ReplaceRootTbfQdisc(const std::string& if_name,
   ReplaceTbfQdisc(if_name, TC_H_ROOT, kRootQdiscHandle, condition);
 }
 
-void DeleteRootQdisc(const std::string& if_name) {
+void DeleteRootQdiscControlled(
+    const std::string& if_name, std::stop_token stop_token,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline) {
   RequireInterfaceName(if_name);
   const unsigned int if_index = if_nametoindex(if_name.c_str());
   if (if_index == 0U) {
@@ -3508,12 +3528,18 @@ void DeleteRootQdisc(const std::string& if_name) {
   message->tcm_parent = TC_H_ROOT;
   message->tcm_info = 0;
 
-  SendNetlinkRequest(nlh, sequence);
+  SendNetlinkRequest(nlh, sequence, nullptr, stop_token, absolute_deadline);
+}
+
+void DeleteRootQdisc(const std::string& if_name) {
+  DeleteRootQdiscControlled(if_name, {}, std::nullopt);
 }
 
 namespace {
 
-void ReplaceDirectionalPrioQdisc(const std::string& if_name) {
+void ReplaceDirectionalPrioQdisc(
+    const std::string& if_name, std::stop_token stop_token,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline) {
   RequireInterfaceName(if_name);
   const unsigned int if_index = if_nametoindex(if_name.c_str());
   if (if_index == 0U) {
@@ -3539,11 +3565,13 @@ void ReplaceDirectionalPrioQdisc(const std::string& if_name) {
   options.bands = kDirectionalBandCount;
   mnl_attr_put_strz(nlh, TCA_KIND, "prio");
   mnl_attr_put(nlh, TCA_OPTIONS, sizeof(options), &options);
-  SendNetlinkRequest(nlh, sequence);
+  SendNetlinkRequest(nlh, sequence, nullptr, stop_token, absolute_deadline);
 }
 
-void ReplaceDirectionalFlowerFilter(const std::string& if_name,
-                                    const DirectionalNetworkPolicy& policy) {
+void ReplaceDirectionalFlowerFilter(
+    const std::string& if_name, const DirectionalNetworkPolicy& policy,
+    std::stop_token stop_token,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline) {
   RequireInterfaceName(if_name);
   const unsigned int if_index = if_nametoindex(if_name.c_str());
   if (if_index == 0U) {
@@ -3579,7 +3607,7 @@ void ReplaceDirectionalFlowerFilter(const std::string& if_name,
   mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST, destination.s_addr);
   mnl_attr_put_u32(nlh, TCA_FLOWER_KEY_IPV4_DST_MASK, exact_mask);
   mnl_attr_nest_end(nlh, options);
-  SendNetlinkRequest(nlh, sequence);
+  SendNetlinkRequest(nlh, sequence, nullptr, stop_token, absolute_deadline);
 }
 
 std::vector<TcFilterInfo> ListDirectionalFilters(
@@ -3619,33 +3647,37 @@ bool HasOwnedDirectionalRoot(const std::vector<QdiscInfo>& qdiscs,
 void ApplyDirectionalNetworkPolicies(
     const std::string& if_name,
     const std::vector<DirectionalNetworkPolicy>& policies,
-    std::stop_token stop_token) {
+    std::stop_token stop_token,
+    std::optional<std::chrono::steady_clock::time_point> absolute_deadline =
+        std::nullopt) {
   ValidateDirectionalNetworkPolicies(policies);
   const bool had_owned_root =
       HasOwnedDirectionalRoot(ListQdiscs(stop_token), if_name);
   if (had_owned_root) {
-    DeleteRootQdisc(if_name);
+    DeleteRootQdiscControlled(if_name, stop_token, absolute_deadline);
   }
   if (policies.empty()) {
     return;
   }
 
-  ReplaceDirectionalPrioQdisc(if_name);
+  ReplaceDirectionalPrioQdisc(if_name, stop_token, absolute_deadline);
   for (const DirectionalNetworkPolicy& policy : policies) {
     const std::uint32_t class_id = DirectionalClassId(policy.band);
     if (HasBandwidthCondition(policy.condition)) {
       const std::uint32_t tbf_handle = DirectionalTbfHandle(policy.band);
-      ReplaceTbfQdisc(if_name, class_id, tbf_handle, policy.condition);
+      ReplaceTbfQdisc(if_name, class_id, tbf_handle, policy.condition,
+                      stop_token, absolute_deadline);
       if (HasNetemCondition(policy.condition)) {
         ReplaceNetemQdisc(if_name, TC_H_MAKE(TC_H_MAJ(tbf_handle), 1U),
-                          DirectionalNetemHandle(policy.band),
-                          policy.condition);
+                          DirectionalNetemHandle(policy.band), policy.condition,
+                          stop_token, absolute_deadline);
       }
     } else {
       ReplaceNetemQdisc(if_name, class_id, DirectionalNetemHandle(policy.band),
-                        policy.condition);
+                        policy.condition, stop_token, absolute_deadline);
     }
-    ReplaceDirectionalFlowerFilter(if_name, policy);
+    ReplaceDirectionalFlowerFilter(if_name, policy, stop_token,
+                                   absolute_deadline);
   }
 
   const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
@@ -3670,13 +3702,23 @@ void UpdateDirectionalNetworkPoliciesInNamespace(
     int netns_fd, const std::string& if_name,
     const std::vector<DirectionalNetworkPolicy>& previous,
     const std::vector<DirectionalNetworkPolicy>& desired,
-    std::stop_token stop_token) {
+    std::stop_token stop_token,
+    std::optional<std::chrono::steady_clock::time_point> operation_deadline,
+    std::stop_token rollback_stop_token,
+    const std::function<std::chrono::steady_clock::time_point()>&
+        begin_rollback) {
   if (netns_fd < 0) {
     throw std::runtime_error("invalid network namespace fd");
   }
   RequireInterfaceName(if_name);
   ValidateDirectionalNetworkPolicies(previous);
   ValidateDirectionalNetworkPolicies(desired);
+  if (static_cast<bool>(begin_rollback) !=
+      rollback_stop_token.stop_possible()) {
+    throw std::invalid_argument(
+        "directional policy rollback control requires both a stop token and "
+        "begin callback");
+  }
   ExecuteInNetworkNamespace(netns_fd, [&]() {
     const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
     static_cast<void>(HasOwnedDirectionalRoot(qdiscs, if_name));
@@ -3688,15 +3730,64 @@ void UpdateDirectionalNetworkPoliciesInNamespace(
           "state on " +
           if_name);
     }
+    std::stop_source local_rollback_stop_source;
     try {
-      ApplyDirectionalNetworkPolicies(if_name, desired, stop_token);
-    } catch (const std::exception& apply_error) {
-      const std::string apply_message = apply_error.what();
+      ApplyDirectionalNetworkPolicies(if_name, desired, stop_token,
+                                      operation_deadline);
+    } catch (...) {
+      const std::exception_ptr apply_error = std::current_exception();
+      const std::string apply_message = ExceptionMessage(apply_error);
+      const bool apply_cancelled = [&] {
+        try {
+          std::rethrow_exception(apply_error);
+        } catch (const SimulationCancelled&) {
+          return true;
+        } catch (...) {
+          return false;
+        }
+      }();
+      std::optional<std::jthread> local_rollback_timer;
+      std::optional<std::chrono::steady_clock::time_point> rollback_deadline;
       try {
-        ApplyDirectionalNetworkPolicies(if_name, previous, {});
-      } catch (const std::exception& rollback_error) {
-        throw std::runtime_error(apply_message +
-                                 "; rollback failed: " + rollback_error.what());
+        if (begin_rollback) {
+          rollback_deadline = begin_rollback();
+        } else {
+          rollback_deadline = std::chrono::steady_clock::now() +
+                              kDirectionalPolicyRollbackTimeout;
+          local_rollback_timer.emplace(
+              [deadline = *rollback_deadline,
+               &local_rollback_stop_source](std::stop_token timer_stop_token) {
+                try {
+                  std::condition_variable_any condition;
+                  std::mutex mutex;
+                  std::unique_lock<std::mutex> lock(mutex);
+                  condition.wait_until(lock, timer_stop_token, deadline,
+                                       [] { return false; });
+                } catch (...) {
+                  local_rollback_stop_source.request_stop();
+                  return;
+                }
+                if (!timer_stop_token.stop_requested()) {
+                  local_rollback_stop_source.request_stop();
+                }
+              });
+          rollback_stop_token = local_rollback_stop_source.get_token();
+        }
+      } catch (...) {
+        throw DirectionalNetworkPolicyOutcomeUnconfirmed(
+            apply_message + "; rollback setup failed: " +
+            ExceptionMessage(std::current_exception()));
+      }
+      try {
+        ApplyDirectionalNetworkPolicies(if_name, previous, rollback_stop_token,
+                                        rollback_deadline);
+      } catch (...) {
+        throw DirectionalNetworkPolicyOutcomeUnconfirmed(
+            apply_message +
+            "; rollback failed: " + ExceptionMessage(std::current_exception()));
+      }
+      if (apply_cancelled) {
+        std::rethrow_exception(apply_error);
       }
       throw std::runtime_error(apply_message + "; prior state restored");
     }

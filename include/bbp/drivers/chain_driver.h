@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -102,6 +103,12 @@ struct ChainRawTransactionResult {
   std::string change_amount;
   std::string fee;
   uint64_t mempool_size = 0;
+};
+
+struct ChainRawTransactionBroadcastControl {
+  std::function<void()> before_broadcast;
+  std::function<void(const ChainRawTransactionResult&)> after_broadcast;
+  std::function<void()> deterministic_rejection;
 };
 
 enum class ChainWalletMode {
@@ -320,7 +327,9 @@ class ChainDriver {
       const std::string& source_address, const std::string& source_private_key,
       const std::string& destination_address, uint64_t amount_satoshis,
       uint64_t fee_satoshis, std::chrono::seconds timeout,
-      std::stop_token stop_token = {}) const = 0;
+      std::stop_token stop_token = {},
+      const ChainRawTransactionBroadcastControl* broadcast_control =
+          nullptr) const = 0;
   virtual ChainWalletTransactionResult SendWalletTransaction(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       const std::string& destination_address, uint64_t amount_satoshis,

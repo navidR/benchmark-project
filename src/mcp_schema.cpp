@@ -62,12 +62,6 @@ constexpr std::array kSimulationPartitionScopes{
     SimulationPartitionScope::kRegion,
     SimulationPartitionScope::kRole,
 };
-constexpr std::array kMcpLifecycleWorkloadKinds{
-    WorkloadKind::kBlockGeneration,
-    WorkloadKind::kWaitUntilHeight,
-    WorkloadKind::kWaitForPeers,
-    WorkloadKind::kWalletTransactions,
-};
 
 boost::json::object TypeSchema(std::string_view type) {
   return boost::json::object{{"type", type}};
@@ -981,6 +975,9 @@ boost::json::object DiagnosticSchema() {
   properties["node_id"] = IdentifierSchema();
   properties["action"] = IdentifierSchema();
   properties["state"] = IdentifierSchema();
+  properties["phase"] = StringEnumSchema(
+      boost::json::array{"before_stop", "stop_requested", "original_exited",
+                         "replacement_ready", "completed"});
   properties["command_id"] = IdentifierSchema();
   properties["requested_count"] = Uint64Schema();
   properties["current_node_count"] = Uint64Schema();
@@ -1150,8 +1147,17 @@ boost::json::object AddDraft(boost::json::object schema) {
 
 boost::json::object McpLifecycleWorkloadSchema() {
   boost::json::array variants;
-  variants.reserve(kMcpLifecycleWorkloadKinds.size());
-  for (const WorkloadKind kind : kMcpLifecycleWorkloadKinds) {
+  variants.reserve(kLifecycleWorkloadKinds.size());
+  for (const WorkloadKind kind : kLifecycleWorkloadKinds) {
+    variants.push_back(WorkloadVariant(kind, "type", false));
+  }
+  return AddDraft(boost::json::object{{"oneOf", std::move(variants)}});
+}
+
+boost::json::object McpOneShotWorkloadSchema() {
+  boost::json::array variants;
+  variants.reserve(kOneShotWorkloadKinds.size());
+  for (const WorkloadKind kind : kOneShotWorkloadKinds) {
     variants.push_back(WorkloadVariant(kind, "type", false));
   }
   return AddDraft(boost::json::object{{"oneOf", std::move(variants)}});
@@ -1522,6 +1528,8 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
     case McpOperationKind::kRemoveMasternode:
     case McpOperationKind::kRestartMasternode:
       return McpResultFamily::kRoleMutation;
+    case McpOperationKind::kInvokeWorkload:
+      return McpResultFamily::kWorkloadInvocation;
     case McpOperationKind::kStartWorkload:
     case McpOperationKind::kInspectWorkload:
     case McpOperationKind::kReconfigureWorkload:
@@ -1695,6 +1703,11 @@ boost::json::object BuildMcpOperationInputSchema(
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
       required.emplace_back("node_ids");
       add_timeout();
+      break;
+    case McpOperationKind::kInvokeWorkload:
+      add_run();
+      properties["workload"] = McpOneShotWorkloadSchema();
+      required.emplace_back("workload");
       break;
     case McpOperationKind::kStartWorkload:
       add_run();
@@ -2619,6 +2632,15 @@ boost::json::object BuildMcpResultSchema(
                                 {"then", std::move(non_wait_result)}});
       }
       break;
+    case McpResultFamily::kWorkloadInvocation:
+      properties["run_id"] = IdentifierSchema();
+      properties["invocation_id"] = IdentifierSchema();
+      properties["action"] = StringEnumSchema(
+          EnumNames(kOneShotWorkloadKinds,
+                    [](WorkloadKind kind) { return WorkloadKindName(kind); }));
+      properties["state"] = ConstStringSchema("completed");
+      require({"run_id", "invocation_id", "action", "state"});
+      break;
     case McpResultFamily::kInstrumentation:
       properties["run_id"] = IdentifierSchema();
       properties["instrumentation_id"] = IdentifierSchema();
@@ -2832,6 +2854,60 @@ boost::json::object BuildMcpResultSchema(
                                          ConstStringSchema("error")}}}}}});
         }
 #endif
+        if (std::find(selected_operations.begin(), selected_operations.end(),
+                      McpOperationKind::kInvokeWorkload) !=
+            selected_operations.end()) {
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation", ConstStringSchema("workload.invoke")},
+                        {"state", ConstStringSchema("succeeded")}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"terminal_result_family",
+                         ConstStringSchema("workload_invocation")},
+                        {"terminal_result",
+                         boost::json::object{
+                             {"properties",
+                              boost::json::object{
+                                  {"result_family",
+                                   ConstStringSchema("workload_invocation")}}},
+                             {"required", Required({"result_family"})}}}}}}}});
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation", ConstStringSchema("workload.invoke")},
+                        {"state", StringEnumSchema(boost::json::array{
+                                      "queued", "running", "cancelling"})}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"terminal_result_family",
+                         ConstStringSchema("workload_invocation")}}}}}});
+          constraints.emplace_back(boost::json::object{
+              {"if",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{
+                        {"operation", ConstStringSchema("workload.invoke")},
+                        {"state", StringEnumSchema(boost::json::array{
+                                      "failed", "cancelled"})}}},
+                   {"required", Required({"operation", "state"})}}},
+              {"then",
+               boost::json::object{
+                   {"properties",
+                    boost::json::object{{"terminal_result_family",
+                                         ConstStringSchema("error")}}}}}});
+        }
         if (std::find(selected_operations.begin(), selected_operations.end(),
                       McpOperationKind::kAssignRole) !=
             selected_operations.end()) {
@@ -3062,7 +3138,8 @@ boost::json::object BuildMcpOperationOutputSchema(
 #endif
       operation == McpOperationKind::kAssignRole ||
       operation == McpOperationKind::kRemoveRole ||
-      operation == McpOperationKind::kRemoveWallet;
+      operation == McpOperationKind::kRemoveWallet ||
+      operation == McpOperationKind::kInvokeWorkload;
   const std::span<const McpOperationKind> wrapper_operations =
       has_dedicated_wrapper ? std::span<const McpOperationKind>(operation_only)
                             : selected_operations;
