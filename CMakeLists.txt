@@ -289,6 +289,7 @@ add_executable(bbp
   src/simulator_app.cpp
   src/simulator_host_probes.cpp
   src/simulator_scenario_serialization.cpp
+  src/simulator_yaml_decoding.cpp
   src/simulator_log_pane.cpp
   src/tui.cpp
   src/tui_command_admission.cpp
@@ -526,6 +527,7 @@ if(BUILD_TESTING)
     src/simulator_app.cpp
     src/simulator_host_probes.cpp
     src/simulator_scenario_serialization.cpp
+    src/simulator_yaml_decoding.cpp
     src/scheduled_scenario_event.cpp
     src/simulation_command_processor.cpp
     src/simulation_command_queue.cpp
