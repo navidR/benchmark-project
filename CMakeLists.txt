@@ -290,6 +290,7 @@ add_executable(bbp
   src/simulator_host_probes.cpp
   src/simulator_json_field_decoding.cpp
   src/simulator_network_rule_decoding.cpp
+  src/simulator_peer_topology_decoding.cpp
   src/simulator_scenario_serialization.cpp
   src/simulator_yaml_decoding.cpp
   src/simulator_log_pane.cpp
@@ -530,6 +531,7 @@ if(BUILD_TESTING)
     src/simulator_host_probes.cpp
     src/simulator_json_field_decoding.cpp
     src/simulator_network_rule_decoding.cpp
+    src/simulator_peer_topology_decoding.cpp
     src/simulator_scenario_serialization.cpp
     src/simulator_yaml_decoding.cpp
     src/scheduled_scenario_event.cpp
