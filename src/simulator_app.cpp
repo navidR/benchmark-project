@@ -242,6 +242,48 @@ class WorkloadMutationFailedAfterRollback final : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+constexpr auto kWorkloadServiceShutdownBound = std::chrono::seconds(15);
+
+class WorkloadServiceShutdownTimeout final : public std::runtime_error {
+ public:
+  explicit WorkloadServiceShutdownTimeout(
+      const McpLiveWorkloadDrainResult& result)
+      : std::runtime_error(
+            "workload service did not drain within the 15000 ms shutdown "
+            "bound; referenced simulator state was retained until every "
+            "callback and worker exited"),
+        active_callback_count_(result.active_callback_count),
+        active_worker_count_(result.active_worker_count),
+        admission_closed_(result.admission_closed),
+        cancellation_requested_(result.cancellation_requested) {}
+
+  boost::json::object Diagnostic() const {
+    return boost::json::object{
+        {"code", "workload_service_shutdown_timeout"},
+        {"message", what()},
+        {"severity", "critical"},
+        {"active_callback_count",
+         static_cast<std::uint64_t>(active_callback_count_)},
+        {"active_worker_count",
+         static_cast<std::uint64_t>(active_worker_count_)},
+        {"shutdown_bound_ms",
+         static_cast<std::uint64_t>(
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 kWorkloadServiceShutdownBound)
+                 .count())},
+        {"admission_closed", admission_closed_},
+        {"cancellation_requested", cancellation_requested_},
+        {"safe_to_destroy", false},
+    };
+  }
+
+ private:
+  std::size_t active_callback_count_;
+  std::size_t active_worker_count_;
+  bool admission_closed_;
+  bool cancellation_requested_;
+};
+
 [[noreturn]] void RethrowWorkloadMutationAfterVerifiedRollback(
     const std::exception_ptr& error) {
   try {
@@ -16643,12 +16685,25 @@ std::vector<bool> StopNodes(
         std::nullopt,
     std::stop_token cleanup_stop_token = {},
     bool allow_partial_preparation = false) {
+  const auto shutdown_started = std::chrono::steady_clock::now();
   const auto shutdown_timeout =
       best_effort ? std::chrono::seconds(2) : std::chrono::seconds(15);
-  auto shutdown_deadline = std::chrono::steady_clock::now() + shutdown_timeout;
+  auto shutdown_deadline = shutdown_started + shutdown_timeout;
   if (absolute_deadline) {
     shutdown_deadline = std::min(shutdown_deadline, *absolute_deadline);
   }
+  const auto shutdown_budget =
+      shutdown_deadline > shutdown_started
+          ? shutdown_deadline - shutdown_started
+          : std::chrono::steady_clock::duration::zero();
+  const auto shutdown_phase = shutdown_budget / 5;
+  // Preserve one immutable deadline while reserving bounded opportunities for
+  // RPC stop, graceful exit, SIGTERM, SIGKILL, and verified resource cleanup.
+  // An earlier phase may finish early, but cannot consume a later reservation.
+  const auto rpc_deadline = shutdown_started + shutdown_phase;
+  const auto graceful_exit_deadline = shutdown_started + shutdown_phase * 2;
+  const auto terminate_deadline = shutdown_started + shutdown_phase * 3;
+  const auto kill_deadline = shutdown_started + shutdown_phase * 4;
   std::vector<bool> resource_cleanup_verified(nodes.size(), false);
   std::exception_ptr first_failure;
   const auto record_failure = [&](std::string_view description,
@@ -16679,56 +16734,67 @@ std::vector<bool> StopNodes(
       return false;
     }
   };
-  const auto lock_process_state = [&](NodeRuntime& node) {
-    if (node.run_process_state == nullptr) {
-      throw std::logic_error("node has no run process synchronization state: " +
-                             node.config.id);
-    }
-    std::optional<RunProcessState::Guard> guard =
-        node.run_process_state->TryLockUntil(shutdown_deadline,
-                                             cleanup_stop_token);
-    if (!guard) {
-      throw std::runtime_error(
-          "node cleanup could not acquire process state before deadline: " +
-          node.config.id);
-    }
-    return std::move(*guard);
-  };
-  const auto node_process_running = [&](NodeRuntime& node) {
-    try {
-      auto process_guard = lock_process_state(node);
-      return node.process.running();
-    } catch (...) {
-      return true;
-    }
-  };
-  const auto transition_node_state = [&](NodeRuntime& node,
-                                         NodeRuntimeLifecycle state) {
-    {
-      auto process_guard = lock_process_state(node);
-      node.SetLifecycle(state);
-    }
-    WriteNodeStateEvent(events_path, options.run_id, node, state);
-  };
-  const auto request_node_terminate = [&](NodeRuntime& node) {
-    auto process_guard = lock_process_state(node);
-    return node.process.RequestTerminate();
-  };
-  const auto request_node_kill = [&](NodeRuntime& node) {
-    auto process_guard = lock_process_state(node);
-    return node.process.RequestKill();
-  };
+  const auto lock_process_state =
+      [&](NodeRuntime& node,
+          std::chrono::steady_clock::time_point phase_deadline) {
+        if (node.run_process_state == nullptr) {
+          throw std::logic_error(
+              "node has no run process synchronization state: " +
+              node.config.id);
+        }
+        std::optional<RunProcessState::Guard> guard =
+            node.run_process_state->TryLockUntil(phase_deadline,
+                                                 cleanup_stop_token);
+        if (!guard) {
+          throw std::runtime_error(
+              "node cleanup could not acquire process state before deadline: " +
+              node.config.id);
+        }
+        return std::move(*guard);
+      };
+  const auto node_process_running =
+      [&](NodeRuntime& node,
+          std::chrono::steady_clock::time_point phase_deadline) {
+        try {
+          auto process_guard = lock_process_state(node, phase_deadline);
+          return node.process.running();
+        } catch (...) {
+          return true;
+        }
+      };
+  const auto transition_node_state =
+      [&](NodeRuntime& node, NodeRuntimeLifecycle state,
+          std::chrono::steady_clock::time_point phase_deadline) {
+        {
+          auto process_guard = lock_process_state(node, phase_deadline);
+          node.SetLifecycle(state);
+        }
+        WriteNodeStateEvent(events_path, options.run_id, node, state);
+      };
+  const auto request_node_terminate =
+      [&](NodeRuntime& node,
+          std::chrono::steady_clock::time_point phase_deadline) {
+        auto process_guard = lock_process_state(node, phase_deadline);
+        return node.process.RequestTerminate();
+      };
+  const auto request_node_kill =
+      [&](NodeRuntime& node,
+          std::chrono::steady_clock::time_point phase_deadline) {
+        auto process_guard = lock_process_state(node, phase_deadline);
+        return node.process.RequestKill();
+      };
 
   for (auto& node : nodes) {
     bool running = false;
     cleanup_step("perf counter reset", [&] {
-      auto process_guard = lock_process_state(node);
+      auto process_guard = lock_process_state(node, rpc_deadline);
       ResetNodePerfCounters(node, process_guard);
       running = node.process.running();
     });
     if (running) {
       cleanup_step("stopping state event", [&] {
-        transition_node_state(node, NodeRuntimeLifecycle::kStopping);
+        transition_node_state(node, NodeRuntimeLifecycle::kStopping,
+                              rpc_deadline);
       });
     }
   }
@@ -16741,7 +16807,7 @@ std::vector<bool> StopNodes(
   std::vector<std::size_t> running_processes;
   running_processes.reserve(nodes.size());
   for (std::size_t index = 0; index < nodes.size(); ++index) {
-    if (node_process_running(nodes[index])) {
+    if (node_process_running(nodes[index], rpc_deadline)) {
       running_processes.push_back(index);
       cleanup_step("RPC stop event", [&] {
         WriteEvent(events_path, options.run_id, nodes[index].config.id,
@@ -16756,9 +16822,9 @@ std::vector<bool> StopNodes(
     }
   }
   std::jthread rpc_deadline_timer(
-      [shutdown_deadline, &rpc_stop_source](std::stop_token stop_token) {
+      [rpc_deadline, &rpc_stop_source](std::stop_token stop_token) {
         try {
-          WaitUntil(shutdown_deadline, stop_token);
+          WaitUntil(rpc_deadline, stop_token);
         } catch (const SimulationCancelled&) {
           return;
         }
@@ -16766,7 +16832,7 @@ std::vector<bool> StopNodes(
       });
   for (const std::size_t index : running_processes) {
     if (cleanup_stop_token.stop_requested() ||
-        std::chrono::steady_clock::now() >= shutdown_deadline) {
+        std::chrono::steady_clock::now() >= rpc_deadline) {
       rpc_failures[index] = std::make_exception_ptr(
           std::runtime_error("node RPC stop deadline expired before request: " +
                              nodes[index].config.id));
@@ -16784,28 +16850,37 @@ std::vector<bool> StopNodes(
     record_failure("node RPC stop", failure);
   }
 
-  bool process_running = true;
+  std::vector<std::size_t> graceful_processes;
+  graceful_processes.reserve(running_processes.size());
+  for (const std::size_t index : running_processes) {
+    if (!rpc_failures[index]) {
+      graceful_processes.push_back(index);
+    }
+  }
+  bool process_running = !graceful_processes.empty();
   while (process_running &&
-         std::chrono::steady_clock::now() < shutdown_deadline &&
+         std::chrono::steady_clock::now() < graceful_exit_deadline &&
          !cleanup_stop_token.stop_requested()) {
     process_running = false;
-    for (auto& node : nodes) {
-      process_running = node_process_running(node) || process_running;
+    for (const std::size_t index : graceful_processes) {
+      process_running =
+          node_process_running(nodes[index], graceful_exit_deadline) ||
+          process_running;
     }
     if (process_running) {
       const auto now = std::chrono::steady_clock::now();
-      if (now < shutdown_deadline) {
+      if (now < graceful_exit_deadline) {
         std::this_thread::sleep_for(
             std::min(std::chrono::milliseconds(20),
                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                         shutdown_deadline - now)));
+                         graceful_exit_deadline - now)));
       }
     }
   }
 
   running_processes.clear();
   for (std::size_t index = 0; index < nodes.size(); ++index) {
-    if (!node_process_running(nodes[index])) {
+    if (!node_process_running(nodes[index], terminate_deadline)) {
       continue;
     }
     running_processes.push_back(index);
@@ -16817,14 +16892,12 @@ std::vector<bool> StopNodes(
   std::vector<std::exception_ptr> termination_failures(nodes.size());
   for (const std::size_t index : running_processes) {
     try {
-      static_cast<void>(request_node_terminate(nodes[index]));
+      static_cast<void>(
+          request_node_terminate(nodes[index], terminate_deadline));
     } catch (...) {
       termination_failures[index] = std::current_exception();
     }
   }
-  const auto terminate_deadline =
-      std::min(std::chrono::steady_clock::now() + std::chrono::seconds(1),
-               shutdown_deadline);
   bool terminating_processes = true;
   while (terminating_processes &&
          std::chrono::steady_clock::now() < terminate_deadline &&
@@ -16832,7 +16905,8 @@ std::vector<bool> StopNodes(
     terminating_processes = false;
     for (const std::size_t index : running_processes) {
       terminating_processes =
-          node_process_running(nodes[index]) || terminating_processes;
+          node_process_running(nodes[index], terminate_deadline) ||
+          terminating_processes;
     }
     if (terminating_processes) {
       const auto now = std::chrono::steady_clock::now();
@@ -16847,21 +16921,18 @@ std::vector<bool> StopNodes(
   std::vector<std::size_t> kill_processes;
   kill_processes.reserve(running_processes.size());
   for (const std::size_t index : running_processes) {
-    if (!node_process_running(nodes[index])) {
+    if (!node_process_running(nodes[index], kill_deadline)) {
       continue;
     }
     kill_processes.push_back(index);
     try {
-      static_cast<void>(request_node_kill(nodes[index]));
+      static_cast<void>(request_node_kill(nodes[index], kill_deadline));
     } catch (...) {
       if (!termination_failures[index]) {
         termination_failures[index] = std::current_exception();
       }
     }
   }
-  const auto kill_deadline =
-      std::min(std::chrono::steady_clock::now() + std::chrono::seconds(5),
-               shutdown_deadline);
   bool killed_processes_running = true;
   while (killed_processes_running &&
          std::chrono::steady_clock::now() < kill_deadline &&
@@ -16869,7 +16940,8 @@ std::vector<bool> StopNodes(
     killed_processes_running = false;
     for (const std::size_t index : kill_processes) {
       killed_processes_running =
-          node_process_running(nodes[index]) || killed_processes_running;
+          node_process_running(nodes[index], kill_deadline) ||
+          killed_processes_running;
     }
     if (killed_processes_running) {
       const auto now = std::chrono::steady_clock::now();
@@ -16882,7 +16954,8 @@ std::vector<bool> StopNodes(
     }
   }
   for (const std::size_t index : kill_processes) {
-    if (node_process_running(nodes[index]) && !termination_failures[index]) {
+    if (node_process_running(nodes[index], shutdown_deadline) &&
+        !termination_failures[index]) {
       termination_failures[index] = std::make_exception_ptr(std::runtime_error(
           "node process survived SIGKILL: " + nodes[index].config.id));
     }
@@ -16895,7 +16968,7 @@ std::vector<bool> StopNodes(
     auto& node = nodes[index];
     std::optional<RunProcessState::Guard> final_process_guard;
     try {
-      final_process_guard.emplace(lock_process_state(node));
+      final_process_guard.emplace(lock_process_state(node, shutdown_deadline));
       const bool daemon_absence_verified = !node.process.running();
       if (!daemon_absence_verified) {
         throw std::runtime_error(
@@ -23516,6 +23589,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   std::shared_ptr<McpLiveInstrumentationService>
       installed_instrumentation_service;
   std::shared_ptr<McpLiveRoleService> installed_role_service;
+  bool workload_shutdown_complete = false;
+  bool workload_shutdown_safe_to_destroy = false;
+  std::exception_ptr workload_shutdown_failure;
   std::atomic<std::shared_ptr<McpLiveRoleService>> command_role_service;
   std::mutex lifecycle_failure_mutex;
   std::timed_mutex node_mutation_mutex;
@@ -23584,16 +23660,29 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       lifecycle_supervisor.reset();
     }
   };
-  const auto request_workload_shutdown = [&](bool run_failed) {
+  struct WorkloadShutdownRecords {
+    std::array<std::shared_ptr<LiveWalletWorkloadRecord>,
+               kMaximumScenarioActionCount>
+        wallets;
+    std::array<std::shared_ptr<LiveBlockGenerationWorkloadRecord>,
+               kMaximumScenarioActionCount>
+        block_generators;
+    std::array<std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>,
+               kMaximumScenarioActionCount>
+        height_waits;
+    std::array<std::shared_ptr<LiveWaitForPeersWorkloadRecord>,
+               kMaximumScenarioActionCount>
+        peer_waits;
+    std::size_t wallet_count = 0U;
+    std::size_t block_generator_count = 0U;
+    std::size_t height_wait_count = 0U;
+    std::size_t peer_wait_count = 0U;
+  };
+  const auto request_workload_shutdown =
+      [&](bool run_failed) -> WorkloadShutdownRecords {
     const std::chrono::steady_clock::time_point shutdown_requested_at =
         observed_run_stop().value_or(std::chrono::steady_clock::now());
-    std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
-    std::vector<std::shared_ptr<LiveBlockGenerationWorkloadRecord>>
-        block_records;
-    std::vector<std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>>
-        height_wait_records;
-    std::vector<std::shared_ptr<LiveWaitForPeersWorkloadRecord>>
-        peer_wait_records;
+    WorkloadShutdownRecords retained;
     {
       std::scoped_lock lock(
           wallet_workloads->mutex, block_generation_workloads->mutex,
@@ -23602,28 +23691,46 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       block_generation_workloads->shutting_down = true;
       wait_until_height_workloads->shutting_down = true;
       wait_for_peers_workloads->shutting_down = true;
-      records.reserve(wallet_workloads->records.size());
       for (const auto& [id, record] : wallet_workloads->records) {
         static_cast<void>(id);
-        records.push_back(record);
+        if (retained.wallet_count == retained.wallets.size()) {
+          throw std::logic_error(
+              "wallet workload registry exceeds its configured capacity");
+        }
+        retained.wallets[retained.wallet_count++] = record;
       }
-      block_records.reserve(block_generation_workloads->records.size());
       for (const auto& [id, record] : block_generation_workloads->records) {
         static_cast<void>(id);
-        block_records.push_back(record);
+        if (retained.block_generator_count ==
+            retained.block_generators.size()) {
+          throw std::logic_error(
+              "block generation workload registry exceeds its configured "
+              "capacity");
+        }
+        retained.block_generators[retained.block_generator_count++] = record;
       }
-      height_wait_records.reserve(wait_until_height_workloads->records.size());
       for (const auto& [id, record] : wait_until_height_workloads->records) {
         static_cast<void>(id);
-        height_wait_records.push_back(record);
+        if (retained.height_wait_count == retained.height_waits.size()) {
+          throw std::logic_error(
+              "wait-until-height workload registry exceeds its configured "
+              "capacity");
+        }
+        retained.height_waits[retained.height_wait_count++] = record;
       }
-      peer_wait_records.reserve(wait_for_peers_workloads->records.size());
       for (const auto& [id, record] : wait_for_peers_workloads->records) {
         static_cast<void>(id);
-        peer_wait_records.push_back(record);
+        if (retained.peer_wait_count == retained.peer_waits.size()) {
+          throw std::logic_error(
+              "wait-for-peers workload registry exceeds its configured "
+              "capacity");
+        }
+        retained.peer_waits[retained.peer_wait_count++] = record;
       }
     }
-    for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
+    for (std::size_t index = 0U; index < retained.wallet_count; ++index) {
+      const std::shared_ptr<LiveWalletWorkloadRecord>& record =
+          retained.wallets[index];
       std::lock_guard<std::mutex> lock(record->mutex);
       if (IsTerminalLiveWalletWorkloadState(record->state)) {
         continue;
@@ -23631,11 +23738,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       record->state = LiveWalletWorkloadState::kStopping;
       record->request = run_failed ? LiveWalletWorkloadRequest::kRunFailure
                                    : LiveWalletWorkloadRequest::kShutdown;
-      record->epoch_stop_source.request_stop();
       record->changed.notify_all();
     }
-    for (const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record :
-         block_records) {
+    for (std::size_t index = 0U; index < retained.block_generator_count;
+         ++index) {
+      const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record =
+          retained.block_generators[index];
       std::lock_guard<std::mutex> lock(record->mutex);
       if (IsTerminalLiveWorkloadState(record->state)) {
         continue;
@@ -23643,11 +23751,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       record->state = LiveWorkloadState::kStopping;
       record->request = run_failed ? LiveWorkloadRequest::kRunFailure
                                    : LiveWorkloadRequest::kShutdown;
-      record->boundary_stop_source.request_stop();
       record->changed.notify_all();
     }
-    for (const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record :
-         height_wait_records) {
+    for (std::size_t index = 0U; index < retained.height_wait_count; ++index) {
+      const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record =
+          retained.height_waits[index];
       std::lock_guard<std::mutex> lock(record->mutex);
       if (IsTerminalLiveWorkloadState(record->state) ||
           record->completion_pending) {
@@ -23661,18 +23769,17 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           (record->request == LiveWorkloadRequest::kNone ||
            record->request == LiveWorkloadRequest::kStopSettle)) {
         record->epoch_timed_out = true;
-        record->epoch_stop_source.request_stop();
         record->changed.notify_all();
         continue;
       }
       record->state = LiveWorkloadState::kStopping;
       record->request = run_failed ? LiveWorkloadRequest::kRunFailure
                                    : LiveWorkloadRequest::kShutdown;
-      record->epoch_stop_source.request_stop();
       record->changed.notify_all();
     }
-    for (const std::shared_ptr<LiveWaitForPeersWorkloadRecord>& record :
-         peer_wait_records) {
+    for (std::size_t index = 0U; index < retained.peer_wait_count; ++index) {
+      const std::shared_ptr<LiveWaitForPeersWorkloadRecord>& record =
+          retained.peer_waits[index];
       std::lock_guard<std::mutex> lock(record->mutex);
       if (IsTerminalLiveWorkloadState(record->state) ||
           record->completion_pending) {
@@ -23686,95 +23793,295 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           (record->request == LiveWorkloadRequest::kNone ||
            record->request == LiveWorkloadRequest::kStopSettle)) {
         record->epoch_timed_out = true;
-        record->epoch_stop_source.request_stop();
         record->changed.notify_all();
         continue;
       }
       record->state = LiveWorkloadState::kStopping;
       record->request = run_failed ? LiveWorkloadRequest::kRunFailure
                                    : LiveWorkloadRequest::kShutdown;
-      record->epoch_stop_source.request_stop();
       record->changed.notify_all();
     }
-    return std::make_tuple(std::move(records), std::move(block_records),
-                           std::move(height_wait_records),
-                           std::move(peer_wait_records));
+    return retained;
   };
   const auto stop_wallet_workloads = [&](bool run_failed) {
-    mcp_application.SetWorkloadService(nullptr);
-    auto [records, block_records, height_wait_records, peer_wait_records] =
-        request_workload_shutdown(run_failed);
-    for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
-      if (record->worker.joinable()) {
-        record->worker.join();
+    if (workload_shutdown_complete) {
+      if (workload_shutdown_failure) {
+        std::rethrow_exception(workload_shutdown_failure);
       }
-      std::lock_guard<std::mutex> lock(record->mutex);
-      if (!IsTerminalLiveWalletWorkloadState(record->state)) {
-        record->state = run_failed ? LiveWalletWorkloadState::kFailed
-                                   : LiveWalletWorkloadState::kCancelled;
-        record->terminal_outcome = run_failed ? "failed" : "cancelled";
-        if (run_failed && !record->failure) {
-          record->failure = "run failed while wallet workload was active";
-        }
-        record->changed.notify_all();
+      return;
+    }
+    const std::chrono::steady_clock::time_point shutdown_deadline =
+        std::chrono::steady_clock::now() + kWorkloadServiceShutdownBound;
+    std::exception_ptr shutdown_failure;
+    const auto remember_shutdown_failure =
+        [&](const std::exception_ptr& failure) noexcept {
+          if (!shutdown_failure) {
+            shutdown_failure = failure;
+          }
+        };
+    try {
+      mcp_application.CloseWorkloadService(shutdown_deadline);
+    } catch (const std::exception& error) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "workload service admission closure failed; retrying: "
+                     << error.what();
+      try {
+        mcp_application.CloseWorkloadService(shutdown_deadline);
+      } catch (...) {
+        BBP_LOG(error)
+            << "workload service admission closure failed repeatedly";
+        std::terminate();
+      }
+    } catch (...) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "workload service admission closure failed; retrying";
+      try {
+        mcp_application.CloseWorkloadService(shutdown_deadline);
+      } catch (...) {
+        BBP_LOG(error)
+            << "workload service admission closure failed repeatedly";
+        std::terminate();
       }
     }
-    for (const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record :
-         height_wait_records) {
-      if (record->worker.joinable()) {
-        record->worker.join();
+    WorkloadShutdownRecords retained_records;
+    try {
+      retained_records = request_workload_shutdown(run_failed);
+    } catch (const std::exception& error) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "workload lifecycle cancellation failed; retrying: "
+                     << error.what();
+      try {
+        retained_records = request_workload_shutdown(run_failed);
+      } catch (...) {
+        BBP_LOG(error) << "workload lifecycle cancellation failed repeatedly";
+        std::terminate();
       }
-      std::lock_guard<std::mutex> lock(record->mutex);
-      if (!IsTerminalLiveWorkloadState(record->state)) {
-        record->state = run_failed ? LiveWorkloadState::kFailed
-                                   : LiveWorkloadState::kCancelled;
-        record->terminal_outcome = run_failed ? "failed" : "cancelled";
-        if (run_failed && !record->failure) {
-          record->failure =
-              "run failed while wait-until-height workload was active";
-        }
-        record->changed.notify_all();
-      }
-    }
-    for (const std::shared_ptr<LiveWaitForPeersWorkloadRecord>& record :
-         peer_wait_records) {
-      if (record->worker.joinable()) {
-        record->worker.join();
-      }
-      std::lock_guard<std::mutex> lock(record->mutex);
-      if (!IsTerminalLiveWorkloadState(record->state)) {
-        record->state = run_failed ? LiveWorkloadState::kFailed
-                                   : LiveWorkloadState::kCancelled;
-        record->terminal_outcome = run_failed ? "failed" : "cancelled";
-        if (run_failed && !record->failure) {
-          record->failure =
-              "run failed while wait-for-peers workload was active";
-        }
-        record->changed.notify_all();
+    } catch (...) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "workload lifecycle cancellation failed; retrying";
+      try {
+        retained_records = request_workload_shutdown(run_failed);
+      } catch (...) {
+        BBP_LOG(error) << "workload lifecycle cancellation failed repeatedly";
+        std::terminate();
       }
     }
-    for (const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record :
-         block_records) {
-      if (record->worker.joinable()) {
-        record->worker.join();
+    try {
+      mcp_application.RequestWorkloadServiceCancellation();
+    } catch (const std::exception& error) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "workload service cancellation failed; retrying: "
+                     << error.what();
+      try {
+        mcp_application.RequestWorkloadServiceCancellation();
+      } catch (...) {
+        BBP_LOG(error) << "workload service cancellation failed repeatedly";
+        std::terminate();
       }
-      std::lock_guard<std::mutex> lock(record->mutex);
-      if (!IsTerminalLiveWorkloadState(record->state)) {
-        record->state = run_failed ? LiveWorkloadState::kFailed
-                                   : LiveWorkloadState::kCancelled;
-        record->terminal_outcome = run_failed ? "failed" : "cancelled";
-        if (run_failed && !record->failure) {
-          record->failure =
-              "run failed while block generation workload was active";
-        }
-        record->changed.notify_all();
+    } catch (...) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "workload service cancellation failed; retrying";
+      try {
+        mcp_application.RequestWorkloadServiceCancellation();
+      } catch (...) {
+        BBP_LOG(error) << "workload service cancellation failed repeatedly";
+        std::terminate();
       }
     }
-    while (installed_workload_service &&
-           installed_workload_service.use_count() > 1U) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::optional<McpLiveWorkloadDrainResult> shutdown_deadline_snapshot;
+    bool safe_to_destroy = false;
+    try {
+      const McpLiveWorkloadDrainResult drain_result =
+          mcp_application.WaitForWorkloadServiceDrain();
+      safe_to_destroy = drain_result.safe_to_destroy();
+      if (!safe_to_destroy) {
+        shutdown_deadline_snapshot = drain_result;
+        mcp_application.PublishWorkloadServiceShutdownTimeout(
+            drain_result, std::chrono::duration_cast<std::chrono::milliseconds>(
+                              kWorkloadServiceShutdownBound));
+        BBP_LOG(error)
+            << "workload service did not drain within the 15000 ms shutdown "
+               "bound; active_callbacks="
+            << drain_result.active_callback_count
+            << "; active_workers=" << drain_result.active_worker_count;
+        try {
+          const WorkloadServiceShutdownTimeout shutdown_timeout(drain_result);
+          WriteEvent(events_path, options.run_id, "sim",
+                     SimulationEventKind::kRunFailed,
+                     boost::json::serialize(shutdown_timeout.Diagnostic()));
+        } catch (const std::exception& error) {
+          BBP_LOG(error) << "workload service shutdown timeout evidence "
+                            "publication failed: "
+                         << error.what();
+        } catch (...) {
+          BBP_LOG(error) << "workload service shutdown timeout evidence "
+                            "publication failed";
+        }
+      }
+    } catch (const std::exception& error) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "bounded workload service drain failed: "
+                     << error.what();
+    } catch (...) {
+      remember_shutdown_failure(std::current_exception());
+      BBP_LOG(error) << "bounded workload service drain failed";
+    }
+    if (!safe_to_destroy) {
+      try {
+        const McpLiveWorkloadDrainResult quarantine_result =
+            mcp_application.WaitForWorkloadServiceQuarantine();
+        safe_to_destroy = quarantine_result.safe_to_destroy();
+      } catch (const std::exception& error) {
+        remember_shutdown_failure(std::current_exception());
+        BBP_LOG(error) << "workload service quarantine wait failed: "
+                       << error.what();
+      } catch (...) {
+        remember_shutdown_failure(std::current_exception());
+        BBP_LOG(error) << "workload service quarantine wait failed";
+      }
+    }
+    if (!safe_to_destroy && installed_workload_service) {
+      try {
+        const McpLiveWorkloadDrainResult quarantine_result =
+            installed_workload_service->WaitUntilDrained();
+        safe_to_destroy = quarantine_result.safe_to_destroy();
+      } catch (const std::exception& error) {
+        remember_shutdown_failure(std::current_exception());
+        BBP_LOG(error) << "direct workload service quarantine wait failed: "
+                       << error.what();
+      } catch (...) {
+        remember_shutdown_failure(std::current_exception());
+        BBP_LOG(error) << "direct workload service quarantine wait failed";
+      }
+    }
+    if (!safe_to_destroy) {
+      BBP_LOG(error)
+          << "workload service quarantine did not prove referenced simulator "
+             "state safe to destroy";
+      std::terminate();
+    }
+    workload_shutdown_safe_to_destroy = true;
+    const auto join_worker = [](std::thread& worker) {
+      if (!worker.joinable()) {
+        return;
+      }
+      try {
+        worker.join();
+      } catch (...) {
+        BBP_LOG(error) << "drained workload worker could not be joined";
+        std::terminate();
+      }
+    };
+    for (std::size_t index = 0U; index < retained_records.wallet_count;
+         ++index) {
+      join_worker(retained_records.wallets[index]->worker);
+    }
+    for (std::size_t index = 0U; index < retained_records.height_wait_count;
+         ++index) {
+      join_worker(retained_records.height_waits[index]->worker);
+    }
+    for (std::size_t index = 0U; index < retained_records.peer_wait_count;
+         ++index) {
+      join_worker(retained_records.peer_waits[index]->worker);
+    }
+    for (std::size_t index = 0U; index < retained_records.block_generator_count;
+         ++index) {
+      join_worker(retained_records.block_generators[index]->worker);
+    }
+    for (std::size_t index = 0U; index < retained_records.wallet_count;
+         ++index) {
+      const std::shared_ptr<LiveWalletWorkloadRecord>& record =
+          retained_records.wallets[index];
+      try {
+        std::lock_guard<std::mutex> record_lock(record->mutex);
+        if (!IsTerminalLiveWalletWorkloadState(record->state)) {
+          record->state = run_failed ? LiveWalletWorkloadState::kFailed
+                                     : LiveWalletWorkloadState::kCancelled;
+          record->terminal_outcome = run_failed ? "failed" : "cancelled";
+          if (run_failed && !record->failure) {
+            record->failure = "run failed while wallet workload was active";
+          }
+          record->changed.notify_all();
+        }
+      } catch (...) {
+        remember_shutdown_failure(std::current_exception());
+      }
+    }
+    for (std::size_t index = 0U; index < retained_records.height_wait_count;
+         ++index) {
+      const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record =
+          retained_records.height_waits[index];
+      try {
+        std::lock_guard<std::mutex> record_lock(record->mutex);
+        if (!IsTerminalLiveWorkloadState(record->state)) {
+          record->state = run_failed ? LiveWorkloadState::kFailed
+                                     : LiveWorkloadState::kCancelled;
+          record->terminal_outcome = run_failed ? "failed" : "cancelled";
+          if (run_failed && !record->failure) {
+            record->failure =
+                "run failed while wait-until-height workload was active";
+          }
+          record->changed.notify_all();
+        }
+      } catch (...) {
+        remember_shutdown_failure(std::current_exception());
+      }
+    }
+    for (std::size_t index = 0U; index < retained_records.peer_wait_count;
+         ++index) {
+      const std::shared_ptr<LiveWaitForPeersWorkloadRecord>& record =
+          retained_records.peer_waits[index];
+      try {
+        std::lock_guard<std::mutex> record_lock(record->mutex);
+        if (!IsTerminalLiveWorkloadState(record->state)) {
+          record->state = run_failed ? LiveWorkloadState::kFailed
+                                     : LiveWorkloadState::kCancelled;
+          record->terminal_outcome = run_failed ? "failed" : "cancelled";
+          if (run_failed && !record->failure) {
+            record->failure =
+                "run failed while wait-for-peers workload was active";
+          }
+          record->changed.notify_all();
+        }
+      } catch (...) {
+        remember_shutdown_failure(std::current_exception());
+      }
+    }
+    for (std::size_t index = 0U; index < retained_records.block_generator_count;
+         ++index) {
+      const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record =
+          retained_records.block_generators[index];
+      try {
+        std::lock_guard<std::mutex> record_lock(record->mutex);
+        if (!IsTerminalLiveWorkloadState(record->state)) {
+          record->state = run_failed ? LiveWorkloadState::kFailed
+                                     : LiveWorkloadState::kCancelled;
+          record->terminal_outcome = run_failed ? "failed" : "cancelled";
+          if (run_failed && !record->failure) {
+            record->failure =
+                "run failed while block generation workload was active";
+          }
+          record->changed.notify_all();
+        }
+      } catch (...) {
+        remember_shutdown_failure(std::current_exception());
+      }
     }
     installed_workload_service.reset();
+    workload_shutdown_complete = true;
+    if (shutdown_deadline_snapshot) {
+      try {
+        workload_shutdown_failure = std::make_exception_ptr(
+            WorkloadServiceShutdownTimeout(*shutdown_deadline_snapshot));
+      } catch (...) {
+        workload_shutdown_failure = std::current_exception();
+      }
+    } else {
+      workload_shutdown_failure = shutdown_failure;
+    }
+    if (workload_shutdown_failure) {
+      std::rethrow_exception(workload_shutdown_failure);
+    }
   };
   const auto stop_transaction_observer = [&] {
     if (transaction_observer) {
@@ -23862,15 +24169,49 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       BBP_LOG(error) << component << " failed during run cleanup";
     }
   };
+  const auto cleanup_workload_step =
+      [&](bool run_failed) -> std::exception_ptr {
+    try {
+      stop_wallet_workloads(run_failed);
+      return {};
+    } catch (const WorkloadServiceShutdownTimeout& error) {
+      if (!workload_shutdown_safe_to_destroy) {
+        BBP_LOG(error)
+            << "workload shutdown timeout escaped before a safe drain";
+        std::terminate();
+      }
+      BBP_LOG(error) << "wallet workload shutdown failed during run cleanup: "
+                     << error.what();
+      return std::current_exception();
+    } catch (const std::exception& error) {
+      if (!workload_shutdown_safe_to_destroy) {
+        BBP_LOG(error)
+            << "workload shutdown failure escaped before a safe drain";
+        std::terminate();
+      }
+      BBP_LOG(error) << "wallet workload shutdown failed during run cleanup: "
+                     << error.what();
+      return std::current_exception();
+    } catch (...) {
+      if (!workload_shutdown_safe_to_destroy) {
+        BBP_LOG(error)
+            << "unknown workload shutdown failure escaped before a safe drain";
+        std::terminate();
+      }
+      BBP_LOG(error) << "wallet workload shutdown failed during run cleanup";
+      return std::current_exception();
+    }
+  };
   const auto handle_run_failure = [&](std::string_view detail) {
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    // The pre-existing run failure remains primary; workload shutdown retains
+    // its own failure only after reaching a safe drain.
+    static_cast<void>(cleanup_workload_step(true));
     cleanup_step("instrumentation shutdown",
                  [&] { stop_instrumentation(true); });
     cleanup_step("role mutation shutdown", stop_role_mutations);
-    cleanup_step("wallet workload shutdown",
-                 [&] { stop_wallet_workloads(true); });
     cleanup_step("transaction observer shutdown", stop_transaction_observer);
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
@@ -23929,11 +24270,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    const std::exception_ptr workload_shutdown_error =
+        cleanup_workload_step(false);
     cleanup_step("instrumentation shutdown",
                  [&] { stop_instrumentation(false); });
     cleanup_step("role mutation shutdown", stop_role_mutations);
-    cleanup_step("wallet workload shutdown",
-                 [&] { stop_wallet_workloads(false); });
     cleanup_step("transaction observer shutdown", stop_transaction_observer);
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
@@ -23944,10 +24285,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         metrics_collector->Stop();
       }
     });
-    cleanup_step("run cancellation event", [&] {
-      WriteEvent(events_path, options.run_id, "sim",
-                 SimulationEventKind::kRunCancelled);
-    });
+    if (!workload_shutdown_error) {
+      cleanup_step("run cancellation event", [&] {
+        WriteEvent(events_path, options.run_id, "sim",
+                   SimulationEventKind::kRunCancelled);
+      });
+    }
     const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
     cleanup_step("node shutdown", [&] {
       StopNodes(options, events_path, driver, current_nodes, true);
@@ -23959,6 +24302,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         WriteNodeLogTails(events_path, options, driver, current_nodes);
       }
     });
+    if (workload_shutdown_error) {
+      std::rethrow_exception(workload_shutdown_error);
+    }
     cleanup_step("run finished event", [&] {
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRunFinished);
@@ -23970,11 +24316,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    const std::exception_ptr workload_shutdown_error =
+        cleanup_workload_step(false);
     cleanup_step("instrumentation shutdown",
                  [&] { stop_instrumentation(false); });
     cleanup_step("role mutation shutdown", stop_role_mutations);
-    cleanup_step("wallet workload shutdown",
-                 [&] { stop_wallet_workloads(false); });
     cleanup_step("transaction observer shutdown", stop_transaction_observer);
     cleanup_step("command processor shutdown", stop_command_processor);
     cleanup_step("peer connectivity shutdown", stop_peer_connectivity);
@@ -23985,23 +24331,26 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         metrics_collector->Stop();
       }
     });
-    cleanup_step("simulation duration event", [&] {
-      boost::json::object detail;
-      detail["duration_ms"] = options.simulation_duration->count();
-      detail["wall_duration_ms"] =
-          options.time_scale.WallDuration(*options.simulation_duration).count();
-      detail["time_scale"] = options.time_scale.value();
-      detail["stop_requested_at_ms"] =
-          duration_stop_requested_at_ms.load(std::memory_order_acquire);
-      detail["elapsed_wall_ms"] =
-          simulation_epoch
-              ? ElapsedMilliseconds(*simulation_epoch,
-                                    std::chrono::steady_clock::now())
-              : 0U;
-      WriteEvent(events_path, options.run_id, "sim",
-                 SimulationEventKind::kSimulationDurationReached,
-                 boost::json::serialize(detail));
-    });
+    if (!workload_shutdown_error) {
+      cleanup_step("simulation duration event", [&] {
+        boost::json::object detail;
+        detail["duration_ms"] = options.simulation_duration->count();
+        detail["wall_duration_ms"] =
+            options.time_scale.WallDuration(*options.simulation_duration)
+                .count();
+        detail["time_scale"] = options.time_scale.value();
+        detail["stop_requested_at_ms"] =
+            duration_stop_requested_at_ms.load(std::memory_order_acquire);
+        detail["elapsed_wall_ms"] =
+            simulation_epoch
+                ? ElapsedMilliseconds(*simulation_epoch,
+                                      std::chrono::steady_clock::now())
+                : 0U;
+        WriteEvent(events_path, options.run_id, "sim",
+                   SimulationEventKind::kSimulationDurationReached,
+                   boost::json::serialize(detail));
+      });
+    }
     const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
     cleanup_step("node shutdown", [&] {
       StopNodes(options, events_path, driver, current_nodes, true);
@@ -24013,6 +24362,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         WriteNodeLogTails(events_path, options, driver, current_nodes);
       }
     });
+    if (workload_shutdown_error) {
+      std::rethrow_exception(workload_shutdown_error);
+    }
     cleanup_step("run finished event", [&] {
       WriteEvent(events_path, options.run_id, "sim",
                  SimulationEventKind::kRunFinished);
@@ -25556,7 +25908,6 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           }
         }
         mcp_application.MarkRunStopping();
-        static_cast<void>(request_workload_shutdown(true));
         request_simulation_stop();
       }
     });
@@ -25647,6 +25998,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     auto instrumentation_service = instrumentation_controller->MakeService();
     mcp_application.SetInstrumentationService(instrumentation_service);
     installed_instrumentation_service = std::move(instrumentation_service);
+    auto workload_service = std::make_shared<McpLiveWorkloadService>();
     const auto runtime_wallet_validation_options = [&] {
       Options validation = options;
       const RuntimeWalletSnapshot wallet_snapshot =
@@ -25762,7 +26114,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         wallet_workloads->records.emplace(record->id, record);
 
         try {
-          record->worker = std::thread([&, record] {
+          auto worker_lease = installed_workload_service->AcquireWorkerLease();
+          record->worker = std::thread([&, record,
+                                        worker_lease =
+                                            std::move(worker_lease)] {
+            const std::stop_token service_stop_token =
+                worker_lease.stop_token();
             const auto set_terminal =
                 [&](LiveWalletWorkloadState state, std::string outcome,
                     std::optional<std::string> failure = std::nullopt) {
@@ -25802,7 +26159,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     lock.unlock();
                     WriteLiveWalletWorkloadState(events_path, options, *record);
                     lock.lock();
-                    if (!record->changed.wait(lock, stop_token, [&] {
+                    if (!record->changed.wait(lock, service_stop_token, [&] {
                           return record->request !=
                                  LiveWalletWorkloadRequest::kPause;
                         })) {
@@ -25866,7 +26223,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                   epoch_wallets = record->wallet_snapshot;
                 }
 
-                CombinedStopToken execution_stop(stop_token, epoch_stop_token);
+                CombinedStopToken execution_stop(service_stop_token,
+                                                 epoch_stop_token);
                 WalletWorkloadExecutionContext execution{
                     .accounting = record->accounting,
                     .workload_id = record->id,
@@ -26056,7 +26414,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     return;
                   }
                   if (request == LiveWalletWorkloadRequest::kShutdown ||
-                      stop_token.stop_requested()) {
+                      service_stop_token.stop_requested()) {
                     cancel_outstanding_tracking();
                     set_terminal(LiveWalletWorkloadState::kCancelled,
                                  "cancelled");
@@ -26172,7 +26530,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         block_generation_workloads->records.emplace(record->id, record);
 
         try {
-          record->worker = std::thread([&, record] {
+          auto worker_lease = installed_workload_service->AcquireWorkerLease();
+          record->worker = std::thread([&, record,
+                                        worker_lease =
+                                            std::move(worker_lease)] {
+            const std::stop_token service_stop_token =
+                worker_lease.stop_token();
             const auto set_terminal =
                 [&](LiveWorkloadState state, std::string outcome,
                     std::optional<std::string> failure = std::nullopt) {
@@ -26221,7 +26584,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     WriteLiveBlockGenerationWorkloadState(events_path, options,
                                                           *record);
                     lock.lock();
-                    if (!record->changed.wait(lock, stop_token, [&] {
+                    if (!record->changed.wait(lock, service_stop_token, [&] {
                           return record->request != LiveWorkloadRequest::kPause;
                         })) {
                       record->request = LiveWorkloadRequest::kShutdown;
@@ -26276,7 +26639,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                  "count_reached");
                     return;
                   }
-                  if (stop_token.stop_requested()) {
+                  if (service_stop_token.stop_requested()) {
                     record->request = LiveWorkloadRequest::kShutdown;
                     lock.unlock();
                     set_terminal(LiveWorkloadState::kCancelled, "cancelled");
@@ -26305,13 +26668,16 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                                         *record);
                 }
 
+                CombinedStopToken execution_stop(service_stop_token,
+                                                 boundary_stop_token);
+                const std::stop_token execution_stop_token =
+                    execution_stop.get_token();
                 auto mutation_lock = AcquireNodeMutationLock(
-                    node_mutation_mutex, boundary_stop_token);
+                    node_mutation_mutex, execution_stop_token);
                 RuntimeNodeSnapshot execution_nodes = node_inventory.Snapshot();
                 const auto authorize_mutation = [&, record] {
                   std::lock_guard<std::mutex> lock(record->mutex);
-                  if (boundary_stop_token.stop_requested() ||
-                      stop_token.stop_requested() ||
+                  if (execution_stop_token.stop_requested() ||
                       record->request == LiveWorkloadRequest::kStopCancel ||
                       record->request == LiveWorkloadRequest::kShutdown ||
                       record->request == LiveWorkloadRequest::kRunFailure) {
@@ -26329,7 +26695,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     GenerateBlockWorkloadBoundary(
                         driver, block_generation_mutex, execution_nodes,
                         boundary_workload, chain_spec.default_reward_address,
-                        std::stop_token{}, boundary_stop_token,
+                        std::stop_token{}, execution_stop_token,
                         authorize_mutation);
                 if (boundary.hashes.size() != 1U) {
                   throw std::logic_error(
@@ -26355,7 +26721,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     record->ordinal, 0U, std::stop_token{}, record->id);
                 SynchronizeBlockWorkloadBoundary(
                     options, events_path, driver, execution_nodes, boundary,
-                    boundary_workload.sync_timeout_sec, boundary_stop_token);
+                    boundary_workload.sync_timeout_sec, execution_stop_token);
                 {
                   std::lock_guard<std::mutex> lock(record->mutex);
                   ++record->completed_boundaries;
@@ -26384,7 +26750,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                 finalize_outstanding_attempt(true);
                 set_terminal(LiveWorkloadState::kStopped, "stopped");
               } else if (request == LiveWorkloadRequest::kShutdown ||
-                         stop_token.stop_requested()) {
+                         service_stop_token.stop_requested()) {
                 finalize_outstanding_attempt(true);
                 set_terminal(LiveWorkloadState::kCancelled, "cancelled");
               } else {
@@ -26755,7 +27121,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         wait_until_height_workloads->records.emplace(record->id, record);
 
         try {
-          record->worker = std::thread([&, record] {
+          auto worker_lease = installed_workload_service->AcquireWorkerLease();
+          record->worker = std::thread([&, record,
+                                        worker_lease =
+                                            std::move(worker_lease)] {
+            const std::stop_token service_stop_token =
+                worker_lease.stop_token();
             const auto set_terminal =
                 [&](LiveWorkloadState state, std::string outcome,
                     std::optional<std::string> failure = std::nullopt) {
@@ -26796,7 +27167,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     WriteLiveWaitUntilHeightWorkloadState(events_path, options,
                                                           *record);
                     lock.lock();
-                    if (!record->changed.wait(lock, stop_token, [&] {
+                    if (!record->changed.wait(lock, service_stop_token, [&] {
                           return record->request != LiveWorkloadRequest::kPause;
                         })) {
                       record->request = LiveWorkloadRequest::kShutdown;
@@ -26850,7 +27221,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                       continue;
                     }
                   }
-                  if (stop_token.stop_requested()) {
+                  if (service_stop_token.stop_requested()) {
                     record->request = LiveWorkloadRequest::kShutdown;
                     lock.unlock();
                     set_terminal(LiveWorkloadState::kCancelled, "cancelled");
@@ -26875,10 +27246,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                                         *record);
                 }
 
+                CombinedStopToken execution_stop(service_stop_token,
+                                                 epoch_stop_source.get_token());
                 const std::stop_token execution_stop_token =
-                    epoch_stop_source.get_token();
-                std::stop_callback stop_epoch_on_run_stop(
-                    stop_token, [&, epoch_stop_source] {
+                    execution_stop.get_token();
+                std::stop_callback stop_epoch_on_service_stop(
+                    service_stop_token, [&, epoch_stop_source] {
                       const auto observed_at = std::chrono::steady_clock::now();
                       record_run_stop(observed_at);
                       const auto requested_at =
@@ -27056,7 +27429,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     "run failed while wait-until-height workload was active");
               } else if (run_stop_admitted ||
                          request == LiveWorkloadRequest::kShutdown ||
-                         stop_token.stop_requested()) {
+                         service_stop_token.stop_requested()) {
                 set_terminal(LiveWorkloadState::kCancelled, "cancelled");
               } else if (request == LiveWorkloadRequest::kStopCancel ||
                          request == LiveWorkloadRequest::kStopSettle) {
@@ -27472,7 +27845,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         wait_for_peers_workloads->records.emplace(record->id, record);
 
         try {
-          record->worker = std::thread([&, record] {
+          auto worker_lease = installed_workload_service->AcquireWorkerLease();
+          record->worker = std::thread([&, record,
+                                        worker_lease =
+                                            std::move(worker_lease)] {
+            const std::stop_token service_stop_token =
+                worker_lease.stop_token();
             const auto set_terminal =
                 [&](LiveWorkloadState state, std::string outcome,
                     std::optional<std::string> failure = std::nullopt) {
@@ -27513,7 +27891,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     WriteLiveWaitForPeersWorkloadState(events_path, options,
                                                        *record);
                     lock.lock();
-                    if (!record->changed.wait(lock, stop_token, [&] {
+                    if (!record->changed.wait(lock, service_stop_token, [&] {
                           return record->request != LiveWorkloadRequest::kPause;
                         })) {
                       record->request = LiveWorkloadRequest::kShutdown;
@@ -27567,7 +27945,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                       continue;
                     }
                   }
-                  if (stop_token.stop_requested()) {
+                  if (service_stop_token.stop_requested()) {
                     record->request = LiveWorkloadRequest::kShutdown;
                     lock.unlock();
                     set_terminal(LiveWorkloadState::kCancelled, "cancelled");
@@ -27592,10 +27970,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                                      *record);
                 }
 
+                CombinedStopToken execution_stop(service_stop_token,
+                                                 epoch_stop_source.get_token());
                 const std::stop_token execution_stop_token =
-                    epoch_stop_source.get_token();
-                std::stop_callback stop_epoch_on_run_stop(
-                    stop_token, [&, epoch_stop_source] {
+                    execution_stop.get_token();
+                std::stop_callback stop_epoch_on_service_stop(
+                    service_stop_token, [&, epoch_stop_source] {
                       const auto observed_at = std::chrono::steady_clock::now();
                       record_run_stop(observed_at);
                       const auto requested_at =
@@ -27773,7 +28153,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                     "run failed while wait-for-peers workload was active");
               } else if (run_stop_admitted ||
                          request == LiveWorkloadRequest::kShutdown ||
-                         stop_token.stop_requested()) {
+                         service_stop_token.stop_requested()) {
                 set_terminal(LiveWorkloadState::kCancelled, "cancelled");
               } else if (request == LiveWorkloadRequest::kStopCancel ||
                          request == LiveWorkloadRequest::kStopSettle) {
@@ -28527,7 +28907,6 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           return completed_result;
         };
 
-    auto workload_service = std::make_shared<McpLiveWorkloadService>();
     workload_service->operation = [&, require_workload_record,
                                    launch_wallet_workload,
                                    runtime_wallet_validation_options,
@@ -28948,8 +29327,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       }
       return boost::json::value(std::move(result));
     };
+    installed_workload_service = workload_service;
     mcp_application.SetWorkloadService(workload_service);
-    installed_workload_service = std::move(workload_service);
+    workload_service.reset();
 
     auto role_service = std::make_shared<McpLiveRoleService>();
     role_service->operation = [&](McpOperationKind kind,
@@ -31679,9 +32059,9 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     mcp_application.MarkRunStopping();
     stop_duration_timer();
     stop_lifecycle_supervisor();
+    stop_wallet_workloads(false);
     stop_instrumentation(false);
     stop_role_mutations();
-    stop_wallet_workloads(false);
     stop_transaction_observer();
     stop_command_processor();
     stop_peer_connectivity();
@@ -32905,6 +33285,16 @@ class EditorRunController {
           "managed run cleanup did not finish before the timeout", true);
     }
     if (context->state == EditorRunState::kFailed) {
+      if (context->failure) {
+        try {
+          std::rethrow_exception(context->failure);
+        } catch (const WorkloadServiceShutdownTimeout& error) {
+          throw McpOperationFailure("workload_service_shutdown_timeout",
+                                    error.what(), false,
+                                    boost::json::array{error.Diagnostic()});
+        } catch (...) {
+        }
+      }
       const std::string detail = context->failure
                                      ? ExceptionMessage(context->failure)
                                      : "unknown managed-run failure";

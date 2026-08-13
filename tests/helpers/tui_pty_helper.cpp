@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -29,6 +30,7 @@
 #include <limits>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1750,25 +1752,68 @@ pid_t ProcessStartedPid(std::string_view events) {
 
 bool ProcessExists(pid_t pid) { return kill(pid, 0) == 0 || errno == EPERM; }
 
+bool TcpPortAccepting(std::string_view address, std::uint16_t port) {
+  const int descriptor =
+      socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+  if (descriptor < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "create TCP cleanup probe");
+  }
+  sockaddr_in endpoint{};
+  endpoint.sin_family = AF_INET;
+  endpoint.sin_port = htons(port);
+  if (inet_pton(AF_INET, std::string(address).c_str(), &endpoint.sin_addr) !=
+      1) {
+    static_cast<void>(close(descriptor));
+    throw std::runtime_error("invalid TCP cleanup-probe address");
+  }
+  int result = 0;
+  do {
+    result = connect(descriptor, reinterpret_cast<const sockaddr*>(&endpoint),
+                     sizeof(endpoint));
+  } while (result != 0 && errno == EINTR);
+  const int connect_error = errno;
+  static_cast<void>(close(descriptor));
+  if (result == 0) {
+    return true;
+  }
+  if (connect_error == ECONNREFUSED) {
+    return false;
+  }
+  throw std::system_error(connect_error, std::generic_category(),
+                          "connect TCP cleanup probe");
+}
+
 std::vector<pid_t> EventProcessPids(std::string_view events) {
-  constexpr std::string_view event_marker = "\"event\":\"process_started\"";
+  constexpr std::string_view started_marker = "\"event\":\"process_started\"";
+  constexpr std::string_view restarted_marker =
+      "\"event\":\"process_restarted\"";
   constexpr std::string_view pid_marker = "\\\"pid\\\":";
   std::vector<pid_t> pids;
   std::size_t offset = 0U;
-  while ((offset = events.find(event_marker, offset)) !=
-         std::string_view::npos) {
+  while (offset < events.size()) {
+    const std::size_t started = events.find(started_marker, offset);
+    const std::size_t restarted = events.find(restarted_marker, offset);
+    if (started == std::string_view::npos &&
+        restarted == std::string_view::npos) {
+      break;
+    }
+    offset = started == std::string_view::npos ? restarted
+             : restarted == std::string_view::npos
+                 ? started
+                 : std::min(started, restarted);
     const std::size_t line_end = events.find('\n', offset);
     const std::size_t pid_field = events.find(pid_marker, offset);
     if (pid_field == std::string_view::npos ||
         (line_end != std::string_view::npos && pid_field >= line_end)) {
-      throw std::runtime_error("process_started event did not contain a pid");
+      throw std::runtime_error("process event did not contain a pid");
     }
     const std::size_t begin = pid_field + pid_marker.size();
     const std::size_t end = events.find_first_not_of("0123456789", begin);
     const long parsed =
         std::stol(std::string(events.substr(begin, end - begin)));
     if (parsed <= 0) {
-      throw std::runtime_error("process_started pid was not positive");
+      throw std::runtime_error("process event pid was not positive");
     }
     pids.push_back(static_cast<pid_t>(parsed));
     offset = line_end == std::string_view::npos ? events.size() : line_end + 1U;
@@ -1862,6 +1907,213 @@ void RequireOwnedResourcesRemoved(const std::filesystem::path& run_root,
   }
   RequireNoRpcCredentials(run_root);
 }
+
+std::vector<std::string> ProcessArguments(pid_t pid) {
+  const std::string command_line = ReadFile(std::filesystem::path("/proc") /
+                                            std::to_string(pid) / "cmdline");
+  std::vector<std::string> arguments;
+  std::size_t begin = 0U;
+  while (begin < command_line.size()) {
+    const std::size_t end = command_line.find('\0', begin);
+    arguments.emplace_back(command_line.substr(begin, end - begin));
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1U;
+  }
+  return arguments;
+}
+
+bool PathIsBelow(const std::filesystem::path& path,
+                 const std::filesystem::path& parent) {
+  const std::filesystem::path normalized_path = path.lexically_normal();
+  const std::filesystem::path normalized_parent = parent.lexically_normal();
+  auto path_component = normalized_path.begin();
+  for (auto parent_component = normalized_parent.begin();
+       parent_component != normalized_parent.end();
+       ++parent_component, ++path_component) {
+    if (path_component == normalized_path.end() ||
+        *path_component != *parent_component) {
+      return false;
+    }
+  }
+  return path_component != normalized_path.end();
+}
+
+std::set<pid_t> CgroupProcessIds(const std::filesystem::path& root) {
+  std::set<pid_t> pids;
+  if (!std::filesystem::exists(root)) {
+    return pids;
+  }
+  const auto collect = [&](const std::filesystem::path& cgroup) {
+    std::istringstream stream(ReadFile(cgroup / "cgroup.procs"));
+    long parsed = 0;
+    while (stream >> parsed) {
+      if (parsed > 0 && parsed <= std::numeric_limits<pid_t>::max()) {
+        pids.insert(static_cast<pid_t>(parsed));
+      }
+    }
+  };
+  collect(root);
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(root)) {
+    if (entry.is_directory()) {
+      collect(entry.path());
+    }
+  }
+  return pids;
+}
+
+class ScopedFixtureProcessCleanup {
+ public:
+  ScopedFixtureProcessCleanup(std::filesystem::path daemon,
+                              std::filesystem::path run_root)
+      : daemon_(std::filesystem::canonical(std::move(daemon))),
+        run_root_(std::move(run_root).lexically_normal()) {}
+
+  ScopedFixtureProcessCleanup(const ScopedFixtureProcessCleanup&) = delete;
+  ScopedFixtureProcessCleanup& operator=(const ScopedFixtureProcessCleanup&) =
+      delete;
+
+  ~ScopedFixtureProcessCleanup() {
+    if (armed_) {
+      Cleanup();
+    }
+  }
+
+  void Disarm() noexcept { armed_ = false; }
+
+ private:
+  bool MatchesFixture(pid_t pid, std::string_view resource_id) const {
+    std::error_code error;
+    const std::filesystem::path executable = std::filesystem::read_symlink(
+        std::filesystem::path("/proc") / std::to_string(pid) / "exe", error);
+    if (error || executable != daemon_) {
+      return false;
+    }
+
+    const std::vector<std::string> arguments = ProcessArguments(pid);
+    const std::filesystem::path nodes_root = run_root_ / "nodes";
+    bool data_directory_matches = false;
+    bool credential_matches = false;
+    for (const std::string& argument : arguments) {
+      constexpr std::string_view kDataDirectory = "-datadir=";
+      constexpr std::string_view kCredential = "-rpccookiefile=";
+      if (argument.starts_with(kDataDirectory)) {
+        data_directory_matches =
+            PathIsBelow(argument.substr(kDataDirectory.size()), nodes_root);
+      } else if (argument.starts_with(kCredential)) {
+        credential_matches =
+            PathIsBelow(argument.substr(kCredential.size()), nodes_root);
+      }
+    }
+    if (!data_directory_matches || !credential_matches) {
+      return false;
+    }
+
+    const std::string process_cgroup = ReadFile(std::filesystem::path("/proc") /
+                                                std::to_string(pid) / "cgroup");
+    return process_cgroup.find("0::/bbp/" + std::string(resource_id) + "/") !=
+           std::string::npos;
+  }
+
+  static void WaitForPidfdExit(int descriptor) {
+    pollfd process{
+        .fd = descriptor,
+        .events = POLLIN,
+        .revents = 0,
+    };
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now());
+      const int timeout =
+          static_cast<int>(std::max<std::int64_t>(1, remaining.count()));
+      const int result = poll(&process, 1, timeout);
+      if (result > 0 || (result < 0 && errno != EINTR)) {
+        return;
+      }
+    }
+  }
+
+  static bool CgroupEmpty(const std::filesystem::path& cgroup) {
+    return ReadFile(cgroup / "cgroup.procs").empty() &&
+           ReadFile(cgroup / "cgroup.events").find("populated 0") !=
+               std::string::npos;
+  }
+
+  static void RemoveEmptyCgroupTree(const std::filesystem::path& root) {
+    if (!std::filesystem::exists(root)) {
+      return;
+    }
+    std::vector<std::filesystem::path> descendants;
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(root)) {
+      if (entry.is_directory()) {
+        descendants.push_back(entry.path());
+      }
+    }
+    std::sort(descendants.begin(), descendants.end(),
+              [](const auto& left, const auto& right) {
+                return left.native().size() > right.native().size();
+              });
+    for (const std::filesystem::path& cgroup : descendants) {
+      if (CgroupEmpty(cgroup)) {
+        static_cast<void>(rmdir(cgroup.c_str()));
+      }
+    }
+    if (CgroupEmpty(root)) {
+      static_cast<void>(rmdir(root.c_str()));
+    }
+  }
+
+  void Cleanup() noexcept {
+    try {
+      if (!std::filesystem::exists(run_root_ / ".bbp-run")) {
+        return;
+      }
+      const std::string resource_id = MarkerResourceId(run_root_);
+      const std::filesystem::path cgroup =
+          std::filesystem::path("/sys/fs/cgroup/bbp") / resource_id;
+      std::vector<int> process_descriptors;
+      for (const pid_t pid : CgroupProcessIds(cgroup)) {
+#ifdef SYS_pidfd_open
+        const int descriptor =
+            static_cast<int>(syscall(SYS_pidfd_open, pid, 0U));
+        if (descriptor < 0) {
+          continue;
+        }
+        if (!MatchesFixture(pid, resource_id)) {
+          static_cast<void>(close(descriptor));
+          continue;
+        }
+#ifdef SYS_pidfd_send_signal
+        if (syscall(SYS_pidfd_send_signal, descriptor, SIGKILL, nullptr, 0U) ==
+                0 ||
+            errno == ESRCH) {
+          process_descriptors.push_back(descriptor);
+        } else {
+          static_cast<void>(close(descriptor));
+        }
+#else
+        static_cast<void>(close(descriptor));
+#endif
+#endif
+      }
+      for (const int descriptor : process_descriptors) {
+        WaitForPidfdExit(descriptor);
+        static_cast<void>(close(descriptor));
+      }
+      RemoveEmptyCgroupTree(cgroup);
+    } catch (...) {
+    }
+  }
+
+  std::filesystem::path daemon_;
+  std::filesystem::path run_root_;
+  bool armed_ = true;
+};
 
 void RequirePrivateMcpPath(const std::filesystem::path& path, mode_t type,
                            mode_t permissions) {
@@ -4495,6 +4747,428 @@ void CheckMcpRestartCancellationAfterAdmission(
   RequireExitZero(&process, "MCP restart cancellation TUI exit");
 }
 
+void CheckMcpWorkloadServiceShutdownDrain(
+    const std::filesystem::path& command,
+    const std::filesystem::path& helper_binary) {
+  constexpr auto kWorkloadServiceShutdownBound = 15s;
+  OwnedTemporaryDirectory directory("mcp-workload-service-shutdown");
+  const std::filesystem::path daemon =
+      CopyActiveDaemonFixtures(helper_binary, directory.root());
+  const std::filesystem::path benchmark_root = directory.root() / "runs";
+  const std::filesystem::path home_directory = directory.root() / "home";
+  std::filesystem::create_directory(home_directory);
+  const std::string run_id =
+      "workload-drain-" + std::to_string(static_cast<long long>(getpid()));
+  const std::filesystem::path run_root = benchmark_root / run_id;
+  const std::filesystem::path events_path = run_root / "events.jsonl";
+  ScopedFixtureProcessCleanup failure_cleanup(daemon, run_root);
+
+  PtyProcess process(command,
+                     {"--benchmark-root",
+                      benchmark_root.string(),
+                      "--run-id",
+                      run_id,
+                      "--nodes",
+                      "1",
+                      "--node-capacity",
+                      "1",
+                      "--node-binary",
+                      daemon.string(),
+                      "--no-isolate-network",
+                      "--no-mining",
+                      "--ready-timeout-sec",
+                      "20",
+                      "--sync-timeout-sec",
+                      "20",
+                      "--refresh-ms",
+                      "50",
+                      "--metrics-interval",
+                      "50ms"},
+                     30, 120, home_directory);
+  static_cast<void>(
+      process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
+                        "MCP workload-service shutdown-drain TUI"));
+  static_cast<void>(
+      WaitForFileText(events_path, "\"event\":\"rpc_ready\"", 30s));
+  {
+    std::ofstream gate(run_root / "bbp-test-restart-readiness-gate");
+    if (!gate) {
+      throw std::runtime_error(
+          "could not enable workload-service restart readiness gate");
+    }
+    gate << "hold workload invocation across run shutdown\n";
+  }
+  TestGateRelease release_guard(run_root /
+                                "bbp-test-restart-readiness-release");
+
+  const McpTestSession mcp =
+      ConnectMcpTestSession(home_directory / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  boost::json::object invocation_submitted;
+  const auto submission_deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < submission_deadline) {
+    invocation_submitted = SubmitMcpOperation(
+        mcp, &request_id, "workload.invoke",
+        boost::json::object{
+            {"run_id", run_id},
+            {"workload",
+             boost::json::object{{"type", "restart_node"}, {"node", 1U}}}});
+    if (invocation_submitted.if_contains("operation_id") != nullptr) {
+      break;
+    }
+    const boost::json::value* code = invocation_submitted.if_contains("code");
+    const boost::json::value* retryable =
+        invocation_submitted.if_contains("retryable");
+    if (code == nullptr || !code->is_string() ||
+        code->as_string() != "run_not_ready" || retryable == nullptr ||
+        !retryable->is_bool() || !retryable->as_bool()) {
+      throw std::runtime_error(
+          "workload-service restart invocation was not admitted: " +
+          boost::json::serialize(invocation_submitted));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  const boost::json::value* invocation_id_value =
+      invocation_submitted.if_contains("operation_id");
+  if (invocation_id_value == nullptr || !invocation_id_value->is_string()) {
+    throw std::runtime_error(
+        "workload-service restart invocation was not admitted after run "
+        "readiness");
+  }
+  const std::string invocation_operation_id(invocation_id_value->as_string());
+
+  static_cast<void>(WaitForFileText(
+      run_root / "bbp-test-restart-readiness-held", "firo-1", 10s));
+  const auto shutdown_started = std::chrono::steady_clock::now();
+  const boost::json::object stop_submitted = SubmitMcpOperation(
+      mcp, &request_id, "run.stop",
+      boost::json::object{{"run_id", run_id}, {"timeout_sec", 20U}});
+  const boost::json::value* stop_id_value =
+      stop_submitted.if_contains("operation_id");
+  if (stop_id_value == nullptr || !stop_id_value->is_string()) {
+    throw std::runtime_error("workload-service run.stop was not submitted: " +
+                             boost::json::serialize(stop_submitted));
+  }
+  const std::string stop_operation_id(stop_id_value->as_string());
+
+  boost::json::value stopping_registry;
+  bool stopping_published = false;
+  const auto stopping_deadline = shutdown_started + 5s;
+  while (std::chrono::steady_clock::now() < stopping_deadline) {
+    stopping_registry =
+        ReadMcpResourceData(mcp, &request_id, "bbp:///run_registry",
+                            "workload-service stopping run registry");
+    if (stopping_registry.is_array()) {
+      for (const boost::json::value& value : stopping_registry.as_array()) {
+        if (value.is_object() &&
+            value.as_object().at("run_id").as_string() == run_id &&
+            value.as_object().at("state").as_string() == "stopping") {
+          stopping_published = true;
+          break;
+        }
+      }
+    }
+    if (stopping_published) {
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  if (!stopping_published) {
+    throw std::runtime_error(
+        "run.stop did not publish stopping while the workload callback was "
+        "held: " +
+        boost::json::serialize(stopping_registry));
+  }
+
+  const std::string held_events = ReadFile(events_path);
+  RequireNotContains(held_events, "\"event\":\"run_finished\"",
+                     "held workload-service shutdown");
+  RequireNotContains(held_events, "\"event\":\"node_restarted\"",
+                     "held workload-service restart");
+
+  constexpr std::size_t kMaximumAdmissionAttempts = 64U;
+  const auto admission_closure_deadline = shutdown_started + 5s;
+  boost::json::object rejected;
+  for (std::size_t attempt = 0U;
+       attempt < kMaximumAdmissionAttempts &&
+       std::chrono::steady_clock::now() < admission_closure_deadline;
+       ++attempt) {
+    boost::json::object candidate = SubmitMcpOperation(
+        mcp, &request_id, "workload.invoke",
+        boost::json::object{
+            {"run_id", run_id},
+            {"workload",
+             boost::json::object{
+                 {"type", "checkpoint"},
+                 {"name", "after-service-close-" + std::to_string(attempt)}}}});
+    const boost::json::value* candidate_id =
+        candidate.if_contains("operation_id");
+    if (candidate_id == nullptr) {
+      rejected = std::move(candidate);
+      break;
+    }
+    if (!candidate_id->is_string()) {
+      throw std::runtime_error(
+          "race-admitted workload returned an invalid operation id: " +
+          boost::json::serialize(candidate));
+    }
+    const std::string candidate_operation_id(candidate_id->as_string());
+    boost::json::object candidate_terminal;
+    while (std::chrono::steady_clock::now() < admission_closure_deadline) {
+      candidate_terminal = McpToolCall(
+          mcp.port, mcp.token, mcp.session_id, mcp.protocol_version,
+          request_id++, "operation.get",
+          boost::json::object{{"operation_id", candidate_operation_id}});
+      const std::string_view state = candidate_terminal.at("state").as_string();
+      if (state == "succeeded" || state == "failed" || state == "cancelled") {
+        break;
+      }
+      std::this_thread::sleep_for(20ms);
+    }
+    if (candidate_terminal.empty() ||
+        (candidate_terminal.at("state").as_string() != "succeeded" &&
+         candidate_terminal.at("state").as_string() != "failed" &&
+         candidate_terminal.at("state").as_string() != "cancelled")) {
+      throw std::runtime_error(
+          "race-admitted workload did not terminate before the next admission "
+          "probe: " +
+          boost::json::serialize(candidate_terminal));
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  const boost::json::value* rejected_code = rejected.if_contains("code");
+  const boost::json::value* rejected_retryable =
+      rejected.if_contains("retryable");
+  if (rejected.empty() || rejected.if_contains("operation_id") != nullptr ||
+      rejected_code == nullptr || !rejected_code->is_string() ||
+      rejected_code->as_string() != "workload_service_stopping" ||
+      rejected_retryable == nullptr || !rejected_retryable->is_bool() ||
+      rejected_retryable->as_bool() ||
+      std::chrono::steady_clock::now() >= admission_closure_deadline) {
+    throw std::runtime_error(
+        "workload service did not close admission well before its shutdown "
+        "bound: " +
+        boost::json::serialize(rejected));
+  }
+  RequireNotContains(ReadFile(events_path), "\"event\":\"run_finished\"",
+                     "closed but held workload-service shutdown");
+  if (std::chrono::steady_clock::now() - shutdown_started >=
+      kWorkloadServiceShutdownBound) {
+    throw std::runtime_error(
+        "workload-service test gate was not released within the declared "
+        "shutdown bound");
+  }
+  release_guard.Release();
+
+  boost::json::object invocation_terminal;
+  boost::json::object stop_terminal;
+  const auto shutdown_deadline =
+      shutdown_started + kWorkloadServiceShutdownBound;
+  const auto terminal_state = [](const boost::json::object& operation) {
+    if (operation.empty()) {
+      return false;
+    }
+    const std::string_view state = operation.at("state").as_string();
+    return state == "succeeded" || state == "failed" || state == "cancelled";
+  };
+  while (std::chrono::steady_clock::now() < shutdown_deadline &&
+         (!terminal_state(invocation_terminal) ||
+          !terminal_state(stop_terminal))) {
+    if (!terminal_state(invocation_terminal)) {
+      invocation_terminal = McpToolCall(
+          mcp.port, mcp.token, mcp.session_id, mcp.protocol_version,
+          request_id++, "operation.get",
+          boost::json::object{{"operation_id", invocation_operation_id}});
+    }
+    if (!terminal_state(stop_terminal)) {
+      stop_terminal =
+          McpToolCall(mcp.port, mcp.token, mcp.session_id, mcp.protocol_version,
+                      request_id++, "operation.get",
+                      boost::json::object{{"operation_id", stop_operation_id}});
+    }
+    if (!terminal_state(invocation_terminal) ||
+        !terminal_state(stop_terminal)) {
+      std::this_thread::sleep_for(20ms);
+    }
+  }
+  const auto shutdown_finished = std::chrono::steady_clock::now();
+  if (!terminal_state(invocation_terminal) || !terminal_state(stop_terminal) ||
+      shutdown_finished - shutdown_started >= kWorkloadServiceShutdownBound) {
+    throw std::runtime_error(
+        "workload-service cancellation and drain exceeded the declared "
+        "15-second bound");
+  }
+
+  const std::string_view invocation_state =
+      invocation_terminal.at("state").as_string();
+  if (!invocation_terminal.at("cancel_requested").as_bool()) {
+    throw std::runtime_error(
+        "post-admission held workload invocation did not observe run "
+        "cancellation: " +
+        boost::json::serialize(invocation_terminal));
+  }
+  const bool invocation_succeeded = invocation_state == "succeeded";
+  if (invocation_succeeded) {
+    const boost::json::value* invocation_result =
+        invocation_terminal.if_contains("terminal_result");
+    if (invocation_result == nullptr || !invocation_result->is_object()) {
+      throw std::runtime_error(
+          "completed post-admission held workload invocation omitted its "
+          "authoritative result: " +
+          boost::json::serialize(invocation_terminal));
+    }
+    const boost::json::object& invocation_result_object =
+        invocation_result->as_object();
+    if (invocation_result_object.at("result_family").as_string() !=
+            "workload_invocation" ||
+        invocation_result_object.at("run_id").as_string() != run_id ||
+        invocation_result_object.at("invocation_id").as_string().empty() ||
+        invocation_result_object.at("action").as_string() != "restart_node" ||
+        invocation_result_object.at("state").as_string() != "completed") {
+      throw std::runtime_error(
+          "post-admission held workload invocation returned inconsistent "
+          "completion evidence: " +
+          boost::json::serialize(invocation_terminal));
+    }
+  } else {
+    const boost::json::value* invocation_error =
+        invocation_terminal.if_contains("terminal_error");
+    if (invocation_state != "cancelled" ||
+        invocation_terminal.if_contains("terminal_result") != nullptr ||
+        invocation_error == nullptr || !invocation_error->is_object()) {
+      throw std::runtime_error(
+          "post-admission held workload invocation returned neither "
+          "authoritative completion nor typed cancellation: " +
+          boost::json::serialize(invocation_terminal));
+    }
+    const boost::json::object& invocation_error_object =
+        invocation_error->as_object();
+    if (invocation_error_object.at("result_family").as_string() != "error" ||
+        invocation_error_object.at("code").as_string() != "cancelled" ||
+        invocation_error_object.at("retryable").as_bool()) {
+      throw std::runtime_error(
+          "post-admission held workload invocation returned inconsistent "
+          "cancellation evidence: " +
+          boost::json::serialize(invocation_terminal));
+    }
+  }
+
+  if (stop_terminal.at("state").as_string() != "succeeded" ||
+      !stop_terminal.at("terminal_result").is_object()) {
+    throw std::runtime_error(
+        "bounded workload-service run.stop did not succeed: " +
+        boost::json::serialize(stop_terminal));
+  }
+  const boost::json::object& stop_result =
+      stop_terminal.at("terminal_result").as_object();
+  if (stop_result.at("result_family").as_string() != "run_lifecycle" ||
+      stop_result.at("run_id").as_string() != run_id ||
+      stop_result.at("state").as_string() != "stopped") {
+    throw std::runtime_error(
+        "bounded workload-service run.stop returned inconsistent evidence: " +
+        boost::json::serialize(stop_terminal));
+  }
+
+  const std::string stopped_events = ReadFile(events_path);
+  RequireContains(stopped_events, "\"event\":\"run_cancelled\"",
+                  "drained workload-service shutdown");
+  RequireContains(stopped_events, "\"event\":\"run_finished\"",
+                  "drained workload-service shutdown");
+  const std::size_t restarted =
+      stopped_events.find("\"event\":\"node_restarted\"");
+  const std::size_t finished =
+      stopped_events.find("\"event\":\"run_finished\"");
+  const std::size_t expected_restart_count = invocation_succeeded ? 1U : 0U;
+  if (CountOccurrences(stopped_events, "\"event\":\"node_restarted\"") !=
+          expected_restart_count ||
+      finished == std::string::npos ||
+      (invocation_succeeded &&
+       (restarted == std::string::npos || restarted >= finished))) {
+    throw std::runtime_error(
+        "drained workload-service shutdown events did not match the "
+        "authoritative restart outcome");
+  }
+  const std::vector<pid_t> daemon_pids = EventProcessPids(stopped_events);
+  if (daemon_pids.size() != 2U) {
+    throw std::runtime_error(
+        "held restart did not record both original and replacement daemon "
+        "identities");
+  }
+  RequireOwnedResourcesRemoved(run_root, 1U, daemon_pids, {});
+  if (TcpPortAccepting("127.0.0.1", 18888U)) {
+    throw std::runtime_error(
+        "owned replacement daemon retained the fixture RPC port after "
+        "run.stop");
+  }
+  if (!process.Running()) {
+    throw std::runtime_error(
+        "BBP exited after draining the held workload callback");
+  }
+  const boost::json::value stopped_registry =
+      ReadMcpResourceData(mcp, &request_id, "bbp:///run_registry",
+                          "drained workload-service run registry");
+  if (!stopped_registry.is_array() || stopped_registry.as_array().empty()) {
+    throw std::runtime_error(
+        "MCP was not readable after workload-service drain");
+  }
+
+  const std::string fresh_run_id =
+      "fresh-drain-" + std::to_string(static_cast<long long>(getpid()));
+  const boost::json::object fresh_launch = InvokeMcpOperation(
+      mcp, &request_id, "run.launch",
+      boost::json::object{
+          {"scenario", boost::json::object{{"run_id", fresh_run_id},
+                                           {"nodes", 0U},
+                                           {"isolated_network", false},
+                                           {"ready_timeout_sec", 5U},
+                                           {"sync_timeout_sec", 5U}}}},
+      10s, "fresh zero-node run after workload-service drain");
+  if (fresh_launch.at("result_family").as_string() != "run_lifecycle" ||
+      fresh_launch.at("run_id").as_string() != fresh_run_id ||
+      fresh_launch.at("state").as_string() != "active" ||
+      fresh_launch.at("node_count").to_number<std::uint64_t>() != 0U) {
+    throw std::runtime_error(
+        "fresh zero-node run returned inconsistent launch evidence: " +
+        boost::json::serialize(fresh_launch));
+  }
+
+  const boost::json::object fresh_checkpoint = InvokeMcpOperation(
+      mcp, &request_id, "workload.invoke",
+      boost::json::object{
+          {"run_id", fresh_run_id},
+          {"workload", boost::json::object{{"type", "checkpoint"},
+                                           {"name", "after-service-drain"}}}},
+      10s, "fresh checkpoint after workload-service drain");
+  if (fresh_checkpoint.at("result_family").as_string() !=
+          "workload_invocation" ||
+      fresh_checkpoint.at("run_id").as_string() != fresh_run_id ||
+      fresh_checkpoint.at("action").as_string() != "checkpoint" ||
+      fresh_checkpoint.at("state").as_string() != "completed") {
+    throw std::runtime_error(
+        "fresh checkpoint returned inconsistent completion evidence: " +
+        boost::json::serialize(fresh_checkpoint));
+  }
+  const boost::json::object fresh_stop = InvokeMcpOperation(
+      mcp, &request_id, "run.stop",
+      boost::json::object{{"run_id", fresh_run_id}, {"timeout_sec", 15U}}, 15s,
+      "fresh zero-node stop after workload-service drain");
+  if (fresh_stop.at("result_family").as_string() != "run_lifecycle" ||
+      fresh_stop.at("run_id").as_string() != fresh_run_id ||
+      fresh_stop.at("state").as_string() != "stopped" || !process.Running()) {
+    throw std::runtime_error(
+        "fresh zero-node run did not stop through the surviving host: " +
+        boost::json::serialize(fresh_stop));
+  }
+
+  process.Write("\x1b");
+  static_cast<void>(process.ReadUntil(
+      "Confirm exit", 3s,
+      "workload-service shutdown-drain confirmed exit modal"));
+  process.Write("y");
+  RequireExitZero(&process, "workload-service shutdown-drain TUI exit");
+  failure_cleanup.Disarm();
+}
+
 boost::json::object RawTransactionTestWorkload() {
   return boost::json::object{
       {"type", "send_raw_transaction"},
@@ -6065,6 +6739,20 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
       std::cerr << "MCP raw-transaction funding-admission cancellation "
                    "regression failed: "
+                << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 &&
+      std::string_view(argv[1]) == "--mcp-workload-service-shutdown-drain") {
+    try {
+      CheckMcpWorkloadServiceShutdownDrain(argv[2],
+                                           std::filesystem::canonical(argv[0]));
+      std::cout << "MCP workload-service shutdown cancellation, admission, "
+                   "and drain checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "MCP workload-service shutdown-drain regression failed: "
                 << error.what() << '\n';
       return 1;
     }

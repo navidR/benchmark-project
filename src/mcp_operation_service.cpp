@@ -170,7 +170,13 @@ void ValidateError(McpOperationError* error) {
           member.key() != "available_node_capacity" &&
           member.key() != "resource_kind" && member.key() != "address" &&
           member.key() != "port" && member.key() != "purpose" &&
-          member.key() != "mutation_started") {
+          member.key() != "mutation_started" && member.key() != "severity" &&
+          member.key() != "active_callback_count" &&
+          member.key() != "active_worker_count" &&
+          member.key() != "shutdown_bound_ms" &&
+          member.key() != "admission_closed" &&
+          member.key() != "cancellation_requested" &&
+          member.key() != "safe_to_destroy") {
         diagnostics_valid = false;
         break;
       }
@@ -244,11 +250,18 @@ void ValidateError(McpOperationError* error) {
     }
     for (const std::string_view count :
          {"requested_count", "current_node_count", "node_capacity",
-          "available_node_capacity"}) {
+          "available_node_capacity", "active_callback_count",
+          "active_worker_count", "shutdown_bound_ms"}) {
       const boost::json::value* member = diagnostic.if_contains(count);
       if (member != nullptr &&
           !(member->is_uint64() ||
             (member->is_int64() && member->as_int64() >= 0))) {
+        diagnostics_valid = false;
+        break;
+      }
+      if (count == "shutdown_bound_ms" && member != nullptr &&
+          ((member->is_uint64() && member->as_uint64() == 0U) ||
+           (member->is_int64() && member->as_int64() == 0))) {
         diagnostics_valid = false;
         break;
       }
@@ -257,12 +270,28 @@ void ValidateError(McpOperationError* error) {
     const boost::json::value* port = diagnostic.if_contains("port");
     const boost::json::value* mutation_started =
         diagnostic.if_contains("mutation_started");
+    const boost::json::value* severity = diagnostic.if_contains("severity");
+    const boost::json::value* admission_closed =
+        diagnostic.if_contains("admission_closed");
+    const boost::json::value* cancellation_requested =
+        diagnostic.if_contains("cancellation_requested");
+    const boost::json::value* safe_to_destroy =
+        diagnostic.if_contains("safe_to_destroy");
     if ((address != nullptr &&
          (!address->is_string() || address->as_string().empty() ||
           address->as_string().size() > kMcpMaximumEvidenceTextBytes)) ||
         (port != nullptr && !(port->is_uint64() && port->as_uint64() > 0U &&
                               port->as_uint64() <= 65535U)) ||
-        (mutation_started != nullptr && !mutation_started->is_bool())) {
+        (mutation_started != nullptr && !mutation_started->is_bool()) ||
+        (severity != nullptr &&
+         (!severity->is_string() || (severity->as_string() != "info" &&
+                                     severity->as_string() != "warning" &&
+                                     severity->as_string() != "error" &&
+                                     severity->as_string() != "critical"))) ||
+        (admission_closed != nullptr && !admission_closed->is_bool()) ||
+        (cancellation_requested != nullptr &&
+         !cancellation_requested->is_bool()) ||
+        (safe_to_destroy != nullptr && !safe_to_destroy->is_bool())) {
       diagnostics_valid = false;
       break;
     }

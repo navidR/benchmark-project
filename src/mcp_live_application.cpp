@@ -1249,6 +1249,238 @@ McpRunEvidenceQuery ParseEvidenceQuery(const boost::json::object& arguments,
 
 }  // namespace
 
+struct McpLiveWorkloadControl {
+  McpLiveWorkloadControl();
+  ~McpLiveWorkloadControl();
+
+  std::mutex mutex;
+  std::condition_variable_any changed;
+  std::stop_source cancellation;
+  std::optional<std::chrono::steady_clock::time_point> first_deadline;
+  std::size_t active_callback_count = 0U;
+  std::size_t active_worker_count = 0U;
+  bool admission_closed = false;
+  bool cancellation_dispatch_requested = false;
+  std::jthread cancellation_dispatcher;
+};
+
+McpLiveWorkloadControl::McpLiveWorkloadControl()
+    : cancellation_dispatcher([this](std::stop_token dispatcher_stop_token) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool dispatch = changed.wait(lock, dispatcher_stop_token, [this] {
+          return cancellation_dispatch_requested;
+        });
+        if (!dispatch) {
+          return;
+        }
+        lock.unlock();
+        cancellation.request_stop();
+      }) {}
+
+McpLiveWorkloadControl::~McpLiveWorkloadControl() {
+  cancellation_dispatcher.request_stop();
+  changed.notify_all();
+}
+
+namespace {
+
+McpLiveWorkloadDrainResult WorkloadDrainResultLocked(
+    const McpLiveWorkloadControl& control, bool timed_out = false) {
+  const bool drained =
+      control.active_callback_count == 0U && control.active_worker_count == 0U;
+  return McpLiveWorkloadDrainResult{
+      .admission_closed = control.admission_closed,
+      .cancellation_requested = control.cancellation_dispatch_requested,
+      .drained = drained,
+      .timed_out = timed_out,
+      .active_callback_count = control.active_callback_count,
+      .active_worker_count = control.active_worker_count,
+      .first_deadline = control.first_deadline.value_or(
+          std::chrono::steady_clock::time_point{})};
+}
+
+[[noreturn]] void ThrowWorkloadServiceStopping() {
+  throw McpOperationFailure("workload_service_stopping",
+                            "the simulator workload service is stopping",
+                            false);
+}
+
+class McpLiveWorkloadCallbackLease {
+ public:
+  explicit McpLiveWorkloadCallbackLease(
+      std::shared_ptr<McpLiveWorkloadControl> control) noexcept
+      : control_(std::move(control)) {}
+
+  ~McpLiveWorkloadCallbackLease() {
+    if (!control_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(control_->mutex);
+    if (control_->active_callback_count == 0U) {
+      std::terminate();
+    }
+    --control_->active_callback_count;
+    control_->changed.notify_all();
+  }
+
+  McpLiveWorkloadCallbackLease(const McpLiveWorkloadCallbackLease&) = delete;
+  McpLiveWorkloadCallbackLease& operator=(const McpLiveWorkloadCallbackLease&) =
+      delete;
+
+ private:
+  std::shared_ptr<McpLiveWorkloadControl> control_;
+};
+
+McpLiveWorkloadCallbackLease AdmitWorkloadCallback(
+    const std::shared_ptr<McpLiveWorkloadControl>& control) {
+  std::lock_guard<std::mutex> lock(control->mutex);
+  if (control->admission_closed) {
+    ThrowWorkloadServiceStopping();
+  }
+  ++control->active_callback_count;
+  return McpLiveWorkloadCallbackLease(control);
+}
+
+}  // namespace
+
+bool McpLiveWorkloadDrainResult::safe_to_destroy() const noexcept {
+  return admission_closed && cancellation_requested && drained;
+}
+
+McpLiveWorkloadWorkerLease::McpLiveWorkloadWorkerLease(
+    std::shared_ptr<McpLiveWorkloadControl> control) noexcept
+    : control_(std::move(control)) {}
+
+McpLiveWorkloadWorkerLease::~McpLiveWorkloadWorkerLease() { Release(); }
+
+McpLiveWorkloadWorkerLease::McpLiveWorkloadWorkerLease(
+    McpLiveWorkloadWorkerLease&& other) noexcept
+    : control_(std::move(other.control_)) {}
+
+McpLiveWorkloadWorkerLease& McpLiveWorkloadWorkerLease::operator=(
+    McpLiveWorkloadWorkerLease&& other) noexcept {
+  if (this != &other) {
+    Release();
+    control_ = std::move(other.control_);
+  }
+  return *this;
+}
+
+McpLiveWorkloadWorkerLease::operator bool() const noexcept {
+  return static_cast<bool>(control_);
+}
+
+std::stop_token McpLiveWorkloadWorkerLease::stop_token() const noexcept {
+  return control_ ? control_->cancellation.get_token() : std::stop_token{};
+}
+
+void McpLiveWorkloadWorkerLease::Release() noexcept {
+  if (!control_) {
+    return;
+  }
+  std::shared_ptr<McpLiveWorkloadControl> control = std::move(control_);
+  std::lock_guard<std::mutex> lock(control->mutex);
+  if (control->active_worker_count == 0U) {
+    std::terminate();
+  }
+  --control->active_worker_count;
+  control->changed.notify_all();
+}
+
+McpLiveWorkloadService::McpLiveWorkloadService()
+    : control_(std::make_shared<McpLiveWorkloadControl>()) {}
+
+McpLiveWorkloadService::~McpLiveWorkloadService() = default;
+
+boost::json::object McpLiveWorkloadService::ExecuteOperation(
+    McpOperationKind kind, const boost::json::object& arguments,
+    std::stop_token stop_token) {
+  McpLiveWorkloadCallbackLease callback_lease = AdmitWorkloadCallback(control_);
+  CombinedStopToken cancellation(stop_token,
+                                 control_->cancellation.get_token());
+  const auto execute = operation;
+  if (!execute) {
+    throw std::logic_error(
+        "MCP workload service operation callback is unavailable");
+  }
+  return execute(kind, arguments, cancellation.token());
+}
+
+boost::json::value McpLiveWorkloadService::Read(bool history,
+                                                std::stop_token stop_token) {
+  McpLiveWorkloadCallbackLease callback_lease = AdmitWorkloadCallback(control_);
+  CombinedStopToken cancellation(stop_token,
+                                 control_->cancellation.get_token());
+  const auto execute = read;
+  if (!execute) {
+    throw std::logic_error("MCP workload service read callback is unavailable");
+  }
+  return execute(history, cancellation.token());
+}
+
+McpLiveWorkloadWorkerLease McpLiveWorkloadService::AcquireWorkerLease() {
+  std::lock_guard<std::mutex> lock(control_->mutex);
+  if (control_->admission_closed) {
+    ThrowWorkloadServiceStopping();
+  }
+  ++control_->active_worker_count;
+  return McpLiveWorkloadWorkerLease(control_);
+}
+
+McpLiveWorkloadDrainResult McpLiveWorkloadService::CloseAdmission(
+    std::chrono::steady_clock::time_point deadline) {
+  std::lock_guard<std::mutex> lock(control_->mutex);
+  if (!control_->admission_closed) {
+    control_->admission_closed = true;
+    control_->first_deadline = deadline;
+  }
+  return WorkloadDrainResultLocked(*control_);
+}
+
+McpLiveWorkloadDrainResult McpLiveWorkloadService::RequestCancellation() {
+  McpLiveWorkloadDrainResult result;
+  {
+    std::lock_guard<std::mutex> lock(control_->mutex);
+    control_->cancellation_dispatch_requested = true;
+    result = WorkloadDrainResultLocked(*control_);
+  }
+  control_->changed.notify_all();
+  return result;
+}
+
+McpLiveWorkloadDrainResult McpLiveWorkloadService::DrainResult() {
+  std::lock_guard<std::mutex> lock(control_->mutex);
+  return WorkloadDrainResultLocked(*control_);
+}
+
+McpLiveWorkloadDrainResult McpLiveWorkloadService::WaitUntilDrained(
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::stop_token stop_token) {
+  std::unique_lock<std::mutex> lock(control_->mutex);
+  if (deadline && control_->first_deadline &&
+      *deadline > *control_->first_deadline) {
+    deadline = control_->first_deadline;
+  }
+  const auto drained = [this] {
+    return control_->active_callback_count == 0U &&
+           control_->active_worker_count == 0U;
+  };
+  bool completed = drained();
+  if (!completed && deadline) {
+    completed =
+        control_->changed.wait_until(lock, stop_token, *deadline, drained);
+  } else if (!completed && stop_token.stop_possible()) {
+    completed = control_->changed.wait(lock, stop_token, drained);
+  } else if (!completed) {
+    control_->changed.wait(lock, drained);
+    completed = true;
+  }
+  const bool timed_out = !completed && !stop_token.stop_requested() &&
+                         deadline &&
+                         std::chrono::steady_clock::now() >= *deadline;
+  return WorkloadDrainResultLocked(*control_, timed_out);
+}
+
 boost::json::object ExecuteAndNormalizeSimulationRoleMutation(
     const McpLiveRoleService& service, std::string_view run_id,
     SimulationCommandKind kind, const SimulationRoleMutationRequest& request,
@@ -1655,8 +1887,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                          run_stop_source_.get_token());
           boost::json::object result;
           try {
-            result = workload_service->operation(kind, arguments,
-                                                 cancellation.token());
+            result = workload_service->ExecuteOperation(kind, arguments,
+                                                        cancellation.token());
           } catch (const SimulationCancelled&) {
             throw McpOperationCancelled();
           }
@@ -2696,7 +2928,7 @@ boost::json::value McpLiveApplication::ReadResource(
     }
     return ResourceEnvelope(
         family, config_.run_id,
-        workload_service->read(family == McpInformationFamily::kWorkloadHistory,
+        workload_service->Read(family == McpInformationFamily::kWorkloadHistory,
                                stop_token));
   }
 
@@ -3377,12 +3609,165 @@ void McpLiveApplication::SetWorkloadService(
   if (shutdown_) {
     throw std::runtime_error("MCP live application is shutting down");
   }
+  if (service && workload_admission_closed_) {
+    throw std::runtime_error("MCP workload service admission is closed");
+  }
   workload_service_ = std::move(service);
+}
+
+McpLiveWorkloadDrainResult McpLiveApplication::CloseWorkloadService(
+    std::chrono::steady_clock::time_point deadline) {
+  std::shared_ptr<McpLiveWorkloadService> service;
+  McpLiveWorkloadDrainResult result{.admission_closed = true,
+                                    .cancellation_requested = false,
+                                    .drained = true,
+                                    .timed_out = false,
+                                    .active_callback_count = 0U,
+                                    .active_worker_count = 0U,
+                                    .first_deadline = deadline};
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    workload_admission_closed_ = true;
+    if (!workload_shutdown_deadline_) {
+      workload_shutdown_deadline_ = deadline;
+    }
+    result.first_deadline = *workload_shutdown_deadline_;
+    if (workload_service_) {
+      if (draining_workload_service_) {
+        throw std::logic_error(
+            "MCP workload service admission has multiple owners");
+      }
+      draining_workload_service_ = std::move(workload_service_);
+    }
+    service = draining_workload_service_;
+    if (service) {
+      result = service->CloseAdmission(*workload_shutdown_deadline_);
+    }
+  }
+  return result;
+}
+
+McpLiveWorkloadDrainResult
+McpLiveApplication::RequestWorkloadServiceCancellation() {
+  std::shared_ptr<McpLiveWorkloadService> service;
+  std::chrono::steady_clock::time_point first_deadline;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!workload_admission_closed_) {
+      throw std::logic_error(
+          "MCP workload service cancellation requires closed admission");
+    }
+    service = draining_workload_service_;
+    first_deadline = workload_shutdown_deadline_.value_or(
+        std::chrono::steady_clock::time_point{});
+  }
+  if (service) {
+    return service->RequestCancellation();
+  }
+  return McpLiveWorkloadDrainResult{.admission_closed = true,
+                                    .cancellation_requested = true,
+                                    .drained = true,
+                                    .timed_out = false,
+                                    .active_callback_count = 0U,
+                                    .active_worker_count = 0U,
+                                    .first_deadline = first_deadline};
+}
+
+McpLiveWorkloadDrainResult McpLiveApplication::WaitForWorkloadServiceDrain(
+    std::stop_token stop_token) {
+  std::shared_ptr<McpLiveWorkloadService> service;
+  std::chrono::steady_clock::time_point first_deadline;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    service = draining_workload_service_;
+    first_deadline = workload_shutdown_deadline_.value_or(
+        std::chrono::steady_clock::time_point{});
+  }
+  if (!service) {
+    return McpLiveWorkloadDrainResult{.admission_closed = true,
+                                      .cancellation_requested = true,
+                                      .drained = true,
+                                      .timed_out = false,
+                                      .active_callback_count = 0U,
+                                      .active_worker_count = 0U,
+                                      .first_deadline = first_deadline};
+  }
+  const McpLiveWorkloadDrainResult initial = service->DrainResult();
+  McpLiveWorkloadDrainResult result =
+      service->WaitUntilDrained(initial.first_deadline, stop_token);
+  if (result.safe_to_destroy()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (draining_workload_service_ == service) {
+      draining_workload_service_.reset();
+    }
+  }
+  return result;
+}
+
+McpLiveWorkloadDrainResult McpLiveApplication::WaitForWorkloadServiceQuarantine(
+    std::stop_token stop_token) {
+  std::shared_ptr<McpLiveWorkloadService> service;
+  std::chrono::steady_clock::time_point first_deadline;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    service = draining_workload_service_;
+    first_deadline = workload_shutdown_deadline_.value_or(
+        std::chrono::steady_clock::time_point{});
+  }
+  if (!service) {
+    return McpLiveWorkloadDrainResult{.admission_closed = true,
+                                      .cancellation_requested = true,
+                                      .drained = true,
+                                      .timed_out = false,
+                                      .active_callback_count = 0U,
+                                      .active_worker_count = 0U,
+                                      .first_deadline = first_deadline};
+  }
+  McpLiveWorkloadDrainResult result =
+      service->WaitUntilDrained(std::nullopt, stop_token);
+  if (result.safe_to_destroy()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (draining_workload_service_ == service) {
+      draining_workload_service_.reset();
+    }
+  }
+  return result;
+}
+
+void McpLiveApplication::PublishWorkloadServiceShutdownTimeout(
+    const McpLiveWorkloadDrainResult& result,
+    std::chrono::milliseconds shutdown_bound) const noexcept {
+  constexpr std::string_view kCode = "workload_service_shutdown_timeout";
+  constexpr std::string_view kMessage =
+      "workload callbacks or workers did not drain before the shutdown "
+      "deadline";
+  const std::uint64_t bound_ms =
+      shutdown_bound.count() > 0
+          ? static_cast<std::uint64_t>(shutdown_bound.count())
+          : 0U;
+  PublishEvidence(
+      McpInformationFamily::kLifecycle, std::string(kCode),
+      std::string(kMessage), std::nullopt,
+      boost::json::object{
+          {"code", kCode},
+          {"message", kMessage},
+          {"severity", "critical"},
+          {"active_callback_count",
+           static_cast<std::uint64_t>(result.active_callback_count)},
+          {"active_worker_count",
+           static_cast<std::uint64_t>(result.active_worker_count)},
+          {"shutdown_bound_ms", bound_ms},
+          {"admission_closed", result.admission_closed},
+          {"cancellation_requested", result.cancellation_requested},
+          {"safe_to_destroy", result.safe_to_destroy()}});
 }
 
 std::shared_ptr<McpLiveWorkloadService> McpLiveApplication::WorkloadService()
     const {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (workload_admission_closed_) {
+    ThrowWorkloadServiceStopping();
+  }
   return workload_service_;
 }
 
@@ -3610,6 +3995,11 @@ void McpLiveApplication::Shutdown(
 void McpLiveApplication::ShutdownImpl(
     std::optional<std::chrono::steady_clock::time_point> deadline,
     std::stop_token stop_token) {
+  if (!config_.retained_run) {
+    static_cast<void>(CloseWorkloadService(
+        deadline.value_or(std::chrono::steady_clock::time_point::max())));
+    static_cast<void>(RequestWorkloadServiceCancellation());
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     shutdown_ = true;

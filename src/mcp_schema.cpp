@@ -988,6 +988,14 @@ boost::json::object DiagnosticSchema() {
   properties["port"] = IntegerSchema(1U, 65535U);
   properties["purpose"] = IdentifierSchema();
   properties["mutation_started"] = TypeSchema("boolean");
+  properties["severity"] = StringEnumSchema(
+      boost::json::array{"info", "warning", "error", "critical"});
+  properties["active_callback_count"] = Uint64Schema();
+  properties["active_worker_count"] = Uint64Schema();
+  properties["shutdown_bound_ms"] = Uint64Schema(1U);
+  properties["admission_closed"] = TypeSchema("boolean");
+  properties["cancellation_requested"] = TypeSchema("boolean");
+  properties["safe_to_destroy"] = TypeSchema("boolean");
   return ClosedObject(std::move(properties), Required({"code", "message"}));
 }
 

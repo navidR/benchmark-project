@@ -2462,6 +2462,277 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
+    mcp_live_workload_service_shutdown_bounds_drain_and_preserves_lifetime) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::optional<McpEvidenceRecord> timeout_evidence;
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence =
+          [&](McpEvidenceRecord record) {
+            timeout_evidence = std::move(record);
+          },
+      .close_run_subscriptions = [](std::string_view) {}});
+
+  struct ReferencedLifetime {
+    explicit ReferencedLifetime(std::atomic_bool* destroyed)
+        : destroyed(destroyed) {}
+    ~ReferencedLifetime() { destroyed->store(true, std::memory_order_release); }
+
+    std::atomic_bool* destroyed;
+  };
+
+  std::atomic_bool referenced_state_destroyed = false;
+  std::shared_ptr<ReferencedLifetime> referenced_state =
+      std::make_shared<ReferencedLifetime>(&referenced_state_destroyed);
+  const std::weak_ptr<ReferencedLifetime> referenced_lifetime =
+      referenced_state;
+  std::atomic_bool release_callback = false;
+  std::atomic_bool release_service_stop_callback = false;
+  std::atomic_bool service_stop_observed = false;
+  std::atomic_bool service_stop_callback_exited = false;
+  std::atomic_bool caller_stop_observed = false;
+  std::atomic_uint32_t operation_calls = 0U;
+  std::atomic_uint32_t read_calls = 0U;
+  std::promise<void> callback_entered;
+  std::future<void> callback_admitted = callback_entered.get_future();
+  std::promise<void> service_stop_callback_entered;
+  std::future<void> service_stop_callback_admitted =
+      service_stop_callback_entered.get_future();
+  std::promise<void> service_stop_callback_finished;
+  std::future<void> service_stop_callback_drained =
+      service_stop_callback_finished.get_future();
+
+  auto service = std::make_shared<McpLiveWorkloadService>();
+  service->operation = [&, referenced_state](McpOperationKind,
+                                             const boost::json::object&,
+                                             std::stop_token stop_token) {
+    operation_calls.fetch_add(1U, std::memory_order_release);
+    std::stop_callback observe_service_stop(stop_token, [&] {
+      service_stop_observed.store(true, std::memory_order_release);
+      service_stop_callback_entered.set_value();
+      while (!release_service_stop_callback.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(1ms);
+      }
+      service_stop_callback_exited.store(true, std::memory_order_release);
+      service_stop_callback_finished.set_value();
+    });
+    callback_entered.set_value();
+    while (!release_callback.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(1ms);
+    }
+    return boost::json::object{{"state", "completed"}};
+  };
+  service->read = [&, referenced_state](bool, std::stop_token stop_token) {
+    read_calls.fetch_add(1U, std::memory_order_release);
+    caller_stop_observed.store(stop_token.stop_requested(),
+                               std::memory_order_release);
+    return boost::json::value(boost::json::array{});
+  };
+  referenced_state.reset();
+  application.SetWorkloadService(service);
+  application.MarkRunStarted();
+  std::stop_source caller_stop;
+  caller_stop.request_stop();
+  static_cast<void>(service->Read(false, caller_stop.get_token()));
+  BOOST_TEST(caller_stop_observed.load(std::memory_order_acquire));
+  McpOperationPlan stale_application_plan = application.OperationFactory()(
+      McpOperationKind::kInspectWorkload,
+      boost::json::object{{"run_id", "live-application"},
+                          {"workload_id", "held-workload"}},
+      "stale-session");
+  BOOST_REQUIRE(stale_application_plan.executor);
+
+  McpLiveWorkloadWorkerLease original_worker_lease =
+      service->AcquireWorkerLease();
+  McpLiveWorkloadWorkerLease worker_lease = std::move(original_worker_lease);
+  BOOST_TEST(!static_cast<bool>(original_worker_lease));
+  BOOST_TEST(!original_worker_lease.stop_token().stop_possible());
+  BOOST_TEST(static_cast<bool>(worker_lease));
+  BOOST_TEST(worker_lease.stop_token().stop_possible());
+
+  std::shared_ptr<McpLiveWorkloadService> stale_service = service;
+  std::future<boost::json::object> active_callback =
+      std::async(std::launch::async, [service] {
+        return service->ExecuteOperation(McpOperationKind::kInspectWorkload,
+                                         boost::json::object{},
+                                         std::stop_token{});
+      });
+  std::future<McpLiveWorkloadDrainResult> close_result;
+  AtomicReleaseGuard release_guard(&release_callback);
+  AtomicReleaseGuard service_stop_release_guard(&release_service_stop_callback);
+  BOOST_REQUIRE(callback_admitted.wait_for(2s) == std::future_status::ready);
+
+  const auto first_deadline = std::chrono::steady_clock::now() + 50ms;
+  close_result = std::async(std::launch::async, [&application, first_deadline] {
+    return application.CloseWorkloadService(first_deadline);
+  });
+  BOOST_REQUIRE(close_result.wait_for(1s) == std::future_status::ready);
+  const McpLiveWorkloadDrainResult closed = close_result.get();
+  BOOST_TEST(closed.admission_closed);
+  BOOST_TEST(!closed.cancellation_requested);
+  BOOST_TEST(!closed.drained);
+  BOOST_TEST(!closed.timed_out);
+  BOOST_TEST(closed.active_callback_count == 1U);
+  BOOST_TEST(closed.active_worker_count == 1U);
+  BOOST_CHECK(closed.first_deadline == first_deadline);
+  BOOST_TEST(!service_stop_observed.load(std::memory_order_acquire));
+  BOOST_TEST(!worker_lease.stop_token().stop_requested());
+
+  const auto repeated_close_started = std::chrono::steady_clock::now();
+  const McpLiveWorkloadDrainResult closed_again =
+      application.CloseWorkloadService(first_deadline + 2s);
+  BOOST_CHECK(std::chrono::steady_clock::now() - repeated_close_started < 1s);
+  BOOST_CHECK(closed_again.first_deadline == first_deadline);
+  BOOST_TEST(!closed_again.cancellation_requested);
+
+  const McpLiveWorkloadDrainResult cancellation_requested =
+      application.RequestWorkloadServiceCancellation();
+  BOOST_REQUIRE(service_stop_callback_admitted.wait_for(2s) ==
+                std::future_status::ready);
+  BOOST_TEST(cancellation_requested.admission_closed);
+  BOOST_TEST(cancellation_requested.cancellation_requested);
+  BOOST_TEST(!cancellation_requested.drained);
+  BOOST_TEST(!cancellation_requested.timed_out);
+  BOOST_TEST(cancellation_requested.active_callback_count == 1U);
+  BOOST_TEST(cancellation_requested.active_worker_count == 1U);
+  BOOST_CHECK(cancellation_requested.first_deadline == first_deadline);
+  BOOST_TEST(service_stop_observed.load(std::memory_order_acquire));
+  BOOST_TEST(!service_stop_callback_exited.load(std::memory_order_acquire));
+  BOOST_TEST(worker_lease.stop_token().stop_requested());
+
+  const auto bounded_wait_started = std::chrono::steady_clock::now();
+  const McpLiveWorkloadDrainResult timed_out =
+      application.WaitForWorkloadServiceDrain();
+  BOOST_CHECK(std::chrono::steady_clock::now() - bounded_wait_started < 1s);
+  BOOST_TEST(timed_out.admission_closed);
+  BOOST_TEST(timed_out.cancellation_requested);
+  BOOST_TEST(!timed_out.drained);
+  BOOST_TEST(timed_out.timed_out);
+  BOOST_TEST(timed_out.active_callback_count == 1U);
+  BOOST_TEST(timed_out.active_worker_count == 1U);
+  BOOST_TEST(!timed_out.safe_to_destroy());
+
+  const auto require_stopping = [](const auto& invoke) {
+    try {
+      invoke();
+      BOOST_FAIL("stale workload service call passed closed admission");
+    } catch (const McpOperationFailure& failure) {
+      BOOST_TEST(failure.code() == "workload_service_stopping");
+      BOOST_TEST(!failure.retryable());
+    }
+  };
+  McpOperationService stale_plan_executor;
+  stale_plan_executor.RegisterSession("live-session");
+  const McpOperationSnapshot stale_submitted = stale_plan_executor.Submit(
+      "live-session", McpOperationKind::kInspectWorkload,
+      stale_application_plan.progress_total,
+      std::move(stale_application_plan.executor));
+  const McpOperationSnapshot stale_terminal =
+      WaitForTerminal(&stale_plan_executor, stale_submitted.operation_id);
+  BOOST_CHECK(stale_terminal.state == McpOperationState::kFailed);
+  BOOST_REQUIRE(stale_terminal.error);
+  BOOST_TEST(stale_terminal.error->code == "workload_service_stopping");
+  BOOST_TEST(!stale_terminal.error->retryable);
+  stale_plan_executor.Shutdown();
+
+  require_stopping([&] {
+    static_cast<void>(application.OperationFactory()(
+        McpOperationKind::kInspectWorkload,
+        boost::json::object{{"run_id", "live-application"},
+                            {"workload_id", "fresh-workload"}},
+        "fresh-session"));
+  });
+  require_stopping([&] {
+    static_cast<void>(application.ResourceReader()(
+        McpInformationFamily::kWorkloads, "fresh-session", std::stop_token{}));
+  });
+  require_stopping([&] {
+    static_cast<void>(stale_service->ExecuteOperation(
+        McpOperationKind::kInspectWorkload, boost::json::object{},
+        std::stop_token{}));
+  });
+  require_stopping([&] {
+    static_cast<void>(stale_service->Read(false, std::stop_token{}));
+  });
+  require_stopping(
+      [&] { static_cast<void>(stale_service->AcquireWorkerLease()); });
+  BOOST_TEST(operation_calls.load(std::memory_order_acquire) == 1U);
+  BOOST_TEST(read_calls.load(std::memory_order_acquire) == 1U);
+
+  application.PublishWorkloadServiceShutdownTimeout(timed_out, 50ms);
+  BOOST_REQUIRE(timeout_evidence);
+  BOOST_CHECK(timeout_evidence->family == McpInformationFamily::kLifecycle);
+  BOOST_REQUIRE(timeout_evidence->kind);
+  BOOST_TEST(*timeout_evidence->kind == "workload_service_shutdown_timeout");
+  BOOST_REQUIRE(timeout_evidence->data);
+  const boost::json::object& diagnostic = timeout_evidence->data->as_object();
+  BOOST_TEST(diagnostic.at("code").as_string() ==
+             "workload_service_shutdown_timeout");
+  BOOST_TEST(diagnostic.at("severity").as_string() == "critical");
+  BOOST_TEST(diagnostic.at("active_callback_count").as_uint64() == 1U);
+  BOOST_TEST(diagnostic.at("active_worker_count").as_uint64() == 1U);
+  BOOST_TEST(diagnostic.at("shutdown_bound_ms").as_uint64() == 50U);
+  BOOST_TEST(diagnostic.at("admission_closed").as_bool());
+  BOOST_TEST(diagnostic.at("cancellation_requested").as_bool());
+  BOOST_TEST(!diagnostic.at("safe_to_destroy").as_bool());
+
+  service.reset();
+  stale_service.reset();
+  BOOST_TEST(!referenced_lifetime.expired());
+  release_service_stop_callback.store(true, std::memory_order_release);
+  BOOST_REQUIRE(service_stop_callback_drained.wait_for(2s) ==
+                std::future_status::ready);
+  BOOST_TEST(service_stop_callback_exited.load(std::memory_order_acquire));
+  release_callback.store(true, std::memory_order_release);
+  BOOST_TEST(active_callback.get().at("state").as_string() == "completed");
+  BOOST_TEST(!referenced_lifetime.expired());
+
+  worker_lease = McpLiveWorkloadWorkerLease{};
+  const McpLiveWorkloadDrainResult drained =
+      application.WaitForWorkloadServiceQuarantine();
+  BOOST_TEST(drained.admission_closed);
+  BOOST_TEST(drained.cancellation_requested);
+  BOOST_TEST(drained.drained);
+  BOOST_TEST(!drained.timed_out);
+  BOOST_TEST(drained.active_callback_count == 0U);
+  BOOST_TEST(drained.active_worker_count == 0U);
+  BOOST_TEST(drained.safe_to_destroy());
+  BOOST_TEST(referenced_lifetime.expired());
+  BOOST_TEST(referenced_state_destroyed.load(std::memory_order_acquire));
+
+  const McpLiveWorkloadDrainResult closed_after_drain =
+      application.CloseWorkloadService(first_deadline + 4s);
+  BOOST_CHECK(closed_after_drain.first_deadline == first_deadline);
+
+  auto replacement_service = std::make_shared<McpLiveWorkloadService>();
+  replacement_service->operation =
+      [](McpOperationKind, const boost::json::object&, std::stop_token) {
+        return boost::json::object{};
+      };
+  replacement_service->read = [](bool, std::stop_token) {
+    return boost::json::value(boost::json::array{});
+  };
+  BOOST_CHECK_THROW(application.SetWorkloadService(replacement_service),
+                    std::runtime_error);
+
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_live_workload_operations_separate_one_shot_and_retained_lifecycle) {
   LiveApplicationDirectory temporary;
   const auto options =

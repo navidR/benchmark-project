@@ -1949,6 +1949,15 @@ if(BUILD_TESTING)
     bbp-scenario-restart-node-snapshot-admission-production
     PROPERTIES TIMEOUT 60
   )
+  add_test(NAME bbp-mcp-workload-service-shutdown-drain-production
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --mcp-workload-service-shutdown-drain
+      $<TARGET_FILE:bbp>
+  )
+  set_tests_properties(
+    bbp-mcp-workload-service-shutdown-drain-production
+    PROPERTIES TIMEOUT 60
+  )
   add_test(NAME bbp-mcp-raw-transaction-cancellation-production
     COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
       --mcp-raw-transaction-cancellation

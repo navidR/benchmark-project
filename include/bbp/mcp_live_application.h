@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -30,6 +31,45 @@ struct McpLiveNodeInventorySnapshot {
   std::vector<std::string> node_ids;
 };
 
+struct McpLiveWorkloadControl;
+
+struct McpLiveWorkloadDrainResult {
+  bool admission_closed = false;
+  bool cancellation_requested = false;
+  bool drained = false;
+  bool timed_out = false;
+  std::size_t active_callback_count = 0U;
+  std::size_t active_worker_count = 0U;
+  std::chrono::steady_clock::time_point first_deadline{};
+
+  bool safe_to_destroy() const noexcept;
+};
+
+class McpLiveWorkloadWorkerLease {
+ public:
+  McpLiveWorkloadWorkerLease() noexcept = default;
+  ~McpLiveWorkloadWorkerLease();
+
+  McpLiveWorkloadWorkerLease(const McpLiveWorkloadWorkerLease&) = delete;
+  McpLiveWorkloadWorkerLease& operator=(const McpLiveWorkloadWorkerLease&) =
+      delete;
+  McpLiveWorkloadWorkerLease(McpLiveWorkloadWorkerLease&& other) noexcept;
+  McpLiveWorkloadWorkerLease& operator=(
+      McpLiveWorkloadWorkerLease&& other) noexcept;
+
+  explicit operator bool() const noexcept;
+  std::stop_token stop_token() const noexcept;
+
+ private:
+  friend struct McpLiveWorkloadService;
+
+  explicit McpLiveWorkloadWorkerLease(
+      std::shared_ptr<McpLiveWorkloadControl> control) noexcept;
+  void Release() noexcept;
+
+  std::shared_ptr<McpLiveWorkloadControl> control_;
+};
+
 // Simulator-owned workload service. MCP supplies typed arguments and
 // cancellation; the service owns validation and execution shared with the
 // scenario/TUI paths. Lifecycle operations additionally own retained workload
@@ -37,10 +77,36 @@ struct McpLiveNodeInventorySnapshot {
 // invocation identity, returns its complete typed result, and remains
 // unregistered.
 struct McpLiveWorkloadService {
+  McpLiveWorkloadService();
+  ~McpLiveWorkloadService();
+
+  McpLiveWorkloadService(const McpLiveWorkloadService&) = delete;
+  McpLiveWorkloadService& operator=(const McpLiveWorkloadService&) = delete;
+
   std::function<boost::json::object(
       McpOperationKind, const boost::json::object&, std::stop_token)>
       operation;
   std::function<boost::json::value(bool history, std::stop_token)> read;
+
+  boost::json::object ExecuteOperation(McpOperationKind kind,
+                                       const boost::json::object& arguments,
+                                       std::stop_token stop_token);
+  boost::json::value Read(bool history, std::stop_token stop_token);
+  McpLiveWorkloadWorkerLease AcquireWorkerLease();
+  McpLiveWorkloadDrainResult WaitUntilDrained(
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt,
+      std::stop_token stop_token = {});
+
+ private:
+  friend class McpLiveApplication;
+
+  McpLiveWorkloadDrainResult CloseAdmission(
+      std::chrono::steady_clock::time_point deadline);
+  McpLiveWorkloadDrainResult RequestCancellation();
+  McpLiveWorkloadDrainResult DrainResult();
+
+  std::shared_ptr<McpLiveWorkloadControl> control_;
 };
 
 // Simulator-owned instrumentation lifecycle service. MCP supplies typed
@@ -119,6 +185,16 @@ class McpLiveApplication {
   bool read_only() const;
   std::uint32_t current_node_count() const;
   void SetWorkloadService(std::shared_ptr<McpLiveWorkloadService> service);
+  McpLiveWorkloadDrainResult CloseWorkloadService(
+      std::chrono::steady_clock::time_point deadline);
+  McpLiveWorkloadDrainResult RequestWorkloadServiceCancellation();
+  McpLiveWorkloadDrainResult WaitForWorkloadServiceDrain(
+      std::stop_token stop_token = {});
+  McpLiveWorkloadDrainResult WaitForWorkloadServiceQuarantine(
+      std::stop_token stop_token = {});
+  void PublishWorkloadServiceShutdownTimeout(
+      const McpLiveWorkloadDrainResult& result,
+      std::chrono::milliseconds shutdown_bound) const noexcept;
   void SetInstrumentationService(
       std::shared_ptr<McpLiveInstrumentationService> service);
   void SetRoleService(std::shared_ptr<McpLiveRoleService> service);
@@ -203,11 +279,15 @@ class McpLiveApplication {
   std::condition_variable_any requests_drained_;
   std::map<std::uint64_t, PendingCommand> pending_commands_;
   std::shared_ptr<McpLiveWorkloadService> workload_service_;
+  std::shared_ptr<McpLiveWorkloadService> draining_workload_service_;
+  std::optional<std::chrono::steady_clock::time_point>
+      workload_shutdown_deadline_;
   std::shared_ptr<McpLiveInstrumentationService> instrumentation_service_;
   std::shared_ptr<McpLiveRoleService> role_service_;
   std::stop_source request_stop_source_;
   std::stop_source run_stop_source_;
   std::size_t active_requests_ = 0U;
+  bool workload_admission_closed_ = false;
   bool run_started_ = false;
   bool stop_requested_ = false;
   bool run_stopped_ = false;

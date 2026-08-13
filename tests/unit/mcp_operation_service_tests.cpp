@@ -315,7 +315,14 @@ BOOST_AUTO_TEST_CASE(mcp_operation_failure_retains_typed_bounded_error) {
                                       {"node_id", "firo-1"},
                                       {"action", "restart_node"},
                                       {"state", "indeterminate"},
-                                      {"phase", "replacement_ready"}}});
+                                      {"phase", "replacement_ready"},
+                                      {"severity", "critical"},
+                                      {"active_callback_count", 1U},
+                                      {"active_worker_count", 2U},
+                                      {"shutdown_bound_ms", 15000U},
+                                      {"admission_closed", true},
+                                      {"cancellation_requested", true},
+                                      {"safe_to_destroy", false}}});
       });
   const McpOperationSnapshot terminal =
       WaitForTerminal(&service, "session-a", submitted.operation_id);
@@ -328,6 +335,15 @@ BOOST_AUTO_TEST_CASE(mcp_operation_failure_retains_typed_bounded_error) {
   BOOST_TEST(
       terminal.error->diagnostics.front().as_object().at("phase").as_string() ==
       "replacement_ready");
+  const boost::json::object& diagnostic =
+      terminal.error->diagnostics.front().as_object();
+  BOOST_TEST(diagnostic.at("severity").as_string() == "critical");
+  BOOST_TEST(diagnostic.at("active_callback_count").as_uint64() == 1U);
+  BOOST_TEST(diagnostic.at("active_worker_count").as_uint64() == 2U);
+  BOOST_TEST(diagnostic.at("shutdown_bound_ms").as_uint64() == 15000U);
+  BOOST_TEST(diagnostic.at("admission_closed").as_bool());
+  BOOST_TEST(diagnostic.at("cancellation_requested").as_bool());
+  BOOST_TEST(!diagnostic.at("safe_to_destroy").as_bool());
   const boost::json::object snapshot_json = McpOperationSnapshotJson(terminal);
   BOOST_TEST(
       snapshot_json.at("terminal_error").as_object().at("code").as_string() ==
