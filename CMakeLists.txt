@@ -294,6 +294,7 @@ add_executable(bbp
   src/simulator_scenario_serialization.cpp
   src/simulator_wallet_configuration_decoding.cpp
   src/simulator_wallet_transaction_distribution_decoding.cpp
+  src/simulator_wallet_transaction_validation.cpp
   src/simulator_yaml_decoding.cpp
   src/simulator_log_pane.cpp
   src/tui.cpp
@@ -537,6 +538,7 @@ if(BUILD_TESTING)
     src/simulator_scenario_serialization.cpp
     src/simulator_wallet_configuration_decoding.cpp
     src/simulator_wallet_transaction_distribution_decoding.cpp
+    src/simulator_wallet_transaction_validation.cpp
     src/simulator_yaml_decoding.cpp
     src/scheduled_scenario_event.cpp
     src/simulation_command_processor.cpp
