@@ -288,6 +288,7 @@ add_executable(bbp
   src/signal_stop_monitor.cpp
   src/simulator_app.cpp
   src/simulator_host_probes.cpp
+  src/simulator_scenario_serialization.cpp
   src/simulator_log_pane.cpp
   src/tui.cpp
   src/tui_command_admission.cpp
@@ -524,6 +525,7 @@ if(BUILD_TESTING)
     src/scenario_workload_admission.cpp
     src/simulator_app.cpp
     src/simulator_host_probes.cpp
+    src/simulator_scenario_serialization.cpp
     src/scheduled_scenario_event.cpp
     src/simulation_command_processor.cpp
     src/simulation_command_queue.cpp
