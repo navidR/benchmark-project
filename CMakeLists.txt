@@ -292,6 +292,7 @@ add_executable(bbp
   src/simulator_network_rule_decoding.cpp
   src/simulator_peer_topology_decoding.cpp
   src/simulator_resource_limit_decoding.cpp
+  src/simulator_resource_profile_decoding.cpp
   src/simulator_scenario_serialization.cpp
   src/simulator_wallet_configuration_decoding.cpp
   src/simulator_wallet_transaction_distribution_decoding.cpp
@@ -537,6 +538,7 @@ if(BUILD_TESTING)
     src/simulator_network_rule_decoding.cpp
     src/simulator_peer_topology_decoding.cpp
     src/simulator_resource_limit_decoding.cpp
+    src/simulator_resource_profile_decoding.cpp
     src/simulator_scenario_serialization.cpp
     src/simulator_wallet_configuration_decoding.cpp
     src/simulator_wallet_transaction_distribution_decoding.cpp

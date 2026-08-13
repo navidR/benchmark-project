@@ -37,7 +37,6 @@
 #include <random>
 #include <set>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -103,6 +102,7 @@
 #include "simulator_network_rule_decoding.h"
 #include "simulator_peer_topology_decoding.h"
 #include "simulator_resource_limit_decoding.h"
+#include "simulator_resource_profile_decoding.h"
 #include "simulator_scenario_serialization.h"
 #include "simulator_wallet_configuration_decoding.h"
 #include "simulator_wallet_transaction_distribution_decoding.h"
@@ -112,7 +112,9 @@
 namespace bbp {
 namespace {
 
+using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ConsecutiveNodeIndexes;
+using simulator_app_internal::InitialResourceLimits;
 using simulator_app_internal::IsTopologyEdgeConditionField;
 using simulator_app_internal::JsonAmountField;
 using simulator_app_internal::JsonOptionalAmountField;
@@ -141,6 +143,7 @@ using simulator_app_internal::ParseNetworkPartitionRuleObject;
 using simulator_app_internal::ParseNodeRoleTopologyObject;
 using simulator_app_internal::ParsePeerTopologyConfig;
 using simulator_app_internal::ParseResourceLimitPatchObject;
+using simulator_app_internal::ParseResourceProfiles;
 using simulator_app_internal::ParseScenarioNodeWalletConfig;
 using simulator_app_internal::ParseTopologyEdgeWorkloadCondition;
 using simulator_app_internal::ParseWalletFundingStrategy;
@@ -153,6 +156,7 @@ using simulator_app_internal::RejectTopologyEdgeConditionFields;
 using simulator_app_internal::RejectUnsupportedFields;
 using simulator_app_internal::RequireCgroupWeight;
 using simulator_app_internal::RequireNonZero;
+using simulator_app_internal::RequireSafeScenarioIdentifier;
 using simulator_app_internal::StableRuleHandle;
 using simulator_app_internal::ToChainWalletMode;
 using simulator_app_internal::ValidateNetworkPartitionRule;
@@ -594,10 +598,9 @@ const PeerConnectivityPolicy* FindPeerConnectivityPolicy(
   return nullptr;
 }
 
-ResourceLimits InitialResourceLimits(const Options& options);
-ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
-                                       const ResourceLimitPatch& patch,
-                                       const std::string& node_id);
+}  // namespace
+
+namespace simulator_app_internal {
 
 void RequireSafeScenarioIdentifier(std::string_view value,
                                    std::string_view field) {
@@ -613,6 +616,10 @@ void RequireSafeScenarioIdentifier(std::string_view value,
     }
   }
 }
+
+}  // namespace simulator_app_internal
+
+namespace {
 
 std::filesystem::path ParseScenarioNodePath(const boost::json::object& node,
                                             const char* field,
@@ -661,149 +668,6 @@ void ValidateScenarioNodeDataDirectory(const std::filesystem::path& data_dir,
     throw std::runtime_error(
         "scenario node " + std::string(node_id) +
         " data_dir must be below its owned nodes/<id> directory");
-  }
-}
-
-uint64_t ParsePositiveUint64Text(std::string_view text,
-                                 std::string_view field) {
-  uint64_t value = 0U;
-  const char* const begin = text.data();
-  const char* const end = begin + text.size();
-  const auto [next, error] = std::from_chars(begin, end, value);
-  if (text.empty() || error != std::errc() || next != end || value == 0U) {
-    throw std::runtime_error(std::string(field) + " must be a positive uint64");
-  }
-  return value;
-}
-
-uint64_t ParseBinaryByteSize(const boost::json::value& value,
-                             std::string_view field) {
-  if (!value.is_string()) {
-    throw std::runtime_error(std::string(field) +
-                             " must be a binary byte-size string");
-  }
-  const std::string text(value.as_string());
-  const std::pair<std::string_view, uint64_t> suffixes[] = {
-      {"TiB", 1ULL << 40U},
-      {"GiB", 1ULL << 30U},
-      {"MiB", 1ULL << 20U},
-      {"KiB", 1ULL << 10U},
-      {"B", 1U}};
-  for (const auto& [suffix, multiplier] : suffixes) {
-    if (text.size() <= suffix.size() ||
-        std::string_view(text).substr(text.size() - suffix.size()) != suffix) {
-      continue;
-    }
-    const std::string_view magnitude(text.data(), text.size() - suffix.size());
-    const uint64_t parsed = ParsePositiveUint64Text(magnitude, field);
-    if (parsed > std::numeric_limits<uint64_t>::max() / multiplier) {
-      throw std::runtime_error(std::string(field) + " overflows uint64 bytes");
-    }
-    return parsed * multiplier;
-  }
-  throw std::runtime_error(std::string(field) +
-                           " must use B, KiB, MiB, GiB, or TiB");
-}
-
-void ApplyCpuMaxAlias(const boost::json::value& value, std::string_view field,
-                      boost::json::object* canonical) {
-  if (!value.is_string()) {
-    throw std::runtime_error(std::string(field) + " must be a string");
-  }
-  std::istringstream input(std::string(value.as_string()));
-  std::string quota_text;
-  std::string period_text;
-  std::string extra;
-  if (!(input >> quota_text >> period_text) || (input >> extra)) {
-    throw std::runtime_error(std::string(field) +
-                             " must contain exactly quota-or-max and period");
-  }
-  if (quota_text == "max") {
-    (*canonical)["cpu_quota_us"] = nullptr;
-  } else {
-    (*canonical)["cpu_quota_us"] = ParsePositiveUint64Text(quota_text, field);
-  }
-  (*canonical)["cpu_period_us"] = ParsePositiveUint64Text(period_text, field);
-}
-
-ResourceLimits ParseResourceProfile(const boost::json::object& object,
-                                    const ResourceLimits& defaults,
-                                    std::string_view profile_name) {
-  RejectUnsupportedFields(
-      object, ScenarioObjectFields(ScenarioObjectKind::kResourceProfile),
-      "scenario resource profile " + std::string(profile_name));
-  boost::json::object canonical = object;
-  const bool memory_high_alias = object.if_contains("memory_high") != nullptr;
-  const bool memory_max_alias = object.if_contains("memory_max") != nullptr;
-  if (memory_high_alias && object.if_contains("memory_high_bytes") != nullptr) {
-    throw std::runtime_error("resource profile " + std::string(profile_name) +
-                             " specifies both memory_high and "
-                             "memory_high_bytes");
-  }
-  if (memory_max_alias && object.if_contains("memory_max_bytes") != nullptr) {
-    throw std::runtime_error("resource profile " + std::string(profile_name) +
-                             " specifies both memory_max and "
-                             "memory_max_bytes");
-  }
-  if (memory_high_alias) {
-    canonical["memory_high_bytes"] = ParseBinaryByteSize(
-        object.at("memory_high"), "resource profile memory_high");
-    canonical.erase("memory_high");
-  }
-  if (memory_max_alias) {
-    canonical["memory_max_bytes"] = ParseBinaryByteSize(
-        object.at("memory_max"), "resource profile memory_max");
-    canonical.erase("memory_max");
-  }
-
-  const bool cpu_quota_alias = object.if_contains("cpu_quota") != nullptr;
-  const bool cpu_max_alias = object.if_contains("cpu_max") != nullptr;
-  if (cpu_quota_alias && cpu_max_alias) {
-    throw std::runtime_error("resource profile " + std::string(profile_name) +
-                             " specifies both cpu_quota and cpu_max");
-  }
-  if ((cpu_quota_alias || cpu_max_alias) &&
-      (object.if_contains("cpu_quota_us") != nullptr ||
-       object.if_contains("cpu_period_us") != nullptr)) {
-    throw std::runtime_error("resource profile " + std::string(profile_name) +
-                             " CPU aliases conflict with cpu_quota_us or "
-                             "cpu_period_us");
-  }
-  if (cpu_quota_alias || cpu_max_alias) {
-    const char* const alias = cpu_quota_alias ? "cpu_quota" : "cpu_max";
-    ApplyCpuMaxAlias(object.at(alias), "resource profile " + std::string(alias),
-                     &canonical);
-    canonical.erase(alias);
-  }
-
-  ResourceLimitPatch patch = ParseResourceLimitPatchObject(canonical);
-  if (patch.memory_max_bytes && !patch.memory_high_bytes &&
-      defaults.memory_high_bytes > *patch.memory_max_bytes) {
-    patch.memory_high_bytes = *patch.memory_max_bytes;
-  }
-  return ApplyResourceLimitPatch(
-      defaults, patch, "resource profile " + std::string(profile_name));
-}
-
-void ParseResourceProfiles(const boost::json::object& scenario,
-                           Options* options) {
-  const boost::json::value* value = scenario.if_contains("resource_profiles");
-  if (value == nullptr) {
-    return;
-  }
-  if (!value->is_object()) {
-    throw std::runtime_error("scenario resource_profiles must be an object");
-  }
-  const ResourceLimits defaults = InitialResourceLimits(*options);
-  for (const auto& [name_json, profile_value] : value->as_object()) {
-    const std::string name(name_json);
-    RequireSafeScenarioIdentifier(name, "resource profile name");
-    if (!profile_value.is_object()) {
-      throw std::runtime_error("scenario resource profile " + name +
-                               " must be an object");
-    }
-    options->resource_profiles.emplace(
-        name, ParseResourceProfile(profile_value.as_object(), defaults, name));
   }
 }
 
@@ -4811,6 +4675,10 @@ using simulator_app_internal::WalletTransactionsWorkloadJson;
 using simulator_app_internal::WorkloadJson;
 using simulator_app_internal::YamlFromJson;
 
+}  // namespace
+
+namespace simulator_app_internal {
+
 ResourceLimits InitialResourceLimits(const Options& options) {
   return ResourceLimits{
       .memory_high_bytes = options.memory_high_bytes,
@@ -4877,6 +4745,10 @@ ResourceLimits ApplyResourceLimitPatch(const ResourceLimits& current,
   RequireNonZero(next.pids_max, "pids_max");
   return next;
 }
+
+}  // namespace simulator_app_internal
+
+namespace {
 
 void VerifyResourceLimits(const Cgroup& cgroup,
                           const ResourceLimits& expected) {
