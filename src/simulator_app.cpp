@@ -101,6 +101,7 @@
 #include "bbp/simulator/yaml_helpers.h"
 #include "bbp/tui.h"
 #include "bbp/util.h"
+#include "simulator_host_probes.h"
 
 namespace bbp {
 namespace {
@@ -6406,6 +6407,10 @@ Options ParseOptions(int argc, char** argv,
   return options;
 }
 
+}  // namespace
+
+namespace simulator_app_internal {
+
 boost::json::array LinksJson(const std::vector<LinkInfo>& links) {
   boost::json::array links_json;
   for (const LinkInfo& link : links) {
@@ -6577,6 +6582,20 @@ boost::json::array DirectionalNetworkPoliciesJson(
   }
   return array;
 }
+
+}  // namespace simulator_app_internal
+
+namespace {
+
+using simulator_app_internal::AddNetworkConditionJsonFields;
+using simulator_app_internal::AddressesJson;
+using simulator_app_internal::DirectionalNetworkPoliciesJson;
+using simulator_app_internal::LinksJson;
+using simulator_app_internal::NetworkConditionJson;
+using simulator_app_internal::QdiscJson;
+using simulator_app_internal::QdiscsJson;
+using simulator_app_internal::RoutesJson;
+using simulator_app_internal::TcFiltersJson;
 
 boost::json::object NetworkBlockRuleJson(const NetworkBlockRule& rule) {
   boost::json::object object;
@@ -7237,232 +7256,6 @@ QdiscInfo VerifyNodeNetworkCondition(const NodeVethConfig& config,
         config.host_name);
   }
   return summary;
-}
-
-std::string NetworkProbeJson() {
-  boost::json::object result;
-  result["links"] = LinksJson(ListNetworkLinks());
-  result["ipv4_addresses"] = AddressesJson(ListIpv4Addresses());
-  result["ipv4_routes"] = RoutesJson(ListIpv4Routes());
-  result["qdiscs"] = QdiscsJson(ListQdiscs());
-  result["tc_filters"] = TcFiltersJson(ListTcFilters());
-  return boost::json::serialize(result);
-}
-
-std::string CapabilityProbeJson() {
-  boost::json::object result;
-  result["cap_sys_admin"] = HasEffectiveCapability(CAP_SYS_ADMIN);
-  result["cap_net_admin"] = HasEffectiveCapability(CAP_NET_ADMIN);
-  result["cap_sys_resource"] = HasEffectiveCapability(CAP_SYS_RESOURCE);
-  return boost::json::serialize(result);
-}
-
-std::string CgroupFreezeProbeJson() {
-  CgroupFreezeProbe probe = Cgroup::ProbeFreezeThaw();
-  boost::json::object result;
-  result["run_id"] = probe.run_id;
-  result["node_id"] = probe.node_id;
-  result["child_pid"] = probe.child_pid;
-  result["frozen_after_freeze"] = probe.frozen_after_freeze;
-  result["frozen_after_thaw"] = probe.frozen_after_thaw;
-  return boost::json::serialize(result);
-}
-
-std::string NetworkNamespaceProbeJson() {
-  NetworkNamespaceProbe probe = ProbeIsolatedNetworkNamespace();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["parent_links"] = LinksJson(probe.parent_links);
-  result["namespace_links"] = LinksJson(probe.namespace_links);
-  return boost::json::serialize(result);
-}
-
-std::string VethProbeJson() {
-  VethProbe probe = ProbeVethPair();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["parent_before"] = LinksJson(probe.parent_before);
-  result["parent_after_create"] = LinksJson(probe.parent_after_create);
-  result["parent_after_move"] = LinksJson(probe.parent_after_move);
-  result["namespace_after_move"] = LinksJson(probe.namespace_after_move);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string NetworkConditionProbeJson() {
-  NetworkConditionProbe probe = ProbeNetworkCondition();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["condition"] = NetworkConditionJson(probe.condition);
-  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
-  result["namespace_qdiscs_after_apply"] =
-      QdiscsJson(probe.namespace_qdiscs_after_apply);
-  result["namespace_qdiscs_after_delete"] =
-      QdiscsJson(probe.namespace_qdiscs_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string CombinedNetworkConditionProbeJson() {
-  NetworkConditionProbe probe = ProbeCombinedNetworkCondition();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["condition"] = NetworkConditionJson(probe.condition);
-  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
-  result["namespace_qdiscs_after_apply"] =
-      QdiscsJson(probe.namespace_qdiscs_after_apply);
-  result["namespace_qdiscs_after_delete"] =
-      QdiscsJson(probe.namespace_qdiscs_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string DirectionalNetworkPolicyProbeJson() {
-  DirectionalNetworkPolicyProbe probe = ProbeDirectionalNetworkPolicies();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["policies"] = DirectionalNetworkPoliciesJson(probe.policies);
-  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
-  result["namespace_qdiscs_after_apply"] =
-      QdiscsJson(probe.namespace_qdiscs_after_apply);
-  result["namespace_filters_after_apply"] =
-      TcFiltersJson(probe.namespace_filters_after_apply);
-  result["namespace_qdiscs_after_delete"] =
-      QdiscsJson(probe.namespace_qdiscs_after_delete);
-  result["namespace_filters_after_delete"] =
-      TcFiltersJson(probe.namespace_filters_after_delete);
-  result["non_owned_root_preserved"] = probe.non_owned_root_preserved;
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string BandwidthLimitProbeJson() {
-  BandwidthLimitProbe probe = ProbeBandwidthLimit();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["condition"] = NetworkConditionJson(probe.condition);
-  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
-  result["namespace_qdiscs_after_apply"] =
-      QdiscsJson(probe.namespace_qdiscs_after_apply);
-  result["namespace_qdiscs_after_delete"] =
-      QdiscsJson(probe.namespace_qdiscs_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string NetworkConditionUpdateProbeJson() {
-  NetworkConditionUpdateProbe probe = ProbeNetworkConditionUpdate();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["initial_condition"] = NetworkConditionJson(probe.initial_condition);
-  result["updated_condition"] = NetworkConditionJson(probe.updated_condition);
-  result["parent_qdiscs_after_initial"] =
-      QdiscsJson(probe.parent_qdiscs_after_initial);
-  result["parent_qdiscs_after_update"] =
-      QdiscsJson(probe.parent_qdiscs_after_update);
-  result["parent_qdiscs_after_delete"] =
-      QdiscsJson(probe.parent_qdiscs_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string DropFilterProbeJson() {
-  DropFilterProbe probe = ProbeDropFilter();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["dst_address"] = probe.dst_address;
-  result["src_port"] = probe.src_port;
-  result["dst_port"] = probe.dst_port;
-  result["handle"] = probe.handle;
-  result["parent_filters_before"] = TcFiltersJson(probe.parent_filters_before);
-  result["parent_filters_after_apply"] =
-      TcFiltersJson(probe.parent_filters_after_apply);
-  result["parent_filters_after_delete"] =
-      TcFiltersJson(probe.parent_filters_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string QdiscProbeJson() {
-  QdiscProbe probe = ProbeQdiscDump();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["namespace_links"] = LinksJson(probe.namespace_links);
-  result["namespace_qdiscs"] = QdiscsJson(probe.namespace_qdiscs);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string QdiscMutationProbeJson() {
-  QdiscMutationProbe probe = ProbeQdiscMutation();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["pfifo_limit_packets"] = probe.pfifo_limit_packets;
-  result["namespace_qdiscs_before"] = QdiscsJson(probe.namespace_qdiscs_before);
-  result["namespace_qdiscs_after_replace"] =
-      QdiscsJson(probe.namespace_qdiscs_after_replace);
-  result["namespace_qdiscs_after_delete"] =
-      QdiscsJson(probe.namespace_qdiscs_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string RouteProbeJson() {
-  RouteProbe probe = ProbeIpv4RouteAssignment();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["assigned_address"] = probe.assigned_address;
-  result["assigned_prefix_len"] = probe.assigned_prefix_len;
-  result["route_destination"] = probe.route_destination;
-  result["route_prefix_len"] = probe.route_prefix_len;
-  result["namespace_links_after_route"] =
-      LinksJson(probe.namespace_links_after_route);
-  result["namespace_addresses"] = AddressesJson(probe.namespace_addresses);
-  result["namespace_routes"] = RoutesJson(probe.namespace_routes);
-  result["namespace_addresses_after_delete"] =
-      AddressesJson(probe.namespace_addresses_after_delete);
-  result["namespace_routes_after_delete"] =
-      RoutesJson(probe.namespace_routes_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
-}
-
-std::string AddressProbeJson() {
-  AddressProbe probe = ProbeIpv4AddressAssignment();
-  boost::json::object result;
-  result["helper_pid"] = probe.helper_pid;
-  result["host_name"] = probe.host_name;
-  result["peer_name"] = probe.peer_name;
-  result["assigned_address"] = probe.assigned_address;
-  result["assigned_prefix_len"] = probe.assigned_prefix_len;
-  result["parent_after_move"] = LinksJson(probe.parent_after_move);
-  result["namespace_links_after_address"] =
-      LinksJson(probe.namespace_links_after_address);
-  result["namespace_addresses"] = AddressesJson(probe.namespace_addresses);
-  result["namespace_addresses_after_delete"] =
-      AddressesJson(probe.namespace_addresses_after_delete);
-  result["parent_after_delete"] = LinksJson(probe.parent_after_delete);
-  return boost::json::serialize(result);
 }
 
 boost::json::object NetworkPolicyCounterJson(const TcFilterInfo& filter) {
@@ -35498,7 +35291,7 @@ int SimulatorApp::Run(int argc, char** argv) {
   RequireSafeOutputDirectory(options.output_dir);
   ApplicationInstanceLock instance_lock;
   if (options.probe_network) {
-    BBP_LOG(info) << NetworkProbeJson();
+    BBP_LOG(info) << simulator_app_internal::NetworkProbeJson();
     return 0;
   }
   if (!options.report_run.empty()) {
@@ -35512,71 +35305,73 @@ int SimulatorApp::Run(int argc, char** argv) {
         instance_lock.state_directory());
   }
   if (options.probe_capabilities) {
-    BBP_LOG(info) << CapabilityProbeJson();
+    BBP_LOG(info) << simulator_app_internal::CapabilityProbeJson();
     return 0;
   }
   if (options.probe_cgroup_freeze) {
-    BBP_LOG(info) << CgroupFreezeProbeJson();
+    BBP_LOG(info) << simulator_app_internal::CgroupFreezeProbeJson();
     return 0;
   }
   if (options.probe_drop_filter) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << DropFilterProbeJson();
+    BBP_LOG(info) << simulator_app_internal::DropFilterProbeJson();
     return 0;
   }
   if (options.probe_directional_network_condition) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << DirectionalNetworkPolicyProbeJson();
+    BBP_LOG(info)
+        << simulator_app_internal::DirectionalNetworkPolicyProbeJson();
     return 0;
   }
   if (options.probe_netns) {
     RequireEffectiveCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
-    BBP_LOG(info) << NetworkNamespaceProbeJson();
+    BBP_LOG(info) << simulator_app_internal::NetworkNamespaceProbeJson();
     return 0;
   }
   if (options.probe_veth) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << VethProbeJson();
+    BBP_LOG(info) << simulator_app_internal::VethProbeJson();
     return 0;
   }
   if (options.probe_bandwidth_limit) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << BandwidthLimitProbeJson();
+    BBP_LOG(info) << simulator_app_internal::BandwidthLimitProbeJson();
     return 0;
   }
   if (options.probe_network_condition) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << NetworkConditionProbeJson();
+    BBP_LOG(info) << simulator_app_internal::NetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_combined_network_condition) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << CombinedNetworkConditionProbeJson();
+    BBP_LOG(info)
+        << simulator_app_internal::CombinedNetworkConditionProbeJson();
     return 0;
   }
   if (options.probe_network_condition_update) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << NetworkConditionUpdateProbeJson();
+    BBP_LOG(info) << simulator_app_internal::NetworkConditionUpdateProbeJson();
     return 0;
   }
   if (options.probe_address) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << AddressProbeJson();
+    BBP_LOG(info) << simulator_app_internal::AddressProbeJson();
     return 0;
   }
   if (options.probe_route) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << RouteProbeJson();
+    BBP_LOG(info) << simulator_app_internal::RouteProbeJson();
     return 0;
   }
   if (options.probe_qdisc) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << QdiscProbeJson();
+    BBP_LOG(info) << simulator_app_internal::QdiscProbeJson();
     return 0;
   }
   if (options.probe_qdisc_mutation) {
     RequireNetworkSetupCapabilities();
-    BBP_LOG(info) << QdiscMutationProbeJson();
+    BBP_LOG(info) << simulator_app_internal::QdiscMutationProbeJson();
     return 0;
   }
   if (options.cleanup_run) {
