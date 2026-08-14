@@ -107,6 +107,7 @@
 #include "simulator_scenario_chain_decoding.h"
 #include "simulator_scenario_mutation_option_decoding.h"
 #include "simulator_scenario_node_decoding.h"
+#include "simulator_scenario_node_resolution.h"
 #include "simulator_scenario_serialization.h"
 #include "simulator_wallet_configuration_decoding.h"
 #include "simulator_wallet_transaction_distribution_decoding.h"
@@ -122,6 +123,12 @@ using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ConsecutiveNodeIndexes;
+using simulator_app_internal::EffectiveNodeBinary;
+using simulator_app_internal::EffectiveNodeChainNetwork;
+using simulator_app_internal::EffectiveNodeExtraArgs;
+using simulator_app_internal::EffectiveNodeLifecyclePolicy;
+using simulator_app_internal::EffectiveNodeWalletConfig;
+using simulator_app_internal::HasTimedNodeLifecycle;
 using simulator_app_internal::InitialResourceLimits;
 using simulator_app_internal::IsTopologyEdgeConditionField;
 using simulator_app_internal::JsonAmountField;
@@ -141,6 +148,8 @@ using simulator_app_internal::JsonUint32Field;
 using simulator_app_internal::JsonUint32Value;
 using simulator_app_internal::JsonUint64Field;
 using simulator_app_internal::JsonUint64Value;
+using simulator_app_internal::NodeDataDirectoryRelative;
+using simulator_app_internal::NodeListContains;
 using simulator_app_internal::NodeListsOverlap;
 using simulator_app_internal::ParseAmountDistribution;
 using simulator_app_internal::ParseIntervalDistribution;
@@ -168,6 +177,8 @@ using simulator_app_internal::RequireCgroupWeight;
 using simulator_app_internal::RequireNonZero;
 using simulator_app_internal::RequireSafeScenarioIdentifier;
 using simulator_app_internal::ResolveNodeProfileAssignments;
+using simulator_app_internal::ScenarioNodeConfigAt;
+using simulator_app_internal::ScenarioNodeId;
 using simulator_app_internal::ScenarioNodeRoles;
 using simulator_app_internal::StableRuleHandle;
 using simulator_app_internal::ToChainWalletMode;
@@ -566,15 +577,6 @@ std::uint32_t ParseCliUint32Text(std::string_view text,
   return value;
 }
 
-bool NodeListContains(const std::vector<uint32_t>& nodes, uint32_t node_index) {
-  for (uint32_t candidate : nodes) {
-    if (candidate == node_index) {
-      return true;
-    }
-  }
-  return false;
-}
-
 std::string NodeRoleName(const NodeRoleTopology& topology,
                          std::uint32_t node_index) {
   const bool wallet = NodeListContains(topology.wallet_nodes, node_index);
@@ -638,86 +640,6 @@ bool SameNodeSet(std::vector<uint32_t> left, std::vector<uint32_t> right) {
   std::sort(left.begin(), left.end());
   std::sort(right.begin(), right.end());
   return left == right;
-}
-
-std::string ScenarioNodeId(const Options& options, uint32_t node_index) {
-  if (node_index >= options.nodes) {
-    throw std::runtime_error("scenario node index is out of range");
-  }
-  if (!options.node_ids.empty()) {
-    return options.node_ids.at(node_index);
-  }
-  return ChainDriverSpecFor(options.chain).node_id_prefix + "-" +
-         std::to_string(node_index + 1U);
-}
-
-const ScenarioNodeConfig* ScenarioNodeConfigAt(const Options& options,
-                                               uint32_t node_index) {
-  if (options.scenario_node_configs.empty()) {
-    return nullptr;
-  }
-  return &options.scenario_node_configs.at(node_index);
-}
-
-std::filesystem::path EffectiveNodeBinary(const Options& options,
-                                          uint32_t node_index) {
-  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
-  if (!options.chain_daemon_cli_override && config != nullptr &&
-      config->binary) {
-    return *config->binary;
-  }
-  return options.chain_daemon;
-}
-
-std::filesystem::path NodeDataDirectoryRelative(const Options& options,
-                                                uint32_t node_index) {
-  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
-  if (config != nullptr && config->data_dir) {
-    return *config->data_dir;
-  }
-  return std::filesystem::path("nodes") / ScenarioNodeId(options, node_index) /
-         "data";
-}
-
-ChainNetwork EffectiveNodeChainNetwork(const Options& options,
-                                       uint32_t node_index) {
-  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
-  return config == nullptr ? ChainNetwork::kRegtest : config->network;
-}
-
-const ChainExtraArgs& EffectiveNodeExtraArgs(const Options& options,
-                                             uint32_t node_index) {
-  static const ChainExtraArgs empty;
-  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
-  return config == nullptr ? empty : config->extra_args;
-}
-
-NodeLifecyclePolicy EffectiveNodeLifecyclePolicy(const Options& options,
-                                                 uint32_t node_index) {
-  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
-  return config == nullptr ? NodeLifecyclePolicy{} : config->lifecycle;
-}
-
-bool HasTimedNodeLifecycle(const Options& options) {
-  return std::any_of(options.scenario_node_configs.begin(),
-                     options.scenario_node_configs.end(),
-                     [](const ScenarioNodeConfig& node) {
-                       return node.lifecycle.start_time.has_value() ||
-                              node.lifecycle.stop_time.has_value();
-                     });
-}
-
-ScenarioNodeWalletConfig EffectiveNodeWalletConfig(const Options& options,
-                                                   uint32_t node_index) {
-  const ScenarioNodeConfig* config = ScenarioNodeConfigAt(options, node_index);
-  if (config != nullptr && config->wallet) {
-    return *config->wallet;
-  }
-  ScenarioNodeWalletConfig wallet;
-  wallet.enabled = NodeListContains(options.topology.wallet_nodes, node_index);
-  wallet.strategy = options.wallet_initialization.strategy;
-  wallet.mode = options.wallet_initialization.mode;
-  return wallet;
 }
 
 bool NodeHasScenarioRole(const Options& options, uint32_t node_index,
