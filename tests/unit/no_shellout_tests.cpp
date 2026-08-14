@@ -133,7 +133,11 @@ BOOST_AUTO_TEST_CASE(
     simulator_transaction_load_preserves_deadline_and_failure_classes) {
   const std::filesystem::path simulator =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::filesystem::path workload_details =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" /
+      "simulator_workload_event_details.cpp";
   const std::string source = bbp::ReadText(simulator);
+  const std::string detail_source = bbp::ReadText(workload_details);
   const std::size_t submit =
       source.find("transaction = driver.SubmitWalletTransaction(");
   BOOST_REQUIRE(submit != std::string::npos);
@@ -199,7 +203,7 @@ BOOST_AUTO_TEST_CASE(
                   "outcome = TransactionLoadOutcome::kCancelled;",
                   "error_class = \"cancellation\";");
   const std::size_t error_class =
-      source.find("detail[\"error_class\"] = error_class");
+      detail_source.find("detail[\"error_class\"] = error_class");
   BOOST_REQUIRE(error_class != std::string::npos);
 
   const std::size_t observe_sets =
