@@ -7,7 +7,6 @@
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -103,6 +102,7 @@
 #include "simulator_json_field_decoding.h"
 #include "simulator_native_mining_rpc.h"
 #include "simulator_network_rule_decoding.h"
+#include "simulator_node_lifecycle_event_details.h"
 #include "simulator_node_process_state.h"
 #include "simulator_option_parsing.h"
 #include "simulator_peer_topology_decoding.h"
@@ -142,6 +142,7 @@ using simulator_app_internal::EffectiveNodeChainNetwork;
 using simulator_app_internal::EffectiveNodeExtraArgs;
 using simulator_app_internal::EffectiveNodeLifecyclePolicy;
 using simulator_app_internal::EffectiveNodeWalletConfig;
+using simulator_app_internal::ElapsedMilliseconds;
 using simulator_app_internal::HasTimedNodeLifecycle;
 using simulator_app_internal::InitialResourceLimits;
 using simulator_app_internal::IsCurrentRunningNodeProcess;
@@ -165,6 +166,7 @@ using simulator_app_internal::JsonUint64Field;
 using simulator_app_internal::JsonUint64Value;
 using simulator_app_internal::LockNodeProcessState;
 using simulator_app_internal::NodeDataDirectoryRelative;
+using simulator_app_internal::NodeLifecycleDeadlineDetail;
 using simulator_app_internal::NodeListContains;
 using simulator_app_internal::NodeListsOverlap;
 using simulator_app_internal::NodeProcessGeneration;
@@ -192,6 +194,8 @@ using simulator_app_internal::ParseWalletInitializationObject;
 using simulator_app_internal::ParseWalletTransactionFeePolicy;
 using simulator_app_internal::ParseWalletTransactionMode;
 using simulator_app_internal::ParseWalletTransferStrategy;
+using simulator_app_internal::ProcessExitDetail;
+using simulator_app_internal::ProcessStartedDetail;
 using simulator_app_internal::RejectTopologyEdgeConditionFields;
 using simulator_app_internal::RejectUnsupportedFields;
 using simulator_app_internal::RejectUnsupportedScenarioActionFields;
@@ -203,6 +207,9 @@ using simulator_app_internal::RequireNonZero;
 using simulator_app_internal::RequireSafeScenarioIdentifier;
 using simulator_app_internal::ResetNodePerfCounters;
 using simulator_app_internal::ResolveNodeProfileAssignments;
+using simulator_app_internal::RestartDetail;
+using simulator_app_internal::RestartPolicyAppliedDetail;
+using simulator_app_internal::RestartRequestedDetail;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::ScenarioNodeConfigAt;
 using simulator_app_internal::ScenarioNodeId;
@@ -511,18 +518,6 @@ std::chrono::steady_clock::time_point SteadyDeadline(
   }
   return epoch +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay);
-}
-
-std::uint64_t ElapsedMilliseconds(
-    std::chrono::steady_clock::time_point epoch,
-    std::chrono::steady_clock::time_point timestamp) {
-  if (timestamp <= epoch) {
-    return 0U;
-  }
-  const auto elapsed =
-      std::chrono::duration_cast<std::chrono::milliseconds>(timestamp - epoch)
-          .count();
-  return static_cast<std::uint64_t>(elapsed);
 }
 
 boost::json::object ScheduledEventLifecycleDetail(
@@ -3040,29 +3035,6 @@ boost::json::object RuntimeRoleGenerationDetail(
   };
 }
 
-std::string ProcessExitDetail(const ChildProcess& process,
-                              const RunProcessState::Guard&) {
-  const bool running = process.running();
-  boost::json::object detail;
-  detail["running"] = running;
-  detail["pid"] = process.pid();
-  const std::optional<int> status = process.exit_status();
-  if (!status) {
-    return boost::json::serialize(detail);
-  }
-  detail["raw_status"] = *status;
-  if (WIFEXITED(*status)) {
-    detail["kind"] = "exit";
-    detail["exit_code"] = WEXITSTATUS(*status);
-  } else if (WIFSIGNALED(*status)) {
-    detail["kind"] = "signal";
-    detail["signal"] = WTERMSIG(*status);
-  } else {
-    detail["kind"] = "other";
-  }
-  return boost::json::serialize(detail);
-}
-
 std::string RestartNodeWorkloadDetail(uint32_t workload_index,
                                       uint32_t workload_count, uint32_t node,
                                       uint64_t restart_count) {
@@ -4259,13 +4231,6 @@ void StopNodeProcess(const Options& options,
                      bool allow_rpc_unavailable = false,
                      SimulationCommandControl* operation_control = nullptr);
 
-std::string RestartDetail(pid_t pid, uint64_t restart_count,
-                          std::string_view reason);
-std::string RestartRequestedDetail(NodeRuntime& node, std::string_view reason);
-std::string RestartPolicyAppliedDetail(
-    const NodeRuntime& node, int wait_status, bool restart,
-    std::string_view suppression_reason = {});
-
 class NodeExitedBeforeRpcReady final : public std::runtime_error {
  public:
   NodeExitedBeforeRpcReady(std::string_view node_id, int wait_status)
@@ -4278,51 +4243,6 @@ class NodeExitedBeforeRpcReady final : public std::runtime_error {
  private:
   int wait_status_;
 };
-
-std::string NodeLifecycleDeadlineDetail(
-    const NodeRuntime& node, const SimulationTimeScale& time_scale,
-    std::chrono::steady_clock::time_point simulation_epoch,
-    std::chrono::milliseconds simulation_offset, std::string_view reason) {
-  const std::chrono::milliseconds wall_offset =
-      time_scale.WallDuration(simulation_offset);
-  boost::json::object detail;
-  detail["reason"] = reason;
-  detail["restart_policy"] =
-      std::string(NodeRestartPolicyName(node.lifecycle_policy.restart_policy));
-  detail["scheduled_simulation_ms"] = simulation_offset.count();
-  detail["scheduled_wall_ms"] = wall_offset.count();
-  const std::uint64_t elapsed =
-      ElapsedMilliseconds(simulation_epoch, std::chrono::steady_clock::now());
-  detail["elapsed_wall_ms"] = elapsed;
-  detail["lateness_ms"] =
-      elapsed > static_cast<std::uint64_t>(wall_offset.count())
-          ? elapsed - static_cast<std::uint64_t>(wall_offset.count())
-          : 0U;
-  return boost::json::serialize(detail);
-}
-
-std::string ProcessStartedDetail(
-    const NodeRuntime& node, std::string_view reason,
-    std::chrono::steady_clock::time_point simulation_epoch,
-    const SimulationTimeScale& time_scale, const RunProcessState::Guard&) {
-  boost::json::object detail;
-  detail["pid"] = node.process.pid();
-  detail["reason"] = reason;
-  detail["restart_policy"] =
-      std::string(NodeRestartPolicyName(node.lifecycle_policy.restart_policy));
-  if (node.lifecycle_policy.start_time) {
-    detail["scheduled_simulation_ms"] =
-        node.lifecycle_policy.start_time->count();
-    detail["scheduled_wall_ms"] =
-        time_scale.WallDuration(*node.lifecycle_policy.start_time).count();
-  } else {
-    detail["scheduled_simulation_ms"] = 0;
-    detail["scheduled_wall_ms"] = 0;
-  }
-  detail["elapsed_wall_ms"] =
-      ElapsedMilliseconds(simulation_epoch, std::chrono::steady_clock::now());
-  return boost::json::serialize(detail);
-}
 
 [[noreturn]] void RecordNodeExitBeforeRpcReady(
     const Options& options, const std::filesystem::path& events_path,
@@ -8947,49 +8867,6 @@ void ApplyRuntimeNetworkPartitionHeals(const Options& options,
     ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, true,
                                  0U, 0U, stop_token);
   }
-}
-
-std::string RestartDetail(pid_t pid, uint64_t restart_count,
-                          std::string_view reason) {
-  boost::json::object detail;
-  detail["pid"] = pid;
-  detail["restart_count"] = restart_count;
-  detail["reason"] = reason;
-  return boost::json::serialize(detail);
-}
-
-std::string RestartRequestedDetail(NodeRuntime& node, std::string_view reason) {
-  boost::json::object detail;
-  detail["restart_count"] = node.RestartCount() + 1U;
-  detail["reason"] = reason;
-  detail["restart_policy"] =
-      std::string(NodeRestartPolicyName(node.lifecycle_policy.restart_policy));
-  return boost::json::serialize(detail);
-}
-
-std::string RestartPolicyAppliedDetail(const NodeRuntime& node, int wait_status,
-                                       bool restart,
-                                       std::string_view suppression_reason) {
-  boost::json::object detail;
-  detail["restart_policy"] =
-      std::string(NodeRestartPolicyName(node.lifecycle_policy.restart_policy));
-  detail["restart"] = restart;
-  if (suppression_reason.empty()) {
-    detail["suppression_reason"] = nullptr;
-  } else {
-    detail["suppression_reason"] = suppression_reason;
-  }
-  detail["raw_status"] = wait_status;
-  if (WIFEXITED(wait_status)) {
-    detail["exit_kind"] = "exit";
-    detail["exit_code"] = WEXITSTATUS(wait_status);
-  } else if (WIFSIGNALED(wait_status)) {
-    detail["exit_kind"] = "signal";
-    detail["signal"] = WTERMSIG(wait_status);
-  } else {
-    detail["exit_kind"] = "other";
-  }
-  return boost::json::serialize(detail);
 }
 
 bool WaitForNodeFrozenState(const Cgroup& cgroup, bool expected,
