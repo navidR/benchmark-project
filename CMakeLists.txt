@@ -291,6 +291,7 @@ add_executable(bbp
   src/simulator_json_field_decoding.cpp
   src/simulator_network_rule_decoding.cpp
   src/simulator_node_mutation_request_decoding.cpp
+  src/simulator_option_parsing.cpp
   src/simulator_peer_topology_decoding.cpp
   src/simulator_profile_assignment.cpp
   src/simulator_resource_limit_decoding.cpp
@@ -547,6 +548,7 @@ if(BUILD_TESTING)
     src/simulator_json_field_decoding.cpp
     src/simulator_network_rule_decoding.cpp
     src/simulator_node_mutation_request_decoding.cpp
+    src/simulator_option_parsing.cpp
     src/simulator_peer_topology_decoding.cpp
     src/simulator_profile_assignment.cpp
     src/simulator_resource_limit_decoding.cpp
