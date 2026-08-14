@@ -296,6 +296,7 @@ add_executable(bbp
   src/simulator_node_process_state.cpp
   src/simulator_option_parsing.cpp
   src/simulator_peer_topology_decoding.cpp
+  src/simulator_perf_counter_attachment.cpp
   src/simulator_profile_assignment.cpp
   src/simulator_resource_limit_decoding.cpp
   src/simulator_resource_profile_decoding.cpp
@@ -556,6 +557,7 @@ if(BUILD_TESTING)
     src/simulator_node_process_state.cpp
     src/simulator_option_parsing.cpp
     src/simulator_peer_topology_decoding.cpp
+    src/simulator_perf_counter_attachment.cpp
     src/simulator_profile_assignment.cpp
     src/simulator_resource_limit_decoding.cpp
     src/simulator_resource_profile_decoding.cpp
