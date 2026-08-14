@@ -100,6 +100,7 @@
 #include "simulator_host_probes.h"
 #include "simulator_json_field_decoding.h"
 #include "simulator_network_rule_decoding.h"
+#include "simulator_node_process_state.h"
 #include "simulator_option_parsing.h"
 #include "simulator_peer_topology_decoding.h"
 #include "simulator_profile_assignment.h"
@@ -138,6 +139,7 @@ using simulator_app_internal::EffectiveNodeLifecyclePolicy;
 using simulator_app_internal::EffectiveNodeWalletConfig;
 using simulator_app_internal::HasTimedNodeLifecycle;
 using simulator_app_internal::InitialResourceLimits;
+using simulator_app_internal::IsCurrentRunningNodeProcess;
 using simulator_app_internal::IsTopologyEdgeConditionField;
 using simulator_app_internal::JsonAmountField;
 using simulator_app_internal::JsonOptionalAmountField;
@@ -156,9 +158,12 @@ using simulator_app_internal::JsonUint32Field;
 using simulator_app_internal::JsonUint32Value;
 using simulator_app_internal::JsonUint64Field;
 using simulator_app_internal::JsonUint64Value;
+using simulator_app_internal::LockNodeProcessState;
 using simulator_app_internal::NodeDataDirectoryRelative;
 using simulator_app_internal::NodeListContains;
 using simulator_app_internal::NodeListsOverlap;
+using simulator_app_internal::NodeProcessGeneration;
+using simulator_app_internal::NodeProcessRunning;
 using simulator_app_internal::ParseAmountDistribution;
 using simulator_app_internal::ParseIntervalDistribution;
 using simulator_app_internal::ParseIoLimits;
@@ -185,10 +190,14 @@ using simulator_app_internal::ParseWalletTransferStrategy;
 using simulator_app_internal::RejectTopologyEdgeConditionFields;
 using simulator_app_internal::RejectUnsupportedFields;
 using simulator_app_internal::RejectUnsupportedScenarioActionFields;
+using simulator_app_internal::RequestNodeKill;
+using simulator_app_internal::RequestNodeTerminate;
 using simulator_app_internal::RequireCgroupWeight;
+using simulator_app_internal::RequireNodeRunning;
 using simulator_app_internal::RequireNonZero;
 using simulator_app_internal::RequireSafeScenarioIdentifier;
 using simulator_app_internal::ResolveNodeProfileAssignments;
+using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::ScenarioNodeConfigAt;
 using simulator_app_internal::ScenarioNodeId;
 using simulator_app_internal::ScenarioNodeRoles;
@@ -1681,49 +1690,11 @@ void TransitionNodeState(const std::filesystem::path& events_path,
              NodeRuntimeLifecycleName(state));
 }
 
-RunProcessState::Guard LockNodeProcessState(const NodeRuntime& node) {
-  if (node.run_process_state == nullptr) {
-    throw std::logic_error("node has no run process synchronization state: " +
-                           node.config.id);
-  }
-  return node.run_process_state->Lock();
-}
-
-void RequireNodeRunning(const NodeRuntime& node, const RunProcessState::Guard&,
-                        std::string_view action) {
-  if (!node.AllowsChainMetrics() || !node.process.running()) {
-    throw std::runtime_error(
-        std::string(action) + " requires a Running node: " + node.config.id +
-        " (state=" + std::string(NodeRuntimeLifecycleName(node.Lifecycle())) +
-        ")");
-  }
-}
-
-void RequireNodeRunning(const NodeRuntime& node, std::string_view action) {
-  auto process_guard = LockNodeProcessState(node);
-  RequireNodeRunning(node, process_guard, action);
-}
-
-bool NodeProcessRunning(const NodeRuntime& node) {
-  auto process_guard = LockNodeProcessState(node);
-  return node.process.running();
-}
-
 void WriteNodeStateEvent(const std::filesystem::path& events_path,
                          const std::string& run_id, const NodeRuntime& node,
                          NodeRuntimeLifecycle state) {
   WriteEvent(events_path, run_id, node.config.id, SimulationEventKind::kState,
              NodeRuntimeLifecycleName(state));
-}
-
-bool RequestNodeTerminate(NodeRuntime& node) {
-  auto process_guard = LockNodeProcessState(node);
-  return node.process.RequestTerminate();
-}
-
-bool RequestNodeKill(NodeRuntime& node) {
-  auto process_guard = LockNodeProcessState(node);
-  return node.process.RequestKill();
 }
 
 bool WaitForNodeProcessExitUntil(NodeRuntime& node,
@@ -1736,27 +1707,6 @@ bool WaitForNodeProcessExitUntil(NodeRuntime& node,
     WaitForDuration(std::chrono::milliseconds(20), stop_token);
   }
   return !NodeProcessRunning(node);
-}
-
-struct NodeProcessGeneration {
-  pid_t pid = -1;
-  std::uint64_t restart_count = 0U;
-};
-
-NodeProcessGeneration RunningNodeProcessGeneration(
-    NodeRuntime& node, const RunProcessState::Guard& process_guard,
-    std::string_view action) {
-  RequireNodeRunning(node, process_guard, action);
-  return {.pid = node.process.pid(), .restart_count = node.RestartCount()};
-}
-
-bool IsCurrentRunningNodeProcess(NodeRuntime& node,
-                                 const RunProcessState::Guard&,
-                                 const NodeProcessGeneration& generation) {
-  return node.Lifecycle() == NodeRuntimeLifecycle::kRunning &&
-         node.process.pid() == generation.pid &&
-         node.RestartCount() == generation.restart_count &&
-         node.process.running();
 }
 
 bool StartNativeMiningForCurrentProcess(
