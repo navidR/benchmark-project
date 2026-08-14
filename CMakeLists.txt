@@ -318,6 +318,7 @@ add_executable(bbp
   src/simulator_scheduled_command_event_details.cpp
   src/simulator_scheduled_event_decoding.cpp
   src/simulator_wallet_configuration_decoding.cpp
+  src/simulator_wallet_metrics_json.cpp
   src/simulator_wallet_transaction_distribution_decoding.cpp
   src/simulator_wallet_transaction_validation.cpp
   src/simulator_workload_event_details.cpp
@@ -588,6 +589,7 @@ if(BUILD_TESTING)
     src/simulator_scheduled_command_event_details.cpp
     src/simulator_scheduled_event_decoding.cpp
     src/simulator_wallet_configuration_decoding.cpp
+    src/simulator_wallet_metrics_json.cpp
     src/simulator_wallet_transaction_distribution_decoding.cpp
     src/simulator_wallet_transaction_validation.cpp
     src/simulator_workload_event_details.cpp
