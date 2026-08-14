@@ -5,9 +5,14 @@
 namespace bbp {
 
 struct Options;
+struct ProfileSwitchWorkload;
+enum class WorkloadKind;
 
 namespace simulator_app_internal {
 
+ProfileSwitchWorkload ParseProfileSwitchWorkload(
+    const boost::json::object& object, const Options& options,
+    WorkloadKind kind);
 void ParseNetworkProfiles(const boost::json::object& scenario,
                           Options* options);
 void ResolveNodeProfileAssignments(Options* options);

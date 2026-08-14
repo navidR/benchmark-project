@@ -160,6 +160,7 @@ using simulator_app_internal::ParseNetworkPartitionRuleObject;
 using simulator_app_internal::ParseNetworkProfiles;
 using simulator_app_internal::ParseNodeRoleTopologyObject;
 using simulator_app_internal::ParsePeerTopologyConfig;
+using simulator_app_internal::ParseProfileSwitchWorkload;
 using simulator_app_internal::ParseResourceLimitPatchObject;
 using simulator_app_internal::ParseResourceProfiles;
 using simulator_app_internal::ParseScenarioChains;
@@ -640,100 +641,6 @@ bool SameNodeSet(std::vector<uint32_t> left, std::vector<uint32_t> right) {
   std::sort(left.begin(), left.end());
   std::sort(right.begin(), right.end());
   return left == right;
-}
-
-bool NodeHasScenarioRole(const Options& options, uint32_t node_index,
-                         std::string_view role) {
-  if (role == "miner") {
-    return NodeListContains(options.topology.miner_nodes, node_index);
-  }
-  if (role == "wallet") {
-    return NodeListContains(options.topology.wallet_nodes, node_index);
-  }
-  if (role == "base" || role == "node") {
-    return !NodeListContains(options.topology.miner_nodes, node_index) &&
-           !NodeListContains(options.topology.wallet_nodes, node_index);
-  }
-  throw std::runtime_error(
-      "profile switch role selector must be role:base, role:node, "
-      "role:wallet, or role:miner");
-}
-
-ProfileSwitchWorkload ParseProfileSwitchWorkload(
-    const boost::json::object& object, const Options& options,
-    WorkloadKind kind) {
-  ProfileSwitchWorkload workload;
-  workload.profile = JsonStringField(object, "profile");
-  RequireSafeScenarioIdentifier(workload.profile, "profile switch name");
-  const boost::json::value* targets = object.if_contains("nodes");
-  if (targets == nullptr) {
-    throw std::runtime_error("scenario " + std::string(WorkloadKindName(kind)) +
-                             " requires nodes");
-  }
-
-  std::vector<std::string> requested_ids;
-  if (targets->is_array()) {
-    if (targets->as_array().empty()) {
-      throw std::runtime_error("scenario " +
-                               std::string(WorkloadKindName(kind)) +
-                               " nodes must not be empty");
-    }
-    for (const boost::json::value& target : targets->as_array()) {
-      if (!target.is_string()) {
-        throw std::runtime_error("scenario " +
-                                 std::string(WorkloadKindName(kind)) +
-                                 " nodes entries must be node ID strings");
-      }
-      requested_ids.emplace_back(target.as_string());
-    }
-  } else if (targets->is_string()) {
-    const std::string selector(targets->as_string());
-    constexpr std::string_view kRolePrefix = "role:";
-    if (!std::string_view(selector).starts_with(kRolePrefix)) {
-      throw std::runtime_error("scenario " +
-                               std::string(WorkloadKindName(kind)) +
-                               " string nodes selector must start with role:");
-    }
-    const std::string_view role =
-        std::string_view(selector).substr(kRolePrefix.size());
-    for (uint32_t node_index = 0U; node_index < options.nodes; ++node_index) {
-      if (NodeHasScenarioRole(options, node_index, role)) {
-        requested_ids.push_back(ScenarioNodeId(options, node_index));
-      }
-    }
-    if (requested_ids.empty()) {
-      throw std::runtime_error("scenario " +
-                               std::string(WorkloadKindName(kind)) +
-                               " role selector resolved no nodes");
-    }
-  } else {
-    throw std::runtime_error("scenario " + std::string(WorkloadKindName(kind)) +
-                             " nodes must be an ID array or role selector");
-  }
-
-  std::set<std::string> unique_ids;
-  for (const std::string& requested_id : requested_ids) {
-    if (!unique_ids.insert(requested_id).second) {
-      throw std::runtime_error("scenario " +
-                               std::string(WorkloadKindName(kind)) +
-                               " nodes contains duplicate ID: " + requested_id);
-    }
-    bool found = false;
-    for (uint32_t node_index = 0U; node_index < options.nodes; ++node_index) {
-      if (ScenarioNodeId(options, node_index) == requested_id) {
-        workload.nodes.push_back(node_index + 1U);
-        workload.node_ids.push_back(requested_id);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      throw std::runtime_error("scenario " +
-                               std::string(WorkloadKindName(kind)) +
-                               " references unknown node ID: " + requested_id);
-    }
-  }
-  return workload;
 }
 
 bool IsRejectedWalletMaterialField(std::string_view field) {
