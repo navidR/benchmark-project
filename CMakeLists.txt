@@ -306,6 +306,7 @@ add_executable(bbp
   src/simulator_process_spawn_readiness.cpp
   src/simulator_profile_assignment.cpp
   src/simulator_resolved_scenario_persistence.cpp
+  src/simulator_retained_run_registry.cpp
   src/simulator_resource_event_details.cpp
   src/simulator_resource_limit_decoding.cpp
   src/simulator_resource_profile_decoding.cpp
@@ -580,6 +581,7 @@ if(BUILD_TESTING)
     src/simulator_process_spawn_readiness.cpp
     src/simulator_profile_assignment.cpp
     src/simulator_resolved_scenario_persistence.cpp
+    src/simulator_retained_run_registry.cpp
     src/simulator_resource_event_details.cpp
     src/simulator_resource_limit_decoding.cpp
     src/simulator_resource_profile_decoding.cpp
