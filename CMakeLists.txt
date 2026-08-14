@@ -299,6 +299,7 @@ add_executable(bbp
   src/simulator_scenario_mutation_option_decoding.cpp
   src/simulator_scenario_node_decoding.cpp
   src/simulator_scenario_node_resolution.cpp
+  src/simulator_scenario_option_application.cpp
   src/simulator_scenario_serialization.cpp
   src/simulator_scenario_workload_decoding.cpp
   src/simulator_scheduled_command_decoding.cpp
@@ -554,6 +555,7 @@ if(BUILD_TESTING)
     src/simulator_scenario_mutation_option_decoding.cpp
     src/simulator_scenario_node_decoding.cpp
     src/simulator_scenario_node_resolution.cpp
+    src/simulator_scenario_option_application.cpp
     src/simulator_scenario_serialization.cpp
     src/simulator_scenario_workload_decoding.cpp
     src/simulator_scheduled_command_decoding.cpp
