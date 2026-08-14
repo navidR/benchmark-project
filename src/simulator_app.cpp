@@ -97,6 +97,7 @@
 #include "bbp/simulator/wallet_transaction_plan.h"
 #include "bbp/tui.h"
 #include "bbp/util.h"
+#include "simulator_event_writing.h"
 #include "simulator_host_probes.h"
 #include "simulator_json_field_decoding.h"
 #include "simulator_network_rule_decoding.h"
@@ -203,10 +204,13 @@ using simulator_app_internal::ScenarioNodeId;
 using simulator_app_internal::ScenarioNodeRoles;
 using simulator_app_internal::StableRuleHandle;
 using simulator_app_internal::ToChainWalletMode;
+using simulator_app_internal::TransitionNodeState;
 using simulator_app_internal::ValidateNetworkPartitionRule;
 using simulator_app_internal::ValidateProfileSwitchReferences;
 using simulator_app_internal::ValidateScenarioWorkload;
 using simulator_app_internal::ValidateWalletTransactionsWorkload;
+using simulator_app_internal::WriteEvent;
+using simulator_app_internal::WriteNodeStateEvent;
 
 std::mutex node_network_state_mutex;
 std::timed_mutex runtime_publication_mutex;
@@ -1663,38 +1667,6 @@ std::string MetricsJson(
     object["directional_network_policy_counters"] = std::move(policies);
   }
   return boost::json::serialize(object);
-}
-
-void WriteEvent(const std::filesystem::path& events_path,
-                const std::string& run_id, const std::string& node_id,
-                SimulationEventKind event_kind, std::string_view detail = "") {
-  boost::json::object object;
-  object["timestamp"] = NowIso8601();
-  object["run_id"] = run_id;
-  object["node_id"] = node_id;
-  object["event"] = SimulationEventKindName(event_kind);
-  object["detail"] = detail;
-  AppendLine(events_path, boost::json::serialize(object));
-}
-
-void TransitionNodeState(const std::filesystem::path& events_path,
-                         const std::string& run_id, NodeRuntime& node,
-                         NodeRuntimeLifecycle state) {
-  if (node.run_process_state != nullptr) {
-    auto process_guard = node.run_process_state->Lock();
-    node.SetLifecycle(state);
-  } else {
-    node.SetLifecycle(state);
-  }
-  WriteEvent(events_path, run_id, node.config.id, SimulationEventKind::kState,
-             NodeRuntimeLifecycleName(state));
-}
-
-void WriteNodeStateEvent(const std::filesystem::path& events_path,
-                         const std::string& run_id, const NodeRuntime& node,
-                         NodeRuntimeLifecycle state) {
-  WriteEvent(events_path, run_id, node.config.id, SimulationEventKind::kState,
-             NodeRuntimeLifecycleName(state));
 }
 
 bool WaitForNodeProcessExitUntil(NodeRuntime& node,
