@@ -295,6 +295,7 @@ add_executable(bbp
   src/simulator_resource_limit_decoding.cpp
   src/simulator_resource_profile_decoding.cpp
   src/simulator_scenario_chain_decoding.cpp
+  src/simulator_scenario_mutation_option_decoding.cpp
   src/simulator_scenario_node_decoding.cpp
   src/simulator_scenario_serialization.cpp
   src/simulator_wallet_configuration_decoding.cpp
@@ -544,6 +545,7 @@ if(BUILD_TESTING)
     src/simulator_resource_limit_decoding.cpp
     src/simulator_resource_profile_decoding.cpp
     src/simulator_scenario_chain_decoding.cpp
+    src/simulator_scenario_mutation_option_decoding.cpp
     src/simulator_scenario_node_decoding.cpp
     src/simulator_scenario_serialization.cpp
     src/simulator_wallet_configuration_decoding.cpp

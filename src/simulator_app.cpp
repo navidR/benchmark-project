@@ -105,6 +105,7 @@
 #include "simulator_resource_limit_decoding.h"
 #include "simulator_resource_profile_decoding.h"
 #include "simulator_scenario_chain_decoding.h"
+#include "simulator_scenario_mutation_option_decoding.h"
 #include "simulator_scenario_node_decoding.h"
 #include "simulator_scenario_serialization.h"
 #include "simulator_wallet_configuration_decoding.h"
@@ -115,7 +116,11 @@
 namespace bbp {
 namespace {
 
+using simulator_app_internal::ApplyNetworkBlockRules;
+using simulator_app_internal::ApplyNetworkPartitionRules;
+using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyResourceLimitPatch;
+using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ConsecutiveNodeIndexes;
 using simulator_app_internal::InitialResourceLimits;
 using simulator_app_internal::IsTopologyEdgeConditionField;
@@ -633,88 +638,6 @@ bool SameNodeSet(std::vector<uint32_t> left, std::vector<uint32_t> right) {
   std::sort(left.begin(), left.end());
   std::sort(right.begin(), right.end());
   return left == right;
-}
-
-void ApplyNodeConditions(const boost::json::array& conditions, uint32_t nodes,
-                         std::string_view source,
-                         std::map<uint32_t, NetworkCondition>& output) {
-  for (const boost::json::value& value : conditions) {
-    if (!value.is_object()) {
-      throw std::runtime_error(std::string(source) +
-                               " entries must be JSON objects");
-    }
-    const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(
-        object, ScenarioObjectFields(ScenarioObjectKind::kNodeNetworkCondition),
-        std::string(source) + " entry");
-    const uint32_t node = JsonUint32Field(object, "node");
-    if (node == 0 || node > nodes) {
-      throw std::runtime_error(std::string(source) + " node must be in 1.." +
-                               std::to_string(nodes));
-    }
-    output[node - 1U] = ParseNetworkConditionObject(object);
-  }
-}
-
-void ApplyNetworkBlockRules(const boost::json::array& rules, uint32_t nodes,
-                            std::string_view source,
-                            std::vector<NetworkBlockRule>& output) {
-  for (const boost::json::value& value : rules) {
-    if (!value.is_object()) {
-      throw std::runtime_error(std::string(source) +
-                               " entries must be JSON objects");
-    }
-    const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(
-        object, ScenarioObjectFields(ScenarioObjectKind::kNetworkBlockRule),
-        std::string(source) + " entry");
-    NetworkBlockRule rule = ParseNetworkBlockRuleObject(object);
-    if (rule.node_index >= nodes) {
-      throw std::runtime_error(std::string(source) + " node must be in 1.." +
-                               std::to_string(nodes));
-    }
-    output.push_back(std::move(rule));
-  }
-}
-
-void ApplyNetworkPartitionRules(const boost::json::array& rules, uint32_t nodes,
-                                std::string_view source,
-                                std::vector<NetworkPartitionRule>& output) {
-  for (const boost::json::value& value : rules) {
-    if (!value.is_object()) {
-      throw std::runtime_error(std::string(source) +
-                               " entries must be JSON objects");
-    }
-    const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(
-        object, ScenarioObjectFields(ScenarioObjectKind::kNetworkPartition),
-        std::string(source) + " entry");
-    NetworkPartitionRule rule = ParseNetworkPartitionRuleObject(object);
-    ValidateNetworkPartitionRule(rule, nodes, source);
-    output.push_back(std::move(rule));
-  }
-}
-
-void ApplyResourceLimitPatches(const boost::json::array& updates,
-                               uint32_t nodes, std::string_view source,
-                               std::map<uint32_t, ResourceLimitPatch>& output) {
-  for (const boost::json::value& value : updates) {
-    if (!value.is_object()) {
-      throw std::runtime_error(std::string(source) +
-                               " entries must be JSON objects");
-    }
-    const boost::json::object& object = value.as_object();
-    RejectUnsupportedFields(
-        object,
-        ScenarioObjectFields(ScenarioObjectKind::kRuntimeResourceLimits),
-        std::string(source) + " entry");
-    const uint32_t node = JsonUint32Field(object, "node");
-    if (node == 0 || node > nodes) {
-      throw std::runtime_error(std::string(source) + " node must be in 1.." +
-                               std::to_string(nodes));
-    }
-    output[node - 1U] = ParseResourceLimitPatchObject(object);
-  }
 }
 
 std::string ScenarioNodeId(const Options& options, uint32_t node_index) {
