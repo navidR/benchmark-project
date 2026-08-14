@@ -287,6 +287,7 @@ add_executable(bbp
   src/simulation_time_scale.cpp
   src/signal_stop_monitor.cpp
   src/simulator_app.cpp
+  src/simulator_cancellable_waiting.cpp
   src/simulator_event_writing.cpp
   src/simulator_host_probes.cpp
   src/simulator_json_field_decoding.cpp
@@ -546,6 +547,7 @@ if(BUILD_TESTING)
     src/scenario_fields.cpp
     src/scenario_workload_admission.cpp
     src/simulator_app.cpp
+    src/simulator_cancellable_waiting.cpp
     src/simulator_event_writing.cpp
     src/simulator_host_probes.cpp
     src/simulator_json_field_decoding.cpp

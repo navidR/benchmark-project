@@ -97,6 +97,7 @@
 #include "bbp/simulator/wallet_transaction_plan.h"
 #include "bbp/tui.h"
 #include "bbp/util.h"
+#include "simulator_cancellable_waiting.h"
 #include "simulator_event_writing.h"
 #include "simulator_host_probes.h"
 #include "simulator_json_field_decoding.h"
@@ -203,12 +204,16 @@ using simulator_app_internal::ScenarioNodeConfigAt;
 using simulator_app_internal::ScenarioNodeId;
 using simulator_app_internal::ScenarioNodeRoles;
 using simulator_app_internal::StableRuleHandle;
+using simulator_app_internal::ThrowIfStopRequested;
 using simulator_app_internal::ToChainWalletMode;
 using simulator_app_internal::TransitionNodeState;
 using simulator_app_internal::ValidateNetworkPartitionRule;
 using simulator_app_internal::ValidateProfileSwitchReferences;
 using simulator_app_internal::ValidateScenarioWorkload;
 using simulator_app_internal::ValidateWalletTransactionsWorkload;
+using simulator_app_internal::WaitForDuration;
+using simulator_app_internal::WaitForNodeProcessExitUntil;
+using simulator_app_internal::WaitUntil;
 using simulator_app_internal::WriteEvent;
 using simulator_app_internal::WriteNodeStateEvent;
 
@@ -317,12 +322,6 @@ std::unique_ptr<boost::asio::ip::tcp::acceptor> ReserveTcpEndpoint(
   return reservation;
 }
 
-void ThrowIfStopRequested(std::stop_token stop_token) {
-  if (stop_token.stop_requested()) {
-    throw SimulationCancelled();
-  }
-}
-
 std::string ExceptionMessage(const std::exception_ptr& error) {
   try {
     std::rethrow_exception(error);
@@ -421,29 +420,6 @@ constexpr auto kWorkloadMutationRollbackTimeout = std::chrono::seconds(10);
     }
   }
   throw WorkloadMutationOutcomeUnconfirmed(message);
-}
-
-void WaitForDuration(std::chrono::milliseconds duration,
-                     std::stop_token stop_token) {
-  ThrowIfStopRequested(stop_token);
-  std::condition_variable_any condition;
-  std::mutex mutex;
-  std::unique_lock<std::mutex> lock(mutex);
-  condition.wait_for(lock, stop_token, duration, [] { return false; });
-  ThrowIfStopRequested(stop_token);
-}
-
-void WaitUntil(std::chrono::steady_clock::time_point deadline,
-               std::stop_token stop_token) {
-  ThrowIfStopRequested(stop_token);
-  if (std::chrono::steady_clock::now() >= deadline) {
-    return;
-  }
-  std::condition_variable_any condition;
-  std::mutex mutex;
-  std::unique_lock<std::mutex> lock(mutex);
-  condition.wait_until(lock, stop_token, deadline, [] { return false; });
-  ThrowIfStopRequested(stop_token);
 }
 
 class WorkloadMutationRollbackControl {
@@ -1667,18 +1643,6 @@ std::string MetricsJson(
     object["directional_network_policy_counters"] = std::move(policies);
   }
   return boost::json::serialize(object);
-}
-
-bool WaitForNodeProcessExitUntil(NodeRuntime& node,
-                                 std::chrono::steady_clock::time_point deadline,
-                                 std::stop_token stop_token = {}) {
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (!NodeProcessRunning(node)) {
-      return true;
-    }
-    WaitForDuration(std::chrono::milliseconds(20), stop_token);
-  }
-  return !NodeProcessRunning(node);
 }
 
 bool StartNativeMiningForCurrentProcess(
