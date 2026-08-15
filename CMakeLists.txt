@@ -295,6 +295,7 @@ add_executable(bbp
   src/simulator_metrics_json.cpp
   src/simulator_metrics_sampling.cpp
   src/simulator_native_mining_rpc.cpp
+  src/simulator_network_block_application.cpp
   src/simulator_network_condition_application.cpp
   src/simulator_network_event_details.cpp
   src/simulator_network_rule_decoding.cpp
@@ -577,6 +578,7 @@ if(BUILD_TESTING)
     src/simulator_metrics_json.cpp
     src/simulator_metrics_sampling.cpp
     src/simulator_native_mining_rpc.cpp
+    src/simulator_network_block_application.cpp
     src/simulator_network_condition_application.cpp
     src/simulator_network_event_details.cpp
     src/simulator_network_rule_decoding.cpp
