@@ -318,6 +318,7 @@ add_executable(bbp
   src/simulator_resource_limit_decoding.cpp
   src/simulator_resource_profile_decoding.cpp
   src/simulator_runtime_identity_details.cpp
+  src/simulator_runtime_network_block_rules.cpp
   src/simulator_scenario_chain_decoding.cpp
   src/simulator_scenario_mutation_option_decoding.cpp
   src/simulator_scenario_node_decoding.cpp
@@ -603,6 +604,7 @@ if(BUILD_TESTING)
     src/simulator_resource_limit_decoding.cpp
     src/simulator_resource_profile_decoding.cpp
     src/simulator_runtime_identity_details.cpp
+    src/simulator_runtime_network_block_rules.cpp
     src/simulator_scenario_chain_decoding.cpp
     src/simulator_scenario_mutation_option_decoding.cpp
     src/simulator_scenario_node_decoding.cpp
