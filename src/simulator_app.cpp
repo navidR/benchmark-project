@@ -98,6 +98,7 @@
 #include "simulator_managed_run_root.h"
 #include "simulator_metrics_sampling.h"
 #include "simulator_native_mining_rpc.h"
+#include "simulator_network_condition_application.h"
 #include "simulator_network_event_details.h"
 #include "simulator_network_rule_decoding.h"
 #include "simulator_node_lifecycle_event_details.h"
@@ -132,6 +133,7 @@
 #include "simulator_wallet_transaction_distribution_decoding.h"
 #include "simulator_wallet_transaction_validation.h"
 #include "simulator_workload_event_details.h"
+#include "simulator_workload_mutation_error.h"
 #include "simulator_yaml_decoding.h"
 
 namespace bbp {
@@ -225,6 +227,7 @@ using simulator_app_internal::RejectTopologyEdgeConditionFields;
 using simulator_app_internal::RejectUnsupportedFields;
 using simulator_app_internal::RejectUnsupportedScenarioActionFields;
 using simulator_app_internal::RemovePreparedRunRoot;
+using simulator_app_internal::ReplaceNodeNetworkConditionTransactional;
 using simulator_app_internal::RequestNodeKill;
 using simulator_app_internal::RequestNodeTerminate;
 using simulator_app_internal::RequireCgroupWeight;
@@ -242,6 +245,7 @@ using simulator_app_internal::ResourceProfileUpdateDetail;
 using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
+using simulator_app_internal::RestoreNodeNetworkCondition;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
 using simulator_app_internal::RuntimeRoleGenerationDetail;
@@ -259,6 +263,7 @@ using simulator_app_internal::StartNodeProcessAttempt;
 using simulator_app_internal::StopNativeMining;
 using simulator_app_internal::StopNativeMiningBeforeDeadline;
 using simulator_app_internal::ThrowIfStopRequested;
+using simulator_app_internal::ThrowWorkloadMutationOutcomeUnconfirmed;
 using simulator_app_internal::ToChainWalletMode;
 using simulator_app_internal::TransactionLoadAttemptDetail;
 using simulator_app_internal::TransactionLoadCompletedDetail;
@@ -269,12 +274,14 @@ using simulator_app_internal::ValidateNetworkPartitionRule;
 using simulator_app_internal::ValidateProfileSwitchReferences;
 using simulator_app_internal::ValidateScenarioWorkload;
 using simulator_app_internal::ValidateWalletTransactionsWorkload;
+using simulator_app_internal::VerifyNodeNetworkCondition;
 using simulator_app_internal::WaitForDuration;
 using simulator_app_internal::WaitForNodeProcessExitUntil;
 using simulator_app_internal::WaitUntil;
 using simulator_app_internal::WalletAddressDetail;
 using simulator_app_internal::WalletFundingDetail;
 using simulator_app_internal::WalletTransactionDetail;
+using simulator_app_internal::WorkloadMutationOutcomeUnconfirmed;
 using simulator_app_internal::WriteEvent;
 using simulator_app_internal::WriteLogTailChunkEvent;
 using simulator_app_internal::WriteMetricsSnapshot;
@@ -328,11 +335,6 @@ std::string ExceptionMessage(const std::exception_ptr& error) {
     return "unknown exception";
   }
 }
-
-class WorkloadMutationOutcomeUnconfirmed final : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
 
 class WorkloadMutationCancelledAfterRollback final : public std::runtime_error {
  public:
@@ -402,22 +404,6 @@ class WorkloadServiceShutdownTimeout final : public std::runtime_error {
 }
 
 constexpr auto kWorkloadMutationRollbackTimeout = std::chrono::seconds(10);
-
-[[noreturn]] void ThrowWorkloadMutationOutcomeUnconfirmed(
-    std::string_view context, const std::exception_ptr& original_error,
-    const std::vector<std::string>& rollback_errors = {}) {
-  std::string message(context);
-  if (original_error) {
-    message += ": " + ExceptionMessage(original_error);
-  }
-  if (!rollback_errors.empty()) {
-    message += "; rollback failed:";
-    for (const std::string& rollback_error : rollback_errors) {
-      message += " [" + rollback_error + "]";
-    }
-  }
-  throw WorkloadMutationOutcomeUnconfirmed(message);
-}
 
 class WorkloadMutationRollbackControl {
  public:
@@ -884,29 +870,6 @@ void RequireSafeOutputDirectory(const std::filesystem::path& output_dir) {
   if (absolute == absolute.root_path()) {
     throw std::runtime_error("output directory must not be filesystem root");
   }
-}
-
-const QdiscInfo* FindQdiscByInterfaceName(const std::vector<QdiscInfo>& qdiscs,
-                                          std::string_view name) {
-  for (const QdiscInfo& qdisc : qdiscs) {
-    if (qdisc.if_name == name) {
-      return &qdisc;
-    }
-  }
-  return nullptr;
-}
-
-QdiscInfo VerifyNodeNetworkCondition(const NodeVethConfig& config,
-                                     std::stop_token stop_token = {}) {
-  const std::vector<QdiscInfo> qdiscs = ListQdiscs(stop_token);
-  QdiscInfo summary;
-  if (!QdiscsMatchNetworkCondition(qdiscs, config.host_name, config.condition,
-                                   &summary)) {
-    throw std::runtime_error(
-        "host-side qdisc does not match requested network condition: " +
-        config.host_name);
-  }
-  return summary;
 }
 
 void PublishOperatorConnectionCommand(const Options& options,
@@ -5354,73 +5317,6 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
       .next_transaction_index = transaction_index,
       .queue_maximum_size = 0U,
   };
-}
-
-void RestoreNodeNetworkCondition(const NodeVethConfig& previous) {
-  if (previous.apply_condition) {
-    ReplaceNetworkConditionQdisc(previous.host_name, previous.condition);
-    static_cast<void>(VerifyNodeNetworkCondition(previous));
-    return;
-  }
-  std::exception_ptr delete_error;
-  try {
-    DeleteRootQdisc(previous.host_name);
-  } catch (...) {
-    delete_error = std::current_exception();
-  }
-  const QdiscInfo* qdisc =
-      FindQdiscByInterfaceName(ListQdiscs(), previous.host_name);
-  if (qdisc != nullptr &&
-      (qdisc->kind == QdiscKind::kNetem || qdisc->kind == QdiscKind::kTbf ||
-       qdisc->kind == QdiscKind::kTbfNetem)) {
-    if (delete_error) {
-      std::rethrow_exception(delete_error);
-    }
-    throw std::runtime_error(
-        "network condition qdisc remained after rollback removal");
-  }
-}
-
-QdiscInfo ReplaceNodeNetworkConditionTransactional(
-    NodeRuntime* node, const NetworkCondition& condition,
-    std::stop_token stop_token) {
-  if (!node->network) {
-    throw std::runtime_error(
-        "runtime network condition requires isolated networking");
-  }
-  const NodeVethConfig previous = *node->network;
-  NodeVethConfig updated = previous;
-  updated.apply_condition = true;
-  updated.condition = condition;
-  try {
-    ThrowIfStopRequested(stop_token);
-    ReplaceNetworkConditionQdisc(updated.host_name, updated.condition);
-    ThrowIfStopRequested(stop_token);
-    const QdiscInfo qdisc = VerifyNodeNetworkCondition(updated, stop_token);
-    node->network = updated;
-    node->network_profile.clear();
-    return qdisc;
-  } catch (...) {
-    const std::exception_ptr original_error = std::current_exception();
-    std::string rollback_error;
-    try {
-      RestoreNodeNetworkCondition(previous);
-    } catch (const std::exception& restore_error) {
-      rollback_error = restore_error.what();
-      BBP_LOG(error) << "failed to restore network condition for "
-                     << node->config.id << ": " << restore_error.what();
-    } catch (...) {
-      rollback_error = "unknown exception";
-      BBP_LOG(error) << "failed to restore network condition for "
-                     << node->config.id << ": unknown exception";
-    }
-    if (!rollback_error.empty()) {
-      ThrowWorkloadMutationOutcomeUnconfirmed(
-          "network condition update outcome is unconfirmed", original_error,
-          {rollback_error});
-    }
-    std::rethrow_exception(original_error);
-  }
 }
 
 void ApplyRuntimeNetworkConditionUpdates(
