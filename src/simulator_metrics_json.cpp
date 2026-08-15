@@ -6,7 +6,7 @@
 #include <utility>
 
 #include "bbp/util.h"
-#include "simulator_host_probes.h"
+#include "simulator_network_state_json.h"
 #include "simulator_scenario_serialization.h"
 
 namespace bbp::simulator_app_internal {

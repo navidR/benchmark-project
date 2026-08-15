@@ -9,6 +9,7 @@
 #include "bbp/capability.h"
 #include "bbp/cgroup.h"
 #include "bbp/network.h"
+#include "simulator_network_state_json.h"
 #include "simulator_scenario_serialization.h"
 
 namespace bbp::simulator_app_internal {
