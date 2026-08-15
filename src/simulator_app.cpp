@@ -121,6 +121,7 @@
 #include "simulator_retained_run_registry.h"
 #include "simulator_runtime_identity_details.h"
 #include "simulator_runtime_network_block_rules.h"
+#include "simulator_runtime_network_condition_updates.h"
 #include "simulator_runtime_network_partition_rules.h"
 #include "simulator_scenario_chain_decoding.h"
 #include "simulator_scenario_mutation_option_decoding.h"
@@ -150,6 +151,7 @@ using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ApplyRuntimeNetworkBlockRules;
+using simulator_app_internal::ApplyRuntimeNetworkConditionUpdates;
 using simulator_app_internal::ApplyRuntimeNetworkPartition;
 using simulator_app_internal::ApplyRuntimeNetworkPartitionHeals;
 using simulator_app_internal::ApplyRuntimeNetworkPartitions;
@@ -5329,44 +5331,6 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
       .next_transaction_index = transaction_index,
       .queue_maximum_size = 0U,
   };
-}
-
-void ApplyRuntimeNetworkConditionUpdates(
-    const Options& options, const std::filesystem::path& events_path,
-    auto& nodes, std::stop_token stop_token) {
-  for (const auto& [node_index, condition] :
-       options.runtime_node_network_conditions) {
-    ThrowIfStopRequested(stop_token);
-    if (node_index >= nodes.size()) {
-      throw std::runtime_error(
-          "runtime network condition node is out of range");
-    }
-    NodeRuntime& node = nodes[node_index];
-    QdiscInfo qdisc;
-    NodeVethConfig updated_network;
-    {
-      std::lock_guard<std::mutex> lock(node_network_state_mutex);
-      qdisc = ReplaceNodeNetworkConditionTransactional(&node, condition,
-                                                       stop_token);
-      try {
-        updated_network = *node.network;
-      } catch (...) {
-        ThrowWorkloadMutationOutcomeUnconfirmed(
-            "network condition update completed without coherent runtime "
-            "evidence",
-            std::current_exception());
-      }
-    }
-    try {
-      WriteEvent(events_path, options.run_id, node.config.id,
-                 SimulationEventKind::kNetworkConditionUpdated,
-                 NetworkConditionVerificationDetail(updated_network, qdisc));
-    } catch (...) {
-      ThrowWorkloadMutationOutcomeUnconfirmed(
-          "network condition update completed without a publishable outcome",
-          std::current_exception());
-    }
-  }
 }
 
 void ApplyNetworkProfileSwitch(const Options& options,
@@ -20374,7 +20338,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
 
       ApplyRuntimeResourceLimitUpdates(options, events_path, nodes, stop_token);
       ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes,
-                                          stop_token);
+                                          node_network_state_mutex, stop_token);
       ApplyRuntimeNetworkBlockRules(options, events_path, nodes,
                                     node_network_state_mutex, stop_token);
       ApplyRuntimeNetworkPartitions(options, events_path, nodes,
