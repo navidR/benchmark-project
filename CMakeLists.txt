@@ -293,6 +293,7 @@ add_executable(bbp
   src/simulator_host_probes.cpp
   src/simulator_json_field_decoding.cpp
   src/simulator_managed_run_root.cpp
+  src/simulator_masternode_funding_boundary.cpp
   src/simulator_metrics_json.cpp
   src/simulator_metrics_sampling.cpp
   src/simulator_native_mining_rpc.cpp
@@ -589,6 +590,7 @@ if(BUILD_TESTING)
     src/simulator_host_probes.cpp
     src/simulator_json_field_decoding.cpp
     src/simulator_managed_run_root.cpp
+    src/simulator_masternode_funding_boundary.cpp
     src/simulator_metrics_json.cpp
     src/simulator_metrics_sampling.cpp
     src/simulator_native_mining_rpc.cpp
