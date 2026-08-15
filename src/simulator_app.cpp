@@ -121,6 +121,7 @@
 #include "simulator_retained_run_registry.h"
 #include "simulator_runtime_identity_details.h"
 #include "simulator_runtime_network_block_rules.h"
+#include "simulator_runtime_network_partition_rules.h"
 #include "simulator_scenario_chain_decoding.h"
 #include "simulator_scenario_mutation_option_decoding.h"
 #include "simulator_scenario_node_decoding.h"
@@ -150,6 +151,8 @@ using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ApplyRuntimeNetworkBlockRules;
 using simulator_app_internal::ApplyRuntimeNetworkPartition;
+using simulator_app_internal::ApplyRuntimeNetworkPartitionHeals;
+using simulator_app_internal::ApplyRuntimeNetworkPartitions;
 using simulator_app_internal::ApplyRuntimeNetworkUnblockRules;
 using simulator_app_internal::ApplyScenarioJson;
 using simulator_app_internal::ApplyScenarioWorkloads;
@@ -5473,30 +5476,6 @@ void ApplyNetworkProfileSwitch(const Options& options,
     ThrowWorkloadMutationOutcomeUnconfirmed(
         "network profile update completed without a publishable outcome",
         std::current_exception());
-  }
-}
-
-void ApplyRuntimeNetworkPartitions(const Options& options,
-                                   const std::filesystem::path& events_path,
-                                   auto& nodes, std::stop_token stop_token) {
-  for (const NetworkPartitionRule& partition : options.runtime_partitions) {
-    ThrowIfStopRequested(stop_token);
-    ApplyRuntimeNetworkPartition(options, events_path, nodes,
-                                 node_network_state_mutex, partition, false, 0U,
-                                 0U, stop_token);
-  }
-}
-
-void ApplyRuntimeNetworkPartitionHeals(const Options& options,
-                                       const std::filesystem::path& events_path,
-                                       auto& nodes,
-                                       std::stop_token stop_token) {
-  for (const NetworkPartitionRule& partition :
-       options.runtime_partition_heals) {
-    ThrowIfStopRequested(stop_token);
-    ApplyRuntimeNetworkPartition(options, events_path, nodes,
-                                 node_network_state_mutex, partition, true, 0U,
-                                 0U, stop_token);
   }
 }
 
@@ -20398,9 +20377,10 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                           stop_token);
       ApplyRuntimeNetworkBlockRules(options, events_path, nodes,
                                     node_network_state_mutex, stop_token);
-      ApplyRuntimeNetworkPartitions(options, events_path, nodes, stop_token);
+      ApplyRuntimeNetworkPartitions(options, events_path, nodes,
+                                    node_network_state_mutex, stop_token);
       ApplyRuntimeNetworkPartitionHeals(options, events_path, nodes,
-                                        stop_token);
+                                        node_network_state_mutex, stop_token);
       ApplyRuntimeNetworkUnblockRules(options, events_path, nodes,
                                       node_network_state_mutex, stop_token);
       ApplyRuntimeNodeRestarts(options, events_path, driver,
