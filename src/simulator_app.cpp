@@ -136,6 +136,7 @@
 #include "simulator_source_scenario_persistence.h"
 #include "simulator_tcp_endpoint_reservation.h"
 #include "simulator_wallet_configuration_decoding.h"
+#include "simulator_wallet_node_initialization.h"
 #include "simulator_wallet_transaction_distribution_decoding.h"
 #include "simulator_wallet_transaction_validation.h"
 #include "simulator_workload_event_details.h"
@@ -174,6 +175,7 @@ using simulator_app_internal::FreezeNodeWorkloadDetail;
 using simulator_app_internal::GeneratedBlocksDetail;
 using simulator_app_internal::HasTimedNodeLifecycle;
 using simulator_app_internal::HeightWaitDetail;
+using simulator_app_internal::InitializeWalletNodes;
 using simulator_app_internal::InitialResourceLimits;
 using simulator_app_internal::IsCurrentRunningNodeProcess;
 using simulator_app_internal::IsTopologyEdgeConditionField;
@@ -2486,67 +2488,6 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
   if (!published_manifest || *published_manifest != startup_manifest) {
     throw std::runtime_error(
         "startup runtime resource manifest read-back failed");
-  }
-}
-
-void InitializeWalletNodes(const Options& options,
-                           const std::filesystem::path& events_path,
-                           const ChainDriver& driver, auto& nodes,
-                           SimulationRegistry& registry,
-                           std::stop_token stop_token) {
-  if (!options.wallet_backed_workload_requested) {
-    return;
-  }
-  if (registry.wallet_initialization().strategy !=
-      WalletInitializationStrategy::kDriverRpc) {
-    throw std::runtime_error(
-        "wallet-backed workload requires driver_rpc wallet initialization");
-  }
-
-  for (size_t wallet_index = 0; wallet_index < registry.wallets().size();
-       ++wallet_index) {
-    ThrowIfStopRequested(stop_token);
-    WalletIdentity& wallet = registry.MutableWalletByIndex(wallet_index);
-    if (wallet.node == 0U || wallet.node > nodes.size()) {
-      throw std::runtime_error("wallet node is out of range");
-    }
-    NodeRuntime& node = nodes[wallet.node - 1U];
-    wallet.node_id = node.config.id;
-    while (!node.AllowsChainMetrics()) {
-      ThrowIfStopRequested(stop_token);
-      if (node.DeclarativeStopApplied() ||
-          node.Lifecycle() == NodeRuntimeLifecycle::kStopped ||
-          node.Lifecycle() == NodeRuntimeLifecycle::kFailed ||
-          node.Lifecycle() == NodeRuntimeLifecycle::kCleaned) {
-        throw std::runtime_error(
-            "wallet node did not reach Running before initialization: " +
-            node.config.id);
-      }
-      WaitForDuration(std::chrono::milliseconds(20), stop_token);
-    }
-    if (!node.config.wallet_enabled) {
-      throw std::runtime_error(
-          "wallet node was not started with wallet support enabled");
-    }
-    WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kWalletAddressRequested,
-               WalletAddressDetail(wallet, registry.wallet_initialization()));
-    wallet.address = driver.CreateWalletAddress(
-        node.config, ToChainWalletMode(registry.wallet_initialization()),
-        stop_token);
-    if (wallet.address.empty()) {
-      throw std::runtime_error("chain wallet RPC returned an empty address");
-    }
-    wallet.funding_address = driver.CreateWalletFundingAddress(
-        node.config, ToChainWalletMode(registry.wallet_initialization()),
-        wallet.address, stop_token);
-    if (wallet.funding_address.empty()) {
-      throw std::runtime_error(
-          "chain wallet RPC returned an empty funding address");
-    }
-    WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kWalletAddressCreated,
-               WalletAddressDetail(wallet, registry.wallet_initialization()));
   }
 }
 
