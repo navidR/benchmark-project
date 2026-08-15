@@ -101,6 +101,7 @@
 #include "simulator_network_block_application.h"
 #include "simulator_network_condition_application.h"
 #include "simulator_network_event_details.h"
+#include "simulator_network_partition_application.h"
 #include "simulator_network_partition_planning.h"
 #include "simulator_network_rule_decoding.h"
 #include "simulator_node_lifecycle_event_details.h"
@@ -146,6 +147,7 @@ using simulator_app_internal::ApplyNetworkPartitionRules;
 using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
+using simulator_app_internal::ApplyRuntimeNetworkPartition;
 using simulator_app_internal::ApplyScenarioJson;
 using simulator_app_internal::ApplyScenarioWorkloads;
 using simulator_app_internal::ApplyScheduledScenarioEvents;
@@ -189,7 +191,6 @@ using simulator_app_internal::LockNodeProcessState;
 using simulator_app_internal::MutateNetworkBlockRuleTransactional;
 using simulator_app_internal::NetworkBlockMutationResult;
 using simulator_app_internal::NetworkBlockRuleForHandle;
-using simulator_app_internal::NetworkBlockRulePresent;
 using simulator_app_internal::NodeDataDirectoryRelative;
 using simulator_app_internal::NodeExitedBeforeRpcReady;
 using simulator_app_internal::NodeLifecycleDeadlineDetail;
@@ -223,7 +224,6 @@ using simulator_app_internal::ParseWalletInitializationObject;
 using simulator_app_internal::ParseWalletTransactionFeePolicy;
 using simulator_app_internal::ParseWalletTransactionMode;
 using simulator_app_internal::ParseWalletTransferStrategy;
-using simulator_app_internal::PartitionBlockRules;
 using simulator_app_internal::PeerChurnDetail;
 using simulator_app_internal::PeerCountWaitDetail;
 using simulator_app_internal::PrepareManagedRunRoot;
@@ -238,8 +238,6 @@ using simulator_app_internal::ReplaceNodeNetworkConditionTransactional;
 using simulator_app_internal::RequestNodeKill;
 using simulator_app_internal::RequestNodeTerminate;
 using simulator_app_internal::RequireCgroupWeight;
-using simulator_app_internal::RequireNetworkBlockHandleAvailable;
-using simulator_app_internal::RequireNetworkBlockNode;
 using simulator_app_internal::RequireNodeRunning;
 using simulator_app_internal::RequireNonZero;
 using simulator_app_internal::RequireSafeScenarioIdentifier;
@@ -254,7 +252,6 @@ using simulator_app_internal::ResourceProfileUpdateDetail;
 using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
-using simulator_app_internal::RestoreNetworkBlockRule;
 using simulator_app_internal::RestoreNodeNetworkCondition;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
@@ -657,11 +654,9 @@ using simulator_app_internal::NetworkBlockRuleDetail;
 using simulator_app_internal::NetworkBlockRuleJson;
 using simulator_app_internal::NetworkConditionJson;
 using simulator_app_internal::NetworkConditionVerificationDetail;
-using simulator_app_internal::NetworkPartitionDetail;
 using simulator_app_internal::NetworkPartitionRuleJson;
 using simulator_app_internal::NetworkProfileUpdateDetail;
 using simulator_app_internal::NodeRoleTopologyJson;
-using simulator_app_internal::PartitionRuleResultJson;
 using simulator_app_internal::PerfCounterNamesJson;
 using simulator_app_internal::QdiscJson;
 using simulator_app_internal::QdiscsJson;
@@ -5534,133 +5529,14 @@ void ApplyRuntimeNetworkUnblockRules(const Options& options,
   }
 }
 
-void ApplyRuntimeNetworkPartition(
-    const Options& options, const std::filesystem::path& events_path,
-    auto& nodes, const NetworkPartitionRule& partition, bool heal,
-    uint32_t workload_index = 0, uint32_t workload_count = 0,
-    std::stop_token stop_token = {},
-    std::optional<std::uint64_t> operator_sequence = std::nullopt) {
-  struct PartitionRuleState {
-    NetworkBlockRule rule;
-    bool existed_before = false;
-    bool present_after = false;
-  };
-  const std::vector<NetworkBlockRule> rules =
-      PartitionBlockRules(partition, nodes);
-  std::vector<PartitionRuleState> states;
-  states.reserve(rules.size());
-  boost::json::array rule_results;
-  {
-    std::lock_guard<std::mutex> lock(node_network_state_mutex);
-    std::set<std::pair<std::uint32_t, std::uint32_t>> planned_handles;
-    for (const NetworkBlockRule& rule : rules) {
-      ThrowIfStopRequested(stop_token);
-      NodeRuntime& node = nodes[rule.node_index];
-      RequireNetworkBlockNode(node);
-      if (!planned_handles.emplace(rule.node_index, rule.handle).second) {
-        throw std::runtime_error(
-            "network partition produced a duplicate rule handle: " +
-            std::to_string(rule.handle));
-      }
-      RequireNetworkBlockHandleAvailable(node, rule);
-      states.push_back(PartitionRuleState{
-          .rule = rule,
-          .existed_before = NetworkBlockRulePresent(node, rule),
-          .present_after = false,
-      });
-    }
-
-    std::vector<std::size_t> attempted;
-    try {
-      for (std::size_t index = 0; index < states.size(); ++index) {
-        ThrowIfStopRequested(stop_token);
-        attempted.push_back(index);
-        PartitionRuleState& state = states[index];
-        NodeRuntime& node = nodes[state.rule.node_index];
-        if (heal) {
-          if (state.existed_before) {
-            DeleteEgressIpv4TcpDropFilter(node.network->host_name,
-                                          state.rule.handle);
-          }
-        } else {
-          ReplaceEgressIpv4TcpDropFilter(
-              node.network->host_name, state.rule.src_address,
-              state.rule.src_port, state.rule.dst_address, state.rule.dst_port,
-              state.rule.handle);
-        }
-        ThrowIfStopRequested(stop_token);
-        state.present_after = NetworkBlockRulePresent(node, state.rule);
-        if (!heal && !state.present_after) {
-          throw std::runtime_error(
-              "runtime network partition rule was not visible after apply");
-        }
-        if (heal && state.present_after) {
-          throw std::runtime_error(
-              "runtime network partition rule remained after heal");
-        }
-      }
-    } catch (...) {
-      const std::exception_ptr original_error = std::current_exception();
-      std::vector<std::string> rollback_errors;
-      for (auto iter = attempted.rbegin(); iter != attempted.rend(); ++iter) {
-        const PartitionRuleState& state = states[*iter];
-        try {
-          RestoreNetworkBlockRule(nodes[state.rule.node_index], state.rule,
-                                  state.existed_before);
-        } catch (const std::exception& error) {
-          rollback_errors.push_back(std::to_string(state.rule.handle) + " on " +
-                                    nodes[state.rule.node_index].config.id +
-                                    ": " + error.what());
-          BBP_LOG(error) << "failed to roll back partition rule "
-                         << state.rule.handle << " on "
-                         << nodes[state.rule.node_index].config.id << ": "
-                         << error.what();
-        } catch (...) {
-          rollback_errors.push_back(std::to_string(state.rule.handle) + " on " +
-                                    nodes[state.rule.node_index].config.id +
-                                    ": unknown exception");
-          BBP_LOG(error) << "failed to roll back partition rule "
-                         << state.rule.handle << " on "
-                         << nodes[state.rule.node_index].config.id
-                         << ": unknown exception";
-        }
-      }
-      if (!rollback_errors.empty()) {
-        ThrowWorkloadMutationOutcomeUnconfirmed(
-            "network partition mutation outcome is unconfirmed", original_error,
-            rollback_errors);
-      }
-      std::rethrow_exception(original_error);
-    }
-  }
-
-  try {
-    for (const PartitionRuleState& state : states) {
-      const NodeRuntime& node = nodes[state.rule.node_index];
-      rule_results.push_back(PartitionRuleResultJson(
-          node, state.rule, state.existed_before, state.present_after));
-    }
-
-    const SimulationEventKind event_kind =
-        heal ? SimulationEventKind::kNetworkPartitionHealed
-             : SimulationEventKind::kNetworkPartitionApplied;
-    WriteEvent(events_path, options.run_id, "sim", event_kind,
-               NetworkPartitionDetail(partition, rule_results, workload_index,
-                                      workload_count, operator_sequence));
-  } catch (...) {
-    ThrowWorkloadMutationOutcomeUnconfirmed(
-        "network partition completed without a publishable outcome",
-        std::current_exception());
-  }
-}
-
 void ApplyRuntimeNetworkPartitions(const Options& options,
                                    const std::filesystem::path& events_path,
                                    auto& nodes, std::stop_token stop_token) {
   for (const NetworkPartitionRule& partition : options.runtime_partitions) {
     ThrowIfStopRequested(stop_token);
-    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, false,
-                                 0U, 0U, stop_token);
+    ApplyRuntimeNetworkPartition(options, events_path, nodes,
+                                 node_network_state_mutex, partition, false, 0U,
+                                 0U, stop_token);
   }
 }
 
@@ -5671,8 +5547,9 @@ void ApplyRuntimeNetworkPartitionHeals(const Options& options,
   for (const NetworkPartitionRule& partition :
        options.runtime_partition_heals) {
     ThrowIfStopRequested(stop_token);
-    ApplyRuntimeNetworkPartition(options, events_path, nodes, partition, true,
-                                 0U, 0U, stop_token);
+    ApplyRuntimeNetworkPartition(options, events_path, nodes,
+                                 node_network_state_mutex, partition, true, 0U,
+                                 0U, stop_token);
   }
 }
 
@@ -14371,7 +14248,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               const NetworkPartitionRule partition =
                   RuntimePartitionRule(*command.partition, nodes);
               ApplyRuntimeNetworkPartition(
-                  options, events_path, nodes, partition,
+                  options, events_path, nodes, node_network_state_mutex,
+                  partition,
                   command.kind == SimulationCommandKind::kHealPartition, 0U, 0U,
                   command_stop_token, command.sequence);
             } else if (command.kind ==
@@ -17476,13 +17354,13 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             }
             case WorkloadKind::kPartitionNodes:
               ApplyRuntimeNetworkPartition(
-                  options, events_path, nodes,
+                  options, events_path, nodes, node_network_state_mutex,
                   scenario_workload.network_partition.partition, false,
                   action_index, action_count, operation_stop_token);
               break;
             case WorkloadKind::kHealPartition:
               ApplyRuntimeNetworkPartition(
-                  options, events_path, nodes,
+                  options, events_path, nodes, node_network_state_mutex,
                   scenario_workload.network_partition.partition, true,
                   action_index, action_count, operation_stop_token);
               break;

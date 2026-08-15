@@ -298,6 +298,7 @@ add_executable(bbp
   src/simulator_network_block_application.cpp
   src/simulator_network_condition_application.cpp
   src/simulator_network_event_details.cpp
+  src/simulator_network_partition_application.cpp
   src/simulator_network_partition_planning.cpp
   src/simulator_network_rule_decoding.cpp
   src/simulator_node_lifecycle_event_details.cpp
@@ -582,6 +583,7 @@ if(BUILD_TESTING)
     src/simulator_network_block_application.cpp
     src/simulator_network_condition_application.cpp
     src/simulator_network_event_details.cpp
+    src/simulator_network_partition_application.cpp
     src/simulator_network_partition_planning.cpp
     src/simulator_network_rule_decoding.cpp
     src/simulator_node_lifecycle_event_details.cpp
