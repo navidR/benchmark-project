@@ -246,23 +246,25 @@ BOOST_AUTO_TEST_CASE(
     simulator_reserves_transaction_observation_before_every_mutating_send) {
   const std::filesystem::path simulator =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::filesystem::path raw_transaction_workload =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" /
+      "simulator_raw_transaction_workload.cpp";
   const std::string source = bbp::ReadText(simulator);
+  const std::string raw_source = bbp::ReadText(raw_transaction_workload);
 
   const std::size_t raw_function =
-      source.find("void ApplySendRawTransactionWorkload(");
+      raw_source.find("void ApplySendRawTransactionWorkload(");
   const std::size_t raw_reserve =
-      source.find("transaction_tracker.Reserve(nodes);", raw_function);
+      raw_source.find("transaction_tracker.Reserve(nodes);", raw_function);
   const std::size_t raw_send =
-      source.find("driver.SendRawTransaction(", raw_function);
+      raw_source.find("driver.SendRawTransaction(", raw_function);
   const std::size_t load_function = source.find(
-      "WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(",
-      raw_function);
+      "WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(");
   BOOST_REQUIRE(raw_function != std::string::npos);
   BOOST_REQUIRE(raw_reserve != std::string::npos);
   BOOST_REQUIRE(raw_send != std::string::npos);
   BOOST_REQUIRE(load_function != std::string::npos);
   BOOST_TEST(raw_reserve < raw_send);
-  BOOST_TEST(raw_send < load_function);
 
   const std::size_t load_reserve =
       source.find("transaction_tracker.TryReserve(nodes);", load_function);
