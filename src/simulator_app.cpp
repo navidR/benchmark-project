@@ -102,6 +102,7 @@
 #include "simulator_network_event_details.h"
 #include "simulator_network_rule_decoding.h"
 #include "simulator_node_lifecycle_event_details.h"
+#include "simulator_node_log_tail.h"
 #include "simulator_node_process_state.h"
 #include "simulator_offline_run_cleanup.h"
 #include "simulator_option_parsing.h"
@@ -273,7 +274,9 @@ using simulator_app_internal::WalletAddressDetail;
 using simulator_app_internal::WalletFundingDetail;
 using simulator_app_internal::WalletTransactionDetail;
 using simulator_app_internal::WriteEvent;
+using simulator_app_internal::WriteLogTailChunkEvent;
 using simulator_app_internal::WriteMetricsSnapshot;
+using simulator_app_internal::WriteNodeLogTails;
 using simulator_app_internal::WriteNodeStateEvent;
 using simulator_app_internal::WriteRetainedRunRegistrySummary;
 using simulator_app_internal::WriteSourceScenarioFile;
@@ -1832,79 +1835,6 @@ MasternodeIdentity RegisteredMasternodeIdentity(
       .state = status.state,
       .status = status.status,
   };
-}
-
-std::string LogTailDetail(std::string_view kind, const LogTailChunk& chunk) {
-  boost::json::object detail;
-  detail["kind"] = kind;
-  detail["start_offset"] = chunk.start_offset;
-  detail["next_offset"] = chunk.next_offset;
-  detail["truncated"] = chunk.truncated;
-  detail["offset_reset"] = chunk.offset_reset;
-  detail["text"] = chunk.text;
-  return boost::json::serialize(detail);
-}
-
-SimulationEventKind LogTailEventKind(ChainLogSource source) {
-  switch (source) {
-    case ChainLogSource::kDaemon:
-      return SimulationEventKind::kDaemonLogTail;
-    case ChainLogSource::kStdout:
-      return SimulationEventKind::kStdoutTail;
-    case ChainLogSource::kStderr:
-      return SimulationEventKind::kStderrTail;
-  }
-  throw std::runtime_error("unknown chain log source");
-}
-
-void WriteLogTailChunkEvent(const std::filesystem::path& events_path,
-                            const Options& options,
-                            const ChainNodeConfig& config,
-                            ChainLogSource source, const LogTailChunk& chunk) {
-  const std::string_view kind = ChainLogSourceName(source);
-  WriteEvent(events_path, options.run_id, config.id, LogTailEventKind(source),
-             LogTailDetail(kind, chunk));
-}
-
-void WriteLogTailEvent(const std::filesystem::path& events_path,
-                       const Options& options, const ChainDriver& driver,
-                       const NodeRuntime& node, ChainLogSource source,
-                       LogTailCursor* cursor) {
-  std::optional<LogTailChunk> chunk;
-  try {
-    chunk = driver.ReadLogTail(node.config, source, *cursor, kMaxLogTailBytes);
-  } catch (const std::exception& error) {
-    BBP_LOG(warning) << "cannot read " << ChainLogSourceName(source) << " for "
-                     << node.config.id << ": " << error.what();
-    return;
-  }
-  if (!chunk) {
-    return;
-  }
-  *cursor = chunk->next_cursor;
-  if (chunk->text.empty() && !chunk->truncated && !chunk->offset_reset) {
-    return;
-  }
-  WriteLogTailChunkEvent(events_path, options, node.config, source, *chunk);
-}
-
-void WriteNodeLogTail(const std::filesystem::path& events_path,
-                      const Options& options, const ChainDriver& driver,
-                      NodeRuntime& node) {
-  WriteLogTailEvent(events_path, options, driver, node, ChainLogSource::kStdout,
-                    &node.stdout_log_cursor);
-  WriteLogTailEvent(events_path, options, driver, node, ChainLogSource::kStderr,
-                    &node.stderr_log_cursor);
-  WriteLogTailEvent(events_path, options, driver, node, ChainLogSource::kDaemon,
-                    &node.daemon_log_cursor);
-}
-
-void WriteNodeLogTails(const std::filesystem::path& events_path,
-                       const Options& options, const ChainDriver& driver,
-                       auto& nodes) {
-  for (NodeRuntime& node : nodes) {
-    WriteNodeLogTail(events_path, options, driver, node);
-  }
 }
 
 void StopNodeProcess(const Options& options,

@@ -298,6 +298,7 @@ add_executable(bbp
   src/simulator_network_event_details.cpp
   src/simulator_network_rule_decoding.cpp
   src/simulator_node_lifecycle_event_details.cpp
+  src/simulator_node_log_tail.cpp
   src/simulator_node_mutation_request_decoding.cpp
   src/simulator_node_process_state.cpp
   src/simulator_offline_run_cleanup.cpp
@@ -575,6 +576,7 @@ if(BUILD_TESTING)
     src/simulator_network_event_details.cpp
     src/simulator_network_rule_decoding.cpp
     src/simulator_node_lifecycle_event_details.cpp
+    src/simulator_node_log_tail.cpp
     src/simulator_node_mutation_request_decoding.cpp
     src/simulator_node_process_state.cpp
     src/simulator_offline_run_cleanup.cpp
