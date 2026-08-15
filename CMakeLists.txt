@@ -321,6 +321,7 @@ add_executable(bbp
   src/simulator_runtime_network_block_rules.cpp
   src/simulator_runtime_network_condition_updates.cpp
   src/simulator_runtime_network_partition_rules.cpp
+  src/simulator_runtime_published_node_config.cpp
   src/simulator_scenario_chain_decoding.cpp
   src/simulator_scenario_mutation_option_decoding.cpp
   src/simulator_scenario_node_decoding.cpp
@@ -610,6 +611,7 @@ if(BUILD_TESTING)
     src/simulator_runtime_network_block_rules.cpp
     src/simulator_runtime_network_condition_updates.cpp
     src/simulator_runtime_network_partition_rules.cpp
+    src/simulator_runtime_published_node_config.cpp
     src/simulator_scenario_chain_decoding.cpp
     src/simulator_scenario_mutation_option_decoding.cpp
     src/simulator_scenario_node_decoding.cpp
