@@ -339,6 +339,7 @@ add_executable(bbp
   src/simulator_scheduled_event_decoding.cpp
   src/simulator_source_scenario_persistence.cpp
   src/simulator_tcp_endpoint_reservation.cpp
+  src/simulator_transaction_observation_tracking.cpp
   src/simulator_wallet_configuration_decoding.cpp
   src/simulator_wallet_metrics_json.cpp
   src/simulator_wallet_node_initialization.cpp
@@ -634,6 +635,7 @@ if(BUILD_TESTING)
     src/simulator_scheduled_event_decoding.cpp
     src/simulator_source_scenario_persistence.cpp
     src/simulator_tcp_endpoint_reservation.cpp
+    src/simulator_transaction_observation_tracking.cpp
     src/simulator_wallet_configuration_decoding.cpp
     src/simulator_wallet_metrics_json.cpp
     src/simulator_wallet_node_initialization.cpp

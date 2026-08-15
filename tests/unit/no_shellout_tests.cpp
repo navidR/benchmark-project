@@ -136,8 +136,12 @@ BOOST_AUTO_TEST_CASE(
   const std::filesystem::path workload_details =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" /
       "simulator_workload_event_details.cpp";
+  const std::filesystem::path observation_tracking =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" /
+      "simulator_transaction_observation_tracking.cpp";
   const std::string source = bbp::ReadText(simulator);
   const std::string detail_source = bbp::ReadText(workload_details);
+  const std::string observation_source = bbp::ReadText(observation_tracking);
   const std::size_t submit =
       source.find("transaction = driver.SubmitWalletTransaction(");
   BOOST_REQUIRE(submit != std::string::npos);
@@ -207,19 +211,21 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(error_class != std::string::npos);
 
   const std::size_t observe_sets =
-      source.find("ObserveTrackedSetsUntilVisible(");
+      observation_source.find("ObserveTrackedSetsUntilVisible(");
   BOOST_REQUIRE(observe_sets != std::string::npos);
-  const std::size_t shared_deadline = source.find(
+  const std::size_t shared_deadline = observation_source.find(
       "const auto deadline = std::chrono::steady_clock::now() + "
       "timeout",
       observe_sets);
   BOOST_REQUIRE(shared_deadline != std::string::npos);
-  const std::size_t bounded_observation =
-      source.find("driver.ObserveTransactionUntil(", shared_deadline);
+  const std::size_t bounded_observation = observation_source.find(
+      "driver.ObserveTransactionUntil(", shared_deadline);
   BOOST_REQUIRE(bounded_observation != std::string::npos);
+  const std::size_t transaction_arguments = observation_source.find(
+      "node.config, transaction.txid", bounded_observation);
+  BOOST_REQUIRE(transaction_arguments != std::string::npos);
   const std::size_t deadline_argument =
-      source.find("node.config, transaction.txid, deadline, stop_token",
-                  bounded_observation);
+      observation_source.find("deadline, stop_token", transaction_arguments);
   BOOST_REQUIRE(deadline_argument != std::string::npos);
 
   BOOST_TEST(submit < configured_deadline);
@@ -232,7 +238,8 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(transport < internal);
   BOOST_TEST(internal < cancellation);
   BOOST_TEST(shared_deadline < bounded_observation);
-  BOOST_TEST(bounded_observation < deadline_argument);
+  BOOST_TEST(bounded_observation < transaction_arguments);
+  BOOST_TEST(transaction_arguments < deadline_argument);
 }
 
 BOOST_AUTO_TEST_CASE(
