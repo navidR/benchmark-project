@@ -25,6 +25,7 @@
 #include "simulator_resource_limit_decoding.h"
 #include "simulator_resource_profile_decoding.h"
 #include "simulator_scenario_chain_decoding.h"
+#include "simulator_scenario_identifier.h"
 #include "simulator_scenario_mutation_option_decoding.h"
 #include "simulator_scenario_node_decoding.h"
 #include "simulator_scenario_workload_decoding.h"

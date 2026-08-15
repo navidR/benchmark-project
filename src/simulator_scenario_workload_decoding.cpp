@@ -21,7 +21,7 @@
 #include "simulator_peer_topology_decoding.h"
 #include "simulator_profile_assignment.h"
 #include "simulator_resource_limit_decoding.h"
-#include "simulator_resource_profile_decoding.h"
+#include "simulator_scenario_identifier.h"
 #include "simulator_scenario_node_resolution.h"
 #include "simulator_wallet_transaction_distribution_decoding.h"
 #include "simulator_wallet_transaction_validation.h"

@@ -18,7 +18,7 @@
 #include "bbp/scenario_fields.h"
 #include "bbp/simulator/options.h"
 #include "simulator_json_field_decoding.h"
-#include "simulator_resource_profile_decoding.h"
+#include "simulator_scenario_identifier.h"
 #include "simulator_wallet_configuration_decoding.h"
 
 namespace bbp::simulator_app_internal {

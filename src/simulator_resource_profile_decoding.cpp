@@ -16,6 +16,7 @@
 #include "bbp/simulator/options.h"
 #include "simulator_json_field_decoding.h"
 #include "simulator_resource_limit_decoding.h"
+#include "simulator_scenario_identifier.h"
 
 namespace bbp::simulator_app_internal {
 

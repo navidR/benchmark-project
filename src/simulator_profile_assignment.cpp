@@ -16,7 +16,7 @@
 #include "bbp/simulator/scenario_workload.h"
 #include "simulator_json_field_decoding.h"
 #include "simulator_network_rule_decoding.h"
-#include "simulator_resource_profile_decoding.h"
+#include "simulator_scenario_identifier.h"
 #include "simulator_scenario_node_resolution.h"
 
 namespace bbp::simulator_app_internal {

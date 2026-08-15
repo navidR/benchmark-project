@@ -34,7 +34,7 @@
 #include "bbp/util.h"
 #include "simulator_cancellable_waiting.h"
 #include "simulator_json_field_decoding.h"
-#include "simulator_resource_profile_decoding.h"
+#include "simulator_scenario_identifier.h"
 
 namespace bbp::simulator_app_internal {
 namespace {

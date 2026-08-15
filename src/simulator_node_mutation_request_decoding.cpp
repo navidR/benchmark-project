@@ -17,6 +17,7 @@
 #include "simulator_peer_topology_decoding.h"
 #include "simulator_resource_limit_decoding.h"
 #include "simulator_resource_profile_decoding.h"
+#include "simulator_scenario_identifier.h"
 
 namespace bbp {
 
