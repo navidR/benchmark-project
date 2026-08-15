@@ -109,6 +109,7 @@
 #include "simulator_node_log_tail.h"
 #include "simulator_node_process_state.h"
 #include "simulator_offline_run_cleanup.h"
+#include "simulator_operator_connection_publication.h"
 #include "simulator_option_parsing.h"
 #include "simulator_peer_topology_decoding.h"
 #include "simulator_perf_counter_attachment.h"
@@ -247,6 +248,7 @@ using simulator_app_internal::PeerCountWaitDetail;
 using simulator_app_internal::PrepareManagedRunRoot;
 using simulator_app_internal::ProcessExitDetail;
 using simulator_app_internal::ProfileRollbackFailureDetail;
+using simulator_app_internal::PublishOperatorConnectionCommand;
 using simulator_app_internal::RawTransactionDetail;
 using simulator_app_internal::RejectTopologyEdgeConditionFields;
 using simulator_app_internal::RejectUnsupportedFields;
@@ -567,62 +569,6 @@ void RequireSafeOutputDirectory(const std::filesystem::path& output_dir) {
   const std::filesystem::path absolute = std::filesystem::absolute(output_dir);
   if (absolute == absolute.root_path()) {
     throw std::runtime_error("output directory must not be filesystem root");
-  }
-}
-
-void PublishOperatorConnectionCommand(const Options& options,
-                                      const std::filesystem::path& run_root,
-                                      const std::filesystem::path& events_path,
-                                      const ChainDriver& driver,
-                                      const auto& nodes, bool* resolved) {
-  if (*resolved) {
-    return;
-  }
-  for (const NodeRuntime& node : nodes) {
-    {
-      auto process_guard = LockNodeProcessState(node);
-      if (!node.AllowsChainMetrics() || !node.process.running()) {
-        continue;
-      }
-    }
-    const std::optional<OperatorConnectionCommand> connection =
-        driver.BuildOperatorConnectionCommand(node.config, run_root);
-    *resolved = true;
-    if (!connection) {
-      return;
-    }
-
-    boost::json::array arguments;
-    arguments.reserve(connection->arguments.size());
-    for (const std::string& argument : connection->arguments) {
-      arguments.emplace_back(argument);
-    }
-    boost::json::array argv;
-    argv.reserve(connection->arguments.size() + 1U);
-    argv.emplace_back(connection->executable.string());
-    for (const std::string& argument : connection->arguments) {
-      argv.emplace_back(argument);
-    }
-    boost::json::object detail;
-    detail["kind"] = "manual_firo_gui";
-    detail["manual_launch"] = true;
-    detail["discovery_disabled"] = true;
-    detail["wallet_enabled"] = true;
-    detail["network"] = ChainNetworkName(node.config.network);
-    detail["executable"] = connection->executable.string();
-    detail["arguments"] = std::move(arguments);
-    detail["argv"] = std::move(argv);
-    detail["command"] = connection->ShellCommand();
-    detail["data_dir"] = connection->data_dir.string();
-    detail["peer_address"] = connection->peer_address;
-    detail["peer_port"] = connection->peer_port;
-    detail["peer_endpoint"] =
-        connection->peer_address + ":" + std::to_string(connection->peer_port);
-    WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kOperatorConnectionCommand,
-               boost::json::serialize(detail));
-    BBP_LOG(info) << "manual Firo GUI command: " << connection->ShellCommand();
-    return;
   }
 }
 
