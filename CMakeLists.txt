@@ -336,6 +336,7 @@ add_executable(bbp
   src/simulator_runtime_node_removal.cpp
   src/simulator_runtime_node_replacement.cpp
   src/simulator_runtime_node_restart.cpp
+  src/simulator_runtime_node_startup.cpp
   src/simulator_runtime_node_stop.cpp
   src/simulator_runtime_published_node_config.cpp
   src/simulator_runtime_workload_validation.cpp
@@ -646,6 +647,7 @@ if(BUILD_TESTING)
     src/simulator_runtime_node_removal.cpp
     src/simulator_runtime_node_replacement.cpp
     src/simulator_runtime_node_restart.cpp
+    src/simulator_runtime_node_startup.cpp
     src/simulator_runtime_node_stop.cpp
     src/simulator_runtime_published_node_config.cpp
     src/simulator_runtime_workload_validation.cpp
