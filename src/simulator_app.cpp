@@ -115,6 +115,7 @@
 #include "simulator_option_parsing.h"
 #include "simulator_peer_topology_decoding.h"
 #include "simulator_perf_counter_attachment.h"
+#include "simulator_perf_counter_transactions.h"
 #include "simulator_process_spawn_readiness.h"
 #include "simulator_profile_assignment.h"
 #include "simulator_raw_transaction_workload.h"
@@ -160,6 +161,7 @@ using simulator_app_internal::AcquireScenarioHeightWaitAdmission;
 using simulator_app_internal::ApplyNetworkBlockRules;
 using simulator_app_internal::ApplyNetworkPartitionRules;
 using simulator_app_internal::ApplyNodeConditions;
+using simulator_app_internal::ApplyPerfCounterCommand;
 using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ApplyRuntimeNetworkBlockRules;
@@ -254,6 +256,10 @@ using simulator_app_internal::NodeExitedBeforeRpcReady;
 using simulator_app_internal::NodeLifecycleDeadlineDetail;
 using simulator_app_internal::NodeListContains;
 using simulator_app_internal::NodeListsOverlap;
+using simulator_app_internal::NodePerfCounterAssignment;
+using simulator_app_internal::NodePerfCounterConfiguration;
+using simulator_app_internal::NodePerfCounterSnapshot;
+using simulator_app_internal::NodePerfCounterTransactionBackend;
 using simulator_app_internal::NodeProcessGeneration;
 using simulator_app_internal::NodeProcessRunning;
 using simulator_app_internal::NodeReportRelativePath;
@@ -304,6 +310,7 @@ using simulator_app_internal::RejectUnsupportedFields;
 using simulator_app_internal::RejectUnsupportedScenarioActionFields;
 using simulator_app_internal::RemovePreparedRunRoot;
 using simulator_app_internal::ReplaceNodeNetworkConditionTransactional;
+using simulator_app_internal::ReplaceNodePerfCountersTransactional;
 using simulator_app_internal::RequestNodeKill;
 using simulator_app_internal::RequestNodeTerminate;
 using simulator_app_internal::RequireCgroupWeight;
@@ -329,6 +336,7 @@ using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
 using simulator_app_internal::RestoreNodeNetworkCondition;
+using simulator_app_internal::RollBackNodePerfCounterSnapshots;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
 using simulator_app_internal::RuntimeNodePointers;
@@ -345,6 +353,7 @@ using simulator_app_internal::ScenarioNodeRoles;
 using simulator_app_internal::ScheduledBlockDetail;
 using simulator_app_internal::ScheduledEventLifecycleDetail;
 using simulator_app_internal::SimulationCommandDetail;
+using simulator_app_internal::SnapshotPerfCounterConfiguration;
 using simulator_app_internal::StableRuleHandle;
 using simulator_app_internal::StartNativeMiningForCurrentProcess;
 using simulator_app_internal::StartNodeProcessAttempt;
@@ -6621,310 +6630,6 @@ NodeRuntime& FindNodeRuntimeById(auto& nodes, const std::string& node_id) {
   return *node;
 }
 
-struct NodePerfCounterConfiguration {
-  std::string node_id;
-  std::vector<PerfCounterKind> kinds;
-  PerfCounterTargetKind target_kind = PerfCounterTargetKind::kNode;
-  std::string target_id;
-};
-
-struct NodePerfCounterAssignment {
-  NodeRuntime* node = nullptr;
-  NodePerfCounterConfiguration configuration;
-  bool require_running = true;
-  bool require_attachment = true;
-};
-
-struct NodePerfCounterTransactionBackend {
-  std::function<bool(const NodeRuntime&)> is_running;
-  std::function<void(NodeRuntime&, const RunProcessState::Guard&,
-                     bool require_attachment)>
-      attach;
-  std::function<void(NodeRuntime&, const RunProcessState::Guard&)> reset;
-};
-
-struct NodePerfCounterSnapshot {
-  explicit NodePerfCounterSnapshot(
-      NodeRuntime& runtime, const NodePerfCounterConfiguration& configuration)
-      : node(&runtime),
-        configuration_kinds(configuration.kinds),
-        configuration_kind(configuration.target_kind),
-        configuration_id(configuration.target_id) {}
-
-  NodeRuntime* node;
-  std::vector<PerfCounterKind> configuration_kinds;
-  PerfCounterTargetKind configuration_kind = PerfCounterTargetKind::kNode;
-  std::string configuration_id;
-  std::optional<ProcessPerfCounters> process_counters;
-  std::optional<CgroupPerfCounters> cgroup_counters;
-  pid_t target_pid = -1;
-  pid_t attached_pid = -1;
-  std::uint64_t process_generation = 0U;
-  std::filesystem::path cgroup_path;
-  std::vector<int> cpus;
-  std::optional<PerfCounterErrorKind> error_kind;
-  std::string error;
-  bool replacement_started = false;
-};
-
-NodePerfCounterConfiguration SnapshotPerfCounterConfiguration(
-    const NodePerfCounterSnapshot& snapshot) {
-  return NodePerfCounterConfiguration{
-      .node_id = snapshot.node->config.id,
-      .kinds = snapshot.configuration_kinds,
-      .target_kind = snapshot.configuration_kind,
-      .target_id = snapshot.configuration_id,
-  };
-}
-
-void SwapNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot,
-                                 const RunProcessState::Guard&) {
-  NodeRuntime& node = *snapshot.node;
-  node.perf_counter_kinds.swap(snapshot.configuration_kinds);
-  node.perf_counter_target_id.swap(snapshot.configuration_id);
-  std::swap(node.perf_counter_target_kind, snapshot.configuration_kind);
-  node.process_perf_counters.swap(snapshot.process_counters);
-  node.cgroup_perf_counters.swap(snapshot.cgroup_counters);
-  std::swap(node.perf_counter_target_pid, snapshot.target_pid);
-  std::swap(node.perf_counter_attached_pid, snapshot.attached_pid);
-  std::swap(node.perf_counter_process_generation, snapshot.process_generation);
-  node.perf_counter_cgroup_path.swap(snapshot.cgroup_path);
-  node.perf_counter_cpus.swap(snapshot.cpus);
-  node.perf_counter_error_kind.swap(snapshot.error_kind);
-  node.perf_counter_error.swap(snapshot.error);
-}
-
-void BeginNodePerfCounterReplacement(NodePerfCounterSnapshot& snapshot,
-                                     const RunProcessState::Guard& guard) {
-  SwapNodePerfCounterSnapshot(snapshot, guard);
-  snapshot.replacement_started = true;
-}
-
-void RestoreNodePerfCounterSnapshot(NodePerfCounterSnapshot& snapshot,
-                                    const RunProcessState::Guard& guard) {
-  if (!snapshot.replacement_started) {
-    return;
-  }
-  SwapNodePerfCounterSnapshot(snapshot, guard);
-  snapshot.replacement_started = false;
-}
-
-void RequireNodePerfCounterAttachment(const NodeRuntime& node,
-                                      const RunProcessState::Guard&) {
-  if (node.perf_counter_error_kind || !node.perf_counter_error.empty()) {
-    throw std::runtime_error(
-        "perf counter attachment failed for " + node.config.id + ": " +
-        (node.perf_counter_error.empty() ? std::string(PerfCounterErrorKindName(
-                                               *node.perf_counter_error_kind))
-                                         : node.perf_counter_error));
-  }
-  const bool process_target =
-      node.perf_counter_target_kind == PerfCounterTargetKind::kNode ||
-      node.perf_counter_target_kind == PerfCounterTargetKind::kWallet;
-  if (process_target) {
-    if (!node.process_perf_counters || node.cgroup_perf_counters ||
-        node.perf_counter_target_pid <= 0 ||
-        node.perf_counter_attached_pid != node.perf_counter_target_pid) {
-      throw std::runtime_error(
-          "process perf counter attachment is incomplete "
-          "for " +
-          node.config.id);
-    }
-    return;
-  }
-  if (!node.cgroup_perf_counters || node.process_perf_counters ||
-      node.perf_counter_cgroup_path.empty() || node.perf_counter_cpus.empty()) {
-    throw std::runtime_error(
-        "cgroup perf counter attachment is incomplete for " + node.config.id);
-  }
-}
-
-std::vector<NodePerfCounterSnapshot> ReplaceNodePerfCountersTransactional(
-    std::span<const NodePerfCounterAssignment> assignments,
-    const RunProcessState::Guard& process_guard,
-    std::stop_token stop_token = {},
-    const NodePerfCounterTransactionBackend* backend = nullptr) {
-  if (assignments.empty()) {
-    throw std::invalid_argument(
-        "perf counter transaction requires at least one node");
-  }
-  if (backend != nullptr &&
-      (!backend->is_running || !backend->attach || !backend->reset)) {
-    throw std::invalid_argument(
-        "perf counter transaction backend is incomplete");
-  }
-  std::set<std::string> unique_nodes;
-  for (const NodePerfCounterAssignment& assignment : assignments) {
-    if (assignment.node == nullptr ||
-        assignment.configuration.node_id != assignment.node->config.id ||
-        assignment.configuration.target_id.empty() ||
-        assignment.configuration.kinds.empty() ||
-        !unique_nodes.insert(assignment.configuration.node_id).second) {
-      throw std::invalid_argument(
-          "perf counter transaction contains an invalid or duplicate node");
-    }
-    const std::set<PerfCounterKind> unique_kinds(
-        assignment.configuration.kinds.begin(),
-        assignment.configuration.kinds.end());
-    if (unique_kinds.size() != assignment.configuration.kinds.size()) {
-      throw std::invalid_argument(
-          "perf counter transaction contains duplicate counters");
-    }
-    const bool running = backend != nullptr
-                             ? backend->is_running(*assignment.node)
-                             : assignment.node->process.running();
-    if (assignment.require_running && !running) {
-      throw std::runtime_error("perf counter target node is not running: " +
-                               assignment.configuration.node_id);
-    }
-    if ((assignment.configuration.target_kind ==
-             PerfCounterTargetKind::kGroup ||
-         assignment.configuration.target_kind ==
-             PerfCounterTargetKind::kCgroup) &&
-        !assignment.node->cgroup) {
-      throw std::runtime_error(
-          "perf counter target node has no owned cgroup: " +
-          assignment.configuration.node_id);
-    }
-  }
-  ThrowIfStopRequested(stop_token);
-
-  std::vector<NodePerfCounterSnapshot> snapshots;
-  snapshots.reserve(assignments.size());
-  try {
-    for (const NodePerfCounterAssignment& assignment : assignments) {
-      ThrowIfStopRequested(stop_token);
-      snapshots.emplace_back(*assignment.node, assignment.configuration);
-      NodePerfCounterSnapshot& snapshot = snapshots.back();
-      BeginNodePerfCounterReplacement(snapshot, process_guard);
-      const bool running = backend != nullptr
-                               ? backend->is_running(*assignment.node)
-                               : assignment.node->process.running();
-      if (running) {
-        if (backend != nullptr) {
-          backend->attach(*assignment.node, process_guard,
-                          assignment.require_attachment);
-        } else {
-          AttachNodePerfCounters(*assignment.node, process_guard);
-          if (assignment.require_attachment) {
-            RequireNodePerfCounterAttachment(*assignment.node, process_guard);
-          }
-        }
-      } else {
-        if (backend != nullptr) {
-          backend->reset(*assignment.node, process_guard);
-        } else {
-          ResetNodePerfCounters(*assignment.node, process_guard);
-        }
-      }
-    }
-    ThrowIfStopRequested(stop_token);
-  } catch (...) {
-    for (auto snapshot = snapshots.rbegin(); snapshot != snapshots.rend();
-         ++snapshot) {
-      RestoreNodePerfCounterSnapshot(*snapshot, process_guard);
-    }
-    throw;
-  }
-  return snapshots;
-}
-
-void ApplyPerfCounterCommand(
-    const SimulationCommand& command, auto& nodes,
-    const RunProcessState::Guard& process_guard,
-    const NodePerfCounterTransactionBackend* backend = nullptr) {
-  if (!command.perf_counter_target) {
-    throw std::runtime_error("perf counter command requires a typed target");
-  }
-  const PerfCounterTarget& target = *command.perf_counter_target;
-  if (target.id.empty()) {
-    throw std::runtime_error("perf counter target id must not be empty");
-  }
-  if (target.node_ids.empty()) {
-    throw std::runtime_error("perf counter target must resolve to a node");
-  }
-  if (command.perf_counter_kinds.empty()) {
-    throw std::runtime_error("perf counter selection must not be empty");
-  }
-  const std::set<PerfCounterKind> unique_kinds(
-      command.perf_counter_kinds.begin(), command.perf_counter_kinds.end());
-  if (unique_kinds.size() != command.perf_counter_kinds.size()) {
-    throw std::runtime_error("perf counter selection contains duplicates");
-  }
-  if (target.kind == PerfCounterTargetKind::kGroup) {
-    if (command.node_id != "sim") {
-      throw std::runtime_error("group perf counter command must target sim");
-    }
-  } else {
-    if (target.node_ids.size() != 1U ||
-        command.node_id != target.node_ids.front()) {
-      throw std::runtime_error(
-          "non-group perf counter command must target its resolved node");
-    }
-    if ((target.kind == PerfCounterTargetKind::kNode ||
-         target.kind == PerfCounterTargetKind::kCgroup) &&
-        target.id != target.node_ids.front()) {
-      throw std::runtime_error(
-          "node and cgroup perf target ids must equal their resolved node");
-    }
-    if (target.kind == PerfCounterTargetKind::kWallet &&
-        !IsCanonicalWalletPerfTargetId(target.id)) {
-      throw std::runtime_error(
-          "wallet perf target id must be wallet-<positive-index>");
-    }
-  }
-
-  std::vector<NodeRuntime*> target_nodes;
-  target_nodes.reserve(target.node_ids.size());
-  std::set<std::string> unique_nodes;
-  for (const std::string& node_id : target.node_ids) {
-    if (node_id.empty() || !unique_nodes.insert(node_id).second) {
-      throw std::runtime_error(
-          "perf counter target contains an empty or duplicate node id");
-    }
-    const auto node = std::find_if(nodes.begin(), nodes.end(),
-                                   [&](const NodeRuntime& candidate) {
-                                     return candidate.config.id == node_id;
-                                   });
-    if (node == nodes.end()) {
-      throw std::runtime_error("perf counter target references unknown node: " +
-                               node_id);
-    }
-    const bool running = backend != nullptr ? backend->is_running(*node)
-                                            : node->process.running();
-    if (!running) {
-      throw std::runtime_error("perf counter target node is not running: " +
-                               node_id);
-    }
-    if ((target.kind == PerfCounterTargetKind::kGroup ||
-         target.kind == PerfCounterTargetKind::kCgroup) &&
-        !node->cgroup) {
-      throw std::runtime_error(
-          "perf counter target node has no owned cgroup: " + node_id);
-    }
-    target_nodes.push_back(&*node);
-  }
-
-  std::vector<NodePerfCounterAssignment> assignments;
-  assignments.reserve(target_nodes.size());
-  for (NodeRuntime* node : target_nodes) {
-    assignments.push_back(NodePerfCounterAssignment{
-        .node = node,
-        .configuration =
-            NodePerfCounterConfiguration{
-                .node_id = node->config.id,
-                .kinds = command.perf_counter_kinds,
-                .target_kind = target.kind,
-                .target_id = target.id,
-            },
-        .require_running = true,
-        .require_attachment = true,
-    });
-  }
-  static_cast<void>(ReplaceNodePerfCountersTransactional(
-      assignments, process_guard, {}, backend));
-}
-
 constexpr std::size_t kMaximumRetainedInstrumentationMeasurements = 1024U;
 constexpr std::size_t kMaximumRetainedInstrumentationMeasurementBytes =
     kMcpMaximumRetainedResultBytes;
@@ -7619,16 +7324,6 @@ void ValidateLiveInstrumentationDuration(std::chrono::milliseconds duration,
     throw std::invalid_argument(
         "instrumentation " + std::string(field) +
         " exceeds the monotonic clock range: " + error.what());
-  }
-}
-
-void RollBackNodePerfCounterSnapshots(
-    std::vector<NodePerfCounterSnapshot>& snapshots,
-    RunProcessState& run_process_state) {
-  auto process_guard = run_process_state.Lock();
-  for (auto snapshot = snapshots.rbegin(); snapshot != snapshots.rend();
-       ++snapshot) {
-    RestoreNodePerfCounterSnapshot(*snapshot, process_guard);
   }
 }
 

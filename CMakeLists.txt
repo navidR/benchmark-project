@@ -315,6 +315,7 @@ add_executable(bbp
   src/simulator_option_parsing.cpp
   src/simulator_peer_topology_decoding.cpp
   src/simulator_perf_counter_attachment.cpp
+  src/simulator_perf_counter_transactions.cpp
   src/simulator_process_spawn_readiness.cpp
   src/simulator_profile_assignment.cpp
   src/simulator_raw_transaction_workload.cpp
@@ -616,6 +617,7 @@ if(BUILD_TESTING)
     src/simulator_option_parsing.cpp
     src/simulator_peer_topology_decoding.cpp
     src/simulator_perf_counter_attachment.cpp
+    src/simulator_perf_counter_transactions.cpp
     src/simulator_process_spawn_readiness.cpp
     src/simulator_profile_assignment.cpp
     src/simulator_raw_transaction_workload.cpp
