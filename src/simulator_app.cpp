@@ -162,6 +162,7 @@
 #include "simulator_source_scenario_persistence.h"
 #include "simulator_tcp_endpoint_reservation.h"
 #include "simulator_topology_edge_workload.h"
+#include "simulator_transaction_load_completion_publication.h"
 #include "simulator_transaction_observation_tracking.h"
 #include "simulator_wallet_configuration_decoding.h"
 #include "simulator_wallet_node_initialization.h"
@@ -571,6 +572,7 @@ using simulator_app_internal::WaitUntilHeightWorkloadJson;
 using simulator_app_internal::WalletTransactionsWorkloadJson;
 using simulator_app_internal::WorkloadJson;
 using simulator_app_internal::WriteScenarioFiles;
+using simulator_app_internal::WriteTransactionLoadCompletions;
 using simulator_app_internal::YamlFromJson;
 
 }  // namespace
@@ -584,25 +586,6 @@ void RequireSafeOutputDirectory(const std::filesystem::path& output_dir) {
   const std::filesystem::path absolute = std::filesystem::absolute(output_dir);
   if (absolute == absolute.root_path()) {
     throw std::runtime_error("output directory must not be filesystem root");
-  }
-}
-
-void WriteTransactionLoadCompletions(
-    const Options& options, const std::filesystem::path& events_path,
-    const std::vector<PendingTransactionLoadCompletion>& completions) {
-  for (const PendingTransactionLoadCompletion& completion : completions) {
-    if (!completion.accounting) {
-      throw std::runtime_error(
-          "pending transaction load completion has no accounting");
-    }
-    const TransactionLoadSnapshot snapshot =
-        completion.accounting->Snapshot(completion.elapsed);
-    WriteEvent(events_path, options.run_id, "sim",
-               SimulationEventKind::kTransactionLoadCompleted,
-               TransactionLoadCompletedDetail(
-                   completion.workload_index, completion.workload_count,
-                   completion.workload, completion.attempt_limit,
-                   completion.queue_maximum_size, snapshot));
   }
 }
 
