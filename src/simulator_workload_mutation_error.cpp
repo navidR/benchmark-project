@@ -3,6 +3,8 @@
 #include <exception>
 #include <string>
 
+#include "bbp/simulation_cancelled.h"
+
 namespace bbp::simulator_app_internal {
 namespace {
 
@@ -17,6 +19,20 @@ std::string ExceptionMessage(const std::exception_ptr& error) {
 }
 
 }  // namespace
+
+[[noreturn]] void RethrowWorkloadMutationAfterVerifiedRollback(
+    const std::exception_ptr& error) {
+  try {
+    std::rethrow_exception(error);
+  } catch (const SimulationCancelled&) {
+    throw WorkloadMutationCancelledAfterRollback();
+  } catch (const std::exception& exception) {
+    throw WorkloadMutationFailedAfterRollback(exception.what());
+  } catch (...) {
+    throw WorkloadMutationFailedAfterRollback(
+        "workload mutation failed after a verified rollback");
+  }
+}
 
 [[noreturn]] void ThrowWorkloadMutationOutcomeUnconfirmed(
     std::string_view context, const std::exception_ptr& original_error,

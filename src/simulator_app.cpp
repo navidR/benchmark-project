@@ -124,6 +124,7 @@
 #include "simulator_resource_event_details.h"
 #include "simulator_resource_limit_application.h"
 #include "simulator_resource_limit_decoding.h"
+#include "simulator_resource_limit_orchestration.h"
 #include "simulator_resource_profile_decoding.h"
 #include "simulator_retained_run_registry.h"
 #include "simulator_runtime_identity_details.h"
@@ -176,6 +177,7 @@ using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyPerfCounterCommand;
 using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
+using simulator_app_internal::ApplyResourceLimitUpdate;
 using simulator_app_internal::ApplyRuntimeNetworkBlockRules;
 using simulator_app_internal::ApplyRuntimeNetworkConditionUpdates;
 using simulator_app_internal::ApplyRuntimeNetworkPartition;
@@ -183,6 +185,7 @@ using simulator_app_internal::ApplyRuntimeNetworkPartitionHeals;
 using simulator_app_internal::ApplyRuntimeNetworkPartitions;
 using simulator_app_internal::ApplyRuntimeNetworkUnblockRules;
 using simulator_app_internal::ApplyRuntimeNodeFreezes;
+using simulator_app_internal::ApplyRuntimeResourceLimitUpdates;
 using simulator_app_internal::ApplyScenarioJson;
 using simulator_app_internal::ApplyScheduledScenarioEvents;
 using simulator_app_internal::ApplySendRawTransactionWorkload;
@@ -356,6 +359,7 @@ using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
 using simulator_app_internal::RestoreNodeNetworkCondition;
+using simulator_app_internal::RethrowWorkloadMutationAfterVerifiedRollback;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::RuntimeMasternodeAddContext;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
@@ -421,6 +425,8 @@ using simulator_app_internal::WalletWorkloadExecutionContext;
 using simulator_app_internal::WalletWorkloadExecutionEnd;
 using simulator_app_internal::WalletWorkloadExecutionResult;
 using simulator_app_internal::WalletWorkloadFundingState;
+using simulator_app_internal::WorkloadMutationCancelledAfterRollback;
+using simulator_app_internal::WorkloadMutationFailedAfterRollback;
 using simulator_app_internal::WorkloadMutationOutcomeUnconfirmed;
 using simulator_app_internal::WriteEvent;
 using simulator_app_internal::WriteLiveBlockGenerationWorkloadState;
@@ -481,17 +487,6 @@ std::string ExceptionMessage(const std::exception_ptr& error) {
   }
 }
 
-class WorkloadMutationCancelledAfterRollback final : public std::runtime_error {
- public:
-  WorkloadMutationCancelledAfterRollback()
-      : std::runtime_error("workload mutation cancellation was rolled back") {}
-};
-
-class WorkloadMutationFailedAfterRollback final : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
-
 constexpr auto kWorkloadServiceShutdownBound = std::chrono::seconds(15);
 
 class WorkloadServiceShutdownTimeout final : public std::runtime_error {
@@ -533,20 +528,6 @@ class WorkloadServiceShutdownTimeout final : public std::runtime_error {
   bool admission_closed_;
   bool cancellation_requested_;
 };
-
-[[noreturn]] void RethrowWorkloadMutationAfterVerifiedRollback(
-    const std::exception_ptr& error) {
-  try {
-    std::rethrow_exception(error);
-  } catch (const SimulationCancelled&) {
-    throw WorkloadMutationCancelledAfterRollback();
-  } catch (const std::exception& exception) {
-    throw WorkloadMutationFailedAfterRollback(exception.what());
-  } catch (...) {
-    throw WorkloadMutationFailedAfterRollback(
-        "workload mutation failed after a verified rollback");
-  }
-}
 
 constexpr auto kWorkloadMutationRollbackTimeout = std::chrono::seconds(10);
 
@@ -745,76 +726,6 @@ void ConnectAvailableStartupPeers(
       changed_node, lifecycle_epoch, stop_token);
 }
 
-void ApplyResourceLimitUpdate(
-    const Options& options, const std::filesystem::path& events_path,
-    NodeRuntime& node, const ResourceLimitPatch& patch,
-    std::stop_token stop_token = {},
-    const std::function<void()>& authorize_mutation = {},
-    std::optional<uint32_t> workload_index = std::nullopt,
-    std::optional<uint32_t> workload_count = std::nullopt,
-    std::optional<uint32_t> workload_node = std::nullopt,
-    std::optional<std::uint64_t> operator_sequence = std::nullopt,
-    bool resolve_operator_io_limit = false) {
-  std::lock_guard<std::mutex> lock(node_resource_state_mutex);
-  if (!node.cgroup) {
-    throw std::runtime_error("resource update requires a node cgroup");
-  }
-  const ResourceLimits previous = node.resources;
-  const ResourceLimitPatch effective_patch =
-      resolve_operator_io_limit
-          ? ResolveOperatorResourceLimitPatch(previous, patch)
-          : patch;
-  const ResourceLimits next =
-      ApplyResourceLimitPatch(previous, effective_patch, node.config.id);
-  ThrowIfStopRequested(stop_token);
-  const bool mutation_admitted = static_cast<bool>(authorize_mutation);
-  if (authorize_mutation) {
-    authorize_mutation();
-  }
-  try {
-    WriteResourceLimits(*node.cgroup, previous, next);
-    ThrowIfStopRequested(stop_token);
-  } catch (...) {
-    const std::exception_ptr apply_error = std::current_exception();
-    std::vector<std::string> rollback_errors;
-    try {
-      WriteResourceLimits(*node.cgroup, next, previous);
-    } catch (const std::exception& restore_error) {
-      rollback_errors.push_back(restore_error.what());
-      BBP_LOG(error) << "failed to restore partially applied resource update "
-                        "for "
-                     << node.config.id << ": " << restore_error.what();
-    } catch (...) {
-      rollback_errors.push_back("unknown exception");
-      BBP_LOG(error) << "failed to restore partially applied resource update "
-                        "for "
-                     << node.config.id << ": unknown exception";
-    }
-    if (!rollback_errors.empty()) {
-      ThrowWorkloadMutationOutcomeUnconfirmed(
-          "resource limit update outcome is unconfirmed", apply_error,
-          rollback_errors);
-    }
-    if (mutation_admitted) {
-      RethrowWorkloadMutationAfterVerifiedRollback(apply_error);
-    }
-    std::rethrow_exception(apply_error);
-  }
-  try {
-    node.resources = next;
-    node.resource_profile.clear();
-    WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kResourceLimitsUpdated,
-               ResourceLimitUpdateDetail(patch, previous, next, workload_index,
-                                         workload_count, workload_node,
-                                         operator_sequence));
-  } catch (...) {
-    ThrowWorkloadMutationOutcomeUnconfirmed(
-        "resource limit update completed without a publishable outcome",
-        std::current_exception());
-  }
-}
-
 void WriteProfileRollbackFailureEventSafely(
     const Options& options, const std::filesystem::path& events_path,
     WorkloadKind kind, std::string_view profile,
@@ -943,20 +854,6 @@ void ApplyResourceProfileSwitch(
     ThrowWorkloadMutationOutcomeUnconfirmed(
         "resource profile update completed without a publishable outcome",
         std::current_exception());
-  }
-}
-
-void ApplyRuntimeResourceLimitUpdates(const Options& options,
-                                      const std::filesystem::path& events_path,
-                                      auto& nodes, std::stop_token stop_token) {
-  for (const auto& [node_index, patch] :
-       options.runtime_node_resource_updates) {
-    ThrowIfStopRequested(stop_token);
-    if (node_index >= nodes.size()) {
-      throw std::runtime_error("runtime resource update node is out of range");
-    }
-    NodeRuntime& node = nodes[node_index];
-    ApplyResourceLimitUpdate(options, events_path, node, patch, stop_token);
   }
 }
 
@@ -3768,10 +3665,10 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               if (!command.resource_limit_patch) {
                 throw std::runtime_error("resource limit patch is missing");
               }
-              ApplyResourceLimitUpdate(options, events_path, node,
-                                       *command.resource_limit_patch, {}, {},
-                                       std::nullopt, std::nullopt, std::nullopt,
-                                       command.sequence, true);
+              ApplyResourceLimitUpdate(
+                  options, events_path, node, *command.resource_limit_patch,
+                  node_resource_state_mutex, {}, {}, std::nullopt, std::nullopt,
+                  std::nullopt, command.sequence, true);
             } else if (command.kind == SimulationCommandKind::kKillNode) {
               bool was_paused = false;
               {
@@ -7389,10 +7286,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               const ResourceLimitUpdateWorkload& workload =
                   scenario_workload.update_resource_limits;
               NodeRuntime& node = nodes[workload.node - 1U];
-              ApplyResourceLimitUpdate(options, events_path, node,
-                                       workload.patch, operation_stop_token,
-                                       authorize_mutation, action_index,
-                                       action_count, workload.node);
+              ApplyResourceLimitUpdate(
+                  options, events_path, node, workload.patch,
+                  node_resource_state_mutex, operation_stop_token,
+                  authorize_mutation, action_index, action_count,
+                  workload.node);
               break;
             }
             case WorkloadKind::kSetResourceProfile:
@@ -10573,7 +10471,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
           },
           stop_token);
 
-      ApplyRuntimeResourceLimitUpdates(options, events_path, nodes, stop_token);
+      ApplyRuntimeResourceLimitUpdates(options, events_path, nodes,
+                                       node_resource_state_mutex, stop_token);
       ApplyRuntimeNetworkConditionUpdates(options, events_path, nodes,
                                           node_network_state_mutex, stop_token);
       ApplyRuntimeNetworkBlockRules(options, events_path, nodes,
