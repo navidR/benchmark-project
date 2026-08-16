@@ -290,6 +290,7 @@ add_executable(bbp
   src/simulator_block_generation_boundary.cpp
   src/simulator_cancellable_waiting.cpp
   src/simulator_event_writing.cpp
+  src/simulator_height_wait_readback.cpp
   src/simulator_host_probes.cpp
   src/simulator_initial_peer_connectivity.cpp
   src/simulator_json_field_decoding.cpp
@@ -609,6 +610,7 @@ if(BUILD_TESTING)
     src/simulator_block_generation_boundary.cpp
     src/simulator_cancellable_waiting.cpp
     src/simulator_event_writing.cpp
+    src/simulator_height_wait_readback.cpp
     src/simulator_host_probes.cpp
     src/simulator_initial_peer_connectivity.cpp
     src/simulator_json_field_decoding.cpp

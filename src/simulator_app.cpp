@@ -93,6 +93,7 @@
 #include "simulator_block_generation_boundary.h"
 #include "simulator_cancellable_waiting.h"
 #include "simulator_event_writing.h"
+#include "simulator_height_wait_readback.h"
 #include "simulator_host_probes.h"
 #include "simulator_initial_peer_connectivity.h"
 #include "simulator_json_field_decoding.h"
@@ -422,6 +423,7 @@ using simulator_app_internal::ValidateNetworkPartitionRule;
 using simulator_app_internal::ValidateProfileSwitchReferences;
 using simulator_app_internal::ValidateWalletTransactionsWorkload;
 using simulator_app_internal::WaitForDuration;
+using simulator_app_internal::WaitForHeightReadback;
 using simulator_app_internal::WaitForNodeFrozenState;
 using simulator_app_internal::WaitForNodeProcessExitUntil;
 using simulator_app_internal::WaitUntil;
@@ -583,19 +585,6 @@ void RequireSafeOutputDirectory(const std::filesystem::path& output_dir) {
   if (absolute == absolute.root_path()) {
     throw std::runtime_error("output directory must not be filesystem root");
   }
-}
-
-std::optional<std::uint64_t> WaitForHeightReadback(
-    const ChainDriver& driver, const ChainNodeConfig& config,
-    std::uint64_t target_height, std::chrono::seconds timeout,
-    std::stop_token stop_token) {
-  driver.WaitForHeight(config, target_height, timeout, stop_token);
-  const std::uint64_t observed_height =
-      driver.ReadMetrics(config, stop_token).height;
-  if (observed_height < target_height) {
-    return std::nullopt;
-  }
-  return observed_height;
 }
 
 void WriteTransactionLoadCompletions(
