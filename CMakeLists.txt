@@ -314,6 +314,7 @@ add_executable(bbp
   src/simulator_offline_run_cleanup.cpp
   src/simulator_operator_connection_publication.cpp
   src/simulator_option_parsing.cpp
+  src/simulator_peer_churn_workloads.cpp
   src/simulator_peer_topology_decoding.cpp
   src/simulator_perf_counter_attachment.cpp
   src/simulator_perf_counter_transactions.cpp
@@ -629,6 +630,7 @@ if(BUILD_TESTING)
     src/simulator_offline_run_cleanup.cpp
     src/simulator_operator_connection_publication.cpp
     src/simulator_option_parsing.cpp
+    src/simulator_peer_churn_workloads.cpp
     src/simulator_peer_topology_decoding.cpp
     src/simulator_perf_counter_attachment.cpp
     src/simulator_perf_counter_transactions.cpp
