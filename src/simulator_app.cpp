@@ -745,100 +745,6 @@ void ConnectAvailableStartupPeers(
       changed_node, lifecycle_epoch, stop_token);
 }
 
-void StartNodes(const Options& options, const std::filesystem::path& run_root,
-                const std::filesystem::path& events_path,
-                const ChainDriverSpec& chain_spec, const ChainDriver& driver,
-                const RuntimePeerTopology& runtime_topology,
-                std::vector<NodeRuntime>& nodes,
-                RunProcessState& run_process_state,
-                std::chrono::steady_clock::time_point simulation_epoch,
-                std::stop_token stop_token) {
-  if (options.isolate_network) {
-    RequireNetworkSetupCapabilities();
-  }
-  if (options.isolate_network && options.nodes > 1 &&
-      !HostIpv4ForwardingEnabled()) {
-    throw std::runtime_error(
-        "isolated multi-node chain runs require IPv4 forwarding in the parent "
-        "network namespace");
-  }
-  nodes.reserve(options.nodes);
-  std::vector<ChainNodeConfig> prepared_configs;
-  prepared_configs.reserve(options.nodes);
-  for (uint32_t i = 0; i < options.nodes; ++i) {
-    ChainNodeConfigRequest config_request;
-    config_request.run_id = options.run_id;
-    config_request.run_root = run_root;
-    config_request.daemon_binary = EffectiveNodeBinary(options, i);
-    config_request.data_dir = NodeDataDirectoryRelative(options, i);
-    config_request.node_index = i;
-    config_request.network = EffectiveNodeChainNetwork(options, i);
-    config_request.extra_args = EffectiveNodeExtraArgs(options, i);
-    if (!options.node_ids.empty()) {
-      config_request.node_id = options.node_ids.at(i);
-    }
-    config_request.wallet_enabled =
-        EffectiveNodeWalletConfig(options, i).enabled;
-    config_request.connect_peers =
-        StartupPeerAddresses(options, runtime_topology, chain_spec, i);
-    prepared_configs.push_back(MakeChainNodeConfig(chain_spec, config_request));
-  }
-  RuntimeNodeResourceManifest startup_manifest{
-      .ownership = RequireRunOwnership(options),
-      .isolated_network = options.isolate_network,
-      .nodes = {},
-  };
-  startup_manifest.nodes.reserve(prepared_configs.size());
-  WriteRuntimeNodeResourceManifest(startup_manifest);
-
-  for (uint32_t i = 0; i < options.nodes; ++i) {
-    ThrowIfStopRequested(stop_token);
-    std::string resource_profile_name;
-    const auto resource_profile = options.node_resource_profiles.find(i);
-    if (resource_profile != options.node_resource_profiles.end()) {
-      resource_profile_name = resource_profile->second;
-    }
-    std::string network_profile_name;
-    const auto network_profile = options.node_network_profiles.find(i);
-    if (network_profile != options.node_network_profiles.end()) {
-      network_profile_name = network_profile->second;
-    }
-    std::vector<DirectionalNetworkPolicy> directional_network_policies;
-    if (options.isolate_network) {
-      directional_network_policies =
-          DirectionalNetworkPoliciesForNode(options, runtime_topology, i);
-    }
-    nodes.emplace_back();
-    startup_manifest.nodes.push_back(
-        RuntimeNodeResourceEntryFor(options, prepared_configs[i], i,
-                                    RuntimeNodeResourceState::kPendingAdd));
-    WriteRuntimeNodeResourceManifest(startup_manifest);
-    PrepareNodeRuntime(
-        options, events_path, nodes.back(), std::move(prepared_configs[i]), i,
-        InitialResourceLimits(options, i), std::move(resource_profile_name),
-        std::move(network_profile_name),
-        std::move(directional_network_policies), std::nullopt,
-        run_process_state, stop_token);
-    nodes.back().lifecycle_policy = EffectiveNodeLifecyclePolicy(options, i);
-  }
-
-  simulator_app_internal::StartInitialPreparedNodes(
-      options, events_path, driver, nodes, node_network_state_mutex,
-      simulation_epoch, stop_token);
-  ConnectAvailableStartupPeers(options, events_path, driver, nodes,
-                               std::nullopt, simulation_epoch, stop_token);
-  for (RuntimeNodeResourceEntry& entry : startup_manifest.nodes) {
-    entry.state = RuntimeNodeResourceState::kLive;
-  }
-  WriteRuntimeNodeResourceManifest(startup_manifest);
-  const std::optional<RuntimeNodeResourceManifest> published_manifest =
-      TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
-  if (!published_manifest || *published_manifest != startup_manifest) {
-    throw std::runtime_error(
-        "startup runtime resource manifest read-back failed");
-  }
-}
-
 void ApplyResourceLimitUpdate(
     const Options& options, const std::filesystem::path& events_path,
     NodeRuntime& node, const ResourceLimitPatch& patch,
@@ -3324,9 +3230,10 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   };
   try {
     try {
-      StartNodes(options, run_root, events_path, chain_spec, driver,
-                 *runtime_topology, startup_nodes, run_process_state,
-                 lifecycle_epoch, stop_token);
+      simulator_app_internal::StartInitialNodes(
+          options, run_root, events_path, chain_spec, driver, *runtime_topology,
+          startup_nodes, run_process_state, node_network_state_mutex,
+          lifecycle_epoch, stop_token);
     } catch (...) {
       initialize_node_inventory();
       throw;

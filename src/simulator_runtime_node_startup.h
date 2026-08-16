@@ -12,10 +12,13 @@
 namespace bbp {
 
 class ChainDriver;
+struct ChainDriverSpec;
 struct ChainNodeConfig;
 struct NodeRuntime;
 struct Options;
+class RunProcessState;
 class RuntimeNodeSnapshot;
+class RuntimePeerTopology;
 
 namespace simulator_app_internal {
 
@@ -41,6 +44,15 @@ bool StartPreparedNode(const Options& options,
                        std::string_view reason,
                        std::chrono::steady_clock::time_point lifecycle_epoch,
                        std::stop_token stop_token);
+
+void StartInitialNodes(
+    const Options& options, const std::filesystem::path& run_root,
+    const std::filesystem::path& events_path, const ChainDriverSpec& chain_spec,
+    const ChainDriver& driver, const RuntimePeerTopology& runtime_topology,
+    std::vector<NodeRuntime>& nodes, RunProcessState& run_process_state,
+    std::mutex& node_network_state_mutex,
+    std::chrono::steady_clock::time_point simulation_epoch,
+    std::stop_token stop_token);
 
 void StartInitialPreparedNodes(
     const Options& options, const std::filesystem::path& events_path,
