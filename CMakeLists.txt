@@ -292,6 +292,7 @@ add_executable(bbp
   src/simulator_event_writing.cpp
   src/simulator_host_probes.cpp
   src/simulator_json_field_decoding.cpp
+  src/simulator_live_workload_state.cpp
   src/simulator_managed_run_root.cpp
   src/simulator_masternode_funding_boundary.cpp
   src/simulator_metrics_json.cpp
@@ -591,6 +592,7 @@ if(BUILD_TESTING)
     src/simulator_event_writing.cpp
     src/simulator_host_probes.cpp
     src/simulator_json_field_decoding.cpp
+    src/simulator_live_workload_state.cpp
     src/simulator_managed_run_root.cpp
     src/simulator_masternode_funding_boundary.cpp
     src/simulator_metrics_json.cpp
