@@ -332,6 +332,7 @@ add_executable(bbp
   src/simulator_runtime_network_partition_rules.cpp
   src/simulator_runtime_node_addition.cpp
   src/simulator_runtime_node_cleanup.cpp
+  src/simulator_runtime_node_freeze.cpp
   src/simulator_runtime_node_removal.cpp
   src/simulator_runtime_node_replacement.cpp
   src/simulator_runtime_published_node_config.cpp
@@ -639,6 +640,7 @@ if(BUILD_TESTING)
     src/simulator_runtime_network_partition_rules.cpp
     src/simulator_runtime_node_addition.cpp
     src/simulator_runtime_node_cleanup.cpp
+    src/simulator_runtime_node_freeze.cpp
     src/simulator_runtime_node_removal.cpp
     src/simulator_runtime_node_replacement.cpp
     src/simulator_runtime_published_node_config.cpp
