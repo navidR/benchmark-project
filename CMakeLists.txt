@@ -347,6 +347,7 @@ add_executable(bbp
   src/simulator_wallet_node_initialization.cpp
   src/simulator_wallet_transaction_distribution_decoding.cpp
   src/simulator_wallet_transaction_validation.cpp
+  src/simulator_wallet_transaction_workload_execution.cpp
   src/simulator_workload_event_details.cpp
   src/simulator_workload_mutation_error.cpp
   src/simulator_yaml_decoding.cpp
@@ -645,6 +646,7 @@ if(BUILD_TESTING)
     src/simulator_wallet_node_initialization.cpp
     src/simulator_wallet_transaction_distribution_decoding.cpp
     src/simulator_wallet_transaction_validation.cpp
+    src/simulator_wallet_transaction_workload_execution.cpp
     src/simulator_workload_event_details.cpp
     src/simulator_workload_mutation_error.cpp
     src/simulator_yaml_decoding.cpp

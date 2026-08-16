@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <stdexcept>
 
 #include "bbp/simulation_cancelled.h"
 #include "simulator_node_process_state.h"
@@ -12,6 +13,20 @@ void ThrowIfStopRequested(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
     throw SimulationCancelled();
   }
+}
+
+std::chrono::steady_clock::time_point SteadyDeadline(
+    std::chrono::steady_clock::time_point epoch,
+    std::chrono::milliseconds delay) {
+  const auto remaining = std::chrono::steady_clock::time_point::max() - epoch;
+  const auto maximum_delay =
+      std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+  if (delay > maximum_delay) {
+    throw std::runtime_error(
+        "scheduled event time exceeds monotonic clock range");
+  }
+  return epoch +
+         std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay);
 }
 
 void WaitForDuration(std::chrono::milliseconds duration,
