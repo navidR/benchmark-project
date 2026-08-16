@@ -319,6 +319,7 @@ add_executable(bbp
   src/simulator_perf_counter_transactions.cpp
   src/simulator_process_spawn_readiness.cpp
   src/simulator_profile_assignment.cpp
+  src/simulator_profile_switching.cpp
   src/simulator_raw_transaction_workload.cpp
   src/simulator_resolved_scenario_persistence.cpp
   src/simulator_retained_run_registry.cpp
@@ -632,6 +633,7 @@ if(BUILD_TESTING)
     src/simulator_perf_counter_transactions.cpp
     src/simulator_process_spawn_readiness.cpp
     src/simulator_profile_assignment.cpp
+    src/simulator_profile_switching.cpp
     src/simulator_raw_transaction_workload.cpp
     src/simulator_resolved_scenario_persistence.cpp
     src/simulator_retained_run_registry.cpp

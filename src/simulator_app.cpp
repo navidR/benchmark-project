@@ -119,6 +119,7 @@
 #include "simulator_perf_counter_transactions.h"
 #include "simulator_process_spawn_readiness.h"
 #include "simulator_profile_assignment.h"
+#include "simulator_profile_switching.h"
 #include "simulator_raw_transaction_workload.h"
 #include "simulator_resolved_scenario_persistence.h"
 #include "simulator_resource_event_details.h"
@@ -173,11 +174,13 @@ using simulator_app_internal::AddRuntimeNodesTransactional;
 using simulator_app_internal::ApplyDeclarativeStopDuringStart;
 using simulator_app_internal::ApplyNetworkBlockRules;
 using simulator_app_internal::ApplyNetworkPartitionRules;
+using simulator_app_internal::ApplyNetworkProfileSwitch;
 using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyPerfCounterCommand;
 using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ApplyResourceLimitUpdate;
+using simulator_app_internal::ApplyResourceProfileSwitch;
 using simulator_app_internal::ApplyRuntimeNetworkBlockRules;
 using simulator_app_internal::ApplyRuntimeNetworkConditionUpdates;
 using simulator_app_internal::ApplyRuntimeNetworkPartition;
@@ -320,7 +323,6 @@ using simulator_app_internal::PrepareManagedRunRoot;
 using simulator_app_internal::PrepareMasternodeFunding;
 using simulator_app_internal::PrepareNodeRuntime;
 using simulator_app_internal::ProcessExitDetail;
-using simulator_app_internal::ProfileRollbackFailureDetail;
 using simulator_app_internal::PublishOperatorConnectionCommand;
 using simulator_app_internal::RawTransactionDetail;
 using simulator_app_internal::RecordAndPublishGeneratedBlockWorkloadBoundary;
@@ -354,12 +356,9 @@ using simulator_app_internal::ResetNodePerfCounters;
 using simulator_app_internal::ResolveNodeProfileAssignments;
 using simulator_app_internal::ResourceLimitUpdateDetail;
 using simulator_app_internal::ResourcePressureDetail;
-using simulator_app_internal::ResourceProfileUpdateDetail;
 using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
-using simulator_app_internal::RestoreNodeNetworkCondition;
-using simulator_app_internal::RethrowWorkloadMutationAfterVerifiedRollback;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::RuntimeMasternodeAddContext;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
@@ -412,7 +411,6 @@ using simulator_app_internal::ValidateLiveInstrumentationDuration;
 using simulator_app_internal::ValidateNetworkPartitionRule;
 using simulator_app_internal::ValidateProfileSwitchReferences;
 using simulator_app_internal::ValidateWalletTransactionsWorkload;
-using simulator_app_internal::VerifyNodeNetworkCondition;
 using simulator_app_internal::WaitForDuration;
 using simulator_app_internal::WaitForNodeFrozenState;
 using simulator_app_internal::WaitForNodeProcessExitUntil;
@@ -617,7 +615,6 @@ using simulator_app_internal::NetworkBlockRuleJson;
 using simulator_app_internal::NetworkConditionJson;
 using simulator_app_internal::NetworkConditionVerificationDetail;
 using simulator_app_internal::NetworkPartitionRuleJson;
-using simulator_app_internal::NetworkProfileUpdateDetail;
 using simulator_app_internal::NodeRoleTopologyJson;
 using simulator_app_internal::PerfCounterNamesJson;
 using simulator_app_internal::QdiscJson;
@@ -724,137 +721,6 @@ void ConnectAvailableStartupPeers(
   simulator_app_internal::ConnectAvailableStartupPeers(
       options, events_path, driver, nodes, node_network_state_mutex,
       changed_node, lifecycle_epoch, stop_token);
-}
-
-void WriteProfileRollbackFailureEventSafely(
-    const Options& options, const std::filesystem::path& events_path,
-    WorkloadKind kind, std::string_view profile,
-    const std::exception_ptr& original_error,
-    const std::vector<std::string>& rollback_errors) noexcept {
-  if (rollback_errors.empty()) {
-    return;
-  }
-  try {
-    WriteEvent(
-        events_path, options.run_id, "sim",
-        SimulationEventKind::kProfileUpdateRollbackFailed,
-        ProfileRollbackFailureDetail(
-            kind, profile, ExceptionMessage(original_error), rollback_errors));
-  } catch (const std::exception& event_error) {
-    BBP_LOG(error) << "failed to record profile rollback failure: "
-                   << event_error.what();
-  } catch (...) {
-    BBP_LOG(error) << "failed to record profile rollback failure: unknown "
-                      "exception";
-  }
-}
-
-void ApplyResourceProfileSwitch(
-    const Options& options, const std::filesystem::path& events_path,
-    auto& nodes, const ProfileSwitchWorkload& workload, uint32_t workload_index,
-    uint32_t workload_count, std::stop_token stop_token,
-    const std::function<void()>& authorize_mutation = {}) {
-  const ResourceLimits& desired =
-      options.resource_profiles.at(workload.profile);
-  struct PreviousState {
-    uint32_t node = 0U;
-    ResourceLimits limits;
-    std::string profile;
-  };
-  std::vector<PreviousState> previous_states;
-  previous_states.reserve(workload.nodes.size());
-  std::vector<std::size_t> attempted;
-
-  {
-    std::lock_guard<std::mutex> lock(node_resource_state_mutex);
-    for (const uint32_t one_based_node : workload.nodes) {
-      if (one_based_node == 0U || one_based_node > nodes.size()) {
-        throw std::runtime_error(
-            "resource profile target node is out of range");
-      }
-      const NodeRuntime& runtime = nodes[one_based_node - 1U];
-      if (!runtime.cgroup) {
-        throw std::runtime_error("resource profile update requires a cgroup");
-      }
-      previous_states.push_back(PreviousState{
-          .node = one_based_node,
-          .limits = runtime.resources,
-          .profile = runtime.resource_profile,
-      });
-    }
-
-    attempted.reserve(previous_states.size());
-    bool mutation_admitted = false;
-    try {
-      for (std::size_t index = 0; index < previous_states.size(); ++index) {
-        ThrowIfStopRequested(stop_token);
-        NodeRuntime& runtime = nodes[previous_states[index].node - 1U];
-        if (!mutation_admitted && authorize_mutation) {
-          authorize_mutation();
-          mutation_admitted = true;
-        }
-        attempted.push_back(index);
-        WriteResourceLimits(*runtime.cgroup, previous_states[index].limits,
-                            desired);
-        ThrowIfStopRequested(stop_token);
-      }
-    } catch (...) {
-      const std::exception_ptr original_error = std::current_exception();
-      std::vector<std::string> rollback_errors;
-      for (auto iter = attempted.rbegin(); iter != attempted.rend(); ++iter) {
-        const PreviousState& previous = previous_states[*iter];
-        NodeRuntime& runtime = nodes[previous.node - 1U];
-        try {
-          WriteResourceLimits(*runtime.cgroup, desired, previous.limits);
-        } catch (const std::exception& error) {
-          rollback_errors.push_back(runtime.config.id + ": " + error.what());
-        } catch (...) {
-          rollback_errors.push_back(runtime.config.id +
-                                    ": unknown rollback error");
-        }
-      }
-      WriteProfileRollbackFailureEventSafely(
-          options, events_path, WorkloadKind::kSetResourceProfile,
-          workload.profile, original_error, rollback_errors);
-      if (!rollback_errors.empty()) {
-        ThrowWorkloadMutationOutcomeUnconfirmed(
-            "resource profile update outcome is unconfirmed", original_error,
-            rollback_errors);
-      }
-      if (mutation_admitted) {
-        RethrowWorkloadMutationAfterVerifiedRollback(original_error);
-      }
-      std::rethrow_exception(original_error);
-    }
-
-    try {
-      for (const PreviousState& previous : previous_states) {
-        NodeRuntime& runtime = nodes[previous.node - 1U];
-        runtime.resources = desired;
-        runtime.resource_profile = workload.profile;
-      }
-    } catch (...) {
-      ThrowWorkloadMutationOutcomeUnconfirmed(
-          "resource profile kernel state was applied without a coherent "
-          "runtime state",
-          std::current_exception());
-    }
-  }
-
-  try {
-    for (const PreviousState& previous : previous_states) {
-      const NodeRuntime& runtime = nodes[previous.node - 1U];
-      WriteEvent(events_path, options.run_id, runtime.config.id,
-                 SimulationEventKind::kResourceProfileUpdated,
-                 ResourceProfileUpdateDetail(
-                     workload, previous.node, previous.profile, previous.limits,
-                     desired, workload_index, workload_count));
-    }
-  } catch (...) {
-    ThrowWorkloadMutationOutcomeUnconfirmed(
-        "resource profile update completed without a publishable outcome",
-        std::current_exception());
-  }
 }
 
 void ApplyResourcePressureWorkload(
@@ -1578,116 +1444,6 @@ void ApplyTopologyEdgeWorkload(
           rollback_errors);
     }
     std::rethrow_exception(original_error);
-  }
-}
-
-void ApplyNetworkProfileSwitch(const Options& options,
-                               const std::filesystem::path& events_path,
-                               auto& nodes,
-                               const ProfileSwitchWorkload& workload,
-                               uint32_t workload_index, uint32_t workload_count,
-                               std::stop_token stop_token) {
-  const NetworkCondition& desired =
-      options.network_profiles.at(workload.profile);
-  struct PreviousState {
-    uint32_t node = 0U;
-    NodeVethConfig network;
-    std::string profile;
-    NodeVethConfig current_network;
-    QdiscInfo applied_qdisc{};
-  };
-  std::vector<PreviousState> previous_states;
-  previous_states.reserve(workload.nodes.size());
-  std::vector<std::size_t> attempted;
-
-  {
-    std::lock_guard<std::mutex> lock(node_network_state_mutex);
-    for (const uint32_t one_based_node : workload.nodes) {
-      if (one_based_node == 0U || one_based_node > nodes.size()) {
-        throw std::runtime_error("network profile target node is out of range");
-      }
-      const NodeRuntime& runtime = nodes[one_based_node - 1U];
-      if (!runtime.network) {
-        throw std::runtime_error(
-            "network profile update requires isolated networking");
-      }
-      previous_states.push_back(PreviousState{
-          .node = one_based_node,
-          .network = *runtime.network,
-          .profile = runtime.network_profile,
-          .current_network = {},
-          .applied_qdisc = {},
-      });
-    }
-
-    try {
-      for (std::size_t index = 0; index < previous_states.size(); ++index) {
-        ThrowIfStopRequested(stop_token);
-        attempted.push_back(index);
-        PreviousState& previous = previous_states[index];
-        NodeVethConfig desired_network = previous.network;
-        desired_network.apply_condition = true;
-        desired_network.condition = desired;
-        ReplaceNetworkConditionQdisc(desired_network.host_name, desired);
-        ThrowIfStopRequested(stop_token);
-        previous.applied_qdisc =
-            VerifyNodeNetworkCondition(desired_network, stop_token);
-        previous.current_network = std::move(desired_network);
-      }
-    } catch (...) {
-      const std::exception_ptr original_error = std::current_exception();
-      std::vector<std::string> rollback_errors;
-      for (auto iter = attempted.rbegin(); iter != attempted.rend(); ++iter) {
-        const PreviousState& previous = previous_states[*iter];
-        try {
-          RestoreNodeNetworkCondition(previous.network);
-        } catch (const std::exception& error) {
-          rollback_errors.push_back(nodes[previous.node - 1U].config.id + ": " +
-                                    error.what());
-        } catch (...) {
-          rollback_errors.push_back(nodes[previous.node - 1U].config.id +
-                                    ": unknown rollback error");
-        }
-      }
-      WriteProfileRollbackFailureEventSafely(
-          options, events_path, WorkloadKind::kSetNetworkProfile,
-          workload.profile, original_error, rollback_errors);
-      if (!rollback_errors.empty()) {
-        ThrowWorkloadMutationOutcomeUnconfirmed(
-            "network profile update outcome is unconfirmed", original_error,
-            rollback_errors);
-      }
-      std::rethrow_exception(original_error);
-    }
-
-    try {
-      for (PreviousState& previous : previous_states) {
-        NodeRuntime& runtime = nodes[previous.node - 1U];
-        runtime.network = previous.current_network;
-        runtime.network_profile = workload.profile;
-      }
-    } catch (...) {
-      ThrowWorkloadMutationOutcomeUnconfirmed(
-          "network profile kernel state was applied without a coherent "
-          "runtime state",
-          std::current_exception());
-    }
-  }
-
-  try {
-    for (const PreviousState& previous : previous_states) {
-      const NodeRuntime& runtime = nodes[previous.node - 1U];
-      WriteEvent(events_path, options.run_id, runtime.config.id,
-                 SimulationEventKind::kNetworkProfileUpdated,
-                 NetworkProfileUpdateDetail(
-                     workload, previous.node, previous.profile,
-                     previous.network, previous.current_network,
-                     previous.applied_qdisc, workload_index, workload_count));
-    }
-  } catch (...) {
-    ThrowWorkloadMutationOutcomeUnconfirmed(
-        "network profile update completed without a publishable outcome",
-        std::current_exception());
   }
 }
 
@@ -4301,14 +4057,15 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                                            *command.profile);
                 }
                 ApplyResourceProfileSwitch(options, events_path, nodes,
-                                           workload, 0U, 0U,
-                                           command_stop_token);
+                                           node_resource_state_mutex, workload,
+                                           0U, 0U, command_stop_token);
               } else {
                 if (!options.network_profiles.contains(*command.profile)) {
                   throw std::runtime_error("unknown network profile: " +
                                            *command.profile);
                 }
-                ApplyNetworkProfileSwitch(options, events_path, nodes, workload,
+                ApplyNetworkProfileSwitch(options, events_path, nodes,
+                                          node_network_state_mutex, workload,
                                           0U, 0U, command_stop_token);
               }
             } else {
@@ -7295,14 +7052,15 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             }
             case WorkloadKind::kSetResourceProfile:
               ApplyResourceProfileSwitch(
-                  options, events_path, nodes, scenario_workload.profile_switch,
-                  action_index, action_count, operation_stop_token,
-                  authorize_mutation);
+                  options, events_path, nodes, node_resource_state_mutex,
+                  scenario_workload.profile_switch, action_index, action_count,
+                  operation_stop_token, authorize_mutation);
               break;
             case WorkloadKind::kSetNetworkProfile:
               ApplyNetworkProfileSwitch(
-                  options, events_path, nodes, scenario_workload.profile_switch,
-                  action_index, action_count, operation_stop_token);
+                  options, events_path, nodes, node_network_state_mutex,
+                  scenario_workload.profile_switch, action_index, action_count,
+                  operation_stop_token);
               break;
             case WorkloadKind::kResourcePressure:
               ApplyResourcePressureWorkload(
