@@ -13,7 +13,6 @@
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
-#include <boost/program_options.hpp>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -130,6 +129,7 @@
 #include "simulator_runtime_network_condition_updates.h"
 #include "simulator_runtime_network_partition_rules.h"
 #include "simulator_runtime_published_node_config.h"
+#include "simulator_runtime_workload_validation.h"
 #include "simulator_scenario_chain_decoding.h"
 #include "simulator_scenario_identifier.h"
 #include "simulator_scenario_mutation_option_decoding.h"
@@ -169,7 +169,6 @@ using simulator_app_internal::ApplyRuntimeNetworkPartitionHeals;
 using simulator_app_internal::ApplyRuntimeNetworkPartitions;
 using simulator_app_internal::ApplyRuntimeNetworkUnblockRules;
 using simulator_app_internal::ApplyScenarioJson;
-using simulator_app_internal::ApplyScenarioWorkloads;
 using simulator_app_internal::ApplyScheduledScenarioEvents;
 using simulator_app_internal::ApplySendRawTransactionWorkload;
 using simulator_app_internal::ApplyWalletTransactionsWorkload;
@@ -262,6 +261,10 @@ using simulator_app_internal::NodeRoleName;
 using simulator_app_internal::OneShotRawTransactionRejected;
 using simulator_app_internal::OperatorWalletTransactionDetail;
 using simulator_app_internal::ParseAmountDistribution;
+using simulator_app_internal::ParseAndValidateLiveBlockGenerationWorkload;
+using simulator_app_internal::ParseAndValidateLiveWaitForPeersWorkload;
+using simulator_app_internal::ParseAndValidateLiveWaitUntilHeightWorkload;
+using simulator_app_internal::ParseAndValidateOneShotWorkload;
 using simulator_app_internal::ParseIntervalDistribution;
 using simulator_app_internal::ParseIoLimits;
 using simulator_app_internal::ParseNetworkBlockRuleObject;
@@ -329,6 +332,7 @@ using simulator_app_internal::RestoreNodeNetworkCondition;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
 using simulator_app_internal::RuntimeNodePointers;
+using simulator_app_internal::RuntimeOneShotWorkloadValidationOptions;
 using simulator_app_internal::RuntimePartitionRule;
 using simulator_app_internal::RuntimePublishedNodeConfig;
 using simulator_app_internal::RuntimeRoleGenerationDetail;
@@ -361,7 +365,6 @@ using simulator_app_internal::TransactionSetObservation;
 using simulator_app_internal::TransitionNodeState;
 using simulator_app_internal::ValidateNetworkPartitionRule;
 using simulator_app_internal::ValidateProfileSwitchReferences;
-using simulator_app_internal::ValidateScenarioWorkload;
 using simulator_app_internal::ValidateWalletTransactionsWorkload;
 using simulator_app_internal::VerifyNodeNetworkCondition;
 using simulator_app_internal::WaitForDuration;
@@ -2300,157 +2303,6 @@ void ApplyTopologyEdgeWorkload(
     }
     std::rethrow_exception(original_error);
   }
-}
-
-BlockGenerationWorkload ParseAndValidateLiveBlockGenerationWorkload(
-    const boost::json::object& workload, const Options& options,
-    const RuntimeNodeSnapshot& nodes) {
-  if (nodes.empty()) {
-    throw McpOperationFailure(
-        "workload_node_unavailable",
-        "block generation requires at least one active node", true);
-  }
-  boost::json::array workloads;
-  workloads.emplace_back(workload);
-  Options validation_options = options;
-  validation_options.workloads.clear();
-  validation_options.scheduled_events.clear();
-  if (validation_options.generate_node == 0U) {
-    validation_options.generate_node = 1U;
-  }
-  boost::program_options::variables_map variables;
-  ApplyScenarioWorkloads(workloads, variables, validation_options);
-  if (validation_options.workloads.size() != 1U ||
-      validation_options.workloads.front().kind !=
-          WorkloadKind::kBlockGeneration) {
-    throw std::runtime_error(
-        "workload operation requires a block_generation workload");
-  }
-  const BlockGenerationWorkload parsed =
-      validation_options.workloads.front().block_generation;
-  static_cast<void>(RequireRuntimeNodeNumber(nodes, parsed.node,
-                                             "block generation workload"));
-  return parsed;
-}
-
-WaitUntilHeightWorkload ParseAndValidateLiveWaitUntilHeightWorkload(
-    const boost::json::object& workload, const Options& options,
-    const RuntimeNodeSnapshot& nodes) {
-  if (nodes.empty()) {
-    throw McpOperationFailure(
-        "workload_node_unavailable",
-        "wait-until-height requires at least one active node", true);
-  }
-  boost::json::array workloads;
-  workloads.emplace_back(workload);
-  Options validation_options = options;
-  validation_options.workloads.clear();
-  validation_options.scheduled_events.clear();
-  boost::program_options::variables_map variables;
-  ApplyScenarioWorkloads(workloads, variables, validation_options);
-  if (validation_options.workloads.size() != 1U ||
-      validation_options.workloads.front().kind !=
-          WorkloadKind::kWaitUntilHeight) {
-    throw std::runtime_error(
-        "workload operation requires a wait_until_height workload");
-  }
-  WaitUntilHeightWorkload parsed =
-      validation_options.workloads.front().wait_until_height;
-  parsed.node_id =
-      RequireRuntimeNodeNumber(nodes, parsed.node, "wait_until_height workload")
-          .config.id;
-  if (parsed.timeout_sec == 0U) {
-    throw std::runtime_error(
-        "wait_until_height timeout_sec must be greater than zero");
-  }
-  return parsed;
-}
-
-WaitForPeersWorkload ParseAndValidateLiveWaitForPeersWorkload(
-    const boost::json::object& workload, const Options& options,
-    const RuntimeNodeSnapshot& nodes) {
-  if (nodes.empty()) {
-    throw McpOperationFailure(
-        "workload_node_unavailable",
-        "wait-for-peers requires at least one active node", true);
-  }
-  boost::json::array workloads;
-  workloads.emplace_back(workload);
-  Options validation_options = options;
-  validation_options.workloads.clear();
-  validation_options.scheduled_events.clear();
-  boost::program_options::variables_map variables;
-  ApplyScenarioWorkloads(workloads, variables, validation_options);
-  if (validation_options.workloads.size() != 1U ||
-      validation_options.workloads.front().kind !=
-          WorkloadKind::kWaitForPeers) {
-    throw std::runtime_error(
-        "workload operation requires a wait_for_peers workload");
-  }
-  const WaitForPeersWorkload parsed =
-      validation_options.workloads.front().wait_for_peers;
-  static_cast<void>(
-      RequireRuntimeNodeNumber(nodes, parsed.node, "wait_for_peers workload"));
-  if (parsed.peer_count == 0U) {
-    throw std::runtime_error(
-        "wait_for_peers peer_count must be greater than zero");
-  }
-  if (parsed.timeout_sec == 0U) {
-    throw std::runtime_error(
-        "wait_for_peers timeout_sec must be greater than zero");
-  }
-  return parsed;
-}
-
-Options RuntimeOneShotWorkloadValidationOptions(
-    const Options& options, const RuntimeNodeSnapshot& nodes,
-    const RuntimeWalletSnapshot& roles,
-    const PeerTopologyConfig& live_topology_config) {
-  if (nodes.size() > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::overflow_error(
-        "runtime node inventory exceeds one-shot workload uint32 limit");
-  }
-  Options validation = options;
-  validation.nodes = static_cast<std::uint32_t>(nodes.size());
-  validation.node_ids.clear();
-  validation.node_ids.reserve(nodes.size());
-  for (const NodeRuntime& node : nodes) {
-    validation.node_ids.push_back(node.config.id);
-  }
-  validation.topology = roles.registry().topology();
-  validation.topology.node_count = validation.nodes;
-  validation.topology.peer_topology = live_topology_config;
-  validation.empty_control_plane = nodes.empty();
-  validation.generate_node = nodes.empty() ? 0U : 1U;
-  validation.workloads.clear();
-  validation.scheduled_events.clear();
-  validation.workloads_configured = false;
-  validation.wallet_backed_workload_requested = false;
-  return validation;
-}
-
-ScenarioWorkload ParseAndValidateOneShotWorkload(
-    const boost::json::object& workload, Options validation_options) {
-  boost::json::array workloads;
-  workloads.emplace_back(workload);
-  boost::program_options::variables_map variables;
-  ApplyScenarioWorkloads(workloads, variables, validation_options);
-  if (validation_options.workloads.size() != 1U) {
-    throw std::logic_error(
-        "one-shot workload parser did not produce exactly one workload");
-  }
-  ScenarioWorkload parsed = std::move(validation_options.workloads.front());
-  if (!IsOneShotWorkloadKind(parsed.kind)) {
-    throw McpOperationFailure(
-        "workload_not_one_shot",
-        "workload.invoke requires a finite one-shot workload; use "
-        "workload.start for " +
-            std::string(WorkloadKindName(parsed.kind)),
-        false);
-  }
-  ValidateScenarioWorkload(parsed, validation_options.nodes,
-                           validation_options);
-  return parsed;
 }
 
 void ApplyNetworkProfileSwitch(const Options& options,
@@ -20082,28 +19934,6 @@ boost::json::object ResolveScenario(const boost::json::object& scenario) {
   const Options options = ParseAndValidateScenario(scenario);
   return BuildResolvedScenarioDocument(options,
                                        ChainDriverSpecFor(options.chain));
-}
-
-WalletTransactionsWorkload ParseAndValidateWalletTransactionsWorkload(
-    const boost::json::object& workload, const Options& options) {
-  boost::json::array workloads;
-  workloads.emplace_back(workload);
-  Options validation_options = options;
-  validation_options.workloads.clear();
-  validation_options.scheduled_events.clear();
-  validation_options.wallet_backed_workload_requested = false;
-  boost::program_options::variables_map variables;
-  ApplyScenarioWorkloads(workloads, variables, validation_options);
-  if (validation_options.workloads.size() != 1U ||
-      validation_options.workloads.front().kind !=
-          WorkloadKind::kWalletTransactions) {
-    throw std::runtime_error(
-        "workload operation requires a wallet_transactions workload");
-  }
-  const WalletTransactionsWorkload& parsed =
-      validation_options.workloads.front().wallet_transactions;
-  ValidateWalletTransactionsWorkload(parsed, validation_options);
-  return parsed;
 }
 
 SimulationCommand ParseAndValidateSimulationCommand(
