@@ -46,9 +46,10 @@ BOOST_AUTO_TEST_CASE(simulator_source_does_not_shell_out) {
 
 BOOST_AUTO_TEST_CASE(
     simulator_cleanup_gates_network_removed_on_verified_deletion) {
-  const std::filesystem::path simulator =
-      std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
-  const std::string source = bbp::ReadText(simulator);
+  const std::filesystem::path cleanup = std::filesystem::path(BBP_SOURCE_DIR) /
+                                        "src" /
+                                        "simulator_runtime_node_cleanup.cpp";
+  const std::string source = bbp::ReadText(cleanup);
   const std::size_t identity_gate =
       source.find("!node.network_namespace->node_veth_identity()");
   BOOST_REQUIRE(identity_gate != std::string::npos);
