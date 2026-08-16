@@ -94,6 +94,7 @@
 #include "simulator_cancellable_waiting.h"
 #include "simulator_event_writing.h"
 #include "simulator_host_probes.h"
+#include "simulator_initial_peer_connectivity.h"
 #include "simulator_json_field_decoding.h"
 #include "simulator_live_instrumentation_controller.h"
 #include "simulator_live_workload_state.h"
@@ -227,7 +228,10 @@ using simulator_app_internal::GeneratedBlockWorkloadBoundary;
 using simulator_app_internal::HasTimedNodeLifecycle;
 using simulator_app_internal::HeightWaitDetail;
 using simulator_app_internal::HostIpv4ForwardingEnabled;
+using simulator_app_internal::InitialAllowedPeers;
+using simulator_app_internal::InitialAllPeerPolicyNodeIds;
 using simulator_app_internal::InitializeWalletNodes;
+using simulator_app_internal::InitialPeerCountPolicies;
 using simulator_app_internal::InitialResourceLimits;
 using simulator_app_internal::IsCurrentRunningNodeProcess;
 using simulator_app_internal::IsTerminalLiveWalletWorkloadState;
@@ -990,54 +994,6 @@ NodeRuntime& FindNodeRuntimeById(auto& nodes, const std::string& node_id) {
     throw std::runtime_error("unknown block producer node: " + node_id);
   }
   return *node;
-}
-
-std::map<std::string, PeerCountPolicy> InitialPeerCountPolicies(
-    const Options& options, const auto& nodes) {
-  std::map<std::string, PeerCountPolicy> policies;
-  for (const PeerConnectivityPolicy& policy :
-       options.topology.peer_connectivity) {
-    if (policy.node >= nodes.size()) {
-      throw std::runtime_error(
-          "peer connectivity policy references an unknown node");
-    }
-    policies.emplace(nodes[policy.node].config.id, policy.peer_count);
-  }
-  return policies;
-}
-
-std::set<std::string> InitialAllPeerPolicyNodeIds(const Options& options,
-                                                  const auto& nodes) {
-  std::set<std::string> node_ids;
-  for (const PeerConnectivityPolicy& policy :
-       options.topology.peer_connectivity) {
-    if (policy.mode != PeerConnectivityMode::kAllPeers) {
-      continue;
-    }
-    if (policy.node >= nodes.size()) {
-      throw std::runtime_error("all-peers policy references an unknown node");
-    }
-    node_ids.insert(nodes[policy.node].config.id);
-  }
-  return node_ids;
-}
-
-PeerConnectivityController::AllowedPeerMap InitialAllowedPeers(
-    const RuntimePeerTopology& topology, const auto& nodes) {
-  PeerConnectivityController::AllowedPeerMap allowed;
-  for (std::uint32_t node_index = 0; node_index < nodes.size(); ++node_index) {
-    std::vector<std::string> peer_ids;
-    for (const std::uint32_t peer_index :
-         topology.ActivePeerIndexes(node_index)) {
-      if (peer_index >= nodes.size()) {
-        throw std::runtime_error(
-            "logical topology peer references an unknown running node");
-      }
-      peer_ids.push_back(nodes[peer_index].config.id);
-    }
-    allowed.emplace(nodes[node_index].config.id, std::move(peer_ids));
-  }
-  return allowed;
 }
 
 void ExportNodeReport(const std::filesystem::path& run_root,

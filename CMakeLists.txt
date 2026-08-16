@@ -291,6 +291,7 @@ add_executable(bbp
   src/simulator_cancellable_waiting.cpp
   src/simulator_event_writing.cpp
   src/simulator_host_probes.cpp
+  src/simulator_initial_peer_connectivity.cpp
   src/simulator_json_field_decoding.cpp
   src/simulator_live_workload_state.cpp
   src/simulator_live_instrumentation_controller.cpp
@@ -608,6 +609,7 @@ if(BUILD_TESTING)
     src/simulator_cancellable_waiting.cpp
     src/simulator_event_writing.cpp
     src/simulator_host_probes.cpp
+    src/simulator_initial_peer_connectivity.cpp
     src/simulator_json_field_decoding.cpp
     src/simulator_live_workload_state.cpp
     src/simulator_live_instrumentation_controller.cpp
