@@ -312,6 +312,7 @@ add_executable(bbp
   src/simulator_node_log_tail.cpp
   src/simulator_node_mutation_request_decoding.cpp
   src/simulator_node_process_state.cpp
+  src/simulator_node_report_export.cpp
   src/simulator_offline_run_cleanup.cpp
   src/simulator_operator_connection_publication.cpp
   src/simulator_option_parsing.cpp
@@ -630,6 +631,7 @@ if(BUILD_TESTING)
     src/simulator_node_log_tail.cpp
     src/simulator_node_mutation_request_decoding.cpp
     src/simulator_node_process_state.cpp
+    src/simulator_node_report_export.cpp
     src/simulator_offline_run_cleanup.cpp
     src/simulator_operator_connection_publication.cpp
     src/simulator_option_parsing.cpp

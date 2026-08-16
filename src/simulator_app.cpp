@@ -112,6 +112,7 @@
 #include "simulator_node_lifecycle_event_details.h"
 #include "simulator_node_log_tail.h"
 #include "simulator_node_process_state.h"
+#include "simulator_node_report_export.h"
 #include "simulator_offline_run_cleanup.h"
 #include "simulator_operator_connection_publication.h"
 #include "simulator_option_parsing.h"
@@ -218,6 +219,7 @@ using simulator_app_internal::EffectiveNodeLifecyclePolicy;
 using simulator_app_internal::EffectiveNodeWalletConfig;
 using simulator_app_internal::ElapsedMilliseconds;
 using simulator_app_internal::ExpectedTransactionLoadObservations;
+using simulator_app_internal::ExportNodeReport;
 using simulator_app_internal::FindPeerConnectivityPolicy;
 using simulator_app_internal::FreezeNodeForDuration;
 using simulator_app_internal::FreezeNodeWorkloadDetail;
@@ -295,7 +297,6 @@ using simulator_app_internal::NodeListsOverlap;
 using simulator_app_internal::NodePerfCounterTransactionBackend;
 using simulator_app_internal::NodeProcessGeneration;
 using simulator_app_internal::NodeProcessRunning;
-using simulator_app_internal::NodeReportRelativePath;
 using simulator_app_internal::NodeRestartAdmission;
 using simulator_app_internal::NodeRoleName;
 using simulator_app_internal::OneShotRawTransactionRejected;
@@ -994,30 +995,6 @@ NodeRuntime& FindNodeRuntimeById(auto& nodes, const std::string& node_id) {
     throw std::runtime_error("unknown block producer node: " + node_id);
   }
   return *node;
-}
-
-void ExportNodeReport(const std::filesystem::path& run_root,
-                      const SimulationCommand& command) {
-  const std::filesystem::path relative = NodeReportRelativePath(command);
-  const std::filesystem::path output = run_root / relative;
-  EnsureDirectory(output.parent_path());
-  std::filesystem::path temporary = output;
-  temporary += ".tmp";
-  std::error_code ec;
-  std::filesystem::remove(temporary, ec);
-  ec.clear();
-  try {
-    WriteText(temporary,
-              BuildNodeReportJson(run_root, command.node_id, command.sequence) +
-                  "\n");
-    std::filesystem::rename(temporary, output, ec);
-    if (ec) {
-      throw std::runtime_error("rename node report failed: " + ec.message());
-    }
-  } catch (...) {
-    std::filesystem::remove(temporary, ec);
-    throw;
-  }
 }
 
 enum class BenchmarkTerminalOutcome {
