@@ -126,6 +126,7 @@
 #include "simulator_resource_limit_application.h"
 #include "simulator_resource_limit_decoding.h"
 #include "simulator_resource_limit_orchestration.h"
+#include "simulator_resource_pressure_workload.h"
 #include "simulator_resource_profile_decoding.h"
 #include "simulator_retained_run_registry.h"
 #include "simulator_runtime_identity_details.h"
@@ -177,9 +178,9 @@ using simulator_app_internal::ApplyNetworkPartitionRules;
 using simulator_app_internal::ApplyNetworkProfileSwitch;
 using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyPerfCounterCommand;
-using simulator_app_internal::ApplyResourceLimitPatch;
 using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ApplyResourceLimitUpdate;
+using simulator_app_internal::ApplyResourcePressureWorkload;
 using simulator_app_internal::ApplyResourceProfileSwitch;
 using simulator_app_internal::ApplyRuntimeNetworkBlockRules;
 using simulator_app_internal::ApplyRuntimeNetworkConditionUpdates;
@@ -355,7 +356,6 @@ using simulator_app_internal::ReserveTcpEndpoint;
 using simulator_app_internal::ResetNodePerfCounters;
 using simulator_app_internal::ResolveNodeProfileAssignments;
 using simulator_app_internal::ResourceLimitUpdateDetail;
-using simulator_app_internal::ResourcePressureDetail;
 using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
@@ -632,7 +632,6 @@ using simulator_app_internal::WaitForPeersWorkloadJson;
 using simulator_app_internal::WaitUntilHeightWorkloadJson;
 using simulator_app_internal::WalletTransactionsWorkloadJson;
 using simulator_app_internal::WorkloadJson;
-using simulator_app_internal::WriteResourceLimits;
 using simulator_app_internal::WriteScenarioFiles;
 using simulator_app_internal::YamlFromJson;
 
@@ -721,159 +720,6 @@ void ConnectAvailableStartupPeers(
   simulator_app_internal::ConnectAvailableStartupPeers(
       options, events_path, driver, nodes, node_network_state_mutex,
       changed_node, lifecycle_epoch, stop_token);
-}
-
-void ApplyResourcePressureWorkload(
-    const Options& options, const std::filesystem::path& events_path,
-    const std::filesystem::path& metrics_path, const ChainDriver& driver,
-    auto& nodes, RunProcessState& run_process_state,
-    const NodeRoleTopology& runtime_role_topology,
-    const ResourcePressureWorkload& workload, uint32_t workload_index,
-    uint32_t workload_count, std::stop_token stop_token) {
-  NodeRuntime& node = nodes[workload.node - 1U];
-  if (!node.cgroup) {
-    throw std::runtime_error("resource pressure requires a node cgroup");
-  }
-
-  ResourceLimits previous_limits;
-  ResourceLimits pressure_limits;
-  std::string previous_profile;
-  {
-    std::lock_guard<std::mutex> lock(node_resource_state_mutex);
-    previous_limits = node.resources;
-    previous_profile = node.resource_profile;
-    pressure_limits = ApplyResourceLimitPatch(previous_limits, workload.patch,
-                                              node.config.id);
-    try {
-      WriteResourceLimits(*node.cgroup, previous_limits, pressure_limits);
-    } catch (...) {
-      const std::exception_ptr apply_error = std::current_exception();
-      std::vector<std::string> rollback_errors;
-      try {
-        WriteResourceLimits(*node.cgroup, pressure_limits, previous_limits);
-      } catch (const std::exception& restore_error) {
-        rollback_errors.push_back(restore_error.what());
-        BBP_LOG(error) << "failed to restore partially applied resource "
-                          "pressure limits for "
-                       << node.config.id << ": " << restore_error.what();
-      } catch (...) {
-        rollback_errors.push_back("unknown exception");
-        BBP_LOG(error) << "failed to restore partially applied resource "
-                          "pressure limits for "
-                       << node.config.id << ": unknown exception";
-      }
-      if (!rollback_errors.empty()) {
-        ThrowWorkloadMutationOutcomeUnconfirmed(
-            "resource pressure admission outcome is unconfirmed", apply_error,
-            rollback_errors);
-      }
-      std::rethrow_exception(apply_error);
-    }
-    try {
-      node.resources = pressure_limits;
-      node.resource_profile.clear();
-    } catch (...) {
-      const std::exception_ptr publication_error = std::current_exception();
-      std::vector<std::string> rollback_errors;
-      try {
-        WriteResourceLimits(*node.cgroup, pressure_limits, previous_limits);
-      } catch (...) {
-        rollback_errors.push_back("kernel limits: " +
-                                  ExceptionMessage(std::current_exception()));
-      }
-      try {
-        node.resources = previous_limits;
-        node.resource_profile = previous_profile;
-      } catch (...) {
-        rollback_errors.push_back("runtime limits: " +
-                                  ExceptionMessage(std::current_exception()));
-      }
-      if (!rollback_errors.empty()) {
-        ThrowWorkloadMutationOutcomeUnconfirmed(
-            "resource pressure kernel state was applied without coherent "
-            "runtime state",
-            publication_error, rollback_errors);
-      }
-      std::rethrow_exception(publication_error);
-    }
-  }
-
-  try {
-    WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kResourcePressureStarted,
-               ResourcePressureDetail(workload, previous_limits,
-                                      pressure_limits, pressure_limits,
-                                      workload_index, workload_count));
-    WaitForDuration(std::chrono::milliseconds(workload.duration_ms),
-                    stop_token);
-    WriteMetricsSnapshot(metrics_path, options, driver, nodes,
-                         run_process_state,
-                         {node_network_state_mutex, node_resource_state_mutex},
-                         {}, {}, stop_token, &runtime_role_topology);
-  } catch (...) {
-    const std::exception_ptr original_error = std::current_exception();
-    std::vector<std::string> rollback_errors;
-    try {
-      {
-        std::lock_guard<std::mutex> lock(node_resource_state_mutex);
-        WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
-        node.resources = previous_limits;
-        node.resource_profile = previous_profile;
-      }
-    } catch (const std::exception& restore_error) {
-      rollback_errors.push_back(restore_error.what());
-      BBP_LOG(error) << "failed to restore resource pressure limits for "
-                     << node.config.id << ": " << restore_error.what();
-    } catch (...) {
-      rollback_errors.push_back("unknown exception");
-      BBP_LOG(error) << "failed to restore resource pressure limits for "
-                     << node.config.id << ": unknown exception";
-    }
-    if (!rollback_errors.empty()) {
-      ThrowWorkloadMutationOutcomeUnconfirmed(
-          "resource pressure outcome is unconfirmed", original_error,
-          rollback_errors);
-    }
-    try {
-      WriteEvent(events_path, options.run_id, node.config.id,
-                 SimulationEventKind::kResourcePressureRestoredAfterError,
-                 ResourcePressureDetail(workload, previous_limits,
-                                        pressure_limits, previous_limits,
-                                        workload_index, workload_count));
-    } catch (const std::exception& event_error) {
-      BBP_LOG(error) << "failed to record restored resource pressure for "
-                     << node.config.id << ": " << event_error.what();
-    } catch (...) {
-      BBP_LOG(error) << "failed to record restored resource pressure for "
-                     << node.config.id << ": unknown exception";
-    }
-    std::rethrow_exception(original_error);
-  }
-
-  try {
-    {
-      std::lock_guard<std::mutex> lock(node_resource_state_mutex);
-      WriteResourceLimits(*node.cgroup, node.resources, previous_limits);
-      node.resources = previous_limits;
-      node.resource_profile = previous_profile;
-    }
-  } catch (...) {
-    ThrowWorkloadMutationOutcomeUnconfirmed(
-        "resource pressure completion could not restore prior limits",
-        std::current_exception());
-  }
-  try {
-    WriteEvent(events_path, options.run_id, node.config.id,
-               SimulationEventKind::kResourcePressureFinished,
-               ResourcePressureDetail(workload, previous_limits,
-                                      pressure_limits, previous_limits,
-                                      workload_index, workload_count));
-  } catch (...) {
-    ThrowWorkloadMutationOutcomeUnconfirmed(
-        "resource pressure restored prior limits without a publishable "
-        "completion",
-        std::current_exception());
-  }
 }
 
 void ApplyConnectPeerWorkload(
@@ -7065,6 +6911,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             case WorkloadKind::kResourcePressure:
               ApplyResourcePressureWorkload(
                   options, events_path, metrics_path, driver, nodes,
+                  node_network_state_mutex, node_resource_state_mutex,
                   run_process_state,
                   runtime_wallet_registry.Snapshot().registry().topology(),
                   scenario_workload.resource_pressure, action_index,
