@@ -347,6 +347,7 @@ add_executable(bbp
   src/simulator_runtime_node_startup.cpp
   src/simulator_runtime_node_stop.cpp
   src/simulator_runtime_published_node_config.cpp
+  src/simulator_runtime_topology_publication_planning.cpp
   src/simulator_runtime_workload_validation.cpp
   src/simulator_scenario_chain_decoding.cpp
   src/simulator_scenario_identifier.cpp
@@ -668,6 +669,7 @@ if(BUILD_TESTING)
     src/simulator_runtime_node_startup.cpp
     src/simulator_runtime_node_stop.cpp
     src/simulator_runtime_published_node_config.cpp
+    src/simulator_runtime_topology_publication_planning.cpp
     src/simulator_runtime_workload_validation.cpp
     src/simulator_scenario_chain_decoding.cpp
     src/simulator_scenario_identifier.cpp

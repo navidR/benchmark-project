@@ -147,6 +147,7 @@
 #include "simulator_runtime_node_startup.h"
 #include "simulator_runtime_node_stop.h"
 #include "simulator_runtime_published_node_config.h"
+#include "simulator_runtime_topology_publication_planning.h"
 #include "simulator_runtime_workload_validation.h"
 #include "simulator_scenario_chain_decoding.h"
 #include "simulator_scenario_identifier.h"
@@ -213,7 +214,10 @@ using simulator_app_internal::ConfirmMasternodeTransactions;
 using simulator_app_internal::ConsecutiveNodeIndexes;
 using simulator_app_internal::DirectionalNetworkPoliciesForNode;
 using simulator_app_internal::DiscoverRetainedRuns;
+using simulator_app_internal::DynamicDirectionalNetworkPolicies;
 using simulator_app_internal::DynamicPhysicalTopologyPeerEndpoints;
+using simulator_app_internal::DynamicRestartPeerEndpoints;
+using simulator_app_internal::DynamicTopologyPeerIds;
 using simulator_app_internal::EffectiveNodeBinary;
 using simulator_app_internal::EffectiveNodeChainNetwork;
 using simulator_app_internal::EffectiveNodeExtraArgs;
@@ -669,60 +673,6 @@ std::vector<bool> StopNodes(
       options, events_path, driver, nodes, RuntimeNodeResourceEntryFor,
       best_effort, remove_run_cgroup, explicit_resource_slots,
       absolute_deadline, cleanup_stop_token, allow_partial_preparation);
-}
-
-std::vector<DirectionalNetworkPolicy> DynamicDirectionalNetworkPolicies(
-    const RuntimePeerTopology& topology,
-    const SimulationNetworkAddressPlan& address_plan,
-    const std::vector<std::uint32_t>& resource_slots,
-    std::uint32_t node_index) {
-  std::vector<DirectionalNetworkPolicy> policies;
-  for (const RuntimePeerTopologyEdge& edge : topology.edges()) {
-    if (edge.from == node_index && edge.active && edge.condition) {
-      policies.push_back(DirectionalNetworkPolicy{
-          .band = edge.band,
-          .destination_address =
-              address_plan.NodeAddress(resource_slots.at(edge.to)),
-          .condition = *edge.condition,
-      });
-    }
-  }
-  return policies;
-}
-
-std::vector<std::string> DynamicTopologyPeerIds(
-    const RuntimePeerTopology& topology,
-    const std::vector<ChainNodeConfig>& configs, std::uint32_t node_index) {
-  std::vector<std::string> peers;
-  for (const std::uint32_t peer_index :
-       topology.ActivePeerIndexes(node_index)) {
-    peers.push_back(configs.at(peer_index).id);
-  }
-  return peers;
-}
-
-std::vector<std::string> DynamicRestartPeerEndpoints(
-    const NodeRoleTopology& role_topology, const RuntimePeerTopology& topology,
-    const std::vector<ChainNodeConfig>& configs, std::uint32_t node_index) {
-  std::vector<std::uint32_t> peer_indexes =
-      topology.ActivePeerIndexes(node_index);
-  const PeerConnectivityPolicy* policy =
-      FindPeerConnectivityPolicy(role_topology, node_index);
-  if (policy != nullptr) {
-    const std::uint32_t initial_peer_count = policy->peer_count.minimum();
-    if (initial_peer_count > peer_indexes.size()) {
-      throw std::runtime_error(
-          "initial peer count exceeds eligible logical topology peers");
-    }
-    peer_indexes.resize(initial_peer_count);
-  }
-  std::vector<std::string> peers;
-  peers.reserve(peer_indexes.size());
-  for (const std::uint32_t peer_index : peer_indexes) {
-    const ChainNodeConfig& peer = configs.at(peer_index);
-    peers.push_back(peer.p2p_host + ":" + std::to_string(peer.p2p_port));
-  }
-  return peers;
 }
 
 std::unique_lock<std::timed_mutex> AcquireNodeMutationLock(
