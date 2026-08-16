@@ -42,6 +42,13 @@ bool StartPreparedNode(const Options& options,
                        std::chrono::steady_clock::time_point lifecycle_epoch,
                        std::stop_token stop_token);
 
+void StartInitialPreparedNodes(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    std::mutex& node_network_state_mutex,
+    std::chrono::steady_clock::time_point simulation_epoch,
+    std::stop_token stop_token);
+
 void ConnectAvailableStartupPeers(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver, std::vector<NodeRuntime>& nodes,

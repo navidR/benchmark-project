@@ -951,91 +951,9 @@ void StartNodes(const Options& options, const std::filesystem::path& run_root,
     nodes.back().lifecycle_policy = EffectiveNodeLifecyclePolicy(options, i);
   }
 
-  std::stop_source initial_start_stop_source;
-  std::stop_callback stop_initial_starts_on_request(
-      stop_token, [&initial_start_stop_source] {
-        initial_start_stop_source.request_stop();
-      });
-  std::mutex initial_start_failure_mutex;
-  std::exception_ptr initial_start_failure;
-  const std::size_t initial_start_count = static_cast<std::size_t>(
-      std::count_if(nodes.begin(), nodes.end(), [](const NodeRuntime& node) {
-        return !node.lifecycle_policy.start_time.has_value();
-      }));
-  std::atomic<std::size_t> initial_starts_in_progress(initial_start_count);
-  std::condition_variable_any initial_starts_finished;
-  std::mutex initial_starts_finished_mutex;
-  std::vector<std::jthread> initial_starts;
-  initial_starts.reserve(initial_start_count);
-  for (NodeRuntime& node : nodes) {
-    if (node.lifecycle_policy.start_time) {
-      continue;
-    }
-    NodeRuntime* initial_node = &node;
-    initial_starts.emplace_back([&options, &events_path, &driver, initial_node,
-                                 simulation_epoch, &initial_start_stop_source,
-                                 &initial_start_failure_mutex,
-                                 &initial_start_failure,
-                                 &initial_starts_in_progress,
-                                 &initial_starts_finished,
-                                 &initial_starts_finished_mutex] {
-      bool start_in_progress = true;
-      const auto mark_start_finished = [&] {
-        if (!start_in_progress) {
-          return;
-        }
-        start_in_progress = false;
-        initial_starts_in_progress.fetch_sub(1U, std::memory_order_acq_rel);
-        initial_starts_finished.notify_all();
-      };
-      try {
-        const bool started = StartPreparedNode(
-            options, events_path, driver, *initial_node, "initial_start",
-            simulation_epoch, initial_start_stop_source.get_token());
-        mark_start_finished();
-        if (started && initial_node->lifecycle_policy.stop_time &&
-            !initial_node->DeclarativeStopApplied() &&
-            initial_starts_in_progress.load(std::memory_order_acquire) != 0U) {
-          const auto stop_deadline = SteadyDeadline(
-              simulation_epoch, options.time_scale.WallDuration(
-                                    *initial_node->lifecycle_policy.stop_time));
-          std::unique_lock<std::mutex> wait_lock(initial_starts_finished_mutex);
-          initial_starts_finished.wait_until(
-              wait_lock, initial_start_stop_source.get_token(), stop_deadline,
-              [&initial_starts_in_progress] {
-                return initial_starts_in_progress.load(
-                           std::memory_order_acquire) == 0U;
-              });
-          wait_lock.unlock();
-          ThrowIfStopRequested(initial_start_stop_source.get_token());
-          if (initial_starts_in_progress.load(std::memory_order_acquire) !=
-                  0U &&
-              std::chrono::steady_clock::now() >= stop_deadline) {
-            ApplyDeclarativeStopDuringStart(
-                options, events_path, driver, *initial_node, simulation_epoch,
-                initial_start_stop_source.get_token());
-          }
-        }
-      } catch (...) {
-        mark_start_finished();
-        {
-          std::lock_guard<std::mutex> lock(initial_start_failure_mutex);
-          if (!initial_start_failure) {
-            initial_start_failure = std::current_exception();
-          }
-        }
-        initial_start_stop_source.request_stop();
-      }
-    });
-  }
-  for (std::jthread& initial_start : initial_starts) {
-    if (initial_start.joinable()) {
-      initial_start.join();
-    }
-  }
-  if (initial_start_failure) {
-    std::rethrow_exception(initial_start_failure);
-  }
+  simulator_app_internal::StartInitialPreparedNodes(
+      options, events_path, driver, nodes, node_network_state_mutex,
+      simulation_epoch, stop_token);
   ConnectAvailableStartupPeers(options, events_path, driver, nodes,
                                std::nullopt, simulation_epoch, stop_token);
   for (RuntimeNodeResourceEntry& entry : startup_manifest.nodes) {
