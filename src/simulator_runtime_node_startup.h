@@ -1,10 +1,13 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <stop_token>
 #include <string_view>
+#include <vector>
 
 namespace bbp {
 
@@ -12,6 +15,7 @@ class ChainDriver;
 struct ChainNodeConfig;
 struct NodeRuntime;
 struct Options;
+class RuntimeNodeSnapshot;
 
 namespace simulator_app_internal {
 
@@ -37,6 +41,22 @@ bool StartPreparedNode(const Options& options,
                        std::string_view reason,
                        std::chrono::steady_clock::time_point lifecycle_epoch,
                        std::stop_token stop_token);
+
+void ConnectAvailableStartupPeers(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    std::mutex& node_network_state_mutex,
+    std::optional<std::size_t> changed_node,
+    std::chrono::steady_clock::time_point lifecycle_epoch,
+    std::stop_token stop_token);
+
+void ConnectAvailableStartupPeers(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, const RuntimeNodeSnapshot& nodes,
+    std::mutex& node_network_state_mutex,
+    std::optional<std::size_t> changed_node,
+    std::chrono::steady_clock::time_point lifecycle_epoch,
+    std::stop_token stop_token);
 
 }  // namespace simulator_app_internal
 }  // namespace bbp

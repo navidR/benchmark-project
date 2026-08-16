@@ -1,16 +1,24 @@
 #include "simulator_runtime_node_startup.h"
 
 #include <atomic>
+#include <boost/json/object.hpp>
+#include <boost/json/serialize.hpp>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
+#include "bbp/drivers/chain_driver.h"
 #include "bbp/node_lifecycle_policy.h"
+#include "bbp/runtime_node_inventory.h"
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulator/node_runtime.h"
@@ -261,6 +269,184 @@ bool StartPreparedNode(const Options& options,
   return StartNodeProcessWithPolicy(options, events_path, driver, node,
                                     node_network_state_mutex, reason,
                                     lifecycle_epoch, false, true, stop_token);
+}
+
+namespace {
+
+std::string NodePeerEndpoint(const NodeRuntime& node) {
+  return node.config.p2p_host + ":" + std::to_string(node.config.p2p_port);
+}
+
+void ConnectAvailableStartupPeersImpl(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, auto& nodes,
+    std::mutex& node_network_state_mutex,
+    std::optional<std::size_t> changed_node,
+    std::chrono::steady_clock::time_point lifecycle_epoch,
+    std::stop_token stop_token) {
+  std::set<std::pair<std::size_t, std::string>> completed_connections;
+  while (true) {
+    ThrowIfStopRequested(stop_token);
+    bool stop_applied = false;
+    const auto now = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+      if (changed_node && index != *changed_node) {
+        continue;
+      }
+      NodeRuntime& node = nodes[index];
+      if (node.lifecycle_policy.stop_time && !node.DeclarativeStopApplied() &&
+          now >= SteadyDeadline(lifecycle_epoch,
+                                options.time_scale.WallDuration(
+                                    *node.lifecycle_policy.stop_time))) {
+        ApplyDeclarativeStopDuringStart(options, events_path, driver, node,
+                                        lifecycle_epoch, stop_token);
+        stop_applied = true;
+      }
+    }
+    if (stop_applied) {
+      continue;
+    }
+
+    std::optional<std::chrono::steady_clock::time_point> next_stop_deadline;
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+      if (changed_node && index != *changed_node) {
+        continue;
+      }
+      const NodeRuntime& node = nodes[index];
+      if (!node.lifecycle_policy.stop_time || node.DeclarativeStopApplied()) {
+        continue;
+      }
+      const auto deadline = SteadyDeadline(
+          lifecycle_epoch,
+          options.time_scale.WallDuration(*node.lifecycle_policy.stop_time));
+      if (!next_stop_deadline || deadline < *next_stop_deadline) {
+        next_stop_deadline = deadline;
+      }
+    }
+
+    std::stop_source operation_stop_source;
+    std::stop_callback stop_on_request(stop_token, [&operation_stop_source] {
+      operation_stop_source.request_stop();
+    });
+    std::optional<std::jthread> deadline_timer;
+    if (next_stop_deadline) {
+      deadline_timer.emplace(
+          [deadline = *next_stop_deadline,
+           &operation_stop_source](std::stop_token timer_stop_token) {
+            try {
+              WaitUntil(deadline, timer_stop_token);
+            } catch (const SimulationCancelled&) {
+              return;
+            }
+            operation_stop_source.request_stop();
+          });
+    }
+    const auto stop_deadline_timer = [&] {
+      if (deadline_timer) {
+        deadline_timer->request_stop();
+        if (deadline_timer->joinable()) {
+          deadline_timer->join();
+        }
+        deadline_timer.reset();
+      }
+    };
+
+    try {
+      std::map<std::string, std::size_t> running_endpoints;
+      for (std::size_t index = 0; index < nodes.size(); ++index) {
+        if (nodes[index].AllowsChainMetrics() &&
+            NodeProcessRunning(nodes[index])) {
+          running_endpoints.emplace(NodePeerEndpoint(nodes[index]), index);
+        }
+      }
+      for (std::size_t source_index = 0; source_index < nodes.size();
+           ++source_index) {
+        NodeRuntime& source = nodes[source_index];
+        if (!source.AllowsChainMetrics() || !NodeProcessRunning(source)) {
+          continue;
+        }
+        std::vector<std::string> connect_peers;
+        {
+          std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
+          connect_peers = source.config.connect_peers;
+        }
+        for (const std::string& peer : connect_peers) {
+          if (completed_connections.contains({source_index, peer})) {
+            continue;
+          }
+          const auto target = running_endpoints.find(peer);
+          if (target == running_endpoints.end()) {
+            continue;
+          }
+          if (changed_node && source_index != *changed_node &&
+              target->second != *changed_node) {
+            continue;
+          }
+          ThrowIfStopRequested(operation_stop_source.get_token());
+          driver.ConnectPeer(source.config, peer,
+                             operation_stop_source.get_token());
+          driver.WaitForPeerAddress(
+              source.config, peer,
+              std::chrono::seconds(options.ready_timeout_sec),
+              operation_stop_source.get_token());
+          boost::json::object detail;
+          detail["address"] = peer;
+          detail["reason"] =
+              changed_node ? "declarative_start" : "initial_startup";
+          WriteEvent(events_path, options.run_id, source.config.id,
+                     SimulationEventKind::kStartupPeerConnected,
+                     boost::json::serialize(detail));
+          completed_connections.emplace(source_index, peer);
+        }
+      }
+      const bool lifecycle_deadline_reached =
+          next_stop_deadline &&
+          std::chrono::steady_clock::now() >= *next_stop_deadline;
+      const bool lifecycle_timer_requested =
+          operation_stop_source.stop_requested() &&
+          !stop_token.stop_requested();
+      stop_deadline_timer();
+      if (lifecycle_deadline_reached || lifecycle_timer_requested) {
+        continue;
+      }
+      ThrowIfStopRequested(stop_token);
+      return;
+    } catch (const SimulationCancelled&) {
+      stop_deadline_timer();
+      if (stop_token.stop_requested()) {
+        throw;
+      }
+    } catch (...) {
+      stop_deadline_timer();
+      throw;
+    }
+  }
+}
+
+}  // namespace
+
+void ConnectAvailableStartupPeers(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, std::vector<NodeRuntime>& nodes,
+    std::mutex& node_network_state_mutex,
+    std::optional<std::size_t> changed_node,
+    std::chrono::steady_clock::time_point lifecycle_epoch,
+    std::stop_token stop_token) {
+  ConnectAvailableStartupPeersImpl(options, events_path, driver, nodes,
+                                   node_network_state_mutex, changed_node,
+                                   lifecycle_epoch, stop_token);
+}
+
+void ConnectAvailableStartupPeers(
+    const Options& options, const std::filesystem::path& events_path,
+    const ChainDriver& driver, const RuntimeNodeSnapshot& nodes,
+    std::mutex& node_network_state_mutex,
+    std::optional<std::size_t> changed_node,
+    std::chrono::steady_clock::time_point lifecycle_epoch,
+    std::stop_token stop_token) {
+  ConnectAvailableStartupPeersImpl(options, events_path, driver, nodes,
+                                   node_network_state_mutex, changed_node,
+                                   lifecycle_epoch, stop_token);
 }
 
 }  // namespace bbp::simulator_app_internal
