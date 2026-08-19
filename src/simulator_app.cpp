@@ -136,6 +136,7 @@
 #include "simulator_resource_pressure_workload.h"
 #include "simulator_resource_profile_decoding.h"
 #include "simulator_retained_run_registry.h"
+#include "simulator_retained_tui_application.h"
 #include "simulator_runtime_identity_details.h"
 #include "simulator_runtime_network_block_rules.h"
 #include "simulator_runtime_network_condition_updates.h"
@@ -388,6 +389,7 @@ using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
 using simulator_app_internal::RunningNodeProcessGeneration;
+using simulator_app_internal::RunRetainedTuiWithMcp;
 using simulator_app_internal::RunStopTick;
 using simulator_app_internal::RuntimeMasternodeAddContext;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
@@ -11184,120 +11186,6 @@ std::filesystem::path ResolveRunReference(
   return benchmark_root / reference;
 }
 
-struct RetainedRunContext {
-  std::string run_id;
-  McpLiveApplication::RetainedRun metadata;
-};
-
-RetainedRunContext LoadRetainedRunContext(
-    const std::filesystem::path& run_root) {
-  const boost::json::object report = BuildRunReport(run_root);
-  const std::string run_id = JsonStringField(report, "run_id");
-  RequireSafeScenarioIdentifier(run_id, "retained run id");
-  const std::string chain = JsonStringField(report, "chain");
-  static_cast<void>(ParseChainKind(chain));
-  const std::string state = JsonStringField(report, "status");
-  if (state != "finished" && state != "failed" && state != "cancelled" &&
-      state != "incomplete") {
-    throw std::runtime_error("invalid retained run status: " + state);
-  }
-  bool has_owned_artifacts = false;
-  try {
-    static_cast<void>(LoadRunOwnership(run_id, run_root));
-    has_owned_artifacts = true;
-  } catch (const std::exception&) {
-    // Reports from older or externally copied runs remain readable, but their
-    // files are not exposed without a valid ownership marker.
-  }
-  return RetainedRunContext{.run_id = run_id,
-                            .metadata = McpLiveApplication::RetainedRun{
-                                .chain = chain,
-                                .node_count = JsonUint32Field(report, "nodes"),
-                                .state = state,
-                                .has_owned_artifacts = has_owned_artifacts}};
-}
-
-int RunRetainedTuiWithMcp(const Options& cli_options,
-                          const std::filesystem::path& run_root,
-                          const std::filesystem::path& state_directory) {
-  const RetainedRunContext retained = LoadRetainedRunContext(run_root);
-  SignalStopMonitor signal_monitor;
-  McpLiveApplication mcp_application(
-      McpLiveApplication::Config{.run_id = retained.run_id,
-                                 .run_root = run_root,
-                                 .retained_run = retained.metadata,
-                                 .options = {},
-                                 .command_queue = {},
-                                 .node_inventory_snapshot = {},
-                                 .publication_mutex = {},
-                                 .request_run_stop = {},
-                                 .run_started = {},
-                                 .run_stopping = {},
-                                 .run_stopped = {}});
-  McpEndpoint mcp_endpoint(
-      McpEndpointConfig{
-          .state_directory = state_directory,
-          .run_id = retained.run_id,
-          .server = {},
-          .dispatcher = {},
-          .allowed_operations = mcp_application.SupportedOperations(),
-          .allowed_information_families =
-              mcp_application.SupportedInformationFamilies(),
-          .read_only = mcp_application.read_only()},
-      mcp_application.OperationFactory(), mcp_application.ResourceReader());
-
-  SetConsoleLoggingEnabled(false);
-  std::exception_ptr application_failure;
-  int result = 1;
-  try {
-    mcp_endpoint.Start();
-    const McpEndpointPublication publication = mcp_endpoint.publication();
-    const TuiMcpConnectionInfo mcp_connection{
-        .endpoint = publication.endpoint,
-        .token_file = publication.token_file,
-        .client_config_file = publication.client_config_file,
-    };
-    result =
-        RunTuiReport(run_root, cli_options.tui_once, cli_options.tui_refresh_ms,
-                     mcp_connection, nullptr, signal_monitor.GetToken());
-  } catch (...) {
-    application_failure = std::current_exception();
-  }
-
-  std::exception_ptr cleanup_failure;
-  const auto capture_cleanup_failure = [&](auto&& action) {
-    try {
-      action();
-    } catch (...) {
-      if (!cleanup_failure) {
-        cleanup_failure = std::current_exception();
-      }
-    }
-  };
-  bool endpoint_drained = false;
-  capture_cleanup_failure([&] {
-    mcp_endpoint.StopAdmissionAndDrain();
-    endpoint_drained = true;
-  });
-  if (endpoint_drained) {
-    capture_cleanup_failure([&] { mcp_application.Shutdown(); });
-    capture_cleanup_failure([&] { mcp_endpoint.Stop(); });
-  }
-  SetConsoleLoggingEnabled(true);
-
-  if (application_failure) {
-    std::rethrow_exception(application_failure);
-  }
-  if (cleanup_failure) {
-    std::rethrow_exception(cleanup_failure);
-  }
-  if (signal_monitor.ReceivedSignal() != 0) {
-    BBP_LOG(info) << "graceful shutdown completed after signal "
-                  << signal_monitor.ReceivedSignal();
-  }
-  return result;
-}
-
 }  // namespace
 
 #ifdef BBP_ENABLE_TEST_HOOKS
@@ -11668,8 +11556,9 @@ int SimulatorApp::Run(int argc, char** argv) {
   }
   if (!options.tui_run.empty()) {
     return RunRetainedTuiWithMcp(
-        options, ResolveRunReference(options.output_dir, options.tui_run),
-        instance_lock.state_directory());
+        ResolveRunReference(options.output_dir, options.tui_run),
+        instance_lock.state_directory(), options.tui_once,
+        options.tui_refresh_ms);
   }
   if (options.probe_capabilities) {
     BBP_LOG(info) << simulator_app_internal::CapabilityProbeJson();
