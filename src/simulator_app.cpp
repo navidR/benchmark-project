@@ -161,6 +161,7 @@
 #include "simulator_scheduled_command_event_details.h"
 #include "simulator_scheduled_event_decoding.h"
 #include "simulator_source_scenario_persistence.h"
+#include "simulator_stop_coordination.h"
 #include "simulator_tcp_endpoint_reservation.h"
 #include "simulator_topology_edge_workload.h"
 #include "simulator_transaction_load_completion_publication.h"
@@ -262,6 +263,7 @@ using simulator_app_internal::JsonUint32Field;
 using simulator_app_internal::JsonUint32Value;
 using simulator_app_internal::JsonUint64Field;
 using simulator_app_internal::JsonUint64Value;
+using simulator_app_internal::kRunStopNotObserved;
 using simulator_app_internal::LiveBlockGenerationBoundaryResult;
 using simulator_app_internal::LiveBlockGenerationWorkloadJson;
 using simulator_app_internal::LiveBlockGenerationWorkloadRecord;
@@ -305,6 +307,7 @@ using simulator_app_internal::NodeProcessGeneration;
 using simulator_app_internal::NodeProcessRunning;
 using simulator_app_internal::NodeRestartAdmission;
 using simulator_app_internal::NodeRoleName;
+using simulator_app_internal::ObservedRunStop;
 using simulator_app_internal::OneShotRawTransactionRejected;
 using simulator_app_internal::OperatorWalletTransactionDetail;
 using simulator_app_internal::ParseAmountDistribution;
@@ -344,6 +347,7 @@ using simulator_app_internal::PublishOperatorConnectionCommand;
 using simulator_app_internal::RawTransactionDetail;
 using simulator_app_internal::RecordAndPublishGeneratedBlockWorkloadBoundary;
 using simulator_app_internal::RecordGeneratedBlocks;
+using simulator_app_internal::RecordRunStop;
 using simulator_app_internal::RegisteredMasternodeIdentity;
 using simulator_app_internal::RejectTopologyEdgeConditionFields;
 using simulator_app_internal::RejectUnsupportedFields;
@@ -376,6 +380,7 @@ using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
 using simulator_app_internal::RunningNodeProcessGeneration;
+using simulator_app_internal::RunStopTick;
 using simulator_app_internal::RuntimeMasternodeAddContext;
 using simulator_app_internal::RuntimeMasternodeIdentityJson;
 using simulator_app_internal::RuntimeNodeAdditionDependencies;
@@ -930,21 +935,6 @@ struct BenchmarkHeadlessResult {
       BenchmarkTerminalOutcome::kFinished;
 };
 
-using RunStopTick = std::chrono::steady_clock::duration::rep;
-constexpr RunStopTick kRunStopNotObserved =
-    std::numeric_limits<RunStopTick>::max();
-
-void RecordRunStop(std::atomic<RunStopTick>& run_stop_tick,
-                   std::chrono::steady_clock::time_point observed_at) {
-  const RunStopTick observed_tick = observed_at.time_since_epoch().count();
-  RunStopTick current = run_stop_tick.load(std::memory_order_relaxed);
-  while (observed_tick < current &&
-         !run_stop_tick.compare_exchange_weak(current, observed_tick,
-                                              std::memory_order_release,
-                                              std::memory_order_relaxed)) {
-  }
-}
-
 BenchmarkHeadlessResult RunBenchmarkHeadless(
     Options options, SimulationCommandQueue& command_queue,
     McpLiveApplication& mcp_application, RuntimeNodeInventory& node_inventory,
@@ -967,16 +957,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   const std::stop_token stop_token = simulation_stop_source.get_token();
   std::stop_callback observe_run_stop(
       stop_token, [&] { record_run_stop(std::chrono::steady_clock::now()); });
-  const auto observed_run_stop =
-      [&]() -> std::optional<std::chrono::steady_clock::time_point> {
-    const RunStopTick observed_tick =
-        run_stop_tick.load(std::memory_order_acquire);
-    if (observed_tick == kRunStopNotObserved) {
-      return std::nullopt;
-    }
-    return std::chrono::steady_clock::time_point{
-        std::chrono::steady_clock::duration{observed_tick}};
-  };
+  const auto observed_run_stop = [&] { return ObservedRunStop(run_stop_tick); };
   SimulationCommandQueue* active_command_queue = &command_queue;
   std::mutex scheduled_command_outcome_mutex;
   std::condition_variable_any scheduled_command_outcome_ready;

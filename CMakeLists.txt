@@ -361,6 +361,7 @@ add_executable(bbp
   src/simulator_scheduled_command_event_details.cpp
   src/simulator_scheduled_event_decoding.cpp
   src/simulator_source_scenario_persistence.cpp
+  src/simulator_stop_coordination.cpp
   src/simulator_tcp_endpoint_reservation.cpp
   src/simulator_topology_edge_workload.cpp
   src/simulator_transaction_load_completion_publication.cpp
@@ -683,6 +684,7 @@ if(BUILD_TESTING)
     src/simulator_scheduled_command_event_details.cpp
     src/simulator_scheduled_event_decoding.cpp
     src/simulator_source_scenario_persistence.cpp
+    src/simulator_stop_coordination.cpp
     src/simulator_tcp_endpoint_reservation.cpp
     src/simulator_topology_edge_workload.cpp
     src/simulator_transaction_load_completion_publication.cpp
