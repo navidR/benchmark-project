@@ -374,6 +374,7 @@ add_executable(bbp
   src/simulator_wallet_transaction_workload_execution.cpp
   src/simulator_workload_event_details.cpp
   src/simulator_workload_mutation_error.cpp
+  src/simulator_workload_service_shutdown_diagnostic.cpp
   src/simulator_yaml_decoding.cpp
   src/simulator_log_pane.cpp
   src/tui.cpp
@@ -697,6 +698,7 @@ if(BUILD_TESTING)
     src/simulator_wallet_transaction_workload_execution.cpp
     src/simulator_workload_event_details.cpp
     src/simulator_workload_mutation_error.cpp
+    src/simulator_workload_service_shutdown_diagnostic.cpp
     src/simulator_yaml_decoding.cpp
     src/scheduled_scenario_event.cpp
     src/simulation_command_processor.cpp

@@ -173,6 +173,7 @@
 #include "simulator_wallet_transaction_workload_execution.h"
 #include "simulator_workload_event_details.h"
 #include "simulator_workload_mutation_error.h"
+#include "simulator_workload_service_shutdown_diagnostic.h"
 #include "simulator_yaml_decoding.h"
 
 namespace bbp {
@@ -264,6 +265,7 @@ using simulator_app_internal::JsonUint32Value;
 using simulator_app_internal::JsonUint64Field;
 using simulator_app_internal::JsonUint64Value;
 using simulator_app_internal::kRunStopNotObserved;
+using simulator_app_internal::kWorkloadServiceShutdownBound;
 using simulator_app_internal::LiveBlockGenerationBoundaryResult;
 using simulator_app_internal::LiveBlockGenerationWorkloadJson;
 using simulator_app_internal::LiveBlockGenerationWorkloadRecord;
@@ -448,6 +450,7 @@ using simulator_app_internal::WalletWorkloadFundingState;
 using simulator_app_internal::WorkloadMutationCancelledAfterRollback;
 using simulator_app_internal::WorkloadMutationFailedAfterRollback;
 using simulator_app_internal::WorkloadMutationOutcomeUnconfirmed;
+using simulator_app_internal::WorkloadServiceShutdownTimeout;
 using simulator_app_internal::WriteEvent;
 using simulator_app_internal::WriteLiveBlockGenerationWorkloadState;
 using simulator_app_internal::WriteLiveWaitForPeersWorkloadState;
@@ -506,48 +509,6 @@ std::string ExceptionMessage(const std::exception_ptr& error) {
     return "unknown exception";
   }
 }
-
-constexpr auto kWorkloadServiceShutdownBound = std::chrono::seconds(15);
-
-class WorkloadServiceShutdownTimeout final : public std::runtime_error {
- public:
-  explicit WorkloadServiceShutdownTimeout(
-      const McpLiveWorkloadDrainResult& result)
-      : std::runtime_error(
-            "workload service did not drain within the 15000 ms shutdown "
-            "bound; referenced simulator state was retained until every "
-            "callback and worker exited"),
-        active_callback_count_(result.active_callback_count),
-        active_worker_count_(result.active_worker_count),
-        admission_closed_(result.admission_closed),
-        cancellation_requested_(result.cancellation_requested) {}
-
-  boost::json::object Diagnostic() const {
-    return boost::json::object{
-        {"code", "workload_service_shutdown_timeout"},
-        {"message", what()},
-        {"severity", "critical"},
-        {"active_callback_count",
-         static_cast<std::uint64_t>(active_callback_count_)},
-        {"active_worker_count",
-         static_cast<std::uint64_t>(active_worker_count_)},
-        {"shutdown_bound_ms",
-         static_cast<std::uint64_t>(
-             std::chrono::duration_cast<std::chrono::milliseconds>(
-                 kWorkloadServiceShutdownBound)
-                 .count())},
-        {"admission_closed", admission_closed_},
-        {"cancellation_requested", cancellation_requested_},
-        {"safe_to_destroy", false},
-    };
-  }
-
- private:
-  std::size_t active_callback_count_;
-  std::size_t active_worker_count_;
-  bool admission_closed_;
-  bool cancellation_requested_;
-};
 
 }  // namespace
 
