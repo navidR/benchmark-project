@@ -99,6 +99,7 @@
 #include "simulator_initial_peer_connectivity.h"
 #include "simulator_json_field_decoding.h"
 #include "simulator_live_instrumentation_controller.h"
+#include "simulator_live_workload_reading.h"
 #include "simulator_live_workload_shutdown_request.h"
 #include "simulator_live_workload_state.h"
 #include "simulator_managed_run_root.h"
@@ -350,6 +351,7 @@ using simulator_app_internal::PrepareNodeRuntime;
 using simulator_app_internal::ProcessExitDetail;
 using simulator_app_internal::PublishOperatorConnectionCommand;
 using simulator_app_internal::RawTransactionDetail;
+using simulator_app_internal::ReadLiveWorkloads;
 using simulator_app_internal::RecordAndPublishGeneratedBlockWorkloadBoundary;
 using simulator_app_internal::RecordGeneratedBlocks;
 using simulator_app_internal::RecordRunStop;
@@ -6536,83 +6538,15 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       lock.unlock();
       return LiveWalletWorkloadJson(*record);
     };
-    workload_service->read = [wallet_workloads, block_generation_workloads,
-                              wait_until_height_workloads,
-                              wait_for_peers_workloads](
-                                 bool history,
-                                 std::stop_token read_stop_token) {
-      boost::json::array result;
-      std::vector<std::shared_ptr<LiveWalletWorkloadRecord>> records;
-      std::vector<std::shared_ptr<LiveBlockGenerationWorkloadRecord>>
-          block_records;
-      std::vector<std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>>
-          height_wait_records;
-      std::vector<std::shared_ptr<LiveWaitForPeersWorkloadRecord>>
-          peer_wait_records;
-      {
-        std::scoped_lock lock(wallet_workloads->mutex,
-                              block_generation_workloads->mutex,
-                              wait_until_height_workloads->mutex,
-                              wait_for_peers_workloads->mutex);
-        records.reserve(wallet_workloads->records.size());
-        for (const auto& [id, record] : wallet_workloads->records) {
-          static_cast<void>(id);
-          records.push_back(record);
-        }
-        block_records.reserve(block_generation_workloads->records.size());
-        for (const auto& [id, record] : block_generation_workloads->records) {
-          static_cast<void>(id);
-          block_records.push_back(record);
-        }
-        height_wait_records.reserve(
-            wait_until_height_workloads->records.size());
-        for (const auto& [id, record] : wait_until_height_workloads->records) {
-          static_cast<void>(id);
-          height_wait_records.push_back(record);
-        }
-        peer_wait_records.reserve(wait_for_peers_workloads->records.size());
-        for (const auto& [id, record] : wait_for_peers_workloads->records) {
-          static_cast<void>(id);
-          peer_wait_records.push_back(record);
-        }
-      }
-      const auto append_if_selected = [&](boost::json::object snapshot) {
-        const std::string_view state = snapshot.at("state").as_string();
-        const bool terminal = state == "stopped" || state == "completed" ||
-                              state == "cancelled" || state == "failed";
-        if (history == terminal) {
-          result.emplace_back(std::move(snapshot));
-        }
-      };
-      for (const std::shared_ptr<LiveWalletWorkloadRecord>& record : records) {
-        if (read_stop_token.stop_requested()) {
-          throw McpOperationCancelled();
-        }
-        append_if_selected(LiveWalletWorkloadJson(*record));
-      }
-      for (const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record :
-           block_records) {
-        if (read_stop_token.stop_requested()) {
-          throw McpOperationCancelled();
-        }
-        append_if_selected(LiveBlockGenerationWorkloadJson(*record));
-      }
-      for (const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record :
-           height_wait_records) {
-        if (read_stop_token.stop_requested()) {
-          throw McpOperationCancelled();
-        }
-        append_if_selected(LiveWaitUntilHeightWorkloadJson(*record));
-      }
-      for (const std::shared_ptr<LiveWaitForPeersWorkloadRecord>& record :
-           peer_wait_records) {
-        if (read_stop_token.stop_requested()) {
-          throw McpOperationCancelled();
-        }
-        append_if_selected(LiveWaitForPeersWorkloadJson(*record));
-      }
-      return boost::json::value(std::move(result));
-    };
+    workload_service->read =
+        [wallet_workloads, block_generation_workloads,
+         wait_until_height_workloads, wait_for_peers_workloads](
+            bool history, std::stop_token read_stop_token) {
+          return ReadLiveWorkloads(wallet_workloads, block_generation_workloads,
+                                   wait_until_height_workloads,
+                                   wait_for_peers_workloads, history,
+                                   read_stop_token);
+        };
     installed_workload_service = workload_service;
     mcp_application.SetWorkloadService(workload_service);
     workload_service.reset();
