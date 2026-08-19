@@ -103,6 +103,7 @@
 #include "simulator_live_instrumentation_controller.h"
 #include "simulator_live_wait_for_peers_control.h"
 #include "simulator_live_wallet_workload_control.h"
+#include "simulator_live_wallet_workload_launcher.h"
 #include "simulator_live_workload_reading.h"
 #include "simulator_live_workload_shutdown_request.h"
 #include "simulator_live_workload_state.h"
@@ -213,13 +214,10 @@ using simulator_app_internal::ApplyScenarioJson;
 using simulator_app_internal::ApplyScheduledScenarioEvents;
 using simulator_app_internal::ApplySendRawTransactionWorkload;
 using simulator_app_internal::ApplyTopologyEdgeWorkload;
-using simulator_app_internal::ApplyWalletTransactionsWorkload;
 using simulator_app_internal::AttachNodePerfCounters;
 using simulator_app_internal::BenchmarkRunRoot;
 using simulator_app_internal::BlockGenerationOutcomeUnconfirmed;
-using simulator_app_internal::CheckedWalletWorkloadAdd;
 using simulator_app_internal::CheckpointWorkloadDetail;
-using simulator_app_internal::ClaimedWalletsForWorkload;
 using simulator_app_internal::CombinedStopToken;
 using simulator_app_internal::ConfirmMasternodeTransactions;
 using simulator_app_internal::ConsecutiveNodeIndexes;
@@ -256,6 +254,7 @@ using simulator_app_internal::IsCurrentRunningNodeProcess;
 using simulator_app_internal::IsTerminalLiveWalletWorkloadState;
 using simulator_app_internal::IsTerminalLiveWorkloadState;
 using simulator_app_internal::IsTopologyEdgeConditionField;
+using simulator_app_internal::JoinLiveWalletWorkloadWorker;
 using simulator_app_internal::JsonAmountField;
 using simulator_app_internal::JsonOptionalAmountField;
 using simulator_app_internal::JsonOptionalBoolField;
@@ -304,6 +303,7 @@ using simulator_app_internal::MakeLiveInstrumentationRegistry;
 using simulator_app_internal::MakeLiveInstrumentationService;
 using simulator_app_internal::MakeLiveWaitForPeersOperation;
 using simulator_app_internal::MakeLiveWaitUntilHeightOperation;
+using simulator_app_internal::MakeLiveWalletWorkloadLauncher;
 using simulator_app_internal::MakeLiveWalletWorkloadOperation;
 using simulator_app_internal::MakeNodeVethConfig;
 using simulator_app_internal::MasternodeTransactionConfirmation;
@@ -439,7 +439,6 @@ using simulator_app_internal::ThrowIfStopRequested;
 using simulator_app_internal::ThrowWorkloadMutationOutcomeUnconfirmed;
 using simulator_app_internal::ToChainWalletMode;
 using simulator_app_internal::TransactionLoadAttemptDetail;
-using simulator_app_internal::TransactionLoadCompletedDetail;
 using simulator_app_internal::TransactionLoadProgressDetail;
 using simulator_app_internal::TransactionObservationDetail;
 using simulator_app_internal::TransactionObservationTracker;
@@ -455,13 +454,8 @@ using simulator_app_internal::WaitForNodeFrozenState;
 using simulator_app_internal::WaitForNodeProcessExitUntil;
 using simulator_app_internal::WaitUntil;
 using simulator_app_internal::WalletAddressDetail;
-using simulator_app_internal::WalletClaimsOverlap;
 using simulator_app_internal::WalletFundingDetail;
 using simulator_app_internal::WalletTransactionDetail;
-using simulator_app_internal::WalletWorkloadExecutionContext;
-using simulator_app_internal::WalletWorkloadExecutionEnd;
-using simulator_app_internal::WalletWorkloadExecutionResult;
-using simulator_app_internal::WalletWorkloadFundingState;
 using simulator_app_internal::WorkloadMutationCancelledAfterRollback;
 using simulator_app_internal::WorkloadMutationFailedAfterRollback;
 using simulator_app_internal::WorkloadMutationOutcomeUnconfirmed;
@@ -471,7 +465,6 @@ using simulator_app_internal::WriteEvent;
 using simulator_app_internal::WriteLiveBlockGenerationWorkloadState;
 using simulator_app_internal::WriteLiveWaitForPeersWorkloadState;
 using simulator_app_internal::WriteLiveWaitUntilHeightWorkloadState;
-using simulator_app_internal::WriteLiveWalletWorkloadState;
 using simulator_app_internal::WriteLogTailChunkEvent;
 using simulator_app_internal::WriteMetricsSnapshot;
 using simulator_app_internal::WriteNodeLogTails;
@@ -1260,7 +1253,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     };
     for (std::size_t index = 0U; index < retained_records.wallet_count;
          ++index) {
-      join_worker(retained_records.wallets[index]->worker);
+      JoinLiveWalletWorkloadWorker(*retained_records.wallets[index]);
     }
     for (std::size_t index = 0U; index < retained_records.height_wait_count;
          ++index) {
@@ -3301,432 +3294,11 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       return validation;
     };
 
-    const auto launch_wallet_workload =
-        [&](WalletTransactionsWorkload workload,
-            std::optional<std::string> requested_id)
-        -> std::shared_ptr<LiveWalletWorkloadRecord> {
-      auto record = std::make_shared<LiveWalletWorkloadRecord>();
-      record->workload = std::move(workload);
-      {
-        std::scoped_lock registry_lock(wallet_workloads->mutex,
-                                       block_generation_workloads->mutex,
-                                       wait_until_height_workloads->mutex,
-                                       wait_for_peers_workloads->mutex);
-        if (wallet_workloads->shutting_down ||
-            block_generation_workloads->shutting_down ||
-            wait_until_height_workloads->shutting_down ||
-            wait_for_peers_workloads->shutting_down) {
-          throw McpOperationFailure(
-              "run_not_active",
-              "the run is stopping and cannot start another workload", false);
-        }
-        record->wallet_snapshot = runtime_wallet_registry.Snapshot();
-        Options validation = options;
-        validation.topology = record->wallet_snapshot.registry().topology();
-        validation.wallet_backed_workload_requested =
-            !record->wallet_snapshot.wallets().empty();
-        ValidateWalletTransactionsWorkload(record->workload, validation);
-        record->claimed_wallets = ClaimedWalletsForWorkload(
-            record->workload, record->wallet_snapshot.wallets().size());
-        if (wallet_workloads->records.size() +
-                block_generation_workloads->records.size() +
-                wait_until_height_workloads->records.size() +
-                wait_for_peers_workloads->records.size() >=
-            kMaximumScenarioActionCount) {
-          throw McpOperationFailure(
-              "workload_capacity_exceeded",
-              "workload retained-instance capacity is exhausted", false);
-        }
-        std::size_t active_count = 0U;
-        for (const auto& [existing_id, existing] : wallet_workloads->records) {
-          static_cast<void>(existing_id);
-          std::lock_guard<std::mutex> existing_lock(existing->mutex);
-          if (IsTerminalLiveWalletWorkloadState(existing->state)) {
-            continue;
-          }
-          ++active_count;
-          if (WalletClaimsOverlap(record->claimed_wallets,
-                                  existing->claimed_wallets)) {
-            throw McpOperationFailure(
-                "wallet_admission_conflict",
-                "wallet workload sender admission overlaps active workload " +
-                    existing->id,
-                true);
-          }
-        }
-        if (active_count >= kMaximumWalletTransactionLoadConcurrency) {
-          throw McpOperationFailure(
-              "workload_capacity_exceeded",
-              "active wallet workload capacity is exhausted", true);
-        }
-        if (requested_id) {
-          ValidateMcpIdentifier(*requested_id, "workload_id");
-          if (wallet_workloads->records.contains(*requested_id) ||
-              block_generation_workloads->records.contains(*requested_id) ||
-              wait_until_height_workloads->records.contains(*requested_id) ||
-              wait_for_peers_workloads->records.contains(*requested_id)) {
-            throw McpOperationFailure(
-                "workload_id_conflict",
-                "workload_id is already retained: " + *requested_id, false);
-          }
-          record->id = *requested_id;
-        } else {
-          do {
-            if (wallet_workloads->next_id ==
-                std::numeric_limits<std::uint64_t>::max()) {
-              throw McpOperationFailure(
-                  "workload_id_exhausted",
-                  "wallet workload identity sequence is exhausted", false);
-            }
-            record->id = "wallet-workload-" +
-                         std::to_string(wallet_workloads->next_id++);
-          } while (wallet_workloads->records.contains(record->id) ||
-                   block_generation_workloads->records.contains(record->id) ||
-                   wait_until_height_workloads->records.contains(record->id) ||
-                   wait_for_peers_workloads->records.contains(record->id));
-        }
-        record->ordinal = static_cast<std::uint32_t>(
-            wallet_workloads->records.size() +
-            block_generation_workloads->records.size() +
-            wait_until_height_workloads->records.size() +
-            wait_for_peers_workloads->records.size() + 1U);
-        wallet_workloads->records.emplace(record->id, record);
-
-        try {
-          auto worker_lease = installed_workload_service->AcquireWorkerLease();
-          record->worker = std::thread([&, record,
-                                        worker_lease =
-                                            std::move(worker_lease)] {
-            const std::stop_token service_stop_token =
-                worker_lease.stop_token();
-            const auto set_terminal =
-                [&](LiveWalletWorkloadState state, std::string outcome,
-                    std::optional<std::string> failure = std::nullopt) {
-                  {
-                    std::lock_guard<std::mutex> lock(record->mutex);
-                    record->state = state;
-                    record->terminal_outcome = std::move(outcome);
-                    record->failure = std::move(failure);
-                    record->changed.notify_all();
-                  }
-                  try {
-                    WriteLiveWalletWorkloadState(events_path, options, *record);
-                  } catch (const std::exception& error) {
-                    BBP_LOG(error)
-                        << "failed to publish terminal wallet workload "
-                        << record->id << ": " << error.what();
-                  }
-                };
-            const auto cancel_outstanding_tracking = [&] {
-              const std::size_t cancelled =
-                  transaction_tracker.CancelWorkload(record->id);
-              std::lock_guard<std::mutex> lock(record->mutex);
-              CheckedWalletWorkloadAdd(static_cast<std::uint64_t>(cancelled),
-                                       &record->cancelled_tracking,
-                                       "cancelled tracking");
-            };
-            try {
-              while (true) {
-                WalletTransactionsWorkload epoch_workload;
-                RuntimeWalletSnapshot epoch_wallets;
-                std::stop_token epoch_stop_token;
-                {
-                  std::unique_lock<std::mutex> lock(record->mutex);
-                  while (record->request == LiveWalletWorkloadRequest::kPause) {
-                    record->state = LiveWalletWorkloadState::kPaused;
-                    record->changed.notify_all();
-                    lock.unlock();
-                    WriteLiveWalletWorkloadState(events_path, options, *record);
-                    lock.lock();
-                    if (!record->changed.wait(lock, service_stop_token, [&] {
-                          return record->request !=
-                                 LiveWalletWorkloadRequest::kPause;
-                        })) {
-                      record->request = LiveWalletWorkloadRequest::kShutdown;
-                      break;
-                    }
-                  }
-                  if (record->request ==
-                      LiveWalletWorkloadRequest::kStopCancel) {
-                    lock.unlock();
-                    cancel_outstanding_tracking();
-                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
-                    return;
-                  }
-                  if (record->request ==
-                      LiveWalletWorkloadRequest::kStopSettle) {
-                    lock.unlock();
-                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
-                    return;
-                  }
-                  if (record->request == LiveWalletWorkloadRequest::kShutdown) {
-                    lock.unlock();
-                    cancel_outstanding_tracking();
-                    set_terminal(LiveWalletWorkloadState::kCancelled,
-                                 "cancelled");
-                    return;
-                  }
-                  if (record->request ==
-                      LiveWalletWorkloadRequest::kRunFailure) {
-                    lock.unlock();
-                    cancel_outstanding_tracking();
-                    set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                                 "run failed while wallet workload was active");
-                    return;
-                  }
-                  if (record->request ==
-                      LiveWalletWorkloadRequest::kReconfigure) {
-                    if (!record->pending_workload) {
-                      throw std::logic_error(
-                          "wallet workload reconfigure has no configuration");
-                    }
-                    record->workload = std::move(*record->pending_workload);
-                    record->pending_workload.reset();
-                    if (record->configuration_revision ==
-                        std::numeric_limits<std::uint64_t>::max()) {
-                      throw std::runtime_error(
-                          "wallet workload configuration revision exceeds "
-                          "uint64");
-                    }
-                    ++record->configuration_revision;
-                    record->request = LiveWalletWorkloadRequest::kNone;
-                    record->state = LiveWalletWorkloadState::kStarting;
-                    record->changed.notify_all();
-                    lock.unlock();
-                    WriteLiveWalletWorkloadState(events_path, options, *record);
-                    lock.lock();
-                  }
-                  record->epoch_stop_source = std::stop_source();
-                  epoch_stop_token = record->epoch_stop_source.get_token();
-                  epoch_workload = record->workload;
-                  epoch_wallets = record->wallet_snapshot;
-                }
-
-                CombinedStopToken execution_stop(service_stop_token,
-                                                 epoch_stop_token);
-                WalletWorkloadExecutionContext execution{
-                    .accounting = record->accounting,
-                    .workload_id = record->id,
-                    .started_at = record->started_at,
-                    .next_transaction_index = record->next_transaction_index,
-                    .prepared_funding = &record->prepared_funding,
-                    .yield_requested =
-                        [record] {
-                          std::lock_guard<std::mutex> lock(record->mutex);
-                          return record->request !=
-                                 LiveWalletWorkloadRequest::kNone;
-                        },
-                    .settle_requested =
-                        [record] {
-                          std::lock_guard<std::mutex> lock(record->mutex);
-                          return record->request ==
-                                 LiveWalletWorkloadRequest::kStopSettle;
-                        },
-                    .record_planned =
-                        [record](std::uint64_t count) {
-                          std::lock_guard<std::mutex> lock(record->mutex);
-                          CheckedWalletWorkloadAdd(count, &record->planned,
-                                                   "planned");
-                        },
-                    .record_accepted =
-                        [record](std::uint64_t count) {
-                          std::lock_guard<std::mutex> lock(record->mutex);
-                          CheckedWalletWorkloadAdd(count, &record->accepted,
-                                                   "accepted");
-                        },
-                    .record_load_admission =
-                        [record,
-                         fee_reserve =
-                             EffectiveWalletTransactionFeeReserveSatoshis(
-                                 epoch_workload)](
-                            std::span<const WalletTransactionPlanEntry> plans) {
-                          std::uint64_t reserved = 0U;
-                          for (const WalletTransactionPlanEntry& plan : plans) {
-                            if (plan.amount_satoshis >
-                                std::numeric_limits<std::uint64_t>::max() -
-                                    fee_reserve) {
-                              throw std::runtime_error(
-                                  "wallet workload reservation amount exceeds "
-                                  "uint64");
-                            }
-                            const std::uint64_t amount =
-                                plan.amount_satoshis + fee_reserve;
-                            if (reserved >
-                                std::numeric_limits<std::uint64_t>::max() -
-                                    amount) {
-                              throw std::runtime_error(
-                                  "wallet workload admission reservation "
-                                  "exceeds "
-                                  "uint64");
-                            }
-                            reserved += amount;
-                          }
-                          std::lock_guard<std::mutex> lock(record->mutex);
-                          const std::uint64_t accepted =
-                              static_cast<std::uint64_t>(plans.size());
-                          if (record->accepted >
-                                  std::numeric_limits<std::uint64_t>::max() -
-                                      accepted ||
-                              record->reserved_atomic_units >
-                                  std::numeric_limits<std::uint64_t>::max() -
-                                      reserved) {
-                            throw std::runtime_error(
-                                "wallet workload admission accounting exceeds "
-                                "uint64");
-                          }
-                          record->accepted += accepted;
-                          record->reserved_atomic_units += reserved;
-                        },
-                    .record_released_atomic_units =
-                        [record](std::uint64_t amount) {
-                          std::lock_guard<std::mutex> lock(record->mutex);
-                          CheckedWalletWorkloadAdd(
-                              amount, &record->released_atomic_units,
-                              "released atomic units");
-                        },
-                    .execution_started =
-                        [&, record] {
-                          {
-                            std::lock_guard<std::mutex> lock(record->mutex);
-                            if (record->request ==
-                                LiveWalletWorkloadRequest::kNone) {
-                              record->state = LiveWalletWorkloadState::kRunning;
-                            }
-                            record->changed.notify_all();
-                          }
-                          WriteLiveWalletWorkloadState(events_path, options,
-                                                       *record);
-                        },
-                };
-                try {
-                  RuntimeNodeSnapshot execution_nodes =
-                      node_inventory.Snapshot();
-                  const WalletWorkloadExecutionResult result =
-                      ApplyWalletTransactionsWorkload(
-                          options, events_path, driver, block_generation_mutex,
-                          execution_nodes, epoch_wallets.registry(),
-                          transaction_tracker, nullptr, epoch_workload,
-                          record->ordinal, 0U, execution_stop.get_token(),
-                          &execution);
-                  bool stop_settled = false;
-                  {
-                    std::lock_guard<std::mutex> lock(record->mutex);
-                    record->next_transaction_index =
-                        result.next_transaction_index;
-                    record->queue_maximum_size = std::max(
-                        record->queue_maximum_size, result.queue_maximum_size);
-                    if (record->request ==
-                        LiveWalletWorkloadRequest::kStopSettle) {
-                      stop_settled = true;
-                    }
-                    if (record->request == LiveWalletWorkloadRequest::kPause ||
-                        record->request ==
-                            LiveWalletWorkloadRequest::kReconfigure) {
-                      continue;
-                    }
-                  }
-                  if (stop_settled) {
-                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
-                    return;
-                  }
-                  if (result.end ==
-                      WalletWorkloadExecutionEnd::kRefreshBalances) {
-                    std::unique_lock<std::mutex> lock(record->mutex);
-                    record->changed.wait_for(
-                        lock, execution_stop.get_token(),
-                        std::chrono::milliseconds(100), [&] {
-                          return record->request !=
-                                 LiveWalletWorkloadRequest::kNone;
-                        });
-                    continue;
-                  }
-                  const std::string outcome =
-                      epoch_workload.transaction_count != 0U ? "count_reached"
-                      : epoch_workload.duration ? "duration_expired"
-                                                : "failed";
-                  if (outcome == "failed") {
-                    cancel_outstanding_tracking();
-                    set_terminal(
-                        LiveWalletWorkloadState::kFailed, "failed",
-                        "continuous wallet workload sender ended unexpectedly");
-                  } else {
-                    set_terminal(LiveWalletWorkloadState::kCompleted, outcome);
-                    const auto elapsed =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() -
-                            record->started_at);
-                    const TransactionLoadSnapshot snapshot =
-                        record->accounting->Snapshot(elapsed);
-                    WriteEvent(events_path, options.run_id, "sim",
-                               SimulationEventKind::kTransactionLoadCompleted,
-                               TransactionLoadCompletedDetail(
-                                   record->ordinal, 0U, epoch_workload,
-                                   ExplicitWalletTransactionAttemptLimit(
-                                       epoch_workload),
-                                   record->queue_maximum_size, snapshot));
-                  }
-                  return;
-                } catch (const SimulationCancelled&) {
-                  LiveWalletWorkloadRequest request;
-                  {
-                    std::lock_guard<std::mutex> lock(record->mutex);
-                    record->next_transaction_index =
-                        execution.next_transaction_index;
-                    request = record->request;
-                  }
-                  if (request == LiveWalletWorkloadRequest::kPause ||
-                      request == LiveWalletWorkloadRequest::kReconfigure) {
-                    continue;
-                  }
-                  if (request == LiveWalletWorkloadRequest::kStopCancel ||
-                      request == LiveWalletWorkloadRequest::kStopSettle) {
-                    if (request == LiveWalletWorkloadRequest::kStopCancel) {
-                      cancel_outstanding_tracking();
-                    }
-                    set_terminal(LiveWalletWorkloadState::kStopped, "stopped");
-                    return;
-                  }
-                  if (request == LiveWalletWorkloadRequest::kRunFailure) {
-                    cancel_outstanding_tracking();
-                    set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                                 "run failed while wallet workload was active");
-                    return;
-                  }
-                  if (request == LiveWalletWorkloadRequest::kShutdown ||
-                      service_stop_token.stop_requested()) {
-                    cancel_outstanding_tracking();
-                    set_terminal(LiveWalletWorkloadState::kCancelled,
-                                 "cancelled");
-                    return;
-                  }
-                  cancel_outstanding_tracking();
-                  set_terminal(
-                      LiveWalletWorkloadState::kFailed, "failed",
-                      "wallet workload execution was cancelled unexpectedly");
-                  return;
-                }
-              }
-            } catch (const std::exception& error) {
-              cancel_outstanding_tracking();
-              set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                           error.what());
-            } catch (...) {
-              cancel_outstanding_tracking();
-              set_terminal(LiveWalletWorkloadState::kFailed, "failed",
-                           "unknown wallet workload failure");
-            }
-          });
-        } catch (...) {
-          const auto found = wallet_workloads->records.find(record->id);
-          if (found != wallet_workloads->records.end() &&
-              found->second == record) {
-            wallet_workloads->records.erase(found);
-          }
-          throw;
-        }
-      }
-      return record;
-    };
+    const auto launch_wallet_workload = MakeLiveWalletWorkloadLauncher(
+        options, events_path, driver, node_inventory, runtime_wallet_registry,
+        transaction_tracker, block_generation_mutex, *workload_service,
+        wallet_workloads, block_generation_workloads,
+        wait_until_height_workloads, wait_for_peers_workloads);
 
     const auto find_block_generation_workload_record =
         [block_generation_workloads](std::string_view workload_id) {
