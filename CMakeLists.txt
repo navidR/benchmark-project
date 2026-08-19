@@ -289,6 +289,7 @@ add_executable(bbp
   src/simulator_app.cpp
   src/simulator_block_generation_boundary.cpp
   src/simulator_cancellable_waiting.cpp
+  src/simulator_combined_stop_token.cpp
   src/simulator_event_writing.cpp
   src/simulator_height_wait_readback.cpp
   src/simulator_host_probes.cpp
@@ -613,6 +614,7 @@ if(BUILD_TESTING)
     src/simulator_app.cpp
     src/simulator_block_generation_boundary.cpp
     src/simulator_cancellable_waiting.cpp
+    src/simulator_combined_stop_token.cpp
     src/simulator_event_writing.cpp
     src/simulator_height_wait_readback.cpp
     src/simulator_host_probes.cpp

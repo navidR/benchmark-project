@@ -92,6 +92,7 @@
 #include "bbp/util.h"
 #include "simulator_block_generation_boundary.h"
 #include "simulator_cancellable_waiting.h"
+#include "simulator_combined_stop_token.h"
 #include "simulator_event_writing.h"
 #include "simulator_height_wait_readback.h"
 #include "simulator_host_probes.h"
@@ -212,6 +213,7 @@ using simulator_app_internal::BlockGenerationOutcomeUnconfirmed;
 using simulator_app_internal::CheckedWalletWorkloadAdd;
 using simulator_app_internal::CheckpointWorkloadDetail;
 using simulator_app_internal::ClaimedWalletsForWorkload;
+using simulator_app_internal::CombinedStopToken;
 using simulator_app_internal::ConfirmMasternodeTransactions;
 using simulator_app_internal::ConsecutiveNodeIndexes;
 using simulator_app_internal::DirectionalNetworkPoliciesForNode;
@@ -477,28 +479,6 @@ std::shared_ptr<std::timed_mutex> RuntimePublicationMutex() {
   return mutex;
 }
 std::mutex node_resource_state_mutex;
-
-struct StopForwarder {
-  std::stop_source* target = nullptr;
-
-  void operator()() const noexcept { target->request_stop(); }
-};
-
-class CombinedStopToken {
- public:
-  CombinedStopToken(std::stop_token first, std::stop_token second)
-      : first_callback_(first, StopForwarder{&source_}),
-        second_callback_(second, StopForwarder{&source_}) {}
-
-  [[nodiscard]] std::stop_token get_token() const noexcept {
-    return source_.get_token();
-  }
-
- private:
-  std::stop_source source_;
-  std::stop_callback<StopForwarder> first_callback_;
-  std::stop_callback<StopForwarder> second_callback_;
-};
 
 std::string ExceptionMessage(const std::exception_ptr& error) {
   try {
