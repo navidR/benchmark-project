@@ -296,6 +296,7 @@ add_executable(bbp
   src/simulator_initial_peer_connectivity.cpp
   src/simulator_json_field_decoding.cpp
   src/simulator_live_workload_state.cpp
+  src/simulator_live_workload_shutdown_request.cpp
   src/simulator_live_instrumentation_controller.cpp
   src/simulator_managed_run_root.cpp
   src/simulator_masternode_funding_boundary.cpp
@@ -621,6 +622,7 @@ if(BUILD_TESTING)
     src/simulator_initial_peer_connectivity.cpp
     src/simulator_json_field_decoding.cpp
     src/simulator_live_workload_state.cpp
+    src/simulator_live_workload_shutdown_request.cpp
     src/simulator_live_instrumentation_controller.cpp
     src/simulator_managed_run_root.cpp
     src/simulator_masternode_funding_boundary.cpp
