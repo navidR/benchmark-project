@@ -103,6 +103,7 @@
 #include "simulator_live_height_wait_control.h"
 #include "simulator_live_height_wait_workload_launcher.h"
 #include "simulator_live_instrumentation_controller.h"
+#include "simulator_live_miner_addition.h"
 #include "simulator_live_miner_removal.h"
 #include "simulator_live_peer_wait_workload_launcher.h"
 #include "simulator_live_wait_for_peers_control.h"
@@ -196,6 +197,7 @@ namespace bbp {
 namespace {
 
 using simulator_app_internal::AcquireScenarioHeightWaitAdmission;
+using simulator_app_internal::AddLiveMinerRoles;
 using simulator_app_internal::AddRuntimeNodesTransactional;
 using simulator_app_internal::ApplyDeclarativeStopDuringStart;
 using simulator_app_internal::ApplyNetworkBlockRules;
@@ -275,6 +277,7 @@ using simulator_app_internal::LiveBlockGenerationWorkloadRecord;
 using simulator_app_internal::LiveBlockGenerationWorkloadRegistry;
 using simulator_app_internal::LiveInstrumentationControllerPtr;
 using simulator_app_internal::LiveInstrumentationMeasurementCollector;
+using simulator_app_internal::LiveMinerAdditionContext;
 using simulator_app_internal::LiveMinerRemovalContext;
 using simulator_app_internal::LiveWaitForPeersWorkloadJson;
 using simulator_app_internal::LiveWaitForPeersWorkloadRecord;
@@ -4343,457 +4346,36 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             arguments, operation_stop_token);
       }
       if (kind == McpOperationKind::kAddMiner) {
-        constexpr std::array<std::string_view, 6U> kAllowedFields = {
-            "run_id",       "node_ids",       "count",
-            "create_nodes", "wallet_node_id", "timeout_sec"};
-        RejectUnsupportedFields(arguments, kAllowedFields, "miner.add");
-        const std::uint32_t count =
-            JsonOptionalUint32Field(arguments, "count", 0U);
-        if (count == 0U || count > kSimulationNodeAddMaximumCount) {
-          throw std::invalid_argument("miner.add count must be in 1..16");
-        }
-        const std::uint32_t timeout_sec =
-            JsonOptionalUint32Field(arguments, "timeout_sec", 30U);
-        if (timeout_sec == 0U || timeout_sec > 3600U) {
-          throw std::invalid_argument(
-              "miner.add timeout_sec must be in 1..3600");
-        }
-
-        std::vector<std::string> requested_node_ids;
-        if (const boost::json::value* node_ids =
-                arguments.if_contains("node_ids")) {
-          if (!node_ids->is_array()) {
-            throw std::invalid_argument("miner.add node_ids must be an array");
-          }
-          std::set<std::string> unique_node_ids;
-          requested_node_ids.reserve(node_ids->as_array().size());
-          for (const boost::json::value& node_id : node_ids->as_array()) {
-            if (!node_id.is_string()) {
-              throw std::invalid_argument(
-                  "miner.add node_ids must contain strings");
-            }
-            std::string id(node_id.as_string());
-            RequireSafeScenarioIdentifier(id, "miner.add node_ids");
-            if (!unique_node_ids.insert(id).second) {
-              throw std::invalid_argument("miner.add node_ids must be unique");
-            }
-            requested_node_ids.push_back(std::move(id));
-          }
-          if (requested_node_ids.size() != count) {
-            throw std::invalid_argument(
-                "miner.add count must match node_ids size");
-          }
-        }
-
-        std::optional<std::string> wallet_node_id;
-        if (arguments.if_contains("wallet_node_id") != nullptr) {
-          wallet_node_id = JsonOptionalStringField(arguments, "wallet_node_id",
-                                                   std::string_view());
-          RequireSafeScenarioIdentifier(*wallet_node_id,
-                                        "miner.add wallet_node_id");
-          if (count != 1U) {
-            throw std::invalid_argument(
-                "miner.add wallet_node_id requires count=1");
-          }
-        }
-        const boost::json::value* create_nodes =
-            arguments.if_contains("create_nodes");
-        if (create_nodes != nullptr && !create_nodes->is_object()) {
-          throw std::invalid_argument(
-              "miner.add create_nodes must be an object");
-        }
-        const std::uint32_t selector_count =
-            (!requested_node_ids.empty() ? 1U : 0U) +
-            (wallet_node_id ? 1U : 0U) + (create_nodes != nullptr ? 1U : 0U);
-        if (selector_count > 1U) {
-          throw std::invalid_argument(
-              "miner.add node_ids, wallet_node_id, and create_nodes are "
-              "mutually exclusive");
-        }
-
-        if (options.block_production.enabled &&
-            options.block_production.mode == MiningMode::kNativeMining) {
-          const UnsupportedChainOperation error(
-              ChainKindName(options.chain),
-              "transactional runtime native-miner activation");
-          throw McpOperationFailure("unsupported_chain_operation", error.what(),
-                                    false);
-        }
-        if (options.block_production.enabled &&
-            options.block_production.difficulty) {
-          const UnsupportedChainOperation error(
-              ChainKindName(options.chain),
-              "transactional runtime mining-difficulty activation");
-          throw McpOperationFailure("unsupported_chain_operation", error.what(),
-                                    false);
-        }
-        if (options.block_production.enabled &&
-            options.block_production.mode ==
-                MiningMode::kScheduledBlockProduction &&
-            block_scheduler == nullptr) {
-          throw McpOperationFailure(
-              "mining_scheduler_unavailable",
-              "miner.add requires the active scheduled block producer", true);
-        }
-
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(timeout_sec);
-        std::stop_source bounded_stop_source;
-        std::atomic_bool deadline_expired = false;
-        std::stop_callback stop_on_operation(
-            operation_stop_token,
-            [&bounded_stop_source] { bounded_stop_source.request_stop(); });
-        std::jthread deadline_timer(
-            [deadline, &bounded_stop_source,
-             &deadline_expired](std::stop_token timer_stop_token) {
-              try {
-                WaitUntil(deadline, timer_stop_token);
-              } catch (const SimulationCancelled&) {
-                return;
-              }
-              deadline_expired.store(true, std::memory_order_release);
-              bounded_stop_source.request_stop();
-            });
-        const std::stop_token bounded_stop_token =
-            bounded_stop_source.get_token();
-        SimulationCommandControl role_control;
-        role_control.absolute_deadline = deadline;
-        std::stop_callback cancel_role_publication(bounded_stop_token, [&] {
-          static_cast<void>(role_control.RequestCancellation(
-              deadline_expired.load(std::memory_order_acquire)
-                  ? SimulationCommandCancellationCause::kDeadline
-                  : SimulationCommandCancellationCause::kClientCancel));
-        });
-        ThrowIfStopRequested(bounded_stop_token);
-        auto mutation_lock =
-            AcquireNodeMutationLock(node_mutation_mutex, bounded_stop_token);
-        const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
-        const RuntimeWalletSnapshot before_roles =
-            runtime_wallet_registry.Snapshot();
-        const NodeRoleTopology& before_topology =
-            before_roles.registry().topology();
-
-        if (create_nodes != nullptr) {
-          Options validation_options = options;
-          validation_options.nodes =
-              static_cast<std::uint32_t>(current_nodes.size());
-          SimulationNodeAddRequest node_request;
-          try {
-            node_request = ParseAndValidateSimulationNodeAddRequest(
-                create_nodes->as_object(), validation_options);
-          } catch (const std::runtime_error& error) {
-            if (std::string_view(error.what()) !=
-                "node.add request exceeds the configured node capacity") {
-              throw;
-            }
-            throw McpOperationFailure(
-                "node_capacity_exceeded", error.what(), false,
-                boost::json::array{boost::json::object{
-                    {"code", "node_capacity_exceeded"},
-                    {"message",
-                     "the requested miner-node batch exceeds available "
-                     "capacity"},
-                    {"path", "create_nodes.count"},
-                    {"requested_count", count},
-                    {"current_node_count", current_nodes.size()},
-                    {"node_capacity", node_inventory.capacity()},
-                    {"available_node_capacity",
-                     current_nodes.size() <= node_inventory.capacity()
-                         ? node_inventory.capacity() - current_nodes.size()
-                         : 0U},
-                    {"recoverable", false}}});
-          }
-          if (node_request.count != count) {
-            throw std::invalid_argument(
-                "miner.add count must match create_nodes.count");
-          }
-
-          RuntimeNodeAddResult added;
-          try {
-            std::lock_guard<std::mutex> topology_lock(runtime_topology_mutex);
-            added = AddRuntimeNodesTransactional(
-                options, run_root, events_path, chain_spec, driver,
-                node_inventory, runtime_wallet_registry,
-                RuntimeNodeAdditionRole::kMiner, block_scheduler.get(),
-                &miner_node_ids, &configured_miner_node_ids_mutex, nullptr,
-                *peer_connectivity_controller, &runtime_topology,
-                &live_topology_config, run_process_state, lifecycle_epoch,
-                node_request, &role_control, bounded_stop_token,
-                runtime_node_addition_dependencies);
-          } catch (const SimulationNodeResourceUnavailable& error) {
-            if (role_control.CommitPhase() ==
-                SimulationCommandCommitPhase::kCancelled) {
-              throw SimulationCancelled();
-            }
-            const SimulationNodeResourceFailure& failure = error.failure();
-            throw McpOperationFailure(
-                "node_resource_unavailable", error.what(), true,
-                boost::json::array{boost::json::object{
-                    {"code", "node_resource_unavailable"},
-                    {"message", error.what()},
-                    {"path", "create_nodes"},
-                    {"resource_kind", failure.resource_kind},
-                    {"node_id", failure.node_id},
-                    {"address", failure.address},
-                    {"port", failure.port},
-                    {"purpose", failure.purpose},
-                    {"mutation_started", failure.mutation_started},
-                    {"action", "miner.add"},
-                    {"recoverable", true}}});
-          } catch (const SimulationCommandOutcomeUnconfirmed& error) {
-            mcp_application.MarkRunStopping();
-            request_simulation_stop();
-            throw McpOperationFailure(
-                "miner_add_outcome_unconfirmed",
-                "miner.add create_nodes outcome is unconfirmed: " +
-                    std::string(error.what()),
-                false);
-          } catch (const std::exception&) {
-            if (role_control.CommitPhase() ==
-                SimulationCommandCommitPhase::kCancelled) {
-              throw SimulationCancelled();
-            }
-            throw;
-          } catch (...) {
-            if (role_control.CommitPhase() ==
-                SimulationCommandCommitPhase::kCancelled) {
-              throw SimulationCancelled();
-            }
-            throw;
-          }
-
-          try {
-            if (!added.role_generation || !added.final_miner_count ||
-                added.added_node_ids.size() != count) {
-              throw std::logic_error(
-                  "miner.add create_nodes omitted its joint publication "
-                  "evidence");
-            }
-            boost::json::array node_ids;
-            boost::json::array created_node_ids;
-            node_ids.reserve(added.added_node_ids.size());
-            created_node_ids.reserve(added.added_node_ids.size());
-            for (const std::string& node_id : added.added_node_ids) {
-              node_ids.emplace_back(node_id);
-              created_node_ids.emplace_back(node_id);
-            }
-            return boost::json::object{
-                {"node_ids", std::move(node_ids)},
-                {"assigned_roles", boost::json::array{"miner"}},
-                {"removed_roles", boost::json::array{}},
-                {"action", "miner.add"},
-                {"state", "ready"},
-                {"created_node_ids", std::move(created_node_ids)},
-                {"role_generation", *added.role_generation},
-                {"final_miner_count", *added.final_miner_count},
-                {"inventory_generation", added.inventory_generation},
-                {"final_node_count", added.final_node_count},
-            };
-          } catch (...) {
-            mcp_application.MarkRunStopping();
-            request_simulation_stop();
-            throw McpOperationFailure(
-                "miner_add_outcome_unconfirmed",
-                "miner.add create_nodes published but completion evidence "
-                "failed: " +
-                    ExceptionMessage(std::current_exception()),
-                false);
-          }
-        }
-
-        const auto is_wallet_node = [&](std::size_t index) {
-          return NodeListContains(before_topology.wallet_nodes,
-                                  static_cast<std::uint32_t>(index));
-        };
-        const auto is_miner_node = [&](std::size_t index) {
-          return NodeListContains(before_topology.miner_nodes,
-                                  static_cast<std::uint32_t>(index));
-        };
-        const auto require_compatible_index = [&](std::size_t index) {
-          if (is_miner_node(index)) {
-            throw McpOperationFailure("miner_already_configured",
-                                      "miner.add node is already a miner: " +
-                                          current_nodes[index].config.id,
-                                      false);
-          }
-          if (is_wallet_node(index) &&
-              !before_topology.allow_miner_wallet_overlap) {
-            throw McpOperationFailure(
-                "role_conflict",
-                "miner.add cannot overlap the selected wallet role: " +
-                    current_nodes[index].config.id,
-                false);
-          }
-        };
-
-        std::vector<std::size_t> selected_indexes;
-        selected_indexes.reserve(count);
-        if (!requested_node_ids.empty()) {
-          for (const std::string& requested_node_id : requested_node_ids) {
-            const auto selected =
-                std::find_if(current_nodes.begin(), current_nodes.end(),
-                             [&](const NodeRuntime& node) {
-                               return node.config.id == requested_node_id;
-                             });
-            if (selected == current_nodes.end()) {
-              throw McpOperationFailure(
-                  "node_not_found",
-                  "miner.add node is not active: " + requested_node_id, false);
-            }
-            const std::size_t index = static_cast<std::size_t>(
-                std::distance(current_nodes.begin(), selected));
-            require_compatible_index(index);
-            selected_indexes.push_back(index);
-          }
-        } else if (wallet_node_id) {
-          if (!before_topology.allow_miner_wallet_overlap) {
-            throw McpOperationFailure(
-                "role_conflict",
-                "miner.add wallet_node_id requires miner-wallet overlap "
-                "permission",
-                false);
-          }
-          const auto selected =
-              std::find_if(current_nodes.begin(), current_nodes.end(),
-                           [&](const NodeRuntime& node) {
-                             return node.config.id == *wallet_node_id;
-                           });
-          if (selected == current_nodes.end()) {
-            throw McpOperationFailure(
-                "node_not_found",
-                "miner.add wallet node is not active: " + *wallet_node_id,
-                false);
-          }
-          const std::size_t index = static_cast<std::size_t>(
-              std::distance(current_nodes.begin(), selected));
-          if (!is_wallet_node(index)) {
-            throw McpOperationFailure(
-                "wallet_role_required",
-                "miner.add wallet_node_id is not a registered wallet node: " +
-                    *wallet_node_id,
-                false);
-          }
-          require_compatible_index(index);
-          selected_indexes.push_back(index);
-        } else {
-          auto process_guard = run_process_state.Lock();
-          const auto select_compatible = [&](bool wallet_nodes) {
-            for (std::size_t index = 0U; index < current_nodes.size() &&
-                                         selected_indexes.size() < count;
-                 ++index) {
-              NodeRuntime& node = current_nodes[index];
-              if (is_miner_node(index) ||
-                  is_wallet_node(index) != wallet_nodes ||
-                  (wallet_nodes &&
-                   !before_topology.allow_miner_wallet_overlap) ||
-                  !node.AllowsChainMetrics() || !node.process.running()) {
-                continue;
-              }
-              selected_indexes.push_back(index);
-            }
-          };
-          select_compatible(false);
-          if (selected_indexes.size() < count &&
-              before_topology.allow_miner_wallet_overlap) {
-            select_compatible(true);
-          }
-          if (selected_indexes.size() != count) {
-            throw McpOperationFailure(
-                "miner_backing_node_unavailable",
-                "miner.add found fewer compatible running non-miner nodes "
-                "than requested",
-                false);
-          }
-        }
-
-        std::vector<std::uint32_t> selected_role_indexes;
-        std::vector<std::string> selected_node_ids;
-        selected_role_indexes.reserve(selected_indexes.size());
-        selected_node_ids.reserve(selected_indexes.size());
-        {
-          auto process_guard = run_process_state.Lock();
-          for (const std::size_t index : selected_indexes) {
-            NodeRuntime& node = current_nodes[index];
-            RequireNodeRunning(node, process_guard, "miner.add");
-            selected_role_indexes.push_back(static_cast<std::uint32_t>(index));
-            selected_node_ids.push_back(node.config.id);
-          }
-        }
-
-        std::unique_lock<std::timed_mutex> publication_lock =
-            AcquireRuntimePublicationLock(bounded_stop_token);
-        ThrowIfStopRequested(bounded_stop_token);
-        RuntimeWalletRegistry::PreparedAppend prepared_roles =
-            runtime_wallet_registry.PrepareUpdate(
-                before_roles.generation(), {}, selected_role_indexes, {},
-                static_cast<std::uint32_t>(current_nodes.size()));
-        std::unique_lock<std::mutex> configured_miners_lock(
-            configured_miner_node_ids_mutex);
-        std::vector<std::string> next_miner_node_ids = miner_node_ids;
-        next_miner_node_ids.reserve(next_miner_node_ids.size() +
-                                    selected_node_ids.size());
-        for (const std::string& node_id : selected_node_ids) {
-          if (std::find(next_miner_node_ids.begin(), next_miner_node_ids.end(),
-                        node_id) != next_miner_node_ids.end()) {
-            throw std::logic_error(
-                "miner.add selected an already configured miner: " + node_id);
-          }
-          next_miner_node_ids.push_back(node_id);
-        }
-        std::optional<ProbabilisticBlockScheduler::PreparedAdd>
-            prepared_scheduler;
-        if (block_scheduler != nullptr) {
-          prepared_scheduler.emplace(
-              block_scheduler->PrepareAddMinersInactive(selected_node_ids));
-        }
-        if (!role_control.TryBeginCommit()) {
-          throw SimulationCancelled();
-        }
-        const RuntimeWalletSnapshot published_roles = prepared_roles.Commit();
-        if (prepared_scheduler) {
-          prepared_scheduler->Commit();
-        }
-        miner_node_ids.swap(next_miner_node_ids);
-        role_control.MarkCommitted();
-
-        try {
-          WriteEvent(events_path, options.run_id, "sim",
-                     SimulationEventKind::kRuntimeRoleGenerationPublished,
-                     boost::json::serialize(RuntimeRoleGenerationDetail(
-                         published_roles, current_nodes)));
-          if (block_scheduler != nullptr) {
-            for (const std::string& node_id : selected_node_ids) {
-              block_scheduler->StartMiner(node_id);
-            }
-          }
-          configured_miners_lock.unlock();
-          boost::json::array node_ids;
-          node_ids.reserve(selected_node_ids.size());
-          for (const std::string& node_id : selected_node_ids) {
-            node_ids.emplace_back(node_id);
-          }
-          return boost::json::object{
-              {"node_ids", std::move(node_ids)},
-              {"assigned_roles", boost::json::array{"miner"}},
-              {"removed_roles", boost::json::array{}},
-              {"action", "miner.add"},
-              {"state", "ready"},
-              {"created_node_ids", boost::json::array{}},
-              {"role_generation", published_roles.generation()},
-              {"final_miner_count",
-               published_roles.registry().topology().miner_nodes.size()},
-              {"inventory_generation", current_nodes.generation()},
-              {"final_node_count", current_nodes.size()},
-          };
-        } catch (...) {
-          mcp_application.MarkRunStopping();
-          request_simulation_stop();
-          throw McpOperationFailure(
-              "miner_add_outcome_unconfirmed",
-              "miner.add published but completion evidence failed: " +
-                  ExceptionMessage(std::current_exception()),
-              false);
-        }
+        return AddLiveMinerRoles(
+            LiveMinerAdditionContext{
+                .options = options,
+                .run_root = run_root,
+                .events_path = events_path,
+                .chain_spec = chain_spec,
+                .driver = driver,
+                .mcp_application = mcp_application,
+                .node_inventory = node_inventory,
+                .runtime_wallet_registry = runtime_wallet_registry,
+                .block_scheduler = block_scheduler,
+                .configured_miner_node_ids_mutex =
+                    configured_miner_node_ids_mutex,
+                .miner_node_ids = miner_node_ids,
+                .node_mutation_mutex = node_mutation_mutex,
+                .runtime_topology_mutex = runtime_topology_mutex,
+                .peer_connectivity_controller = peer_connectivity_controller,
+                .runtime_topology = runtime_topology,
+                .live_topology_config = live_topology_config,
+                .run_process_state = run_process_state,
+                .lifecycle_epoch = lifecycle_epoch,
+                .runtime_node_addition_dependencies =
+                    runtime_node_addition_dependencies,
+                .request_simulation_stop = request_simulation_stop,
+                .acquire_node_mutation_lock = AcquireNodeMutationLock,
+                .acquire_runtime_publication_lock =
+                    AcquireRuntimePublicationLock,
+                .exception_message = ExceptionMessage,
+            },
+            arguments, operation_stop_token);
       }
       if (kind != McpOperationKind::kAddWallet) {
         throw std::logic_error("unknown live role mutation operation");
