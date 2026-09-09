@@ -126,6 +126,7 @@
 #include "simulator_node_process_state.h"
 #include "simulator_node_report_export.h"
 #include "simulator_offline_run_cleanup.h"
+#include "simulator_one_shot_workload_dispatch.h"
 #include "simulator_operator_connection_publication.h"
 #include "simulator_option_parsing.h"
 #include "simulator_peer_churn_workloads.h"
@@ -193,9 +194,7 @@ namespace {
 
 using simulator_app_internal::AcquireScenarioHeightWaitAdmission;
 using simulator_app_internal::AddRuntimeNodesTransactional;
-using simulator_app_internal::ApplyConnectPeerWorkload;
 using simulator_app_internal::ApplyDeclarativeStopDuringStart;
-using simulator_app_internal::ApplyDisconnectPeerWorkload;
 using simulator_app_internal::ApplyNetworkBlockRules;
 using simulator_app_internal::ApplyNetworkPartitionRules;
 using simulator_app_internal::ApplyNetworkProfileSwitch;
@@ -203,7 +202,6 @@ using simulator_app_internal::ApplyNodeConditions;
 using simulator_app_internal::ApplyPerfCounterCommand;
 using simulator_app_internal::ApplyResourceLimitPatches;
 using simulator_app_internal::ApplyResourceLimitUpdate;
-using simulator_app_internal::ApplyResourcePressureWorkload;
 using simulator_app_internal::ApplyResourceProfileSwitch;
 using simulator_app_internal::ApplyRuntimeNetworkBlockRules;
 using simulator_app_internal::ApplyRuntimeNetworkConditionUpdates;
@@ -215,16 +213,14 @@ using simulator_app_internal::ApplyRuntimeNodeFreezes;
 using simulator_app_internal::ApplyRuntimeResourceLimitUpdates;
 using simulator_app_internal::ApplyScenarioJson;
 using simulator_app_internal::ApplyScheduledScenarioEvents;
-using simulator_app_internal::ApplySendRawTransactionWorkload;
-using simulator_app_internal::ApplyTopologyEdgeWorkload;
 using simulator_app_internal::AttachNodePerfCounters;
 using simulator_app_internal::BenchmarkRunRoot;
-using simulator_app_internal::CheckpointWorkloadDetail;
 using simulator_app_internal::CombinedStopToken;
 using simulator_app_internal::ConfirmMasternodeTransactions;
 using simulator_app_internal::ConsecutiveNodeIndexes;
 using simulator_app_internal::DirectionalNetworkPoliciesForNode;
 using simulator_app_internal::DiscoverRetainedRuns;
+using simulator_app_internal::DispatchOneShotWorkload;
 using simulator_app_internal::DynamicDirectionalNetworkPolicies;
 using simulator_app_internal::DynamicPhysicalTopologyPeerEndpoints;
 using simulator_app_internal::DynamicRestartPeerEndpoints;
@@ -238,8 +234,6 @@ using simulator_app_internal::ElapsedMilliseconds;
 using simulator_app_internal::ExpectedTransactionLoadObservations;
 using simulator_app_internal::ExportNodeReport;
 using simulator_app_internal::FindPeerConnectivityPolicy;
-using simulator_app_internal::FreezeNodeForDuration;
-using simulator_app_internal::FreezeNodeWorkloadDetail;
 using simulator_app_internal::GenerateBlocksSerialized;
 using simulator_app_internal::GenerateBlockWorkloadBoundary;
 using simulator_app_internal::GeneratedBlocksDetail;
@@ -322,6 +316,7 @@ using simulator_app_internal::NodeRestartAdmission;
 using simulator_app_internal::NodeRoleName;
 using simulator_app_internal::ObservedRunStop;
 using simulator_app_internal::OneShotRawTransactionRejected;
+using simulator_app_internal::OneShotWorkloadContext;
 using simulator_app_internal::OperatorWalletTransactionDetail;
 using simulator_app_internal::ParseAmountDistribution;
 using simulator_app_internal::ParseAndValidateLiveBlockGenerationWorkload;
@@ -390,7 +385,6 @@ using simulator_app_internal::ReserveTcpEndpoint;
 using simulator_app_internal::ResetNodePerfCounters;
 using simulator_app_internal::ResolveNodeProfileAssignments;
 using simulator_app_internal::ResourceLimitUpdateDetail;
-using simulator_app_internal::RestartNodeWorkloadDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
 using simulator_app_internal::RunningNodeProcessGeneration;
@@ -3153,271 +3147,29 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             const RuntimeNodeSnapshot& nodes, std::uint32_t action_index,
             std::uint32_t action_count, std::stop_token operation_stop_token,
             SimulationCommandControl* cancellation_commit_control = nullptr) {
-          if (!IsOneShotWorkloadKind(scenario_workload.kind)) {
-            throw std::logic_error(
-                "one-shot dispatcher received a lifecycle workload");
-          }
-          ThrowIfStopRequested(operation_stop_token);
-          std::function<void()> authorize_mutation;
-          if (cancellation_commit_control != nullptr) {
-            authorize_mutation = [&] {
-              if (cancellation_commit_control->TryBeginCommit()) {
-                return;
-              }
-              if (cancellation_commit_control->CommitPhase() ==
-                  SimulationCommandCommitPhase::kCancelled) {
-                throw SimulationCancelled();
-              }
-              ThrowIfStopRequested(operation_stop_token);
-              throw std::logic_error(
-                  "one-shot workload mutation admission reached an unexpected "
-                  "commit phase");
-            };
-          }
-          switch (scenario_workload.kind) {
-            case WorkloadKind::kConnectPeer:
-              ApplyConnectPeerWorkload(
-                  options, events_path, driver, *peer_connectivity_controller,
-                  nodes, scenario_workload.connect_peer, action_index,
-                  action_count, operation_stop_token,
-                  cancellation_commit_control);
-              break;
-            case WorkloadKind::kDisconnectPeer:
-              ApplyDisconnectPeerWorkload(
-                  options, events_path, driver, *peer_connectivity_controller,
-                  nodes, scenario_workload.disconnect_peer, action_index,
-                  action_count, operation_stop_token,
-                  cancellation_commit_control);
-              break;
-            case WorkloadKind::kRestartNode: {
-              const RestartNodeWorkload& workload =
-                  scenario_workload.restart_node;
-              const auto selected =
-                  std::find_if(nodes.begin(), nodes.end(),
-                               [&](const NodeRuntime& candidate) {
-                                 return candidate.config.id == workload.node_id;
-                               });
-              if (selected == nodes.end()) {
-                throw std::runtime_error(
-                    "restart_node workload references an inactive node id: " +
-                    workload.node_id);
-              }
-              NodeRuntime& node = *selected;
-              if (!RestartNode(options, events_path, driver,
-                               *peer_connectivity_controller, node,
-                               lifecycle_epoch, operation_stop_token,
-                               "requested", cancellation_commit_control,
-                               nullptr, true, nullptr, true,
-                               cancellation_commit_control, stop_token)) {
-                throw std::runtime_error(
-                    "restart_node workload reached node stop_time before "
-                    "completion: " +
-                    node.config.id);
-              }
-              WriteEvent(events_path, options.run_id, node.config.id,
-                         SimulationEventKind::kNodeRestarted,
-                         RestartNodeWorkloadDetail(action_index, action_count,
-                                                   workload.node,
-                                                   node.RestartCount()));
-              if (cancellation_commit_control != nullptr) {
-                cancellation_commit_control->MarkCommitted();
-              }
-              break;
-            }
-            case WorkloadKind::kFreezeNode: {
-              const FreezeNodeWorkload& workload =
-                  scenario_workload.freeze_node;
-              NodeRuntime& node = RequireRuntimeNodeNumber(
-                  nodes, workload.node, "freeze_node workload");
-              RequireNodeRunning(node, "freeze_node workload");
-              FreezeNodeForDuration(options, events_path, node,
-                                    workload.duration_ms, operation_stop_token);
-              try {
-                WriteEvent(events_path, options.run_id, node.config.id,
-                           SimulationEventKind::kNodeFreezeCompleted,
-                           FreezeNodeWorkloadDetail(action_index, action_count,
-                                                    workload.node,
-                                                    workload.duration_ms));
-              } catch (...) {
-                ThrowWorkloadMutationOutcomeUnconfirmed(
-                    "node freeze completed without a publishable workload "
-                    "outcome",
-                    std::current_exception());
-              }
-              break;
-            }
-            case WorkloadKind::kUpdateResourceLimits: {
-              const ResourceLimitUpdateWorkload& workload =
-                  scenario_workload.update_resource_limits;
-              NodeRuntime& node = nodes[workload.node - 1U];
-              ApplyResourceLimitUpdate(
-                  options, events_path, node, workload.patch,
-                  node_resource_state_mutex, operation_stop_token,
-                  authorize_mutation, action_index, action_count,
-                  workload.node);
-              break;
-            }
-            case WorkloadKind::kSetResourceProfile:
-              ApplyResourceProfileSwitch(
-                  options, events_path, nodes, node_resource_state_mutex,
-                  scenario_workload.profile_switch, action_index, action_count,
-                  operation_stop_token, authorize_mutation);
-              break;
-            case WorkloadKind::kSetNetworkProfile:
-              ApplyNetworkProfileSwitch(
-                  options, events_path, nodes, node_network_state_mutex,
-                  scenario_workload.profile_switch, action_index, action_count,
-                  operation_stop_token);
-              break;
-            case WorkloadKind::kResourcePressure:
-              ApplyResourcePressureWorkload(
-                  options, events_path, metrics_path, driver, nodes,
-                  node_network_state_mutex, node_resource_state_mutex,
-                  run_process_state,
-                  runtime_wallet_registry.Snapshot().registry().topology(),
-                  scenario_workload.resource_pressure, action_index,
-                  action_count, operation_stop_token);
-              break;
-            case WorkloadKind::kSetNetworkCondition: {
-              const NetworkConditionWorkload& workload =
-                  scenario_workload.network_condition;
-              NodeRuntime& node = nodes[workload.node - 1U];
-              QdiscInfo qdisc;
-              NodeVethConfig updated_network;
-              {
-                std::lock_guard<std::mutex> lock(node_network_state_mutex);
-                qdisc = ReplaceNodeNetworkConditionTransactional(
-                    &node, workload.condition, operation_stop_token);
-                try {
-                  updated_network = *node.network;
-                } catch (...) {
-                  ThrowWorkloadMutationOutcomeUnconfirmed(
-                      "network condition update completed without coherent "
-                      "runtime evidence",
-                      std::current_exception());
-                }
-              }
-              try {
-                WriteEvent(
-                    events_path, options.run_id, node.config.id,
-                    SimulationEventKind::kNetworkConditionUpdated,
-                    NetworkConditionVerificationDetail(
-                        updated_network, qdisc, action_index, action_count));
-              } catch (...) {
-                ThrowWorkloadMutationOutcomeUnconfirmed(
-                    "network condition update completed without a publishable "
-                    "outcome",
-                    std::current_exception());
-              }
-              break;
-            }
-            case WorkloadKind::kBlockNetworkFlow:
-            case WorkloadKind::kUnblockNetworkFlow: {
-              const NetworkBlockRule& rule =
-                  scenario_workload.network_block.rule;
-              NodeRuntime& node = nodes[rule.node_index];
-              NetworkBlockMutationResult result;
-              {
-                std::lock_guard<std::mutex> lock(node_network_state_mutex);
-                result = MutateNetworkBlockRuleTransactional(
-                    node, rule,
-                    scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow,
-                    operation_stop_token);
-              }
-              try {
-                WriteEvent(
-                    events_path, options.run_id, node.config.id,
-                    scenario_workload.kind == WorkloadKind::kUnblockNetworkFlow
-                        ? SimulationEventKind::kNetworkBlockRemoved
-                        : SimulationEventKind::kNetworkBlockApplied,
-                    NetworkBlockRuleDetail(node, rule, result.existed_before,
-                                           result.present_after, action_index,
-                                           action_count));
-              } catch (...) {
-                ThrowWorkloadMutationOutcomeUnconfirmed(
-                    "network flow mutation completed without a publishable "
-                    "outcome",
-                    std::current_exception());
-              }
-              break;
-            }
-            case WorkloadKind::kPartitionNodes:
-              ApplyRuntimeNetworkPartition(
-                  options, events_path, nodes, node_network_state_mutex,
-                  scenario_workload.network_partition.partition, false,
-                  action_index, action_count, operation_stop_token);
-              break;
-            case WorkloadKind::kHealPartition:
-              ApplyRuntimeNetworkPartition(
-                  options, events_path, nodes, node_network_state_mutex,
-                  scenario_workload.network_partition.partition, true,
-                  action_index, action_count, operation_stop_token);
-              break;
-            case WorkloadKind::kSetEdgeCondition:
-            case WorkloadKind::kActivateEdge:
-            case WorkloadKind::kDeactivateEdge:
-            case WorkloadKind::kRestoreEdge: {
-              std::lock_guard<std::mutex> topology_lock(runtime_topology_mutex);
-              ApplyTopologyEdgeWorkload(
-                  options, events_path, chain_spec, driver,
-                  *peer_connectivity_controller, *runtime_topology, nodes,
-                  node_network_state_mutex, scenario_workload.topology_edge,
-                  scenario_workload.kind, action_index, action_count,
-                  operation_stop_token);
-              break;
-            }
-            case WorkloadKind::kSendRawTransaction:
-              ApplySendRawTransactionWorkload(
-                  options, events_path, driver, block_generation_mutex, nodes,
-                  transaction_tracker, scenario_workload.send_raw_transaction,
-                  action_index, action_count, operation_stop_token,
-                  cancellation_commit_control);
-              break;
-            case WorkloadKind::kCheckpoint: {
-              const CheckpointWorkload& workload = scenario_workload.checkpoint;
-              const std::string name =
-                  workload.name.empty()
-                      ? "checkpoint-" + std::to_string(action_index)
-                      : workload.name;
-              transaction_tracker.ObserveAll(options, events_path, driver,
-                                             nodes, operation_stop_token);
-              const RuntimeWalletSnapshot checkpoint_registry =
-                  runtime_wallet_registry.Snapshot();
-              ThrowIfStopRequested(operation_stop_token);
-              try {
-                const std::uint32_t node_metric_samples = WriteMetricsSnapshot(
-                    metrics_path, options, driver, nodes, run_process_state,
-                    {node_network_state_mutex, node_resource_state_mutex}, {},
-                    {}, operation_stop_token,
-                    &checkpoint_registry.registry().topology());
-                const std::uint32_t wallet_metric_samples =
-                    WriteWalletMetricsSnapshot(wallet_metrics_path, options,
-                                               driver, nodes,
-                                               checkpoint_registry.registry(),
-                                               {}, operation_stop_token);
-                WriteEvent(events_path, options.run_id, "sim",
-                           SimulationEventKind::kCheckpointRecorded,
-                           CheckpointWorkloadDetail(action_index, action_count,
-                                                    name, node_metric_samples,
-                                                    wallet_metric_samples));
-              } catch (const SimulationCancelled&) {
-                throw;
-              } catch (...) {
-                ThrowWorkloadMutationOutcomeUnconfirmed(
-                    "checkpoint did not reach a publishable completion "
-                    "boundary",
-                    std::current_exception());
-              }
-              break;
-            }
-            case WorkloadKind::kBlockGeneration:
-            case WorkloadKind::kWaitUntilHeight:
-            case WorkloadKind::kWaitForPeers:
-            case WorkloadKind::kWalletTransactions:
-            case WorkloadKind::kCount:
-              throw std::logic_error(
-                  "one-shot workload kind has no production dispatcher");
-          }
+          DispatchOneShotWorkload(
+              OneShotWorkloadContext{
+                  .options = options,
+                  .events_path = events_path,
+                  .metrics_path = metrics_path,
+                  .wallet_metrics_path = wallet_metrics_path,
+                  .chain_spec = chain_spec,
+                  .driver = driver,
+                  .peer_connectivity_controller = peer_connectivity_controller,
+                  .runtime_topology = runtime_topology,
+                  .runtime_wallet_registry = runtime_wallet_registry,
+                  .transaction_tracker = transaction_tracker,
+                  .run_process_state = run_process_state,
+                  .node_network_state_mutex = node_network_state_mutex,
+                  .node_resource_state_mutex = node_resource_state_mutex,
+                  .runtime_topology_mutex = runtime_topology_mutex,
+                  .block_generation_mutex = block_generation_mutex,
+                  .lifecycle_epoch = lifecycle_epoch,
+                  .start_node = StartNodeProcessWithPolicy,
+                  .stop_token = stop_token,
+              },
+              scenario_workload, nodes, action_index, action_count,
+              operation_stop_token, cancellation_commit_control);
         };
 
     const auto execute_one_shot_workload =

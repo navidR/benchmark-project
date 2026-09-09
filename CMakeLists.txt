@@ -327,6 +327,7 @@ add_executable(bbp
   src/simulator_node_process_state.cpp
   src/simulator_node_report_export.cpp
   src/simulator_offline_run_cleanup.cpp
+  src/simulator_one_shot_workload_dispatch.cpp
   src/simulator_operator_connection_publication.cpp
   src/simulator_option_parsing.cpp
   src/simulator_peer_churn_workloads.cpp
@@ -664,6 +665,7 @@ if(BUILD_TESTING)
     src/simulator_node_process_state.cpp
     src/simulator_node_report_export.cpp
     src/simulator_offline_run_cleanup.cpp
+    src/simulator_one_shot_workload_dispatch.cpp
     src/simulator_operator_connection_publication.cpp
     src/simulator_option_parsing.cpp
     src/simulator_peer_churn_workloads.cpp
