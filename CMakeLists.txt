@@ -296,6 +296,7 @@ add_executable(bbp
   src/simulator_initial_peer_connectivity.cpp
   src/simulator_json_field_decoding.cpp
   src/simulator_live_block_generation_control.cpp
+  src/simulator_live_block_generation_workload_launcher.cpp
   src/simulator_live_height_wait_control.cpp
   src/simulator_live_wait_for_peers_control.cpp
   src/simulator_live_wallet_workload_control.cpp
@@ -629,6 +630,7 @@ if(BUILD_TESTING)
     src/simulator_initial_peer_connectivity.cpp
     src/simulator_json_field_decoding.cpp
     src/simulator_live_block_generation_control.cpp
+    src/simulator_live_block_generation_workload_launcher.cpp
     src/simulator_live_height_wait_control.cpp
     src/simulator_live_wait_for_peers_control.cpp
     src/simulator_live_wallet_workload_control.cpp
