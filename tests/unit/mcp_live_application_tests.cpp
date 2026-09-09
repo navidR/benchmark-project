@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "../../src/simulator_one_shot_workload_invocation.h"
 #include "bbp/drivers/chain_driver_registry.h"
 #ifdef BBP_FIRO_GUI_LAUNCHER
 #include "bbp/drivers/firo_gui_launcher.h"
@@ -28,6 +29,8 @@
 #include "bbp/mcp_run_evidence.h"
 #include "bbp/operator_connection.h"
 #include "bbp/run_ownership.h"
+#include "bbp/runtime_node_inventory.h"
+#include "bbp/runtime_wallet_registry.h"
 #include "bbp/scenario_service.h"
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_processor.h"
@@ -2729,6 +2732,78 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(application.SetWorkloadService(replacement_service),
                     std::runtime_error);
 
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(mcp_one_shot_invocation_owns_its_dispatch_callback) {
+  LiveApplicationDirectory temporary;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
+  RuntimeNodeInventory inventory(1U);
+  std::vector<NodeRuntime> nodes(1U);
+  nodes.front().config.id = InitialInventory(*options).node_ids.front();
+  inventory.Initialize(nodes);
+  RuntimeWalletRegistry roles;
+  roles.Initialize(SimulationRegistry::FromTopology(
+      options->topology, options->wallet_initialization));
+  std::timed_mutex one_shot_mutex;
+  std::timed_mutex node_mutation_mutex;
+  std::uint64_t next_invocation = 1U;
+  std::atomic<std::uint32_t> dispatch_calls = 0U;
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = options->run_id,
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [options] { return InitialInventory(*options); },
+      .publication_mutex = {},
+      .request_run_stop = [] {},
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {},
+      .publish_evidence = {},
+      .close_run_subscriptions = {}});
+  auto service = std::make_shared<McpLiveWorkloadService>();
+  {
+    simulator_app_internal::OneShotWorkloadDispatcher dispatch =
+        [&dispatch_calls](const ScenarioWorkload&, const RuntimeNodeSnapshot&,
+                          std::uint32_t, std::uint32_t, std::stop_token,
+                          SimulationCommandControl*) { ++dispatch_calls; };
+    auto invoke = simulator_app_internal::MakeOneShotWorkloadInvoker(
+        *options, inventory, roles, options->topology.peer_topology,
+        one_shot_mutex, node_mutation_mutex, next_invocation, application,
+        [] { return false; },
+        [](std::timed_mutex& mutex, std::stop_token) {
+          return std::unique_lock<std::timed_mutex>(mutex);
+        },
+        dispatch, {});
+    service->operation = [invoke = std::move(invoke)](
+                             McpOperationKind,
+                             const boost::json::object& arguments,
+                             std::stop_token stop_token) {
+      return invoke(arguments.at("workload").as_object(), stop_token);
+    };
+    dispatch = {};
+  }
+  service->read = [](bool, std::stop_token) {
+    return boost::json::value(boost::json::array{});
+  };
+  application.SetWorkloadService(service);
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+  const boost::json::object terminal = WaitForTerminal(
+      &dispatcher,
+      Invoke(&dispatcher, "workload.invoke",
+             boost::json::object{
+                 {"run_id", options->run_id},
+                 {"workload", boost::json::object{{"type", "checkpoint"}}}}));
+  BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+  BOOST_TEST(dispatch_calls.load() == 1U);
   application.Shutdown();
 }
 
