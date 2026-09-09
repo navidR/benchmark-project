@@ -108,7 +108,7 @@
 #include "simulator_live_wallet_workload_control.h"
 #include "simulator_live_wallet_workload_launcher.h"
 #include "simulator_live_workload_reading.h"
-#include "simulator_live_workload_shutdown_request.h"
+#include "simulator_live_workload_shutdown.h"
 #include "simulator_live_workload_state.h"
 #include "simulator_managed_run_root.h"
 #include "simulator_masternode_funding_boundary.h"
@@ -254,12 +254,7 @@ using simulator_app_internal::InitialPeerCountPolicies;
 using simulator_app_internal::InitialResourceLimits;
 using simulator_app_internal::IsCurrentRunningNodeProcess;
 using simulator_app_internal::IsTerminalLiveWalletWorkloadState;
-using simulator_app_internal::IsTerminalLiveWorkloadState;
 using simulator_app_internal::IsTopologyEdgeConditionField;
-using simulator_app_internal::JoinLiveBlockGenerationWorkloadWorker;
-using simulator_app_internal::JoinLiveHeightWaitWorkloadWorker;
-using simulator_app_internal::JoinLivePeerWaitWorkloadWorker;
-using simulator_app_internal::JoinLiveWalletWorkloadWorker;
 using simulator_app_internal::JsonAmountField;
 using simulator_app_internal::JsonOptionalAmountField;
 using simulator_app_internal::JsonOptionalBoolField;
@@ -278,7 +273,6 @@ using simulator_app_internal::JsonUint32Value;
 using simulator_app_internal::JsonUint64Field;
 using simulator_app_internal::JsonUint64Value;
 using simulator_app_internal::kRunStopNotObserved;
-using simulator_app_internal::kWorkloadServiceShutdownBound;
 using simulator_app_internal::LiveBlockGenerationWorkloadJson;
 using simulator_app_internal::LiveBlockGenerationWorkloadRecord;
 using simulator_app_internal::LiveBlockGenerationWorkloadRegistry;
@@ -296,7 +290,7 @@ using simulator_app_internal::LiveWalletWorkloadRequest;
 using simulator_app_internal::LiveWalletWorkloadState;
 using simulator_app_internal::LiveWalletWorkloadStateName;
 using simulator_app_internal::LiveWorkloadRequest;
-using simulator_app_internal::LiveWorkloadState;
+using simulator_app_internal::LiveWorkloadShutdownState;
 using simulator_app_internal::LoadRetainedSourceScenario;
 using simulator_app_internal::LockNodeProcessState;
 using simulator_app_internal::MakeLiveBlockGenerationOperation;
@@ -376,7 +370,6 @@ using simulator_app_internal::RemovePreparedRunRoot;
 using simulator_app_internal::RemoveRuntimeNodesTransactional;
 using simulator_app_internal::ReplaceNodeNetworkConditionTransactional;
 using simulator_app_internal::ReplaceRuntimeNodeTransactional;
-using simulator_app_internal::RequestLiveWorkloadShutdown;
 using simulator_app_internal::RequestNodeKill;
 using simulator_app_internal::RequestNodeTerminate;
 using simulator_app_internal::RequireCgroupWeight;
@@ -435,6 +428,7 @@ using simulator_app_internal::StartNativeMiningForCurrentProcess;
 using simulator_app_internal::StartNodeProcessAttempt;
 using simulator_app_internal::StartupPeerAddresses;
 using simulator_app_internal::SteadyDeadline;
+using simulator_app_internal::StopLiveWorkloads;
 using simulator_app_internal::StopNativeMining;
 using simulator_app_internal::StopNativeMiningBeforeDeadline;
 using simulator_app_internal::StopNodeProcess;
@@ -465,7 +459,6 @@ using simulator_app_internal::WorkloadMutationCancelledAfterRollback;
 using simulator_app_internal::WorkloadMutationFailedAfterRollback;
 using simulator_app_internal::WorkloadMutationOutcomeUnconfirmed;
 using simulator_app_internal::WorkloadServiceShutdownTimeout;
-using simulator_app_internal::WorkloadShutdownRecords;
 using simulator_app_internal::WriteEvent;
 using simulator_app_internal::WriteLiveBlockGenerationWorkloadState;
 using simulator_app_internal::WriteLiveWaitForPeersWorkloadState;
@@ -1007,9 +1000,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   std::shared_ptr<McpLiveInstrumentationService>
       installed_instrumentation_service;
   std::shared_ptr<McpLiveRoleService> installed_role_service;
-  bool workload_shutdown_complete = false;
-  bool workload_shutdown_safe_to_destroy = false;
-  std::exception_ptr workload_shutdown_failure;
+  LiveWorkloadShutdownState workload_shutdown;
   std::atomic<std::shared_ptr<McpLiveRoleService>> command_role_service;
   std::mutex lifecycle_failure_mutex;
   std::timed_mutex node_mutation_mutex;
@@ -1078,284 +1069,12 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       lifecycle_supervisor.reset();
     }
   };
-  const auto request_workload_shutdown =
-      [&](bool run_failed) -> WorkloadShutdownRecords {
-    const std::chrono::steady_clock::time_point shutdown_requested_at =
-        observed_run_stop().value_or(std::chrono::steady_clock::now());
-    return RequestLiveWorkloadShutdown(
-        wallet_workloads, block_generation_workloads,
-        wait_until_height_workloads, wait_for_peers_workloads, run_failed,
-        shutdown_requested_at);
-  };
   const auto stop_wallet_workloads = [&](bool run_failed) {
-    if (workload_shutdown_complete) {
-      if (workload_shutdown_failure) {
-        std::rethrow_exception(workload_shutdown_failure);
-      }
-      return;
-    }
-    const std::chrono::steady_clock::time_point shutdown_deadline =
-        std::chrono::steady_clock::now() + kWorkloadServiceShutdownBound;
-    std::exception_ptr shutdown_failure;
-    const auto remember_shutdown_failure =
-        [&](const std::exception_ptr& failure) noexcept {
-          if (!shutdown_failure) {
-            shutdown_failure = failure;
-          }
-        };
-    try {
-      mcp_application.CloseWorkloadService(shutdown_deadline);
-    } catch (const std::exception& error) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "workload service admission closure failed; retrying: "
-                     << error.what();
-      try {
-        mcp_application.CloseWorkloadService(shutdown_deadline);
-      } catch (...) {
-        BBP_LOG(error)
-            << "workload service admission closure failed repeatedly";
-        std::terminate();
-      }
-    } catch (...) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "workload service admission closure failed; retrying";
-      try {
-        mcp_application.CloseWorkloadService(shutdown_deadline);
-      } catch (...) {
-        BBP_LOG(error)
-            << "workload service admission closure failed repeatedly";
-        std::terminate();
-      }
-    }
-    WorkloadShutdownRecords retained_records;
-    try {
-      retained_records = request_workload_shutdown(run_failed);
-    } catch (const std::exception& error) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "workload lifecycle cancellation failed; retrying: "
-                     << error.what();
-      try {
-        retained_records = request_workload_shutdown(run_failed);
-      } catch (...) {
-        BBP_LOG(error) << "workload lifecycle cancellation failed repeatedly";
-        std::terminate();
-      }
-    } catch (...) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "workload lifecycle cancellation failed; retrying";
-      try {
-        retained_records = request_workload_shutdown(run_failed);
-      } catch (...) {
-        BBP_LOG(error) << "workload lifecycle cancellation failed repeatedly";
-        std::terminate();
-      }
-    }
-    try {
-      mcp_application.RequestWorkloadServiceCancellation();
-    } catch (const std::exception& error) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "workload service cancellation failed; retrying: "
-                     << error.what();
-      try {
-        mcp_application.RequestWorkloadServiceCancellation();
-      } catch (...) {
-        BBP_LOG(error) << "workload service cancellation failed repeatedly";
-        std::terminate();
-      }
-    } catch (...) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "workload service cancellation failed; retrying";
-      try {
-        mcp_application.RequestWorkloadServiceCancellation();
-      } catch (...) {
-        BBP_LOG(error) << "workload service cancellation failed repeatedly";
-        std::terminate();
-      }
-    }
-    std::optional<McpLiveWorkloadDrainResult> shutdown_deadline_snapshot;
-    bool safe_to_destroy = false;
-    try {
-      const McpLiveWorkloadDrainResult drain_result =
-          mcp_application.WaitForWorkloadServiceDrain();
-      safe_to_destroy = drain_result.safe_to_destroy();
-      if (!safe_to_destroy) {
-        shutdown_deadline_snapshot = drain_result;
-        mcp_application.PublishWorkloadServiceShutdownTimeout(
-            drain_result, std::chrono::duration_cast<std::chrono::milliseconds>(
-                              kWorkloadServiceShutdownBound));
-        BBP_LOG(error)
-            << "workload service did not drain within the 15000 ms shutdown "
-               "bound; active_callbacks="
-            << drain_result.active_callback_count
-            << "; active_workers=" << drain_result.active_worker_count;
-        try {
-          const WorkloadServiceShutdownTimeout shutdown_timeout(drain_result);
-          WriteEvent(events_path, options.run_id, "sim",
-                     SimulationEventKind::kRunFailed,
-                     boost::json::serialize(shutdown_timeout.Diagnostic()));
-        } catch (const std::exception& error) {
-          BBP_LOG(error) << "workload service shutdown timeout evidence "
-                            "publication failed: "
-                         << error.what();
-        } catch (...) {
-          BBP_LOG(error) << "workload service shutdown timeout evidence "
-                            "publication failed";
-        }
-      }
-    } catch (const std::exception& error) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "bounded workload service drain failed: "
-                     << error.what();
-    } catch (...) {
-      remember_shutdown_failure(std::current_exception());
-      BBP_LOG(error) << "bounded workload service drain failed";
-    }
-    if (!safe_to_destroy) {
-      try {
-        const McpLiveWorkloadDrainResult quarantine_result =
-            mcp_application.WaitForWorkloadServiceQuarantine();
-        safe_to_destroy = quarantine_result.safe_to_destroy();
-      } catch (const std::exception& error) {
-        remember_shutdown_failure(std::current_exception());
-        BBP_LOG(error) << "workload service quarantine wait failed: "
-                       << error.what();
-      } catch (...) {
-        remember_shutdown_failure(std::current_exception());
-        BBP_LOG(error) << "workload service quarantine wait failed";
-      }
-    }
-    if (!safe_to_destroy && installed_workload_service) {
-      try {
-        const McpLiveWorkloadDrainResult quarantine_result =
-            installed_workload_service->WaitUntilDrained();
-        safe_to_destroy = quarantine_result.safe_to_destroy();
-      } catch (const std::exception& error) {
-        remember_shutdown_failure(std::current_exception());
-        BBP_LOG(error) << "direct workload service quarantine wait failed: "
-                       << error.what();
-      } catch (...) {
-        remember_shutdown_failure(std::current_exception());
-        BBP_LOG(error) << "direct workload service quarantine wait failed";
-      }
-    }
-    if (!safe_to_destroy) {
-      BBP_LOG(error)
-          << "workload service quarantine did not prove referenced simulator "
-             "state safe to destroy";
-      std::terminate();
-    }
-    workload_shutdown_safe_to_destroy = true;
-    for (std::size_t index = 0U; index < retained_records.wallet_count;
-         ++index) {
-      JoinLiveWalletWorkloadWorker(*retained_records.wallets[index]);
-    }
-    for (std::size_t index = 0U; index < retained_records.height_wait_count;
-         ++index) {
-      JoinLiveHeightWaitWorkloadWorker(*retained_records.height_waits[index]);
-    }
-    for (std::size_t index = 0U; index < retained_records.peer_wait_count;
-         ++index) {
-      JoinLivePeerWaitWorkloadWorker(*retained_records.peer_waits[index]);
-    }
-    for (std::size_t index = 0U; index < retained_records.block_generator_count;
-         ++index) {
-      JoinLiveBlockGenerationWorkloadWorker(
-          *retained_records.block_generators[index]);
-    }
-    for (std::size_t index = 0U; index < retained_records.wallet_count;
-         ++index) {
-      const std::shared_ptr<LiveWalletWorkloadRecord>& record =
-          retained_records.wallets[index];
-      try {
-        std::lock_guard<std::mutex> record_lock(record->mutex);
-        if (!IsTerminalLiveWalletWorkloadState(record->state)) {
-          record->state = run_failed ? LiveWalletWorkloadState::kFailed
-                                     : LiveWalletWorkloadState::kCancelled;
-          record->terminal_outcome = run_failed ? "failed" : "cancelled";
-          if (run_failed && !record->failure) {
-            record->failure = "run failed while wallet workload was active";
-          }
-          record->changed.notify_all();
-        }
-      } catch (...) {
-        remember_shutdown_failure(std::current_exception());
-      }
-    }
-    for (std::size_t index = 0U; index < retained_records.height_wait_count;
-         ++index) {
-      const std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>& record =
-          retained_records.height_waits[index];
-      try {
-        std::lock_guard<std::mutex> record_lock(record->mutex);
-        if (!IsTerminalLiveWorkloadState(record->state)) {
-          record->state = run_failed ? LiveWorkloadState::kFailed
-                                     : LiveWorkloadState::kCancelled;
-          record->terminal_outcome = run_failed ? "failed" : "cancelled";
-          if (run_failed && !record->failure) {
-            record->failure =
-                "run failed while wait-until-height workload was active";
-          }
-          record->changed.notify_all();
-        }
-      } catch (...) {
-        remember_shutdown_failure(std::current_exception());
-      }
-    }
-    for (std::size_t index = 0U; index < retained_records.peer_wait_count;
-         ++index) {
-      const std::shared_ptr<LiveWaitForPeersWorkloadRecord>& record =
-          retained_records.peer_waits[index];
-      try {
-        std::lock_guard<std::mutex> record_lock(record->mutex);
-        if (!IsTerminalLiveWorkloadState(record->state)) {
-          record->state = run_failed ? LiveWorkloadState::kFailed
-                                     : LiveWorkloadState::kCancelled;
-          record->terminal_outcome = run_failed ? "failed" : "cancelled";
-          if (run_failed && !record->failure) {
-            record->failure =
-                "run failed while wait-for-peers workload was active";
-          }
-          record->changed.notify_all();
-        }
-      } catch (...) {
-        remember_shutdown_failure(std::current_exception());
-      }
-    }
-    for (std::size_t index = 0U; index < retained_records.block_generator_count;
-         ++index) {
-      const std::shared_ptr<LiveBlockGenerationWorkloadRecord>& record =
-          retained_records.block_generators[index];
-      try {
-        std::lock_guard<std::mutex> record_lock(record->mutex);
-        if (!IsTerminalLiveWorkloadState(record->state)) {
-          record->state = run_failed ? LiveWorkloadState::kFailed
-                                     : LiveWorkloadState::kCancelled;
-          record->terminal_outcome = run_failed ? "failed" : "cancelled";
-          if (run_failed && !record->failure) {
-            record->failure =
-                "run failed while block generation workload was active";
-          }
-          record->changed.notify_all();
-        }
-      } catch (...) {
-        remember_shutdown_failure(std::current_exception());
-      }
-    }
-    installed_workload_service.reset();
-    workload_shutdown_complete = true;
-    if (shutdown_deadline_snapshot) {
-      try {
-        workload_shutdown_failure = std::make_exception_ptr(
-            WorkloadServiceShutdownTimeout(*shutdown_deadline_snapshot));
-      } catch (...) {
-        workload_shutdown_failure = std::current_exception();
-      }
-    } else {
-      workload_shutdown_failure = shutdown_failure;
-    }
-    if (workload_shutdown_failure) {
-      std::rethrow_exception(workload_shutdown_failure);
-    }
+    StopLiveWorkloads(options, events_path, mcp_application,
+                      installed_workload_service, wallet_workloads,
+                      block_generation_workloads, wait_until_height_workloads,
+                      wait_for_peers_workloads, run_stop_tick,
+                      workload_shutdown, run_failed);
   };
   const auto stop_transaction_observer = [&] {
     if (transaction_observer) {
@@ -1449,7 +1168,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
       stop_wallet_workloads(run_failed);
       return {};
     } catch (const WorkloadServiceShutdownTimeout& error) {
-      if (!workload_shutdown_safe_to_destroy) {
+      if (!workload_shutdown.safe_to_destroy) {
         BBP_LOG(error)
             << "workload shutdown timeout escaped before a safe drain";
         std::terminate();
@@ -1458,7 +1177,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                      << error.what();
       return std::current_exception();
     } catch (const std::exception& error) {
-      if (!workload_shutdown_safe_to_destroy) {
+      if (!workload_shutdown.safe_to_destroy) {
         BBP_LOG(error)
             << "workload shutdown failure escaped before a safe drain";
         std::terminate();
@@ -1467,7 +1186,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
                      << error.what();
       return std::current_exception();
     } catch (...) {
-      if (!workload_shutdown_safe_to_destroy) {
+      if (!workload_shutdown.safe_to_destroy) {
         BBP_LOG(error)
             << "unknown workload shutdown failure escaped before a safe drain";
         std::terminate();
