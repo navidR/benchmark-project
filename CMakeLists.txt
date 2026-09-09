@@ -298,6 +298,7 @@ add_executable(bbp
   src/simulator_live_block_generation_control.cpp
   src/simulator_live_block_generation_workload_launcher.cpp
   src/simulator_live_height_wait_control.cpp
+  src/simulator_live_height_wait_workload_launcher.cpp
   src/simulator_live_wait_for_peers_control.cpp
   src/simulator_live_wallet_workload_control.cpp
   src/simulator_live_wallet_workload_launcher.cpp
@@ -632,6 +633,7 @@ if(BUILD_TESTING)
     src/simulator_live_block_generation_control.cpp
     src/simulator_live_block_generation_workload_launcher.cpp
     src/simulator_live_height_wait_control.cpp
+    src/simulator_live_height_wait_workload_launcher.cpp
     src/simulator_live_wait_for_peers_control.cpp
     src/simulator_live_wallet_workload_control.cpp
     src/simulator_live_wallet_workload_launcher.cpp
