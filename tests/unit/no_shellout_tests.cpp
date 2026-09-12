@@ -250,15 +250,16 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     simulator_reserves_transaction_observation_before_every_mutating_send) {
-  const std::filesystem::path simulator =
-      std::filesystem::path(BBP_SOURCE_DIR) / "src" / "simulator_app.cpp";
+  const std::filesystem::path live_commands =
+      std::filesystem::path(BBP_SOURCE_DIR) / "src" /
+      "simulator_live_command_execution.cpp";
   const std::filesystem::path raw_transaction_workload =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" /
       "simulator_raw_transaction_workload.cpp";
   const std::filesystem::path wallet_transaction_workload =
       std::filesystem::path(BBP_SOURCE_DIR) / "src" /
       "simulator_wallet_transaction_workload_execution.cpp";
-  const std::string source = bbp::ReadText(simulator);
+  const std::string source = bbp::ReadText(live_commands);
   const std::string raw_source = bbp::ReadText(raw_transaction_workload);
   const std::string wallet_source = bbp::ReadText(wallet_transaction_workload);
 

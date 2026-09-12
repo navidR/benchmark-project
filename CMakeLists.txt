@@ -297,6 +297,7 @@ add_executable(bbp
   src/simulator_json_field_decoding.cpp
   src/simulator_live_block_generation_control.cpp
   src/simulator_live_block_generation_workload_launcher.cpp
+  src/simulator_live_command_execution.cpp
   src/simulator_live_height_wait_control.cpp
   src/simulator_live_height_wait_workload_launcher.cpp
   src/simulator_live_masternode_operations.cpp
@@ -641,6 +642,7 @@ if(BUILD_TESTING)
     src/simulator_json_field_decoding.cpp
     src/simulator_live_block_generation_control.cpp
     src/simulator_live_block_generation_workload_launcher.cpp
+    src/simulator_live_command_execution.cpp
     src/simulator_live_height_wait_control.cpp
     src/simulator_live_height_wait_workload_launcher.cpp
     src/simulator_live_masternode_operations.cpp
