@@ -305,6 +305,7 @@ add_executable(bbp
   src/simulator_live_miner_addition.cpp
   src/simulator_live_miner_removal.cpp
   src/simulator_live_peer_wait_workload_launcher.cpp
+  src/simulator_live_telemetry_collectors.cpp
   src/simulator_live_wait_for_peers_control.cpp
   src/simulator_live_wallet_workload_control.cpp
   src/simulator_live_wallet_workload_launcher.cpp
@@ -651,6 +652,7 @@ if(BUILD_TESTING)
     src/simulator_live_miner_addition.cpp
     src/simulator_live_miner_removal.cpp
     src/simulator_live_peer_wait_workload_launcher.cpp
+    src/simulator_live_telemetry_collectors.cpp
     src/simulator_live_wait_for_peers_control.cpp
     src/simulator_live_wallet_workload_control.cpp
     src/simulator_live_wallet_workload_launcher.cpp

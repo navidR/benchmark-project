@@ -109,6 +109,7 @@
 #include "simulator_live_miner_addition.h"
 #include "simulator_live_miner_removal.h"
 #include "simulator_live_peer_wait_workload_launcher.h"
+#include "simulator_live_telemetry_collectors.h"
 #include "simulator_live_wait_for_peers_control.h"
 #include "simulator_live_wallet_addition.h"
 #include "simulator_live_wallet_removal.h"
@@ -286,6 +287,7 @@ using simulator_app_internal::LiveLifecycleSupervisorContext;
 using simulator_app_internal::LiveMasternodeOperationContext;
 using simulator_app_internal::LiveMinerAdditionContext;
 using simulator_app_internal::LiveMinerRemovalContext;
+using simulator_app_internal::LiveTelemetryCollectorsContext;
 using simulator_app_internal::LiveWaitForPeersWorkloadJson;
 using simulator_app_internal::LiveWaitForPeersWorkloadRecord;
 using simulator_app_internal::LiveWaitForPeersWorkloadRegistry;
@@ -310,7 +312,9 @@ using simulator_app_internal::MakeLiveHeightWaitWorkloadLauncher;
 using simulator_app_internal::MakeLiveInstrumentationController;
 using simulator_app_internal::MakeLiveInstrumentationRegistry;
 using simulator_app_internal::MakeLiveInstrumentationService;
+using simulator_app_internal::MakeLiveNodeLogCollector;
 using simulator_app_internal::MakeLivePeerWaitWorkloadLauncher;
+using simulator_app_internal::MakeLivePeriodicMetricsCollector;
 using simulator_app_internal::MakeLiveSimulationCommandProcessor;
 using simulator_app_internal::MakeLiveWaitForPeersOperation;
 using simulator_app_internal::MakeLiveWaitUntilHeightOperation;
@@ -1625,86 +1629,26 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
             .acquire_node_mutation_lock = AcquireNodeMutationLock,
             .start_node = StartNodeProcessWithPolicy,
         });
-    log_collector = std::make_unique<NodeLogCollector>(
-        driver,
-        [&] {
-          std::unique_lock<std::timed_mutex> publication_lock =
-              AcquireRuntimePublicationLock({});
-          return node_inventory.ConfigSnapshot();
-        },
-        options.metrics_interval, kMaxLogTailBytes,
-        [&](const ChainNodeConfig& config, ChainLogSource source,
-            const LogTailChunk& chunk) {
-          std::unique_lock<std::timed_mutex> publication_lock =
-              AcquireRuntimePublicationLock({});
-          WriteLogTailChunkEvent(events_path, options, config, source, chunk);
-        });
+    const LiveTelemetryCollectorsContext telemetry_context{
+        .options = options,
+        .events_path = events_path,
+        .metrics_path = metrics_path,
+        .wallet_metrics_path = wallet_metrics_path,
+        .driver = driver,
+        .node_inventory = node_inventory,
+        .runtime_wallet_registry = runtime_wallet_registry,
+        .run_process_state = run_process_state,
+        .metrics_synchronization = {node_network_state_mutex,
+                                    node_resource_state_mutex},
+        .metrics_rpc_stop_source = metrics_rpc_stop_source,
+        .wallets_initialized = wallets_initialized,
+        .metrics_collector = metrics_collector,
+        .stop_token = stop_token,
+        .acquire_runtime_publication_lock = AcquireRuntimePublicationLock,
+    };
+    log_collector = MakeLiveNodeLogCollector(telemetry_context);
     log_collector->Start();
-    metrics_collector = std::make_unique<PeriodicMetricsCollector>(
-        options.metrics_sample_count, options.metrics_interval,
-        [&](std::uint32_t sample) {
-          RuntimeNodeSnapshot nodes;
-          std::optional<RuntimeWalletSnapshot> wallet_snapshot;
-          {
-            std::unique_lock<std::timed_mutex> publication_lock =
-                AcquireRuntimePublicationLock(
-                    metrics_rpc_stop_source.get_token());
-            nodes = node_inventory.Snapshot();
-            if (wallets_initialized.load(std::memory_order_acquire)) {
-              wallet_snapshot.emplace(runtime_wallet_registry.Snapshot());
-            }
-          }
-          WriteMetricsSnapshot(
-              metrics_path, options, driver, nodes, run_process_state,
-              {node_network_state_mutex, node_resource_state_mutex},
-              [&](const NodeRuntime& node, std::string_view error) {
-                boost::json::object detail;
-                detail["sample"] = sample;
-                detail["error"] = error;
-                WriteEvent(events_path, options.run_id, node.config.id,
-                           SimulationEventKind::kMetricsNodeUnavailable,
-                           boost::json::serialize(detail));
-                BBP_LOG(warning) << "metrics sample " << sample << " skipped "
-                                 << node.config.id << ": " << error;
-              },
-              [&] { return metrics_collector->StopRequested(); },
-              metrics_rpc_stop_source.get_token(),
-              wallet_snapshot ? &wallet_snapshot->registry().topology()
-                              : nullptr);
-          if (metrics_collector->StopRequested()) {
-            return;
-          }
-          if (wallet_snapshot) {
-            WriteWalletMetricsSnapshot(
-                wallet_metrics_path, options, driver, nodes,
-                wallet_snapshot->registry(),
-                [&](std::uint32_t wallet_index, const NodeRuntime& node,
-                    std::string_view error) {
-                  boost::json::object detail;
-                  detail["sample"] = sample;
-                  detail["wallet_index"] = wallet_index;
-                  detail["error"] = error;
-                  WriteEvent(events_path, options.run_id, node.config.id,
-                             SimulationEventKind::kWalletMetricsUnavailable,
-                             boost::json::serialize(detail));
-                  BBP_LOG(warning) << "wallet metrics sample " << sample
-                                   << " skipped #" << wallet_index << " on "
-                                   << node.config.id << ": " << error;
-                },
-                metrics_rpc_stop_source.get_token());
-          }
-          if (metrics_collector->StopRequested()) {
-            return;
-          }
-          boost::json::object detail;
-          detail["sample"] = sample;
-          detail["sample_count"] = options.metrics_sample_count;
-          detail["interval_ms"] = options.metrics_interval.count();
-          WriteEvent(events_path, options.run_id, "sim",
-                     SimulationEventKind::kMetricsSample,
-                     boost::json::serialize(detail));
-        },
-        [stop_token] { return stop_token.stop_requested(); });
+    metrics_collector = MakeLivePeriodicMetricsCollector(telemetry_context);
     metrics_collector->Start();
     InitializeWalletNodes(options, events_path, driver, nodes,
                           simulation_registry, stop_token);
