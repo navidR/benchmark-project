@@ -30,6 +30,7 @@
 #include "bbp/scenario_service.h"
 #include "bbp/simulation_cancelled.h"
 #include "bbp/simulation_command_queue.h"
+#include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulator/options.h"
 #include "bbp/simulator/workload_kind.h"
 #include "bbp/util.h"
@@ -155,6 +156,10 @@ std::optional<std::string> NodeAddOutcomeError(
     return "successful node-add outcome omitted its inventory generation or "
            "final node count";
   }
+  if (!outcome.node_capacity ||
+      *outcome.node_capacity < *outcome.final_node_count) {
+    return "successful node-add outcome omitted its published reservation";
+  }
   return std::nullopt;
 }
 
@@ -196,26 +201,6 @@ std::optional<std::string> NodeReplaceOutcomeError(
            "or final node count";
   }
   return std::nullopt;
-}
-
-bool IsNodeCapacityFailure(std::string_view message) {
-  return message == "node.add request exceeds the configured node capacity" ||
-         message == "node-add request exceeds the configured node capacity";
-}
-
-boost::json::array NodeCapacityDiagnostics(std::uint64_t requested,
-                                           std::uint32_t current,
-                                           std::uint32_t capacity) {
-  return boost::json::array{boost::json::object{
-      {"code", "node_capacity_exceeded"},
-      {"message", "the requested node batch exceeds available capacity"},
-      {"path", "request.count"},
-      {"requested_count", requested},
-      {"current_node_count", current},
-      {"node_capacity", capacity},
-      {"available_node_capacity",
-       current <= capacity ? capacity - current : 0U},
-  }};
 }
 
 void ThrowIfCancelled(std::stop_token stop_token) {
@@ -723,6 +708,33 @@ boost::json::object NormalizeRoleAssignmentMasternode(
        RequireResultStringMember(identity, "status", true, operation)}};
 }
 
+void CopyNodeReservationResult(const boost::json::object& delegated,
+                               boost::json::object& normalized,
+                               std::uint64_t final_node_count) {
+  const boost::json::value* capacity = delegated.if_contains("node_capacity");
+  const boost::json::value* allocation =
+      delegated.if_contains("network_allocation");
+  if (capacity == nullptr && allocation == nullptr) {
+    return;
+  }
+  const std::uint64_t reservation =
+      RequireUint32ResultMember(delegated, "node_capacity", true);
+  if (reservation < final_node_count || allocation == nullptr) {
+    throw std::logic_error(
+        "role service returned inconsistent node reservation");
+  }
+  if (!allocation->is_null()) {
+    if (!allocation->is_object() ||
+        SimulationNetworkAddressPlan::FromSerialized(allocation->as_object())
+                .capacity() != reservation) {
+      throw std::logic_error(
+          "role service returned inconsistent network allocation");
+    }
+  }
+  normalized["node_capacity"] = reservation;
+  normalized["network_allocation"] = *allocation;
+}
+
 boost::json::object NormalizeRoleAssignmentResult(
     const RoleAssignmentPlan& plan, const boost::json::object& delegated) {
   const std::string expected_action =
@@ -762,6 +774,7 @@ boost::json::object NormalizeRoleAssignmentResult(
        RequireUnsignedResultMember(delegated, "inventory_generation", true)},
       {"final_node_count", final_node_count},
   };
+  CopyNodeReservationResult(delegated, normalized, final_node_count);
 
   if (plan.role == "wallet") {
     if (!RequireArrayMember(delegated, "added_node_ids").empty() ||
@@ -932,6 +945,7 @@ boost::json::object NormalizeRoleRemovalResult(
                                    kOperation)},
       {"final_node_count", final_node_count},
   };
+  CopyNodeReservationResult(delegated, normalized, final_node_count);
 
   if (plan.role == "wallet") {
     const boost::json::array& wallets =
@@ -1568,7 +1582,10 @@ McpLiveApplication::McpLiveApplication(Config config)
   }
   if (config_.retained_run) {
     if (config_.retained_run->chain.empty() ||
-        config_.retained_run->state.empty()) {
+        config_.retained_run->state.empty() ||
+        (config_.retained_run->node_capacity != 0U &&
+         config_.retained_run->node_capacity <
+             config_.retained_run->node_count)) {
       throw std::invalid_argument(
           "MCP retained application requires persisted run metadata");
     }
@@ -2195,42 +2212,18 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   bool role_mutation_operation = false;
   std::optional<std::chrono::steady_clock::duration> command_timeout;
   SimulationCommand command;
-  const auto node_capacity_failure_plan =
-      [](const boost::json::object& request,
-         const Options& validation_options) -> McpOperationPlan {
-    const std::uint64_t requested_count =
-        OptionalUnsigned(request, "count", 0U);
-    const std::uint32_t current_count = validation_options.nodes;
-    const std::uint32_t capacity = validation_options.node_capacity;
-    return McpOperationPlan{
-        .progress_total = kSimulationNodeAddProgressTotal,
-        .executor = [requested_count, current_count,
-                     capacity](McpOperationContext&) -> McpTypedResult {
-          throw McpOperationFailure(
-              "node_capacity_exceeded",
-              "node.add request exceeds the configured node capacity", false,
-              NodeCapacityDiagnostics(requested_count, current_count,
-                                      capacity));
-        }};
-  };
   if (node_add_operation) {
     Options validation_options = *config_.options;
     McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
     validation_options.nodes =
         static_cast<std::uint32_t>(inventory.node_ids.size());
     validation_options.node_ids = std::move(inventory.node_ids);
+    validation_options.node_capacity = inventory.node_capacity;
     command.kind = SimulationCommandKind::kAddNodes;
     command.node_id = "sim";
     const boost::json::object& request = RequireObject(arguments, "request");
-    try {
-      command.node_add =
-          ParseAndValidateSimulationNodeAddRequest(request, validation_options);
-    } catch (const std::runtime_error& error) {
-      if (!IsNodeCapacityFailure(error.what())) {
-        throw;
-      }
-      return node_capacity_failure_plan(request, validation_options);
-    }
+    command.node_add =
+        ParseAndValidateSimulationNodeAddRequest(request, validation_options);
     command.confirmed = true;
   } else if (node_replace_operation) {
     Options validation_options = *config_.options;
@@ -2238,6 +2231,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     validation_options.nodes =
         static_cast<std::uint32_t>(inventory.node_ids.size());
     validation_options.node_ids = std::move(inventory.node_ids);
+    validation_options.node_capacity = inventory.node_capacity;
     command.kind = SimulationCommandKind::kReplaceNode;
     command.node_id = RequireString(arguments, "node_id");
     ValidateMcpIdentifier(command.node_id, "MCP node replacement node_id");
@@ -2265,6 +2259,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     validation_options.nodes =
         static_cast<std::uint32_t>(inventory.node_ids.size());
     validation_options.node_ids = std::move(inventory.node_ids);
+    validation_options.node_capacity = inventory.node_capacity;
     boost::json::object request = arguments;
     request.erase("run_id");
     command.kind = SimulationCommandKind::kRemoveNodes;
@@ -2299,25 +2294,11 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     validation_options.nodes =
         static_cast<std::uint32_t>(inventory.node_ids.size());
     validation_options.node_ids = std::move(inventory.node_ids);
+    validation_options.node_capacity = inventory.node_capacity;
     const boost::json::object& command_request =
         RequireObject(arguments, "command");
-    try {
-      command = ParseAndValidateSimulationCommand(command_request,
-                                                  validation_options);
-    } catch (const std::runtime_error& error) {
-      const boost::json::value* command_kind =
-          command_request.if_contains("kind");
-      const boost::json::value* node_add =
-          command_request.if_contains("node_add");
-      if (!IsNodeCapacityFailure(error.what()) || command_kind == nullptr ||
-          !command_kind->is_string() ||
-          command_kind->as_string() != "add_nodes" || node_add == nullptr ||
-          !node_add->is_object()) {
-        throw;
-      }
-      return node_capacity_failure_plan(node_add->as_object(),
-                                        validation_options);
-    }
+    command =
+        ParseAndValidateSimulationCommand(command_request, validation_options);
     node_add_operation = command.kind == SimulationCommandKind::kAddNodes;
     node_replace_operation =
         command.kind == SimulationCommandKind::kReplaceNode;
@@ -2563,8 +2544,6 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         if (outcome.state == SimulationCommandOutcomeState::kFailed) {
           const std::string error =
               outcome.error.value_or("command failed without an error");
-          const bool capacity_failure =
-              node_add_operation && IsNodeCapacityFailure(error);
           const std::optional<SimulationNodeResourceFailure> resource_failure =
               node_add_operation ? operation_control->NodeResourceFailure()
                                  : std::nullopt;
@@ -2572,19 +2551,14 @@ McpOperationPlan McpLiveApplication::BuildOperation(
               typed_node_operation || node_add_operation ||
               node_replace_operation || node_remove_operation;
           const std::string code =
-              capacity_failure         ? "node_capacity_exceeded"
-              : resource_failure       ? "node_resource_unavailable"
+              resource_failure         ? "node_resource_unavailable"
               : node_add_operation     ? "node_add_failed"
               : node_replace_operation ? "node_replace_failed"
               : node_remove_operation  ? "node_remove_failed"
               : typed_node_operation   ? "node_operation_failed"
                                        : "simulation_command_failed";
           boost::json::array diagnostics;
-          if (capacity_failure) {
-            diagnostics =
-                NodeCapacityDiagnostics(expected_added_node_count, NodeCount(),
-                                        config_.options->node_capacity);
-          } else if (resource_failure) {
+          if (resource_failure) {
             diagnostics.emplace_back(boost::json::object{
                 {"code", code},
                 {"message", error},
@@ -2671,6 +2645,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                     {"added_node_ids", std::move(added_node_ids)},
                     {"affected_node_ids", std::move(affected_node_ids)},
                     {"inventory_generation", *outcome.inventory_generation},
+                    {"node_capacity", *outcome.node_capacity},
+                    {"network_allocation", outcome.network_allocation},
                     {"final_node_count", *outcome.final_node_count}}};
           }
           return McpTypedResult{
@@ -2684,6 +2660,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                   {"action", "node.add"},
                   {"command_id", "command-" + std::to_string(sequence)},
                   {"inventory_generation", *outcome.inventory_generation},
+                  {"node_capacity", *outcome.node_capacity},
+                  {"network_allocation", outcome.network_allocation},
                   {"final_node_count", *outcome.final_node_count},
                   {"unchanged", false}}};
         }
@@ -2711,6 +2689,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                     {"action", "node.replace"},
                     {"affected_node_ids", boost::json::array{command_node_id}},
                     {"inventory_generation", *outcome.inventory_generation},
+                    {"node_capacity", *outcome.node_capacity},
+                    {"network_allocation", outcome.network_allocation},
                     {"final_node_count", *outcome.final_node_count}}};
           }
           return McpTypedResult{
@@ -2725,6 +2705,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                   {"state", "running"},
                   {"command_id", "command-" + std::to_string(sequence)},
                   {"inventory_generation", *outcome.inventory_generation},
+                  {"node_capacity", *outcome.node_capacity},
+                  {"network_allocation", outcome.network_allocation},
                   {"final_node_count", *outcome.final_node_count},
                   {"unchanged", false}}};
         }
@@ -2759,6 +2741,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                     {"removed_node_ids", std::move(removed_node_ids)},
                     {"affected_node_ids", std::move(affected_node_ids)},
                     {"inventory_generation", *outcome.inventory_generation},
+                    {"node_capacity", *outcome.node_capacity},
+                    {"network_allocation", outcome.network_allocation},
                     {"final_node_count", *outcome.final_node_count}}};
           }
           return McpTypedResult{
@@ -2772,6 +2756,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                   {"action", "node.remove"},
                   {"command_id", "command-" + std::to_string(sequence)},
                   {"inventory_generation", *outcome.inventory_generation},
+                  {"node_capacity", *outcome.node_capacity},
+                  {"network_allocation", outcome.network_allocation},
                   {"final_node_count", *outcome.final_node_count},
                   {"unchanged", false}}};
         }
@@ -2828,6 +2814,34 @@ boost::json::value McpLiveApplication::ReadResource(
         "the requested resource is unavailable in the current endpoint", false);
   }
 
+  const auto run_snapshot_json = [&] {
+    if (config_.retained_run) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const RetainedRun& retained = *config_.retained_run;
+      return boost::json::object{
+          {"run_id", config_.run_id},
+          {"chain", retained.chain},
+          {"state", retained.state},
+          {"node_count", retained.node_count},
+          {"node_capacity", retained.node_capacity == 0U
+                                ? retained.node_count
+                                : retained.node_capacity},
+          {"network_allocation", retained.network_allocation},
+          {"available_node_capacity", 0U}};
+    }
+    const McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
+    const auto node_count =
+        static_cast<std::uint32_t>(inventory.node_ids.size());
+    return boost::json::object{
+        {"run_id", config_.run_id},
+        {"chain", CurrentChain()},
+        {"state", RunState(node_count)},
+        {"node_count", node_count},
+        {"node_capacity", inventory.node_capacity},
+        {"network_allocation", inventory.network_allocation},
+        {"available_node_capacity", inventory.node_capacity - node_count}};
+  };
+
   if (family == McpInformationFamily::kCapabilities) {
     if (config_.retained_run) {
       static_cast<void>(ReportSnapshot(stop_token));
@@ -2838,23 +2852,8 @@ boost::json::value McpLiveApplication::ReadResource(
     boost::json::object capabilities =
         BuildMcpCapabilityDocument(selected, information_families);
     capabilities["access_mode"] = read_only() ? "read_only" : "read_write";
-    const std::uint32_t node_count = NodeCount();
-    const ChainKind chain = config_.retained_run
-                                ? ParseChainKind(config_.retained_run->chain)
-                                : config_.options->chain;
-    const std::uint32_t node_capacity =
-        config_.retained_run ? node_count : config_.options->node_capacity;
-    capabilities["current_run"] = boost::json::object{
-        {"run_id", config_.run_id},
-        {"chain", CurrentChain()},
-        {"state", RunState(node_count)},
-        {"node_count", node_count},
-        {"node_capacity", node_capacity},
-        {"chain_node_maximum", ChainDriverSpecFor(chain).max_nodes},
-        {"available_node_capacity", config_.retained_run ? 0U
-                                    : node_count <= node_capacity
-                                        ? node_capacity - node_count
-                                        : 0U}};
+    capabilities["node_capacity_policy"] = McpNodeCapacityPolicy();
+    capabilities["current_run"] = run_snapshot_json();
     return ResourceEnvelope(family, config_.run_id, std::move(capabilities));
   }
   if (family == McpInformationFamily::kSchemas) {
@@ -2893,27 +2892,8 @@ boost::json::value McpLiveApplication::ReadResource(
     if (config_.retained_run) {
       static_cast<void>(ReportSnapshot(stop_token));
     }
-    const std::uint32_t node_count = NodeCount();
-    const std::uint32_t node_capacity =
-        config_.retained_run ? node_count : config_.options->node_capacity;
-    return ResourceEnvelope(
-        family, config_.run_id,
-        boost::json::array{boost::json::object{
-            {"run_id", config_.run_id},
-            {"state", RunState(node_count)},
-            {"chain", CurrentChain()},
-            {"node_count", node_count},
-            {"node_capacity", node_capacity},
-            {"chain_node_maximum",
-             ChainDriverSpecFor(
-                 config_.retained_run
-                     ? ParseChainKind(config_.retained_run->chain)
-                     : config_.options->chain)
-                 .max_nodes},
-            {"available_node_capacity", config_.retained_run ? 0U
-                                        : node_count <= node_capacity
-                                            ? node_capacity - node_count
-                                            : 0U}}});
+    return ResourceEnvelope(family, config_.run_id,
+                            boost::json::array{run_snapshot_json()});
   }
 
   if (!config_.retained_run &&
@@ -3354,7 +3334,13 @@ void McpLiveApplication::RecordCommandOutcome(
               *outcome.inventory_generation != inventory.generation;
           const bool count_mismatch =
               inventory.node_ids.size() != *outcome.final_node_count ||
-              *outcome.final_node_count > config_.options->node_capacity;
+              *outcome.final_node_count > inventory.node_capacity;
+          const bool allocation_mismatch =
+              outcome.node_capacity &&
+              (*outcome.node_capacity != inventory.node_capacity ||
+               outcome.network_allocation != inventory.network_allocation);
+          validated_outcome.node_capacity = inventory.node_capacity;
+          validated_outcome.network_allocation = inventory.network_allocation;
           bool identity_mismatch = count_mismatch;
           if (adding) {
             const std::size_t expected_count =
@@ -3397,6 +3383,11 @@ void McpLiveApplication::RecordCommandOutcome(
                 "successful " + mutation_name +
                 " outcome does not match the authoritative "
                 "inventory generation");
+          } else if (allocation_mismatch) {
+            mark_outcome_unconfirmed(
+                "successful " + mutation_name +
+                " outcome does not match the authoritative reservation "
+                "and network allocation");
           } else if (identity_mismatch) {
             mark_outcome_unconfirmed("successful " + mutation_name +
                                      " outcome does not publish the expected "
@@ -3484,6 +3475,10 @@ void McpLiveApplication::RecordCommandOutcome(
   if (published_outcome->final_node_count) {
     data["final_node_count"] = *published_outcome->final_node_count;
   }
+  if (published_outcome->node_capacity) {
+    data["node_capacity"] = *published_outcome->node_capacity;
+    data["network_allocation"] = published_outcome->network_allocation;
+  }
   if (published_outcome->role_mutation) {
     data["role_mutation"] = *published_outcome->role_mutation;
   }
@@ -3542,9 +3537,33 @@ boost::json::object McpLiveApplication::ReportSnapshot(
       throw std::runtime_error("MCP retained report metadata is inconsistent");
     }
     std::lock_guard<std::mutex> state_lock(mutex_);
-    config_.retained_run->state = std::string(state->as_string());
-    config_.retained_run->node_count = *node_count;
+    RetainedRun updated = *config_.retained_run;
+    const boost::json::value* capacity = report.if_contains("node_capacity");
+    const std::optional<std::uint32_t> node_capacity =
+        capacity == nullptr ? std::nullopt : Uint32Value(*capacity);
+    if (capacity != nullptr &&
+        (!node_capacity || *node_capacity < *node_count)) {
+      throw std::runtime_error(
+          "MCP retained report reservation is inconsistent");
+    }
+    updated.state = std::string(state->as_string());
+    updated.node_count = *node_count;
+    updated.node_capacity =
+        node_capacity.value_or(std::max(*node_count, updated.node_capacity));
+    if (const boost::json::value* allocation =
+            report.if_contains("network_allocation")) {
+      if (!allocation->is_null() &&
+          (!allocation->is_object() ||
+           SimulationNetworkAddressPlan::FromSerialized(allocation->as_object())
+                   .capacity() != updated.node_capacity)) {
+        throw std::runtime_error(
+            "MCP retained report network allocation is inconsistent");
+      }
+      updated.network_allocation = *allocation;
+    }
+    *config_.retained_run = std::move(updated);
   }
+
   if (include_artifacts) {
     report["artifacts"] = BuildMcpRunArtifactInventory(
         config_.run_id, config_.run_root, stop_token);
@@ -3816,6 +3835,20 @@ std::shared_ptr<McpLiveRoleService> McpLiveApplication::RoleService() const {
   return role_service_;
 }
 
+boost::json::object McpNodeCapacityPolicy() {
+  return boost::json::object{
+      {"growth", "automatic_on_explicit_node_creation"},
+      {"node_capacity", "mutable_reservation"},
+      {"available_node_capacity", "unused_current_reservation"},
+      {"maximum_nodes_per_creation_request", kSimulationNodeAddMaximumCount},
+      {"network_address_pool_default", "10.0.0.0/8"},
+      {"network_address_pool_configurable", true},
+      {"link_prefix_length", 31U},
+      {"existing_node_addresses_preserved", true},
+      {"daemon_ports", "fixed_within_each_network_namespace"},
+      {"growth_and_creation", "atomic"}};
+}
+
 McpLiveNodeInventorySnapshot McpLiveApplication::LiveNodeInventory() const {
   if (config_.retained_run || !config_.node_inventory_snapshot) {
     throw std::logic_error("authoritative live node inventory is unavailable");
@@ -3823,10 +3856,11 @@ McpLiveNodeInventorySnapshot McpLiveApplication::LiveNodeInventory() const {
   std::unique_lock<std::timed_mutex> publication_lock =
       AcquirePublicationLock({});
   McpLiveNodeInventorySnapshot snapshot = config_.node_inventory_snapshot();
-  if (snapshot.node_ids.size() > config_.options->node_capacity ||
+  if (snapshot.node_capacity == 0U ||
+      snapshot.node_ids.size() > snapshot.node_capacity ||
       snapshot.node_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
     throw std::logic_error(
-        "authoritative live node inventory exceeds configured capacity");
+        "authoritative live node inventory exceeds its published reservation");
   }
   std::set<std::string> unique;
   for (const std::string& node_id : snapshot.node_ids) {

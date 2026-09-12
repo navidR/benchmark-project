@@ -218,6 +218,12 @@ boost::json::object RemoveLiveMinerRoles(const LiveMinerRemovalContext& context,
          published_roles.registry().topology().miner_nodes.size()},
         {"inventory_generation", current_nodes.generation()},
         {"final_node_count", current_nodes.size()},
+        {"node_capacity", current_nodes.capacity()},
+        {"network_allocation",
+         current_nodes.network_address_plan()
+             ? boost::json::value(
+                   current_nodes.network_address_plan()->ToSerialized())
+             : boost::json::value(nullptr)},
     };
   } catch (...) {
     context.mcp_application.MarkRunStopping();

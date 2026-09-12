@@ -404,6 +404,7 @@ void StartInitialNodes(
     config_request.daemon_binary = EffectiveNodeBinary(options, i);
     config_request.data_dir = NodeDataDirectoryRelative(options, i);
     config_request.node_index = i;
+    config_request.isolated_network = options.isolate_network;
     config_request.network = EffectiveNodeChainNetwork(options, i);
     config_request.extra_args = EffectiveNodeExtraArgs(options, i);
     if (!options.node_ids.empty()) {
@@ -418,6 +419,8 @@ void StartInitialNodes(
   RuntimeNodeResourceManifest startup_manifest{
       .ownership = RequireRunOwnership(options),
       .isolated_network = options.isolate_network,
+      .node_capacity = options.node_capacity,
+      .network_address_plan = options.network_address_plan,
       .nodes = {},
   };
   startup_manifest.nodes.reserve(prepared_configs.size());

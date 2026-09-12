@@ -20,7 +20,6 @@ struct ChainDriverSpec {
   std::string daemon_scenario_field;
   std::string node_id_prefix;
   std::string default_reward_address;
-  std::uint32_t max_nodes = 0;
   std::uint32_t coinbase_spendable_confirmations = 0;
   std::uint16_t p2p_port_base = 0;
   std::uint16_t rpc_port_base = 0;
@@ -37,6 +36,7 @@ struct ChainNodeConfigRequest {
   ChainNetwork network = ChainNetwork::kRegtest;
   ChainExtraArgs extra_args;
   bool wallet_enabled = false;
+  bool isolated_network = false;
   std::vector<std::string> connect_peers;
 };
 

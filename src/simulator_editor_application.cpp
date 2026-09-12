@@ -154,7 +154,7 @@ struct EditorRunSnapshot {
   std::string chain;
   std::uint32_t node_count = 0U;
   std::uint32_t node_capacity = 0U;
-  std::uint32_t chain_node_maximum = 0U;
+  boost::json::value network_allocation = nullptr;
   std::uint32_t available_node_capacity = 0U;
   EditorRunState state = EditorRunState::kStarting;
   std::shared_ptr<SimulationCommandQueue> command_queue;
@@ -202,7 +202,8 @@ BenchmarkHeadlessResult RunPreparedBenchmark(
       RequireRunNetworkInterfacesAvailable(options, setup_stop_token);
       options.network_address_plan = SimulationNetworkAddressPlan::Allocate(
           options.run_id, options.node_capacity,
-          ListIpv4Routes(setup_stop_token));
+          ListIpv4Routes(setup_stop_token), ListIpv4Addresses(setup_stop_token),
+          options.network_address_pool);
     }
     ThrowIfStopRequested(setup_stop_token);
     WriteScenarioFiles(options, run_root, ChainDriverSpecFor(options.chain),
@@ -214,7 +215,8 @@ BenchmarkHeadlessResult RunPreparedBenchmark(
           *context->source_scenario, options.run_id, run_root,
           context->reserved_run_root
               ? std::optional<int>(context->reserved_run_root->descriptor())
-              : std::nullopt);
+              : std::nullopt,
+          &options);
     }
     if (context->reserved_run_root &&
         LoadRunOwnershipAt(options.run_id, run_root.lexically_normal(),
@@ -1110,9 +1112,9 @@ class EditorRunController {
 
   static EditorRunSnapshot SnapshotLocked(const EditorRunContext& context,
                                           bool acquire_tui_read_lease = false) {
-    const std::uint32_t node_count =
-        context.mcp_application->current_node_count();
-    const std::uint32_t node_capacity = context.options->node_capacity;
+    const RuntimeNodeSnapshot nodes = context.node_inventory->Snapshot();
+    const std::uint32_t node_count = static_cast<std::uint32_t>(nodes.size());
+    const std::uint32_t node_capacity = nodes.capacity();
     return EditorRunSnapshot{
         .generation = context.generation,
         .run_id = context.options->run_id,
@@ -1120,8 +1122,11 @@ class EditorRunController {
         .chain = std::string(ChainKindName(context.options->chain)),
         .node_count = node_count,
         .node_capacity = node_capacity,
-        .chain_node_maximum =
-            ChainDriverSpecFor(context.options->chain).max_nodes,
+        .network_allocation =
+            nodes.network_address_plan()
+                ? boost::json::value(
+                      nodes.network_address_plan()->ToSerialized())
+                : boost::json::value(nullptr),
         .available_node_capacity =
             node_count <= node_capacity ? node_capacity - node_count : 0U,
         .state = context.state,
@@ -1487,69 +1492,74 @@ class EditorRunController {
               };
             });
 #endif
-    context->mcp_application =
-        std::make_shared<McpLiveApplication>(McpLiveApplication::Config{
-            .run_id = context->options->run_id,
-            .run_root = BenchmarkRunRoot(*context->options),
-            .retained_run = std::nullopt,
-            .options = context->options,
-            .command_queue = context->command_queue,
+    context->mcp_application = std::make_shared<
+        McpLiveApplication>(McpLiveApplication::Config{
+        .run_id = context->options->run_id,
+        .run_root = BenchmarkRunRoot(*context->options),
+        .retained_run = std::nullopt,
+        .options = context->options,
+        .command_queue = context->command_queue,
 #ifdef BBP_FIRO_GUI_LAUNCHER
-            .operator_connection_launcher =
-                context->operator_connection_launcher,
+        .operator_connection_launcher = context->operator_connection_launcher,
 #endif
-            .node_inventory_snapshot =
-                [weak_context] {
-                  const std::shared_ptr<EditorRunContext> run =
-                      weak_context.lock();
-                  if (!run || !run->node_inventory) {
-                    throw std::runtime_error(
-                        "managed run node inventory is unavailable");
-                  }
-                  const RuntimeNodeSnapshot snapshot =
-                      run->node_inventory->Snapshot();
-                  McpLiveNodeInventorySnapshot result{
-                      .generation = snapshot.generation(), .node_ids = {}};
-                  result.node_ids.reserve(snapshot.size());
-                  for (const NodeRuntime& node : snapshot) {
-                    result.node_ids.push_back(node.config.id);
-                  }
-                  return result;
-                },
-            .publication_mutex = dependencies_.runtime_publication_mutex(),
-            .request_run_stop =
-                [weak_context] {
-                  if (const std::shared_ptr<EditorRunContext> run =
-                          weak_context.lock()) {
-                    RequestHostedStop(run);
-                  }
-                },
-            .run_started =
-                [weak_context] {
-                  if (const std::shared_ptr<EditorRunContext> run =
-                          weak_context.lock()) {
-                    std::lock_guard<std::mutex> lock(run->mutex);
-                    if (run->state == EditorRunState::kStarting) {
-                      run->reached_active = true;
-                      run->state = EditorRunState::kActive;
-                      run->state_changed.notify_all();
-                    }
-                  }
-                },
-            .run_stopping =
-                [weak_context] {
-                  if (const std::shared_ptr<EditorRunContext> run =
-                          weak_context.lock()) {
-                    std::lock_guard<std::mutex> lock(run->mutex);
-                    if (!IsTerminalEditorRunState(run->state)) {
-                      run->state = EditorRunState::kStopping;
-                      run->state_changed.notify_all();
-                    }
-                  }
-                },
-            .run_stopped = {},
-            .publish_evidence = std::move(publish_evidence),
-            .close_run_subscriptions = std::move(close_run_subscriptions)});
+        .node_inventory_snapshot =
+            [weak_context] {
+              const std::shared_ptr<EditorRunContext> run = weak_context.lock();
+              if (!run || !run->node_inventory) {
+                throw std::runtime_error(
+                    "managed run node inventory is unavailable");
+              }
+              const RuntimeNodeSnapshot snapshot =
+                  run->node_inventory->Snapshot();
+              McpLiveNodeInventorySnapshot result{
+                  .generation = snapshot.generation(),
+                  .node_ids = {},
+                  .node_capacity = snapshot.capacity(),
+                  .network_allocation =
+                      snapshot.network_address_plan()
+                          ? boost::json::value(
+                                snapshot.network_address_plan()->ToSerialized())
+                          : boost::json::value(nullptr)};
+              result.node_ids.reserve(snapshot.size());
+              for (const NodeRuntime& node : snapshot) {
+                result.node_ids.push_back(node.config.id);
+              }
+              return result;
+            },
+        .publication_mutex = dependencies_.runtime_publication_mutex(),
+        .request_run_stop =
+            [weak_context] {
+              if (const std::shared_ptr<EditorRunContext> run =
+                      weak_context.lock()) {
+                RequestHostedStop(run);
+              }
+            },
+        .run_started =
+            [weak_context] {
+              if (const std::shared_ptr<EditorRunContext> run =
+                      weak_context.lock()) {
+                std::lock_guard<std::mutex> lock(run->mutex);
+                if (run->state == EditorRunState::kStarting) {
+                  run->reached_active = true;
+                  run->state = EditorRunState::kActive;
+                  run->state_changed.notify_all();
+                }
+              }
+            },
+        .run_stopping =
+            [weak_context] {
+              if (const std::shared_ptr<EditorRunContext> run =
+                      weak_context.lock()) {
+                std::lock_guard<std::mutex> lock(run->mutex);
+                if (!IsTerminalEditorRunState(run->state)) {
+                  run->state = EditorRunState::kStopping;
+                  run->state_changed.notify_all();
+                }
+              }
+            },
+        .run_stopped = {},
+        .publish_evidence = std::move(publish_evidence),
+        .close_run_subscriptions = std::move(close_run_subscriptions)});
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_) {
@@ -1582,9 +1592,11 @@ class EditorRunController {
               throw std::overflow_error(
                   "terminal retained run node count exceeds uint32");
             }
+            Options final_options = *context->options;
+            final_options.node_capacity = nodes.capacity();
+            final_options.network_address_plan = nodes.network_address_plan();
             WriteRetainedRunRegistrySummary(
-                *context->options, state,
-                static_cast<std::uint32_t>(nodes.size()));
+                final_options, state, static_cast<std::uint32_t>(nodes.size()));
             return {};
           } catch (...) {
             return std::current_exception();
@@ -1712,9 +1724,9 @@ std::optional<McpHostedRunSnapshot> McpSnapshot(
       .chain = snapshot->chain,
       .node_count = snapshot->node_count,
       .node_capacity = snapshot->node_capacity,
-      .chain_node_maximum = snapshot->chain_node_maximum,
       .available_node_capacity = snapshot->available_node_capacity,
       .application = snapshot->mcp_application,
+      .network_allocation = snapshot->network_allocation,
   };
 }
 

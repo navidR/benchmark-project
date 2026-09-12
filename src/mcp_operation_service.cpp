@@ -259,6 +259,14 @@ void ValidateError(McpOperationError* error) {
         diagnostics_valid = false;
         break;
       }
+      if (count == "node_capacity" && member != nullptr &&
+          (member->is_uint64()
+               ? member->as_uint64()
+               : static_cast<std::uint64_t>(member->as_int64())) >
+              std::numeric_limits<std::uint32_t>::max()) {
+        diagnostics_valid = false;
+        break;
+      }
       if (count == "shutdown_bound_ms" && member != nullptr &&
           ((member->is_uint64() && member->as_uint64() == 0U) ||
            (member->is_int64() && member->as_int64() == 0))) {

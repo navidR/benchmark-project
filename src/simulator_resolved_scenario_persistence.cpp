@@ -105,10 +105,12 @@ boost::json::object BuildResolvedScenarioDocument(
     resolved["scenario_yaml"] = options.scenario_yaml.string();
   }
   resolved["isolated_network"] = options.isolate_network;
+  resolved["network_address_pool"] = options.network_address_pool;
   if (options.network_address_plan) {
-    resolved["network_address_range"] = options.network_address_plan->Cidr();
+    resolved["network_allocation"] =
+        options.network_address_plan->ToSerialized();
   } else {
-    resolved["network_address_range"] = nullptr;
+    resolved["network_allocation"] = nullptr;
   }
   resolved["ready_timeout_sec"] = options.ready_timeout_sec;
   resolved["sync_timeout_sec"] = options.sync_timeout_sec;

@@ -349,6 +349,7 @@ add_executable(bbp
   src/simulator_profile_assignment.cpp
   src/simulator_profile_switching.cpp
   src/simulator_raw_transaction_workload.cpp
+  src/runtime_capacity_persistence.cpp
   src/simulator_resolved_scenario_persistence.cpp
   src/simulator_retained_run_registry.cpp
   src/simulator_retained_tui_application.cpp
@@ -491,6 +492,35 @@ if(BUILD_TESTING)
     )
   endif()
 
+  add_executable(bbp-runtime-capacity-helper
+    tests/helpers/runtime_capacity_helper.cpp
+  )
+  target_link_libraries(bbp-runtime-capacity-helper PRIVATE
+    Boost::asio
+    Boost::beast
+    Boost::json
+    Boost::system
+    util
+  )
+  target_compile_options(bbp-runtime-capacity-helper PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion
+    -Werror
+  )
+  foreach(mode shared-network isolated)
+    add_test(NAME bbp-runtime-capacity-${mode}
+      COMMAND bbp-runtime-capacity-helper --${mode}
+        $<TARGET_FILE:bbp> $<TARGET_FILE:bbp-tui-pty-helper>
+    )
+    set_tests_properties(bbp-runtime-capacity-${mode} PROPERTIES
+      TIMEOUT 180
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 77
+    )
+  endforeach()
+
   add_executable(bbp-unit-tests
     tests/unit/application_instance_lock_tests.cpp
     tests/unit/block_production_policy_tests.cpp
@@ -557,6 +587,7 @@ if(BUILD_TESTING)
     tests/unit/simulation_event_kind_tests.cpp
     tests/unit/simulation_registry_tests.cpp
     tests/unit/simulator_log_pane_tests.cpp
+    tests/unit/simulator_retained_run_registry_tests.cpp
     tests/unit/simulation_policy_tests.cpp
     tests/unit/simulation_time_scale_tests.cpp
     tests/unit/signal_stop_monitor_tests.cpp
@@ -698,6 +729,7 @@ if(BUILD_TESTING)
     src/simulator_profile_assignment.cpp
     src/simulator_profile_switching.cpp
     src/simulator_raw_transaction_workload.cpp
+    src/runtime_capacity_persistence.cpp
     src/simulator_resolved_scenario_persistence.cpp
     src/simulator_retained_run_registry.cpp
     src/simulator_retained_tui_application.cpp
@@ -1202,9 +1234,9 @@ if(BUILD_TESTING)
     "direct transaction load selects the first non-wallet node as its miner"
   )
   add_argument_failure_test(
-    bbp-direct-load-node-limit-preflight
+    bbp-direct-load-address-pool-exhaustion-preflight
     "--transaction-load-strategy|random_bruteforce|--wallet-node-count|2|--nodes|4294967295|--probe-capabilities"
-    "--nodes currently supports 1..16 for chain smoke runs"
+    "isolated network /31 link pool exhausted: pool 10.0.0.0/8, requested 4294967295, available 8388608"
   )
   add_test(NAME bbp-valid-resource-pressure-scenario
     COMMAND bbp

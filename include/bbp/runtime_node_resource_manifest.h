@@ -12,6 +12,7 @@
 
 #include "bbp/chain_kind.h"
 #include "bbp/run_ownership.h"
+#include "bbp/simulation_network_address_plan.h"
 
 namespace bbp {
 
@@ -45,6 +46,9 @@ struct RuntimeNodeResourceEntry {
 struct RuntimeNodeResourceManifest {
   RunOwnership ownership;
   bool isolated_network = false;
+  std::optional<std::uint32_t> node_capacity = std::nullopt;
+  std::optional<SimulationNetworkAddressPlan> network_address_plan =
+      std::nullopt;
   std::vector<RuntimeNodeResourceEntry> nodes;
 
   bool operator==(const RuntimeNodeResourceManifest&) const = default;

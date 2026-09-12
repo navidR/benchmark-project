@@ -29,6 +29,7 @@
 #include "simulator_event_writing.h"
 #include "simulator_network_event_details.h"
 #include "simulator_network_launch_planning.h"
+#include "simulator_runtime_topology_publication_planning.h"
 #include "simulator_workload_event_details.h"
 #include "simulator_workload_mutation_error.h"
 
@@ -162,13 +163,22 @@ std::vector<std::string> DynamicPhysicalTopologyPeerEndpoints(
 }
 
 void ApplyTopologyEdgeWorkload(
-    const Options& options, const std::filesystem::path& events_path,
+    const Options& launch_options, const std::filesystem::path& events_path,
     const ChainDriverSpec& chain_spec, const ChainDriver& driver,
     PeerConnectivityController& controller,
     RuntimePeerTopology& runtime_topology, const RuntimeNodeSnapshot& nodes,
     std::mutex& node_network_state_mutex, const TopologyEdgeWorkload& workload,
     WorkloadKind action, std::uint32_t workload_index,
     std::uint32_t workload_count, std::stop_token stop_token) {
+  Options options = launch_options;
+  options.nodes = static_cast<std::uint32_t>(nodes.size());
+  options.node_capacity = nodes.capacity();
+  options.network_address_plan = nodes.network_address_plan();
+  std::vector<std::uint32_t> resource_slots;
+  resource_slots.reserve(nodes.size());
+  for (std::size_t index = 0U; index < nodes.size(); ++index) {
+    resource_slots.push_back(nodes.slot(index));
+  }
   ThrowIfStopRequested(stop_token);
   const std::uint32_t from = workload.from - 1U;
   const std::uint32_t to = workload.to - 1U;
@@ -183,7 +193,8 @@ void ApplyTopologyEdgeWorkload(
       runtime_topology.PhysicalPeerRequired(from, to);
   RuntimePeerTopologyEdge attempted = previous;
   const std::vector<DirectionalNetworkPolicy> expected_previous_policies =
-      runtime_topology.DirectionalPolicies(NetworkAddressPlan(options), from);
+      DynamicDirectionalNetworkPolicies(
+          runtime_topology, NetworkAddressPlan(options), resource_slots, from);
   std::vector<DirectionalNetworkPolicy> previous_policies;
   std::vector<std::string> previous_restart_peers;
   std::vector<ChainNodeConfig> node_configs;
@@ -290,8 +301,8 @@ void ApplyTopologyEdgeWorkload(
                               .empty();
     }
 
-    desired_policies =
-        runtime_topology.DirectionalPolicies(NetworkAddressPlan(options), from);
+    desired_policies = DynamicDirectionalNetworkPolicies(
+        runtime_topology, NetworkAddressPlan(options), resource_slots, from);
     desired_allowed =
         RuntimeTopologyAllowedPeers(runtime_topology, nodes, from);
     desired_restart_peers =

@@ -249,6 +249,12 @@ boost::json::object RemoveLiveWalletRoles(
         {"wallets", std::move(wallets)},
         {"inventory_generation", current_nodes.generation()},
         {"final_node_count", current_nodes.size()},
+        {"node_capacity", current_nodes.capacity()},
+        {"network_allocation",
+         current_nodes.network_address_plan()
+             ? boost::json::value(
+                   current_nodes.network_address_plan()->ToSerialized())
+             : boost::json::value(nullptr)},
         {"wallet_generation", published.generation()},
         {"final_wallet_count", published.wallets().size()},
         {"final_wallet_node_count",

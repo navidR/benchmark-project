@@ -144,9 +144,13 @@ std::unique_ptr<ChainCommandExecutor> MakeLiveChainCommandExecutor(
 std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
     SimulationCommandQueue& command_queue,
     const LiveCommandExecutionContext& context) {
+  // The processor reports each outcome on the same thread as its handler.
+  // Keep role mutations excluded until the committed inventory is read back.
+  const auto mutation_admission =
+      std::make_shared<std::unique_lock<std::timed_mutex>>();
   return std::make_unique<SimulationCommandProcessor>(
       command_queue,
-      [context](const SimulationCommand& command) {
+      [context, mutation_admission](const SimulationCommand& command) {
         SimulationCommandOutcome command_outcome;
         std::stop_callback application_shutdown_callback(
             context.command_rpc_stop_source.get_token(), [&] {
@@ -170,10 +174,9 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
         const std::stop_token command_stop_token =
             combined_stop_token.get_token();
         ThrowIfStopRequested(command_stop_token);
-        std::optional<std::unique_lock<std::timed_mutex>> mutation_lock;
         if (SimulationCommandRequiresNodeMutationLock(command.kind)) {
-          mutation_lock.emplace(context.acquire_node_mutation_lock(
-              context.node_mutation_mutex, command_stop_token));
+          *mutation_admission = context.acquire_node_mutation_lock(
+              context.node_mutation_mutex, command_stop_token);
         }
         RequireNoLiveInstrumentationCommandConflict(
             *context.live_instrumentation, command);
@@ -242,6 +245,9 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
             command_outcome.added_node_ids = std::move(added.added_node_ids);
             command_outcome.inventory_generation = added.inventory_generation;
             command_outcome.final_node_count = added.final_node_count;
+            command_outcome.node_capacity = added.node_capacity;
+            command_outcome.network_allocation =
+                std::move(added.network_allocation);
           } catch (const SimulationNodeResourceUnavailable& error) {
             command.operation_control->RecordNodeResourceFailure(
                 error.failure());
@@ -1189,8 +1195,10 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
                          << SimulationCommandKindName(command.kind) << " for "
                          << command.node_id << " failed: " << error;
       },
-      [context](const SimulationCommand& command,
-                const SimulationCommandOutcome& outcome) {
+      [context, mutation_admission](const SimulationCommand& command,
+                                    const SimulationCommandOutcome& outcome) {
+        const std::unique_lock<std::timed_mutex> mutation_lock(
+            std::move(*mutation_admission));
         SimulationCommandOutcome authoritative_outcome = outcome;
         if (outcome.state ==
             SimulationCommandOutcomeState::kOutcomeUnconfirmed) {

@@ -44,6 +44,7 @@
 #include "bbp/simulation_node_add.h"
 #include "bbp/simulator/options.h"
 #include "bbp/util.h"
+#include "runtime_capacity_persistence.h"
 #include "simulator_cancellable_waiting.h"
 #include "simulator_event_writing.h"
 #include "simulator_host_probes.h"
@@ -80,7 +81,7 @@ std::string RuntimeNodeAdditionPeerEndpoint(const NodeRuntime& node) {
 }  // namespace
 
 RuntimeNodeAddResult AddRuntimeNodesTransactional(
-    const Options& options, const std::filesystem::path& run_root,
+    const Options& launch_options, const std::filesystem::path& run_root,
     const std::filesystem::path& events_path, const ChainDriverSpec& chain_spec,
     const ChainDriver& driver, RuntimeNodeInventory& inventory,
     RuntimeWalletRegistry& runtime_registry, RuntimeNodeAdditionRole added_role,
@@ -96,14 +97,23 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     const SimulationNodeAddRequest& request,
     SimulationCommandControl* operation_control, std::stop_token stop_token,
     const RuntimeNodeAdditionDependencies& dependencies) {
+  const RuntimeNodeSnapshot before = inventory.Snapshot();
+  Options options = launch_options;
+  options.nodes = static_cast<std::uint32_t>(before.size());
+  options.node_capacity = before.capacity();
+  options.network_address_plan = before.network_address_plan();
   if (request.chain != options.chain) {
     throw std::runtime_error(
         "node-add chain must match the active simulation chain");
   }
-  if (request.count == 0U) {
-    throw std::runtime_error("node-add count must be greater than zero");
+  if (request.count == 0U || request.count > kSimulationNodeAddMaximumCount) {
+    throw std::runtime_error("node-add count must be in 1..16 per operation");
   }
-  const RuntimeNodeSnapshot before = inventory.Snapshot();
+  if (before.size() >
+      std::numeric_limits<std::uint32_t>::max() - request.count) {
+    throw std::overflow_error(
+        "node-add exceeds the uint32 node identity space");
+  }
   const RuntimeWalletSnapshot before_registry = runtime_registry.Snapshot();
   const WalletIdentity* masternode_funding_wallet = nullptr;
   std::optional<std::uint32_t> masternode_miner_index;
@@ -206,9 +216,13 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
           "node-add command has a conflicting initial inventory");
     }
   }
-  if (request.count > inventory.capacity() - before.size()) {
-    throw std::runtime_error(
-        "node-add request exceeds the configured node capacity");
+  const std::uint32_t requested_node_count =
+      static_cast<std::uint32_t>(before.size()) + request.count;
+  options.node_capacity = std::max(before.capacity(), requested_node_count);
+  if (options.isolate_network && options.node_capacity > before.capacity()) {
+    options.network_address_plan = NetworkAddressPlan(options).Expanded(
+        options.node_capacity, ListIpv4Routes(stop_token),
+        ListIpv4Addresses(stop_token));
   }
   if (request.network && !options.isolate_network) {
     throw std::runtime_error(
@@ -239,7 +253,7 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     }
   }
   for (std::uint32_t slot = 0U;
-       slot < inventory.capacity() &&
+       slot < options.node_capacity &&
        resource_slots.size() < before.size() + request.count;
        ++slot) {
     if (!used_slots.contains(slot)) {
@@ -346,6 +360,7 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     config_request.data_dir =
         std::filesystem::path("nodes") / node_ids[index] / "data";
     config_request.node_index = resource_slots.at(before.size() + index);
+    config_request.isolated_network = options.isolate_network;
     config_request.node_id = node_ids[index];
     config_request.network = ChainNetwork::kRegtest;
     config_request.wallet_enabled =
@@ -526,6 +541,10 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
   bool published = false;
   RuntimeNodeAddResult result;
   result.added_node_ids = node_ids;
+  result.node_capacity = options.node_capacity;
+  if (options.network_address_plan) {
+    result.network_allocation = options.network_address_plan->ToSerialized();
+  }
   std::vector<ChainMasternodeRegistration> registered_masternodes;
   std::vector<MasternodeIdentity> added_masternodes;
   const std::filesystem::path staged_events_path =
@@ -1278,6 +1297,8 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
     const boost::json::object published_generation_detail{
         {"generation", published_generation},
         {"node_count", final_count},
+        {"node_capacity", options.node_capacity},
+        {"network_allocation", result.network_allocation},
         {"node_ids", std::move(published_node_ids)},
         {"node_configs", std::move(published_node_configs)},
         {"topology", std::move(published_topology)},
@@ -1306,10 +1327,22 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
       staged_offset = end + 1U;
     }
 
+    RuntimeNodeResourceManifest live_manifest = pending_manifest;
+    live_manifest.node_capacity = options.node_capacity;
+    live_manifest.network_address_plan = options.network_address_plan;
+    for (RuntimeNodeResourceEntry& entry : live_manifest.nodes) {
+      entry.state = RuntimeNodeResourceState::kLive;
+    }
+    std::optional<PreparedRuntimeCapacityDocuments> capacity_documents;
+    if (options.node_capacity > before.capacity()) {
+      capacity_documents.emplace(PrepareRuntimeCapacityDocuments(options));
+    }
+
     std::unique_lock<std::timed_mutex> publication_lock =
         dependencies.acquire_publication_lock(stop_token);
-    RuntimeNodeInventory::PreparedAppend prepared =
-        inventory.PrepareAppend(before.generation(), insertions, final_configs);
+    RuntimeNodeInventory::PreparedAppend prepared = inventory.PrepareAppend(
+        before.generation(), insertions, final_configs, options.node_capacity,
+        options.network_address_plan);
     RuntimeWalletRegistry::PreparedAppend prepared_registry_update =
         runtime_registry.PrepareUpdate(before_registry.generation(),
                                        added_wallets, added_miner_nodes,
@@ -1338,12 +1371,47 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
       }
     }
     std::unique_lock<std::mutex> network_lock(dependencies.network_state_mutex);
-    if (operation_control != nullptr) {
-      if (!operation_control->TryBeginCommit()) {
-        throw SimulationCancelled();
+    try {
+      if (capacity_documents) {
+        PublishRuntimeCapacityDocuments(*capacity_documents);
       }
-    } else {
-      ThrowIfStopRequested(stop_token);
+      WriteRuntimeNodeResourceManifest(live_manifest);
+      const auto persisted =
+          TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
+      if (!persisted || *persisted != live_manifest) {
+        throw std::runtime_error(
+            "node-add live resource manifest read-back failed");
+      }
+      if (operation_control != nullptr) {
+        if (!operation_control->TryBeginCommit()) {
+          throw SimulationCancelled();
+        }
+      } else {
+        ThrowIfStopRequested(stop_token);
+      }
+    } catch (...) {
+      const std::exception_ptr failure = std::current_exception();
+      std::string restore_errors;
+      const auto restore = [&](auto&& operation) {
+        try {
+          operation();
+        } catch (...) {
+          restore_errors += "; " + RuntimeNodeAdditionExceptionMessage(
+                                       std::current_exception());
+        }
+      };
+      // Keep readers excluded until the prior reservation is durable again.
+      restore([&] { WriteRuntimeNodeResourceManifest(pending_manifest); });
+      if (capacity_documents) {
+        restore([&] { RestoreRuntimeCapacityDocuments(*capacity_documents); });
+      }
+      if (!restore_errors.empty()) {
+        throw SimulationCommandOutcomeUnconfirmed(
+            "node-add capacity preparation failed: " +
+            RuntimeNodeAdditionExceptionMessage(failure) +
+            "; reservation restoration failed" + restore_errors);
+      }
+      std::rethrow_exception(failure);
     }
     prepared_peer_registration.Commit();
     for (std::size_t index = 0U; index < before.size(); ++index) {
@@ -1382,33 +1450,6 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
       result.final_wallet_count = published_registry.wallets().size();
       result.final_wallet_node_count =
           published_registry.registry().topology().wallet_nodes.size();
-    }
-    RuntimeNodeResourceManifest live_manifest = pending_manifest;
-    for (RuntimeNodeResourceEntry& entry : live_manifest.nodes) {
-      entry.state = RuntimeNodeResourceState::kLive;
-    }
-    try {
-      WriteRuntimeNodeResourceManifest(live_manifest);
-      const std::optional<RuntimeNodeResourceManifest> persisted =
-          TryLoadRuntimeNodeResourceManifest(RequireRunOwnership(options));
-      if (!persisted || *persisted != live_manifest) {
-        throw std::runtime_error(
-            "node-add live resource manifest read-back failed");
-      }
-    } catch (...) {
-      const std::exception_ptr promotion_failure = std::current_exception();
-      try {
-        WriteRuntimeNodeResourceManifest(pending_manifest);
-      } catch (...) {
-        throw SimulationCommandOutcomeUnconfirmed(
-            "node-add published but live resource manifest promotion failed: " +
-            RuntimeNodeAdditionExceptionMessage(promotion_failure) +
-            "; pending resource manifest restoration failed: " +
-            RuntimeNodeAdditionExceptionMessage(std::current_exception()));
-      }
-      throw SimulationCommandOutcomeUnconfirmed(
-          "node-add published but live resource manifest promotion failed: " +
-          RuntimeNodeAdditionExceptionMessage(promotion_failure));
     }
     WriteEvent(events_path, options.run_id, "sim",
                SimulationEventKind::kRuntimeGenerationPublished,

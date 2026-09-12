@@ -102,6 +102,8 @@ BOOST_AUTO_TEST_CASE(
   const std::set<std::string> unique(members.begin(), members.end());
   BOOST_TEST(unique.size() == members.size());
   BOOST_TEST(unique.contains("scenario.simulation"));
+  BOOST_TEST(unique.contains("scenario.network_address_pool"));
+  BOOST_TEST(unique.contains("scenario.node_capacity"));
   BOOST_TEST(unique.contains("simulation.name"));
   BOOST_TEST(unique.contains("scenario.firod"));
   BOOST_TEST(unique.contains("scenario.bitcoind"));

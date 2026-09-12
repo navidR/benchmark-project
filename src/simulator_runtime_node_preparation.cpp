@@ -43,6 +43,8 @@ RuntimeNodeResourceManifest RuntimeNodeResourceManifestFor(
   RuntimeNodeResourceManifest manifest{
       .ownership = RequireRunOwnership(options),
       .isolated_network = options.isolate_network,
+      .node_capacity = nodes.capacity(),
+      .network_address_plan = nodes.network_address_plan(),
       .nodes = {},
   };
   manifest.nodes.reserve(nodes.size());

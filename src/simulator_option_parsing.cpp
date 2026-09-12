@@ -440,12 +440,9 @@ void ApplyDirectTransactionLoadOptions(
         "direct transaction load selects the first non-wallet node as its "
         "miner; use a scenario for a custom miner");
   }
-  const std::uint32_t maximum_nodes =
-      ChainDriverSpecFor(options->chain).max_nodes;
-  if (options->nodes < 1U || options->nodes > maximum_nodes) {
-    throw std::runtime_error("--nodes currently supports 1.." +
-                             std::to_string(maximum_nodes) +
-                             " for chain smoke runs");
+  if (options->nodes == 0U) {
+    throw std::runtime_error(
+        "--nodes must be greater than zero for a direct transaction-load run");
   }
   if (wallet_node_count < 2U) {
     throw std::runtime_error(
@@ -786,8 +783,7 @@ Options ParseOptions(int argc, char** argv,
   std::string ready_timeout_text;
   std::string sync_timeout_text;
 
-  const std::string nodes_help =
-      "chain regtest nodes, 1.." + std::to_string(default_chain_spec.max_nodes);
+  const std::string nodes_help = "initial chain regtest node count";
   po::options_description canonical_options(
       "Blockchain Benchmark Project options");
   canonical_options.add_options()("help", "show this help")(
@@ -814,7 +810,8 @@ Options ParseOptions(int argc, char** argv,
       "nodes", po::value<std::uint32_t>(),
       "total nodes for a direct transaction-load run")(
       "node-capacity", po::value<std::uint32_t>(),
-      "maximum live nodes for this run; defaults to the chain limit")(
+      "initial node reservation; defaults to max(initial nodes, 1) and grows "
+      "with explicit node creation")(
       "wallet-node-count", po::value<std::uint32_t>(),
       "wallet nodes for a direct transaction-load run (minimum 2)")(
       "transaction-load-strategy", po::value<std::string>(),
@@ -829,6 +826,8 @@ Options ParseOptions(int argc, char** argv,
       "explicitly select the default per-node isolated networking mode")(
       "no-isolate-network",
       "explicitly opt out of per-node isolation and use loopback networking")(
+      "network-address-pool", po::value<std::string>(),
+      "managed IPv4 CIDR pool for /31 node links; defaults to 10.0.0.0/8")(
       "metrics-sample-count", po::value<std::uint32_t>(),
       "periodic metric sample limit; zero keeps the run active until explicit "
       "stop, while a positive count makes the run finite")(
@@ -873,7 +872,8 @@ Options ParseOptions(int argc, char** argv,
       "milliseconds between integrated TUI report refreshes")(
       "nodes", po::value<uint32_t>(&options.nodes), nodes_help.c_str())(
       "node-capacity", po::value<std::uint32_t>(&options.node_capacity),
-      "maximum live nodes for this run; defaults to the selected chain limit")(
+      "initial node reservation; defaults to max(initial nodes, 1) and grows "
+      "with explicit node creation")(
       "wallet-node-count", po::value<std::uint32_t>(&wallet_node_count),
       "wallet nodes for direct transaction load; assigns wallets first and "
       "one miner next, or overlaps the final wallet when all nodes are "
@@ -941,6 +941,9 @@ Options ParseOptions(int argc, char** argv,
       "explicitly run each chain node in its own network namespace and veth "
       "link")("no-isolate-network", po::bool_switch(&no_isolate_network),
               "explicitly use loopback-only node networking")(
+      "network-address-pool",
+      po::value<std::string>(&options.network_address_pool),
+      "managed IPv4 CIDR pool for /31 node links; defaults to 10.0.0.0/8")(
       "network-bandwidth-kbps",
       po::value<uint32_t>(&options.network_condition.bandwidth_kbps),
       "TBF bandwidth limit in decimal kilobytes per second for each isolated "
@@ -1275,7 +1278,32 @@ Options ParseOptions(int argc, char** argv,
     throw std::runtime_error("--node-capacity must be greater than zero");
   }
   if (options.node_capacity == 0U) {
-    options.node_capacity = chain_spec.max_nodes;
+    options.node_capacity = std::max(options.nodes, 1U);
+  }
+  options.network_address_pool =
+      SimulationNetworkAddressPlan::CanonicalPoolCidr(
+          options.network_address_pool);
+  if (options.isolate_network) {
+    const std::uint32_t available =
+        SimulationNetworkAddressPlan::PoolLinkCapacity(
+            options.network_address_pool);
+    if (options.node_capacity > available) {
+      throw std::runtime_error(
+          "isolated network /31 link pool exhausted: pool " +
+          options.network_address_pool + ", requested " +
+          std::to_string(options.node_capacity) + ", available " +
+          std::to_string(available));
+    }
+  } else {
+    const std::uint32_t available =
+        std::numeric_limits<std::uint16_t>::max() -
+        std::max(chain_spec.rpc_port_base, chain_spec.p2p_port_base) + 1U;
+    if (options.nodes > available) {
+      throw std::runtime_error("loopback port exhaustion: requested " +
+                               std::to_string(options.nodes) +
+                               " node port pairs, available " +
+                               std::to_string(available));
+    }
   }
   if (options.memory_high_bytes > options.memory_max_bytes) {
     throw std::runtime_error(
@@ -1305,11 +1333,6 @@ Options ParseOptions(int argc, char** argv,
     throw std::runtime_error(
         "network runtime options require --isolate-network");
   }
-  if (options.node_capacity > chain_spec.max_nodes) {
-    throw std::runtime_error(
-        "--node-capacity must not exceed the selected chain limit " +
-        std::to_string(chain_spec.max_nodes));
-  }
   if (options.nodes > options.node_capacity) {
     throw std::runtime_error("--nodes must not exceed --node-capacity");
   }
@@ -1320,10 +1343,8 @@ Options ParseOptions(int argc, char** argv,
       throw std::runtime_error(
           "empty control-plane runs must not define an initial node inventory");
     }
-  } else if (options.nodes < 1 || options.nodes > chain_spec.max_nodes) {
-    throw std::runtime_error("--nodes currently supports 1.." +
-                             std::to_string(chain_spec.max_nodes) +
-                             " for chain smoke runs");
+  } else if (options.nodes == 0U) {
+    throw std::runtime_error("--nodes must be greater than zero");
   }
   RuntimePeerTopology validated_runtime_topology(options.topology.peer_topology,
                                                  options.nodes,

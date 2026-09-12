@@ -174,32 +174,14 @@ boost::json::object AddLiveMinerRoles(const LiveMinerAdditionContext& context,
   if (create_nodes != nullptr) {
     Options validation_options = context.options;
     validation_options.nodes = static_cast<std::uint32_t>(current_nodes.size());
-    SimulationNodeAddRequest node_request;
-    try {
-      node_request = ParseAndValidateSimulationNodeAddRequest(
-          create_nodes->as_object(), validation_options);
-    } catch (const std::runtime_error& error) {
-      if (std::string_view(error.what()) !=
-          "node.add request exceeds the configured node capacity") {
-        throw;
-      }
-      throw McpOperationFailure(
-          "node_capacity_exceeded", error.what(), false,
-          boost::json::array{boost::json::object{
-              {"code", "node_capacity_exceeded"},
-              {"message",
-               "the requested miner-node batch exceeds available "
-               "capacity"},
-              {"path", "create_nodes.count"},
-              {"requested_count", count},
-              {"current_node_count", current_nodes.size()},
-              {"node_capacity", context.node_inventory.capacity()},
-              {"available_node_capacity",
-               current_nodes.size() <= context.node_inventory.capacity()
-                   ? context.node_inventory.capacity() - current_nodes.size()
-                   : 0U},
-              {"recoverable", false}}});
+    validation_options.node_capacity = current_nodes.capacity();
+    validation_options.node_ids.clear();
+    for (const NodeRuntime& node : current_nodes) {
+      validation_options.node_ids.push_back(node.config.id);
     }
+    const SimulationNodeAddRequest node_request =
+        ParseAndValidateSimulationNodeAddRequest(create_nodes->as_object(),
+                                                 validation_options);
     if (node_request.count != count) {
       throw std::invalid_argument(
           "miner.add count must match create_nodes.count");
@@ -286,6 +268,8 @@ boost::json::object AddLiveMinerRoles(const LiveMinerAdditionContext& context,
           {"final_miner_count", *added.final_miner_count},
           {"inventory_generation", added.inventory_generation},
           {"final_node_count", added.final_node_count},
+          {"node_capacity", added.node_capacity},
+          {"network_allocation", added.network_allocation},
       };
     } catch (...) {
       context.mcp_application.MarkRunStopping();
@@ -477,6 +461,12 @@ boost::json::object AddLiveMinerRoles(const LiveMinerAdditionContext& context,
          published_roles.registry().topology().miner_nodes.size()},
         {"inventory_generation", current_nodes.generation()},
         {"final_node_count", current_nodes.size()},
+        {"node_capacity", current_nodes.capacity()},
+        {"network_allocation",
+         current_nodes.network_address_plan()
+             ? boost::json::value(
+                   current_nodes.network_address_plan()->ToSerialized())
+             : boost::json::value(nullptr)},
     };
   } catch (...) {
     context.mcp_application.MarkRunStopping();

@@ -15,7 +15,9 @@
 
 #include "bbp/mcp_operation_service.h"
 #include "bbp/run_ownership.h"
+#include "bbp/simulator/options.h"
 #include "bbp/util.h"
+#include "runtime_capacity_persistence.h"
 
 namespace bbp::simulator_app_internal {
 namespace {
@@ -66,9 +68,14 @@ std::string ExceptionMessage(const std::exception_ptr& error) {
 void WriteSourceScenarioFile(const boost::json::object& source_scenario,
                              const std::string& run_id,
                              const std::filesystem::path& run_root,
-                             std::optional<int> reserved_run_root_fd) {
+                             std::optional<int> reserved_run_root_fd,
+                             const Options* options) {
   boost::json::object source = source_scenario;
   source["run_id"] = run_id;
+  if (options != nullptr) {
+    source["node_capacity"] = options->node_capacity;
+    source["network_address_pool"] = options->network_address_pool;
+  }
   const std::string source_text = boost::json::serialize(source) + "\n";
   if (reserved_run_root_fd) {
     CreateTextAt(*reserved_run_root_fd, "source-scenario.json", source_text);
@@ -80,7 +87,6 @@ void WriteSourceScenarioFile(const boost::json::object& source_scenario,
 boost::json::object LoadRetainedSourceScenario(
     const std::filesystem::path& source_root, std::string_view source_run_id,
     std::stop_token stop_token) {
-  constexpr std::size_t kMaximumSourceScenarioBytes = 4U * 1024U * 1024U;
   boost::json::object source_scenario;
   try {
     UniqueFileDescriptor source_root_fd(
@@ -94,9 +100,9 @@ boost::json::object LoadRetainedSourceScenario(
         LoadRunOwnershipAt(std::string(source_run_id), source_root,
                            source_root_fd.get(), stop_token);
 
-    const boost::json::value parsed = boost::json::parse(
-        ReadTextAt(source_root_fd.get(), "source-scenario.json",
-                   kMaximumSourceScenarioBytes, stop_token));
+    const boost::json::value parsed =
+        boost::json::parse(ReadRuntimeCapacityDocumentAt(
+            source_root_fd.get(), "source-scenario.json", stop_token));
     if (!parsed.is_object()) {
       throw std::runtime_error("the retained source scenario is not an object");
     }
@@ -107,6 +113,17 @@ boost::json::object LoadRetainedSourceScenario(
         embedded_run_id->as_string() != source_run_id) {
       throw std::runtime_error(
           "the retained source scenario has an inconsistent run id");
+    }
+
+    // Pending additions retain the last committed reservation in the manifest.
+    const auto manifest = TryLoadRuntimeNodeResourceManifest(
+        initial_ownership, std::nullopt, stop_token);
+    if (manifest && manifest->node_capacity) {
+      source_scenario["node_capacity"] = *manifest->node_capacity;
+      if (manifest->network_address_plan) {
+        source_scenario["network_address_pool"] =
+            manifest->network_address_plan->PoolCidr();
+      }
     }
 
     const RunOwnership final_ownership =

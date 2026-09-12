@@ -292,6 +292,8 @@ struct SimulationCommandOutcome {
   std::optional<std::uint64_t> inventory_generation;
   std::optional<std::uint32_t> final_node_count;
   std::optional<boost::json::object> role_mutation = std::nullopt;
+  std::optional<std::uint32_t> node_capacity = std::nullopt;
+  boost::json::value network_allocation = nullptr;
 };
 
 class SimulationCommandOutcomeUnconfirmed final : public std::runtime_error {

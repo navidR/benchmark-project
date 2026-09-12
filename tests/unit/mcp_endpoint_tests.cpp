@@ -307,8 +307,8 @@ BOOST_AUTO_TEST_CASE(
       .command_queue = command_queue,
       .node_inventory_snapshot =
           [] {
-            return McpLiveNodeInventorySnapshot{.generation = 1U,
-                                                .node_ids = {"firo-1"}};
+            return McpLiveNodeInventorySnapshot{
+                .generation = 1U, .node_ids = {"firo-1"}, .node_capacity = 1U};
           },
       .publication_mutex = {},
       .request_run_stop = [] {},

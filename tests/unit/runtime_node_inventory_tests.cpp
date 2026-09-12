@@ -113,53 +113,87 @@ BOOST_AUTO_TEST_CASE(runtime_node_inventory_rejects_nonatomic_publication) {
 
 BOOST_AUTO_TEST_CASE(
     runtime_node_inventory_prepares_without_publishing_until_commit) {
-  bbp::RuntimeNodeInventory inventory(2U);
+  bbp::RuntimeNodeInventory inventory(16U);
   std::vector<bbp::NodeRuntime> initial;
-  initial.push_back(RuntimeNode("node-1"));
-  inventory.Initialize(initial);
+  for (std::uint32_t index = 1U; index <= 16U; ++index) {
+    initial.push_back(RuntimeNode("node-" + std::to_string(index)));
+  }
+  inventory.Initialize(initial, bbp::SimulationNetworkAddressPlan::FromCidr(
+                                    "10.42.0.0/20", 16U));
   const bbp::RuntimeNodeSnapshot before = inventory.Snapshot();
-  auto candidate = std::make_shared<bbp::NodeRuntime>(RuntimeNode("node-2"));
+  auto candidate = std::make_shared<bbp::NodeRuntime>(RuntimeNode("node-17"));
   const std::vector<bbp::RuntimeNodeInsertion> insertions{
-      {.slot = 1U, .runtime = candidate}};
-  std::vector<bbp::ChainNodeConfig> published_configs;
-  published_configs.push_back(before.front().config);
-  published_configs.back().connect_peers = {"127.0.0.1:18445"};
+      {.slot = 16U, .runtime = candidate}};
+  std::vector<bbp::ChainNodeConfig> published_configs =
+      inventory.ConfigSnapshot().nodes();
+  published_configs.front().connect_peers = {"127.0.0.1:18445"};
   published_configs.push_back(candidate->config);
+  const auto expanded =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 17U);
+
+  BOOST_CHECK_THROW(
+      inventory.PrepareAppend(
+          before.generation(), insertions, published_configs, 17U,
+          bbp::SimulationNetworkAddressPlan::FromCidr("10.43.0.0/20", 17U)),
+      std::invalid_argument);
 
   bbp::RuntimeNodeInventory::PreparedAppend prepared = inventory.PrepareAppend(
-      before.generation(), insertions, published_configs);
-  BOOST_TEST(before.size() == 1U);
+      before.generation(), insertions, published_configs, 17U, expanded);
   BOOST_TEST(before.front().config.id == "node-1");
   const bbp::RuntimeNodeSnapshot after = prepared.Commit();
 
   BOOST_TEST(after.generation() == before.generation() + 1U);
-  BOOST_TEST(after.size() == 2U);
-  BOOST_TEST(after.back().config.id == "node-2");
+  BOOST_TEST(after.size() == 17U);
+  BOOST_TEST(after.capacity() == 17U);
+  BOOST_TEST(inventory.capacity() == after.capacity());
+  BOOST_TEST(before.size() == 16U);
+  BOOST_TEST(before.capacity() == 16U);
+  BOOST_REQUIRE(before.network_address_plan());
+  BOOST_REQUIRE(after.network_address_plan());
+  BOOST_TEST(before.network_address_plan()->capacity() == 16U);
+  BOOST_TEST(&after.front() == &before.front());
+  BOOST_TEST(after.network_address_plan()->NodeAddress(15U) ==
+             before.network_address_plan()->NodeAddress(15U));
+  BOOST_TEST(after.network_address_plan()->HostAddress(16U) ==
+             expanded.HostAddress(16U));
+  BOOST_TEST(after.back().config.id == "node-17");
   BOOST_TEST(&after.back() == candidate.get());
   const bbp::NodeConfigSnapshot configs = inventory.ConfigSnapshot();
   BOOST_TEST(configs.nodes().front().connect_peers ==
                  std::vector<std::string>({"127.0.0.1:18445"}),
              boost::test_tools::per_element());
+  BOOST_CHECK_THROW(inventory.PrepareAppend(before.generation(), insertions,
+                                            published_configs, 17U, expanded),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(
     runtime_node_inventory_abandoned_prepare_leaves_generation_unchanged) {
-  bbp::RuntimeNodeInventory inventory(2U);
+  bbp::RuntimeNodeInventory inventory(1U);
   std::vector<bbp::NodeRuntime> initial;
   initial.push_back(RuntimeNode("node-1"));
-  inventory.Initialize(initial);
+  const auto allocation =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 1U);
+  inventory.Initialize(initial, allocation);
   const std::uint64_t generation = inventory.Snapshot().generation();
   auto candidate = std::make_shared<bbp::NodeRuntime>(RuntimeNode("node-2"));
   {
     const std::vector<bbp::RuntimeNodeInsertion> insertions{
         {.slot = 1U, .runtime = candidate}};
-    auto prepared = inventory.PrepareAppend(generation, insertions);
+    auto prepared = inventory.PrepareAppend(
+        generation, insertions, {}, 2U,
+        bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 2U));
     static_cast<void>(prepared);
   }
 
   const bbp::RuntimeNodeSnapshot unchanged = inventory.Snapshot();
   BOOST_TEST(unchanged.generation() == generation);
   BOOST_TEST(unchanged.size() == 1U);
+  BOOST_TEST(inventory.capacity() == 1U);
+  BOOST_REQUIRE(unchanged.network_address_plan());
+  BOOST_TEST(unchanged.network_address_plan()->capacity() == 1U);
+  BOOST_TEST(unchanged.network_address_plan()->NodeAddress(0U) ==
+             allocation.NodeAddress(0U));
   BOOST_TEST(unchanged.front().config.id == "node-1");
 }
 
@@ -170,7 +204,9 @@ BOOST_AUTO_TEST_CASE(
   initial.push_back(RuntimeNode("node-1"));
   initial.push_back(RuntimeNode("node-2"));
   initial.push_back(RuntimeNode("node-3"));
-  inventory.Initialize(initial);
+  const auto allocation =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 4U);
+  inventory.Initialize(initial, allocation);
 
   bbp::RuntimeNodeSnapshot old_reader = inventory.Snapshot();
   bbp::NodeRuntime* first = &old_reader[0U];
@@ -191,6 +227,10 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(&after[1U] == third);
   BOOST_TEST(after.slot(0U) == 0U);
   BOOST_TEST(after.slot(1U) == 2U);
+  BOOST_TEST(after.capacity() == 4U);
+  BOOST_REQUIRE(after.network_address_plan());
+  BOOST_TEST(after.network_address_plan()->NodeAddress(3U) ==
+             allocation.NodeAddress(3U));
   BOOST_TEST(inventory.WasNodeIdUsed("node-2"));
   BOOST_TEST(!inventory.WasNodeIdUsed("node-4"));
   BOOST_REQUIRE_EQUAL(prepared.retired_nodes().size(), 1U);
@@ -249,7 +289,9 @@ BOOST_AUTO_TEST_CASE(
   initial.push_back(RuntimeNode("node-1"));
   initial.back().config.binary = "/old/node";
   initial.push_back(RuntimeNode("node-2"));
-  inventory.Initialize(initial);
+  const auto allocation =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 2U);
+  inventory.Initialize(initial, allocation);
 
   const bbp::RuntimeNodeSnapshot before = inventory.Snapshot();
   bbp::NodeRuntime* const first = &before[0U];
@@ -285,6 +327,9 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(before[0U].config.binary == "/old/node");
   BOOST_TEST(inventory.ConfigSnapshot().nodes()[0U].binary == "/new/node");
   BOOST_TEST(inventory.capacity() == 2U);
+  BOOST_REQUIRE(after.network_address_plan());
+  BOOST_TEST(after.network_address_plan()->NodeAddress(0U) ==
+             allocation.NodeAddress(0U));
   BOOST_TEST(inventory.WasNodeIdUsed("node-1"));
   BOOST_TEST(inventory.WasNodeIdUsed("node-2"));
 

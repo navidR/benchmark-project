@@ -1,6 +1,7 @@
 #include "bbp/runtime_peer_topology.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -10,6 +11,50 @@ namespace bbp {
 namespace {
 
 using EdgeKey = std::pair<std::uint32_t, std::uint32_t>;
+constexpr std::uint32_t kMaximumDirectionalBands = 15U;
+using DirectionalBands = std::array<bool, kMaximumDirectionalBands + 1U>;
+
+std::uint32_t AllocateDirectionalBand(std::uint32_t preferred,
+                                      const DirectionalBands& used) {
+  if (preferred != 0U && preferred <= kMaximumDirectionalBands &&
+      !used[preferred]) {
+    return preferred;
+  }
+  for (std::uint32_t band = 1U; band <= kMaximumDirectionalBands; ++band) {
+    if (!used[band]) {
+      return band;
+    }
+  }
+  throw std::runtime_error(
+      "directional qdisc bands exhausted: requested 16, available 15");
+}
+
+std::uint32_t DirectionalBandForState(
+    const RuntimePeerTopologyEdge& state,
+    const std::vector<RuntimePeerTopologyEdge>& edges) {
+  if (!state.active || !state.condition) {
+    return state.band;
+  }
+  DirectionalBands used{};
+  for (const RuntimePeerTopologyEdge& edge : edges) {
+    if (edge.from == state.from && edge.to != state.to && edge.active &&
+        edge.condition) {
+      used.at(edge.band) = true;
+    }
+  }
+  return AllocateDirectionalBand(state.band, used);
+}
+
+void AssignDirectionalBands(std::vector<RuntimePeerTopologyEdge>* edges,
+                            std::uint32_t node_count) {
+  std::vector<DirectionalBands> used(node_count);
+  for (RuntimePeerTopologyEdge& edge : *edges) {
+    if (edge.active && edge.condition) {
+      edge.band = AllocateDirectionalBand(edge.band, used[edge.from]);
+      used[edge.from][edge.band] = true;
+    }
+  }
+}
 
 struct InitialEdgeState {
   bool active = true;
@@ -112,10 +157,6 @@ RuntimePeerTopology::RuntimePeerTopology(const PeerTopologyConfig& topology,
   std::vector<std::uint32_t> next_band(node_count_, 0U);
   for (const auto& [nodes, state] : InitialEdges(topology, node_count_)) {
     const std::uint32_t band = ++next_band[nodes.first];
-    if (band > 15U) {
-      throw std::runtime_error(
-          "runtime topology exceeds the 15-peer directional band limit");
-    }
     edges_.push_back(RuntimePeerTopologyEdge{
         .from = nodes.first,
         .to = nodes.second,
@@ -124,6 +165,7 @@ RuntimePeerTopology::RuntimePeerTopology(const PeerTopologyConfig& topology,
         .condition = state.condition,
     });
   }
+  AssignDirectionalBands(&edges_, node_count_);
   baseline_edges_ = edges_;
 }
 
@@ -202,6 +244,11 @@ std::vector<DirectionalNetworkPolicy> RuntimePeerTopology::DirectionalPolicies(
   std::vector<DirectionalNetworkPolicy> policies;
   for (const RuntimePeerTopologyEdge& edge : edges_) {
     if (edge.from == node_index && edge.active && edge.condition) {
+      if (edge.band > 15U) {
+        throw std::runtime_error(
+            "directional qdisc band unavailable: requested " +
+            std::to_string(edge.band) + ", available 15");
+      }
       policies.push_back(DirectionalNetworkPolicy{
           .band = edge.band,
           .destination_address = address_plan.NodeAddress(edge.to),
@@ -221,7 +268,10 @@ RuntimePeerTopologyEdge RuntimePeerTopology::SetCondition(
         "cannot set a condition on an inactive runtime topology edge");
   }
   const RuntimePeerTopologyEdge previous = edge;
-  edge.condition = condition;
+  RuntimePeerTopologyEdge next = edge;
+  next.condition = condition;
+  next.band = DirectionalBandForState(next, edges_);
+  edge = next;
   return previous;
 }
 
@@ -235,7 +285,10 @@ RuntimePeerTopologyEdge RuntimePeerTopology::SetActive(std::uint32_t from,
                                  : "runtime topology edge is already inactive");
   }
   const RuntimePeerTopologyEdge previous = edge;
-  edge.active = active;
+  RuntimePeerTopologyEdge next = edge;
+  next.active = active;
+  next.band = DirectionalBandForState(next, edges_);
+  edge = next;
   return previous;
 }
 
@@ -251,17 +304,19 @@ RuntimePeerTopologyEdge RuntimePeerTopology::RestoreBaseline(std::uint32_t from,
   if (baseline == baseline_edges_.end()) {
     throw std::runtime_error("runtime topology baseline edge does not exist");
   }
-  edge = *baseline;
+  RuntimePeerTopologyEdge next = *baseline;
+  next.band = DirectionalBandForState(next, edges_);
+  edge = next;
   return previous;
 }
 
 void RuntimePeerTopology::RestoreState(const RuntimePeerTopologyEdge& state) {
   RuntimePeerTopologyEdge& edge = MutableEdge(state.from, state.to);
-  if (edge.band != state.band) {
-    throw std::runtime_error("runtime topology restore band mismatch");
-  }
   if (state.condition) {
     ValidateNetworkCondition(*state.condition);
+  }
+  if (DirectionalBandForState(state, edges_) != state.band) {
+    throw std::runtime_error("runtime topology restore band is unavailable");
   }
   edge = state;
 }
@@ -272,14 +327,18 @@ void RuntimePeerTopology::PreserveCommonStateFrom(
   for (const RuntimePeerTopologyEdge& edge : previous.edges_) {
     previous_edges.emplace(EdgeKey{edge.from, edge.to}, &edge);
   }
-  for (RuntimePeerTopologyEdge& edge : edges_) {
+  std::vector<RuntimePeerTopologyEdge> next = edges_;
+  for (RuntimePeerTopologyEdge& edge : next) {
     const auto previous_edge = previous_edges.find(EdgeKey{edge.from, edge.to});
     if (previous_edge == previous_edges.end()) {
       continue;
     }
     edge.active = previous_edge->second->active;
     edge.condition = previous_edge->second->condition;
+    edge.band = previous_edge->second->band;
   }
+  AssignDirectionalBands(&next, node_count_);
+  edges_.swap(next);
 }
 
 void RuntimePeerTopology::PreserveRemappedStateFrom(
@@ -297,14 +356,18 @@ void RuntimePeerTopology::PreserveRemappedStateFrom(
       previous_edges.emplace(EdgeKey{*from, *to}, &edge);
     }
   }
-  for (RuntimePeerTopologyEdge& edge : edges_) {
+  std::vector<RuntimePeerTopologyEdge> next = edges_;
+  for (RuntimePeerTopologyEdge& edge : next) {
     const auto previous_edge = previous_edges.find(EdgeKey{edge.from, edge.to});
     if (previous_edge == previous_edges.end()) {
       continue;
     }
     edge.active = previous_edge->second->active;
     edge.condition = previous_edge->second->condition;
+    edge.band = previous_edge->second->band;
   }
+  AssignDirectionalBands(&next, node_count_);
+  edges_.swap(next);
 }
 
 RuntimePeerTopologyEdge& RuntimePeerTopology::MutableEdge(std::uint32_t from,

@@ -64,7 +64,7 @@ std::string RuntimeNodeRemovalPeerEndpoint(const NodeRuntime& node) {
 }  // namespace
 
 RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
-    const Options& options, const std::filesystem::path& events_path,
+    const Options& launch_options, const std::filesystem::path& events_path,
     const ChainDriver& driver, RuntimeNodeInventory& inventory,
     RuntimeWalletRegistry& runtime_registry,
     PeerConnectivityController& peer_controller,
@@ -81,6 +81,11 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
     const SimulationNodeRemoveRequest& request,
     SimulationCommandControl* operation_control, std::stop_token stop_token,
     const RuntimeNodeRemovalDependencies& dependencies) {
+  RuntimeNodeSnapshot before = inventory.Snapshot();
+  Options options = launch_options;
+  options.nodes = static_cast<std::uint32_t>(before.size());
+  options.node_capacity = before.capacity();
+  options.network_address_plan = before.network_address_plan();
   if (request.node_ids.empty() ||
       request.node_ids.size() > kSimulationNodeRemoveMaximumCount) {
     throw std::runtime_error("node-remove count is out of range");
@@ -89,7 +94,6 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
       live_topology_config == nullptr || !wallet_workloads) {
     throw std::logic_error("node-remove runtime services are unavailable");
   }
-  RuntimeNodeSnapshot before = inventory.Snapshot();
   RuntimeWalletSnapshot before_registry = runtime_registry.Snapshot();
   if (request.node_ids.size() > before.size()) {
     throw std::runtime_error("node-remove count exceeds the active node count");
@@ -477,6 +481,11 @@ RuntimeNodeRemoveResult RemoveRuntimeNodesTransactional(
     const boost::json::object generation_detail{
         {"generation", before.generation() + 1U},
         {"node_count", final_count},
+        {"node_capacity", before.capacity()},
+        {"network_allocation",
+         before.network_address_plan()
+             ? boost::json::value(before.network_address_plan()->ToSerialized())
+             : boost::json::value(nullptr)},
         {"node_ids", std::move(published_node_ids)},
         {"node_configs", std::move(published_node_configs)},
         {"topology", std::move(published_topology)},

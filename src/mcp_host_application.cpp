@@ -180,7 +180,7 @@ boost::json::object RunSnapshotJson(const McpHostedRunSnapshot& snapshot) {
       {"chain", snapshot.chain},
       {"node_count", snapshot.node_count},
       {"node_capacity", snapshot.node_capacity},
-      {"chain_node_maximum", snapshot.chain_node_maximum},
+      {"network_allocation", snapshot.network_allocation},
       {"available_node_capacity", snapshot.available_node_capacity}};
 }
 
@@ -192,7 +192,7 @@ boost::json::object RetainedRunSnapshotJson(
       {"chain", snapshot.chain},
       {"node_count", snapshot.node_count},
       {"node_capacity", snapshot.node_capacity},
-      {"chain_node_maximum", snapshot.chain_node_maximum},
+      {"network_allocation", snapshot.network_allocation},
       {"available_node_capacity", 0U}};
 }
 
@@ -203,10 +203,8 @@ void ValidateRetainedRunSnapshot(const McpRetainedRunSnapshot& snapshot) {
         snapshot.state != "cancelled" && snapshot.state != "incomplete") {
       throw std::runtime_error("retained run state is not terminal");
     }
-    const ChainKind chain = ParseChainKind(snapshot.chain);
-    if (snapshot.chain_node_maximum != ChainDriverSpecFor(chain).max_nodes ||
-        snapshot.node_capacity > snapshot.chain_node_maximum ||
-        snapshot.node_count > snapshot.node_capacity) {
+    static_cast<void>(ParseChainKind(snapshot.chain));
+    if (snapshot.node_count > snapshot.node_capacity) {
       throw std::runtime_error("retained run node bounds are inconsistent");
     }
   } catch (const std::exception& error) {
@@ -453,13 +451,7 @@ boost::json::value McpHostApplication::ReadResource(
         BuildMcpCapabilityDocument(operations, information_families);
     capabilities["access_mode"] = "read_write";
     capabilities["lifetime"] = "bbp_process";
-    boost::json::object chain_limits;
-    for (std::size_t index = 0U;
-         index < static_cast<std::size_t>(ChainKind::kCount); ++index) {
-      const auto chain = static_cast<ChainKind>(index);
-      chain_limits[ChainKindName(chain)] = ChainDriverSpecFor(chain).max_nodes;
-    }
-    capabilities["chain_node_maximums"] = std::move(chain_limits);
+    capabilities["node_capacity_policy"] = McpNodeCapacityPolicy();
     boost::json::object& limits = capabilities.at("limits").as_object();
     limits["run_registry_entries"] = kMcpHostMaximumRunRegistryEntries;
     limits["run_registry_legacy_bytes"] = kMcpHostMaximumLegacyRegistryBytes;

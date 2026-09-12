@@ -2,6 +2,7 @@
 #include <boost/json/array.hpp>
 #include <boost/json/value.hpp>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -60,10 +61,14 @@ SimulationNodeAddRequest ParseAndValidateSimulationNodeAddRequest(
         "node.add count must be in 1..16 and timeout fields must be in "
         "1..600");
   }
-  if (options.nodes > options.node_capacity ||
-      result.count > options.node_capacity - options.nodes) {
+  if (result.count >
+      std::numeric_limits<std::uint32_t>::max() - options.nodes) {
     throw std::runtime_error(
-        "node.add request exceeds the configured node capacity");
+        "node inventory index exhaustion: requested " +
+        std::to_string(static_cast<std::uint64_t>(options.nodes) +
+                       result.count) +
+        " nodes, available index range 1.." +
+        std::to_string(std::numeric_limits<std::uint32_t>::max()));
   }
   const std::uint32_t final_node_count = options.nodes + result.count;
 

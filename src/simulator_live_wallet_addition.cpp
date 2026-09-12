@@ -167,32 +167,14 @@ boost::json::object AddLiveWalletRoles(const LiveWalletAdditionContext& context,
   if (create_node != nullptr) {
     Options validation_options = context.options;
     validation_options.nodes = static_cast<std::uint32_t>(current_nodes.size());
-    SimulationNodeAddRequest node_request;
-    try {
-      node_request = ParseAndValidateSimulationNodeAddRequest(
-          create_node->as_object(), validation_options);
-    } catch (const std::runtime_error& error) {
-      if (std::string_view(error.what()) !=
-          "node.add request exceeds the configured node capacity") {
-        throw;
-      }
-      throw McpOperationFailure(
-          "node_capacity_exceeded", error.what(), false,
-          boost::json::array{boost::json::object{
-              {"code", "node_capacity_exceeded"},
-              {"message",
-               "the requested wallet-node batch exceeds available "
-               "capacity"},
-              {"path", "create_node.count"},
-              {"requested_count", count},
-              {"current_node_count", current_nodes.size()},
-              {"node_capacity", context.node_inventory.capacity()},
-              {"available_node_capacity",
-               current_nodes.size() <= context.node_inventory.capacity()
-                   ? context.node_inventory.capacity() - current_nodes.size()
-                   : 0U},
-              {"recoverable", false}}});
+    validation_options.node_capacity = current_nodes.capacity();
+    validation_options.node_ids.clear();
+    for (const NodeRuntime& node : current_nodes) {
+      validation_options.node_ids.push_back(node.config.id);
     }
+    const SimulationNodeAddRequest node_request =
+        ParseAndValidateSimulationNodeAddRequest(create_node->as_object(),
+                                                 validation_options);
     if (node_request.count != count) {
       throw std::invalid_argument(
           "wallet.add count must match create_node.count");
@@ -295,6 +277,8 @@ boost::json::object AddLiveWalletRoles(const LiveWalletAdditionContext& context,
           {"wallets", std::move(wallets_json)},
           {"inventory_generation", added.inventory_generation},
           {"final_node_count", added.final_node_count},
+          {"node_capacity", added.node_capacity},
+          {"network_allocation", added.network_allocation},
           {"wallet_generation", *added.wallet_generation},
           {"final_wallet_count", *added.final_wallet_count},
           {"final_wallet_node_count", *added.final_wallet_node_count},
@@ -489,6 +473,12 @@ boost::json::object AddLiveWalletRoles(const LiveWalletAdditionContext& context,
         {"wallets", std::move(wallets_json)},
         {"inventory_generation", current_nodes.generation()},
         {"final_node_count", current_nodes.size()},
+        {"node_capacity", current_nodes.capacity()},
+        {"network_allocation",
+         current_nodes.network_address_plan()
+             ? boost::json::value(
+                   current_nodes.network_address_plan()->ToSerialized())
+             : boost::json::value(nullptr)},
         {"wallet_generation", published.generation()},
         {"final_wallet_count", published.wallets().size()},
         {"final_wallet_node_count",

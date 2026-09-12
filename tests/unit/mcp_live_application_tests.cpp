@@ -93,12 +93,14 @@ boost::json::object LiveScenario() {
       {"chain_daemon", "/bin/true"},
       {"run_id", "live-application"},
       {"nodes", 1U},
+      {"node_capacity", 16U},
       {"block_production", boost::json::object{{"enabled", false}}}};
 }
 
 McpLiveNodeInventorySnapshot InitialInventory(const Options& options) {
   McpLiveNodeInventorySnapshot result{.generation = 1U,
-                                      .node_ids = options.node_ids};
+                                      .node_ids = options.node_ids,
+                                      .node_capacity = options.node_capacity};
   if (result.node_ids.empty()) {
     const std::string& prefix =
         ChainDriverSpecFor(options.chain).node_id_prefix;
@@ -170,9 +172,10 @@ SimulationCommandOutcome CommandOutcome(
                                   .final_node_count = std::nullopt};
 }
 
-SimulationCommandOutcome NodeAddOutcome(std::vector<std::string> node_ids,
-                                        std::uint64_t inventory_generation,
-                                        std::uint32_t final_node_count) {
+SimulationCommandOutcome NodeAddOutcome(
+    std::vector<std::string> node_ids, std::uint64_t inventory_generation,
+    std::uint32_t final_node_count, std::uint32_t node_capacity = 16U,
+    boost::json::value network_allocation = nullptr) {
   return SimulationCommandOutcome{
       .state = SimulationCommandOutcomeState::kSucceeded,
       .cancellation_cause = SimulationCommandCancellationCause::kNone,
@@ -181,7 +184,9 @@ SimulationCommandOutcome NodeAddOutcome(std::vector<std::string> node_ids,
       .added_node_ids = std::move(node_ids),
       .removed_node_ids = {},
       .inventory_generation = inventory_generation,
-      .final_node_count = final_node_count};
+      .final_node_count = final_node_count,
+      .node_capacity = node_capacity,
+      .network_allocation = std::move(network_allocation)};
 }
 
 SimulationCommandOutcome NodeRemoveOutcome(std::vector<std::string> node_ids,
@@ -861,6 +866,8 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(direct_result.at("removed_node_ids").as_array().empty());
   BOOST_TEST(direct_result.at("inventory_generation").as_uint64() == 2U);
   BOOST_TEST(direct_result.at("final_node_count").as_uint64() == 3U);
+  BOOST_TEST(direct_result.at("node_capacity").as_uint64() == 16U);
+  BOOST_TEST(direct_result.at("network_allocation").is_null());
   BOOST_TEST(!direct_result.at("unchanged").as_bool());
 
   const boost::json::object generic_submitted =
@@ -908,7 +915,7 @@ BOOST_AUTO_TEST_CASE(
           .as_object();
   BOOST_TEST(capabilities.at("node_count").as_uint64() == 4U);
   BOOST_TEST(capabilities.at("node_capacity").as_uint64() == 16U);
-  BOOST_TEST(capabilities.at("chain_node_maximum").as_uint64() == 16U);
+  BOOST_TEST(!capabilities.contains("chain_node_maximum"));
   BOOST_TEST(capabilities.at("available_node_capacity").as_uint64() == 12U);
   const std::uint64_t registry_reads_before =
       inventory_reads.load(std::memory_order_relaxed);
@@ -922,47 +929,30 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(run_registry_entry.at("available_node_capacity").as_uint64() ==
              12U);
 
-  const boost::json::object over_capacity = WaitForTerminal(
-      &dispatcher,
-      Invoke(&dispatcher, "node.add",
-             boost::json::object{
-                 {"run_id", "live-application"},
-                 {"request",
-                  boost::json::object{{"chain", "firo"}, {"count", 13U}}}}));
-  BOOST_TEST(over_capacity.at("state").as_string() == "failed");
-  const boost::json::object& capacity_error =
-      over_capacity.at("terminal_error").as_object();
-  BOOST_TEST(capacity_error.at("code").as_string() == "node_capacity_exceeded");
-  const boost::json::object& capacity_diagnostic =
-      capacity_error.at("diagnostics").as_array().front().as_object();
-  BOOST_TEST(capacity_diagnostic.at("requested_count").as_uint64() == 13U);
-  BOOST_TEST(capacity_diagnostic.at("current_node_count").as_uint64() == 4U);
-  BOOST_TEST(capacity_diagnostic.at("node_capacity").as_uint64() == 16U);
-  BOOST_TEST(capacity_diagnostic.at("available_node_capacity").as_uint64() ==
-             12U);
-  BOOST_TEST(!queue->TryPop().has_value());
-  const boost::json::object generic_over_capacity = WaitForTerminal(
-      &dispatcher,
-      Invoke(&dispatcher, "simulation.command",
-             boost::json::object{
-                 {"run_id", "live-application"},
-                 {"command",
-                  boost::json::object{
-                      {"kind", "add_nodes"},
-                      {"node_add", boost::json::object{{"chain", "firo"},
-                                                       {"count", 13U}}}}}}));
-  BOOST_TEST(generic_over_capacity.at("state").as_string() == "failed");
-  const boost::json::object& generic_capacity_error =
-      generic_over_capacity.at("terminal_error").as_object();
-  BOOST_TEST(generic_capacity_error.at("code").as_string() ==
-             "node_capacity_exceeded");
-  BOOST_TEST(generic_capacity_error.at("diagnostics")
-                 .as_array()
-                 .front()
-                 .as_object()
-                 .at("available_node_capacity")
-                 .as_uint64() == 12U);
-  BOOST_TEST(!queue->TryPop().has_value());
+  for (const bool generic : {false, true}) {
+    const boost::json::object request{{"chain", "firo"}, {"count", 13U}};
+    const boost::json::object submitted = Invoke(
+        &dispatcher, generic ? "simulation.command" : "node.add",
+        generic
+            ? boost::json::object{{"run_id", "live-application"},
+                                  {"command",
+                                   boost::json::object{{"kind", "add_nodes"},
+                                                       {"node_add", request}}}}
+            : boost::json::object{{"run_id", "live-application"},
+                                  {"request", request}});
+    const SimulationCommand command = WaitForQueuedCommand(queue.get());
+    BOOST_REQUIRE(command.node_add);
+    BOOST_TEST(command.node_add->count == 13U);
+    application.RecordCommandOutcome(
+        command,
+        CommandOutcome(SimulationCommandOutcomeState::kFailed,
+                       "injected operating-system allocation failure"));
+    const boost::json::object terminal =
+        WaitForTerminal(&dispatcher, submitted);
+    BOOST_TEST(
+        terminal.at("terminal_error").as_object().at("code").as_string() ==
+        "node_add_failed");
+  }
 
   const boost::json::object unavailable_submitted = Invoke(
       &dispatcher, "node.add",
@@ -1038,6 +1028,107 @@ BOOST_AUTO_TEST_CASE(
       {"different"}, 4U, 5U);
   BOOST_TEST(run_stop_requests.load(std::memory_order_acquire) >= 5U);
 
+  dispatcher.Shutdown();
+  application.Shutdown();
+}
+
+BOOST_AUTO_TEST_CASE(
+    mcp_node_add_grows_published_reservation_past_launch_and_16) {
+  LiveApplicationDirectory temporary;
+  boost::json::object scenario = LiveScenario();
+  scenario["nodes"] = 11U;
+  const auto options =
+      std::make_shared<Options>(ParseAndValidateScenario(scenario));
+  auto queue = std::make_shared<SimulationCommandQueue>();
+  std::mutex inventory_mutex;
+  McpLiveNodeInventorySnapshot inventory = InitialInventory(*options);
+  inventory.network_allocation =
+      SimulationNetworkAddressPlan::FromCidr("10.0.0.0/20", 16U).ToSerialized();
+  const boost::json::array original_links =
+      inventory.network_allocation.as_object().at("link_cidrs").as_array();
+  std::atomic_uint32_t stop_requests = 0U;
+  McpLiveApplication application(McpLiveApplication::Config{
+      .run_id = "live-application",
+      .run_root = temporary.path(),
+      .retained_run = std::nullopt,
+      .options = options,
+      .command_queue = queue,
+      .node_inventory_snapshot =
+          [&] {
+            std::lock_guard<std::mutex> lock(inventory_mutex);
+            return inventory;
+          },
+      .publication_mutex = {},
+      .request_run_stop = [&] { ++stop_requests; },
+      .run_started = {},
+      .run_stopping = {},
+      .run_stopped = {}});
+  application.MarkRunStarted();
+  McpDispatcher dispatcher({}, application.OperationFactory(),
+                           application.ResourceReader());
+  dispatcher.SessionHandler()("live-session", true, {});
+
+  for (const bool generic : {false, true}) {
+    const std::uint32_t count = generic ? 1U : 10U;
+    const boost::json::object request{{"chain", "firo"}, {"count", count}};
+    const boost::json::object submitted = Invoke(
+        &dispatcher, generic ? "simulation.command" : "node.add",
+        generic
+            ? boost::json::object{{"run_id", "live-application"},
+                                  {"command",
+                                   boost::json::object{{"kind", "add_nodes"},
+                                                       {"node_add", request}}}}
+            : boost::json::object{{"run_id", "live-application"},
+                                  {"request", request}});
+    const SimulationCommand command = WaitForQueuedCommand(queue.get());
+    std::vector<std::string> added_ids;
+    std::uint64_t generation;
+    std::uint32_t capacity;
+    boost::json::value allocation;
+    {
+      std::lock_guard<std::mutex> lock(inventory_mutex);
+      MarkNodeAddCommitted(command, inventory.generation, inventory.node_ids);
+      for (std::uint32_t index = 0U; index < count; ++index) {
+        added_ids.push_back("grown-" +
+                            std::to_string(inventory.node_ids.size()));
+        inventory.node_ids.push_back(added_ids.back());
+      }
+      generation = ++inventory.generation;
+      capacity = static_cast<std::uint32_t>(inventory.node_ids.size());
+      inventory.node_capacity = capacity;
+      allocation =
+          SimulationNetworkAddressPlan::FromCidr("10.0.0.0/20", capacity)
+              .ToSerialized();
+      inventory.network_allocation = allocation;
+    }
+    application.RecordCommandOutcome(
+        command,
+        NodeAddOutcome(added_ids, generation, capacity, capacity, allocation));
+    const boost::json::object terminal =
+        WaitForTerminal(&dispatcher, submitted);
+    BOOST_TEST(terminal.at("state").as_string() == "succeeded");
+    const boost::json::object& result =
+        terminal.at("terminal_result").as_object();
+    BOOST_TEST(result.at("final_node_count").as_uint64() == capacity);
+    BOOST_TEST(result.at("node_capacity").as_uint64() == capacity);
+    BOOST_TEST(result.at("network_allocation") == allocation);
+    const boost::json::value registry = application.ResourceReader()(
+        McpInformationFamily::kRunRegistry, "live-session", {});
+    const boost::json::object& current =
+        registry.as_object().at("data").as_array().front().as_object();
+    BOOST_TEST(current.at("node_count").as_uint64() == capacity);
+    BOOST_TEST(current.at("node_capacity").as_uint64() == capacity);
+    BOOST_TEST(current.at("available_node_capacity").as_uint64() == 0U);
+    BOOST_TEST(current.at("network_allocation") == allocation);
+    BOOST_TEST(!current.contains("chain_node_maximum"));
+    const boost::json::array& links =
+        allocation.as_object().at("link_cidrs").as_array();
+    BOOST_CHECK(std::equal(original_links.begin(), original_links.end(),
+                           links.begin()));
+  }
+  BOOST_TEST(options->node_capacity == 16U);
+  BOOST_TEST(application.current_node_count() == 22U);
+  BOOST_TEST(stop_requests.load() == 0U);
   dispatcher.Shutdown();
   application.Shutdown();
 }
@@ -3434,6 +3525,10 @@ BOOST_AUTO_TEST_CASE(
                         {"funding_address", "funding-address"}}}},
         {"inventory_generation", 7U},
         {"final_node_count", 2U},
+        {"node_capacity", 32U},
+        {"network_allocation",
+         SimulationNetworkAddressPlan::FromCidr("10.0.0.0/20", 32U)
+             .ToSerialized()},
         {"wallet_generation", 5U},
         {"final_wallet_count", 1U},
         {"final_wallet_node_count", 1U}};
@@ -3460,6 +3555,10 @@ BOOST_AUTO_TEST_CASE(
       {"role_generation", 5U},
       {"inventory_generation", 7U},
       {"final_node_count", 2U},
+      {"node_capacity", 32U},
+      {"network_allocation",
+       SimulationNetworkAddressPlan::FromCidr("10.0.0.0/20", 32U)
+           .ToSerialized()},
       {"final_wallet_count", 1U},
       {"final_wallet_node_count", 1U},
       {"wallets", boost::json::array{boost::json::object{
@@ -4484,8 +4583,9 @@ BOOST_AUTO_TEST_CASE(
       .operator_connection_launcher = launcher_service,
       .node_inventory_snapshot =
           [] {
-            return McpLiveNodeInventorySnapshot{
-                .generation = 1U, .node_ids = {"_firo", "firo-2"}};
+            return McpLiveNodeInventorySnapshot{.generation = 1U,
+                                                .node_ids = {"_firo", "firo-2"},
+                                                .node_capacity = 2U};
           },
       .publication_mutex = std::make_shared<std::timed_mutex>(),
       .request_run_stop = [] {},
@@ -4596,8 +4696,9 @@ BOOST_AUTO_TEST_CASE(
       .operator_connection_launcher = uncertain_launcher_service,
       .node_inventory_snapshot =
           [] {
-            return McpLiveNodeInventorySnapshot{
-                .generation = 1U, .node_ids = {"_firo", "firo-2"}};
+            return McpLiveNodeInventorySnapshot{.generation = 1U,
+                                                .node_ids = {"_firo", "firo-2"},
+                                                .node_capacity = 2U};
           },
       .publication_mutex = std::make_shared<std::timed_mutex>(),
       .request_run_stop = [] {},

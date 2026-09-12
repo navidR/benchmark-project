@@ -75,7 +75,7 @@ std::string RuntimeNodeReplacementExceptionMessage(
 }  // namespace
 
 RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
-    const Options& options, const std::filesystem::path& run_root,
+    const Options& launch_options, const std::filesystem::path& run_root,
     const std::filesystem::path& events_path, const ChainDriver& driver,
     RuntimeNodeInventory& inventory, RuntimeWalletRegistry& runtime_registry,
     PeerConnectivityController& peer_controller,
@@ -95,6 +95,11 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     bool restore_native_mining, std::string_view native_mining_reward_address,
     SimulationCommandControl* operation_control, std::stop_token stop_token,
     const RuntimeNodeReplacementDependencies& dependencies) {
+  const RuntimeNodeSnapshot before = inventory.Snapshot();
+  Options options = launch_options;
+  options.nodes = static_cast<std::uint32_t>(before.size());
+  options.node_capacity = before.capacity();
+  options.network_address_plan = before.network_address_plan();
   if (request.chain != options.chain) {
     throw std::runtime_error(
         "node-replace chain must match the active simulation chain");
@@ -112,7 +117,6 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     throw std::logic_error("node-replace wallet workload service is missing");
   }
 
-  const RuntimeNodeSnapshot before = inventory.Snapshot();
   const RuntimeWalletSnapshot before_registry = runtime_registry.Snapshot();
   if (before.generation() == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("node-replace inventory generation overflow");
@@ -298,7 +302,8 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
   boost::asio::io_context staging_port_context;
   if (options.isolate_network) {
     const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
-    const std::uint32_t offset = chain_spec.max_nodes + target_slot;
+    // Only one replacement runs in this node namespace at a time.
+    constexpr std::uint32_t offset = 1U;
     const auto temporary_port = [&](std::uint16_t base,
                                     std::string_view description) {
       const std::uint32_t value = static_cast<std::uint32_t>(base) + offset;
@@ -997,6 +1002,11 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     boost::json::object generation_detail{
         {"generation", before.generation() + 1U},
         {"node_count", final_configs.size()},
+        {"node_capacity", before.capacity()},
+        {"network_allocation",
+         before.network_address_plan()
+             ? boost::json::value(before.network_address_plan()->ToSerialized())
+             : boost::json::value(nullptr)},
         {"node_ids", std::move(published_node_ids)},
         {"node_configs", std::move(published_node_configs)},
         {"topology", std::move(published_topology)},

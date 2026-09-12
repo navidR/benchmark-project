@@ -136,6 +136,9 @@ BOOST_AUTO_TEST_CASE(
   bbp::RuntimeNodeResourceManifest manifest{
       .ownership = root.ownership(),
       .isolated_network = true,
+      .node_capacity = 18U,
+      .network_address_plan =
+          bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 18U),
       .nodes = {},
   };
   bbp::WriteRuntimeNodeResourceManifest(manifest);
@@ -144,11 +147,12 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(empty->nodes.empty());
   BOOST_TEST(empty->isolated_network);
 
-  manifest.nodes = {
-      Entry("firo-1", 0U),
-      Entry("firo-2", 1U, bbp::RuntimeNodeResourceState::kPendingAdd),
-      Entry("firo-3", 2U, bbp::RuntimeNodeResourceState::kPendingRemove),
-  };
+  for (std::uint32_t slot = 0U; slot < 18U; ++slot) {
+    manifest.nodes.push_back(Entry("firo-" + std::to_string(slot + 1U), slot));
+  }
+  manifest.nodes.back().state = bbp::RuntimeNodeResourceState::kPendingRemove;
+  manifest.nodes.push_back(
+      Entry("firo-19", 18U, bbp::RuntimeNodeResourceState::kPendingAdd));
   bbp::WriteRuntimeNodeResourceManifest(manifest);
   const auto loaded = bbp::TryLoadRuntimeNodeResourceManifest(root.ownership());
   BOOST_REQUIRE(loaded);
@@ -760,13 +764,23 @@ BOOST_AUTO_TEST_CASE(
   ManifestTestRoot root;
   bbp::RuntimeNodeResourceManifest manifest{
       .ownership = root.ownership(),
-      .isolated_network = false,
-      .nodes = {Entry("firo-1", 16U)},
+      .isolated_network = true,
+      .node_capacity = 17U,
+      .network_address_plan =
+          bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 17U),
+      .nodes = {Entry("firo-18", 17U)},
   };
   BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
                     std::runtime_error);
 
-  manifest.nodes.front().slot = 0U;
+  manifest.nodes = {Entry("firo-1", 0U)};
+  manifest.network_address_plan =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 16U);
+  BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
+                    std::runtime_error);
+
+  manifest.network_address_plan =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/20", 17U);
   manifest.nodes.front().data_dir = "nodes/firo-1";
   BOOST_CHECK_THROW(bbp::WriteRuntimeNodeResourceManifest(manifest),
                     std::runtime_error);

@@ -217,3 +217,28 @@ BOOST_AUTO_TEST_CASE(
                         topology, node_ids, reversed, 0U),
                     std::runtime_error);
 }
+
+BOOST_AUTO_TEST_CASE(runtime_peer_topology_allows_unshaped_growth_past_16) {
+  const bbp::PeerTopologyConfig config;
+  const bbp::RuntimePeerTopology original(config, 16U);
+  bbp::RuntimePeerTopology grown(config, 21U);
+  grown.PreserveCommonStateFrom(original);
+  BOOST_TEST(grown.ActivePeerIndexes(0U).size() == 20U);
+  BOOST_TEST(grown.PreservesPhysicalPeerRequirementsFrom(original, 16U));
+  const auto plan =
+      bbp::SimulationNetworkAddressPlan::FromCidr("10.42.0.0/26", 21U);
+  BOOST_TEST(grown.DirectionalPolicies(plan, 0U).empty());
+  BOOST_TEST(
+      bbp::ResolveDirectionalNetworkPolicies(config, plan, 21U, 0U).empty());
+  bbp::NetworkCondition delayed;
+  delayed.delay_ms = 1U;
+  grown.SetCondition(0U, 20U, delayed);
+  BOOST_TEST(grown.Edge(0U, 20U).condition.has_value());
+  for (std::uint32_t target = 1U; target < 15U; ++target) {
+    grown.SetCondition(0U, target, delayed);
+  }
+  BOOST_TEST(grown.DirectionalPolicies(plan, 0U).size() == 15U);
+  BOOST_CHECK_THROW(grown.SetCondition(0U, 15U, delayed), std::runtime_error);
+  BOOST_TEST(!grown.Edge(0U, 15U).condition.has_value());
+  BOOST_TEST(grown.DirectionalPolicies(plan, 0U).size() == 15U);
+}

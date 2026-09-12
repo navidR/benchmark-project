@@ -1,6 +1,6 @@
 #include <array>
 #include <boost/test/unit_test.hpp>
-#include <map>
+#include <limits>
 #include <stdexcept>
 
 #include "bbp/chain_kind.h"
@@ -32,7 +32,6 @@ BOOST_AUTO_TEST_CASE(later_chain_drivers_are_registered) {
       bbp::ChainDriverSpecFor(bbp::ChainKind::kBitcoin);
   BOOST_TEST(bitcoin.name == "bitcoin");
   BOOST_TEST(bitcoin.daemon_option_name == "bitcoind");
-  BOOST_TEST(bitcoin.max_nodes == 16U);
   BOOST_TEST(bitcoin.p2p_port_base == 18444U);
   BOOST_TEST(bitcoin.rpc_port_base == 19443U);
   const std::unique_ptr<bbp::ChainDriver> driver =
@@ -44,7 +43,6 @@ BOOST_AUTO_TEST_CASE(later_chain_drivers_are_registered) {
       bbp::ChainDriverSpecFor(bbp::ChainKind::kMonero);
   BOOST_TEST(monero.name == "monero");
   BOOST_TEST(monero.daemon_option_name == "monerod");
-  BOOST_TEST(monero.max_nodes == 16U);
   BOOST_TEST(monero.coinbase_spendable_confirmations == 60U);
   BOOST_TEST(monero.p2p_port_base == 18080U);
   BOOST_TEST(monero.rpc_port_base == 19081U);
@@ -113,37 +111,59 @@ BOOST_AUTO_TEST_CASE(monero_node_config_uses_unique_digest_credentials) {
   BOOST_TEST(second.rpc_cookie_file.empty());
 }
 
-BOOST_AUTO_TEST_CASE(chain_node_port_ranges_are_disjoint_through_max_nodes) {
+BOOST_AUTO_TEST_CASE(isolated_chain_nodes_reuse_fixed_ports_at_high_indices) {
   const std::array<const bbp::ChainDriverSpec*, 3U> specs = {
       &bbp::DefaultChainDriverSpec(),
       &bbp::ChainDriverSpecFor(bbp::ChainKind::kBitcoin),
       &bbp::ChainDriverSpecFor(bbp::ChainKind::kMonero),
   };
-  std::map<std::uint16_t, std::string> allocated_ports;
-  std::size_t expected_port_count = 0U;
   for (const bbp::ChainDriverSpec* spec : specs) {
-    for (std::uint32_t node_index = 0U; node_index < spec->max_nodes;
-         ++node_index) {
+    for (const std::uint32_t node_index :
+         {0U, 262143U, std::numeric_limits<std::uint32_t>::max()}) {
       bbp::ChainNodeConfigRequest request;
       request.run_id = "port-plan-test";
       request.run_root = "/tmp/port-plan-test";
       request.daemon_binary = "/tmp/daemon";
       request.node_index = node_index;
+      request.isolated_network = true;
       const bbp::ChainNodeConfig config =
           bbp::MakeChainNodeConfig(*spec, request);
-      const auto allocate = [&](std::uint16_t port, std::string protocol) {
-        const std::string owner = spec->name + " " + std::move(protocol) +
-                                  " node " + std::to_string(node_index + 1U);
-        const auto [position, inserted] = allocated_ports.emplace(port, owner);
-        BOOST_CHECK_MESSAGE(inserted, owner + " port " + std::to_string(port) +
-                                          " overlaps " + position->second);
-      };
-      allocate(config.p2p_port, "P2P");
-      allocate(config.rpc_port, "RPC");
+      BOOST_TEST(config.p2p_port == spec->p2p_port_base);
+      BOOST_TEST(config.rpc_port == spec->rpc_port_base);
+      BOOST_TEST(
+          config.id ==
+          spec->node_id_prefix + "-" +
+              std::to_string(static_cast<std::uint64_t>(node_index) + 1U));
     }
-    expected_port_count += static_cast<std::size_t>(spec->max_nodes) * 2U;
   }
-  BOOST_TEST(allocated_ports.size() == expected_port_count);
+}
+
+BOOST_AUTO_TEST_CASE(loopback_chain_nodes_report_port_exhaustion_without_wrap) {
+  const bbp::ChainDriverSpec& spec = bbp::DefaultChainDriverSpec();
+  bbp::ChainNodeConfigRequest request;
+  request.run_root = "/tmp/port-plan-test";
+  request.daemon_binary = "/tmp/daemon";
+  request.node_index =
+      std::numeric_limits<std::uint16_t>::max() - spec.rpc_port_base;
+  const bbp::ChainNodeConfig final_config =
+      bbp::MakeChainNodeConfig(spec, request);
+  BOOST_TEST(final_config.rpc_port == 65535U);
+
+  ++request.node_index;
+  BOOST_CHECK_EXCEPTION(
+      bbp::MakeChainNodeConfig(spec, request), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "loopback port exhaustion: requested port 65536, available "
+               "port range 1..65535";
+      });
+  request.node_index = std::numeric_limits<std::uint32_t>::max();
+  BOOST_CHECK_EXCEPTION(
+      bbp::MakeChainNodeConfig(spec, request), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()).find("loopback port exhaustion") !=
+               std::string::npos;
+      });
 }
 
 BOOST_AUTO_TEST_CASE(chain_node_config_uses_explicit_safe_scenario_id) {

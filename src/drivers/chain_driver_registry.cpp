@@ -22,7 +22,6 @@ constexpr const char* kFiroDaemonOptionName = "firod";
 constexpr const char* kFiroNodeIdPrefix = "firo";
 constexpr const char* kFiroDefaultRewardAddress =
     "TTJW6FsYqLbSiF3ZUwMXRghgQuXK7XTodR";
-constexpr std::uint32_t kFiroMaxNodes = 16;
 constexpr std::uint32_t kFiroCoinbaseSpendableConfirmations = 101;
 constexpr std::uint16_t kFiroP2pPortBase = 18168;
 constexpr std::uint16_t kFiroRpcPortBase = 18888;
@@ -31,7 +30,6 @@ constexpr const char* kBitcoinDaemonOptionName = "bitcoind";
 constexpr const char* kBitcoinNodeIdPrefix = "bitcoin";
 constexpr const char* kBitcoinDefaultRewardAddress =
     "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn";
-constexpr std::uint32_t kBitcoinMaxNodes = 16;
 constexpr std::uint32_t kBitcoinCoinbaseSpendableConfirmations = 101;
 constexpr std::uint16_t kBitcoinP2pPortBase = 18444;
 constexpr std::uint16_t kBitcoinRpcPortBase = 19443;
@@ -41,7 +39,6 @@ constexpr const char* kMoneroNodeIdPrefix = "monero";
 constexpr const char* kMoneroDefaultRewardAddress =
     "42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9"
     "UxqeoyFQMYbqSWYTfJJQAWDm";
-constexpr std::uint32_t kMoneroMaxNodes = 16;
 constexpr std::uint32_t kMoneroCoinbaseSpendableConfirmations = 60;
 constexpr std::uint16_t kMoneroP2pPortBase = 18080;
 constexpr std::uint16_t kMoneroRpcPortBase = 19081;
@@ -76,9 +73,12 @@ std::string RandomCredentialHex() {
 }
 
 std::uint16_t AddPortOffset(std::uint16_t base, std::uint32_t offset) {
-  const std::uint32_t port = static_cast<std::uint32_t>(base) + offset;
+  const std::uint64_t port = static_cast<std::uint64_t>(base) + offset;
   if (port > std::numeric_limits<std::uint16_t>::max()) {
-    throw std::runtime_error("chain node port allocation exceeded uint16");
+    throw std::runtime_error(
+        "loopback port exhaustion: requested port " + std::to_string(port) +
+        ", available port range 1.." +
+        std::to_string(std::numeric_limits<std::uint16_t>::max()));
   }
   return static_cast<std::uint16_t>(port);
 }
@@ -140,7 +140,6 @@ const ChainDriverSpec& DefaultChainDriverSpec() {
       .daemon_scenario_field = kFiroDaemonOptionName,
       .node_id_prefix = kFiroNodeIdPrefix,
       .default_reward_address = kFiroDefaultRewardAddress,
-      .max_nodes = kFiroMaxNodes,
       .coinbase_spendable_confirmations = kFiroCoinbaseSpendableConfirmations,
       .p2p_port_base = kFiroP2pPortBase,
       .rpc_port_base = kFiroRpcPortBase,
@@ -156,7 +155,6 @@ const ChainDriverSpec& BitcoinChainDriverSpec() {
       .daemon_scenario_field = kBitcoinDaemonOptionName,
       .node_id_prefix = kBitcoinNodeIdPrefix,
       .default_reward_address = kBitcoinDefaultRewardAddress,
-      .max_nodes = kBitcoinMaxNodes,
       .coinbase_spendable_confirmations =
           kBitcoinCoinbaseSpendableConfirmations,
       .p2p_port_base = kBitcoinP2pPortBase,
@@ -173,7 +171,6 @@ const ChainDriverSpec& MoneroChainDriverSpec() {
       .daemon_scenario_field = kMoneroDaemonOptionName,
       .node_id_prefix = kMoneroNodeIdPrefix,
       .default_reward_address = kMoneroDefaultRewardAddress,
-      .max_nodes = kMoneroMaxNodes,
       .coinbase_spendable_confirmations = kMoneroCoinbaseSpendableConfirmations,
       .p2p_port_base = kMoneroP2pPortBase,
       .rpc_port_base = kMoneroRpcPortBase,
@@ -241,7 +238,9 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
                                     const ChainNodeConfigRequest& request) {
   const std::string node_id =
       request.node_id.empty()
-          ? spec.node_id_prefix + "-" + std::to_string(request.node_index + 1U)
+          ? spec.node_id_prefix + "-" +
+                std::to_string(static_cast<std::uint64_t>(request.node_index) +
+                               1U)
           : request.node_id;
   const std::filesystem::path node_root = request.run_root / "nodes" / node_id;
 
@@ -252,8 +251,10 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
   config.binary = request.daemon_binary;
   config.data_dir = ResolveNodeDataDirectory(request, node_id);
   config.log_dir = node_root;
-  config.p2p_port = AddPortOffset(spec.p2p_port_base, request.node_index);
-  config.rpc_port = AddPortOffset(spec.rpc_port_base, request.node_index);
+  const std::uint32_t port_offset =
+      request.isolated_network ? 0U : request.node_index;
+  config.p2p_port = AddPortOffset(spec.p2p_port_base, port_offset);
+  config.rpc_port = AddPortOffset(spec.rpc_port_base, port_offset);
   config.rpc_authentication = spec.rpc_authentication;
   switch (spec.rpc_authentication) {
     case RpcAuthenticationMode::kCookieFile:

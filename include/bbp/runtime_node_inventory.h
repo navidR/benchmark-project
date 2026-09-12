@@ -6,6 +6,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "bbp/node_config_snapshot.h"
+#include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulator/node_runtime.h"
 
 namespace bbp {
@@ -81,6 +83,9 @@ class RuntimeNodeSnapshot {
   [[nodiscard]] bool empty() const;
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] std::uint64_t generation() const;
+  [[nodiscard]] std::uint32_t capacity() const;
+  [[nodiscard]] const std::optional<SimulationNetworkAddressPlan>&
+  network_address_plan() const;
   [[nodiscard]] std::uint32_t slot(std::size_t index) const;
   [[nodiscard]] NodeRuntime& operator[](std::size_t index) const;
   [[nodiscard]] NodeRuntime& at(std::size_t index) const;
@@ -194,11 +199,13 @@ class RuntimeNodeInventory {
   RuntimeNodeInventory(const RuntimeNodeInventory&) = delete;
   RuntimeNodeInventory& operator=(const RuntimeNodeInventory&) = delete;
 
-  void Initialize(std::vector<NodeRuntime>& nodes);
+  void Initialize(
+      std::vector<NodeRuntime>& nodes,
+      std::optional<SimulationNetworkAddressPlan> network_address_plan = {});
   [[nodiscard]] RuntimeNodeSnapshot Snapshot() const;
   [[nodiscard]] NodeConfigSnapshot ConfigSnapshot() const;
   [[nodiscard]] bool WasNodeIdUsed(std::string_view node_id) const;
-  [[nodiscard]] std::uint32_t capacity() const { return capacity_; }
+  [[nodiscard]] std::uint32_t capacity() const;
 
   RuntimeNodeSnapshot PublishAppend(
       std::uint64_t expected_generation,
@@ -210,6 +217,13 @@ class RuntimeNodeInventory {
       std::uint64_t expected_generation,
       const std::vector<RuntimeNodeInsertion>& insertions,
       const std::vector<ChainNodeConfig>& published_configs);
+  PreparedAppend PrepareAppend(
+      std::uint64_t expected_generation,
+      const std::vector<RuntimeNodeInsertion>& insertions,
+      const std::vector<ChainNodeConfig>& published_configs,
+      std::uint32_t candidate_capacity,
+      const std::optional<SimulationNetworkAddressPlan>&
+          candidate_network_address_plan);
   PreparedRemoval PrepareRemoval(
       std::uint64_t expected_generation,
       const std::vector<std::string>& removed_node_ids,
@@ -222,9 +236,9 @@ class RuntimeNodeInventory {
  private:
   static std::shared_ptr<RuntimeNodeSnapshot::Generation> MakeGeneration(
       std::uint64_t generation, std::vector<RuntimeNodeInsertion> nodes,
-      std::uint32_t capacity);
+      std::uint32_t capacity,
+      std::optional<SimulationNetworkAddressPlan> network_address_plan = {});
 
-  const std::uint32_t capacity_;
   mutable std::mutex mutex_;
   std::shared_ptr<const RuntimeNodeSnapshot::Generation> generation_;
   std::set<std::string> used_node_ids_;

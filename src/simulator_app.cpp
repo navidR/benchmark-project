@@ -1413,7 +1413,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   }
   const auto initialize_node_inventory = [&] {
     try {
-      node_inventory.Initialize(startup_nodes);
+      node_inventory.Initialize(startup_nodes, options.network_address_plan);
       nodes = node_inventory.Snapshot();
     } catch (...) {
       const std::exception_ptr initialization_failure =

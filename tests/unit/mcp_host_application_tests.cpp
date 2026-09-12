@@ -15,6 +15,7 @@
 #include "bbp/mcp_host_application.h"
 #include "bbp/mcp_live_application.h"
 #include "bbp/simulation_command_queue.h"
+#include "bbp/simulation_network_address_plan.h"
 #include "bbp/simulator/options.h"
 
 namespace bbp {
@@ -306,11 +307,13 @@ BOOST_AUTO_TEST_CASE(
                 .run_id = "live-run",
                 .state = "active",
                 .chain = "firo",
-                .node_count = 3U,
-                .node_capacity = 8U,
-                .chain_node_maximum = 16U,
-                .available_node_capacity = 5U,
+                .node_count = 21U,
+                .node_capacity = 32U,
+                .available_node_capacity = 11U,
                 .application = {},
+                .network_allocation =
+                    SimulationNetworkAddressPlan::FromCidr("10.0.0.0/20", 32U)
+                        .ToSerialized(),
             };
           },
       .snapshot_run_membership_revision = [] { return 0U; },
@@ -323,9 +326,13 @@ BOOST_AUTO_TEST_CASE(
                     .run_id = "z-retained",
                     .state = "cancelled",
                     .chain = "monero",
-                    .node_count = 2U,
-                    .node_capacity = 4U,
+                    .node_count = 21U,
+                    .node_capacity = 32U,
                     .chain_node_maximum = 16U,
+                    .network_allocation =
+                        SimulationNetworkAddressPlan::FromCidr("10.0.0.0/20",
+                                                               32U)
+                            .ToSerialized(),
                 },
                 McpRetainedRunSnapshot{
                     .run_id = "live-run",
@@ -367,7 +374,15 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(active.at("run_id").as_string() == "live-run");
   BOOST_TEST(active.at("state").as_string() == "active");
   BOOST_TEST(active.at("generation").as_uint64() == 42U);
-  BOOST_TEST(active.at("available_node_capacity").as_uint64() == 5U);
+  BOOST_TEST(active.at("node_count").as_uint64() == 21U);
+  BOOST_TEST(active.at("node_capacity").as_uint64() == 32U);
+  BOOST_TEST(active.at("available_node_capacity").as_uint64() == 11U);
+  BOOST_TEST(!active.contains("chain_node_maximum"));
+  BOOST_TEST(active.at("network_allocation")
+                 .as_object()
+                 .at("link_cidrs")
+                 .as_array()
+                 .size() == 32U);
 
   const boost::json::object& first_retained = runs[1].as_object();
   BOOST_TEST(first_retained.at("run_id").as_string() == "a-retained");
@@ -375,7 +390,8 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(first_retained.at("chain").as_string() == "bitcoin");
   BOOST_TEST(first_retained.at("node_count").as_uint64() == 1U);
   BOOST_TEST(first_retained.at("node_capacity").as_uint64() == 2U);
-  BOOST_TEST(first_retained.at("chain_node_maximum").as_uint64() == 16U);
+  BOOST_TEST(!first_retained.contains("chain_node_maximum"));
+  BOOST_TEST(first_retained.at("network_allocation").is_null());
   BOOST_TEST(first_retained.at("available_node_capacity").as_uint64() == 0U);
   BOOST_TEST(first_retained.if_contains("generation") == nullptr);
 
@@ -383,9 +399,11 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(second_retained.at("run_id").as_string() == "z-retained");
   BOOST_TEST(second_retained.at("state").as_string() == "cancelled");
   BOOST_TEST(second_retained.at("chain").as_string() == "monero");
-  BOOST_TEST(second_retained.at("node_count").as_uint64() == 2U);
-  BOOST_TEST(second_retained.at("node_capacity").as_uint64() == 4U);
-  BOOST_TEST(second_retained.at("chain_node_maximum").as_uint64() == 16U);
+  BOOST_TEST(second_retained.at("node_count").as_uint64() == 21U);
+  BOOST_TEST(second_retained.at("node_capacity").as_uint64() == 32U);
+  BOOST_TEST(second_retained.at("network_allocation") ==
+             active.at("network_allocation"));
+  BOOST_TEST(!second_retained.contains("chain_node_maximum"));
   BOOST_TEST(second_retained.at("available_node_capacity").as_uint64() == 0U);
   BOOST_TEST(second_retained.if_contains("generation") == nullptr);
 
@@ -534,7 +552,8 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
           .node_inventory_snapshot =
               [] {
                 return McpLiveNodeInventorySnapshot{.generation = 1U,
-                                                    .node_ids = {"firo-1"}};
+                                                    .node_ids = {"firo-1"},
+                                                    .node_capacity = 1U};
               },
           .publication_mutex = std::make_shared<std::timed_mutex>(),
           .request_run_stop = [] {},
@@ -671,7 +690,8 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_instrumentation) {
           .node_inventory_snapshot =
               [] {
                 return McpLiveNodeInventorySnapshot{.generation = 1U,
-                                                    .node_ids = {"firo-1"}};
+                                                    .node_ids = {"firo-1"},
+                                                    .node_capacity = 1U};
               },
           .publication_mutex = std::make_shared<std::timed_mutex>(),
           .request_run_stop = [] {},
@@ -838,7 +858,8 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_rejects_run_work_while_starting) {
           .node_inventory_snapshot =
               [] {
                 return McpLiveNodeInventorySnapshot{.generation = 1U,
-                                                    .node_ids = {"firo-1"}};
+                                                    .node_ids = {"firo-1"},
+                                                    .node_capacity = 1U};
               },
           .publication_mutex = std::make_shared<std::timed_mutex>(),
           .request_run_stop = [] {},

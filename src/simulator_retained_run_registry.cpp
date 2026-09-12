@@ -25,9 +25,11 @@
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/mcp_operation_service.h"
 #include "bbp/run_ownership.h"
+#include "bbp/runtime_node_resource_manifest.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulator/options.h"
 #include "bbp/util.h"
+#include "runtime_capacity_persistence.h"
 #include "simulator_managed_run_root.h"
 
 namespace bbp {
@@ -82,9 +84,6 @@ constexpr std::string_view kRetainedRunRegistrySummaryTemporaryName =
 constexpr std::string_view kRetainedRunRegistrySummaryFormat =
     "bbp-retained-run-registry";
 constexpr std::uint64_t kRetainedRunRegistrySummaryVersion = 1U;
-constexpr std::size_t kMaximumRetainedRunRegistrySummaryBytes = 4096U;
-constexpr std::size_t kMaximumRetainedRunResolvedScenarioBytes =
-    4U * 1024U * 1024U;
 
 class RetainedRunRegistryLimitExceeded : public std::runtime_error {
  public:
@@ -146,10 +145,6 @@ void RequireRetainedRunRegistryFields(
     std::initializer_list<std::string_view> expected,
     std::string_view context) {
   const std::set<std::string_view> fields(expected);
-  if (object.size() != fields.size()) {
-    throw std::runtime_error(std::string(context) +
-                             " has an unexpected field count");
-  }
   for (const auto& member : object) {
     const std::string_view field(member.key().data(), member.key().size());
     if (!fields.contains(field)) {
@@ -166,12 +161,21 @@ void ValidateRetainedRunRegistrySnapshot(
       snapshot.state != "cancelled" && snapshot.state != "incomplete") {
     throw std::runtime_error("retained run registry state is invalid");
   }
-  const ChainKind chain = ParseChainKind(snapshot.chain);
-  if (snapshot.chain_node_maximum != ChainDriverSpecFor(chain).max_nodes ||
-      snapshot.node_capacity > snapshot.chain_node_maximum ||
-      snapshot.node_count > snapshot.node_capacity) {
+  static_cast<void>(ParseChainKind(snapshot.chain));
+  if (snapshot.node_count > snapshot.node_capacity ||
+      (snapshot.chain_node_maximum &&
+       snapshot.node_capacity > *snapshot.chain_node_maximum)) {
     throw std::runtime_error(
         "retained run registry node bounds are inconsistent");
+  }
+  if (!snapshot.network_allocation.is_null()) {
+    if (!snapshot.network_allocation.is_object() ||
+        SimulationNetworkAddressPlan::FromSerialized(
+            snapshot.network_allocation.as_object())
+                .capacity() != snapshot.node_capacity) {
+      throw std::runtime_error(
+          "retained run network allocation differs from reserved capacity");
+    }
   }
 }
 
@@ -239,7 +243,7 @@ McpRetainedRunSnapshot ParseRetainedRunRegistrySummary(
   RequireRetainedRunRegistryFields(
       document,
       {"format", "version", "run_id", "state", "chain", "node_count",
-       "node_capacity", "chain_node_maximum"},
+       "node_capacity", "chain_node_maximum", "network_allocation"},
       "retained run registry summary");
   if (RetainedRunRegistryString(document, "format", "registry summary") !=
           kRetainedRunRegistrySummaryFormat ||
@@ -257,8 +261,14 @@ McpRetainedRunSnapshot ParseRetainedRunRegistrySummary(
           RetainedRunRegistryUint32(document, "node_count", "registry summary"),
       .node_capacity = RetainedRunRegistryUint32(document, "node_capacity",
                                                  "registry summary"),
-      .chain_node_maximum = RetainedRunRegistryUint32(
-          document, "chain_node_maximum", "registry summary"),
+      .chain_node_maximum =
+          document.if_contains("chain_node_maximum")
+              ? std::optional<std::uint32_t>(RetainedRunRegistryUint32(
+                    document, "chain_node_maximum", "registry summary"))
+              : std::nullopt,
+      .network_allocation = document.if_contains("network_allocation")
+                                ? document.at("network_allocation")
+                                : boost::json::value(nullptr),
   };
   if (snapshot.run_id != expected_run_id) {
     throw std::runtime_error(
@@ -319,10 +329,8 @@ std::string ReadLegacyRetainedRunRegistryFile(
 McpRetainedRunSnapshot LoadLegacyRetainedRunRegistrySnapshotAt(
     int run_root_fd, std::string_view run_id, std::size_t* remaining_bytes,
     std::stop_token stop_token) {
-  const std::string resolved_text = ReadLegacyRetainedRunRegistryFile(
-      run_root_fd, "resolved-scenario.json",
-      kMaximumRetainedRunResolvedScenarioBytes, remaining_bytes, stop_token,
-      true);
+  const std::string resolved_text = ReadRuntimeCapacityDocumentAt(
+      run_root_fd, "resolved-scenario.json", stop_token);
   boost::json::value resolved_value;
   try {
     resolved_value = boost::json::parse(resolved_text);
@@ -343,16 +351,21 @@ McpRetainedRunSnapshot LoadLegacyRetainedRunRegistrySnapshotAt(
   }
   const std::string chain =
       RetainedRunRegistryString(resolved, "chain", "resolved scenario");
-  const ChainKind chain_kind = ParseChainKind(chain);
+  static_cast<void>(ParseChainKind(chain));
   std::uint32_t node_count =
       RetainedRunRegistryUint32(resolved, "nodes", "resolved scenario");
   const boost::json::value* capacity_value =
       resolved.if_contains("node_capacity");
-  const std::uint32_t node_capacity =
+  std::uint32_t node_capacity =
       capacity_value == nullptr
           ? node_count
           : RetainedRunRegistryUint32(resolved, "node_capacity",
                                       "resolved scenario");
+
+  boost::json::value network_allocation =
+      resolved.if_contains("network_allocation")
+          ? resolved.at("network_allocation")
+          : boost::json::value(nullptr);
 
   bool run_started = false;
   bool run_finished = false;
@@ -420,8 +433,17 @@ McpRetainedRunSnapshot LoadLegacyRetainedRunRegistrySnapshotAt(
         throw std::runtime_error(
             "legacy retained runtime generation detail is not an object");
       }
-      node_count =
-          RetainedRunRegistryRuntimeNodeCount(detail_value.as_object());
+      const boost::json::object& publication = detail_value.as_object();
+      node_count = RetainedRunRegistryRuntimeNodeCount(publication);
+      node_capacity =
+          publication.if_contains("node_capacity")
+              ? RetainedRunRegistryUint32(publication, "node_capacity",
+                                          "runtime generation")
+              : std::max(node_capacity, node_count);
+      if (const auto* allocation =
+              publication.if_contains("network_allocation")) {
+        network_allocation = *allocation;
+      }
     }
   }
 
@@ -435,7 +457,7 @@ McpRetainedRunSnapshot LoadLegacyRetainedRunRegistrySnapshotAt(
       .chain = chain,
       .node_count = node_count,
       .node_capacity = node_capacity,
-      .chain_node_maximum = ChainDriverSpecFor(chain_kind).max_nodes,
+      .network_allocation = std::move(network_allocation),
   };
   ValidateRetainedRunRegistrySnapshot(snapshot);
   return snapshot;
@@ -451,14 +473,9 @@ McpRetainedRunSnapshot LoadRetainedRunRegistrySnapshotAt(
     return LoadLegacyRetainedRunRegistrySnapshotAt(
         run_root_fd, run_id, remaining_legacy_bytes, stop_token);
   }
-  if (*summary_size == 0U ||
-      *summary_size > kMaximumRetainedRunRegistrySummaryBytes) {
-    throw std::runtime_error(
-        "retained run registry summary exceeds its byte bound");
-  }
   return ParseRetainedRunRegistrySummary(
-      ReadTextAt(run_root_fd, kRetainedRunRegistrySummaryFileName,
-                 kMaximumRetainedRunRegistrySummaryBytes, stop_token),
+      ReadRuntimeCapacityDocumentAt(
+          run_root_fd, kRetainedRunRegistrySummaryFileName, stop_token),
       run_id);
 }
 
@@ -493,14 +510,16 @@ void WriteRetainedRunRegistrySummary(const Options& options,
         "retained run registry ownership does not match the launched run");
   }
 
-  const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
   const McpRetainedRunSnapshot snapshot{
       .run_id = options.run_id,
       .state = std::string(state),
       .chain = std::string(ChainKindName(options.chain)),
       .node_count = node_count,
       .node_capacity = options.node_capacity,
-      .chain_node_maximum = chain_spec.max_nodes,
+      .network_allocation =
+          options.network_address_plan
+              ? boost::json::value(options.network_address_plan->ToSerialized())
+              : boost::json::value(nullptr),
   };
   ValidateRetainedRunRegistrySnapshot(snapshot);
   const boost::json::object document{
@@ -511,13 +530,9 @@ void WriteRetainedRunRegistrySummary(const Options& options,
       {"chain", snapshot.chain},
       {"node_count", snapshot.node_count},
       {"node_capacity", snapshot.node_capacity},
-      {"chain_node_maximum", snapshot.chain_node_maximum},
+      {"network_allocation", snapshot.network_allocation},
   };
   std::string contents = boost::json::serialize(document);
-  if (contents.size() >= kMaximumRetainedRunRegistrySummaryBytes) {
-    throw std::logic_error(
-        "retained run registry summary exceeded its byte bound");
-  }
   contents.push_back('\n');
 
   const std::string temporary_name(kRetainedRunRegistrySummaryTemporaryName);
@@ -585,8 +600,8 @@ void WriteRetainedRunRegistrySummary(const Options& options,
   }
 
   const McpRetainedRunSnapshot read_back = ParseRetainedRunRegistrySummary(
-      ReadTextAt(run_root_fd.get(), kRetainedRunRegistrySummaryFileName,
-                 kMaximumRetainedRunRegistrySummaryBytes, {}),
+      ReadRuntimeCapacityDocumentAt(run_root_fd.get(),
+                                    kRetainedRunRegistrySummaryFileName),
       options.run_id);
   const RunOwnership final_ownership =
       LoadRunOwnershipAt(options.run_id, run_root, run_root_fd.get());
@@ -594,7 +609,7 @@ void WriteRetainedRunRegistrySummary(const Options& options,
       read_back.state != snapshot.state || read_back.chain != snapshot.chain ||
       read_back.node_count != snapshot.node_count ||
       read_back.node_capacity != snapshot.node_capacity ||
-      read_back.chain_node_maximum != snapshot.chain_node_maximum ||
+      read_back.network_allocation != snapshot.network_allocation ||
       final_ownership != initial_ownership) {
     throw std::runtime_error(
         "retained run registry summary failed durable read-back");
@@ -740,6 +755,32 @@ std::vector<McpRetainedRunSnapshot> DiscoverRetainedRuns(
       }
       McpRetainedRunSnapshot snapshot = LoadRetainedRunRegistrySnapshotAt(
           child_fd.get(), run_id, &remaining_legacy_bytes, stop_token);
+      if (!RetainedRunRegistryFileSizeAt(child_fd.get(),
+                                         kRetainedRunRegistrySummaryFileName)) {
+        const auto manifest = TryLoadRuntimeNodeResourceManifest(
+            initial_ownership, std::nullopt, stop_token);
+        if (manifest && manifest->node_capacity &&
+            std::all_of(
+                manifest->nodes.begin(), manifest->nodes.end(),
+                [](const RuntimeNodeResourceEntry& entry) {
+                  return entry.state == RuntimeNodeResourceState::kLive ||
+                         entry.state == RuntimeNodeResourceState::kPendingAdd;
+                })) {
+          snapshot.node_count = static_cast<std::uint32_t>(std::count_if(
+              manifest->nodes.begin(), manifest->nodes.end(),
+              [](const RuntimeNodeResourceEntry& entry) {
+                return entry.state == RuntimeNodeResourceState::kLive;
+              }));
+          snapshot.node_capacity = *manifest->node_capacity;
+          snapshot.chain_node_maximum.reset();
+          snapshot.network_allocation =
+              manifest->network_address_plan
+                  ? boost::json::value(
+                        manifest->network_address_plan->ToSerialized())
+                  : boost::json::value(nullptr);
+          ValidateRetainedRunRegistrySnapshot(snapshot);
+        }
+      }
       const RunOwnership final_ownership =
           LoadRunOwnershipAt(run_id, run_root, child_fd.get(), stop_token);
       if (final_ownership != initial_ownership) {

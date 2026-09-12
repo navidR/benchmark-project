@@ -208,6 +208,44 @@ boost::json::object Nullable(boost::json::object schema) {
   return OneOf({std::move(schema), TypeSchema("null")});
 }
 
+boost::json::object NodeCapacitySchema() {
+  boost::json::object schema = IntegerSchema();
+  schema["description"] =
+      "Mutable node reservation; grows automatically when nodes are added. "
+      "This is not a total chain node limit.";
+  return schema;
+}
+
+boost::json::object NodeAddBatchCountSchema() {
+  boost::json::object schema =
+      IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+  schema["description"] =
+      "Nodes or roles to add in this request; at most 16 per request. "
+      "The runtime reservation grows automatically as needed.";
+  return schema;
+}
+
+boost::json::object NetworkAllocationSchema() {
+  boost::json::object pool_cidr = StringSchema(1U);
+  pool_cidr["description"] =
+      "Configured IPv4 allocation pool; defaults to 10.0.0.0/8.";
+  boost::json::object link_cidr = StringSchema(1U);
+  link_cidr["pattern"] =
+      "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}"
+      "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/31$";
+  boost::json::object schema = Nullable(ClosedObject(
+      boost::json::object{
+          {"pool_cidr", std::move(pool_cidr)},
+          {"link_cidrs", ArraySchema(std::move(link_cidr), 0U,
+                                     (kMaximumUint32 + 1U) / 2U, true)}},
+      Required({"pool_cidr", "link_cidrs"})));
+  schema["description"] =
+      "Current isolated network allocation, or null without network "
+      "namespaces. Each link keeps a stable /31 subnet; daemon ports are "
+      "fixed within each network namespace.";
+  return schema;
+}
+
 boost::json::object LatencyMatrixCellSchema() {
   return Nullable(IntegerSchema(0U, kMaximumNetworkDelayMilliseconds));
 }
@@ -339,7 +377,19 @@ boost::json::object GenericFieldSchema(std::string_view field) {
             [](PerfCounterKind kind) { return PerfCounterKindName(kind); })),
         1U, kPerfCounterKinds.size(), true);
   }
-  if (field == "count" || field == "node_count" || field == "node_capacity" ||
+  if (field == "node_capacity") {
+    return NodeCapacitySchema();
+  }
+  if (field == "network_address_pool") {
+    boost::json::object schema = StringSchema(1U);
+    schema["default"] = "10.0.0.0/8";
+    schema["description"] =
+        "Configurable IPv4 pool for isolated networking. Each link receives "
+        "a stable /31 subnet; daemon ports are fixed within each network "
+        "namespace.";
+    return schema;
+  }
+  if (field == "count" || field == "node_count" ||
       field == "wallet_node_count" || field == "miner_node_count" ||
       field == "average_degree" || field == "attachment_count" ||
       field == "minimum_peer_count" || field == "maximum_peer_count" ||
@@ -981,7 +1031,7 @@ boost::json::object DiagnosticSchema() {
   properties["command_id"] = IdentifierSchema();
   properties["requested_count"] = Uint64Schema();
   properties["current_node_count"] = Uint64Schema();
-  properties["node_capacity"] = Uint64Schema();
+  properties["node_capacity"] = NodeCapacitySchema();
   properties["available_node_capacity"] = Uint64Schema();
   properties["resource_kind"] = IdentifierSchema();
   properties["address"] = StringSchema(1U);
@@ -1002,7 +1052,7 @@ boost::json::object DiagnosticSchema() {
 boost::json::object NodeMutationConfigSchema() {
   boost::json::object properties;
   properties["chain"] = ChainSchema();
-  properties["count"] = IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+  properties["count"] = NodeAddBatchCountSchema();
   properties["node_ids"] = ArraySchema(NodeAddIdentifierSchema(), 1U,
                                        kSimulationNodeAddMaximumCount, true);
   properties["binary"] = StringSchema(1U);
@@ -1180,6 +1230,12 @@ boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind) {
   switch (kind) {
     case ScenarioObjectKind::kRoot:
       properties["sync_timeout_sec"] = Nullable(IntegerSchema());
+      properties["node_capacity"].as_object()["minimum"] = 1U;
+      properties["node_capacity"].as_object()["description"] =
+          "Initial node reservation; when omitted, defaults to the larger "
+          "of the initial node count and 1. An explicit value must cover the "
+          "initial nodes. The reservation grows automatically as nodes are "
+          "added; each add request is limited to 16 nodes.";
       break;
     case ScenarioObjectKind::kSimulation:
       break;
@@ -1655,7 +1711,7 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["node_id"] = IdentifierSchema();
       properties["node_ids"] = ArraySchema(
           NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
-      properties["count"] = IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+      properties["count"] = NodeAddBatchCountSchema();
       properties["mode"] =
           StringEnumSchema(boost::json::array{"public", "private"});
       properties["create_node"] = NodeMutationConfigSchema();
@@ -1680,7 +1736,7 @@ boost::json::object BuildMcpOperationInputSchema(
       add_run();
       properties["node_ids"] = ArraySchema(
           IdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
-      properties["count"] = IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+      properties["count"] = NodeAddBatchCountSchema();
       properties["create_nodes"] = NodeMutationConfigSchema();
       properties["wallet_node_id"] = IdentifierSchema();
       required.emplace_back("count");
@@ -1697,7 +1753,7 @@ boost::json::object BuildMcpOperationInputSchema(
       add_run();
       properties["node_ids"] = ArraySchema(
           IdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
-      properties["count"] = IntegerSchema(1U, kSimulationNodeAddMaximumCount);
+      properties["count"] = NodeAddBatchCountSchema();
       properties["create_nodes"] = NodeMutationConfigSchema();
       properties["funding_wallet_id"] = IdentifierSchema();
       required.emplace_back("count");
@@ -2129,6 +2185,8 @@ boost::json::object BuildMcpResultSchema(
           NodeAddIdentifierSchema(), 1U, kSimulationNodeAddMaximumCount, true);
       properties["inventory_generation"] = Uint64Schema();
       properties["final_node_count"] = IntegerSchema();
+      properties["node_capacity"] = NodeCapacitySchema();
+      properties["network_allocation"] = NetworkAllocationSchema();
       properties["role_mutation"] = RuntimeRoleMutationResultSchema();
       require({"run_id", "command_id", "accepted", "state"});
       constraints.emplace_back(boost::json::object{
@@ -2199,6 +2257,8 @@ boost::json::object BuildMcpResultSchema(
                                           kMaximumSafeCollection);
       properties["inventory_generation"] = Uint64Schema();
       properties["final_node_count"] = IntegerSchema();
+      properties["node_capacity"] = NodeCapacitySchema();
+      properties["network_allocation"] = NetworkAllocationSchema();
       properties["wallet_generation"] = IntegerSchema(1U);
       properties["final_wallet_count"] = Uint64Schema();
       properties["final_wallet_node_count"] = Uint64Schema();
@@ -2255,6 +2315,8 @@ boost::json::object BuildMcpResultSchema(
           MasternodeMutationIdentitySchema(), 1U, kMaximumSafeCollection);
       properties["inventory_generation"] = Uint64Schema(1U);
       properties["final_node_count"] = IntegerSchema(1U);
+      properties["node_capacity"] = NodeCapacitySchema();
+      properties["network_allocation"] = NetworkAllocationSchema();
       require({"run_id", "node_ids", "assigned_roles", "removed_roles",
                "action", "state"});
       for (const std::string_view action : {"miner.add", "miner.remove"}) {

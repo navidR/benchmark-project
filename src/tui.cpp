@@ -1468,7 +1468,8 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   mvaddch(top, left + popup_cols - 1, ACS_URCORNER);
   mvaddch(top + kPopupRows - 1, left, ACS_LLCORNER);
   mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
-  AddText(top + 1, left + 2, popup_cols - 4, "Live command", A_BOLD);
+  AddText(top + 1, left + 2, popup_cols - 4,
+          "Live command: add-nodes grows capacity (1..16 per request)", A_BOLD);
   AddText(top + 2, left + 2, popup_cols - 4,
           "block-production <probability> <period-ms>  mining-difficulty "
           "<value>");

@@ -5,6 +5,8 @@
 
 #include <boost/test/unit_test.hpp>
 #include <filesystem>
+#include <limits>
+#include <set>
 #include <string>
 
 #include "bbp/run_ownership.h"
@@ -145,8 +147,19 @@ BOOST_AUTO_TEST_CASE(run_interface_names_are_bound_to_the_resource_identity) {
              bbp::RunInterfaceName(second_owner, 0U, 'h'));
   BOOST_TEST(bbp::RunInterfaceAlias(first_owner, 0U, 'h') !=
              bbp::RunInterfaceAlias(second_owner, 0U, 'h'));
-  BOOST_CHECK_THROW(bbp::RunInterfaceName(first_owner, 16U, 'h'),
-                    std::runtime_error);
+  std::set<std::string> expanded_names;
+  for (const std::uint32_t slot :
+       {16U, 99U, std::numeric_limits<std::uint32_t>::max()}) {
+    for (const char suffix : {'h', 'p'}) {
+      const std::string name = bbp::RunInterfaceName(first_owner, slot, suffix);
+      BOOST_TEST(name.size() <= 15U);
+      BOOST_TEST(expanded_names.insert(name).second);
+      BOOST_TEST(name != bbp::RunInterfaceName(second_owner, slot, suffix));
+    }
+  }
+  BOOST_TEST(bbp::RunInterfaceAlias(
+                 first_owner, std::numeric_limits<std::uint32_t>::max(), 'h')
+                 .ends_with(":n4294967296h"));
   BOOST_CHECK_THROW(bbp::RunInterfaceName(first_owner, 0U, 'x'),
                     std::runtime_error);
 }

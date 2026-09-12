@@ -29,7 +29,12 @@ struct Options;
 struct McpLiveNodeInventorySnapshot {
   std::uint64_t generation = 0U;
   std::vector<std::string> node_ids;
+  std::uint32_t node_capacity = 0U;
+  boost::json::value network_allocation = nullptr;
 };
+
+// Shared discovery policy for live and process-level MCP endpoints.
+boost::json::object McpNodeCapacityPolicy();
 
 struct McpLiveWorkloadControl;
 
@@ -147,6 +152,8 @@ class McpLiveApplication {
     std::uint32_t node_count = 0U;
     std::string state;
     bool has_owned_artifacts = false;
+    std::uint32_t node_capacity = 0U;
+    boost::json::value network_allocation = nullptr;
   };
 
   struct Config {

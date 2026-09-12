@@ -462,7 +462,7 @@ std::shared_ptr<ReservedManagedRunRoot> ReserveManagedReplayRunRoot(
 }
 
 void PrepareManagedRunRoot(
-    Options* options, ManagedRunNodeVethConfigFactory make_node_veth_config,
+    Options* options, ManagedRunNodeVethConfigFactory,
     const std::shared_ptr<ReservedManagedRunRoot>& reservation) {
   const std::filesystem::path run_root = BenchmarkRunRoot(*options);
   if (reservation) {
@@ -502,17 +502,18 @@ void PrepareManagedRunRoot(
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
     Cgroup::RemoveStaleRun(previous_ownership);
     if (previous_manifest) {
-      Options cleanup_options = *options;
-      cleanup_options.run_ownership = previous_ownership;
       if (previous_manifest->isolated_network) {
-        if (make_node_veth_config == nullptr) {
-          throw std::logic_error(
-              "managed run-root preparation has no veth configuration "
-              "factory");
-        }
         for (const RuntimeNodeResourceEntry& entry : previous_manifest->nodes) {
-          DeleteNodeVethNetwork(
-              make_node_veth_config(cleanup_options, entry.slot));
+          NodeVethConfig config;
+          config.host_name =
+              RunInterfaceName(previous_ownership, entry.slot, 'h');
+          config.peer_name =
+              RunInterfaceName(previous_ownership, entry.slot, 'p');
+          config.host_ownership_alias =
+              RunInterfaceAlias(previous_ownership, entry.slot, 'h');
+          config.peer_ownership_alias =
+              RunInterfaceAlias(previous_ownership, entry.slot, 'p');
+          DeleteNodeVethNetwork(config);
         }
       }
       for (const RuntimeNodeResourceEntry& entry : previous_manifest->nodes) {

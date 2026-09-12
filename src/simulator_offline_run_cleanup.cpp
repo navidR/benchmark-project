@@ -70,7 +70,6 @@ const RunOwnership& RequireRunOwnership(const Options& options) {
 
 void LoadCleanupMetadata(const std::filesystem::path& run_root,
                          Options* options, std::stop_token stop_token) {
-  constexpr std::size_t kMaximumResolvedScenarioBytes = 4U * 1024U * 1024U;
   const std::filesystem::path resolved_path =
       run_root / "resolved-scenario.json";
   if (!std::filesystem::exists(resolved_path)) {
@@ -78,7 +77,7 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
   }
 
   const boost::json::value value = boost::json::parse(
-      ReadText(resolved_path, kMaximumResolvedScenarioBytes, stop_token));
+      ReadText(resolved_path, std::string{}.max_size(), stop_token));
   if (!value.is_object()) {
     throw std::runtime_error("resolved scenario is not a JSON object: " +
                              resolved_path.string());
@@ -95,11 +94,31 @@ void LoadCleanupMetadata(const std::filesystem::path& run_root,
     }
     options->isolate_network = isolated->as_bool();
   }
-  const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options->chain);
-  if (options->nodes > chain_spec.max_nodes) {
-    throw std::runtime_error(
-        "cleanup currently supports resolved node counts in 0.." +
-        std::to_string(chain_spec.max_nodes));
+  if (object.contains("node_capacity")) {
+    options->node_capacity =
+        JsonOptionalUint32Field(object, "node_capacity", 0U);
+    if (options->node_capacity == 0U ||
+        options->nodes > options->node_capacity) {
+      throw std::runtime_error(
+          "resolved scenario node capacity must be positive and cover its "
+          "node count");
+    }
+  }
+  if (const boost::json::value* allocation =
+          object.if_contains("network_allocation");
+      allocation != nullptr && !allocation->is_null()) {
+    if (!allocation->is_object() || !object.contains("node_capacity") ||
+        !options->isolate_network) {
+      throw std::runtime_error(
+          "resolved scenario network allocation requires isolated node "
+          "capacity metadata");
+    }
+    options->network_address_plan =
+        SimulationNetworkAddressPlan::FromSerialized(allocation->as_object());
+    if (options->network_address_plan->capacity() != options->node_capacity) {
+      throw std::runtime_error(
+          "resolved scenario network allocation does not match node capacity");
+    }
   }
   const boost::json::value* node_configs = object.if_contains("node_configs");
   if (node_configs != nullptr) {

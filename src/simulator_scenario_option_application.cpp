@@ -214,9 +214,6 @@ void ApplyScenarioJson(const boost::json::object& scenario,
           "scenario node_capacity must be greater than zero");
     }
   }
-  if (options.node_capacity == 0U) {
-    options.node_capacity = chain_spec.max_nodes;
-  }
   const bool chain_daemon_provided =
       OptionProvided(vm, "node-binary") || OptionProvided(vm, "chain-daemon") ||
       OptionProvided(vm, chain_spec.daemon_option_name.c_str());
@@ -399,6 +396,11 @@ void ApplyScenarioJson(const boost::json::object& scenario,
       !OptionProvided(vm, "no-isolate-network")) {
     options.isolate_network = JsonOptionalBoolField(
         scenario, "isolated_network", options.isolate_network);
+  }
+  if (!OptionProvided(vm, "network-address-pool") &&
+      scenario.if_contains("network_address_pool") != nullptr) {
+    options.network_address_pool =
+        JsonStringField(scenario, "network_address_pool");
   }
   const boost::json::value* workloads = scenario.if_contains("workloads");
   if (workloads != nullptr) {

@@ -221,15 +221,11 @@ struct stat RequireDescriptorBoundRunRoot(const std::filesystem::path& run_root,
   return opened;
 }
 
-void RequireInterfaceInputs(const RunOwnership& ownership,
-                            std::uint32_t node_index, char suffix) {
+void RequireInterfaceInputs(const RunOwnership& ownership, char suffix) {
   RequireResourceId(ownership.resource_id);
   if (ownership.interface_token !=
       ownership.resource_id.substr(0U, kInterfaceTokenHexCount)) {
     throw std::runtime_error("run ownership interface token is inconsistent");
-  }
-  if (node_index >= 16U) {
-    throw std::runtime_error("run interface node index must be 0..15");
   }
   if (suffix != 'h' && suffix != 'p') {
     throw std::runtime_error("run interface suffix must be h or p");
@@ -462,16 +458,33 @@ RunOwnershipMarkerIdentity WriteRunOwnershipMarkerAt(
 
 std::string RunInterfaceName(const RunOwnership& ownership,
                              std::uint32_t node_index, char suffix) {
-  RequireInterfaceInputs(ownership, node_index, suffix);
-  return "bbp" + ownership.interface_token + "n" +
-         std::to_string(node_index + 1U) + suffix;
+  RequireInterfaceInputs(ownership, suffix);
+  if (node_index < 16U) {
+    return "bbp" + ownership.interface_token + "n" +
+           std::to_string(node_index + 1U) + suffix;
+  }
+  std::uint32_t owner_hash = 2166136261U;
+  for (const unsigned char character : ownership.resource_id) {
+    owner_hash ^= character;
+    owner_hash *= 16777619U;
+  }
+  std::uint64_t identity = (std::uint64_t{owner_hash} << 32U) | node_index;
+  constexpr std::string_view kDigits = "0123456789abcdefghijklmnopqrstuvwxyz";
+  std::string name(15U, '0');
+  name.front() = 'b';
+  name.back() = suffix;
+  for (std::size_t index = 13U; index > 0U; --index) {
+    name[index] = kDigits[identity % kDigits.size()];
+    identity /= kDigits.size();
+  }
+  return name;
 }
 
 std::string RunInterfaceAlias(const RunOwnership& ownership,
                               std::uint32_t node_index, char suffix) {
-  RequireInterfaceInputs(ownership, node_index, suffix);
+  RequireInterfaceInputs(ownership, suffix);
   return "bbp:" + ownership.resource_id + ":n" +
-         std::to_string(node_index + 1U) + suffix;
+         std::to_string(std::uint64_t{node_index} + 1U) + suffix;
 }
 
 }  // namespace bbp

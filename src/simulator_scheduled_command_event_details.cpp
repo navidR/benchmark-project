@@ -304,6 +304,10 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
     if (outcome->inventory_generation) {
       detail["inventory_generation"] = *outcome->inventory_generation;
     }
+    if (outcome->node_capacity) {
+      detail["node_capacity"] = *outcome->node_capacity;
+      detail["network_allocation"] = outcome->network_allocation;
+    }
     if (outcome->final_node_count) {
       detail["final_node_count"] = *outcome->final_node_count;
     }

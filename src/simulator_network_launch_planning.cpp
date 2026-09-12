@@ -93,7 +93,7 @@ std::string StartupPeerAddress(const Options& options,
                                uint32_t node_index) {
   return PeerHost(options, node_index) + ":" +
          std::to_string(static_cast<uint32_t>(chain_spec.p2p_port_base) +
-                        node_index);
+                        (options.isolate_network ? 0U : node_index));
 }
 
 std::vector<uint32_t> ConfiguredStartupPeerIndexes(

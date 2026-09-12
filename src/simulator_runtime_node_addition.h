@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/json/value.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +45,8 @@ struct RuntimeNodeAddResult {
   std::vector<std::string> added_node_ids;
   std::uint64_t inventory_generation = 0U;
   std::uint32_t final_node_count = 0U;
+  std::uint32_t node_capacity = 0U;
+  boost::json::value network_allocation = nullptr;
   std::vector<WalletIdentity> added_wallets;
   std::optional<std::uint64_t> wallet_generation;
   std::optional<std::size_t> final_wallet_count;

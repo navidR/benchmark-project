@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/json/object.hpp>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -13,12 +14,27 @@ struct PeerTopologyConfig;
 
 class SimulationNetworkAddressPlan {
  public:
+  static std::string CanonicalPoolCidr(std::string_view pool_cidr);
+  static std::uint32_t PoolLinkCapacity(std::string_view pool_cidr);
   static SimulationNetworkAddressPlan Allocate(
       std::string_view run_id, std::uint32_t node_count,
-      const std::vector<RouteInfo>& routes);
-  static SimulationNetworkAddressPlan FromCidr(std::string_view cidr,
+      const std::vector<RouteInfo>& routes,
+      const std::vector<AddressInfo>& addresses = {},
+      std::string_view pool_cidr = "10.0.0.0/8");
+  // Constructs the first node_count /31 links without kernel collision checks.
+  static SimulationNetworkAddressPlan FromCidr(std::string_view pool_cidr,
                                                std::uint32_t node_count);
+  static SimulationNetworkAddressPlan FromSerialized(
+      const boost::json::object& allocation);
 
+  SimulationNetworkAddressPlan Expanded(
+      std::uint32_t new_capacity, const std::vector<RouteInfo>& routes,
+      const std::vector<AddressInfo>& addresses = {}) const;
+  std::uint32_t capacity() const;
+  std::string PoolCidr() const;
+  std::vector<std::string> LinkCidrs() const;
+  boost::json::object ToSerialized() const;
+  // Compatibility spelling: a non-contiguous plan has a pool, not a run range.
   std::string Cidr() const;
   std::string HostAddress(std::uint32_t node_index) const;
   std::string NodeAddress(std::uint32_t node_index) const;
@@ -30,12 +46,19 @@ class SimulationNetworkAddressPlan {
       const std::vector<RouteInfo>& routes,
       const std::vector<AddressInfo>& addresses) const;
 
- private:
-  SimulationNetworkAddressPlan(std::uint32_t base_address,
-                               std::uint32_t node_count);
+  bool operator==(const SimulationNetworkAddressPlan&) const = default;
 
-  std::uint32_t base_address_ = 0;
-  std::uint32_t node_count_ = 0;
+ private:
+  SimulationNetworkAddressPlan(std::uint32_t pool_base,
+                               std::uint8_t pool_prefix_length);
+  SimulationNetworkAddressPlan ExpandedFrom(
+      std::uint32_t new_capacity, const std::vector<RouteInfo>& routes,
+      const std::vector<AddressInfo>& addresses,
+      std::uint64_t first_slot) const;
+
+  std::uint32_t pool_base_ = 0U;
+  std::uint8_t pool_prefix_length_ = 0U;
+  std::vector<std::uint32_t> link_bases_;
 };
 
 std::vector<DirectionalNetworkPolicy> ResolveDirectionalNetworkPolicies(

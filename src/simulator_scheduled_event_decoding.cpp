@@ -104,7 +104,7 @@ void ApplyScheduledScenarioEvents(
   std::uint32_t planned_node_count = options.nodes;
   std::vector<std::string> planned_node_ids = options.node_ids;
   if (planned_node_ids.empty()) {
-    planned_node_ids.reserve(options.node_capacity);
+    planned_node_ids.reserve(options.nodes);
     const std::string& prefix =
         ChainDriverSpecFor(options.chain).node_id_prefix;
     for (std::uint32_t index = 0U; index < options.nodes; ++index) {

@@ -11,6 +11,8 @@ namespace bbp {
 
 struct RuntimeNodeSnapshot::Generation {
   std::uint64_t sequence = 0U;
+  std::uint32_t capacity = 0U;
+  std::optional<SimulationNetworkAddressPlan> network_address_plan;
   std::vector<RuntimeNodeInsertion> nodes;
   std::vector<ChainNodeConfig> configs;
 };
@@ -74,6 +76,16 @@ std::uint64_t RuntimeNodeSnapshot::generation() const {
   return generation_ ? generation_->sequence : 0U;
 }
 
+std::uint32_t RuntimeNodeSnapshot::capacity() const {
+  return generation_ ? generation_->capacity : 0U;
+}
+
+const std::optional<SimulationNetworkAddressPlan>&
+RuntimeNodeSnapshot::network_address_plan() const {
+  static const std::optional<SimulationNetworkAddressPlan> empty;
+  return generation_ ? generation_->network_address_plan : empty;
+}
+
 std::uint32_t RuntimeNodeSnapshot::slot(std::size_t index) const {
   if (!generation_ || index >= generation_->nodes.size()) {
     throw std::out_of_range("runtime node snapshot slot is out of range");
@@ -115,20 +127,27 @@ RuntimeNodeSnapshot::Iterator RuntimeNodeSnapshot::end() const {
 }
 
 RuntimeNodeInventory::RuntimeNodeInventory(std::uint32_t capacity)
-    : capacity_(capacity), generation_(MakeGeneration(0U, {}, capacity)) {
-  if (capacity_ == 0U) {
+    : generation_(MakeGeneration(0U, {}, capacity)) {
+  if (capacity == 0U) {
     throw std::invalid_argument("runtime node capacity must be positive");
   }
 }
 
-void RuntimeNodeInventory::Initialize(std::vector<NodeRuntime>& nodes) {
+void RuntimeNodeInventory::Initialize(
+    std::vector<NodeRuntime>& nodes,
+    std::optional<SimulationNetworkAddressPlan> network_address_plan) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (generation_->sequence != 0U || !generation_->nodes.empty()) {
     throw std::logic_error("runtime node inventory is already initialized");
   }
-  if (nodes.size() > capacity_) {
+  if (nodes.size() > generation_->capacity) {
     throw std::invalid_argument(
         "initial runtime node count exceeds configured capacity");
+  }
+  if (network_address_plan &&
+      network_address_plan->capacity() != generation_->capacity) {
+    throw std::invalid_argument(
+        "initial network address plan does not match the node capacity");
   }
   std::set<std::string> node_ids;
   std::vector<ChainNodeConfig> configs;
@@ -142,6 +161,8 @@ void RuntimeNodeInventory::Initialize(std::vector<NodeRuntime>& nodes) {
   }
   auto owner = std::make_shared<std::vector<NodeRuntime>>();
   auto generation = std::make_shared<RuntimeNodeSnapshot::Generation>();
+  generation->capacity = generation_->capacity;
+  generation->network_address_plan = std::move(network_address_plan);
   std::vector<RuntimeNodeInsertion> insertions;
   insertions.reserve(nodes.size());
   *owner = std::move(nodes);
@@ -180,6 +201,11 @@ bool RuntimeNodeInventory::WasNodeIdUsed(std::string_view node_id) const {
   return used_node_ids_.contains(std::string(node_id));
 }
 
+std::uint32_t RuntimeNodeInventory::capacity() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return generation_->capacity;
+}
+
 RuntimeNodeSnapshot RuntimeNodeInventory::PublishAppend(
     std::uint64_t expected_generation,
     const std::vector<RuntimeNodeInsertion>& insertions) {
@@ -197,6 +223,18 @@ RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
     std::uint64_t expected_generation,
     const std::vector<RuntimeNodeInsertion>& insertions,
     const std::vector<ChainNodeConfig>& published_configs) {
+  const RuntimeNodeSnapshot current = Snapshot();
+  return PrepareAppend(expected_generation, insertions, published_configs,
+                       current.capacity(), current.network_address_plan());
+}
+
+RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
+    std::uint64_t expected_generation,
+    const std::vector<RuntimeNodeInsertion>& insertions,
+    const std::vector<ChainNodeConfig>& published_configs,
+    std::uint32_t candidate_capacity,
+    const std::optional<SimulationNetworkAddressPlan>&
+        candidate_network_address_plan) {
   std::unique_lock<std::mutex> lock(mutex_);
   if (generation_->sequence != expected_generation) {
     throw std::runtime_error(
@@ -206,9 +244,35 @@ RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
     throw std::invalid_argument(
         "runtime node publication requires at least one insertion");
   }
-  if (insertions.size() > capacity_ - generation_->nodes.size()) {
+  if (candidate_capacity < generation_->capacity) {
+    throw std::invalid_argument(
+        "runtime node publication cannot shrink the node capacity");
+  }
+  if (insertions.size() > candidate_capacity - generation_->nodes.size()) {
     throw std::runtime_error(
         "runtime node publication exceeds configured capacity");
+  }
+  if (candidate_network_address_plan.has_value() !=
+      generation_->network_address_plan.has_value()) {
+    throw std::invalid_argument(
+        "runtime node publication cannot change the network allocation mode");
+  }
+  if (candidate_network_address_plan) {
+    if (candidate_network_address_plan->capacity() != candidate_capacity) {
+      throw std::invalid_argument(
+          "runtime network address plan does not match the node capacity");
+    }
+    const SimulationNetworkAddressPlan& previous =
+        *generation_->network_address_plan;
+    for (std::uint32_t slot = 0U; slot < generation_->capacity; ++slot) {
+      if (candidate_network_address_plan->HostAddress(slot) !=
+              previous.HostAddress(slot) ||
+          candidate_network_address_plan->NodeAddress(slot) !=
+              previous.NodeAddress(slot)) {
+        throw std::invalid_argument(
+            "runtime node publication must preserve every reserved address");
+      }
+    }
   }
   if (generation_->sequence == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("runtime node inventory generation overflow");
@@ -228,7 +292,8 @@ RuntimeNodeInventory::PreparedAppend RuntimeNodeInventory::PrepareAppend(
     }
   }
   auto next_generation =
-      MakeGeneration(generation_->sequence + 1U, std::move(next), capacity_);
+      MakeGeneration(generation_->sequence + 1U, std::move(next),
+                     candidate_capacity, candidate_network_address_plan);
   if (!published_configs.empty()) {
     if (published_configs.size() != next_generation->nodes.size()) {
       throw std::invalid_argument(
@@ -300,8 +365,9 @@ RuntimeNodeInventory::PreparedRemoval RuntimeNodeInventory::PrepareRemoval(
     throw std::invalid_argument(
         "runtime node removal references an unknown node id");
   }
-  auto next_generation = MakeGeneration(generation_->sequence + 1U,
-                                        std::move(retained), capacity_);
+  auto next_generation =
+      MakeGeneration(generation_->sequence + 1U, std::move(retained),
+                     generation_->capacity, generation_->network_address_plan);
   if (published_configs.size() != next_generation->nodes.size()) {
     throw std::invalid_argument(
         "runtime node removal published configs must match the next "
@@ -387,7 +453,8 @@ RuntimeNodeInventory::PrepareReplacement(
         "runtime node replacement references an unknown node id");
   }
   auto next_generation =
-      MakeGeneration(generation_->sequence + 1U, std::move(next), capacity_);
+      MakeGeneration(generation_->sequence + 1U, std::move(next),
+                     generation_->capacity, generation_->network_address_plan);
   next_generation->configs = published_configs;
   return PreparedReplacement(this, std::move(lock), std::move(next_generation));
 }
@@ -407,9 +474,10 @@ RuntimeNodeInventory::PreparedReplacement::Commit() noexcept {
 }
 
 std::shared_ptr<RuntimeNodeSnapshot::Generation>
-RuntimeNodeInventory::MakeGeneration(std::uint64_t generation,
-                                     std::vector<RuntimeNodeInsertion> nodes,
-                                     std::uint32_t capacity) {
+RuntimeNodeInventory::MakeGeneration(
+    std::uint64_t generation, std::vector<RuntimeNodeInsertion> nodes,
+    std::uint32_t capacity,
+    std::optional<SimulationNetworkAddressPlan> network_address_plan) {
   std::set<std::uint32_t> slots;
   std::set<std::string> node_ids;
   std::vector<ChainNodeConfig> configs;
@@ -436,6 +504,8 @@ RuntimeNodeInventory::MakeGeneration(std::uint64_t generation,
   return std::make_shared<RuntimeNodeSnapshot::Generation>(
       RuntimeNodeSnapshot::Generation{
           .sequence = generation,
+          .capacity = capacity,
+          .network_address_plan = std::move(network_address_plan),
           .nodes = std::move(nodes),
           .configs = std::move(configs),
       });

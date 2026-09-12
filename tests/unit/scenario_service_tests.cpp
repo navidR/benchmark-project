@@ -3,6 +3,7 @@
 #include <boost/test/unit_test.hpp>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -291,13 +292,48 @@ BOOST_AUTO_TEST_CASE(scenario_service_allows_explicit_empty_active_run) {
   BOOST_TEST(options.nodes == 0U);
   BOOST_TEST(options.generate_node == 0U);
   BOOST_TEST(!options.block_production.enabled);
-  BOOST_TEST(options.node_capacity ==
-             ChainDriverSpecFor(ChainKind::kFiro).max_nodes);
+  BOOST_TEST(options.node_capacity == 1U);
 
   const boost::json::object resolved = ResolveScenario(scenario);
   BOOST_TEST(resolved.at("nodes").as_uint64() == 0U);
-  BOOST_TEST(resolved.at("node_capacity").as_uint64() ==
-             ChainDriverSpecFor(ChainKind::kFiro).max_nodes);
+  BOOST_TEST(resolved.at("node_capacity").as_uint64() == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(scenario_service_node_reservation_has_no_chain_maximum) {
+  for (const std::string_view chain : {"firo", "bitcoin", "monero"}) {
+    boost::json::object scenario = MinimalScenario();
+    scenario["chain"] = chain;
+    scenario["nodes"] = 21U;
+    const Options defaults = ParseAndValidateScenario(scenario);
+    BOOST_TEST(defaults.nodes == 21U);
+    BOOST_TEST(defaults.node_capacity == 21U);
+
+    scenario["node_capacity"] = 256U;
+    BOOST_TEST(ParseAndValidateScenario(scenario).node_capacity == 256U);
+    scenario["node_capacity"] = 20U;
+    BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+    scenario["node_capacity"] = 0U;
+    BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_service_validates_and_canonicalizes_address_pool) {
+  boost::json::object scenario = MinimalScenario();
+  BOOST_TEST(ParseAndValidateScenario(scenario).network_address_pool ==
+             "10.0.0.0/8");
+  scenario["network_address_pool"] = "10.2.3.4/20";
+  BOOST_TEST(ParseAndValidateScenario(scenario).network_address_pool ==
+             "10.2.0.0/20");
+
+  scenario["isolated_network"] = false;
+  for (const std::string_view invalid :
+       {"invalid", "10.0.0.0", "10.0.0.0/33", "10.0.0.0/32", "::1/64"}) {
+    scenario["network_address_pool"] = invalid;
+    BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+  }
+  scenario["network_address_pool"] = 10U;
+  BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(scenario_service_preserves_absent_wallet_lifetime_limit) {
@@ -568,6 +604,28 @@ BOOST_AUTO_TEST_CASE(
       std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(scenario_service_node_add_allows_reservation_growth) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 11U;
+  scenario["node_capacity"] = 16U;
+  Options options = ParseAndValidateScenario(scenario);
+  const boost::json::object request{{"chain", "firo"}, {"count", 10U}};
+  const SimulationNodeAddRequest add =
+      ParseAndValidateSimulationNodeAddRequest(request, options);
+  BOOST_TEST(add.count == 10U);
+  BOOST_TEST(options.node_capacity == 16U);
+  BOOST_TEST(options.nodes + add.count == 21U);
+
+  options.nodes = std::numeric_limits<std::uint32_t>::max();
+  BOOST_CHECK_EXCEPTION(
+      ParseAndValidateSimulationNodeAddRequest(request, options),
+      std::runtime_error, [](const std::runtime_error& error) {
+        return std::string(error.what()) ==
+               "node inventory index exhaustion: requested 4294967305 nodes, "
+               "available index range 1..4294967295";
+      });
+}
+
 BOOST_AUTO_TEST_CASE(
     scenario_service_node_replace_preserves_target_and_ignores_capacity) {
   boost::json::object scenario = MinimalScenario();
@@ -744,8 +802,7 @@ BOOST_AUTO_TEST_CASE(
       {"node_add", boost::json::object{{"chain", "firo"}, {"count", 1U}}}}};
 
   const Options options = ParseAndValidateScenario(scenario);
-  BOOST_TEST(options.node_capacity ==
-             ChainDriverSpecFor(ChainKind::kFiro).max_nodes);
+  BOOST_TEST(options.node_capacity == 1U);
   BOOST_REQUIRE_EQUAL(options.scheduled_events.size(), 1U);
   const SimulationCommand& add =
       std::get<SimulationCommand>(options.scheduled_events.front().action);
@@ -755,25 +812,34 @@ BOOST_AUTO_TEST_CASE(
 }
 
 BOOST_AUTO_TEST_CASE(
-    scenario_service_rejects_cumulative_scheduled_node_add_over_capacity) {
+    scenario_service_accepts_cumulative_scheduled_growth_past_reservation) {
   boost::json::object scenario = MinimalScenario();
   scenario["node_capacity"] = 4U;
   scenario["events"] = boost::json::array{
       boost::json::object{
           {"at", "2s"},
           {"action", "add_nodes"},
-          {"node_add", boost::json::object{{"chain", "firo"}, {"count", 2U}}}},
-      boost::json::object{
-          {"at", "1s"},
-          {"action", "add_nodes"},
-          {"node_add", boost::json::object{{"chain", "firo"}, {"count", 2U}}}}};
+          {"node_add", boost::json::object{{"chain", "firo"}, {"count", 16U}}}},
+      boost::json::object{{"at", "1s"},
+                          {"action", "add_nodes"},
+                          {"node_add", boost::json::object{{"chain", "firo"},
+                                                           {"count", 16U}}}}};
 
-  BOOST_CHECK_EXCEPTION(
-      ParseAndValidateScenario(scenario), std::runtime_error,
-      [](const std::runtime_error& error) {
-        return std::string(error.what()) ==
-               "node.add request exceeds the configured node capacity";
-      });
+  const Options options = ParseAndValidateScenario(scenario);
+  BOOST_TEST(options.node_capacity == 4U);
+  BOOST_REQUIRE_EQUAL(options.scheduled_events.size(), 2U);
+  const SimulationCommand& first =
+      std::get<SimulationCommand>(options.scheduled_events[0].action);
+  const SimulationCommand& second =
+      std::get<SimulationCommand>(options.scheduled_events[1].action);
+  BOOST_REQUIRE(first.node_add);
+  BOOST_REQUIRE(second.node_add);
+  BOOST_REQUIRE_EQUAL(first.node_add->node_ids.size(), 16U);
+  BOOST_REQUIRE_EQUAL(second.node_add->node_ids.size(), 16U);
+  BOOST_TEST(first.node_add->node_ids.front() == "firo-2");
+  BOOST_TEST(first.node_add->node_ids.back() == "firo-17");
+  BOOST_TEST(second.node_add->node_ids.front() == "firo-18");
+  BOOST_TEST(second.node_add->node_ids.back() == "firo-33");
 }
 
 BOOST_AUTO_TEST_CASE(

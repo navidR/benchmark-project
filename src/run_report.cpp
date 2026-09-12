@@ -33,6 +33,7 @@
 #include "bbp/mcp_registry.h"
 #include "bbp/operator_command_status.h"
 #include "bbp/perf_counter.h"
+#include "bbp/runtime_node_resource_manifest.h"
 #include "bbp/simulation_command.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulation_registry.h"
@@ -43,7 +44,6 @@ namespace bbp {
 namespace {
 
 constexpr std::size_t kMaximumNodeLogTailBytes = 256U * 1024U;
-constexpr std::size_t kMaximumResolvedScenarioBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaximumNodeMetricHistorySamples = 120U;
 constexpr std::size_t kMaximumOperatorCommandSummaries =
     kMaximumRunReportSummaryRecords;
@@ -1421,8 +1421,22 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   if (!std::filesystem::exists(path)) {
     return;
   }
-  boost::json::value value = boost::json::parse(
-      ReadText(path, kMaximumResolvedScenarioBytes, stop_token));
+  const int root = open(path.parent_path().c_str(),
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (root < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "open resolved scenario root");
+  }
+  std::string text;
+  try {
+    text = ReadTextAt(root, path.filename().string(), std::string{}.max_size(),
+                      stop_token);
+  } catch (...) {
+    static_cast<void>(close(root));
+    throw;
+  }
+  static_cast<void>(close(root));
+  boost::json::value value = boost::json::parse(text);
   ThrowIfReportCancelled(stop_token);
   if (!value.is_object()) {
     throw std::runtime_error("resolved scenario is not a JSON object: " +
@@ -1435,6 +1449,9 @@ void LoadResolvedScenario(const std::filesystem::path& path,
   CopyField(scenario, "chain", report);
   CopyField(scenario, "chains", report);
   CopyField(scenario, "nodes", report);
+  CopyField(scenario, "node_capacity", report);
+  CopyField(scenario, "network_address_pool", report);
+  CopyField(scenario, "network_allocation", report);
   CopyField(scenario, "generate_blocks", report);
   CopyField(scenario, "generate_node", report);
   CopyField(scenario, "block_production", report);
@@ -3313,6 +3330,29 @@ struct IncrementalRunReport::Impl {
           throw std::runtime_error(
               "runtime generation publication is incomplete");
         }
+        const auto capacity = OptionalUint64Field(publication, "node_capacity");
+        if (publication.if_contains("node_capacity") &&
+            (!capacity || *capacity < *node_count ||
+             *capacity > std::numeric_limits<std::uint32_t>::max())) {
+          throw std::runtime_error(
+              "runtime generation capacity is inconsistent with its inventory");
+        }
+        const auto* allocation = publication.if_contains("network_allocation");
+        if (allocation && !allocation->is_null()) {
+          if (!allocation->is_object()) {
+            throw std::runtime_error(
+                "runtime network allocation is not an object");
+          }
+          const auto plan = SimulationNetworkAddressPlan::FromSerialized(
+              allocation->as_object());
+          const auto reserved =
+              capacity.value_or(OptionalUint64Field(report, "node_capacity")
+                                    .value_or(*node_count));
+          if (plan.capacity() != reserved) {
+            throw std::runtime_error(
+                "runtime network allocation differs from reserved capacity");
+          }
+        }
         std::set<std::string> active_node_ids;
         for (const boost::json::value& value : node_ids->as_array()) {
           if (!value.is_string() ||
@@ -3348,6 +3388,12 @@ struct IncrementalRunReport::Impl {
         runtime_active_node_ids = std::move(active_node_ids);
         report["inventory_generation"] = *generation;
         report["nodes"] = *node_count;
+        report["node_capacity"] = capacity.value_or(
+            std::max(OptionalUint64Field(report, "node_capacity").value_or(0U),
+                     *node_count));
+        CopyField(publication, "network_address_pool", &report);
+        CopyField(publication, "network_allocation", &report);
+        report["inventory_publication_complete"] = true;
         report["node_ids"] = *node_ids;
         report["node_configs"] = *node_configs;
         report["topology"] = *topology;
@@ -3826,9 +3872,75 @@ struct IncrementalRunReport::Impl {
     wallet.last_metrics = metric;
   }
 
+  void RecoverCapacityFromManifest(std::stop_token stop_token) {
+    const auto manifest_path = run_root / "runtime-node-resources.json";
+    const auto status = std::filesystem::symlink_status(manifest_path);
+    if (status.type() == std::filesystem::file_type::not_found) {
+      return;
+    }
+    const auto ownership =
+        LoadRunOwnership(expected_run_id, run_root, stop_token);
+    const auto manifest =
+        TryLoadRuntimeNodeResourceManifest(ownership, std::nullopt, stop_token);
+    if (!manifest || !manifest->node_capacity ||
+        !std::all_of(manifest->nodes.begin(), manifest->nodes.end(),
+                     [](const RuntimeNodeResourceEntry& entry) {
+                       return entry.state == RuntimeNodeResourceState::kLive ||
+                              entry.state ==
+                                  RuntimeNodeResourceState::kPendingAdd;
+                     })) {
+      return;
+    }
+    std::set<std::string> active_ids;
+    boost::json::array node_ids;
+    for (const auto& entry : manifest->nodes) {
+      if (entry.state != RuntimeNodeResourceState::kLive) {
+        continue;
+      }
+      active_ids.insert(entry.node_id);
+      node_ids.emplace_back(entry.node_id);
+    }
+    std::set<std::string> published_ids;
+    if (runtime_active_node_ids) {
+      published_ids = *runtime_active_node_ids;
+    } else if (const auto* configs = ArrayField(report, "node_configs")) {
+      for (const auto& config : *configs) {
+        if (config.is_object()) {
+          published_ids.insert(OptionalStringField(config.as_object(), "id"));
+        }
+      }
+    }
+    if (published_ids != active_ids) {
+      // The manifest proves resource identity, count, and allocation. It does
+      // not prove a missing event's role, topology, or full node configuration.
+      report["inventory_publication_complete"] = false;
+      report["inventory_generation"] = nullptr;
+      report["node_configs"] = nullptr;
+      report["topology"] = nullptr;
+      report["topology_current_edges"] = nullptr;
+      std::erase_if(nodes, [&](const auto& item) {
+        return !active_ids.contains(item.first);
+      });
+    }
+    runtime_active_node_ids = std::move(active_ids);
+    report["nodes"] = node_ids.size();
+    report["node_ids"] = std::move(node_ids);
+    report["node_capacity"] = *manifest->node_capacity;
+    report["network_allocation"] =
+        manifest->network_address_plan
+            ? boost::json::value(manifest->network_address_plan->ToSerialized())
+            : boost::json::value(nullptr);
+    if (manifest->network_address_plan) {
+      report["network_address_pool"] =
+          manifest->network_address_plan->PoolCidr();
+    }
+  }
+
   void UpdateReport() {
-    const bool ok =
-        run_started && run_finished && !run_failed && !run_cancelled;
+    const bool ok = run_started && run_finished && !run_failed &&
+                    !run_cancelled &&
+                    (!report.if_contains("inventory_publication_complete") ||
+                     report.at("inventory_publication_complete").as_bool());
     const RunReportStatus status =
         run_failed ? RunReportStatus::kFailed
                    : (run_cancelled ? RunReportStatus::kCancelled
@@ -3912,6 +4024,9 @@ struct IncrementalRunReport::Impl {
         run_root / "events.jsonl", &event_cursor, maximum_records_per_file,
         &stats.event_records, stop_token,
         [this](const boost::json::object& event) { ProcessEvent(event); });
+    if (!event_backlog) {
+      RecoverCapacityFromManifest(stop_token);
+    }
     ThrowIfReportCancelled(stop_token);
     const bool metric_backlog = ConsumeFile(
         run_root / "metrics.jsonl", &metric_cursor, maximum_records_per_file,

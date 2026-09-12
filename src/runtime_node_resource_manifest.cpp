@@ -44,13 +44,10 @@ constexpr std::string_view kRunCleanupReceiptPrefix =
     ".bbp-run-cleanup-receipt-";
 constexpr std::string_view kRetiredRunCleanupReceiptPrefix =
     ".bbp-retired-run-cleanup-receipt-";
-constexpr std::uint64_t kManifestVersion = 2U;
+constexpr std::uint64_t kManifestVersion = 3U;
 constexpr std::uint64_t kNodeMarkerVersion = 1U;
 constexpr std::uint64_t kRunCleanupReceiptVersion = 1U;
-constexpr std::size_t kMaximumManifestBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumRunCleanupReceiptBytes = 4096U;
-constexpr std::size_t kMaximumRuntimeNodeSlots = 16U;
-constexpr std::size_t kMaximumManifestEntries = kMaximumRuntimeNodeSlots + 1U;
 constexpr std::size_t kMaximumTraversalDepth = 64U;
 constexpr std::size_t kMaximumTraversalEntries = 1000000U;
 
@@ -219,10 +216,6 @@ void RequireEntry(const RuntimeNodeResourceEntry& entry) {
         "only pending replacement resources may select root_name");
   }
   RequireRelativeDataDirectory(entry);
-  if (entry.slot >= kMaximumRuntimeNodeSlots) {
-    throw std::runtime_error(
-        "runtime resource slot exceeds the manifest bound");
-  }
   if (entry.chain == ChainKind::kCount) {
     throw std::runtime_error("runtime resource chain is invalid");
   }
@@ -234,9 +227,16 @@ void RequireManifest(const RuntimeNodeResourceManifest& manifest) {
     throw std::runtime_error(
         "runtime resource manifest ownership no longer matches its run");
   }
-  if (manifest.nodes.size() > kMaximumManifestEntries) {
+  if (manifest.node_capacity && *manifest.node_capacity == 0U) {
     throw std::runtime_error(
-        "runtime resource manifest node count is too large");
+        "runtime resource manifest node capacity must be positive");
+  }
+  if (manifest.network_address_plan &&
+      (!manifest.isolated_network || !manifest.node_capacity ||
+       manifest.network_address_plan->capacity() != *manifest.node_capacity)) {
+    throw std::runtime_error(
+        "runtime resource manifest network allocation must match its "
+        "isolated node capacity");
   }
   std::set<std::string> root_names;
   std::map<std::string, const RuntimeNodeResourceEntry*, std::less<>>
@@ -245,6 +245,12 @@ void RequireManifest(const RuntimeNodeResourceManifest& manifest) {
   std::vector<const RuntimeNodeResourceEntry*> replacements;
   for (const RuntimeNodeResourceEntry& entry : manifest.nodes) {
     RequireEntry(entry);
+    if (manifest.node_capacity &&
+        entry.state != RuntimeNodeResourceState::kPendingAdd &&
+        entry.slot >= *manifest.node_capacity) {
+      throw std::runtime_error(
+          "runtime resource manifest committed slot exceeds node capacity");
+    }
     if (!root_names.insert(std::string(EntryRootName(entry))).second) {
       throw std::runtime_error(
           "runtime resource manifest contains a duplicate root name");
@@ -417,11 +423,15 @@ std::string ReadBoundedFileAt(int parent, std::string_view name,
     ThrowErrno("inspect runtime ownership file", errno);
   }
   if (!S_ISREG(status.st_mode) || status.st_uid != geteuid() ||
-      status.st_size < 0 ||
-      static_cast<std::uint64_t>(status.st_size) > maximum ||
-      (status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+      status.st_size < 0 || (status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
     throw std::runtime_error(
         "runtime ownership file is not a bounded owned regular file");
+  }
+  if (static_cast<std::uintmax_t>(status.st_size) > maximum) {
+    throw std::runtime_error("runtime ownership file requires " +
+                             std::to_string(status.st_size) +
+                             " bytes; available read capacity is " +
+                             std::to_string(maximum) + " bytes");
   }
   std::string contents(static_cast<std::size_t>(status.st_size), '\0');
   std::size_t offset = 0U;
@@ -1163,19 +1173,21 @@ void WriteRuntimeNodeResourceManifest(
     }
     nodes.emplace_back(std::move(node));
   }
-  const std::string contents =
-      boost::json::serialize(boost::json::object{
-          {"version", kManifestVersion},
-          {"run_id", manifest.ownership.run_id},
-          {"resource_id", manifest.ownership.resource_id},
-          {"isolated_network", manifest.isolated_network},
-          {"nodes", std::move(nodes)},
-      }) +
-      "\n";
-  if (contents.size() > kMaximumManifestBytes) {
-    throw std::runtime_error(
-        "runtime resource manifest exceeds its size bound");
+  boost::json::object object{
+      {"version", kManifestVersion},
+      {"run_id", manifest.ownership.run_id},
+      {"resource_id", manifest.ownership.resource_id},
+      {"isolated_network", manifest.isolated_network},
+      {"nodes", std::move(nodes)},
+  };
+  if (manifest.node_capacity) {
+    object["node_capacity"] = *manifest.node_capacity;
   }
+  if (manifest.network_address_plan) {
+    object["network_allocation"] =
+        manifest.network_address_plan->ToSerialized();
+  }
+  const std::string contents = boost::json::serialize(object) + "\n";
 
   UniqueFd run_root =
       OpenOwnedRunRoot(manifest.ownership, expected_root, stop_token);
@@ -1225,7 +1237,7 @@ void WriteRuntimeNodeResourceManifest(
       throw std::runtime_error(
           "runtime resource manifest publication read-back failed");
     }
-    if (ReadBoundedFileAt(run_root.get(), kManifestName, kMaximumManifestBytes,
+    if (ReadBoundedFileAt(run_root.get(), kManifestName, contents.size(),
                           stop_token) != contents) {
       throw std::runtime_error(
           "runtime resource manifest contents differ after publication");
@@ -1256,16 +1268,17 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
     throw std::runtime_error("runtime resource manifest is not a regular file");
   }
   const boost::json::value parsed = boost::json::parse(ReadBoundedFileAt(
-      run_root.get(), kManifestName, kMaximumManifestBytes, stop_token));
+      run_root.get(), kManifestName, std::string{}.max_size(), stop_token));
   if (!parsed.is_object()) {
     throw std::runtime_error("runtime resource manifest is not an object");
   }
   const boost::json::object& object = parsed.as_object();
-  RejectUnknownFields(
-      object, {"version", "run_id", "resource_id", "isolated_network", "nodes"},
-      "runtime resource manifest");
+  RejectUnknownFields(object,
+                      {"version", "run_id", "resource_id", "isolated_network",
+                       "node_capacity", "network_allocation", "nodes"},
+                      "runtime resource manifest");
   const std::uint64_t version = RequiredUnsigned(object, "version");
-  if ((version != 1U && version != kManifestVersion) ||
+  if ((version != 1U && version != 2U && version != kManifestVersion) ||
       RequiredString(object, "run_id") != ownership.run_id ||
       RequiredString(object, "resource_id") != ownership.resource_id) {
     throw std::runtime_error(
@@ -1274,8 +1287,7 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
   const boost::json::value* isolated = object.if_contains("isolated_network");
   const boost::json::value* node_values = object.if_contains("nodes");
   if (isolated == nullptr || !isolated->is_bool() || node_values == nullptr ||
-      !node_values->is_array() ||
-      node_values->as_array().size() > kMaximumManifestEntries) {
+      !node_values->is_array()) {
     throw std::runtime_error(
         "runtime resource manifest has invalid isolation or node fields");
   }
@@ -1285,6 +1297,23 @@ std::optional<RuntimeNodeResourceManifest> TryLoadRuntimeNodeResourceManifest(
       .isolated_network = isolated->as_bool(),
       .nodes = {},
   };
+  if (object.contains("node_capacity")) {
+    const std::uint64_t capacity = RequiredUnsigned(object, "node_capacity");
+    if (capacity > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(
+          "runtime resource manifest node capacity exceeds uint32");
+    }
+    manifest.node_capacity = static_cast<std::uint32_t>(capacity);
+  }
+  if (const boost::json::value* allocation =
+          object.if_contains("network_allocation")) {
+    if (!allocation->is_object()) {
+      throw std::runtime_error(
+          "runtime resource manifest network allocation is not an object");
+    }
+    manifest.network_address_plan =
+        SimulationNetworkAddressPlan::FromSerialized(allocation->as_object());
+  }
   manifest.nodes.reserve(node_values->as_array().size());
   for (const boost::json::value& value : node_values->as_array()) {
     if (!value.is_object()) {

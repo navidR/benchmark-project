@@ -26,9 +26,11 @@ struct McpHostedRunSnapshot {
   std::string chain;
   std::uint32_t node_count = 0U;
   std::uint32_t node_capacity = 0U;
-  std::uint32_t chain_node_maximum = 0U;
+  // Accepted only for legacy retained metadata; never a live node limit.
+  std::optional<std::uint32_t> chain_node_maximum = std::nullopt;
   std::uint32_t available_node_capacity = 0U;
   std::shared_ptr<McpLiveApplication> application;
+  boost::json::value network_allocation = nullptr;
 };
 
 struct McpRetainedRunSnapshot {
@@ -37,7 +39,9 @@ struct McpRetainedRunSnapshot {
   std::string chain;
   std::uint32_t node_count = 0U;
   std::uint32_t node_capacity = 0U;
-  std::uint32_t chain_node_maximum = 0U;
+  // Accepted only for legacy retained metadata; never a live node limit.
+  std::optional<std::uint32_t> chain_node_maximum = std::nullopt;
+  boost::json::value network_allocation = nullptr;
 };
 
 inline constexpr std::size_t kMcpHostMaximumRunRegistryEntries = 256U;

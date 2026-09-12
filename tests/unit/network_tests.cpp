@@ -1,6 +1,7 @@
 #include <libmnl/libmnl.h>
 #include <linux/if_ether.h>
 #include <linux/pkt_sched.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
@@ -96,9 +97,9 @@ void RenameLinkForTest(const std::string& current,
 
 class ScopedNamespaceVeth {
  public:
-  ScopedNamespaceVeth()
+  explicit ScopedNamespaceVeth(bbp::NodeVethConfig config = UniqueVethConfig())
       : network_namespace_(bbp::NetworkNamespace::Create()),
-        config_(UniqueVethConfig()) {
+        config_(std::move(config)) {
     std::optional<bbp::NodeVethIdentity> acquired;
     bbp::SetupNodeVethNetwork(network_namespace_.fd(), config_, &acquired);
     if (!acquired) {
@@ -119,6 +120,7 @@ class ScopedNamespaceVeth {
 
   int namespace_fd() const { return network_namespace_.fd(); }
   const bbp::NodeVethConfig& config() const { return config_; }
+  const bbp::NodeVethIdentity& identity() const { return identity_; }
 
  private:
   bbp::NetworkNamespace network_namespace_;
@@ -590,6 +592,71 @@ BOOST_AUTO_TEST_CASE(veth_setup_failure_completes_verified_rollback) {
     }
     throw;
   }
+}
+
+BOOST_AUTO_TEST_CASE(veth_setup_supports_rfc3021_endpoints_and_gateway) {
+  bbp::NodeVethConfig config = UniqueVethConfig();
+  config.node_address = config.host_address;
+  config.host_address.replace(config.host_address.rfind('.') + 1U,
+                              std::string::npos, "0");
+  config.prefix_len = 31U;
+  std::optional<ScopedNamespaceVeth> topology;
+  try {
+    topology.emplace(config);
+  } catch (const std::exception& error) {
+    if (ExplicitPrivilegeFailure(error)) {
+      BOOST_TEST_MESSAGE(
+          "skipping privileged /31 setup test: " << error.what());
+      return;
+    }
+    throw;
+  }
+
+  const std::vector<bbp::AddressInfo> host_addresses = bbp::ListIpv4Addresses();
+  BOOST_TEST(std::any_of(host_addresses.begin(), host_addresses.end(),
+                         [&](const bbp::AddressInfo& address) {
+                           return address.if_name == config.host_name &&
+                                  address.address == config.host_address &&
+                                  address.prefix_len == 31U;
+                         }));
+  const std::vector<bbp::AddressInfo> node_addresses =
+      bbp::ListIpv4AddressesInNamespace(topology->namespace_fd());
+  BOOST_TEST(std::any_of(node_addresses.begin(), node_addresses.end(),
+                         [&](const bbp::AddressInfo& address) {
+                           return address.if_name == config.peer_name &&
+                                  address.address == config.node_address &&
+                                  address.prefix_len == 31U;
+                         }));
+  const std::vector<bbp::RouteInfo> routes =
+      bbp::ListIpv4RoutesInNamespace(topology->namespace_fd());
+  BOOST_TEST(std::any_of(
+      routes.begin(), routes.end(), [&](const bbp::RouteInfo& route) {
+        return route.oif_name == config.peer_name &&
+               route.destination == config.host_address &&
+               route.prefix_len == 31U && route.gateway.empty() &&
+               route.scope == RT_SCOPE_LINK && route.table == RT_TABLE_MAIN &&
+               route.type == RTN_UNICAST;
+      }));
+  BOOST_TEST(std::any_of(
+      routes.begin(), routes.end(), [&](const bbp::RouteInfo& route) {
+        return route.oif_name == config.peer_name &&
+               route.destination == "0.0.0.0" && route.prefix_len == 0U &&
+               route.gateway == config.host_address &&
+               route.table == RT_TABLE_MAIN && route.type == RTN_UNICAST;
+      }));
+
+  bbp::DeleteNodeVethNetwork(config, topology->identity());
+  const auto owned_endpoint = [&](const bbp::LinkInfo& link) {
+    return link.ownership_alias == config.host_ownership_alias ||
+           link.ownership_alias == config.peer_ownership_alias;
+  };
+  const std::vector<bbp::LinkInfo> host_links = bbp::ListNetworkLinks();
+  BOOST_TEST(
+      std::none_of(host_links.begin(), host_links.end(), owned_endpoint));
+  const std::vector<bbp::LinkInfo> node_links =
+      bbp::ListNetworkLinksInNamespace(topology->namespace_fd());
+  BOOST_TEST(
+      std::none_of(node_links.begin(), node_links.end(), owned_endpoint));
 }
 
 BOOST_AUTO_TEST_CASE(directional_netlink_failure_rolls_back_applied_mutations) {
