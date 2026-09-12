@@ -104,6 +104,7 @@
 #include "simulator_live_height_wait_control.h"
 #include "simulator_live_height_wait_workload_launcher.h"
 #include "simulator_live_instrumentation_controller.h"
+#include "simulator_live_lifecycle_supervisor.h"
 #include "simulator_live_masternode_operations.h"
 #include "simulator_live_miner_addition.h"
 #include "simulator_live_miner_removal.h"
@@ -281,6 +282,7 @@ using simulator_app_internal::LiveBlockGenerationWorkloadRegistry;
 using simulator_app_internal::LiveCommandExecutionContext;
 using simulator_app_internal::LiveInstrumentationControllerPtr;
 using simulator_app_internal::LiveInstrumentationMeasurementCollector;
+using simulator_app_internal::LiveLifecycleSupervisorContext;
 using simulator_app_internal::LiveMasternodeOperationContext;
 using simulator_app_internal::LiveMinerAdditionContext;
 using simulator_app_internal::LiveMinerRemovalContext;
@@ -401,6 +403,7 @@ using simulator_app_internal::ResolveNodeProfileAssignments;
 using simulator_app_internal::ResourceLimitUpdateDetail;
 using simulator_app_internal::RestartPolicyAppliedDetail;
 using simulator_app_internal::RestartRequestedDetail;
+using simulator_app_internal::RunLiveLifecycleSupervisor;
 using simulator_app_internal::RunningNodeProcessGeneration;
 using simulator_app_internal::RunRetainedTuiWithMcp;
 using simulator_app_internal::RunStopTick;
@@ -1597,199 +1600,31 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         }
       }
     }
-    lifecycle_supervisor.emplace([&](std::stop_token supervisor_stop_token) {
-      std::stop_source operation_stop_source;
-      std::stop_callback stop_on_supervisor(
-          supervisor_stop_token,
-          [&operation_stop_source] { operation_stop_source.request_stop(); });
-      std::stop_callback stop_on_simulation(
-          stop_token,
-          [&operation_stop_source] { operation_stop_source.request_stop(); });
-      const std::stop_token operation_stop_token =
-          operation_stop_source.get_token();
-      try {
-        std::condition_variable_any wakeup;
-        std::mutex wakeup_mutex;
-        while (!operation_stop_token.stop_requested()) {
-          {
-            auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                         operation_stop_token);
-            const RuntimeNodeSnapshot nodes = node_inventory.Snapshot();
-            for (std::size_t index = 0; index < nodes.size(); ++index) {
-              if (operation_stop_token.stop_requested()) {
-                return;
-              }
-              NodeRuntime& node = nodes[index];
-              const auto now = std::chrono::steady_clock::now();
-              const bool stop_due =
-                  node.lifecycle_policy.stop_time &&
-                  now >= SteadyDeadline(lifecycle_epoch,
-                                        options.time_scale.WallDuration(
-                                            *node.lifecycle_policy.stop_time));
-              if (stop_due && !node.DeclarativeStopApplied()) {
-                if (block_scheduler && is_configured_miner(node.config.id)) {
-                  block_scheduler->StopMiner(node.config.id);
-                }
-                if (node.DeclarativeStopApplied()) {
-                  continue;
-                }
-                node.MarkDeclarativeStopApplied();
-                WriteEvent(
-                    events_path, options.run_id, node.config.id,
-                    SimulationEventKind::kNodeStopDeadlineReached,
-                    NodeLifecycleDeadlineDetail(
-                        node, options.time_scale, lifecycle_epoch,
-                        *node.lifecycle_policy.stop_time, "declarative_stop"));
-                if (NodeProcessRunning(node)) {
-                  StopNodeProcess(options, events_path, driver, node,
-                                  operation_stop_token);
-                } else {
-                  {
-                    auto process_guard = run_process_state.Lock();
-                    ResetNodePerfCounters(node, process_guard);
-                    node.SetLifecycle(NodeRuntimeLifecycle::kStopped);
-                  }
-                  WriteNodeStateEvent(events_path, options.run_id, node,
-                                      NodeRuntimeLifecycle::kStopped);
-                }
-                {
-                  auto process_guard = run_process_state.Lock();
-                  run_process_state.RemoveActiveNativeMiner(process_guard,
-                                                            node.config.id);
-                }
-                continue;
-              }
-
-              bool node_started = false;
-              if (node.lifecycle_policy.start_time &&
-                  node.Lifecycle() == NodeRuntimeLifecycle::kCgroupReady &&
-                  now >=
-                      SteadyDeadline(lifecycle_epoch,
-                                     options.time_scale.WallDuration(
-                                         *node.lifecycle_policy.start_time))) {
-                WriteEvent(events_path, options.run_id, node.config.id,
-                           SimulationEventKind::kNodeStartDeadlineReached,
-                           NodeLifecycleDeadlineDetail(
-                               node, options.time_scale, lifecycle_epoch,
-                               *node.lifecycle_policy.start_time,
-                               "declarative_start"));
-                node_started = StartPreparedNode(
-                    options, events_path, driver, node, "declarative_start",
-                    lifecycle_epoch, operation_stop_token);
-                if (node_started) {
-                  ConnectAvailableStartupPeers(options, events_path, driver,
-                                               nodes, index, lifecycle_epoch,
-                                               operation_stop_token);
-                  if (is_configured_miner(node.config.id) &&
-                      options.block_production.enabled &&
-                      options.block_production.difficulty) {
-                    RequireNodeRunning(node, "declarative mining difficulty");
-                    driver.SetMiningDifficulty(
-                        node.config, *options.block_production.difficulty,
-                        operation_stop_token);
-                  }
-                  PublishOperatorConnectionCommand(
-                      options, run_root, events_path, driver, nodes,
-                      &operator_connection_resolved);
-                }
-              }
-              if (node_started && block_scheduler &&
-                  is_configured_miner(node.config.id)) {
-                block_scheduler->StartMiner(node.config.id);
-              } else if (node_started && options.block_production.enabled &&
-                         options.block_production.mode ==
-                             MiningMode::kNativeMining &&
-                         is_configured_miner(node.config.id)) {
-                static_cast<void>(StartNativeMiningForCurrentProcess(
-                    driver, node, run_process_state,
-                    chain_spec.default_reward_address, operation_stop_token,
-                    "declarative native mining start"));
-              }
-
-              bool node_restarted = false;
-              std::optional<int> exited_wait_status;
-              std::string process_exit_detail;
-              {
-                auto process_guard = run_process_state.Lock();
-                if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning ||
-                    node.process.running()) {
-                  continue;
-                }
-                exited_wait_status = node.process.exit_status();
-                if (!exited_wait_status) {
-                  throw std::runtime_error(
-                      "node exited without a wait status: " + node.config.id);
-                }
-                ResetNodePerfCounters(node, process_guard);
-                process_exit_detail =
-                    ProcessExitDetail(node.process, process_guard);
-                node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
-              }
-              WriteEvent(events_path, options.run_id, node.config.id,
-                         SimulationEventKind::kProcessExited,
-                         process_exit_detail);
-              WriteEvent(
-                  events_path, options.run_id, node.config.id,
-                  SimulationEventKind::kState,
-                  NodeRuntimeLifecycleName(NodeRuntimeLifecycle::kFailed));
-              const bool restart = NodeRestartPolicyAllowsRestart(
-                  node.lifecycle_policy.restart_policy, *exited_wait_status);
-              WriteEvent(events_path, options.run_id, node.config.id,
-                         SimulationEventKind::kRestartPolicyApplied,
-                         RestartPolicyAppliedDetail(node, *exited_wait_status,
-                                                    restart));
-              if (!restart) {
-                throw std::runtime_error(
-                    "node process exited and restart policy did not restart "
-                    "it: " +
-                    node.config.id);
-              }
-              node_restarted = RestartNode(
-                  options, events_path, driver, *peer_connectivity_controller,
-                  node, lifecycle_epoch, operation_stop_token,
-                  "restart_policy");
-              if (node_restarted && is_configured_miner(node.config.id) &&
-                  options.block_production.enabled &&
-                  options.block_production.difficulty) {
-                RequireNodeRunning(node, "restart mining difficulty restore");
-                driver.SetMiningDifficulty(node.config,
-                                           *options.block_production.difficulty,
-                                           operation_stop_token);
-              }
-              if (node_restarted && block_scheduler &&
-                  is_configured_miner(node.config.id)) {
-                block_scheduler->StartMiner(node.config.id);
-              } else if (node_restarted && options.block_production.enabled &&
-                         options.block_production.mode ==
-                             MiningMode::kNativeMining &&
-                         is_configured_miner(node.config.id)) {
-                static_cast<void>(StartNativeMiningForCurrentProcess(
-                    driver, node, run_process_state,
-                    chain_spec.default_reward_address, operation_stop_token,
-                    "restart-policy native mining restore"));
-              }
-            }
-          }
-          std::unique_lock<std::mutex> wait_lock(wakeup_mutex);
-          wakeup.wait_for(wait_lock, operation_stop_token,
-                          std::chrono::milliseconds(20), [] { return false; });
-        }
-      } catch (const SimulationCancelled&) {
-        if (operation_stop_token.stop_requested()) {
-          return;
-        }
-        throw;
-      } catch (...) {
-        {
-          std::lock_guard<std::mutex> lock(lifecycle_failure_mutex);
-          if (!lifecycle_failure) {
-            lifecycle_failure = std::current_exception();
-          }
-        }
-        mcp_application.MarkRunStopping();
-        request_simulation_stop();
-      }
-    });
+    lifecycle_supervisor.emplace(
+        RunLiveLifecycleSupervisor,
+        LiveLifecycleSupervisorContext{
+            .options = options,
+            .run_root = run_root,
+            .events_path = events_path,
+            .chain_spec = chain_spec,
+            .driver = driver,
+            .node_inventory = node_inventory,
+            .run_process_state = run_process_state,
+            .node_mutation_mutex = node_mutation_mutex,
+            .node_network_state_mutex = node_network_state_mutex,
+            .lifecycle_epoch = lifecycle_epoch,
+            .operator_connection_resolved = operator_connection_resolved,
+            .lifecycle_failure_mutex = lifecycle_failure_mutex,
+            .lifecycle_failure = lifecycle_failure,
+            .mcp_application = mcp_application,
+            .block_scheduler = block_scheduler,
+            .peer_connectivity_controller = peer_connectivity_controller,
+            .is_configured_miner = is_configured_miner,
+            .request_simulation_stop = request_simulation_stop,
+            .stop_token = stop_token,
+            .acquire_node_mutation_lock = AcquireNodeMutationLock,
+            .start_node = StartNodeProcessWithPolicy,
+        });
     log_collector = std::make_unique<NodeLogCollector>(
         driver,
         [&] {
