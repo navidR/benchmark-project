@@ -312,6 +312,7 @@ add_executable(bbp
   src/simulator_live_wallet_workload_launcher.cpp
   src/simulator_live_workload_state.cpp
   src/simulator_live_workload_reading.cpp
+  src/simulator_live_workload_service_binding.cpp
   src/simulator_live_wallet_addition.cpp
   src/simulator_live_wallet_removal.cpp
   src/simulator_live_workload_shutdown.cpp
@@ -660,6 +661,7 @@ if(BUILD_TESTING)
     src/simulator_live_wallet_workload_launcher.cpp
     src/simulator_live_workload_state.cpp
     src/simulator_live_workload_reading.cpp
+    src/simulator_live_workload_service_binding.cpp
     src/simulator_live_wallet_addition.cpp
     src/simulator_live_wallet_removal.cpp
     src/simulator_live_workload_shutdown.cpp

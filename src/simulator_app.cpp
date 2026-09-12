@@ -117,6 +117,7 @@
 #include "simulator_live_wallet_workload_control.h"
 #include "simulator_live_wallet_workload_launcher.h"
 #include "simulator_live_workload_reading.h"
+#include "simulator_live_workload_service_binding.h"
 #include "simulator_live_workload_shutdown.h"
 #include "simulator_live_workload_state.h"
 #include "simulator_managed_run_root.h"
@@ -306,6 +307,7 @@ using simulator_app_internal::LiveWalletWorkloadRequest;
 using simulator_app_internal::LiveWalletWorkloadState;
 using simulator_app_internal::LiveWalletWorkloadStateName;
 using simulator_app_internal::LiveWorkloadRequest;
+using simulator_app_internal::LiveWorkloadServiceBindingContext;
 using simulator_app_internal::LiveWorkloadShutdownState;
 using simulator_app_internal::LoadRetainedSourceScenario;
 using simulator_app_internal::LockNodeProcessState;
@@ -324,6 +326,7 @@ using simulator_app_internal::MakeLiveWaitForPeersOperation;
 using simulator_app_internal::MakeLiveWaitUntilHeightOperation;
 using simulator_app_internal::MakeLiveWalletWorkloadLauncher;
 using simulator_app_internal::MakeLiveWalletWorkloadOperation;
+using simulator_app_internal::MakeLiveWorkloadServiceBinding;
 using simulator_app_internal::MakeNodeVethConfig;
 using simulator_app_internal::MakeOneShotWorkloadInvoker;
 using simulator_app_internal::MutateNetworkBlockRuleTransactional;
@@ -1652,311 +1655,40 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
         MakeLiveInstrumentationService(*instrumentation_controller);
     mcp_application.SetInstrumentationService(instrumentation_service);
     installed_instrumentation_service = std::move(instrumentation_service);
-    auto workload_service = std::make_shared<McpLiveWorkloadService>();
-    const auto runtime_wallet_validation_options = [&] {
-      Options validation = options;
-      const RuntimeWalletSnapshot wallet_snapshot =
-          runtime_wallet_registry.Snapshot();
-      validation.topology = wallet_snapshot.registry().topology();
-      validation.wallet_backed_workload_requested =
-          !wallet_snapshot.wallets().empty();
-      return validation;
-    };
-
-    const auto launch_wallet_workload = MakeLiveWalletWorkloadLauncher(
-        options, events_path, driver, node_inventory, runtime_wallet_registry,
-        transaction_tracker, block_generation_mutex, *workload_service,
-        wallet_workloads, block_generation_workloads,
-        wait_until_height_workloads, wait_for_peers_workloads);
-
-    const auto find_block_generation_workload_record =
-        [block_generation_workloads](std::string_view workload_id) {
-          std::lock_guard<std::mutex> lock(block_generation_workloads->mutex);
-          const auto found = block_generation_workloads->records.find(
-              std::string(workload_id));
-          return found == block_generation_workloads->records.end()
-                     ? std::shared_ptr<LiveBlockGenerationWorkloadRecord>{}
-                     : found->second;
-        };
-    const auto launch_block_generation_workload =
-        MakeLiveBlockGenerationWorkloadLauncher(
-            options, events_path, driver, node_inventory,
-            chain_spec.default_reward_address, block_generation_mutex,
-            [&node_mutation_mutex](std::stop_token mutation_stop_token) {
-              return AcquireNodeMutationLock(node_mutation_mutex,
-                                             mutation_stop_token);
-            },
-            *workload_service, wallet_workloads, block_generation_workloads,
-            wait_until_height_workloads, wait_for_peers_workloads);
-
-    const auto block_generation_operation = MakeLiveBlockGenerationOperation(
-        find_block_generation_workload_record,
-        [&, launch_block_generation_workload](
-            const boost::json::object& workload_value,
-            std::optional<std::string> requested_id,
-            std::stop_token operation_stop_token) {
-          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                       operation_stop_token);
-          const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
-          const BlockGenerationWorkload workload =
-              ParseAndValidateLiveBlockGenerationWorkload(
-                  workload_value, options, current_nodes);
-          return launch_block_generation_workload(workload,
-                                                  std::move(requested_id));
-        },
-        [&](const boost::json::object& workload_value) {
-          const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
-          return ParseAndValidateLiveBlockGenerationWorkload(
-              workload_value, options, current_nodes);
-        },
-        [&](const LiveBlockGenerationWorkloadRecord& record) {
-          WriteLiveBlockGenerationWorkloadState(events_path, options, record);
+    auto [workload_service, launch_wallet_workload, execute_one_shot_workload] =
+        MakeLiveWorkloadServiceBinding(LiveWorkloadServiceBindingContext{
+            .options = options,
+            .events_path = events_path,
+            .metrics_path = metrics_path,
+            .wallet_metrics_path = wallet_metrics_path,
+            .chain_spec = chain_spec,
+            .driver = driver,
+            .node_inventory = node_inventory,
+            .runtime_wallet_registry = runtime_wallet_registry,
+            .transaction_tracker = transaction_tracker,
+            .run_process_state = run_process_state,
+            .peer_connectivity_controller = peer_connectivity_controller,
+            .runtime_topology = runtime_topology,
+            .live_topology_config = live_topology_config,
+            .mcp_application = mcp_application,
+            .node_mutation_mutex = node_mutation_mutex,
+            .one_shot_workload_mutex = one_shot_workload_mutex,
+            .block_generation_mutex = block_generation_mutex,
+            .node_network_state_mutex = node_network_state_mutex,
+            .node_resource_state_mutex = node_resource_state_mutex,
+            .runtime_topology_mutex = runtime_topology_mutex,
+            .lifecycle_epoch = lifecycle_epoch,
+            .next_one_shot_invocation = next_one_shot_invocation,
+            .run_stop_tick = run_stop_tick,
+            .wallet_workloads = wallet_workloads,
+            .block_generation_workloads = block_generation_workloads,
+            .wait_until_height_workloads = wait_until_height_workloads,
+            .wait_for_peers_workloads = wait_for_peers_workloads,
+            .request_simulation_stop = request_simulation_stop,
+            .acquire_node_mutation_lock = AcquireNodeMutationLock,
+            .start_node = StartNodeProcessWithPolicy,
+            .stop_token = stop_token,
         });
-
-    const auto find_wait_until_height_workload_record =
-        [wait_until_height_workloads](std::string_view workload_id) {
-          std::lock_guard<std::mutex> lock(wait_until_height_workloads->mutex);
-          const auto found = wait_until_height_workloads->records.find(
-              std::string(workload_id));
-          return found == wait_until_height_workloads->records.end()
-                     ? std::shared_ptr<LiveWaitUntilHeightWorkloadRecord>{}
-                     : found->second;
-        };
-    const auto launch_wait_until_height_workload =
-        MakeLiveHeightWaitWorkloadLauncher(
-            options, events_path, driver, node_inventory, run_stop_tick,
-            [&node_mutation_mutex](std::stop_token mutation_stop_token) {
-              return AcquireNodeMutationLock(node_mutation_mutex,
-                                             mutation_stop_token);
-            },
-            *workload_service, wallet_workloads, block_generation_workloads,
-            wait_until_height_workloads, wait_for_peers_workloads);
-
-    const auto wait_until_height_operation = MakeLiveWaitUntilHeightOperation(
-        find_wait_until_height_workload_record,
-        [&, launch_wait_until_height_workload](
-            const boost::json::object& workload_value,
-            std::optional<std::string> requested_id,
-            std::stop_token operation_stop_token) {
-          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                       operation_stop_token);
-          const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
-          const WaitUntilHeightWorkload workload =
-              ParseAndValidateLiveWaitUntilHeightWorkload(
-                  workload_value, options, current_nodes);
-          return launch_wait_until_height_workload(workload,
-                                                   std::move(requested_id));
-        },
-        [&](const boost::json::object& workload_value,
-            std::stop_token operation_stop_token) {
-          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                       operation_stop_token);
-          return ParseAndValidateLiveWaitUntilHeightWorkload(
-              workload_value, options, node_inventory.Snapshot());
-        },
-        [&](const LiveWaitUntilHeightWorkloadRecord& record) {
-          WriteLiveWaitUntilHeightWorkloadState(events_path, options, record);
-        });
-
-    const auto find_wait_for_peers_workload_record =
-        [wait_for_peers_workloads](std::string_view workload_id) {
-          std::lock_guard<std::mutex> lock(wait_for_peers_workloads->mutex);
-          const auto found =
-              wait_for_peers_workloads->records.find(std::string(workload_id));
-          return found == wait_for_peers_workloads->records.end()
-                     ? std::shared_ptr<LiveWaitForPeersWorkloadRecord>{}
-                     : found->second;
-        };
-    const auto launch_wait_for_peers_workload =
-        MakeLivePeerWaitWorkloadLauncher(
-            options, events_path, driver, node_inventory, run_stop_tick,
-            [&node_mutation_mutex](std::stop_token mutation_stop_token) {
-              return AcquireNodeMutationLock(node_mutation_mutex,
-                                             mutation_stop_token);
-            },
-            *workload_service, wallet_workloads, block_generation_workloads,
-            wait_until_height_workloads, wait_for_peers_workloads);
-
-    const auto wait_for_peers_operation = MakeLiveWaitForPeersOperation(
-        find_wait_for_peers_workload_record,
-        [&, launch_wait_for_peers_workload](
-            const boost::json::object& workload_value,
-            std::optional<std::string> requested_id,
-            std::stop_token operation_stop_token) {
-          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                       operation_stop_token);
-          const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
-          const WaitForPeersWorkload workload =
-              ParseAndValidateLiveWaitForPeersWorkload(workload_value, options,
-                                                       current_nodes);
-          return launch_wait_for_peers_workload(workload,
-                                                std::move(requested_id));
-        },
-        [&](const boost::json::object& workload_value,
-            std::stop_token operation_stop_token) {
-          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                       operation_stop_token);
-          return ParseAndValidateLiveWaitForPeersWorkload(
-              workload_value, options, node_inventory.Snapshot());
-        },
-        [&](const LiveWaitForPeersWorkloadRecord& record) {
-          WriteLiveWaitForPeersWorkloadState(events_path, options, record);
-        });
-
-    const auto dispatch_one_shot_workload =
-        [&](const ScenarioWorkload& scenario_workload,
-            const RuntimeNodeSnapshot& nodes, std::uint32_t action_index,
-            std::uint32_t action_count, std::stop_token operation_stop_token,
-            SimulationCommandControl* cancellation_commit_control = nullptr) {
-          DispatchOneShotWorkload(
-              OneShotWorkloadContext{
-                  .options = options,
-                  .events_path = events_path,
-                  .metrics_path = metrics_path,
-                  .wallet_metrics_path = wallet_metrics_path,
-                  .chain_spec = chain_spec,
-                  .driver = driver,
-                  .peer_connectivity_controller = peer_connectivity_controller,
-                  .runtime_topology = runtime_topology,
-                  .runtime_wallet_registry = runtime_wallet_registry,
-                  .transaction_tracker = transaction_tracker,
-                  .run_process_state = run_process_state,
-                  .node_network_state_mutex = node_network_state_mutex,
-                  .node_resource_state_mutex = node_resource_state_mutex,
-                  .runtime_topology_mutex = runtime_topology_mutex,
-                  .block_generation_mutex = block_generation_mutex,
-                  .lifecycle_epoch = lifecycle_epoch,
-                  .start_node = StartNodeProcessWithPolicy,
-                  .stop_token = stop_token,
-              },
-              scenario_workload, nodes, action_index, action_count,
-              operation_stop_token, cancellation_commit_control);
-        };
-
-    const auto execute_one_shot_workload =
-        [&](const ScenarioWorkload& scenario_workload,
-            std::uint32_t action_index, std::uint32_t action_count,
-            std::stop_token operation_stop_token) {
-          auto one_shot_lock = AcquireNodeMutationLock(one_shot_workload_mutex,
-                                                       operation_stop_token);
-          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                       operation_stop_token);
-          const RuntimeNodeSnapshot current_nodes = node_inventory.Snapshot();
-          dispatch_one_shot_workload(scenario_workload, current_nodes,
-                                     action_index, action_count,
-                                     operation_stop_token);
-        };
-
-    const auto invoke_one_shot_workload = MakeOneShotWorkloadInvoker(
-        options, node_inventory, runtime_wallet_registry, live_topology_config,
-        one_shot_workload_mutex, node_mutation_mutex, next_one_shot_invocation,
-        mcp_application, request_simulation_stop, AcquireNodeMutationLock,
-        dispatch_one_shot_workload, stop_token);
-
-    const auto wallet_workload_operation = MakeLiveWalletWorkloadOperation(
-        wallet_workloads,
-        [&, launch_wallet_workload, runtime_wallet_validation_options](
-            const boost::json::object& workload_value,
-            std::optional<std::string> requested_id,
-            std::stop_token operation_stop_token) {
-          auto mutation_lock = AcquireNodeMutationLock(node_mutation_mutex,
-                                                       operation_stop_token);
-          const Options validation_options =
-              runtime_wallet_validation_options();
-          const WalletTransactionsWorkload workload =
-              ParseAndValidateWalletTransactionsWorkload(workload_value,
-                                                         validation_options);
-          return launch_wallet_workload(workload, std::move(requested_id));
-        },
-        [runtime_wallet_validation_options](
-            const boost::json::object& workload_value) {
-          const Options validation_options =
-              runtime_wallet_validation_options();
-          return ParseAndValidateWalletTransactionsWorkload(workload_value,
-                                                            validation_options);
-        },
-        [&](const WalletTransactionsWorkload& workload) {
-          RuntimeWalletSnapshot wallet_snapshot =
-              runtime_wallet_registry.Snapshot();
-          Options validation = options;
-          validation.topology = wallet_snapshot.registry().topology();
-          validation.wallet_backed_workload_requested =
-              !wallet_snapshot.wallets().empty();
-          ValidateWalletTransactionsWorkload(workload, validation);
-          return wallet_snapshot;
-        });
-
-    workload_service->operation = [&, wallet_workload_operation,
-                                   invoke_one_shot_workload,
-                                   find_block_generation_workload_record,
-                                   block_generation_operation,
-                                   find_wait_until_height_workload_record,
-                                   wait_until_height_operation,
-                                   find_wait_for_peers_workload_record,
-                                   wait_for_peers_operation](
-                                      McpOperationKind kind,
-                                      const boost::json::object& arguments,
-                                      std::stop_token operation_stop_token) {
-      if (kind == McpOperationKind::kInvokeWorkload) {
-        const boost::json::value* workload = arguments.if_contains("workload");
-        if (workload == nullptr || !workload->is_object()) {
-          throw std::invalid_argument(
-              "workload.invoke requires a workload object");
-        }
-        return invoke_one_shot_workload(workload->as_object(),
-                                        operation_stop_token);
-      }
-      if (kind == McpOperationKind::kStartWorkload) {
-        const boost::json::value* workload_value =
-            arguments.if_contains("workload");
-        if (workload_value != nullptr && workload_value->is_object()) {
-          const boost::json::value* type =
-              workload_value->as_object().if_contains("type");
-          if (type != nullptr && type->is_string()) {
-            if (type->as_string() == "block_generation") {
-              return block_generation_operation(kind, arguments,
-                                                operation_stop_token);
-            }
-            if (type->as_string() == "wait_until_height") {
-              return wait_until_height_operation(kind, arguments,
-                                                 operation_stop_token);
-            }
-            if (type->as_string() == "wait_for_peers") {
-              return wait_for_peers_operation(kind, arguments,
-                                              operation_stop_token);
-            }
-          }
-        }
-      } else {
-        const boost::json::value* workload_id =
-            arguments.if_contains("workload_id");
-        if (workload_id != nullptr && workload_id->is_string()) {
-          if (find_block_generation_workload_record(workload_id->as_string())) {
-            return block_generation_operation(kind, arguments,
-                                              operation_stop_token);
-          }
-          if (find_wait_until_height_workload_record(
-                  workload_id->as_string())) {
-            return wait_until_height_operation(kind, arguments,
-                                               operation_stop_token);
-          }
-          if (find_wait_for_peers_workload_record(workload_id->as_string())) {
-            return wait_for_peers_operation(kind, arguments,
-                                            operation_stop_token);
-          }
-        }
-      }
-      return wallet_workload_operation(kind, arguments, operation_stop_token);
-    };
-    workload_service->read =
-        [wallet_workloads, block_generation_workloads,
-         wait_until_height_workloads, wait_for_peers_workloads](
-            bool history, std::stop_token read_stop_token) {
-          return ReadLiveWorkloads(wallet_workloads, block_generation_workloads,
-                                   wait_until_height_workloads,
-                                   wait_for_peers_workloads, history,
-                                   read_stop_token);
-        };
     installed_workload_service = workload_service;
     mcp_application.SetWorkloadService(workload_service);
     workload_service.reset();
