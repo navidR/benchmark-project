@@ -920,11 +920,56 @@ BOOST_AUTO_TEST_CASE(
           .as_object()
           .at("resources")
           .as_array();
-  BOOST_REQUIRE_EQUAL(resources.size(), 2U);
+  BOOST_REQUIRE_GE(resources.size(), 2U);
   BOOST_TEST(resources[0].as_object().at("uri").as_string() ==
              "bbp:///capabilities");
   BOOST_TEST(resources[1].as_object().at("uri").as_string() ==
              "bbp:///schemas");
+
+  // Every advertised reusable contract must be readable on this filtered
+  // endpoint, without a run or an application resource callback.
+  const boost::json::array discovered_resources = resources;
+  bool found_scenario = false;
+  bool found_error = false;
+  for (const auto& resource : discovered_resources) {
+    const std::string uri(resource.as_object().at("uri").as_string());
+    if (!uri.starts_with("bbp:///schemas/")) {
+      continue;
+    }
+    found_scenario = found_scenario || uri == "bbp:///schemas/scenario";
+    found_error = found_error || uri == "bbp:///schemas/results/error";
+    BOOST_TEST(uri != "bbp:///schemas/results/mutation");
+    const auto read = protocol.Handle(ProtocolRequest(
+        http::verb::post,
+        RequestBody(40U, "resources/read", boost::json::object{{"uri", uri}}),
+        session));
+    const auto result = boost::json::parse(read.body()).as_object();
+    BOOST_REQUIRE(result.contains("result"));
+    const auto& content = result.at("result")
+                              .as_object()
+                              .at("contents")
+                              .as_array()
+                              .front()
+                              .as_object();
+    BOOST_TEST(content.at("mimeType").as_string() == "application/schema+json");
+    const auto schema = boost::json::parse(content.at("text").as_string());
+    BOOST_REQUIRE(schema.is_object());
+    BOOST_TEST(schema.as_object().contains("$schema"));
+  }
+  BOOST_TEST(found_scenario);
+  BOOST_TEST(found_error);
+  const auto hidden_schema = protocol.Handle(ProtocolRequest(
+      http::verb::post,
+      RequestBody(
+          41U, "resources/read",
+          boost::json::object{{"uri", "bbp:///schemas/results/mutation"}}),
+      session));
+  BOOST_TEST(boost::json::parse(hidden_schema.body())
+                 .as_object()
+                 .at("error")
+                 .as_object()
+                 .at("code")
+                 .as_int64() == -32002);
 
   const auto capabilities_response = protocol.Handle(ProtocolRequest(
       http::verb::post,

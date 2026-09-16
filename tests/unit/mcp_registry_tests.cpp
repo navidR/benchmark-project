@@ -5,7 +5,9 @@
 #include <boost/test/unit_test.hpp>
 #include <cstddef>
 #include <limits>
+#include <regex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -15,7 +17,9 @@
 #include "bbp/default_peer_topology.h"
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/mcp_registry.h"
+#include "bbp/positive_duration.h"
 #include "bbp/scenario_fields.h"
+#include "bbp/scenario_service.h"
 #include "bbp/simulation_command.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/simulator/workload_kind.h"
@@ -240,7 +244,8 @@ void RequirePositiveWorkloadTimeouts(const boost::json::object& schema,
       WorkloadKind::kRestoreEdge,        WorkloadKind::kSendRawTransaction,
       WorkloadKind::kWalletTransactions,
   };
-  const boost::json::array& variants = schema.at("oneOf").as_array();
+  const boost::json::array& variants =
+      schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array();
   for (const WorkloadKind kind : kKinds) {
     const boost::json::object& variant =
         VariantWithConst(variants, discriminator, WorkloadKindName(kind));
@@ -251,7 +256,8 @@ void RequirePositiveWorkloadTimeouts(const boost::json::object& schema,
 void RequirePositiveWalletSendTimeout(const boost::json::object& schema,
                                       std::string_view discriminator) {
   const boost::json::object& variant = VariantWithConst(
-      schema.at("oneOf").as_array(), discriminator,
+      schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+      discriminator,
       SimulationCommandKindName(SimulationCommandKind::kSendWalletTransaction));
   const boost::json::object& wallet_send =
       variant.at("properties").as_object().at("wallet_send").as_object();
@@ -260,18 +266,18 @@ void RequirePositiveWalletSendTimeout(const boost::json::object& schema,
 
 void RequireNoSetEdgeConditionTimeout(const boost::json::object& schema,
                                       std::string_view discriminator) {
-  const boost::json::object& variant =
-      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
-                       WorkloadKindName(WorkloadKind::kSetEdgeCondition));
+  const boost::json::object& variant = VariantWithConst(
+      schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+      discriminator, WorkloadKindName(WorkloadKind::kSetEdgeCondition));
   BOOST_TEST(!variant.at("properties").as_object().contains("timeout_sec"));
 }
 
 void RequireSetEdgeConditionField(const boost::json::object& schema,
                                   std::string_view discriminator,
                                   bool scheduled) {
-  const boost::json::object& variant =
-      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
-                       WorkloadKindName(WorkloadKind::kSetEdgeCondition));
+  const boost::json::object& variant = VariantWithConst(
+      schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+      discriminator, WorkloadKindName(WorkloadKind::kSetEdgeCondition));
   std::set<std::string> required{std::string(discriminator), "from", "to"};
   if (scheduled) {
     required.emplace("at");
@@ -314,16 +320,17 @@ void RequireEdgeActionFields(const boost::json::object& schema,
   }
   for (const WorkloadKind kind : kEdgeActionKinds) {
     const boost::json::object& variant = VariantWithConst(
-        schema.at("oneOf").as_array(), discriminator, WorkloadKindName(kind));
+        schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+        discriminator, WorkloadKindName(kind));
     BOOST_TEST(PropertySet(variant) == expected);
   }
 }
 
 void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
                                             std::string_view discriminator) {
-  const boost::json::object& block_generation =
-      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
-                       WorkloadKindName(WorkloadKind::kBlockGeneration));
+  const boost::json::object& block_generation = VariantWithConst(
+      schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+      discriminator, WorkloadKindName(WorkloadKind::kBlockGeneration));
   const boost::json::object& properties =
       block_generation.at("properties").as_object();
   BOOST_TEST(properties.contains("node"));
@@ -340,9 +347,9 @@ void RequireSingleNodeBlockGenerationSchema(const boost::json::object& schema,
 
 void RequireSingleNodeHeightWaitSchema(const boost::json::object& schema,
                                        std::string_view discriminator) {
-  const boost::json::object& height_wait =
-      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
-                       WorkloadKindName(WorkloadKind::kWaitUntilHeight));
+  const boost::json::object& height_wait = VariantWithConst(
+      schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+      discriminator, WorkloadKindName(WorkloadKind::kWaitUntilHeight));
   const boost::json::object& properties =
       height_wait.at("properties").as_object();
   BOOST_TEST(properties.contains("node"));
@@ -357,9 +364,9 @@ void RequireSingleNodeHeightWaitSchema(const boost::json::object& schema,
 
 void RequireSingleNodePeerWaitSchema(const boost::json::object& schema,
                                      std::string_view discriminator) {
-  const boost::json::object& peer_wait =
-      VariantWithConst(schema.at("oneOf").as_array(), discriminator,
-                       WorkloadKindName(WorkloadKind::kWaitForPeers));
+  const boost::json::object& peer_wait = VariantWithConst(
+      schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+      discriminator, WorkloadKindName(WorkloadKind::kWaitForPeers));
   const boost::json::object& properties =
       peer_wait.at("properties").as_object();
   BOOST_TEST(properties.contains("node"));
@@ -702,7 +709,18 @@ BOOST_AUTO_TEST_CASE(mcp_registry_exposes_every_information_family_and_bound) {
   const auto families = NamedSet(ArrayField(document, "information_families"));
   BOOST_TEST(families.size() ==
              static_cast<std::size_t>(McpInformationFamily::kCount));
-  BOOST_TEST(BuildMcpResourceRegistry().size() == families.size());
+  const boost::json::array resources = BuildMcpResourceRegistry();
+  const auto resource_names = NamedSet(resources);
+  for (const std::string& family : families) {
+    BOOST_TEST(resource_names.contains(family));
+  }
+  for (const boost::json::value& resource : resources) {
+    const boost::json::object& descriptor = resource.as_object();
+    if (!families.contains(std::string(descriptor.at("name").as_string()))) {
+      BOOST_TEST(std::string_view(descriptor.at("uri").as_string())
+                     .starts_with("bbp:///schemas/"));
+    }
+  }
   BOOST_TEST(BuildMcpToolRegistry().size() ==
              static_cast<std::size_t>(McpOperationKind::kCount));
   const auto results = NamedSet(ArrayField(document, "result_families"));
@@ -784,6 +802,131 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_object_schemas_match_every_descriptor) {
   BOOST_TEST(scenario.at("allOf").as_array().size() ==
              static_cast<std::size_t>(ChainKind::kCount) * 2U + 2U);
   RequireClosedSchemaTree(scenario);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_resolved_schema_covers_the_production_document) {
+  const boost::json::object schema = BuildMcpResolvedScenarioSchema();
+  const boost::json::object resolved = ResolveScenario(boost::json::object{
+      {"chain", "firo"},
+      {"chain_daemon", "/bin/true"},
+      {"run_id", "mcp-resolved-schema"},
+      {"nodes", 1U},
+      {"block_production", boost::json::object{{"enabled", false}}}});
+  const auto require_members = [](const boost::json::object& object,
+                                  const boost::json::object& object_schema) {
+    const boost::json::object& properties =
+        object_schema.at("properties").as_object();
+    for (const auto& member : object) {
+      BOOST_TEST(properties.contains(member.key()));
+    }
+    for (const boost::json::value& field :
+         object_schema.at("required").as_array()) {
+      BOOST_TEST(object.contains(field.as_string()));
+    }
+  };
+  require_members(resolved, schema);
+  const boost::json::object& properties = schema.at("properties").as_object();
+  require_members(resolved.at("simulation").as_object(),
+                  properties.at("simulation").as_object());
+  require_members(
+      resolved.at("node_configs").as_array().front().as_object(),
+      properties.at("node_configs").as_object().at("items").as_object());
+  RequireClosedSchemaTree(schema);
+  const boost::json::object result =
+      BuildMcpResultSchema(McpResultFamily::kScenario);
+  BOOST_TEST(result.at("properties").as_object().at("scenario").as_object() ==
+             schema);
+  const boost::json::object input = BuildMcpScenarioSchema();
+  BOOST_TEST(!input.at("properties").as_object().contains("node_configs"));
+  BOOST_TEST(input.contains("allOf"));
+  BOOST_TEST(!schema.contains("allOf"));
+}
+
+BOOST_AUTO_TEST_CASE(mcp_scenario_identifiers_match_safe_production_names) {
+  const boost::json::object scenario = BuildMcpScenarioSchema();
+  const boost::json::object& properties = scenario.at("properties").as_object();
+  const boost::json::object& node =
+      SchemaWithType(properties.at("nodes").as_object().at("oneOf").as_array(),
+                     "array")
+          .at("items")
+          .as_object();
+  const boost::json::object& identifier =
+      node.at("properties").as_object().at("id").as_object();
+  BOOST_TEST(identifier.at("minLength").as_uint64() == 1U);
+  BOOST_TEST(identifier.at("maxLength").as_uint64() == 32U);
+  const std::regex pattern(std::string(identifier.at("pattern").as_string()));
+  for (const std::string& accepted :
+       {std::string("_node"), std::string("-node"), std::string(32U, 'a')}) {
+    BOOST_TEST(std::regex_match(accepted, pattern));
+  }
+  for (const std::string& rejected :
+       {std::string{}, std::string("node.name"), std::string(33U, 'a')}) {
+    BOOST_TEST(!std::regex_match(rejected, pattern));
+  }
+  BOOST_TEST(properties.at("run_id").as_object() == identifier);
+  for (const McpResultFamily family :
+       {McpResultFamily::kRunLifecycle, McpResultFamily::kRuntimeCommand,
+        McpResultFamily::kMutation, McpResultFamily::kRoleMutation,
+        McpResultFamily::kWorkload, McpResultFamily::kWorkloadInvocation,
+        McpResultFamily::kInstrumentation, McpResultFamily::kEvidencePage,
+        McpResultFamily::kArtifactContent, McpResultFamily::kCleanup}) {
+    const boost::json::object result = BuildMcpResultSchema(family);
+    BOOST_TEST(result.at("properties").as_object().at("run_id").as_object() ==
+               identifier);
+  }
+  const boost::json::object stop =
+      BuildMcpOperationInputSchema(McpOperationKind::kStopRun);
+  BOOST_TEST(stop.at("properties").as_object().at("run_id").as_object() ==
+             identifier);
+  BOOST_TEST(properties.at("simulation")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("name")
+                 .as_object() == identifier);
+  for (const std::string_view section : {"resources", "network"}) {
+    BOOST_TEST(node.at("properties")
+                   .as_object()
+                   .at(section)
+                   .as_object()
+                   .at("properties")
+                   .as_object()
+                   .at("profile")
+                   .as_object() == identifier);
+  }
+  for (const std::string_view section :
+       {"resource_profiles", "network_profiles"}) {
+    const boost::json::object& patterns =
+        properties.at(section).as_object().at("patternProperties").as_object();
+    BOOST_TEST(patterns.size() == 1U);
+    BOOST_TEST(patterns.begin()->key() == identifier.at("pattern").as_string());
+  }
+  const boost::json::object peer =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kPeerConnectivity);
+  BOOST_TEST(SchemaWithType(peer.at("properties")
+                                .as_object()
+                                .at("node")
+                                .as_object()
+                                .at("oneOf")
+                                .as_array(),
+                            "string") == identifier);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_duration_schema_publishes_the_production_grammar) {
+  const boost::json::object simulation =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kSimulation);
+  const boost::json::object& duration =
+      simulation.at("properties").as_object().at("duration").as_object();
+  const std::regex pattern(std::string(duration.at("pattern").as_string()));
+  for (const std::string accepted : {"1ms", "002s", "3m", "1h"}) {
+    BOOST_TEST(std::regex_match(accepted, pattern));
+    BOOST_CHECK_NO_THROW(PositiveDuration::Parse(accepted));
+  }
+  for (const std::string rejected : {"0ms", "000s", "-1s", "1.5s", "2", "1d"}) {
+    BOOST_TEST(!std::regex_match(rejected, pattern));
+    BOOST_CHECK_THROW(PositiveDuration::Parse(rejected), std::runtime_error);
+  }
+  BOOST_TEST(!duration.at("description").as_string().empty());
 }
 
 BOOST_AUTO_TEST_CASE(mcp_bandwidth_schema_uses_unsigned_decimal_kilobytes) {
@@ -889,7 +1032,7 @@ BOOST_AUTO_TEST_CASE(mcp_network_condition_loss_fields_are_mutually_exclusive) {
                                             .as_object()
                                             .at("items")
                                             .as_object()
-                                            .at("oneOf")
+                                            .at("anyOf")
                                             .as_array();
   for (const WorkloadKind kind :
        {WorkloadKind::kSetNetworkCondition, WorkloadKind::kSetEdgeCondition}) {
@@ -1523,7 +1666,7 @@ BOOST_AUTO_TEST_CASE(mcp_scheduled_events_cover_every_registered_action) {
                                            .as_object()
                                            .at("items")
                                            .as_object()
-                                           .at("oneOf")
+                                           .at("anyOf")
                                            .as_array();
   BOOST_REQUIRE(variants.size() ==
                 static_cast<std::size_t>(WorkloadKind::kCount) +
@@ -1561,7 +1704,7 @@ BOOST_AUTO_TEST_CASE(
           .as_object()
           .at("items")
           .as_object()
-          .at("oneOf")
+          .at("anyOf")
           .as_array();
   const std::array role_commands{
       std::pair{SimulationCommandKind::kAssignRole,
@@ -2087,7 +2230,7 @@ BOOST_AUTO_TEST_CASE(mcp_node_add_schema_is_shared_and_matches_runtime_bounds) {
                                                      .as_object()
                                                      .at("items")
                                                      .as_object()
-                                                     .at("oneOf")
+                                                     .at("anyOf")
                                                      .as_array();
   const boost::json::object& scheduled =
       VariantWithConst(scheduled_variants, "action", "add_nodes");
@@ -2472,7 +2615,7 @@ BOOST_AUTO_TEST_CASE(
                                                      .as_object()
                                                      .at("items")
                                                      .as_object()
-                                                     .at("oneOf")
+                                                     .at("anyOf")
                                                      .as_array();
   const boost::json::object& scheduled =
       VariantWithConst(scheduled_variants, "action", "remove_nodes");
@@ -2539,9 +2682,9 @@ BOOST_AUTO_TEST_CASE(
   };
   const auto require_wallet_schema = [&](const boost::json::object& schema,
                                          std::string_view discriminator) {
-    const boost::json::object& wallet =
-        VariantWithConst(schema.at("oneOf").as_array(), discriminator,
-                         WorkloadKindName(WorkloadKind::kWalletTransactions));
+    const boost::json::object& wallet = VariantWithConst(
+        schema.at(discriminator == "action" ? "anyOf" : "oneOf").as_array(),
+        discriminator, WorkloadKindName(WorkloadKind::kWalletTransactions));
     const boost::json::object& properties = wallet.at("properties").as_object();
     for (const std::string_view field : rejected_fields) {
       BOOST_TEST(!properties.contains(field));
@@ -2668,6 +2811,20 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
     const boost::json::object& tool = tools[index].as_object();
     BOOST_TEST(tool.at("name").as_string() == McpOperationKindName(operation));
     const boost::json::object& input = tool.at("inputSchema").as_object();
+    const boost::json::object& metadata = tool.at("_meta").as_object();
+    const std::string result_family(
+        McpResultFamilyName(McpOperationResultFamily(operation)));
+    BOOST_TEST(metadata.at("bbp/result_family").as_string() == result_family);
+    BOOST_TEST(metadata.at("bbp/result_schema").as_string() ==
+               "bbp:///schemas/results/" + result_family);
+    BOOST_TEST(metadata.at("bbp/error_schema").as_string() ==
+               "bbp:///schemas/results/error");
+    const boost::json::object& input_properties =
+        input.at("properties").as_object();
+    BOOST_TEST(metadata.contains("bbp/scenario_schema") ==
+               input_properties.contains("scenario"));
+    BOOST_TEST(metadata.contains("bbp/simulation_command_schema") ==
+               input_properties.contains("command"));
     BOOST_TEST(input.at("additionalProperties").as_bool() == false);
     RequireClosedSchemaTree(input);
     const boost::json::object& output = tool.at("outputSchema").as_object();
@@ -2822,6 +2979,56 @@ BOOST_AUTO_TEST_CASE(mcp_tool_and_result_schemas_have_mechanical_parity) {
                    .as_object()
                    .at("const")
                    .as_string() == operation_name);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(mcp_evidence_page_items_inherit_page_run_identity) {
+  const boost::json::object page =
+      BuildMcpResultSchema(McpResultFamily::kEvidencePage);
+  const boost::json::object subscription =
+      BuildMcpResultSchema(McpResultFamily::kSubscription);
+  const auto& page_item = page.at("properties")
+                              .as_object()
+                              .at("items")
+                              .as_object()
+                              .at("items")
+                              .as_object();
+  const auto& subscription_item = subscription.at("properties")
+                                      .as_object()
+                                      .at("items")
+                                      .as_object()
+                                      .at("items")
+                                      .as_object();
+  BOOST_TEST(StringSet(page.at("required").as_array()).contains("run_id"));
+  BOOST_TEST(StringSet(page_item.at("required").as_array()) ==
+             std::set<std::string>({"family", "sequence", "timestamp_ms"}));
+  BOOST_TEST(page_item.at("properties") == subscription_item.at("properties"));
+  BOOST_TEST(
+      StringSet(subscription_item.at("required").as_array()) ==
+      std::set<std::string>({"run_id", "family", "sequence", "timestamp_ms"}));
+  constexpr std::array operations{McpOperationKind::kCreateSubscription};
+  const boost::json::object notifications =
+      BuildMcpNotificationDiscovery(operations);
+  BOOST_TEST(notifications.at("schemas")
+                 .as_object()
+                 .at(kMcpSubscriptionUpdatedNotification)
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("item")
+                 .as_object() == subscription_item);
+}
+
+BOOST_AUTO_TEST_CASE(mcp_tool_metadata_omits_unavailable_schema_resources) {
+  constexpr std::array operations{McpOperationKind::kValidateScenario,
+                                  McpOperationKind::kInvokeRuntimeCommand};
+  constexpr std::array families{McpInformationFamily::kCapabilities};
+  const boost::json::array tools = BuildMcpToolRegistry(operations, families);
+  for (const boost::json::value& tool : tools) {
+    const boost::json::object& metadata =
+        tool.as_object().at("_meta").as_object();
+    BOOST_TEST(metadata.size() == 1U);
+    BOOST_TEST(metadata.contains("bbp/result_family"));
   }
 }
 

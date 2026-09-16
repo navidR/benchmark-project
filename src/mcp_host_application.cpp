@@ -238,24 +238,6 @@ boost::json::object ResourceEnvelope(std::string_view host_id,
   return result;
 }
 
-boost::json::object BuildSchemaDocument(
-    std::span<const McpOperationKind> operations,
-    std::span<const McpInformationFamily> information_families) {
-  boost::json::object operation_schemas;
-  for (const McpOperationKind operation : operations) {
-    operation_schemas[McpOperationKindName(operation)] = boost::json::object{
-        {"input",
-         BuildMcpOperationInputSchema(operation, information_families)},
-        {"output", BuildMcpOperationOutputSchema(operation, operations)}};
-  }
-  return boost::json::object{
-      {"scenario", BuildMcpScenarioSchema()},
-      {"simulation_command", BuildMcpSimulationCommandSchema()},
-      {"operations", std::move(operation_schemas)},
-      {"resources", BuildMcpResourceRegistry(information_families)},
-  };
-}
-
 }  // namespace
 
 McpHostApplication::McpHostApplication(Config config)
@@ -464,7 +446,7 @@ boost::json::value McpHostApplication::ReadResource(
   if (family == McpInformationFamily::kSchemas) {
     return ResourceEnvelope(
         config_.host_id, run ? &*run : nullptr, family,
-        BuildSchemaDocument(operations, information_families));
+        BuildMcpSchemaDocument(operations, information_families));
   }
   if (family == McpInformationFamily::kRunRegistry) {
     std::vector<McpRetainedRunSnapshot> retained;

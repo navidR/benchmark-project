@@ -194,22 +194,11 @@ boost::json::array NamedInformationFamilyArray(
 
 boost::json::array NamedResultFamilyArray(
     std::span<const McpOperationKind> operations) {
-  std::array<bool, EnumCount(McpResultFamily::kCount)> selected{};
-  for (const McpOperationKind operation : operations) {
-    selected[EnumCount(McpOperationResultFamily(operation))] = true;
-  }
-  if (!operations.empty()) {
-    selected[EnumCount(McpResultFamily::kOperation)] = true;
-    selected[EnumCount(McpResultFamily::kError)] = true;
-  }
   boost::json::array result;
-  for (std::size_t index = 0U; index < selected.size(); ++index) {
-    if (!selected[index]) {
-      continue;
-    }
+  for (const McpResultFamily family : McpOperationResultFamilies(operations)) {
+    const auto& descriptor = kResultFamilies[EnumCount(family)];
     result.emplace_back(boost::json::object{
-        {"name", kResultFamilies[index].name},
-        {"description", kResultFamilies[index].description}});
+        {"name", descriptor.name}, {"description", descriptor.description}});
   }
   return result;
 }
@@ -292,6 +281,25 @@ std::optional<boost::json::object> McpUnavailableBuildOperationResult(
   return std::nullopt;
 }
 
+std::vector<McpResultFamily> McpOperationResultFamilies(
+    std::span<const McpOperationKind> operations) {
+  std::array<bool, EnumCount(McpResultFamily::kCount)> selected{};
+  for (const McpOperationKind operation : operations) {
+    selected.at(EnumCount(McpOperationResultFamily(operation))) = true;
+  }
+  if (!operations.empty()) {
+    selected[EnumCount(McpResultFamily::kOperation)] = true;
+    selected[EnumCount(McpResultFamily::kError)] = true;
+  }
+  std::vector<McpResultFamily> result;
+  for (std::size_t index = 0U; index < selected.size(); ++index) {
+    if (selected[index]) {
+      result.push_back(static_cast<McpResultFamily>(index));
+    }
+  }
+  return result;
+}
+
 boost::json::array BuildMcpResourceRegistry() {
   std::array<McpInformationFamily, EnumCount(McpInformationFamily::kCount)>
       information_families{};
@@ -302,6 +310,17 @@ boost::json::array BuildMcpResourceRegistry() {
 }
 
 boost::json::array BuildMcpResourceRegistry(
+    std::span<const McpInformationFamily> information_families) {
+  std::array<McpOperationKind, EnumCount(McpOperationKind::kCount)>
+      operations{};
+  for (std::size_t index = 0U; index < operations.size(); ++index) {
+    operations[index] = static_cast<McpOperationKind>(index);
+  }
+  return BuildMcpResourceRegistry(operations, information_families);
+}
+
+boost::json::array BuildMcpResourceRegistry(
+    std::span<const McpOperationKind> operations,
     std::span<const McpInformationFamily> information_families) {
   boost::json::array resources;
   resources.reserve(information_families.size());
@@ -316,6 +335,14 @@ boost::json::array BuildMcpResourceRegistry(
                             {"name", descriptor.name},
                             {"description", descriptor.description},
                             {"mimeType", "application/json"}});
+  }
+  for (const McpInformationFamily family : information_families) {
+    if (family == McpInformationFamily::kSchemas) {
+      for (auto& resource : BuildMcpSchemaResourceRegistry(operations)) {
+        resources.push_back(std::move(resource));
+      }
+      break;
+    }
   }
   return resources;
 }

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
@@ -251,7 +252,7 @@ boost::json::object LatencyMatrixCellSchema() {
 }
 
 boost::json::object NodeSelectorSchema() {
-  return OneOf({IdentifierSchema(), IntegerSchema(1U)});
+  return OneOf({NodeAddIdentifierSchema(), IntegerSchema(1U)});
 }
 
 boost::json::object NodeSelectorArraySchema(std::size_t minimum = 1U) {
@@ -270,7 +271,14 @@ boost::json::object Fixed8AmountSchema() {
 
 boost::json::object DurationSchema() {
   return boost::json::object{
-      {"type", "string"}, {"minLength", 2U}, {"maxLength", 64U}};
+      {"type", "string"},
+      {"minLength", 2U},
+      {"maxLength", 64U},
+      {"pattern", "^0*[1-9][0-9]*(?:ms|s|m|h)$"},
+      {"description",
+       "Positive integer followed by ms, s, m, or h (milliseconds, seconds, "
+       "minutes, or hours). The converted duration must fit signed 64-bit "
+       "milliseconds."}};
 }
 
 boost::json::object DistributionSchema() {
@@ -415,8 +423,13 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "write_operations_per_sec") {
     return Uint64Schema();
   }
-  if (field == "id" || field == "name" || field == "profile" ||
-      field == "run_id") {
+  if (field == "name" || field == "profile") {
+    return NodeAddIdentifierSchema();
+  }
+  if (field == "run_id") {
+    return RunIdentifierSchema();
+  }
+  if (field == "id") {
     return IdentifierSchema();
   }
   if (field == "cleanup_policy") {
@@ -516,7 +529,7 @@ boost::json::object ResourceLimitsSchema() {
 
 boost::json::object PatternMapSchema(boost::json::object value_schema) {
   boost::json::object patterns;
-  patterns["^[A-Za-z0-9][A-Za-z0-9_.-]*$"] = std::move(value_schema);
+  patterns["^[A-Za-z0-9_-]{1,32}$"] = std::move(value_schema);
   return boost::json::object{{"type", "object"},
                              {"patternProperties", std::move(patterns)},
                              {"additionalProperties", false}};
@@ -735,11 +748,12 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
       break;
     case WorkloadKind::kSetResourceProfile:
     case WorkloadKind::kSetNetworkProfile:
-      properties["nodes"] = OneOf(
-          {ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true),
-           boost::json::object{
-               {"type", "string"},
-               {"pattern", "^role:(?:base|node|wallet|miner)$"}}});
+      properties["nodes"] =
+          OneOf({ArraySchema(NodeAddIdentifierSchema(), 1U,
+                             kMaximumSafeCollection, true),
+                 boost::json::object{
+                     {"type", "string"},
+                     {"pattern", "^role:(?:base|node|wallet|miner)$"}}});
       require({"nodes", "profile"});
       break;
     case WorkloadKind::kResourcePressure:
@@ -888,7 +902,7 @@ boost::json::object ScheduledEventSchema() {
     variants.push_back(CommandVariant(static_cast<SimulationCommandKind>(index),
                                       "action", true));
   }
-  return boost::json::object{{"oneOf", std::move(variants)}};
+  return boost::json::object{{"anyOf", std::move(variants)}};
 }
 
 boost::json::object ChainSchema() {
@@ -1111,7 +1125,7 @@ boost::json::object InstrumentationTargetSchema() {
                       Required({"kind", "id", "node_ids"}));
 }
 
-boost::json::object EvidenceRecordSchema() {
+boost::json::object EvidenceRecordSchema(bool require_run_id = true) {
   boost::json::object properties;
   properties["run_id"] = IdentifierSchema();
   properties["family"] = InformationFamilySchema();
@@ -1124,7 +1138,9 @@ boost::json::object EvidenceRecordSchema() {
   properties["data"] = boost::json::object{};
   return ClosedObject(
       std::move(properties),
-      Required({"run_id", "family", "sequence", "timestamp_ms"}));
+      require_run_id
+          ? Required({"run_id", "family", "sequence", "timestamp_ms"})
+          : Required({"family", "sequence", "timestamp_ms"}));
 }
 
 boost::json::object ExactAccountingSchema() {
@@ -1247,6 +1263,7 @@ boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind) {
       required = Required({"driver", "default_binary"});
       break;
     case ScenarioObjectKind::kNode:
+      properties["id"] = NodeAddIdentifierSchema();
       properties["chain"] =
           StringEnumSchema(EnumNames(ChainKind::kCount, [](ChainKind chain) {
             return ChainKindName(chain);
@@ -1553,6 +1570,218 @@ boost::json::object BuildMcpScenarioSchema() {
   return schema;
 }
 
+boost::json::object BuildMcpResolvedScenarioSchema() {
+  boost::json::object schema = BuildMcpScenarioSchema();
+  // Resolved documents retain both daemon aliases and computed values. The
+  // input-only alias exclusions do not apply to the serializer's output.
+  schema.erase("allOf");
+  schema.erase("x-bbp-members");
+  schema["description"] =
+      "Canonical resolved scenario with defaults, computed timing, node "
+      "configurations, and redacted RPC credentials. This is an output "
+      "document; scenario inputs use the separate source scenario schema.";
+  boost::json::object& properties = schema.at("properties").as_object();
+  const boost::json::object milliseconds = IntegerSchema(
+      0U, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+  properties["nodes"] = IntegerSchema();
+  properties["generate_node"] = Nullable(IntegerSchema(1U));
+  properties["chains"].as_object().erase("minProperties");
+  // Empty editor scenarios resolve without a daemon executable.
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(ChainKind::kCount); ++index) {
+    properties[ChainDriverSpecFor(static_cast<ChainKind>(index))
+                   .daemon_scenario_field] = StringSchema();
+  }
+  properties["network_allocation"] = NetworkAllocationSchema();
+  properties["keep_artifacts"] = TypeSchema("boolean");
+  properties["scenario_json"] = StringSchema(1U);
+  properties["scenario_yaml"] = StringSchema(1U);
+  properties["metrics_interval_ms"] = milliseconds;
+
+  boost::json::object& simulation = properties.at("simulation").as_object();
+  boost::json::object& simulation_properties =
+      simulation.at("properties").as_object();
+  simulation_properties["duration"] = Nullable(DurationSchema());
+  simulation_properties["duration_ms"] = Nullable(milliseconds);
+  simulation_properties["wall_duration_ms"] = Nullable(milliseconds);
+  simulation_properties["time_scale_millionths"] = Uint64Schema(1U);
+  simulation_properties["metrics_interval_ms"] = milliseconds;
+  simulation_properties["tui_refresh_interval_ms"] = milliseconds;
+  simulation["required"] =
+      Required({"name", "seed", "duration", "duration_ms", "wall_duration_ms",
+                "time_scale", "time_scale_millionths", "cleanup_policy",
+                "privilege_mode", "log_retention_policy", "metrics_interval",
+                "metrics_interval_ms", "output_dir", "tui_refresh_interval",
+                "tui_refresh_interval_ms"});
+
+  boost::json::object node =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNode);
+  boost::json::object& node_properties = node.at("properties").as_object();
+  node_properties["index"] = IntegerSchema(1U);
+  node_properties["rpc"] = ClosedObject(
+      boost::json::object{
+          {"authentication",
+           StringEnumSchema(boost::json::array{"cookie", "digest", "basic"})},
+          {"credential_file_lifecycle",
+           Nullable(ConstStringSchema("ephemeral"))},
+          {"credentials", ConstStringSchema("<generated-redacted>")},
+          {"binding_scope", StringEnumSchema(boost::json::array{
+                                "node_veth_only", "loopback_only"})}},
+      Required({"authentication", "credential_file_lifecycle", "credentials",
+                "binding_scope"}));
+  node_properties["start_time"] = Nullable(DurationSchema());
+  node_properties["start_time_ms"] = milliseconds;
+  node_properties["wall_start_time_ms"] = milliseconds;
+  node_properties["stop_time"] = Nullable(DurationSchema());
+  node_properties["stop_time_ms"] = Nullable(milliseconds);
+  node_properties["wall_stop_time_ms"] = Nullable(milliseconds);
+  node_properties["resources"] = ClosedObject(
+      boost::json::object{{"profile", Nullable(NodeAddIdentifierSchema())},
+                          {"resolved", ResourceLimitsSchema()}},
+      Required({"profile", "resolved"}));
+  node_properties["network"] = ClosedObject(
+      boost::json::object{{"profile", Nullable(NodeAddIdentifierSchema())},
+                          {"resolved", Nullable(NetworkConditionSchema())}},
+      Required({"profile", "resolved"}));
+  node["required"] =
+      Required({"index", "id", "chain", "role", "binary", "data_dir",
+                "chain_config", "rpc", "wallet", "start_time", "start_time_ms",
+                "wall_start_time_ms", "stop_time", "stop_time_ms",
+                "wall_stop_time_ms", "restart_policy", "resources", "network"});
+  properties["node_configs"] = ArraySchema(std::move(node));
+
+  boost::json::object peer =
+      BuildMcpScenarioObjectSchema(ScenarioObjectKind::kPeerConnectivity);
+  peer.at("properties").as_object()["mode"] =
+      StringEnumSchema(boost::json::array{"fixed_count", "all_peers"});
+  peer["required"] = Required({"node", "mode"});
+  for (boost::json::value& variant :
+       properties.at("topology").as_object().at("oneOf").as_array()) {
+    boost::json::object& topology = variant.as_object();
+    boost::json::object& topology_properties =
+        topology.at("properties").as_object();
+    for (const std::string_view field : {"wallet_nodes", "miner_nodes"}) {
+      topology_properties.at(field).as_object().erase("minItems");
+    }
+    topology_properties["peer_connectivity"] = ArraySchema(peer);
+    topology_properties["resolved_edges"] = ArraySchema(
+        BuildMcpScenarioObjectSchema(ScenarioObjectKind::kTopologyEdge));
+    topology["required"] =
+        Required({"type", "node_count", "wallet_node_count", "miner_node_count",
+                  "allow_miner_wallet_overlap", "wallet_nodes", "miner_nodes",
+                  "wallet_initialization", "resolved_edges"});
+  }
+  properties["topology_initial_edges"] = ArraySchema(ClosedObject(
+      boost::json::object{{"from", IntegerSchema(1U)},
+                          {"to", IntegerSchema(1U)},
+                          {"band", IntegerSchema()},
+                          {"active", TypeSchema("boolean")},
+                          {"condition", Nullable(NetworkConditionSchema())}},
+      Required({"from", "to", "band", "active", "condition"})));
+
+  for (const std::string_view collection : {"workloads", "events"}) {
+    for (boost::json::value& variant :
+         properties.at(collection)
+             .as_object()
+             .at("items")
+             .as_object()
+             .at(collection == "events" ? "anyOf" : "oneOf")
+             .as_array()) {
+      boost::json::object& action = variant.as_object();
+      boost::json::object& fields = action.at("properties").as_object();
+      if (fields.contains("cpu_quota_us")) {
+        fields["cpu_quota_us"] = Nullable(Uint64Schema());
+      }
+      const std::string_view discriminator =
+          collection == "events" ? "action" : "type";
+      if (fields.at(discriminator).as_object().at("const").as_string() ==
+          WorkloadKindName(WorkloadKind::kWalletTransactions)) {
+        fields["transaction_count"] = Nullable(IntegerSchema());
+        fields["transaction_rate"] = Nullable(NumberSchema());
+        fields["transaction_rate_millionths"] = Nullable(Uint64Schema(1U));
+        fields["duration"] = Nullable(DurationSchema());
+        fields["fee_reserve"] = Fixed8AmountSchema();
+        fields["fee_reserve_satoshis"] = Uint64Schema();
+        fields["retained_balance_basis_points"] = IntegerSchema(0U, 9999U);
+      }
+      if (collection == "events") {
+        fields["sequence"] = Uint64Schema();
+        fields["at_ms"] = milliseconds;
+        fields["wall_at_ms"] = milliseconds;
+        boost::json::array& action_required = action.at("required").as_array();
+        for (const std::string_view field :
+             {"sequence", "at_ms", "wall_at_ms"}) {
+          action_required.emplace_back(field);
+        }
+        // The current event serializer retains mutation identity but omits
+        // its request object. Describe that output without weakening inputs.
+        for (const std::string_view request :
+             {"node_add", "node_remove", "node_replace"}) {
+          if (fields.erase(request) == 0U) {
+            continue;
+          }
+          for (auto field = action_required.begin();
+               field != action_required.end(); ++field) {
+            if (field->as_string() == request) {
+              action_required.erase(field);
+              break;
+            }
+          }
+          if (request != "node_replace") {
+            fields["node"] = ConstStringSchema("sim");
+            action_required.emplace_back("node");
+          }
+        }
+      }
+    }
+  }
+
+  properties["default_network_condition"] = NetworkConditionSchema();
+  const boost::json::object node_condition =
+      ClosedObject(boost::json::object{{"node", IntegerSchema(1U)},
+                                       {"condition", NetworkConditionSchema()}},
+                   Required({"node", "condition"}));
+  properties["node_network_conditions"] = ArraySchema(node_condition);
+  properties["runtime_node_network_conditions"] = ArraySchema(node_condition);
+  for (const std::string_view field :
+       {"runtime_node_blocks", "runtime_node_unblocks"}) {
+    properties[field] = ArraySchema(
+        BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNetworkBlockRule));
+  }
+  for (const std::string_view field :
+       {"runtime_partitions", "runtime_partition_heals"}) {
+    properties[field] = ArraySchema(
+        BuildMcpScenarioObjectSchema(ScenarioObjectKind::kNetworkPartition));
+  }
+  properties["runtime_node_resource_limits"] = ArraySchema(
+      ClosedObject(boost::json::object{{"node", IntegerSchema(1U)},
+                                       {"limits", ResourceLimitsSchema()}},
+                   Required({"node", "limits"})));
+  schema["required"] = Required({"run_id",
+                                 "simulation",
+                                 "chain",
+                                 "chains",
+                                 "nodes",
+                                 "node_capacity",
+                                 "generate_node",
+                                 "chain_daemon",
+                                 "isolated_network",
+                                 "network_address_pool",
+                                 "network_allocation",
+                                 "ready_timeout_sec",
+                                 "sync_timeout_sec",
+                                 "metrics_sample_count",
+                                 "metrics_interval_ms",
+                                 "keep_artifacts",
+                                 "block_production",
+                                 "topology_initial_edges",
+                                 "node_configs",
+                                 "workloads",
+                                 "events",
+                                 "resources"});
+  return schema;
+}
+
 McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
   switch (operation) {
     case McpOperationKind::kValidateScenario:
@@ -1626,7 +1855,7 @@ boost::json::object BuildMcpOperationInputSchema(
   boost::json::object properties;
   boost::json::array required;
   const auto add_run = [&] {
-    properties["run_id"] = IdentifierSchema();
+    properties["run_id"] = RunIdentifierSchema();
     required.emplace_back("run_id");
   };
   const auto add_node = [&] {
@@ -1865,6 +2094,7 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kCreateSubscription:
       add_run();
+      properties["run_id"] = IdentifierSchema();
       properties["families"] =
           ArraySchema(InformationFamilySchema(information_families), 1U,
                       information_families.size(), true);
@@ -2110,7 +2340,7 @@ boost::json::object FiroQtLauncherMutationSchema() {
   return AddDraft(ClosedObject(
       boost::json::object{
           {"result_family", ConstStringSchema("mutation")},
-          {"run_id", IdentifierSchema()},
+          {"run_id", RunIdentifierSchema()},
           {"added_node_ids",
            ArraySchema(NodeAddIdentifierSchema(), 0U, 0U, true)},
           {"removed_node_ids",
@@ -2159,18 +2389,18 @@ boost::json::object BuildMcpResultSchema(
       require({"valid", "diagnostics"});
       break;
     case McpResultFamily::kScenario:
-      properties["scenario"] = BuildMcpScenarioSchema();
+      properties["scenario"] = BuildMcpResolvedScenarioSchema();
       require({"scenario"});
       break;
     case McpResultFamily::kRunLifecycle:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["state"] = RunStateSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["node_count"] = IntegerSchema();
       require({"run_id", "state"});
       break;
     case McpResultFamily::kRuntimeCommand:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["command_id"] = IdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["accepted"] = TypeSchema("boolean");
@@ -2240,7 +2470,7 @@ boost::json::object BuildMcpResultSchema(
                        {"required", Required({"action"})}}}});
       break;
     case McpResultFamily::kMutation:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["added_node_ids"] =
           ArraySchema(IdentifierSchema(), 0U, kMaximumSafeCollection, true);
@@ -2294,7 +2524,7 @@ boost::json::object BuildMcpResultSchema(
                           "final_node_count"})}}}});
       break;
     case McpResultFamily::kRoleMutation:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["node_ids"] =
           ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
@@ -2521,7 +2751,7 @@ boost::json::object BuildMcpResultSchema(
       }
       break;
     case McpResultFamily::kWorkload:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["workload_id"] = IdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["state"] = WorkloadStateSchema();
@@ -2703,7 +2933,7 @@ boost::json::object BuildMcpResultSchema(
       }
       break;
     case McpResultFamily::kWorkloadInvocation:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["invocation_id"] = IdentifierSchema();
       properties["action"] = StringEnumSchema(
           EnumNames(kOneShotWorkloadKinds,
@@ -2712,7 +2942,7 @@ boost::json::object BuildMcpResultSchema(
       require({"run_id", "invocation_id", "action", "state"});
       break;
     case McpResultFamily::kInstrumentation:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["instrumentation_id"] = IdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
       properties["state"] = OperationStateSchema();
@@ -2722,15 +2952,15 @@ boost::json::object BuildMcpResultSchema(
           {"run_id", "instrumentation_id", "state", "sample_count", "targets"});
       break;
     case McpResultFamily::kEvidencePage:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["items"] =
-          ArraySchema(EvidenceRecordSchema(), 0U, kMcpListPageSize);
+          ArraySchema(EvidenceRecordSchema(false), 0U, kMcpListPageSize);
       properties["next_cursor"] = CursorSchema();
       properties["truncated"] = TypeSchema("boolean");
       require({"run_id", "items", "next_cursor", "truncated"});
       break;
     case McpResultFamily::kArtifactContent:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["artifact_id"] = IdentifierSchema();
       properties["offset"] = Uint64Schema();
       properties["size"] = Uint64Schema();
@@ -3305,6 +3535,9 @@ boost::json::array BuildMcpToolRegistry(
     std::span<const McpOperationKind> selected_operations,
     std::span<const McpInformationFamily> information_families) {
   const std::span<const McpNamedCapability> registry = McpOperationRegistry();
+  const bool publishes_schemas =
+      std::find(information_families.begin(), information_families.end(),
+                McpInformationFamily::kSchemas) != information_families.end();
   boost::json::array tools;
   tools.reserve(selected_operations.size());
   for (const McpOperationKind operation : selected_operations) {
@@ -3312,13 +3545,32 @@ boost::json::array BuildMcpToolRegistry(
     if (index >= registry.size()) {
       throw std::logic_error("unknown MCP operation kind");
     }
+    boost::json::object input_schema =
+        BuildMcpOperationInputSchema(operation, information_families);
+    const std::string_view result_family =
+        McpResultFamilyName(McpOperationResultFamily(operation));
+    boost::json::object metadata{{"bbp/result_family", result_family}};
+    if (publishes_schemas) {
+      metadata["bbp/result_schema"] =
+          "bbp:///schemas/results/" + std::string(result_family);
+      metadata["bbp/error_schema"] = "bbp:///schemas/results/error";
+      const boost::json::object& properties =
+          input_schema.at("properties").as_object();
+      if (properties.contains("scenario")) {
+        metadata["bbp/scenario_schema"] = "bbp:///schemas/scenario";
+      }
+      if (properties.contains("command")) {
+        metadata["bbp/simulation_command_schema"] =
+            "bbp:///schemas/simulation_command";
+      }
+    }
     tools.emplace_back(boost::json::object{
         {"name", registry[index].name},
         {"description", registry[index].description},
-        {"inputSchema",
-         BuildMcpOperationInputSchema(operation, information_families)},
+        {"inputSchema", std::move(input_schema)},
         {"outputSchema",
-         BuildMcpOperationOutputSchema(operation, selected_operations)}});
+         BuildMcpOperationOutputSchema(operation, selected_operations)},
+        {"_meta", std::move(metadata)}});
   }
   return tools;
 }

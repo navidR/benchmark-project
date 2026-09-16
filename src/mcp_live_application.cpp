@@ -1157,30 +1157,6 @@ boost::json::object EmptyInstrumentationMeasurements() {
   };
 }
 
-boost::json::object BuildSchemaDocument(
-    std::span<const McpOperationKind> selected_operations,
-    std::span<const McpInformationFamily> selected_information_families) {
-  boost::json::object operation_schemas;
-  const std::span<const McpNamedCapability> operations = McpOperationRegistry();
-  for (const McpOperationKind kind : selected_operations) {
-    const std::size_t index = static_cast<std::size_t>(kind);
-    if (index >= operations.size()) {
-      throw std::logic_error("unknown MCP operation kind");
-    }
-    operation_schemas[operations[index].name] = boost::json::object{
-        {"input",
-         BuildMcpOperationInputSchema(kind, selected_information_families)},
-        {"output", BuildMcpOperationOutputSchema(kind, selected_operations)},
-    };
-  }
-  return boost::json::object{
-      {"scenario", BuildMcpScenarioSchema()},
-      {"simulation_command", BuildMcpSimulationCommandSchema()},
-      {"operations", std::move(operation_schemas)},
-      {"resources", BuildMcpResourceRegistry(selected_information_families)},
-  };
-}
-
 boost::json::value ReadJsonObjectFile(const std::filesystem::path& path,
                                       std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
@@ -2862,7 +2838,7 @@ boost::json::value McpLiveApplication::ReadResource(
         SupportedInformationFamilies();
     return ResourceEnvelope(
         family, config_.run_id,
-        BuildSchemaDocument(selected, information_families));
+        BuildMcpSchemaDocument(selected, information_families));
   }
   if (family == McpInformationFamily::kResolvedScenario) {
     boost::json::value scenario = ReadJsonObjectFile(

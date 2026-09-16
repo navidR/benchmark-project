@@ -557,8 +557,8 @@ boost::json::object ResourcePage(const boost::json::object& params,
                                  const McpProtocolConfig& config) {
   const std::vector<McpInformationFamily> information_families =
       EffectiveInformationFamilies(config);
-  const boost::json::array all =
-      BuildMcpResourceRegistry(information_families);
+  const boost::json::array all = BuildMcpResourceRegistry(
+      EffectiveOperations(config), information_families);
   const std::size_t begin = ParseCursor(params).value_or(0U);
   if (begin > all.size()) {
     throw std::invalid_argument("resource cursor is out of range");
@@ -590,6 +590,9 @@ std::optional<McpOperationKind> RegisteredTool(std::string_view name) {
 }
 
 std::optional<McpInformationFamily> RegisteredResource(std::string_view uri) {
+  if (uri.starts_with("bbp:///schemas/")) {
+    return McpInformationFamily::kSchemas;
+  }
   constexpr std::string_view kPrefix = "bbp:///";
   if (!uri.starts_with(kPrefix)) {
     return std::nullopt;
@@ -1315,15 +1318,16 @@ struct McpProtocol::Impl {
       return CapabilityDocument(config);
     }
     if (uri == "bbp:///schemas") {
-      const boost::json::object capabilities = CapabilityDocument(config);
-      return boost::json::object{
-          {"scenario", BuildMcpScenarioSchema()},
-          {"tools",
-           BuildMcpToolRegistry(EffectiveOperations(config),
-                                EffectiveInformationFamilies(config))},
-          {"resources",
-           BuildMcpResourceRegistry(EffectiveInformationFamilies(config))},
-          {"results", capabilities.at("result_families")}};
+      return BuildMcpSchemaDocument(EffectiveOperations(config),
+                                    EffectiveInformationFamilies(config));
+    }
+    if (uri.starts_with("bbp:///schemas/")) {
+      auto schema = ReadMcpSchemaResource(uri, EffectiveOperations(config));
+      if (!schema) {
+        throw McpResourceUnavailable(std::string(uri),
+                                     "unknown or unavailable BBP schema");
+      }
+      return std::move(*schema);
     }
     if (!resource_handler) {
       throw std::runtime_error("resource is not available in the current run");
@@ -1367,14 +1371,16 @@ struct McpProtocol::Impl {
         throw McpResourceUnavailable(
             uri, "BBP resource is unavailable in the current endpoint");
       }
-      if (uri != "bbp:///capabilities" && uri != "bbp:///schemas" &&
-          !resource_handler) {
+      if (*family != McpInformationFamily::kCapabilities &&
+          *family != McpInformationFamily::kSchemas && !resource_handler) {
         throw McpResourceUnavailable(
             uri, "BBP resource is unavailable in the current run");
       }
       boost::json::value value;
       try {
         value = ReadResource(uri, session_id, stop_token);
+      } catch (const McpResourceUnavailable&) {
+        throw;
       } catch (const McpOperationFailure& failure) {
         throw McpResourceUnavailable(uri, failure.what(), failure.code(),
                                      failure.retryable(),
@@ -1388,7 +1394,9 @@ struct McpProtocol::Impl {
       return boost::json::object{
           {"contents", boost::json::array{boost::json::object{
                            {"uri", uri},
-                           {"mimeType", "application/json"},
+                           {"mimeType", uri.starts_with("bbp:///schemas/")
+                                            ? "application/schema+json"
+                                            : "application/json"},
                            {"text", boost::json::serialize(value)}}}}};
     }
     if (request.method == "tools/call") {
