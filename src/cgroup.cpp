@@ -1285,12 +1285,6 @@ void RequireNativeCgroupRoot(const std::filesystem::path& root) {
     throw std::runtime_error("cgroup v2 is not mounted at native root " +
                              root.string());
   }
-  if (access(root.c_str(), W_OK) != 0 ||
-      access((root / "cgroup.subtree_control").c_str(), W_OK) != 0) {
-    throw std::runtime_error("native cgroup root is not writable at " +
-                             root.string() + ": " + std::strerror(errno));
-  }
-
   const std::set<std::string> required = RequiredControllers();
   const std::set<std::string> unavailable =
       SetDifference(required, ControllerSet(root / "cgroup.controllers"));
@@ -1348,7 +1342,7 @@ class BoundCgroupDirectory {
       std::filesystem::path display_path,
       std::optional<CgroupPathIdentity> expected_identity = std::nullopt,
       std::optional<std::uint64_t> expected_mount_id = std::nullopt,
-      bool require_parent_mount = true) {
+      bool require_parent_mount = true, bool require_ownership = true) {
     struct stat before{};
     if (fstatat(parent_descriptor, name.c_str(), &before,
                 AT_SYMLINK_NOFOLLOW) != 0) {
@@ -1367,7 +1361,7 @@ class BoundCgroupDirectory {
 
     BoundCgroupDirectory acquired(parent_descriptor, std::move(name),
                                   std::move(display_path), before,
-                                  require_parent_mount);
+                                  require_parent_mount, require_ownership);
     if (expected_identity &&
         (static_cast<std::uint64_t>(acquired.identity_.st_dev) !=
              expected_identity->device ||
@@ -1406,6 +1400,7 @@ class BoundCgroupDirectory {
     identity_ = other.identity_;
     mount_id_ = other.mount_id_;
     removed_ = other.removed_;
+    require_ownership_ = other.require_ownership_;
     other.parent_descriptor_ = -1;
     other.descriptor_ = -1;
     other.removed_ = true;
@@ -1443,7 +1438,8 @@ class BoundCgroupDirectory {
                                std::strerror(errno));
     }
     if (!S_ISDIR(opened.st_mode) || !SameCgroupIdentity(opened, identity_) ||
-        opened.st_uid != identity_.st_uid || identity_.st_uid != geteuid()) {
+        opened.st_uid != identity_.st_uid ||
+        (require_ownership_ && identity_.st_uid != geteuid())) {
       throw CgroupOwnershipMismatch("acquired cgroup identity changed: " +
                                     display_path_.string());
     }
@@ -1472,10 +1468,12 @@ class BoundCgroupDirectory {
  private:
   BoundCgroupDirectory(int parent_descriptor, std::string name,
                        std::filesystem::path display_path,
-                       const struct stat& before, bool require_parent_mount)
+                       const struct stat& before, bool require_parent_mount,
+                       bool require_ownership)
       : name_(std::move(name)),
         display_path_(std::move(display_path)),
-        identity_(before) {
+        identity_(before),
+        require_ownership_(require_ownership) {
     parent_descriptor_ = fcntl(parent_descriptor, F_DUPFD_CLOEXEC, 0);
     if (parent_descriptor_ < 0) {
       throw std::runtime_error("duplicate cgroup parent failed for " +
@@ -1504,7 +1502,8 @@ class BoundCgroupDirectory {
                                std::strerror(error));
     }
     if (!S_ISDIR(opened.st_mode) || !SameCgroupIdentity(before, opened) ||
-        opened.st_uid != geteuid()) {
+        before.st_uid != opened.st_uid ||
+        (require_ownership_ && opened.st_uid != geteuid())) {
       Close();
       throw CgroupOwnershipMismatch(
           "cgroup ownership or identity changed during acquisition: " +
@@ -1544,6 +1543,7 @@ class BoundCgroupDirectory {
   struct stat identity_{};
   std::uint64_t mount_id_ = 0U;
   bool removed_ = false;
+  bool require_ownership_ = true;
 };
 
 BoundCgroupDirectory AcquireBoundScopeRoot(
@@ -1575,7 +1575,7 @@ BoundCgroupDirectory AcquireBoundScopeRoot(
         expected_identity
             ? std::optional<std::uint64_t>(expected_identity->mount_id)
             : std::nullopt,
-        false);
+        false, config.allow_root_process_move);
   } catch (...) {
     static_cast<void>(close(parent_descriptor));
     throw;

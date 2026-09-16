@@ -1,3 +1,4 @@
+#include <grp.h>
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
@@ -21,6 +22,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bbp/cgroup.h"
@@ -1227,6 +1229,174 @@ BOOST_AUTO_TEST_CASE(
   error.clear();
   BOOST_REQUIRE(std::filesystem::remove(not_enabled_root, error));
   BOOST_REQUIRE(!error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    native_cgroup_scope_accepts_a_delegated_subtree_below_an_unwritable_root) {
+  if (geteuid() != 0) {
+    BOOST_TEST_MESSAGE("skipping native delegation fixture: requires root");
+    return;
+  }
+  std::unique_ptr<PreparedRunGuard> parent =
+      PreparePrivilegedTestRun(UniqueRunId());
+  if (!parent) {
+    return;
+  }
+  const std::filesystem::path root = RunCgroupPath(parent->run_id());
+  const std::filesystem::path simulator = root / "bbp";
+  const std::filesystem::path state_directory =
+      TestDirectory(parent->run_id() + "-native-delegation");
+  const std::string run_id = "delegated-run";
+  BOOST_REQUIRE(std::filesystem::create_directory(state_directory));
+  struct FixtureCleanup {
+    std::filesystem::path simulator;
+    std::filesystem::path state_directory;
+    std::string run_id;
+    ~FixtureCleanup() {
+      std::error_code ignored;
+      std::filesystem::remove(simulator / run_id, ignored);
+      std::filesystem::remove(simulator, ignored);
+      std::filesystem::remove_all(state_directory, ignored);
+    }
+  } cleanup{simulator, state_directory, run_id};
+
+  constexpr uid_t delegated_uid = 65534;
+  constexpr gid_t delegated_gid = 65534;
+  BOOST_REQUIRE(chmod(state_directory.c_str(), 0700) == 0);
+  BOOST_REQUIRE(chown(state_directory.c_str(), delegated_uid, delegated_gid) ==
+                0);
+  const std::filesystem::path diagnostic = state_directory / "child-error";
+  bbp::WriteText(diagnostic, "child exited without a diagnostic");
+  BOOST_REQUIRE(chown(diagnostic.c_str(), delegated_uid, delegated_gid) == 0);
+  BOOST_REQUIRE(std::filesystem::create_directory(simulator));
+  BOOST_REQUIRE(chmod(root.c_str(), 0755) == 0);
+  BOOST_REQUIRE(chmod((root / "cgroup.subtree_control").c_str(), 0644) == 0);
+  // The first child must reject ownership even when permissions allow writes.
+  BOOST_REQUIRE(chmod(simulator.c_str(), 0777) == 0);
+  const std::set<std::string> required = {"cpu", "io", "memory", "pids"};
+  const std::set<std::string> enabled =
+      ControllerSet(root / "cgroup.subtree_control");
+  BOOST_REQUIRE(std::includes(enabled.begin(), enabled.end(), required.begin(),
+                              required.end()));
+  struct stat root_before{};
+  struct stat root_control_before{};
+  BOOST_REQUIRE(stat(root.c_str(), &root_before) == 0);
+  BOOST_REQUIRE(stat((root / "cgroup.subtree_control").c_str(),
+                     &root_control_before) == 0);
+  BOOST_REQUIRE(root_before.st_uid == 0);
+  BOOST_REQUIRE(root_control_before.st_uid == 0);
+  const std::string root_controllers_before =
+      bbp::ReadText(root / "cgroup.subtree_control");
+  const std::string root_processes_before =
+      bbp::ReadText(root / "cgroup.procs");
+  const std::string simulator_controllers_before =
+      bbp::ReadText(simulator / "cgroup.subtree_control");
+  const bbp::CgroupScopeTestConfig config{
+      .root = root,
+      .simulator_name = "bbp",
+      .state_file = state_directory / "scope-state.json",
+      .allow_root_process_move = false,
+  };
+
+  const auto run_child = [&](bool delegated) {
+    const pid_t pid = fork();
+    BOOST_REQUIRE(pid >= 0);
+    if (pid == 0) {
+      try {
+        const auto require = [](bool condition, const std::string& message) {
+          if (!condition) {
+            throw std::runtime_error(message);
+          }
+        };
+        require(setgroups(0, nullptr) == 0 && setgid(delegated_gid) == 0 &&
+                    setuid(delegated_uid) == 0,
+                "could not drop child credentials");
+        require(access(root.c_str(), W_OK) == -1 && errno == EACCES,
+                "native scope root must be unwritable by the child");
+        require(access((root / "cgroup.subtree_control").c_str(), W_OK) == -1 &&
+                    errno == EACCES,
+                "native root controllers must be unwritable by the child");
+        require(access(simulator.c_str(), W_OK) == 0,
+                "BBP directory must be writable by the child");
+        if (!delegated) {
+          bool rejected = false;
+          try {
+            bbp::PrepareCgroupRunInTestScope(config, run_id);
+          } catch (const std::runtime_error& failure) {
+            require(std::string(failure.what())
+                            .find("cgroup ownership or identity changed during "
+                                  "acquisition: " +
+                                  simulator.string()) != std::string::npos,
+                    "ownership rejection must identify the BBP subtree: " +
+                        std::string(failure.what()));
+            rejected = true;
+          }
+          require(rejected, "root-owned BBP subtree was accepted");
+          require(!std::filesystem::exists(config.state_file),
+                  "rejected ownership created scope state");
+        } else {
+          const std::string process_cgroup_before =
+              bbp::ReadText("/proc/self/cgroup");
+          TestScopeRunGuard run(config, run_id);
+          require(std::filesystem::is_directory(simulator / run_id),
+                  "delegated run was not created");
+          require(
+              ControllerSet(simulator / "cgroup.subtree_control") == required,
+              "required BBP controllers were not enabled");
+          for (const auto& entry :
+               std::filesystem::directory_iterator(simulator)) {
+            require(!entry.is_directory() || entry.path().filename() == run_id,
+                    "native preparation created an unexpected controller");
+          }
+          run.Remove();
+          require(!std::filesystem::exists(simulator / run_id) &&
+                      !std::filesystem::exists(config.state_file),
+                  "delegated run cleanup left a run or scope state");
+          require(std::filesystem::is_directory(simulator),
+                  "cleanup removed the pre-existing delegated BBP subtree");
+          require(bbp::ReadText("/proc/self/cgroup") == process_cgroup_before,
+                  "native preparation or cleanup moved the child process");
+        }
+        _exit(0);
+      } catch (const std::exception& failure) {
+        try {
+          bbp::WriteText(diagnostic, failure.what());
+        } catch (...) {
+        }
+        _exit(1);
+      }
+    }
+    ChildGuard child(pid);
+    const int status = child.Wait();
+    BOOST_REQUIRE_MESSAGE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                          bbp::ReadText(diagnostic));
+  };
+
+  run_child(false);
+  BOOST_REQUIRE(chown(simulator.c_str(), delegated_uid, delegated_gid) == 0);
+  BOOST_REQUIRE(chmod(simulator.c_str(), 0755) == 0);
+  for (const char* control :
+       {"cgroup.procs", "cgroup.threads", "cgroup.subtree_control"}) {
+    BOOST_REQUIRE(chown((simulator / control).c_str(), delegated_uid,
+                        delegated_gid) == 0);
+  }
+  run_child(true);
+  for (const auto& [path, before] :
+       {std::pair{root, root_before},
+        std::pair{root / "cgroup.subtree_control", root_control_before}}) {
+    struct stat after{};
+    BOOST_REQUIRE(stat(path.c_str(), &after) == 0);
+    BOOST_TEST(after.st_ino == before.st_ino);
+    BOOST_TEST(after.st_uid == before.st_uid);
+    BOOST_TEST(after.st_gid == before.st_gid);
+    BOOST_TEST(after.st_mode == before.st_mode);
+  }
+  BOOST_TEST(bbp::ReadText(root / "cgroup.subtree_control") ==
+             root_controllers_before);
+  BOOST_TEST(bbp::ReadText(root / "cgroup.procs") == root_processes_before);
+  BOOST_TEST(bbp::ReadText(simulator / "cgroup.subtree_control") ==
+             simulator_controllers_before);
+  BOOST_REQUIRE(std::filesystem::remove(simulator));
 }
 
 BOOST_AUTO_TEST_CASE(
