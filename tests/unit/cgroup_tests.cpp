@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -37,10 +38,16 @@ std::filesystem::path TestDirectory(std::string_view suffix) {
           std::string(suffix));
 }
 
-std::string UniqueRunId(std::string_view suffix) {
+std::string TestRunId(pid_t pid, std::uint64_t sequence) {
+  // Full hexadecimal PID and sequence fit within the production run-ID bound.
+  std::ostringstream id;
+  id << "cgt-" << std::hex << pid << '-' << sequence;
+  return id.str();
+}
+
+std::string UniqueRunId() {
   static std::atomic<std::uint64_t> sequence{0U};
-  return "cgt-" + std::to_string(getpid()) + "-" +
-         std::to_string(sequence.fetch_add(1U)) + "-" + std::string(suffix);
+  return TestRunId(getpid(), sequence.fetch_add(1U));
 }
 
 std::filesystem::path RunCgroupPath(std::string_view run_id) {
@@ -235,6 +242,7 @@ bool WaitForExecutable(pid_t pid, const std::filesystem::path& executable,
 }
 
 std::unique_ptr<PreparedRunGuard> PreparePrivilegedTestRun(std::string run_id) {
+  bbp::RequireSafeRunId(run_id);
   try {
     return std::make_unique<PreparedRunGuard>(std::move(run_id));
   } catch (const std::exception& error) {
@@ -293,6 +301,29 @@ void WriteMetricFixture(const std::filesystem::path& dir,
 }
 
 }  // namespace
+
+BOOST_AUTO_TEST_CASE(cgroup_fixture_run_ids_are_bounded_and_unique) {
+  std::set<std::string> ids;
+  for (const pid_t pid :
+       {pid_t{1}, pid_t{1234567}, std::numeric_limits<pid_t>::max()}) {
+    for (const std::uint64_t sequence :
+         {std::uint64_t{0}, std::uint64_t{1},
+          std::numeric_limits<std::uint64_t>::max()}) {
+      const std::string id = TestRunId(pid, sequence);
+      BOOST_CHECK_NO_THROW(bbp::RequireSafeRunId(id));
+      BOOST_TEST(ids.insert(id).second);
+    }
+  }
+  BOOST_TEST(TestRunId(1234567, 1U) == TestRunId(1234567, 1U));
+  const std::string first = UniqueRunId();
+  BOOST_TEST(first != UniqueRunId());
+}
+
+BOOST_AUTO_TEST_CASE(cgroup_fixture_invalid_ids_fail_before_privilege_skip) {
+  BOOST_CHECK_THROW(PreparePrivilegedTestRun(std::string(33U, 'x')),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(PreparePrivilegedTestRun("../invalid"), std::runtime_error);
+}
 
 BOOST_AUTO_TEST_CASE(cgroup_metrics_read_io_memory_and_pressure_totals) {
   const std::filesystem::path dir = TestDirectory("metrics");
@@ -537,11 +568,11 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(cgroup_refuses_unprepared_and_preexisting_run_ownership) {
   std::unique_ptr<PreparedRunGuard> delegated_parent =
-      PreparePrivilegedTestRun(UniqueRunId("foreign-parent"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!delegated_parent) {
     return;
   }
-  const std::string run_id = UniqueRunId("foreign");
+  const std::string run_id = UniqueRunId();
   const std::filesystem::path run_path = RunCgroupPath(run_id);
   std::error_code ec;
   const bool created = std::filesystem::create_directory(run_path, ec);
@@ -586,7 +617,7 @@ BOOST_AUTO_TEST_CASE(cgroup_refuses_unprepared_and_preexisting_run_ownership) {
 }
 
 BOOST_AUTO_TEST_CASE(stale_cgroup_cleanup_requires_exact_run_marker) {
-  const std::string run_id = UniqueRunId("stale-owner");
+  const std::string run_id = UniqueRunId();
   const std::filesystem::path parent = TestDirectory("stale-owner");
   const std::filesystem::path run_directory = parent / run_id;
   std::filesystem::remove_all(parent);
@@ -606,7 +637,7 @@ BOOST_AUTO_TEST_CASE(stale_cgroup_cleanup_requires_exact_run_marker) {
 }
 
 BOOST_AUTO_TEST_CASE(stale_cleanup_is_scoped_to_one_same_id_run_instance) {
-  const std::string run_id = UniqueRunId("same-id");
+  const std::string run_id = UniqueRunId();
   const std::filesystem::path parent = TestDirectory("same-id-roots");
   const std::filesystem::path first_root = parent / "first" / run_id;
   const std::filesystem::path second_root = parent / "second" / run_id;
@@ -679,8 +710,8 @@ BOOST_AUTO_TEST_CASE(stale_cleanup_is_scoped_to_one_same_id_run_instance) {
 
 BOOST_AUTO_TEST_CASE(
     stale_cgroup_cleanup_refuses_an_exact_resource_id_collision) {
-  const std::string first_run_id = UniqueRunId("collision-owner");
-  const std::string second_run_id = UniqueRunId("collision-request");
+  const std::string first_run_id = UniqueRunId();
+  const std::string second_run_id = UniqueRunId();
   const std::filesystem::path parent = TestDirectory("resource-collision");
   const std::filesystem::path first_root = parent / first_run_id;
   const std::filesystem::path second_root = parent / second_run_id;
@@ -743,7 +774,7 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     stale_cgroup_cleanup_refuses_replaced_run_root_and_cgroup_inodes) {
-  const std::string run_id = UniqueRunId("inode-owner");
+  const std::string run_id = UniqueRunId();
   const std::filesystem::path parent = TestDirectory("inode-owner");
   const std::filesystem::path run_root = parent / run_id;
   const std::filesystem::path displaced_root = parent / "displaced";
@@ -809,7 +840,7 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     stale_cgroup_cleanup_does_not_kill_a_post_verification_replacement) {
-  const std::string run_id = UniqueRunId("verify-swap");
+  const std::string run_id = UniqueRunId();
   const std::filesystem::path parent = TestDirectory("verified-replacement");
   const std::filesystem::path run_root = parent / run_id;
   std::filesystem::remove_all(parent);
@@ -921,7 +952,7 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(cgroup_recursively_kills_and_removes_nested_descendants) {
   std::unique_ptr<PreparedRunGuard> run =
-      PreparePrivilegedTestRun(UniqueRunId("nested"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!run) {
     return;
   }
@@ -959,7 +990,7 @@ BOOST_AUTO_TEST_CASE(cgroup_recursively_kills_and_removes_nested_descendants) {
 BOOST_AUTO_TEST_CASE(
     cgroup_replacement_acquisition_is_strongly_exception_safe) {
   std::unique_ptr<PreparedRunGuard> run =
-      PreparePrivilegedTestRun(UniqueRunId("replacement-acquire"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!run) {
     return;
   }
@@ -990,7 +1021,7 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(cgroup_pidfd_fallback_kills_a_helper_and_its_descendant) {
   std::unique_ptr<PreparedRunGuard> run =
-      PreparePrivilegedTestRun(UniqueRunId("pidfd-fallback"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!run) {
     return;
   }
@@ -1084,7 +1115,7 @@ BOOST_AUTO_TEST_CASE(cgroup_pidfd_fallback_kills_a_helper_and_its_descendant) {
 
 BOOST_AUTO_TEST_CASE(network_namespace_helper_is_owned_by_node_cgroup) {
   std::unique_ptr<PreparedRunGuard> run =
-      PreparePrivilegedTestRun(UniqueRunId("netns"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!run) {
     return;
   }
@@ -1111,7 +1142,7 @@ BOOST_AUTO_TEST_CASE(network_namespace_helper_is_owned_by_node_cgroup) {
 
 BOOST_AUTO_TEST_CASE(
     native_cgroup_scope_rejects_root_controller_gaps_before_mutation) {
-  const std::string suffix = UniqueRunId("native-preflight");
+  const std::string suffix = UniqueRunId();
   const std::filesystem::path root = "/sys/fs/cgroup";
   const std::filesystem::path not_enabled_root = root / suffix;
   const std::filesystem::path unavailable_root =
@@ -1225,7 +1256,7 @@ BOOST_AUTO_TEST_CASE(
     return;
   }
 
-  const std::string suffix = UniqueRunId("native-root");
+  const std::string suffix = UniqueRunId();
   const std::filesystem::path state_file = TestDirectory(suffix + "-state");
   std::error_code error;
   std::filesystem::remove(state_file, error);
@@ -1286,11 +1317,11 @@ BOOST_AUTO_TEST_CASE(
   const std::filesystem::path binary = binary_environment;
   BOOST_REQUIRE(std::filesystem::is_regular_file(binary));
 
-  const std::string suffix = UniqueRunId("native-firod");
+  const std::string suffix = UniqueRunId();
   const std::filesystem::path root = "/sys/fs/cgroup";
   const std::filesystem::path data_root = TestDirectory(suffix + "-data");
   const std::filesystem::path foreign = root / (suffix + "-foreign");
-  const std::string run_id = UniqueRunId("firod-run");
+  const std::string run_id = UniqueRunId();
   const std::filesystem::path run_root = RunCgroupPath(run_id);
   const std::string root_controllers_before =
       bbp::ReadText(root / "cgroup.subtree_control");
@@ -1402,11 +1433,11 @@ BOOST_AUTO_TEST_CASE(
 BOOST_AUTO_TEST_CASE(
     cgroup_scope_cleanup_refuses_a_post_run_controller_replacement) {
   std::unique_ptr<PreparedRunGuard> delegated_parent =
-      PreparePrivilegedTestRun(UniqueRunId("swap-parent"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!delegated_parent) {
     return;
   }
-  const std::string suffix = UniqueRunId("scope-replacement");
+  const std::string suffix = UniqueRunId();
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
   const std::filesystem::path simulator = scope_root / "bbp";
@@ -1528,11 +1559,11 @@ BOOST_AUTO_TEST_CASE(
 BOOST_AUTO_TEST_CASE(
     cgroup_scope_restores_processes_and_controller_state_once) {
   std::unique_ptr<PreparedRunGuard> delegated_parent =
-      PreparePrivilegedTestRun(UniqueRunId("scope-parent"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!delegated_parent) {
     return;
   }
-  const std::string suffix = UniqueRunId("scope");
+  const std::string suffix = UniqueRunId();
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
   const std::filesystem::path state_file = TestDirectory("scope-state");
@@ -1677,11 +1708,11 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(cgroup_scope_recovers_an_exact_bound_pending_created_run) {
   std::unique_ptr<PreparedRunGuard> delegated_parent =
-      PreparePrivilegedTestRun(UniqueRunId("pending-parent"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!delegated_parent) {
     return;
   }
-  const std::string suffix = UniqueRunId("scope-pending");
+  const std::string suffix = UniqueRunId();
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
   const std::filesystem::path state_file = TestDirectory("scope-pending-state");
@@ -1698,10 +1729,10 @@ BOOST_AUTO_TEST_CASE(cgroup_scope_recovers_an_exact_bound_pending_created_run) {
   }
   std::filesystem::create_directories(ownership_roots / "first");
   std::filesystem::create_directories(ownership_roots / "second");
-  const bbp::RunOwnership first = bbp::CreateRunOwnership(
-      UniqueRunId("pending-first"), ownership_roots / "first");
-  const bbp::RunOwnership second = bbp::CreateRunOwnership(
-      UniqueRunId("pending-second"), ownership_roots / "second");
+  const bbp::RunOwnership first =
+      bbp::CreateRunOwnership(UniqueRunId(), ownership_roots / "first");
+  const bbp::RunOwnership second =
+      bbp::CreateRunOwnership(UniqueRunId(), ownership_roots / "second");
   bbp::WriteRunOwnershipMarker(first);
   bbp::WriteRunOwnershipMarker(second);
   const bbp::CgroupScopeTestConfig config{
@@ -1756,11 +1787,11 @@ BOOST_AUTO_TEST_CASE(cgroup_scope_recovers_an_exact_bound_pending_created_run) {
 
 BOOST_AUTO_TEST_CASE(cgroup_scope_prepare_failure_restores_partial_mutations) {
   std::unique_ptr<PreparedRunGuard> delegated_parent =
-      PreparePrivilegedTestRun(UniqueRunId("rollback-parent"));
+      PreparePrivilegedTestRun(UniqueRunId());
   if (!delegated_parent) {
     return;
   }
-  const std::string suffix = UniqueRunId("scope-rollback");
+  const std::string suffix = UniqueRunId();
   const std::filesystem::path scope_root =
       std::filesystem::path("/sys/fs/cgroup/bbp") / suffix;
   const std::filesystem::path simulator = scope_root / "bbp";
