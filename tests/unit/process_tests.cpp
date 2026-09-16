@@ -1,6 +1,9 @@
 #include <fcntl.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -11,12 +14,14 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "../../src/owned_process_spawn.h"
 #include "bbp/process.h"
 #include "bbp/util.h"
 
@@ -55,6 +60,63 @@ class UniqueFd {
  private:
   int fd_ = -1;
 };
+
+class Subreaper {
+ public:
+  Subreaper() {
+    if (prctl(PR_GET_CHILD_SUBREAPER, &previous_) != 0 ||
+        prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) {
+      throw std::runtime_error("set process test subreaper");
+    }
+  }
+  ~Subreaper() { static_cast<void>(prctl(PR_SET_CHILD_SUBREAPER, previous_)); }
+
+ private:
+  int previous_ = 0;
+};
+
+class OwnedTestPid {
+ public:
+  explicit OwnedTestPid(pid_t pid) : pid_(pid) {}
+  ~OwnedTestPid() {
+    if (pid_ > 0) {
+      static_cast<void>(kill(pid_, SIGKILL));
+      while (waitpid(pid_, nullptr, 0) < 0 && errno == EINTR) {
+      }
+    }
+  }
+  int Wait() {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+      int status = 0;
+      if (waitpid(pid_, &status, WNOHANG) == pid_) {
+        pid_ = -1;
+        return status;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    throw std::runtime_error(
+        "owned test child did not exit within two seconds");
+  }
+
+ private:
+  pid_t pid_;
+};
+
+int parent_death_ready = -1;
+int parent_death_release = -1;
+
+void DelayParentDeathInstallation() {
+  const pid_t pid = getpid();
+  if (write(parent_death_ready, &pid, sizeof(pid)) != sizeof(pid)) {
+    _exit(125);
+  }
+  char token;
+  if (read(parent_death_release, &token, 1) != 1) {
+    _exit(126);
+  }
+}
 
 class NetworkNamespaceHelper {
  public:
@@ -582,4 +644,112 @@ BOOST_AUTO_TEST_CASE(child_process_timeout_force_kills_complete_process_group) {
   BOOST_REQUIRE(WIFSIGNALED(*status));
   BOOST_TEST(WTERMSIG(*status) == SIGKILL);
   std::filesystem::remove_all(run_dir);
+}
+
+BOOST_AUTO_TEST_CASE(child_process_survives_launching_thread_exit) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("bbp-process-thread-" + std::to_string(getpid()));
+  bbp::ProcessSpec spec;
+  spec.binary = "/bin/sleep";
+  spec.argv = {"30"};
+  spec.stdout_path = root / "stdout.log";
+  spec.stderr_path = root / "stderr.log";
+  bbp::ChildProcess child =
+      std::async(std::launch::async, [&] {
+        return bbp::ChildProcess::Spawn(spec, std::nullopt);
+      }).get();
+  const bool exited = child.WaitForExit(std::chrono::milliseconds(50));
+  child.Terminate(std::chrono::seconds(1));
+  BOOST_TEST(!exited);
+  std::filesystem::remove_all(root);
+}
+
+BOOST_AUTO_TEST_CASE(child_process_tree_dies_after_owner_kill_or_crash) {
+  Subreaper subreaper;
+  for (const int signal : {SIGKILL, SIGSEGV}) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("bbp-parent-death-" + std::to_string(getpid()) + "-" +
+                       std::to_string(signal));
+    const auto descendant_path = root / "descendant.pid";
+    bbp::ProcessSpec spec;
+    spec.binary = std::filesystem::canonical("/proc/self/exe").parent_path() /
+                  "bbp-process-tree-helper";
+    spec.argv = {descendant_path.string(), (root / "leader.term").string(),
+                 (root / "descendant.term").string(), "--ignore-term"};
+    spec.stdout_path = root / "stdout.log";
+    spec.stderr_path = root / "stderr.log";
+    int ready[2];
+    BOOST_REQUIRE(pipe2(ready, O_CLOEXEC) == 0);
+    UniqueFd ready_read(ready[0]);
+    UniqueFd ready_write(ready[1]);
+    const pid_t owner_pid = fork();
+    BOOST_REQUIRE(owner_pid >= 0);
+    if (owner_pid == 0) {
+      ready_read.Reset();
+      static_cast<void>(::signal(SIGSEGV, SIG_DFL));
+      const rlimit core_limit{0U, 0U};
+      if (setrlimit(RLIMIT_CORE, &core_limit) != 0) {
+        _exit(125);
+      }
+      const bbp::ChildProcess child =
+          bbp::ChildProcess::Spawn(spec, std::nullopt);
+      WriteStatus(ready_write.get(), child.pid());
+      for (;;) {
+        pause();
+      }
+    }
+    OwnedTestPid owner_guard(owner_pid);
+    ready_write.Reset();
+    pollfd descriptor{.fd = ready_read.get(), .events = POLLIN, .revents = 0};
+    BOOST_REQUIRE(poll(&descriptor, 1, 2000) == 1);
+    const pid_t child_pid = ReadStatus(ready_read.get());
+    OwnedTestPid child_guard(child_pid);
+    BOOST_REQUIRE(WaitForFile(descendant_path, std::chrono::seconds(2)));
+    OwnedTestPid descendant_guard(ReadPid(descendant_path));
+    BOOST_REQUIRE(kill(owner_pid, signal) == 0);
+    const int owner_status = owner_guard.Wait();
+    BOOST_REQUIRE(WIFSIGNALED(owner_status));
+    BOOST_TEST(WTERMSIG(owner_status) == signal);
+    for (OwnedTestPid* child : {&child_guard, &descendant_guard}) {
+      const int status = child->Wait();
+      BOOST_REQUIRE(WIFSIGNALED(status));
+      BOOST_TEST(WTERMSIG(status) == SIGKILL);
+    }
+    std::filesystem::remove_all(root);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(child_process_refuses_parent_death_before_installation) {
+  Subreaper subreaper;
+  int ready[2];
+  int release[2];
+  BOOST_REQUIRE(pipe2(ready, O_CLOEXEC) == 0);
+  UniqueFd ready_read(ready[0]);
+  UniqueFd ready_write(ready[1]);
+  BOOST_REQUIRE(pipe2(release, O_CLOEXEC) == 0);
+  UniqueFd release_read(release[0]);
+  UniqueFd release_write(release[1]);
+  const pid_t owner_pid = fork();
+  BOOST_REQUIRE(owner_pid >= 0);
+  if (owner_pid == 0) {
+    ready_read.Reset();
+    release_write.Reset();
+    parent_death_ready = ready_write.get();
+    parent_death_release = release_read.get();
+    bbp::SetOwnedForkBeforeParentDeathHookForTest(DelayParentDeathInstallation);
+    static_cast<void>(bbp::ForkOwnedProcess([] { _exit(99); }));
+    _exit(124);
+  }
+  OwnedTestPid owner_guard(owner_pid);
+  ready_write.Reset();
+  release_read.Reset();
+  pollfd descriptor{.fd = ready_read.get(), .events = POLLIN, .revents = 0};
+  BOOST_REQUIRE(poll(&descriptor, 1, 2000) == 1);
+  OwnedTestPid child_guard(ReadStatus(ready_read.get()));
+  BOOST_REQUIRE(kill(owner_pid, SIGKILL) == 0);
+  static_cast<void>(owner_guard.Wait());
+  BOOST_REQUIRE(write(release_write.get(), "x", 1) == 1);
+  const int status = child_guard.Wait();
+  BOOST_REQUIRE(WIFEXITED(status));
+  BOOST_TEST(WEXITSTATUS(status) == 127);
 }

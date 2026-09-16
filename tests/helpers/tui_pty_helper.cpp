@@ -3,6 +3,8 @@
 #include <poll.h>
 #include <pty.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -191,6 +193,12 @@ class PtyProcess {
 
   bool Running() const {
     return pid_ > 0 && (kill(pid_, 0) == 0 || errno == EPERM);
+  }
+
+  void Signal(int signal) const {
+    if (pid_ <= 0 || kill(pid_, signal) != 0) {
+      throw std::runtime_error("could not signal PTY child");
+    }
   }
 
   int Wait(std::chrono::milliseconds timeout = 10s) {
@@ -3414,6 +3422,98 @@ void CheckDirectLoadLifecycle(const std::filesystem::path& command,
   std::filesystem::create_directories(benchmark_root);
   CheckFiniteDirectLoadOption(command, daemon, benchmark_root);
   CheckIndefiniteDirectLoadLifecycle(command, daemon, benchmark_root);
+}
+
+void CheckAbruptParentDeath(const std::filesystem::path& command,
+                            const std::filesystem::path& daemon,
+                            const std::filesystem::path& benchmark_root) {
+  const rlimit core_limit{0U, 0U};
+  if (setrlimit(RLIMIT_CORE, &core_limit) != 0 ||
+      prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) {
+    throw std::runtime_error("could not configure isolated crash test");
+  }
+  std::filesystem::create_directories(benchmark_root);
+  for (const int signal : {SIGKILL, SIGSEGV}) {
+    const std::string run_id = "parent-death-" + std::to_string(getpid()) +
+                               "-" + std::to_string(signal);
+    const auto run_root = benchmark_root / run_id;
+    OwnedTemporaryDirectory home(run_id);
+    ScopedFixtureProcessCleanup fallback(daemon, run_root);
+    std::vector<pid_t> daemon_pids;
+    std::vector<pid_t> namespace_pids;
+    std::exception_ptr failure;
+    try {
+      PtyProcess process(
+          command,
+          {"--firod", daemon.string(), "--benchmark-root",
+           benchmark_root.string(), "--run-id", run_id, "--nodes", "2",
+           "--no-mining", "--metrics-sample-count", "1000",
+           "--metrics-interval", "100ms", "--no-tui", "--keep-artifacts"},
+          24, 80, home.root());
+      const auto deadline = std::chrono::steady_clock::now() + 30s;
+      while (std::chrono::steady_clock::now() < deadline) {
+        static_cast<void>(process.ReadFor(50ms));
+        daemon_pids = EventProcessPids(ReadFile(run_root / "events.jsonl"));
+        namespace_pids =
+            MetricNamespacePids(ReadFile(run_root / "metrics.jsonl"));
+        if (daemon_pids.size() == 2U && namespace_pids.size() == 2U) {
+          break;
+        }
+      }
+      if (daemon_pids.size() != 2U || namespace_pids.size() != 2U) {
+        throw std::runtime_error("isolated Firo children did not become ready");
+      }
+      std::vector<pid_t> children = daemon_pids;
+      children.insert(children.end(), namespace_pids.begin(),
+                      namespace_pids.end());
+      for (const pid_t pid : children) {
+        if (!ProcessExists(pid)) {
+          throw std::runtime_error("managed child exited before BBP crash");
+        }
+      }
+      process.Signal(signal);
+      if (process.Wait(5s) != 128 + signal) {
+        throw std::runtime_error("BBP did not die from the requested signal");
+      }
+      const auto exit_deadline = std::chrono::steady_clock::now() + 5s;
+      for (const pid_t pid : children) {
+        int status = 0;
+        pid_t waited = 0;
+        do {
+          waited = waitpid(pid, &status, WNOHANG);
+          if (waited == pid) {
+            break;
+          }
+          if (waited < 0 && errno != EINTR) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "reap managed crash-test child");
+          }
+          std::this_thread::sleep_for(10ms);
+        } while (std::chrono::steady_clock::now() < exit_deadline);
+        if (waited != pid || !WIFSIGNALED(status) ||
+            WTERMSIG(status) != SIGKILL) {
+          throw std::runtime_error(
+              "managed child was not killed within five seconds of BBP death");
+        }
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    // This task proves immediate process termination. Existing explicit
+    // cleanup removes the residual resources; startup recovery is separate.
+    if (std::filesystem::exists(run_root / ".bbp-run")) {
+      PtyProcess cleanup(command,
+                         {"--cleanup-run", run_id, "--benchmark-root",
+                          benchmark_root.string()},
+                         24, 80, home.root());
+      RequireExitZero(&cleanup, "post-crash owned resource cleanup");
+    }
+    if (failure) {
+      std::rethrow_exception(failure);
+    }
+    RequireOwnedResourcesRemoved(run_root, 2U, daemon_pids, namespace_pids);
+    fallback.Disarm();
+  }
 }
 
 void WriteActiveScenario(const std::filesystem::path& path) {
@@ -6665,6 +6765,17 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
       std::cerr << "direct-load lifecycle regression failed: " << error.what()
                 << '\n';
+      return 1;
+    }
+  }
+  if (argc == 5 && std::string_view(argv[1]) == "--abrupt-parent-death") {
+    try {
+      CheckAbruptParentDeath(argv[2], argv[3], argv[4]);
+      std::cout << "real isolated Firo and namespace helpers terminate after "
+                   "BBP kill and crash\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "parent-death regression failed: " << error.what() << '\n';
       return 1;
     }
   }

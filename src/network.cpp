@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "bbp/simulation_cancelled.h"
+#include "owned_process_spawn.h"
 
 namespace bbp {
 
@@ -1649,13 +1650,7 @@ UniqueFd StartNetworkNamespaceHelper(
   UniqueFd read_end(pipe_fds[0]);
   UniqueFd write_end(pipe_fds[1]);
 
-  const pid_t pid = fork();
-  if (pid < 0) {
-    throw std::runtime_error(std::string("fork failed: ") +
-                             std::strerror(errno));
-  }
-
-  if (pid == 0) {
+  const pid_t pid = ForkOwnedProcess([&] {
     read_end.Reset();
     int status = 0;
     if (cgroup_procs.get() >= 0) {
@@ -1686,6 +1681,10 @@ UniqueFd StartNetworkNamespaceHelper(
     while (true) {
       pause();
     }
+  });
+  if (pid < 0) {
+    throw std::runtime_error(std::string("owned fork failed: ") +
+                             std::strerror(errno));
   }
 
   write_end.Reset();

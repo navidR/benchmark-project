@@ -38,6 +38,7 @@
 
 #include "bbp/run_ownership.h"
 #include "bbp/util.h"
+#include "owned_process_spawn.h"
 
 namespace bbp {
 namespace {
@@ -3718,17 +3719,17 @@ CgroupFreezeProbe Cgroup::ProbeFreezeThaw() {
 
   Cgroup::PrepareRun(probe.run_id);
   Cgroup cgroup = Cgroup::Create(probe.run_id, probe.node_id);
-  pid_t child = fork();
-  if (child < 0) {
-    cgroup.Remove(std::chrono::steady_clock::now() + std::chrono::seconds(1));
-    Cgroup::RemoveRun(probe.run_id);
-    throw std::runtime_error(std::string("fork failed: ") +
-                             std::strerror(errno));
-  }
-  if (child == 0) {
+  const pid_t child = ForkOwnedProcess([] {
     for (;;) {
       pause();
     }
+  });
+  if (child < 0) {
+    const int error = errno;
+    cgroup.Remove(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    Cgroup::RemoveRun(probe.run_id);
+    throw std::runtime_error(std::string("owned fork failed: ") +
+                             std::strerror(error));
   }
 
   probe.child_pid = child;

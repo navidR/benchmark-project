@@ -265,6 +265,7 @@ add_executable(bbp
   src/periodic_metrics_collector.cpp
   src/positive_duration.cpp
   src/process.cpp
+  src/owned_process_spawn.cpp
   src/process_control_config.cpp
   src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
@@ -657,6 +658,7 @@ if(BUILD_TESTING)
     src/periodic_metrics_collector.cpp
     src/positive_duration.cpp
     src/process.cpp
+    src/owned_process_spawn.cpp
     src/process_control_config.cpp
     src/probabilistic_block_scheduler.cpp
     src/resource_limit_patch.cpp
@@ -1183,6 +1185,13 @@ if(BUILD_TESTING)
     "optional firod used by the real direct-load lifecycle regression"
   )
   if(BBP_FIROD_INTEGRATION_BINARY)
+    add_test(NAME bbp-owned-process-parent-death
+      COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+        --abrupt-parent-death
+        $<TARGET_FILE:bbp>
+        "${BBP_FIROD_INTEGRATION_BINARY}"
+        "${CMAKE_CURRENT_BINARY_DIR}/parent-death-artifacts"
+    )
     add_test(NAME bbp-direct-transaction-load-lifecycle
       COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
         --direct-load-lifecycle

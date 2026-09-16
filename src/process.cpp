@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "bbp/util.h"
+#include "owned_process_spawn.h"
 
 namespace bbp {
 namespace {
@@ -185,17 +186,7 @@ ChildProcess ChildProcess::Spawn(
                              std::strerror(errno));
   }
 
-  pid_t pid = fork();
-  if (pid < 0) {
-    close(gate[0]);
-    close(gate[1]);
-    close(setup_status[0]);
-    close(setup_status[1]);
-    throw std::runtime_error(std::string("fork failed: ") +
-                             std::strerror(errno));
-  }
-
-  if (pid == 0) {
+  const pid_t pid = ForkOwnedProcess([&] {
     close(gate[1]);
     close(setup_status[0]);
     sigset_t empty_signal_mask;
@@ -253,6 +244,15 @@ ChildProcess ChildProcess::Spawn(
 
     execv(executable.c_str(), argv.data());
     ChildFail("execv");
+  });
+  if (pid < 0) {
+    const int error = errno;
+    close(gate[0]);
+    close(gate[1]);
+    close(setup_status[0]);
+    close(setup_status[1]);
+    throw std::runtime_error(std::string("owned fork failed: ") +
+                             std::strerror(error));
   }
 
   close(gate[0]);

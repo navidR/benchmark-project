@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -66,11 +67,18 @@ int main(int argc, char** argv) {
     return 3;
   }
 
+  const pid_t parent = getpid();
   const pid_t descendant = fork();
   if (descendant < 0) {
     return 4;
   }
   if (descendant == 0) {
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent) {
+      _exit(127);
+    }
+    if (!WriteFile(argv[1], std::to_string(getpid()))) {
+      _exit(5);
+    }
     if (ignore_term) {
       while (true) {
         pause();
@@ -78,12 +86,6 @@ int main(int argc, char** argv) {
     }
     _exit(WaitForTermination(signals, argv[3]));
   }
-  if (!WriteFile(argv[1], std::to_string(descendant))) {
-    kill(descendant, SIGKILL);
-    waitpid(descendant, nullptr, 0);
-    return 5;
-  }
-
   if (ignore_term) {
     while (true) {
       pause();
