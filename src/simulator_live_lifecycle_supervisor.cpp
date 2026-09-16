@@ -151,14 +151,18 @@ void RunLiveLifecycleSupervisor(std::stop_token supervisor_stop_token,
           std::string process_exit_detail;
           {
             auto process_guard = context.run_process_state.Lock();
+            // Reap before publishing so every exit handled below has its
+            // pending signal observation recorded before process replacement.
+            const bool node_exited =
+                node.Lifecycle() == NodeRuntimeLifecycle::kRunning &&
+                !node.process.running();
             PublishNodeSignalObservation(node, process_guard,
                                          context.events_path,
                                          context.options.run_id);
             PublishHelperSignalObservation(node, process_guard,
                                            context.events_path,
                                            context.options.run_id);
-            if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning ||
-                node.process.running()) {
+            if (!node_exited) {
               continue;
             }
             exited_wait_status = node.process.exit_status();

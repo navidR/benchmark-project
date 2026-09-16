@@ -712,36 +712,36 @@ BOOST_AUTO_TEST_CASE(
   invalid = wallet;
   invalid.mode.reset();
   rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
-  invalid = wallet;
-  invalid.funding_wallet_id = "firo-funder";
-  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  auto funded_wallet = wallet;
+  funded_wallet.funding_wallet_id = "firo-funder";
+  rejected(bbp::SimulationCommandKind::kAssignRole, funded_wallet);
 
-  invalid = wallet;
-  invalid.role = bbp::SimulationRoleKind::kMiner;
-  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
-  invalid.mode.reset();
-  invalid.funding_wallet_id = "firo-funder";
-  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  auto invalid_miner = wallet;
+  invalid_miner.role = bbp::SimulationRoleKind::kMiner;
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid_miner);
+  invalid_miner.mode.reset();
+  invalid_miner.funding_wallet_id = "firo-funder";
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid_miner);
 
-  invalid = wallet;
-  invalid.role = bbp::SimulationRoleKind::kMasternode;
-  invalid.mode.reset();
-  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
-  invalid.funding_wallet_id = "firo/funder";
-  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
-  invalid.funding_wallet_id = "firo-funder";
-  invalid.mode = bbp::WalletPrivacyMode::kPrivate;
-  rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
+  auto invalid_masternode = wallet;
+  invalid_masternode.role = bbp::SimulationRoleKind::kMasternode;
+  invalid_masternode.mode.reset();
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid_masternode);
+  invalid_masternode.funding_wallet_id = "firo/funder";
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid_masternode);
+  invalid_masternode.funding_wallet_id = "firo-funder";
+  invalid_masternode.mode = bbp::WalletPrivacyMode::kPrivate;
+  rejected(bbp::SimulationCommandKind::kAssignRole, invalid_masternode);
 
   invalid = wallet;
   invalid.role = bbp::SimulationRoleKind::kCount;
   rejected(bbp::SimulationCommandKind::kAssignRole, invalid);
 
-  invalid = wallet;
-  rejected(bbp::SimulationCommandKind::kRemoveRole, invalid);
-  invalid.mode.reset();
-  invalid.funding_wallet_id = "firo-funder";
-  rejected(bbp::SimulationCommandKind::kRemoveRole, invalid);
+  auto invalid_removal = wallet;
+  rejected(bbp::SimulationCommandKind::kRemoveRole, invalid_removal);
+  invalid_removal.mode.reset();
+  invalid_removal.funding_wallet_id = "firo-funder";
+  rejected(bbp::SimulationCommandKind::kRemoveRole, invalid_removal);
 
   const bbp::SimulationRoleMutationRequest masternode{
       .node_ids = {"firo-1"},

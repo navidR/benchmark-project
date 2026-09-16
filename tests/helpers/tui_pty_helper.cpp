@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <boost/asio/ip/address_v4.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -3511,6 +3512,9 @@ void CheckNodeSignals(const std::filesystem::path& command,
       std::istringstream lines(ReadFile(events_path));
       std::string line;
       while (std::getline(lines, line)) {
+        // A live append can leave the snapshot's final record incomplete.
+        // Only newline-terminated records are ready for parsing.
+        if (lines.eof()) break;
         const auto event = boost::json::parse(line).as_object();
         if (event.at("event") != "process_signal_observed") continue;
         const auto detail =
@@ -3792,9 +3796,8 @@ void CheckAbruptParentDeath(
       if (daemon_pids.size() != 2U || namespace_pids.size() != 2U) {
         throw std::runtime_error("isolated Firo children did not become ready");
       }
-      std::vector<pid_t> children = daemon_pids;
-      children.insert(children.end(), namespace_pids.begin(),
-                      namespace_pids.end());
+      const std::array<pid_t, 4> children{daemon_pids[0], daemon_pids[1],
+                                          namespace_pids[0], namespace_pids[1]};
       {
         PtyProcess observer(command,
                             {"--benchmark-root", benchmark_root.string(),
