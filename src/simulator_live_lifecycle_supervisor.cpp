@@ -22,6 +22,7 @@
 #include "bbp/simulator/options.h"
 #include "simulator_cancellable_waiting.h"
 #include "simulator_event_writing.h"
+#include "simulator_helper_signal.h"
 #include "simulator_native_mining_rpc.h"
 #include "simulator_node_lifecycle_event_details.h"
 #include "simulator_node_process_state.h"
@@ -153,6 +154,9 @@ void RunLiveLifecycleSupervisor(std::stop_token supervisor_stop_token,
             PublishNodeSignalObservation(node, process_guard,
                                          context.events_path,
                                          context.options.run_id);
+            PublishHelperSignalObservation(node, process_guard,
+                                           context.events_path,
+                                           context.options.run_id);
             if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning ||
                 node.process.running()) {
               continue;

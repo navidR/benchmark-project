@@ -328,7 +328,8 @@ SimulationCommand ParseScheduledSimulationCommand(
 
   if (kind == SimulationCommandKind::kSignalNode ||
       kind == SimulationCommandKind::kSignalWallet ||
-      kind == SimulationCommandKind::kSignalMiner) {
+      kind == SimulationCommandKind::kSignalMiner ||
+      kind == SimulationCommandKind::kSignalHelper) {
     const auto* signal = object.if_contains("signal");
     if (signal == nullptr ||
         (!signal->is_string() && !signal->is_int64() && !signal->is_uint64())) {

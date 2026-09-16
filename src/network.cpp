@@ -17,6 +17,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -40,12 +41,14 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "bbp/simulation_cancelled.h"
+#include "owned_process_signal.h"
 #include "owned_process_spawn.h"
 
 namespace bbp {
@@ -1631,8 +1634,8 @@ void WaitForPid(pid_t pid) {
 }
 
 UniqueFd StartNetworkNamespaceHelper(
-    pid_t* helper_pid,
-    const std::filesystem::path* owner_cgroup_path = nullptr) {
+    pid_t* helper_pid, const std::filesystem::path* owner_cgroup_path = nullptr,
+    int* helper_pidfd = nullptr) {
   UniqueFd cgroup_procs;
   if (owner_cgroup_path != nullptr) {
     cgroup_procs = UniqueFd(open(
@@ -1671,6 +1674,26 @@ UniqueFd StartNetworkNamespaceHelper(
       }
     }
     cgroup_procs.Reset();
+    // This child never execs: discard the controller/TUI signal handlers and
+    // blocked mask so injected signals retain their normal kernel behavior.
+    struct sigaction default_action{};
+    default_action.sa_handler = SIG_DFL;
+    sigemptyset(&default_action.sa_mask);
+    for (int signal = 1; status == 0 && signal < NSIG; ++signal) {
+      if (signal == SIGKILL || signal == SIGSTOP) continue;
+      if (sigaction(signal, &default_action, nullptr) != 0 && errno != EINVAL) {
+        status = errno;
+      }
+      // libc rejects its reserved signals with EINVAL.
+    }
+    sigset_t empty_mask;
+    sigemptyset(&empty_mask);
+    if (status == 0 && sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0) {
+      status = errno;
+    }
+    if (status == 0 && setsid() < 0) {
+      status = errno;
+    }
     if (status == 0 && unshare(CLONE_NEWNET) != 0) {
       status = errno;
     }
@@ -1700,9 +1723,18 @@ UniqueFd StartNetworkNamespaceHelper(
   }
 
   try {
+    UniqueFd pidfd;
+    if (helper_pidfd != nullptr) {
+      pidfd = UniqueFd(static_cast<int>(syscall(SYS_pidfd_open, pid, 0)));
+      if (pidfd.get() < 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "open owned namespace helper pidfd");
+      }
+    }
     UniqueFd netns =
         OpenFileDescriptor("/proc/" + std::to_string(pid) + "/ns/net");
     *helper_pid = pid;
+    if (helper_pidfd != nullptr) *helper_pidfd = pidfd.Release();
     return netns;
   } catch (...) {
     kill(pid, SIGKILL);
@@ -2677,15 +2709,19 @@ void ValidateNetlinkAcknowledgementForTest(
 
 NetworkNamespace NetworkNamespace::Create() {
   pid_t helper_pid = -1;
-  UniqueFd netns = StartNetworkNamespaceHelper(&helper_pid);
-  return NetworkNamespace(helper_pid, netns.Release());
+  int helper_pidfd = -1;
+  UniqueFd netns =
+      StartNetworkNamespaceHelper(&helper_pid, nullptr, &helper_pidfd);
+  return NetworkNamespace(helper_pid, netns.Release(), helper_pidfd);
 }
 
 NetworkNamespace NetworkNamespace::Create(
     const std::filesystem::path& owner_cgroup_path) {
   pid_t helper_pid = -1;
-  UniqueFd netns = StartNetworkNamespaceHelper(&helper_pid, &owner_cgroup_path);
-  return NetworkNamespace(helper_pid, netns.Release());
+  int helper_pidfd = -1;
+  UniqueFd netns = StartNetworkNamespaceHelper(&helper_pid, &owner_cgroup_path,
+                                               &helper_pidfd);
+  return NetworkNamespace(helper_pid, netns.Release(), helper_pidfd);
 }
 
 NetworkNamespace::NetworkNamespace(NetworkNamespace&& other) noexcept {
@@ -2698,16 +2734,54 @@ NetworkNamespace& NetworkNamespace::operator=(
     return *this;
   }
   Stop();
+  if (helper_pidfd_ >= 0) close(helper_pidfd_);
   helper_pid_ = other.helper_pid_;
+  helper_pidfd_ = other.helper_pidfd_;
+  helper_exit_status_ = other.helper_exit_status_;
   fd_ = other.fd_;
   node_veth_identity_ = std::move(other.node_veth_identity_);
   other.helper_pid_ = -1;
+  other.helper_pidfd_ = -1;
+  other.helper_exit_status_.reset();
   other.fd_ = -1;
   other.node_veth_identity_.reset();
   return *this;
 }
 
-NetworkNamespace::~NetworkNamespace() { Stop(); }
+NetworkNamespace::~NetworkNamespace() {
+  Stop();
+  if (helper_pidfd_ >= 0) close(helper_pidfd_);
+}
+
+ProcessSignalDelivery NetworkNamespace::DeliverHelperSignal(
+    int signal, ProcessSignalScope scope) {
+  return DeliverOwnedProcessSignal(helper_pid_, helper_pidfd_, signal, scope);
+}
+
+std::string_view NetworkNamespace::HelperObservedState() const {
+  if (helper_exit_status_) return "exited";
+  if (helper_pidfd_ < 0) {
+    throw std::logic_error("cannot observe an unowned namespace helper");
+  }
+  siginfo_t state{};
+  int result;
+  do {
+    result = waitid(P_PIDFD, static_cast<id_t>(helper_pidfd_), &state,
+                    WEXITED | WSTOPPED | WCONTINUED | WNOHANG | WNOWAIT);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "observe namespace helper");
+  }
+  if (state.si_pid == 0 || state.si_code == CLD_CONTINUED) return "running";
+  if (state.si_code == CLD_STOPPED || state.si_code == CLD_TRAPPED)
+    return "stopped";
+  helper_exit_status_ =
+      state.si_code == CLD_EXITED
+          ? state.si_status << 8
+          : state.si_status | (state.si_code == CLD_DUMPED ? 0x80 : 0);
+  return "exited";
+}
 
 void NetworkNamespace::Stop() {
   try {
@@ -2739,18 +2813,31 @@ void NetworkNamespace::StopHelperAndVerify(
     throw std::runtime_error("network namespace stop deadline expired");
   }
   if (helper_pid_ > 0) {
-    if (kill(helper_pid_, SIGKILL) != 0 && errno != ESRCH) {
-      throw std::runtime_error("kill network namespace helper failed: " +
-                               std::string(std::strerror(errno)));
+    try {
+      const auto delivery =
+          DeliverHelperSignal(SIGKILL, ProcessSignalScope::kProcess);
+      if (delivery.kernel_result < 0 && delivery.error_number != ESRCH) {
+        throw std::system_error(delivery.error_number, std::generic_category(),
+                                "kill network namespace helper");
+      }
+    } catch (const std::system_error& error) {
+      if (error.code().value() != ESRCH) throw;
     }
-    int status = 0;
     while (true) {
       if (stop_token.stop_requested()) {
         throw std::runtime_error("network namespace stop cancelled");
       }
-      const pid_t waited = waitpid(helper_pid_, &status, WNOHANG);
-      if (waited == helper_pid_) {
+      siginfo_t state{};
+      const int waited = waitid(P_PIDFD, static_cast<id_t>(helper_pidfd_),
+                                &state, WEXITED | WNOHANG);
+      if (waited == 0 && state.si_pid != 0) {
+        helper_exit_status_ =
+            state.si_code == CLD_EXITED
+                ? state.si_status << 8
+                : state.si_status | (state.si_code == CLD_DUMPED ? 0x80 : 0);
         helper_pid_ = -1;
+        close(helper_pidfd_);
+        helper_pidfd_ = -1;
         return;
       }
       if (waited < 0 && errno == EINTR) {

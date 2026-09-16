@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/process_signal.h"
+
 namespace bbp {
 
 class DirectionalNetworkPolicyOutcomeUnconfirmed : public std::runtime_error {
@@ -254,6 +256,10 @@ class NetworkNamespace {
     node_veth_identity_ = std::move(identity);
   }
   void ClearNodeVethIdentity() noexcept { node_veth_identity_.reset(); }
+  ProcessSignalDelivery DeliverHelperSignal(int signal,
+                                            ProcessSignalScope scope);
+  std::string_view HelperObservedState() const;
+  std::optional<int> helper_exit_status() const { return helper_exit_status_; }
   void Stop();
   void StopHelperAndVerify(std::chrono::steady_clock::time_point deadline,
                            std::stop_token stop_token = {});
@@ -261,10 +267,12 @@ class NetworkNamespace {
                      std::stop_token stop_token = {});
 
  private:
-  NetworkNamespace(pid_t helper_pid, int fd)
-      : helper_pid_(helper_pid), fd_(fd) {}
+  NetworkNamespace(pid_t helper_pid, int fd, int helper_pidfd)
+      : helper_pid_(helper_pid), helper_pidfd_(helper_pidfd), fd_(fd) {}
 
   pid_t helper_pid_ = -1;
+  int helper_pidfd_ = -1;
+  mutable std::optional<int> helper_exit_status_;
   int fd_ = -1;
   std::optional<NodeVethIdentity> node_veth_identity_;
 };

@@ -1076,6 +1076,14 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(
       std::get<SimulationCommand>(miner_options.scheduled_events.front().action)
           .kind == SimulationCommandKind::kSignalMiner);
+  event["action"] = "signal_helper";
+  const auto helper_options = ParseAndValidateScenario(scenario);
+  BOOST_CHECK(std::get<SimulationCommand>(
+                  helper_options.scheduled_events.front().action)
+                  .kind == SimulationCommandKind::kSignalHelper);
+  runtime["kind"] = "signal_helper";
+  BOOST_CHECK(ParseAndValidateSimulationCommand(runtime, options).kind ==
+              SimulationCommandKind::kSignalHelper);
   runtime["kind"] = "signal_miner";
   BOOST_TEST(ParseAndValidateSimulationCommand(runtime, options)
                  .signal_request->signal == SIGCONT);

@@ -4,10 +4,12 @@
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,6 +23,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1469,4 +1473,67 @@ BOOST_AUTO_TEST_CASE(directional_network_policy_rejects_invalid_destination) {
   BOOST_CHECK_THROW(
       bbp::DirectionalNetworkPoliciesMatch({}, {}, "veth0", {policy}),
       std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    namespace_helper_signals_preserve_ownership_and_namespace) {
+  std::optional<bbp::NetworkNamespace> original;
+  try {
+    original.emplace(bbp::NetworkNamespace::Create());
+  } catch (const std::exception& error) {
+    if (!ExplicitPrivilegeFailure(error)) throw;
+    BOOST_TEST_MESSAGE(
+        "skipping privileged helper signal test: " << error.what());
+    return;
+  }
+  const pid_t pid = original->helper_pid();
+  struct stat before{};
+  BOOST_REQUIRE(fstat(original->fd(), &before) == 0);
+  bbp::NetworkNamespace owner = std::move(*original);
+  BOOST_CHECK_THROW(
+      original->DeliverHelperSignal(SIGKILL, bbp::ProcessSignalScope::kProcess),
+      std::system_error);
+  const auto wait_state = [&](std::string_view expected) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (owner.HelperObservedState() != expected &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    BOOST_REQUIRE(owner.HelperObservedState() == expected);
+  };
+  const auto harmless =
+      owner.DeliverHelperSignal(SIGWINCH, bbp::ProcessSignalScope::kProcess);
+  BOOST_TEST(harmless.kernel_result == 0);
+  BOOST_TEST(harmless.target_pid == pid);
+  BOOST_TEST(harmless.process_group_id == pid);
+  BOOST_TEST(getsid(pid) == pid);
+  BOOST_TEST(
+      owner.DeliverHelperSignal(SIGSTOP, bbp::ProcessSignalScope::kProcessGroup)
+          .kernel_result == 0);
+  wait_state("stopped");
+  BOOST_TEST(
+      owner.DeliverHelperSignal(SIGCONT, bbp::ProcessSignalScope::kProcess)
+          .kernel_result == 0);
+  wait_state("running");
+  BOOST_TEST(
+      owner.DeliverHelperSignal(SIGKILL, bbp::ProcessSignalScope::kProcessGroup)
+          .kernel_result == 0);
+  wait_state("exited");
+  BOOST_REQUIRE(owner.helper_exit_status());
+  BOOST_REQUIRE(WIFSIGNALED(*owner.helper_exit_status()));
+  BOOST_TEST(WTERMSIG(*owner.helper_exit_status()) == SIGKILL);
+  BOOST_CHECK_THROW(
+      owner.DeliverHelperSignal(SIGCONT, bbp::ProcessSignalScope::kProcess),
+      std::system_error);
+  struct stat after{};
+  BOOST_REQUIRE(fstat(owner.fd(), &after) == 0);
+  BOOST_TEST(after.st_ino == before.st_ino);
+  BOOST_TEST(after.st_dev == before.st_dev);
+  owner.StopAndVerify(std::chrono::steady_clock::now() +
+                      std::chrono::seconds(2));
+  BOOST_TEST(kill(pid, 0) == -1);
+  BOOST_TEST(errno == ESRCH);
+  owner.StopAndVerify(std::chrono::steady_clock::now() +
+                      std::chrono::seconds(2));
 }

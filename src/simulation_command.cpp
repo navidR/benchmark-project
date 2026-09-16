@@ -264,6 +264,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "signal_wallet";
     case SimulationCommandKind::kSignalMiner:
       return "signal_miner";
+    case SimulationCommandKind::kSignalHelper:
+      return "signal_helper";
     case SimulationCommandKind::kConnectPeer:
       return "connect_peer";
     case SimulationCommandKind::kDisconnectPeer:
@@ -344,6 +346,7 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "signal_node") return SimulationCommandKind::kSignalNode;
   if (name == "signal_wallet") return SimulationCommandKind::kSignalWallet;
   if (name == "signal_miner") return SimulationCommandKind::kSignalMiner;
+  if (name == "signal_helper") return SimulationCommandKind::kSignalHelper;
   if (name == "kill_node") {
     return SimulationCommandKind::kKillNode;
   }
@@ -430,6 +433,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kSignalWallet:
     case SimulationCommandKind::kSignalMiner:
+    case SimulationCommandKind::kSignalHelper:
     case SimulationCommandKind::kDisconnectPeer:
     case SimulationCommandKind::kSetPeerCountPolicy:
     case SimulationCommandKind::kFreezeNode:

@@ -39,6 +39,7 @@ struct NodeRuntime {
   ChildProcess process;
   // Protected by run_process_state; scoped to this exact process generation.
   std::optional<NodeSignalObservation> signal_observation;
+  std::optional<NodeSignalObservation> helper_signal_observation;
   RunProcessState* run_process_state = nullptr;
   NodeLifecyclePolicy lifecycle_policy;
   std::optional<std::chrono::steady_clock::time_point> process_started_at;

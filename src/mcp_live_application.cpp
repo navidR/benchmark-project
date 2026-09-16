@@ -54,6 +54,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kSignalNode,
     McpOperationKind::kSignalWallet,
     McpOperationKind::kSignalMiner,
+    McpOperationKind::kSignalHelper,
     McpOperationKind::kRestartNode,
     McpOperationKind::kReplaceNode,
     McpOperationKind::kAddWallet,
@@ -1789,6 +1790,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kSignalNode &&
       kind != McpOperationKind::kSignalWallet &&
       kind != McpOperationKind::kSignalMiner &&
+      kind != McpOperationKind::kSignalHelper &&
       kind != McpOperationKind::kRestartNode &&
       kind != McpOperationKind::kReplaceNode &&
       kind != McpOperationKind::kAddWallet &&
@@ -2198,6 +2200,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                     kind == McpOperationKind::kSignalNode ||
                                     kind == McpOperationKind::kSignalWallet ||
                                     kind == McpOperationKind::kSignalMiner ||
+                                    kind == McpOperationKind::kSignalHelper ||
                                     kind == McpOperationKind::kRestartNode;
   const bool direct_node_add_operation = kind == McpOperationKind::kAddNode;
   const bool direct_node_replace_operation =
@@ -2286,7 +2289,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                        : SimulationCommandKind::kRestartNode;
     if (kind == McpOperationKind::kSignalNode ||
         kind == McpOperationKind::kSignalWallet ||
-        kind == McpOperationKind::kSignalMiner) {
+        kind == McpOperationKind::kSignalMiner ||
+        kind == McpOperationKind::kSignalHelper) {
       Options validation_options = *config_.options;
       McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
       validation_options.nodes =
@@ -2295,10 +2299,11 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       validation_options.node_capacity = inventory.node_capacity;
       command = ParseAndValidateSimulationCommand(
           boost::json::object{
-              {"kind", kind == McpOperationKind::kSignalNode ? "signal_node"
-                       : kind == McpOperationKind::kSignalWallet
-                           ? "signal_wallet"
-                           : "signal_miner"},
+              {"kind",
+               kind == McpOperationKind::kSignalNode     ? "signal_node"
+               : kind == McpOperationKind::kSignalWallet ? "signal_wallet"
+               : kind == McpOperationKind::kSignalMiner  ? "signal_miner"
+                                                         : "signal_helper"},
               {"node", command.node_id},
               {"signal", arguments.at("signal")},
               {"scope", arguments.at("scope")}},
@@ -2380,6 +2385,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                 ? "wallet.signal"
             : command_kind == SimulationCommandKind::kSignalMiner
                 ? "miner.signal"
+            : command_kind == SimulationCommandKind::kSignalHelper
+                ? "helper.signal"
             : command_kind == SimulationCommandKind::kRestartNode
                 ? "node.restart"
             : command_kind == SimulationCommandKind::kAddNodes ? "node.add"
@@ -2618,7 +2625,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         }
         if (command_kind == SimulationCommandKind::kSignalNode ||
             command_kind == SimulationCommandKind::kSignalWallet ||
-            command_kind == SimulationCommandKind::kSignalMiner) {
+            command_kind == SimulationCommandKind::kSignalMiner ||
+            command_kind == SimulationCommandKind::kSignalHelper) {
           if (!outcome.signal_delivery) {
             throw McpOperationFailure(
                 "node_outcome_unconfirmed",
@@ -3281,7 +3289,8 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
        kind == SimulationCommandKind::kSetResourceProfile ||
        kind == SimulationCommandKind::kSignalNode ||
        kind == SimulationCommandKind::kSignalWallet ||
-       kind == SimulationCommandKind::kSignalMiner) &&
+       kind == SimulationCommandKind::kSignalMiner ||
+       kind == SimulationCommandKind::kSignalHelper) &&
       operation_control->CommitPhase() !=
           SimulationCommandCommitPhase::kCancelled) {
     // Cancellation lost admission. The short mutation owns its result through

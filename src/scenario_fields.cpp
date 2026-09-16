@@ -433,6 +433,7 @@ std::span<const std::string_view> ScenarioCommandFields(
     case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kSignalWallet:
     case SimulationCommandKind::kSignalMiner:
+    case SimulationCommandKind::kSignalHelper:
       return kSignal;
     case SimulationCommandKind::kSetMiningDifficulty:
       return kDifficulty;

@@ -341,6 +341,7 @@ add_executable(bbp
   src/simulator_node_process_state.cpp
   src/simulator_node_report_export.cpp
   src/simulator_node_signal.cpp
+  src/simulator_helper_signal.cpp
   src/simulator_offline_run_cleanup.cpp
   src/simulator_one_shot_workload_dispatch.cpp
   src/simulator_one_shot_workload_invocation.cpp
@@ -727,6 +728,7 @@ if(BUILD_TESTING)
     src/simulator_node_process_state.cpp
     src/simulator_node_report_export.cpp
     src/simulator_node_signal.cpp
+    src/simulator_helper_signal.cpp
     src/simulator_offline_run_cleanup.cpp
     src/simulator_one_shot_workload_dispatch.cpp
     src/simulator_one_shot_workload_invocation.cpp
@@ -1207,7 +1209,7 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/wallet-signal-artifacts"
     )
     set_tests_properties(bbp-wallet-signal-operation PROPERTIES TIMEOUT 90)
-    foreach(signal_target IN ITEMS miner default-miner)
+    foreach(signal_target IN ITEMS miner default-miner helper helper-kill)
       add_test(NAME bbp-${signal_target}-signal-operation
         COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
           --${signal_target}-signals

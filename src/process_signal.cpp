@@ -1,10 +1,17 @@
 #include "bbp/process_signal.h"
 
 #include <signal.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <charconv>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
+
+#include "owned_process_signal.h"
 
 namespace bbp {
 namespace {
@@ -120,6 +127,57 @@ std::string_view ProcessSignalScopeName(ProcessSignalScope scope) {
       return "process_group";
   }
   throw std::invalid_argument("invalid process signal scope");
+}
+
+ProcessSignalDelivery DeliverOwnedProcessSignal(pid_t pid, int pidfd,
+                                                int signal,
+                                                ProcessSignalScope scope) {
+  static_cast<void>(ProcessSignalName(signal));
+  if (scope != ProcessSignalScope::kProcess &&
+      scope != ProcessSignalScope::kProcessGroup) {
+    throw std::invalid_argument("invalid process signal delivery scope");
+  }
+  if (pid <= 0 || pidfd < 0) {
+    throw std::system_error(ECHILD, std::generic_category(),
+                            "signal target has no live owned child identity");
+  }
+  siginfo_t state{};
+  int inspected;
+  do {
+    inspected = waitid(P_PIDFD, static_cast<id_t>(pidfd), &state,
+                       WEXITED | WNOHANG | WNOWAIT);
+  } while (inspected < 0 && errno == EINTR);
+  if (inspected < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "verify signal target child ownership");
+  }
+  if (state.si_pid != 0) {
+    throw std::system_error(ESRCH, std::generic_category(),
+                            "signal target has already exited");
+  }
+  unsigned int flags = 0U;
+  if (scope == ProcessSignalScope::kProcessGroup) {
+    if (getpgid(pid) != pid || getsid(pid) != pid) {
+      throw std::system_error(EPERM, std::generic_category(),
+                              "signal target is not an owned private group");
+    }
+    // Linux UAPI PIDFD_SIGNAL_PROCESS_GROUP (available since Linux 6.9).
+    flags = 1U << 2U;
+  }
+  int result = -1;
+#ifdef SYS_pidfd_send_signal
+  result = static_cast<int>(
+      syscall(SYS_pidfd_send_signal, pidfd, signal, nullptr, flags));
+#else
+  errno = ENOSYS;
+#endif
+  const int error = result < 0 ? errno : 0;
+  return {.target_pid = pid,
+          .process_group_id = pid,
+          .signal = signal,
+          .scope = scope,
+          .kernel_result = result,
+          .error_number = error};
 }
 
 }  // namespace bbp

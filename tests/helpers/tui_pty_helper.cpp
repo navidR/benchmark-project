@@ -3434,15 +3434,18 @@ void CheckNodeSignals(const std::filesystem::path& command,
                       const std::filesystem::path& daemon,
                       const std::filesystem::path& benchmark_root,
                       std::string_view target = "node") {
+  const bool helper_target = target == "helper" || target == "helper_kill";
   const bool wallet_target = target == "wallet";
   const bool default_miner = target == "default_miner";
   const bool miner_target = target == "miner" || default_miner;
-  const std::string command_kind = wallet_target  ? "signal_wallet"
-                                   : miner_target ? "signal_miner"
-                                                  : "signal_node";
-  const std::string operation = wallet_target  ? "wallet.signal"
-                                : miner_target ? "miner.signal"
-                                               : "node.signal";
+  const std::string command_kind = wallet_target   ? "signal_wallet"
+                                   : miner_target  ? "signal_miner"
+                                   : helper_target ? "signal_helper"
+                                                   : "signal_node";
+  const std::string operation = wallet_target   ? "wallet.signal"
+                                : miner_target  ? "miner.signal"
+                                : helper_target ? "helper.signal"
+                                                : "node.signal";
   OwnedTemporaryDirectory home(std::string(target) + "-signals");
   std::filesystem::create_directories(benchmark_root);
   const std::string run_id = "node-signals-" + std::to_string(getpid());
@@ -3490,7 +3493,15 @@ void CheckNodeSignals(const std::filesystem::path& command,
   const auto pids = EventProcessPids(ReadFile(events_path));
   if (pids.size() != 1U)
     throw std::runtime_error("signal test expected one daemon");
-  pid_t current_pid = pids.front();
+  const pid_t daemon_pid = pids.front();
+  pid_t current_pid = daemon_pid;
+  if (helper_target) {
+    const auto helpers =
+        MetricNamespacePids(ReadFile(run_root / "metrics.jsonl"));
+    if (helpers.size() != 1U)
+      throw std::runtime_error("signal test expected one namespace helper");
+    current_pid = helpers.front();
+  }
   const auto mcp = ConnectMcpTestSession(home.root() / ".bbp" / "mcp");
   std::uint64_t request_id = 2U;
   const auto wait_observation = [&](std::string_view state,
@@ -3554,6 +3565,11 @@ void CheckNodeSignals(const std::filesystem::path& command,
                          delivery.at("target") != "miner_node_daemon")) {
       throw std::runtime_error("miner signal lost shared daemon identity");
     }
+    if (helper_target &&
+        (result.at("action") != "helper.signal" ||
+         delivery.at("target") != "network_namespace_helper")) {
+      throw std::runtime_error("helper signal targeted the wrong process kind");
+    }
     return result;
   };
 
@@ -3562,14 +3578,18 @@ void CheckNodeSignals(const std::filesystem::path& command,
   process.Write("c");
   static_cast<void>(
       process.ReadUntil("Live command", 3s, "node signal palette"));
-  process.Write(wallet_target  ? "signal-wallet SIGSTOP process\n"
-                : miner_target ? "signal-miner SIGSTOP process\n"
-                               : "signal-node SIGSTOP process\n");
+  process.Write(wallet_target   ? "signal-wallet SIGSTOP process\n"
+                : miner_target  ? "signal-miner SIGSTOP process\n"
+                : helper_target ? "signal-helper SIGSTOP process\n"
+                                : "signal-node SIGSTOP process\n");
   const auto confirmation = process.ReadUntil("Confirm destructive action", 3s,
                                               "node signal confirmation");
   RequireContains(confirmation, "SIGSTOP", "explicit signal confirmation");
   if (wallet_target || miner_target)
     RequireContains(confirmation, "all node roles", "shared daemon warning");
+  if (helper_target)
+    RequireContains(confirmation, "network namespace keeper",
+                    "explicit helper selection");
   process.Write("y");
   static_cast<void>(wait_observation("stopped", {}));
   const auto continued = send(SIGCONT, "process", false);
@@ -3591,9 +3611,22 @@ void CheckNodeSignals(const std::filesystem::path& command,
     // The implicit default uses restart_policy=never; explicit roles below
     // exercise fatal restart while this variant checks active mining recovery.
     if (default_miner) break;
+    if (helper_target &&
+        ((target == "helper_kill") != (std::string_view(signal) == "SIGKILL")))
+      continue;
     const auto result = send(signal, scope, false);
     const auto observed =
         wait_observation("exited", result.at("command_id").as_string());
+    if (helper_target) {
+      if (observed.at("restart_action") != "not_restarted" ||
+          observed.at("cleanup_state") != "namespace_retained" ||
+          observed.at("terminating_signal").to_number<int>() !=
+              (target == "helper_kill" ? SIGKILL : SIGTERM) ||
+          observed.at("target_pid").to_number<pid_t>() != current_pid) {
+        throw std::runtime_error("helper exit lost lifecycle evidence");
+      }
+      break;
+    }
     if (observed.at("restart_action") != "restart_requested" ||
         observed.at("target_pid").to_number<pid_t>() != current_pid) {
       throw std::runtime_error("signal exit lost restart-policy correlation");
@@ -3612,16 +3645,18 @@ void CheckNodeSignals(const std::filesystem::path& command,
           "signal restart did not replace the exited daemon");
     current_pid = restarted_pids.back();
   }
-  if (wallet_target || (miner_target && !default_miner)) {
+  if (wallet_target || (miner_target && !default_miner) || helper_target) {
     boost::json::object remove_arguments{{"run_id", run_id}};
     if (wallet_target)
       remove_arguments["node_id"] = "firo-1";
     else
       remove_arguments["node_ids"] = boost::json::array{"firo-1"};
-    static_cast<void>(InvokeMcpOperation(
-        mcp, &request_id, wallet_target ? "wallet.remove" : "miner.remove",
-        std::move(remove_arguments), 5s,
-        "remove role before signal rejection"));
+    if (!helper_target) {
+      static_cast<void>(InvokeMcpOperation(
+          mcp, &request_id, wallet_target ? "wallet.remove" : "miner.remove",
+          std::move(remove_arguments), 5s,
+          "remove role before signal rejection"));
+    }
     const auto rejected =
         SubmitMcpOperation(mcp, &request_id, operation,
                            boost::json::object{{"run_id", run_id},
@@ -3640,10 +3675,11 @@ void CheckNodeSignals(const std::filesystem::path& command,
     } while (std::chrono::steady_clock::now() < deadline);
     if (terminal.at("state") != "failed")
       throw std::runtime_error("removed role was still signalable");
-    RequireContains(
-        boost::json::serialize(terminal.at("terminal_error")),
-        wallet_target ? "no registered wallet" : "no configured miner role",
-        "removed role rejection");
+    RequireContains(boost::json::serialize(terminal.at("terminal_error")),
+                    wallet_target   ? "no registered wallet"
+                    : helper_target ? "already exited"
+                                    : "no configured miner role",
+                    "removed role rejection");
     // The still-owned daemon must be alive and respond to the node operation.
     const auto alive =
         InvokeMcpOperation(mcp, &request_id, "node.signal",
@@ -3655,8 +3691,9 @@ void CheckNodeSignals(const std::filesystem::path& command,
     if (alive.at("signal_delivery")
                 .as_object()
                 .at("target_pid")
-                .to_number<pid_t>() != current_pid ||
-        !ProcessExists(current_pid))
+                .to_number<pid_t>() !=
+            (helper_target ? daemon_pid : current_pid) ||
+        !ProcessExists(helper_target ? daemon_pid : current_pid))
       throw std::runtime_error("rejected role signal affected backing daemon");
   }
   // Existing query surface must expose the follow-up lifecycle observations.
@@ -7121,7 +7158,9 @@ int main(int argc, char** argv) {
   if (argc == 5 && (std::string_view(argv[1]) == "--node-signals" ||
                     std::string_view(argv[1]) == "--wallet-signals" ||
                     std::string_view(argv[1]) == "--miner-signals" ||
-                    std::string_view(argv[1]) == "--default-miner-signals")) {
+                    std::string_view(argv[1]) == "--default-miner-signals" ||
+                    std::string_view(argv[1]) == "--helper-signals" ||
+                    std::string_view(argv[1]) == "--helper-kill-signals")) {
     try {
       CheckNodeSignals(
           argv[2], argv[3], argv[4],
@@ -7129,7 +7168,9 @@ int main(int argc, char** argv) {
           : std::string_view(argv[1]) == "--miner-signals" ? "miner"
           : std::string_view(argv[1]) == "--default-miner-signals"
               ? "default_miner"
-              : "node");
+          : std::string_view(argv[1]) == "--helper-signals"      ? "helper"
+          : std::string_view(argv[1]) == "--helper-kill-signals" ? "helper_kill"
+                                                                 : "node");
       std::cout << "real node scenario/TUI/MCP signal and restart evidence "
                    "checks passed\n";
       return 0;

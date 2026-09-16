@@ -537,6 +537,12 @@ BOOST_AUTO_TEST_CASE(tui_signal_node_requires_scope_and_confirmation) {
   BOOST_REQUIRE(miner.signal_request);
   BOOST_TEST(miner.signal_request->signal == SIGCONT);
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(miner.kind));
+  const auto helper =
+      bbp::TuiCommandParser::Parse("signal-helper SIGTERM process", 0U);
+  BOOST_CHECK(helper.kind == bbp::SimulationCommandKind::kSignalHelper);
+  BOOST_REQUIRE(helper.signal_request);
+  BOOST_TEST(helper.signal_request->signal == SIGTERM);
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(helper.kind));
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("signal-node SIGKILL", 0U),
                     std::exception);
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("signal-node 0 process", 0U),

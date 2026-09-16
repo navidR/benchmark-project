@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "bbp/util.h"
+#include "owned_process_signal.h"
 #include "owned_process_spawn.h"
 
 namespace bbp {
@@ -401,47 +402,18 @@ bool ChildProcess::RequestKill() {
 
 ProcessSignalDelivery ChildProcess::DeliverSignal(int signal,
                                                   ProcessSignalScope scope) {
-  static_cast<void>(ProcessSignalName(signal));
-  if (scope != ProcessSignalScope::kProcess &&
-      scope != ProcessSignalScope::kProcessGroup) {
-    throw std::invalid_argument("invalid process signal delivery scope");
-  }
-  if (pid_ <= 0 || pidfd_ < 0 || exit_status_) {
+  if (exit_status_) {
+    static_cast<void>(ProcessSignalName(signal));
+    static_cast<void>(ProcessSignalScopeName(scope));
     throw std::system_error(ECHILD, std::generic_category(),
                             "signal target has no live owned child identity");
   }
-  siginfo_t state{};
-  int inspected;
-  do {
-    inspected = waitid(P_PIDFD, static_cast<id_t>(pidfd_), &state,
-                       WEXITED | WNOHANG | WNOWAIT);
-  } while (inspected < 0 && errno == EINTR);
-  if (inspected < 0) {
-    throw std::system_error(errno, std::generic_category(),
-                            "verify signal target child ownership");
+  try {
+    return DeliverOwnedProcessSignal(pid_, pidfd_, signal, scope);
+  } catch (const std::system_error& error) {
+    if (error.code().value() == ESRCH) static_cast<void>(running());
+    throw;
   }
-  if (state.si_pid != 0) {
-    static_cast<void>(running());
-    throw std::system_error(ESRCH, std::generic_category(),
-                            "signal target has already exited");
-  }
-  unsigned int flags = 0U;
-  if (scope == ProcessSignalScope::kProcessGroup) {
-    if (getpgid(pid_) != pid_ || getsid(pid_) != pid_) {
-      throw std::system_error(EPERM, std::generic_category(),
-                              "signal target is not an owned private group");
-    }
-    // Linux UAPI PIDFD_SIGNAL_PROCESS_GROUP (available since Linux 6.9).
-    flags = 1U << 2U;
-  }
-  const int result = PidfdSendSignal(pidfd_, signal, flags);
-  const int error = result < 0 ? errno : 0;
-  return {.target_pid = pid_,
-          .process_group_id = pid_,
-          .signal = signal,
-          .scope = scope,
-          .kernel_result = result,
-          .error_number = error};
 }
 
 void ChildProcess::Kill() {

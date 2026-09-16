@@ -38,6 +38,7 @@
 #include "simulator_cancellable_waiting.h"
 #include "simulator_combined_stop_token.h"
 #include "simulator_event_writing.h"
+#include "simulator_helper_signal.h"
 #include "simulator_live_instrumentation_controller.h"
 #include "simulator_native_mining_rpc.h"
 #include "simulator_network_block_application.h"
@@ -537,6 +538,20 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
           if (command.operation_control) {
             command.operation_control->MarkCommitted();
           }
+        } else if (command.kind == SimulationCommandKind::kSignalHelper) {
+          auto process_guard = context.run_process_state.Lock();
+          if (!node.network_namespace ||
+              node.network_namespace->helper_pid() <= 0) {
+            throw std::runtime_error(
+                "selected node has no owned network namespace helper");
+          }
+          if (node.network_namespace->HelperObservedState() == "exited") {
+            throw std::runtime_error(
+                "selected network namespace helper has already exited");
+          }
+          authorize_resource_mutation();
+          command_outcome.signal_delivery =
+              DeliverHelperSignal(node, command, process_guard);
         } else if (command.kind == SimulationCommandKind::kSignalNode ||
                    command.kind == SimulationCommandKind::kSignalWallet ||
                    command.kind == SimulationCommandKind::kSignalMiner) {
