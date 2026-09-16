@@ -19,6 +19,7 @@
 
 #include "bbp/simulation_command.h"
 #include "bbp/util.h"
+#include "simulator_scenario_identifier.h"
 
 namespace bbp {
 namespace {
@@ -343,6 +344,15 @@ void ValidateRunIdentifier(std::string_view run_id) {
   }
 }
 
+void ValidateNodeIdentifier(std::string_view node_id) {
+  try {
+    simulator_app_internal::RequireSafeScenarioIdentifier(node_id,
+                                                          "MCP node id");
+  } catch (const std::runtime_error& error) {
+    throw std::invalid_argument(error.what());
+  }
+}
+
 void ValidateEvidenceRecord(const McpEvidenceRecord& record) {
   ValidateRunIdentifier(record.run_id);
   ValidateInformationFamily(record.family);
@@ -352,7 +362,9 @@ void ValidateEvidenceRecord(const McpEvidenceRecord& record) {
       ValidateMcpIdentifier(*value, label);
     }
   };
-  validate_optional_identifier(record.node_id, "evidence node id");
+  if (record.node_id) {
+    ValidateNodeIdentifier(*record.node_id);
+  }
   validate_optional_identifier(record.kind, "evidence kind");
   validate_optional_identifier(record.artifact_id, "evidence artifact id");
   if (record.message && record.message->size() > kMcpMaximumEvidenceTextBytes) {
@@ -1621,7 +1633,7 @@ McpSubscriptionSnapshot McpOperationService::CreateSubscription(
         "MCP subscription node selection exceeds its retained bound");
   }
   for (const std::string& node_id : request.node_ids) {
-    ValidateMcpIdentifier(node_id, "MCP subscription node id");
+    ValidateNodeIdentifier(node_id);
   }
   std::sort(request.node_ids.begin(), request.node_ids.end());
   if (std::adjacent_find(request.node_ids.begin(), request.node_ids.end()) !=

@@ -1275,6 +1275,24 @@ BOOST_AUTO_TEST_CASE(mcp_subscription_rejects_invalid_run_identifiers) {
                     std::invalid_argument);
 }
 
+BOOST_AUTO_TEST_CASE(mcp_subscription_rejects_invalid_node_identifiers) {
+  McpOperationService service;
+  service.RegisterSession("session-a");
+  for (const std::string& node_id :
+       {std::string{}, std::string("node.name"), std::string(33U, 'n')}) {
+    const McpSubscriptionRequest request{
+        .run_id = "run-a",
+        .families = {McpInformationFamily::kMetrics},
+        .node_ids = {node_id},
+        .cursor = 0U};
+    BOOST_CHECK_THROW(service.CreateSubscription("session-a", request),
+                      std::invalid_argument);
+    BOOST_CHECK_THROW(service.Publish(Evidence(McpInformationFamily::kMetrics,
+                                               node_id, "invalid node")),
+                      std::invalid_argument);
+  }
+}
+
 BOOST_AUTO_TEST_CASE(
     mcp_subscription_filters_bounds_queue_and_reports_exact_drops) {
   McpOperationService service(TestConfig(1U, 1U, 2U, 2U, 2U, 2U));

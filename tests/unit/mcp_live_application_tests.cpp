@@ -229,12 +229,16 @@ void MarkNodeAddCommitted(const SimulationCommand& command,
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(
-    mcp_live_run_identifiers_match_evidence_and_subscriptions) {
+    mcp_live_scenario_identifiers_match_evidence_and_subscriptions) {
   for (const std::string& run_id :
        {std::string("_hosted-run"), "-" + std::string(31U, 'r')}) {
     LiveApplicationDirectory temporary;
     boost::json::object scenario = LiveScenario();
     scenario["run_id"] = run_id;
+    const std::string node_id =
+        run_id.front() == '_' ? "_selected-node" : "-" + std::string(31U, 'n');
+    scenario["nodes"] = boost::json::array{boost::json::object{
+        {"id", node_id}, {"chain", "firo"}, {"role", "base"}}};
     const auto options =
         std::make_shared<Options>(ParseAndValidateScenario(scenario));
     McpDispatcher* evidence_dispatcher = nullptr;
@@ -298,6 +302,43 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(items.front().as_object().at("run_id").as_string() == run_id);
     BOOST_TEST(items.front().as_object().at("kind").as_string() ==
                "run_started");
+    const boost::json::object selected =
+        Invoke(&dispatcher, "subscription.create",
+               {{"run_id", run_id},
+                {"families", boost::json::array{"metrics"}},
+                {"node_ids", boost::json::array{node_id}}});
+    const boost::json::object selected_poll{
+        {"subscription_id", selected.at("subscription_id")}, {"cursor", "0"}};
+    BOOST_CHECK_THROW(
+        dispatcher.ToolHandler()("subscription.poll", selected_poll,
+                                 "other-session", {}),
+        std::runtime_error);
+    McpEvidenceRecord metric{.run_id = run_id,
+                             .family = McpInformationFamily::kMetrics,
+                             .sequence = 0U,
+                             .timestamp_ms = 2U,
+                             .node_id = node_id,
+                             .kind = "sample",
+                             .message = std::nullopt,
+                             .artifact_id = std::nullopt,
+                             .data = std::nullopt};
+    dispatcher.Publish(metric);
+    metric.run_id = "_other-run";
+    dispatcher.Publish(metric);
+    metric.run_id = run_id;
+    metric.node_id = "_unselected-node";
+    dispatcher.Publish(metric);
+    metric.node_id = std::nullopt;
+    dispatcher.Publish(metric);
+    const boost::json::object selected_page =
+        Invoke(&dispatcher, "subscription.poll", selected_poll);
+    const boost::json::array& selected_items =
+        selected_page.at("items").as_array();
+    BOOST_REQUIRE_EQUAL(selected_items.size(), 1U);
+    BOOST_TEST(selected_items.front().as_object().at("node_id").as_string() ==
+               node_id);
+    BOOST_TEST(selected_items.front().as_object().at("run_id").as_string() ==
+               run_id);
     application.MarkRunStopped();
     const boost::json::object stopped =
         Invoke(&dispatcher, "subscription.poll", poll);

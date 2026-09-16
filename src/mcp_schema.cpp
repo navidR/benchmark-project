@@ -1131,7 +1131,7 @@ boost::json::object EvidenceRecordSchema(bool require_run_id = true) {
   properties["family"] = InformationFamilySchema();
   properties["sequence"] = Uint64Schema();
   properties["timestamp_ms"] = Uint64Schema();
-  properties["node_id"] = IdentifierSchema();
+  properties["node_id"] = NodeAddIdentifierSchema();
   properties["kind"] = IdentifierSchema();
   properties["message"] = StringSchema();
   properties["artifact_id"] = IdentifierSchema();
@@ -2078,8 +2078,8 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["families"] =
           ArraySchema(InformationFamilySchema(information_families), 1U,
                       information_families.size(), true);
-      properties["node_ids"] =
-          ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
+      properties["node_ids"] = ArraySchema(NodeAddIdentifierSchema(), 1U,
+                                           kMaximumSafeCollection, true);
       properties["cursor"] = CursorSchema();
       required.emplace_back("families");
       break;

@@ -978,6 +978,12 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_identifiers_match_safe_production_names) {
       BuildMcpOperationInputSchema(McpOperationKind::kCreateSubscription);
   BOOST_TEST(subscribe.at("properties").as_object().at("run_id").as_object() ==
              identifier);
+  BOOST_TEST(subscribe.at("properties")
+                 .as_object()
+                 .at("node_ids")
+                 .as_object()
+                 .at("items")
+                 .as_object() == identifier);
   const boost::json::object subscription =
       BuildMcpResultSchema(McpResultFamily::kSubscription);
   BOOST_TEST(subscription.at("properties")
@@ -989,6 +995,16 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_identifiers_match_safe_production_names) {
                  .at("properties")
                  .as_object()
                  .at("run_id")
+                 .as_object() == identifier);
+  BOOST_TEST(subscription.at("properties")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("node_id")
                  .as_object() == identifier);
   BOOST_TEST(properties.at("simulation")
                  .as_object()
