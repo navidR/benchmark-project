@@ -1713,25 +1713,6 @@ boost::json::object BuildMcpResolvedScenarioSchema() {
              {"sequence", "at_ms", "wall_at_ms"}) {
           action_required.emplace_back(field);
         }
-        // The current event serializer retains mutation identity but omits
-        // its request object. Describe that output without weakening inputs.
-        for (const std::string_view request :
-             {"node_add", "node_remove", "node_replace"}) {
-          if (fields.erase(request) == 0U) {
-            continue;
-          }
-          for (auto field = action_required.begin();
-               field != action_required.end(); ++field) {
-            if (field->as_string() == request) {
-              action_required.erase(field);
-              break;
-            }
-          }
-          if (request != "node_replace") {
-            fields["node"] = ConstStringSchema("sim");
-            action_required.emplace_back("node");
-          }
-        }
       }
     }
   }

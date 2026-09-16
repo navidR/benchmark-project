@@ -188,8 +188,8 @@ boost::json::object RuntimePeerTopologyEdgeJsonImpl(
   return object;
 }
 
-void AddPeerTopologyJsonImpl(const PeerTopologyConfig& topology,
-                             uint32_t node_count, boost::json::object* object) {
+void AddPeerTopologyRequestJson(const PeerTopologyConfig& topology,
+                                boost::json::object* object) {
   (*object)["type"] = std::string(PeerTopologyKindName(topology.kind));
   switch (topology.kind) {
     case PeerTopologyKind::kFullMesh:
@@ -227,6 +227,11 @@ void AddPeerTopologyJsonImpl(const PeerTopologyConfig& topology,
     case PeerTopologyKind::kCount:
       throw std::logic_error("unknown peer topology kind");
   }
+}
+
+void AddPeerTopologyJsonImpl(const PeerTopologyConfig& topology,
+                             uint32_t node_count, boost::json::object* object) {
+  AddPeerTopologyRequestJson(topology, object);
   (*object)["resolved_edges"] =
       ResolvedPeerTopologyEdgesJson(topology, node_count);
 }
@@ -586,6 +591,8 @@ boost::json::object SimulationCommandScenarioJson(
       command.kind != SimulationCommandKind::kPartitionNodes &&
       command.kind != SimulationCommandKind::kHealPartition &&
       command.kind != SimulationCommandKind::kSetPerfCounters &&
+      command.kind != SimulationCommandKind::kAddNodes &&
+      command.kind != SimulationCommandKind::kRemoveNodes &&
       command.kind != SimulationCommandKind::kAssignRole &&
       command.kind != SimulationCommandKind::kRemoveRole) {
     object["node"] = command.node_id;
@@ -683,6 +690,67 @@ boost::json::object SimulationCommandScenarioJson(
     send["fee"] = FormatFixed8Amount(command.wallet_send->fee_satoshis);
     send["timeout_sec"] = command.wallet_send->timeout_sec;
     object["wallet_send"] = std::move(send);
+  }
+  if (command.node_add) {
+    const SimulationNodeAddRequest& request = *command.node_add;
+    boost::json::object add;
+    add["chain"] = std::string(ChainKindName(request.chain));
+    add["count"] = request.count;
+    boost::json::array node_ids;
+    for (const std::string& node_id : request.node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    add["node_ids"] = std::move(node_ids);
+    if (request.binary) {
+      add["binary"] = *request.binary;
+    }
+    if (request.topology) {
+      boost::json::object topology;
+      AddPeerTopologyRequestJson(*request.topology, &topology);
+      add["topology"] = std::move(topology);
+    }
+    if (request.resources) {
+      add["resources"] = ResourceLimitsJson(*request.resources);
+    }
+    if (request.network) {
+      add["network"] = NetworkConditionJson(*request.network);
+    }
+    add["ready_timeout_sec"] = request.ready_timeout_sec;
+    add["sync_timeout_sec"] = request.sync_timeout_sec;
+    object["node_add"] = std::move(add);
+  }
+  if (command.node_replace) {
+    const SimulationNodeReplaceRequest& request = *command.node_replace;
+    boost::json::object replacement;
+    replacement["chain"] = std::string(ChainKindName(request.chain));
+    replacement["count"] = request.count;
+    boost::json::array node_ids;
+    for (const std::string& node_id : request.node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    replacement["node_ids"] = std::move(node_ids);
+    if (request.binary) {
+      replacement["binary"] = *request.binary;
+    }
+    if (request.resources) {
+      replacement["resources"] = ResourceLimitPatchJson(*request.resources);
+    }
+    if (request.network) {
+      replacement["network"] = NetworkConditionJson(*request.network);
+    }
+    replacement["ready_timeout_sec"] = request.ready_timeout_sec;
+    replacement["sync_timeout_sec"] = request.sync_timeout_sec;
+    object["node_replace"] = std::move(replacement);
+  }
+  if (command.node_remove) {
+    boost::json::object remove;
+    boost::json::array node_ids;
+    for (const std::string& node_id : command.node_remove->node_ids) {
+      node_ids.emplace_back(node_id);
+    }
+    remove["node_ids"] = std::move(node_ids);
+    remove["timeout_sec"] = command.node_remove->timeout_sec;
+    object["node_remove"] = std::move(remove);
   }
   if (command.role_mutation) {
     boost::json::object mutation;

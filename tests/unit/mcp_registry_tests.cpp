@@ -806,11 +806,52 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_object_schemas_match_every_descriptor) {
 
 BOOST_AUTO_TEST_CASE(mcp_resolved_schema_covers_the_production_document) {
   const boost::json::object schema = BuildMcpResolvedScenarioSchema();
+  const boost::json::array events{
+      boost::json::object{
+          {"at", "1s"},
+          {"action", "add_nodes"},
+          {"node_add",
+           boost::json::object{
+               {"chain", "firo"},
+               {"count", 1U},
+               {"node_ids", boost::json::array{"added-node"}},
+               {"binary", "/opt/firod"},
+               {"topology",
+                boost::json::object{{"type", "star"}, {"center_node", 2U}}},
+               {"resources", boost::json::object{{"cpu_quota_us", nullptr},
+                                                 {"cpu_weight", 444U}}},
+               {"network", boost::json::object{{"delay_ms", 7U}}},
+               {"ready_timeout_sec", 41U},
+               {"sync_timeout_sec", 43U}}}},
+      boost::json::object{
+          {"at", "2s"},
+          {"action", "replace_node"},
+          {"node", "added-node"},
+          {"node_replace",
+           boost::json::object{
+               {"chain", "firo"},
+               {"count", 1U},
+               {"node_ids", boost::json::array{"added-node"}},
+               {"binary", "/opt/replacement/firod"},
+               {"resources",
+                boost::json::object{{"cpu_quota_us", nullptr},
+                                    {"io_max", boost::json::array{}}}},
+               {"network", boost::json::object{{"delay_ms", 11U}}},
+               {"ready_timeout_sec", 47U},
+               {"sync_timeout_sec", 53U}}}},
+      boost::json::object{
+          {"at", "3s"},
+          {"action", "remove_nodes"},
+          {"node_remove",
+           boost::json::object{{"node_ids", boost::json::array{"added-node"}},
+                               {"timeout_sec", 59U}}}}};
   const boost::json::object resolved = ResolveScenario(boost::json::object{
       {"chain", "firo"},
       {"chain_daemon", "/bin/true"},
       {"run_id", "mcp-resolved-schema"},
       {"nodes", 1U},
+      {"node_capacity", 2U},
+      {"events", events},
       {"block_production", boost::json::object{{"enabled", false}}}});
   const auto require_members = [](const boost::json::object& object,
                                   const boost::json::object& object_schema) {
@@ -831,6 +872,60 @@ BOOST_AUTO_TEST_CASE(mcp_resolved_schema_covers_the_production_document) {
   require_members(
       resolved.at("node_configs").as_array().front().as_object(),
       properties.at("node_configs").as_object().at("items").as_object());
+  const boost::json::array& resolved_events = resolved.at("events").as_array();
+  BOOST_REQUIRE_EQUAL(resolved_events.size(), events.size());
+  const boost::json::array& event_schemas = properties.at("events")
+                                                .as_object()
+                                                .at("items")
+                                                .as_object()
+                                                .at("anyOf")
+                                                .as_array();
+  for (std::size_t index = 0U; index < events.size(); ++index) {
+    const boost::json::object& event = resolved_events[index].as_object();
+    const boost::json::object& source = events[index].as_object();
+    const std::string_view request = index == 0U   ? "node_add"
+                                     : index == 1U ? "node_replace"
+                                                   : "node_remove";
+    BOOST_TEST(event.at("action") == source.at("action"));
+    BOOST_TEST(event.at("sequence").as_uint64() == index + 1U);
+    BOOST_TEST(event.at("at_ms").as_int64() == (index + 1U) * 1000U);
+    BOOST_REQUIRE(event.contains(request));
+    const boost::json::object& payload = event.at(request).as_object();
+    // Preserve supplied values while allowing canonical defaults in objects.
+    for (const auto& field : source.at(request).as_object()) {
+      if (field.value().is_object()) {
+        for (const auto& nested : field.value().as_object()) {
+          BOOST_TEST(payload.at(field.key()).as_object().at(nested.key()) ==
+                     nested.value());
+        }
+      } else {
+        BOOST_TEST(payload.at(field.key()) == field.value());
+      }
+    }
+    BOOST_TEST(event.contains("node") == (index == 1U));
+    if (index == 1U) {
+      BOOST_TEST(event.at("node") == source.at("node"));
+      // Replacement patches must not gain defaults that overwrite old limits.
+      BOOST_TEST(payload.at("resources") ==
+                 source.at(request).as_object().at("resources"));
+    }
+    const auto matching = std::find_if(
+        event_schemas.begin(), event_schemas.end(), [&](const auto& candidate) {
+          return candidate.as_object()
+                     .at("properties")
+                     .as_object()
+                     .at("action")
+                     .as_object()
+                     .at("const") == event.at("action");
+        });
+    BOOST_REQUIRE(matching != event_schemas.end());
+    require_members(event, matching->as_object());
+    require_members(payload, matching->as_object()
+                                 .at("properties")
+                                 .as_object()
+                                 .at(request)
+                                 .as_object());
+  }
   RequireClosedSchemaTree(schema);
   const boost::json::object result =
       BuildMcpResultSchema(McpResultFamily::kScenario);
