@@ -959,6 +959,24 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_identifiers_match_safe_production_names) {
     BOOST_TEST(!std::regex_match(rejected, pattern));
   }
   BOOST_TEST(properties.at("run_id").as_object() == identifier);
+  for (const McpOperationKind operation :
+       {McpOperationKind::kStopNode, McpOperationKind::kKillNode,
+        McpOperationKind::kRestartNode, McpOperationKind::kReplaceNode}) {
+    const boost::json::object input = BuildMcpOperationInputSchema(operation);
+    BOOST_TEST(input.at("properties").as_object().at("node_id").as_object() ==
+               identifier);
+  }
+  for (const McpOperationKind operation :
+       {McpOperationKind::kReportRun, McpOperationKind::kQueryEvidence,
+        McpOperationKind::kQueryLogs, McpOperationKind::kFollowLogs}) {
+    const boost::json::object input = BuildMcpOperationInputSchema(operation);
+    BOOST_TEST(input.at("properties")
+                   .as_object()
+                   .at("node_ids")
+                   .as_object()
+                   .at("items")
+                   .as_object() == identifier);
+  }
   for (const McpResultFamily family :
        {McpResultFamily::kRunLifecycle, McpResultFamily::kRuntimeCommand,
         McpResultFamily::kMutation, McpResultFamily::kRoleMutation,

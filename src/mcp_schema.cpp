@@ -1036,7 +1036,7 @@ boost::json::object DiagnosticSchema() {
   properties["message"] = StringSchema(1U);
   properties["path"] = StringSchema();
   properties["recoverable"] = TypeSchema("boolean");
-  properties["node_id"] = IdentifierSchema();
+  properties["node_id"] = NodeAddIdentifierSchema();
   properties["action"] = IdentifierSchema();
   properties["state"] = IdentifierSchema();
   properties["phase"] = StringEnumSchema(
@@ -1840,7 +1840,7 @@ boost::json::object BuildMcpOperationInputSchema(
     required.emplace_back("run_id");
   };
   const auto add_node = [&] {
-    properties["node_id"] = IdentifierSchema();
+    properties["node_id"] = NodeAddIdentifierSchema();
     required.emplace_back("node_id");
   };
   const auto add_timeout = [&] {
@@ -1872,8 +1872,8 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kReportRun:
       add_run();
-      properties["node_ids"] =
-          ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
+      properties["node_ids"] = ArraySchema(NodeAddIdentifierSchema(), 1U,
+                                           kMaximumSafeCollection, true);
       properties["include_artifacts"] = TypeSchema("boolean");
       break;
     case McpOperationKind::kInvokeRuntimeCommand:
@@ -2044,8 +2044,8 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["families"] =
           ArraySchema(InformationFamilySchema(information_families), 1U,
                       information_families.size(), true);
-      properties["node_ids"] =
-          ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
+      properties["node_ids"] = ArraySchema(NodeAddIdentifierSchema(), 1U,
+                                           kMaximumSafeCollection, true);
       properties["cursor"] = CursorSchema();
       properties["limit"] = BoundedLimitSchema();
       required.emplace_back("families");
@@ -2053,8 +2053,8 @@ boost::json::object BuildMcpOperationInputSchema(
     case McpOperationKind::kQueryLogs:
     case McpOperationKind::kFollowLogs:
       add_run();
-      properties["node_ids"] =
-          ArraySchema(IdentifierSchema(), 1U, kMaximumSafeCollection, true);
+      properties["node_ids"] = ArraySchema(NodeAddIdentifierSchema(), 1U,
+                                           kMaximumSafeCollection, true);
       properties["cursor"] = CursorSchema();
       properties["start_sequence"] = Uint64Schema();
       properties["end_sequence"] = Uint64Schema();

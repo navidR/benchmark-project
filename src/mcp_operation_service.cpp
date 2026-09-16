@@ -143,6 +143,15 @@ std::string BoundedErrorMessage(std::string_view message) {
   return std::string(message.substr(0U, kMcpMaximumEvidenceTextBytes));
 }
 
+void ValidateNodeIdentifier(std::string_view node_id) {
+  try {
+    simulator_app_internal::RequireSafeScenarioIdentifier(node_id,
+                                                          "MCP node id");
+  } catch (const std::runtime_error& error) {
+    throw std::invalid_argument(error.what());
+  }
+}
+
 void ValidateError(McpOperationError* error) {
   try {
     ValidateMcpIdentifier(error->code, "MCP operation error code");
@@ -220,7 +229,11 @@ void ValidateError(McpOperationError* error) {
         break;
       }
       try {
-        ValidateMcpIdentifier(member->as_string(), identifier);
+        if (identifier == "node_id") {
+          ValidateNodeIdentifier(member->as_string());
+        } else {
+          ValidateMcpIdentifier(member->as_string(), identifier);
+        }
       } catch (const std::invalid_argument&) {
         diagnostics_valid = false;
         break;
@@ -339,15 +352,6 @@ bool ContainsNode(const std::vector<std::string>& node_ids,
 void ValidateRunIdentifier(std::string_view run_id) {
   try {
     RequireSafeRunId(run_id);
-  } catch (const std::runtime_error& error) {
-    throw std::invalid_argument(error.what());
-  }
-}
-
-void ValidateNodeIdentifier(std::string_view node_id) {
-  try {
-    simulator_app_internal::RequireSafeScenarioIdentifier(node_id,
-                                                          "MCP node id");
   } catch (const std::runtime_error& error) {
     throw std::invalid_argument(error.what());
   }

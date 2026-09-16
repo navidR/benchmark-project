@@ -131,6 +131,13 @@ bool IsSafeNodeAddIdentifier(std::string_view value) {
          });
 }
 
+void ValidateNodeIdentifier(std::string_view node_id) {
+  if (!IsSafeNodeAddIdentifier(node_id)) {
+    throw std::invalid_argument(
+        "MCP node id must be a 1..32 character safe node identifier");
+  }
+}
+
 std::optional<std::string> NodeAddOutcomeError(
     const SimulationCommand& command, const SimulationCommandOutcome& outcome) {
   if (!command.node_add) {
@@ -1215,6 +1222,9 @@ McpRunEvidenceQuery ParseEvidenceQuery(const boost::json::object& arguments,
           ? std::vector<McpInformationFamily>{McpInformationFamily::kLogHistory}
           : RequireFamilies(arguments);
   query.node_ids = OptionalStringArray(arguments, "node_ids", logs_only);
+  for (const std::string& node_id : query.node_ids) {
+    ValidateNodeIdentifier(node_id);
+  }
   const std::uint64_t start = OptionalUnsigned(arguments, "start_sequence", 0U);
   query.cursor = OptionalCursor(arguments, "cursor");
   if (query.cursor.empty()) {
@@ -2049,6 +2059,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   if (kind == McpOperationKind::kReportRun) {
     const std::vector<std::string> node_ids =
         OptionalStringArray(arguments, "node_ids");
+    for (const std::string& node_id : node_ids) {
+      ValidateNodeIdentifier(node_id);
+    }
     const bool include_artifacts =
         OptionalBoolean(arguments, "include_artifacts", false);
     if (include_artifacts && config_.retained_run &&
@@ -2210,7 +2223,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     validation_options.node_capacity = inventory.node_capacity;
     command.kind = SimulationCommandKind::kReplaceNode;
     command.node_id = RequireString(arguments, "node_id");
-    ValidateMcpIdentifier(command.node_id, "MCP node replacement node_id");
+    ValidateNodeIdentifier(command.node_id);
     command.node_replace = ParseAndValidateSimulationNodeReplaceRequest(
         RequireObject(arguments, "replacement"), command.node_id,
         validation_options);
@@ -2246,7 +2259,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
     command_timeout = std::chrono::seconds(command.node_remove->timeout_sec);
   } else if (typed_node_operation) {
     command.node_id = RequireString(arguments, "node_id");
-    ValidateMcpIdentifier(command.node_id, "MCP node operation node_id");
+    ValidateNodeIdentifier(command.node_id);
     const std::uint64_t timeout_seconds =
         OptionalUnsigned(arguments, "timeout_sec", 30U);
     if (timeout_seconds == 0U ||

@@ -358,6 +358,8 @@ BOOST_AUTO_TEST_CASE(
     mcp_live_application_reads_real_report_and_waits_for_real_command_outcome) {
   LiveApplicationDirectory temporary;
   boost::json::object scenario = LiveScenario();
+  scenario["nodes"] = boost::json::array{boost::json::object{
+      {"id", "_firo-1"}, {"chain", "firo"}, {"role", "base"}}};
   scenario["ready_timeout_sec"] = 11U;
   scenario["sync_timeout_sec"] = 13U;
   const auto options =
@@ -369,7 +371,7 @@ BOOST_AUTO_TEST_CASE(
       R"({"run_id":"live-application","node_id":"sim","event":"run_started"})");
   AppendLine(
       temporary.path() / "events.jsonl",
-      R"({"run_id":"live-application","node_id":"firo-1","event":"state","detail":"Running"})");
+      R"({"run_id":"live-application","node_id":"_firo-1","event":"state","detail":"Running"})");
 
   auto queue = std::make_shared<SimulationCommandQueue>();
   std::atomic<bool> stop_requested = false;
@@ -442,7 +444,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object report_submitted =
       Invoke(&dispatcher, "run.report",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_ids", boost::json::array{"firo-1"}}});
+                                 {"node_ids", boost::json::array{"_firo-1"}}});
   const boost::json::object report_terminal =
       WaitForTerminal(&dispatcher, report_submitted);
   BOOST_TEST(report_terminal.at("state").as_string() == "succeeded");
@@ -476,7 +478,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object command_arguments{
       {"run_id", "live-application"},
       {"command", boost::json::object{{"kind", "increase_log_verbosity"},
-                                      {"node", "firo-1"}}}};
+                                      {"node", "_firo-1"}}}};
   const boost::json::object command_submitted =
       Invoke(&dispatcher, "simulation.command", command_arguments);
   const SimulationCommand command = WaitForQueuedCommand(queue.get());
@@ -534,7 +536,7 @@ BOOST_AUTO_TEST_CASE(
   SimulationCommand tui_command;
   tui_command.sequence = 99U;
   tui_command.kind = SimulationCommandKind::kIncreaseLogVerbosity;
-  tui_command.node_id = "firo-1";
+  tui_command.node_id = "_firo-1";
   tui_command.confirmed = true;
   application.RecordCommandOutcome(
       tui_command, CommandOutcome(SimulationCommandOutcomeState::kSucceeded));
@@ -554,11 +556,14 @@ BOOST_AUTO_TEST_CASE(
              "succeeded");
 
   const SimulationCommandQueueStats queue_before_invalid_node = queue->Stats();
-  BOOST_CHECK_THROW(Invoke(&dispatcher, "node.stop",
-                           boost::json::object{{"run_id", "live-application"},
-                                               {"node_id", "bad/node"},
-                                               {"timeout_sec", 30U}}),
-                    std::invalid_argument);
+  for (const std::string& node_id :
+       {std::string{}, std::string("bad/node"), std::string(33U, 'n')}) {
+    BOOST_CHECK_THROW(Invoke(&dispatcher, "node.stop",
+                             boost::json::object{{"run_id", "live-application"},
+                                                 {"node_id", node_id},
+                                                 {"timeout_sec", 30U}}),
+                      std::invalid_argument);
+  }
   const SimulationCommandQueueStats queue_after_invalid_node = queue->Stats();
   BOOST_TEST(queue_after_invalid_node.size == queue_before_invalid_node.size);
   BOOST_TEST(queue_after_invalid_node.maximum_size ==
@@ -578,11 +583,11 @@ BOOST_AUTO_TEST_CASE(
     const boost::json::object submitted =
         Invoke(&dispatcher, tool,
                boost::json::object{{"run_id", "live-application"},
-                                   {"node_id", "firo-1"},
+                                   {"node_id", "_firo-1"},
                                    {"timeout_sec", 30U}});
     const SimulationCommand typed_command = WaitForQueuedCommand(queue.get());
     BOOST_CHECK(typed_command.kind == expected_kind);
-    BOOST_TEST(typed_command.node_id == "firo-1");
+    BOOST_TEST(typed_command.node_id == "_firo-1");
     BOOST_TEST(typed_command.confirmed);
     BOOST_REQUIRE(typed_command.operation_control);
     BOOST_TEST(!typed_command.operation_control->stop_source.stop_requested());
@@ -600,7 +605,7 @@ BOOST_AUTO_TEST_CASE(
     BOOST_TEST(mutation.at("removed_node_ids").as_array().empty());
     BOOST_TEST(
         mutation.at("affected_node_ids").as_array().front().as_string() ==
-        "firo-1");
+        "_firo-1");
     BOOST_TEST(mutation.at("action").as_string() ==
                "node." + std::string(expected_actions[index]));
     BOOST_TEST(mutation.at("state").as_string() == expected_states[index]);
@@ -612,7 +617,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object typed_cancellable =
       Invoke(&dispatcher, "node.restart",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "firo-1"},
+                                 {"node_id", "_firo-1"},
                                  {"timeout_sec", 30U}});
   const SimulationCommand cancelled_node_command =
       WaitForQueuedCommand(queue.get());
@@ -641,7 +646,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object typed_timeout =
       Invoke(&dispatcher, "node.stop",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "firo-1"},
+                                 {"node_id", "_firo-1"},
                                  {"timeout_sec", 1U}});
   const SimulationCommand timed_out_node_command =
       WaitForQueuedCommand(queue.get());
@@ -675,7 +680,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object assign_role_command{
       {"kind", "assign_role"},
       {"role_mutation",
-       boost::json::object{{"node_ids", boost::json::array{"firo-1"}},
+       boost::json::object{{"node_ids", boost::json::array{"_firo-1"}},
                            {"roles", boost::json::array{"wallet"}},
                            {"mode", "public"},
                            {"timeout_sec", 1U}}}};
@@ -703,7 +708,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object remove_role_command{
       {"kind", "remove_role"},
       {"role_mutation",
-       boost::json::object{{"node_ids", boost::json::array{"firo-1"}},
+       boost::json::object{{"node_ids", boost::json::array{"_firo-1"}},
                            {"roles", boost::json::array{"wallet"}}}}};
   const boost::json::object role_unconfirmed_submitted =
       Invoke(&dispatcher, "simulation.command",
@@ -1380,7 +1385,12 @@ BOOST_AUTO_TEST_CASE(
     mcp_node_replace_has_direct_generic_progress_failure_and_inventory_parity) {
   LiveApplicationDirectory temporary;
   boost::json::object scenario = LiveScenario();
-  scenario["nodes"] = 2U;
+  const std::string node_id = "-" + std::string(31U, 'n');
+  scenario["nodes"] = boost::json::array{
+      boost::json::object{
+          {"id", "firo-1"}, {"chain", "firo"}, {"role", "base"}},
+      boost::json::object{
+          {"id", node_id}, {"chain", "firo"}, {"role", "base"}}};
   scenario["node_capacity"] = 2U;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(scenario));
@@ -1418,18 +1428,26 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object replacement{
       {"chain", "firo"},
       {"count", 1U},
-      {"node_ids", boost::json::array{"firo-2"}},
+      {"node_ids", boost::json::array{node_id}},
       {"binary", "/bin/true"},
       {"ready_timeout_sec", 11U},
       {"sync_timeout_sec", 13U}};
+  for (const std::string& invalid :
+       {std::string{}, std::string("bad/node"), std::string(33U, 'n')}) {
+    BOOST_CHECK_THROW(Invoke(&dispatcher, "node.replace",
+                             {{"run_id", "live-application"},
+                              {"node_id", invalid},
+                              {"replacement", replacement}}),
+                      std::invalid_argument);
+  }
   const boost::json::object direct_submitted =
       Invoke(&dispatcher, "node.replace",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "firo-2"},
+                                 {"node_id", node_id},
                                  {"replacement", replacement}});
   const SimulationCommand direct_command = WaitForQueuedCommand(queue.get());
   BOOST_CHECK(direct_command.kind == SimulationCommandKind::kReplaceNode);
-  BOOST_TEST(direct_command.node_id == "firo-2");
+  BOOST_TEST(direct_command.node_id == node_id);
   BOOST_REQUIRE(direct_command.node_replace);
   BOOST_TEST(direct_command.node_replace->count == 1U);
   BOOST_REQUIRE(direct_command.operation_control);
@@ -1437,8 +1455,8 @@ BOOST_AUTO_TEST_CASE(
        ++phase) {
     BOOST_TEST(direct_command.operation_control->ReportProgress(phase));
   }
-  publish_inventory(2U, {"firo-1", "firo-2"});
-  MarkNodeAddCommitted(direct_command, 1U, {"firo-1", "firo-2"});
+  publish_inventory(2U, {"firo-1", node_id});
+  MarkNodeAddCommitted(direct_command, 1U, {"firo-1", node_id});
   application.RecordCommandOutcome(direct_command, NodeReplaceOutcome(2U, 2U));
   const boost::json::object direct_terminal =
       WaitForTerminal(&dispatcher, direct_submitted);
@@ -1456,7 +1474,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(direct_result.at("removed_node_ids").as_array().empty());
   BOOST_TEST(
       direct_result.at("affected_node_ids").as_array().front().as_string() ==
-      "firo-2");
+      node_id);
   BOOST_TEST(direct_result.at("inventory_generation").as_uint64() == 2U);
   BOOST_TEST(direct_result.at("final_node_count").as_uint64() == 2U);
 
@@ -1465,12 +1483,12 @@ BOOST_AUTO_TEST_CASE(
       boost::json::object{
           {"run_id", "live-application"},
           {"command", boost::json::object{{"kind", "replace_node"},
-                                          {"node", "firo-2"},
+                                          {"node", node_id},
                                           {"node_replace", replacement}}}});
   const SimulationCommand generic_command = WaitForQueuedCommand(queue.get());
   BOOST_CHECK(generic_command.kind == SimulationCommandKind::kReplaceNode);
-  publish_inventory(3U, {"firo-1", "firo-2"});
-  MarkNodeAddCommitted(generic_command, 2U, {"firo-1", "firo-2"});
+  publish_inventory(3U, {"firo-1", node_id});
+  MarkNodeAddCommitted(generic_command, 2U, {"firo-1", node_id});
   BOOST_TEST(generic_command.operation_control->ReportProgress(
       kSimulationNodeAddProgressTotal));
   application.RecordCommandOutcome(generic_command, NodeReplaceOutcome(3U, 2U));
@@ -1484,14 +1502,14 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(generic_result.at("action").as_string() == "node.replace");
   BOOST_TEST(
       generic_result.at("affected_node_ids").as_array().front().as_string() ==
-      "firo-2");
+      node_id);
   BOOST_TEST(generic_result.at("inventory_generation").as_uint64() == 3U);
   BOOST_TEST(generic_result.at("final_node_count").as_uint64() == 2U);
 
   const boost::json::object failed_submitted =
       Invoke(&dispatcher, "node.replace",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "firo-2"},
+                                 {"node_id", node_id},
                                  {"replacement", replacement}});
   const SimulationCommand failed_command = WaitForQueuedCommand(queue.get());
   application.RecordCommandOutcome(
@@ -1507,7 +1525,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object cancelled_submitted =
       Invoke(&dispatcher, "node.replace",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "firo-2"},
+                                 {"node_id", node_id},
                                  {"replacement", replacement}});
   const SimulationCommand cancelled_command = WaitForQueuedCommand(queue.get());
   BOOST_REQUIRE(cancelled_command.operation_control);
@@ -1526,12 +1544,12 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object unconfirmed_submitted =
       Invoke(&dispatcher, "node.replace",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "firo-2"},
+                                 {"node_id", node_id},
                                  {"replacement", replacement}});
   const SimulationCommand unconfirmed_command =
       WaitForQueuedCommand(queue.get());
-  MarkNodeAddCommitted(unconfirmed_command, 3U, {"firo-1", "firo-2"});
-  publish_inventory(4U, {"replacement", "firo-2"});
+  MarkNodeAddCommitted(unconfirmed_command, 3U, {"firo-1", node_id});
+  publish_inventory(4U, {"replacement", node_id});
   application.RecordCommandOutcome(unconfirmed_command,
                                    NodeReplaceOutcome(4U, 2U));
   const boost::json::object unconfirmed_terminal =
@@ -2295,7 +2313,9 @@ BOOST_AUTO_TEST_CASE(
 BOOST_AUTO_TEST_CASE(
     mcp_live_application_pages_owned_evidence_logs_and_safe_artifacts) {
   LiveApplicationDirectory temporary;
-  const boost::json::object scenario = LiveScenario();
+  boost::json::object scenario = LiveScenario();
+  scenario["nodes"] = boost::json::array{boost::json::object{
+      {"id", "-firo-1"}, {"chain", "firo"}, {"role", "base"}}};
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(scenario));
   const RunOwnership ownership =
@@ -2308,22 +2328,22 @@ BOOST_AUTO_TEST_CASE(
       R"({"timestamp":"2026-07-22T12:00:00Z","run_id":"live-application","node_id":"sim","event":"run_started","detail":""})");
   AppendLine(
       temporary.path() / "events.jsonl",
-      R"({"timestamp":"2026-07-22T12:00:01Z","run_id":"live-application","node_id":"firo-1","event":"daemon_log_tail","detail":"{\"kind\":\"daemon_log\",\"text\":\"ready\\n\"}"})");
+      R"({"timestamp":"2026-07-22T12:00:01Z","run_id":"live-application","node_id":"-firo-1","event":"daemon_log_tail","detail":"{\"kind\":\"daemon_log\",\"text\":\"ready\\n\"}"})");
   AppendLine(
       temporary.path() / "events.jsonl",
-      R"({"timestamp":"2026-07-22T12:00:02Z","run_id":"live-application","node_id":"firo-1","event":"operator_command_failed","detail":"expected failure"})");
+      R"({"timestamp":"2026-07-22T12:00:02Z","run_id":"live-application","node_id":"-firo-1","event":"operator_command_failed","detail":"expected failure"})");
   AppendLine(
       temporary.path() / "metrics.jsonl",
-      R"({"timestamp_ms":1784721603000,"run_id":"live-application","node_id":"firo-1","height":7})");
+      R"({"timestamp_ms":1784721603000,"run_id":"live-application","node_id":"-firo-1","height":7})");
   WriteText(temporary.path() / "simulator.log", "abcdefgh");
-  std::filesystem::create_directories(temporary.path() / "nodes" / "firo-1" /
+  std::filesystem::create_directories(temporary.path() / "nodes" / "-firo-1" /
                                       "data");
-  WriteText(temporary.path() / "nodes" / "firo-1" / "data" / ".cookie",
+  WriteText(temporary.path() / "nodes" / "-firo-1" / "data" / ".cookie",
             "secret");
   std::filesystem::create_directories(temporary.path() / "mcp");
   WriteText(temporary.path() / "mcp" / "token", "must-not-be-listed");
   std::filesystem::create_symlink(
-      "/etc/passwd", temporary.path() / "nodes" / "firo-1" / "escape.log");
+      "/etc/passwd", temporary.path() / "nodes" / "-firo-1" / "escape.log");
 
   auto queue = std::make_shared<SimulationCommandQueue>();
   McpLiveApplication application(McpLiveApplication::Config{
@@ -2385,11 +2405,40 @@ BOOST_AUTO_TEST_CASE(
                  .at("kind")
                  .as_string() == "operator_command_failed");
 
+  for (const std::string& invalid :
+       {std::string{}, std::string("bad/node"), std::string(33U, 'n')}) {
+    for (const std::string_view tool :
+         {"run.report", "evidence.query", "log.query", "log.follow"}) {
+      boost::json::object arguments{{"run_id", "live-application"},
+                                    {"node_ids", boost::json::array{invalid}}};
+      if (tool == "evidence.query") {
+        arguments["families"] = boost::json::array{"events"};
+      }
+      BOOST_CHECK_THROW(Invoke(&dispatcher, tool, arguments),
+                        std::invalid_argument);
+    }
+  }
+  const boost::json::object selected_terminal = WaitForTerminal(
+      &dispatcher, Invoke(&dispatcher, "evidence.query",
+                          {{"run_id", "live-application"},
+                           {"families", boost::json::array{"events"}},
+                           {"node_ids", boost::json::array{"-firo-1"}}}));
+  BOOST_REQUIRE(selected_terminal.at("state").as_string() == "succeeded");
+  const boost::json::array& selected_items =
+      selected_terminal.at("terminal_result")
+          .as_object()
+          .at("items")
+          .as_array();
+  BOOST_REQUIRE_EQUAL(selected_items.size(), 2U);
+  for (const boost::json::value& item : selected_items) {
+    BOOST_TEST(item.as_object().at("node_id").as_string() == "-firo-1");
+  }
+
   const boost::json::object log_terminal = WaitForTerminal(
       &dispatcher,
       Invoke(&dispatcher, "log.query",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_ids", boost::json::array{"firo-1"}}}));
+                                 {"node_ids", boost::json::array{"-firo-1"}}}));
   const boost::json::object& log_page =
       log_terminal.at("terminal_result").as_object();
   BOOST_REQUIRE_EQUAL(log_page.at("items").as_array().size(), 1U);
@@ -2400,12 +2449,12 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object follow_submitted =
       Invoke(&dispatcher, "log.follow",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"node_ids", boost::json::array{"-firo-1"}},
                                  {"cursor", log_page.at("next_cursor")}});
   std::this_thread::sleep_for(50ms);
   AppendLine(
       temporary.path() / "events.jsonl",
-      R"({"timestamp":"2026-07-22T12:00:04Z","run_id":"live-application","node_id":"firo-1","event":"daemon_log_tail","detail":"{\"kind\":\"daemon_log\",\"text\":\"new line\\n\"}"})");
+      R"({"timestamp":"2026-07-22T12:00:04Z","run_id":"live-application","node_id":"-firo-1","event":"daemon_log_tail","detail":"{\"kind\":\"daemon_log\",\"text\":\"new line\\n\"}"})");
   const boost::json::object follow_terminal =
       WaitForTerminal(&dispatcher, follow_submitted);
   BOOST_TEST(follow_terminal.at("state").as_string() == "succeeded");
@@ -2425,7 +2474,7 @@ BOOST_AUTO_TEST_CASE(
   const boost::json::object cancellable_follow =
       Invoke(&dispatcher, "log.follow",
              boost::json::object{{"run_id", "live-application"},
-                                 {"node_ids", boost::json::array{"firo-1"}},
+                                 {"node_ids", boost::json::array{"-firo-1"}},
                                  {"cursor", follow_page.at("next_cursor")}});
   std::this_thread::sleep_for(50ms);
   const auto cancellation_started = std::chrono::steady_clock::now();
