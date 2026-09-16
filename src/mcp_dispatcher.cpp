@@ -331,13 +331,11 @@ boost::json::value McpDispatcher::InvokeToolInSession(
     if (!operation_factory_) {
       throw McpOperationFailure(
           "run_unavailable",
-          "subscription creation requires an authoritative managed run",
-          false);
+          "subscription creation requires an authoritative managed run", false);
     }
     // The application factory owns synchronous run validation; subscription
     // retention remains in this bounded service.
-    static_cast<void>(
-        operation_factory_(kind, arguments, session_id));
+    static_cast<void>(operation_factory_(kind, arguments, session_id));
     McpSubscriptionRequest request{
         .run_id = run_id,
         .families = RequireInformationFamilies(arguments),

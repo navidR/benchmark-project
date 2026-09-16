@@ -158,9 +158,10 @@ BOOST_AUTO_TEST_CASE(run_process_state_cleanup_lock_is_bounded) {
   std::optional<bbp::RunProcessState::Guard> timed_guard =
       state.TryLockUntil(started_at + std::chrono::milliseconds(20));
   BOOST_TEST(!timed_guard);
-  const auto lock_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now() - started_at)
-                                   .count();
+  const auto lock_elapsed_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started_at)
+          .count();
   BOOST_TEST(lock_elapsed_ns <
              std::chrono::duration_cast<std::chrono::nanoseconds>(
                  std::chrono::milliseconds(250))

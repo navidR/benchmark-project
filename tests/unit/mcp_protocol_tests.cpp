@@ -359,49 +359,47 @@ BOOST_AUTO_TEST_CASE(
              http::status::bad_request);
 
   constexpr std::string_view kUnknownSession = "unknown-session";
-  BOOST_TEST(protocol.Handle(ProtocolRequest(
-                 http::verb::post, RequestBody(3U, "ping"), kUnknownSession))
-                 .result() == http::status::not_found);
   BOOST_TEST(
       protocol
-          .Handle(ProtocolRequest(http::verb::post, InitializeBody(4U),
+          .Handle(ProtocolRequest(http::verb::post, RequestBody(3U, "ping"),
                                   kUnknownSession))
           .result() == http::status::not_found);
+  BOOST_TEST(protocol
+                 .Handle(ProtocolRequest(http::verb::post, InitializeBody(4U),
+                                         kUnknownSession))
+                 .result() == http::status::not_found);
   BOOST_TEST(
       protocol.Handle(ProtocolRequest(http::verb::get, {}, kUnknownSession))
           .result() == http::status::not_found);
-  BOOST_TEST(protocol
-                 .Handle(
-                     ProtocolRequest(http::verb::delete_, {}, kUnknownSession))
-                 .result() == http::status::not_found);
+  BOOST_TEST(
+      protocol.Handle(ProtocolRequest(http::verb::delete_, {}, kUnknownSession))
+          .result() == http::status::not_found);
 
   const std::string result_response = boost::json::serialize(
       boost::json::object{{"jsonrpc", "2.0"},
                           {"id", 41U},
                           {"result", boost::json::object{{"accepted", true}}}});
-  const auto accepted_result = protocol.Handle(ProtocolRequest(
-      http::verb::post, result_response, session));
+  const auto accepted_result = protocol.Handle(
+      ProtocolRequest(http::verb::post, result_response, session));
   BOOST_TEST(accepted_result.result() == http::status::accepted);
   BOOST_TEST(accepted_result.body().empty());
 
-  const std::string error_response = boost::json::serialize(
-      boost::json::object{{"jsonrpc", "2.0"},
-                          {"id", "server-request"},
-                          {"error", boost::json::object{{"code", -32001},
-                                                        {"message", "no"}}}});
-  const auto accepted_error = protocol.Handle(ProtocolRequest(
-      http::verb::post, error_response, session));
+  const std::string error_response = boost::json::serialize(boost::json::object{
+      {"jsonrpc", "2.0"},
+      {"id", "server-request"},
+      {"error", boost::json::object{{"code", -32001}, {"message", "no"}}}});
+  const auto accepted_error = protocol.Handle(
+      ProtocolRequest(http::verb::post, error_response, session));
   BOOST_TEST(accepted_error.result() == http::status::accepted);
   BOOST_TEST(accepted_error.body().empty());
 
-  BOOST_REQUIRE(protocol
-                    .Handle(
-                        ProtocolRequest(http::verb::delete_, {}, session))
-                    .result() == http::status::ok);
-  BOOST_TEST(protocol
-                 .Handle(
-                     ProtocolRequest(http::verb::post, result_response, session))
-                 .result() == http::status::not_found);
+  BOOST_REQUIRE(
+      protocol.Handle(ProtocolRequest(http::verb::delete_, {}, session))
+          .result() == http::status::ok);
+  BOOST_TEST(
+      protocol
+          .Handle(ProtocolRequest(http::verb::post, result_response, session))
+          .result() == http::status::not_found);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_protocol_dispatches_registered_tools_and_resources) {
@@ -528,55 +526,49 @@ BOOST_AUTO_TEST_CASE(
           .endpoint_path = "/mcp",
           .endpoint_port = 43123U,
           .allowed_operations = {McpOperationKind::kQueryEvidence},
-          .allowed_information_families = {
-              McpInformationFamily::kCapabilities},
+          .allowed_information_families = {McpInformationFamily::kCapabilities},
           .read_only = true},
       {}, {});
   const std::string restricted_session = Initialize(&restricted);
   MarkInitialized(&restricted, restricted_session);
+  require_error(restricted.Handle(ProtocolRequest(
+                    http::verb::post,
+                    RequestBody(2U, "resources/read",
+                                boost::json::object{{"uri", "bbp:///missing"}}),
+                    restricted_session)),
+                -32002, "bbp:///missing");
+  require_error(restricted.Handle(ProtocolRequest(
+                    http::verb::post,
+                    RequestBody(3U, "resources/read",
+                                boost::json::object{{"uri", "bbp:///logs"}}),
+                    restricted_session)),
+                -32002, "bbp:///logs");
   require_error(
       restricted.Handle(ProtocolRequest(
           http::verb::post,
-          RequestBody(2U, "resources/read",
-                      boost::json::object{{"uri", "bbp:///missing"}}),
-          restricted_session)),
-      -32002, "bbp:///missing");
-  require_error(
-      restricted.Handle(ProtocolRequest(
-          http::verb::post,
-          RequestBody(3U, "resources/read",
-                      boost::json::object{{"uri", "bbp:///logs"}}),
-          restricted_session)),
-      -32002, "bbp:///logs");
-  require_error(
-      restricted.Handle(ProtocolRequest(
-          http::verb::post,
-          RequestBody(4U, "resources/read",
-                      boost::json::object{{"uri", 7U}}),
+          RequestBody(4U, "resources/read", boost::json::object{{"uri", 7U}}),
           restricted_session)),
       -32602);
 
-  McpProtocol failing(
-      McpProtocolConfig{.bearer_token = std::string(kTestToken),
-                        .endpoint_path = "/mcp",
-                        .endpoint_port = 43123U,
-                        .allowed_operations = {},
-                        .allowed_information_families = {},
-                        .read_only = false},
-      {},
-      [](std::string_view, std::string_view,
-         std::stop_token) -> boost::json::value {
-        throw std::invalid_argument("resource callback failed");
-      });
+  McpProtocol failing(McpProtocolConfig{.bearer_token = std::string(kTestToken),
+                                        .endpoint_path = "/mcp",
+                                        .endpoint_port = 43123U,
+                                        .allowed_operations = {},
+                                        .allowed_information_families = {},
+                                        .read_only = false},
+                      {},
+                      [](std::string_view, std::string_view,
+                         std::stop_token) -> boost::json::value {
+                        throw std::invalid_argument("resource callback failed");
+                      });
   const std::string failing_session = Initialize(&failing);
   MarkInitialized(&failing, failing_session);
-  require_error(
-      failing.Handle(ProtocolRequest(
-          http::verb::post,
-          RequestBody(5U, "resources/read",
-                      boost::json::object{{"uri", "bbp:///logs"}}),
-          failing_session)),
-      -32603);
+  require_error(failing.Handle(ProtocolRequest(
+                    http::verb::post,
+                    RequestBody(5U, "resources/read",
+                                boost::json::object{{"uri", "bbp:///logs"}}),
+                    failing_session)),
+                -32603);
 
   McpProtocol unavailable(
       McpProtocolConfig{.bearer_token = std::string(kTestToken),
@@ -622,13 +614,9 @@ BOOST_AUTO_TEST_CASE(
                         .allowed_information_families = {},
                         .read_only = false},
       [](std::string_view, const boost::json::object&, std::string_view,
-         std::stop_token) -> boost::json::value {
-        throw 1;
-      },
+         std::stop_token) -> boost::json::value { throw 1; },
       [](std::string_view, std::string_view,
-         std::stop_token) -> boost::json::value {
-        throw 2;
-      });
+         std::stop_token) -> boost::json::value { throw 2; });
   const std::string session = Initialize(&protocol);
   MarkInitialized(&protocol, session);
 
@@ -645,11 +633,10 @@ BOOST_AUTO_TEST_CASE(
 
   const auto tool_error = protocol.Handle(ProtocolRequest(
       http::verb::post,
-      RequestBody(
-          2U, "tools/call",
-          boost::json::object{
-              {"name", "run.report"},
-              {"arguments", boost::json::object{{"run_id", "run-a"}}}}),
+      RequestBody(2U, "tools/call",
+                  boost::json::object{
+                      {"name", "run.report"},
+                      {"arguments", boost::json::object{{"run_id", "run-a"}}}}),
       session));
   BOOST_REQUIRE(tool_error.result() == http::status::ok);
   const boost::json::object structured_error =
@@ -683,10 +670,9 @@ BOOST_AUTO_TEST_CASE(
           throw 3;
         }
       });
-  require_internal_error(
-      session_callback_protocol.Handle(
-          ProtocolRequest(http::verb::post, InitializeBody(4U))),
-      4U);
+  require_internal_error(session_callback_protocol.Handle(ProtocolRequest(
+                             http::verb::post, InitializeBody(4U))),
+                         4U);
   BOOST_TEST(session_callback_protocol.Stats().sessions == 0U);
 }
 
@@ -703,13 +689,12 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_preserves_typed_tool_failures) {
         if (arguments.at("failure").as_string() == "cancelled") {
           throw McpOperationCancelled(
               "cancelled with evidence",
-              boost::json::array{
-                  boost::json::object{{"node_id", "node-2"}}});
+              boost::json::array{boost::json::object{{"node_id", "node-2"}}});
         }
-        throw McpOperationFailure(
-            "capacity_reached", "configured capacity reached", true,
-            boost::json::array{
-                boost::json::object{{"limit", 10U}, {"requested", 11U}}});
+        throw McpOperationFailure("capacity_reached",
+                                  "configured capacity reached", true,
+                                  boost::json::array{boost::json::object{
+                                      {"limit", 10U}, {"requested", 11U}}});
       },
       {});
   const std::string session = Initialize(&protocol);
@@ -727,8 +712,10 @@ BOOST_AUTO_TEST_CASE(mcp_protocol_preserves_typed_tool_failures) {
   };
   const auto structured_error = [](const auto& response) {
     BOOST_REQUIRE(response.result() == http::status::ok);
-    const boost::json::object result =
-        boost::json::parse(response.body()).as_object().at("result").as_object();
+    const boost::json::object result = boost::json::parse(response.body())
+                                           .as_object()
+                                           .at("result")
+                                           .as_object();
     BOOST_TEST(result.at("isError").as_bool());
     return result.at("structuredContent").as_object();
   };
@@ -760,16 +747,15 @@ BOOST_AUTO_TEST_CASE(
   McpProtocol protocol = MakeProtocol();
   const std::string session = Initialize(&protocol);
   MarkInitialized(&protocol, session);
-  const std::string malformed_notification = boost::json::serialize(
-      boost::json::object{
+  const std::string malformed_notification =
+      boost::json::serialize(boost::json::object{
           {"jsonrpc", "2.0"},
           {"method", "notifications/cancelled"},
           {"params",
-           boost::json::array{
-               boost::json::object{{"requestId", 7U}}}}});
+           boost::json::array{boost::json::object{{"requestId", 7U}}}}});
 
-  const auto response = protocol.Handle(ProtocolRequest(
-      http::verb::post, malformed_notification, session));
+  const auto response = protocol.Handle(
+      ProtocolRequest(http::verb::post, malformed_notification, session));
   BOOST_TEST(response.result() == http::status::accepted);
   BOOST_TEST(response.body().empty());
 }
@@ -792,9 +778,9 @@ BOOST_AUTO_TEST_CASE(
       [&](std::string_view uri, std::string_view, std::stop_token stop_token) {
         request_started.store(true, std::memory_order_release);
         const auto deadline = std::chrono::steady_clock::now() + 2s;
-        while (!inspect_nonmatching_cancellation.load(
-                   std::memory_order_acquire) &&
-               std::chrono::steady_clock::now() < deadline) {
+        while (
+            !inspect_nonmatching_cancellation.load(std::memory_order_acquire) &&
+            std::chrono::steady_clock::now() < deadline) {
           std::this_thread::yield();
         }
         cancelled_by_nonmatching_request.store(stop_token.stop_requested(),
@@ -819,8 +805,8 @@ BOOST_AUTO_TEST_CASE(
                     boost::json::object{{"uri", "bbp:///logs"}}),
         session));
   });
-  BOOST_REQUIRE(WaitFor(
-      [&] { return request_started.load(std::memory_order_acquire); }));
+  BOOST_REQUIRE(
+      WaitFor([&] { return request_started.load(std::memory_order_acquire); }));
 
   const auto nonmatching = protocol.Handle(ProtocolRequest(
       http::verb::post, CancelledBody(boost::json::value(8U)), session));
@@ -829,8 +815,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE(WaitFor([&] {
     return nonmatching_cancellation_checked.load(std::memory_order_acquire);
   }));
-  BOOST_TEST(
-      !cancelled_by_nonmatching_request.load(std::memory_order_acquire));
+  BOOST_TEST(!cancelled_by_nonmatching_request.load(std::memory_order_acquire));
 
   const auto cancelled = protocol.Handle(ProtocolRequest(
       http::verb::post, CancelledBody(boost::json::value(7U)), session));
@@ -1022,8 +1007,7 @@ BOOST_AUTO_TEST_CASE(
           .endpoint_path = "/mcp",
           .endpoint_port = 43123U,
           .allowed_operations = {McpOperationKind::kQueryEvidence},
-          .allowed_information_families = {
-              McpInformationFamily::kCapabilities},
+          .allowed_information_families = {McpInformationFamily::kCapabilities},
           .read_only = true},
       [&tool_calls](std::string_view, const boost::json::object&,
                     std::string_view, std::stop_token) {
@@ -1045,17 +1029,16 @@ BOOST_AUTO_TEST_CASE(
           .as_array()
           .front()
           .as_object();
-  const boost::json::array& family_names =
-      evidence_tool.at("inputSchema")
-          .as_object()
-          .at("properties")
-          .as_object()
-          .at("families")
-          .as_object()
-          .at("items")
-          .as_object()
-          .at("enum")
-          .as_array();
+  const boost::json::array& family_names = evidence_tool.at("inputSchema")
+                                               .as_object()
+                                               .at("properties")
+                                               .as_object()
+                                               .at("families")
+                                               .as_object()
+                                               .at("items")
+                                               .as_object()
+                                               .at("enum")
+                                               .as_array();
   BOOST_REQUIRE_EQUAL(family_names.size(), 1U);
   BOOST_TEST(family_names.front().as_string() == "capabilities");
 
@@ -1089,14 +1072,13 @@ BOOST_AUTO_TEST_CASE(
 
   const auto hidden_response = protocol.Handle(ProtocolRequest(
       http::verb::post,
-      RequestBody(
-          3U, "tools/call",
-          boost::json::object{
-              {"name", "evidence.query"},
-              {"arguments",
-               boost::json::object{
-                   {"run_id", "retained"},
-                   {"families", boost::json::array{"events"}}}}}),
+      RequestBody(3U, "tools/call",
+                  boost::json::object{
+                      {"name", "evidence.query"},
+                      {"arguments",
+                       boost::json::object{
+                           {"run_id", "retained"},
+                           {"families", boost::json::array{"events"}}}}}),
       session));
   BOOST_TEST(hidden_response.body().find(
                  "information family is unavailable in the current endpoint") !=
@@ -1105,14 +1087,13 @@ BOOST_AUTO_TEST_CASE(
 
   const auto allowed_response = protocol.Handle(ProtocolRequest(
       http::verb::post,
-      RequestBody(
-          4U, "tools/call",
-          boost::json::object{
-              {"name", "evidence.query"},
-              {"arguments",
-               boost::json::object{
-                   {"run_id", "retained"},
-                   {"families", boost::json::array{"capabilities"}}}}}),
+      RequestBody(4U, "tools/call",
+                  boost::json::object{
+                      {"name", "evidence.query"},
+                      {"arguments",
+                       boost::json::object{
+                           {"run_id", "retained"},
+                           {"families", boost::json::array{"capabilities"}}}}}),
       session));
   BOOST_TEST(allowed_response.body().find("\"isError\":false") !=
              std::string::npos);
@@ -1149,15 +1130,14 @@ BOOST_AUTO_TEST_CASE(
     mcp_protocol_rejects_invalid_information_family_allowlists) {
   const auto duplicate = [] {
     return std::make_unique<McpProtocol>(
-        McpProtocolConfig{
-            .bearer_token = std::string(kTestToken),
-            .endpoint_path = "/mcp",
-            .endpoint_port = 43123U,
-            .allowed_operations = {},
-            .allowed_information_families = {
-                McpInformationFamily::kCapabilities,
-                McpInformationFamily::kCapabilities},
-            .read_only = false},
+        McpProtocolConfig{.bearer_token = std::string(kTestToken),
+                          .endpoint_path = "/mcp",
+                          .endpoint_port = 43123U,
+                          .allowed_operations = {},
+                          .allowed_information_families =
+                              {McpInformationFamily::kCapabilities,
+                               McpInformationFamily::kCapabilities},
+                          .read_only = false},
         McpToolHandler{}, McpResourceHandler{});
   };
   BOOST_CHECK_THROW(duplicate(), std::runtime_error);
@@ -1169,8 +1149,7 @@ BOOST_AUTO_TEST_CASE(
             .endpoint_path = "/mcp",
             .endpoint_port = 43123U,
             .allowed_operations = {},
-            .allowed_information_families = {
-                McpInformationFamily::kCount},
+            .allowed_information_families = {McpInformationFamily::kCount},
             .read_only = false},
         McpToolHandler{}, McpResourceHandler{});
   };
@@ -1477,17 +1456,15 @@ BOOST_AUTO_TEST_CASE(
 BOOST_AUTO_TEST_CASE(
     mcp_protocol_sse_resume_is_stream_scoped_bounded_and_versioned) {
   McpProtocol protocol = MakeProtocol();
-  const std::string newest_session =
-      Initialize(&protocol, false, "2025-11-25");
+  const std::string newest_session = Initialize(&protocol, false, "2025-11-25");
   MarkInitialized(&protocol, newest_session, "2025-11-25");
   protocol.EnqueueNotification(
       newest_session, kMcpOperationUpdatedNotification,
       boost::json::object{{"operation_id", "operation-a"},
                           {"progress_completed", 1}});
 
-  auto newest_get =
-      ProtocolRequest(http::verb::get, {}, newest_session, kTestToken,
-                      "2025-11-25");
+  auto newest_get = ProtocolRequest(http::verb::get, {}, newest_session,
+                                    kTestToken, "2025-11-25");
   newest_get.set(http::field::accept, "text/event-stream");
   const auto first = protocol.Handle(newest_get);
   BOOST_REQUIRE(first.result() == http::status::ok);
@@ -1508,8 +1485,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE_EQUAL(second_ids.size(), 2U);
   BOOST_TEST(second_ids[0].ends_with(".0"));
   BOOST_TEST(second_ids[1].ends_with(".2"));
-  BOOST_TEST(first_ids[0].substr(0U, 32U) !=
-             second_ids[0].substr(0U, 32U));
+  BOOST_TEST(first_ids[0].substr(0U, 32U) != second_ids[0].substr(0U, 32U));
   BOOST_TEST(second.body().find("\"progress_completed\":1") ==
              std::string::npos);
 
@@ -1535,30 +1511,25 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(SseEventIds(resumed_second.body()).empty());
   BOOST_TEST(resumed_second.body() == "retry: 1000\n\n");
 
-  newest_get.set("Last-Event-ID",
-                 first_ids[0].substr(0U, 33U) + "2");
-  BOOST_TEST(protocol.Handle(newest_get).result() ==
-             http::status::bad_request);
+  newest_get.set("Last-Event-ID", first_ids[0].substr(0U, 33U) + "2");
+  BOOST_TEST(protocol.Handle(newest_get).result() == http::status::bad_request);
 
   newest_get.erase("Last-Event-ID");
-  for (std::size_t index = 2U;
-       index <= kMcpMaximumSubscriptionsPerSession; ++index) {
+  for (std::size_t index = 2U; index <= kMcpMaximumSubscriptionsPerSession;
+       ++index) {
     BOOST_REQUIRE(protocol.Handle(newest_get).result() == http::status::ok);
   }
   newest_get.set("Last-Event-ID", first_ids[1]);
-  BOOST_TEST(protocol.Handle(newest_get).result() ==
-             http::status::bad_request);
+  BOOST_TEST(protocol.Handle(newest_get).result() == http::status::bad_request);
 
-  const std::string stable_session =
-      Initialize(&protocol, false, "2025-06-18");
+  const std::string stable_session = Initialize(&protocol, false, "2025-06-18");
   MarkInitialized(&protocol, stable_session, "2025-06-18");
   protocol.EnqueueNotification(
       stable_session, kMcpOperationUpdatedNotification,
       boost::json::object{{"operation_id", "operation-b"},
                           {"progress_completed", 1}});
-  auto stable_get =
-      ProtocolRequest(http::verb::get, {}, stable_session, kTestToken,
-                      "2025-06-18");
+  auto stable_get = ProtocolRequest(http::verb::get, {}, stable_session,
+                                    kTestToken, "2025-06-18");
   stable_get.set(http::field::accept, "text/event-stream");
   const auto stable = protocol.Handle(stable_get);
   BOOST_REQUIRE(stable.result() == http::status::ok);

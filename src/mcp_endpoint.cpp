@@ -372,8 +372,7 @@ struct McpEndpoint::Impl {
           .endpoint_path = "/mcp",
           .endpoint_port = 0U,
           .allowed_operations = config.allowed_operations,
-          .allowed_information_families =
-              config.allowed_information_families,
+          .allowed_information_families = config.allowed_information_families,
           .read_only = config.read_only};
       server = std::make_unique<McpServer>(
           config.server, std::move(protocol_config), dispatcher.ToolHandler(),

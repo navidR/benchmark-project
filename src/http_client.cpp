@@ -91,7 +91,7 @@ RpcCredentials ReadCookieCredentials(const std::filesystem::path& path) {
         path, std::string("open failed: ") + std::strerror(errno));
   }
   const UniqueFd fd(raw_fd);
-  struct stat status {};
+  struct stat status{};
   if (fstat(fd.get(), &status) != 0) {
     throw CredentialFileError(
         path, std::string("stat failed: ") + std::strerror(errno));
@@ -637,11 +637,10 @@ HttpResponse HttpClient::PostJsonWithDeadline(
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
       throw boost::system::system_error(
-          beast::error::timeout,
-          "digest RPC serialization deadline expired");
+          beast::error::timeout, "digest RPC serialization deadline expired");
     }
-    static_cast<void>(
-        lock.try_lock_until(std::min(deadline, now + std::chrono::milliseconds(10))));
+    static_cast<void>(lock.try_lock_until(
+        std::min(deadline, now + std::chrono::milliseconds(10))));
   }
   JsonConnection connection(endpoint, deadline);
   connection.Connect(stop_token);

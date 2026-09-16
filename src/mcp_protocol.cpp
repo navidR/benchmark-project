@@ -438,9 +438,9 @@ std::optional<McpSseCursor> ParseSseCursor(std::string_view value) {
   }
   std::uint64_t sequence = 0U;
   const std::string_view sequence_text = value.substr(separator + 1U);
-  const auto [end, error] =
-      std::from_chars(sequence_text.data(),
-                      sequence_text.data() + sequence_text.size(), sequence, 10);
+  const auto [end, error] = std::from_chars(
+      sequence_text.data(), sequence_text.data() + sequence_text.size(),
+      sequence, 10);
   if (error != std::errc{} ||
       end != sequence_text.data() + sequence_text.size()) {
     return std::nullopt;
@@ -513,8 +513,7 @@ std::vector<McpInformationFamily> EffectiveInformationFamilies(
   for (std::size_t index = 0U;
        index < static_cast<std::size_t>(McpInformationFamily::kCount);
        ++index) {
-    information_families.push_back(
-        static_cast<McpInformationFamily>(index));
+    information_families.push_back(static_cast<McpInformationFamily>(index));
   }
   return information_families;
 }
@@ -610,9 +609,9 @@ std::optional<McpInformationFamily> RegisteredResource(std::string_view uri) {
       static_cast<std::size_t>(found - information_families.begin()));
 }
 
-void ValidateSelectedInformationFamilies(
-    McpOperationKind operation, const boost::json::object& arguments,
-    const McpProtocolConfig& config) {
+void ValidateSelectedInformationFamilies(McpOperationKind operation,
+                                         const boost::json::object& arguments,
+                                         const McpProtocolConfig& config) {
   if (operation != McpOperationKind::kQueryEvidence &&
       operation != McpOperationKind::kCreateSubscription) {
     return;
@@ -625,11 +624,9 @@ void ValidateSelectedInformationFamilies(
     if (!value.is_string()) {
       continue;
     }
-    const std::string uri =
-        "bbp:///" + std::string(value.as_string().data(),
-                                value.as_string().size());
-    const std::optional<McpInformationFamily> family =
-        RegisteredResource(uri);
+    const std::string uri = "bbp:///" + std::string(value.as_string().data(),
+                                                    value.as_string().size());
+    const std::optional<McpInformationFamily> family = RegisteredResource(uri);
     if (family && !InformationFamilyAllowed(config, *family)) {
       throw std::invalid_argument(
           "requested BBP information family is unavailable in the current "
@@ -824,9 +821,7 @@ struct McpProtocol::Impl {
         session->second.state != McpSessionState::kInitialized) {
       return {};
     }
-    if (!session->second.active_requests
-             .emplace(request_key, request)
-             .second) {
+    if (!session->second.active_requests.emplace(request_key, request).second) {
       throw std::invalid_argument(
           "JSON-RPC request id is already active in this session");
     }
@@ -843,8 +838,7 @@ struct McpProtocol::Impl {
       if (session == sessions.end()) {
         return;
       }
-      const auto request =
-          session->second.active_requests.find(request_key);
+      const auto request = session->second.active_requests.find(request_key);
       if (request != session->second.active_requests.end() &&
           request->second == expected_request) {
         session->second.active_requests.erase(request);
@@ -858,8 +852,7 @@ struct McpProtocol::Impl {
                      const boost::json::object& params) {
     const boost::json::value* request_id = params.if_contains("requestId");
     if (request_id == nullptr) {
-      throw std::invalid_argument(
-          "notifications/cancelled requires requestId");
+      throw std::invalid_argument("notifications/cancelled requires requestId");
     }
     const std::string request_key = JsonRpcRequestKey(*request_id);
     std::shared_ptr<McpActiveRequest> request;
@@ -1173,8 +1166,8 @@ struct McpProtocol::Impl {
     if (session.cursors.size() == kMcpMaximumNotificationsPerSession) {
       session.cursors.pop_front();
     }
-    session.cursors.push_back(McpSseCursor{
-        .stream_id = std::move(stream_id), .sequence = sequence});
+    session.cursors.push_back(
+        McpSseCursor{.stream_id = std::move(stream_id), .sequence = sequence});
   }
 
   std::string CreateSseStreamLocked(McpSession& session) {
@@ -1436,9 +1429,8 @@ struct McpProtocol::Impl {
         }
         result = tool_handler(name, arguments, session_id, stop_token);
       } catch (const McpOperationCancelled& cancelled) {
-        boost::json::object structured_error =
-            ToolError("cancelled", cancelled.what(), false,
-                      cancelled.diagnostics());
+        boost::json::object structured_error = ToolError(
+            "cancelled", cancelled.what(), false, cancelled.diagnostics());
         return boost::json::object{
             {"content",
              boost::json::array{boost::json::object{
@@ -1532,10 +1524,9 @@ struct McpProtocol::Impl {
           std::lock_guard<std::mutex> lock(mutex);
           sessions.erase(*session_id);
         }
-        return JsonResponse(
-            http_request,
-            JsonRpcError(request.id, -32603, "internal error",
-                         "non-standard callback exception"));
+        return JsonResponse(http_request,
+                            JsonRpcError(request.id, -32603, "internal error",
+                                         "non-standard callback exception"));
       }
     }
     ArmInitializationDeadline(*session_id);
@@ -1693,8 +1684,7 @@ struct McpProtocol::Impl {
     try {
       boost::json::value result;
       try {
-        result =
-            Dispatch(*request, *session_id, active_request->stop_token());
+        result = Dispatch(*request, *session_id, active_request->stop_token());
       } catch (...) {
         if (!active_request->Complete()) {
           return TextResponse(http_request, http::status::accepted, "");
@@ -1704,8 +1694,8 @@ struct McpProtocol::Impl {
       if (!active_request->Complete()) {
         return TextResponse(http_request, http::status::accepted, "");
       }
-      return JsonResponse(
-          http_request, JsonRpcResult(request->id, std::move(result)));
+      return JsonResponse(http_request,
+                          JsonRpcResult(request->id, std::move(result)));
     } catch (const McpResourceUnavailable& unavailable) {
       return JsonResponse(
           http_request,
@@ -1721,16 +1711,16 @@ struct McpProtocol::Impl {
           http_request,
           JsonRpcError(request->id, -32602, "invalid params", error.what()));
     } catch (const std::out_of_range&) {
-      return JsonResponse(http_request,
-                          JsonRpcError(request->id, -32601, "method not found"));
+      return JsonResponse(
+          http_request, JsonRpcError(request->id, -32601, "method not found"));
     } catch (const std::exception& error) {
       return JsonResponse(
           http_request,
           JsonRpcError(request->id, -32603, "internal error", error.what()));
     } catch (...) {
-      return JsonResponse(
-          http_request, JsonRpcError(request->id, -32603, "internal error",
-                       "non-standard callback exception"));
+      return JsonResponse(http_request,
+                          JsonRpcError(request->id, -32603, "internal error",
+                                       "non-standard callback exception"));
     }
   }
 
@@ -1795,14 +1785,12 @@ struct McpProtocol::Impl {
             notification.sequence <= after) {
           continue;
         }
-        body +=
-            "id: " + SseEventId(stream_id, notification.sequence) + "\n";
+        body += "id: " + SseEventId(stream_id, notification.sequence) + "\n";
         body += "event: message\n";
         body += "data: " + notification.json + "\n\n";
       }
       if (target.protocol_version == "2025-11-25") {
-        body += "retry: " + std::to_string(kSseReconnectDelay.count()) +
-                "\n\n";
+        body += "retry: " + std::to_string(kSseReconnectDelay.count()) + "\n\n";
       }
     }
     if (body.empty()) {
@@ -1960,10 +1948,10 @@ void McpProtocol::BroadcastNotification(std::string_view method,
       session.notifications.pop_front();
       ++impl_->stats.notifications_dropped;
     }
-    session.notifications.push_back(McpNotification{
-        .sequence = session.next_notification_sequence++,
-        .stream_id = {},
-        .json = json});
+    session.notifications.push_back(
+        McpNotification{.sequence = session.next_notification_sequence++,
+                        .stream_id = {},
+                        .json = json});
     ++impl_->stats.notifications_enqueued;
   }
 }

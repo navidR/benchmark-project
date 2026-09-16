@@ -245,8 +245,7 @@ BOOST_AUTO_TEST_CASE(
       Invoke(&dispatcher, "subscription.create",
              boost::json::object{{"run_id", "run-b"},
                                  {"families", boost::json::array{"metrics"}}}),
-      McpOperationFailure,
-      [](const McpOperationFailure& failure) {
+      McpOperationFailure, [](const McpOperationFailure& failure) {
         return failure.code() == "run_not_found";
       });
   dispatcher.Publish(McpEvidenceRecord{.run_id = "run-a",
@@ -300,16 +299,15 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(delivered_object.at("item").as_object().at("run_id").as_string() ==
              "run-a");
   dispatcher.CloseRunSubscriptions("run-a");
-  dispatcher.Publish(McpEvidenceRecord{
-      .run_id = "run-a",
-      .family = McpInformationFamily::kMetrics,
-      .sequence = 0U,
-      .timestamp_ms = 3U,
-      .node_id = "node-1",
-      .kind = "late",
-      .message = "must not leak",
-      .artifact_id = std::nullopt,
-      .data = std::nullopt});
+  dispatcher.Publish(McpEvidenceRecord{.run_id = "run-a",
+                                       .family = McpInformationFamily::kMetrics,
+                                       .sequence = 0U,
+                                       .timestamp_ms = 3U,
+                                       .node_id = "node-1",
+                                       .kind = "late",
+                                       .message = "must not leak",
+                                       .artifact_id = std::nullopt,
+                                       .data = std::nullopt});
   const boost::json::object closed =
       Invoke(&dispatcher, "subscription.poll",
              boost::json::object{

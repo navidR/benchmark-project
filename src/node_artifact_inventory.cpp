@@ -227,7 +227,7 @@ void ScanDataDirectory(int directory_fd, std::string_view relative_parent,
       return;
     }
     ++state->visited_entries;
-    struct stat status {};
+    struct stat status{};
     if (fstatat(directory_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) < 0) {
       RememberWarning(ErrnoText("inspect node artifact", errno), state);
       continue;
@@ -277,7 +277,7 @@ void ScanNodeRootLogs(int node_fd, ScanState* state) {
     if (!HasLogSuffix(name)) {
       continue;
     }
-    struct stat status {};
+    struct stat status{};
     if (fstatat(node_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) < 0 ||
         !S_ISREG(status.st_mode)) {
       continue;

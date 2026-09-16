@@ -137,12 +137,10 @@ ApplicationInstanceLock::ApplicationInstanceLock(
   process_guard_held_ = true;
   const std::filesystem::path lock_path = state_directory_ / kLockFileName;
   try {
-    const int state_directory_fd =
-        OpenPrivateStateDirectory(state_directory_);
+    const int state_directory_fd = OpenPrivateStateDirectory(state_directory_);
     lock_fd_ =
         openat(state_directory_fd, kLockFileName.data(),
-               O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
-               S_IRUSR | S_IWUSR);
+               O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
     const int open_error = errno;
     close(state_directory_fd);
     if (lock_fd_ < 0) {
