@@ -1,6 +1,7 @@
 #include "bbp/tui.h"
 
 #include <ncursesw/curses.h>
+#include <ncursesw/term.h>
 
 #include <algorithm>
 #include <boost/algorithm/string/join.hpp>
@@ -141,6 +142,12 @@ class CursesSession {
  public:
   CursesSession() {
     std::setlocale(LC_ALL, "");
+    // newterm leaks its preliminary screen when terminal lookup fails.
+    int terminal_error = 0;
+    if (setupterm(nullptr, fileno(stdout), &terminal_error) == ERR) {
+      throw std::runtime_error("ncurses initialization failed");
+    }
+    del_curterm(cur_term);
     screen_ = newterm(nullptr, stdout, stdin);
     if (screen_ == nullptr) {
       throw std::runtime_error("ncurses initialization failed");
@@ -816,19 +823,19 @@ void DrawMetricSparklineLine(int y, int cols, const boost::json::array& history,
   if (cols <= 0) {
     return;
   }
-  const int label_width = std::min(cols, 12);
+  const int label_columns = std::min(cols, 12);
   const int stats_width = cols >= 64 ? 30 : 0;
-  const int chart_width = std::max(0, cols - label_width - stats_width);
+  const int chart_width = std::max(0, cols - label_columns - stats_width);
   const MetricSparkline chart = BuildMetricSparkline(
       history, field, static_cast<std::size_t>(chart_width));
-  AddText(y, 0, label_width, label, A_BOLD);
-  AddText(y, label_width, chart_width, chart.text);
+  AddText(y, 0, label_columns, label, A_BOLD);
+  AddText(y, label_columns, chart_width, chart.text);
   if (stats_width > 0) {
     const std::string stats = " " + MetricChartValueText(chart.latest, unit) +
                               " [" + MetricChartValueText(chart.minimum, unit) +
                               ".." + MetricChartValueText(chart.maximum, unit) +
                               "]";
-    AddText(y, label_width + chart_width, stats_width, stats,
+    AddText(y, label_columns + chart_width, stats_width, stats,
             COLOR_PAIR(kColorMuted));
   }
 }

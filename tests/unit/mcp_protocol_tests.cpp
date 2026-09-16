@@ -1391,12 +1391,14 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     mcp_protocol_expiry_reclaims_capacity_when_cleanup_throws) {
+  // Fill every slot before expiry, including under instrumentation.
+  constexpr auto initialization_timeout = 5s;
   std::atomic<std::size_t> close_attempts = 0U;
   McpProtocol protocol(
       McpProtocolConfig{.bearer_token = std::string(kTestToken),
                         .endpoint_path = "/mcp",
                         .endpoint_port = 43123U,
-                        .uninitialized_session_timeout = 1s,
+                        .uninitialized_session_timeout = initialization_timeout,
                         .allowed_operations = {},
                         .allowed_information_families = {},
                         .read_only = false},
@@ -1414,11 +1416,13 @@ BOOST_AUTO_TEST_CASE(
       http::verb::post, InitializeBody(kMcpMaximumSessions + 1U)));
   BOOST_TEST(full.result() == http::status::service_unavailable);
 
-  BOOST_REQUIRE(WaitFor([&] {
-    const McpProtocolStats stats = protocol.Stats();
-    return stats.sessions == 0U &&
-           stats.expired_sessions == kMcpMaximumSessions;
-  }));
+  BOOST_REQUIRE(WaitFor(
+      [&] {
+        const McpProtocolStats stats = protocol.Stats();
+        return stats.sessions == 0U &&
+               stats.expired_sessions == kMcpMaximumSessions;
+      },
+      initialization_timeout + 2s));
   static_cast<void>(Initialize(&protocol));
   BOOST_REQUIRE(WaitFor(
       [&] {
@@ -1426,7 +1430,7 @@ BOOST_AUTO_TEST_CASE(
         return stats.expired_sessions == kMcpMaximumSessions + 1U &&
                stats.failed_session_cleanups == kMcpMaximumSessions + 1U;
       },
-      3s));
+      initialization_timeout + 2s));
   BOOST_REQUIRE(WaitFor(
       [&] {
         return close_attempts.load(std::memory_order_relaxed) ==

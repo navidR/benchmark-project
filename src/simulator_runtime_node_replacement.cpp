@@ -297,9 +297,9 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
   }
   staging_config.masternode.reset();
 
+  boost::asio::io_context staging_port_context;
   std::unique_ptr<boost::asio::ip::tcp::acceptor> staging_rpc_reservation;
   std::unique_ptr<boost::asio::ip::tcp::acceptor> staging_p2p_reservation;
-  boost::asio::io_context staging_port_context;
   if (options.isolate_network) {
     const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
     // Only one replacement runs in this node namespace at a time.

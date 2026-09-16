@@ -2036,12 +2036,7 @@ void KillBoundCgroupProcesses(const BoundCgroupDirectory& cgroup,
     cgroup.RequireLinkedIdentity();
     const std::vector<pid_t> pids =
         BoundCgroupPids(cgroup, deadline, stop_token);
-    if (pids.empty()) {
-      if (BoundCgroupPopulated(cgroup, deadline, stop_token)) {
-        throw std::runtime_error(
-            "cgroup remained recursively populated without cgroup.kill: " +
-            cgroup.display_path().string());
-      }
+    if (pids.empty() && !BoundCgroupPopulated(cgroup, deadline, stop_token)) {
       return;
     }
     for (const pid_t pid : pids) {

@@ -159,6 +159,31 @@ void RequireCleanupActive(
   }
 }
 
+void WaitForReleasedNodeNetwork(const NodeVethConfig& config,
+                                std::chrono::steady_clock::time_point deadline,
+                                std::stop_token stop_token) {
+  // Namespace destruction can remove its veth after every process is reaped.
+  // Observe that release without claiming ownership of a surviving endpoint.
+  for (;;) {
+    RequireCleanupActive(deadline, stop_token);
+    const std::vector<LinkInfo> links = ListNetworkLinks(stop_token);
+    const bool present =
+        std::any_of(links.begin(), links.end(), [&](const LinkInfo& link) {
+          return link.name == config.host_name ||
+                 link.name == config.peer_name ||
+                 link.ownership_alias == config.host_ownership_alias ||
+                 link.ownership_alias == config.peer_ownership_alias;
+        });
+    if (!present) {
+      DeleteNodeVethNetwork(config, stop_token);
+      return;
+    }
+    WaitUntil(std::min(deadline, std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(20)),
+              stop_token);
+  }
+}
+
 }  // namespace
 
 McpRunCleanupResult CleanupRun(
@@ -360,6 +385,8 @@ McpRunCleanupResult CleanupRun(
       manifest ? manifest->nodes.size() : options.nodes,
       !has_network_resources);
   if (cgroup_cleanup_verified && has_network_resources) {
+    const auto network_release_deadline = absolute_deadline.value_or(
+        std::chrono::steady_clock::now() + std::chrono::seconds(30));
     if (manifest) {
       for (std::size_t index = 0U; index < manifest->nodes.size(); ++index) {
         const RuntimeNodeResourceEntry& entry = manifest->nodes[index];
@@ -371,9 +398,11 @@ McpRunCleanupResult CleanupRun(
             RunInterfaceAlias(ownership, entry.slot, 'h');
         config.peer_ownership_alias =
             RunInterfaceAlias(ownership, entry.slot, 'p');
-        network_cleanup_verified[index] = cleanup_step(
-            "owned node network removal",
-            [&] { DeleteNodeVethNetwork(config, cleanup_stop_token); });
+        network_cleanup_verified[index] =
+            cleanup_step("owned node network removal", [&] {
+              WaitForReleasedNodeNetwork(config, network_release_deadline,
+                                         cleanup_stop_token);
+            });
       }
     } else {
       for (uint32_t i = 0; i < options.nodes; ++i) {
@@ -383,9 +412,11 @@ McpRunCleanupResult CleanupRun(
         config.peer_name = RunInterfaceName(ownership, i, 'p');
         config.host_ownership_alias = RunInterfaceAlias(ownership, i, 'h');
         config.peer_ownership_alias = RunInterfaceAlias(ownership, i, 'p');
-        network_cleanup_verified[i] = cleanup_step(
-            "owned node network removal",
-            [&] { DeleteNodeVethNetwork(config, cleanup_stop_token); });
+        network_cleanup_verified[i] =
+            cleanup_step("owned node network removal", [&] {
+              WaitForReleasedNodeNetwork(config, network_release_deadline,
+                                         cleanup_stop_token);
+            });
       }
     }
   }
