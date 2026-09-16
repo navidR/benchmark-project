@@ -818,10 +818,10 @@ Options ParseOptions(int argc, char** argv,
       "direct random_bruteforce or equal_fanout load; defaults: full mesh, "
       "isolated namespaces, one miner (the final wallet when all nodes are "
       "wallets), public driver wallets, all-wallet random redistribution "
-      "retaining 80 percent or one complete equal fan-out at 2 tx/s, "
+      "retaining 80 percent or repeated equal fan-out at 2 tx/s, "
       "concurrency 2, queue 8, uniform 0.01..0.10 coin random amounts, "
-      "fixed 0.00001000 coin fee, simulation seed, and continuous metrics "
-      "until explicit stop")(
+      "fixed 0.00001000 coin fee, simulation seed, and continuous transactions "
+      "and metrics until explicit stop")(
       "isolate-network",
       "explicitly select the default per-node isolated networking mode")(
       "no-isolate-network",
