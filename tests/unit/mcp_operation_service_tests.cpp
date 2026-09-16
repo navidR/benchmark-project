@@ -1250,6 +1250,31 @@ BOOST_AUTO_TEST_CASE(mcp_subscription_capacity_and_cancellation_are_bounded) {
       std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(mcp_subscription_rejects_invalid_run_identifiers) {
+  McpOperationService service;
+  service.RegisterSession("session-a");
+  for (const std::string& run_id :
+       {std::string{}, std::string("run.name"), std::string(33U, 'r')}) {
+    const McpSubscriptionRequest request{
+        .run_id = run_id,
+        .families = {McpInformationFamily::kMetrics},
+        .node_ids = {},
+        .cursor = 0U};
+    BOOST_CHECK_THROW(service.CreateSubscription("session-a", request),
+                      std::invalid_argument);
+    BOOST_CHECK_THROW(
+        service.Publish(Evidence(McpInformationFamily::kMetrics, "node-1",
+                                 "invalid run", run_id)),
+        std::invalid_argument);
+    BOOST_CHECK_THROW(service.CloseRunSubscriptions(run_id),
+                      std::invalid_argument);
+  }
+  BOOST_CHECK_THROW(ValidateMcpIdentifier("_id", "operation id"),
+                    std::invalid_argument);
+  BOOST_CHECK_THROW(ValidateMcpIdentifier("-id", "subscription id"),
+                    std::invalid_argument);
+}
+
 BOOST_AUTO_TEST_CASE(
     mcp_subscription_filters_bounds_queue_and_reports_exact_drops) {
   McpOperationService service(TestConfig(1U, 1U, 2U, 2U, 2U, 2U));

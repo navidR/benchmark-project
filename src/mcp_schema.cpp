@@ -1127,7 +1127,7 @@ boost::json::object InstrumentationTargetSchema() {
 
 boost::json::object EvidenceRecordSchema(bool require_run_id = true) {
   boost::json::object properties;
-  properties["run_id"] = IdentifierSchema();
+  properties["run_id"] = RunIdentifierSchema();
   properties["family"] = InformationFamilySchema();
   properties["sequence"] = Uint64Schema();
   properties["timestamp_ms"] = Uint64Schema();
@@ -2094,7 +2094,6 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kCreateSubscription:
       add_run();
-      properties["run_id"] = IdentifierSchema();
       properties["families"] =
           ArraySchema(InformationFamilySchema(information_families), 1U,
                       information_families.size(), true);
@@ -3368,7 +3367,7 @@ boost::json::object BuildMcpResultSchema(
       }
       break;
     case McpResultFamily::kSubscription:
-      properties["run_id"] = IdentifierSchema();
+      properties["run_id"] = RunIdentifierSchema();
       properties["subscription_id"] = IdentifierSchema();
       properties["items"] = ArraySchema(EvidenceRecordSchema(), 0U,
                                         kMcpMaximumNotificationsPerSession);

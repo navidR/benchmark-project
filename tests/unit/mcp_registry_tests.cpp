@@ -869,7 +869,8 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_identifiers_match_safe_production_names) {
         McpResultFamily::kMutation, McpResultFamily::kRoleMutation,
         McpResultFamily::kWorkload, McpResultFamily::kWorkloadInvocation,
         McpResultFamily::kInstrumentation, McpResultFamily::kEvidencePage,
-        McpResultFamily::kArtifactContent, McpResultFamily::kCleanup}) {
+        McpResultFamily::kArtifactContent, McpResultFamily::kCleanup,
+        McpResultFamily::kSubscription}) {
     const boost::json::object result = BuildMcpResultSchema(family);
     BOOST_TEST(result.at("properties").as_object().at("run_id").as_object() ==
                identifier);
@@ -878,6 +879,22 @@ BOOST_AUTO_TEST_CASE(mcp_scenario_identifiers_match_safe_production_names) {
       BuildMcpOperationInputSchema(McpOperationKind::kStopRun);
   BOOST_TEST(stop.at("properties").as_object().at("run_id").as_object() ==
              identifier);
+  const boost::json::object subscribe =
+      BuildMcpOperationInputSchema(McpOperationKind::kCreateSubscription);
+  BOOST_TEST(subscribe.at("properties").as_object().at("run_id").as_object() ==
+             identifier);
+  const boost::json::object subscription =
+      BuildMcpResultSchema(McpResultFamily::kSubscription);
+  BOOST_TEST(subscription.at("properties")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("items")
+                 .as_object()
+                 .at("properties")
+                 .as_object()
+                 .at("run_id")
+                 .as_object() == identifier);
   BOOST_TEST(properties.at("simulation")
                  .as_object()
                  .at("properties")

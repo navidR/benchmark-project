@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "bbp/simulation_command.h"
+#include "bbp/util.h"
 
 namespace bbp {
 namespace {
@@ -334,8 +335,16 @@ bool ContainsNode(const std::vector<std::string>& node_ids,
                          node_ids.end());
 }
 
+void ValidateRunIdentifier(std::string_view run_id) {
+  try {
+    RequireSafeRunId(run_id);
+  } catch (const std::runtime_error& error) {
+    throw std::invalid_argument(error.what());
+  }
+}
+
 void ValidateEvidenceRecord(const McpEvidenceRecord& record) {
-  ValidateMcpIdentifier(record.run_id, "evidence run id");
+  ValidateRunIdentifier(record.run_id);
   ValidateInformationFamily(record.family);
   const auto validate_optional_identifier = [](const auto& value,
                                                std::string_view label) {
@@ -1588,7 +1597,7 @@ std::optional<McpOperationSnapshot> McpOperationService::WaitForOperation(
 
 McpSubscriptionSnapshot McpOperationService::CreateSubscription(
     std::string_view session_id, McpSubscriptionRequest request) {
-  ValidateMcpIdentifier(request.run_id, "MCP subscription run id");
+  ValidateRunIdentifier(request.run_id);
   if (request.families.empty()) {
     throw std::invalid_argument(
         "MCP subscription requires an information family");
@@ -1737,7 +1746,7 @@ McpSubscriptionSnapshot McpOperationService::CancelSubscription(
 }
 
 void McpOperationService::CloseRunSubscriptions(std::string_view run_id) {
-  ValidateMcpIdentifier(run_id, "MCP subscription run id");
+  ValidateRunIdentifier(run_id);
   {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     for (auto& [session_id, session] : impl_->sessions) {

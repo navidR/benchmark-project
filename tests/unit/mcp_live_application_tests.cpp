@@ -229,6 +229,91 @@ void MarkNodeAddCommitted(const SimulationCommand& command,
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(
+    mcp_live_run_identifiers_match_evidence_and_subscriptions) {
+  for (const std::string& run_id :
+       {std::string("_hosted-run"), "-" + std::string(31U, 'r')}) {
+    LiveApplicationDirectory temporary;
+    boost::json::object scenario = LiveScenario();
+    scenario["run_id"] = run_id;
+    const auto options =
+        std::make_shared<Options>(ParseAndValidateScenario(scenario));
+    McpDispatcher* evidence_dispatcher = nullptr;
+    McpLiveApplication application(McpLiveApplication::Config{
+        .run_id = run_id,
+        .run_root = temporary.path(),
+        .retained_run = std::nullopt,
+        .options = options,
+        .command_queue = std::make_shared<SimulationCommandQueue>(),
+        .node_inventory_snapshot =
+            [options] { return InitialInventory(*options); },
+        .publication_mutex = {},
+        .request_run_stop = [] {},
+        .run_started = {},
+        .run_stopping = {},
+        .run_stopped = {},
+        .publish_evidence =
+            [&](McpEvidenceRecord record) {
+              evidence_dispatcher->Publish(std::move(record));
+            },
+        .close_run_subscriptions =
+            [&](std::string_view stopped_run_id) {
+              evidence_dispatcher->CloseRunSubscriptions(stopped_run_id);
+            }});
+    McpDispatcher dispatcher({}, application.OperationFactory(),
+                             application.ResourceReader());
+    evidence_dispatcher = &dispatcher;
+    dispatcher.SessionHandler()("live-session", true, {});
+    dispatcher.SessionHandler()("other-session", true, {});
+    BOOST_CHECK_THROW(Invoke(&dispatcher, "subscription.create",
+                             {{"run_id", "_other-run"},
+                              {"families", boost::json::array{"lifecycle"}}}),
+                      McpOperationFailure);
+    const boost::json::object subscription = Invoke(
+        &dispatcher, "subscription.create",
+        {{"run_id", run_id}, {"families", boost::json::array{"lifecycle"}}});
+    const boost::json::object poll{
+        {"subscription_id", subscription.at("subscription_id")},
+        {"cursor", "0"}};
+    BOOST_CHECK_THROW(dispatcher.ToolHandler()("subscription.poll", poll,
+                                               "other-session", {}),
+                      std::runtime_error);
+    dispatcher.Publish(
+        McpEvidenceRecord{.run_id = "_other-run",
+                          .family = McpInformationFamily::kLifecycle,
+                          .sequence = 0U,
+                          .timestamp_ms = 1U,
+                          .node_id = std::nullopt,
+                          .kind = "run_started",
+                          .message = std::nullopt,
+                          .artifact_id = std::nullopt,
+                          .data = std::nullopt});
+    application.MarkRunStarted();
+    dispatcher.CloseRunSubscriptions("_other-run");
+    const boost::json::object page =
+        Invoke(&dispatcher, "subscription.poll", poll);
+    BOOST_TEST(page.at("run_id").as_string() == run_id);
+    BOOST_TEST(page.at("active").as_bool());
+    const boost::json::array& items = page.at("items").as_array();
+    BOOST_REQUIRE_EQUAL(items.size(), 1U);
+    BOOST_TEST(items.front().as_object().at("run_id").as_string() == run_id);
+    BOOST_TEST(items.front().as_object().at("kind").as_string() ==
+               "run_started");
+    application.MarkRunStopped();
+    const boost::json::object stopped =
+        Invoke(&dispatcher, "subscription.poll", poll);
+    BOOST_TEST(!stopped.at("active").as_bool());
+    BOOST_TEST(stopped.at("items")
+                   .as_array()
+                   .back()
+                   .as_object()
+                   .at("kind")
+                   .as_string() == "run_stopped");
+    application.Shutdown();
+    dispatcher.Shutdown();
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
     mcp_live_application_reads_real_report_and_waits_for_real_command_outcome) {
   LiveApplicationDirectory temporary;
   boost::json::object scenario = LiveScenario();
