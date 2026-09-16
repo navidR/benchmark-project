@@ -1050,6 +1050,27 @@ BOOST_AUTO_TEST_CASE(
   runtime.erase("scope");
   BOOST_CHECK_THROW(ParseAndValidateSimulationCommand(runtime, options),
                     std::exception);
+
+  auto& event = scenario.at("events").as_array().front().as_object();
+  event["action"] = "signal_wallet";
+  const auto wallet_options = ParseAndValidateScenario(scenario);
+  const auto& wallet_command = std::get<SimulationCommand>(
+      wallet_options.scheduled_events.front().action);
+  BOOST_CHECK(wallet_command.kind == SimulationCommandKind::kSignalWallet);
+  BOOST_TEST(wallet_command.signal_request->signal == SIGCONT);
+  BOOST_TEST(ResolveScenario(scenario)
+                 .at("events")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("signal")
+                 .as_string() == "SIGCONT");
+  runtime["kind"] = "signal_wallet";
+  BOOST_CHECK_THROW(ParseAndValidateSimulationCommand(runtime, options),
+                    std::exception);
+  runtime["scope"] = "process";
+  BOOST_CHECK(ParseAndValidateSimulationCommand(runtime, options).kind ==
+              SimulationCommandKind::kSignalWallet);
 }
 
 }  // namespace bbp

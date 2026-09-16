@@ -43,6 +43,8 @@ constexpr auto kOperations = std::to_array<McpNamedCapability>(
      {"node.signal",
       "Deliver an explicit signal to an owned node daemon; kernel acceptance "
       "is not termination"},
+     {"wallet.signal",
+      "Signal the selected wallet backing node daemon; affects all its roles"},
      {"node.restart", "Restart a selected owned node"},
      {"node.replace", "Transactionally replace a selected owned node"},
      {"wallet.add", "Transactionally initialize and register a wallet"},

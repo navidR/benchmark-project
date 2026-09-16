@@ -44,6 +44,7 @@ enum class SimulationCommandKind {
   kSetMiningDifficulty,
   kKillNode,
   kSignalNode,
+  kSignalWallet,
   kConnectPeer,
   kDisconnectPeer,
   kSetPeerCountPolicy,

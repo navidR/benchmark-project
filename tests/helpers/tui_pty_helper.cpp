@@ -3432,8 +3432,13 @@ void CheckDirectLoadLifecycle(const std::filesystem::path& command,
 
 void CheckNodeSignals(const std::filesystem::path& command,
                       const std::filesystem::path& daemon,
-                      const std::filesystem::path& benchmark_root) {
-  OwnedTemporaryDirectory home("node-signals");
+                      const std::filesystem::path& benchmark_root,
+                      bool wallet_target = false) {
+  const std::string command_kind =
+      wallet_target ? "signal_wallet" : "signal_node";
+  const std::string operation = wallet_target ? "wallet.signal" : "node.signal";
+  OwnedTemporaryDirectory home(wallet_target ? "wallet-signals"
+                                             : "node-signals");
   std::filesystem::create_directories(benchmark_root);
   const std::string run_id = "node-signals-" + std::to_string(getpid());
   const auto run_root = benchmark_root / run_id;
@@ -3446,17 +3451,17 @@ void CheckNodeSignals(const std::filesystem::path& command,
         {"chain_daemon", daemon.string()},
         {"run_id", run_id},
 
-        {"nodes",
-         boost::json::array{boost::json::object{{"id", "firo-1"},
-                                                {"chain", "firo"},
-                                                {"role", "base"},
-                                                {"restart_policy", "always"}}}},
+        {"nodes", boost::json::array{boost::json::object{
+                      {"id", "firo-1"},
+                      {"chain", "firo"},
+                      {"role", wallet_target ? "wallet" : "base"},
+                      {"restart_policy", "always"}}}},
         {"block_production", boost::json::object{{"enabled", false}}},
         {"metrics_sample_count", 1000U},
         {"metrics_interval_ms", 100U},
         {"events",
          boost::json::array{boost::json::object{{"at", "1ms"},
-                                                {"action", "signal_node"},
+                                                {"action", command_kind},
                                                 {"node", "firo-1"},
                                                 {"signal", "SIGWINCH"},
                                                 {"scope", "process"}}}}});
@@ -3502,7 +3507,7 @@ void CheckNodeSignals(const std::filesystem::path& command,
                         bool runtime) {
     boost::json::object arguments{{"run_id", run_id}};
     if (runtime) {
-      arguments["command"] = boost::json::object{{"kind", "signal_node"},
+      arguments["command"] = boost::json::object{{"kind", command_kind},
                                                  {"node", "firo-1"},
                                                  {"signal", std::move(signal)},
                                                  {"scope", scope}};
@@ -3512,7 +3517,7 @@ void CheckNodeSignals(const std::filesystem::path& command,
       arguments["scope"] = scope;
     }
     const auto result = InvokeMcpOperation(
-        mcp, &request_id, runtime ? "simulation.command" : "node.signal",
+        mcp, &request_id, runtime ? "simulation.command" : operation,
         std::move(arguments), 5s, "node signal delivery");
     const auto& delivery = result.at("signal_delivery").as_object();
     if (delivery.at("kernel_result").to_number<int>() != 0 ||
@@ -3524,17 +3529,31 @@ void CheckNodeSignals(const std::filesystem::path& command,
       throw std::runtime_error("inconsistent node signal delivery: " +
                                boost::json::serialize(result));
     }
+    if (wallet_target) {
+      const auto& wallet = delivery.at("wallet").as_object();
+      if (result.at("action") != "wallet.signal" ||
+          delivery.at("target") != "wallet_node_daemon" ||
+          wallet.at("wallet_index").to_number<unsigned>() != 1U ||
+          wallet.at("node_id") != "firo-1" ||
+          wallet.at("registry_generation").to_number<unsigned>() == 0U) {
+        throw std::runtime_error("wallet signal lost shared daemon identity");
+      }
+    }
     return result;
   };
 
   // Selected-node TUI confirmation must preserve the complete typed request.
+  if (wallet_target) process.Write("w");
   process.Write("c");
   static_cast<void>(
       process.ReadUntil("Live command", 3s, "node signal palette"));
-  process.Write("signal-node SIGSTOP process\n");
+  process.Write(wallet_target ? "signal-wallet SIGSTOP process\n"
+                              : "signal-node SIGSTOP process\n");
   const auto confirmation = process.ReadUntil("Confirm destructive action", 3s,
                                               "node signal confirmation");
   RequireContains(confirmation, "SIGSTOP", "explicit signal confirmation");
+  if (wallet_target)
+    RequireContains(confirmation, "all node roles", "shared daemon warning");
   process.Write("y");
   static_cast<void>(wait_observation("stopped", {}));
   const auto continued = send(SIGCONT, "process", false);
@@ -3568,6 +3587,47 @@ void CheckNodeSignals(const std::filesystem::path& command,
           "signal restart did not replace the exited daemon");
     current_pid = restarted_pids.back();
   }
+  if (wallet_target) {
+    static_cast<void>(InvokeMcpOperation(
+        mcp, &request_id, "wallet.remove",
+        boost::json::object{{"run_id", run_id}, {"node_id", "firo-1"}}, 5s,
+        "remove wallet role before signal rejection"));
+    const auto rejected =
+        SubmitMcpOperation(mcp, &request_id, "wallet.signal",
+                           boost::json::object{{"run_id", run_id},
+                                               {"node_id", "firo-1"},
+                                               {"signal", "SIGKILL"},
+                                               {"scope", "process"}});
+    boost::json::object terminal;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    do {
+      terminal = McpToolCall(
+          mcp.port, mcp.token, mcp.session_id, mcp.protocol_version,
+          request_id++, "operation.get",
+          boost::json::object{{"operation_id", rejected.at("operation_id")}});
+      if (terminal.at("state") == "failed") break;
+      static_cast<void>(process.ReadFor(20ms));
+    } while (std::chrono::steady_clock::now() < deadline);
+    if (terminal.at("state") != "failed")
+      throw std::runtime_error("removed wallet was still signalable");
+    RequireContains(boost::json::serialize(terminal.at("terminal_error")),
+                    "no registered wallet", "removed wallet rejection");
+    // The still-owned daemon must be alive and respond to the node operation.
+    const auto alive =
+        InvokeMcpOperation(mcp, &request_id, "node.signal",
+                           boost::json::object{{"run_id", run_id},
+                                               {"node_id", "firo-1"},
+                                               {"signal", "SIGWINCH"},
+                                               {"scope", "process"}},
+                           5s, "removed wallet retains unchanged daemon");
+    if (alive.at("signal_delivery")
+                .as_object()
+                .at("target_pid")
+                .to_number<pid_t>() != current_pid ||
+        !ProcessExists(current_pid))
+      throw std::runtime_error(
+          "rejected wallet signal affected backing daemon");
+  }
   // Existing query surface must expose the follow-up lifecycle observations.
   const auto lifecycle = InvokeMcpOperation(
       mcp, &request_id, "evidence.query",
@@ -3594,9 +3654,14 @@ void CheckNodeSignals(const std::filesystem::path& command,
   fallback.Disarm();
 }
 
-void CheckAbruptParentDeath(const std::filesystem::path& command,
-                            const std::filesystem::path& daemon,
-                            const std::filesystem::path& benchmark_root) {
+void CheckAbruptParentDeath(
+    const std::filesystem::path& command, const std::filesystem::path& daemon,
+    const std::filesystem::path& configured_benchmark_root) {
+  // Previous retained fixtures can fill an unread PTY with recovery messages.
+  // Keep each invocation isolated while retaining both crash cases for
+  // inspection.
+  const auto benchmark_root =
+      configured_benchmark_root / ("fixture-" + std::to_string(getpid()));
   const rlimit core_limit{0U, 0U};
   if (setrlimit(RLIMIT_CORE, &core_limit) != 0 ||
       prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) {
@@ -7022,9 +7087,11 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  if (argc == 5 && std::string_view(argv[1]) == "--node-signals") {
+  if (argc == 5 && (std::string_view(argv[1]) == "--node-signals" ||
+                    std::string_view(argv[1]) == "--wallet-signals")) {
     try {
-      CheckNodeSignals(argv[2], argv[3], argv[4]);
+      CheckNodeSignals(argv[2], argv[3], argv[4],
+                       std::string_view(argv[1]) == "--wallet-signals");
       std::cout << "real node scenario/TUI/MCP signal and restart evidence "
                    "checks passed\n";
       return 0;

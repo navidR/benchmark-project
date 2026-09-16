@@ -642,33 +642,39 @@ BOOST_AUTO_TEST_CASE(
       WaitForTerminal(&dispatcher, typed_cancellable);
   BOOST_TEST(typed_cancelled_terminal.at("state").as_string() == "cancelled");
 
-  const auto signal_submitted =
-      Invoke(&dispatcher, "node.signal",
-             boost::json::object{{"run_id", "live-application"},
-                                 {"node_id", "_firo-1"},
-                                 {"signal", "SIGSTOP"},
-                                 {"scope", "process"}});
-  const auto signal_command = WaitForQueuedCommand(queue.get());
-  BOOST_CHECK(signal_command.kind == SimulationCommandKind::kSignalNode);
-  BOOST_REQUIRE(signal_command.signal_request);
-  static_cast<void>(
-      Invoke(&dispatcher, "operation.cancel",
-             boost::json::object{
-                 {"operation_id", signal_submitted.at("operation_id")}}));
-  const auto cancel_deadline = std::chrono::steady_clock::now() + 1s;
-  while (!signal_command.operation_control->stop_source.stop_requested() &&
-         std::chrono::steady_clock::now() < cancel_deadline) {
-    std::this_thread::sleep_for(1ms);
+  for (const std::string_view signal_operation :
+       {"node.signal", "wallet.signal"}) {
+    const auto signal_submitted =
+        Invoke(&dispatcher, signal_operation,
+               boost::json::object{{"run_id", "live-application"},
+                                   {"node_id", "_firo-1"},
+                                   {"signal", "SIGSTOP"},
+                                   {"scope", "process"}});
+    const auto signal_command = WaitForQueuedCommand(queue.get());
+    BOOST_CHECK(signal_command.kind ==
+                (signal_operation == "node.signal"
+                     ? SimulationCommandKind::kSignalNode
+                     : SimulationCommandKind::kSignalWallet));
+    BOOST_REQUIRE(signal_command.signal_request);
+    static_cast<void>(
+        Invoke(&dispatcher, "operation.cancel",
+               boost::json::object{
+                   {"operation_id", signal_submitted.at("operation_id")}}));
+    const auto cancel_deadline = std::chrono::steady_clock::now() + 1s;
+    while (!signal_command.operation_control->stop_source.stop_requested() &&
+           std::chrono::steady_clock::now() < cancel_deadline) {
+      std::this_thread::sleep_for(1ms);
+    }
+    application.RecordCommandOutcome(
+        signal_command,
+        CommandOutcome(SimulationCommandOutcomeState::kCancelled,
+                       "cancelled before delivery", "running",
+                       SimulationCommandCancellationCause::kClientCancel));
+    BOOST_TEST(!signal_command.operation_control->TryBeginCommit());
+    BOOST_TEST(WaitForTerminal(&dispatcher, signal_submitted)
+                   .at("state")
+                   .as_string() == "cancelled");
   }
-  application.RecordCommandOutcome(
-      signal_command,
-      CommandOutcome(SimulationCommandOutcomeState::kCancelled,
-                     "cancelled before delivery", "running",
-                     SimulationCommandCancellationCause::kClientCancel));
-  BOOST_TEST(!signal_command.operation_control->TryBeginCommit());
-  BOOST_TEST(
-      WaitForTerminal(&dispatcher, signal_submitted).at("state").as_string() ==
-      "cancelled");
 
   const auto timeout_started = std::chrono::steady_clock::now();
   const boost::json::object typed_timeout =

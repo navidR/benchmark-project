@@ -1525,7 +1525,7 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
             COLOR_PAIR(kColorWarning));
   } else {
     AddText(top + 19, left + 2, popup_cols - 4,
-            "signal-node <signal> process|process_group",
+            "signal-node|signal-wallet <signal> process|process_group",
             COLOR_PAIR(kColorMuted));
   }
   AddText(top + 20, left + 2, popup_cols - 4,
@@ -1550,7 +1550,7 @@ void DrawCommandPaletteInput(int rows, int cols, std::string_view input,
             COLOR_PAIR(kColorWarning));
   } else {
     AddText(top + 19, left + 2, popup_cols - 4,
-            "signal-node <signal> process|process_group",
+            "signal-node|signal-wallet <signal> process|process_group",
             COLOR_PAIR(kColorMuted));
   }
 }
@@ -2909,6 +2909,11 @@ bool QueueParsedNodeCommand(
                     ? partition->group_a.node_ids.front()
                     : "sim";
     } else {
+      if (parsed.kind == SimulationCommandKind::kSignalWallet &&
+          confirmed_target.empty() && state->view != TuiView::kWallets) {
+        throw std::runtime_error(
+            "signal-wallet requires a selected wallet in the wallet view");
+      }
       node_id = std::move(confirmed_target);
       if (node_id.empty()) {
         const boost::json::array* nodes = NodeSummaries(report);
@@ -2925,6 +2930,9 @@ bool QueueParsedNodeCommand(
         node_id = JsonString(*node, "node_id");
       }
       target = node_id;
+      if (parsed.kind == SimulationCommandKind::kSignalWallet) {
+        target = "wallet daemon (all node roles): " + node_id;
+      }
     }
 
     if (role_mutation_command) {
@@ -2984,7 +2992,8 @@ bool QueueParsedNodeCommand(
         sequence = command_queue->PushRoleMutation(
             parsed.kind, std::move(*role_mutation), confirmed);
       } else {
-        if (parsed.kind == SimulationCommandKind::kSignalNode) {
+        if (parsed.kind == SimulationCommandKind::kSignalNode ||
+            parsed.kind == SimulationCommandKind::kSignalWallet) {
           SimulationCommand command;
           command.kind = parsed.kind;
           command.node_id = node_id;

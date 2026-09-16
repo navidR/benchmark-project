@@ -210,7 +210,8 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
         RuntimeNodeSnapshot nodes;
         std::optional<RuntimeWalletSnapshot> command_wallet_snapshot;
         if (needs_runtime_snapshot) {
-          if (command.kind == SimulationCommandKind::kSendWalletTransaction) {
+          if (command.kind == SimulationCommandKind::kSendWalletTransaction ||
+              command.kind == SimulationCommandKind::kSignalWallet) {
             std::unique_lock<std::timed_mutex> publication_lock =
                 context.acquire_runtime_publication_lock(command_stop_token);
             nodes = context.node_inventory.Snapshot();
@@ -536,12 +537,45 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
           if (command.operation_control) {
             command.operation_control->MarkCommitted();
           }
-        } else if (command.kind == SimulationCommandKind::kSignalNode) {
+        } else if (command.kind == SimulationCommandKind::kSignalNode ||
+                   command.kind == SimulationCommandKind::kSignalWallet) {
+          boost::json::object wallet_selection;
+          if (command.kind == SimulationCommandKind::kSignalWallet) {
+            if (!command_wallet_snapshot) {
+              throw std::runtime_error("wallet registry is not initialized");
+            }
+            const auto& wallets = command_wallet_snapshot->wallets();
+            const auto wallet =
+                std::find_if(wallets.begin(), wallets.end(),
+                             [&](const WalletIdentity& entry) {
+                               return entry.node_id == command.node_id;
+                             });
+            if (wallet == wallets.end()) {
+              throw std::runtime_error(
+                  "signal_wallet node has no registered wallet: " +
+                  command.node_id);
+            }
+            const auto& role_nodes =
+                command_wallet_snapshot->registry().topology().wallet_nodes;
+            if (wallet->node == 0U || wallet->node > nodes.size() ||
+                &nodes[wallet->node - 1U] != &node ||
+                std::find(role_nodes.begin(), role_nodes.end(),
+                          wallet->node - 1U) == role_nodes.end() ||
+                !node.config.wallet_enabled || wallet->address.empty()) {
+              throw std::runtime_error(
+                  "signal_wallet requires an initialized current wallet role");
+            }
+            wallet_selection = boost::json::object{
+                {"wallet_index", wallet->wallet_index},
+                {"node_id", wallet->node_id},
+                {"registry_generation", command_wallet_snapshot->generation()}};
+          }
           auto process_guard = context.run_process_state.Lock();
-          RequireNodeRunning(node, process_guard, "signal_node");
+          RequireNodeRunning(node, process_guard,
+                             SimulationCommandKindName(command.kind));
           authorize_resource_mutation();
-          command_outcome.signal_delivery =
-              DeliverNodeSignal(node, command, process_guard);
+          command_outcome.signal_delivery = DeliverNodeSignal(
+              node, command, process_guard, std::move(wallet_selection));
         } else if (command.kind == SimulationCommandKind::kKillNode) {
           bool was_paused = false;
           {

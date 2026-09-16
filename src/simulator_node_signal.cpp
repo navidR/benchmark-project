@@ -6,6 +6,7 @@
 #include <boost/json/serialize.hpp>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "bbp/node_lifecycle_policy.h"
 #include "bbp/simulation_event_kind.h"
@@ -40,16 +41,18 @@ boost::json::object Observe(NodeRuntime& node) {
 
 boost::json::object DeliverNodeSignal(NodeRuntime& node,
                                       const SimulationCommand& command,
-                                      const RunProcessState::Guard&) {
+                                      const RunProcessState::Guard&,
+                                      boost::json::object wallet_selection) {
   if (!command.signal_request) {
-    throw std::logic_error("signal_node requires a signal request");
+    throw std::logic_error("process signal command requires a signal request");
   }
   const auto delivery = node.process.DeliverSignal(
       command.signal_request->signal, command.signal_request->scope);
   if (command.operation_control) command.operation_control->MarkCommitted();
   try {
     boost::json::object result{
-        {"target", "node_daemon"},
+        {"target",
+         wallet_selection.empty() ? "node_daemon" : "wallet_node_daemon"},
         {"target_pid", delivery.target_pid},
         {"process_group_id", delivery.process_group_id},
         {"signal", delivery.signal},
@@ -61,6 +64,9 @@ boost::json::object DeliverNodeSignal(NodeRuntime& node,
         {"observation", Observe(node)},
         {"evidence_families",
          boost::json::array{"events", "lifecycle", "logs", "cleanup_state"}}};
+    if (!wallet_selection.empty()) {
+      result["wallet"] = std::move(wallet_selection);
+    }
     if (delivery.kernel_result == 0) {
       node.signal_observation =
           NodeSignalObservation{.command_sequence = command.sequence,

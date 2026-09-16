@@ -11,9 +11,10 @@
 namespace bbp::simulator_app_internal {
 
 // Caller holds node mutation admission and the process-state guard.
-boost::json::object DeliverNodeSignal(NodeRuntime& node,
-                                      const SimulationCommand& command,
-                                      const RunProcessState::Guard& guard);
+boost::json::object DeliverNodeSignal(
+    NodeRuntime& node, const SimulationCommand& command,
+    const RunProcessState::Guard& guard,
+    boost::json::object wallet_selection = {});
 void PublishNodeSignalObservation(NodeRuntime& node,
                                   const RunProcessState::Guard& guard,
                                   const std::filesystem::path& events_path,

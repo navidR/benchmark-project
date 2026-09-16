@@ -523,6 +523,14 @@ BOOST_AUTO_TEST_CASE(tui_signal_node_requires_scope_and_confirmation) {
   BOOST_CHECK(parsed.signal_request->scope ==
               bbp::ProcessSignalScope::kProcess);
   BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(parsed.kind));
+  const auto wallet =
+      bbp::TuiCommandParser::Parse("signal-wallet SIGCONT process_group", 0U);
+  BOOST_CHECK(wallet.kind == bbp::SimulationCommandKind::kSignalWallet);
+  BOOST_REQUIRE(wallet.signal_request);
+  BOOST_TEST(wallet.signal_request->signal == SIGCONT);
+  BOOST_CHECK(wallet.signal_request->scope ==
+              bbp::ProcessSignalScope::kProcessGroup);
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(wallet.kind));
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("signal-node SIGKILL", 0U),
                     std::exception);
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("signal-node 0 process", 0U),

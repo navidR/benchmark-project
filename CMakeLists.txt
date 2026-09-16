@@ -1199,6 +1199,14 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/node-signal-artifacts"
     )
     set_tests_properties(bbp-node-signal-operation PROPERTIES TIMEOUT 90)
+    add_test(NAME bbp-wallet-signal-operation
+      COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+        --wallet-signals
+        $<TARGET_FILE:bbp>
+        "${BBP_FIROD_INTEGRATION_BINARY}"
+        "${CMAKE_CURRENT_BINARY_DIR}/wallet-signal-artifacts"
+    )
+    set_tests_properties(bbp-wallet-signal-operation PROPERTIES TIMEOUT 90)
     add_test(NAME bbp-owned-process-parent-death
       COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
         --abrupt-parent-death
