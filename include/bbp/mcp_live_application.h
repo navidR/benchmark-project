@@ -250,7 +250,8 @@ class McpLiveApplication {
   std::uint64_t SubmitCommand(SimulationCommand command);
   void DetachPendingCommand(std::uint64_t sequence) noexcept;
   SimulationCommandOutcome WaitForCommand(
-      std::uint64_t sequence, std::stop_token stop_token,
+      std::uint64_t sequence, SimulationCommandKind kind,
+      std::stop_token stop_token,
       const std::shared_ptr<SimulationCommandControl>& operation_control,
       std::optional<std::chrono::steady_clock::time_point>
           cancellation_deadline = std::nullopt,

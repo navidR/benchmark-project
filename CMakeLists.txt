@@ -559,6 +559,7 @@ if(BUILD_TESTING)
     tests/unit/node_runtime_tests.cpp
     tests/unit/operator_connection_tests.cpp
     tests/unit/operator_command_status_tests.cpp
+    tests/unit/operator_resource_mutation_tests.cpp
     tests/unit/peer_connectivity_controller_tests.cpp
     tests/unit/peer_list_pane_tests.cpp
     tests/unit/perf_counter_tests.cpp

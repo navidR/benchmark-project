@@ -61,6 +61,7 @@
 #include "simulator_transaction_observation_tracking.h"
 #include "simulator_wallet_transaction_validation.h"
 #include "simulator_workload_event_details.h"
+#include "simulator_workload_mutation_error.h"
 
 namespace bbp::simulator_app_internal {
 namespace {
@@ -224,6 +225,14 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
         NodeRuntime& node = needs_direct_node ? context.find_node_runtime_by_id(
                                                     nodes, command.node_id)
                                               : unused_node;
+        const auto authorize_resource_mutation = [&] {
+          // Called under the resource lock, immediately before the first write.
+          ThrowIfStopRequested(command_stop_token);
+          if (command.operation_control &&
+              !command.operation_control->TryBeginCommit()) {
+            throw SimulationCancelled();
+          }
+        };
         if (command.kind == SimulationCommandKind::kAddNodes) {
           if (!command.node_add) {
             throw std::runtime_error("node-add payload is missing");
@@ -513,11 +522,19 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
           if (!command.resource_limit_patch) {
             throw std::runtime_error("resource limit patch is missing");
           }
-          ApplyResourceLimitUpdate(context.options, context.events_path, node,
-                                   *command.resource_limit_patch,
-                                   context.node_resource_state_mutex, {}, {},
-                                   std::nullopt, std::nullopt, std::nullopt,
-                                   command.sequence, true);
+          try {
+            ApplyResourceLimitUpdate(context.options, context.events_path, node,
+                                     *command.resource_limit_patch,
+                                     context.node_resource_state_mutex, {},
+                                     authorize_resource_mutation, std::nullopt,
+                                     std::nullopt, std::nullopt,
+                                     command.sequence, true);
+          } catch (const WorkloadMutationOutcomeUnconfirmed& error) {
+            throw SimulationCommandOutcomeUnconfirmed(error.what());
+          }
+          if (command.operation_control) {
+            command.operation_control->MarkCommitted();
+          }
         } else if (command.kind == SimulationCommandKind::kKillNode) {
           bool was_paused = false;
           {
@@ -1134,9 +1151,17 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
               throw std::runtime_error("unknown resource profile: " +
                                        *command.profile);
             }
-            ApplyResourceProfileSwitch(context.options, context.events_path,
-                                       nodes, context.node_resource_state_mutex,
-                                       workload, 0U, 0U, command_stop_token);
+            try {
+              ApplyResourceProfileSwitch(
+                  context.options, context.events_path, nodes,
+                  context.node_resource_state_mutex, workload, 0U, 0U, {},
+                  authorize_resource_mutation);
+            } catch (const WorkloadMutationOutcomeUnconfirmed& error) {
+              throw SimulationCommandOutcomeUnconfirmed(error.what());
+            }
+            if (command.operation_control) {
+              command.operation_control->MarkCommitted();
+            }
           } else {
             if (!context.options.network_profiles.contains(*command.profile)) {
               throw std::runtime_error("unknown network profile: " +

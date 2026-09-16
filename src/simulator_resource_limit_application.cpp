@@ -5,12 +5,23 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bbp/cgroup.h"
 #include "bbp/simulator/resource_limits.h"
 
 namespace bbp::simulator_app_internal {
+
+#ifdef BBP_ENABLE_TEST_HOOKS
+namespace {
+std::function<void()> resource_limits_applied_hook;
+}  // namespace
+
+void SetResourceLimitsAppliedHookForTest(std::function<void()> hook) {
+  resource_limits_applied_hook = std::move(hook);
+}
+#endif
 
 void VerifyResourceLimits(const Cgroup& cgroup,
                           const ResourceLimits& expected) {
@@ -94,6 +105,11 @@ void WriteResourceLimits(const Cgroup& cgroup, const ResourceLimits& previous,
     cgroup.SetPidsMax(next.pids_max);
   }
   VerifyResourceLimits(cgroup, next);
+#ifdef BBP_ENABLE_TEST_HOOKS
+  if (resource_limits_applied_hook) {
+    resource_limits_applied_hook();
+  }
+#endif
 }
 
 }  // namespace bbp::simulator_app_internal

@@ -2381,8 +2381,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
         const SimulationCommandOutcome outcome = [&] {
           try {
             return WaitForCommand(
-                sequence, stop_token, operation_control, cancellation_deadline,
-                terminal_deadline, reconciliation_bound,
+                sequence, command_kind, stop_token, operation_control,
+                cancellation_deadline, terminal_deadline, reconciliation_bound,
                 node_add_operation || node_replace_operation ||
                         node_remove_operation
                     ? &context
@@ -3124,7 +3124,8 @@ void McpLiveApplication::DetachPendingCommand(std::uint64_t sequence) noexcept {
 }
 
 SimulationCommandOutcome McpLiveApplication::WaitForCommand(
-    std::uint64_t sequence, std::stop_token stop_token,
+    std::uint64_t sequence, SimulationCommandKind kind,
+    std::stop_token stop_token,
     const std::shared_ptr<SimulationCommandControl>& operation_control,
     std::optional<std::chrono::steady_clock::time_point> cancellation_deadline,
     std::optional<std::chrono::steady_clock::time_point> terminal_deadline,
@@ -3205,15 +3206,24 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
         SimulationCommandCancellationCause::kClientCancel);
   }
   lock.lock();
+  const auto owner_completed = [&] {
+    const auto outcome = pending_commands_.find(sequence);
+    return outcome == pending_commands_.end() || outcome->second.completed;
+  };
+  if ((kind == SimulationCommandKind::kSetResourceLimits ||
+       kind == SimulationCommandKind::kSetResourceProfile) &&
+      operation_control->CommitPhase() !=
+          SimulationCommandCommitPhase::kCancelled) {
+    // Cancellation lost admission. The short resource transaction owns its
+    // result through publication or write-failure rollback.
+    command_outcome_ready_.wait(lock, owner_completed);
+  }
   auto drain_deadline = std::chrono::steady_clock::now() + reconciliation_bound;
   if (terminal_deadline) {
     drain_deadline = std::min(drain_deadline, *terminal_deadline);
   }
   const bool owner_reconciled =
-      command_outcome_ready_.wait_until(lock, drain_deadline, [&] {
-        const auto outcome = pending_commands_.find(sequence);
-        return outcome == pending_commands_.end() || outcome->second.completed;
-      });
+      command_outcome_ready_.wait_until(lock, drain_deadline, owner_completed);
   pending = pending_commands_.find(sequence);
   if (pending == pending_commands_.end()) {
     throw std::logic_error("MCP simulation command outcome was lost");
