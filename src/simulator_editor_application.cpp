@@ -59,6 +59,7 @@
 #include "simulator_resolved_scenario_persistence.h"
 #include "simulator_retained_run_registry.h"
 #include "simulator_source_scenario_persistence.h"
+#include "simulator_startup_recovery.h"
 #include "simulator_stop_coordination.h"
 #include "simulator_workload_service_shutdown_diagnostic.h"
 
@@ -174,6 +175,7 @@ BenchmarkHeadlessResult RunPreparedBenchmark(
       context->simulation_stop_source.get_token();
   std::unique_ptr<NetworkAllocationLock> network_allocation_lock;
   bool run_prepared = false;
+  std::optional<RunRecoveryLease> recovery_lease;
   try {
     ThrowIfStopRequested(setup_stop_token);
     if (context->reserved_run_root) {
@@ -193,6 +195,7 @@ BenchmarkHeadlessResult RunPreparedBenchmark(
       run_prepared = true;
     }
     context->retained_run_root_available = true;
+    recovery_lease.emplace(RequireRunOwnership(options));
     if (context->run_root_prepared) {
       context->run_root_prepared(setup_stop_token);
     }
@@ -246,10 +249,12 @@ BenchmarkHeadlessResult RunPreparedBenchmark(
     std::rethrow_exception(setup_failure);
   }
 
-  return dependencies.run_benchmark_headless(
+  const BenchmarkHeadlessResult result = dependencies.run_benchmark_headless(
       options, *context->command_queue, *context->mcp_application,
       *context->node_inventory, context->simulation_stop_source,
       context->run_stop_tick, {});
+  recovery_lease->Complete();
+  return result;
 }
 
 class EditorRunController {

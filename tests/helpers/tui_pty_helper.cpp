@@ -3433,11 +3433,37 @@ void CheckAbruptParentDeath(const std::filesystem::path& command,
     throw std::runtime_error("could not configure isolated crash test");
   }
   std::filesystem::create_directories(benchmark_root);
+  OwnedTemporaryDirectory foreign("startup-recovery-foreign");
+  const auto foreign_marker = foreign.root() / ".bbp-active-v1";
+  {
+    std::ofstream stream(foreign_marker);
+    stream << "foreign sentinel\n";
+  }
+  const auto foreign_link =
+      benchmark_root / ("foreign-" + std::to_string(getpid()));
+  std::filesystem::create_directory_symlink(foreign.root(), foreign_link);
   for (const int signal : {SIGKILL, SIGSEGV}) {
     const std::string run_id = "parent-death-" + std::to_string(getpid()) +
                                "-" + std::to_string(signal);
     const auto run_root = benchmark_root / run_id;
     OwnedTemporaryDirectory home(run_id);
+    OwnedTemporaryDirectory recovery_home("recovery-" + run_id);
+    const auto activity_path = run_root / ".bbp-active-v1";
+    const std::string next_run_id =
+        "recovered-" + std::to_string(getpid()) + "-" + std::to_string(signal);
+    const std::vector<std::string> restart_arguments{"--benchmark-root",
+                                                     benchmark_root.string(),
+                                                     "--run-id",
+                                                     next_run_id,
+                                                     "--nodes",
+                                                     "0",
+                                                     "--no-mining",
+                                                     "--metrics-sample-count",
+                                                     "1",
+                                                     "--metrics-interval",
+                                                     "1ms",
+                                                     "--no-tui",
+                                                     "--keep-artifacts"};
     ScopedFixtureProcessCleanup fallback(daemon, run_root);
     std::vector<pid_t> daemon_pids;
     std::vector<pid_t> namespace_pids;
@@ -3466,10 +3492,24 @@ void CheckAbruptParentDeath(const std::filesystem::path& command,
       std::vector<pid_t> children = daemon_pids;
       children.insert(children.end(), namespace_pids.begin(),
                       namespace_pids.end());
+      {
+        PtyProcess observer(command,
+                            {"--benchmark-root", benchmark_root.string(),
+                             "--probe-capabilities"},
+                            24, 80, recovery_home.root());
+        RequireExitZero(&observer, "startup alongside an active run");
+        RequireContains(observer.ReadFor(50ms),
+                        "startup recovery preserved active run " + run_id,
+                        "active-run ownership guard");
+      }
       for (const pid_t pid : children) {
         if (!ProcessExists(pid)) {
           throw std::runtime_error("managed child exited before BBP crash");
         }
+      }
+      {
+        std::ofstream stream(run_root / "retained-artifact");
+        stream << "keep\n";
       }
       process.Signal(signal);
       if (process.Wait(5s) != 128 + signal) {
@@ -3496,12 +3536,63 @@ void CheckAbruptParentDeath(const std::filesystem::path& command,
               "managed child was not killed within five seconds of BBP death");
         }
       }
+      if (signal == SIGKILL) {
+        const std::string original_record = ReadFile(activity_path);
+        {
+          std::ofstream stream(activity_path);
+          stream << "unverified\n";
+        }
+        int rejected = 0;
+        try {
+          PtyProcess invalid(command, restart_arguments, 24, 80,
+                             recovery_home.root());
+          rejected = invalid.Wait();
+        } catch (...) {
+          std::ofstream stream(activity_path);
+          stream << original_record;
+          throw;
+        }
+        {
+          std::ofstream stream(activity_path);
+          stream << original_record;
+        }
+        if (rejected == 0 ||
+            std::filesystem::exists(benchmark_root / next_run_id) ||
+            !std::filesystem::exists(
+                std::filesystem::path("/sys/fs/cgroup/bbp") /
+                MarkerResourceId(run_root))) {
+          throw std::runtime_error(
+              "unverified recovery admitted mutation or removed resources");
+        }
+      }
+      {
+        PtyProcess restarted(command, restart_arguments, 24, 80,
+                             recovery_home.root());
+        RequireExitZero(&restarted, "automatic recovery before new run");
+        RequireContains(restarted.ReadFor(50ms),
+                        "startup recovery completed for " + run_id,
+                        "automatic crash recovery");
+      }
+      RequireOwnedResourcesRemoved(run_root, 2U, daemon_pids, namespace_pids);
+      {
+        PtyProcess repeated(command,
+                            {"--benchmark-root", benchmark_root.string(),
+                             "--probe-capabilities"},
+                            24, 80, recovery_home.root());
+        RequireExitZero(&repeated, "idempotent startup recovery");
+      }
+      if (std::filesystem::exists(activity_path) ||
+          ReadFile(run_root / "retained-artifact") != "keep\n" ||
+          ReadFile(foreign_marker) != "foreign sentinel\n" ||
+          !std::filesystem::is_symlink(foreign_link)) {
+        throw std::runtime_error(
+            "startup recovery crossed an artifact ownership boundary");
+      }
     } catch (...) {
       failure = std::current_exception();
     }
-    // This task proves immediate process termination. Existing explicit
-    // cleanup removes the residual resources; startup recovery is separate.
-    if (std::filesystem::exists(run_root / ".bbp-run")) {
+    // Keep the fixture bounded even when a production assertion fails.
+    if (failure && std::filesystem::exists(run_root / ".bbp-run")) {
       PtyProcess cleanup(command,
                          {"--cleanup-run", run_id, "--benchmark-root",
                           benchmark_root.string()},
@@ -3514,6 +3605,7 @@ void CheckAbruptParentDeath(const std::filesystem::path& command,
     RequireOwnedResourcesRemoved(run_root, 2U, daemon_pids, namespace_pids);
     fallback.Disarm();
   }
+  std::filesystem::remove(foreign_link);
 }
 
 void WriteActiveScenario(const std::filesystem::path& path) {

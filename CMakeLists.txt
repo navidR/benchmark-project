@@ -266,6 +266,7 @@ add_executable(bbp
   src/positive_duration.cpp
   src/process.cpp
   src/owned_process_spawn.cpp
+  src/simulator_startup_recovery.cpp
   src/process_control_config.cpp
   src/probabilistic_block_scheduler.cpp
   src/run_report.cpp
@@ -659,6 +660,7 @@ if(BUILD_TESTING)
     src/positive_duration.cpp
     src/process.cpp
     src/owned_process_spawn.cpp
+    src/simulator_startup_recovery.cpp
     src/process_control_config.cpp
     src/probabilistic_block_scheduler.cpp
     src/resource_limit_patch.cpp

@@ -184,6 +184,7 @@
 #include "simulator_scheduled_command_event_details.h"
 #include "simulator_scheduled_event_decoding.h"
 #include "simulator_source_scenario_persistence.h"
+#include "simulator_startup_recovery.h"
 #include "simulator_stop_coordination.h"
 #include "simulator_tcp_endpoint_reservation.h"
 #include "simulator_topology_edge_workload.h"
@@ -2671,6 +2672,7 @@ int SimulatorApp::Run(int argc, char** argv) {
   SetMinimumLogLevel(options.log_level);
   RequireSafeOutputDirectory(options.output_dir);
   ApplicationInstanceLock instance_lock;
+  simulator_app_internal::RecoverStaleRuns(options.output_dir);
   if (options.probe_network) {
     BBP_LOG(info) << simulator_app_internal::NetworkProbeJson();
     return 0;
