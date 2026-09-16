@@ -20,9 +20,9 @@ namespace {
 
 constexpr std::array<std::string_view,
 #ifdef BBP_FIRO_GUI_LAUNCHER
-                     36U
+                     37U
 #else
-                     35U
+                     36U
 #endif
                      >
     kCommandNames = {
@@ -46,6 +46,7 @@ constexpr std::array<std::string_view,
         "stop-node",
         "signal-node",
         "signal-wallet",
+        "signal-miner",
         "restart",
         "kill",
         "generate-blocks",
@@ -752,12 +753,14 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
       };
     }
 
-    if (tokens[0] == "signal-node" || tokens[0] == "signal-wallet") {
+    if (tokens[0] == "signal-node" || tokens[0] == "signal-wallet" ||
+        tokens[0] == "signal-miner") {
       RequireArgumentCount(tokens, 3U, tokens[0]);
       ParsedTuiCommand parsed;
-      parsed.kind = tokens[0] == "signal-node"
-                        ? SimulationCommandKind::kSignalNode
-                        : SimulationCommandKind::kSignalWallet;
+      parsed.kind =
+          tokens[0] == "signal-node"     ? SimulationCommandKind::kSignalNode
+          : tokens[0] == "signal-wallet" ? SimulationCommandKind::kSignalWallet
+                                         : SimulationCommandKind::kSignalMiner;
       parsed.signal_request =
           ProcessSignalRequest{.signal = ParseProcessSignal(tokens[1]),
                                .scope = ParseProcessSignalScope(tokens[2])};

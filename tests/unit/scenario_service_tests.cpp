@@ -1071,6 +1071,21 @@ BOOST_AUTO_TEST_CASE(
   runtime["scope"] = "process";
   BOOST_CHECK(ParseAndValidateSimulationCommand(runtime, options).kind ==
               SimulationCommandKind::kSignalWallet);
+  event["action"] = "signal_miner";
+  const auto miner_options = ParseAndValidateScenario(scenario);
+  BOOST_CHECK(
+      std::get<SimulationCommand>(miner_options.scheduled_events.front().action)
+          .kind == SimulationCommandKind::kSignalMiner);
+  runtime["kind"] = "signal_miner";
+  BOOST_TEST(ParseAndValidateSimulationCommand(runtime, options)
+                 .signal_request->signal == SIGCONT);
+  BOOST_TEST(ResolveScenario(scenario)
+                 .at("events")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("signal")
+                 .as_string() == "SIGCONT");
 }
 
 }  // namespace bbp

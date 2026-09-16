@@ -1207,6 +1207,16 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/wallet-signal-artifacts"
     )
     set_tests_properties(bbp-wallet-signal-operation PROPERTIES TIMEOUT 90)
+    foreach(signal_target IN ITEMS miner default-miner)
+      add_test(NAME bbp-${signal_target}-signal-operation
+        COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+          --${signal_target}-signals
+          $<TARGET_FILE:bbp>
+          "${BBP_FIROD_INTEGRATION_BINARY}"
+          "${CMAKE_CURRENT_BINARY_DIR}/${signal_target}-signal-artifacts"
+      )
+      set_tests_properties(bbp-${signal_target}-signal-operation PROPERTIES TIMEOUT 90)
+    endforeach()
     add_test(NAME bbp-owned-process-parent-death
       COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
         --abrupt-parent-death

@@ -51,6 +51,7 @@ enum class McpOperationKind {
   kKillNode,
   kSignalNode,
   kSignalWallet,
+  kSignalMiner,
   kRestartNode,
   kReplaceNode,
   kAddWallet,

@@ -53,6 +53,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kKillNode,
     McpOperationKind::kSignalNode,
     McpOperationKind::kSignalWallet,
+    McpOperationKind::kSignalMiner,
     McpOperationKind::kRestartNode,
     McpOperationKind::kReplaceNode,
     McpOperationKind::kAddWallet,
@@ -1787,6 +1788,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       kind != McpOperationKind::kKillNode &&
       kind != McpOperationKind::kSignalNode &&
       kind != McpOperationKind::kSignalWallet &&
+      kind != McpOperationKind::kSignalMiner &&
       kind != McpOperationKind::kRestartNode &&
       kind != McpOperationKind::kReplaceNode &&
       kind != McpOperationKind::kAddWallet &&
@@ -2195,6 +2197,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                                     kind == McpOperationKind::kKillNode ||
                                     kind == McpOperationKind::kSignalNode ||
                                     kind == McpOperationKind::kSignalWallet ||
+                                    kind == McpOperationKind::kSignalMiner ||
                                     kind == McpOperationKind::kRestartNode;
   const bool direct_node_add_operation = kind == McpOperationKind::kAddNode;
   const bool direct_node_replace_operation =
@@ -2282,7 +2285,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
                        ? SimulationCommandKind::kKillNode
                        : SimulationCommandKind::kRestartNode;
     if (kind == McpOperationKind::kSignalNode ||
-        kind == McpOperationKind::kSignalWallet) {
+        kind == McpOperationKind::kSignalWallet ||
+        kind == McpOperationKind::kSignalMiner) {
       Options validation_options = *config_.options;
       McpLiveNodeInventorySnapshot inventory = LiveNodeInventory();
       validation_options.nodes =
@@ -2292,7 +2296,9 @@ McpOperationPlan McpLiveApplication::BuildOperation(
       command = ParseAndValidateSimulationCommand(
           boost::json::object{
               {"kind", kind == McpOperationKind::kSignalNode ? "signal_node"
-                                                             : "signal_wallet"},
+                       : kind == McpOperationKind::kSignalWallet
+                           ? "signal_wallet"
+                           : "signal_miner"},
               {"node", command.node_id},
               {"signal", arguments.at("signal")},
               {"scope", arguments.at("scope")}},
@@ -2372,6 +2378,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
             : command_kind == SimulationCommandKind::kSignalNode ? "node.signal"
             : command_kind == SimulationCommandKind::kSignalWallet
                 ? "wallet.signal"
+            : command_kind == SimulationCommandKind::kSignalMiner
+                ? "miner.signal"
             : command_kind == SimulationCommandKind::kRestartNode
                 ? "node.restart"
             : command_kind == SimulationCommandKind::kAddNodes ? "node.add"
@@ -2609,7 +2617,8 @@ McpOperationPlan McpLiveApplication::BuildOperation(
           throw std::logic_error("unknown simulation command outcome state");
         }
         if (command_kind == SimulationCommandKind::kSignalNode ||
-            command_kind == SimulationCommandKind::kSignalWallet) {
+            command_kind == SimulationCommandKind::kSignalWallet ||
+            command_kind == SimulationCommandKind::kSignalMiner) {
           if (!outcome.signal_delivery) {
             throw McpOperationFailure(
                 "node_outcome_unconfirmed",
@@ -3271,7 +3280,8 @@ SimulationCommandOutcome McpLiveApplication::WaitForCommand(
   if ((kind == SimulationCommandKind::kSetResourceLimits ||
        kind == SimulationCommandKind::kSetResourceProfile ||
        kind == SimulationCommandKind::kSignalNode ||
-       kind == SimulationCommandKind::kSignalWallet) &&
+       kind == SimulationCommandKind::kSignalWallet ||
+       kind == SimulationCommandKind::kSignalMiner) &&
       operation_control->CommitPhase() !=
           SimulationCommandCommitPhase::kCancelled) {
     // Cancellation lost admission. The short mutation owns its result through

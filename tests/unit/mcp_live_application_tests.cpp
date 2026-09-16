@@ -643,7 +643,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(typed_cancelled_terminal.at("state").as_string() == "cancelled");
 
   for (const std::string_view signal_operation :
-       {"node.signal", "wallet.signal"}) {
+       {"node.signal", "wallet.signal", "miner.signal"}) {
     const auto signal_submitted =
         Invoke(&dispatcher, signal_operation,
                boost::json::object{{"run_id", "live-application"},
@@ -654,7 +654,9 @@ BOOST_AUTO_TEST_CASE(
     BOOST_CHECK(signal_command.kind ==
                 (signal_operation == "node.signal"
                      ? SimulationCommandKind::kSignalNode
-                     : SimulationCommandKind::kSignalWallet));
+                 : signal_operation == "wallet.signal"
+                     ? SimulationCommandKind::kSignalWallet
+                     : SimulationCommandKind::kSignalMiner));
     BOOST_REQUIRE(signal_command.signal_request);
     static_cast<void>(
         Invoke(&dispatcher, "operation.cancel",

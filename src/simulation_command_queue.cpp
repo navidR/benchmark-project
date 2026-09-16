@@ -348,6 +348,7 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
       break;
     case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kSignalWallet:
+    case SimulationCommandKind::kSignalMiner:
       RequirePayload(command, command.signal_request.has_value(), 1U);
       static_cast<void>(ProcessSignalName(command.signal_request->signal));
       static_cast<void>(ProcessSignalScopeName(command.signal_request->scope));
@@ -457,6 +458,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kSetBlockProductionPolicy:
     case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kSignalWallet:
+    case SimulationCommandKind::kSignalMiner:
     case SimulationCommandKind::kSetMiningDifficulty:
     case SimulationCommandKind::kConnectPeer:
     case SimulationCommandKind::kDisconnectPeer:

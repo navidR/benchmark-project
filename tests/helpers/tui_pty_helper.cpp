@@ -3433,12 +3433,17 @@ void CheckDirectLoadLifecycle(const std::filesystem::path& command,
 void CheckNodeSignals(const std::filesystem::path& command,
                       const std::filesystem::path& daemon,
                       const std::filesystem::path& benchmark_root,
-                      bool wallet_target = false) {
-  const std::string command_kind =
-      wallet_target ? "signal_wallet" : "signal_node";
-  const std::string operation = wallet_target ? "wallet.signal" : "node.signal";
-  OwnedTemporaryDirectory home(wallet_target ? "wallet-signals"
-                                             : "node-signals");
+                      std::string_view target = "node") {
+  const bool wallet_target = target == "wallet";
+  const bool default_miner = target == "default_miner";
+  const bool miner_target = target == "miner" || default_miner;
+  const std::string command_kind = wallet_target  ? "signal_wallet"
+                                   : miner_target ? "signal_miner"
+                                                  : "signal_node";
+  const std::string operation = wallet_target  ? "wallet.signal"
+                                : miner_target ? "miner.signal"
+                                               : "node.signal";
+  OwnedTemporaryDirectory home(std::string(target) + "-signals");
   std::filesystem::create_directories(benchmark_root);
   const std::string run_id = "node-signals-" + std::to_string(getpid());
   const auto run_root = benchmark_root / run_id;
@@ -3446,7 +3451,7 @@ void CheckNodeSignals(const std::filesystem::path& command,
   const auto scenario_path = home.root() / "scenario.json";
   {
     std::ofstream stream(scenario_path);
-    stream << boost::json::serialize(boost::json::object{
+    boost::json::object scenario{
         {"chain", "firo"},
         {"chain_daemon", daemon.string()},
         {"run_id", run_id},
@@ -3454,9 +3459,13 @@ void CheckNodeSignals(const std::filesystem::path& command,
         {"nodes", boost::json::array{boost::json::object{
                       {"id", "firo-1"},
                       {"chain", "firo"},
-                      {"role", wallet_target ? "wallet" : "base"},
+                      {"role", wallet_target  ? "wallet"
+                               : miner_target ? "miner"
+                                              : "base"},
                       {"restart_policy", "always"}}}},
-        {"block_production", boost::json::object{{"enabled", false}}},
+        {"block_production", boost::json::object{{"enabled", default_miner},
+                                                 {"period_ms", 200U},
+                                                 {"probability", 1.0}}},
         {"metrics_sample_count", 1000U},
         {"metrics_interval_ms", 100U},
         {"events",
@@ -3464,7 +3473,9 @@ void CheckNodeSignals(const std::filesystem::path& command,
                                                 {"action", command_kind},
                                                 {"node", "firo-1"},
                                                 {"signal", "SIGWINCH"},
-                                                {"scope", "process"}}}}});
+                                                {"scope", "process"}}}}};
+    if (default_miner) scenario["nodes"] = 1U;
+    stream << boost::json::serialize(scenario);
   }
   ScopedFixtureProcessCleanup fallback(daemon, run_root);
   PtyProcess process(
@@ -3539,6 +3550,10 @@ void CheckNodeSignals(const std::filesystem::path& command,
         throw std::runtime_error("wallet signal lost shared daemon identity");
       }
     }
+    if (miner_target && (result.at("action") != "miner.signal" ||
+                         delivery.at("target") != "miner_node_daemon")) {
+      throw std::runtime_error("miner signal lost shared daemon identity");
+    }
     return result;
   };
 
@@ -3547,12 +3562,13 @@ void CheckNodeSignals(const std::filesystem::path& command,
   process.Write("c");
   static_cast<void>(
       process.ReadUntil("Live command", 3s, "node signal palette"));
-  process.Write(wallet_target ? "signal-wallet SIGSTOP process\n"
-                              : "signal-node SIGSTOP process\n");
+  process.Write(wallet_target  ? "signal-wallet SIGSTOP process\n"
+                : miner_target ? "signal-miner SIGSTOP process\n"
+                               : "signal-node SIGSTOP process\n");
   const auto confirmation = process.ReadUntil("Confirm destructive action", 3s,
                                               "node signal confirmation");
   RequireContains(confirmation, "SIGSTOP", "explicit signal confirmation");
-  if (wallet_target)
+  if (wallet_target || miner_target)
     RequireContains(confirmation, "all node roles", "shared daemon warning");
   process.Write("y");
   static_cast<void>(wait_observation("stopped", {}));
@@ -3563,9 +3579,18 @@ void CheckNodeSignals(const std::filesystem::path& command,
   static_cast<void>(
       wait_observation("running", nonfatal.at("command_id").as_string()));
 
+  if (default_miner) {
+    const std::string marker = "\"event\":\"scheduled_block_produced\"";
+    const auto produced = CountOccurrences(ReadFile(events_path), marker);
+    static_cast<void>(
+        WaitForFileOccurrences(events_path, marker, produced + 1U, 10s));
+  }
   std::size_t restart_count = 0U;
   for (const auto& [signal, scope] : {std::pair{"SIGTERM", "process"},
                                       std::pair{"SIGKILL", "process_group"}}) {
+    // The implicit default uses restart_policy=never; explicit roles below
+    // exercise fatal restart while this variant checks active mining recovery.
+    if (default_miner) break;
     const auto result = send(signal, scope, false);
     const auto observed =
         wait_observation("exited", result.at("command_id").as_string());
@@ -3587,13 +3612,18 @@ void CheckNodeSignals(const std::filesystem::path& command,
           "signal restart did not replace the exited daemon");
     current_pid = restarted_pids.back();
   }
-  if (wallet_target) {
+  if (wallet_target || (miner_target && !default_miner)) {
+    boost::json::object remove_arguments{{"run_id", run_id}};
+    if (wallet_target)
+      remove_arguments["node_id"] = "firo-1";
+    else
+      remove_arguments["node_ids"] = boost::json::array{"firo-1"};
     static_cast<void>(InvokeMcpOperation(
-        mcp, &request_id, "wallet.remove",
-        boost::json::object{{"run_id", run_id}, {"node_id", "firo-1"}}, 5s,
-        "remove wallet role before signal rejection"));
+        mcp, &request_id, wallet_target ? "wallet.remove" : "miner.remove",
+        std::move(remove_arguments), 5s,
+        "remove role before signal rejection"));
     const auto rejected =
-        SubmitMcpOperation(mcp, &request_id, "wallet.signal",
+        SubmitMcpOperation(mcp, &request_id, operation,
                            boost::json::object{{"run_id", run_id},
                                                {"node_id", "firo-1"},
                                                {"signal", "SIGKILL"},
@@ -3609,9 +3639,11 @@ void CheckNodeSignals(const std::filesystem::path& command,
       static_cast<void>(process.ReadFor(20ms));
     } while (std::chrono::steady_clock::now() < deadline);
     if (terminal.at("state") != "failed")
-      throw std::runtime_error("removed wallet was still signalable");
-    RequireContains(boost::json::serialize(terminal.at("terminal_error")),
-                    "no registered wallet", "removed wallet rejection");
+      throw std::runtime_error("removed role was still signalable");
+    RequireContains(
+        boost::json::serialize(terminal.at("terminal_error")),
+        wallet_target ? "no registered wallet" : "no configured miner role",
+        "removed role rejection");
     // The still-owned daemon must be alive and respond to the node operation.
     const auto alive =
         InvokeMcpOperation(mcp, &request_id, "node.signal",
@@ -3619,14 +3651,13 @@ void CheckNodeSignals(const std::filesystem::path& command,
                                                {"node_id", "firo-1"},
                                                {"signal", "SIGWINCH"},
                                                {"scope", "process"}},
-                           5s, "removed wallet retains unchanged daemon");
+                           5s, "removed role retains unchanged daemon");
     if (alive.at("signal_delivery")
                 .as_object()
                 .at("target_pid")
                 .to_number<pid_t>() != current_pid ||
         !ProcessExists(current_pid))
-      throw std::runtime_error(
-          "rejected wallet signal affected backing daemon");
+      throw std::runtime_error("rejected role signal affected backing daemon");
   }
   // Existing query surface must expose the follow-up lifecycle observations.
   const auto lifecycle = InvokeMcpOperation(
@@ -7088,10 +7119,17 @@ int main(int argc, char** argv) {
     }
   }
   if (argc == 5 && (std::string_view(argv[1]) == "--node-signals" ||
-                    std::string_view(argv[1]) == "--wallet-signals")) {
+                    std::string_view(argv[1]) == "--wallet-signals" ||
+                    std::string_view(argv[1]) == "--miner-signals" ||
+                    std::string_view(argv[1]) == "--default-miner-signals")) {
     try {
-      CheckNodeSignals(argv[2], argv[3], argv[4],
-                       std::string_view(argv[1]) == "--wallet-signals");
+      CheckNodeSignals(
+          argv[2], argv[3], argv[4],
+          std::string_view(argv[1]) == "--wallet-signals"  ? "wallet"
+          : std::string_view(argv[1]) == "--miner-signals" ? "miner"
+          : std::string_view(argv[1]) == "--default-miner-signals"
+              ? "default_miner"
+              : "node");
       std::cout << "real node scenario/TUI/MCP signal and restart evidence "
                    "checks passed\n";
       return 0;

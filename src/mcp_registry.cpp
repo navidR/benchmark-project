@@ -45,6 +45,8 @@ constexpr auto kOperations = std::to_array<McpNamedCapability>(
       "is not termination"},
      {"wallet.signal",
       "Signal the selected wallet backing node daemon; affects all its roles"},
+     {"miner.signal",
+      "Signal the configured miner node daemon; affects all its roles"},
      {"node.restart", "Restart a selected owned node"},
      {"node.replace", "Transactionally replace a selected owned node"},
      {"wallet.add", "Transactionally initialize and register a wallet"},

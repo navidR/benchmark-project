@@ -36,6 +36,7 @@ constexpr std::array kHostOperations = {
     McpOperationKind::kKillNode,
     McpOperationKind::kSignalNode,
     McpOperationKind::kSignalWallet,
+    McpOperationKind::kSignalMiner,
     McpOperationKind::kRestartNode,
     McpOperationKind::kReplaceNode,
     McpOperationKind::kAddWallet,

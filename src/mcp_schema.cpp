@@ -351,8 +351,9 @@ boost::json::object SignalDeliverySchema() {
       "without an observed job-control stop; it does not imply RPC readiness "
       "or that the delivered signal has taken effect.";
   boost::json::object properties{
-      {"target", StringEnumSchema(
-                     boost::json::array{"node_daemon", "wallet_node_daemon"})},
+      {"target",
+       StringEnumSchema(boost::json::array{"node_daemon", "wallet_node_daemon",
+                                           "miner_node_daemon"})},
       {"wallet", ClosedObject({{"wallet_index", IntegerSchema(1U)},
                                {"node_id", NodeAddIdentifierSchema()},
                                {"registry_generation", Uint64Schema()}},
@@ -383,7 +384,8 @@ boost::json::object SignalDeliverySchema() {
                          {"target", ConstStringSchema("wallet_node_daemon")}}}};
   schema["then"] = boost::json::object{{"required", Required({"wallet"})}};
   schema["description"] =
-      "A wallet_node_daemon target shares its process with all backing node "
+      "A wallet_node_daemon or miner_node_daemon target shares its process "
+      "with all node "
       "roles.";
   return schema;
 }
@@ -926,7 +928,8 @@ boost::json::object CommandVariant(SimulationCommandKind kind,
     required.emplace_back("node");
   }
   if (kind == SimulationCommandKind::kSignalNode ||
-      kind == SimulationCommandKind::kSignalWallet) {
+      kind == SimulationCommandKind::kSignalWallet ||
+      kind == SimulationCommandKind::kSignalMiner) {
     properties["scope"] = SignalScopeSchema();
   }
   if (properties.contains("resource_limits")) {
@@ -1865,6 +1868,7 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
       return McpResultFamily::kEvidencePage;
     case McpOperationKind::kSignalNode:
     case McpOperationKind::kSignalWallet:
+    case McpOperationKind::kSignalMiner:
     case McpOperationKind::kInvokeRuntimeCommand:
       return McpResultFamily::kRuntimeCommand;
 #ifdef BBP_FIRO_GUI_LAUNCHER
@@ -1989,6 +1993,7 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kSignalNode:
     case McpOperationKind::kSignalWallet:
+    case McpOperationKind::kSignalMiner:
       add_run();
       add_node();
       add_timeout();
@@ -2246,8 +2251,9 @@ boost::json::object SignalResultSchema(McpOperationKind operation) {
   auto& delivery =
       schema.at("properties").as_object().at("signal_delivery").as_object();
   delivery.at("properties").as_object()["target"] = ConstStringSchema(
-      operation == McpOperationKind::kSignalWallet ? "wallet_node_daemon"
-                                                   : "node_daemon");
+      operation == McpOperationKind::kSignalWallet  ? "wallet_node_daemon"
+      : operation == McpOperationKind::kSignalMiner ? "miner_node_daemon"
+                                                    : "node_daemon");
   if (operation == McpOperationKind::kSignalWallet) {
     delivery.at("required").as_array().emplace_back("wallet");
     delivery["description"] =
@@ -2503,8 +2509,9 @@ boost::json::object BuildMcpResultSchema(
            boost::json::object{
                {"properties",
                 boost::json::object{
-                    {"action", StringEnumSchema(boost::json::array{
-                                   "node.signal", "wallet.signal"})}}},
+                    {"action",
+                     StringEnumSchema(boost::json::array{
+                         "node.signal", "wallet.signal", "miner.signal"})}}},
                {"required", Required({"action"})}}},
           {"then", boost::json::object{
                        {"required",
@@ -3158,7 +3165,8 @@ boost::json::object BuildMcpResultSchema(
                                 Required({"terminal_error"})}}}}}}}}});
         for (const McpOperationKind operation : selected_operations) {
           if (operation == McpOperationKind::kSignalNode ||
-              operation == McpOperationKind::kSignalWallet) {
+              operation == McpOperationKind::kSignalWallet ||
+              operation == McpOperationKind::kSignalMiner) {
             constraints.emplace_back(boost::json::object{
                 {"if",
                  boost::json::object{
@@ -3579,7 +3587,8 @@ boost::json::object BuildMcpOperationOutputSchema(
 #endif
     choices.emplace_back(
         (operation == McpOperationKind::kSignalNode ||
-         operation == McpOperationKind::kSignalWallet)
+         operation == McpOperationKind::kSignalWallet ||
+         operation == McpOperationKind::kSignalMiner)
             ? SignalResultSchema(operation)
         : IsTypedNodeLifecycleOperation(operation)
             ? TypedNodeLifecycleMutationSchema(operation)

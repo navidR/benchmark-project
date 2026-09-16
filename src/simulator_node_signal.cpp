@@ -51,8 +51,10 @@ boost::json::object DeliverNodeSignal(NodeRuntime& node,
   if (command.operation_control) command.operation_control->MarkCommitted();
   try {
     boost::json::object result{
-        {"target",
-         wallet_selection.empty() ? "node_daemon" : "wallet_node_daemon"},
+        {"target", command.kind == SimulationCommandKind::kSignalMiner
+                       ? "miner_node_daemon"
+                   : wallet_selection.empty() ? "node_daemon"
+                                              : "wallet_node_daemon"},
         {"target_pid", delivery.target_pid},
         {"process_group_id", delivery.process_group_id},
         {"signal", delivery.signal},

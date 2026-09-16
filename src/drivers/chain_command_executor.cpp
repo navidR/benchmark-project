@@ -97,6 +97,7 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
       return;
     case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kSignalWallet:
+    case SimulationCommandKind::kSignalMiner:
     case SimulationCommandKind::kKillNode:
       throw std::runtime_error(
           "process lifecycle commands must be handled by the simulator process "

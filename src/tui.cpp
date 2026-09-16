@@ -1524,9 +1524,10 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
     AddText(top + 19, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   } else {
-    AddText(top + 19, left + 2, popup_cols - 4,
-            "signal-node|signal-wallet <signal> process|process_group",
-            COLOR_PAIR(kColorMuted));
+    AddText(
+        top + 19, left + 2, popup_cols - 4,
+        "signal-node|signal-wallet|signal-miner <signal> process|process_group",
+        COLOR_PAIR(kColorMuted));
   }
   AddText(top + 20, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
@@ -1549,9 +1550,10 @@ void DrawCommandPaletteInput(int rows, int cols, std::string_view input,
     AddText(top + 19, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
   } else {
-    AddText(top + 19, left + 2, popup_cols - 4,
-            "signal-node|signal-wallet <signal> process|process_group",
-            COLOR_PAIR(kColorMuted));
+    AddText(
+        top + 19, left + 2, popup_cols - 4,
+        "signal-node|signal-wallet|signal-miner <signal> process|process_group",
+        COLOR_PAIR(kColorMuted));
   }
 }
 
@@ -2932,6 +2934,8 @@ bool QueueParsedNodeCommand(
       target = node_id;
       if (parsed.kind == SimulationCommandKind::kSignalWallet) {
         target = "wallet daemon (all node roles): " + node_id;
+      } else if (parsed.kind == SimulationCommandKind::kSignalMiner) {
+        target = "miner daemon (all node roles): " + node_id;
       }
     }
 
@@ -2993,7 +2997,8 @@ bool QueueParsedNodeCommand(
             parsed.kind, std::move(*role_mutation), confirmed);
       } else {
         if (parsed.kind == SimulationCommandKind::kSignalNode ||
-            parsed.kind == SimulationCommandKind::kSignalWallet) {
+            parsed.kind == SimulationCommandKind::kSignalWallet ||
+            parsed.kind == SimulationCommandKind::kSignalMiner) {
           SimulationCommand command;
           command.kind = parsed.kind;
           command.node_id = node_id;

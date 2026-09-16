@@ -538,7 +538,14 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
             command.operation_control->MarkCommitted();
           }
         } else if (command.kind == SimulationCommandKind::kSignalNode ||
-                   command.kind == SimulationCommandKind::kSignalWallet) {
+                   command.kind == SimulationCommandKind::kSignalWallet ||
+                   command.kind == SimulationCommandKind::kSignalMiner) {
+          if (command.kind == SimulationCommandKind::kSignalMiner &&
+              !context.is_configured_miner(command.node_id)) {
+            throw std::runtime_error(
+                "signal_miner node has no configured miner role: " +
+                command.node_id);
+          }
           boost::json::object wallet_selection;
           if (command.kind == SimulationCommandKind::kSignalWallet) {
             if (!command_wallet_snapshot) {
