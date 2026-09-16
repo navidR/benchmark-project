@@ -32,7 +32,8 @@ std::string NormalizedOptionName(std::string_view argument) {
   }
   std::string name;
   name.reserve(raw_name.size());
-  for (const unsigned char character : raw_name) {
+  for (const char raw_character : raw_name) {
+    const auto character = static_cast<unsigned char>(raw_character);
     const bool lower = character >= 'a' && character <= 'z';
     const bool upper = character >= 'A' && character <= 'Z';
     const bool digit = character >= '0' && character <= '9';
@@ -186,7 +187,8 @@ void ValidateArgument(std::string_view argument, std::size_t* total_bytes) {
   if (argument.size() > kMaximumArgumentBytes) {
     throw std::runtime_error("chain extra argument exceeds 1024 bytes");
   }
-  for (const unsigned char character : argument) {
+  for (const char raw_character : argument) {
+    const auto character = static_cast<unsigned char>(raw_character);
     if (character == 0U || character < 0x20U || character == 0x7fU) {
       throw std::runtime_error(
           "chain extra argument must not contain control characters");

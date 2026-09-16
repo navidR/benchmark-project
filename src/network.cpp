@@ -300,7 +300,8 @@ void RequireInterfaceName(const std::string& name) {
     throw std::runtime_error("interface name must be 1.." +
                              std::to_string(IFNAMSIZ - 1) + " bytes");
   }
-  for (const unsigned char c : name) {
+  for (const char character : name) {
+    const auto c = static_cast<unsigned char>(character);
     const bool ok = std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
     if (!ok) {
       throw std::runtime_error("interface name contains unsafe character: " +
@@ -2118,7 +2119,7 @@ int ParsePrioOptions(const nlattr* attr, QdiscInfo* qdisc) {
   }
   const tc_prio_qopt options = CopyAttributePayload<tc_prio_qopt>(attr);
   qdisc->has_prio_options = true;
-  qdisc->prio_bands = options.bands;
+  qdisc->prio_bands = static_cast<std::uint32_t>(options.bands);
   return MNL_CB_OK;
 }
 

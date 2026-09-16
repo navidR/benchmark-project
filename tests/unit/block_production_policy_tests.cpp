@@ -30,6 +30,6 @@ BOOST_AUTO_TEST_CASE(mining_difficulty_validates_inputs) {
   BOOST_CHECK_THROW(bbp::MiningDifficulty(0.0), std::runtime_error);
   BOOST_CHECK_THROW(bbp::MiningDifficulty(-1.0), std::runtime_error);
   BOOST_CHECK_THROW(
-      bbp::MiningDifficulty(std::numeric_limits<double>::infinity()),
+      bbp::MiningDifficulty{std::numeric_limits<double>::infinity()},
       std::runtime_error);
 }

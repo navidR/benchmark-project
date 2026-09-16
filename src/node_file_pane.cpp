@@ -88,7 +88,8 @@ std::string EscapeConfigurationPathComponent(std::string_view component) {
   constexpr std::string_view kHex = "0123456789ABCDEF";
   std::string escaped;
   escaped.reserve(component.size());
-  for (const unsigned char character : component) {
+  for (const char raw_character : component) {
+    const auto character = static_cast<unsigned char>(raw_character);
     if (character >= 0x20U && character <= 0x7eU && character != '\\') {
       escaped.push_back(static_cast<char>(character));
     } else if (character == '\\') {

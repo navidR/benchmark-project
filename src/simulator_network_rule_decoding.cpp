@@ -95,15 +95,15 @@ uint32_t StableRuleHandle(const NetworkBlockRule& rule) {
     }
   };
   mix_uint32(rule.node_index + 1U);
-  for (const unsigned char c : rule.src_address) {
-    mix_byte(c);
+  for (const char c : rule.src_address) {
+    mix_byte(static_cast<unsigned char>(c));
   }
   if (rule.src_port != 0U) {
     mix_byte(0xFFU);
     mix_uint32(rule.src_port);
   }
-  for (const unsigned char c : rule.dst_address) {
-    mix_byte(c);
+  for (const char c : rule.dst_address) {
+    mix_byte(static_cast<unsigned char>(c));
   }
   mix_uint32(rule.dst_port);
   hash &= 0x00FFFFFFU;

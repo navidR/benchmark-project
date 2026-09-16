@@ -133,7 +133,8 @@ RpcCredentials ReadCookieCredentials(const std::filesystem::path& path) {
       separator + 1U == credential.size()) {
     throw CredentialFileError(path, "has malformed contents");
   }
-  for (const unsigned char character : credential) {
+  for (const char raw_character : credential) {
+    const auto character = static_cast<unsigned char>(raw_character);
     if (character < 0x20U || character == 0x7fU) {
       throw CredentialFileError(path, "has malformed contents");
     }
@@ -388,7 +389,8 @@ std::string QuotedDigestValue(std::string_view value) {
   std::string output;
   output.reserve(value.size() + 2U);
   output.push_back('"');
-  for (const unsigned char character : value) {
+  for (const char raw_character : value) {
+    const auto character = static_cast<unsigned char>(raw_character);
     if (character < 0x20U || character == 0x7fU) {
       throw std::runtime_error(
           "RPC digest authentication value contains a control character");

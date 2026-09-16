@@ -3008,8 +3008,8 @@ void CheckNodeReplacementPublication(
        ready_daemon.string(), "--no-isolate-network", "--no-mining",
        "--refresh-ms", "50", "--metrics-interval", "50ms"},
       30, 120, home_directory);
-  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 5s,
-                                      "node replacement TUI"));
+  static_cast<void>(process.ReadUntil(run_root.string(), 5s,
+                                      "node replacement active run view"));
   static_cast<void>(
       WaitForFileText(events_path, "\"event\":\"run_started\"", 5s));
   static_cast<void>(

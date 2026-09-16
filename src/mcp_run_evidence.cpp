@@ -705,7 +705,8 @@ bool TextArtifactSuffix(std::string_view name) {
 
 std::uint64_t Fnv1a(std::string_view text, std::uint64_t seed) {
   std::uint64_t hash = seed;
-  for (const unsigned char character : text) {
+  for (const char raw_character : text) {
+    const auto character = static_cast<unsigned char>(raw_character);
     hash ^= character;
     hash *= 1099511628211ULL;
   }

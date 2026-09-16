@@ -106,7 +106,8 @@ UniqueFd OpenDirectoryAt(int parent_fd, const char* name) {
 std::string EscapePathComponent(std::string_view component) {
   std::ostringstream output;
   output << std::uppercase << std::hex;
-  for (const unsigned char character : component) {
+  for (const char raw_character : component) {
+    const auto character = static_cast<unsigned char>(raw_character);
     if (character >= 0x20U && character <= 0x7eU && character != '\\') {
       output << static_cast<char>(character);
     } else if (character == '\\') {

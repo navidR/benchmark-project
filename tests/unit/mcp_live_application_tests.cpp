@@ -3342,6 +3342,8 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_instrumentation_operations_route_one_stable_lifecycle) {
+  // Callbacks record checks; Boost.Test runs only after workers have joined.
+  bool callback_arguments_valid = true;
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -3408,8 +3410,9 @@ BOOST_AUTO_TEST_CASE(
       throw McpOperationCancelled();
     }
     std::lock_guard<std::mutex> lock(state_mutex);
-    BOOST_TEST(arguments.at("instrumentation_id").as_string() ==
-               "instrumentation-1");
+    callback_arguments_valid =
+        callback_arguments_valid &&
+        (arguments.at("instrumentation_id").as_string() == "instrumentation-1");
     switch (kind) {
       case McpOperationKind::kStartInstrumentation:
         break;
@@ -3527,10 +3530,12 @@ BOOST_AUTO_TEST_CASE(
 
   dispatcher.Shutdown();
   application.Shutdown();
+  BOOST_TEST(callback_arguments_valid);
 }
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_wallet_lifecycle_routes_authoritative_role_mutation_service) {
+  bool callback_arguments_valid = true;
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -3558,11 +3563,13 @@ BOOST_AUTO_TEST_CASE(
                         McpOperationKind::kRemoveWallet) != supported.end());
 
   auto service = std::make_shared<McpLiveRoleService>();
-  service->operation = [](McpOperationKind kind,
-                          const boost::json::object& arguments,
-                          std::stop_token stop_token) {
-    BOOST_CHECK(kind == McpOperationKind::kAddWallet ||
-                kind == McpOperationKind::kRemoveWallet);
+  service->operation = [&callback_arguments_valid](
+                           McpOperationKind kind,
+                           const boost::json::object& arguments,
+                           std::stop_token stop_token) {
+    callback_arguments_valid =
+        callback_arguments_valid && (kind == McpOperationKind::kAddWallet ||
+                                     kind == McpOperationKind::kRemoveWallet);
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
@@ -3571,7 +3578,9 @@ BOOST_AUTO_TEST_CASE(
       if (const boost::json::value* plural =
               arguments.if_contains("node_ids")) {
         node_ids = plural->as_array();
-        BOOST_TEST(arguments.at("timeout_sec").as_uint64() == 30U);
+        callback_arguments_valid =
+            callback_arguments_valid &&
+            (arguments.at("timeout_sec").as_uint64() == 30U);
       } else {
         node_ids.emplace_back(arguments.at("node_id"));
       }
@@ -3601,8 +3610,10 @@ BOOST_AUTO_TEST_CASE(
           {"final_wallet_node_count", 0U},
       };
     }
-    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
-    BOOST_TEST(arguments.at("mode").as_string() == "public");
+    callback_arguments_valid =
+        callback_arguments_valid && (arguments.at("count").as_uint64() == 1U);
+    callback_arguments_valid = callback_arguments_valid &&
+                               (arguments.at("mode").as_string() == "public");
     const boost::json::value* node_id = arguments.if_contains("node_id");
     if (node_id != nullptr && node_id->as_string() == "firo-cancel") {
       throw SimulationCancelled();
@@ -3703,6 +3714,7 @@ BOOST_AUTO_TEST_CASE(
                                  {"mode", "public"}});
   BOOST_TEST(WaitForTerminal(&dispatcher, cancelled).at("state").as_string() ==
              "cancelled");
+  BOOST_TEST(callback_arguments_valid);
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -3786,6 +3798,7 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_role_assign_delegates_one_typed_batch_and_normalizes_results) {
+  bool callback_arguments_valid = true;
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -3813,13 +3826,18 @@ BOOST_AUTO_TEST_CASE(
 
   std::size_t service_calls = 0U;
   auto service = std::make_shared<McpLiveRoleService>();
-  service->operation = [&service_calls](McpOperationKind kind,
-                                        const boost::json::object& arguments,
-                                        std::stop_token stop_token) {
+  service->operation = [&service_calls, &callback_arguments_valid](
+                           McpOperationKind kind,
+                           const boost::json::object& arguments,
+                           std::stop_token stop_token) {
     ++service_calls;
-    BOOST_TEST(arguments.at("run_id").as_string() == "live-application");
+    callback_arguments_valid =
+        callback_arguments_valid &&
+        (arguments.at("run_id").as_string() == "live-application");
     const boost::json::array& node_ids = arguments.at("node_ids").as_array();
-    BOOST_TEST(arguments.at("count").as_uint64() == node_ids.size());
+    callback_arguments_valid =
+        callback_arguments_valid &&
+        (arguments.at("count").as_uint64() == node_ids.size());
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
@@ -3827,7 +3845,8 @@ BOOST_AUTO_TEST_CASE(
       throw SimulationCancelled();
     }
     if (node_ids.front().as_string() == "firo-secret") {
-      BOOST_CHECK(kind == McpOperationKind::kAddMasternode);
+      callback_arguments_valid = callback_arguments_valid &&
+                                 (kind == McpOperationKind::kAddMasternode);
       return boost::json::object{
           {"node_ids", node_ids},
           {"assigned_roles", boost::json::array{"masternode"}},
@@ -3858,7 +3877,8 @@ BOOST_AUTO_TEST_CASE(
       };
     }
     if (kind == McpOperationKind::kAddWallet) {
-      BOOST_TEST(arguments.at("mode").as_string() == "public");
+      callback_arguments_valid = callback_arguments_valid &&
+                                 (arguments.at("mode").as_string() == "public");
       boost::json::array wallets;
       for (std::size_t index = 0U; index < node_ids.size(); ++index) {
         wallets.emplace_back(boost::json::object{
@@ -3899,8 +3919,11 @@ BOOST_AUTO_TEST_CASE(
           {"final_node_count", 2U},
       };
     }
-    BOOST_REQUIRE(kind == McpOperationKind::kAddMasternode);
-    BOOST_TEST(arguments.at("funding_wallet_id").as_string() == "firo-wallet");
+    callback_arguments_valid =
+        callback_arguments_valid && kind == McpOperationKind::kAddMasternode;
+    callback_arguments_valid =
+        callback_arguments_valid &&
+        (arguments.at("funding_wallet_id").as_string() == "firo-wallet");
     boost::json::array masternodes;
     for (std::size_t index = 0U; index < node_ids.size(); ++index) {
       masternodes.emplace_back(boost::json::object{
@@ -4025,9 +4048,11 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(stop_requested);
   dispatcher.Shutdown();
   application.Shutdown();
+  BOOST_TEST(callback_arguments_valid);
 }
 
 BOOST_AUTO_TEST_CASE(mcp_live_role_assign_rejects_delegated_schema_overflow) {
+  bool callback_arguments_valid = true;
   using RoleOperation = decltype(McpLiveRoleService{}.operation);
   const auto reject_delegated =
       [](boost::json::array node_ids, std::string_view role,
@@ -4076,10 +4101,13 @@ BOOST_AUTO_TEST_CASE(mcp_live_role_assign_rejects_delegated_schema_overflow) {
 
   reject_delegated(
       boost::json::array{"firo-count-overflow"}, "miner", boost::json::object{},
-      [](McpOperationKind kind, const boost::json::object& arguments,
-         std::stop_token stop_token) {
-        BOOST_CHECK(kind == McpOperationKind::kAddMiner);
-        BOOST_TEST(!stop_token.stop_requested());
+      [&callback_arguments_valid](McpOperationKind kind,
+                                  const boost::json::object& arguments,
+                                  std::stop_token stop_token) {
+        callback_arguments_valid =
+            callback_arguments_valid && (kind == McpOperationKind::kAddMiner);
+        callback_arguments_valid =
+            callback_arguments_valid && (!stop_token.stop_requested());
         return boost::json::object{
             {"node_ids", arguments.at("node_ids")},
             {"assigned_roles", boost::json::array{"miner"}},
@@ -4099,10 +4127,13 @@ BOOST_AUTO_TEST_CASE(mcp_live_role_assign_rejects_delegated_schema_overflow) {
   reject_delegated(
       boost::json::array{"firo-text-overflow"}, "wallet",
       boost::json::object{{"mode", "public"}},
-      [](McpOperationKind kind, const boost::json::object& arguments,
-         std::stop_token stop_token) {
-        BOOST_CHECK(kind == McpOperationKind::kAddWallet);
-        BOOST_TEST(!stop_token.stop_requested());
+      [&callback_arguments_valid](McpOperationKind kind,
+                                  const boost::json::object& arguments,
+                                  std::stop_token stop_token) {
+        callback_arguments_valid =
+            callback_arguments_valid && (kind == McpOperationKind::kAddWallet);
+        callback_arguments_valid =
+            callback_arguments_valid && (!stop_token.stop_requested());
         return boost::json::object{
             {"added_node_ids", boost::json::array{}},
             {"removed_node_ids", boost::json::array{}},
@@ -4126,10 +4157,12 @@ BOOST_AUTO_TEST_CASE(mcp_live_role_assign_rejects_delegated_schema_overflow) {
             {"final_wallet_node_count", 1U},
         };
       });
+  BOOST_TEST(callback_arguments_valid);
 }
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_role_remove_delegates_one_typed_batch_and_normalizes_results) {
+  bool callback_arguments_valid = true;
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -4156,14 +4189,20 @@ BOOST_AUTO_TEST_CASE(
 
   std::size_t service_calls = 0U;
   auto service = std::make_shared<McpLiveRoleService>();
-  service->operation = [&service_calls](McpOperationKind kind,
-                                        const boost::json::object& arguments,
-                                        std::stop_token stop_token) {
+  service->operation = [&service_calls, &callback_arguments_valid](
+                           McpOperationKind kind,
+                           const boost::json::object& arguments,
+                           std::stop_token stop_token) {
     ++service_calls;
-    BOOST_TEST(arguments.at("run_id").as_string() == "live-application");
-    BOOST_TEST(arguments.if_contains("roles") == nullptr);
-    BOOST_TEST(arguments.if_contains("count") == nullptr);
-    BOOST_TEST(arguments.at("timeout_sec").as_uint64() == 45U);
+    callback_arguments_valid =
+        callback_arguments_valid &&
+        (arguments.at("run_id").as_string() == "live-application");
+    callback_arguments_valid =
+        callback_arguments_valid && (arguments.if_contains("roles") == nullptr);
+    callback_arguments_valid =
+        callback_arguments_valid && (arguments.if_contains("count") == nullptr);
+    callback_arguments_valid = callback_arguments_valid &&
+                               (arguments.at("timeout_sec").as_uint64() == 45U);
     const boost::json::array& node_ids = arguments.at("node_ids").as_array();
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
@@ -4213,7 +4252,8 @@ BOOST_AUTO_TEST_CASE(
           {"final_node_count", 2U},
       };
     }
-    BOOST_REQUIRE(kind == McpOperationKind::kRemoveMasternode);
+    callback_arguments_valid = callback_arguments_valid &&
+                               (kind == McpOperationKind::kRemoveMasternode);
     boost::json::array masternodes;
     for (std::size_t index = 0U; index < node_ids.size(); ++index) {
       boost::json::object identity{
@@ -4338,10 +4378,12 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(stop_requested);
   dispatcher.Shutdown();
   application.Shutdown();
+  BOOST_TEST(callback_arguments_valid);
 }
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_role_remove_rejects_impossible_delegated_evidence) {
+  bool callback_arguments_valid = true;
   using RoleOperation = decltype(McpLiveRoleService{}.operation);
   const auto reject_delegated = [](std::string_view role,
                                    RoleOperation operation) {
@@ -4388,10 +4430,13 @@ BOOST_AUTO_TEST_CASE(
   };
 
   reject_delegated(
-      "miner", [](McpOperationKind kind, const boost::json::object& arguments,
-                  std::stop_token stop_token) {
-        BOOST_CHECK(kind == McpOperationKind::kRemoveMiner);
-        BOOST_TEST(!stop_token.stop_requested());
+      "miner", [&callback_arguments_valid](McpOperationKind kind,
+                                           const boost::json::object& arguments,
+                                           std::stop_token stop_token) {
+        callback_arguments_valid = callback_arguments_valid &&
+                                   (kind == McpOperationKind::kRemoveMiner);
+        callback_arguments_valid =
+            callback_arguments_valid && (!stop_token.stop_requested());
         return boost::json::object{
             {"node_ids", arguments.at("node_ids")},
             {"assigned_roles", boost::json::array{}},
@@ -4405,11 +4450,14 @@ BOOST_AUTO_TEST_CASE(
             {"final_node_count", 1U},
         };
       });
-  reject_delegated("masternode", [](McpOperationKind kind,
-                                    const boost::json::object& arguments,
-                                    std::stop_token stop_token) {
-    BOOST_CHECK(kind == McpOperationKind::kRemoveMasternode);
-    BOOST_TEST(!stop_token.stop_requested());
+  reject_delegated("masternode", [&callback_arguments_valid](
+                                     McpOperationKind kind,
+                                     const boost::json::object& arguments,
+                                     std::stop_token stop_token) {
+    callback_arguments_valid = callback_arguments_valid &&
+                               (kind == McpOperationKind::kRemoveMasternode);
+    callback_arguments_valid =
+        callback_arguments_valid && (!stop_token.stop_requested());
     return boost::json::object{
         {"node_ids", arguments.at("node_ids")},
         {"assigned_roles", boost::json::array{}},
@@ -4438,10 +4486,12 @@ BOOST_AUTO_TEST_CASE(
         {"final_node_count", 1U},
     };
   });
+  BOOST_TEST(callback_arguments_valid);
 }
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_miner_lifecycle_routes_role_results_and_cancellation) {
+  bool callback_arguments_valid = true;
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -4469,17 +4519,20 @@ BOOST_AUTO_TEST_CASE(
                         McpOperationKind::kRemoveMiner) != supported.end());
 
   auto service = std::make_shared<McpLiveRoleService>();
-  service->operation = [](McpOperationKind kind,
-                          const boost::json::object& arguments,
-                          std::stop_token stop_token) {
-    BOOST_CHECK(kind == McpOperationKind::kAddMiner ||
-                kind == McpOperationKind::kRemoveMiner);
+  service->operation = [&callback_arguments_valid](
+                           McpOperationKind kind,
+                           const boost::json::object& arguments,
+                           std::stop_token stop_token) {
+    callback_arguments_valid =
+        callback_arguments_valid && (kind == McpOperationKind::kAddMiner ||
+                                     kind == McpOperationKind::kRemoveMiner);
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
     if (kind == McpOperationKind::kRemoveMiner) {
-      BOOST_TEST(arguments.at("node_ids").as_array() ==
-                 boost::json::array{"firo-1"});
+      callback_arguments_valid =
+          callback_arguments_valid &&
+          (arguments.at("node_ids").as_array() == boost::json::array{"firo-1"});
       return boost::json::object{
           {"node_ids", boost::json::array{"firo-1"}},
           {"assigned_roles", boost::json::array{}},
@@ -4493,7 +4546,8 @@ BOOST_AUTO_TEST_CASE(
           {"final_node_count", 1U},
       };
     }
-    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
+    callback_arguments_valid =
+        callback_arguments_valid && (arguments.at("count").as_uint64() == 1U);
     if (const boost::json::value* node_ids = arguments.if_contains("node_ids");
         node_ids != nullptr &&
         node_ids->as_array().front().as_string() == "firo-cancel") {
@@ -4574,10 +4628,12 @@ BOOST_AUTO_TEST_CASE(
              "cancelled");
   dispatcher.Shutdown();
   application.Shutdown();
+  BOOST_TEST(callback_arguments_valid);
 }
 
 BOOST_AUTO_TEST_CASE(
     mcp_live_masternode_lifecycle_routes_redacted_role_results) {
+  bool callback_arguments_valid = true;
   LiveApplicationDirectory temporary;
   const auto options =
       std::make_shared<Options>(ParseAndValidateScenario(LiveScenario()));
@@ -4607,9 +4663,10 @@ BOOST_AUTO_TEST_CASE(
   }
 
   auto service = std::make_shared<McpLiveRoleService>();
-  service->operation = [](McpOperationKind kind,
-                          const boost::json::object& arguments,
-                          std::stop_token stop_token) {
+  service->operation = [&callback_arguments_valid](
+                           McpOperationKind kind,
+                           const boost::json::object& arguments,
+                           std::stop_token stop_token) {
     if (stop_token.stop_requested()) {
       throw McpOperationCancelled();
     }
@@ -4621,9 +4678,11 @@ BOOST_AUTO_TEST_CASE(
     const bool adding = kind == McpOperationKind::kAddMasternode;
     const bool removing = kind == McpOperationKind::kRemoveMasternode;
     if (adding) {
-      BOOST_TEST(arguments.at("count").as_uint64() == 1U);
-      BOOST_TEST(arguments.at("funding_wallet_id").as_string() ==
-                 "firo-wallet");
+      callback_arguments_valid =
+          callback_arguments_valid && (arguments.at("count").as_uint64() == 1U);
+      callback_arguments_valid =
+          callback_arguments_valid &&
+          (arguments.at("funding_wallet_id").as_string() == "firo-wallet");
     }
     boost::json::object identity{
         {"node", 1U},
@@ -4708,6 +4767,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(cancelled.at("state").as_string() == "cancelled");
   dispatcher.Shutdown();
   application.Shutdown();
+  BOOST_TEST(callback_arguments_valid);
 }
 
 #ifdef BBP_FIRO_GUI_LAUNCHER

@@ -22,7 +22,8 @@ using Interval = std::pair<std::uint64_t, std::uint64_t>;
 
 std::uint32_t StableRunHash(std::string_view run_id) {
   std::uint32_t hash = 2166136261U;
-  for (const unsigned char character : run_id) {
+  for (const char raw_character : run_id) {
+    const auto character = static_cast<unsigned char>(raw_character);
     hash ^= character;
     hash *= 16777619U;
   }

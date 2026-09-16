@@ -464,7 +464,8 @@ std::string RunInterfaceName(const RunOwnership& ownership,
            std::to_string(node_index + 1U) + suffix;
   }
   std::uint32_t owner_hash = 2166136261U;
-  for (const unsigned char character : ownership.resource_id) {
+  for (const char raw_character : ownership.resource_id) {
+    const auto character = static_cast<unsigned char>(raw_character);
     owner_hash ^= character;
     owner_hash *= 16777619U;
   }

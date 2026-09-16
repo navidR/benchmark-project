@@ -56,6 +56,8 @@ BOOST_AUTO_TEST_CASE(
   std::optional<McpHostedRunSnapshot> current_run;
   std::size_t cleanup_calls = 0U;
   std::size_t replay_calls = 0U;
+  // Worker callbacks throw on bad arguments; terminal-state assertions below
+  // report failures on the test thread because Boost.Test is not thread-safe.
   McpHostApplication application(McpHostApplication::Config{
       .host_id = "editor-host",
       .snapshot_run =
@@ -70,7 +72,9 @@ BOOST_AUTO_TEST_CASE(
           },
       .launch_run =
           [&](const boost::json::object& scenario, std::stop_token) {
-            BOOST_TEST(scenario.at("run_id").as_string() == "launched-run");
+            if (scenario.at("run_id").as_string() != "launched-run") {
+              throw std::runtime_error("unexpected launch scenario");
+            }
             std::lock_guard<std::mutex> lock(run_mutex);
             current_run = McpHostedRunSnapshot{.generation = 1U,
                                                .run_id = "launched-run",
@@ -84,15 +88,20 @@ BOOST_AUTO_TEST_CASE(
       .replay_run =
           [&](std::string_view source_run_id, std::optional<std::string> run_id,
               std::stop_token stop_token) {
-            BOOST_TEST(source_run_id == "retained-source");
-            BOOST_TEST(!stop_token.stop_requested());
+            if (source_run_id != "retained-source" ||
+                stop_token.stop_requested()) {
+              throw std::runtime_error("unexpected replay request");
+            }
             if (replay_calls++ == 0U) {
-              BOOST_REQUIRE(run_id.has_value());
-              BOOST_TEST(*run_id == "replayed-run");
+              if (run_id != "replayed-run") {
+                throw std::runtime_error("unexpected explicit replay run ID");
+              }
               return McpRunLifecycleResult{
                   .run_id = *run_id, .state = "active", .node_count = 2U};
             }
-            BOOST_TEST(!run_id.has_value());
+            if (run_id.has_value()) {
+              throw std::runtime_error("expected generated replay run ID");
+            }
             return McpRunLifecycleResult{.run_id = "generated-replay",
                                          .state = "active",
                                          .node_count = 2U};
@@ -100,8 +109,9 @@ BOOST_AUTO_TEST_CASE(
       .stop_run =
           [&](std::string_view run_id, std::chrono::seconds timeout,
               std::stop_token) {
-            BOOST_TEST(run_id == "launched-run");
-            BOOST_TEST(timeout == 30s);
+            if (run_id != "launched-run" || timeout != 30s) {
+              throw std::runtime_error("unexpected stop request");
+            }
             std::lock_guard<std::mutex> lock(run_mutex);
             current_run.reset();
             return McpRunLifecycleResult{
@@ -110,16 +120,19 @@ BOOST_AUTO_TEST_CASE(
       .clean_run =
           [&](std::string_view run_id, std::chrono::seconds timeout,
               bool remove_retained_artifacts, std::stop_token stop_token) {
-            BOOST_TEST(!stop_token.stop_requested());
+            if (stop_token.stop_requested()) {
+              throw std::runtime_error("unexpected cleanup cancellation");
+            }
             if (cleanup_calls == 0U) {
-              BOOST_TEST(run_id == "_retained-default");
-              BOOST_TEST(timeout == 30s);
-              BOOST_TEST(!remove_retained_artifacts);
+              if (run_id != "_retained-default" || timeout != 30s ||
+                  remove_retained_artifacts) {
+                throw std::runtime_error("unexpected default cleanup request");
+              }
             } else {
-              BOOST_TEST(cleanup_calls == 1U);
-              BOOST_TEST(run_id == "retained-remove");
-              BOOST_TEST(timeout == 3600s);
-              BOOST_TEST(remove_retained_artifacts);
+              if (cleanup_calls != 1U || run_id != "retained-remove" ||
+                  timeout != 3600s || !remove_retained_artifacts) {
+                throw std::runtime_error("unexpected removing cleanup request");
+              }
             }
             ++cleanup_calls;
             return McpRunCleanupResult{
@@ -512,7 +525,8 @@ BOOST_AUTO_TEST_CASE(
                 result.complete = false;
                 break;
               default:
-                BOOST_FAIL("unexpected cleanup callback invocation");
+                throw std::runtime_error(
+                    "unexpected cleanup callback invocation");
             }
             return result;
           }});
@@ -565,17 +579,20 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
   role_service->operation = [&delegated](McpOperationKind kind,
                                          const boost::json::object& arguments,
                                          std::stop_token stop_token) {
-    BOOST_CHECK(kind == McpOperationKind::kAddMiner ||
-                kind == McpOperationKind::kRemoveMiner);
-    BOOST_TEST(arguments.at("run_id").as_string() == "role-run");
-    BOOST_TEST(arguments.at("node_ids").as_array() ==
-               boost::json::array{"firo-1"});
-    BOOST_TEST(arguments.if_contains("roles") == nullptr);
-    BOOST_TEST(arguments.at("timeout_sec").as_uint64() == 30U);
-    BOOST_TEST(!stop_token.stop_requested());
+    if ((kind != McpOperationKind::kAddMiner &&
+         kind != McpOperationKind::kRemoveMiner) ||
+        arguments.at("run_id").as_string() != "role-run" ||
+        arguments.at("node_ids").as_array() != boost::json::array{"firo-1"} ||
+        arguments.if_contains("roles") != nullptr ||
+        arguments.at("timeout_sec").as_uint64() != 30U ||
+        stop_token.stop_requested()) {
+      throw std::runtime_error("unexpected delegated role request");
+    }
     delegated.insert(kind);
     if (kind == McpOperationKind::kRemoveMiner) {
-      BOOST_TEST(arguments.if_contains("count") == nullptr);
+      if (arguments.if_contains("count") != nullptr) {
+        throw std::runtime_error("unexpected count in miner removal request");
+      }
       return boost::json::object{
           {"node_ids", boost::json::array{"firo-1"}},
           {"assigned_roles", boost::json::array{}},
@@ -589,7 +606,9 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_generic_role_mutations) {
           {"final_node_count", 1U},
       };
     }
-    BOOST_TEST(arguments.at("count").as_uint64() == 1U);
+    if (arguments.at("count").as_uint64() != 1U) {
+      throw std::runtime_error("unexpected count in miner addition request");
+    }
     return boost::json::object{
         {"node_ids", boost::json::array{"firo-1"}},
         {"assigned_roles", boost::json::array{"miner"}},
@@ -704,9 +723,11 @@ BOOST_AUTO_TEST_CASE(mcp_host_application_delegates_instrumentation) {
   instrumentation_service->operation =
       [&delegated](McpOperationKind kind, const boost::json::object& arguments,
                    std::stop_token stop_token) {
-        BOOST_CHECK(kind == McpOperationKind::kStartInstrumentation);
-        BOOST_TEST(arguments.at("run_id").as_string() == "instrumentation-run");
-        BOOST_TEST(!stop_token.stop_requested());
+        if (kind != McpOperationKind::kStartInstrumentation ||
+            arguments.at("run_id").as_string() != "instrumentation-run" ||
+            stop_token.stop_requested()) {
+          throw std::runtime_error("unexpected instrumentation request");
+        }
         ++delegated;
         return boost::json::object{
             {"instrumentation_id", "instrumentation-1"},
