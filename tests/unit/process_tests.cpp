@@ -753,3 +753,139 @@ BOOST_AUTO_TEST_CASE(child_process_refuses_parent_death_before_installation) {
   BOOST_REQUIRE(WIFEXITED(status));
   BOOST_TEST(WEXITSTATUS(status) == 127);
 }
+
+BOOST_AUTO_TEST_CASE(process_signal_names_numbers_and_realtime_bounds) {
+  BOOST_TEST(bbp::ParseProcessSignal("SIGTERM") == SIGTERM);
+  BOOST_TEST(bbp::ParseProcessSignal(std::to_string(SIGINT)) == SIGINT);
+  BOOST_TEST(bbp::ParseProcessSignal("SIGPOLL") == SIGIO);
+  BOOST_TEST(bbp::ParseProcessSignal("SIGRTMIN") == SIGRTMIN);
+  BOOST_TEST(bbp::ParseProcessSignal("SIGRTMAX") == SIGRTMAX);
+  BOOST_TEST(bbp::ParseProcessSignal("SIGRTMIN+1") == SIGRTMIN + 1);
+  BOOST_TEST(bbp::ParseProcessSignal("SIGRTMAX-1") == SIGRTMAX - 1);
+  BOOST_TEST(bbp::ParseProcessSignal(bbp::ProcessSignalName(SIGRTMAX - 1)) ==
+             SIGRTMAX - 1);
+  for (const std::string& value :
+       {std::string{}, std::string("SIGUNKNOWN"), std::string("15x"),
+        std::string(" 15"), std::string("-1"), std::string("0"),
+        std::to_string(NSIG),
+        "SIGRTMIN+" + std::to_string(SIGRTMAX - SIGRTMIN + 1),
+        std::string("SIGRTMAX-999999999999999999999")}) {
+    BOOST_CHECK_THROW(bbp::ParseProcessSignal(value), std::invalid_argument);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(child_process_signal_scope_excludes_foreign_processes) {
+  Subreaper subreaper;
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("bbp-process-signals-" + std::to_string(getpid()));
+  const auto descendant_path = root / "descendant.pid";
+  bbp::ProcessSpec spec;
+  spec.binary = std::filesystem::canonical("/proc/self/exe").parent_path() /
+                "bbp-process-tree-helper";
+  spec.argv = {descendant_path.string(), (root / "leader.term").string(),
+               (root / "descendant.term").string(), "--ignore-term"};
+  spec.stdout_path = root / "stdout.log";
+  spec.stderr_path = root / "stderr.log";
+  bbp::ChildProcess child = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  try {
+    BOOST_REQUIRE(WaitForFile(descendant_path, std::chrono::seconds(2)));
+    const pid_t descendant = ReadPid(descendant_path);
+    OwnedTestPid descendant_guard(descendant);
+    const pid_t foreign = fork();
+    BOOST_REQUIRE(foreign >= 0);
+    if (foreign == 0) {
+      const int joined = setpgid(0, child.pid());
+      _exit(joined < 0 && errno == EPERM ? 0 : 1);
+    }
+    OwnedTestPid foreign_guard(foreign);
+    const int foreign_status = foreign_guard.Wait();
+    BOOST_REQUIRE(WIFEXITED(foreign_status));
+    BOOST_TEST(WEXITSTATUS(foreign_status) == 0);
+
+    const auto deliver = [&](int signal, bbp::ProcessSignalScope scope) {
+      const auto result = child.DeliverSignal(signal, scope);
+      BOOST_TEST(result.target_pid == child.pid());
+      BOOST_TEST(result.process_group_id == child.pid());
+      BOOST_TEST(result.signal == signal);
+      BOOST_TEST(static_cast<int>(result.scope) == static_cast<int>(scope));
+      BOOST_REQUIRE(result.kernel_result == 0);
+      BOOST_TEST(result.error_number == 0);
+    };
+    const auto wait_stopped = [](pid_t pid, bool stopped) {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      do {
+        const auto state = ProcessState(pid);
+        if (state && *state != 'Z' && (*state == 'T') == stopped) {
+          return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      } while (std::chrono::steady_clock::now() < deadline);
+      return false;
+    };
+    using Scope = bbp::ProcessSignalScope;
+    BOOST_CHECK_THROW(child.DeliverSignal(0, Scope::kProcess),
+                      std::invalid_argument);
+    BOOST_CHECK_THROW(child.DeliverSignal(SIGTERM, static_cast<Scope>(99)),
+                      std::invalid_argument);
+    deliver(SIGWINCH, Scope::kProcess);
+    BOOST_TEST(child.running());
+    deliver(SIGSTOP, Scope::kProcess);
+    BOOST_REQUIRE(wait_stopped(child.pid(), true));
+    BOOST_REQUIRE(wait_stopped(descendant, false));
+    deliver(SIGCONT, Scope::kProcess);
+    BOOST_REQUIRE(wait_stopped(child.pid(), false));
+    deliver(SIGSTOP, Scope::kProcessGroup);
+    BOOST_REQUIRE(wait_stopped(child.pid(), true));
+    BOOST_REQUIRE(wait_stopped(descendant, true));
+    deliver(SIGCONT, Scope::kProcessGroup);
+    BOOST_REQUIRE(wait_stopped(child.pid(), false));
+    BOOST_REQUIRE(wait_stopped(descendant, false));
+    deliver(SIGKILL, Scope::kProcessGroup);
+    BOOST_REQUIRE(child.WaitForExit(std::chrono::seconds(2)));
+    BOOST_REQUIRE(child.exit_status());
+    BOOST_REQUIRE(WIFSIGNALED(*child.exit_status()));
+    BOOST_TEST(WTERMSIG(*child.exit_status()) == SIGKILL);
+    const int descendant_status = descendant_guard.Wait();
+    BOOST_REQUIRE(WIFSIGNALED(descendant_status));
+    BOOST_TEST(WTERMSIG(descendant_status) == SIGKILL);
+    BOOST_CHECK_THROW(child.DeliverSignal(SIGCONT, Scope::kProcessGroup),
+                      std::system_error);
+  } catch (...) {
+    child.Kill();
+    throw;
+  }
+  std::filesystem::remove_all(root);
+}
+
+BOOST_AUTO_TEST_CASE(
+    child_process_signal_requires_current_owner_and_reports_exit) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("bbp-process-signal-owner-" + std::to_string(getpid()));
+  bbp::ProcessSpec spec;
+  spec.binary = "/bin/sleep";
+  spec.argv = {"30"};
+  spec.stdout_path = root / "stdout.log";
+  spec.stderr_path = root / "stderr.log";
+  bbp::ChildProcess previous = bbp::ChildProcess::Spawn(spec, std::nullopt);
+  bbp::ChildProcess owner = std::move(previous);
+  try {
+    BOOST_CHECK_THROW(
+        previous.DeliverSignal(SIGKILL, bbp::ProcessSignalScope::kProcess),
+        std::system_error);
+    BOOST_TEST(owner.running());
+    const auto result =
+        owner.DeliverSignal(SIGTERM, bbp::ProcessSignalScope::kProcess);
+    BOOST_TEST(result.target_pid == owner.pid());
+    BOOST_TEST(result.kernel_result == 0);
+    BOOST_TEST(result.error_number == 0);
+    BOOST_REQUIRE(owner.WaitForExit(std::chrono::seconds(2)));
+    BOOST_REQUIRE(owner.exit_status());
+    BOOST_REQUIRE(WIFSIGNALED(*owner.exit_status()));
+    BOOST_TEST(WTERMSIG(*owner.exit_status()) == SIGTERM);
+  } catch (...) {
+    owner.Kill();
+    throw;
+  }
+  std::filesystem::remove_all(root);
+}

@@ -265,6 +265,7 @@ add_executable(bbp
   src/periodic_metrics_collector.cpp
   src/positive_duration.cpp
   src/process.cpp
+  src/process_signal.cpp
   src/owned_process_spawn.cpp
   src/simulator_startup_recovery.cpp
   src/process_control_config.cpp
@@ -659,6 +660,7 @@ if(BUILD_TESTING)
     src/periodic_metrics_collector.cpp
     src/positive_duration.cpp
     src/process.cpp
+    src/process_signal.cpp
     src/owned_process_spawn.cpp
     src/simulator_startup_recovery.cpp
     src/process_control_config.cpp

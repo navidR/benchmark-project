@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/process_signal.h"
+
 namespace bbp {
 
 struct ProcessSpec {
@@ -39,6 +41,10 @@ class ChildProcess {
   bool WaitForExit(std::chrono::milliseconds timeout);
   bool RequestTerminate();
   bool RequestKill();
+  // A successful kernel result reports delivery acceptance, not termination.
+  // Observe lifecycle separately with running/WaitForExit/exit_status.
+  // Group delivery requires Linux 6.9; unsupported kernels return EINVAL.
+  ProcessSignalDelivery DeliverSignal(int signal, ProcessSignalScope scope);
   void Terminate(std::chrono::milliseconds graceful_timeout);
   void Kill();
   std::optional<int> exit_status() const { return exit_status_; }

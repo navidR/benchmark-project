@@ -11,6 +11,7 @@
 #include <cstring>
 #include <set>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 
 #include "bbp/util.h"
@@ -101,13 +102,14 @@ int PidfdOpen(pid_t pid) {
 #endif
 }
 
-int PidfdSendSignal(int pidfd, int sig) {
+int PidfdSendSignal(int pidfd, int sig, unsigned int flags = 0U) {
 #ifdef SYS_pidfd_send_signal
   return static_cast<int>(
-      syscall(SYS_pidfd_send_signal, pidfd, sig, nullptr, 0));
+      syscall(SYS_pidfd_send_signal, pidfd, sig, nullptr, flags));
 #else
   (void)pidfd;
   (void)sig;
+  (void)flags;
   errno = ENOSYS;
   return -1;
 #endif
@@ -203,8 +205,10 @@ ChildProcess ChildProcess::Spawn(
         setns(*spec.network_namespace_fd, CLONE_NEWNET) != 0) {
       ChildSetupFail("setns network namespace", setup_status[1]);
     }
-    if (setpgid(0, 0) != 0) {
-      ChildSetupFail("setpgid", setup_status[1]);
+    // A private session keeps unrelated ambient-session processes out of the
+    // owned group. The foreground child remains its group leader (PGID=PID).
+    if (setsid() < 0) {
+      ChildSetupFail("setsid", setup_status[1]);
     }
     if (!spec.cwd.empty() && chdir(spec.cwd.c_str()) != 0) {
       ChildSetupFail("chdir", setup_status[1]);
@@ -371,6 +375,51 @@ bool ChildProcess::RequestKill() {
   }
   SignalProcessGroupAndLeader(pid_, pidfd_, SIGKILL);
   return true;
+}
+
+ProcessSignalDelivery ChildProcess::DeliverSignal(int signal,
+                                                  ProcessSignalScope scope) {
+  static_cast<void>(ProcessSignalName(signal));
+  if (scope != ProcessSignalScope::kProcess &&
+      scope != ProcessSignalScope::kProcessGroup) {
+    throw std::invalid_argument("invalid process signal delivery scope");
+  }
+  if (pid_ <= 0 || pidfd_ < 0 || exit_status_) {
+    throw std::system_error(ECHILD, std::generic_category(),
+                            "signal target has no live owned child identity");
+  }
+  siginfo_t state{};
+  int inspected;
+  do {
+    inspected = waitid(P_PIDFD, static_cast<id_t>(pidfd_), &state,
+                       WEXITED | WNOHANG | WNOWAIT);
+  } while (inspected < 0 && errno == EINTR);
+  if (inspected < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "verify signal target child ownership");
+  }
+  if (state.si_pid != 0) {
+    static_cast<void>(running());
+    throw std::system_error(ESRCH, std::generic_category(),
+                            "signal target has already exited");
+  }
+  unsigned int flags = 0U;
+  if (scope == ProcessSignalScope::kProcessGroup) {
+    if (getpgid(pid_) != pid_ || getsid(pid_) != pid_) {
+      throw std::system_error(EPERM, std::generic_category(),
+                              "signal target is not an owned private group");
+    }
+    // Linux UAPI PIDFD_SIGNAL_PROCESS_GROUP (available since Linux 6.9).
+    flags = 1U << 2U;
+  }
+  const int result = PidfdSendSignal(pidfd_, signal, flags);
+  const int error = result < 0 ? errno : 0;
+  return {.target_pid = pid_,
+          .process_group_id = pid_,
+          .signal = signal,
+          .scope = scope,
+          .kernel_result = result,
+          .error_number = error};
 }
 
 void ChildProcess::Kill() {
