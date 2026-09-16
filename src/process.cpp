@@ -340,6 +340,28 @@ bool ChildProcess::running() const {
   return true;
 }
 
+std::string_view ChildProcess::ObservedState() const {
+  if (exit_status_) return "exited";
+  if (pidfd_ < 0) {
+    throw std::logic_error("cannot observe an unowned process");
+  }
+  siginfo_t state{};
+  int result;
+  do {
+    result = waitid(P_PIDFD, static_cast<id_t>(pidfd_), &state,
+                    WEXITED | WSTOPPED | WCONTINUED | WNOHANG | WNOWAIT);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "observe owned process state");
+  }
+  if (state.si_pid == 0 || state.si_code == CLD_CONTINUED) return "running";
+  if (state.si_code == CLD_STOPPED || state.si_code == CLD_TRAPPED)
+    return "stopped";
+  static_cast<void>(running());
+  return "exited";
+}
+
 bool ChildProcess::WaitForExit(std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {

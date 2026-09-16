@@ -326,7 +326,20 @@ SimulationCommand ParseScheduledSimulationCommand(
     command.node_id = ScenarioCommandNodeId(object, "node", options);
   }
 
-  if (kind == SimulationCommandKind::kSetBlockProductionPolicy) {
+  if (kind == SimulationCommandKind::kSignalNode) {
+    const auto* signal = object.if_contains("signal");
+    if (signal == nullptr ||
+        (!signal->is_string() && !signal->is_int64() && !signal->is_uint64())) {
+      throw std::invalid_argument("signal must be a canonical name or integer");
+    }
+    const std::string value =
+        signal->is_string()  ? std::string(signal->as_string())
+        : signal->is_int64() ? std::to_string(signal->as_int64())
+                             : std::to_string(signal->as_uint64());
+    command.signal_request = ProcessSignalRequest{
+        .signal = ParseProcessSignal(value),
+        .scope = ParseProcessSignalScope(JsonStringField(object, "scope"))};
+  } else if (kind == SimulationCommandKind::kSetBlockProductionPolicy) {
     const std::uint64_t period_ms = JsonUint64Field(object, "period_ms");
     if (period_ms == 0U ||
         period_ms > static_cast<std::uint64_t>(

@@ -48,6 +48,7 @@
 #include "simulator_network_rule_decoding.h"
 #include "simulator_node_process_state.h"
 #include "simulator_node_report_export.h"
+#include "simulator_node_signal.h"
 #include "simulator_perf_counter_attachment.h"
 #include "simulator_perf_counter_transactions.h"
 #include "simulator_profile_switching.h"
@@ -535,6 +536,12 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
           if (command.operation_control) {
             command.operation_control->MarkCommitted();
           }
+        } else if (command.kind == SimulationCommandKind::kSignalNode) {
+          auto process_guard = context.run_process_state.Lock();
+          RequireNodeRunning(node, process_guard, "signal_node");
+          authorize_resource_mutation();
+          command_outcome.signal_delivery =
+              DeliverNodeSignal(node, command, process_guard);
         } else if (command.kind == SimulationCommandKind::kKillNode) {
           bool was_paused = false;
           {
@@ -1191,7 +1198,8 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
                      SimulationEventKind::kOperatorCommandCompleted,
                      SimulationCommandDetail(command, {}, &command_outcome));
         } catch (const std::exception& error) {
-          if ((command.kind == SimulationCommandKind::kAddNodes &&
+          if (command_outcome.signal_delivery ||
+              (command.kind == SimulationCommandKind::kAddNodes &&
                !command_outcome.added_node_ids.empty()) ||
               (command.kind == SimulationCommandKind::kReplaceNode &&
                command_outcome.inventory_generation.has_value()) ||

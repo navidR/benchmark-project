@@ -38,6 +38,9 @@ class ChildProcess {
   pid_t pid() const { return pid_; }
   int pidfd() const { return pidfd_; }
   bool running() const;
+  // Observes the owned leader without consuming stop/continue notifications.
+  // "running" means alive, including a sleeping process, not RPC readiness.
+  std::string_view ObservedState() const;
   bool WaitForExit(std::chrono::milliseconds timeout);
   bool RequestTerminate();
   bool RequestKill();

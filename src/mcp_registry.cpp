@@ -40,6 +40,9 @@ constexpr auto kOperations = std::to_array<McpNamedCapability>(
      {"node.remove", "Gracefully remove an owned node and its resources"},
      {"node.stop", "Gracefully stop a selected owned node"},
      {"node.kill", "Force-kill a selected owned node"},
+     {"node.signal",
+      "Deliver an explicit signal to an owned node daemon; kernel acceptance "
+      "is not termination"},
      {"node.restart", "Restart a selected owned node"},
      {"node.replace", "Transactionally replace a selected owned node"},
      {"wallet.add", "Transactionally initialize and register a wallet"},

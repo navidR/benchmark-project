@@ -60,6 +60,7 @@ struct ParsedTuiCommand {
   std::optional<SimulationNodeRemoveRequest> node_remove = std::nullopt;
   std::optional<SimulationRoleMutationRequest> role_mutation = std::nullopt;
   std::optional<TuiLocalAction> local_action = std::nullopt;
+  std::optional<ProcessSignalRequest> signal_request = std::nullopt;
 };
 
 }  // namespace bbp

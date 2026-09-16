@@ -17,6 +17,7 @@ enum class SimulationEventKind {
   kNodeStopDeadlineReached,
   kProcessStarted,
   kProcessExited,
+  kProcessSignalObserved,
   kProcessExitedBeforeRpcReady,
   kRpcReady,
   kOperatorConnectionCommand,

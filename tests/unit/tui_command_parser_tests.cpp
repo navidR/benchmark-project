@@ -1,3 +1,5 @@
+#include <signal.h>
+
 #include <boost/test/unit_test.hpp>
 #include <string_view>
 
@@ -510,4 +512,22 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_rejects_invalid_network_commands) {
                     std::runtime_error);
   BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("heal firo-2 extra", 0U),
                     std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(tui_signal_node_requires_scope_and_confirmation) {
+  const auto parsed =
+      bbp::TuiCommandParser::Parse("signal-node SIGSTOP process", 0U);
+  BOOST_CHECK(parsed.kind == bbp::SimulationCommandKind::kSignalNode);
+  BOOST_REQUIRE(parsed.signal_request);
+  BOOST_TEST(parsed.signal_request->signal == SIGSTOP);
+  BOOST_CHECK(parsed.signal_request->scope ==
+              bbp::ProcessSignalScope::kProcess);
+  BOOST_TEST(bbp::SimulationCommandRequiresConfirmation(parsed.kind));
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("signal-node SIGKILL", 0U),
+                    std::exception);
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("signal-node 0 process", 0U),
+                    std::exception);
+  BOOST_CHECK_THROW(
+      bbp::TuiCommandParser::Parse("signal-node SIGCONT cgroup", 0U),
+      std::exception);
 }

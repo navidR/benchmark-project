@@ -14,6 +14,14 @@ std::string ProcessSignalName(int signal);
 
 enum class ProcessSignalScope { kProcess, kProcessGroup };
 
+ProcessSignalScope ParseProcessSignalScope(std::string_view value);
+std::string_view ProcessSignalScopeName(ProcessSignalScope scope);
+
+struct ProcessSignalRequest {
+  int signal = 0;
+  ProcessSignalScope scope = ProcessSignalScope::kProcess;
+};
+
 struct ProcessSignalDelivery {
   pid_t target_pid = -1;
   pid_t process_group_id = -1;

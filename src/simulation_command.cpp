@@ -258,6 +258,8 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "set_mining_difficulty";
     case SimulationCommandKind::kKillNode:
       return "kill_node";
+    case SimulationCommandKind::kSignalNode:
+      return "signal_node";
     case SimulationCommandKind::kConnectPeer:
       return "connect_peer";
     case SimulationCommandKind::kDisconnectPeer:
@@ -335,6 +337,7 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "set_mining_difficulty") {
     return SimulationCommandKind::kSetMiningDifficulty;
   }
+  if (name == "signal_node") return SimulationCommandKind::kSignalNode;
   if (name == "kill_node") {
     return SimulationCommandKind::kKillNode;
   }
@@ -418,6 +421,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kStopMining:
     case SimulationCommandKind::kDisconnectNode:
     case SimulationCommandKind::kKillNode:
+    case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kDisconnectPeer:
     case SimulationCommandKind::kSetPeerCountPolicy:
     case SimulationCommandKind::kFreezeNode:

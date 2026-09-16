@@ -597,6 +597,10 @@ boost::json::object SimulationCommandScenarioJson(
       command.kind != SimulationCommandKind::kRemoveRole) {
     object["node"] = command.node_id;
   }
+  if (command.signal_request) {
+    object["signal"] = ProcessSignalName(command.signal_request->signal);
+    object["scope"] = ProcessSignalScopeName(command.signal_request->scope);
+  }
   if (command.block_production_policy) {
     object["period_ms"] = command.block_production_policy->period().count();
     object["probability"] = command.block_production_policy->probability();

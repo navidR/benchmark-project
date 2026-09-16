@@ -58,7 +58,8 @@ class PtyProcess {
   PtyProcess(const std::filesystem::path& command,
              std::vector<std::string> arguments, unsigned short rows,
              unsigned short cols,
-             const std::filesystem::path& home_directory = {}) {
+             const std::filesystem::path& home_directory = {},
+             bool ignore_terminal_hangup = false) {
     struct winsize size{};
     size.ws_row = rows;
     size.ws_col = cols;
@@ -67,6 +68,11 @@ class PtyProcess {
       throw std::system_error(errno, std::generic_category(), "forkpty");
     }
     if (pid_ == 0) {
+      // A crashing PTY session leader also sends SIGHUP to its foreground
+      // group. Isolate parent-death tests from that competing death cause.
+      if (ignore_terminal_hangup && ::signal(SIGHUP, SIG_IGN) == SIG_ERR) {
+        _exit(127);
+      }
       static_cast<void>(setenv("TERM", "xterm", 1));
       static_cast<void>(setenv("ESCDELAY", "25", 1));
       if (!home_directory.empty()) {
@@ -3424,6 +3430,170 @@ void CheckDirectLoadLifecycle(const std::filesystem::path& command,
   CheckIndefiniteDirectLoadLifecycle(command, daemon, benchmark_root);
 }
 
+void CheckNodeSignals(const std::filesystem::path& command,
+                      const std::filesystem::path& daemon,
+                      const std::filesystem::path& benchmark_root) {
+  OwnedTemporaryDirectory home("node-signals");
+  std::filesystem::create_directories(benchmark_root);
+  const std::string run_id = "node-signals-" + std::to_string(getpid());
+  const auto run_root = benchmark_root / run_id;
+  const auto events_path = run_root / "events.jsonl";
+  const auto scenario_path = home.root() / "scenario.json";
+  {
+    std::ofstream stream(scenario_path);
+    stream << boost::json::serialize(boost::json::object{
+        {"chain", "firo"},
+        {"chain_daemon", daemon.string()},
+        {"run_id", run_id},
+
+        {"nodes",
+         boost::json::array{boost::json::object{{"id", "firo-1"},
+                                                {"chain", "firo"},
+                                                {"role", "base"},
+                                                {"restart_policy", "always"}}}},
+        {"block_production", boost::json::object{{"enabled", false}}},
+        {"metrics_sample_count", 1000U},
+        {"metrics_interval_ms", 100U},
+        {"events",
+         boost::json::array{boost::json::object{{"at", "1ms"},
+                                                {"action", "signal_node"},
+                                                {"node", "firo-1"},
+                                                {"signal", "SIGWINCH"},
+                                                {"scope", "process"}}}}});
+  }
+  ScopedFixtureProcessCleanup fallback(daemon, run_root);
+  PtyProcess process(
+      command,
+      {"--scenario", scenario_path.string(), "--benchmark-root",
+       benchmark_root.string(), "--refresh-ms", "50", "--keep-artifacts"},
+      24, 80, home.root());
+  static_cast<void>(process.ReadUntil("Blockchain Benchmark Project TUI", 10s,
+                                      "node signals TUI"));
+  static_cast<void>(WaitForFileText(
+      events_path, "\"event\":\"scheduled_event_completed\"", 30s));
+  const auto pids = EventProcessPids(ReadFile(events_path));
+  if (pids.size() != 1U)
+    throw std::runtime_error("signal test expected one daemon");
+  pid_t current_pid = pids.front();
+  const auto mcp = ConnectMcpTestSession(home.root() / ".bbp" / "mcp");
+  std::uint64_t request_id = 2U;
+  const auto wait_observation = [&](std::string_view state,
+                                    std::string_view command_id) {
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      std::istringstream lines(ReadFile(events_path));
+      std::string line;
+      while (std::getline(lines, line)) {
+        const auto event = boost::json::parse(line).as_object();
+        if (event.at("event") != "process_signal_observed") continue;
+        const auto detail =
+            boost::json::parse(event.at("detail").as_string()).as_object();
+        if (detail.at("state").as_string() == state &&
+            (command_id.empty() ||
+             detail.at("command_id").as_string() == command_id))
+          return detail;
+      }
+      static_cast<void>(process.ReadFor(20ms));
+    }
+    throw std::runtime_error("missing node signal observation: " +
+                             std::string(state));
+  };
+  const auto send = [&](boost::json::value signal, std::string_view scope,
+                        bool runtime) {
+    boost::json::object arguments{{"run_id", run_id}};
+    if (runtime) {
+      arguments["command"] = boost::json::object{{"kind", "signal_node"},
+                                                 {"node", "firo-1"},
+                                                 {"signal", std::move(signal)},
+                                                 {"scope", scope}};
+    } else {
+      arguments["node_id"] = "firo-1";
+      arguments["signal"] = std::move(signal);
+      arguments["scope"] = scope;
+    }
+    const auto result = InvokeMcpOperation(
+        mcp, &request_id, runtime ? "simulation.command" : "node.signal",
+        std::move(arguments), 5s, "node signal delivery");
+    const auto& delivery = result.at("signal_delivery").as_object();
+    if (delivery.at("kernel_result").to_number<int>() != 0 ||
+        delivery.at("errno").to_number<int>() != 0 ||
+        !delivery.at("accepted").as_bool() ||
+        delivery.at("target_pid").to_number<pid_t>() != current_pid ||
+        delivery.at("process_group_id").to_number<pid_t>() != current_pid ||
+        delivery.at("scope").as_string() != scope) {
+      throw std::runtime_error("inconsistent node signal delivery: " +
+                               boost::json::serialize(result));
+    }
+    return result;
+  };
+
+  // Selected-node TUI confirmation must preserve the complete typed request.
+  process.Write("c");
+  static_cast<void>(
+      process.ReadUntil("Live command", 3s, "node signal palette"));
+  process.Write("signal-node SIGSTOP process\n");
+  const auto confirmation = process.ReadUntil("Confirm destructive action", 3s,
+                                              "node signal confirmation");
+  RequireContains(confirmation, "SIGSTOP", "explicit signal confirmation");
+  process.Write("y");
+  static_cast<void>(wait_observation("stopped", {}));
+  const auto continued = send(SIGCONT, "process", false);
+  static_cast<void>(
+      wait_observation("running", continued.at("command_id").as_string()));
+  const auto nonfatal = send("SIGWINCH", "process", true);
+  static_cast<void>(
+      wait_observation("running", nonfatal.at("command_id").as_string()));
+
+  std::size_t restart_count = 0U;
+  for (const auto& [signal, scope] : {std::pair{"SIGTERM", "process"},
+                                      std::pair{"SIGKILL", "process_group"}}) {
+    const auto result = send(signal, scope, false);
+    const auto observed =
+        wait_observation("exited", result.at("command_id").as_string());
+    if (observed.at("restart_action") != "restart_requested" ||
+        observed.at("target_pid").to_number<pid_t>() != current_pid) {
+      throw std::runtime_error("signal exit lost restart-policy correlation");
+    }
+    if (std::string_view(signal) == "SIGTERM") {
+      if (observed.at("exit_code").to_number<int>() != 0)
+        throw std::runtime_error("Firo SIGTERM exit status was not observed");
+    } else if (observed.at("terminating_signal").to_number<int>() != SIGKILL) {
+      throw std::runtime_error("SIGKILL terminating signal was not observed");
+    }
+    const auto restarted = WaitForFileOccurrences(
+        events_path, "\"event\":\"process_restarted\"", ++restart_count, 20s);
+    const auto restarted_pids = EventProcessPids(restarted);
+    if (restarted_pids.back() == current_pid || ProcessExists(current_pid))
+      throw std::runtime_error(
+          "signal restart did not replace the exited daemon");
+    current_pid = restarted_pids.back();
+  }
+  // Existing query surface must expose the follow-up lifecycle observations.
+  const auto lifecycle = InvokeMcpOperation(
+      mcp, &request_id, "evidence.query",
+      boost::json::object{{"run_id", run_id},
+                          {"families", boost::json::array{"lifecycle"}},
+                          {"node_ids", boost::json::array{"firo-1"}},
+                          {"limit", 64U}},
+      5s, "signal lifecycle evidence");
+  RequireContains(boost::json::serialize(lifecycle), "process_signal_observed",
+                  "MCP node signal evidence");
+  static_cast<void>(InvokeMcpOperation(
+      mcp, &request_id, "run.stop",
+      boost::json::object{{"run_id", run_id}, {"timeout_sec", 15U}}, 20s,
+      "signal test cleanup"));
+  const auto finished = ReadFile(events_path);
+  RequireOwnedResourcesRemoved(
+      run_root, 1U, EventProcessPids(finished),
+      MetricNamespacePids(ReadFile(run_root / "metrics.jsonl")));
+  process.Write("\x1b");
+  static_cast<void>(
+      process.ReadUntil("Confirm exit", 3s, "node signal TUI exit"));
+  process.Write("y");
+  RequireExitZero(&process, "node signal TUI exit");
+  fallback.Disarm();
+}
+
 void CheckAbruptParentDeath(const std::filesystem::path& command,
                             const std::filesystem::path& daemon,
                             const std::filesystem::path& benchmark_root) {
@@ -3475,7 +3645,7 @@ void CheckAbruptParentDeath(const std::filesystem::path& command,
            benchmark_root.string(), "--run-id", run_id, "--nodes", "2",
            "--no-mining", "--metrics-sample-count", "1000",
            "--metrics-interval", "100ms", "--no-tui", "--keep-artifacts"},
-          24, 80, home.root());
+          24, 80, home.root(), true);
       const auto deadline = std::chrono::steady_clock::now() + 30s;
       while (std::chrono::steady_clock::now() < deadline) {
         static_cast<void>(process.ReadFor(50ms));
@@ -3533,7 +3703,11 @@ void CheckAbruptParentDeath(const std::filesystem::path& command,
         if (waited != pid || !WIFSIGNALED(status) ||
             WTERMSIG(status) != SIGKILL) {
           throw std::runtime_error(
-              "managed child was not killed within five seconds of BBP death");
+              "managed child was not killed within five seconds of BBP death: "
+              "pid=" +
+              std::to_string(pid) + " waited=" + std::to_string(waited) +
+              " raw_status=" + std::to_string(status) +
+              " parent_signal=" + std::to_string(signal));
         }
       }
       if (signal == SIGKILL) {
@@ -6845,6 +7019,17 @@ int main(int argc, char** argv) {
       return RunReadyFiroDaemon(argc, argv);
     } catch (const std::exception& error) {
       std::cerr << "ready Firo daemon failed: " << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 5 && std::string_view(argv[1]) == "--node-signals") {
+    try {
+      CheckNodeSignals(argv[2], argv[3], argv[4]);
+      std::cout << "real node scenario/TUI/MCP signal and restart evidence "
+                   "checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "node signal regression failed: " << error.what() << '\n';
       return 1;
     }
   }

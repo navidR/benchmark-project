@@ -1415,6 +1415,13 @@ void DrawCommandConfirmationPopup(int rows, int cols,
   AddText(top + 3, left + 2, popup_cols - 4,
           std::string(SimulationCommandKindName(pending.command.kind)));
   AddText(top + 4, left + 2, popup_cols - 4, "Target: " + pending.target_text);
+  if (pending.command.signal_request) {
+    AddText(
+        top + 5, left + 2, popup_cols - 4,
+        ProcessSignalName(pending.command.signal_request->signal) + " scope: " +
+            std::string(
+                ProcessSignalScopeName(pending.command.signal_request->scope)));
+  }
   AddText(top + 6, left + 2, popup_cols - 4,
           "Press y to confirm; n or Esc cancels.", COLOR_PAIR(kColorMuted));
 }
@@ -1516,6 +1523,10 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   if (!error.empty()) {
     AddText(top + 19, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
+  } else {
+    AddText(top + 19, left + 2, popup_cols - 4,
+            "signal-node <signal> process|process_group",
+            COLOR_PAIR(kColorMuted));
   }
   AddText(top + 20, left + 2, popup_cols - 4,
           "Enter submits. Tab completes. Esc closes.", COLOR_PAIR(kColorMuted));
@@ -1537,6 +1548,10 @@ void DrawCommandPaletteInput(int rows, int cols, std::string_view input,
   if (!error.empty()) {
     AddText(top + 19, left + 2, popup_cols - 4, error,
             COLOR_PAIR(kColorWarning));
+  } else {
+    AddText(top + 19, left + 2, popup_cols - 4,
+            "signal-node <signal> process|process_group",
+            COLOR_PAIR(kColorMuted));
   }
 }
 
@@ -2969,7 +2984,14 @@ bool QueueParsedNodeCommand(
         sequence = command_queue->PushRoleMutation(
             parsed.kind, std::move(*role_mutation), confirmed);
       } else {
-        if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
+        if (parsed.kind == SimulationCommandKind::kSignalNode) {
+          SimulationCommand command;
+          command.kind = parsed.kind;
+          command.node_id = node_id;
+          command.signal_request = parsed.signal_request;
+          command.confirmed = confirmed;
+          sequence = command_queue->PushRuntimeCommand(std::move(command));
+        } else if (parsed.kind == SimulationCommandKind::kSetMiningDifficulty) {
           if (!parsed.mining_difficulty) {
             throw std::runtime_error("mining difficulty is missing");
           }

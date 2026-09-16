@@ -95,9 +95,11 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
       difficulty_handler_(FindNode(nodes, command.node_id),
                           *command.mining_difficulty, stop_token);
       return;
+    case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kKillNode:
       throw std::runtime_error(
-          "kill-node commands must be handled by the simulator process owner");
+          "process lifecycle commands must be handled by the simulator process "
+          "owner");
     case SimulationCommandKind::kConnectPeer: {
       const ChainNodeConfig& node = FindNode(nodes, command.node_id);
       const ChainNodeConfig& peer = FindNode(nodes, RequirePeerNodeId(command));

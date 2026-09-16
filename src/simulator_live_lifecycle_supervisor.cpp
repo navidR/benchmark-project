@@ -25,6 +25,7 @@
 #include "simulator_native_mining_rpc.h"
 #include "simulator_node_lifecycle_event_details.h"
 #include "simulator_node_process_state.h"
+#include "simulator_node_signal.h"
 #include "simulator_operator_connection_publication.h"
 #include "simulator_perf_counter_attachment.h"
 #include "simulator_runtime_node_startup.h"
@@ -149,6 +150,9 @@ void RunLiveLifecycleSupervisor(std::stop_token supervisor_stop_token,
           std::string process_exit_detail;
           {
             auto process_guard = context.run_process_state.Lock();
+            PublishNodeSignalObservation(node, process_guard,
+                                         context.events_path,
+                                         context.options.run_id);
             if (node.Lifecycle() != NodeRuntimeLifecycle::kRunning ||
                 node.process.running()) {
               continue;

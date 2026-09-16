@@ -24,6 +24,7 @@
 #include "bbp/network.h"
 #include "bbp/peer_count_policy.h"
 #include "bbp/perf_counter.h"
+#include "bbp/process_signal.h"
 #include "bbp/simulation_node_add.h"
 #include "bbp/simulation_partition.h"
 #include "bbp/simulation_registry.h"
@@ -42,6 +43,7 @@ enum class SimulationCommandKind {
   kSetBlockProductionPolicy,
   kSetMiningDifficulty,
   kKillNode,
+  kSignalNode,
   kConnectPeer,
   kDisconnectPeer,
   kSetPeerCountPolicy,
@@ -294,6 +296,7 @@ struct SimulationCommandOutcome {
   std::optional<boost::json::object> role_mutation = std::nullopt;
   std::optional<std::uint32_t> node_capacity = std::nullopt;
   boost::json::value network_allocation = nullptr;
+  std::optional<boost::json::object> signal_delivery = std::nullopt;
 };
 
 class SimulationCommandOutcomeUnconfirmed final : public std::runtime_error {
@@ -348,6 +351,7 @@ struct SimulationCommand {
   std::optional<SimulationNodeReplaceRequest> node_replace = std::nullopt;
   std::optional<SimulationNodeRemoveRequest> node_remove;
   std::optional<SimulationRoleMutationRequest> role_mutation = std::nullopt;
+  std::optional<ProcessSignalRequest> signal_request = std::nullopt;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;
   std::shared_ptr<SimulationCommandControl> operation_control;

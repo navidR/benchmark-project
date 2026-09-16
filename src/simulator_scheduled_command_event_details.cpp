@@ -116,6 +116,13 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
   boost::json::object detail;
   detail["sequence"] = command.sequence;
   detail["kind"] = SimulationCommandKindName(command.kind);
+  if (command.signal_request) {
+    detail["signal"] = ProcessSignalName(command.signal_request->signal);
+    detail["scope"] = ProcessSignalScopeName(command.signal_request->scope);
+  }
+  if (outcome && outcome->signal_delivery) {
+    detail["signal_delivery"] = *outcome->signal_delivery;
+  }
   if (command.block_production_policy) {
     detail["period_ms"] = command.block_production_policy->period().count();
     detail["probability"] = command.block_production_policy->probability();

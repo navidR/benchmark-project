@@ -27,7 +27,8 @@ std::size_t SimulationCommandPayloadCount(const SimulationCommand& command) {
          static_cast<std::size_t>(command.node_add.has_value()) +
          static_cast<std::size_t>(command.node_replace.has_value()) +
          static_cast<std::size_t>(command.node_remove.has_value()) +
-         static_cast<std::size_t>(command.role_mutation.has_value());
+         static_cast<std::size_t>(command.role_mutation.has_value()) +
+         static_cast<std::size_t>(command.signal_request.has_value());
 }
 
 void RequirePayload(const SimulationCommand& command, bool expected_present,
@@ -345,6 +346,11 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
             "block production policy command must target sim");
       }
       break;
+    case SimulationCommandKind::kSignalNode:
+      RequirePayload(command, command.signal_request.has_value(), 1U);
+      static_cast<void>(ProcessSignalName(command.signal_request->signal));
+      static_cast<void>(ProcessSignalScopeName(command.signal_request->scope));
+      break;
     case SimulationCommandKind::kSetMiningDifficulty:
       RequirePayload(command, command.mining_difficulty.has_value(), 1U);
       break;
@@ -448,6 +454,7 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kExportNodeReport:
       break;
     case SimulationCommandKind::kSetBlockProductionPolicy:
+    case SimulationCommandKind::kSignalNode:
     case SimulationCommandKind::kSetMiningDifficulty:
     case SimulationCommandKind::kConnectPeer:
     case SimulationCommandKind::kDisconnectPeer:

@@ -340,6 +340,7 @@ add_executable(bbp
   src/simulator_node_mutation_request_decoding.cpp
   src/simulator_node_process_state.cpp
   src/simulator_node_report_export.cpp
+  src/simulator_node_signal.cpp
   src/simulator_offline_run_cleanup.cpp
   src/simulator_one_shot_workload_dispatch.cpp
   src/simulator_one_shot_workload_invocation.cpp
@@ -725,6 +726,7 @@ if(BUILD_TESTING)
     src/simulator_node_mutation_request_decoding.cpp
     src/simulator_node_process_state.cpp
     src/simulator_node_report_export.cpp
+    src/simulator_node_signal.cpp
     src/simulator_offline_run_cleanup.cpp
     src/simulator_one_shot_workload_dispatch.cpp
     src/simulator_one_shot_workload_invocation.cpp
@@ -1189,6 +1191,14 @@ if(BUILD_TESTING)
     "optional firod used by the real direct-load lifecycle regression"
   )
   if(BBP_FIROD_INTEGRATION_BINARY)
+    add_test(NAME bbp-node-signal-operation
+      COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+        --node-signals
+        $<TARGET_FILE:bbp>
+        "${BBP_FIROD_INTEGRATION_BINARY}"
+        "${CMAKE_CURRENT_BINARY_DIR}/node-signal-artifacts"
+    )
+    set_tests_properties(bbp-node-signal-operation PROPERTIES TIMEOUT 90)
     add_test(NAME bbp-owned-process-parent-death
       COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
         --abrupt-parent-death

@@ -106,4 +106,20 @@ std::string ProcessSignalName(int signal) {
   return std::to_string(signal);
 }
 
+ProcessSignalScope ParseProcessSignalScope(std::string_view value) {
+  if (value == "process") return ProcessSignalScope::kProcess;
+  if (value == "process_group") return ProcessSignalScope::kProcessGroup;
+  throw std::invalid_argument("signal scope must be process or process_group");
+}
+
+std::string_view ProcessSignalScopeName(ProcessSignalScope scope) {
+  switch (scope) {
+    case ProcessSignalScope::kProcess:
+      return "process";
+    case ProcessSignalScope::kProcessGroup:
+      return "process_group";
+  }
+  throw std::invalid_argument("invalid process signal scope");
+}
+
 }  // namespace bbp

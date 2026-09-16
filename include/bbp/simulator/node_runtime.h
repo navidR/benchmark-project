@@ -21,6 +21,13 @@
 
 namespace bbp {
 
+struct NodeSignalObservation {
+  std::uint64_t command_sequence = 0;
+  pid_t target_pid = -1;
+  std::uint64_t restart_count = 0;
+  std::string last_state;
+};
+
 struct NodeRuntime {
   ChainNodeConfig config;
   std::vector<std::string> process_start_connect_peers;
@@ -30,6 +37,8 @@ struct NodeRuntime {
   std::optional<NodeVethConfig> network;
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
+  // Protected by run_process_state; scoped to this exact process generation.
+  std::optional<NodeSignalObservation> signal_observation;
   RunProcessState* run_process_state = nullptr;
   NodeLifecyclePolicy lifecycle_policy;
   std::optional<std::chrono::steady_clock::time_point> process_started_at;

@@ -1,3 +1,5 @@
+#include <signal.h>
+
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/test/unit_test.hpp>
@@ -1005,6 +1007,49 @@ BOOST_AUTO_TEST_CASE(scenario_service_rejects_scheduled_removal_of_role_node) {
                "scheduled node.remove requires wallet.remove before removing "
                "wallet node firo-2";
       });
+}
+
+BOOST_AUTO_TEST_CASE(
+    scenario_node_signal_serializes_and_requires_explicit_scope) {
+  auto scenario = MinimalScenario();
+  scenario["events"] =
+      boost::json::array{boost::json::object{{"at", "1ms"},
+                                             {"action", "signal_node"},
+                                             {"node", 1U},
+                                             {"signal", SIGCONT},
+                                             {"scope", "process_group"}}};
+  const auto resolved = ResolveScenario(scenario);
+  const auto options = ParseAndValidateScenario(scenario);
+  const auto& command =
+      std::get<SimulationCommand>(options.scheduled_events.front().action);
+  BOOST_REQUIRE(command.signal_request);
+  BOOST_TEST(command.signal_request->signal == SIGCONT);
+  BOOST_CHECK(command.signal_request->scope ==
+              ProcessSignalScope::kProcessGroup);
+  BOOST_TEST(resolved.at("events")
+                 .as_array()
+                 .front()
+                 .as_object()
+                 .at("signal")
+                 .as_string() == "SIGCONT");
+  boost::json::object runtime{{"kind", "signal_node"},
+                              {"node", 1U},
+                              {"signal", "SIGSTOP"},
+                              {"scope", "process"}};
+  BOOST_TEST(ParseAndValidateSimulationCommand(runtime, options)
+                 .signal_request->signal == SIGSTOP);
+  for (const auto& invalid : boost::json::array{0, NSIG, -1, 9.5, "SIGFAKE"}) {
+    runtime["signal"] = invalid;
+    BOOST_CHECK_THROW(ParseAndValidateSimulationCommand(runtime, options),
+                      std::exception);
+  }
+  runtime["signal"] = "SIGCONT";
+  runtime["scope"] = "cgroup";
+  BOOST_CHECK_THROW(ParseAndValidateSimulationCommand(runtime, options),
+                    std::exception);
+  runtime.erase("scope");
+  BOOST_CHECK_THROW(ParseAndValidateSimulationCommand(runtime, options),
+                    std::exception);
 }
 
 }  // namespace bbp

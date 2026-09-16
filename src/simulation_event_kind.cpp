@@ -26,6 +26,8 @@ std::string_view SimulationEventKindName(SimulationEventKind kind) {
       return "node_stop_deadline_reached";
     case SimulationEventKind::kProcessStarted:
       return "process_started";
+    case SimulationEventKind::kProcessSignalObserved:
+      return "process_signal_observed";
     case SimulationEventKind::kProcessExited:
       return "process_exited";
     case SimulationEventKind::kProcessExitedBeforeRpcReady:
@@ -198,6 +200,8 @@ std::optional<SimulationEventKind> SimulationEventKindFromName(
   if (name == "node_stop_deadline_reached")
     return SimulationEventKind::kNodeStopDeadlineReached;
   if (name == "process_started") return SimulationEventKind::kProcessStarted;
+  if (name == "process_signal_observed")
+    return SimulationEventKind::kProcessSignalObserved;
   if (name == "process_exited") return SimulationEventKind::kProcessExited;
   if (name == "process_exited_before_rpc_ready")
     return SimulationEventKind::kProcessExitedBeforeRpcReady;

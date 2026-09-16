@@ -1,3 +1,5 @@
+#include <signal.h>
+
 #include <algorithm>
 #include <array>
 #include <boost/json/array.hpp>
@@ -310,7 +312,70 @@ boost::json::object IoLimitSchema() {
   return BuildMcpScenarioObjectSchema(ScenarioObjectKind::kIoLimit);
 }
 
+boost::json::object SignalValueSchema() {
+  auto name = StringSchema(1U);
+  name["description"] =
+      "Host signal name (SIGTERM, SIGSTOP, SIGCONT, SIGRTMIN+n, SIGRTMAX-n) or "
+      "exact decimal string; shared host parser rejects unknown names and "
+      "out-of-range values.";
+  name["pattern"] = "^(SIG[A-Z0-9]+([+-][0-9]+)?|[0-9]+)$";
+  return OneOf({IntegerSchema(1U, NSIG - 1U), std::move(name)});
+}
+
+boost::json::object SignalScopeSchema() {
+  auto schema =
+      StringEnumSchema(boost::json::array{"process", "process_group"});
+  schema["description"] =
+      "Explicit owned daemon or its private process group. Group delivery "
+      "requires Linux 6.9; kernel errors return without fallback.";
+  return schema;
+}
+
+boost::json::object SignalDeliverySchema() {
+  boost::json::object observed{
+      {"state",
+       StringEnumSchema(boost::json::array{"running", "stopped", "exited"})},
+      {"restart_count", Uint64Schema()},
+      {"restart_policy", StringSchema(1U)},
+      {"restart_action",
+       StringEnumSchema(boost::json::array{"none_observed",
+                                           "awaiting_lifecycle_supervisor"})},
+      {"cleanup_state", ConstStringSchema("not_requested_by_signal")},
+      {"raw_status", IntegerSchema()},
+      {"exit_code", IntegerSchema(0U, 255U)},
+      {"terminating_signal", IntegerSchema(1U, NSIG - 1U)},
+      {"core_dumped", TypeSchema("boolean")}};
+  observed.at("state").as_object()["description"] =
+      "Observed leader state, including for group delivery. Running means "
+      "alive "
+      "without an observed job-control stop; it does not imply RPC readiness "
+      "or that the delivered signal has taken effect.";
+  boost::json::object properties{
+      {"target", ConstStringSchema("node_daemon")},
+      {"target_pid", IntegerSchema(1U)},
+      {"process_group_id", IntegerSchema(1U)},
+      {"signal", IntegerSchema(1U, NSIG - 1U)},
+      {"signal_name", StringSchema(1U)},
+      {"scope", SignalScopeSchema()},
+      {"kernel_result",
+       boost::json::object{{"type", "integer"},
+                           {"enum", boost::json::array{-1, 0}}}},
+      {"errno", IntegerSchema()},
+      {"accepted", TypeSchema("boolean")},
+      {"observation",
+       ClosedObject(std::move(observed),
+                    Required({"state", "restart_count", "restart_policy",
+                              "restart_action", "cleanup_state"}))},
+      {"evidence_families", ArraySchema(StringSchema(1U), 1U)}};
+  return ClosedObject(
+      std::move(properties),
+      Required({"target", "target_pid", "process_group_id", "signal",
+                "signal_name", "scope", "kernel_result", "errno", "accepted",
+                "observation", "evidence_families"}));
+}
+
 boost::json::object GenericFieldSchema(std::string_view field) {
+  if (field == "signal") return SignalValueSchema();
   if (field == "enabled" || field == "native_mining" || field == "all_peers" ||
       field == "bidirectional" || field == "active" || field == "isolated" ||
       field == "allow_miner_wallet_overlap" || field == "generate_blocks" ||
@@ -845,6 +910,9 @@ boost::json::object CommandVariant(SimulationCommandKind kind,
   }
   if (ScenarioCommandFieldAllowed(kind, "node")) {
     required.emplace_back("node");
+  }
+  if (kind == SimulationCommandKind::kSignalNode) {
+    properties["scope"] = SignalScopeSchema();
   }
   if (properties.contains("resource_limits")) {
     properties["resource_limits"] = ResourceLimitsSchema();
@@ -1780,6 +1848,7 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
     case McpOperationKind::kQueryLogs:
     case McpOperationKind::kFollowLogs:
       return McpResultFamily::kEvidencePage;
+    case McpOperationKind::kSignalNode:
     case McpOperationKind::kInvokeRuntimeCommand:
       return McpResultFamily::kRuntimeCommand;
 #ifdef BBP_FIRO_GUI_LAUNCHER
@@ -1901,6 +1970,15 @@ boost::json::object BuildMcpOperationInputSchema(
       required.emplace_back("node_ids");
       properties["timeout_sec"] =
           IntegerSchema(1U, kSimulationNodeAddMaximumTimeoutSeconds);
+      break;
+    case McpOperationKind::kSignalNode:
+      add_run();
+      add_node();
+      add_timeout();
+      properties["signal"] = SignalValueSchema();
+      properties["scope"] = SignalScopeSchema();
+      required.emplace_back("signal");
+      required.emplace_back("scope");
       break;
     case McpOperationKind::kStopNode:
     case McpOperationKind::kKillNode:
@@ -2138,6 +2216,17 @@ std::string_view TypedNodeLifecycleState(McpOperationKind operation) {
     default:
       throw std::logic_error("operation is not a typed node lifecycle action");
   }
+}
+
+boost::json::object NodeSignalResultSchema() {
+  auto schema = BuildMcpResultSchema(McpResultFamily::kRuntimeCommand);
+  schema.at("properties").as_object()["action"] =
+      ConstStringSchema("node.signal");
+  auto& required = schema.at("required").as_array();
+  required.emplace_back("action");
+  required.emplace_back("signal_delivery");
+  required.emplace_back("affected_node_ids");
+  return schema;
 }
 
 boost::json::object TypedNodeLifecycleMutationSchema(
@@ -2380,6 +2469,16 @@ boost::json::object BuildMcpResultSchema(
       require({"run_id", "state"});
       break;
     case McpResultFamily::kRuntimeCommand:
+      properties["signal_delivery"] = SignalDeliverySchema();
+      constraints.emplace_back(boost::json::object{
+          {"if", boost::json::object{{"properties",
+                                      boost::json::object{
+                                          {"action",
+                                           ConstStringSchema("node.signal")}}},
+                                     {"required", Required({"action"})}}},
+          {"then", boost::json::object{
+                       {"required",
+                        Required({"signal_delivery", "affected_node_ids"})}}}});
       properties["run_id"] = RunIdentifierSchema();
       properties["command_id"] = IdentifierSchema();
       properties["operation_id"] = IdentifierSchema();
@@ -3028,6 +3127,23 @@ boost::json::object BuildMcpResultSchema(
                                {"required",
                                 Required({"terminal_error"})}}}}}}}}});
         for (const McpOperationKind operation : selected_operations) {
+          if (operation == McpOperationKind::kSignalNode) {
+            constraints.emplace_back(boost::json::object{
+                {"if",
+                 boost::json::object{
+                     {"properties",
+                      boost::json::object{
+                          {"operation", ConstStringSchema("node.signal")},
+                          {"state", ConstStringSchema("succeeded")}}},
+                     {"required", Required({"operation", "state"})}}},
+                {"then",
+                 boost::json::object{
+                     {"properties",
+                      boost::json::object{
+                          {"terminal_result_family",
+                           ConstStringSchema("runtime_command")},
+                          {"terminal_result", NodeSignalResultSchema()}}}}}});
+          }
           if (!IsTypedNodeLifecycleOperation(operation)) {
             continue;
           }
@@ -3430,7 +3546,8 @@ boost::json::object BuildMcpOperationOutputSchema(
   } else {
 #endif
     choices.emplace_back(
-        IsTypedNodeLifecycleOperation(operation)
+        operation == McpOperationKind::kSignalNode ? NodeSignalResultSchema()
+        : IsTypedNodeLifecycleOperation(operation)
             ? TypedNodeLifecycleMutationSchema(operation)
         : operation == McpOperationKind::kAddNode ? NodeAddMutationSchema()
         : operation == McpOperationKind::kRemoveNode

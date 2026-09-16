@@ -414,6 +414,7 @@ std::span<const std::string_view> ScenarioCommandFields(
   static constexpr auto kNodeReplace = Fields("node_replace");
   static constexpr auto kNodeRemove = Fields("node_remove");
   static constexpr auto kRoleMutation = Fields("role_mutation");
+  static constexpr auto kSignal = Fields("signal", "scope");
   switch (kind) {
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:
@@ -429,6 +430,8 @@ std::span<const std::string_view> ScenarioCommandFields(
       return kNone;
     case SimulationCommandKind::kSetBlockProductionPolicy:
       return kPolicy;
+    case SimulationCommandKind::kSignalNode:
+      return kSignal;
     case SimulationCommandKind::kSetMiningDifficulty:
       return kDifficulty;
     case SimulationCommandKind::kConnectPeer:
