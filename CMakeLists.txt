@@ -584,6 +584,7 @@ if(BUILD_TESTING)
     tests/unit/run_process_state_tests.cpp
     tests/unit/runtime_node_inventory_tests.cpp
     tests/unit/runtime_wallet_registry_tests.cpp
+    tests/unit/target_address_tests.cpp
     tests/unit/scenario_fields_tests.cpp
     tests/unit/scenario_workload_admission_tests.cpp
     tests/unit/scenario_service_tests.cpp
@@ -2197,6 +2198,13 @@ if(BUILD_TESTING)
   set_tests_properties(bbp-integrated-tui-live-transaction-load
     PROPERTIES
       PASS_REGULAR_EXPRESSION "load a=8 s=2 r=1 to=1 bp=1 d=1 p=2 c=1 f=1 cn=1"
+  )
+  add_test(NAME bbp-integrated-tui-target-addresses
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTEST_COMMAND=$<TARGET_FILE:bbp>"
+      "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+      "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/tui-target-addresses"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/tui_target_addresses.cmake"
   )
   add_test(NAME bbp-integrated-tui-exit-confirmation
     COMMAND "${CMAKE_COMMAND}"

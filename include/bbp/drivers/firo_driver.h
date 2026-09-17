@@ -87,6 +87,9 @@ class FiroDriver final : public ChainDriver {
   std::string CreateWalletAddress(
       const FiroNodeConfig& config, WalletMode wallet_mode,
       std::stop_token stop_token = {}) const override;
+  bool ValidateTargetAddress(const FiroNodeConfig& config,
+                             const std::string& address,
+                             std::stop_token stop_token = {}) const override;
   std::string CreateWalletFundingAddress(
       const FiroNodeConfig& config, WalletMode wallet_mode,
       const std::string& wallet_address,

@@ -71,6 +71,8 @@ enum class SimulationCommandKind {
   kRemoveNodes,
   kAssignRole,
   kRemoveRole,
+  kAddTargetAddress,
+  kRemoveTargetAddress,
   kCount,
 };
 
@@ -355,6 +357,7 @@ struct SimulationCommand {
   std::optional<SimulationNodeRemoveRequest> node_remove;
   std::optional<SimulationRoleMutationRequest> role_mutation = std::nullopt;
   std::optional<ProcessSignalRequest> signal_request = std::nullopt;
+  std::optional<std::string> target_address = std::nullopt;
   bool confirmed = false;
   std::optional<std::uint32_t> scheduled_event_sequence;
   std::shared_ptr<SimulationCommandControl> operation_control;

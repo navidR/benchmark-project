@@ -1,8 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "bbp/simulation_registry.h"
@@ -74,9 +78,19 @@ class RuntimeWalletRegistry {
   PreparedAppend PrepareReplace(std::uint64_t expected_generation,
                                 SimulationRegistry registry);
 
+  void SetTargetAddress(const std::string& address, bool enabled,
+                        const std::function<void()>& before_commit = {});
+  [[nodiscard]] std::vector<std::string> TargetAddresses() const;
+  [[nodiscard]] std::optional<std::string> SelectTargetAddress(
+      std::uint64_t transaction_index,
+      std::size_t managed_recipient_count) const;
+
  private:
   mutable std::mutex mutex_;
   std::shared_ptr<const RuntimeWalletSnapshot::Generation> generation_;
+  std::vector<std::string> target_addresses_;
 };
+
+void ValidateTargetAddressText(std::string_view address);
 
 }  // namespace bbp

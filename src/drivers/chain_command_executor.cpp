@@ -151,6 +151,8 @@ void ChainCommandExecutor::Execute(const SimulationCommand& command,
     case SimulationCommandKind::kRemoveNodes:
     case SimulationCommandKind::kAssignRole:
     case SimulationCommandKind::kRemoveRole:
+    case SimulationCommandKind::kAddTargetAddress:
+    case SimulationCommandKind::kRemoveTargetAddress:
     case SimulationCommandKind::kCount:
       throw std::runtime_error(
           "command must be handled by the simulator resource owner");

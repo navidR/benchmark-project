@@ -314,6 +314,10 @@ std::string_view SimulationCommandKindName(SimulationCommandKind kind) {
       return "assign_role";
     case SimulationCommandKind::kRemoveRole:
       return "remove_role";
+    case SimulationCommandKind::kAddTargetAddress:
+      return "add_target_address";
+    case SimulationCommandKind::kRemoveTargetAddress:
+      return "remove_target_address";
     case SimulationCommandKind::kCount:
       break;
   }
@@ -422,6 +426,10 @@ std::optional<SimulationCommandKind> SimulationCommandKindFromName(
   if (name == "remove_role") {
     return SimulationCommandKind::kRemoveRole;
   }
+  if (name == "add_target_address")
+    return SimulationCommandKind::kAddTargetAddress;
+  if (name == "remove_target_address")
+    return SimulationCommandKind::kRemoveTargetAddress;
   return std::nullopt;
 }
 
@@ -448,6 +456,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kSendWalletTransaction:
     case SimulationCommandKind::kAssignRole:
     case SimulationCommandKind::kRemoveRole:
+    case SimulationCommandKind::kAddTargetAddress:
       return true;
     case SimulationCommandKind::kIncreaseLogVerbosity:
     case SimulationCommandKind::kDecreaseLogVerbosity:
@@ -462,6 +471,7 @@ bool SimulationCommandRequiresConfirmation(SimulationCommandKind kind) {
     case SimulationCommandKind::kExportNodeReport:
     case SimulationCommandKind::kSetPerfCounters:
     case SimulationCommandKind::kAddNodes:
+    case SimulationCommandKind::kRemoveTargetAddress:
       return false;
     case SimulationCommandKind::kReplaceNode:
     case SimulationCommandKind::kRemoveNodes:

@@ -284,6 +284,9 @@ class ChainDriver {
   virtual std::string CreateWalletAddress(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       std::stop_token stop_token = {}) const = 0;
+  virtual bool ValidateTargetAddress(const ChainNodeConfig& config,
+                                     const std::string& address,
+                                     std::stop_token stop_token = {}) const;
   virtual std::string CreateWalletFundingAddress(
       const ChainNodeConfig& config, ChainWalletMode wallet_mode,
       const std::string& wallet_address, std::stop_token stop_token = {}) const;

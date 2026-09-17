@@ -7,6 +7,8 @@
 #include <string_view>
 #include <utility>
 
+#include "bbp/runtime_wallet_registry.h"
+
 namespace bbp {
 namespace {
 
@@ -28,7 +30,8 @@ std::size_t SimulationCommandPayloadCount(const SimulationCommand& command) {
          static_cast<std::size_t>(command.node_replace.has_value()) +
          static_cast<std::size_t>(command.node_remove.has_value()) +
          static_cast<std::size_t>(command.role_mutation.has_value()) +
-         static_cast<std::size_t>(command.signal_request.has_value());
+         static_cast<std::size_t>(command.signal_request.has_value()) +
+         static_cast<std::size_t>(command.target_address.has_value());
 }
 
 void RequirePayload(const SimulationCommand& command, bool expected_present,
@@ -412,6 +415,14 @@ void ValidateSimulationCommand(const SimulationCommand& command) {
     case SimulationCommandKind::kSendWalletTransaction:
       ValidateWalletSendCommand(command);
       break;
+    case SimulationCommandKind::kAddTargetAddress:
+    case SimulationCommandKind::kRemoveTargetAddress:
+      RequirePayload(command, command.target_address.has_value(), 1U);
+      ValidateTargetAddressText(*command.target_address);
+      if (command.node_id != "sim") {
+        throw std::invalid_argument("target address commands must target sim");
+      }
+      break;
     case SimulationCommandKind::kAddNodes:
       ValidateNodeAddCommand(command);
       break;
@@ -477,6 +488,8 @@ std::uint64_t SimulationCommandQueue::Push(SimulationCommandKind kind,
     case SimulationCommandKind::kSetPerfCounters:
     case SimulationCommandKind::kSendWalletTransaction:
     case SimulationCommandKind::kAddNodes:
+    case SimulationCommandKind::kAddTargetAddress:
+    case SimulationCommandKind::kRemoveTargetAddress:
     case SimulationCommandKind::kReplaceNode:
     case SimulationCommandKind::kRemoveNodes:
     case SimulationCommandKind::kAssignRole:
@@ -1068,6 +1081,8 @@ std::uint64_t SimulationCommandQueue::PushCommand(SimulationCommand command) {
   if ((command.kind == SimulationCommandKind::kAddNodes ||
        command.kind == SimulationCommandKind::kReplaceNode ||
        command.kind == SimulationCommandKind::kRemoveNodes ||
+       command.kind == SimulationCommandKind::kAddTargetAddress ||
+       command.kind == SimulationCommandKind::kRemoveTargetAddress ||
        command.kind == SimulationCommandKind::kAssignRole ||
        command.kind == SimulationCommandKind::kRemoveRole) &&
       !command.operation_control) {

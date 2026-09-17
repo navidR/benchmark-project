@@ -121,6 +121,13 @@ ChainTransactionObservation ChainDriver::ObserveTransactionUntil(
   return observation;
 }
 
+bool ChainDriver::ValidateTargetAddress(const ChainNodeConfig&,
+                                        const std::string&,
+                                        std::stop_token) const {
+  throw UnsupportedChainOperation("selected chain",
+                                  "external target addresses");
+}
+
 std::string ChainDriver::CreateWalletFundingAddress(
     const ChainNodeConfig&, ChainWalletMode, const std::string& wallet_address,
     std::stop_token) const {

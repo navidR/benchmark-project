@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "bbp/runtime_wallet_registry.h"
 #include "bbp/util.h"
 
 namespace bbp {
@@ -20,9 +21,9 @@ namespace {
 
 constexpr std::array<std::string_view,
 #ifdef BBP_FIRO_GUI_LAUNCHER
-                     38U
+                     40U
 #else
-                     37U
+                     39U
 #endif
                      >
     kCommandNames = {
@@ -63,6 +64,8 @@ constexpr std::array<std::string_view,
         "export-node-report",
         "perf-counters",
         "wallet-send",
+        "add-target",
+        "remove-target",
 #ifdef BBP_FIRO_GUI_LAUNCHER
         "firo-qt",
 #endif
@@ -170,6 +173,16 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
   }
 
   try {
+    if (tokens[0] == "add-target" || tokens[0] == "remove-target") {
+      RequireArgumentCount(tokens, 2U, tokens[0] + " <address>");
+      ValidateTargetAddressText(tokens[1]);
+      ParsedTuiCommand parsed;
+      parsed.kind = tokens[0] == "add-target"
+                        ? SimulationCommandKind::kAddTargetAddress
+                        : SimulationCommandKind::kRemoveTargetAddress;
+      parsed.target_address = tokens[1];
+      return parsed;
+    }
     if (tokens[0] == "add-nodes") {
       if (tokens.size() != 3U && tokens.size() != 4U) {
         throw std::runtime_error(

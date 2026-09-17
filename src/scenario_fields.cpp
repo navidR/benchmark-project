@@ -410,6 +410,7 @@ std::span<const std::string_view> ScenarioCommandFields(
   static constexpr auto kPartition = Fields("partition");
   static constexpr auto kPerf = Fields("perf_target", "perf_counters");
   static constexpr auto kWallet = Fields("wallet_send");
+  static constexpr auto kTargetAddress = Fields("target_address");
   static constexpr auto kNodeAdd = Fields("node_add");
   static constexpr auto kNodeReplace = Fields("node_replace");
   static constexpr auto kNodeRemove = Fields("node_remove");
@@ -461,6 +462,9 @@ std::span<const std::string_view> ScenarioCommandFields(
       return kPerf;
     case SimulationCommandKind::kSendWalletTransaction:
       return kWallet;
+    case SimulationCommandKind::kAddTargetAddress:
+    case SimulationCommandKind::kRemoveTargetAddress:
+      return kTargetAddress;
     case SimulationCommandKind::kAddNodes:
       return kNodeAdd;
     case SimulationCommandKind::kReplaceNode:
@@ -481,6 +485,8 @@ bool ScenarioCommandFieldAllowed(SimulationCommandKind kind,
   const std::span<const std::string_view> fields = ScenarioCommandFields(kind);
   if (field == "node") {
     return kind != SimulationCommandKind::kSetBlockProductionPolicy &&
+           kind != SimulationCommandKind::kAddTargetAddress &&
+           kind != SimulationCommandKind::kRemoveTargetAddress &&
            kind != SimulationCommandKind::kPartitionNodes &&
            kind != SimulationCommandKind::kHealPartition &&
            kind != SimulationCommandKind::kSetPerfCounters &&

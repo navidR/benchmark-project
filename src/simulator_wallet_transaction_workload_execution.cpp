@@ -70,6 +70,18 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
     std::uint32_t workload_count, std::stop_token stop_token,
     WalletWorkloadExecutionContext* execution) {
   const std::vector<WalletIdentity>& wallets = registry.wallets();
+  const auto select_target =
+      [&](std::uint64_t transaction_index) -> std::optional<std::string> {
+    if (execution && execution->select_target_address && wallets.size() > 1U &&
+        workload.mode == WalletPrivacyMode::kPublic &&
+        (workload.strategy == WalletTransferStrategy::kRandomBruteforce ||
+         workload.strategy == WalletTransferStrategy::kRandom ||
+         workload.strategy == WalletTransferStrategy::kRoundRobin)) {
+      return execution->select_target_address(transaction_index,
+                                              wallets.size() - 1U);
+    }
+    return std::nullopt;
+  };
   std::vector<WalletWorkloadFundingState> new_funding;
   std::vector<WalletWorkloadFundingState>* funding = nullptr;
   if (execution != nullptr && execution->prepared_funding != nullptr &&
@@ -341,6 +353,7 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
               std::string error_class;
               std::string error_message;
               bool submitted = false;
+              std::optional<std::string> target_address;
               bool submission_started = false;
               bool release_if_balance_unavailable = true;
               bool cancel_queue_after_settlement = false;
@@ -379,13 +392,14 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
                     error_message =
                         "bounded transaction observation capacity is full";
                   } else {
+                    target_address = select_target(task.transaction_index);
                     submission_started = true;
                     release_if_balance_unavailable = false;
                     transaction = driver.SubmitWalletTransaction(
                         sender_node.config,
                         ToChainWalletMode(registry.wallet_initialization()),
-                        receiver.address, task.plan.amount_satoshis,
-                        workload.fee_satoshis,
+                        target_address.value_or(receiver.address),
+                        task.plan.amount_satoshis, workload.fee_satoshis,
                         std::chrono::seconds(workload.timeout_sec),
                         load_stop_token);
                     const std::string& txid = RequireSingleWalletTransactionId(
@@ -538,7 +552,8 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
                           sender_funding.ready_balance_satoshis,
                           task.plan.amount_satoshis, task.plan.interval_before,
                           task.scheduled_simulation_elapsed,
-                          task.scheduled_wall_elapsed, transaction));
+                          task.scheduled_wall_elapsed, transaction,
+                          target_address));
                 }
                 WriteEvent(events_path, options.run_id, sender_node.config.id,
                            SimulationEventKind::kTransactionLoadAttempt,
@@ -546,7 +561,7 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
                                workload_index, workload_count, workload,
                                attempt_limit, task, sender, receiver, outcome,
                                latency, submitted ? &transaction : nullptr,
-                               error_class, error_message));
+                               error_class, error_message, target_address));
               } catch (...) {
                 record_infrastructure_error(std::current_exception());
               }
@@ -879,12 +894,14 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
       execution->record_accepted(1U);
     }
     ChainWalletTransactionResult transaction;
+    const auto target_address = select_target(transaction_index + 1U);
     try {
       transaction = driver.SendWalletTransaction(
           sender_node.config,
-          ToChainWalletMode(registry.wallet_initialization()), receiver.address,
-          plan_entry.amount_satoshis, workload.fee_satoshis,
-          std::chrono::seconds(workload.timeout_sec), stop_token);
+          ToChainWalletMode(registry.wallet_initialization()),
+          target_address.value_or(receiver.address), plan_entry.amount_satoshis,
+          workload.fee_satoshis, std::chrono::seconds(workload.timeout_sec),
+          stop_token);
     } catch (const ChainTransactionRejected&) {
       if (accounting) {
         static_cast<void>(accounting->RecordOutcome(
@@ -928,7 +945,7 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
             static_cast<uint64_t>(sender_funding.preparation_hashes.size()),
             sender_funding.ready_balance_satoshis, plan_entry.amount_satoshis,
             plan_entry.interval_before, scheduled_simulation_elapsed,
-            scheduled_wall_elapsed, transaction));
+            scheduled_wall_elapsed, transaction, target_address));
     std::shared_ptr<TransactionLoadConfirmation> confirmation;
     if (accounting) {
       confirmation = std::make_shared<TransactionLoadConfirmation>(

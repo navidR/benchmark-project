@@ -3042,7 +3042,8 @@ boost::json::value McpLiveApplication::ReadResource(
     case McpInformationFamily::kBalances:
     case McpInformationFamily::kWalletMetrics:
       data = SelectReportFields(
-          report, {"wallets_summary", "wallet_funding", "wallet_transactions"});
+          report, {"wallets_summary", "wallet_funding", "wallet_transactions",
+                   "target_addresses"});
       break;
     case McpInformationFamily::kMining:
       data = SelectReportFields(

@@ -271,6 +271,44 @@ BOOST_AUTO_TEST_CASE(firo_builds_isolated_manual_gui_command) {
   std::filesystem::remove_all(test_dir);
 }
 
+BOOST_AUTO_TEST_CASE(firo_validates_external_target_addresses) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"isvalid":true},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalid":false},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalid":"true"},"error":null,"id":"bbp"})",
+      R"({"result":{},"error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  auto served = std::async(std::launch::async, [&] {
+    return ServeRpcResponses(acceptor, responses, &requests);
+  });
+  bbp::FiroNodeConfig config;
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  BOOST_TEST(driver.ValidateTargetAddress(config, "external"));
+  BOOST_TEST(!driver.ValidateTargetAddress(config, "wrong-network"));
+  BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "malformed"),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "missing"),
+                    std::runtime_error);
+  BOOST_TEST(served.get() == std::vector<std::string>(4U, "validateaddress"),
+             boost::test_tools::per_element());
+  BOOST_TEST(requests.front()
+                 .as_object()
+                 .at("params")
+                 .as_array()
+                 .front()
+                 .as_string() == "external");
+}
+
 BOOST_AUTO_TEST_CASE(firo_reads_normalized_chain_metrics) {
   namespace asio = boost::asio;
   using tcp = asio::ip::tcp;

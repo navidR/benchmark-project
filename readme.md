@@ -947,6 +947,27 @@ driver, records the operator command plus wallet submission and per-node
 visibility events, and never accepts signing keys or raw recipient addresses
 from this surface.
 
+To include an external Firo-Qt receiving address in ongoing public-wallet
+traffic, open the command palette (`c`) and use:
+
+```text
+add-target <address>
+remove-target <address>
+```
+
+BBP validates the address against the running Firo network before adding it.
+Targets receive a share of `random_bruteforce`, `random`, and `round_robin`
+workloads at the existing total transaction rate. Each target gets one slot
+per recipient cycle alongside managed recipients; duplicates do not add weight.
+Targets never become senders or managed wallets. Explicit fan-out and hotspot
+workloads keep their configured recipients, and private-wallet traffic is unchanged.
+The wallet view shows active targets and submission counts; these counts are not
+external-wallet balances. BBP still tracks transaction confirmation across its
+managed nodes. Removing a target stops future selection, but in-flight payments
+may finish. Targets belong to the current run and must be added again for a new run.
+The equivalent `simulation.command` actions are `add_target_address` and
+`remove_target_address`, each with a `target_address` field and no `node` field.
+
 Per-node cgroup limits can also be changed live through typed, confirmed
 commands:
 

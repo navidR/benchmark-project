@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "bbp/network.h"
+#include "bbp/runtime_wallet_registry.h"
 #include "bbp/scenario_fields.h"
 #include "bbp/scenario_service.h"
 #include "bbp/simulation_command_queue.h"
@@ -314,6 +315,8 @@ SimulationCommand ParseScheduledSimulationCommand(
   command.kind = kind;
   command.confirmed = true;
   if (kind == SimulationCommandKind::kSetBlockProductionPolicy ||
+      kind == SimulationCommandKind::kAddTargetAddress ||
+      kind == SimulationCommandKind::kRemoveTargetAddress ||
       kind == SimulationCommandKind::kPartitionNodes ||
       kind == SimulationCommandKind::kHealPartition ||
       kind == SimulationCommandKind::kSetPerfCounters ||
@@ -326,10 +329,14 @@ SimulationCommand ParseScheduledSimulationCommand(
     command.node_id = ScenarioCommandNodeId(object, "node", options);
   }
 
-  if (kind == SimulationCommandKind::kSignalNode ||
-      kind == SimulationCommandKind::kSignalWallet ||
-      kind == SimulationCommandKind::kSignalMiner ||
-      kind == SimulationCommandKind::kSignalHelper) {
+  if (kind == SimulationCommandKind::kAddTargetAddress ||
+      kind == SimulationCommandKind::kRemoveTargetAddress) {
+    command.target_address = JsonStringField(object, "target_address");
+    ValidateTargetAddressText(*command.target_address);
+  } else if (kind == SimulationCommandKind::kSignalNode ||
+             kind == SimulationCommandKind::kSignalWallet ||
+             kind == SimulationCommandKind::kSignalMiner ||
+             kind == SimulationCommandKind::kSignalHelper) {
     const auto* signal = object.if_contains("signal");
     if (signal == nullptr ||
         (!signal->is_string() && !signal->is_int64() && !signal->is_uint64())) {

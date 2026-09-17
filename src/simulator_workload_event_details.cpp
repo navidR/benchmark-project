@@ -230,7 +230,8 @@ std::string WalletTransactionDetail(
     std::chrono::milliseconds interval_before,
     std::optional<std::chrono::milliseconds> scheduled_simulation_elapsed,
     std::optional<std::chrono::milliseconds> scheduled_wall_elapsed,
-    const ChainWalletTransactionResult& transaction) {
+    const ChainWalletTransactionResult& transaction,
+    const std::optional<std::string>& target_address) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
@@ -256,6 +257,12 @@ std::string WalletTransactionDetail(
   detail["receiver_node"] = receiver.node;
   detail["sender_address"] = sender.address;
   detail["receiver_address"] = receiver.address;
+  if (target_address) {
+    detail["receiver_wallet_index"] = nullptr;
+    detail["receiver_node"] = nullptr;
+    detail["receiver_address"] = *target_address;
+    detail["external_receiver"] = true;
+  }
   detail["funding_miner_node"] = funding_miner_node;
   detail["funding_blocks_per_wallet"] = workload.funding_blocks_per_wallet;
   detail["funding_hash_count"] = funding_hash_count;
@@ -308,7 +315,8 @@ std::string TransactionLoadAttemptDetail(
     const WalletIdentity& receiver, TransactionLoadOutcome outcome,
     std::chrono::microseconds latency,
     const ChainWalletTransactionResult* transaction,
-    std::string_view error_class, std::string_view error_message) {
+    std::string_view error_class, std::string_view error_message,
+    const std::optional<std::string>& target_address) {
   boost::json::object detail;
   detail["workload_index"] = workload_index;
   detail["workload_count"] = workload_count;
@@ -326,6 +334,12 @@ std::string TransactionLoadAttemptDetail(
   detail["receiver_wallet_index"] = receiver.wallet_index;
   detail["sender_node"] = sender.node;
   detail["receiver_node"] = receiver.node;
+  if (target_address) {
+    detail["receiver_wallet_index"] = nullptr;
+    detail["receiver_node"] = nullptr;
+    detail["receiver_address"] = *target_address;
+    detail["external_receiver"] = true;
+  }
   detail["amount"] = FormatFixed8Amount(task.plan.amount_satoshis);
   detail["amount_satoshis"] = task.plan.amount_satoshis;
   detail["fee_policy"] =

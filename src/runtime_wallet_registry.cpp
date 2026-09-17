@@ -1,5 +1,6 @@
 #include "bbp/runtime_wallet_registry.h"
 
+#include <algorithm>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -11,6 +12,61 @@ struct RuntimeWalletSnapshot::Generation {
   std::uint64_t sequence = 0U;
   SimulationRegistry registry;
 };
+
+void ValidateTargetAddressText(std::string_view address) {
+  if (address.empty() || address.size() > 512U ||
+      std::any_of(address.begin(), address.end(),
+                  [](unsigned char ch) { return ch <= 32U || ch >= 127U; })) {
+    throw std::invalid_argument(
+        "target address must be 1..512 printable non-space characters");
+  }
+}
+
+void RuntimeWalletRegistry::SetTargetAddress(
+    const std::string& address, bool enabled,
+    const std::function<void()>& before_commit) {
+  ValidateTargetAddressText(address);
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (enabled) {
+    for (const auto& wallet : generation_->registry.wallets()) {
+      if (wallet.address == address || wallet.funding_address == address) {
+        throw std::invalid_argument(
+            "address already belongs to a managed wallet");
+      }
+    }
+  }
+  auto updated = target_addresses_;
+  const auto found = std::find(updated.begin(), updated.end(), address);
+  if (enabled && found == updated.end()) {
+    updated.push_back(address);
+  } else if (!enabled && found != updated.end()) {
+    updated.erase(found);
+  }
+  if (before_commit) before_commit();
+  target_addresses_.swap(updated);
+}
+
+std::vector<std::string> RuntimeWalletRegistry::TargetAddresses() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return target_addresses_;
+}
+
+std::optional<std::string> RuntimeWalletRegistry::SelectTargetAddress(
+    std::uint64_t transaction_index,
+    std::size_t managed_recipient_count) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (target_addresses_.empty()) return std::nullopt;
+  if (managed_recipient_count >
+      std::numeric_limits<std::size_t>::max() - target_addresses_.size()) {
+    throw std::overflow_error("target address recipient count overflow");
+  }
+  // Reserve one slot per external address; other slots keep the workload's
+  // managed recipient. Targets never become senders or consume node indexes.
+  const auto slot =
+      transaction_index % (managed_recipient_count + target_addresses_.size());
+  if (slot < target_addresses_.size()) return target_addresses_.at(slot);
+  return std::nullopt;
+}
 
 std::uint64_t RuntimeWalletSnapshot::generation() const {
   return generation_ ? generation_->sequence : 0U;

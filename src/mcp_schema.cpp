@@ -392,6 +392,11 @@ boost::json::object SignalDeliverySchema() {
 }
 
 boost::json::object GenericFieldSchema(std::string_view field) {
+  if (field == "target_address") {
+    auto schema = StringSchema(1U);
+    schema["maxLength"] = 512U;
+    return schema;
+  }
   if (field == "signal") return SignalValueSchema();
   if (field == "enabled" || field == "native_mining" || field == "all_peers" ||
       field == "bidirectional" || field == "active" || field == "isolated" ||

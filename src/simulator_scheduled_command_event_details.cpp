@@ -222,6 +222,9 @@ std::string SimulationCommandDetail(const SimulationCommand& command,
     send["timeout_sec"] = command.wallet_send->timeout_sec;
     detail["wallet_send"] = std::move(send);
   }
+  if (command.target_address) {
+    detail["target_address"] = *command.target_address;
+  }
   if (command.node_add) {
     boost::json::object add;
     add["chain"] = std::string(ChainKindName(command.node_add->chain));

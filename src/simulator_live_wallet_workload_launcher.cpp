@@ -150,6 +150,7 @@ LiveWalletWorkloadLauncher MakeLiveWalletWorkloadLauncher(
         auto worker_lease = workload_service.AcquireWorkerLease();
         record->worker = std::thread([&options, &events_path, &driver,
                                       &node_inventory, &transaction_tracker,
+                                      &runtime_wallet_registry,
                                       &block_generation_mutex, record,
                                       worker_lease = std::move(worker_lease)] {
           const std::stop_token service_stop_token = worker_lease.stop_token();
@@ -257,6 +258,12 @@ LiveWalletWorkloadLauncher MakeLiveWalletWorkloadLauncher(
               CombinedStopToken execution_stop(service_stop_token,
                                                epoch_stop_token);
               WalletWorkloadExecutionContext execution{
+                  .select_target_address =
+                      [&runtime_wallet_registry](std::uint64_t index,
+                                                 std::size_t count) {
+                        return runtime_wallet_registry.SelectTargetAddress(
+                            index, count);
+                      },
                   .accounting = record->accounting,
                   .workload_id = record->id,
                   .started_at = record->started_at,

@@ -1151,6 +1151,20 @@ std::uint64_t FiroDriver::ReadBlockNonRewardTransactionCount(
   return static_cast<std::uint64_t>(transactions->as_array().size() - 1U);
 }
 
+bool FiroDriver::ValidateTargetAddress(const FiroNodeConfig& config,
+                                       const std::string& address,
+                                       std::stop_token stop_token) const {
+  const auto result = RpcCall(config, "validateaddress",
+                              boost::json::array{address}, stop_token);
+  if (!result.is_object())
+    throw std::runtime_error("validateaddress returned a non-object");
+  const auto* valid = result.as_object().if_contains("isvalid");
+  if (valid == nullptr || !valid->is_bool()) {
+    throw std::runtime_error("validateaddress returned no boolean isvalid");
+  }
+  return valid->as_bool();
+}
+
 std::string FiroDriver::CreateWalletAddress(const FiroNodeConfig& config,
                                             WalletMode wallet_mode,
                                             std::stop_token stop_token) const {

@@ -1500,7 +1500,8 @@ void DrawCommandPalette(int rows, int cols, std::string_view input,
   mvaddch(top + kPopupRows - 1, left, ACS_LLCORNER);
   mvaddch(top + kPopupRows - 1, left + popup_cols - 1, ACS_LRCORNER);
   AddText(top + 1, left + 2, popup_cols - 4,
-          "Live command: add-nodes grows capacity (1..16 per request)", A_BOLD);
+          "Live command: add-target <address>  remove-target <address>",
+          A_BOLD);
   AddText(top + 2, left + 2, popup_cols - 4,
           "block-production <probability> <period-ms>  mining-difficulty "
           "<value>");
@@ -2088,9 +2089,42 @@ const boost::json::object* LastWalletTransaction(
 }
 
 void DrawSelectedWalletDetail(int top, int bottom, int cols,
+                              const boost::json::object& report,
                               const boost::json::object* wallet) {
   if (top < 0 || bottom - top < 4 || cols <= 0) {
     return;
+  }
+  const auto* targets = report.if_contains("target_addresses");
+  if (targets != nullptr && targets->is_array()) {
+    std::size_t remaining = 0U;
+    for (const auto& value : targets->as_array()) {
+      if (value.is_object() &&
+          JsonBool(value.as_object(), "active").value_or(false)) {
+        ++remaining;
+      }
+    }
+    if (remaining != 0U && bottom - top >= 7) {
+      DrawHorizontalLine(top++);
+      AddText(top++, 0, cols,
+              "External Targets (" + std::to_string(remaining) + ")", A_BOLD);
+      for (const auto& value : targets->as_array()) {
+        if (!value.is_object() ||
+            !JsonBool(value.as_object(), "active").value_or(false)) {
+          continue;
+        }
+        if (bottom - top < 6) break;
+        const auto& target = value.as_object();
+        AddText(top++, 0, cols,
+                JsonString(target, "address", "-") + "  submitted=" +
+                    JsonIntegerText(target, "transactions_submitted", "0"));
+        --remaining;
+      }
+      if (remaining != 0U) {
+        AddText(top++, 0, cols,
+                "+" + std::to_string(remaining) + " more targets",
+                COLOR_PAIR(kColorMuted));
+      }
+    }
   }
   DrawHorizontalLine(top);
   AddText(top + 1, 0, cols, "Selected Wallet", A_BOLD);
@@ -2628,7 +2662,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
                              selected_node, NodeAt(*nodes, selected_node));
     } else if (view == TuiView::kWallets) {
       DrawSelectedWalletDetail(
-          detail_top, content_bottom, cols,
+          detail_top, content_bottom, cols, report,
           wallets == nullptr ? nullptr : WalletAt(*wallets, selected_wallet));
     } else if (view == TuiView::kTopology) {
       DrawSelectedTopologyDetail(
@@ -2831,6 +2865,12 @@ bool QueueParsedNodeCommand(
       if (!parsed.block_production_policy) {
         throw std::runtime_error("block production policy is missing");
       }
+    } else if (parsed.kind == SimulationCommandKind::kAddTargetAddress ||
+               parsed.kind == SimulationCommandKind::kRemoveTargetAddress) {
+      if (!parsed.target_address)
+        throw std::runtime_error("target address is missing");
+      node_id = "sim";
+      target = "receive-only target " + *parsed.target_address;
     } else if (parsed.kind == SimulationCommandKind::kAddNodes) {
       if (!parsed.node_add) {
         throw std::runtime_error("node-add payload is missing");
@@ -3007,6 +3047,14 @@ bool QueueParsedNodeCommand(
         }
         sequence = command_queue->PushPerfCounters(std::move(*perf_target),
                                                    parsed.perf_counter_kinds);
+      } else if (parsed.kind == SimulationCommandKind::kAddTargetAddress ||
+                 parsed.kind == SimulationCommandKind::kRemoveTargetAddress) {
+        SimulationCommand command;
+        command.kind = parsed.kind;
+        command.node_id = "sim";
+        command.target_address = parsed.target_address;
+        command.confirmed = confirmed;
+        sequence = command_queue->PushRuntimeCommand(std::move(command));
       } else if (parsed.kind == SimulationCommandKind::kSendWalletTransaction) {
         if (!wallet_send) {
           throw std::runtime_error("wallet send payload is missing");

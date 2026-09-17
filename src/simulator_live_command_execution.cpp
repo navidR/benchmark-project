@@ -204,6 +204,8 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
             command.kind != SimulationCommandKind::kRemoveRole;
         const bool needs_direct_node =
             needs_runtime_snapshot &&
+            command.kind != SimulationCommandKind::kAddTargetAddress &&
+            command.kind != SimulationCommandKind::kRemoveTargetAddress &&
             command.kind != SimulationCommandKind::kSetPerfCounters &&
             command.kind != SimulationCommandKind::kSendWalletTransaction &&
             command.kind != SimulationCommandKind::kPartitionNodes &&
@@ -424,6 +426,43 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
             }
             throw;
           }
+        } else if (command.kind == SimulationCommandKind::kAddTargetAddress ||
+                   command.kind ==
+                       SimulationCommandKind::kRemoveTargetAddress) {
+          if (!command.target_address) {
+            throw std::invalid_argument("target address is missing");
+          }
+          const bool enabled =
+              command.kind == SimulationCommandKind::kAddTargetAddress;
+          if (enabled) {
+            if (!context.wallets_initialized.load(std::memory_order_acquire)) {
+              throw std::runtime_error("wallet registry is not initialized");
+            }
+            const auto wallets = context.runtime_wallet_registry.Snapshot();
+            if (wallets.registry().wallet_initialization().mode !=
+                WalletPrivacyMode::kPublic) {
+              throw std::invalid_argument(
+                  "external targets currently require public wallet mode");
+            }
+            bool validated = false;
+            for (const auto& candidate : nodes) {
+              if (!NodeProcessRunning(candidate)) continue;
+              validated = context.driver.ValidateTargetAddress(
+                  candidate.config, *command.target_address,
+                  command_stop_token);
+              if (!validated)
+                throw std::invalid_argument(
+                    "invalid target address for the running chain network");
+              break;
+            }
+            if (!validated)
+              throw std::runtime_error(
+                  "no running node can validate the target address");
+          }
+          context.runtime_wallet_registry.SetTargetAddress(
+              *command.target_address, enabled, authorize_resource_mutation);
+          if (command.operation_control)
+            command.operation_control->MarkCommitted();
         } else if (command.kind == SimulationCommandKind::kExportNodeReport) {
           ExportNodeReport(context.run_root, command);
         } else if (command.kind == SimulationCommandKind::kSetPerfCounters) {
@@ -1254,7 +1293,7 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
                      SimulationEventKind::kOperatorCommandCompleted,
                      SimulationCommandDetail(command, {}, &command_outcome));
         } catch (const std::exception& error) {
-          if (command_outcome.signal_delivery ||
+          if (command_outcome.signal_delivery || command.target_address ||
               (command.kind == SimulationCommandKind::kAddNodes &&
                !command_outcome.added_node_ids.empty()) ||
               (command.kind == SimulationCommandKind::kReplaceNode &&

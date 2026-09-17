@@ -2194,6 +2194,57 @@ void RememberWalletAddressEvent(
   CopyOptionalWalletModeField(object, "mode", &wallet);
 }
 
+boost::json::object& TargetAddressReport(boost::json::array* targets,
+                                         const std::string& address) {
+  for (auto& value : *targets) {
+    if (OptionalStringField(value.as_object(), "address") == address)
+      return value.as_object();
+  }
+  targets->emplace_back(
+      boost::json::object{{"address", address},
+                          {"active", false},
+                          {"transactions_submitted", std::uint64_t{0}},
+                          {"amount_submitted_satoshis", std::uint64_t{0}}});
+  return targets->back().as_object();
+}
+
+void RememberTargetAddressCommand(const boost::json::object& event,
+                                  boost::json::array* targets) {
+  const auto detail = ParseEventDetail(event);
+  if (!detail.is_object()) return;
+  const auto& object = detail.as_object();
+  const auto command = OptionalStringField(object, "kind");
+  if (command != "add_target_address" && command != "remove_target_address")
+    return;
+  const auto address = OptionalStringField(object, "target_address");
+  if (!address.empty()) {
+    TargetAddressReport(targets, address)["active"] =
+        command == "add_target_address";
+  }
+}
+
+void RememberTargetAddressPayment(const boost::json::value& detail,
+                                  boost::json::array* targets) {
+  if (!detail.is_object()) return;
+  const auto& object = detail.as_object();
+  const auto* external = object.if_contains("external_receiver");
+  if (external == nullptr || !external->is_bool() || !external->as_bool())
+    return;
+  const auto address = OptionalStringField(object, "receiver_address");
+  if (address.empty()) return;
+  auto& target = TargetAddressReport(targets, address);
+  const auto count = target.at("transactions_submitted").as_uint64();
+  const auto total = target.at("amount_submitted_satoshis").as_uint64();
+  const auto amount =
+      OptionalUint64Field(object, "amount_satoshis").value_or(0U);
+  if (count == std::numeric_limits<std::uint64_t>::max() ||
+      total > std::numeric_limits<std::uint64_t>::max() - amount) {
+    throw std::overflow_error("target address payment counters overflow");
+  }
+  target["transactions_submitted"] = count + 1U;
+  target["amount_submitted_satoshis"] = total + amount;
+}
+
 void RememberWalletTransactionEvent(
     const boost::json::value& detail,
     std::map<std::uint64_t, WalletReport>* wallets) {
@@ -2870,6 +2921,7 @@ struct IncrementalRunReport::Impl {
         "topology_edge_updates",
         "topology_edge_rollback_failures",
         "wallet_funding",
+        "target_addresses",
         "wallet_transactions",
         "workload_instances",
         "workload_history",
@@ -3802,11 +3854,13 @@ struct IncrementalRunReport::Impl {
         ++wallet_transaction_count;
         boost::json::value detail = ParseEventDetail(event);
         RememberWalletTransactionEvent(detail, &wallets);
+        RememberTargetAddressPayment(detail, &Array("target_addresses"));
         AppendBoundedEventSummary(event, kMaximumWalletTransactionSummaries,
                                   &Array("wallet_transactions"));
         break;
       }
       case SimulationEventKind::kOperatorCommandCompleted:
+        RememberTargetAddressCommand(event, &Array("target_addresses"));
         AppendOperatorCommandSummary(event, OperatorCommandStatus::kCompleted,
                                      &Array("operator_commands"));
         ApplyBlockProductionPolicyEvent(event, &report);

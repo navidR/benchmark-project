@@ -61,6 +61,7 @@ struct ParsedTuiCommand {
   std::optional<SimulationRoleMutationRequest> role_mutation = std::nullopt;
   std::optional<TuiLocalAction> local_action = std::nullopt;
   std::optional<ProcessSignalRequest> signal_request = std::nullopt;
+  std::optional<std::string> target_address = std::nullopt;
 };
 
 }  // namespace bbp

@@ -54,6 +54,8 @@ struct WalletWorkloadFundingState {
 };
 
 struct WalletWorkloadExecutionContext {
+  std::function<std::optional<std::string>(std::uint64_t, std::size_t)>
+      select_target_address = {};
   std::shared_ptr<TransactionLoadAccounting> accounting;
   std::string workload_id;
   std::chrono::steady_clock::time_point started_at;

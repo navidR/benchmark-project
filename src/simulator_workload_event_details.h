@@ -78,7 +78,8 @@ std::string WalletTransactionDetail(
     std::chrono::milliseconds interval_before,
     std::optional<std::chrono::milliseconds> scheduled_simulation_elapsed,
     std::optional<std::chrono::milliseconds> scheduled_wall_elapsed,
-    const ChainWalletTransactionResult& transaction);
+    const ChainWalletTransactionResult& transaction,
+    const std::optional<std::string>& target_address = std::nullopt);
 std::string TransactionLoadAttemptDetail(
     std::uint32_t workload_index, std::uint32_t workload_count,
     const WalletTransactionsWorkload& workload,
@@ -87,7 +88,8 @@ std::string TransactionLoadAttemptDetail(
     const WalletIdentity& receiver, TransactionLoadOutcome outcome,
     std::chrono::microseconds latency,
     const ChainWalletTransactionResult* transaction,
-    std::string_view error_class, std::string_view error_message);
+    std::string_view error_class, std::string_view error_message,
+    const std::optional<std::string>& target_address = std::nullopt);
 std::string TransactionLoadProgressDetail(
     std::uint32_t workload_index, std::uint32_t workload_count,
     const TransactionLoadSnapshot& snapshot);
