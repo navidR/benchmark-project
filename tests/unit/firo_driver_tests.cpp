@@ -1,3 +1,5 @@
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -179,7 +181,7 @@ BOOST_AUTO_TEST_CASE(firo_builds_isolated_manual_gui_command) {
   BOOST_CHECK(std::ranges::find(connection->arguments, "-disablewallet") ==
               connection->arguments.end());
   BOOST_TEST(connection->ShellCommand().starts_with(
-      "'" + std::filesystem::canonical(qt_binary).string() + "' '-regtest'"));
+      "'" + std::filesystem::canonical(qt_binary).string() + "' -regtest"));
   const std::filesystem::perms permissions =
       std::filesystem::status(connection->data_dir).permissions();
   BOOST_CHECK((permissions & std::filesystem::perms::owner_all) ==
@@ -188,6 +190,61 @@ BOOST_AUTO_TEST_CASE(firo_builds_isolated_manual_gui_command) {
               std::filesystem::perms::none);
   BOOST_CHECK((permissions & std::filesystem::perms::others_all) ==
               std::filesystem::perms::none);
+
+  std::vector<bbp::ChainNodeConfig> peers;
+  for (unsigned index = 0U; index < 20U; ++index) {
+    auto peer = config;
+    peer.p2p_host = "10.77.0." + std::to_string(index + 2U);
+    peers.push_back(std::move(peer));
+  }
+  peers.push_back(
+      config);  // A repeated endpoint must not consume another slot.
+  const auto all_peers =
+      driver.BuildOperatorConnectionCommand(config, run_root, peers);
+  BOOST_REQUIRE(all_peers);
+  BOOST_TEST(std::count_if(all_peers->arguments.begin(),
+                           all_peers->arguments.end(), [](const auto& arg) {
+                             return arg.starts_with("-connect=");
+                           }) == 20);
+  BOOST_CHECK(std::ranges::find(all_peers->arguments, "-maxconnections=20") !=
+              all_peers->arguments.end());
+  for (unsigned index = 0U; index < 20U; ++index) {
+    BOOST_TEST(all_peers->arguments[2U + index] ==
+               "-connect=10.77.0." + std::to_string(index + 2U) + ":19168");
+  }
+  peers.back().p2p_host = "0.0.0.0";
+  BOOST_CHECK_THROW(
+      driver.BuildOperatorConnectionCommand(config, run_root, peers),
+      std::runtime_error);
+  peers.back() = config;
+  peers.back().network = static_cast<bbp::ChainNetwork>(1);
+  BOOST_CHECK_THROW(
+      driver.BuildOperatorConnectionCommand(config, run_root, peers),
+      std::runtime_error);
+
+  if (geteuid() == 0) {
+    // Model a root Docker run below a desktop user's directory.
+    BOOST_REQUIRE(chown(test_dir.c_str(), 65534U, 65534U) == 0);
+    const auto desktop =
+        driver.BuildOperatorConnectionCommand(config, run_root);
+    struct stat owner{};
+    BOOST_REQUIRE(stat(desktop->data_dir.c_str(), &owner) == 0);
+    BOOST_TEST(owner.st_uid == 65534U);
+    BOOST_TEST(owner.st_gid == 65534U);
+    BOOST_TEST((owner.st_mode & 0777U) == 0700U);
+    const pid_t child = fork();
+    if (child == 0) {
+      if (setgid(65534U) != 0 || setuid(65534U) != 0) {
+        _exit(1);
+      }
+      _exit(mkdir((desktop->data_dir / "regtest").c_str(), 0700) == 0 ? 0 : 2);
+    }
+    BOOST_REQUIRE(child > 0);
+    int status = 0;
+    BOOST_REQUIRE(waitpid(child, &status, 0) == child);
+    BOOST_REQUIRE(WIFEXITED(status));
+    BOOST_TEST(WEXITSTATUS(status) == 0);
+  }
 
   config.p2p_port = 0U;
   BOOST_CHECK_THROW(driver.BuildOperatorConnectionCommand(config, run_root),

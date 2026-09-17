@@ -11,12 +11,14 @@ struct SimulatorLogVisualRow {
   std::size_t byte_offset = 0U;
   std::string text;
   bool starts_record = false;
+  bool copyable_command = false;
 };
 
 class SimulatorLogPane {
  public:
   void Refresh(const std::vector<std::string>& records,
-               std::size_t content_width, std::size_t visible_rows);
+               std::size_t content_width, std::size_t visible_rows,
+               const std::vector<std::string>& operator_argv = {});
 
   void ScrollUp(std::size_t row_count);
   void ScrollDown(std::size_t row_count);

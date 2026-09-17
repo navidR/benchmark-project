@@ -20,6 +20,7 @@
 
 #include "bbp/operator_connection.h"
 #include "bbp/simulation_cancelled.h"
+#include "bbp/simulator_log_pane.h"
 #ifdef BBP_FIRO_GUI_LAUNCHER
 #include "bbp/drivers/firo_gui_launcher.h"
 #endif
@@ -250,12 +251,63 @@ BOOST_AUTO_TEST_CASE(operator_connection_renders_every_argv_element) {
   connection.executable = "/tmp/Firo GUI/firo-qt";
   connection.arguments = {"-regtest", "-datadir=/tmp/a'b", "$(touch /tmp/x)"};
   BOOST_TEST(connection.ShellCommand() ==
-             "'/tmp/Firo GUI/firo-qt' '-regtest' "
+             "'/tmp/Firo GUI/firo-qt' -regtest "
              "'-datadir=/tmp/a'\"'\"'b' '$(touch /tmp/x)'");
 
   connection.executable.clear();
   BOOST_CHECK_THROW(static_cast<void>(connection.ShellCommand()),
                     std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(operator_command_log_copy_executes_exact_arguments) {
+  bbp::OperatorConnectionCommand connection;
+  connection.executable = "/usr/bin/printf";
+  connection.arguments = {"%s\\0", "-regtest",
+                          "",      "two words",
+                          "a'b",   "$HOME;$(false);`false`",
+                          "*",     std::string(200U, '\'')};
+  for (unsigned index = 0U; index < 20U; ++index) {
+    connection.arguments.push_back("-connect=10.77.0." +
+                                   std::to_string(index + 2U) + ":18168");
+  }
+  std::vector<std::string> argv{connection.executable.string()};
+  argv.insert(argv.end(), connection.arguments.begin(),
+              connection.arguments.end());
+  std::string expected;
+  for (std::size_t index = 1U; index < connection.arguments.size(); ++index) {
+    expected += connection.arguments[index];
+    expected.push_back('\0');
+  }
+  const auto output = std::filesystem::temp_directory_path() /
+                      ("bbp-command-copy-" + std::to_string(getpid()));
+  const std::string record =
+      "2026-09-17 [info] manual Firo GUI command: " + connection.ShellCommand();
+  for (const std::size_t width : {16U, 38U, 78U, 118U, 158U}) {
+    bbp::SimulatorLogPane pane;
+    pane.Refresh({record}, width, 1000U, argv);
+    std::string copied;
+    for (const auto& row : pane.Rows()) {
+      BOOST_TEST(row.copyable_command);
+      BOOST_TEST(row.text.size() <= width);
+      copied += row.text + "\n";
+    }
+    const std::string script =
+        "{\n" + copied + "} > " + bbp::PosixShellQuote(output.string());
+    const pid_t child = fork();
+    if (child == 0) {
+      execl("/bin/sh", "sh", "-c", script.c_str(), static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    BOOST_REQUIRE(child > 0);
+    int status = 0;
+    BOOST_REQUIRE(waitpid(child, &status, 0) == child);
+    BOOST_REQUIRE(WIFEXITED(status));
+    BOOST_TEST(WEXITSTATUS(status) == 0);
+    std::ifstream stream(output, std::ios::binary);
+    const std::string actual{std::istreambuf_iterator<char>(stream), {}};
+    BOOST_CHECK(actual == expected);
+  }
+  std::filesystem::remove(output);
 }
 
 BOOST_AUTO_TEST_CASE(operator_connection_is_recovered_from_run_report) {
@@ -272,6 +324,48 @@ BOOST_AUTO_TEST_CASE(operator_connection_is_recovered_from_run_report) {
 }
 
 #ifdef BBP_FIRO_GUI_LAUNCHER
+BOOST_AUTO_TEST_CASE(firo_qt_launcher_validates_all_twenty_peers) {
+  auto connection = LauncherConnection(18444U);
+  boost::json::array peers{"127.0.0.1:18444"};
+  for (unsigned index = 1U; index < 20U; ++index) {
+    const std::string endpoint = "127.0.0.1:" + std::to_string(18444U + index);
+    peers.emplace_back(endpoint);
+    connection.arguments.insert(connection.arguments.begin() + 2 + index,
+                                "-connect=" + endpoint);
+  }
+  for (auto& arg : connection.arguments) {
+    if (arg == "-maxconnections=1") {
+      arg = "-maxconnections=20";
+    }
+  }
+  auto report = LauncherReport("firo-1", 18444U);
+  SetLauncherConnection(&report, connection);
+  report.at("operator_connection_command").as_object()["peer_endpoints"] =
+      peers;
+  bbp::FiroQtLauncherService service([&](std::string_view, std::stop_token) {
+    return bbp::FiroQtLauncherAuthority{1U, "firo-1", connection};
+  });
+  const auto launcher = service.ReplaceFromReport(report, "firo-1");
+  BOOST_TEST(launcher.operator_command == connection.ShellCommand());
+  for (const char* invalid :
+       {"0.0.0.0:18168", "224.0.0.1:18168", "127.0.0.1:0", "127.0.0.1:65536",
+        "127.0.0.1:18444", "127.0.0.1:42;id"}) {
+    auto altered = report;
+    altered.at("operator_connection_command")
+        .as_object()
+        .at("peer_endpoints")
+        .as_array()
+        .back() = invalid;
+    BOOST_CHECK_THROW(service.ReplaceFromReport(altered, "firo-1"),
+                      std::runtime_error);
+  }
+  connection.arguments.back() = "-upnp=1";
+  SetLauncherConnection(&report, connection);
+  BOOST_CHECK_THROW(service.ReplaceFromReport(report, "firo-1"),
+                    std::runtime_error);
+  service.CloseAndCleanup();
+}
+
 BOOST_AUTO_TEST_CASE(
     firo_qt_launcher_has_exact_content_mode_execution_and_cleanup) {
   const std::filesystem::path foreign_path = CreateMatchingForeignLauncher();

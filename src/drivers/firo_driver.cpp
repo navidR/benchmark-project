@@ -1,6 +1,7 @@
 #include "bbp/drivers/firo_driver.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -661,21 +662,35 @@ std::uint64_t FiroDriver::WalletTransactionFeeReserveSatoshis(
 
 std::optional<OperatorConnectionCommand>
 FiroDriver::BuildOperatorConnectionCommand(
-    const FiroNodeConfig& config, const std::filesystem::path& run_root) const {
-  if (config.network != ChainNetwork::kRegtest) {
-    throw std::runtime_error("Firo driver supports only regtest network");
-  }
-  if (config.p2p_port == 0U) {
-    throw std::runtime_error(
-        "Firo operator connection requires a nonzero P2P port");
-  }
-  boost::system::error_code address_error;
-  const boost::asio::ip::address peer_address =
-      boost::asio::ip::make_address(config.p2p_host, address_error);
-  if (address_error || !peer_address.is_v4() || peer_address.is_unspecified() ||
-      peer_address.is_multicast()) {
-    throw std::runtime_error(
-        "Firo operator connection requires a reachable IPv4 peer address");
+    const FiroNodeConfig& config, const std::filesystem::path& run_root,
+    const std::vector<ChainNodeConfig>& peers) const {
+  std::vector<std::string> endpoints;
+  const auto add_peer = [&endpoints](const ChainNodeConfig& peer) {
+    if (peer.network != ChainNetwork::kRegtest) {
+      throw std::runtime_error("Firo driver supports only regtest network");
+    }
+    if (peer.p2p_port == 0U) {
+      throw std::runtime_error(
+          "Firo operator connection requires a nonzero P2P port");
+    }
+    boost::system::error_code address_error;
+    const auto address =
+        boost::asio::ip::make_address(peer.p2p_host, address_error);
+    if (address_error || !address.is_v4() || address.is_unspecified() ||
+        address.is_multicast()) {
+      throw std::runtime_error(
+          "Firo operator connection requires a reachable IPv4 peer address");
+    }
+    const std::string endpoint =
+        peer.p2p_host + ":" + std::to_string(peer.p2p_port);
+    if (std::find(endpoints.begin(), endpoints.end(), endpoint) ==
+        endpoints.end()) {
+      endpoints.push_back(endpoint);
+    }
+  };
+  add_peer(config);
+  for (const auto& peer : peers) {
+    add_peer(peer);
   }
   if (!std::filesystem::is_directory(run_root)) {
     throw std::runtime_error("Firo operator connection run root is missing: " +
@@ -694,6 +709,36 @@ FiroDriver::BuildOperatorConnectionCommand(
   const std::filesystem::path data_dir =
       canonical_run_root / "operator" / "firo-qt";
   EnsureDirectory(data_dir);
+  const std::filesystem::path canonical_data_dir =
+      std::filesystem::canonical(data_dir);
+  if (canonical_data_dir != data_dir ||
+      canonical_data_dir == std::filesystem::canonical(config.data_dir)) {
+    throw std::runtime_error(
+        "Firo operator data directory is not isolated below the run root");
+  }
+  // Docker/sudo may create the run as root inside a user's benchmark directory.
+  // Keep the desktop wallet private, but assign it to that directory's owner.
+  if (geteuid() == 0) {
+    for (auto owner_path = data_dir; !owner_path.empty();) {
+      struct stat owner{};
+      if (stat(owner_path.c_str(), &owner) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "stat Firo operator directory owner");
+      }
+      if (owner.st_uid != 0) {
+        if (chown(data_dir.c_str(), owner.st_uid, owner.st_gid) != 0) {
+          throw std::system_error(errno, std::generic_category(),
+                                  "set Firo operator directory owner");
+        }
+        break;
+      }
+      const auto parent = owner_path.parent_path();
+      if (parent == owner_path) {
+        break;
+      }
+      owner_path = parent;
+    }
+  }
   std::error_code permission_error;
   std::filesystem::permissions(data_dir, std::filesystem::perms::owner_all,
                                std::filesystem::perm_options::replace,
@@ -703,17 +748,6 @@ FiroDriver::BuildOperatorConnectionCommand(
         "set Firo operator data directory permissions failed: " +
         permission_error.message());
   }
-  const std::filesystem::path canonical_data_dir =
-      std::filesystem::canonical(data_dir);
-  const auto path_mismatch =
-      std::mismatch(canonical_run_root.begin(), canonical_run_root.end(),
-                    canonical_data_dir.begin(), canonical_data_dir.end());
-  if (path_mismatch.first != canonical_run_root.end() ||
-      canonical_data_dir == std::filesystem::canonical(config.data_dir)) {
-    throw std::runtime_error(
-        "Firo operator data directory is not isolated below the run root");
-  }
-
   OperatorConnectionCommand command;
   command.executable = std::move(executable);
   command.data_dir = canonical_data_dir;
@@ -722,17 +756,23 @@ FiroDriver::BuildOperatorConnectionCommand(
   command.arguments = {
       "-regtest",
       Arg("-datadir", canonical_data_dir.string()),
-      Arg("-connect", config.p2p_host + ":" + std::to_string(config.p2p_port)),
-      "-dns=0",
-      "-dnsseed=0",
-      "-forcednsseed=0",
-      "-maxconnections=1",
-      "-listen=0",
-      "-discover=0",
-      "-listenonion=0",
-      "-torsetup=0",
-      "-upnp=0",
   };
+  for (const auto& endpoint : endpoints) {
+    command.arguments.push_back(Arg("-connect", endpoint));
+  }
+  command.arguments.insert(
+      command.arguments.end(),
+      {
+          "-dns=0",
+          "-dnsseed=0",
+          "-forcednsseed=0",
+          Arg("-maxconnections", std::to_string(endpoints.size())),
+          "-listen=0",
+          "-discover=0",
+          "-listenonion=0",
+          "-torsetup=0",
+          "-upnp=0",
+      });
   return command;
 }
 

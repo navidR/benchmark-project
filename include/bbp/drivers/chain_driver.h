@@ -238,8 +238,9 @@ class ChainDriver {
   virtual std::uint64_t WalletTransactionFeeReserveSatoshis(
       ChainWalletMode mode, std::uint64_t requested_fee_rate_satoshis) const;
   virtual std::optional<OperatorConnectionCommand>
-  BuildOperatorConnectionCommand(const ChainNodeConfig& config,
-                                 const std::filesystem::path& run_root) const;
+  BuildOperatorConnectionCommand(
+      const ChainNodeConfig& config, const std::filesystem::path& run_root,
+      const std::vector<ChainNodeConfig>& peers = {}) const;
 #ifdef BBP_FIRO_GUI_LAUNCHER
   virtual std::shared_ptr<OperatorConnectionLauncher>
   CreateOperatorConnectionLauncher(

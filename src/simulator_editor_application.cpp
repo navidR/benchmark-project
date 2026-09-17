@@ -56,6 +56,7 @@
 #include "simulator_network_launch_planning.h"
 #include "simulator_node_process_state.h"
 #include "simulator_offline_run_cleanup.h"
+#include "simulator_operator_connection_publication.h"
 #include "simulator_resolved_scenario_persistence.h"
 #include "simulator_retained_run_registry.h"
 #include "simulator_source_scenario_persistence.h"
@@ -1484,7 +1485,8 @@ class EditorRunController {
                   CreateChainDriver(run->options->chain);
               std::optional<OperatorConnectionCommand> command =
                   driver->BuildOperatorConnectionCommand(
-                      config, BenchmarkRunRoot(*run->options));
+                      config, BenchmarkRunRoot(*run->options),
+                      OperatorConnectionPeers(snapshot));
               if (!command) {
                 throw std::runtime_error(
                     "the active chain has no operator launcher command");

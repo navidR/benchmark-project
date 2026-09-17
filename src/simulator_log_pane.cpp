@@ -6,6 +6,8 @@
 #include <optional>
 #include <string_view>
 
+#include "bbp/operator_connection.h"
+
 namespace bbp {
 namespace {
 
@@ -31,14 +33,42 @@ std::size_t WrappedRowLength(std::string_view remaining,
 }
 
 std::vector<SimulatorLogVisualRow> WrapRecords(
-    const std::vector<std::string>& records, std::size_t content_width) {
+    const std::vector<std::string>& records, std::size_t content_width,
+    const std::vector<std::string>& operator_argv) {
   std::vector<SimulatorLogVisualRow> rows;
   if (content_width == 0U) {
     return rows;
   }
+  std::string operator_command;
+  if (!operator_argv.empty() && !operator_argv.front().empty()) {
+    OperatorConnectionCommand command;
+    command.executable = operator_argv.front();
+    command.arguments.assign(operator_argv.begin() + 1, operator_argv.end());
+    operator_command = command.ShellCommand();
+  }
   for (std::size_t record_index = 0U; record_index < records.size();
        ++record_index) {
     const std::string& record = records[record_index];
+    constexpr std::string_view marker = "manual Firo GUI command: ";
+    const auto marker_pos = record.find(marker);
+    if (!operator_command.empty() && marker_pos != std::string::npos &&
+        record.substr(marker_pos + marker.size()) == operator_command &&
+        content_width >= 16U) {
+      const std::string title = record.substr(0U, marker_pos + marker.size());
+      for (std::size_t offset = 0U; offset < title.size();
+           offset += content_width - 2U) {
+        rows.push_back({record_index, offset,
+                        "# " + title.substr(offset, content_width - 2U),
+                        offset == 0U, true});
+      }
+      const auto command_lines =
+          CopyableShellCommandLines(operator_argv, content_width);
+      for (std::size_t index = 0U; index < command_lines.size(); ++index) {
+        rows.push_back({record_index, title.size() + index,
+                        command_lines[index], false, true});
+      }
+      continue;
+    }
     if (record.empty()) {
       rows.push_back(SimulatorLogVisualRow{
           .record_index = record_index,
@@ -110,7 +140,8 @@ std::optional<std::size_t> FindAnchorRow(
 
 void SimulatorLogPane::Refresh(const std::vector<std::string>& records,
                                std::size_t content_width,
-                               std::size_t visible_rows) {
+                               std::size_t visible_rows,
+                               const std::vector<std::string>& operator_argv) {
   std::optional<VisualRowAnchor> anchor;
   if (!follow_tail_ && first_visible_row_ < rows_.size()) {
     const SimulatorLogVisualRow& row = rows_[first_visible_row_];
@@ -124,7 +155,7 @@ void SimulatorLogPane::Refresh(const std::vector<std::string>& records,
   }
 
   records_ = records;
-  rows_ = WrapRecords(records_, content_width);
+  rows_ = WrapRecords(records_, content_width, operator_argv);
   visible_rows_ = visible_rows;
   if (follow_tail_) {
     first_visible_row_ = MaximumFirstVisibleRow();

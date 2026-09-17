@@ -18,6 +18,18 @@
 
 namespace bbp::simulator_app_internal {
 
+std::vector<ChainNodeConfig> OperatorConnectionPeers(
+    const RuntimeNodeSnapshot& nodes) {
+  std::vector<ChainNodeConfig> peers;
+  for (const NodeRuntime& node : nodes) {
+    auto process_guard = LockNodeProcessState(node);
+    if (node.AllowsChainMetrics() && node.process.running()) {
+      peers.push_back(node.config);
+    }
+  }
+  return peers;
+}
+
 void PublishOperatorConnectionCommand(const Options& options,
                                       const std::filesystem::path& run_root,
                                       const std::filesystem::path& events_path,
@@ -27,24 +39,24 @@ void PublishOperatorConnectionCommand(const Options& options,
   if (*resolved) {
     return;
   }
-  for (const NodeRuntime& node : nodes) {
-    {
-      auto process_guard = LockNodeProcessState(node);
-      if (!node.AllowsChainMetrics() || !node.process.running()) {
-        continue;
-      }
-    }
+  const auto peers = OperatorConnectionPeers(nodes);
+  if (!peers.empty()) {
+    const ChainNodeConfig& node = peers.front();
     const std::optional<OperatorConnectionCommand> connection =
-        driver.BuildOperatorConnectionCommand(node.config, run_root);
+        driver.BuildOperatorConnectionCommand(node, run_root, peers);
     *resolved = true;
     if (!connection) {
       return;
     }
 
     boost::json::array arguments;
+    boost::json::array endpoints;
     arguments.reserve(connection->arguments.size());
     for (const std::string& argument : connection->arguments) {
       arguments.emplace_back(argument);
+      if (argument.starts_with("-connect=")) {
+        endpoints.emplace_back(argument.substr(9U));
+      }
     }
     boost::json::array argv;
     argv.reserve(connection->arguments.size() + 1U);
@@ -57,7 +69,7 @@ void PublishOperatorConnectionCommand(const Options& options,
     detail["manual_launch"] = true;
     detail["discovery_disabled"] = true;
     detail["wallet_enabled"] = true;
-    detail["network"] = ChainNetworkName(node.config.network);
+    detail["network"] = ChainNetworkName(node.network);
     detail["executable"] = connection->executable.string();
     detail["arguments"] = std::move(arguments);
     detail["argv"] = std::move(argv);
@@ -67,7 +79,8 @@ void PublishOperatorConnectionCommand(const Options& options,
     detail["peer_port"] = connection->peer_port;
     detail["peer_endpoint"] =
         connection->peer_address + ":" + std::to_string(connection->peer_port);
-    WriteEvent(events_path, options.run_id, node.config.id,
+    detail["peer_endpoints"] = std::move(endpoints);
+    WriteEvent(events_path, options.run_id, node.id,
                SimulationEventKind::kOperatorConnectionCommand,
                boost::json::serialize(detail));
     BBP_LOG(info) << "manual Firo GUI command: " << connection->ShellCommand();

@@ -74,7 +74,8 @@ ChainWalletTransactionDirectionFromName(std::string_view name) {
 
 std::optional<OperatorConnectionCommand>
 ChainDriver::BuildOperatorConnectionCommand(
-    const ChainNodeConfig&, const std::filesystem::path&) const {
+    const ChainNodeConfig&, const std::filesystem::path&,
+    const std::vector<ChainNodeConfig>&) const {
   return std::nullopt;
 }
 

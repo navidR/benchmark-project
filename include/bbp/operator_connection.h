@@ -73,6 +73,10 @@ class OperatorConnectionLauncher {
 #endif
 
 std::string PosixShellQuote(std::string_view value);
+std::vector<std::string> OperatorConnectionArgvFromReport(
+    const boost::json::object& report);
+std::vector<std::string> CopyableShellCommandLines(
+    const std::vector<std::string>& argv, std::size_t width);
 std::string OperatorConnectionCommandFromReport(
     const boost::json::object& report);
 

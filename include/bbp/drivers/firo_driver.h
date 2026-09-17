@@ -43,8 +43,8 @@ class FiroDriver final : public ChainDriver {
       WalletMode mode,
       std::uint64_t requested_fee_rate_satoshis) const override;
   std::optional<OperatorConnectionCommand> BuildOperatorConnectionCommand(
-      const FiroNodeConfig& config,
-      const std::filesystem::path& run_root) const override;
+      const FiroNodeConfig& config, const std::filesystem::path& run_root,
+      const std::vector<ChainNodeConfig>& peers = {}) const override;
 #ifdef BBP_FIRO_GUI_LAUNCHER
   std::shared_ptr<OperatorConnectionLauncher> CreateOperatorConnectionLauncher(
       OperatorConnectionLauncherAuthorityResolver resolver) const override;

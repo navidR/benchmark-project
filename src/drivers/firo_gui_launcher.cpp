@@ -11,6 +11,7 @@
 #include <array>
 #include <boost/json/value.hpp>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <exception>
 #include <limits>
@@ -363,7 +364,7 @@ ParsedFiroQtLauncherCommand FiroQtLauncherCommandFromReport(
         "the running benchmark has no Firo-Qt connection command");
   }
   const boost::json::object& object = connection->as_object();
-  constexpr std::array<std::string_view, 15U> kAllowedFields{
+  constexpr std::array<std::string_view, 16U> kAllowedFields{
       "arguments",
       "argv",
       "command",
@@ -376,6 +377,7 @@ ParsedFiroQtLauncherCommand FiroQtLauncherCommandFromReport(
       "node_id",
       "peer_address",
       "peer_endpoint",
+      "peer_endpoints",
       "peer_port",
       "timestamp",
       "wallet_enabled",
@@ -443,20 +445,67 @@ ParsedFiroQtLauncherCommand FiroQtLauncherCommandFromReport(
     throw std::runtime_error(
         "the Firo-Qt connection command has inconsistent peer_endpoint");
   }
-  const std::vector<std::string> arguments{
+  std::vector<std::string> endpoints{peer_endpoint};
+  if (const auto* peers = object.if_contains("peer_endpoints")) {
+    if (!peers->is_array() || peers->as_array().empty()) {
+      throw std::runtime_error(
+          "the Firo-Qt connection command has invalid peers");
+    }
+    endpoints.clear();
+    for (const auto& value : peers->as_array()) {
+      if (!value.is_string()) {
+        throw std::runtime_error(
+            "the Firo-Qt connection command has invalid peer");
+      }
+      const std::string endpoint(value.as_string());
+      const auto colon = endpoint.find(':');
+      if (colon == std::string::npos ||
+          endpoint.find_first_not_of("0123456789.:") != std::string::npos) {
+        throw std::runtime_error(
+            "the Firo-Qt connection command has invalid peer");
+      }
+      const std::string address = endpoint.substr(0U, colon);
+      struct in_addr parsed{};
+      unsigned port = 0U;
+      const char* end = endpoint.data() + endpoint.size();
+      const auto result =
+          std::from_chars(endpoint.data() + colon + 1U, end, port);
+      if (inet_pton(AF_INET, address.c_str(), &parsed) != 1 ||
+          parsed.s_addr == 0U ||
+          (ntohl(parsed.s_addr) & 0xf0000000U) == 0xe0000000U ||
+          result.ec != std::errc{} || result.ptr != end || port == 0U ||
+          port > 65535U || endpoint != address + ":" + std::to_string(port) ||
+          std::find(endpoints.begin(), endpoints.end(), endpoint) !=
+              endpoints.end()) {
+        throw std::runtime_error(
+            "the Firo-Qt connection command has invalid peer");
+      }
+      endpoints.push_back(endpoint);
+    }
+    if (endpoints.front() != peer_endpoint) {
+      throw std::runtime_error(
+          "the Firo-Qt connection command has inconsistent peers");
+    }
+  }
+  std::vector<std::string> arguments{
       "-regtest",
       "-datadir=" + data_dir,
-      "-connect=" + peer_endpoint,
-      "-dns=0",
-      "-dnsseed=0",
-      "-forcednsseed=0",
-      "-maxconnections=1",
-      "-listen=0",
-      "-discover=0",
-      "-listenonion=0",
-      "-torsetup=0",
-      "-upnp=0",
   };
+  for (const auto& endpoint : endpoints) {
+    arguments.push_back("-connect=" + endpoint);
+  }
+  arguments.insert(arguments.end(),
+                   {
+                       "-dns=0",
+                       "-dnsseed=0",
+                       "-forcednsseed=0",
+                       "-maxconnections=" + std::to_string(endpoints.size()),
+                       "-listen=0",
+                       "-discover=0",
+                       "-listenonion=0",
+                       "-torsetup=0",
+                       "-upnp=0",
+                   });
   RequireLauncherStringArray(object, "arguments", arguments);
   std::vector<std::string> argv;
   argv.reserve(arguments.size() + 1U);

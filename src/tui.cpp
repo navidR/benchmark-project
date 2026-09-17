@@ -1169,7 +1169,8 @@ int LogPaneRows(int rows) {
 
 void DrawLogPane(int top, int rows, int cols,
                  const std::vector<std::string>& log_lines,
-                 SimulatorLogPane* log_pane) {
+                 SimulatorLogPane* log_pane,
+                 const boost::json::object& report) {
   if (top <= 0 || cols <= 0 || rows - top < 4) {
     return;
   }
@@ -1184,7 +1185,8 @@ void DrawLogPane(int top, int rows, int cols,
     return;
   }
   log_pane->Refresh(log_lines, static_cast<std::size_t>(content_width),
-                    static_cast<std::size_t>(capacity));
+                    static_cast<std::size_t>(capacity),
+                    OperatorConnectionArgvFromReport(report));
   const std::vector<SimulatorLogVisualRow>& visual_rows = log_pane->Rows();
   std::string title = "Simulator Logs";
   if (!visual_rows.empty()) {
@@ -1204,6 +1206,10 @@ void DrawLogPane(int top, int rows, int cols,
   int y = last_line - static_cast<int>(visible_rows) + 1;
   for (std::size_t index = first; index < last && y <= last_line; ++index) {
     const SimulatorLogVisualRow& row = visual_rows[index];
+    if (row.copyable_command) {
+      AddText(y++, 0, cols, row.text);
+      continue;
+    }
     const std::string_view prefix =
         row.starts_record ? kFirstRowPrefix : kContinuationPrefix;
     AddText(y, 0, static_cast<int>(prefix.size()), prefix,
@@ -2316,7 +2322,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
     AddText(5, 0, cols, "error: " + std::string(error),
             COLOR_PAIR(kColorWarning) | A_BOLD);
     if (log_rows != 0) {
-      DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane);
+      DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane, report);
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
@@ -2444,7 +2450,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
                                      : "No node metric histories in report.";
     AddText(13, 0, cols, empty_text, COLOR_PAIR(kColorMuted));
     if (log_rows != 0) {
-      DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane);
+      DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane, report);
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
@@ -2634,7 +2640,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   }
 
   if (log_rows != 0) {
-    DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane);
+    DrawLogPane(log_top, rows, cols, log_lines, simulator_log_pane, report);
   }
   DrawNodeLogPane(content_bottom, cols, node_log_pane);
   DrawPeerListPane(content_bottom, cols, peer_list_pane);

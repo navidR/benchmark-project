@@ -1,6 +1,9 @@
 #pragma once
 
 #include <filesystem>
+#include <vector>
+
+#include "bbp/drivers/chain_driver.h"
 
 namespace bbp {
 
@@ -9,6 +12,9 @@ class RuntimeNodeSnapshot;
 struct Options;
 
 namespace simulator_app_internal {
+
+std::vector<ChainNodeConfig> OperatorConnectionPeers(
+    const RuntimeNodeSnapshot& nodes);
 
 void PublishOperatorConnectionCommand(const Options& options,
                                       const std::filesystem::path& run_root,

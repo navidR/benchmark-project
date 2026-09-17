@@ -1652,10 +1652,10 @@ std::pair<std::string, std::filesystem::path> ReadLauncherDialog(
   }
   RequireContains(output, "Script path:", context);
   RequireContains(output, "Complete command:", context);
-  RequireContains(output, "'-regtest'", context);
-  RequireContains(output, "'-connect=", context);
-  RequireContains(output, "'-maxconnections=1'", context);
-  RequireContains(output, "'-upnp=0'", context);
+  RequireContains(output, "-regtest", context);
+  RequireContains(output, "-connect=", context);
+  RequireContains(output, "-maxconnections=1", context);
+  RequireContains(output, "-upnp=0", context);
   RequireContains(output, "BBP has not launched Firo-Qt", context);
   return {std::move(output), std::move(path)};
 }
@@ -3950,11 +3950,11 @@ std::string ActiveOperatorConnectionCommand(
     const std::filesystem::path& run_root,
     const std::filesystem::path& qt_binary) {
   const std::filesystem::path data_dir = run_root / "operator" / "firo-qt";
-  return "'" + std::filesystem::canonical(qt_binary).string() +
-         "' '-regtest' '-datadir=" + data_dir.string() +
-         "' '-connect=127.0.0.1:18168' '-dns=0' '-dnsseed=0' "
-         "'-forcednsseed=0' '-maxconnections=1' '-listen=0' '-discover=0' "
-         "'-listenonion=0' '-torsetup=0' '-upnp=0'";
+  return std::filesystem::canonical(qt_binary).string() +
+         " -regtest -datadir=" + data_dir.string() +
+         " -connect=127.0.0.1:18168 -dns=0 -dnsseed=0 "
+         "-forcednsseed=0 -maxconnections=1 -listen=0 -discover=0 "
+         "-listenonion=0 -torsetup=0 -upnp=0";
 }
 
 void CheckHomeEndKeys(const std::filesystem::path& command,
