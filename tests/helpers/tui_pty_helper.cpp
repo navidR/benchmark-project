@@ -3957,6 +3957,43 @@ std::string ActiveOperatorConnectionCommand(
          "'-listenonion=0' '-torsetup=0' '-upnp=0'";
 }
 
+void CheckHomeEndKeys(const std::filesystem::path& command,
+                      const std::filesystem::path& source_run) {
+  OwnedRunCopy run(source_run, "home-end-keys");
+  OwnedTemporaryDirectory home("home-end-keys-home");
+  std::filesystem::create_directory(home.root() / "home");
+  std::vector<std::string> lines{"FIRST_LOG_RECORD"};
+  for (std::size_t index = 0U; index < 30U; ++index) {
+    lines.push_back("intermediate log line " + std::to_string(index));
+  }
+  lines.push_back("LAST_LOG_RECORD");
+  run.WriteSimulatorLog(lines);
+
+  PtyProcess process(command,
+                     {"--run", run.run_root().string(), "--refresh-ms", "50"},
+                     24, 80, home.root() / "home");
+  static_cast<void>(
+      process.ReadUntil("LAST_LOG_RECORD", 5s, "initial log tail"));
+  for (const auto& [home_key, end_key] :
+       {std::pair{"\033[H", "\033[F"}, std::pair{"\033[1~", "\033[4~"},
+        std::pair{"\033OH", "\033OF"}, std::pair{"\033[7~", "\033[8~"}}) {
+    process.Write(home_key);
+    RequireNotContains(process.ReadUntil("FIRST_LOG_RECORD", 5s, "Home key"),
+                       "Confirm exit", "Home must scroll without exiting");
+    process.Write(end_key);
+    RequireNotContains(process.ReadUntil("LAST_LOG_RECORD", 5s, "End key"),
+                       "Confirm exit", "End must scroll without exiting");
+  }
+  process.Write("\033");
+  static_cast<void>(process.ReadUntil("Confirm exit", 5s, "standalone Escape"));
+  process.Write("n");
+  static_cast<void>(process.ReadFor(100ms));
+  process.Write("\033[H");
+  static_cast<void>(process.ReadUntil("FIRST_LOG_RECORD", 5s, "cancel exit"));
+  process.Write("q");
+  RequireExitZero(&process, "Home/End key TUI");
+}
+
 void CheckSimulatorLogWrapping(const std::filesystem::path& command,
                                const std::filesystem::path& source_run) {
   OwnedRunCopy run(source_run, "simulator-log-wrap");
@@ -7213,6 +7250,17 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
       std::cerr << "empty control-plane regression failed: " << error.what()
                 << '\n';
+      return 1;
+    }
+  }
+  if (argc == 4 && std::string_view(argv[1]) == "--home-end-keys") {
+    try {
+      CheckHomeEndKeys(argv[2], argv[3]);
+      std::cout
+          << "Home/End key scrolling and standalone Escape checks passed\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "Home/End key regression failed: " << error.what() << '\n';
       return 1;
     }
   }

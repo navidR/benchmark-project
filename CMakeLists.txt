@@ -2288,6 +2288,12 @@ if(BUILD_TESTING)
       $<TARGET_FILE:bbp>
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
   )
+  add_test(NAME bbp-tui-home-end-keys
+    COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
+      --home-end-keys
+      $<TARGET_FILE:bbp>
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+  )
   add_test(NAME bbp-empty-control-plane-lifecycle
     COMMAND $<TARGET_FILE:bbp-tui-pty-helper>
       --empty-control-plane

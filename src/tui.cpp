@@ -157,6 +157,17 @@ class CursesSession {
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    // Terminfo may list only one of the standard Home/End encodings.
+    for (const char* sequence : {"\033[H", "\033[1~", "\033OH", "\033[7~"}) {
+      if (key_defined(sequence) == 0) {
+        define_key(sequence, KEY_HOME);
+      }
+    }
+    for (const char* sequence : {"\033[F", "\033[4~", "\033OF", "\033[8~"}) {
+      if (key_defined(sequence) == 0) {
+        define_key(sequence, KEY_END);
+      }
+    }
     nodelay(stdscr, TRUE);
     curs_set(0);
     if (has_colors() == TRUE) {
