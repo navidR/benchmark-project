@@ -220,6 +220,7 @@ add_executable(bbp
   src/chain_extra_args.cpp
   src/chain_network.cpp
   src/chain_kind.cpp
+  src/conntrack.cpp
   src/default_peer_topology.cpp
   src/drivers/chain_driver.cpp
   src/drivers/chain_command_executor.cpp
@@ -536,6 +537,7 @@ if(BUILD_TESTING)
     tests/unit/chain_network_tests.cpp
     tests/unit/chain_kind_tests.cpp
     tests/unit/chain_wallet_transaction_tests.cpp
+    tests/unit/conntrack_tests.cpp
     tests/unit/default_peer_topology_tests.cpp
     tests/unit/bitcoin_driver_tests.cpp
     tests/unit/firo_driver_tests.cpp
@@ -616,6 +618,7 @@ if(BUILD_TESTING)
     src/chain_extra_args.cpp
     src/chain_network.cpp
     src/chain_kind.cpp
+    src/conntrack.cpp
     src/block_production_policy.cpp
     src/default_peer_topology.cpp
     src/simulation_command.cpp

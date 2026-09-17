@@ -21,8 +21,10 @@
 #include <vector>
 
 #include "bbp/capability.h"
+#include "bbp/conntrack.h"
 #include "bbp/drivers/chain_driver.h"
 #include "bbp/drivers/chain_driver_registry.h"
+#include "bbp/logging.h"
 #include "bbp/node_lifecycle_policy.h"
 #include "bbp/runtime_node_inventory.h"
 #include "bbp/runtime_node_resource_manifest.h"
@@ -393,6 +395,17 @@ void StartInitialNodes(
     throw std::runtime_error(
         "isolated multi-node chain runs require IPv4 forwarding in the parent "
         "network namespace");
+  }
+  try {
+    const std::uint32_t capacity = EnsureConntrackCapacity();
+    BBP_LOG(info) << "connection tracking limit: net.netfilter.nf_conntrack_max="
+                  << capacity;
+  } catch (const std::exception& error) {
+    BBP_LOG(warning) << "could not ensure connection tracking capacity: "
+                     << error.what()
+                     << "; continuing without verified capacity. On the host, "
+                        "set net.netfilter.nf_conntrack_max to at least "
+                     << kMinimumConntrackCapacity;
   }
   nodes.reserve(options.nodes);
   std::vector<ChainNodeConfig> prepared_configs;

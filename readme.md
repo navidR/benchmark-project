@@ -57,6 +57,14 @@ the Firo path is working end to end.
 The normal development path is a Docker container with the project mounted. The
 examples below use `benchmark-project-codex` as the container name.
 
+Before starting benchmark nodes, BBP raises `net.netfilter.nf_conntrack_max`
+to 1,048,576 if it is lower, then verifies the value. Higher limits are left
+unchanged. This shared kernel setting is not restored on exit and is not made
+persistent across reboots. If the setting is missing or not writable (for
+example, in an unprivileged container), BBP logs a warning and continues with
+the existing limit. Raising this ceiling permits more kernel memory use; it
+does not reduce RPC connection creation or guarantee sustained throughput.
+
 Set paths used by the commands:
 
 ```bash
