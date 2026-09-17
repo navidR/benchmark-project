@@ -15,8 +15,7 @@
 
 namespace bbp {
 
-constexpr std::size_t kMaximumRetainedTransactionObservations = 256U;
-constexpr std::size_t kMaximumTransactionObservationNodes = 16U;
+constexpr std::size_t kMaximumRetainedTransactionObservations = 65'536U;
 
 struct TrackedTransaction {
   std::string txid;

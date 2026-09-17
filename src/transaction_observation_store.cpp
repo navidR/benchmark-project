@@ -159,11 +159,6 @@ void TransactionObservationStore::CommitReservation(
     throw std::runtime_error(
         "transaction observation nodes must be nonempty and unique");
   }
-  if (required.size() > kMaximumTransactionObservationNodes) {
-    throw std::runtime_error(
-        "transaction observation node count exceeds " +
-        std::to_string(kMaximumTransactionObservationNodes));
-  }
   for (const std::string& node_id : required) {
     if (node_id.empty()) {
       throw std::runtime_error(

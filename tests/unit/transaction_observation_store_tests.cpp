@@ -99,6 +99,47 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(stats.rejected == 1U);
 }
 
+BOOST_AUTO_TEST_CASE(transaction_observation_store_default_capacity) {
+  bbp::TransactionObservationStore store;
+  BOOST_TEST(store.Stats().capacity == 65'536U);
+  {
+    auto reservation = store.Reserve(65'536U);
+    BOOST_TEST(store.Stats().reserved == 65'536U);
+    BOOST_TEST(!store.TryReserve());
+  }
+  BOOST_TEST(store.Stats().reserved == 0U);
+  BOOST_TEST(store.TryReserve().has_value());
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_observation_store_tracks_more_than_256_pending_transactions) {
+  bbp::TransactionObservationStore store;
+  constexpr std::size_t kTransactionCount = 1'024U;
+  std::vector<std::string> node_ids;
+  for (std::size_t index = 0U; index < 20U; ++index) {
+    node_ids.push_back("node-" + std::to_string(index + 1U));
+  }
+  for (std::size_t index = 0U; index < kTransactionCount; ++index) {
+    store.Track(Transaction("tx-" + std::to_string(index)), node_ids);
+  }
+  BOOST_TEST(store.Stats().active == kTransactionCount);
+  BOOST_TEST(store.PendingTransactions().size() == kTransactionCount);
+
+  for (std::size_t index = 0U; index < kTransactionCount; ++index) {
+    const std::string txid = "tx-" + std::to_string(index);
+    for (std::size_t node = 0U; node < node_ids.size(); ++node) {
+      const auto transition = store.Record(txid, node_ids[node], true, true);
+      BOOST_TEST(transition.tracked);
+      BOOST_TEST(transition.retired == (node + 1U == node_ids.size()));
+    }
+  }
+  BOOST_TEST(store.Stats().active == 0U);
+  BOOST_TEST(store.Stats().retired == kTransactionCount);
+  BOOST_TEST(store.Stats().rejected == 0U);
+  BOOST_TEST(store.Stats().confirmation_transitions ==
+             kTransactionCount * node_ids.size());
+}
+
 BOOST_AUTO_TEST_CASE(
     transaction_observation_unused_reservation_releases_capacity) {
   bbp::TransactionObservationStore store(1U);
@@ -225,6 +266,54 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!duplicate.tracked);
   BOOST_CHECK_THROW(store.Track(Transaction("tx-1"), {"node-1", "node-2"}),
                     std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(
+    transaction_observation_store_supports_more_than_sixteen_nodes) {
+  for (const std::size_t node_count : {17U, 20U, 64U, 1'000U}) {
+    BOOST_TEST_CONTEXT("node_count=" << node_count) {
+      std::vector<std::string> node_ids;
+      std::vector<bbp::TransactionLoadConfirmation::ObservationKey> expected;
+      for (std::size_t index = 0U; index < node_count; ++index) {
+        node_ids.push_back("node-" + std::to_string(index + 1U));
+        expected.emplace_back("tx-1", node_ids.back());
+      }
+      const auto accounting =
+          std::make_shared<bbp::TransactionLoadAccounting>();
+      accounting->RecordOutcome(bbp::TransactionLoadOutcome::kSubmitted,
+                                std::chrono::microseconds(1));
+      const auto confirmation =
+          std::make_shared<bbp::TransactionLoadConfirmation>(accounting,
+                                                             expected);
+      bbp::TransactionObservationStore store(1U);
+      auto reservation = store.Reserve();
+      reservation.Commit({Transaction("tx-1", confirmation)}, node_ids);
+      BOOST_TEST(store.Stats().reserved == 0U);
+      BOOST_TEST(!store.TryReserve());
+
+      for (std::size_t index = 0U; index + 1U < node_count; ++index) {
+        const auto transition =
+            store.Record("tx-1", node_ids[index], true, true);
+        BOOST_TEST(transition.first_visible);
+        BOOST_TEST(transition.first_confirmed);
+        BOOST_TEST(!transition.retired);
+        BOOST_TEST(!transition.load_progress);
+      }
+      BOOST_TEST(store.Stats().active == 1U);
+      const auto final = store.Record("tx-1", node_ids.back(), true, true);
+      BOOST_TEST(final.retired);
+      BOOST_REQUIRE(final.load_progress);
+      BOOST_TEST(final.load_progress->submitted == 1U);
+      BOOST_TEST(final.load_progress->confirmed == 1U);
+      BOOST_TEST(store.Stats().active == 0U);
+      BOOST_TEST(store.Stats().retired == 1U);
+      BOOST_TEST(store.Stats().visibility_transitions == node_count);
+      BOOST_TEST(store.Stats().confirmation_transitions == node_count);
+      BOOST_TEST(store.Stats().maximum_retained == 1U);
+      BOOST_TEST(!store.Record("tx-1", node_ids.back(), true, true).tracked);
+      BOOST_TEST(store.TryReserve().has_value());
+    }
+  }
 }
 
 BOOST_AUTO_TEST_CASE(
