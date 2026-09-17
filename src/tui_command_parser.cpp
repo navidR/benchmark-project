@@ -21,9 +21,9 @@ namespace {
 
 constexpr std::array<std::string_view,
 #ifdef BBP_FIRO_GUI_LAUNCHER
-                     40U
+                     41U
 #else
-                     39U
+                     40U
 #endif
                      >
     kCommandNames = {
@@ -66,6 +66,7 @@ constexpr std::array<std::string_view,
         "wallet-send",
         "add-target",
         "remove-target",
+        "show-firo-qt",
 #ifdef BBP_FIRO_GUI_LAUNCHER
         "firo-qt",
 #endif
@@ -173,6 +174,12 @@ ParsedTuiCommand TuiCommandParser::Parse(std::string_view input,
   }
 
   try {
+    if (tokens[0] == "show-firo-qt") {
+      RequireArgumentCount(tokens, 1U, "show-firo-qt");
+      ParsedTuiCommand parsed;
+      parsed.local_action = TuiLocalAction::kShowFiroQtCommand;
+      return parsed;
+    }
     if (tokens[0] == "add-target" || tokens[0] == "remove-target") {
       RequireArgumentCount(tokens, 2U, tokens[0] + " <address>");
       ValidateTargetAddressText(tokens[1]);

@@ -394,6 +394,17 @@ BOOST_AUTO_TEST_CASE(tui_command_parser_builds_local_firo_qt_action) {
 #endif
 }
 
+BOOST_AUTO_TEST_CASE(tui_command_parser_builds_firo_qt_log_request) {
+  const auto command = bbp::TuiCommandParser::Parse(" show-firo-qt ", 0U);
+  BOOST_REQUIRE(command.local_action);
+  BOOST_CHECK(*command.local_action == bbp::TuiLocalAction::kShowFiroQtCommand);
+  BOOST_TEST(bbp::TuiLocalActionName(*command.local_action) ==
+             "show_firo_qt_command");
+  BOOST_TEST(bbp::TuiCommandParser::Complete("show-firo") == "show-firo-qt ");
+  BOOST_CHECK_THROW(bbp::TuiCommandParser::Parse("show-firo-qt now", 0U),
+                    std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(tui_command_parser_builds_network_commands) {
   const bbp::ParsedTuiCommand condition = bbp::TuiCommandParser::Parse(
       "network-condition 20 80 10 11 12 13 14 900", 0U);

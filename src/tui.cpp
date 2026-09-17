@@ -1,7 +1,11 @@
 #include "bbp/tui.h"
 
+// Boost.Log must precede ncurses' timeout and set_attributes macros.
+// clang-format off
+#include "bbp/logging.h"
 #include <ncursesw/curses.h>
 #include <ncursesw/term.h>
+// clang-format on
 
 #include <algorithm>
 #include <boost/algorithm/string/join.hpp>
@@ -2806,6 +2810,29 @@ bool QueueParsedNodeCommand(
     bool confirmed = false, std::string confirmed_target = {},
     std::optional<SimulationPartition> confirmed_partition = std::nullopt,
     std::optional<SimulationWalletSend> confirmed_wallet_send = std::nullopt) {
+  if (parsed.local_action == TuiLocalAction::kShowFiroQtCommand) {
+    if (command_queue == nullptr) {
+      state->command_input_error =
+          "Reprinting the Firo-Qt command requires a running benchmark.";
+      state->command_status = state->command_input_error;
+      return false;
+    }
+    auto argv = OperatorConnectionArgvFromReport(report);
+    if (argv.empty() || argv.front().empty()) {
+      state->command_input_error =
+          "No Firo-Qt command is available for this run yet.";
+      state->command_status = state->command_input_error;
+      return false;
+    }
+    OperatorConnectionCommand command;
+    command.executable = argv.front();
+    command.arguments.assign(argv.begin() + 1, argv.end());
+    BBP_LOG(info) << "manual Firo GUI command: " << command.ShellCommand();
+    state->simulator_log_pane.ScrollEnd();
+    state->command_input_error.clear();
+    state->command_status = "Firo-Qt command reprinted in Simulator Logs.";
+    return true;
+  }
 #ifdef BBP_FIRO_GUI_LAUNCHER
   if (parsed.local_action) {
     if (command_queue == nullptr) {

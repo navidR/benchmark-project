@@ -7008,6 +7008,27 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
       run_root, daemon.parent_path() / "firo-qt");
   RequireContains(connection_events, expected_qt_command,
                   "active generated Firo-Qt command evidence");
+  const auto simulator_log = run_root / "simulator.log";
+  const std::size_t printed_before =
+      CountOccurrences(ReadFile(simulator_log), expected_qt_command);
+  for (std::size_t request = 1U; request <= 2U; ++request) {
+    process.Write("c");
+    static_cast<void>(
+        process.ReadUntil("Live command", 3s, "Firo-Qt log request input"));
+    process.Write("show-firo-qt\n");
+    const auto rendered = process.ReadFor(300ms);
+    RequireNotContains(rendered, "Native Firo-Qt launcher",
+                       "log request must not open a launcher dialog");
+    const auto log = WaitForFileOccurrences(simulator_log, expected_qt_command,
+                                            printed_before + request, 3s);
+    if (CountOccurrences(log, expected_qt_command) !=
+            printed_before + request ||
+        !process.Running() || !ProcessExists(daemon_pid) ||
+        std::filesystem::exists(qt_execution_marker)) {
+      throw std::runtime_error(
+          "Firo-Qt log request must only reprint the complete command once");
+    }
+  }
   CheckBlockGenerationWorkloadLifecycle(run_id, run_root, home_directory);
   const std::uint64_t height_wait_shutdown_target =
       CheckWaitUntilHeightWorkloadLifecycle(run_id, run_root, home_directory);
