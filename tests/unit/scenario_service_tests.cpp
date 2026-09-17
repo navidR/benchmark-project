@@ -375,6 +375,52 @@ BOOST_AUTO_TEST_CASE(scenario_service_preserves_absent_wallet_lifetime_limit) {
 }
 
 BOOST_AUTO_TEST_CASE(
+    scenario_service_preserves_explicit_legacy_wallet_transaction_count) {
+  boost::json::object scenario = MinimalScenario();
+  scenario["nodes"] = 3U;
+  scenario["topology"] =
+      boost::json::object{{"node_count", 3U},
+                          {"wallet_node_count", 2U},
+                          {"miner_node_count", 1U},
+                          {"wallet_nodes", boost::json::array{1U, 2U}},
+                          {"miner_nodes", boost::json::array{3U}}};
+  const Options options = ParseAndValidateScenario(scenario);
+  for (const std::string_view strategy :
+       {"round_robin", "random", "fanout", "hotspot"}) {
+    BOOST_TEST_CONTEXT(strategy) {
+      boost::json::object workload{{"type", "wallet_transactions"},
+                                   {"strategy", strategy},
+                                   {"transaction_count", 1U},
+                                   {"amount", "1.00000000"},
+                                   {"fee", "0.00001000"}};
+      if (strategy == "fanout") {
+        workload["sender_wallets"] = boost::json::array{1U};
+      } else if (strategy == "hotspot") {
+        workload["receiver_wallets"] = boost::json::array{2U};
+      }
+      scenario["workloads"] = boost::json::array{workload};
+      const boost::json::object resolved = ResolveScenario(scenario);
+      BOOST_CHECK(resolved.at("workloads")
+                      .as_array()
+                      .front()
+                      .as_object()
+                      .at("transaction_count") == 1U);
+      BOOST_TEST(ParseAndValidateWalletTransactionsWorkload(workload, options)
+                     .transaction_count == 1U);
+
+      workload.erase("transaction_count");
+      scenario["workloads"] = boost::json::array{workload};
+      BOOST_TEST(!ExplicitWalletTransactionAttemptLimit(
+          ParseAndValidateScenario(scenario)
+              .workloads.front()
+              .wallet_transactions));
+      BOOST_TEST(!ExplicitWalletTransactionAttemptLimit(
+          ParseAndValidateWalletTransactionsWorkload(workload, options)));
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
     scenario_service_initializes_explicit_wallet_role_without_workload) {
   boost::json::object scenario = MinimalScenario();
   scenario["nodes"] =

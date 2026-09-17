@@ -401,10 +401,6 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
               "scenario transaction load transaction_count and duration are "
               "mutually exclusive");
         }
-        if (transaction_count_present) {
-          transactions.transaction_count =
-              JsonOptionalUint32Field(workload, "transaction_count", 0U);
-        }
         if (duration_present) {
           const boost::json::value& duration = workload.at("duration");
           if (!duration.is_string()) {
@@ -436,6 +432,8 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
             "scenario wallet_transactions transaction_count and "
             "transaction_rate are mutually exclusive");
       }
+      transactions.transaction_count =
+          JsonOptionalUint32Field(workload, "transaction_count", 0U);
       if (transaction_rate_present) {
         transactions.transaction_rate = WalletTransactionRate::FromDouble(
             JsonOptionalDoubleField(workload, "transaction_rate", 0.0));
