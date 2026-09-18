@@ -1,1092 +1,289 @@
 # Blockchain Benchmark Project
 
-Blockchain Benchmark Project is a Linux-local blockchain benchmark simulator.
+Blockchain Benchmark Project (BBP) runs real blockchain daemons on one Linux
+machine, applies controlled network and resource conditions, and records
+workload events and metrics. It provides a CLI, an ncurses terminal UI (TUI),
+and a local Model Context Protocol (MCP) server.
 
-The goal is to run real blockchain daemon processes locally, isolate them like
-separate nodes, apply controlled CPU, memory, process, and network conditions,
-drive benchmark workloads, and write reproducible metrics.
+## Scope and Features
 
-Firo is the current priority. Bitcoin Core and Monero are future targets after
-the Firo path is working end to end.
+Each run uses one chain and a local test network; mainnet, testnet, and mixed-chain
+runs are not supported.
 
-## What Works Now
+| Driver | Network | Implemented scope and limits |
+| --- | --- | --- |
+| Firo (`firod`) | Regtest | Block generation, public and private Spark wallet workloads, raw transactions, masternode operations, and Firo-Qt connection commands. |
+| Bitcoin Core (`bitcoind`) | Regtest | Daemon lifecycle, block generation, peer control, and chain metrics. Wallet initialization, transaction submission, and native continuous mining are not implemented. |
+| Monero (`monerod`) | Regtest fakechain | Daemon lifecycle, block generation, native mining, and chain metrics. Wallet initialization and transaction submission are not implemented; live connections are limited to configured startup peers. |
 
-- Start up to 16 Firo regtest nodes.
-- Run Firo nodes inside isolated network namespaces with one veth pair per node.
-- Apply simple per-node network conditions through host-side `netem` or TBF.
-- Apply and remove live per-node TCP block rules, optionally scoped by source.
-- Apply and heal source-aware group network partitions after startup or as an
-  ordered workload.
-- Apply live per-node cgroup resource updates after startup or as an ordered
-  workload.
-- Restart a running Firo node before workload generation or as an ordered
-  workload.
-- Freeze and thaw a running Firo node cgroup before workload generation or as
-  an ordered workload.
-- Wait for JSON-RPC readiness.
-- Produce regtest blocks through a reproducible global Bernoulli scheduler,
-  selecting one configured miner uniformly after each successful draw.
-- Wait for blocks from explicit generation workloads to propagate before those
-  workloads complete.
-- Record optional periodic metric samples concurrently with wallet setup,
-  runtime events, and workloads.
-- Record nine process performance counters through the official Linux
-  `libperf` API, including raw/scaled values and multiplexing times.
-- Record cgroup usage, pressure, event counters, and configured limits.
-- Record Firo daemon version, protocol version, and subversion in metrics.
-- Record event and metric files under a run directory.
-- Operate a live run through ncurses and view a completed run in read-only
-  mode.
-- Exercise Linux network namespace, veth, address, route, and qdisc operations
-  through simulator probes.
-- Run unit tests with CTest.
+Shared facilities include:
+
+- Per-node cgroup v2 CPU, memory, I/O, and process limits, with live updates.
+- Network namespaces and virtual Ethernet links, enabled by default; delay,
+  loss, bandwidth limits, directional conditions, and partition/heal operations.
+- Configurable peer topologies, scheduled events, node restart/freeze operations,
+  and live node creation and removal.
+- JSON/YAML scenarios, seeded block scheduling and transaction strategies.
+- Chain, wallet, resource, network, and optional Linux performance-counter
+  metrics, plus retained logs and reports.
+
+There is no fixed 16-node ceiling. `--node-capacity` is an initial reservation,
+defaulting to the initial node count (at least one), and can grow with explicit
+node creation. Address-pool or loopback-port limits and available host resources
+still apply. The default full-mesh topology becomes expensive as node count grows.
+Seeded scheduling does not make daemon execution or benchmark results deterministic.
 
 ## Requirements
 
-- Linux with cgroup v2, network namespaces, veth, and traffic-control support.
-- CMake 3.20 or newer.
-- A C++20 compiler.
-- A compiled `firod` binary for Firo smoke runs.
-- Privileges/capabilities for network probes, usually `CAP_SYS_ADMIN` and
-  `CAP_NET_ADMIN`.
-- Permission to use `perf_event_open(2)` for daemon processes. Prefer
-  `CAP_PERFMON` on kernels that provide it; `CAP_SYS_ADMIN` also grants access
-  on older kernels. The host's `kernel.perf_event_paranoid` and container
-  seccomp policy must permit the call.
+- Linux with cgroup v2 and writable access to the required controllers.
+- Network namespace, veth, and traffic-control support; isolated runs require
+  `CAP_SYS_ADMIN` and `CAP_NET_ADMIN`.
+- A C/C++ toolchain supporting C++20, CMake 3.20+, Git, and GNU Make.
+- Initialized submodules for Boost, libmnl, libyaml, and ncurses; libperf sources
+  are also vendored. Chain daemon binaries are built separately.
+- For Firo, an executable `firo-qt` beside the resolved `firod` binary. Current
+  startup generates its connection command even for headless runs.
+- A terminal for the TUI, or `--no-tui` for headless use.
 
-The normal development path is a Docker container with the project mounted. The
-examples below use `benchmark-project-codex` as the container name.
+Use a dedicated Linux environment or a container configured for these kernel
+operations. An ordinary unprivileged Docker container is not sufficient.
+`--no-isolate-network` selects loopback networking; it does not remove the cgroup
+requirements or permit network shaping.
 
-Before starting benchmark nodes, BBP raises `net.netfilter.nf_conntrack_max`
-to 1,048,576 if it is lower, then verifies the value. Higher limits are left
-unchanged. This shared kernel setting is not restored on exit and is not made
-persistent across reboots. If the setting is missing or not writable (for
-example, in an unprivileged container), BBP logs a warning and continues with
-the existing limit. Raising this ceiling permits more kernel memory use; it
-does not reduce RPC connection creation or guarantee sustained throughput.
+Performance counters additionally need permission to call `perf_event_open`
+under the host's perf and container seccomp policies. When unavailable, BBP
+records availability/error fields rather than treating missing counters as zero.
 
-Set paths used by the commands:
-
-```bash
-export PROJECT_ROOT=/path/to/benchmark-project
-export FIROD=/path/to/firod
-```
+At node startup, BBP attempts to raise the shared
+`net.netfilter.nf_conntrack_max` limit to 1,048,576 when lower. It warns and
+continues if this fails. Successful changes are not restored on exit and may
+allow greater kernel memory use.
 
 ## Build
 
-Configure and build inside Docker:
+From the repository root:
 
 ```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug &&
-   cmake --build build -j16'
+git submodule update --init --recursive
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build -j$(nproc)
+./build/bbp --help
 ```
 
-Build directly on the host:
+The optional native Firo-Qt launcher is disabled by default. Enable it at
+configure time with `-DFIRO_GUI_LAUNCHER=ON`; the `show-firo-qt` log command does
+not require that option.
+
+## Tests
+
+Select the unit-test executable explicitly:
 
 ```bash
-cd "$PROJECT_ROOT"
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j16
+ctest --test-dir build -R '^bbp-unit-tests$' --output-on-failure
 ```
 
-## Test
+Despite its name, this executable also contains privilege-dependent kernel
+checks, which can skip when facilities are unavailable. Setting `BBP_REAL_FIROD`
+opts into a real-daemon cgroup test; leave it unset for ordinary unit testing.
 
-Run unit tests:
+The complete CTest suite also includes CLI, TUI, lifecycle, and runtime
+integration tests. Inspect the list before running it in a disposable test
+environment, not alongside an active benchmark:
 
 ```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ctest --test-dir build --output-on-failure'
+ctest --test-dir build -N
+ctest --test-dir build --output-on-failure
 ```
 
-## Run Firo Smoke Benchmarks
+CLI probes such as `--probe-veth`, `--probe-cgroup-freeze`, and
+`--probe-directional-network-condition` exercise kernel operations and are not
+read-only checks. The separate [MCP acceptance client](tests/integration/mcp_discovery_client.py)
+starts, stops, and cleans runs; its header documents the required Python packages.
 
-One Firo node:
+## Quick Start
+
+Run a finite, three-node Firo benchmark in a suitably privileged environment:
 
 ```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
-  benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp \
-     --chain firo \
-     --node-binary "$FIROD" \
-     --benchmark-root runs \
-     --run-id smoke1 \
-     --replace-run \
-     --nodes 1 \
-     --block-production-probability 1 \
-     --block-production-period-ms 250 \
-     --metrics-sample-count 4 \
-     --metrics-interval 250ms \
-     --ready-timeout-sec 45'
+export FIROD=/absolute/path/to/firod
+./build/bbp --chain firo --node-binary "$FIROD" \
+  --benchmark-root runs --run-id smoke-3 --nodes 3 \
+  --block-production-probability 1 --block-production-period-ms 1000 \
+  --metrics-sample-count 5 --metrics-interval 1s --no-tui
 ```
 
-Multiple Firo nodes:
+Scheduled production makes one probability draw per period and, on success,
+selects a configured miner uniformly to request a block. A positive metric
+sample count gives this headless run an automatic endpoint; it is not a limit
+on total wall time, which also includes setup and cleanup.
+
+Use a new run ID for each run. `--replace-run` deletes an existing validated,
+simulator-owned run directory; do not use it for results you need to keep.
+Without a sample limit or scenario duration, a run stays active until explicitly
+stopped. Omit `--no-tui` for interactive operation; Ctrl-C requests headless
+shutdown. `--no-mining` disables scheduled production, not metrics.
+
+BBP uses `$HOME/.bbp/bbp.lock` to allow one application instance per HOME.
+Use the existing TUI/MCP connection to operate a live application.
+
+## Workloads and Scenarios
+
+For continuous public-wallet traffic with two wallets and one miner:
 
 ```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
-  benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp \
-     --chain firo \
-     --node-binary "$FIROD" \
-     --benchmark-root runs \
-     --run-id smoke3 \
-     --replace-run \
-     --nodes 3 \
-     --block-production-probability 1 \
-     --block-production-period-ms 250 \
-     --metrics-sample-count 4 \
-     --metrics-interval 250ms \
-     --generate-node 2 \
-     --ready-timeout-sec 45 \
-     --sync-timeout-sec 45'
+./build/bbp --chain firo --node-binary "$FIROD" \
+  --benchmark-root runs --run-id wallet-load --nodes 3 \
+  --wallet-node-count 2 --transaction-load-strategy random_bruteforce
 ```
 
-Multiple isolated Firo nodes:
+This initializes and funds managed wallets before generating traffic.
+The direct CLI also accepts `equal_fanout`; both use a default rate of 2
+transactions/second and concurrency 2. These options require at least two
+wallets and cannot be combined with `--scenario`. Rate, amount, funding, and
+queue settings belong in a scenario for custom workloads.
 
-```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
-  benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp \
-     --chain firo \
-     --node-binary "$FIROD" \
-     --benchmark-root runs \
-     --run-id isolated-smoke \
-     --replace-run \
-     --nodes 3 \
-     --block-production-probability 1 \
-     --block-production-period-ms 250 \
-     --metrics-sample-count 4 \
-     --metrics-interval 250ms \
-     --ready-timeout-sec 45 \
-     --sync-timeout-sec 45 \
-     --isolate-network'
-```
-
-Isolated Firo node with a default network condition:
-
-```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
-  benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp \
-     --chain firo \
-     --node-binary "$FIROD" \
-     --benchmark-root runs \
-     --run-id isolated-delay \
-     --replace-run \
-     --nodes 1 \
-     --block-production-probability 1 \
-     --block-production-period-ms 250 \
-     --metrics-sample-count 4 \
-     --metrics-interval 250ms \
-     --ready-timeout-sec 45 \
-     --isolate-network \
-     --network-delay-ms 5'
-```
-
-Isolated Firo node with a bandwidth limit. Bandwidth values are unsigned
-decimal kilobytes per second (`1` = 1,000 bytes/s); `0` means unlimited:
-
-```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" -e FIROD="$FIROD" \
-  benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp \
-     --chain firo \
-     --node-binary "$FIROD" \
-     --benchmark-root runs \
-     --run-id isolated-bandwidth \
-     --replace-run \
-     --nodes 1 \
-     --block-production-probability 1 \
-     --block-production-period-ms 250 \
-     --metrics-sample-count 4 \
-     --metrics-interval 250ms \
-     --ready-timeout-sec 45 \
-     --isolate-network \
-     --network-bandwidth-kbps 2500'
-```
-
-Per-node isolated network conditions use repeatable JSON objects:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id isolated-per-node \
-  --replace-run \
-  --nodes 2 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --isolate-network \
-  --node-network-condition-json '{"node":2,"bandwidth_kbps":2500}'
-```
-
-Runtime network updates use the same JSON shape and are applied after nodes are
-running, while scheduled block production and metrics collection continue:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id live-netem \
-  --replace-run \
-  --nodes 2 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --isolate-network \
-  --runtime-node-network-condition-json '{"node":2,"bandwidth_kbps":1250}'
-```
-
-Runtime block/unblock rules match a destination IPv4 address and TCP port on a
-node's host-side veth. Add `src_address` when the rule should only match one
-source node. This example applies and then removes the same source-scoped rule
-while scheduled block production and metrics collection continue:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id live-block-unblock \
-  --replace-run \
-  --nodes 2 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --isolate-network \
-  --runtime-node-block-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}' \
-  --runtime-node-unblock-json '{"node":1,"src_address":"10.210.2.2","dst_address":"10.210.1.2","dst_port":18168}'
-```
-
-Runtime partition/heal accepts two node groups and installs source-aware
-cross-group P2P block rules in both directions:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id live-partition-heal \
-  --replace-run \
-  --nodes 3 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --isolate-network \
-  --runtime-partition-json '{"group_a":[1,2],"group_b":[3]}' \
-  --runtime-heal-partition-json '{"group_a":[1,2],"group_b":[3]}'
-```
-
-The current implementation applies bandwidth with TBF and delay/loss conditions
-with `netem`. When both are requested, TBF is the root qdisc and netem is
-attached below it. The netem fields are `delay_ms`, `jitter_ms`,
-`loss_basis_points`, `duplicate_basis_points`, `corrupt_basis_points`,
-`reorder_basis_points`, and `limit_packets`.
-
-Default resource limits apply to each node cgroup:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id resource-smoke \
-  --replace-run \
-  --nodes 1 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --memory-high-bytes 1073741824 \
-  --memory-max-bytes 1610612736 \
-  --cpu-quota-us 75000 \
-  --cpu-period-us 100000 \
-  --pids-max 128
-```
-
-Runtime resource updates are applied after nodes are running, before block
-generation. Omitted fields keep their current values; `cpu_quota_us: null`
-restores unlimited CPU quota.
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id live-resources \
-  --replace-run \
-  --nodes 1 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --runtime-node-resource-json '{"node":1,"memory_high_bytes":1073741824,"cpu_quota_us":50000,"cpu_period_us":100000,"pids_max":128}'
-```
-
-Runtime restarts stop a node through Firo RPC, respawn it in the same
-cgroup/network/data directory, wait for RPC readiness, then continue the run:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id restart-smoke \
-  --replace-run \
-  --nodes 1 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --runtime-node-restart-json '{"node":1}'
-```
-
-Runtime freezes pause a node cgroup for a bounded duration, verify frozen and
-thawed states, then continue the run:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id freeze-smoke \
-  --replace-run \
-  --nodes 1 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 4 \
-  --metrics-interval 250ms \
-  --runtime-node-freeze-json '{"node":1,"duration_ms":100}'
-```
-
-Extra metric samples can be collected while runtime updates, restarts, and
-scheduled block production execute. The nodes remain active until the requested
-sample count is complete:
-
-```bash
-./build/bbp \
-  --chain firo \
-  --node-binary "$FIROD" \
-  --benchmark-root runs \
-  --run-id sampled-smoke \
-  --replace-run \
-  --nodes 1 \
-  --block-production-probability 1 \
-  --block-production-period-ms 250 \
-  --metrics-sample-count 5 \
-  --metrics-interval 1s
-```
-
-Temporary chain RPC unavailability during restart or freeze is recorded as a
-`metrics_node_unavailable` event for that node. Remaining nodes and later
-samples continue; storage and internal collection failures still fail the run.
-The default `--metrics-sample-count 0` keeps metrics and scheduled block
-production running until the integrated TUI exits. Headless runs that must
-finish automatically should pass a positive sample count. `--no-mining`
-disables scheduled production without disabling metrics.
-`generated_block_count` counts blocks explicitly requested by the simulator;
-native-mining output is reflected in chain height and is not attributed to a
-specific miner unless that chain driver can report the attribution.
-
-Every node sample attempts to include `cycles`, `instructions`, cache and
-branch references/misses, context switches, page faults, and task clock. The
-simulator uses its owned daemon PID and reopens the counters after a restart.
-`perf_counter_target_pid`, `perf_counter_attached_pid`, and
-`perf_counter_process_generation` identify that attachment. Each counter keeps
-its raw value, safely scaled value, enabled time, and running time so
-multiplexing remains visible.
-
-The perf layer also supports cgroup-v2 attachment for live group/cgroup
-requests. Per-process attachment continues to use the official libperf API;
-the cgroup-only path opens the simulator-owned cgroup directory and calls
-`perf_event_open(2)` with `PERF_FLAG_PID_CGROUP` once per counter and allowed
-CPU, because libperf's public counting API does not expose that flag. CPU
-selection comes from the simulator's kernel affinity mask so container cpuset
-restrictions and file-descriptor use remain explicit.
-
-For a Docker run, grant perf access explicitly when it is not already covered
-by the privileged simulator environment, for example with `--cap-add PERFMON`
-(or `--cap-add SYS_ADMIN` on older kernels). Some Docker seccomp profiles also
-deny `perf_event_open`; use an administrator-approved profile that permits the
-syscall. The current host policy can be inspected without changing it at
-`/proc/sys/kernel/perf_event_paranoid`. If the kernel denies or does not support
-the events, the benchmark continues to collect its other metrics and records
-`perf_counters_available: false` with a typed `perf_counter_error_kind` and
-error detail; unavailable counters are never reported as zero.
-
-The same run settings can be loaded from a JSON or YAML scenario file. Both
-formats use the same field names and validation rules.
-
-Canonical global run policy belongs in the typed `simulation` object:
+A minimal `scenario.json` with a duration and scheduled checkpoint:
 
 ```json
 {
+  "chain": "firo",
   "simulation": {
-    "name": "firo-regtest-100",
-    "seed": 12345,
-    "duration": "2h",
-    "time_scale": 2.0,
-    "metrics_interval": "1s",
-    "output_dir": "runs",
-    "tui_refresh_interval": "250ms"
-  }
-}
-```
-
-Durations require a positive integer plus `ms`, `s`, `m`, or `h`.
-`time_scale` is a positive fixed-point multiplier with at most six decimal
-places: `2.0` advances scheduled simulation time twice as fast as monotonic
-wall time, while `0.5` advances it at half speed. Conversion rounds wall
-deadlines up to the next millisecond. Scheduled lifecycle details preserve
-`scheduled_at_ms` in simulation time and `scheduled_wall_at_ms` for the scaled
-monotonic deadline; lateness is measured against the latter. Metrics and TUI
-refresh intervals remain wall-clock intervals.
-
-A configured duration is measured from the active event-engine epoch, after
-nodes and wallets are ready. It is a hard, stop-aware boundary and ends with
-`simulation_duration_reached` followed by the normal node cleanup and
-`run_finished` lifecycle. Scheduled events must occur strictly before that
-boundary. `duration` cannot be combined with the legacy positive
-`metrics_sample_count` finite-run mechanism. The global seed is the default for
-block scheduling, seeded topology resolution, and wallet transaction strategy;
-an explicitly configured subsystem seed still takes precedence. CLI
-`--benchmark-root`, `--metrics-interval`, `--refresh-ms`, and block-production
-seed settings override scenario values.
-
-The historical top-level `output_dir`, `metrics_interval_ms`, and
-`metrics_sample_count` fields remain compatibility inputs. Canonical and legacy
-aliases cannot be combined in one scenario.
-
-The remaining canonical global policies use explicit values that match the
-implemented Linux MVP:
-
-```json
-{
-  "simulation": {
-    "cleanup_policy": "automatic",
-    "privilege_mode": "direct",
-    "log_retention_policy": "preserve"
-  }
-}
-```
-
-`automatic` stops owned processes and removes owned network and cgroup runtime
-resources on every normal, failed, or cancelled run. The diagnostic
-`retain_cgroups` cleanup policy maps to the legacy `--keep-cgroups` behavior;
-the CLI option takes precedence and a later owned `--cleanup-run` removes the
-retained run cgroup. Network resources and processes are never retained.
-`direct` records that the simulator process itself uses the required Linux
-capabilities; helper and rootless modes are not implemented. `preserve` keeps
-daemon logs, normalized log events, metrics, events, and resolved scenario data
-inside the validated run directory. Unsupported policy names are rejected
-rather than silently selecting an unimplemented helper or deletion mode.
-
-```json
-{
-  "chain_daemon": "/path/to/firod",
-  "output_dir": "runs",
-  "run_id": "scenario-smoke",
+    "name": "firo-regtest",
+    "seed": 42,
+    "duration": "30s",
+    "metrics_interval": "1s"
+  },
   "nodes": 3,
-  "ready_timeout_sec": 45,
-  "metrics_sample_count": 5,
-  "metrics_interval_ms": 1000,
-  "block_production": {
-    "enabled": true,
-    "native_mining": false,
-    "period_ms": 1000,
-    "probability": 0.5,
-    "seed": 7,
-    "difficulty": null
-  },
-  "workloads": [
-    {
-      "type": "wait_for_peers",
-      "node": 2,
-      "peer_count": 1,
-      "timeout_sec": 45
-    },
-    {
-      "type": "disconnect_peer",
-      "node": 2,
-      "peer": 1,
-      "timeout_sec": 45
-    },
-    {
-      "type": "connect_peer",
-      "node": 2,
-      "peer": 1,
-      "timeout_sec": 45
-    },
-    {
-      "type": "partition_nodes",
-      "group_a": [1],
-      "group_b": [2, 3]
-    },
-    {
-      "type": "heal_partition",
-      "group_a": [1],
-      "group_b": [2, 3]
-    },
-    {
-      "type": "block_generation",
-      "node": 2,
-      "count": 1,
-      "sync_timeout_sec": 45
-    },
-    {
-      "type": "block_generation",
-      "node": 1,
-      "count": 1,
-      "sync_timeout_sec": 45
-    },
-    {
-      "type": "wait_until_height",
-      "node": 2,
-      "height": 1,
-      "timeout_sec": 45
-    }
-  ],
-  "resources": {
-    "memory_high_bytes": 1073741824,
-    "memory_max_bytes": 1610612736,
-    "cpu_quota_us": 75000,
-    "cpu_period_us": 100000,
-    "pids_max": 128,
-    "runtime_node_limits": [
-      {
-        "node": 1,
-        "memory_high_bytes": 805306368,
-        "cpu_quota_us": null,
-        "pids_max": 128
-      }
-    ]
-  },
-  "network": {
-    "isolated": true,
-    "default_condition": {
-      "delay_ms": 1,
-      "limit_packets": 1000
-    },
-    "runtime_node_conditions": [
-      {
-        "node": 1,
-        "delay_ms": 3,
-        "jitter_ms": 1
-      }
-    ],
-    "runtime_node_blocks": [
-      {
-        "node": 1,
-        "src_address": "10.210.2.2",
-        "dst_address": "10.210.1.2",
-        "dst_port": 18168
-      }
-    ],
-    "runtime_node_unblocks": [
-      {
-        "node": 1,
-        "src_address": "10.210.2.2",
-        "dst_address": "10.210.1.2",
-        "dst_port": 18168
-      }
-    ],
-    "runtime_partitions": [
-      {
-        "group_a": [1, 2],
-        "group_b": [3]
-      }
-    ],
-    "runtime_partition_heals": [
-      {
-        "group_a": [1, 2],
-        "group_b": [3]
-      }
-    ]
-  },
-  "process": {
-    "runtime_node_restarts": [
-      {
-        "node": 1
-      }
-    ],
-    "runtime_node_freezes": [
-      {
-        "node": 1,
-        "duration_ms": 100
-      }
-    ]
-  }
-}
-```
-
-Run it:
-
-```bash
-./build/bbp --scenario /path/to/scenario.json --replace-run
-```
-
-The equivalent YAML entry point is:
-
-```bash
-./build/bbp --scenario /path/to/scenario.yaml --replace-run
-```
-
-Wallet and miner roles can be declared in the scenario topology. Counts resolve
-deterministically to concrete node lists; explicit `wallet_nodes` and
-`miner_nodes` may be used when a scenario needs fixed assignments. If a
-scenario has miners, each successful global block-production draw selects one
-active miner uniformly. Without a topology, `generate_node` identifies the
-single default miner.
-
-```json
-{
-  "node_count": 3,
-  "topology": {
-    "node_count": 3,
-    "wallet_node_count": 2,
-    "miner_node_count": 1,
-    "allow_miner_wallet_overlap": false
-  }
-}
-```
-
-Logical P2P topology is selected by the same typed `topology` object. The
-default is `full_mesh`; supported graph types are `ring`, `star`,
-`random_graph`, `scale_free_graph`, `latency_matrix`, `custom_edge_list`,
-`partitioned_groups`, and `internet_like_region_graph`. Seeded graph resolution
-is deterministic, node ids are 1-based in scenario files, and the canonical
-directed `resolved_edges` array is written to `resolved-scenario.json`.
-
-```json
-{
-  "node_count": 4,
-  "topology": {
-    "node_count": 4,
-    "type": "ring",
-    "peer_connectivity": [
-      {"node": 1, "all_peers": true}
-    ]
-  }
-}
-```
-
-`star` accepts `center_node`; `random_graph` accepts `seed` and
-`average_degree`; `scale_free_graph` accepts `seed` plus either
-`attachment_count` or `average_degree`. A custom edge has `from`, `to`,
-`bidirectional`, and `active` fields. It may also define the flattened typed
-condition fields `bandwidth_kbps`, `delay_ms`, `jitter_ms`,
-`loss_basis_points`, `duplicate_basis_points`, `corrupt_basis_points`,
-`reorder_basis_points`, and `limit_packets`. The compatibility field
-`latency_ms` maps to `delay_ms`; when both are present, their values must match.
-Directional conditions require `network.isolated: true` and are validated
-before the simulator creates resources.
-
-For each source node, active outgoing edges receive deterministic bands in
-canonical destination order. Unconditioned edges retain their bands so adding
-or removing a condition does not renumber later destinations. The simulator
-applies each condition to an exact destination IPv4 `/32` on the source node's
-namespace-side veth through direct rtnetlink calls, verifies the qdisc and
-flower-filter state from the kernel, and records a
-`directional_network_policies_verified` event. The current 16-node isolated
-address plan permits at most 15 outgoing destination bands per source. The
-configured and resolved edge conditions are preserved in
-`resolved-scenario.json` and in the shared CLI/TUI run report.
-
-Every periodic node sample also reads the current simulator-owned flower and
-per-band qdisc objects inside that node's namespace. The metrics preserve exact
-per-edge classifier counters and every TBF/netem stage, plus checked aggregate
-packet, byte, drop, overlimit, queue, backlog, and requeue fields under
-`directional_network_*`. A combined TBF-plus-netem path uses its ingress TBF
-bytes and packets once while summing distinct drop/queue counters across both
-stages. Kernel state is matched against the synchronized current policy before
-publishing a sample. The report retains the complete final
-`directional_network_policy_counters` array, and the TUI node detail shows the
-current shaped-edge packet/drop summary.
-
-Active outgoing edges are also the authoritative allowed-peer set for each
-node. Background peer-count enforcement selects only allowed logical peers, and
-scenario or TUI `connect_peer` actions reject a target that is not an active
-outgoing edge. `disconnect_peer` remains available for removing a stale session
-after topology changes.
-
-The ordered `events` array can mutate an inventory edge with
-`set_edge_condition`, `activate_edge`, `deactivate_edge`, or `restore_edge`.
-`from` and `to` are required 1-based node ids. Condition updates use the same
-flattened typed fields as custom edges; activation, deactivation, and restore
-instead accept a positive `timeout_sec` for the verified driver peer action.
-Inactive custom edges remain in the inventory and reserve their canonical band,
-so later activation never renumbers another destination. `restore_edge` restores
-both the configured active state and configured condition.
-
-```json
-{
   "events": [
-    {
-      "at": "5s",
-      "action": "set_edge_condition",
-      "from": 1,
-      "to": 2,
-      "bandwidth_kbps": 1250,
-      "delay_ms": 40
-    },
-    {
-      "at": "10s",
-      "action": "deactivate_edge",
-      "from": 1,
-      "to": 2,
-      "timeout_sec": 15
-    },
-    {
-      "at": "15s",
-      "action": "restore_edge",
-      "from": 1,
-      "to": 2,
-      "timeout_sec": 15
-    }
+    {"at": "10s", "action": "checkpoint", "name": "mid-run"}
   ]
 }
 ```
 
-The complete ordered action sequence is validated before resource creation,
-including edge existence/state and peer-policy feasibility. Each live change is
-transactional across kernel policy read-back, the synchronized logical
-allow-list, driver peer state, and restart peer configuration. Successful
-changes emit `topology_edge_updated`; incomplete rollback emits
-`topology_edge_update_rollback_failed`. The resolved scenario preserves
-`topology_initial_edges`, while the shared report exposes bounded
-`topology_edge_updates` and the event-reduced `topology_current_edges`; the TUI
-uses that current state for its eligible-edge count.
-
-Use a typed `checkpoint` action to force a correlated observation point. It
-refreshes transaction visibility, writes one current resource/network/chain
-metric sample for every available node, writes wallet samples when wallet roles
-are active, and records a `checkpoint_recorded` event with exact sample counts.
-An optional safe `name` is preserved in the resolved scenario and shared run
-report:
-
-```json
-{"at":"30s","action":"checkpoint","name":"before-partition"}
-```
-
-Partition and region node groups must assign every simulated node exactly once.
-Region edges connect the first node in each region as its gateway; without
-explicit `region_edges`, all region gateways form a backbone mesh. A latency
-matrix uses `null` for an absent directed edge and a non-negative millisecond
-value for a present directed edge; each off-diagonal value also resolves to the
-edge's typed `delay_ms` condition:
-
-```json
-{
-  "node_count": 3,
-  "topology": {
-    "node_count": 3,
-    "type": "latency_matrix",
-    "latency_matrix_ms": [
-      [0, 20, null],
-      [35, 0, 10],
-      [null, null, 0]
-    ]
-  }
-}
-```
-
-Peer-count policies are resolved against each node's eligible logical peers.
-`all_peers` means all active outgoing edges for that node, and an impossible
-minimum is rejected before any process or network resource is created.
-
-Raw Firo transactions can be driven without enabling the wallet. The workload
-mines mature funding to the source address, signs with the supplied regtest WIF,
-submits the transaction, and waits for it in the mempool:
-
-```json
-{
-  "type": "send_raw_transaction",
-  "funding_node": 1,
-  "submit_node": 1,
-  "source_address": "TEDbE9M6woLAtvxKoFitLpFgeDHFicgTA2",
-  "source_private_key": "cTpB4YiyKiBcPxnefsDpbnDxFDffjqJob8wGCEDXxgQ7zQoMXJdH",
-  "destination_address": "TPxjJMGYU3jFz9zioYfGcq7w47ZGFW3Xbh",
-  "funding_blocks": 101,
-  "amount": "39.99000000",
-  "fee": "0.01000000",
-  "timeout_sec": 30
-}
-```
-
-Each run writes:
-
-- `runs/<run-id>/scenario.yaml`
-- `runs/<run-id>/resolved-scenario.json`
-- `runs/<run-id>/events.jsonl`
-- `runs/<run-id>/metrics.jsonl`
-- `runs/<run-id>/nodes/<node-id>/`
-
-Block-generation workloads run sequentially. For each one, the
-`generated_blocks` event detail is JSON with the workload index, generator node,
-generated count, start and target height, reward address, and returned block
-hashes. Per-node block sync confirmations are exposed in reports as
-`height_reached`. Compact event summaries preserve event timestamps when they
-are present in `events.jsonl`.
-`wait_until_height` workloads wait for one Firo node to reach a target height
-and emit a structured `height_wait_reached` event.
-`wait_for_peers` workloads wait for one Firo node to report at least the target
-peer count and emit a structured `peer_count_reached` event.
-`disconnect_peer` workloads call Firo `disconnectnode` for one target peer, wait
-for that peer address to disappear from `getpeerinfo`, and emit a structured
-`peer_disconnected` event.
-`connect_peer` workloads call Firo `addnode <address> onetry`, wait for the
-target address in `getpeerinfo`, and emit a structured `peer_connected` event.
-`send_raw_transaction` workloads use Firo raw transaction RPCs with wallet
-disabled and emit a structured `raw_transaction_submitted` event.
-`restart_node` workloads restart one Firo node and emit a structured
-`node_restarted` event.
-`freeze_node` workloads freeze one Firo node cgroup for `duration_ms`, thaw it,
-and emit a structured `node_freeze_completed` event.
-`update_resource_limits` workloads apply live cgroup limit changes to one node
-and emit a structured `resource_limits_updated` event.
-`partition_nodes` workloads install source-aware group P2P drop filters and
-emit a structured `network_partition_applied` event.
-`heal_partition` workloads remove matching group P2P drop filters and emit a
-structured `network_partition_healed` event.
-An explicit empty scenario workload list, `"workloads": []`, disables block
-generation for that run.
-
-Summarize an existing run:
-
 ```bash
-./build/bbp --benchmark-root runs --report-run <run-id>
+./build/bbp --scenario scenario.json --node-binary "$FIROD" \
+  --benchmark-root runs --no-tui
 ```
 
-The compact report includes the run status, lifecycle timestamps, failure
-detail when present, event counts, workload summaries, final per-node metrics,
-latest log tails, and the newest 120 derived metric samples per node under
-`metrics_history`. The bounded history retains its original timestamps and
-exposes the total unbounded sample count separately as `metric_samples`.
+JSON and YAML use the same fields. For this example, duration starts after
+startup; scenarios with explicit node start/stop times instead measure from the
+node-lifecycle epoch. Duration cannot be combined with a positive
+`metrics_sample_count`.
+`simulation.time_scale` scales scheduled simulation time; metrics and TUI refresh
+intervals remain wall-clock intervals.
 
-View an existing run in the read-only TUI:
+Scenario `workloads` describe ordered actions; `events` schedule actions with
+`at` and `action`. Supported workload families include:
 
-```bash
-./build/bbp --benchmark-root runs --run <run-id>
-```
+| Family | Actions |
+| --- | --- |
+| Blocks and readiness | `block_generation`, `wait_until_height`, `wait_for_peers` |
+| Firo transactions | `wallet_transactions`, `send_raw_transaction` |
+| Lifecycle and resources | `restart_node`, `freeze_node`, `resource_pressure`, `update_resource_limits`, `set_resource_profile` |
+| Network and peers | `connect_peer`, `disconnect_peer`, `set_network_condition`, `set_network_profile`, `block_network_flow`, `unblock_network_flow`, `partition_nodes`, `heal_partition` |
+| Topology and evidence | `set_edge_condition`, `activate_edge`, `deactivate_edge`, `restore_edge`, `checkpoint` |
 
-The TUI shows run status, lifecycle timestamps, workload summary, node chain
-state, resource metrics, network counters, host qdisc state, directional edge
-qdisc packet/drop totals, and simulator logs. Use
-the arrow keys to select a node. Press `p` to toggle its connected-peer pane or
-`l` to toggle its separate log pane. Both panes support arrow keys, Page Up,
-Page Down, Home, and End for scrolling; press the opening key again to close
-the pane. Press `h` for the selected node's metric-history charts. The ASCII
-sparklines show CPU, memory, IO and network rates, height, mempool size, and—on
-taller terminals—throttling, peers, RPC latency, and drops; the newest samples
-are on the right and each row shows its latest and retained min/max values.
-`Tab` cycles node, wallet, topology, and metric views, while `n`, `w`, `g`, and
-`h` select them directly.
+Actions remain subject to chain capabilities and network-isolation requirements.
+Wallet strategies include `round_robin`, `random`, `fanout`, `hotspot`,
+`random_bruteforce`, and `equal_fanout`.
+Network `bandwidth_kbps` values are decimal **kilobytes/second**, not kilobits;
+zero means unlimited.
 
-Press `b` to open the selected node's safe artifact browser. The data view
-lists a bounded inventory below that run's `nodes/<node-id>/data` directory;
-the configuration view shows the canonical resolved node configuration and
-latest normalized runtime paths/endpoints; and the log view lists regular
-`.log` files while directing log contents through the existing bounded driver
-tails. Left/Right or `[`/`]` cycles these sections, the standard arrow,
-Page Up, Page Down, Home, and End keys scroll, `u` reloads the inventory, and
-`b` closes it. The browser rejects unsafe node IDs, opens each directory with
-no-follow semantics, never traverses symlinks, escapes control bytes, redacts
-password/secret/token/cookie fields, and bounds traversal depth and results.
+See [scenario fixtures](tests/scenarios) for field-level examples, including
+[wallet loads](tests/scenarios/valid-wallet-transaction-load-strategies.json)
+and [network controls](tests/scenarios/valid-network-control-workloads.json).
+Fixtures often contain placeholder daemon paths and are not ready-to-run
+benchmarks. The MCP schema resources expose the current input contracts.
 
-During a live benchmark launched without `--no-tui`, press `d` to disconnect
-the selected node from the simulated network or `s` to request that its mining
-operation stop. While the node log pane is open, `+` and `-` request higher or
-lower daemon log verbosity. Commands pass through the chain driver; when the
-selected chain does not support an operation, the TUI shows a dismissible
-`Command error` popup instead of attempting a chain-specific fallback.
+## TUI and MCP
 
-Press `c` to open the typed command palette. Live performance collection can
-be retargeted without restarting the benchmark:
+The TUI opens by default. Tab cycles node, wallet, topology, and metric views;
+arrows select entries. `l` opens node logs, `p` peers, `b` the artifact browser,
+`c` the command palette, and `i` MCP connection details. Escape opens the exit
+confirmation. Completed runs can be opened read-only with `--run`.
+
+The application automatically starts an authenticated HTTP MCP endpoint on
+`127.0.0.1` with an allocated port. Connection details are logged and published
+in `$HOME/.bbp/mcp/client.json`, with the bearer token in
+`$HOME/.bbp/mcp/token`. Both files contain sensitive connection material and
+are removed on normal shutdown; do not commit or share them.
+
+MCP supports scenario validation/resolution, run lifecycle, runtime commands,
+workload control, instrumentation, and evidence queries. Discover supported
+operations and schemas through `tools/list`, `resources/list`,
+`bbp:///capabilities`, and `bbp:///schemas`; do not assume every driver supports
+every advertised operation. Running `./build/bbp --no-tui` without a scenario or
+initial nodes opens an idle control application for MCP-managed runs.
+
+### Firo-Qt and External Funding
+
+For a live Firo run, BBP can generate a connection command when an executable
+`firo-qt` exists beside the resolved `firod` binary. Open the command palette
+(`c`) and enter:
 
 ```text
-perf-counters cycles,instructions,task-clock
-perf-counters cgroup page-faults
-perf-counters node firo-1 cycles,instructions
-perf-counters wallet 1 task-clock,page-faults
-perf-counters group topology-1 cache-misses,branch-misses
-perf-counters cgroup firo-2 cycles
+show-firo-qt
 ```
 
-With only a counter list, the target is inferred from the selected node,
-wallet, or topology group. A target kind without an ID resolves through the
-current compatible selection. Explicit node and cgroup IDs are owned node IDs;
-wallet IDs are positive one-based indexes (optionally prefixed with `#`); group
-IDs are the exact names shown by the topology view. Node and wallet targets use
-the daemon process through libperf. Cgroup and group targets attach to each
-resolved simulator-owned node cgroup on every allowed CPU. A group change is
-transactional: if any member cannot be attached, every member retains its
-previous live session and configuration. The selected configuration is
-preserved and reopened across node restarts.
+This reprints `manual Firo GUI command: ...` in Simulator Logs; it does not
+launch the GUI. Run the printed command from a graphical session with access to
+the referenced paths and peer addresses. It uses a separate wallet directory
+under `operator/firo-qt`, not a managed node's data directory. Container paths
+and networking must also be reachable from that session.
 
-From the wallet view, the selected wallet can submit a distinct live wallet
-transaction without exposing an address or private wallet material in the
-command:
+To fund a Firo-Qt regtest receiving address from an active public-wallet workload,
+use the command palette:
 
 ```text
-wallet-send <receiver-wallet-index> <amount> <fee> [timeout-sec]
-wallet-send 2 0.10000000 0.00001000 45
+add-target <receiving-address>
+remove-target <receiving-address>
 ```
 
-The selected wallet remains the typed sender through the destructive-action
-confirmation; the receiver is a different positive one-based wallet index.
-Amounts and fees use exact fixed-eight coin units, the amount must be positive,
-and the optional timeout defaults to 30 seconds. The simulator resolves both
-wallet identities through the run registry, calls only the active chain
-driver, records the operator command plus wallet submission and per-node
-visibility events, and never accepts signing keys or raw recipient addresses
-from this surface.
+`add-target` validates and registers the address; it is not an immediate payment.
+Targets receive a share of ongoing `random_bruteforce`, `random`, or
+`round_robin` traffic at the existing total rate. They are not managed wallets
+or senders. Private traffic and explicitly targeted fan-out/hotspot workloads
+are unchanged. Targets last for the current run; removal stops future selection,
+but in-flight payments may finish. Submission counts are not wallet balances.
 
-To include an external Firo-Qt receiving address in ongoing public-wallet
-traffic, open the command palette (`c`) and use:
+## Output and Cleanup
 
-```text
-add-target <address>
-remove-target <address>
-```
+Artifacts live under `<benchmark-root>/<run-id>/` (default root: `runs`):
 
-BBP validates the address against the running Firo network before adding it.
-Targets receive a share of `random_bruteforce`, `random`, and `round_robin`
-workloads at the existing total transaction rate. Each target gets one slot
-per recipient cycle alongside managed recipients; duplicates do not add weight.
-Targets never become senders or managed wallets. Explicit fan-out and hotspot
-workloads keep their configured recipients, and private-wallet traffic is unchanged.
-The wallet view shows active targets and submission counts; these counts are not
-external-wallet balances. BBP still tracks transaction confirmation across its
-managed nodes. Removing a target stops future selection, but in-flight payments
-may finish. Targets belong to the current run and must be added again for a new run.
-The equivalent `simulation.command` actions are `add_target_address` and
-`remove_target_address`, each with a `target_address` field and no `node` field.
+| Artifact | Contents |
+| --- | --- |
+| `source-scenario.json`, `resolved-scenario.json` | Stored input and resolved configuration |
+| `events.jsonl` | Lifecycle, workload, command, and diagnostic events |
+| `metrics.jsonl`, `wallet-metrics.jsonl` | Node and wallet samples, when collected |
+| `simulator.log` | Simulator messages and generated operator commands |
+| `nodes/<node-id>/` | Daemon data, configuration, and logs |
+| `runtime-node-resources.json` | Owned runtime-resource inventory |
 
-Per-node cgroup limits can also be changed live through typed, confirmed
-commands:
+JSONL files contain one JSON record per line. Performance-counter samples retain
+raw/scaled values and timing information when available. Treat run directories
+as sensitive: daemon data and configuration can contain wallet material and RPC
+credentials.
 
-```text
-resource-limit memory-high 1073741824
-resource-limit memory-max 2147483648
-resource-limit cpu-max 50000 100000
-resource-limit cpu-max max 100000
-resource-limit cpu-weight 250
-resource-limit io-max 259:0 10485760 max 1000 max
-resource-limit io-max 259:0 max max max max
-resource-limit io-weight 300
-resource-limit pids-max 128
-```
-
-All values are exact unsigned decimals. CPU quota and each `io-max` dimension
-accept `max`; all-`max` IO values clear only the named device and preserve
-limits for every other device. Weights use the cgroup-v2 range `1..10000`.
-Each successful change is read back from the owned cgroup, emits a
-`resource_limits_updated` event correlated with the operator command sequence,
-and rolls the complete prior resource state back if a partial write fails.
-
-Metrics record `perf_counter_target_kind`, `perf_counter_target_id`, the
-process PID fields or `perf_counter_cgroup_path` and `perf_counter_cpus`, and
-the exact ordered counter selection. Topology group summaries publish an
-aggregate only when every member reports the matching group target and ordered
-selection. Sums saturate explicitly at `uint64` and expose
-`aggregation_overflow` and `perf_counter_aggregation_overflow` rather than
-wrapping.
-
-Without an explicit topology policy, a multi-node run starts with every node
-connected to every other node. Scenario peer-count policies can replace that
-default with per-node minimum and maximum connection counts.
-
-Render one TUI frame and exit, useful for validation:
+After the application exits, inspect retained results:
 
 ```bash
-TERM=xterm ./build/bbp --benchmark-root runs --run <run-id> --once
+./build/bbp --benchmark-root runs --report-run smoke-3
+./build/bbp --benchmark-root runs --run smoke-3
 ```
 
-## Run Network Probes
+`--report-run` logs a JSON summary of status, events, workloads, final metrics,
+and bounded recent metric history. Raw JSONL files retain the collected history.
 
-The probes validate the Linux isolation and network-control pieces used by the
-simulator.
+Default cleanup stops owned processes and removes owned network/cgroup resources
+while preserving artifacts. For stale resources after an interrupted run:
 
 ```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp --probe-network &&
-   ./build/bbp --probe-capabilities &&
-   ./build/bbp --probe-cgroup-freeze &&
-   ./build/bbp --probe-netns &&
-   ./build/bbp --probe-veth &&
-   ./build/bbp --probe-address &&
-   ./build/bbp --probe-route &&
-   ./build/bbp --probe-qdisc &&
-   ./build/bbp --probe-qdisc-mutation &&
-   ./build/bbp --probe-bandwidth-limit &&
-   ./build/bbp --probe-network-condition &&
-   ./build/bbp --probe-combined-network-condition &&
-   ./build/bbp --probe-directional-network-condition &&
-   ./build/bbp --probe-network-condition-update'
+./build/bbp --benchmark-root runs --cleanup-run smoke-3
 ```
 
-Useful focused probes:
-
-```bash
-./build/bbp --probe-veth
-./build/bbp --probe-capabilities
-./build/bbp --probe-cgroup-freeze
-./build/bbp --probe-route
-./build/bbp --probe-qdisc-mutation
-./build/bbp --probe-bandwidth-limit
-./build/bbp --probe-network-condition
-./build/bbp --probe-combined-network-condition
-./build/bbp --probe-directional-network-condition
-./build/bbp --probe-network-condition-update
-```
-
-The directional probe enters a temporary node namespace on a worker thread,
-installs an owned 16-band `prio` root on the namespace-side veth, classifies
-exact IPv4 destinations with `flower`, and verifies independent netem and
-TBF-plus-netem branches through kernel read-back. It then removes the complete
-policy and proves that a foreign root qdisc is rejected and preserved.
-
-## Cleanup Checks
-
-Check for leftover Firo daemons:
-
-```bash
-docker exec benchmark-project-codex bash -lc 'pgrep -a firod || true'
-```
-
-Check for leaked temporary veth names:
-
-```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp --probe-network | rg "bbp[0-9]+[hp]" || true'
-```
-
-Remove stale simulator-owned kernel objects for a run ID:
-
-```bash
-docker exec -e PROJECT_ROOT="$PROJECT_ROOT" benchmark-project-codex bash -lc \
-  'cd "$PROJECT_ROOT" &&
-   ./build/bbp \
-     --benchmark-root runs \
-     --cleanup-run isolated-smoke'
-```
+Use cleanup only for an inactive run you own, with the required privileges.
+Do not remove ownership metadata or run cleanup against a live benchmark.
 
 ## License
 
-GPLv3. See `LICENSE`.
+[GNU General Public License v3](LICENSE).
