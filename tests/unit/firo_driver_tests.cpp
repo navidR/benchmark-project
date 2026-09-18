@@ -281,8 +281,17 @@ BOOST_AUTO_TEST_CASE(firo_validates_external_target_addresses) {
   const std::vector<std::string> responses = {
       R"({"result":{"isvalid":true},"error":null,"id":"bbp"})",
       R"({"result":{"isvalid":false},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalidSpark":true},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalidSpark":false},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalid":false,"isvalidSpark":true},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalid":true,"isvalidSpark":false},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalid":false,"isvalidSpark":false},"error":null,"id":"bbp"})",
       R"({"result":{"isvalid":"true"},"error":null,"id":"bbp"})",
-      R"({"result":{},"error":null,"id":"bbp"})"};
+      R"({"result":{"isvalidSpark":"true"},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalid":true,"isvalidSpark":null},"error":null,"id":"bbp"})",
+      R"({"result":{"isvalid":null,"isvalidSpark":true},"error":null,"id":"bbp"})",
+      R"({"result":{},"error":null,"id":"bbp"})",
+      R"({"result":true,"error":null,"id":"bbp"})"};
   std::vector<boost::json::value> requests;
   auto served = std::async(std::launch::async, [&] {
     return ServeRpcResponses(acceptor, responses, &requests);
@@ -295,11 +304,27 @@ BOOST_AUTO_TEST_CASE(firo_validates_external_target_addresses) {
   const bbp::FiroDriver driver(std::chrono::seconds(1));
   BOOST_TEST(driver.ValidateTargetAddress(config, "external"));
   BOOST_TEST(!driver.ValidateTargetAddress(config, "wrong-network"));
+  BOOST_CHECK_NO_THROW(
+      BOOST_TEST(driver.ValidateTargetAddress(config, "external-spark")));
+  BOOST_CHECK_NO_THROW(
+      BOOST_TEST(!driver.ValidateTargetAddress(config, "wrong-network-spark")));
+  BOOST_TEST(driver.ValidateTargetAddress(config, "combined-spark"));
+  BOOST_TEST(driver.ValidateTargetAddress(config, "combined-transparent"));
+  BOOST_TEST(!driver.ValidateTargetAddress(config, "combined-invalid"));
   BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "malformed"),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "malformed-spark"),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "null-spark-flag"),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "null-public-flag"),
                     std::runtime_error);
   BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "missing"),
                     std::runtime_error);
-  BOOST_TEST(served.get() == std::vector<std::string>(4U, "validateaddress"),
+  BOOST_CHECK_THROW(driver.ValidateTargetAddress(config, "non-object"),
+                    std::runtime_error);
+  BOOST_TEST(served.get() ==
+                 std::vector<std::string>(responses.size(), "validateaddress"),
              boost::test_tools::per_element());
   BOOST_TEST(requests.front()
                  .as_object()
@@ -1691,6 +1716,46 @@ BOOST_AUTO_TEST_CASE(firo_submits_public_transfer_with_exact_rpc_payload) {
   BOOST_TEST(send_params[2].as_string().empty());
   BOOST_TEST(send_params[3].as_string().empty());
   BOOST_TEST(!send_params[4].as_bool());
+}
+
+BOOST_AUTO_TEST_CASE(firo_submits_transparent_funds_to_spark_target) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  asio::io_context server_context;
+  tcp::acceptor acceptor(
+      server_context,
+      tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  const std::vector<std::string> responses = {
+      R"({"result":{"isvalidSpark":true},"error":null,"id":"bbp"})",
+      R"({"result":true,"error":null,"id":"bbp"})",
+      R"({"result":"spark-mint-tx","error":null,"id":"bbp"})"};
+  std::vector<boost::json::value> requests;
+  auto served = std::async(std::launch::async, [&] {
+    return ServeRpcResponses(acceptor, responses, &requests);
+  });
+  bbp::FiroNodeConfig config;
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  const std::string address = "sr1-external-spark-target";
+
+  BOOST_CHECK_NO_THROW(BOOST_TEST(driver.ValidateTargetAddress(config, address)));
+  const auto result = driver.SubmitWalletTransaction(
+      config, bbp::WalletMode::kPublic, address, 1000000ULL, 1000ULL,
+      std::chrono::seconds(1));
+  const std::vector<std::string> expected_methods = {
+      "validateaddress", "settxfee", "sendtoaddress"};
+  BOOST_TEST(served.get() == expected_methods, boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(result.txids.size(), 1U);
+  BOOST_TEST(result.txids.front() == "spark-mint-tx");
+  BOOST_REQUIRE_EQUAL(requests.size(), 3U);
+  const auto& params = requests.back().as_object().at("params").as_array();
+  BOOST_REQUIRE_EQUAL(params.size(), 5U);
+  BOOST_TEST(params[0].as_string() == address);
+  BOOST_TEST(params[1].as_string() == "0.01000000");
+  BOOST_TEST(!params[4].as_bool());
 }
 
 BOOST_AUTO_TEST_CASE(firo_load_submission_returns_before_observation) {

@@ -1159,10 +1159,15 @@ bool FiroDriver::ValidateTargetAddress(const FiroNodeConfig& config,
   if (!result.is_object())
     throw std::runtime_error("validateaddress returned a non-object");
   const auto* valid = result.as_object().if_contains("isvalid");
-  if (valid == nullptr || !valid->is_bool()) {
-    throw std::runtime_error("validateaddress returned no boolean isvalid");
+  const auto* valid_spark = result.as_object().if_contains("isvalidSpark");
+  if ((valid == nullptr && valid_spark == nullptr) ||
+      (valid != nullptr && !valid->is_bool()) ||
+      (valid_spark != nullptr && !valid_spark->is_bool())) {
+    throw std::runtime_error(
+        "validateaddress returned missing or non-boolean validity flags");
   }
-  return valid->as_bool();
+  return (valid != nullptr && valid->as_bool()) ||
+         (valid_spark != nullptr && valid_spark->as_bool());
 }
 
 std::string FiroDriver::CreateWalletAddress(const FiroNodeConfig& config,
