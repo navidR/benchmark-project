@@ -1965,12 +1965,6 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   if (y >= bottom) {
     return;
   }
-  AddDetailPair(y, 0, cols, "routes",
-                JsonMetricText(metric_object, "network_routes"));
-  ++y;
-  if (y >= bottom) {
-    return;
-  }
   AddDetailPair(y, 0, left_width, "net total down / up",
                 JsonBytesKiBText(metric_object, "network_downlink_bytes") +
                     " / " +
@@ -3214,7 +3208,7 @@ bool HandleCommandPaletteInput(int ch, const boost::json::object& report,
   }
   if (ch >= 0 && ch <= 255 &&
       std::isprint(static_cast<unsigned char>(ch)) != 0 &&
-      state->command_input.size() < 128U) {
+      state->command_input.size() < 1024U) {
     state->command_input.push_back(static_cast<char>(ch));
     state->command_input_error.clear();
     return true;
