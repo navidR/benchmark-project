@@ -1809,16 +1809,6 @@ void DrawSelectedNodeDetail(int top, int bottom, int cols,
   const int left_width = std::max(0, cols / 2);
   const int right_width = std::max(0, cols - left_width);
   int y = top + 2;
-  const std::string operator_command =
-      OperatorConnectionCommandFromReport(report);
-  if (!operator_command.empty()) {
-    AddText(y, 0, cols, "manual GUI command: " + operator_command,
-            COLOR_PAIR(kColorTitle) | A_BOLD);
-    ++y;
-    if (y >= bottom) {
-      return;
-    }
-  }
   AddDetailPair(y, 0, left_width, "id", JsonString(*node, "node_id", "-"));
   AddDetailPair(y, left_width, right_width, "state",
                 JsonString(*node, "final_state", "-"));

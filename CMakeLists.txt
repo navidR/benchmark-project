@@ -2192,6 +2192,17 @@ if(BUILD_TESTING)
     PROPERTIES
       PASS_REGULAR_EXPRESSION "load a=6 s=2 r=0 to=0 bp=3 d=3 p=2 c=0 f=1 cn=0; manual GUI command available"
   )
+  add_test(NAME bbp-tui-selected-node-detail
+    COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm COLUMNS=160 LINES=60
+      $<TARGET_FILE:bbp>
+      --run "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tui-run"
+      --once
+  )
+  set_tests_properties(bbp-tui-selected-node-detail
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION "Selected Node"
+      FAIL_REGULAR_EXPRESSION "manual GUI command:"
+  )
   add_test(NAME bbp-integrated-tui-live-transaction-load
     COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm COLUMNS=160 LINES=40
       $<TARGET_FILE:bbp>
