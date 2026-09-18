@@ -37,12 +37,33 @@ bool NodeProcessRunning(const NodeRuntime& node) {
 
 bool RequestNodeTerminate(NodeRuntime& node) {
   auto process_guard = LockNodeProcessState(node);
+  for (auto& companion : node.companion_processes) {
+    companion.RequestTerminate();
+  }
   return node.process.RequestTerminate();
 }
 
 bool RequestNodeKill(NodeRuntime& node) {
   auto process_guard = LockNodeProcessState(node);
+  for (auto& companion : node.companion_processes) {
+    companion.RequestKill();
+  }
   return node.process.RequestKill();
+}
+
+void StopNodeCompanionProcesses(NodeRuntime& node) {
+  auto process_guard = LockNodeProcessState(node);
+  for (auto& companion : node.companion_processes) {
+    companion.RequestTerminate();
+  }
+  for (auto& companion : node.companion_processes) {
+    companion.Terminate(std::chrono::seconds(5));
+    if (companion.running()) {
+      throw std::runtime_error("node companion survived termination: " +
+                               node.config.id);
+    }
+  }
+  node.companion_processes.clear();
 }
 
 NodeProcessGeneration RunningNodeProcessGeneration(

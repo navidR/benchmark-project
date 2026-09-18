@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -1065,4 +1066,133 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_THROW(driver.WaitReady(TestConfig(), std::chrono::seconds(1),
                                      stopped.get_token()),
                     bbp::SimulationCancelled);
+}
+
+BOOST_AUTO_TEST_CASE(monero_wallet_converts_amount_and_submits_once) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  asio::io_context context;
+  tcp::acceptor acceptor(context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const std::vector<std::string> responses{
+      JsonRpcResult("{\"tx_hash\":\"" + std::string(kHashA) + "\",\"amount\":123456780000}")};
+  auto served = std::async(std::launch::async,
+      [&] { return ServeDigestResponses(acceptor, responses); });
+  auto config = TestConfig();
+  config.rpc_host = "127.0.0.1";
+  config.wallet_enabled = true;
+  config.wallet_rpc_port = acceptor.local_endpoint().port();
+  const bbp::MoneroDriver driver(std::chrono::seconds(1));
+  const auto result = driver.SubmitWalletTransaction(config, bbp::ChainWalletMode::kPrivate,
+      std::string(kMiningAddress), 12345678, 1000, std::chrono::seconds(2));
+  const auto requests = served.get();
+  BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+  const auto& request = requests.front().body.as_object();
+  BOOST_TEST(std::string(request.at("method").as_string()) == "transfer");
+  const auto& params = request.at("params").as_object();
+  BOOST_TEST(params.at("do_not_relay").as_bool() == false);
+  BOOST_TEST(params.at("priority").to_number<std::uint64_t>() == 1U);
+  BOOST_TEST(params.at("destinations").as_array().front().as_object()
+                 .at("amount").to_number<std::uint64_t>() == 123456780000ULL);
+  BOOST_REQUIRE_EQUAL(result.txids.size(), 1U);
+  BOOST_TEST(result.txids.front() == std::string(kHashA));
+  BOOST_TEST(result.destination_amount == "0.12345678");
+}
+
+BOOST_AUTO_TEST_CASE(monero_wallet_keeps_relay_failures_uncertain) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  const std::vector<std::string> responses{
+      R"({"error":{"code":-17,"message":"Not enough money"}})",
+      R"({"error":{"code":-4,"message":"Transfer failed"}})",
+      JsonRpcResult(R"({"tx_hash":"invalid","amount":10000})")};
+  asio::io_context context;
+  tcp::acceptor acceptor(context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  auto served = std::async(std::launch::async,
+      [&] { return ServeDigestResponses(acceptor, responses); });
+  auto config = TestConfig();
+  config.rpc_host = "127.0.0.1";
+  config.wallet_enabled = true;
+  config.wallet_rpc_port = acceptor.local_endpoint().port();
+  const bbp::MoneroDriver driver(std::chrono::seconds(1));
+  const auto submit = [&] {
+    return driver.SubmitWalletTransaction(config, bbp::ChainWalletMode::kPublic,
+        std::string(kMiningAddress), 1, 1, std::chrono::seconds(2));
+  };
+  BOOST_CHECK_THROW(submit(), bbp::ChainTransactionRejected);
+  BOOST_CHECK_THROW(submit(), bbp::ChainTransactionInternalRpcFailure);
+  BOOST_CHECK_THROW(submit(), bbp::ChainTransactionInternalRpcFailure);
+  BOOST_TEST(served.get().size() == 3U);
+  BOOST_CHECK_THROW(driver.SubmitWalletTransaction(config, bbp::ChainWalletMode::kPublic,
+      std::string(kMiningAddress), std::numeric_limits<std::uint64_t>::max(), 1,
+      std::chrono::seconds(2)), bbp::ChainTransactionRejected);
+}
+
+BOOST_AUTO_TEST_CASE(monero_wallet_funding_respects_unlocks_and_confirmations) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  const std::string outputs = JsonRpcResult(
+      R"({"transfers":[{"amount":2000000000000,"block_height":90,"unlocked":true,"frozen":false},{"amount":1000000000000,"block_height":80,"unlocked":true,"frozen":true}]})");
+  const std::vector<std::string> responses{
+      JsonRpcResult("{}"),
+      JsonRpcResult(R"({"balance":3000000000000,"unlocked_balance":3000000000000,"blocks_to_unlock":0})"),
+      JsonRpcResult(R"({"height":100})"), outputs,
+      JsonRpcResult("{}"),
+      JsonRpcResult(R"({"balance":3000000000000,"unlocked_balance":3000000000000})"),
+      JsonRpcResult(R"({"height":160})"), outputs};
+  asio::io_context context;
+  tcp::acceptor acceptor(context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  auto served = std::async(std::launch::async,
+      [&] { return ServeDigestResponses(acceptor, responses); });
+  auto config = TestConfig();
+  config.rpc_host = "127.0.0.1";
+  config.wallet_enabled = true;
+  config.wallet_rpc_port = acceptor.local_endpoint().port();
+  const bbp::MoneroDriver driver(std::chrono::seconds(1));
+  const auto preparation = driver.PrepareWalletFunding(config, bbp::ChainWalletMode::kPrivate,
+      std::string(kMiningAddress), 100000000, 60, std::chrono::seconds(2));
+  BOOST_TEST(preparation.minimum_chain_height == 160U);
+  BOOST_TEST(preparation.confirmation_blocks_required == 0U);
+  BOOST_TEST(preparation.txids.empty());
+  BOOST_TEST(driver.WaitForWalletBalance(config, bbp::ChainWalletMode::kPrivate,
+      100000000, 60, std::chrono::seconds(2)) == 200000000U);
+  BOOST_TEST(served.get().size() == 8U);
+}
+
+BOOST_AUTO_TEST_CASE(monero_wallet_snapshot_bounds_history_and_rounds_fees_up) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  const std::vector<std::string> responses{
+      JsonRpcResult(R"({"balance":3000000000000,"unlocked_balance":2000000000000})"),
+      JsonRpcResult("{\"out\":[{\"txid\":\"" + std::string(kHashA) +
+          "\",\"address\":\"sender\",\"destinations\":[{\"address\":\"recipient\",\"amount\":1000000000000}],\"amount\":1000000000000,\"fee\":10001,\"confirmations\":1,\"timestamp\":2}],"
+          "\"pool\":[{\"txid\":\"" + std::string(kHashB) +
+          "\",\"address\":\"receiver\",\"amount\":20000,\"timestamp\":1}]}"),
+      JsonRpcResult(R"({"balance":20000,"unlocked_balance":10000})"),
+      JsonRpcResult("{\"pool\":[{\"txid\":\"" + std::string(kHashB) +
+          "\",\"address\":\"receiver\",\"amount\":20000,\"timestamp\":1}]}")};
+  asio::io_context context;
+  tcp::acceptor acceptor(context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  auto served = std::async(std::launch::async,
+      [&] { return ServeDigestResponses(acceptor, responses); });
+  auto config = TestConfig();
+  config.rpc_host = "127.0.0.1";
+  config.wallet_enabled = true;
+  config.wallet_rpc_port = acceptor.local_endpoint().port();
+  const bbp::MoneroDriver driver(std::chrono::seconds(1));
+  const auto snapshot = driver.ReadWalletSnapshot(config, bbp::ChainWalletMode::kPrivate, 1);
+  BOOST_TEST(snapshot.available_balance_satoshis == 200000000U);
+  BOOST_TEST(snapshot.immature_balance_satoshis == 99999998U);
+  BOOST_TEST(snapshot.unconfirmed_balance_satoshis == 2U);
+  BOOST_TEST(snapshot.transaction_count == 2U);
+  BOOST_TEST(snapshot.transaction_history_truncated);
+  BOOST_REQUIRE_EQUAL(snapshot.transactions.size(), 1U);
+  BOOST_TEST(snapshot.transactions.front().amount_satoshis == -100000000);
+  BOOST_TEST(snapshot.transactions.front().address == "recipient");
+  BOOST_TEST(*snapshot.transactions.front().fee_satoshis == -2);
+  // A refresh between the balance and history reads must not inflate totals.
+  const auto refreshed = driver.ReadWalletSnapshot(config, bbp::ChainWalletMode::kPrivate, 1);
+  BOOST_TEST(refreshed.available_balance_satoshis == 1U);
+  BOOST_TEST(refreshed.unconfirmed_balance_satoshis == 1U);
+  BOOST_TEST(refreshed.immature_balance_satoshis == 0U);
+  BOOST_TEST(served.get().size() == 4U);
 }

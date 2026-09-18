@@ -12,6 +12,19 @@ class MoneroDriver final : public ChainDriver {
   explicit MoneroDriver(std::chrono::milliseconds rpc_timeout);
 
   ProcessSpec RenderProcess(const ChainNodeConfig& config) const override;
+  std::vector<ProcessSpec> RenderCompanionProcesses(
+      const ChainNodeConfig& config) const override;
+  bool SupportsWalletTransactionMode(ChainWalletMode mode) const override;
+  std::uint64_t WalletTransactionFeeReserveSatoshis(
+      ChainWalletMode mode, std::uint64_t requested_fee_rate_satoshis) const override;
+  bool ValidateTargetAddress(const ChainNodeConfig& config,
+                             const std::string& address,
+                             std::stop_token stop_token = {}) const override;
+  ChainWalletTransactionResult SubmitWalletTransaction(
+      const ChainNodeConfig& config, ChainWalletMode wallet_mode,
+      const std::string& destination_address, std::uint64_t amount_satoshis,
+      std::uint64_t fee_satoshis, std::chrono::seconds timeout,
+      std::stop_token stop_token = {}) const override;
   std::optional<LogTailChunk> ReadLogTail(
       const ChainNodeConfig& config, ChainLogSource source,
       const LogTailCursor& cursor, std::uint64_t max_bytes) const override;
@@ -122,6 +135,14 @@ class MoneroDriver final : public ChainDriver {
   void CleanupRpcCredentials(const ChainNodeConfig& config) const override;
 
  private:
+  static void ValidateDigestConfiguration(const ChainNodeConfig& config);
+  boost::json::object WalletRpcCall(
+      const ChainNodeConfig& config, std::string_view method,
+      const boost::json::object& params, std::stop_token stop_token = {},
+      std::optional<std::chrono::steady_clock::time_point> deadline = {}) const;
+  void InitializeWallet(const ChainNodeConfig& config,
+                        std::chrono::steady_clock::time_point deadline,
+                        std::stop_token stop_token) const;
   boost::json::object JsonRpcCall(const ChainNodeConfig& config,
                                   std::string_view method,
                                   const boost::json::object& params,
@@ -136,6 +157,8 @@ class MoneroDriver final : public ChainDriver {
                   bool ban, std::stop_token stop_token) const;
 
   HttpClient http_;
+  HttpClient block_http_{std::chrono::seconds(120)};
+  HttpClient wallet_http_{std::chrono::seconds(60)};
 };
 
 }  // namespace bbp

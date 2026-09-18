@@ -83,6 +83,7 @@ void RunLiveLifecycleSupervisor(std::stop_token supervisor_stop_token,
               StopNodeProcess(context.options, context.events_path,
                               context.driver, node, operation_stop_token);
             } else {
+              StopNodeCompanionProcesses(node);
               {
                 auto process_guard = context.run_process_state.Lock();
                 ResetNodePerfCounters(node, process_guard);
@@ -156,6 +157,15 @@ void RunLiveLifecycleSupervisor(std::stop_token supervisor_stop_token,
             const bool node_exited =
                 node.Lifecycle() == NodeRuntimeLifecycle::kRunning &&
                 !node.process.running();
+            if (node.Lifecycle() == NodeRuntimeLifecycle::kRunning &&
+                !node_exited) {
+              for (auto& companion : node.companion_processes) {
+                if (!companion.running()) {
+                  throw std::runtime_error(
+                      "required node companion exited: " + node.config.id);
+                }
+              }
+            }
             PublishNodeSignalObservation(node, process_guard,
                                          context.events_path,
                                          context.options.run_id);

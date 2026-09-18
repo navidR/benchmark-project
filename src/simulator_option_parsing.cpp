@@ -1,6 +1,7 @@
 #include "simulator_option_parsing.h"
 
 #include <algorithm>
+#include <array>
 #include <boost/json/parse.hpp>
 #include <boost/json/value.hpp>
 #include <boost/program_options.hpp>
@@ -1295,9 +1296,19 @@ Options ParseOptions(int argc, char** argv,
           std::to_string(available));
     }
   } else {
-    const std::uint32_t available =
+    std::uint32_t available =
         std::numeric_limits<std::uint16_t>::max() -
-        std::max(chain_spec.rpc_port_base, chain_spec.p2p_port_base) + 1U;
+        std::max({chain_spec.rpc_port_base, chain_spec.p2p_port_base,
+                  chain_spec.wallet_rpc_port_base}) + 1U;
+    if (chain_spec.wallet_rpc_port_base != 0U) {
+      std::array<std::uint16_t, 3> bases{
+          chain_spec.p2p_port_base, chain_spec.rpc_port_base,
+          chain_spec.wallet_rpc_port_base};
+      std::sort(bases.begin(), bases.end());
+      available = std::min({available,
+          static_cast<std::uint32_t>(bases[1] - bases[0]),
+          static_cast<std::uint32_t>(bases[2] - bases[1])});
+    }
     if (options.nodes > available) {
       throw std::runtime_error("loopback port exhaustion: requested " +
                                std::to_string(options.nodes) +

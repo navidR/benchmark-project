@@ -128,6 +128,7 @@ void StopNodeProcess(const Options& options,
             reconciliation_deadline, *operation_control->absolute_deadline);
       }
       if (WaitForNodeProcessExitUntil(node, reconciliation_deadline)) {
+        StopNodeCompanionProcesses(node);
         {
           auto process_guard = LockNodeProcessState(node);
           ResetNodePerfCounters(node, process_guard);
@@ -165,11 +166,13 @@ void StopNodeProcess(const Options& options,
       WriteNodeStateEvent(events_path, options.run_id, node,
                           NodeRuntimeLifecycle::kRunning);
     } else if (reconciled_stopped) {
+      StopNodeCompanionProcesses(node);
       WriteNodeStateEvent(events_path, options.run_id, node,
                           NodeRuntimeLifecycle::kStopped);
     }
     throw;
   }
+  StopNodeCompanionProcesses(node);
   {
     auto process_guard = LockNodeProcessState(node);
     node.SetLifecycle(NodeRuntimeLifecycle::kStopped);

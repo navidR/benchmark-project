@@ -59,6 +59,7 @@ void StartNodeProcessAttempt(
     bool transition_to_running, std::stop_token stop_token,
     const ChainNodeConfig* process_config_override) {
   ProcessSpec process;
+  std::vector<ProcessSpec> companions;
   ChainNodeConfig process_config;
   {
     std::lock_guard<std::mutex> network_lock(node_network_state_mutex);
@@ -73,6 +74,7 @@ void StartNodeProcessAttempt(
       process_config.connect_peers = node.process_start_connect_peers;
     }
     process = driver.RenderProcess(process_config);
+    companions = driver.RenderCompanionProcesses(process_config);
   }
   if (node.network_namespace) {
     process.network_namespace_fd = node.network_namespace->fd();
@@ -93,9 +95,22 @@ void StartNodeProcessAttempt(
   WriteNodeStateEvent(events_path, options.run_id, node,
                       NodeRuntimeLifecycle::kStarting);
   ChildProcess spawned;
+  StopNodeCompanionProcesses(node);
   try {
+    {
+      auto process_guard = LockNodeProcessState(node);
+      node.companion_processes.reserve(companions.size());
+    }
     spawned = ChildProcess::Spawn(process, node.cgroup->access_path());
+    for (auto& companion : companions) {
+      companion.network_namespace_fd = process.network_namespace_fd;
+      auto child = ChildProcess::Spawn(companion, node.cgroup->access_path());
+      auto process_guard = LockNodeProcessState(node);
+      node.companion_processes.push_back(std::move(child));
+    }
   } catch (...) {
+    spawned.Kill();
+    StopNodeCompanionProcesses(node);
     {
       auto process_guard = LockNodeProcessState(node);
       ResetNodePerfCounters(node, process_guard);
@@ -134,10 +149,26 @@ void StartNodeProcessAttempt(
   std::stop_callback stop_readiness_on_request(
       stop_token,
       [&readiness_stop_source] { readiness_stop_source.request_stop(); });
+  const auto companions_running = [&] {
+    auto process_guard = LockNodeProcessState(node);
+    for (auto& companion : node.companion_processes) {
+      if (!companion.running()) return false;
+    }
+    return true;
+  };
+  const auto record_companion_exit = [&] {
+    {
+      auto process_guard = LockNodeProcessState(node);
+      node.SetLifecycle(NodeRuntimeLifecycle::kFailed);
+    }
+    WriteNodeStateEvent(events_path, options.run_id, node,
+                        NodeRuntimeLifecycle::kFailed);
+    throw std::runtime_error("node companion exited before RPC readiness: " + node.config.id);
+  };
   std::jthread exit_monitor([&](std::stop_token monitor_stop_token) {
     try {
       while (!monitor_stop_token.stop_requested()) {
-        if (!NodeProcessRunning(node)) {
+        if (!NodeProcessRunning(node) || !companions_running()) {
           readiness_stop_source.request_stop();
           return;
         }
@@ -161,6 +192,7 @@ void StartNodeProcessAttempt(
     if (!NodeProcessRunning(node)) {
       RecordNodeExitBeforeRpcReady(options, events_path, node);
     }
+    if (!companions_running()) record_companion_exit();
     throw;
   } catch (...) {
     stop_exit_monitor();
@@ -179,6 +211,7 @@ void StartNodeProcessAttempt(
   if (!NodeProcessRunning(node)) {
     RecordNodeExitBeforeRpcReady(options, events_path, node);
   }
+  if (!companions_running()) record_companion_exit();
   WriteEvent(events_path, options.run_id, node.config.id,
              SimulationEventKind::kRpcReady);
   if (transition_to_running) {

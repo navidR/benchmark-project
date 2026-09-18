@@ -446,7 +446,7 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
             }
             bool validated = false;
             for (const auto& candidate : nodes) {
-              if (!NodeProcessRunning(candidate)) continue;
+              if (!candidate.config.wallet_enabled || !NodeProcessRunning(candidate)) continue;
               validated = context.driver.ValidateTargetAddress(
                   candidate.config, *command.target_address,
                   command_stop_token);
@@ -929,6 +929,9 @@ std::unique_ptr<SimulationCommandProcessor> MakeLiveSimulationCommandProcessor(
                             if (node.process.running() &&
                                 node.process.pid() == expected.pid &&
                                 node.RestartCount() == expected.restart_count) {
+                              for (auto& companion : node.companion_processes) {
+                                companion.RequestKill();
+                              }
                               requested = node.process.RequestKill();
                             }
                           }

@@ -26,6 +26,7 @@ void RequireNodeRunning(const NodeRuntime& node, std::string_view action);
 bool NodeProcessRunning(const NodeRuntime& node);
 bool RequestNodeTerminate(NodeRuntime& node);
 bool RequestNodeKill(NodeRuntime& node);
+void StopNodeCompanionProcesses(NodeRuntime& node);
 NodeProcessGeneration RunningNodeProcessGeneration(
     NodeRuntime& node, const RunProcessState::Guard& process_guard,
     std::string_view action);

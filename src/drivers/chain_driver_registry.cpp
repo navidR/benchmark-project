@@ -174,6 +174,7 @@ const ChainDriverSpec& MoneroChainDriverSpec() {
       .coinbase_spendable_confirmations = kMoneroCoinbaseSpendableConfirmations,
       .p2p_port_base = kMoneroP2pPortBase,
       .rpc_port_base = kMoneroRpcPortBase,
+      .wallet_rpc_port_base = 20082,
       .rpc_authentication = RpcAuthenticationMode::kDigest,
   };
   return spec;
@@ -255,6 +256,9 @@ ChainNodeConfig MakeChainNodeConfig(const ChainDriverSpec& spec,
       request.isolated_network ? 0U : request.node_index;
   config.p2p_port = AddPortOffset(spec.p2p_port_base, port_offset);
   config.rpc_port = AddPortOffset(spec.rpc_port_base, port_offset);
+  if (spec.wallet_rpc_port_base != 0U) {
+    config.wallet_rpc_port = AddPortOffset(spec.wallet_rpc_port_base, port_offset);
+  }
   config.rpc_authentication = spec.rpc_authentication;
   switch (spec.rpc_authentication) {
     case RpcAuthenticationMode::kCookieFile:

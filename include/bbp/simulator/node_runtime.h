@@ -37,6 +37,7 @@ struct NodeRuntime {
   std::optional<NodeVethConfig> network;
   std::vector<DirectionalNetworkPolicy> directional_network_policies;
   ChildProcess process;
+  std::vector<ChildProcess> companion_processes;
   // Protected by run_process_state; scoped to this exact process generation.
   std::optional<NodeSignalObservation> signal_observation;
   std::optional<NodeSignalObservation> helper_signal_observation;

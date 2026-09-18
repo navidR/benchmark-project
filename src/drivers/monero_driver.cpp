@@ -26,6 +26,13 @@ namespace {
 constexpr std::uint32_t kMoneroPeerLimit = 16U;
 constexpr std::uint32_t kPeerBanSeconds = 3600U;
 
+std::uint32_t PeerLimit(const ChainNodeConfig& config) {
+  if (config.connect_peers.size() > std::numeric_limits<std::uint32_t>::max())
+    throw std::runtime_error("Monero peer count exceeds uint32");
+  return std::max(kMoneroPeerLimit,
+                  static_cast<std::uint32_t>(config.connect_peers.size()));
+}
+
 void ThrowIfStopRequested(std::stop_token stop_token) {
   if (stop_token.stop_requested()) {
     throw SimulationCancelled();
@@ -52,25 +59,6 @@ bool HasControlCharacter(std::string_view value) {
   return std::any_of(value.begin(), value.end(), [](unsigned char character) {
     return character < 0x20U || character == 0x7fU;
   });
-}
-
-void ValidateDigestConfiguration(const ChainNodeConfig& config) {
-  if (config.rpc_authentication != RpcAuthenticationMode::kDigest) {
-    throw std::runtime_error(
-        "Monero daemon launch requires Digest RPC authentication");
-  }
-  if (!config.rpc_cookie_file.empty()) {
-    throw std::runtime_error(
-        "Monero Digest authentication rejects an RPC cookie file");
-  }
-  if (config.rpc_user.empty() || config.rpc_user.size() > 256U ||
-      config.rpc_password.empty() || config.rpc_password.size() > 256U ||
-      config.rpc_user.find(':') != std::string::npos ||
-      config.rpc_password.find(':') != std::string::npos ||
-      HasControlCharacter(config.rpc_user) ||
-      HasControlCharacter(config.rpc_password)) {
-    throw std::runtime_error("Monero Digest credentials are missing or unsafe");
-  }
 }
 
 std::uint64_t JsonUint64(const boost::json::object& object,
@@ -304,6 +292,25 @@ std::uint64_t CheckedElapsedMilliseconds(
 MoneroDriver::MoneroDriver(std::chrono::milliseconds rpc_timeout)
     : http_(rpc_timeout) {}
 
+void MoneroDriver::ValidateDigestConfiguration(const ChainNodeConfig& config) {
+  if (config.rpc_authentication != RpcAuthenticationMode::kDigest) {
+    throw std::runtime_error(
+        "Monero daemon launch requires Digest RPC authentication");
+  }
+  if (!config.rpc_cookie_file.empty()) {
+    throw std::runtime_error(
+        "Monero Digest authentication rejects an RPC cookie file");
+  }
+  if (config.rpc_user.empty() || config.rpc_user.size() > 256U ||
+      config.rpc_password.empty() || config.rpc_password.size() > 256U ||
+      config.rpc_user.find(':') != std::string::npos ||
+      config.rpc_password.find(':') != std::string::npos ||
+      HasControlCharacter(config.rpc_user) ||
+      HasControlCharacter(config.rpc_password)) {
+    throw std::runtime_error("Monero Digest credentials are missing or unsafe");
+  }
+}
+
 ProcessSpec MoneroDriver::RenderProcess(const ChainNodeConfig& config) const {
   if (config.network != ChainNetwork::kRegtest) {
     throw std::runtime_error("Monero driver supports only regtest fakechain");
@@ -346,9 +353,9 @@ ProcessSpec MoneroDriver::RenderProcess(const ChainNodeConfig& config) const {
       Arg("--rpc-bind-port", std::to_string(config.rpc_port)),
       "--confirm-external-bind",
       "--allow-local-ip",
-      Arg("--max-connections-per-ip", std::to_string(kMoneroPeerLimit)),
-      Arg("--out-peers", std::to_string(config.listen ? kMoneroPeerLimit : 0U)),
-      Arg("--in-peers", std::to_string(config.listen ? kMoneroPeerLimit : 0U)),
+      Arg("--max-connections-per-ip", std::to_string(PeerLimit(config))),
+      Arg("--out-peers", std::to_string(config.listen ? PeerLimit(config) : 0U)),
+      Arg("--in-peers", std::to_string(config.listen ? PeerLimit(config) : 0U)),
   };
   for (const std::string& peer : config.connect_peers) {
     spec.argv.push_back(Arg("--add-exclusive-node", peer));
@@ -402,6 +409,9 @@ void MoneroDriver::WaitReady(const ChainNodeConfig& config,
       }
       if (JsonUint64(info, "height") < 1U) {
         throw std::runtime_error("Monero fakechain height is below genesis");
+      }
+      if (config.wallet_enabled) {
+        InitializeWallet(config, deadline, stop_token);
       }
       return;
     } catch (const std::exception& error) {
@@ -702,35 +712,6 @@ std::uint64_t MoneroDriver::ReadBlockNonRewardTransactionCount(
   return static_cast<std::uint64_t>(transactions.size());
 }
 
-std::string MoneroDriver::CreateWalletAddress(
-    const ChainNodeConfig&, ChainWalletMode, std::stop_token stop_token) const {
-  Unsupported(stop_token, "wallet initialization");
-}
-
-std::string MoneroDriver::CreateWalletFundingAddress(
-    const ChainNodeConfig&, ChainWalletMode, const std::string&,
-    std::stop_token stop_token) const {
-  Unsupported(stop_token, "wallet funding");
-}
-
-ChainWalletFundingResult MoneroDriver::PrepareWalletFunding(
-    const ChainNodeConfig&, ChainWalletMode, const std::string&, std::uint64_t,
-    std::uint64_t, std::chrono::seconds, std::stop_token stop_token) const {
-  Unsupported(stop_token, "wallet funding");
-}
-
-std::uint64_t MoneroDriver::WaitForWalletBalance(
-    const ChainNodeConfig&, ChainWalletMode, std::uint64_t, std::uint64_t,
-    std::chrono::seconds, std::stop_token stop_token) const {
-  Unsupported(stop_token, "wallet balance polling");
-}
-
-ChainWalletSnapshot MoneroDriver::ReadWalletSnapshot(
-    const ChainNodeConfig&, ChainWalletMode, std::uint32_t,
-    std::stop_token stop_token) const {
-  Unsupported(stop_token, "wallet metrics");
-}
-
 ChainUtxo MoneroDriver::FindSpendableOutput(const ChainNodeConfig&,
                                             const std::vector<std::string>&,
                                             const std::string&, std::uint64_t,
@@ -745,12 +726,6 @@ ChainRawTransactionResult MoneroDriver::SendRawTransaction(
     std::chrono::seconds, std::stop_token stop_token,
     const ChainRawTransactionBroadcastControl*) const {
   Unsupported(stop_token, "raw transaction submission");
-}
-
-ChainWalletTransactionResult MoneroDriver::SendWalletTransaction(
-    const ChainNodeConfig&, ChainWalletMode, const std::string&, std::uint64_t,
-    std::uint64_t, std::chrono::seconds, std::stop_token stop_token) const {
-  Unsupported(stop_token, "wallet transaction submission");
 }
 
 ChainTransactionObservation MoneroDriver::ObserveTransaction(
@@ -934,7 +909,7 @@ void MoneroDriver::StopMining(const ChainNodeConfig& config,
 
 void MoneroDriver::SetNetworkActive(const ChainNodeConfig& config, bool active,
                                     std::stop_token stop_token) const {
-  const std::uint32_t requested = active ? kMoneroPeerLimit : 0U;
+  const std::uint32_t requested = active ? PeerLimit(config) : 0U;
   const auto peer_limit = [&](std::string_view path, std::string_view field,
                               bool set, std::uint32_t value,
                               std::stop_token operation_stop_token) {
@@ -1003,6 +978,14 @@ void MoneroDriver::SetNetworkActive(const ChainNodeConfig& config, bool active,
 
 void MoneroDriver::Stop(const ChainNodeConfig& config,
                         std::stop_token stop_token) const {
+  if (config.wallet_enabled) {
+    try {
+      static_cast<void>(WalletRpcCall(config, "stop_wallet", {}, stop_token));
+    } catch (const SimulationCancelled&) {
+      throw;
+    } catch (const std::exception&) {
+    }
+  }
   try {
     static_cast<void>(PlainRpcCall(config, "/stop_daemon", {}, stop_token));
   } catch (const SimulationCancelled&) {
@@ -1013,6 +996,7 @@ void MoneroDriver::Stop(const ChainNodeConfig& config,
 
 void MoneroDriver::CleanupRpcCredentials(const ChainNodeConfig& config) const {
   ValidateDigestConfiguration(config);
+  std::filesystem::remove(config.log_dir / ".bbp-wallet-secret.conf");
 }
 
 boost::json::object MoneroDriver::JsonRpcCall(
@@ -1023,8 +1007,10 @@ boost::json::object MoneroDriver::JsonRpcCall(
   request["id"] = "bbp";
   request["method"] = method;
   request["params"] = params;
+  // Batch funding includes native proof-of-work and can exceed a metrics RPC deadline.
+  const HttpClient& client = method == "generateblocks" ? block_http_ : http_;
   const HttpResponse response =
-      http_.PostJson(Endpoint(config), "/json_rpc",
+      client.PostJson(Endpoint(config), "/json_rpc",
                      boost::json::serialize(request), stop_token);
   if (response.status != 200) {
     throw std::runtime_error("Monero RPC HTTP status " +

@@ -4,6 +4,11 @@
 
 namespace bbp {
 
+std::vector<ProcessSpec> ChainDriver::RenderCompanionProcesses(
+    const ChainNodeConfig&) const {
+  return {};
+}
+
 std::string_view ChainSyncStatusName(ChainSyncStatus status) {
   switch (status) {
     case ChainSyncStatus::kUnknown:

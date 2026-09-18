@@ -300,6 +300,7 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
   boost::asio::io_context staging_port_context;
   std::unique_ptr<boost::asio::ip::tcp::acceptor> staging_rpc_reservation;
   std::unique_ptr<boost::asio::ip::tcp::acceptor> staging_p2p_reservation;
+  std::unique_ptr<boost::asio::ip::tcp::acceptor> staging_wallet_reservation;
   if (options.isolate_network) {
     const ChainDriverSpec& chain_spec = ChainDriverSpecFor(options.chain);
     // Only one replacement runs in this node namespace at a time.
@@ -316,11 +317,24 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     };
     staging_config.rpc_port = temporary_port(chain_spec.rpc_port_base, "RPC");
     staging_config.p2p_port = temporary_port(chain_spec.p2p_port_base, "P2P");
+    if (staging_config.wallet_rpc_port != 0U) {
+      staging_config.wallet_rpc_port =
+          temporary_port(chain_spec.wallet_rpc_port_base, "wallet RPC");
+    }
     if (staging_config.rpc_port == prior_config.rpc_port ||
         staging_config.rpc_port == prior_config.p2p_port ||
         staging_config.p2p_port == prior_config.rpc_port ||
         staging_config.p2p_port == prior_config.p2p_port ||
-        staging_config.rpc_port == staging_config.p2p_port) {
+        staging_config.rpc_port == staging_config.p2p_port ||
+        (staging_config.wallet_rpc_port != 0U &&
+         (staging_config.wallet_rpc_port == prior_config.wallet_rpc_port ||
+          staging_config.wallet_rpc_port == prior_config.rpc_port ||
+          staging_config.wallet_rpc_port == prior_config.p2p_port ||
+          staging_config.wallet_rpc_port == staging_config.rpc_port ||
+          staging_config.wallet_rpc_port == staging_config.p2p_port)) ||
+        (prior_config.wallet_rpc_port != 0U &&
+         (staging_config.rpc_port == prior_config.wallet_rpc_port ||
+          staging_config.p2p_port == prior_config.wallet_rpc_port))) {
       throw std::runtime_error(
           "node-replace temporary isolated ports collide with the live node");
     }
@@ -336,6 +350,12 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
         EffectiveP2pBindAddress(options.chain, staging_config), 0U, "tcp_port",
         staging_config.id, "replacement P2P");
     staging_config.p2p_port = staging_p2p_reservation->local_endpoint().port();
+    if (staging_config.wallet_rpc_port != 0U) {
+      staging_wallet_reservation = ReserveTcpEndpoint(
+          staging_port_context, staging_config.rpc_bind, 0U, "tcp_port",
+          staging_config.id, "replacement wallet RPC");
+      staging_config.wallet_rpc_port = staging_wallet_reservation->local_endpoint().port();
+    }
   }
 
   std::vector<bool> target_component(before.size(), false);
@@ -541,6 +561,7 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     });
     rollback_step("stop replacement candidate", [&] {
       if (!NodeProcessRunning(*candidate)) {
+        StopNodeCompanionProcesses(*candidate);
         return;
       }
       try {
@@ -566,6 +587,7 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
         throw std::runtime_error(
             "replacement candidate survived rollback termination");
       }
+      StopNodeCompanionProcesses(*candidate);
     });
     if (root_orientation == RuntimeNodeRootOrientation::kExchanged) {
       rollback_step("restore original and staging roots", [&] {
@@ -787,6 +809,15 @@ RuntimeNodeReplaceResult ReplaceRuntimeNodeTransactional(
     Options replacement_options = options;
     replacement_options.ready_timeout_sec = request.ready_timeout_sec;
     replacement_options.sync_timeout_sec = request.sync_timeout_sec;
+    if (staging_wallet_reservation) {
+      boost::system::error_code error;
+      staging_wallet_reservation->close(error);
+      if (error) {
+        throw std::runtime_error(
+            "node-replace could not release the wallet RPC port reservation: " +
+            error.message());
+      }
+    }
     if (staging_rpc_reservation) {
       boost::system::error_code error;
       staging_rpc_reservation->close(error);

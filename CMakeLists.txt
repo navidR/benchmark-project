@@ -228,6 +228,7 @@ add_executable(bbp
   src/drivers/bitcoin_driver.cpp
   src/drivers/firo_driver.cpp
   src/drivers/monero_driver.cpp
+  src/drivers/monero_wallet.cpp
   src/http_client.cpp
   src/log_tail.cpp
   src/log_level.cpp
@@ -629,6 +630,7 @@ if(BUILD_TESTING)
     src/drivers/bitcoin_driver.cpp
     src/drivers/firo_driver.cpp
     src/drivers/monero_driver.cpp
+    src/drivers/monero_wallet.cpp
     src/http_client.cpp
     src/log_tail.cpp
     src/log_level.cpp

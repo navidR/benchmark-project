@@ -159,6 +159,7 @@ bool RestartNode(
       throw;
     }
   }
+  StopNodeCompanionProcesses(node);
   if (operation_control != nullptr) {
     operation_control->restart_phase.store(
         SimulationNodeRestartPhase::kOriginalExited, std::memory_order_release);

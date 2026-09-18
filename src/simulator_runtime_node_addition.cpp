@@ -418,6 +418,7 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
   struct CandidatePortReservations {
     std::unique_ptr<boost::asio::ip::tcp::acceptor> rpc;
     std::unique_ptr<boost::asio::ip::tcp::acceptor> p2p;
+    std::unique_ptr<boost::asio::ip::tcp::acceptor> wallet_rpc;
   };
   boost::asio::io_context port_reservation_context;
   std::vector<CandidatePortReservations> port_reservations;
@@ -435,6 +436,11 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
           ReserveTcpEndpoint(port_reservation_context,
                              EffectiveP2pBindAddress(options.chain, config),
                              config.p2p_port, "tcp_port", config.id, "P2P");
+      if (config.wallet_enabled && config.wallet_rpc_port != 0U) {
+        reservation.wallet_rpc = ReserveTcpEndpoint(
+            port_reservation_context, config.rpc_bind, config.wallet_rpc_port,
+            "tcp_port", config.id, "wallet RPC");
+      }
       port_reservations.push_back(std::move(reservation));
     }
   }
@@ -899,6 +905,12 @@ RuntimeNodeAddResult AddRuntimeNodesTransactional(
       ThrowIfStopRequested(stop_token);
       if (!options.isolate_network) {
         boost::system::error_code close_error;
+        if (port_reservations[index].wallet_rpc) {
+          port_reservations[index].wallet_rpc->close(close_error);
+          if (close_error) {
+            throw std::runtime_error("node-add could not release the wallet RPC port reservation: " + close_error.message());
+          }
+        }
         port_reservations[index].rpc->close(close_error);
         if (close_error) {
           throw std::runtime_error(

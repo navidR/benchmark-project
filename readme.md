@@ -14,7 +14,7 @@ runs are not supported.
 | --- | --- | --- |
 | Firo (`firod`) | Regtest | Block generation, public and private Spark wallet workloads, raw transactions, masternode operations, and Firo-Qt connection commands. |
 | Bitcoin Core (`bitcoind`) | Regtest | Daemon lifecycle, block generation, peer control, and chain metrics. Wallet initialization, transaction submission, and native continuous mining are not implemented. |
-| Monero (`monerod`) | Regtest fakechain | Daemon lifecycle, block generation, native mining, and chain metrics. Wallet initialization and transaction submission are not implemented; live connections are limited to configured startup peers. |
+| Monero (`monerod`) | Regtest fakechain | Daemon and wallet lifecycle, wallet funding, native private transfers, transaction tracking, wallet/chain metrics, block generation, and native mining. Live connections are limited to configured startup peers. |
 
 Shared facilities include:
 
@@ -43,6 +43,7 @@ Seeded scheduling does not make daemon execution or benchmark results determinis
   are also vendored. Chain daemon binaries are built separately.
 - For Firo, an executable `firo-qt` beside the resolved `firod` binary. Current
   startup generates its connection command even for headless runs.
+- For Monero wallet nodes, an executable `monero-wallet-rpc` beside `monerod`.
 - A terminal for the TUI, or `--no-tui` for headless use.
 
 Use a dedicated Linux environment or a container configured for these kernel
@@ -178,7 +179,7 @@ Scenario `workloads` describe ordered actions; `events` schedule actions with
 | Family | Actions |
 | --- | --- |
 | Blocks and readiness | `block_generation`, `wait_until_height`, `wait_for_peers` |
-| Firo transactions | `wallet_transactions`, `send_raw_transaction` |
+| Transactions | `wallet_transactions` (Firo and Monero), `send_raw_transaction` (Firo) |
 | Lifecycle and resources | `restart_node`, `freeze_node`, `resource_pressure`, `update_resource_limits`, `set_resource_profile` |
 | Network and peers | `connect_peer`, `disconnect_peer`, `set_network_condition`, `set_network_profile`, `block_network_flow`, `unblock_network_flow`, `partition_nodes`, `heal_partition` |
 | Topology and evidence | `set_edge_condition`, `activate_edge`, `deactivate_edge`, `restore_edge`, `checkpoint` |
@@ -194,6 +195,45 @@ See [scenario fixtures](tests/scenarios) for field-level examples, including
 and [network controls](tests/scenarios/valid-network-control-workloads.json).
 Fixtures often contain placeholder daemon paths and are not ready-to-run
 benchmarks. The MCP schema resources expose the current input contracts.
+
+### Monero Wallet Workloads
+
+Run two managed wallets and one miner with native private transfers:
+
+```bash
+./build/bbp --chain monero --node-binary /absolute/path/to/monerod \
+  --benchmark-root runs --run-id monero-wallet-load --nodes 3 \
+  --wallet-node-count 2 --transaction-load-strategy random_bruteforce \
+  --memory-max-bytes 4294967296 --memory-high-bytes 3221225472
+```
+
+BBP owns each wallet RPC process in its node's cgroup and network namespace.
+Wallet files persist under the node's data directory and reopen after restart.
+An unexpected wallet RPC exit fails the run and triggers owned cleanup.
+The network is local fakechain, although Monero uses mainnet-format addresses
+there. These wallets do not spend mainnet funds.
+
+Both generic wallet modes use Monero's native private transfers. BBP amounts
+have eight decimal places; the driver converts them to Monero's twelve-place
+atomic units. Monero computes fees at native priority 1; BBP's `fee` does not
+override them. Funding reserves at least 0.01 XMR per planned transfer.
+Coinbase outputs require 60 blocks to unlock, and ordinary transfers retain
+Monero's native unlock rules. Each payment must fit one native transaction;
+payments requiring splitting are rejected before relay.
+Relay follows native Monero timing, so submission does not imply immediate
+visibility or confirmation on every node. An uncertain relay outcome is not
+automatically retried.
+
+Allow sufficient memory for RandomX, especially when using native continuous
+mining. The example provides 4 GiB per node, shared with its wallet process.
+Runtime difficulty changes, relative log-verbosity changes, and Bitcoin-style
+raw transaction workloads are not supported by this driver.
+
+Verified on 2026-09-18 with native Monero v0.18.1.0-ea9be68fb: two funded
+wallets sent payments in both directions, both payments confirmed on all three
+nodes, both wallets retained their history after restart, and normal shutdown
+removed owned processes, node cgroups, and wallet credential configurations.
+A separate wallet-process kill check verified run failure and owned cleanup.
 
 ## TUI and MCP
 

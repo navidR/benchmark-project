@@ -63,6 +63,7 @@ struct ChainNodeConfig {
   std::filesystem::path log_dir;
   uint16_t p2p_port = 0;
   uint16_t rpc_port = 0;
+  uint16_t wallet_rpc_port = 0;
   std::string rpc_user;
   std::string rpc_password;
   RpcAuthenticationMode rpc_authentication = RpcAuthenticationMode::kBasic;
@@ -234,6 +235,8 @@ class ChainDriver {
   virtual ~ChainDriver() = default;
 
   virtual ProcessSpec RenderProcess(const ChainNodeConfig& config) const = 0;
+  virtual std::vector<ProcessSpec> RenderCompanionProcesses(
+      const ChainNodeConfig& config) const;
   virtual bool SupportsWalletTransactionMode(ChainWalletMode mode) const;
   virtual std::uint64_t WalletTransactionFeeReserveSatoshis(
       ChainWalletMode mode, std::uint64_t requested_fee_rate_satoshis) const;

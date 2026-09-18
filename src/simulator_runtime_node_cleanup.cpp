@@ -141,12 +141,18 @@ std::vector<bool> StopRuntimeNodesImpl(
       [&](NodeRuntime& node,
           std::chrono::steady_clock::time_point phase_deadline) {
         auto process_guard = lock_process_state(node, phase_deadline);
+        for (auto& companion : node.companion_processes) {
+          companion.RequestTerminate();
+        }
         return node.process.RequestTerminate();
       };
   const auto request_node_kill =
       [&](NodeRuntime& node,
           std::chrono::steady_clock::time_point phase_deadline) {
         auto process_guard = lock_process_state(node, phase_deadline);
+        for (auto& companion : node.companion_processes) {
+          companion.RequestKill();
+        }
         return node.process.RequestKill();
       };
 
@@ -370,6 +376,13 @@ std::vector<bool> StopRuntimeNodesImpl(
         node.cgroup->KillAll(shutdown_deadline, cleanup_stop_token);
         exact_cgroup_empty = node.cgroup->Empty();
       }
+      for (auto& companion : node.companion_processes) {
+        if (companion.running()) {
+          throw std::runtime_error("node companion survived cleanup: " +
+                                   node.config.id);
+        }
+      }
+      node.companion_processes.clear();
       if (!RuntimeNodeSupportDestructionAllowed(
               daemon_absence_verified, exact_cgroup_acquired,
               exact_cgroup_empty, allow_partial_preparation)) {
@@ -379,6 +392,8 @@ std::vector<bool> StopRuntimeNodesImpl(
             "permitted unacquired candidate cgroup: " +
             node.config.id);
       }
+
+      driver.CleanupRpcCredentials(node.config);
 
       std::uint32_t resource_slot = 0U;
       if (explicit_resource_slots != nullptr) {

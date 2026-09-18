@@ -67,6 +67,7 @@ void ApplyDeclarativeStopDuringStart(
   if (NodeProcessRunning(node)) {
     StopNodeProcess(options, events_path, driver, node, stop_token, true);
   } else {
+    StopNodeCompanionProcesses(node);
     {
       auto process_guard = LockNodeProcessState(node);
       ResetNodePerfCounters(node, process_guard);
