@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "bbp/run_report.h"
+#include "bbp/runtime_node_resource_manifest.h"
 #include "bbp/simulation_event_kind.h"
 #include "bbp/util.h"
 
@@ -2900,5 +2901,42 @@ BOOST_AUTO_TEST_CASE(incremental_run_report_does_not_skip_invalid_jsonl) {
   bbp::IncrementalRunReport incremental(dir);
   BOOST_CHECK_THROW(incremental.Refresh(), std::exception);
   BOOST_CHECK_THROW(incremental.Refresh(), std::exception);
+  std::filesystem::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(incremental_run_report_recovers_manifest_only_changes) {
+  const auto dir = MakeTestDir("run-report-manifest-refresh");
+  bbp::WriteText(
+      dir / "resolved-scenario.json",
+      R"({"run_id":"manifest-refresh","chain":"firo","nodes":1,"node_configs":[{"index":1,"id":"firo-1","chain":"firo","role":"base"}]})");
+  const auto ownership = bbp::CreateRunOwnership("manifest-refresh", dir);
+  bbp::WriteRunOwnershipMarker(ownership);
+  bbp::RuntimeNodeResourceManifest manifest{
+      .ownership = ownership,
+      .isolated_network = false,
+      .node_capacity = 1U,
+      .nodes = {{.node_id = "firo-1",
+                 .slot = 0U,
+                 .chain = bbp::ChainKind::kFiro,
+                 .data_dir = "nodes/firo-1/data",
+                 .root_name = std::nullopt}},
+  };
+  bbp::WriteRuntimeNodeResourceManifest(manifest);
+  bbp::AppendLine(
+      dir / "metrics.jsonl",
+      R"({"run_id":"manifest-refresh","node_id":"firo-1","timestamp_ms":1})");
+  bbp::IncrementalRunReport incremental(dir);
+  BOOST_TEST(incremental.Refresh().at("nodes_summary").as_array().size() == 1U);
+
+  // Recovery must invalidate summaries even when no JSONL record arrived.
+  manifest.nodes.clear();
+  manifest.node_capacity = 2U;
+  bbp::WriteRuntimeNodeResourceManifest(manifest);
+  const auto& recovered = incremental.Refresh();
+  BOOST_TEST(incremental.last_refresh_stats().event_records == 0U);
+  BOOST_TEST(JsonInteger(recovered, "node_capacity") == 2U);
+  BOOST_TEST(recovered.at("nodes_summary").as_array().empty());
+  BOOST_TEST(!recovered.at("inventory_publication_complete").as_bool());
+  BOOST_TEST(incremental.Refresh() == bbp::BuildRunReport(dir));
   std::filesystem::remove_all(dir);
 }

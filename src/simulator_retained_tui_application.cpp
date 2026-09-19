@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "bbp/chain_kind.h"
 #include "bbp/logging.h"
@@ -26,9 +28,8 @@ struct RetainedRunContext {
   McpLiveApplication::RetainedRun metadata;
 };
 
-RetainedRunContext LoadRetainedRunContext(
-    const std::filesystem::path& run_root) {
-  const boost::json::object report = BuildRunReport(run_root);
+RetainedRunContext LoadRetainedRunContext(const std::filesystem::path& run_root,
+                                          const boost::json::object& report) {
   const std::string run_id = JsonStringField(report, "run_id");
   RequireSafeScenarioIdentifier(run_id, "retained run id");
   const std::string chain = JsonStringField(report, "chain");
@@ -59,7 +60,9 @@ RetainedRunContext LoadRetainedRunContext(
 int RunRetainedTuiWithMcp(const std::filesystem::path& run_root,
                           const std::filesystem::path& state_directory,
                           bool once, std::uint32_t refresh_ms) {
-  const RetainedRunContext retained = LoadRetainedRunContext(run_root);
+  auto report = std::make_unique<IncrementalRunReport>(run_root);
+  const RetainedRunContext retained =
+      LoadRetainedRunContext(run_root, report->Refresh());
   SignalStopMonitor signal_monitor;
   McpLiveApplication mcp_application(
       McpLiveApplication::Config{.run_id = retained.run_id,
@@ -97,7 +100,7 @@ int RunRetainedTuiWithMcp(const std::filesystem::path& run_root,
         .client_config_file = publication.client_config_file,
     };
     result = RunTuiReport(run_root, once, refresh_ms, mcp_connection, nullptr,
-                          signal_monitor.GetToken());
+                          signal_monitor.GetToken(), std::move(report));
   } catch (...) {
     application_failure = std::current_exception();
   }

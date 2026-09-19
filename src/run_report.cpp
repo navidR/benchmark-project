@@ -1346,7 +1346,7 @@ boost::json::object ParseJsonObjectLine(const std::filesystem::path& path,
     throw std::runtime_error(path.string() + ":" + std::to_string(line_number) +
                              " JSONL entry is not an object");
   }
-  return value.as_object();
+  return std::move(value).as_object();
 }
 
 template <typename Callback>
@@ -3097,6 +3097,7 @@ struct IncrementalRunReport::Impl {
       if (!line.empty()) {
         const boost::json::object object =
             ParseJsonObjectLine(path, line, next_line_number);
+        summaries_dirty = true;
         callback(object);
         ++*records_read;
       }
@@ -3945,6 +3946,14 @@ struct IncrementalRunReport::Impl {
                      })) {
       return;
     }
+    const auto update_field = [this](std::string_view key,
+                                     boost::json::value value) {
+      const boost::json::value* current = report.if_contains(key);
+      if (current == nullptr || *current != value) {
+        summaries_dirty = true;
+        report[key] = std::move(value);
+      }
+    };
     std::set<std::string> active_ids;
     boost::json::array node_ids;
     for (const auto& entry : manifest->nodes) {
@@ -3967,26 +3976,28 @@ struct IncrementalRunReport::Impl {
     if (published_ids != active_ids) {
       // The manifest proves resource identity, count, and allocation. It does
       // not prove a missing event's role, topology, or full node configuration.
-      report["inventory_publication_complete"] = false;
-      report["inventory_generation"] = nullptr;
-      report["node_configs"] = nullptr;
-      report["topology"] = nullptr;
-      report["topology_current_edges"] = nullptr;
+      summaries_dirty = true;
+      update_field("inventory_publication_complete", false);
+      update_field("inventory_generation", nullptr);
+      update_field("node_configs", nullptr);
+      update_field("topology", nullptr);
+      update_field("topology_current_edges", nullptr);
       std::erase_if(nodes, [&](const auto& item) {
         return !active_ids.contains(item.first);
       });
     }
     runtime_active_node_ids = std::move(active_ids);
-    report["nodes"] = node_ids.size();
-    report["node_ids"] = std::move(node_ids);
-    report["node_capacity"] = *manifest->node_capacity;
-    report["network_allocation"] =
+    update_field("nodes", node_ids.size());
+    update_field("node_ids", std::move(node_ids));
+    update_field("node_capacity", *manifest->node_capacity);
+    update_field(
+        "network_allocation",
         manifest->network_address_plan
             ? boost::json::value(manifest->network_address_plan->ToSerialized())
-            : boost::json::value(nullptr);
+            : boost::json::value(nullptr));
     if (manifest->network_address_plan) {
-      report["network_address_pool"] =
-          manifest->network_address_plan->PoolCidr();
+      update_field("network_address_pool",
+                   boost::json::value(manifest->network_address_plan->PoolCidr()));
     }
   }
 
@@ -4051,6 +4062,7 @@ struct IncrementalRunReport::Impl {
     report["wallets_summary"] = WalletsJson(wallets);
     report["nodes_summary"] = NodesJson(nodes);
     AddTopologyViewSummaries(&report);
+    summaries_dirty = false;
   }
 
   void RequireMatchingRunId(const boost::json::object& record,
@@ -4096,7 +4108,9 @@ struct IncrementalRunReport::Impl {
     stats.has_backlog =
         event_backlog || metric_backlog || wallet_metric_backlog;
     ThrowIfReportCancelled(stop_token);
-    UpdateReport();
+    if (summaries_dirty) {
+      UpdateReport();
+    }
     ThrowIfReportCancelled(stop_token);
     return report;
   }
@@ -4104,6 +4118,8 @@ struct IncrementalRunReport::Impl {
   std::filesystem::path run_root;
   std::string expected_run_id;
   boost::json::object report;
+  // Persist across a cancelled refresh after records have been consumed.
+  bool summaries_dirty = false;
   std::uint64_t event_count = 0;
   std::uint64_t metric_count = 0;
   std::uint64_t scheduled_block_count = 0;

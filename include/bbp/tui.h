@@ -8,6 +8,8 @@
 #include <stop_token>
 #include <string>
 
+#include "bbp/run_report.h"
+
 namespace bbp {
 
 #ifdef BBP_FIRO_GUI_LAUNCHER
@@ -34,11 +36,13 @@ struct TuiRunSnapshot {
 
 using TuiRunSnapshotProvider = std::function<TuiRunSnapshot()>;
 
+// An initial reader, when supplied, must belong to run_root.
 int RunTuiReport(const std::filesystem::path& run_root, bool once,
                  std::uint32_t refresh_ms,
                  const TuiMcpConnectionInfo& mcp_connection,
                  SimulationCommandQueue* command_queue = nullptr,
-                 std::stop_token stop_token = {});
+                 std::stop_token stop_token = {},
+                 std::unique_ptr<IncrementalRunReport> initial_report = {});
 int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
                  std::uint32_t refresh_ms,
                  const TuiMcpConnectionInfo& mcp_connection,

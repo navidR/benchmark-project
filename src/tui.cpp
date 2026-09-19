@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "bbp/drivers/chain_wallet_transaction.h"
@@ -3617,13 +3618,20 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
   return false;
 }
 
+int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
+                     std::uint32_t refresh_ms,
+                     const TuiMcpConnectionInfo& mcp_connection,
+                     std::stop_token stop_token,
+                     std::unique_ptr<IncrementalRunReport> initial_report);
+
 }  // namespace
 
 int RunTuiReport(const std::filesystem::path& run_root, bool once,
                  std::uint32_t refresh_ms,
                  const TuiMcpConnectionInfo& mcp_connection,
                  SimulationCommandQueue* command_queue,
-                 std::stop_token stop_token) {
+                 std::stop_token stop_token,
+                 std::unique_ptr<IncrementalRunReport> initial_report) {
   std::shared_ptr<SimulationCommandQueue> shared_command_queue;
   if (command_queue != nullptr) {
     // Preserve the fixed-root API's caller-owned queue lifetime contract.
@@ -3640,14 +3648,26 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       .publication_mutex = {},
       .read_lease = {},
   };
-  return RunTuiReport([snapshot]() { return snapshot; }, once, refresh_ms,
-                      mcp_connection, stop_token);
+  return RunTuiReportImpl([snapshot]() { return snapshot; }, once, refresh_ms,
+                          mcp_connection, stop_token,
+                          std::move(initial_report));
 }
 
 int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
                  std::uint32_t refresh_ms,
                  const TuiMcpConnectionInfo& mcp_connection,
                  std::stop_token stop_token) {
+  return RunTuiReportImpl(std::move(snapshot_provider), once, refresh_ms,
+                          mcp_connection, stop_token, {});
+}
+
+namespace {
+
+int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
+                     std::uint32_t refresh_ms,
+                     const TuiMcpConnectionInfo& mcp_connection,
+                     std::stop_token stop_token,
+                     std::unique_ptr<IncrementalRunReport> initial_report) {
   if (!snapshot_provider) {
     throw std::invalid_argument("TUI run snapshot provider is empty");
   }
@@ -3655,7 +3675,7 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
   CursesSession curses;
   const std::uint32_t sleep_step_ms = 50;
   TuiState state;
-  std::optional<IncrementalRunReport> live_report;
+  std::unique_ptr<IncrementalRunReport> live_report;
   std::optional<TuiRunSnapshot> snapshot;
   const boost::json::object empty_report;
 
@@ -3674,6 +3694,11 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
     snapshot = std::move(next_snapshot);
     return run_changed;
   };
+
+  if (initial_report) {
+    static_cast<void>(update_snapshot(snapshot_provider()));
+    live_report = std::move(initial_report);
+  }
 
   while (true) {
     if (stop_token.stop_requested()) {
@@ -3699,7 +3724,8 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
           }
         }
         if (!live_report) {
-          live_report.emplace(snapshot->run_root, stop_token);
+          live_report = std::make_unique<IncrementalRunReport>(
+              snapshot->run_root, stop_token);
         }
         report =
             &live_report->Refresh(once ? std::numeric_limits<std::size_t>::max()
@@ -3817,4 +3843,5 @@ int RunTuiReport(TuiRunSnapshotProvider snapshot_provider, bool once,
   }
 }
 
+}  // namespace
 }  // namespace bbp
