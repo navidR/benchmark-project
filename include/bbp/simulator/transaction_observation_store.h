@@ -93,6 +93,8 @@ class TransactionObservationStore {
                 const std::vector<std::string>& required_node_ids);
   std::size_t CancelWorkload(std::string_view workload_id);
   [[nodiscard]] std::vector<TrackedTransaction> PendingTransactions() const;
+  [[nodiscard]] std::vector<TrackedTransaction> PendingTransactionsForNode(
+      const std::string& node_id) const;
   TransactionObservationTransition Record(std::string_view txid,
                                           std::string_view node_id,
                                           bool visible, bool confirmed);

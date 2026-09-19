@@ -106,14 +106,13 @@ void TransactionObservationTracker::ObserveAll(
     const Options& options, const std::filesystem::path& events_path,
     const ChainDriver& driver, const RuntimeNodeSnapshot& nodes,
     std::stop_token stop_token) {
-  const std::vector<TrackedTransaction> transactions =
-      observations_.PendingTransactions();
-  for (const TrackedTransaction& transaction : transactions) {
-    for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
-      const NodeRuntime& node = nodes[node_index];
-      if (!node.AllowsChainMetrics()) {
-        continue;
-      }
+  for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+    const NodeRuntime& node = nodes[node_index];
+    if (!node.AllowsChainMetrics()) {
+      continue;
+    }
+    for (const TrackedTransaction& transaction :
+         observations_.PendingTransactionsForNode(node.config.id)) {
       const ChainTransactionObservation observation =
           driver.ObserveTransaction(node.config, transaction.txid, stop_token);
       RecordObservation(options, events_path, transaction,
@@ -144,6 +143,16 @@ TransactionObservationTracker::ObserveTrackedSetsUntilVisible(
         "transaction load observation requires an observable node");
   }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
+  // Visibility is a recorded milestone. A slow peer must not cause repeated
+  // queries to peers that already saw the transaction; ObserveAll continues
+  // collecting the separate confirmation milestone for every required node.
+  std::vector<std::vector<std::vector<ChainTransactionState>>> observed;
+  observed.reserve(transaction_sets.size());
+  for (const auto& transactions : transaction_sets) {
+    observed.emplace_back(transactions.size(),
+                          std::vector<ChainTransactionState>(
+                              nodes.size(), ChainTransactionState::kUnknown));
+  }
   try {
     while (true) {
       ThrowIfStopRequested(stop_token);
@@ -163,11 +172,20 @@ TransactionObservationTracker::ObserveTrackedSetsUntilVisible(
         }
         bool set_visible = true;
         bool set_confirmed = true;
-        for (const TrackedTransaction& transaction : transaction_set) {
+        for (std::size_t tx_index = 0U; tx_index < transaction_set.size();
+             ++tx_index) {
+          const TrackedTransaction& transaction = transaction_set[tx_index];
           for (std::size_t node_index = 0U; node_index < nodes.size();
                ++node_index) {
             const NodeRuntime& node = nodes[node_index];
             if (!node.AllowsChainMetrics()) {
+              continue;
+            }
+            ChainTransactionState& state =
+                observed[set_index][tx_index][node_index];
+            if (state != ChainTransactionState::kUnknown) {
+              set_confirmed =
+                  set_confirmed && state == ChainTransactionState::kConfirmed;
               continue;
             }
             try {
@@ -177,6 +195,7 @@ TransactionObservationTracker::ObserveTrackedSetsUntilVisible(
               RecordObservation(options, events_path, transaction,
                                 static_cast<std::uint32_t>(node_index + 1U),
                                 node.config.id, observation);
+              state = observation.state;
               if (observation.state == ChainTransactionState::kUnknown) {
                 set_visible = false;
                 set_confirmed = false;

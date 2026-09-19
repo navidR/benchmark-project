@@ -65,6 +65,7 @@ boost::json::value ServeRpcResponse(boost::asio::ip::tcp::acceptor& acceptor,
 
   http::response<http::string_body> response{http::status::ok, 11};
   response.set(http::field::content_type, "application/json");
+  response.keep_alive(false);
   response.body() = response_body;
   response.prepare_payload();
   http::write(socket, response);

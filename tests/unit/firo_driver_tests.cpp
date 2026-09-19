@@ -64,6 +64,7 @@ std::vector<std::string> ServeRpcResponses(
             : static_cast<http::status>(response_statuses->at(response_index));
     http::response<http::string_body> response{status, 11};
     response.set(http::field::content_type, "application/json");
+    response.keep_alive(false);
     response.body() = body;
     response.prepare_payload();
     http::write(socket, response);
@@ -100,6 +101,7 @@ std::vector<std::string> ServeDelayedRpcResponses(
             : static_cast<http::status>(response_statuses->at(response_index));
     http::response<http::string_body> response{status, 11};
     response.set(http::field::content_type, "application/json");
+    response.keep_alive(false);
     response.body() = responses.at(response_index);
     response.prepare_payload();
     beast::error_code write_error;
@@ -1741,13 +1743,15 @@ BOOST_AUTO_TEST_CASE(firo_submits_transparent_funds_to_spark_target) {
   const bbp::FiroDriver driver(std::chrono::seconds(1));
   const std::string address = "sr1-external-spark-target";
 
-  BOOST_CHECK_NO_THROW(BOOST_TEST(driver.ValidateTargetAddress(config, address)));
+  BOOST_CHECK_NO_THROW(
+      BOOST_TEST(driver.ValidateTargetAddress(config, address)));
   const auto result = driver.SubmitWalletTransaction(
       config, bbp::WalletMode::kPublic, address, 1000000ULL, 1000ULL,
       std::chrono::seconds(1));
   const std::vector<std::string> expected_methods = {
       "validateaddress", "settxfee", "sendtoaddress"};
-  BOOST_TEST(served.get() == expected_methods, boost::test_tools::per_element());
+  BOOST_TEST(served.get() == expected_methods,
+             boost::test_tools::per_element());
   BOOST_REQUIRE_EQUAL(result.txids.size(), 1U);
   BOOST_TEST(result.txids.front() == "spark-mint-tx");
   BOOST_REQUIRE_EQUAL(requests.size(), 3U);

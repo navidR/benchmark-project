@@ -234,6 +234,8 @@ BOOST_AUTO_TEST_CASE(
                       {"tx-1", "node-1"}, {"tx-1", "node-2"}});
   bbp::TransactionObservationStore store(2U);
   store.Track(Transaction("tx-1", confirmation), {"node-1", "node-2"});
+  BOOST_TEST(store.PendingTransactionsForNode("node-1").size() == 1U);
+  BOOST_TEST(store.PendingTransactionsForNode("foreign-node").empty());
 
   bbp::TransactionObservationTransition transition =
       store.Record("tx-1", "node-1", true, false);
@@ -250,6 +252,9 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(!transition.retired);
   BOOST_TEST(!transition.load_progress);
   BOOST_TEST(store.Stats().active == 1U);
+  BOOST_TEST(store.PendingTransactionsForNode("node-1").empty());
+  BOOST_REQUIRE_EQUAL(store.PendingTransactionsForNode("node-2").size(), 1U);
+  BOOST_TEST(store.PendingTransactionsForNode("node-2").front().txid == "tx-1");
   transition = store.Record("tx-1", "node-2", true, true);
   BOOST_TEST(transition.first_visible);
   BOOST_TEST(transition.first_confirmed);

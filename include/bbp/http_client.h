@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <stop_token>
 #include <string>
@@ -32,7 +33,8 @@ struct RpcEndpoint {
 
 class HttpClient {
  public:
-  explicit HttpClient(std::chrono::milliseconds timeout) : timeout_(timeout) {}
+  explicit HttpClient(std::chrono::milliseconds timeout);
+  ~HttpClient();
 
   HttpResponse PostJson(const RpcEndpoint& endpoint, std::string_view path,
                         std::string_view body,
@@ -49,6 +51,8 @@ class HttpClient {
       std::stop_token stop_token) const;
 
   std::chrono::milliseconds timeout_;
+  struct ConnectionPool;
+  std::unique_ptr<ConnectionPool> connections_;
   mutable std::timed_mutex digest_mutex_;
 };
 

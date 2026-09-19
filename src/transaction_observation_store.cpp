@@ -230,6 +230,20 @@ TransactionObservationStore::PendingTransactions() const {
   return pending;
 }
 
+std::vector<TrackedTransaction>
+TransactionObservationStore::PendingTransactionsForNode(
+    const std::string& node_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<TrackedTransaction> pending;
+  for (const Entry& entry : entries_) {
+    if (entry.required_node_ids.contains(node_id) &&
+        !entry.confirmed_node_ids.contains(node_id)) {
+      pending.push_back(entry.transaction);
+    }
+  }
+  return pending;
+}
+
 TransactionObservationTransition TransactionObservationStore::Record(
     std::string_view txid, std::string_view node_id, bool visible,
     bool confirmed) {

@@ -1,6 +1,7 @@
 #include "bbp/http_client.h"
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -15,6 +16,7 @@
 #include <boost/system/system_error.hpp>
 #include <cctype>
 #include <cerrno>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -440,6 +442,22 @@ class JsonConnection {
     stream_.socket().shutdown(tcp::socket::shutdown_both, shutdown_error);
   }
 
+  void SetDeadline(std::chrono::steady_clock::time_point deadline) {
+    deadline_ = deadline;
+  }
+
+  bool Reusable() {
+    if (!keep_alive_ || buffer_.size() != 0U) {
+      return false;
+    }
+    // A server may close an idle keep-alive socket. Reconnect only before
+    // sending; a failed request is never replayed because it may mutate state.
+    char byte;
+    const auto received = recv(stream_.socket().native_handle(), &byte, 1U,
+                               MSG_PEEK | MSG_DONTWAIT);
+    return received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+  }
+
   void Connect(std::stop_token stop_token) {
     ThrowIfStopped(stop_token);
     beast::error_code operation_error;
@@ -507,6 +525,7 @@ class JsonConnection {
                            });
         });
     Run(stop_token, completed, operation_error, "HTTP JSON POST");
+    keep_alive_ = response.keep_alive();
 
     HttpExchange exchange;
     exchange.response.status = static_cast<int>(response.result_int());
@@ -576,17 +595,8 @@ class JsonConnection {
   tcp::resolver::results_type endpoints_;
   beast::flat_buffer buffer_;
   bool deadline_expired_ = false;
+  bool keep_alive_ = false;
 };
-
-HttpExchange SendJson(const RpcEndpoint& endpoint, std::string_view path,
-                      std::string_view body,
-                      const std::optional<std::string>& authorization,
-                      std::chrono::steady_clock::time_point deadline,
-                      std::stop_token stop_token) {
-  JsonConnection connection(endpoint, deadline);
-  connection.Connect(stop_token);
-  return connection.Send(path, body, authorization, stop_token);
-}
 
 std::chrono::steady_clock::time_point DeadlineAfter(
     std::chrono::milliseconds timeout) {
@@ -600,6 +610,96 @@ std::chrono::steady_clock::time_point DeadlineAfter(
 }
 
 }  // namespace
+
+struct HttpClient::ConnectionPool {
+  // Firo's default HTTP work queue holds 16 requests. Bound each node's
+  // concurrent BBP requests below that while allowing independent nodes to run.
+  static constexpr std::size_t kPerEndpoint = 4U;
+
+  struct Endpoint {
+    Endpoint() { idle.reserve(kPerEndpoint); }
+    std::mutex mutex;
+    std::condition_variable_any available;
+    std::size_t active = 0U;
+    std::vector<std::unique_ptr<JsonConnection>> idle;
+  };
+
+  struct Lease {
+    Endpoint& endpoint;
+    std::unique_ptr<JsonConnection> connection;
+
+    ~Lease() {
+      {
+        std::lock_guard lock(endpoint.mutex);
+        if (connection) {
+          endpoint.idle.push_back(std::move(connection));
+        }
+        --endpoint.active;
+      }
+      endpoint.available.notify_one();
+    }
+  };
+
+  HttpResponse Post(const RpcEndpoint& rpc, std::string_view path,
+                    std::string_view body, const std::string& authorization,
+                    std::chrono::steady_clock::time_point deadline,
+                    std::stop_token stop_token) {
+    Endpoint* endpoint;
+    {
+      std::lock_guard lock(mutex);
+      auto& entry = endpoints[{rpc.host, rpc.port}];
+      if (!entry) {
+        entry = std::make_unique<Endpoint>();
+      }
+      endpoint = entry.get();
+    }
+    std::unique_lock lock(endpoint->mutex);
+    const bool admitted = endpoint->available.wait_until(
+        lock, stop_token, deadline,
+        [&] { return endpoint->active < kPerEndpoint; });
+    if (stop_token.stop_requested()) {
+      throw SimulationCancelled();
+    }
+    if (!admitted || std::chrono::steady_clock::now() >= deadline) {
+      throw boost::system::system_error(beast::error::timeout,
+                                        "HTTP JSON admission deadline expired");
+    }
+    ++endpoint->active;
+    Lease lease{*endpoint, nullptr};
+    if (!endpoint->idle.empty()) {
+      lease.connection = std::move(endpoint->idle.back());
+      endpoint->idle.pop_back();
+    }
+    lock.unlock();
+    try {
+      if (!lease.connection || !lease.connection->Reusable()) {
+        lease.connection = std::make_unique<JsonConnection>(rpc, deadline);
+        lease.connection->Connect(stop_token);
+      } else {
+        lease.connection->SetDeadline(deadline);
+      }
+      HttpResponse response =
+          lease.connection->Send(path, body, authorization, stop_token)
+              .response;
+      if (!lease.connection->Reusable()) {
+        lease.connection.reset();
+      }
+      return response;
+    } catch (...) {
+      lease.connection.reset();
+      throw;
+    }
+  }
+
+  std::mutex mutex;
+  std::map<std::pair<std::string, std::uint16_t>, std::unique_ptr<Endpoint>>
+      endpoints;
+};
+
+HttpClient::HttpClient(std::chrono::milliseconds timeout)
+    : timeout_(timeout), connections_(std::make_unique<ConnectionPool>()) {}
+
+HttpClient::~HttpClient() = default;
 
 HttpResponse HttpClient::PostJson(const RpcEndpoint& endpoint,
                                   std::string_view path, std::string_view body,
@@ -625,8 +725,8 @@ HttpResponse HttpClient::PostJsonWithDeadline(
   if (endpoint.authentication != RpcAuthenticationMode::kDigest) {
     const std::string authorization =
         "Basic " + Base64Encode(credentials.user + ":" + credentials.password);
-    return SendJson(endpoint, path, body, authorization, deadline, stop_token)
-        .response;
+    return connections_->Post(endpoint, path, body, authorization, deadline,
+                              stop_token);
   }
 
   std::unique_lock<std::timed_mutex> lock(digest_mutex_, std::defer_lock);

@@ -2,7 +2,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/test/unit_test.hpp>
@@ -146,6 +148,173 @@ DigestConversation RunDigestConversation(
 }
 
 }  // namespace
+
+namespace {
+
+// Persistent peers and overlapping requests are needed to exercise transport
+// reuse and admission; the single-response fixtures above cannot model them.
+class PersistentHttpServer {
+ public:
+  explicit PersistentHttpServer(std::chrono::milliseconds delay = {})
+      : acceptor_(context_, {boost::asio::ip::make_address_v4("127.0.0.1"), 0}),
+        delay_(delay) {
+    Accept();
+    worker_ = std::thread([this] { context_.run(); });
+  }
+  ~PersistentHttpServer() {
+    context_.stop();
+    worker_.join();
+  }
+  bbp::RpcEndpoint Endpoint() const {
+    bbp::RpcEndpoint result;
+    result.port = acceptor_.local_endpoint().port();
+    result.user = "test";
+    result.password = "test";
+    return result;
+  }
+
+  std::atomic_uint connections{0U};
+  std::atomic_uint requests{0U};
+  std::atomic_uint maximum_active{0U};
+
+ private:
+  struct Session {
+    explicit Session(boost::asio::ip::tcp::socket peer)
+        : socket(std::move(peer)), timer(socket.get_executor()) {}
+    boost::asio::ip::tcp::socket socket;
+    boost::asio::steady_timer timer;
+    boost::beast::flat_buffer buffer;
+    boost::beast::http::request<boost::beast::http::string_body> request;
+    boost::beast::http::response<boost::beast::http::string_body> response;
+  };
+  void Accept() {
+    acceptor_.async_accept([this](auto error, auto socket) {
+      if (!error) {
+        ++connections;
+        Read(std::make_shared<Session>(std::move(socket)));
+        Accept();
+      }
+    });
+  }
+  void Read(const std::shared_ptr<Session>& session) {
+    namespace http = boost::beast::http;
+    session->request = {};
+    http::async_read(
+        session->socket, session->buffer, session->request,
+        [this, session](auto error, std::size_t) {
+          if (error) {
+            return;
+          }
+          ++requests;
+          if (session->request.target() == "/drop") {
+            session->socket.close();
+            return;
+          }
+          ++active_;
+          maximum_active.store(std::max(maximum_active.load(), active_));
+          session->timer.expires_after(delay_);
+          session->timer.async_wait([this, session](auto error) {
+            if (error) {
+              return;
+            }
+            Reply(session);
+          });
+        });
+  }
+  void Reply(const std::shared_ptr<Session>& session) {
+    namespace http = boost::beast::http;
+    auto& response = session->response;
+    response = {
+        active_ > 16U ? http::status::internal_server_error : http::status::ok,
+        11};
+    response.keep_alive(session->request.target() != "/close");
+    response.body() = session->request.body();
+    response.prepare_payload();
+    http::async_write(session->socket, response,
+                      [this, session](auto error, std::size_t) {
+                        --active_;
+                        if (!error && session->response.keep_alive()) {
+                          Read(session);
+                        }
+                      });
+  }
+
+  boost::asio::io_context context_;
+  boost::asio::ip::tcp::acceptor acceptor_;
+  std::chrono::milliseconds delay_;
+  unsigned active_ = 0U;
+  std::thread worker_;
+};
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(
+    http_client_reuses_connections_without_replaying_requests) {
+  PersistentHttpServer server;
+  const bbp::HttpClient client(std::chrono::seconds(2));
+  const auto endpoint = server.Endpoint();
+  BOOST_TEST(client.PostJson(endpoint, "/", "first").body == "first");
+  BOOST_TEST(client.PostJson(endpoint, "/", "second").body == "second");
+  BOOST_TEST(server.connections.load() == 1U);
+  BOOST_TEST(client.PostJson(endpoint, "/close", "third").body == "third");
+  BOOST_TEST(client.PostJson(endpoint, "/", "fourth").body == "fourth");
+  BOOST_TEST(server.connections.load() == 2U);
+  // The peer received the mutation but lost its response. Replaying would
+  // execute it twice, so the error must reach the caller unchanged.
+  BOOST_CHECK_THROW(client.PostJson(endpoint, "/drop", "mutation"),
+                    boost::system::system_error);
+  BOOST_TEST(server.requests.load() == 5U);
+  BOOST_TEST(client.PostJson(endpoint, "/", "next").body == "next");
+  BOOST_TEST(server.connections.load() == 3U);
+}
+
+BOOST_AUTO_TEST_CASE(http_client_bounds_node_pressure_and_admission_waits) {
+  using namespace std::chrono_literals;
+  PersistentHttpServer server(300ms);
+  PersistentHttpServer independent;
+  const bbp::HttpClient client(5s);
+  const auto endpoint = server.Endpoint();
+  std::vector<std::future<bbp::HttpResponse>> calls;
+  for (unsigned index = 0U; index < 24U; ++index) {
+    calls.push_back(std::async(std::launch::async, [&, index] {
+      return client.PostJson(endpoint, "/", std::to_string(index));
+    }));
+  }
+  const auto started = std::chrono::steady_clock::now();
+  while (server.requests.load() == 0U &&
+         std::chrono::steady_clock::now() - started < 1s) {
+    std::this_thread::sleep_for(1ms);
+  }
+  BOOST_REQUIRE(server.requests.load() > 0U);
+  std::this_thread::sleep_for(30ms);
+  BOOST_TEST(client.PostJson(independent.Endpoint(), "/", "independent").body ==
+             "independent");
+  const unsigned admitted = server.requests.load();
+  BOOST_CHECK_EXCEPTION(
+      client.PostJsonUntil(endpoint, "/", "expired",
+                           std::chrono::steady_clock::now() + 30ms),
+      boost::system::system_error,
+      [](const boost::system::system_error& error) {
+        return error.code() == boost::beast::error::timeout;
+      });
+  std::stop_source stop;
+  auto cancelled = std::async(std::launch::async, [&] {
+    return client.PostJson(endpoint, "/", "cancelled", stop.get_token());
+  });
+  std::this_thread::sleep_for(10ms);
+  stop.request_stop();
+  BOOST_REQUIRE(cancelled.wait_for(200ms) == std::future_status::ready);
+  BOOST_CHECK_THROW(cancelled.get(), bbp::SimulationCancelled);
+  BOOST_TEST(server.requests.load() == admitted);
+  for (unsigned index = 0U; index < calls.size(); ++index) {
+    const auto response = calls[index].get();
+    BOOST_TEST(response.status == 200);
+    BOOST_TEST(response.body == std::to_string(index));
+  }
+  BOOST_TEST(server.requests.load() == calls.size());
+  BOOST_TEST(server.maximum_active.load() <= 16U);
+  BOOST_TEST(server.connections.load() < calls.size());
+}
 
 BOOST_AUTO_TEST_CASE(http_client_uses_secure_cookie_credentials) {
   namespace asio = boost::asio;
