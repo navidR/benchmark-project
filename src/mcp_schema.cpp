@@ -1315,6 +1315,31 @@ boost::json::object AddDraft(boost::json::object schema) {
   return schema;
 }
 
+// Resolved wallet configurations include nullable limits and computed values
+// that callers must not supply as scenario or workload input.
+void ResolveWalletWorkloadFields(boost::json::object& fields) {
+  fields["transaction_count"] = Nullable(IntegerSchema());
+  fields["transaction_rate"] = Nullable(NumberSchema());
+  fields["transaction_rate_millionths"] = Nullable(Uint64Schema(1U));
+  fields["duration"] = Nullable(DurationSchema());
+  fields["fee_reserve"] = Fixed8AmountSchema();
+  fields["fee_reserve_satoshis"] = Uint64Schema();
+  fields["retained_balance_basis_points"] = IntegerSchema(0U, 9999U);
+}
+
+boost::json::object McpWorkloadConfigurationResultSchema() {
+  boost::json::array variants;
+  variants.reserve(kLifecycleWorkloadKinds.size());
+  for (const WorkloadKind kind : kLifecycleWorkloadKinds) {
+    auto schema = WorkloadVariant(kind, "type", false);
+    if (kind == WorkloadKind::kWalletTransactions) {
+      ResolveWalletWorkloadFields(schema.at("properties").as_object());
+    }
+    variants.push_back(std::move(schema));
+  }
+  return AddDraft(boost::json::object{{"oneOf", std::move(variants)}});
+}
+
 boost::json::object McpLifecycleWorkloadSchema() {
   boost::json::array variants;
   variants.reserve(kLifecycleWorkloadKinds.size());
@@ -1794,13 +1819,7 @@ boost::json::object BuildMcpResolvedScenarioSchema() {
           collection == "events" ? "action" : "type";
       if (fields.at(discriminator).as_object().at("const").as_string() ==
           WorkloadKindName(WorkloadKind::kWalletTransactions)) {
-        fields["transaction_count"] = Nullable(IntegerSchema());
-        fields["transaction_rate"] = Nullable(NumberSchema());
-        fields["transaction_rate_millionths"] = Nullable(Uint64Schema(1U));
-        fields["duration"] = Nullable(DurationSchema());
-        fields["fee_reserve"] = Fixed8AmountSchema();
-        fields["fee_reserve_satoshis"] = Uint64Schema();
-        fields["retained_balance_basis_points"] = IntegerSchema(0U, 9999U);
+        ResolveWalletWorkloadFields(fields);
       }
       if (collection == "events") {
         fields["sequence"] = Uint64Schema();
@@ -2912,7 +2931,7 @@ boost::json::object BuildMcpResultSchema(
           "none", "stopped", "count_reached", "duration_expired",
           "height_reached", "peer_count_reached", "cancelled", "failed"});
       properties["configuration_revision"] = Uint64Schema();
-      properties["configuration"] = McpLifecycleWorkloadSchema();
+      properties["configuration"] = McpWorkloadConfigurationResultSchema();
       properties["accounting"] =
           OneOf({ExactAccountingSchema(), BlockGenerationAccountingSchema()});
       properties["last_result"] =

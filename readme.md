@@ -100,6 +100,9 @@ CLI probes such as `--probe-veth`, `--probe-cgroup-freeze`, and
 `--probe-directional-network-condition` exercise kernel operations and are not
 read-only checks. The separate [MCP acceptance client](tests/integration/mcp_discovery_client.py)
 starts, stops, and cleans runs; its header documents the required Python packages.
+The [wallet result schema regression](tests/integration/mcp_wallet_result_schema.py)
+uses the same packages and a disposable active run with two public wallets to
+check resolved workload results and strict input validation.
 
 ## Quick Start
 
