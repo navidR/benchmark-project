@@ -362,8 +362,10 @@ std::vector<PoolViewLine> TuiPoolPane::Lines(int rows, int columns,
                      detail_lines, detail_offset_);
   canvas.Put(
       rows - 1, 0, columns,
-      retained ? "x pane | Enter inspect | Backspace back | captured source"
-               : "s source | a auto | x pane | Enter inspect | Backspace back");
+      retained
+          ? "x Switch Pane | Enter inspect | Backspace back | captured source"
+          : "s source | a auto | x Switch Pane | Enter inspect | Backspace "
+            "back");
   std::vector<PoolViewLine> result;
   for (auto& line : canvas.lines)
     result.push_back({std::move(line.text), line.selected, line.selected_column,

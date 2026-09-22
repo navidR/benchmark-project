@@ -24,7 +24,7 @@ inline std::array<Rect, 4> Layout(int rows, int columns, unsigned focus,
   const int height = std::max(0, rows - 4);
   if (height >= 10) {
     const int top = height / 2;
-    result[0] = {0, 3, columns, top};
+    result[0] = {0, 3, columns, top + 1};
     const unsigned detail = pool ? (focus == 1 ? 1 : 2)
                                  : (focus == 1   ? 1
                                     : focus == 3 ? 3
@@ -192,19 +192,23 @@ class Canvas {
     }
     std::string border(static_cast<std::size_t>(rect.width), '-');
     border.front() = border.back() = '+';
-    Put(rect.y, rect.x, rect.width, border);
     Put(rect.y + rect.height - 1, rect.x, rect.width, border);
     title = (focused ? "> " : "  ") + title;
-    const int available = std::max(1, rect.width - 4);
-    if (title.size() + position.size() + 1 <=
-        static_cast<std::size_t>(available)) {
-      title.resize(static_cast<std::size_t>(available) - position.size(), ' ');
-      title += position;
+    const auto interior = static_cast<std::size_t>(rect.width - 2);
+    const auto title_size = std::min(interior, title.size());
+    border.replace(1, title_size, title.substr(0, title_size));
+    if (!position.empty() && position.size() + title_size + 1 <= interior)
+      border.replace(static_cast<std::size_t>(rect.width - 1) - position.size(),
+                     position.size(), position);
+    Put(rect.y, rect.x, rect.width, border);
+
+    if (!position.empty()) {
+      std::string footer(static_cast<std::size_t>(rect.width), '-');
+      footer.front() = footer.back() = '+';
+      const auto size = std::min(interior, position.size());
+      footer.replace(1, size, position.substr(0, size));
+      Put(rect.y + rect.height - 1, rect.x, rect.width, footer);
     }
-    Put(rect.y, rect.x + 1, rect.width - 2, title);
-    // Position remains visible even if a small title bar cannot hold both.
-    if (!position.empty())
-      Put(rect.y + rect.height - 1, rect.x + 1, rect.width - 2, position);
   }
   void Body(Rect rect, int row, std::string text, bool selected = false) {
     if (row >= 0 && row < rect.Rows())

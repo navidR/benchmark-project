@@ -346,7 +346,8 @@ std::vector<ChainViewLine> TuiChainPane::Lines(int rows, int columns,
   transaction_detail_max_ =
       canvas.Section(layout[3], "4 Transaction details", active && focus_ == 3,
                      tx_fields, transaction_detail_offset_);
-  canvas.Put(rows - 1, 0, columns, "x pane | Enter inspect | Backspace back");
+  canvas.Put(rows - 1, 0, columns,
+             "x Switch Pane | Enter inspect | Backspace back");
   std::vector<ChainViewLine> result;
   for (auto& line : canvas.lines)
     result.push_back({std::move(line.text), line.selected, line.selected_column,
