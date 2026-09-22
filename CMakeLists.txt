@@ -216,6 +216,9 @@ add_executable(bbp
   src/application_instance_lock.cpp
   src/chain_block_json.cpp
   src/chain_view_schema.cpp
+  src/tui_pool_pane.cpp
+  src/pool_view.cpp
+  src/pool_view_json.cpp
   src/chain_view.cpp
   src/tui_chain_pane.cpp
   src/block_production_policy.cpp
@@ -226,6 +229,9 @@ add_executable(bbp
   src/chain_kind.cpp
   src/conntrack.cpp
   src/default_peer_topology.cpp
+  src/drivers/chain_pool.cpp
+  src/drivers/bitcoin_family_pool.cpp
+  src/drivers/monero_pool.cpp
   src/drivers/chain_block.cpp
   src/drivers/bitcoin_family_blocks.cpp
   src/drivers/monero_blocks.cpp
@@ -540,6 +546,7 @@ if(BUILD_TESTING)
   add_executable(bbp-unit-tests
     tests/unit/application_instance_lock_tests.cpp
     tests/unit/chain_view_tests.cpp
+    tests/unit/pool_view_tests.cpp
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
@@ -631,12 +638,18 @@ if(BUILD_TESTING)
     src/conntrack.cpp
     src/chain_block_json.cpp
     src/chain_view_schema.cpp
+    src/tui_pool_pane.cpp
+    src/pool_view.cpp
+    src/pool_view_json.cpp
     src/chain_view.cpp
     src/tui_chain_pane.cpp
     src/block_production_policy.cpp
     src/default_peer_topology.cpp
     src/simulation_command.cpp
     src/simulation_event_kind.cpp
+    src/drivers/chain_pool.cpp
+    src/drivers/bitcoin_family_pool.cpp
+    src/drivers/monero_pool.cpp
     src/drivers/chain_block.cpp
     src/drivers/bitcoin_family_blocks.cpp
     src/drivers/monero_blocks.cpp

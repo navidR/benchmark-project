@@ -34,6 +34,7 @@ constexpr auto kOperations = std::to_array<McpNamedCapability>(
      {"run.report", "Build an exact retained or live report"},
      {"chain.query",
       "Read a bounded canonical block page and selected block detail"},
+     {"pool.query", "Read a bounded transaction-pool page and selected detail"},
      {"simulation.command", "Invoke a registered runtime command"},
 #ifdef BBP_FIRO_GUI_LAUNCHER
      {"local.firo_qt_launcher", "Create the owned native Firo-Qt launcher"},
@@ -128,6 +129,7 @@ constexpr auto kInformationFamilies = std::to_array<McpNamedCapability>(
      {"chain",
       "Lazy chain blocks and transactions from an identified node or captured "
       "records"},
+     {"pool", "Current or captured transaction pool from one identified node"},
      {"generated_commands", "Safe generated operator commands"},
      {"artifacts", "Run-owned artifact inventory"},
      {"artifact_contents", "Safe bounded run-owned artifact contents"},
@@ -149,6 +151,8 @@ constexpr auto kResultFamilies = std::to_array<McpNamedCapability>(
      {"chain_page",
       "Bounded block page with normalized byte units and selected "
       "transactions"},
+     {"pool_page",
+      "Bounded pool page with exact nullable units and selected transaction"},
      {"artifact_content", "Bounded safe artifact bytes and metadata"},
      {"operation", "Stable long-operation progress and terminal outcome"},
      {"subscription", "Subscription identity and bounded notification page"},

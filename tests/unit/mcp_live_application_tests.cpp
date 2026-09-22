@@ -28,6 +28,7 @@
 #include "bbp/mcp_live_application.h"
 #include "bbp/mcp_run_evidence.h"
 #include "bbp/operator_connection.h"
+#include "bbp/pool_view.h"
 #include "bbp/run_ownership.h"
 #include "bbp/runtime_node_inventory.h"
 #include "bbp/runtime_wallet_registry.h"
@@ -474,6 +475,56 @@ BOOST_AUTO_TEST_CASE(
              scenario.at("ready_timeout_sec").to_number<std::uint64_t>());
   BOOST_TEST(node_report.at("sync_timeout_sec").to_number<std::uint64_t>() ==
              scenario.at("sync_timeout_sec").to_number<std::uint64_t>());
+
+  // TUI reads, MCP queries/resources and subscriptions must use the same
+  // normalized pool service, including selected-transaction identity.
+  auto pool = std::make_shared<PoolViewService>(temporary.path(), [] {
+    return std::vector<PoolReader>{
+        {.node_id = "_firo-1",
+         .snapshot =
+             [](std::stop_token) {
+               ChainPoolSnapshot snapshot;
+               for (char digit : {'a', 'b'}) {
+                 ChainPoolTransaction tx;
+                 tx.id = std::string(64, digit);
+                 snapshot.transactions.push_back(tx);
+               }
+               CalculatePoolSummary(snapshot);
+               return snapshot;
+             },
+         .detail = [](const ChainPoolTransaction& tx,
+                      std::stop_token) { return tx; },
+         .departure = {}}};
+  });
+  application.SetPoolViewService(pool);
+  const auto pool_subscription =
+      Invoke(&dispatcher, "subscription.create",
+             {{"run_id", "live-application"},
+              {"families", boost::json::array{"pool"}}});
+  const auto tui_pool = pool->Query({.selected_id = std::string(64, 'b')});
+  const auto pool_terminal = WaitForTerminal(
+      &dispatcher, Invoke(&dispatcher, "pool.query",
+                          {{"run_id", "live-application"},
+                           {"selected_id", std::string(64, 'b')},
+                           {"limit", 1U}}));
+  BOOST_REQUIRE(pool_terminal.at("state").as_string() == "succeeded");
+  const auto& pool_result = pool_terminal.at("terminal_result").as_object();
+  BOOST_TEST(pool_result.at("result_family").as_string() == "pool_page");
+  BOOST_TEST(pool_result.at("page").as_object().at("detail") ==
+             tui_pool.at("detail"));
+  const auto pool_resource = application.ResourceReader()(
+      McpInformationFamily::kPool, "live-session", {});
+  BOOST_TEST(pool_resource.as_object()
+                 .at("data")
+                 .as_object()
+                 .at("source_node")
+                 .as_string() == "_firo-1");
+  const auto pool_notifications =
+      Invoke(&dispatcher, "subscription.poll",
+             {{"subscription_id", pool_subscription.at("subscription_id")},
+              {"cursor", "0"},
+              {"limit", 8U}});
+  BOOST_TEST(!pool_notifications.at("items").as_array().empty());
 
   const boost::json::object command_arguments{
       {"run_id", "live-application"},

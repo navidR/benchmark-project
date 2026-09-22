@@ -1,6 +1,7 @@
 #include "bbp/tui.h"
 
 #include "bbp/tui_chain_pane.h"
+#include "bbp/tui_pool_pane.h"
 
 // Boost.Log must precede ncurses' timeout and set_attributes macros.
 // clang-format off
@@ -82,6 +83,7 @@ struct TuiState {
   std::size_t selected_topology_group = 0;
   TuiView view = TuiView::kNodes;
   TuiChainPane chain_pane;
+  TuiPoolPane pool_pane;
   NodeFilePane node_file_pane;
   NodeLogPane node_log_pane;
   SimulatorLogPane simulator_log_pane;
@@ -117,6 +119,7 @@ void ResetRunUiState(TuiState* state) {
   ReleaseOperatorConnectionLauncher(state);
 #endif
   state->chain_pane.Reset();
+  state->pool_pane.Reset();
   state->selected_node = 0U;
   state->selected_wallet = 0U;
   state->selected_topology_group = 0U;
@@ -2680,7 +2683,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   DrawNetworkRulePane(content_bottom, cols, network_rule_pane);
   DrawNodeFilePane(content_bottom, cols, node_file_pane);
   DrawHorizontalLine(rows - 2);
-  std::string footer = "MCP [i]. Chain [v]. ";
+  std::string footer = "MCP [i]. Chain [v]. Pool [o]. ";
   if (!command_status.empty()) {
     footer += std::string(command_status) + " | ";
   }
@@ -2700,7 +2703,8 @@ void DrawFrameBody(const std::filesystem::path& run_root,
         "u reloads; b closes.";
   } else {
     footer +=
-        "Logs [/] row, PgUp/PgDn page, Home/End. Arrows select. Tab/n/w/v/g/h "
+        "Logs [/] row, PgUp/PgDn page, Home/End. Arrows select. "
+        "Tab/n/w/v/o/g/h "
         "view. b files. p peers. a rules. c command. e export. "
         "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. Esc "
         "asks; q exits.";
@@ -2727,8 +2731,17 @@ void DrawSummary(
     bool mcp_connection_dialog_open, const TuiMcpConnectionInfo& mcp_connection,
     const std::optional<PendingConfirmation>& pending_confirmation,
     const TuiExitConfirmation& exit_confirmation,
-    SimulatorLogPane* simulator_log_pane, const TuiChainPane* chain_pane) {
-  if (view == TuiView::kChain) {
+    SimulatorLogPane* simulator_log_pane, const TuiChainPane* chain_pane,
+    const TuiPoolPane* pool_pane) {
+  if (view == TuiView::kPool) {
+    int pool_rows = 0, pool_columns = 0;
+    getmaxyx(stdscr, pool_rows, pool_columns);
+    erase();
+    const auto pool_lines = pool_pane->Lines(pool_rows, pool_columns);
+    for (std::size_t row = 0; row < pool_lines.size(); ++row)
+      AddText(static_cast<int>(row), 0, pool_columns, pool_lines[row].text,
+              pool_lines[row].selected ? A_REVERSE : A_NORMAL);
+  } else if (view == TuiView::kChain) {
     int chain_rows = 0, chain_columns = 0;
     getmaxyx(stdscr, chain_rows, chain_columns);
     erase();
@@ -3288,9 +3301,10 @@ bool HandleMcpConnectionDialogInput(int ch, TuiState* state) {
 }
 
 bool HandleSimulatorLogInput(int ch, TuiState* state) {
-  if (state->view == TuiView::kChain || state->view == TuiView::kMetrics ||
-      state->node_log_pane.IsOpen() || state->peer_list_pane.IsOpen() ||
-      state->network_rule_pane.IsOpen() || state->node_file_pane.IsOpen()) {
+  if (state->view == TuiView::kPool || state->view == TuiView::kChain ||
+      state->view == TuiView::kMetrics || state->node_log_pane.IsOpen() ||
+      state->peer_list_pane.IsOpen() || state->network_rule_pane.IsOpen() ||
+      state->node_file_pane.IsOpen()) {
     return false;
   }
   const std::size_t page_rows =
@@ -3390,6 +3404,36 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
     }
   }
 
+  if (ch == 'o' || ch == 'O') {
+    state->view = TuiView::kPool;
+    state->node_log_pane.Close();
+    state->peer_list_pane.Close();
+    state->network_rule_pane.Close();
+    state->node_file_pane.Close();
+    return true;
+  }
+  if (state->view == TuiView::kPool) {
+    std::optional<PoolNavigation> key;
+    if (ch == KEY_UP)
+      key = PoolNavigation::kUp;
+    else if (ch == KEY_DOWN)
+      key = PoolNavigation::kDown;
+    else if (ch == KEY_PPAGE)
+      key = PoolNavigation::kPageUp;
+    else if (ch == KEY_NPAGE)
+      key = PoolNavigation::kPageDown;
+    else if (ch == KEY_HOME)
+      key = PoolNavigation::kHome;
+    else if (ch == KEY_END)
+      key = PoolNavigation::kEnd;
+    else if (ch == 'x' || ch == 'X' || ch == '\n')
+      key = PoolNavigation::kFocus;
+    if (key) {
+      state->pool_pane.Navigate(*key);
+      return true;
+    }
+  }
+
   if (HandleSimulatorLogInput(ch, state)) {
     return true;
   }
@@ -3403,6 +3447,9 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
         state->view = TuiView::kChain;
         break;
       case TuiView::kChain:
+        state->view = TuiView::kPool;
+        break;
+      case TuiView::kPool:
         state->view = TuiView::kTopology;
         state->node_log_pane.Close();
         state->peer_list_pane.Close();
@@ -3450,7 +3497,8 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
   }
 
   const boost::json::array* wallets = WalletSummaries(report);
-  if (state->view == TuiView::kChain) return false;
+  if (state->view == TuiView::kChain || state->view == TuiView::kPool)
+    return false;
   if (ch == 'l' || ch == 'L') {
     const std::optional<std::size_t> selected_node =
         SelectedNodeIndex(report, *state);
@@ -3814,6 +3862,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
       .publication_mutex = {},
       .read_lease = {},
       .chain_view = std::make_shared<ChainViewService>(run_root),
+      .pool_view = std::make_shared<PoolViewService>(run_root),
   };
   return RunTuiReportImpl([snapshot]() { return snapshot; }, once, refresh_ms,
                           mcp_connection, stop_token,
@@ -3946,23 +3995,31 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       state.chain_pane.Refresh(snapshot->chain_view, screen_rows);
     } else
       state.chain_pane.Cancel();
+    if (state.view == TuiView::kPool) {
+      int screen_rows = 0, screen_cols = 0;
+      getmaxyx(stdscr, screen_rows, screen_cols);
+      static_cast<void>(screen_cols);
+      state.pool_pane.Refresh(snapshot->pool_view, screen_rows);
+    } else
+      state.pool_pane.Cancel();
+    const auto pool_revision = state.pool_pane.revision();
     const auto chain_revision = state.chain_pane.revision();
     if (has_active_run) {
-      DrawSummary(snapshot->run_root, report, error, log_lines, state.view,
-                  state.selected_node, state.selected_wallet,
-                  state.selected_topology_group, state.node_log_pane,
-                  state.peer_list_pane, state.network_rule_pane,
-                  state.node_file_pane, state.command_status,
-                  state.command_error_open, state.command_error,
-                  state.command_palette_open, state.command_input,
-                  state.command_input_error,
+      DrawSummary(
+          snapshot->run_root, report, error, log_lines, state.view,
+          state.selected_node, state.selected_wallet,
+          state.selected_topology_group, state.node_log_pane,
+          state.peer_list_pane, state.network_rule_pane, state.node_file_pane,
+          state.command_status, state.command_error_open, state.command_error,
+          state.command_palette_open, state.command_input,
+          state.command_input_error,
 #ifdef BBP_FIRO_GUI_LAUNCHER
-                  state.firo_qt_launcher_dialog_open,
-                  state.firo_qt_launcher_path, state.firo_qt_launcher_command,
+          state.firo_qt_launcher_dialog_open, state.firo_qt_launcher_path,
+          state.firo_qt_launcher_command,
 #endif
-                  state.mcp_connection_dialog_open, mcp_connection,
-                  state.pending_confirmation, state.exit_confirmation,
-                  &state.simulator_log_pane, &state.chain_pane);
+          state.mcp_connection_dialog_open, mcp_connection,
+          state.pending_confirmation, state.exit_confirmation,
+          &state.simulator_log_pane, &state.chain_pane, &state.pool_pane);
     } else {
       DrawEmptySummary(state.mcp_connection_dialog_open, mcp_connection,
                        state.exit_confirmation);
@@ -3983,6 +4040,9 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       }
       if (state.view == TuiView::kChain &&
           state.chain_pane.revision() != chain_revision)
+        break;
+      if (state.view == TuiView::kPool &&
+          state.pool_pane.revision() != pool_revision)
         break;
       const int ch = getch();
       if (ch == KEY_RESIZE) {

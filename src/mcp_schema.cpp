@@ -21,6 +21,7 @@
 #include "bbp/mcp_registry.h"
 #include "bbp/node_lifecycle_policy.h"
 #include "bbp/perf_counter.h"
+#include "bbp/pool_view.h"
 #include "bbp/scenario_fields.h"
 #include "bbp/simulation_command.h"
 #include "bbp/simulation_partition.h"
@@ -1871,6 +1872,8 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
       return McpResultFamily::kCleanup;
     case McpOperationKind::kQueryChain:
       return McpResultFamily::kChainPage;
+    case McpOperationKind::kQueryPool:
+      return McpResultFamily::kPoolPage;
     case McpOperationKind::kReportRun:
     case McpOperationKind::kQueryEvidence:
     case McpOperationKind::kQueryLogs:
@@ -1974,6 +1977,13 @@ boost::json::object BuildMcpOperationInputSchema(
       add_run();
       properties["first_height"] = Uint64Schema();
       properties["selected_height"] = Uint64Schema();
+      properties["limit"] = IntegerSchema(1U, 32U);
+      break;
+    case McpOperationKind::kQueryPool:
+      add_run();
+      properties["selected_id"] = boost::json::object{
+          {"type", "string"}, {"pattern", "^[0-9a-fA-F]{64}$"}};
+      properties["index"] = IntegerSchema(0U, 65535U);
       properties["limit"] = IntegerSchema(1U, 32U);
       break;
     case McpOperationKind::kReportRun:
@@ -3090,6 +3100,11 @@ boost::json::object BuildMcpResultSchema(
     case McpResultFamily::kChainPage:
       properties["run_id"] = RunIdentifierSchema();
       properties["page"] = ChainViewPageSchema();
+      require({"run_id", "page"});
+      break;
+    case McpResultFamily::kPoolPage:
+      properties["run_id"] = RunIdentifierSchema();
+      properties["page"] = PoolViewPageSchema();
       require({"run_id", "page"});
       break;
     case McpResultFamily::kEvidencePage:

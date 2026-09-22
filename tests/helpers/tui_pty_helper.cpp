@@ -4029,6 +4029,35 @@ void CheckHomeEndKeys(const std::filesystem::path& command,
   process.Resize(12, 30);
   RequireNotContains(process.ReadFor(100ms), "Confirm exit",
                      "narrow chain view");
+  // Exercise pool view discovery and the real ncurses input route using a
+  // retained capture. Service/navigation behavior is covered at its boundary.
+  {
+    std::ofstream stream(run.run_root() / "transaction-pool.json");
+    const boost::json::object tx{{"id", std::string(64, 'a')}};
+    stream << boost::json::serialize(boost::json::object{
+        {"version", 1},
+        {"source_node", "captured-pool"},
+        {"sampled_at_ms", 123000U},
+        {"summary", boost::json::object{{"transaction_count", 1U}}},
+        {"transactions", boost::json::array{tx}},
+        {"detail", tx}});
+  }
+  process.Resize(30, 100);
+  process.Write("o");
+  const auto pool_frame =
+      process.ReadUntil("Pool transactions:", 5s, "pool view");
+  if (pool_frame.find("captured-pool") == std::string::npos)
+    static_cast<void>(
+        process.ReadUntil("captured-pool", 5s, "captured pool source"));
+  for (const auto key :
+       {"\033[H", "\033[F", "\033[A", "\033[B", "\033[5~", "\033[6~", "x"}) {
+    process.Write(key);
+    RequireNotContains(process.ReadFor(50ms), "Confirm exit",
+                       "pool navigation");
+  }
+  process.Resize(12, 30);
+  RequireNotContains(process.ReadFor(100ms), "Confirm exit",
+                     "narrow pool view");
   process.Write("q");
   RequireExitZero(&process, "Home/End key TUI");
 }

@@ -6,6 +6,7 @@ enum class TuiView {
   kNodes,
   kWallets,
   kChain,
+  kPool,
   kTopology,
   kMetrics,
 };

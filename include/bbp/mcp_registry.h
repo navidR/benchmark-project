@@ -42,6 +42,7 @@ enum class McpOperationKind {
   kReplayRun,
   kReportRun,
   kQueryChain,
+  kQueryPool,
   kInvokeRuntimeCommand,
 #ifdef BBP_FIRO_GUI_LAUNCHER
   kCreateFiroQtLauncher,
@@ -125,6 +126,7 @@ enum class McpInformationFamily {
   kCommandHistory,
   kReports,
   kChain,
+  kPool,
   kGeneratedCommands,
   kArtifacts,
   kArtifactContents,
@@ -146,6 +148,7 @@ enum class McpResultFamily {
   kInstrumentation,
   kEvidencePage,
   kChainPage,
+  kPoolPage,
   kArtifactContent,
   kOperation,
   kSubscription,

@@ -25,6 +25,7 @@ class OperatorConnectionLauncher;
 #endif
 class SimulationCommandQueue;
 class ChainViewService;
+class PoolViewService;
 struct Options;
 
 struct McpLiveNodeInventorySnapshot {
@@ -207,6 +208,8 @@ class McpLiveApplication {
       std::shared_ptr<McpLiveInstrumentationService> service);
   void SetChainViewService(std::shared_ptr<ChainViewService> service);
   std::shared_ptr<ChainViewService> ChainView() const;
+  void SetPoolViewService(std::shared_ptr<PoolViewService> service);
+  std::shared_ptr<PoolViewService> PoolView() const;
   void SetRoleService(std::shared_ptr<McpLiveRoleService> service);
 
   // Called exactly once by SimulationCommandProcessor. Successful node
@@ -286,6 +289,7 @@ class McpLiveApplication {
 
   Config config_;
   std::shared_ptr<ChainViewService> chain_view_service_;
+  std::shared_ptr<PoolViewService> pool_view_service_;
   mutable std::mutex mutex_;
   std::condition_variable command_outcome_ready_;
   std::condition_variable_any requests_drained_;

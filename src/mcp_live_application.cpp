@@ -27,6 +27,7 @@
 #include "bbp/mcp_registry.h"
 #include "bbp/mcp_run_evidence.h"
 #include "bbp/operator_connection.h"
+#include "bbp/pool_view.h"
 #include "bbp/run_report.h"
 #include "bbp/scenario_service.h"
 #include "bbp/simulation_cancelled.h"
@@ -44,6 +45,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kResolveScenario,
     McpOperationKind::kStopRun,
     McpOperationKind::kQueryChain,
+    McpOperationKind::kQueryPool,
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
 #ifdef BBP_FIRO_GUI_LAUNCHER
@@ -81,8 +83,9 @@ constexpr std::array kLiveOperations = {
 
 constexpr std::array kRetainedOperations = {
     McpOperationKind::kValidateScenario, McpOperationKind::kResolveScenario,
-    McpOperationKind::kQueryChain,       McpOperationKind::kReportRun,
-    McpOperationKind::kGetOperation,     McpOperationKind::kCancelOperation,
+    McpOperationKind::kQueryChain,       McpOperationKind::kQueryPool,
+    McpOperationKind::kReportRun,        McpOperationKind::kGetOperation,
+    McpOperationKind::kCancelOperation,
 };
 
 constexpr std::array kOwnedRunOperations = {
@@ -1566,8 +1569,8 @@ boost::json::object ExecuteAndNormalizeSimulationRoleMutation(
 
 McpLiveApplication::McpLiveApplication(Config config)
     : config_(std::move(config)),
-      chain_view_service_(
-          std::make_shared<ChainViewService>(config_.run_root)) {
+      chain_view_service_(std::make_shared<ChainViewService>(config_.run_root)),
+      pool_view_service_(std::make_shared<PoolViewService>(config_.run_root)) {
   if (config_.run_id.empty()) {
     throw std::invalid_argument("MCP live application requires a run id");
   }
@@ -1784,6 +1787,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
       kind != McpOperationKind::kQueryChain &&
+      kind != McpOperationKind::kQueryPool &&
       kind != McpOperationKind::kInvokeRuntimeCommand &&
 #ifdef BBP_FIRO_GUI_LAUNCHER
       kind != McpOperationKind::kCreateFiroQtLauncher &&
@@ -2131,6 +2135,32 @@ McpOperationPlan McpLiveApplication::BuildOperation(
               .value =
                   EvidencePage(config_.run_id, McpInformationFamily::kReports,
                                std::move(report))};
+        }};
+  }
+
+  if (kind == McpOperationKind::kQueryPool) {
+    PoolViewRequest request;
+    if (arguments.contains("selected_id"))
+      request.selected_id = JsonString(arguments, "selected_id");
+    const auto index = OptionalUnsigned(arguments, "index", 0);
+    const auto limit = OptionalUnsigned(arguments, "limit", 16);
+    if (index >= ChainPoolSnapshot::kMaximumTransactions || limit == 0 ||
+        limit > 32)
+      throw std::invalid_argument(
+          "pool.query requires index 0..65535 and limit 1..32");
+    request.index = static_cast<std::uint32_t>(index);
+    request.limit = static_cast<std::uint32_t>(limit);
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, request](McpOperationContext& context) {
+          CombinedStopToken cancellation(context.stop_token(),
+                                         request_stop_source_.get_token());
+          auto page = PoolView()->Query(request, cancellation.token());
+          return McpTypedResult{
+              .family = McpResultFamily::kPoolPage,
+              .value = boost::json::object{{"result_family", "pool_page"},
+                                           {"run_id", config_.run_id},
+                                           {"page", std::move(page)}}};
         }};
   }
 
@@ -3143,6 +3173,9 @@ boost::json::value McpLiveApplication::ReadResource(
     case McpInformationFamily::kChain:
       data = ChainView()->Query({}, stop_token);
       break;
+    case McpInformationFamily::kPool:
+      data = PoolView()->Query({}, stop_token);
+      break;
     case McpInformationFamily::kReports:
       data = std::move(report);
       break;
@@ -4011,6 +4044,35 @@ void McpLiveApplication::MarkRunStarted() {
   }
 }
 
+void McpLiveApplication::SetPoolViewService(
+    std::shared_ptr<PoolViewService> service) {
+  if (!service) throw std::invalid_argument("pool view service is required");
+  service->SetObserver([this](const boost::json::object& page) {
+    PublishEvidence(
+        McpInformationFamily::kPool, "pool_page", "pool snapshot captured",
+        std::nullopt,
+        boost::json::object{{"source_node", page.at("source_node")},
+                            {"sampled_at_ms", page.at("sampled_at_ms")},
+                            {"summary", page.at("summary")},
+                            {"departed_id", page.at("departed_id")},
+                            {"departure_reason", page.at("departure_reason")},
+                            {"notice", page.at("notice")}});
+  });
+  std::shared_ptr<PoolViewService> previous;
+  bool stopping;
+  {
+    std::lock_guard lock(mutex_);
+    stopping = stop_requested_ || shutdown_;
+    previous = std::exchange(pool_view_service_, service);
+  }
+  if (stopping) service->Close();
+  if (previous) previous->Close();
+}
+std::shared_ptr<PoolViewService> McpLiveApplication::PoolView() const {
+  std::lock_guard lock(mutex_);
+  return pool_view_service_;
+}
+
 void McpLiveApplication::SetChainViewService(
     std::shared_ptr<ChainViewService> service) {
   if (!service) throw std::invalid_argument("chain view service is required");
@@ -4053,6 +4115,7 @@ void McpLiveApplication::MarkRunStopping() {
   }
   run_stop_source_.request_stop();
   ChainView()->Close();
+  PoolView()->Close();
   if (notify && config_.run_stopping) {
     config_.run_stopping();
   }
@@ -4170,6 +4233,7 @@ void McpLiveApplication::ShutdownImpl(
   request_stop_source_.request_stop();
   run_stop_source_.request_stop();
   ChainView()->Close();
+  PoolView()->Close();
   std::unique_lock<std::mutex> lock(mutex_);
   const auto requests_drained = [this] { return active_requests_ == 0U; };
   if (deadline) {

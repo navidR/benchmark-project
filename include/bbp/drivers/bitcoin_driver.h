@@ -43,6 +43,12 @@ class BitcoinDriver final : public ChainDriver {
   ChainBlockDetail ReadBlockDetail(
       const ChainNodeConfig& config, const std::string& hash,
       std::stop_token stop_token = {}) const override;
+  ChainPoolSnapshot ReadPoolSnapshot(
+      const ChainNodeConfig& config,
+      std::stop_token stop_token = {}) const override;
+  ChainPoolTransaction ReadPoolTransaction(
+      const ChainNodeConfig& config, const ChainPoolTransaction& entry,
+      std::stop_token stop_token = {}) const override;
   std::vector<std::string> PeerAddresses(
       const ChainNodeConfig& config,
       std::stop_token stop_token = {}) const override;

@@ -2967,3 +2967,53 @@ BOOST_AUTO_TEST_CASE(firo_driver_chain_block_detail) {
   BOOST_TEST(detail.transactions[1].fee->ends_with(" coin"));
   BOOST_TEST(!detail.transactions[1].weight.has_value());
 }
+
+// Pool virtual bytes must never be mislabeled as full serialized bytes.
+BOOST_AUTO_TEST_CASE(firo_driver_pool_units_and_selected_detail) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  asio::io_context io;
+  tcp::acceptor acceptor(
+      io, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const std::string id(64, 'a');
+  boost::json::object entry{{"size", 100},
+                            {"vsize", 100},
+                            {"fee", 0.00002},
+                            {"time", 123},
+                            {"depends", boost::json::array{}}};
+
+  const auto rpc = [](boost::json::value value) {
+    return boost::json::serialize(boost::json::object{
+        {"result", std::move(value)}, {"error", nullptr}, {"id", "bbp"}});
+  };
+  const std::vector<std::string> responses{
+      rpc(boost::json::object{{"usage", 999}}),
+      rpc(boost::json::object{{id, entry}}),
+      rpc(boost::json::object{
+          {"txid", id},
+          {"size", 180},
+          {"vin", boost::json::array{boost::json::object{}}},
+          {"vout", boost::json::array{boost::json::object{}}},
+          {"extraPayload", "abcd"}})};
+  auto served = std::async(std::launch::async, [&] {
+    return ServeRpcResponses(acceptor, responses, nullptr);
+  });
+  bbp::ChainNodeConfig config;
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::FiroDriver driver(std::chrono::seconds(1));
+  auto snapshot = driver.ReadPoolSnapshot(config);
+  BOOST_REQUIRE_EQUAL(snapshot.transactions.size(), 1U);
+  BOOST_TEST(!snapshot.summary.size.total.has_value());
+  BOOST_TEST(snapshot.summary.total_fees.value() == 2000U);
+  BOOST_TEST(snapshot.summary.average_fee_rate.value() == 20.0);
+  BOOST_TEST(!snapshot.summary.weight.total.has_value());
+  const auto detail =
+      driver.ReadPoolTransaction(config, snapshot.transactions.front());
+  BOOST_TEST(detail.serialized_size.value() == 180U);
+  BOOST_TEST(detail.metadata_size.value() == 2U);
+  BOOST_TEST(detail.id == id);
+  served.get();
+}

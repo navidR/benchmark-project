@@ -1260,3 +1260,47 @@ BOOST_AUTO_TEST_CASE(monero_driver_chain_block_detail) {
   BOOST_TEST(*detail.transactions[1].metadata_size == 2U);
   BOOST_TEST(*detail.transactions[1].fee == "1000 atomic (1e-12 coin)");
 }
+
+// Monero fees use twelve-decimal atomic units and rates divide by native
+// weight.
+BOOST_AUTO_TEST_CASE(monero_driver_pool_units_and_empty_sample) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  asio::io_context io;
+  tcp::acceptor acceptor(
+      io, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  boost::json::object entry{
+      {"id_hash", std::string(kHashA)},
+      {"blob_size", 200},
+      {"weight", 400},
+      {"fee", 20000},
+      {"receive_time", 123},
+      {"relayed", false},
+      {"do_not_relay", true},
+      {"double_spend_seen", true},
+      {"tx_json", R"({"vin":[{}],"vout":[{},{}],"extra":[1,2,3]})"}};
+  const std::vector<std::string> responses{
+      boost::json::serialize(boost::json::object{
+          {"status", "OK"}, {"transactions", boost::json::array{entry}}}),
+      R"({"status":"OK"})"};
+  auto served = std::async(std::launch::async, [&] {
+    return ServeDigestResponses(acceptor, responses);
+  });
+  auto config = TestConfig(acceptor.local_endpoint().port());
+  config.rpc_host = "127.0.0.1";
+  const bbp::MoneroDriver driver(std::chrono::seconds(1));
+  const auto snapshot = driver.ReadPoolSnapshot(config);
+  BOOST_REQUIRE_EQUAL(snapshot.transactions.size(), 1U);
+  BOOST_TEST(snapshot.summary.size.total.value() == 200U);
+  BOOST_TEST(snapshot.summary.weight.total.value() == 400U);
+  BOOST_TEST(snapshot.summary.total_fees.value() == 20000U);
+  BOOST_TEST(snapshot.summary.average_fee_rate.value() == 50.0);
+  const auto detail =
+      driver.ReadPoolTransaction(config, snapshot.transactions.front());
+  BOOST_TEST(detail.metadata_size.value() == 3U);
+  BOOST_TEST(!detail.relayed.value());
+  BOOST_TEST(!detail.dependencies.has_value());
+  BOOST_TEST(detail.validation.has_value());
+  BOOST_TEST(driver.ReadPoolSnapshot(config).summary.transaction_count == 0U);
+  served.get();
+}

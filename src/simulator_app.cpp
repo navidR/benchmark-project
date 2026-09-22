@@ -1894,6 +1894,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     ThrowIfStopRequested(stop_token);
     mcp_application.SetChainViewService(
         MakeLiveChainViewService(run_root, driver_owner, node_inventory));
+    mcp_application.SetPoolViewService(
+        MakeLivePoolViewService(run_root, driver_owner, node_inventory));
     mcp_application.MarkRunStarted();
     {
       RuntimeNodeSnapshot nodes;

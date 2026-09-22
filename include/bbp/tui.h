@@ -17,6 +17,7 @@ class OperatorConnectionLauncher;
 #endif
 class SimulationCommandQueue;
 class ChainViewService;
+class PoolViewService;
 
 struct TuiMcpConnectionInfo {
   std::string endpoint;
@@ -34,6 +35,7 @@ struct TuiRunSnapshot {
   std::shared_ptr<std::timed_mutex> publication_mutex;
   std::shared_ptr<void> read_lease;
   std::shared_ptr<ChainViewService> chain_view = {};
+  std::shared_ptr<PoolViewService> pool_view = {};
 };
 
 using TuiRunSnapshotProvider = std::function<TuiRunSnapshot()>;
