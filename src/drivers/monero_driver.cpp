@@ -10,6 +10,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -25,6 +26,7 @@ namespace {
 
 constexpr std::uint32_t kMoneroPeerLimit = 16U;
 constexpr std::uint32_t kPeerBanSeconds = 3600U;
+constexpr std::uint32_t kMaximumGeneratedBlocksPerRpc = 16U;
 
 std::uint32_t PeerLimit(const ChainNodeConfig& config) {
   if (config.connect_peers.size() > std::numeric_limits<std::uint32_t>::max())
@@ -351,7 +353,8 @@ ProcessSpec MoneroDriver::RenderProcess(const ChainNodeConfig& config) const {
       "--confirm-external-bind",
       "--allow-local-ip",
       Arg("--max-connections-per-ip", std::to_string(PeerLimit(config))),
-      Arg("--out-peers", std::to_string(config.listen ? PeerLimit(config) : 0U)),
+      Arg("--out-peers",
+          std::to_string(config.listen ? PeerLimit(config) : 0U)),
       Arg("--in-peers", std::to_string(config.listen ? PeerLimit(config) : 0U)),
   };
   for (const std::string& peer : config.connect_peers) {
@@ -657,20 +660,32 @@ std::vector<std::string> MoneroDriver::GenerateBlocks(
     throw std::runtime_error("Monero block generation count must be positive");
   }
   ValidateMiningAddress(address);
-  boost::json::object params;
-  params["amount_of_blocks"] = count;
-  params["wallet_address"] = address;
-  params["prev_block"] = "";
-  params["starting_nonce"] = 0;
-  const boost::json::object result =
-      JsonRpcCall(config, "generateblocks", params, stop_token);
-  const std::uint64_t generated_height = JsonUint64(result, "height");
-  std::vector<std::string> hashes =
-      ParseHashArray(result, "blocks", "generateblocks");
-  if (hashes.size() != count) {
-    throw std::runtime_error("Monero RPC generateblocks returned " +
-                             std::to_string(hashes.size()) + " hashes for " +
-                             std::to_string(count) + " requested blocks");
+  std::vector<std::string> hashes;
+  hashes.reserve(count);
+  std::uint64_t generated_height = 0U;
+  while (hashes.size() < count) {
+    ThrowIfStopRequested(stop_token);
+    const std::uint32_t chunk = std::min<std::uint32_t>(
+        kMaximumGeneratedBlocksPerRpc,
+        count - static_cast<std::uint32_t>(hashes.size()));
+    boost::json::object params;
+    params["amount_of_blocks"] = chunk;
+    params["wallet_address"] = address;
+    params["prev_block"] = "";
+    params["starting_nonce"] = 0;
+    const boost::json::object result =
+        JsonRpcCall(config, "generateblocks", params, stop_token);
+    generated_height = JsonUint64(result, "height");
+    std::vector<std::string> chunk_hashes =
+        ParseHashArray(result, "blocks", "generateblocks");
+    if (chunk_hashes.size() != chunk) {
+      throw std::runtime_error("Monero RPC generateblocks returned " +
+                               std::to_string(chunk_hashes.size()) +
+                               " hashes for " + std::to_string(chunk) +
+                               " requested blocks");
+    }
+    hashes.insert(hashes.end(), std::make_move_iterator(chunk_hashes.begin()),
+                  std::make_move_iterator(chunk_hashes.end()));
   }
 
   boost::json::object header_params;
@@ -1004,11 +1019,12 @@ boost::json::object MoneroDriver::JsonRpcCall(
   request["id"] = "bbp";
   request["method"] = method;
   request["params"] = params;
-  // Batch funding includes native proof-of-work and can exceed a metrics RPC deadline.
+  // Batch funding includes native proof-of-work and can exceed a metrics RPC
+  // deadline.
   const HttpClient& client = method == "generateblocks" ? block_http_ : http_;
   const HttpResponse response =
       client.PostJson(Endpoint(config), "/json_rpc",
-                     boost::json::serialize(request), stop_token);
+                      boost::json::serialize(request), stop_token);
   if (response.status != 200) {
     throw std::runtime_error("Monero RPC HTTP status " +
                              std::to_string(response.status) + " for " +

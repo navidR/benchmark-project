@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -3618,6 +3619,119 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
   return false;
 }
 
+struct TuiReportRefreshResult {
+  std::uint64_t generation = 0U;
+  std::filesystem::path run_root;
+  std::unique_ptr<IncrementalRunReport> live_report;
+  boost::json::object report;
+  std::vector<std::string> log_lines;
+  std::string error;
+  bool has_backlog = false;
+  bool cancelled = false;
+};
+
+class TuiReportRefreshTask {
+ public:
+  TuiReportRefreshTask() = default;
+  TuiReportRefreshTask(const TuiReportRefreshTask&) = delete;
+  TuiReportRefreshTask& operator=(const TuiReportRefreshTask&) = delete;
+
+  ~TuiReportRefreshTask() { CancelAndWait(); }
+
+  bool Active() const { return future_.valid(); }
+
+  bool Ready() const {
+    return future_.valid() && future_.wait_for(std::chrono::milliseconds(0)) ==
+                                  std::future_status::ready;
+  }
+
+  void Start(const TuiRunSnapshot& snapshot,
+             std::unique_ptr<IncrementalRunReport> live_report,
+             std::stop_token application_stop_token) {
+    if (Active()) {
+      throw std::logic_error("TUI report refresh is already active");
+    }
+    stop_source_ = std::make_shared<std::stop_source>();
+    const std::shared_ptr<std::stop_source> stop_source = stop_source_;
+    future_ = std::async(
+        std::launch::async, [snapshot, live_report = std::move(live_report),
+                             stop_source, application_stop_token]() mutable {
+          TuiReportRefreshResult result;
+          result.generation = snapshot.generation;
+          result.run_root = snapshot.run_root;
+          std::stop_callback stop_with_application(
+              application_stop_token,
+              [stop_source] { stop_source->request_stop(); });
+          const std::stop_token refresh_stop_token = stop_source->get_token();
+          try {
+            std::unique_lock<std::timed_mutex> publication_lock;
+            if (snapshot.publication_mutex) {
+              publication_lock = std::unique_lock<std::timed_mutex>(
+                  *snapshot.publication_mutex, std::defer_lock);
+              while (!publication_lock.try_lock_for(
+                  std::chrono::milliseconds(10))) {
+                if (refresh_stop_token.stop_requested()) {
+                  result.cancelled = true;
+                  result.live_report = std::move(live_report);
+                  return result;
+                }
+              }
+            }
+            if (!live_report) {
+              live_report = std::make_unique<IncrementalRunReport>(
+                  snapshot.run_root, refresh_stop_token);
+            }
+            const boost::json::object& refreshed = live_report->Refresh(
+                kMaximumReportRecordsPerLiveRefresh, refresh_stop_token);
+            result.has_backlog = live_report->last_refresh_stats().has_backlog;
+            if (publication_lock.owns_lock()) {
+              publication_lock.unlock();
+            }
+            result.report = refreshed;
+            if (!refresh_stop_token.stop_requested()) {
+              result.log_lines =
+                  ReadRecentLogLines(RunLogPath(snapshot.run_root), 256U);
+            }
+          } catch (const std::exception& error) {
+            if (refresh_stop_token.stop_requested()) {
+              result.cancelled = true;
+            } else {
+              result.error = error.what();
+            }
+          }
+          result.live_report = std::move(live_report);
+          return result;
+        });
+  }
+
+  TuiReportRefreshResult Take() {
+    TuiReportRefreshResult result = future_.get();
+    stop_source_.reset();
+    return result;
+  }
+
+  void Wait() const {
+    if (future_.valid()) {
+      future_.wait();
+    }
+  }
+
+  void CancelAndWait() {
+    if (stop_source_) {
+      stop_source_->request_stop();
+    }
+    if (future_.valid()) {
+      future_.wait();
+      future_ = {};
+    }
+    stop_source_.reset();
+  }
+
+ private:
+  std::shared_ptr<std::stop_source> stop_source_;
+  std::future<TuiReportRefreshResult> future_;
+};
+
 int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
                      std::uint32_t refresh_ms,
                      const TuiMcpConnectionInfo& mcp_connection,
@@ -3676,15 +3790,26 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
   const std::uint32_t sleep_step_ms = 50;
   TuiState state;
   std::unique_ptr<IncrementalRunReport> live_report;
+  TuiReportRefreshTask refresh_task;
   std::optional<TuiRunSnapshot> snapshot;
-  const boost::json::object empty_report;
+  boost::json::object report;
+  std::vector<std::string> log_lines;
+  std::string error;
+  bool report_has_backlog = false;
+  bool report_initialized = false;
 
   const auto update_snapshot = [&](TuiRunSnapshot next_snapshot) {
     const bool run_changed = !snapshot ||
                              snapshot->generation != next_snapshot.generation ||
                              snapshot->run_root != next_snapshot.run_root;
     if (run_changed) {
+      refresh_task.CancelAndWait();
       live_report.reset();
+      report = {};
+      log_lines.clear();
+      error.clear();
+      report_has_backlog = false;
+      report_initialized = false;
       ResetRunUiState(&state);
 #ifdef BBP_FIRO_GUI_LAUNCHER
       state.operator_connection_launcher =
@@ -3706,55 +3831,45 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
     }
     static_cast<void>(update_snapshot(snapshot_provider()));
 
-    std::string error;
-    const boost::json::object* report = &empty_report;
-    bool report_has_backlog = false;
     const bool has_active_run = !snapshot->run_root.empty();
-    if (has_active_run) {
-      try {
-        std::unique_lock<std::timed_mutex> publication_lock;
-        if (snapshot->publication_mutex) {
-          publication_lock = std::unique_lock<std::timed_mutex>(
-              *snapshot->publication_mutex, std::defer_lock);
-          while (
-              !publication_lock.try_lock_for(std::chrono::milliseconds(10))) {
-            if (stop_token.stop_requested()) {
-              return FinishTui(&state, 0);
-            }
-          }
+    bool refresh_completed = false;
+    if (refresh_task.Ready()) {
+      TuiReportRefreshResult refreshed = refresh_task.Take();
+      refresh_completed = true;
+      if (refreshed.generation == snapshot->generation &&
+          refreshed.run_root == snapshot->run_root) {
+        live_report = std::move(refreshed.live_report);
+        if (!refreshed.cancelled) {
+          report_initialized = true;
+          report = std::move(refreshed.report);
+          log_lines = std::move(refreshed.log_lines);
+          error = std::move(refreshed.error);
+          report_has_backlog = refreshed.has_backlog;
         }
-        if (!live_report) {
-          live_report = std::make_unique<IncrementalRunReport>(
-              snapshot->run_root, stop_token);
-        }
-        report =
-            &live_report->Refresh(once ? std::numeric_limits<std::size_t>::max()
-                                       : kMaximumReportRecordsPerLiveRefresh,
-                                  stop_token);
-        report_has_backlog = live_report->last_refresh_stats().has_backlog;
-      } catch (const std::exception& e) {
-        if (stop_token.stop_requested()) {
-          return FinishTui(&state, 0);
-        }
-        error = e.what();
       }
     }
-    state.selected_node = ClampNodeSelection(*report, state.selected_node);
-    state.selected_wallet =
-        ClampWalletSelection(*report, state.selected_wallet);
+    if (has_active_run && !refresh_task.Active() && !refresh_completed) {
+      refresh_task.Start(*snapshot, std::move(live_report), stop_token);
+      if (once || !report_initialized) {
+        refresh_task.Wait();
+        continue;
+      }
+    }
+    state.selected_node = ClampNodeSelection(report, state.selected_node);
+    state.selected_wallet = ClampWalletSelection(report, state.selected_wallet);
     state.selected_topology_group =
-        ClampTopologyGroupSelection(*report, state.selected_topology_group);
+        ClampTopologyGroupSelection(report, state.selected_topology_group);
     if (error.empty()) {
       const std::optional<std::size_t> selected_node =
-          SelectedNodeIndex(*report, state);
+          SelectedNodeIndex(report, state);
       if (selected_node) {
-        state.node_log_pane.Refresh(*report, *selected_node);
-        state.peer_list_pane.Refresh(*report, *selected_node);
-        state.network_rule_pane.Refresh(*report, *selected_node);
-        state.node_file_pane.Refresh(snapshot->run_root, *report,
+        state.node_log_pane.Refresh(report, *selected_node);
+        state.peer_list_pane.Refresh(report, *selected_node);
+        state.network_rule_pane.Refresh(report, *selected_node);
+        state.node_file_pane.Refresh(snapshot->run_root, report,
                                      *selected_node);
       }
-      RefreshCommandResults(*report, &state);
+      RefreshCommandResults(report, &state);
     }
 #ifdef BBP_FIRO_GUI_LAUNCHER
     if (state.firo_qt_launcher_dialog_open &&
@@ -3772,9 +3887,7 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
     }
 #endif
     if (has_active_run) {
-      const std::vector<std::string> log_lines =
-          ReadRecentLogLines(RunLogPath(snapshot->run_root), 256U);
-      DrawSummary(snapshot->run_root, *report, error, log_lines, state.view,
+      DrawSummary(snapshot->run_root, report, error, log_lines, state.view,
                   state.selected_node, state.selected_wallet,
                   state.selected_topology_group, state.node_log_pane,
                   state.peer_list_pane, state.network_rule_pane,
@@ -3814,7 +3927,7 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       const bool palette_was_open = state.command_palette_open;
       SimulationCommandQueue* const command_queue =
           snapshot->run_root.empty() ? nullptr : snapshot->command_queue.get();
-      if (HandleInput(ch, snapshot->run_root, *report, command_queue, &state)) {
+      if (HandleInput(ch, snapshot->run_root, report, command_queue, &state)) {
         if (state.exit_confirmation.exit_requested()) {
           return FinishTui(&state, 0);
         }
