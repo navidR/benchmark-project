@@ -96,6 +96,12 @@ void ValidateWalletTransactionsWorkload(
   const bool has_transaction_rate = workload.transaction_rate.has_value();
   const bool has_duration = workload.duration.has_value();
   const bool load_strategy = IsTransactionLoadStrategy(workload.strategy);
+  if (workload.strategy != WalletTransferStrategy::kRandomBruteforce &&
+      workload.transactions_per_wallet_per_cycle != 1U) {
+    throw std::runtime_error(
+        "scenario transactions_per_wallet_per_cycle requires "
+        "random_bruteforce strategy");
+  }
   if (load_strategy) {
     if (has_transaction_count && has_duration) {
       throw std::runtime_error(
@@ -263,7 +269,7 @@ void ValidateWalletTransactionsWorkload(
             "leave at least one sender");
       }
       break;
-    case WalletTransferStrategy::kRandomBruteforce:
+    case WalletTransferStrategy::kRandomBruteforce: {
       if (!workload.sender_wallets.empty() ||
           !workload.receiver_wallets.empty()) {
         throw std::runtime_error(
@@ -276,12 +282,29 @@ void ValidateWalletTransactionsWorkload(
             "scenario random_bruteforce requires "
             "retained_balance_percentage in 0..99.99");
       }
-      if (workload.queue_capacity < wallet_count) {
+      if (workload.transactions_per_wallet_per_cycle == 0U ||
+          workload.transactions_per_wallet_per_cycle >
+              kMaximumWalletTransactionsPerWalletPerCycle) {
+        throw std::runtime_error(
+            "scenario random_bruteforce "
+            "transactions_per_wallet_per_cycle must be in 1.." +
+            std::to_string(kMaximumWalletTransactionsPerWalletPerCycle));
+      }
+      if (wallet_count > std::numeric_limits<std::size_t>::max() /
+                             workload.transactions_per_wallet_per_cycle) {
+        throw std::runtime_error(
+            "scenario random_bruteforce transactions per cycle overflows "
+            "size_t");
+      }
+      const std::size_t transactions_per_cycle =
+          wallet_count * workload.transactions_per_wallet_per_cycle;
+      if (workload.queue_capacity < transactions_per_cycle) {
         throw std::runtime_error(
             "scenario random_bruteforce queue_capacity must fit one "
             "all-wallet scheduling cycle");
       }
       break;
+    }
     case WalletTransferStrategy::kEqualFanout: {
       if (workload.retained_balance_basis_points) {
         throw std::runtime_error(

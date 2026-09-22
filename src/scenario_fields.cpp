@@ -339,7 +339,8 @@ std::span<const std::string_view> ScenarioWorkloadFields(WorkloadKind kind) {
   static constexpr auto kWalletTransactions = Fields(
       "funding_strategy", "strategy", "funding_blocks_per_wallet",
       "readiness_confirmations", "transaction_count", "transaction_rate",
-      "duration", "concurrency", "queue_capacity", "mode", "amount", "interval",
+      "duration", "concurrency", "queue_capacity",
+      "transactions_per_wallet_per_cycle", "mode", "amount", "interval",
       "fee_policy", "fee", "funding_threshold", "retained_balance_percentage",
       "seed", "sender_wallets", "receiver_wallets", "timeout_sec");
   static constexpr auto kCheckpoint = Fields("name");

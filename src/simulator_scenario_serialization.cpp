@@ -542,6 +542,10 @@ boost::json::object WalletTransactionsWorkloadJsonImpl(
     }
     object["concurrency"] = workload.concurrency;
     object["queue_capacity"] = workload.queue_capacity;
+    if (workload.strategy == WalletTransferStrategy::kRandomBruteforce) {
+      object["transactions_per_wallet_per_cycle"] =
+          workload.transactions_per_wallet_per_cycle;
+    }
     object["mode"] = std::string(WalletPrivacyModeName(workload.mode));
     object["fee_policy"] =
         std::string(WalletTransactionFeePolicyName(workload.fee_policy));

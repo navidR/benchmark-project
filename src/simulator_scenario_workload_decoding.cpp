@@ -388,6 +388,8 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
       const bool load_control_present =
           duration_present || workload.if_contains("concurrency") != nullptr ||
           workload.if_contains("queue_capacity") != nullptr ||
+          workload.if_contains("transactions_per_wallet_per_cycle") !=
+              nullptr ||
           workload.if_contains("mode") != nullptr ||
           workload.if_contains("fee_policy") != nullptr;
       if (!load_strategy && load_control_present) {
@@ -416,6 +418,18 @@ void ApplyScenarioWorkloads(const boost::json::array& workloads,
             workload, "concurrency", transactions.concurrency);
         transactions.queue_capacity = JsonOptionalUint32Field(
             workload, "queue_capacity", transactions.queue_capacity);
+        transactions.transactions_per_wallet_per_cycle =
+            JsonOptionalUint32Field(
+                workload, "transactions_per_wallet_per_cycle",
+                transactions.transactions_per_wallet_per_cycle);
+        if (transactions.strategy !=
+                WalletTransferStrategy::kRandomBruteforce &&
+            workload.if_contains("transactions_per_wallet_per_cycle") !=
+                nullptr) {
+          throw std::runtime_error(
+              "scenario transactions_per_wallet_per_cycle requires "
+              "random_bruteforce strategy");
+        }
         transactions.mode = ParseWalletTransactionMode(JsonOptionalStringField(
             workload, "mode",
             WalletPrivacyModeName(options.wallet_initialization.mode)));

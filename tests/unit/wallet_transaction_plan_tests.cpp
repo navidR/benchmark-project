@@ -352,6 +352,24 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(later_batch == repeated_later_batch);
   BOOST_CHECK(later_first_balances == later_second_balances);
   BOOST_CHECK(*later_batch != *partial);
+
+  workload.transactions_per_wallet_per_cycle = 3U;
+  bbp::WalletTransactionLoadPlanner multi(4U, workload);
+  std::vector<std::uint64_t> multi_balances(4U, 100'000U);
+  const auto multi_batch = multi.NextBatch(&multi_balances);
+  BOOST_REQUIRE(multi_batch);
+  BOOST_REQUIRE_EQUAL(multi_batch->size(), 12U);
+  std::vector<std::size_t> transactions_by_sender(4U, 0U);
+  for (const bbp::WalletTransactionPlanEntry& entry : *multi_batch) {
+    ++transactions_by_sender.at(entry.sender_index);
+  }
+  for (std::size_t count : transactions_by_sender) {
+    BOOST_TEST(count == 3U);
+  }
+  for (std::uint64_t balance : multi_balances) {
+    BOOST_TEST(balance >= 80'000U);
+  }
+  BOOST_TEST(multi.batch_size() == 12U);
 }
 
 BOOST_AUTO_TEST_CASE(

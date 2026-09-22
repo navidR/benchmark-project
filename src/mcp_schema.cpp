@@ -491,6 +491,7 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "block_count" || field == "funding_blocks" ||
       field == "funding_blocks_per_wallet" || field == "transaction_count" ||
       field == "concurrency" || field == "queue_capacity" ||
+      field == "transactions_per_wallet_per_cycle" ||
       field == "sender_wallet_index" || field == "receiver_wallet_index" ||
       field == "from_region" || field == "to_region" || field == "src_port" ||
       field == "dst_port" || field == "handle" || field == "duration_ms" ||
@@ -888,6 +889,8 @@ boost::json::object WorkloadVariant(WorkloadKind kind,
                               {"minimum", 0.0},
                               {"maximum", 99.99},
                               {"multipleOf", 0.01}};
+      properties["transactions_per_wallet_per_cycle"] =
+          IntegerSchema(1U, kMaximumWalletTransactionsPerWalletPerCycle);
       properties["sender_wallets"] =
           ArraySchema(IntegerSchema(1U), 1U, kMaximumSafeCollection, true);
       properties["receiver_wallets"] =
