@@ -404,6 +404,9 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(reservations.outstanding_size() == 0U);
   BOOST_TEST(reservations.maximum_size() == 1U);
   BOOST_CHECK_THROW(reservations.Settle(2U, 550U, false), std::runtime_error);
+  BOOST_TEST(reservations.RefreshAvailableBalances({600U, 0U}));
+  BOOST_TEST(reservations.available_balances().front() == 600U);
+  BOOST_TEST(!reservations.RefreshAvailableBalances({600U, 0U}));
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -439,14 +442,20 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
 
   reservations.Settle(1U, std::nullopt, false);
-  BOOST_CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+  BOOST_CHECK(waiting.wait_for(1s) == std::future_status::ready);
+  BOOST_TEST(waiting.get());
+  const auto still_busy = reservations.PlanAndReserve(
+      &planner, 4U, 3U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_TEST(!still_busy.has_plan());
   reservations.Settle(2U, 2'334U, false);
   BOOST_TEST(reservations.available_balances().front() == 1'168U);
   BOOST_TEST(reservations.outstanding_size() == 1U);
-  BOOST_CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+  const auto still_busy_after_refresh = reservations.PlanAndReserve(
+      &planner, 4U, 3U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_TEST(!still_busy_after_refresh.has_plan());
   reservations.Settle(3U, std::nullopt, false);
-  BOOST_CHECK(waiting.wait_for(1s) == std::future_status::ready);
-  BOOST_TEST(waiting.get());
 
   const auto second = reservations.PlanAndReserve(
       &planner, 4U, 3U,
@@ -470,16 +479,14 @@ BOOST_AUTO_TEST_CASE(
   bbp::WalletTransactionsWorkload workload =
       LoadWorkload(bbp::WalletTransferStrategy::kRandomBruteforce, {2U});
   workload.amount.maximum_satoshis = 100U;
-  bbp::WalletTransactionLoadPlanner planner(2U, workload);
-  bbp::TransactionLoadBalanceReservations reservations({2'000U, 0U}, 10U, 4U);
-  for (std::uint64_t index = 1U; index <= 4U; ++index) {
-    const auto admitted = reservations.PlanAndReserve(
-        &planner, index, 5U - index,
-        [](const std::vector<bbp::WalletTransactionPlanEntry>&) {
-          return true;
-        });
-    BOOST_REQUIRE(admitted.admitted);
-  }
+  bbp::WalletTransactionLoadPlanner planner(4U, workload);
+  bbp::TransactionLoadBalanceReservations reservations(
+      {2'000U, 2'000U, 2'000U, 2'000U}, 10U, 4U);
+  const auto admitted = reservations.PlanAndReserve(
+      &planner, 1U, 4U,
+      [](const std::vector<bbp::WalletTransactionPlanEntry>&) { return true; });
+  BOOST_REQUIRE(admitted.admitted);
+  BOOST_REQUIRE_EQUAL(admitted.plans.size(), 4U);
   BOOST_TEST(reservations.outstanding_size() == 4U);
 
   std::vector<std::future<void>> settlements;
@@ -493,7 +500,9 @@ BOOST_AUTO_TEST_CASE(
     settlement.get();
   }
   BOOST_TEST(reservations.outstanding_size() == 0U);
-  BOOST_TEST(reservations.available_balances().front() == 2'000U);
+  for (const std::uint64_t balance : reservations.available_balances()) {
+    BOOST_TEST(balance == 2'000U);
+  }
   BOOST_TEST(reservations.maximum_size() == 4U);
 }
 

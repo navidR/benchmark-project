@@ -464,8 +464,6 @@ std::string TransactionLoadCompletedDetail(
   }
   detail["configured_concurrency"] = workload.concurrency;
   detail["queue_capacity"] = workload.queue_capacity;
-  detail["transactions_per_wallet_per_cycle"] =
-      workload.transactions_per_wallet_per_cycle;
   detail["queue_maximum_depth"] = queue_maximum_size;
   detail["fee_reserve_satoshis"] =
       EffectiveWalletTransactionFeeReserveSatoshis(workload);

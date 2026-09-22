@@ -216,7 +216,8 @@ TransactionLoadBalanceReservations::TransactionLoadBalanceReservations(
     : fee_reserve_satoshis_(fee_reserve_satoshis),
       maximum_reservations_(maximum_reservations),
       available_balances_(std::move(available_balances)),
-      reserved_by_sender_(available_balances_.size(), 0U) {
+      reserved_by_sender_(available_balances_.size(), 0U),
+      outstanding_by_sender_(available_balances_.size(), 0U) {
   if (available_balances_.empty()) {
     throw std::runtime_error(
         "transaction load balance ledger requires a wallet");
@@ -251,6 +252,12 @@ TransactionLoadBalanceReservations::PlanAndReserve(
 
   std::unique_lock lock(mutex_);
   std::vector<std::uint64_t> planned_balances = available_balances_;
+  for (std::size_t sender = 0U; sender < outstanding_by_sender_.size();
+       ++sender) {
+    if (outstanding_by_sender_[sender] != 0U) {
+      planned_balances[sender] = 0U;
+    }
+  }
   std::optional<std::vector<WalletTransactionPlanEntry>> planned =
       planner->NextBatch(
           &planned_balances,
@@ -295,6 +302,9 @@ TransactionLoadBalanceReservations::PlanAndReserve(
       throw std::runtime_error(
           "transaction load reservation sender is outside the balance ledger");
     }
+    if (outstanding_by_sender_[entry.sender_index] != 0U) {
+      throw std::runtime_error("transaction load planner reused a busy sender");
+    }
     if (entry.amount_satoshis >
         std::numeric_limits<std::uint64_t>::max() - fee_reserve_satoshis_) {
       throw std::runtime_error(
@@ -318,6 +328,12 @@ TransactionLoadBalanceReservations::PlanAndReserve(
                                .amount_satoshis = reserved_amount});
     transaction_indexes.push_back(transaction_index);
   }
+  for (std::size_t sender = 0U; sender < outstanding_by_sender_.size();
+       ++sender) {
+    if (outstanding_by_sender_[sender] != 0U) {
+      planned_balances[sender] = expected_balances[sender];
+    }
+  }
   if (expected_balances != planned_balances) {
     throw std::runtime_error(
         "transaction load planner balance delta does not match reservations");
@@ -325,6 +341,10 @@ TransactionLoadBalanceReservations::PlanAndReserve(
 
   available_balances_ = std::move(expected_balances);
   reserved_by_sender_ = std::move(expected_reserved);
+  for (const auto& [transaction_index, reservation] : staged) {
+    static_cast<void>(transaction_index);
+    ++outstanding_by_sender_[reservation.sender_index];
+  }
   reservations_.merge(staged);
   if (!staged.empty()) {
     throw std::runtime_error(
@@ -371,6 +391,10 @@ void TransactionLoadBalanceReservations::Settle(
     const std::uint64_t remaining_reserved =
         reserved_by_sender_[reservation.sender_index] -
         reservation.amount_satoshis;
+    if (outstanding_by_sender_[reservation.sender_index] == 0U) {
+      throw std::runtime_error(
+          "transaction load sender reservation count underflows");
+    }
     std::uint64_t available = available_balances_[reservation.sender_index];
     if (actual_available_balance) {
       if (*actual_available_balance < remaining_reserved) {
@@ -395,6 +419,7 @@ void TransactionLoadBalanceReservations::Settle(
     }
     available_balances_[reservation.sender_index] = available;
     reserved_by_sender_[reservation.sender_index] = remaining_reserved;
+    --outstanding_by_sender_[reservation.sender_index];
     reservations_.erase(found);
     ++balance_revision_;
     if (on_settled) {
@@ -413,8 +438,34 @@ bool TransactionLoadBalanceReservations::WaitForResolution(
   if (reservations_.empty()) {
     return balance_revision_ != observed_revision;
   }
-  return resolved_.wait(lock, stop_token,
-                        [this] { return reservations_.empty(); });
+  return resolved_.wait(lock, stop_token, [this, observed_revision] {
+    return balance_revision_ != observed_revision;
+  });
+}
+
+bool TransactionLoadBalanceReservations::RefreshAvailableBalances(
+    std::vector<std::uint64_t> available_balances) {
+  bool changed = false;
+  {
+    std::lock_guard lock(mutex_);
+    if (!reservations_.empty()) {
+      throw std::runtime_error(
+          "transaction load balances cannot refresh with outstanding work");
+    }
+    if (available_balances.size() != available_balances_.size()) {
+      throw std::runtime_error(
+          "transaction load balance refresh has an invalid wallet count");
+    }
+    changed = available_balances != available_balances_;
+    available_balances_ = std::move(available_balances);
+    if (balance_revision_ == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::runtime_error(
+          "transaction load balance revision overflows uint64");
+    }
+    ++balance_revision_;
+  }
+  resolved_.notify_all();
+  return changed;
 }
 
 std::vector<std::uint64_t>
@@ -455,6 +506,11 @@ void TransactionLoadBalanceReservations::RollBackReservations(
     }
     reserved_by_sender_[reservation.sender_index] -=
         reservation.amount_satoshis;
+    if (outstanding_by_sender_[reservation.sender_index] == 0U) {
+      throw std::runtime_error(
+          "transaction load admission rollback underflows sender count");
+    }
+    --outstanding_by_sender_[reservation.sender_index];
     available_balances_[reservation.sender_index] +=
         reservation.amount_satoshis;
     reservations_.erase(found);

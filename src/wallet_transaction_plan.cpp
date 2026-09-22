@@ -366,17 +366,6 @@ WalletTransactionLoadPlanner::WalletTransactionLoadPlanner(
     throw std::runtime_error("transaction load fee must be greater than zero");
   }
   if (workload_.strategy == WalletTransferStrategy::kRandomBruteforce) {
-    if (workload_.transactions_per_wallet_per_cycle == 0U ||
-        workload_.transactions_per_wallet_per_cycle >
-            kMaximumWalletTransactionsPerWalletPerCycle) {
-      throw std::runtime_error(
-          "random_bruteforce transactions per wallet per cycle is invalid");
-    }
-    if (wallet_count_ > std::numeric_limits<std::size_t>::max() /
-                            workload_.transactions_per_wallet_per_cycle) {
-      throw std::runtime_error(
-          "random_bruteforce transactions per cycle overflows size_t");
-    }
     if (!workload_.sender_wallets.empty() ||
         !workload_.receiver_wallets.empty()) {
       throw std::runtime_error(
@@ -431,49 +420,33 @@ WalletTransactionLoadPlanner::NextBatch(
 
   if (workload_.strategy == WalletTransferStrategy::kRandomBruteforce) {
     std::vector<WalletTransactionPlanEntry> batch;
-    batch.reserve(std::min(maximum_entries, batch_size()));
-    std::vector<std::uint64_t> retained_balances(wallet_count_, 0U);
+    batch.reserve(std::min(maximum_entries, senders_.size()));
     for (const std::size_t sender : senders_) {
-      retained_balances.at(sender) =
-          RetainedBalance(available_balances->at(sender),
-                          *workload_.retained_balance_basis_points);
-    }
-    for (std::uint32_t round = 0U;
-         round < workload_.transactions_per_wallet_per_cycle; ++round) {
-      bool planned_in_round = false;
-      for (const std::size_t sender : senders_) {
-        const std::uint64_t balance = available_balances->at(sender);
-        const std::uint64_t retained = retained_balances.at(sender);
-        if (balance < retained || balance - retained <= fee_reserve_satoshis) {
-          continue;
-        }
-        const std::uint64_t spendable =
-            balance - retained - fee_reserve_satoshis;
-        const std::uint64_t maximum =
-            std::min(workload_.amount.maximum_satoshis, spendable);
-        if (maximum < workload_.amount.minimum_satoshis) {
-          continue;
-        }
-        const std::size_t sampled_receiver =
-            SampleIndex(&rng_, wallet_count_ - 1U);
-        const std::size_t receiver = sampled_receiver >= sender
-                                         ? sampled_receiver + 1U
-                                         : sampled_receiver;
-        const std::uint64_t amount =
-            SampleInclusive(&rng_, workload_.amount.minimum_satoshis, maximum);
-        available_balances->at(sender) =
-            balance - amount - fee_reserve_satoshis;
-        batch.push_back(WalletTransactionPlanEntry{
-            .sender_index = sender,
-            .receiver_index = receiver,
-            .amount_satoshis = amount,
-            .interval_before = std::chrono::milliseconds(0)});
-        planned_in_round = true;
-        if (batch.size() == maximum_entries) {
-          return batch;
-        }
+      const std::uint64_t balance = available_balances->at(sender);
+      const std::uint64_t retained =
+          RetainedBalance(balance, *workload_.retained_balance_basis_points);
+      if (balance < retained || balance - retained <= fee_reserve_satoshis) {
+        continue;
       }
-      if (!planned_in_round) {
+      const std::uint64_t spendable = balance - retained - fee_reserve_satoshis;
+      const std::uint64_t maximum =
+          std::min(workload_.amount.maximum_satoshis, spendable);
+      if (maximum < workload_.amount.minimum_satoshis) {
+        continue;
+      }
+      const std::size_t sampled_receiver =
+          SampleIndex(&rng_, wallet_count_ - 1U);
+      const std::size_t receiver =
+          sampled_receiver >= sender ? sampled_receiver + 1U : sampled_receiver;
+      const std::uint64_t amount =
+          SampleInclusive(&rng_, workload_.amount.minimum_satoshis, maximum);
+      available_balances->at(sender) = balance - amount - fee_reserve_satoshis;
+      batch.push_back(WalletTransactionPlanEntry{
+          .sender_index = sender,
+          .receiver_index = receiver,
+          .amount_satoshis = amount,
+          .interval_before = std::chrono::milliseconds(0)});
+      if (batch.size() == maximum_entries) {
         break;
       }
     }
@@ -530,10 +503,9 @@ WalletTransactionLoadPlanner::NextBatch(
 }
 
 std::size_t WalletTransactionLoadPlanner::batch_size() const {
-  if (workload_.strategy == WalletTransferStrategy::kEqualFanout) {
-    return receivers_.size();
-  }
-  return wallet_count_ * workload_.transactions_per_wallet_per_cycle;
+  return workload_.strategy == WalletTransferStrategy::kEqualFanout
+             ? receivers_.size()
+             : wallet_count_;
 }
 
 std::uint64_t WalletTransactionDurationAttemptLimit(

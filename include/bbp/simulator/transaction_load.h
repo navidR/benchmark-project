@@ -106,6 +106,7 @@ class TransactionLoadBalanceReservations {
               const std::function<void(std::uint64_t)>& on_settled = {});
   bool WaitForResolution(std::uint64_t observed_revision,
                          std::stop_token stop_token = {});
+  bool RefreshAvailableBalances(std::vector<std::uint64_t> available_balances);
 
   [[nodiscard]] std::vector<std::uint64_t> available_balances() const;
   [[nodiscard]] std::size_t outstanding_size() const;
@@ -126,6 +127,7 @@ class TransactionLoadBalanceReservations {
   std::condition_variable_any resolved_;
   std::vector<std::uint64_t> available_balances_;
   std::vector<std::uint64_t> reserved_by_sender_;
+  std::vector<std::size_t> outstanding_by_sender_;
   std::map<std::uint64_t, Reservation> reservations_;
   std::size_t maximum_size_ = 0U;
   std::uint64_t balance_revision_ = 0U;

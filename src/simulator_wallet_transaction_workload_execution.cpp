@@ -225,20 +225,25 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
   }
 
   if (IsTransactionLoadStrategy(workload.strategy)) {
-    std::vector<std::uint64_t> initial_available_balances(wallets.size(), 0U);
-    for (std::size_t wallet_index = 0U; wallet_index < wallets.size();
-         ++wallet_index) {
-      ThrowIfStopRequested(stop_token);
-      const WalletIdentity& wallet = wallets[wallet_index];
-      const NodeRuntime& wallet_node = nodes[wallet.node - 1U];
-      initial_available_balances[wallet_index] =
-          driver
-              .ReadWalletSnapshot(
-                  wallet_node.config,
-                  ToChainWalletMode(registry.wallet_initialization()), 1U,
-                  stop_token)
-              .available_balance_satoshis;
-    }
+    const auto read_available_balances = [&] {
+      std::vector<std::uint64_t> balances(wallets.size(), 0U);
+      for (std::size_t wallet_index = 0U; wallet_index < wallets.size();
+           ++wallet_index) {
+        ThrowIfStopRequested(stop_token);
+        const WalletIdentity& wallet = wallets[wallet_index];
+        const NodeRuntime& wallet_node = nodes[wallet.node - 1U];
+        balances[wallet_index] =
+            driver
+                .ReadWalletSnapshot(
+                    wallet_node.config,
+                    ToChainWalletMode(registry.wallet_initialization()), 1U,
+                    stop_token)
+                .available_balance_satoshis;
+      }
+      return balances;
+    };
+    std::vector<std::uint64_t> initial_available_balances =
+        read_available_balances();
 
     const std::optional<std::uint64_t> attempt_limit =
         ExplicitWalletTransactionAttemptLimit(workload);
@@ -569,6 +574,10 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
               if (!submitted) {
                 continue;
               }
+              if (workload.strategy ==
+                  WalletTransferStrategy::kRandomBruteforce) {
+                continue;
+              }
               try {
                 const std::vector<TransactionSetObservation> observations =
                     transaction_tracker.ObserveTrackedSetsUntilVisible(
@@ -707,6 +716,14 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
             continue;
           }
           ThrowIfStopRequested(load_stop_token);
+          if (workload.strategy == WalletTransferStrategy::kRandomBruteforce) {
+            const bool changed = balance_reservations.RefreshAvailableBalances(
+                read_available_balances());
+            if (!changed) {
+              WaitForDuration(std::chrono::milliseconds(50), load_stop_token);
+            }
+            continue;
+          }
           balance_refresh_required = true;
           break;
         }
@@ -733,11 +750,6 @@ WalletWorkloadExecutionResult ApplyWalletTransactionsWorkload(
         transaction_index += static_cast<std::uint64_t>(admission.plans.size());
         if (execution != nullptr) {
           execution->next_transaction_index = transaction_index;
-        }
-        if (workload.strategy == WalletTransferStrategy::kRandomBruteforce &&
-            admission.admitted) {
-          balance_refresh_required = true;
-          break;
         }
       }
     } catch (...) {

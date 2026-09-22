@@ -24,7 +24,6 @@ enum class WalletTransactionFeePolicy {
 
 constexpr std::uint32_t kMaximumWalletTransactionLoadConcurrency = 64U;
 constexpr std::uint32_t kMaximumWalletTransactionLoadQueueCapacity = 65'536U;
-constexpr std::uint32_t kMaximumWalletTransactionsPerWalletPerCycle = 65'536U;
 
 constexpr std::string_view WalletTransactionFeePolicyName(
     WalletTransactionFeePolicy policy) {
@@ -94,7 +93,6 @@ struct WalletTransactionsWorkload {
   std::optional<std::chrono::milliseconds> duration;
   std::uint32_t concurrency = 1;
   std::uint32_t queue_capacity = 64;
-  std::uint32_t transactions_per_wallet_per_cycle = 1;
   WalletPrivacyMode mode = WalletPrivacyMode::kPublic;
   AmountDistribution amount;
   IntervalDistribution interval;
