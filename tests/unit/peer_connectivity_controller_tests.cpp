@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "../../src/simulator_block_generation_boundary.h"
 #include "bbp/drivers/chain_command_executor.h"
 #include "bbp/node_log_collector.h"
 #include "bbp/peer_connectivity_controller.h"
@@ -20,6 +21,7 @@ namespace {
 
 class TestChainDriver final : public bbp::ChainDriver {
  public:
+  std::function<bbp::ChainMetrics(std::stop_token)> read_metrics;
   bbp::ProcessSpec RenderProcess(const bbp::ChainNodeConfig&) const override {
     return {};
   }
@@ -100,8 +102,8 @@ class TestChainDriver final : public bbp::ChainDriver {
     }
   }
   bbp::ChainMetrics ReadMetrics(const bbp::ChainNodeConfig&,
-                                std::stop_token) const override {
-    return {};
+                                std::stop_token stop) const override {
+    return read_metrics ? read_metrics(stop) : bbp::ChainMetrics{};
   }
   std::vector<std::string> PeerAddresses(const bbp::ChainNodeConfig& config,
                                          std::stop_token) const override {
@@ -1350,4 +1352,45 @@ BOOST_AUTO_TEST_CASE(
                    std::string::npos &&
                message.find("rollback disconnect failure") != std::string::npos;
       });
+}
+
+// Reuse the controllable driver to exercise the production accumulation wait.
+BOOST_AUTO_TEST_CASE(pool_accumulation_threshold_deadline_and_cancellation) {
+  using namespace std::chrono_literals;
+  using bbp::simulator_app_internal::WaitForPoolAccumulation;
+  TestChainDriver driver;
+  unsigned reads = 0;
+  driver.read_metrics = [&](std::stop_token) {
+    bbp::ChainMetrics metrics;
+    metrics.mempool_tx_count = ++reads == 1U ? 3U : 8U;
+    return metrics;
+  };
+  const auto ready = WaitForPoolAccumulation(driver, {}, 8U, 2s, {});
+  BOOST_TEST(ready.threshold_reached);
+  BOOST_TEST(ready.pool_transactions.value() == 8U);
+  BOOST_TEST(reads == 2U);
+  driver.read_metrics = [](std::stop_token) {
+    bbp::ChainMetrics metrics;
+    metrics.mempool_tx_count = 3U;
+    return metrics;
+  };
+  const auto partial = WaitForPoolAccumulation(driver, {}, 8U, 20ms, {});
+  BOOST_TEST(!partial.threshold_reached);
+  BOOST_TEST(partial.pool_transactions.value() == 3U);
+  BOOST_TEST(partial.waited_ms >= 20U);
+  // A stalled observation must share the maximum-wait deadline.
+  driver.read_metrics = [](std::stop_token stop) -> bbp::ChainMetrics {
+    while (!stop.stop_requested()) std::this_thread::sleep_for(1ms);
+    throw bbp::SimulationCancelled();
+  };
+  const auto started = std::chrono::steady_clock::now();
+  const auto unavailable = WaitForPoolAccumulation(driver, {}, 8U, 20ms, {});
+  BOOST_TEST(!unavailable.threshold_reached);
+  BOOST_TEST(!unavailable.pool_transactions.has_value());
+  BOOST_CHECK(std::chrono::steady_clock::now() - started < 1s);
+  std::stop_source shutdown;
+  shutdown.request_stop();
+  BOOST_CHECK_THROW(
+      WaitForPoolAccumulation(driver, {}, 8U, 2s, shutdown.get_token()),
+      bbp::SimulationCancelled);
 }

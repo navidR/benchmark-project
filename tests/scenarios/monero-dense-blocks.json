@@ -1,0 +1,79 @@
+{
+  "run_id": "monero-dense-blocks",
+  "chain": "monero",
+  "output_dir": "runs/dense-blocks-acceptance",
+  "simulation": {
+    "duration": "90s",
+    "metrics_interval": "1s",
+    "cleanup_policy": "automatic",
+    "log_retention_policy": "preserve"
+  },
+  "chains": {
+    "monero": {
+      "driver": "monero",
+      "default_binary": "/path/to/monerod"
+    }
+  },
+  "nodes": 4,
+  "node_capacity": 4,
+  "isolated_network": true,
+  "ready_timeout_sec": 120,
+  "sync_timeout_sec": 120,
+  "block_production": {
+    "enabled": true,
+    "period_ms": 250,
+    "probability": 1,
+    "seed": 471,
+    "min_pool_transactions": 16,
+    "max_pool_wait_ms": 5000
+  },
+  "topology": {
+    "type": "full_mesh",
+    "node_count": 4,
+    "wallet_node_count": 4,
+    "miner_node_count": 1,
+    "wallet_nodes": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "miner_nodes": [
+      4
+    ],
+    "allow_miner_wallet_overlap": true,
+    "wallet_initialization": {
+      "strategy": "driver_rpc",
+      "mode": "private"
+    }
+  },
+  "workloads": [
+    {
+      "type": "wallet_transactions",
+      "strategy": "random_bruteforce",
+      "funding_strategy": "round_robin",
+      "funding_blocks_per_wallet": 140,
+      "readiness_confirmations": 60,
+      "funding_threshold": "0.11000000",
+      "transaction_count": 128,
+      "transaction_rate": 50,
+      "concurrency": 16,
+      "queue_capacity": 256,
+      "mode": "private",
+      "retained_balance_percentage": 80,
+      "amount": {
+        "distribution": "uniform",
+        "min": "0.01000000",
+        "max": "0.10000000"
+      },
+      "fee": "0.00001000",
+      "seed": 471,
+      "timeout_sec": 120
+    }
+  ],
+  "resources": {
+    "memory_max_bytes": 2147483648,
+    "memory_high_bytes": 1610612736,
+    "pids_max": 256
+  }
+}

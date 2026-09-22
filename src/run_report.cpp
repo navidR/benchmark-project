@@ -2936,6 +2936,19 @@ struct IncrementalRunReport::Impl {
       report[field] = boost::json::array{};
     }
     report["operator_connection_command"] = nullptr;
+    report["scheduled_block_transaction_distribution"] =
+        boost::json::object{{"observed_blocks", 0U},
+                            {"unobserved_blocks", 0U},
+                            {"non_reward_transactions", 0U},
+                            {"minimum", nullptr},
+                            {"maximum", nullptr},
+                            {"mean", nullptr},
+                            {"buckets", boost::json::object{{"0", 0U},
+                                                            {"1", 0U},
+                                                            {"2-9", 0U},
+                                                            {"10-99", 0U},
+                                                            {"100-999", 0U},
+                                                            {"1000+", 0U}}}};
 
     event_count = 0;
     metric_count = 0;
@@ -3216,6 +3229,7 @@ struct IncrementalRunReport::Impl {
         break;
       case SimulationEventKind::kScheduledBlockProduced:
         ++scheduled_block_count;
+        RecordScheduledBlockTransactions(event);
         AppendScheduledBlockSummary(event, &Array("scheduled_blocks"));
         break;
       case SimulationEventKind::kScheduledEventStarted:
@@ -4063,6 +4077,51 @@ struct IncrementalRunReport::Impl {
     report["nodes_summary"] = NodesJson(nodes);
     AddTopologyViewSummaries(&report);
     summaries_dirty = false;
+  }
+
+  void RecordScheduledBlockTransactions(const boost::json::object& event) {
+    const auto detail = ParseEventDetail(event);
+    if (!detail.is_object()) return;
+    const auto* hashes = detail.as_object().if_contains("hashes");
+    if (!hashes || !hashes->is_array()) return;
+    const auto* counts =
+        detail.as_object().if_contains("non_reward_transaction_counts");
+    auto& distribution =
+        report.at("scheduled_block_transaction_distribution").as_object();
+    for (std::size_t i = 0; i < hashes->as_array().size(); ++i) {
+      if (!counts || !counts->is_array() ||
+          counts->as_array().size() != hashes->as_array().size() ||
+          counts->as_array()[i].is_null()) {
+        distribution["unobserved_blocks"] =
+            JsonUint(distribution, "unobserved_blocks") + 1U;
+        continue;
+      }
+      const auto count =
+          boost::json::value_to<std::uint64_t>(counts->as_array()[i]);
+      const auto total = JsonUint(distribution, "non_reward_transactions");
+      if (total > std::numeric_limits<std::uint64_t>::max() - count)
+        throw std::runtime_error("scheduled block transaction count overflow");
+      const auto observed = JsonUint(distribution, "observed_blocks") + 1U;
+      distribution["observed_blocks"] = observed;
+      distribution["non_reward_transactions"] = total + count;
+      distribution["mean"] =
+          static_cast<double>(total + count) / static_cast<double>(observed);
+      for (const auto field : {"minimum", "maximum"}) {
+        if (distribution.at(field).is_null() ||
+            (field == std::string_view("minimum")
+                 ? count < JsonUint(distribution, field)
+                 : count > JsonUint(distribution, field)))
+          distribution[field] = count;
+      }
+      const auto bucket = count == 0     ? "0"
+                          : count == 1   ? "1"
+                          : count < 10   ? "2-9"
+                          : count < 100  ? "10-99"
+                          : count < 1000 ? "100-999"
+                                         : "1000+";
+      auto& buckets = distribution.at("buckets").as_object();
+      buckets[bucket] = JsonUint(buckets, bucket) + 1U;
+    }
   }
 
   void RequireMatchingRunId(const boost::json::object& record,

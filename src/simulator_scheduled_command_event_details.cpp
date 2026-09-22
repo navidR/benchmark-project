@@ -12,6 +12,7 @@
 #include "bbp/simulator/scheduled_scenario_event.h"
 #include "bbp/simulator/workload_kind.h"
 #include "bbp/util.h"
+#include "simulator_block_generation_boundary.h"
 #include "simulator_node_lifecycle_event_details.h"
 #include "simulator_scenario_serialization.h"
 
@@ -94,7 +95,10 @@ std::string CheckpointWorkloadDetail(std::uint32_t workload_index,
   return boost::json::serialize(detail);
 }
 
-std::string ScheduledBlockDetail(const std::vector<std::string>& hashes) {
+std::string ScheduledBlockDetail(
+    const std::vector<std::string>& hashes,
+    const std::vector<std::optional<std::uint64_t>>& transaction_counts,
+    const PoolAccumulationResult& accumulation) {
   boost::json::object detail;
   boost::json::array block_hashes;
   block_hashes.reserve(hashes.size());
@@ -102,6 +106,17 @@ std::string ScheduledBlockDetail(const std::vector<std::string>& hashes) {
     block_hashes.emplace_back(hash);
   }
   detail["hashes"] = std::move(block_hashes);
+  boost::json::array counts;
+  for (const auto count : transaction_counts)
+    counts.push_back(count ? boost::json::value(*count)
+                           : boost::json::value(nullptr));
+  detail["non_reward_transaction_counts"] = std::move(counts);
+  detail["pool_transactions_before_mining"] =
+      accumulation.pool_transactions
+          ? boost::json::value(*accumulation.pool_transactions)
+          : boost::json::value(nullptr);
+  detail["pool_wait_ms"] = accumulation.waited_ms;
+  detail["pool_threshold_reached"] = accumulation.threshold_reached;
   return boost::json::serialize(detail);
 }
 

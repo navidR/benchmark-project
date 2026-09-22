@@ -285,6 +285,30 @@ BOOST_AUTO_TEST_CASE(
   rejects_bandwidth("1kB/s", "bandwidth_kbps");
 }
 
+BOOST_AUTO_TEST_CASE(scenario_service_validates_pool_accumulation_policy) {
+  auto scenario = MinimalScenario();
+  auto& policy = scenario.at("block_production").as_object();
+  policy["enabled"] = true;
+  policy["min_pool_transactions"] = 16U;
+  policy["max_pool_wait_ms"] = 5000U;
+  const auto resolved = ResolveScenario(scenario);
+  BOOST_TEST(resolved.at("block_production")
+                 .as_object()
+                 .at("min_pool_transactions")
+                 .as_uint64() == 16U);
+  BOOST_TEST(resolved.at("block_production")
+                 .as_object()
+                 .at("max_pool_wait_ms")
+                 .as_uint64() == 5000U);
+  policy["max_pool_wait_ms"] = 0U;
+  BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+  policy["max_pool_wait_ms"] = 3600001U;
+  BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+  policy["max_pool_wait_ms"] = 5000U;
+  policy["native_mining"] = true;
+  BOOST_CHECK_THROW(ParseAndValidateScenario(scenario), std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(scenario_service_allows_explicit_empty_active_run) {
   boost::json::object scenario = MinimalScenario();
   scenario["nodes"] = 0U;

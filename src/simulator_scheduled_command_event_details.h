@@ -17,6 +17,8 @@ struct SimulationCommandOutcome;
 
 namespace simulator_app_internal {
 
+struct PoolAccumulationResult;
+
 boost::json::object ScheduledEventLifecycleDetail(
     const ScheduledScenarioEvent& event,
     std::chrono::milliseconds scheduled_wall_delay,
@@ -37,7 +39,10 @@ std::string CheckpointWorkloadDetail(std::uint32_t workload_index,
                                      std::string_view name,
                                      std::uint32_t node_metric_samples,
                                      std::uint32_t wallet_metric_samples);
-std::string ScheduledBlockDetail(const std::vector<std::string>& hashes);
+std::string ScheduledBlockDetail(
+    const std::vector<std::string>& hashes,
+    const std::vector<std::optional<std::uint64_t>>& transaction_counts,
+    const PoolAccumulationResult& accumulation);
 std::filesystem::path NodeReportRelativePath(const SimulationCommand& command);
 std::string SimulationCommandDetail(
     const SimulationCommand& command, std::string_view error = {},

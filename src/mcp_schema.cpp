@@ -499,7 +499,8 @@ boost::json::object GenericFieldSchema(std::string_view field) {
       field == "timeout_sec" || field == "sync_timeout_sec" ||
       field == "ready_timeout_sec" || field == "metrics_sample_count" ||
       field == "metrics_interval_ms" || field == "min_peer_count" ||
-      field == "max_peer_count") {
+      field == "max_peer_count" || field == "min_pool_transactions" ||
+      field == "max_pool_wait_ms") {
     return IntegerSchema();
   }
   if (field == "height" || field == "peer_count" || field == "period_ms" ||
@@ -1470,6 +1471,8 @@ boost::json::object BuildMcpScenarioObjectSchema(ScenarioObjectKind kind) {
       break;
     case ScenarioObjectKind::kBlockProduction:
       properties["difficulty"] = Nullable(NumberSchema());
+      properties["min_pool_transactions"] = IntegerSchema(0U, 4294967295ULL);
+      properties["max_pool_wait_ms"] = IntegerSchema(0U, 3600000U);
       break;
     case ScenarioObjectKind::kResources:
       properties["cpu_quota_us"] = Nullable(Uint64Schema());

@@ -126,6 +126,10 @@ boost::json::object BuildResolvedScenarioDocument(
   block_production["probability"] =
       options.block_production.policy.probability();
   block_production["seed"] = options.block_production.policy.seed();
+  block_production["min_pool_transactions"] =
+      options.block_production.min_pool_transactions;
+  block_production["max_pool_wait_ms"] =
+      options.block_production.max_pool_wait_ms;
   if (options.block_production.difficulty) {
     block_production["difficulty"] =
         options.block_production.difficulty->value();

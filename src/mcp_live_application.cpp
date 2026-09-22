@@ -3113,8 +3113,8 @@ boost::json::value McpLiveApplication::ReadResource(
     case McpInformationFamily::kMining:
       data = SelectReportFields(
           report, {"block_production", "generated_blocks", "scheduled_blocks",
-                   "nodes_summary", "role_generation", "miner_node_count",
-                   "miner_node_ids"});
+                   "scheduled_block_transaction_distribution", "nodes_summary",
+                   "role_generation", "miner_node_count", "miner_node_ids"});
       break;
     case McpInformationFamily::kTransactionLoad:
       data = SelectReportFields(

@@ -1474,15 +1474,24 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
               RequireNodeRunning(miner, process_guard,
                                  "scheduled block production");
             }
+            const auto accumulation =
+                simulator_app_internal::WaitForPoolAccumulation(
+                    driver, miner.config,
+                    options.block_production.min_pool_transactions,
+                    std::chrono::milliseconds(
+                        options.block_production.max_pool_wait_ms),
+                    block_production_rpc_stop_source.get_token());
             const std::vector<std::string> hashes = GenerateBlocksSerialized(
                 block_generation_mutex, driver, miner.config, 1U,
                 chain_spec.default_reward_address,
                 block_production_rpc_stop_source.get_token());
-            RecordGeneratedBlocks(driver, miner, hashes,
-                                  block_production_rpc_stop_source.get_token());
-            WriteEvent(events_path, options.run_id, node_id,
-                       SimulationEventKind::kScheduledBlockProduced,
-                       ScheduledBlockDetail(hashes));
+            const auto transaction_counts = RecordGeneratedBlocks(
+                driver, miner, hashes,
+                block_production_rpc_stop_source.get_token());
+            WriteEvent(
+                events_path, options.run_id, node_id,
+                SimulationEventKind::kScheduledBlockProduced,
+                ScheduledBlockDetail(hashes, transaction_counts, accumulation));
           },
           [&](const std::string& node_id, std::string_view error) {
             if (block_production_rpc_stop_source.stop_requested()) {

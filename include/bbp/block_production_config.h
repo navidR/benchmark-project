@@ -14,6 +14,8 @@ struct BlockProductionConfig {
   MiningMode mode = MiningMode::kScheduledBlockProduction;
   BlockProductionPolicy policy{std::chrono::milliseconds(1000), 0.5, 0U};
   std::optional<MiningDifficulty> difficulty;
+  std::uint32_t min_pool_transactions = 0;
+  std::uint32_t max_pool_wait_ms = 0;
 };
 
 }  // namespace bbp

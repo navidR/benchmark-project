@@ -165,7 +165,7 @@ std::span<const std::string_view> ScenarioObjectFields(
              "timeout_sec");
   static constexpr auto kBlockProduction =
       Fields("enabled", "native_mining", "period_ms", "probability", "seed",
-             "difficulty");
+             "difficulty", "min_pool_transactions", "max_pool_wait_ms");
   static constexpr auto kResources = Fields(
       "memory_high_bytes", "memory_max_bytes", "cpu_quota_us", "cpu_period_us",
       "cpu_weight", "io_weight", "io_max", "pids_max", "runtime_node_limits");

@@ -358,6 +358,20 @@ void ApplyScenarioJson(const boost::json::object& scenario,
                                       options.block_production.policy.seed());
     options.block_production.policy = BlockProductionPolicy(
         std::chrono::milliseconds(period_ms), probability, seed);
+    options.block_production.min_pool_transactions =
+        JsonOptionalUint32Field(object, "min_pool_transactions", 0U);
+    options.block_production.max_pool_wait_ms =
+        JsonOptionalUint32Field(object, "max_pool_wait_ms", 0U);
+    if ((options.block_production.min_pool_transactions == 0U) !=
+            (options.block_production.max_pool_wait_ms == 0U) ||
+        options.block_production.max_pool_wait_ms > 3600000U ||
+        (options.block_production.min_pool_transactions != 0U &&
+         (!options.block_production.enabled ||
+          options.block_production.mode == MiningMode::kNativeMining))) {
+      throw std::runtime_error(
+          "pool accumulation requires enabled scheduled mining, positive "
+          "min_pool_transactions and max_pool_wait_ms in 1..3600000");
+    }
     if (!OptionProvided(vm, "mining-difficulty") &&
         object.if_contains("difficulty") != nullptr) {
       const std::optional<double> difficulty =

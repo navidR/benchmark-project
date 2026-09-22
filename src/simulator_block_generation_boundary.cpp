@@ -1,7 +1,9 @@
 #include "simulator_block_generation_boundary.h"
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
+#include <thread>
 #include <utility>
 
 #include "bbp/drivers/chain_driver.h"
@@ -32,11 +34,13 @@ std::unique_lock<std::timed_mutex> AcquireBlockGenerationLock(
 
 }  // namespace
 
-void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
-                           const std::vector<std::string>& block_hashes,
-                           std::stop_token stop_token) {
+std::vector<std::optional<std::uint64_t>> RecordGeneratedBlocks(
+    const ChainDriver& driver, NodeRuntime& node,
+    const std::vector<std::string>& block_hashes, std::stop_token stop_token) {
   node.AddGeneratedBlocks(static_cast<std::uint64_t>(block_hashes.size()));
   std::uint64_t mined_transaction_count = 0;
+  std::vector<std::optional<std::uint64_t>> counts;
+  counts.reserve(block_hashes.size());
   for (const std::string& block_hash : block_hashes) {
     std::uint64_t block_transaction_count = 0;
     try {
@@ -46,6 +50,7 @@ void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
       throw;
     } catch (const std::exception& error) {
       node.MarkMinedTransactionCountIncomplete();
+      counts.emplace_back(std::nullopt);
       BBP_LOG(warning) << "could not count transactions in generated block "
                        << block_hash << " for " << node.config.id << ": "
                        << error.what();
@@ -56,8 +61,58 @@ void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
       throw std::runtime_error("mined transaction count overflow");
     }
     mined_transaction_count += block_transaction_count;
+    counts.emplace_back(block_transaction_count);
   }
   node.AddMinedTransactions(mined_transaction_count);
+  return counts;
+}
+
+PoolAccumulationResult WaitForPoolAccumulation(
+    const ChainDriver& driver, const ChainNodeConfig& node,
+    std::uint32_t minimum_transactions, std::chrono::milliseconds maximum_wait,
+    std::stop_token stop_token) {
+  PoolAccumulationResult result;
+  if (minimum_transactions == 0U) return result;
+  if (maximum_wait <= std::chrono::milliseconds::zero())
+    throw std::invalid_argument(
+        "pool accumulation requires a positive maximum wait");
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = started + maximum_wait;
+  std::stop_source bounded_stop;
+  std::stop_callback requested(stop_token,
+                               [&] { bounded_stop.request_stop(); });
+  std::jthread timer([&](std::stop_token timer_stop) {
+    try {
+      WaitUntil(deadline, timer_stop);
+    } catch (const SimulationCancelled&) {
+      return;
+    }
+    bounded_stop.request_stop();
+  });
+  try {
+    while (std::chrono::steady_clock::now() < deadline) {
+      ThrowIfStopRequested(bounded_stop.get_token());
+      result.pool_transactions =
+          driver.ReadMetrics(node, bounded_stop.get_token()).mempool_tx_count;
+      if (*result.pool_transactions >= minimum_transactions) {
+        result.threshold_reached = true;
+        break;
+      }
+      WaitUntil(std::min(deadline, std::chrono::steady_clock::now() +
+                                       std::chrono::milliseconds(250)),
+                bounded_stop.get_token());
+    }
+  } catch (const SimulationCancelled&) {
+    // Only the accumulation deadline permits mining with a partial pool.
+    ThrowIfStopRequested(stop_token);
+    if (!bounded_stop.stop_requested()) throw;
+  }
+  ThrowIfStopRequested(stop_token);
+  result.waited_ms = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count());
+  return result;
 }
 
 std::vector<std::string> GenerateBlocksSerialized(

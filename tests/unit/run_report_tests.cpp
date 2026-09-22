@@ -1801,6 +1801,10 @@ BOOST_AUTO_TEST_CASE(
     hashes.emplace_back("hash-" + std::to_string(index));
     boost::json::object detail;
     detail["hashes"] = std::move(hashes);
+    if (index != 259U) {  // One legacy event has no recorded transaction count.
+      detail["non_reward_transaction_counts"] = boost::json::array{
+          index < 200U ? boost::json::value(16U) : boost::json::value(0U)};
+    }
     boost::json::object event;
     event["run_id"] = "r1";
     event["node_id"] = "firo-1";
@@ -1826,6 +1830,14 @@ BOOST_AUTO_TEST_CASE(
       boost::json::parse(bbp::BuildRunReportJson(dir));
   const boost::json::object& report = value.as_object();
   BOOST_TEST(JsonInteger(report, "scheduled_block_count") == 260U);
+  const auto& distribution =
+      report.at("scheduled_block_transaction_distribution").as_object();
+  BOOST_TEST(JsonInteger(distribution, "observed_blocks") == 259U);
+  BOOST_TEST(JsonInteger(distribution, "unobserved_blocks") == 1U);
+  BOOST_TEST(JsonInteger(distribution, "non_reward_transactions") == 3200U);
+  BOOST_TEST(JsonInteger(distribution.at("buckets").as_object(), "10-99") ==
+             200U);
+  BOOST_TEST(JsonInteger(distribution.at("buckets").as_object(), "0") == 59U);
   const boost::json::array& blocks = report.at("scheduled_blocks").as_array();
   BOOST_REQUIRE_EQUAL(blocks.size(), 256U);
   BOOST_TEST(blocks.front()

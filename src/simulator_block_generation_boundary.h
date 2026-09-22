@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -22,9 +23,19 @@ struct Options;
 
 namespace simulator_app_internal {
 
-void RecordGeneratedBlocks(const ChainDriver& driver, NodeRuntime& node,
-                           const std::vector<std::string>& block_hashes,
-                           std::stop_token stop_token);
+std::vector<std::optional<std::uint64_t>> RecordGeneratedBlocks(
+    const ChainDriver& driver, NodeRuntime& node,
+    const std::vector<std::string>& block_hashes, std::stop_token stop_token);
+
+struct PoolAccumulationResult {
+  std::optional<std::uint64_t> pool_transactions;
+  std::uint64_t waited_ms = 0;
+  bool threshold_reached = false;
+};
+PoolAccumulationResult WaitForPoolAccumulation(
+    const ChainDriver& driver, const ChainNodeConfig& node,
+    std::uint32_t minimum_transactions, std::chrono::milliseconds maximum_wait,
+    std::stop_token stop_token);
 std::vector<std::string> GenerateBlocksSerialized(
     std::timed_mutex& block_generation_mutex, const ChainDriver& driver,
     const ChainNodeConfig& node, std::uint32_t count,
