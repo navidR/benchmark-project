@@ -619,6 +619,7 @@ struct HttpClient::ConnectionPool {
   struct Endpoint {
     Endpoint() { idle.reserve(kPerEndpoint); }
     std::mutex mutex;
+    std::timed_mutex digest_mutex;
     std::condition_variable_any available;
     std::size_t active = 0U;
     std::vector<std::unique_ptr<JsonConnection>> idle;
@@ -640,19 +641,40 @@ struct HttpClient::ConnectionPool {
     }
   };
 
+  Endpoint& For(const RpcEndpoint& rpc) {
+    std::lock_guard lock(mutex);
+    auto& entry = endpoints[{rpc.host, rpc.port}];
+    if (!entry) {
+      entry = std::make_unique<Endpoint>();
+    }
+    return *entry;
+  }
+
+  std::unique_lock<std::timed_mutex> LockDigest(
+      const RpcEndpoint& rpc, std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token) {
+    std::unique_lock<std::timed_mutex> lock(For(rpc).digest_mutex,
+                                            std::defer_lock);
+    while (!lock.owns_lock()) {
+      if (stop_token.stop_requested()) {
+        throw SimulationCancelled();
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        throw boost::system::system_error(
+            beast::error::timeout, "digest RPC serialization deadline expired");
+      }
+      static_cast<void>(lock.try_lock_until(
+          std::min(deadline, now + std::chrono::milliseconds(10))));
+    }
+    return lock;
+  }
+
   HttpResponse Post(const RpcEndpoint& rpc, std::string_view path,
                     std::string_view body, const std::string& authorization,
                     std::chrono::steady_clock::time_point deadline,
                     std::stop_token stop_token) {
-    Endpoint* endpoint;
-    {
-      std::lock_guard lock(mutex);
-      auto& entry = endpoints[{rpc.host, rpc.port}];
-      if (!entry) {
-        entry = std::make_unique<Endpoint>();
-      }
-      endpoint = entry.get();
-    }
+    Endpoint* endpoint = &For(rpc);
     std::unique_lock lock(endpoint->mutex);
     const bool admitted = endpoint->available.wait_until(
         lock, stop_token, deadline,
@@ -729,19 +751,8 @@ HttpResponse HttpClient::PostJsonWithDeadline(
                               stop_token);
   }
 
-  std::unique_lock<std::timed_mutex> lock(digest_mutex_, std::defer_lock);
-  while (!lock.owns_lock()) {
-    if (stop_token.stop_requested()) {
-      throw SimulationCancelled();
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      throw boost::system::system_error(
-          beast::error::timeout, "digest RPC serialization deadline expired");
-    }
-    static_cast<void>(lock.try_lock_until(
-        std::min(deadline, now + std::chrono::milliseconds(10))));
-  }
+  const std::unique_lock<std::timed_mutex> lock =
+      connections_->LockDigest(endpoint, deadline, stop_token);
   JsonConnection connection(endpoint, deadline);
   connection.Connect(stop_token);
   HttpExchange challenge_response =

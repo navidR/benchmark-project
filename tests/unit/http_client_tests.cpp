@@ -523,6 +523,72 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(lock_owner.get());
 }
 
+BOOST_AUTO_TEST_CASE(
+    http_client_digest_requests_to_different_endpoints_run_concurrently) {
+  namespace asio = boost::asio;
+  namespace beast = boost::beast;
+  namespace http = beast::http;
+  using tcp = asio::ip::tcp;
+
+  asio::io_context context;
+  tcp::acceptor blocked_acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  tcp::acceptor responsive_acceptor(
+      context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
+  std::promise<void> blocked_request_received;
+  std::future<void> blocked_server = std::async(std::launch::async, [&] {
+    tcp::socket socket(blocked_acceptor.get_executor());
+    blocked_acceptor.accept(socket);
+    beast::flat_buffer buffer;
+    http::request<http::string_body> request;
+    http::read(socket, buffer, request);
+    blocked_request_received.set_value();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  });
+  std::future<std::vector<std::string>> responsive_server =
+      std::async(std::launch::async, [&] {
+        return ServeDigestReplies(
+            responsive_acceptor,
+            {{.status = http::status::unauthorized,
+              .challenges =
+                  {"Digest qop=auth,algorithm=MD5,realm=test,nonce=one"},
+              .body = {}},
+             {.status = http::status::ok,
+              .challenges = {},
+              .body = "response"}});
+      });
+
+  const bbp::HttpClient client(std::chrono::seconds(2));
+  std::future<void> blocked_request = std::async(std::launch::async, [&] {
+    BOOST_CHECK_THROW(
+        client.PostJson(
+            DigestEndpoint(blocked_acceptor.local_endpoint().port()), "/",
+            "{}"),
+        std::exception);
+  });
+  BOOST_REQUIRE(blocked_request_received.get_future().wait_for(
+                    std::chrono::seconds(1)) == std::future_status::ready);
+
+  std::future<bbp::HttpResponse> responsive_request =
+      std::async(std::launch::async, [&] {
+        return client.PostJson(
+            DigestEndpoint(responsive_acceptor.local_endpoint().port()), "/",
+            "{}");
+      });
+  BOOST_REQUIRE(responsive_request.wait_for(std::chrono::milliseconds(300)) ==
+                std::future_status::ready);
+  const bbp::HttpResponse response = responsive_request.get();
+  BOOST_TEST(response.status == 200);
+  BOOST_TEST(response.body == "response");
+
+  blocked_server.get();
+  blocked_request.get();
+  const std::vector<std::string> authorizations = responsive_server.get();
+  BOOST_REQUIRE(authorizations.size() == 2U);
+  BOOST_TEST(authorizations.front().empty());
+  BOOST_TEST(!authorizations.back().empty());
+}
+
 BOOST_AUTO_TEST_CASE(http_client_rejects_conflicting_authentication_sources) {
   const bbp::HttpClient client(std::chrono::milliseconds(20));
   bbp::RpcEndpoint endpoint;

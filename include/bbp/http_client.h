@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -53,7 +52,6 @@ class HttpClient {
   std::chrono::milliseconds timeout_;
   struct ConnectionPool;
   std::unique_ptr<ConnectionPool> connections_;
-  mutable std::timed_mutex digest_mutex_;
 };
 
 }  // namespace bbp
