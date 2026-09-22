@@ -32,6 +32,8 @@ constexpr auto kOperations = std::to_array<McpNamedCapability>(
       "default"},
      {"run.replay", "Replay a retained source scenario"},
      {"run.report", "Build an exact retained or live report"},
+     {"chain.query",
+      "Read a bounded canonical block page and selected block detail"},
      {"simulation.command", "Invoke a registered runtime command"},
 #ifdef BBP_FIRO_GUI_LAUNCHER
      {"local.firo_qt_launcher", "Create the owned native Firo-Qt launcher"},
@@ -123,6 +125,9 @@ constexpr auto kInformationFamilies = std::to_array<McpNamedCapability>(
      {"errors", "Structured failures"},
      {"command_history", "Runtime command admission and terminal outcomes"},
      {"reports", "Exact run and node reports"},
+     {"chain",
+      "Lazy chain blocks and transactions from an identified node or captured "
+      "records"},
      {"generated_commands", "Safe generated operator commands"},
      {"artifacts", "Run-owned artifact inventory"},
      {"artifact_contents", "Safe bounded run-owned artifact contents"},
@@ -141,6 +146,9 @@ constexpr auto kResultFamilies = std::to_array<McpNamedCapability>(
      {"workload_invocation", "Completed one-shot workload invocation"},
      {"instrumentation", "Instrumentation identity and measurement state"},
      {"evidence_page", "Cursor-bounded structured evidence page"},
+     {"chain_page",
+      "Bounded block page with normalized byte units and selected "
+      "transactions"},
      {"artifact_content", "Bounded safe artifact bytes and metadata"},
      {"operation", "Stable long-operation progress and terminal outcome"},
      {"subscription", "Subscription identity and bounded notification page"},

@@ -6,6 +6,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
 #include <boost/test/unit_test.hpp>
 #include <condition_variable>
 #include <filesystem>
@@ -1196,4 +1197,66 @@ BOOST_AUTO_TEST_CASE(monero_wallet_snapshot_bounds_history_and_rounds_fees_up) {
   BOOST_TEST(refreshed.unconfirmed_balance_satoshis == 1U);
   BOOST_TEST(refreshed.immature_balance_satoshis == 0U);
   BOOST_TEST(served.get().size() == 4U);
+}
+
+BOOST_AUTO_TEST_CASE(monero_driver_chain_block_detail) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  asio::io_context io;
+  tcp::acceptor acceptor(
+      io, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const std::string hash(kHashA), miner(kHashB), payment(kHashC);
+  const std::string blob =
+      "010100" + std::string(72, '0') + std::string(20, '0') + "01" + payment;
+  boost::json::object block{
+      {"status", "OK"},
+      {"block_header", boost::json::object{{"hash", hash},
+                                           {"height", 0},
+                                           {"depth", 0},
+                                           {"timestamp", 1234},
+                                           {"block_size", 999},
+                                           {"block_weight", 999},
+                                           {"num_txes", 1}}},
+      {"blob", blob},
+      {"miner_tx_hash", miner},
+      {"tx_hashes", boost::json::array{payment}}};
+  const auto txjson = boost::json::serialize(boost::json::object{
+      {"vin", boost::json::array{boost::json::object{}}},
+      {"vout", boost::json::array{boost::json::object{}}},
+      {"extra", boost::json::array{1, 2}},
+      {"rct_signatures", boost::json::object{{"txnFee", 1000}}}});
+  boost::json::object transactions{
+      {"status", "OK"},
+      {"txs",
+       boost::json::array{boost::json::object{{"tx_hash", miner},
+                                              {"as_hex", std::string(20, '0')},
+                                              {"as_json", txjson}},
+                          boost::json::object{{"tx_hash", payment},
+                                              {"as_hex", ""},
+                                              {"pruned_as_hex", "0102"},
+                                              {"prunable_as_hex", ""},
+                                              {"as_json", txjson}}}}};
+  const std::vector<std::string> responses{
+      JsonRpcResult(boost::json::serialize(block)),
+      boost::json::serialize(transactions)};
+  auto server = std::async(std::launch::async, [&] {
+    return ServeDigestResponses(acceptor, responses);
+  });
+  auto config = TestConfig(acceptor.local_endpoint().port());
+  config.rpc_host = "127.0.0.1";
+  const bbp::MoneroDriver driver(std::chrono::seconds(1));
+  const auto detail = driver.ReadBlockDetail(config, hash);
+  server.get();
+  BOOST_TEST(*detail.block.serialized_size == 82U);
+  BOOST_TEST(*detail.block.header_size == 39U);
+  BOOST_TEST(*detail.block.weight == 999U);
+  BOOST_TEST(!detail.transaction_bytes.has_value());
+  BOOST_TEST(*detail.miner_transaction_size == 10U);
+  BOOST_TEST(*detail.metadata_bytes == 72U);
+  BOOST_REQUIRE(detail.transactions.size() == 2U);
+  BOOST_TEST(!detail.transactions[1].serialized_size.has_value());
+  BOOST_TEST(!detail.transactions[1].weight.has_value());
+  BOOST_TEST(!detail.transactions[1].error.empty());
+  BOOST_TEST(*detail.transactions[1].metadata_size == 2U);
+  BOOST_TEST(*detail.transactions[1].fee == "1000 atomic (1e-12 coin)");
 }

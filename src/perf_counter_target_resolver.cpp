@@ -252,6 +252,9 @@ PerfCounterTarget ResolvePerfCounterTarget(
   }
 
   switch (selection.view) {
+    case TuiView::kChain:
+      throw std::runtime_error(
+          "Select a node or wallet for performance counters");
     case TuiView::kNodes:
     case TuiView::kMetrics: {
       const PerfCounterTargetKind kind =

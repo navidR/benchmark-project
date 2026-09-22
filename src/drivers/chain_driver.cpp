@@ -4,6 +4,21 @@
 
 namespace bbp {
 
+ChainBlockSummary ChainDriver::ReadChainTip(const ChainNodeConfig&,
+                                            std::stop_token) const {
+  throw UnsupportedChainOperation("active driver", "block browsing");
+}
+ChainBlockSummary ChainDriver::ReadBlockSummary(const ChainNodeConfig&,
+                                                std::uint64_t,
+                                                std::stop_token) const {
+  throw UnsupportedChainOperation("active driver", "block browsing");
+}
+ChainBlockDetail ChainDriver::ReadBlockDetail(const ChainNodeConfig&,
+                                              const std::string&,
+                                              std::stop_token) const {
+  throw UnsupportedChainOperation("active driver", "block browsing");
+}
+
 std::vector<ProcessSpec> ChainDriver::RenderCompanionProcesses(
     const ChainNodeConfig&) const {
   return {};

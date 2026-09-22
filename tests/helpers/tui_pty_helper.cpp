@@ -3990,6 +3990,45 @@ void CheckHomeEndKeys(const std::filesystem::path& command,
   static_cast<void>(process.ReadFor(100ms));
   process.Write("\033[H");
   static_cast<void>(process.ReadUntil("FIRST_LOG_RECORD", 5s, "cancel exit"));
+  boost::json::array blocks;
+  for (unsigned height = 0; height < 3; ++height) {
+    const boost::json::object summary{
+        {"height", height},
+        {"hash", std::string(64, static_cast<char>('a' + height))}};
+    blocks.emplace_back(boost::json::object{
+        {"summary", summary},
+        {"detail",
+         boost::json::object{{"block", summary},
+                             {"transactions", boost::json::array{}},
+                             {"byte_definition", "Captured test bytes"}}}});
+  }
+  {
+    std::ofstream stream(run.run_root() / "chain-blocks.json");
+    stream << boost::json::serialize(
+        boost::json::object{{"version", 1},
+                            {"source_node", "captured-node"},
+                            {"tip", blocks.back().as_object().at("summary")},
+                            {"records", blocks}});
+  }
+  process.Write("v");
+  const auto chain_frame =
+      process.ReadUntil("Blocks: genesis -> tip", 5s, "chain view");
+  if (chain_frame.find("captured-node") == std::string::npos)
+    static_cast<void>(
+        process.ReadUntil("captured-node", 5s, "captured source"));
+  for (const auto key :
+       {"\033[H", "\033[F", "\033[1~", "\033[4~", "\033OH", "\033OF", "\033[7~",
+        "\033[8~", "\033[A", "\033[B", "\033[5~", "\033[6~"}) {
+    process.Write(key);
+    RequireNotContains(process.ReadFor(100ms), "Confirm exit",
+                       "chain navigation must not open exit");
+  }
+  process.Write("x\033[6~x\033[5~");
+  RequireNotContains(process.ReadFor(100ms), "Confirm exit",
+                     "detail and transaction navigation");
+  process.Resize(12, 30);
+  RequireNotContains(process.ReadFor(100ms), "Confirm exit",
+                     "narrow chain view");
   process.Write("q");
   RequireExitZero(&process, "Home/End key TUI");
 }

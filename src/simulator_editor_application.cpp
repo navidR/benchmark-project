@@ -1754,6 +1754,7 @@ TuiRunSnapshot TuiSnapshot(
 #endif
       .publication_mutex = runtime_publication_mutex(),
       .read_lease = snapshot->tui_read_lease,
+      .chain_view = snapshot->mcp_application->ChainView(),
   };
 }
 

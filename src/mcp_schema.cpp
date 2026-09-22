@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "bbp/chain_kind.h"
+#include "bbp/chain_view.h"
 #include "bbp/default_peer_topology.h"
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/mcp_registry.h"
@@ -1868,6 +1869,8 @@ McpResultFamily McpOperationResultFamily(McpOperationKind operation) {
       return McpResultFamily::kRunLifecycle;
     case McpOperationKind::kCleanRun:
       return McpResultFamily::kCleanup;
+    case McpOperationKind::kQueryChain:
+      return McpResultFamily::kChainPage;
     case McpOperationKind::kReportRun:
     case McpOperationKind::kQueryEvidence:
     case McpOperationKind::kQueryLogs:
@@ -1966,6 +1969,12 @@ boost::json::object BuildMcpOperationInputSchema(
       properties["source_run_id"] = RunIdentifierSchema();
       properties["run_id"] = RunIdentifierSchema();
       required.emplace_back("source_run_id");
+      break;
+    case McpOperationKind::kQueryChain:
+      add_run();
+      properties["first_height"] = Uint64Schema();
+      properties["selected_height"] = Uint64Schema();
+      properties["limit"] = IntegerSchema(1U, 32U);
       break;
     case McpOperationKind::kReportRun:
       add_run();
@@ -3077,6 +3086,11 @@ boost::json::object BuildMcpResultSchema(
       properties["targets"] = ArraySchema(InstrumentationTargetSchema(), 1U);
       require(
           {"run_id", "instrumentation_id", "state", "sample_count", "targets"});
+      break;
+    case McpResultFamily::kChainPage:
+      properties["run_id"] = RunIdentifierSchema();
+      properties["page"] = ChainViewPageSchema();
+      require({"run_id", "page"});
       break;
     case McpResultFamily::kEvidencePage:
       properties["run_id"] = RunIdentifierSchema();

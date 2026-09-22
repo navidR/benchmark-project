@@ -14,6 +14,7 @@
 
 #include "bbp/chain_extra_args.h"
 #include "bbp/chain_network.h"
+#include "bbp/drivers/chain_block.h"
 #include "bbp/drivers/chain_wallet_snapshot.h"
 #include "bbp/http_client.h"
 #include "bbp/log_tail.h"
@@ -272,6 +273,14 @@ class ChainDriver {
       std::chrono::seconds timeout, std::stop_token stop_token = {}) const = 0;
   virtual ChainMetrics ReadMetrics(const ChainNodeConfig& config,
                                    std::stop_token stop_token = {}) const = 0;
+  virtual ChainBlockSummary ReadChainTip(const ChainNodeConfig& config,
+                                         std::stop_token stop_token = {}) const;
+  virtual ChainBlockSummary ReadBlockSummary(
+      const ChainNodeConfig& config, std::uint64_t height,
+      std::stop_token stop_token = {}) const;
+  virtual ChainBlockDetail ReadBlockDetail(
+      const ChainNodeConfig& config, const std::string& hash,
+      std::stop_token stop_token = {}) const;
   virtual std::vector<std::string> PeerAddresses(
       const ChainNodeConfig& config, std::stop_token stop_token = {}) const = 0;
   virtual std::vector<std::string> ConnectedPeerAddresses(

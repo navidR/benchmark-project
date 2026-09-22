@@ -24,6 +24,7 @@ namespace bbp {
 class OperatorConnectionLauncher;
 #endif
 class SimulationCommandQueue;
+class ChainViewService;
 struct Options;
 
 struct McpLiveNodeInventorySnapshot {
@@ -204,6 +205,8 @@ class McpLiveApplication {
       std::chrono::milliseconds shutdown_bound) const noexcept;
   void SetInstrumentationService(
       std::shared_ptr<McpLiveInstrumentationService> service);
+  void SetChainViewService(std::shared_ptr<ChainViewService> service);
+  std::shared_ptr<ChainViewService> ChainView() const;
   void SetRoleService(std::shared_ptr<McpLiveRoleService> service);
 
   // Called exactly once by SimulationCommandProcessor. Successful node
@@ -282,6 +285,7 @@ class McpLiveApplication {
       std::stop_token stop_token);
 
   Config config_;
+  std::shared_ptr<ChainViewService> chain_view_service_;
   mutable std::mutex mutex_;
   std::condition_variable command_outcome_ready_;
   std::condition_variable_any requests_drained_;

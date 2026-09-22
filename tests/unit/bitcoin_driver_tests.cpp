@@ -561,3 +561,71 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(daemon.StopAndReap());
   BOOST_CHECK(!std::filesystem::exists(config.rpc_cookie_file));
 }
+
+// Detects losing exact byte/weight units or inventing unavailable transaction
+// metadata.
+BOOST_AUTO_TEST_CASE(bitcoin_driver_chain_block_detail) {
+  namespace asio = boost::asio;
+  using tcp = asio::ip::tcp;
+  asio::io_context io;
+  tcp::acceptor acceptor(
+      io, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const std::string hash(64, 'a'), miner(64, 'b'), payment(64, 'c');
+  boost::json::object block{
+      {"hash", hash},
+      {"height", 1},
+      {"size", 285},
+      {"weight", 1000},
+      {"time", 1234},
+      {"confirmations", 1},
+      {"tx", boost::json::array{
+                 boost::json::object{
+                     {"txid", miner},
+                     {"size", 100},
+                     {"vin", boost::json::array{boost::json::object{
+                                 {"coinbase", "00"}}}},
+                     {"vout", boost::json::array{boost::json::object{}}}},
+                 boost::json::object{
+                     {"txid", payment},
+                     {"size", 104},
+                     {"vin",
+                      boost::json::array{boost::json::object{{"txid", miner}}}},
+                     {"vout", boost::json::array{boost::json::object{}}},
+                     {"weight", 416},
+                     {"fee", 0.001}}}}};
+  const std::vector<std::string> responses{
+      boost::json::serialize(boost::json::object{
+          {"result", block}, {"error", nullptr}, {"id", "bbp"}}),
+      boost::json::serialize(
+          boost::json::object{{"result", std::string(160, '0')},
+                              {"error", nullptr},
+                              {"id", "bbp"}})};
+  auto server = std::async(std::launch::async, [&] {
+    return ServeRpcResponses(acceptor, responses);
+  });
+  bbp::ChainNodeConfig config;
+  config.rpc_host = "127.0.0.1";
+  config.rpc_port = acceptor.local_endpoint().port();
+  config.rpc_user = "user";
+  config.rpc_password = "password";
+  const bbp::BitcoinDriver driver(std::chrono::seconds(1));
+  const auto detail = driver.ReadBlockDetail(config, hash);
+  server.get();
+  BOOST_TEST(detail.block.hash == hash);
+  BOOST_TEST(*detail.block.serialized_size == 285U);
+  BOOST_TEST(*detail.block.weight == 1000U);
+  BOOST_TEST(*detail.block.header_size == 80U);
+  BOOST_TEST(*detail.transaction_bytes == 204U);
+  BOOST_TEST(*detail.metadata_bytes == 81U);
+  BOOST_TEST(*detail.minimum_transaction_size == 100U);
+  BOOST_TEST(*detail.maximum_transaction_size == 104U);
+  BOOST_TEST(*detail.average_transaction_size == 102.0);
+  BOOST_TEST(*detail.miner_transaction_size == 100U);
+  BOOST_REQUIRE(detail.transactions.size() == 2U);
+  BOOST_TEST(detail.transactions[0].coinbase.value());
+  BOOST_TEST(!detail.transactions[1].coinbase.value());
+  BOOST_TEST(!detail.transactions[1].metadata_size.has_value());
+  BOOST_TEST(std::stod(detail.transactions[1].fee.value()) == 0.001);
+  BOOST_TEST(detail.transactions[1].fee->ends_with(" coin"));
+  BOOST_TEST(*detail.transactions[1].weight == 416U);
+}

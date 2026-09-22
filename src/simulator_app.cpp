@@ -92,6 +92,7 @@
 #include "bbp/util.h"
 #include "simulator_block_generation_boundary.h"
 #include "simulator_cancellable_waiting.h"
+#include "simulator_chain_view.h"
 #include "simulator_combined_stop_token.h"
 #include "simulator_editor_application.h"
 #include "simulator_event_writing.h"
@@ -952,7 +953,7 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
   WriteEvent(events_path, options.run_id, "sim",
              SimulationEventKind::kRunStarted);
 
-  std::unique_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
+  std::shared_ptr<ChainDriver> driver_owner = CreateChainDriver(options.chain);
   ChainDriver& driver = *driver_owner;
   std::mutex configured_miner_node_ids_mutex;
   std::vector<std::string> miner_node_ids;
@@ -1891,6 +1892,8 @@ BenchmarkHeadlessResult RunBenchmarkHeadless(
     }
 
     ThrowIfStopRequested(stop_token);
+    mcp_application.SetChainViewService(
+        MakeLiveChainViewService(run_root, driver_owner, node_inventory));
     mcp_application.MarkRunStarted();
     {
       RuntimeNodeSnapshot nodes;

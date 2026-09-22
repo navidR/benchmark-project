@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "bbp/chain_kind.h"
+#include "bbp/chain_view.h"
 #include "bbp/drivers/chain_driver_registry.h"
 #include "bbp/json_secret_redaction.h"
 #include "bbp/logging.h"
@@ -42,6 +43,7 @@ constexpr std::array kLiveOperations = {
     McpOperationKind::kValidateScenario,
     McpOperationKind::kResolveScenario,
     McpOperationKind::kStopRun,
+    McpOperationKind::kQueryChain,
     McpOperationKind::kReportRun,
     McpOperationKind::kInvokeRuntimeCommand,
 #ifdef BBP_FIRO_GUI_LAUNCHER
@@ -79,8 +81,8 @@ constexpr std::array kLiveOperations = {
 
 constexpr std::array kRetainedOperations = {
     McpOperationKind::kValidateScenario, McpOperationKind::kResolveScenario,
-    McpOperationKind::kReportRun,        McpOperationKind::kGetOperation,
-    McpOperationKind::kCancelOperation,
+    McpOperationKind::kQueryChain,       McpOperationKind::kReportRun,
+    McpOperationKind::kGetOperation,     McpOperationKind::kCancelOperation,
 };
 
 constexpr std::array kOwnedRunOperations = {
@@ -1563,7 +1565,9 @@ boost::json::object ExecuteAndNormalizeSimulationRoleMutation(
 }
 
 McpLiveApplication::McpLiveApplication(Config config)
-    : config_(std::move(config)) {
+    : config_(std::move(config)),
+      chain_view_service_(
+          std::make_shared<ChainViewService>(config_.run_root)) {
   if (config_.run_id.empty()) {
     throw std::invalid_argument("MCP live application requires a run id");
   }
@@ -1779,6 +1783,7 @@ McpOperationPlan McpLiveApplication::BuildOperation(
   }
   if (kind != McpOperationKind::kStopRun &&
       kind != McpOperationKind::kReportRun &&
+      kind != McpOperationKind::kQueryChain &&
       kind != McpOperationKind::kInvokeRuntimeCommand &&
 #ifdef BBP_FIRO_GUI_LAUNCHER
       kind != McpOperationKind::kCreateFiroQtLauncher &&
@@ -2126,6 +2131,31 @@ McpOperationPlan McpLiveApplication::BuildOperation(
               .value =
                   EvidencePage(config_.run_id, McpInformationFamily::kReports,
                                std::move(report))};
+        }};
+  }
+
+  if (kind == McpOperationKind::kQueryChain) {
+    ChainViewRequest request;
+    if (arguments.contains("first_height"))
+      request.first_height = OptionalUnsigned(arguments, "first_height", 0);
+    if (arguments.contains("selected_height"))
+      request.selected_height =
+          OptionalUnsigned(arguments, "selected_height", 0);
+    const auto limit = OptionalUnsigned(arguments, "limit", 16);
+    if (limit == 0 || limit > 32)
+      throw std::invalid_argument("chain.query limit must be 1..32");
+    request.limit = static_cast<std::uint32_t>(limit);
+    return McpOperationPlan{
+        .progress_total = 1U,
+        .executor = [this, request](McpOperationContext& context) {
+          CombinedStopToken cancellation(context.stop_token(),
+                                         request_stop_source_.get_token());
+          auto page = ChainView()->Query(request, cancellation.token());
+          return McpTypedResult{
+              .family = McpResultFamily::kChainPage,
+              .value = boost::json::object{{"result_family", "chain_page"},
+                                           {"run_id", config_.run_id},
+                                           {"page", std::move(page)}}};
         }};
   }
 
@@ -3110,6 +3140,9 @@ boost::json::value McpLiveApplication::ReadResource(
     case McpInformationFamily::kCommandHistory:
       data = SelectReportFields(report, {"operator_commands"});
       break;
+    case McpInformationFamily::kChain:
+      data = ChainView()->Query({}, stop_token);
+      break;
     case McpInformationFamily::kReports:
       data = std::move(report);
       break;
@@ -3978,6 +4011,33 @@ void McpLiveApplication::MarkRunStarted() {
   }
 }
 
+void McpLiveApplication::SetChainViewService(
+    std::shared_ptr<ChainViewService> service) {
+  if (!service) throw std::invalid_argument("chain view service is required");
+  service->SetObserver([this](const boost::json::object& page) {
+    PublishEvidence(
+        McpInformationFamily::kChain, "chain_page",
+        "captured chain page changed", std::nullopt,
+        boost::json::object{{"source_node", page.at("source_node")},
+                            {"tip", page.at("tip")},
+                            {"selected_height", page.at("selected_height")},
+                            {"notice", page.at("notice")}});
+  });
+  std::shared_ptr<ChainViewService> previous;
+  bool stopping;
+  {
+    std::lock_guard lock(mutex_);
+    stopping = stop_requested_ || shutdown_;
+    previous = std::exchange(chain_view_service_, service);
+  }
+  if (stopping) service->Close();
+  if (previous) previous->Close();
+}
+std::shared_ptr<ChainViewService> McpLiveApplication::ChainView() const {
+  std::lock_guard lock(mutex_);
+  return chain_view_service_;
+}
+
 void McpLiveApplication::MarkRunStopping() {
   bool notify = false;
   {
@@ -3992,6 +4052,7 @@ void McpLiveApplication::MarkRunStopping() {
     command_outcome_ready_.notify_all();
   }
   run_stop_source_.request_stop();
+  ChainView()->Close();
   if (notify && config_.run_stopping) {
     config_.run_stopping();
   }
@@ -4108,6 +4169,7 @@ void McpLiveApplication::ShutdownImpl(
   }
   request_stop_source_.request_stop();
   run_stop_source_.request_stop();
+  ChainView()->Close();
   std::unique_lock<std::mutex> lock(mutex_);
   const auto requests_drained = [this] { return active_requests_ == 0U; };
   if (deadline) {

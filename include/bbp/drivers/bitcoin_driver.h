@@ -34,6 +34,15 @@ class BitcoinDriver final : public ChainDriver {
                                 std::stop_token stop_token = {}) const override;
   ChainMetrics ReadMetrics(const ChainNodeConfig& config,
                            std::stop_token stop_token = {}) const override;
+  ChainBlockSummary ReadChainTip(
+      const ChainNodeConfig& config,
+      std::stop_token stop_token = {}) const override;
+  ChainBlockSummary ReadBlockSummary(
+      const ChainNodeConfig& config, std::uint64_t height,
+      std::stop_token stop_token = {}) const override;
+  ChainBlockDetail ReadBlockDetail(
+      const ChainNodeConfig& config, const std::string& hash,
+      std::stop_token stop_token = {}) const override;
   std::vector<std::string> PeerAddresses(
       const ChainNodeConfig& config,
       std::stop_token stop_token = {}) const override;

@@ -1,5 +1,7 @@
 #include "bbp/tui.h"
 
+#include "bbp/tui_chain_pane.h"
+
 // Boost.Log must precede ncurses' timeout and set_attributes macros.
 // clang-format off
 #include "bbp/logging.h"
@@ -79,6 +81,7 @@ struct TuiState {
   std::size_t selected_wallet = 0;
   std::size_t selected_topology_group = 0;
   TuiView view = TuiView::kNodes;
+  TuiChainPane chain_pane;
   NodeFilePane node_file_pane;
   NodeLogPane node_log_pane;
   SimulatorLogPane simulator_log_pane;
@@ -113,6 +116,7 @@ void ResetRunUiState(TuiState* state) {
 #ifdef BBP_FIRO_GUI_LAUNCHER
   ReleaseOperatorConnectionLauncher(state);
 #endif
+  state->chain_pane.Reset();
   state->selected_node = 0U;
   state->selected_wallet = 0U;
   state->selected_topology_group = 0U;
@@ -173,6 +177,11 @@ class CursesSession {
       if (key_defined(sequence) == 0) {
         define_key(sequence, KEY_END);
       }
+    }
+    for (const auto& [sequence, key] :
+         {std::pair{"\033[A", KEY_UP}, std::pair{"\033OA", KEY_UP},
+          std::pair{"\033[B", KEY_DOWN}, std::pair{"\033OB", KEY_DOWN}}) {
+      if (key_defined(sequence) == 0) define_key(sequence, key);
     }
     nodelay(stdscr, TRUE);
     curs_set(0);
@@ -2671,7 +2680,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   DrawNetworkRulePane(content_bottom, cols, network_rule_pane);
   DrawNodeFilePane(content_bottom, cols, node_file_pane);
   DrawHorizontalLine(rows - 2);
-  std::string footer = "MCP [i]. ";
+  std::string footer = "MCP [i]. Chain [v]. ";
   if (!command_status.empty()) {
     footer += std::string(command_status) + " | ";
   }
@@ -2691,7 +2700,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
         "u reloads; b closes.";
   } else {
     footer +=
-        "Logs [/] row, PgUp/PgDn page, Home/End. Arrows select. Tab/n/w/g/h "
+        "Logs [/] row, PgUp/PgDn page, Home/End. Arrows select. Tab/n/w/v/g/h "
         "view. b files. p peers. a rules. c command. e export. "
         "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. Esc "
         "asks; q exits.";
@@ -2718,11 +2727,20 @@ void DrawSummary(
     bool mcp_connection_dialog_open, const TuiMcpConnectionInfo& mcp_connection,
     const std::optional<PendingConfirmation>& pending_confirmation,
     const TuiExitConfirmation& exit_confirmation,
-    SimulatorLogPane* simulator_log_pane) {
-  DrawFrameBody(run_root, report, error, log_lines, view, selected_node,
-                selected_wallet, selected_topology_group, node_log_pane,
-                peer_list_pane, network_rule_pane, node_file_pane,
-                command_status, simulator_log_pane);
+    SimulatorLogPane* simulator_log_pane, const TuiChainPane* chain_pane) {
+  if (view == TuiView::kChain) {
+    int chain_rows = 0, chain_columns = 0;
+    getmaxyx(stdscr, chain_rows, chain_columns);
+    erase();
+    const auto chain_lines = chain_pane->Lines(chain_rows, chain_columns);
+    for (std::size_t row = 0; row < chain_lines.size(); ++row)
+      AddText(static_cast<int>(row), 0, chain_columns, chain_lines[row].text,
+              chain_lines[row].selected ? A_REVERSE : A_NORMAL);
+  } else
+    DrawFrameBody(run_root, report, error, log_lines, view, selected_node,
+                  selected_wallet, selected_topology_group, node_log_pane,
+                  peer_list_pane, network_rule_pane, node_file_pane,
+                  command_status, simulator_log_pane);
   int rows = 0;
   int cols = 0;
   getmaxyx(stdscr, rows, cols);
@@ -3270,9 +3288,9 @@ bool HandleMcpConnectionDialogInput(int ch, TuiState* state) {
 }
 
 bool HandleSimulatorLogInput(int ch, TuiState* state) {
-  if (state->view == TuiView::kMetrics || state->node_log_pane.IsOpen() ||
-      state->peer_list_pane.IsOpen() || state->network_rule_pane.IsOpen() ||
-      state->node_file_pane.IsOpen()) {
+  if (state->view == TuiView::kChain || state->view == TuiView::kMetrics ||
+      state->node_log_pane.IsOpen() || state->peer_list_pane.IsOpen() ||
+      state->network_rule_pane.IsOpen() || state->node_file_pane.IsOpen()) {
     return false;
   }
   const std::size_t page_rows =
@@ -3342,23 +3360,49 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
     return true;
   }
 
+  if (ch == 'v' || ch == 'V') {
+    state->view = TuiView::kChain;
+    state->node_log_pane.Close();
+    state->peer_list_pane.Close();
+    state->network_rule_pane.Close();
+    state->node_file_pane.Close();
+    return true;
+  }
+  if (state->view == TuiView::kChain) {
+    std::optional<ChainNavigation> key;
+    if (ch == KEY_UP)
+      key = ChainNavigation::kUp;
+    else if (ch == KEY_DOWN)
+      key = ChainNavigation::kDown;
+    else if (ch == KEY_PPAGE)
+      key = ChainNavigation::kPageUp;
+    else if (ch == KEY_NPAGE)
+      key = ChainNavigation::kPageDown;
+    else if (ch == KEY_HOME)
+      key = ChainNavigation::kHome;
+    else if (ch == KEY_END)
+      key = ChainNavigation::kEnd;
+    else if (ch == 'x' || ch == 'X' || ch == '\n')
+      key = ChainNavigation::kFocus;
+    if (key) {
+      state->chain_pane.Navigate(*key);
+      return true;
+    }
+  }
+
   if (HandleSimulatorLogInput(ch, state)) {
     return true;
   }
 
-  const boost::json::array* nodes = NodeSummaries(report);
-  if (nodes == nullptr || nodes->empty()) {
-    state->selected_node = 0;
-    return false;
-  }
-
-  const boost::json::array* wallets = WalletSummaries(report);
   if (ch == '\t') {
     switch (state->view) {
       case TuiView::kNodes:
         state->view = TuiView::kWallets;
         break;
       case TuiView::kWallets:
+        state->view = TuiView::kChain;
+        break;
+      case TuiView::kChain:
         state->view = TuiView::kTopology;
         state->node_log_pane.Close();
         state->peer_list_pane.Close();
@@ -3399,6 +3443,14 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
     return true;
   }
 
+  const boost::json::array* nodes = NodeSummaries(report);
+  if (nodes == nullptr || nodes->empty()) {
+    state->selected_node = 0;
+    return false;
+  }
+
+  const boost::json::array* wallets = WalletSummaries(report);
+  if (state->view == TuiView::kChain) return false;
   if (ch == 'l' || ch == 'L') {
     const std::optional<std::size_t> selected_node =
         SelectedNodeIndex(report, *state);
@@ -3761,6 +3813,7 @@ int RunTuiReport(const std::filesystem::path& run_root, bool once,
 #endif
       .publication_mutex = {},
       .read_lease = {},
+      .chain_view = std::make_shared<ChainViewService>(run_root),
   };
   return RunTuiReportImpl([snapshot]() { return snapshot; }, once, refresh_ms,
                           mcp_connection, stop_token,
@@ -3886,6 +3939,14 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       }
     }
 #endif
+    if (state.view == TuiView::kChain) {
+      int screen_rows = 0, screen_cols = 0;
+      getmaxyx(stdscr, screen_rows, screen_cols);
+      static_cast<void>(screen_cols);
+      state.chain_pane.Refresh(snapshot->chain_view, screen_rows);
+    } else
+      state.chain_pane.Cancel();
+    const auto chain_revision = state.chain_pane.revision();
     if (has_active_run) {
       DrawSummary(snapshot->run_root, report, error, log_lines, state.view,
                   state.selected_node, state.selected_wallet,
@@ -3901,7 +3962,7 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
 #endif
                   state.mcp_connection_dialog_open, mcp_connection,
                   state.pending_confirmation, state.exit_confirmation,
-                  &state.simulator_log_pane);
+                  &state.simulator_log_pane, &state.chain_pane);
     } else {
       DrawEmptySummary(state.mcp_connection_dialog_open, mcp_connection,
                        state.exit_confirmation);
@@ -3920,6 +3981,9 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       if (update_snapshot(snapshot_provider())) {
         break;
       }
+      if (state.view == TuiView::kChain &&
+          state.chain_pane.revision() != chain_revision)
+        break;
       const int ch = getch();
       if (ch == KEY_RESIZE) {
         break;

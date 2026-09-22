@@ -214,6 +214,10 @@ mark_target_interface_includes_system(yaml)
 
 add_executable(bbp
   src/application_instance_lock.cpp
+  src/chain_block_json.cpp
+  src/chain_view_schema.cpp
+  src/chain_view.cpp
+  src/tui_chain_pane.cpp
   src/block_production_policy.cpp
   src/capability.cpp
   src/cgroup.cpp
@@ -222,6 +226,9 @@ add_executable(bbp
   src/chain_kind.cpp
   src/conntrack.cpp
   src/default_peer_topology.cpp
+  src/drivers/chain_block.cpp
+  src/drivers/bitcoin_family_blocks.cpp
+  src/drivers/monero_blocks.cpp
   src/drivers/chain_driver.cpp
   src/drivers/chain_command_executor.cpp
   src/drivers/chain_driver_registry.cpp
@@ -292,6 +299,7 @@ add_executable(bbp
   src/simulation_policy.cpp
   src/simulation_time_scale.cpp
   src/signal_stop_monitor.cpp
+  src/simulator_chain_view.cpp
   src/simulator_app.cpp
   src/simulator_block_generation_boundary.cpp
   src/simulator_cancellable_waiting.cpp
@@ -531,6 +539,7 @@ if(BUILD_TESTING)
 
   add_executable(bbp-unit-tests
     tests/unit/application_instance_lock_tests.cpp
+    tests/unit/chain_view_tests.cpp
     tests/unit/block_production_policy_tests.cpp
     tests/unit/capability_tests.cpp
     tests/unit/cgroup_tests.cpp
@@ -620,10 +629,17 @@ if(BUILD_TESTING)
     src/chain_network.cpp
     src/chain_kind.cpp
     src/conntrack.cpp
+    src/chain_block_json.cpp
+    src/chain_view_schema.cpp
+    src/chain_view.cpp
+    src/tui_chain_pane.cpp
     src/block_production_policy.cpp
     src/default_peer_topology.cpp
     src/simulation_command.cpp
     src/simulation_event_kind.cpp
+    src/drivers/chain_block.cpp
+    src/drivers/bitcoin_family_blocks.cpp
+    src/drivers/monero_blocks.cpp
     src/drivers/chain_driver.cpp
     src/drivers/chain_command_executor.cpp
     src/drivers/chain_driver_registry.cpp
@@ -683,6 +699,7 @@ if(BUILD_TESTING)
     src/runtime_peer_topology.cpp
     src/scenario_fields.cpp
     src/scenario_workload_admission.cpp
+    src/simulator_chain_view.cpp
     src/simulator_app.cpp
     src/simulator_block_generation_boundary.cpp
     src/simulator_cancellable_waiting.cpp

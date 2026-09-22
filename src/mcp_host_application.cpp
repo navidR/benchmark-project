@@ -26,6 +26,7 @@ constexpr std::array kHostOperations = {
     McpOperationKind::kStopRun,
     McpOperationKind::kCleanRun,
     McpOperationKind::kReportRun,
+    McpOperationKind::kQueryChain,
     McpOperationKind::kInvokeRuntimeCommand,
 #ifdef BBP_FIRO_GUI_LAUNCHER
     McpOperationKind::kCreateFiroQtLauncher,
