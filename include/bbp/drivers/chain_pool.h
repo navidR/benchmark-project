@@ -30,9 +30,11 @@ struct ChainPoolSizeStatistics {
 
 struct ChainPoolSummary {
   std::uint64_t transaction_count = 0;
-  ChainPoolSizeStatistics size, weight;
+  ChainPoolSizeStatistics size, weight, fees;
   std::optional<std::uint64_t> total_fees, oldest_first_seen, memory_usage;
   std::optional<double> minimum_fee_rate, maximum_fee_rate, average_fee_rate;
+  std::optional<std::uint64_t> youngest_first_seen;
+  std::optional<double> average_first_seen;
   std::string fee_unit, fee_rate_unit, ancestor_size_unit, byte_definition;
 };
 

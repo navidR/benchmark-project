@@ -27,6 +27,7 @@ struct ChainFixture {
   std::atomic<unsigned> branch{0};
   std::atomic<bool> first_healthy{true}, available{true};
   std::atomic<std::size_t> reads{0};
+  unsigned transaction_count = 0;
   ChainFixture() { std::filesystem::create_directories(root); }
   ~ChainFixture() { std::filesystem::remove_all(root); }
   bbp::ChainBlockSummary Summary(std::uint64_t height) {
@@ -61,6 +62,16 @@ struct ChainFixture {
                    bbp::ChainBlockDetail d;
                    d.block = Summary(std::stoull(hash.substr(32), nullptr, 16));
                    d.byte_definition = "test serialized bytes";
+                   for (unsigned i = 1; i <= transaction_count; ++i) {
+                     bbp::ChainBlockTransaction tx;
+                     tx.id = Hash(i);
+                     tx.serialized_size = 100 + i;
+                     tx.fee = std::to_string(i) + " test units";
+                     tx.error = std::string(200, 'x') + " END-OF-TRANSACTION";
+                     d.transactions.push_back(std::move(tx));
+                   }
+                   d.block.transaction_count = transaction_count;
+                   bbp::CalculateBlockTransactionSizes(d);
                    return d;
                  }});
       return readers;
@@ -264,4 +275,55 @@ BOOST_AUTO_TEST_CASE(chain_view_navigation_cancels_obsolete_rpc) {
   pane.Navigate(bbp::ChainNavigation::kEnd);
   BOOST_REQUIRE(
       wait([&] { return cancelled.load() && pane.selected_height() == 150; }));
+}
+
+// A block longer than the viewport must still expose its final transaction
+// and every wrapped detail field, with valid focus/selection after resize.
+BOOST_AUTO_TEST_CASE(chain_view_responsive_transaction_browser) {
+  ChainFixture f;
+  f.transaction_count = 80;
+  auto service = std::make_shared<bbp::ChainViewService>(f.root, f.Readers());
+  bbp::TuiChainPane pane;
+  const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  do {
+    pane.Refresh(service, 44, 80);
+    if (pane.selected_height()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  } while (std::chrono::steady_clock::now() < until);
+  BOOST_REQUIRE(pane.selected_height().has_value());
+  const auto joined = [](const auto& rows) {
+    std::string result;
+    for (const auto& row : rows) result += row.text + "\n";
+    return result;
+  };
+  auto wide = joined(pane.Lines(44, 80));
+  BOOST_TEST(wide.find("3 Blocks") != std::string::npos);
+  BOOST_TEST(wide.find("4 Block transactions") != std::string::npos);
+  BOOST_TEST(wide.find("Weight") != std::string::npos);
+  pane.FocusTransactions();
+  pane.Navigate(bbp::ChainNavigation::kEnd);
+  pane.Navigate(bbp::ChainNavigation::kInspect);
+  wide = joined(pane.Lines(44, 80));
+  BOOST_TEST(wide.find("fee: 80 test units") != std::string::npos);
+  BOOST_TEST(wide.find("4 Transaction details") != std::string::npos);
+  for (const auto [rows, columns] : {std::pair{24, 80}, std::pair{12, 40}}) {
+    pane.Lines(rows, columns);
+    pane.Navigate(bbp::ChainNavigation::kEnd);
+    const auto screen = pane.Lines(rows, columns);
+    BOOST_TEST(joined(screen).find("END-OF-TRANSACTION") != std::string::npos);
+    BOOST_TEST(screen.size() == static_cast<std::size_t>(rows));
+    BOOST_TEST(std::all_of(screen.begin(), screen.end(), [&](const auto& row) {
+      return row.text.size() <= static_cast<std::size_t>(columns);
+    }));
+    pane.Navigate(bbp::ChainNavigation::kHome);
+  }
+  // Detail scrolling must not change the selected transaction.
+  wide = joined(pane.Lines(44, 80));
+  BOOST_TEST(wide.find("fee: 80 test units") != std::string::npos);
+  pane.Navigate(bbp::ChainNavigation::kBack);
+  BOOST_TEST(joined(pane.Lines(44, 80)).find("4 Block transactions") !=
+             std::string::npos);
+  pane.Navigate(bbp::ChainNavigation::kInspect);
+  BOOST_TEST(joined(pane.Lines(44, 80)).find("fee: 80 test units") !=
+             std::string::npos);
 }

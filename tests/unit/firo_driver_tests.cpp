@@ -2982,13 +2982,16 @@ BOOST_AUTO_TEST_CASE(firo_driver_pool_units_and_selected_detail) {
                             {"time", 123},
                             {"depends", boost::json::array{}}};
 
+  auto second = entry;
+  second["fee"] = 0.00004;
+  second["time"] = 223;
   const auto rpc = [](boost::json::value value) {
     return boost::json::serialize(boost::json::object{
         {"result", std::move(value)}, {"error", nullptr}, {"id", "bbp"}});
   };
   const std::vector<std::string> responses{
       rpc(boost::json::object{{"usage", 999}}),
-      rpc(boost::json::object{{id, entry}}),
+      rpc(boost::json::object{{id, entry}, {std::string(64, 'b'), second}}),
       rpc(boost::json::object{
           {"txid", id},
           {"size", 180},
@@ -3005,11 +3008,19 @@ BOOST_AUTO_TEST_CASE(firo_driver_pool_units_and_selected_detail) {
   config.rpc_password = "password";
   const bbp::FiroDriver driver(std::chrono::seconds(1));
   auto snapshot = driver.ReadPoolSnapshot(config);
-  BOOST_REQUIRE_EQUAL(snapshot.transactions.size(), 1U);
+  BOOST_REQUIRE_EQUAL(snapshot.transactions.size(), 2U);
   BOOST_TEST(!snapshot.summary.size.total.has_value());
-  BOOST_TEST(snapshot.summary.total_fees.value() == 2000U);
-  BOOST_TEST(snapshot.summary.average_fee_rate.value() == 20.0);
+  BOOST_TEST(snapshot.summary.total_fees.value() == 6000U);
+  BOOST_TEST(snapshot.summary.average_fee_rate.value() == 30.0);
   BOOST_TEST(!snapshot.summary.weight.total.has_value());
+  // Normalized distributions must preserve native fees and admission times;
+  // the TUI must not recover these facts from daemon response JSON.
+  BOOST_TEST(snapshot.summary.fees.minimum.value() == 2000U);
+  BOOST_TEST(snapshot.summary.fees.maximum.value() == 4000U);
+  BOOST_TEST(snapshot.summary.fees.average.value() == 3000.0);
+  BOOST_TEST(snapshot.summary.oldest_first_seen.value() == 123U);
+  BOOST_TEST(snapshot.summary.youngest_first_seen.value() == 223U);
+  BOOST_TEST(snapshot.summary.average_first_seen.value() == 173.0);
   const auto detail =
       driver.ReadPoolTransaction(config, snapshot.transactions.front());
   BOOST_TEST(detail.serialized_size.value() == 180U);

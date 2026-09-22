@@ -1,11 +1,20 @@
 # Transaction pool view
 
-Press `o` or cycle with `Tab` to open the pool. Arrows, Page Up/Down, Home
-and End move the selector through transaction IDs in ascending order. `x` or
-Enter cycles focus between the list, pool totals and selected transaction
-details; the same keys scroll each pane. Selection stays with its transaction
-through refreshes. A departure shows the known reason, or explicitly says
-unknown, and selects the closest remaining row by position.
+Press `o` to focus the pool side of the combined chain/pool explorer;
+`v` focuses the chain side. Wide terminals show the pool table and selected
+transaction details on the left, beside the chain's block and transaction
+tables. Narrow terminals show the focused side; short terminals show one
+focused pane. All panes have borders, focus markers and position indicators.
+
+`x` cycles pool table, pool details, blocks, then block transactions. Enter on
+the pool table opens its selected transaction; Enter in the lower pool pane
+toggles transaction details and pool totals/distributions. Backspace returns
+to the pool table. Arrows, Page Up/Down, Home and End navigate the focused pane.
+IDs are ordered ascending. Selection follows its transaction through refresh;
+departure shows a known reason or explicitly says unknown and selects the
+closest remaining row. Resize preserves selection. Columns adapt to width;
+full IDs, relationships, units and all normalized fields remain reachable in
+the details. The source and snapshot age remain visible above the pool panes.
 
 The displayed source stays selected while healthy. A source switch is announced;
 absence on another node is not proof of mining or eviction. Each request obtains
@@ -44,3 +53,9 @@ a separate same-node `getmempoolinfo.usage` sample where exposed, not serialized
 bytes. First-seen timestamps use daemon receive/admission time in Unix seconds.
 Input/output counts count decoded RPC entries. No private amounts, missing
 bytes, fees, replacement relation or eviction reason are estimated.
+
+Pool totals include minimum, mean and maximum serialized size, native weight,
+atomic fee, fee rate and age where every transaction supplies the necessary
+value. Age statistics derive from normalized admission timestamps, evaluated
+at capture time for retained data. Older captures without the new fee and age
+statistics display `N/A`; their fields remain optional in MCP discovery.

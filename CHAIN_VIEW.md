@@ -1,10 +1,20 @@
 # Chain view
 
-Press `v` or cycle with `Tab` to browse blocks. The list runs from genesis
-to tip. Arrows, Page Up/Down, Home and End move the selector. Entry selects
-the tip; moving away holds the selection as blocks arrive. End resumes tip
-following. `x` or Enter cycles focus between blocks, block details and
-transactions; the same navigation keys scroll the focused pane.
+Press `v` to focus the chain side of the combined chain/pool explorer;
+`o` focuses the pool side. Wide terminals show four bordered panes: pool
+transactions and their details on the left, blocks and their transactions on
+the right. Narrow terminals show the focused side, with stacked panes; short
+terminals show the focused pane. `x` cycles pool table, pool details, blocks,
+then block transactions. Borders mark focus and display page positions.
+
+Arrows, Page Up/Down, Home and End navigate the focused table or detail pane.
+The block selector starts at the tip; moving away pins it, and End follows the
+tip again. Enter on a block opens block details; Enter on a block transaction
+opens its dedicated detail mode. Backspace returns to the table with both
+selections intact. Every transaction and wrapped field remains reachable.
+Changing the block hash resets transaction selection; resize keeps it valid.
+Lower-priority columns disappear as width decreases; complete normalized values,
+full identifiers and driver byte/fee definitions remain in scrollable details.
 
 The source node is shown explicitly. BBP keeps that source while it answers
 and announces a switch when it becomes unavailable. All RPC calls and decoding

@@ -15,11 +15,14 @@ enum class ChainNavigation {
   kPageDown,
   kHome,
   kEnd,
-  kFocus
+  kFocus,
+  kInspect,
+  kBack
 };
 struct ChainViewLine {
   std::string text;
   bool selected = false;
+  int selected_column = 0, selected_width = 0;
 };
 
 class TuiChainPane {
@@ -28,9 +31,14 @@ class TuiChainPane {
   ~TuiChainPane();
   void Reset();
   void Cancel();
-  void Refresh(std::shared_ptr<ChainViewService> service, int rows);
+  void Refresh(std::shared_ptr<ChainViewService> service, int rows,
+               int columns = 80);
   void Navigate(ChainNavigation key);
-  std::vector<ChainViewLine> Lines(int rows, int columns) const;
+  std::vector<ChainViewLine> Lines(int rows, int columns,
+                                   bool active = true) const;
+  void FocusBlocks() { focus_ = 0; }
+  void FocusTransactions() { focus_ = 2; }
+  bool block_focused() const { return focus_ < 2; }
   std::uint64_t revision() const { return revision_.load(); }
   std::optional<std::uint64_t> selected_height() const { return selected_; }
   bool following_tip() const { return following_; }
@@ -43,9 +51,13 @@ class TuiChainPane {
   std::optional<std::uint64_t> tip_, selected_;
   bool following_ = true;
   unsigned focus_ = 0;
-  std::size_t detail_offset_ = 0, transaction_offset_ = 0;
+  std::size_t detail_offset_ = 0, transaction_index_ = 0;
+  std::size_t transaction_detail_offset_ = 0;
+  std::string transaction_block_;
+  mutable std::size_t transaction_rows_ = 1, detail_rows_ = 1,
+                      transaction_detail_rows_ = 1;
   std::uint32_t page_rows_ = 8;
-  mutable std::size_t detail_scroll_max_ = 0, transaction_scroll_max_ = 0;
+  mutable std::size_t detail_scroll_max_ = 0, transaction_detail_max_ = 0;
   std::optional<ChainViewRequest> last_request_;
   std::chrono::steady_clock::time_point next_refresh_{};
   std::mutex mutex_;

@@ -15,11 +15,14 @@ enum class PoolNavigation {
   kPageDown,
   kHome,
   kEnd,
-  kFocus
+  kFocus,
+  kInspect,
+  kBack
 };
 struct PoolViewLine {
   std::string text;
   bool selected = false;
+  int selected_column = 0, selected_width = 0;
 };
 
 class TuiPoolPane {
@@ -28,9 +31,14 @@ class TuiPoolPane {
   ~TuiPoolPane();
   void Reset();
   void Cancel();
-  void Refresh(std::shared_ptr<PoolViewService> service, int rows);
+  void Refresh(std::shared_ptr<PoolViewService> service, int rows,
+               int columns = 80);
   void Navigate(PoolNavigation key);
-  std::vector<PoolViewLine> Lines(int rows, int columns) const;
+  std::vector<PoolViewLine> Lines(int rows, int columns,
+                                  bool active = true) const;
+  void FocusList() { focus_ = 0; }
+  void FocusDetails() { focus_ = 2; }
+  bool list_focused() const { return focus_ == 0; }
   std::uint64_t revision() const { return revision_.load(); }
   const std::string& selected_id() const { return selected_id_; }
 
@@ -43,6 +51,7 @@ class TuiPoolPane {
   std::uint32_t index_ = 0, count_ = 0, page_rows_ = 8;
   unsigned focus_ = 0;
   std::size_t summary_offset_ = 0, detail_offset_ = 0;
+  mutable std::size_t summary_rows_ = 1, detail_rows_ = 1;
   mutable std::size_t summary_max_ = 0, detail_max_ = 0;
   std::optional<PoolViewRequest> last_request_;
   std::chrono::steady_clock::time_point next_refresh_{};

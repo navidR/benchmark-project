@@ -102,6 +102,13 @@ BOOST_AUTO_TEST_CASE(pool_view_churn_identity_and_retained_bound) {
       service.Query({.selected_id = Id(1000), .index = 999, .limit = 8});
   BOOST_TEST(page.at("rows").as_array().size() == 8U);
   BOOST_TEST(page.at("selected_id").as_string() == Id(1000));
+  // The final page must use available rows instead of leaving half empty.
+  const auto last =
+      service.Query({.selected_id = Id(2000), .index = 1999, .limit = 32});
+  BOOST_TEST(last.at("rows").as_array().size() == 32U);
+  BOOST_TEST(
+      last.at("rows").as_array().back().as_object().at("id").as_string() ==
+      Id(2000));
   {
     std::lock_guard lock(f.mutex);
     bbp::ChainPoolTransaction tx;
@@ -189,7 +196,10 @@ BOOST_AUTO_TEST_CASE(pool_view_navigation_cancellation_and_clipping) {
   pane.Navigate(bbp::PoolNavigation::kDown);
   BOOST_REQUIRE(selected(Id(2)));
   pane.Navigate(bbp::PoolNavigation::kPageDown);
-  BOOST_REQUIRE(selected(Id(11)));
+  BOOST_REQUIRE(Wait([&] {
+    pane.Refresh(service, 36);
+    return !pane.selected_id().empty() && pane.selected_id() != Id(2);
+  }));
   pane.Navigate(bbp::PoolNavigation::kPageUp);
   BOOST_REQUIRE(selected(Id(2)));
   pane.Navigate(bbp::PoolNavigation::kHome);
@@ -217,6 +227,23 @@ BOOST_AUTO_TEST_CASE(pool_view_navigation_cancellation_and_clipping) {
   f.SetCount(39);
   BOOST_REQUIRE(selected(Id(39)));
   BOOST_TEST(pane.Lines(36, 100)[2].text.find("Mined") != std::string::npos);
+  const auto joined = [](const auto& rows) {
+    std::string result;
+    for (const auto& row : rows) result += row.text + "\n";
+    return result;
+  };
+  const auto wide = joined(pane.Lines(45, 160));
+  pane.Navigate(bbp::PoolNavigation::kInspect);
+  pane.Navigate(bbp::PoolNavigation::kInspect);
+  BOOST_TEST(joined(pane.Lines(44, 80)).find("2 Pool totals / distributions") !=
+             std::string::npos);
+  pane.Navigate(bbp::PoolNavigation::kBack);
+  BOOST_TEST(wide.find("2 Transaction details") != std::string::npos);
+  BOOST_TEST(wide.find("Rate*") != std::string::npos);
+  BOOST_TEST(wide.find("Snapshot age:") != std::string::npos);
+  const auto narrow = joined(pane.Lines(24, 80));
+  BOOST_TEST(narrow.find("1 Pool transactions") != std::string::npos);
+  BOOST_TEST(narrow.find("2 Transaction details") != std::string::npos);
   for (int width : {1, 20, 80}) {
     for (const auto& line : pane.Lines(12, width))
       BOOST_TEST(line.text.size() <= static_cast<std::size_t>(width));

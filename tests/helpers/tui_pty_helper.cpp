@@ -4010,25 +4010,6 @@ void CheckHomeEndKeys(const std::filesystem::path& command,
                             {"tip", blocks.back().as_object().at("summary")},
                             {"records", blocks}});
   }
-  process.Write("v");
-  const auto chain_frame =
-      process.ReadUntil("Blocks: genesis -> tip", 5s, "chain view");
-  if (chain_frame.find("captured-node") == std::string::npos)
-    static_cast<void>(
-        process.ReadUntil("captured-node", 5s, "captured source"));
-  for (const auto key :
-       {"\033[H", "\033[F", "\033[1~", "\033[4~", "\033OH", "\033OF", "\033[7~",
-        "\033[8~", "\033[A", "\033[B", "\033[5~", "\033[6~"}) {
-    process.Write(key);
-    RequireNotContains(process.ReadFor(100ms), "Confirm exit",
-                       "chain navigation must not open exit");
-  }
-  process.Write("x\033[6~x\033[5~");
-  RequireNotContains(process.ReadFor(100ms), "Confirm exit",
-                     "detail and transaction navigation");
-  process.Resize(12, 30);
-  RequireNotContains(process.ReadFor(100ms), "Confirm exit",
-                     "narrow chain view");
   // Exercise pool view discovery and the real ncurses input route using a
   // retained capture. Service/navigation behavior is covered at its boundary.
   {
@@ -4042,13 +4023,31 @@ void CheckHomeEndKeys(const std::filesystem::path& command,
         {"transactions", boost::json::array{tx}},
         {"detail", tx}});
   }
+  process.Resize(45, 160);
+  process.Write("v");
+  auto chain_frame = process.ReadUntil("3 Blocks", 5s, "chain view");
+  RequireContains(chain_frame, "1 Pool transactions", "combined explorer");
+  if (chain_frame.find("captured-node") == std::string::npos)
+    chain_frame += process.ReadUntil("captured-node", 5s, "captured source");
+  if (chain_frame.find("captured-pool") == std::string::npos)
+    chain_frame +=
+        process.ReadUntil("captured-pool", 5s, "captured pool source");
+  for (const auto key :
+       {"\033[H", "\033[F", "\033[1~", "\033[4~", "\033OH", "\033OF", "\033[7~",
+        "\033[8~", "\033[A", "\033[B", "\033[5~", "\033[6~"}) {
+    process.Write(key);
+    RequireNotContains(process.ReadFor(100ms), "Confirm exit",
+                       "chain navigation must not open exit");
+  }
+  process.Write("x\n\033[6~\177");
+  RequireNotContains(process.ReadFor(100ms), "Confirm exit",
+                     "detail and transaction navigation");
+  process.Resize(12, 30);
+  RequireNotContains(process.ReadFor(100ms), "Confirm exit",
+                     "narrow chain view");
   process.Resize(30, 100);
   process.Write("o");
-  const auto pool_frame =
-      process.ReadUntil("Pool transactions:", 5s, "pool view");
-  if (pool_frame.find("captured-pool") == std::string::npos)
-    static_cast<void>(
-        process.ReadUntil("captured-pool", 5s, "captured pool source"));
+  static_cast<void>(process.ReadUntil("1 Pool transactions", 5s, "pool view"));
   for (const auto key :
        {"\033[H", "\033[F", "\033[A", "\033[B", "\033[5~", "\033[6~", "x"}) {
     process.Write(key);

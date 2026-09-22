@@ -39,6 +39,9 @@ boost::json::object PoolSummaryJson(const ChainPoolSummary& s) {
   return {{"transaction_count", s.transaction_count},
           {"serialized_size", Statistics(s.size)},
           {"weight", Statistics(s.weight)},
+          {"fees", Statistics(s.fees)},
+          {"youngest_first_seen", Optional(s.youngest_first_seen)},
+          {"average_first_seen", Optional(s.average_first_seen)},
           {"total_fees", Optional(s.total_fees)},
           {"oldest_first_seen", Optional(s.oldest_first_seen)},
           {"memory_usage", Optional(s.memory_usage)},
@@ -96,12 +99,18 @@ boost::json::object PoolViewPageSchema() {
   for (auto name :
        {"fee_unit", "fee_rate_unit", "ancestor_size_unit", "byte_definition"})
     summary[name] = type("string");
+  auto summary_schema = object(std::move(summary));
+  // Additive fields remain optional for older retained snapshots.
+  auto& summary_fields = summary_schema.at("properties").as_object();
+  summary_fields["fees"] = statistics;
+  summary_fields["youngest_first_seen"] = type("integer", true);
+  summary_fields["average_first_seen"] = type("number", true);
   return object(
       {{"mode",
         boost::json::object{{"enum", boost::json::array{"live", "retained"}}}},
        {"source_node", type("string")},
        {"sampled_at_ms", type("integer", true)},
-       {"summary", nullable(object(std::move(summary)))},
+       {"summary", nullable(std::move(summary_schema))},
        {"notice", type("string")},
        {"error", type("string")},
        {"selected_id", type("string")},

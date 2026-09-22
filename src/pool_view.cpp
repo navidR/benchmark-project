@@ -166,7 +166,9 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
     }
   }
   page["selected_index"] = index;
-  const auto first = index >= request.limit / 2 ? index - request.limit / 2 : 0;
+  const auto first = std::min<std::size_t>(
+      index >= request.limit / 2 ? index - request.limit / 2 : 0,
+      entries.size() > request.limit ? entries.size() - request.limit : 0);
   page["first_index"] = first;
   for (std::size_t i = first; i < entries.size() && i - first < request.limit;
        ++i)

@@ -42,8 +42,11 @@ void CalculatePoolSummary(ChainPoolSnapshot& snapshot) {
   summary.transaction_count = entries.size();
   summary.size = Statistics(entries, &ChainPoolTransaction::serialized_size);
   summary.weight = Statistics(entries, &ChainPoolTransaction::weight);
-  summary.total_fees = Statistics(entries, &ChainPoolTransaction::fee).total;
+  summary.fees = Statistics(entries, &ChainPoolTransaction::fee);
+  summary.total_fees = summary.fees.total;
   summary.oldest_first_seen.reset();
+  summary.youngest_first_seen.reset();
+  summary.average_first_seen.reset();
   summary.minimum_fee_rate.reset();
   summary.maximum_fee_rate.reset();
   summary.average_fee_rate.reset();
@@ -56,6 +59,14 @@ void CalculatePoolSummary(ChainPoolSnapshot& snapshot) {
                              return a.first_seen < b.first_seen;
                            }))
             .first_seen;
+    std::uint64_t latest = 0;
+    long double total = 0;
+    for (const auto& entry : entries) {
+      latest = std::max(latest, *entry.first_seen);
+      total += *entry.first_seen;
+    }
+    summary.youngest_first_seen = latest;
+    summary.average_first_seen = static_cast<double>(total / entries.size());
   }
   if (!entries.empty() &&
       std::all_of(entries.begin(), entries.end(),

@@ -2733,22 +2733,38 @@ void DrawSummary(
     const TuiExitConfirmation& exit_confirmation,
     SimulatorLogPane* simulator_log_pane, const TuiChainPane* chain_pane,
     const TuiPoolPane* pool_pane) {
-  if (view == TuiView::kPool) {
-    int pool_rows = 0, pool_columns = 0;
-    getmaxyx(stdscr, pool_rows, pool_columns);
+  if (view == TuiView::kPool || view == TuiView::kChain) {
+    int rows = 0, screen_cols = 0;
+    getmaxyx(stdscr, rows, screen_cols);
     erase();
-    const auto pool_lines = pool_pane->Lines(pool_rows, pool_columns);
-    for (std::size_t row = 0; row < pool_lines.size(); ++row)
-      AddText(static_cast<int>(row), 0, pool_columns, pool_lines[row].text,
-              pool_lines[row].selected ? A_REVERSE : A_NORMAL);
-  } else if (view == TuiView::kChain) {
-    int chain_rows = 0, chain_columns = 0;
-    getmaxyx(stdscr, chain_rows, chain_columns);
-    erase();
-    const auto chain_lines = chain_pane->Lines(chain_rows, chain_columns);
-    for (std::size_t row = 0; row < chain_lines.size(); ++row)
-      AddText(static_cast<int>(row), 0, chain_columns, chain_lines[row].text,
-              chain_lines[row].selected ? A_REVERSE : A_NORMAL);
+    AddText(0, 0, screen_cols, "Blockchain Benchmark Project",
+            A_BOLD | COLOR_PAIR(kColorTitle));
+    const bool wide = screen_cols >= 120;
+    const int left = wide ? screen_cols / 2 : screen_cols;
+    const auto draw = [&](const auto& rendered, int x, int width) {
+      for (std::size_t row = 0; row < rendered.size(); ++row) {
+        const auto& line = rendered[row];
+        const int style = row == 0 || line.text.starts_with('+')
+                              ? A_BOLD | COLOR_PAIR(kColorTitle)
+                              : A_NORMAL;
+        AddText(static_cast<int>(row) + 1, x, width, line.text, style);
+        if (line.selected)
+          AddText(
+              static_cast<int>(row) + 1, x + line.selected_column,
+              line.selected_width,
+              line.text.substr(static_cast<std::size_t>(line.selected_column),
+                               static_cast<std::size_t>(line.selected_width)),
+              A_REVERSE);
+      }
+    };
+    if (wide || view == TuiView::kPool)
+      draw(pool_pane->Lines(rows - 1, left, view == TuiView::kPool), 0, left);
+    if (wide || view == TuiView::kChain) {
+      const int x = wide ? left : 0;
+      draw(chain_pane->Lines(rows - 1, screen_cols - x,
+                             view == TuiView::kChain),
+           x, screen_cols - x);
+    }
   } else
     DrawFrameBody(run_root, report, error, log_lines, view, selected_node,
                   selected_wallet, selected_topology_group, node_log_pane,
@@ -3376,10 +3392,30 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
 
   if (ch == 'v' || ch == 'V') {
     state->view = TuiView::kChain;
+    state->chain_pane.FocusBlocks();
     state->node_log_pane.Close();
     state->peer_list_pane.Close();
     state->network_rule_pane.Close();
     state->node_file_pane.Close();
+    return true;
+  }
+  if ((state->view == TuiView::kChain || state->view == TuiView::kPool) &&
+      (ch == 'x' || ch == 'X')) {
+    if (state->view == TuiView::kPool) {
+      if (state->pool_pane.list_focused())
+        state->pool_pane.FocusDetails();
+      else {
+        state->view = TuiView::kChain;
+        state->chain_pane.FocusBlocks();
+      }
+    } else {
+      if (state->chain_pane.block_focused())
+        state->chain_pane.FocusTransactions();
+      else {
+        state->view = TuiView::kPool;
+        state->pool_pane.FocusList();
+      }
+    }
     return true;
   }
   if (state->view == TuiView::kChain) {
@@ -3396,8 +3432,10 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
       key = ChainNavigation::kHome;
     else if (ch == KEY_END)
       key = ChainNavigation::kEnd;
-    else if (ch == 'x' || ch == 'X' || ch == '\n')
-      key = ChainNavigation::kFocus;
+    else if (ch == '\n' || ch == KEY_ENTER)
+      key = ChainNavigation::kInspect;
+    else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8)
+      key = ChainNavigation::kBack;
     if (key) {
       state->chain_pane.Navigate(*key);
       return true;
@@ -3406,6 +3444,7 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
 
   if (ch == 'o' || ch == 'O') {
     state->view = TuiView::kPool;
+    state->pool_pane.FocusList();
     state->node_log_pane.Close();
     state->peer_list_pane.Close();
     state->network_rule_pane.Close();
@@ -3426,8 +3465,10 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
       key = PoolNavigation::kHome;
     else if (ch == KEY_END)
       key = PoolNavigation::kEnd;
-    else if (ch == 'x' || ch == 'X' || ch == '\n')
-      key = PoolNavigation::kFocus;
+    else if (ch == '\n' || ch == KEY_ENTER)
+      key = PoolNavigation::kInspect;
+    else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8)
+      key = PoolNavigation::kBack;
     if (key) {
       state->pool_pane.Navigate(*key);
       return true;
@@ -3988,20 +4029,18 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       }
     }
 #endif
-    if (state.view == TuiView::kChain) {
-      int screen_rows = 0, screen_cols = 0;
-      getmaxyx(stdscr, screen_rows, screen_cols);
-      static_cast<void>(screen_cols);
-      state.chain_pane.Refresh(snapshot->chain_view, screen_rows);
-    } else
+    if (state.view == TuiView::kChain || state.view == TuiView::kPool) {
+      int rows = 0, screen_cols = 0;
+      getmaxyx(stdscr, rows, screen_cols);
+      const int left = screen_cols >= 120 ? screen_cols / 2 : screen_cols;
+      state.pool_pane.Refresh(snapshot->pool_view, rows - 1, left);
+      state.chain_pane.Refresh(
+          snapshot->chain_view, rows - 1,
+          screen_cols >= 120 ? screen_cols - left : screen_cols);
+    } else {
       state.chain_pane.Cancel();
-    if (state.view == TuiView::kPool) {
-      int screen_rows = 0, screen_cols = 0;
-      getmaxyx(stdscr, screen_rows, screen_cols);
-      static_cast<void>(screen_cols);
-      state.pool_pane.Refresh(snapshot->pool_view, screen_rows);
-    } else
       state.pool_pane.Cancel();
+    }
     const auto pool_revision = state.pool_pane.revision();
     const auto chain_revision = state.chain_pane.revision();
     if (has_active_run) {
@@ -4038,11 +4077,9 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       if (update_snapshot(snapshot_provider())) {
         break;
       }
-      if (state.view == TuiView::kChain &&
-          state.chain_pane.revision() != chain_revision)
-        break;
-      if (state.view == TuiView::kPool &&
-          state.pool_pane.revision() != pool_revision)
+      if ((state.view == TuiView::kChain || state.view == TuiView::kPool) &&
+          (state.chain_pane.revision() != chain_revision ||
+           state.pool_pane.revision() != pool_revision))
         break;
       const int ch = getch();
       if (ch == KEY_RESIZE) {
