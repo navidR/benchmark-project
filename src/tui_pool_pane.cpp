@@ -47,6 +47,10 @@ void TuiPoolPane::Reset() {
   service_.reset();
   page_.reset();
   selected_id_.clear();
+  switching_selection_.clear();
+  pinned_source_.reset();
+  sources_.clear();
+  retained_ = false;
   notice_.clear();
   index_ = count_ = focus_ = 0;
   summary_offset_ = detail_offset_ = 0;
@@ -83,7 +87,15 @@ void TuiPoolPane::Poll() {
   }
   if (!completed) return;
   page_ = std::move(completed);
+  retained_ = Text(*page_, "mode") == "retained";
+  if (retained_) pinned_source_.reset();
+  sources_.clear();
+  if (const auto* sources = page_->if_contains("available_sources");
+      sources && sources->is_array())
+    for (const auto& source : sources->as_array())
+      sources_.emplace_back(source.as_string());
   if (const auto* summary = Object(*page_, "summary")) {
+    switching_selection_.clear();
     count_ =
         static_cast<std::uint32_t>(JsonUint(*summary, "transaction_count"));
     index_ = static_cast<std::uint32_t>(JsonUint(*page_, "selected_index"));
@@ -106,7 +118,9 @@ void TuiPoolPane::Refresh(std::shared_ptr<PoolViewService> service, int rows,
   page_rows_ =
       static_cast<std::uint32_t>(std::clamp(layout[0].Rows() - 1, 1, 32));
   if (!service_) return;
-  const PoolViewRequest request{selected_id_, index_, page_rows_};
+  const PoolViewRequest request{
+      switching_selection_.empty() ? selected_id_ : switching_selection_,
+      index_, page_rows_, pinned_source_};
   const auto now = std::chrono::steady_clock::now();
   std::lock_guard lock(mutex_);
   const bool changed = !last_request_ || *last_request_ != request;
@@ -122,6 +136,31 @@ void TuiPoolPane::Refresh(std::shared_ptr<PoolViewService> service, int rows,
   ready_.notify_one();
 }
 void TuiPoolPane::Navigate(PoolNavigation key) {
+  if (key == PoolNavigation::kNextSource ||
+      key == PoolNavigation::kAutomaticSource) {
+    if (retained_) return;
+    std::optional<std::string> next;
+    if (key == PoolNavigation::kNextSource && !sources_.empty()) {
+      const auto current =
+          pinned_source_
+              ? std::find(sources_.begin(), sources_.end(), *pinned_source_)
+              : sources_.end();
+      if (current == sources_.end())
+        next = sources_.front();
+      else if (std::next(current) != sources_.end())
+        next = *std::next(current);
+    }
+    if (next == pinned_source_) return;
+    Cancel();
+    pinned_source_ = std::move(next);
+    if (!selected_id_.empty()) switching_selection_ = selected_id_;
+    selected_id_.clear();
+    page_.reset();
+    index_ = count_ = 0;
+    summary_offset_ = detail_offset_ = 0;
+    notice_ = "Loading selected source...";
+    return;
+  }
   if (key == PoolNavigation::kInspect) {
     focus_ = focus_ == 2 ? 1 : 2;
     return;
@@ -184,9 +223,12 @@ std::vector<PoolViewLine> TuiPoolPane::Lines(int rows, int columns,
              std::string("POOL | ") + Text(page, "mode") + " | " +
                  (Object(page, "summary") ? std::to_string(count_) : "N/A") +
                  " transactions");
-  const auto source = Text(page, "source_node");
+  const auto source = pinned_source_.value_or(Text(page, "source_node"));
   canvas.Put(1, 0, columns,
              "Source: " + (source.empty() ? std::string("N/A") : source) +
+                 (retained         ? " [captured]"
+                  : pinned_source_ ? " [pinned]"
+                                   : " [auto]") +
                  " | Snapshot age: " + fresh +
                  (retained ? " | captured " : " | sampled ") +
                  Text(page, "sampled_at_ms"));
@@ -318,7 +360,10 @@ std::vector<PoolViewLine> TuiPoolPane::Lines(int rows, int columns,
   detail_max_ =
       canvas.Section(layout[2], "2 Transaction details", active && focus_ == 2,
                      detail_lines, detail_offset_);
-  canvas.Put(rows - 1, 0, columns, "x pane | Enter inspect | Backspace back");
+  canvas.Put(
+      rows - 1, 0, columns,
+      retained ? "x pane | Enter inspect | Backspace back | captured source"
+               : "s source | a auto | x pane | Enter inspect | Backspace back");
   std::vector<PoolViewLine> result;
   for (auto& line : canvas.lines)
     result.push_back({std::move(line.text), line.selected, line.selected_column,

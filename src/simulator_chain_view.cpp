@@ -3,6 +3,7 @@
 #include "bbp/chain_view.h"
 #include "bbp/pool_view.h"
 #include "bbp/runtime_node_inventory.h"
+#include "simulator_node_process_state.h"
 
 namespace bbp {
 std::shared_ptr<ChainViewService> MakeLiveChainViewService(
@@ -41,10 +42,15 @@ std::shared_ptr<PoolViewService> MakeLivePoolViewService(
     RuntimeNodeInventory& inventory) {
   return std::make_shared<PoolViewService>(
       run_root, [driver = std::move(driver), &inventory] {
+        const auto runtime = inventory.Snapshot();
         const auto nodes =
-            std::make_shared<NodeConfigSnapshot>(inventory.ConfigSnapshot());
+            std::make_shared<NodeConfigSnapshot>(runtime.ConfigSnapshot());
         std::vector<PoolReader> readers;
-        for (const auto& config : nodes->nodes()) {
+        for (std::size_t index = 0; index < runtime.size(); ++index) {
+          if (!runtime[index].AllowsChainMetrics() ||
+              !simulator_app_internal::NodeProcessRunning(runtime[index]))
+            continue;
+          const auto& config = nodes->nodes()[index];
           readers.push_back(
               {.node_id = config.id,
                .snapshot =

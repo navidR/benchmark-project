@@ -23,6 +23,7 @@ struct PoolFixture {
                                ("bbp-pool-view-" + std::to_string(getpid()));
   std::mutex mutex;
   bbp::ChainPoolSnapshot pool;
+  std::optional<bbp::ChainPoolSnapshot> second_pool;
   std::atomic<bool> first_healthy{true}, available{true};
   std::atomic<bool> stall{false}, entered{false}, cancelled{false};
   std::atomic<unsigned> reads{0};
@@ -56,7 +57,7 @@ struct PoolFixture {
                    if (!available || (node == "one" && !first_healthy))
                      throw std::runtime_error("offline");
                    std::lock_guard lock(mutex);
-                   return pool;
+                   return node == "two" && second_pool ? *second_pool : pool;
                  },
              .detail =
                  [this](const bbp::ChainPoolTransaction& tx,
@@ -178,6 +179,105 @@ BOOST_AUTO_TEST_CASE(pool_view_sources_empty_and_limit) {
   f.SetCount(0);
   f.pool.transactions.resize(bbp::ChainPoolSnapshot::kMaximumTransactions + 1);
   BOOST_TEST(!service.Query({}).at("error").as_string().empty());
+}
+
+BOOST_AUTO_TEST_CASE(pool_view_pinned_source_failure_and_retained_selection) {
+  PoolFixture f;
+  bbp::PoolViewService service(f.root, f.Readers());
+  auto page = service.Query({.selected_id = Id(2), .source_node = "two"});
+  BOOST_TEST(page.at("source_node").as_string() == "two");
+  BOOST_TEST(page.at("selected_id").as_string() == Id(2));
+  BOOST_TEST(f.reads == 1U);
+  BOOST_TEST(page.at("available_sources").as_array() ==
+             (boost::json::array{"one", "two"}));
+  f.first_healthy = false;
+  page = service.Query({.selected_id = {}, .source_node = "one"});
+  BOOST_TEST(page.at("source_node").as_string() == "one");
+  BOOST_TEST(page.at("source_mode").as_string() == "pinned");
+  BOOST_TEST(page.at("error").as_string().find("offline") !=
+             boost::json::string::npos);
+  BOOST_TEST(page.at("rows").as_array().empty());
+  BOOST_TEST(f.reads ==
+             2U);  // Never consult the healthy alternate while pinned.
+  page = service.Query({.selected_id = {}, .source_node = "removed"});
+  BOOST_TEST(!page.at("error").as_string().empty());
+  BOOST_TEST(f.reads == 2U);
+  BOOST_TEST(service.Query({}).at("source_node").as_string() == "two");
+  BOOST_CHECK_THROW(service.Query({.selected_id = {}, .source_node = "../one"}),
+                    std::invalid_argument);
+  bbp::PoolViewService retained(f.root);
+  BOOST_TEST(!retained.Query({.selected_id = {}, .source_node = "one"})
+                  .at("error")
+                  .as_string()
+                  .empty());
+  page = retained.Query({});
+  BOOST_TEST(page.at("source_mode").as_string() == "retained");
+  BOOST_TEST(page.at("source_node").as_string() == "two");
+  BOOST_TEST(page.at("available_sources").as_array().empty());
+}
+
+// Source changes must invalidate pending and already completed UI results.
+BOOST_AUTO_TEST_CASE(pool_view_source_navigation_discards_obsolete_results) {
+  PoolFixture f;
+  f.SetCount(2);
+  f.second_pool = f.pool;
+  f.second_pool->transactions.erase(f.second_pool->transactions.begin());
+  bbp::CalculatePoolSummary(*f.second_pool);
+  auto service = std::make_shared<bbp::PoolViewService>(f.root, f.Readers());
+  bbp::TuiPoolPane pane;
+  const auto selected = [&](const std::string& id) {
+    return Wait([&] {
+      pane.Refresh(service, 36);
+      return pane.selected_id() == id;
+    });
+  };
+  BOOST_REQUIRE(selected(Id(1)));
+  pane.Navigate(bbp::PoolNavigation::kNextSource);  // Pin one.
+  BOOST_REQUIRE(selected(Id(1)));
+  f.stall = true;
+  BOOST_REQUIRE(Wait([&] {
+    pane.Refresh(service, 36);
+    return f.entered.load();
+  }));
+  pane.Navigate(bbp::PoolNavigation::kNextSource);  // Pin two during the read.
+  BOOST_TEST(pane.selected_id().empty());
+  BOOST_TEST(pane.Lines(36, 80)[1].text.find("two [pinned]") !=
+             std::string::npos);
+  BOOST_TEST(pane.Lines(36, 80)[1].text.find("Snapshot age: N/A") !=
+             std::string::npos);
+  BOOST_REQUIRE(Wait([&] { return f.cancelled.load(); }));
+  f.stall = false;
+  BOOST_REQUIRE(selected(Id(2)));  // Id(1) exists only on the previous source.
+  BOOST_TEST(pane.Lines(36, 80)[0].text.find("1 transactions") !=
+             std::string::npos);
+  pane.Cancel();
+  const auto revision = pane.revision();
+  pane.Refresh(service, 36);
+  BOOST_REQUIRE(Wait([&] { return pane.revision() > revision; }));
+  // Do not Poll the completed two result before switching to automatic.
+  pane.Navigate(bbp::PoolNavigation::kAutomaticSource);
+  BOOST_TEST(pane.selected_id().empty());
+  pane.Refresh(service, 36);
+  BOOST_TEST(pane.selected_id().empty());
+  BOOST_REQUIRE(
+      selected(Id(2)));  // Shared ID survives; automatic stays sticky.
+  BOOST_TEST(pane.Lines(36, 80)[1].text.find("two [auto]") !=
+             std::string::npos);
+  pane.Navigate(bbp::PoolNavigation::kNextSource);
+  BOOST_REQUIRE(selected(Id(2)));
+  // Closing the live service must also release a pin in the retained viewer.
+  service->Close();
+  BOOST_REQUIRE(Wait([&] {
+    pane.Refresh(service, 36);
+    return pane.Lines(36, 80)[1].text.find("one [captured]") !=
+           std::string::npos;
+  }));
+  const auto before = pane.selected_id();
+  pane.Navigate(bbp::PoolNavigation::kNextSource);
+  pane.Navigate(bbp::PoolNavigation::kAutomaticSource);
+  BOOST_TEST(pane.selected_id() == before);
+  BOOST_TEST(pane.Lines(36, 80)[1].text.find("one [captured]") !=
+             std::string::npos);
 }
 
 // The real UI worker must cancel obsolete reads, retain selection through

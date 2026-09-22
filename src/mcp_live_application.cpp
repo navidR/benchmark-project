@@ -2140,6 +2140,11 @@ McpOperationPlan McpLiveApplication::BuildOperation(
 
   if (kind == McpOperationKind::kQueryPool) {
     PoolViewRequest request;
+    if (const auto* source = arguments.if_contains("source_node");
+        source && !source->is_null()) {
+      request.source_node = JsonString(arguments, "source_node");
+      ValidateNodeIdentifier(*request.source_node);
+    }
     if (arguments.contains("selected_id"))
       request.selected_id = JsonString(arguments, "selected_id");
     const auto index = OptionalUnsigned(arguments, "index", 0);

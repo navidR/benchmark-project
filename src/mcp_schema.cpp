@@ -1981,6 +1981,10 @@ boost::json::object BuildMcpOperationInputSchema(
       break;
     case McpOperationKind::kQueryPool:
       add_run();
+      properties["source_node"] = Nullable(NodeAddIdentifierSchema());
+      properties["source_node"].as_object()["description"] =
+          "Pin an eligible live source; omitted or null selects automatic "
+          "failover. Retained runs cannot switch sources.";
       properties["selected_id"] = boost::json::object{
           {"type", "string"}, {"pattern", "^[0-9a-fA-F]{64}$"}};
       properties["index"] = IntegerSchema(0U, 65535U);

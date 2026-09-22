@@ -34,6 +34,14 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
                                            std::stop_token caller) {
   if (request.limit == 0 || request.limit > 32)
     throw std::invalid_argument("pool page limit must be 1..32");
+  if (request.source_node &&
+      (request.source_node->empty() || request.source_node->size() > 32 ||
+       !std::all_of(request.source_node->begin(), request.source_node->end(),
+                    [](unsigned char c) {
+                      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                             (c >= '0' && c <= '9') || c == '-' || c == '_';
+                    })))
+    throw std::invalid_argument("pool source must be a safe node identifier");
   if (request.index >= ChainPoolSnapshot::kMaximumTransactions ||
       (!request.selected_id.empty() &&
        (request.selected_id.size() != 64 ||
@@ -51,6 +59,10 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
   });
   const auto stop = cancellation.get_token();
   boost::json::object page{{"mode", live ? "live" : "retained"},
+                           {"source_mode", !live                 ? "retained"
+                                           : request.source_node ? "pinned"
+                                                                 : "automatic"},
+                           {"available_sources", boost::json::array{}},
                            {"source_node", ""},
                            {"sampled_at_ms", nullptr},
                            {"summary", nullptr},
@@ -80,14 +92,27 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
   ChainPoolSnapshot snapshot;
   const std::string previous_source =
       captured_.empty() ? "" : JsonString(captured_, "source_node");
+  if (!live && request.source_node) {
+    page["source_node"] = previous_source;
+    page["error"] = "Retained pool source switching is unavailable";
+    return page;
+  }
   if (live) {
     auto sources = readers_();
+    auto& available = page.at("available_sources").as_array();
+    for (const auto& source : sources) available.emplace_back(source.node_id);
+    std::sort(available.begin(), available.end(),
+              [](const auto& a, const auto& b) {
+                return a.as_string() < b.as_string();
+              });
     std::stable_sort(
         sources.begin(), sources.end(), [&](const auto& a, const auto& b) {
           return a.node_id == previous_source && b.node_id != previous_source;
         });
     for (auto& candidate : sources) {
       Check(stop);
+      if (request.source_node && candidate.node_id != *request.source_node)
+        continue;
       try {
         snapshot = candidate.snapshot(stop);
         if (snapshot.transactions.size() >
@@ -103,9 +128,13 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
       }
     }
     if (!reader) {
-      page["source_node"] = previous_source;
+      page["source_node"] = request.source_node.value_or(previous_source);
       if (page.at("error").as_string().empty())
-        page["error"] = "No healthy pool source";
+        page["error"] =
+            request.source_node
+                ? "Pinned pool source is not an eligible running node: " +
+                      *request.source_node
+                : "No healthy pool source";
       return page;
     }
     page["error"] = "";

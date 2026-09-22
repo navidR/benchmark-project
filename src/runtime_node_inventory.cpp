@@ -68,6 +68,11 @@ RuntimeNodeSnapshot::Iterator& RuntimeNodeSnapshot::Iterator::operator-=(
 
 bool RuntimeNodeSnapshot::empty() const { return size() == 0U; }
 
+NodeConfigSnapshot RuntimeNodeSnapshot::ConfigSnapshot() const {
+  return generation_ ? NodeConfigSnapshot(generation_->configs, generation_)
+                     : NodeConfigSnapshot{};
+}
+
 std::size_t RuntimeNodeSnapshot::size() const {
   return generation_ ? generation_->nodes.size() : 0U;
 }

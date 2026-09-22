@@ -3453,7 +3453,11 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
   }
   if (state->view == TuiView::kPool) {
     std::optional<PoolNavigation> key;
-    if (ch == KEY_UP)
+    if (ch == 's')
+      key = PoolNavigation::kNextSource;
+    else if (ch == 'a')
+      key = PoolNavigation::kAutomaticSource;
+    else if (ch == KEY_UP)
       key = PoolNavigation::kUp;
     else if (ch == KEY_DOWN)
       key = PoolNavigation::kDown;

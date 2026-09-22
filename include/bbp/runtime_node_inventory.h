@@ -84,6 +84,7 @@ class RuntimeNodeSnapshot {
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] std::uint64_t generation() const;
   [[nodiscard]] std::uint32_t capacity() const;
+  [[nodiscard]] NodeConfigSnapshot ConfigSnapshot() const;
   [[nodiscard]] const std::optional<SimulationNetworkAddressPlan>&
   network_address_plan() const;
   [[nodiscard]] std::uint32_t slot(std::size_t index) const;

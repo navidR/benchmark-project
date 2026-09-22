@@ -109,6 +109,11 @@ boost::json::object PoolViewPageSchema() {
       {{"mode",
         boost::json::object{{"enum", boost::json::array{"live", "retained"}}}},
        {"source_node", type("string")},
+       {"source_mode",
+        boost::json::object{
+            {"enum", boost::json::array{"automatic", "pinned", "retained"}}}},
+       {"available_sources",
+        boost::json::object{{"type", "array"}, {"items", type("string")}}},
        {"sampled_at_ms", type("integer", true)},
        {"summary", nullable(std::move(summary_schema))},
        {"notice", type("string")},

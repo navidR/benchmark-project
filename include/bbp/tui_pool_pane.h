@@ -17,7 +17,9 @@ enum class PoolNavigation {
   kEnd,
   kFocus,
   kInspect,
-  kBack
+  kBack,
+  kNextSource,
+  kAutomaticSource
 };
 struct PoolViewLine {
   std::string text;
@@ -48,6 +50,10 @@ class TuiPoolPane {
   std::shared_ptr<PoolViewService> service_;
   std::shared_ptr<const boost::json::object> page_;
   std::string selected_id_, notice_;
+  std::string switching_selection_;
+  std::optional<std::string> pinned_source_;
+  std::vector<std::string> sources_;
+  bool retained_ = false;
   std::uint32_t index_ = 0, count_ = 0, page_rows_ = 8;
   unsigned focus_ = 0;
   std::size_t summary_offset_ = 0, detail_offset_ = 0;

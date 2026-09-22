@@ -505,6 +505,7 @@ BOOST_AUTO_TEST_CASE(
   const auto pool_terminal = WaitForTerminal(
       &dispatcher, Invoke(&dispatcher, "pool.query",
                           {{"run_id", "live-application"},
+                           {"source_node", "_firo-1"},
                            {"selected_id", std::string(64, 'b')},
                            {"limit", 1U}}));
   BOOST_REQUIRE(pool_terminal.at("state").as_string() == "succeeded");
@@ -512,6 +513,10 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(pool_result.at("result_family").as_string() == "pool_page");
   BOOST_TEST(pool_result.at("page").as_object().at("detail") ==
              tui_pool.at("detail"));
+  BOOST_TEST(pool_result.at("page").as_object().at("source_mode").as_string() ==
+             "pinned");
+  BOOST_TEST(pool_result.at("page").as_object().at("available_sources") ==
+             tui_pool.at("available_sources"));
   const auto pool_resource = application.ResourceReader()(
       McpInformationFamily::kPool, "live-session", {});
   BOOST_TEST(pool_resource.as_object()

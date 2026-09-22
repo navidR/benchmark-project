@@ -25,6 +25,8 @@ struct PoolViewRequest {
   std::string selected_id;
   std::uint32_t index = 0;
   std::uint32_t limit = 16;
+  // Absent selects automatic sticky failover; a value pins exactly one node.
+  std::optional<std::string> source_node = {};
   bool operator==(const PoolViewRequest&) const = default;
 };
 

@@ -16,7 +16,15 @@ closest remaining row. Resize preserves selection. Columns adapt to width;
 full IDs, relationships, units and all normalized fields remain reachable in
 the details. The source and snapshot age remain visible above the pool panes.
 
-The displayed source stays selected while healthy. A source switch is announced;
+Press `s` in either pool pane to cycle eligible running nodes and automatic
+mode; `a` explicitly selects automatic mode. Automatic mode keeps the current
+source while healthy and fails over when necessary. Pinned mode reads only
+the chosen node and displays its failure without switching. The header shows
+the source, mode and snapshot age. Switching cancels obsolete reads, clears
+old displayed data and preserves a selected transaction only if it exists on
+the new source. Retained mode labels the captured source and disables switching.
+
+A source switch is announced;
 absence on another node is not proof of mining or eviction. Each request obtains
 a current node-generation lease. All node reads and decoding belong to drivers.
 A background TUI worker refreshes at a 500 ms cadence with one request at a
@@ -25,7 +33,11 @@ before releasing node state. Workload generation and all-node observation are
 independent of this single-node browsing view.
 
 MCP `pool.query` accepts `run_id`, optional `selected_id`, optional fallback
-`index` (0–65535), and `limit` (1–32). The `pool` resource uses the same service;
+`index` (0–65535), `limit` (1–32), and optional `source_node`. A node ID pins
+that source; omitted or null selects automatic mode. Pages include
+`source_mode` and eligible node IDs in `available_sources`. Retained queries
+reject explicit source selection. The `pool` resource uses automatic mode
+through the same service;
 successful captures publish `pool` subscription notifications. Unknown fields
 are JSON `null` and displayed as `N/A`. Units are carried in each summary.
 
